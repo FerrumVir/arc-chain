@@ -1023,7 +1023,52 @@ unsafe fn dot_i8_i64_x4(row: *const i8, inputs: &[*const i64; 4], len: usize) ->
 /// When the opt-in vectorised kernel is enabled it is tried first and this
 /// falls back to the scalar path on refusal, exactly as the unbatched entry
 /// point does.
-pub fn matmul_i8_into_batched(
+/// Overflow-checked geometry validation for a batched projection.
+///
+/// Every bound the raw-pointer arithmetic below relies on is established HERE,
+/// before either implementation runs and before any output is written.
+///
+/// This exists because `debug_assert_eq!` was not enough and was actively
+/// misleading: it compiles out in release, which is exactly where the
+/// raw-pointer writes live. A public caller passing 1x1 weights, a one-element
+/// input and an EMPTY output slice would, in a release build, have written
+/// through the empty slice's pointer. Enabling the vectorised kernel did not
+/// help either — it refuses on shape and falls through to the same unsafe
+/// scalar path, so a SIMD refusal must never hand an unvalidated shape onward.
+///
+/// Multiplications are `checked_mul`, so a `n_tokens * in_size` that overflows
+/// `usize` is rejected rather than wrapping to a small, apparently valid length.
+fn batched_shape_is_valid(
+    weights: &I8Weights,
+    inputs: &[i64],
+    n_tokens: usize,
+    in_size: usize,
+    output: &[i64],
+) -> bool {
+    let (Some(in_len), Some(out_len), Some(weight_len)) = (
+        n_tokens.checked_mul(in_size),
+        n_tokens.checked_mul(weights.n_rows),
+        weights.n_rows.checked_mul(in_size),
+    ) else {
+        return false;
+    };
+    n_tokens != 0
+        && in_size != 0
+        && weights.n_rows != 0
+        && weights.n_cols == in_size
+        && weights.data.len() == weight_len
+        && weights.scales.len() == weights.n_rows
+        && inputs.len() == in_len
+        && output.len() == out_len
+}
+
+/// Batched per-row I8 projection.
+///
+/// `pub(crate)`: the only callers are the prefill in this module. It was
+/// briefly `pub`, which exposed the unsafe geometry contract below to arbitrary
+/// safe callers. Visibility alone would not be a fix — the invariant has to hold
+/// for internal callers too — so the validation above runs regardless.
+pub(crate) fn matmul_i8_into_batched(
     weights: &I8Weights,
     inputs: &[i64],
     n_tokens: usize,
@@ -1036,8 +1081,20 @@ pub fn matmul_i8_into_batched(
         }
         return;
     }
-    debug_assert_eq!(output.len(), n_tokens * weights.n_rows);
-    debug_assert_eq!(inputs.len(), n_tokens * in_size);
+    // Panics in release as well as debug. An invalid geometry here is a caller
+    // bug that would otherwise become memory unsafety, so failing loudly is the
+    // conservative outcome, not a regression.
+    assert!(
+        batched_shape_is_valid(weights, inputs, n_tokens, in_size, output),
+        "matmul_i8_into_batched: invalid geometry - n_tokens={n_tokens} in_size={in_size} \
+         n_rows={} n_cols={} data={} scales={} inputs={} output={}",
+        weights.n_rows,
+        weights.n_cols,
+        weights.data.len(),
+        weights.scales.len(),
+        inputs.len(),
+        output.len()
+    );
     if crate::canonical_simd::fast_canonical_kernel_enabled()
         && crate::canonical_simd::matmul_i8_batched_fast(
             weights, inputs, n_tokens, in_size, output,
@@ -3837,6 +3894,57 @@ impl CachedIntegerModel {
         Ok(self.generate_preflighted_v2_with_sampling(prompt, max_tokens, eos_tokens, false))
     }
 
+    /// Prefill `prompt` into `cache` and return the final position's logits.
+    ///
+    /// **This is the serving integration point for batched prefill.** Three
+    /// conditions must all hold for the batched path to run:
+    ///
+    ///   1. the operator enabled it (`canonical_prefill::batched_prefill_enabled`,
+    ///      default OFF, settable by `ARC_BATCHED_PREFILL=1` or an explicit call);
+    ///   2. the prompt clears the measured profitability floor
+    ///      ([`crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS`]) — below a
+    ///      full quad, batching is slower, so serving must not take it;
+    ///   3. the batched path accepts this model and shape, having first clamped
+    ///      the chunk to the scratch budget.
+    ///
+    /// Anything else falls back to the token-at-a-time loop, which is the
+    /// reference path. The fallback is safe in the strong sense: batched prefill
+    /// is bit-identical to token-at-a-time (conformance covers ten prompt
+    /// lengths across nine chunk sizes, plus KV bytes and continuation decode),
+    /// and it returns `None` **without touching `cache`** when it refuses. So
+    /// which branch runs changes latency and scratch, never an output.
+    fn prefill_prompt_into_cache(
+        &self,
+        prompt: &[u32],
+        cache: &mut KVCache,
+    ) -> Option<Vec<i64>> {
+        if prompt.is_empty() {
+            return None;
+        }
+        if crate::canonical_prefill::batched_prefill_enabled()
+            && crate::canonical_prefill::batching_is_profitable(prompt.len())
+        {
+            let cfg = &self.config;
+            let chunk = crate::canonical_prefill::SERVING_PREFILL_CHUNK.min(
+                crate::canonical_prefill::max_chunk_within_scratch_budget(
+                    cfg.d_model,
+                    cfg.d_kv,
+                    cfg.d_ff,
+                ),
+            );
+            if let Some(mut out) = self.prefill_canonical_i8_batched(prompt, cache, chunk, false) {
+                if let Some(last) = out.pop() {
+                    return Some(last);
+                }
+            }
+        }
+        let mut logits = Vec::new();
+        for &tok in prompt {
+            logits = self.forward_one_token(tok, cache);
+        }
+        Some(logits)
+    }
+
     fn generate_preflighted(
         &self,
         prompt: &[u32],
@@ -3890,9 +3998,11 @@ impl CachedIntegerModel {
         repetition_penalty: bool,
     ) -> (Vec<u32>, Hash256) {
         let mut cache = KVCache::new(self.config.n_layers);
+        // The BOS forward stays token-at-a-time: it is a single token, which is
+        // below the batching profitability floor by definition.
         let mut logits = self.forward_one_token(self.config.bos_token, &mut cache);
-        for &tok in prompt {
-            logits = self.forward_one_token(tok, &mut cache);
+        if let Some(last) = self.prefill_prompt_into_cache(prompt, &mut cache) {
+            logits = last;
         }
 
         let mut generated = Vec::new();
@@ -6099,6 +6209,224 @@ mod tests {
         assert!(c.refused_shape >= 2, "{c:?}");
         assert!(c.refused_context_window >= 1, "{c:?}");
         reset_prefill_census();
+    }
+
+    // ── Batched projection geometry: the unsafe contract ────────────────────
+    //
+    // `matmul_i8_into_batched` indexes weights, inputs and output with raw
+    // pointers. Before this, its only shape checks were `debug_assert_eq!`,
+    // which compile out in release - precisely where those writes happen.
+    // These tests pin the validation that replaced them.
+
+    fn w1x1() -> I8Weights {
+        I8Weights::quantize_f32(&[0.5f32], 1, 1)
+    }
+
+    #[test]
+    fn batched_shape_predicate_accepts_the_shapes_prefill_actually_uses() {
+        let w = I8Weights::quantize_f32(&vec![0.1f32; 8 * 4], 8, 4);
+        let inputs = vec![0i64; 3 * 4];
+        let output = vec![0i64; 3 * 8];
+        assert!(batched_shape_is_valid(&w, &inputs, 3, 4, &output));
+    }
+
+    #[test]
+    fn batched_shape_predicate_rejects_every_undersized_buffer() {
+        let w = I8Weights::quantize_f32(&vec![0.1f32; 8 * 4], 8, 4);
+        let good_in = vec![0i64; 3 * 4];
+        let good_out = vec![0i64; 3 * 8];
+
+        // Output one short, and the empty-output case Codex identified.
+        assert!(!batched_shape_is_valid(&w, &good_in, 3, 4, &good_out[..23]));
+        assert!(!batched_shape_is_valid(&w1x1(), &[1i64], 1, 1, &[]));
+        // Input one short.
+        assert!(!batched_shape_is_valid(&w, &good_in[..11], 3, 4, &good_out));
+        // Weight data inconsistent with n_rows * in_size. Rebuilt rather than
+        // cloned: I8Weights deliberately does not derive Clone, and adding a
+        // derive to accepted code just to write a test is the wrong trade.
+        let short = I8Weights {
+            data: w.data[..w.data.len() - 1].to_vec(),
+            scales: w.scales.clone(),
+            n_rows: w.n_rows,
+            n_cols: w.n_cols,
+        };
+        assert!(!batched_shape_is_valid(&short, &good_in, 3, 4, &good_out));
+        // Scales inconsistent with n_rows.
+        let scales = I8Weights {
+            data: w.data.clone(),
+            scales: w.scales[..w.scales.len() - 1].to_vec(),
+            n_rows: w.n_rows,
+            n_cols: w.n_cols,
+        };
+        assert!(!batched_shape_is_valid(&scales, &good_in, 3, 4, &good_out));
+        // Declared inner dimension disagreeing with the matrix.
+        assert!(!batched_shape_is_valid(&w, &vec![0i64; 3 * 5], 3, 5, &good_out));
+        // Degenerate counts.
+        assert!(!batched_shape_is_valid(&w, &good_in, 0, 4, &good_out));
+        assert!(!batched_shape_is_valid(&w, &good_in, 3, 0, &good_out));
+    }
+
+    #[test]
+    fn batched_shape_predicate_rejects_overflowing_dimensions() {
+        // n_tokens * in_size must not wrap to a small, apparently valid length.
+        let w = w1x1();
+        let huge = usize::MAX / 2 + 1;
+        assert!(!batched_shape_is_valid(&w, &[1i64], huge, 4, &[0i64]));
+        assert!(!batched_shape_is_valid(&w, &[1i64], 4, huge, &[0i64]));
+        let wide = I8Weights {
+            data: vec![0i8; 4],
+            scales: vec![1i64; 2],
+            n_rows: huge,
+            n_cols: 2,
+        };
+        assert!(!batched_shape_is_valid(&wide, &[1i64, 2], 1, 2, &[0i64]));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid geometry")]
+    fn batched_matmul_panics_on_the_empty_output_slice() {
+        // The exact trigger from the review: valid public 1x1 weights, a
+        // one-element input, and an EMPTY output slice. Must panic, not write
+        // through the empty slice's pointer.
+        let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+        let w = w1x1();
+        let mut out: [i64; 0] = [];
+        matmul_i8_into_batched(&w, &[1i64], 1, 1, &mut out);
+        crate::canonical_simd::set_fast_canonical_kernel(prev);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid geometry")]
+    fn batched_matmul_panics_on_undersized_input() {
+        let w = I8Weights::quantize_f32(&vec![0.1f32; 4 * 4], 4, 4);
+        let mut out = vec![0i64; 2 * 4];
+        matmul_i8_into_batched(&w, &[1i64; 4], 2, 4, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid geometry")]
+    fn simd_refusal_does_not_hand_an_invalid_shape_to_unsafe_scalar_code() {
+        // With the vectorised kernel ENABLED, a bad shape makes it refuse - and
+        // the refusal used to fall straight through to the unsafe scalar path
+        // with the same bad shape. It must panic instead.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
+        crate::canonical_simd::set_fast_canonical_kernel(true);
+        let w = w1x1();
+        let mut out: [i64; 0] = [];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matmul_i8_into_batched(&w, &[1i64], 1, 1, &mut out);
+        }));
+        crate::canonical_simd::set_fast_canonical_kernel(prev);
+        match r {
+            Err(e) => std::panic::resume_unwind(e),
+            Ok(()) => panic!("expected a panic but the call returned"),
+        }
+    }
+
+    #[test]
+    fn batched_matmul_still_computes_the_documented_result() {
+        // Validation must not have changed any accepted result.
+        let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+        let w = I8Weights::quantize_f32(&vec![0.05f32; 6 * 3], 6, 3);
+        let inputs: Vec<i64> = (0..2 * 3).map(|i| (i as i64 + 1) * 1000).collect();
+        let mut batched = vec![0i64; 2 * 6];
+        matmul_i8_into_batched(&w, &inputs, 2, 3, &mut batched);
+        for t in 0..2 {
+            let mut one = vec![0i64; 6];
+            matmul_i8_into(&w, &inputs[t * 3..(t + 1) * 3], 3, &mut one);
+            assert_eq!(&batched[t * 6..(t + 1) * 6], &one[..], "token {t}");
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(prev);
+    }
+
+    // ── Serving integration for batched prefill ─────────────────────────────
+    //
+    // The review's point was blunt and correct: an environment variable that no
+    // serving path reads is not production integration. These tests pin that
+    // `generate_v2` - the entry the native executor actually calls, via
+    // try_generate_v2 - routes through the batched path when enabled, and that
+    // doing so cannot change a served result.
+
+    #[test]
+    fn serving_output_is_identical_with_batched_prefill_on_and_off() {
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let prompt: Vec<u32> = vec![1, 5, 9, 13, 21, 34, 55, 2, 7, 11];
+        let eos = [63u32];
+        let prev_batched = crate::canonical_prefill::batched_prefill_enabled();
+        let prev_simd = crate::canonical_simd::fast_canonical_kernel_enabled();
+
+        for &simd in &[false, true] {
+            if simd && !crate::canonical_simd::dotprod_available() {
+                continue;
+            }
+            crate::canonical_simd::set_fast_canonical_kernel(simd);
+
+            crate::canonical_prefill::set_batched_prefill_enabled(false);
+            crate::canonical_prefill::reset_prefill_census();
+            let (off_tokens, off_hash) = model.generate_v2(&prompt, 6, &eos);
+            let off_census = crate::canonical_prefill::prefill_census();
+            assert_eq!(
+                off_census.chunks, 0,
+                "batched prefill ran while disabled (simd={simd}): {off_census:?}"
+            );
+
+            crate::canonical_prefill::set_batched_prefill_enabled(true);
+            crate::canonical_prefill::reset_prefill_census();
+            let (on_tokens, on_hash) = model.generate_v2(&prompt, 6, &eos);
+            let on_census = crate::canonical_prefill::prefill_census();
+
+            assert_eq!(off_tokens, on_tokens, "served tokens differ (simd={simd})");
+            assert_eq!(off_hash, on_hash, "served output hash differs (simd={simd})");
+            assert!(
+                on_census.chunks > 0 && on_census.tokens as usize >= prompt.len(),
+                "the serving path did not actually use batched prefill (simd={simd}): {on_census:?}"
+            );
+            assert_eq!(
+                on_census.refused_total(),
+                0,
+                "batched prefill refused on the serving path (simd={simd}): {on_census:?}"
+            );
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(prev_simd);
+        crate::canonical_prefill::set_batched_prefill_enabled(prev_batched);
+        crate::canonical_prefill::reset_prefill_census();
+    }
+
+    #[test]
+    fn serving_path_refuses_to_batch_below_the_profitability_floor() {
+        // Batching a sub-quad prompt is a measured LOSS, so admission must keep
+        // serving on the token-at-a-time path even with the switch on.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let prev = crate::canonical_prefill::batched_prefill_enabled();
+        crate::canonical_prefill::set_batched_prefill_enabled(true);
+
+        for len in 1..crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS {
+            let prompt: Vec<u32> = (1..=len as u32).collect();
+            crate::canonical_prefill::reset_prefill_census();
+            let _ = model.generate_v2(&prompt, 3, &[63u32]);
+            let c = crate::canonical_prefill::prefill_census();
+            assert_eq!(
+                c.chunks, 0,
+                "a {len}-token prompt is below the floor and must not batch: {c:?}"
+            );
+        }
+
+        // At the floor it engages, which is what makes the bound a bound.
+        let prompt: Vec<u32> = (1..=crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS as u32).collect();
+        crate::canonical_prefill::reset_prefill_census();
+        let _ = model.generate_v2(&prompt, 3, &[63u32]);
+        assert!(
+            crate::canonical_prefill::prefill_census().chunks > 0,
+            "batching must engage at exactly the profitability floor"
+        );
+
+        crate::canonical_prefill::set_batched_prefill_enabled(prev);
+        crate::canonical_prefill::reset_prefill_census();
     }
 
     fn build_test_model(
