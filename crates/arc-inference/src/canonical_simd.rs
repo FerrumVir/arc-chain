@@ -90,6 +90,10 @@ pub const LIMB_MAX: i64 = 2_139_062_143;
 pub const LIMB_MIN: i64 = -2_155_905_152;
 /// Largest inner dimension whose i32 partial sums cannot overflow.
 pub const MAX_COLS_FOR_I32: usize = 131_071;
+/// Bound on a batched call's token count, so the digit scratch stays bounded.
+/// `n_tokens * LIMB_COUNT * in_size` bytes at most, i.e. 4 MiB per 1024 tokens
+/// at `in_size = 1024`. Larger batches must be chunked by the caller.
+pub const MAX_BATCH_TOKENS: usize = 1024;
 
 const fn derive_limb_bound(digit: i64) -> i64 {
     let (mut acc, mut p, mut i) = (0i64, 1i64, 0usize);
@@ -402,6 +406,80 @@ fn post_scale_bound_holds(input: &[i64], scales: &[i64]) -> bool {
         .all(|s| s.checked_abs().and_then(|a| dot_bound.checked_mul(a)).is_some())
 }
 
+/// Raw output pointer shared across rayon tasks that own disjoint row ranges.
+///
+/// Needed because the batched output is token-major (`out[t * n_rows + i]`), so
+/// one task's elements are strided and cannot be expressed as a `&mut` slice
+/// chunk. Disjointness is guaranteed by the row-block decomposition.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct SendPtr(*mut i64);
+#[cfg(target_arch = "aarch64")]
+unsafe impl Send for SendPtr {}
+#[cfg(target_arch = "aarch64")]
+unsafe impl Sync for SendPtr {}
+#[cfg(target_arch = "aarch64")]
+impl SendPtr {
+    /// Accessor rather than a public field: edition-2021 closures capture
+    /// individual fields, so `p.0` inside a rayon closure would capture the
+    /// bare `*mut i64` (not `Send`) instead of this wrapper.
+    #[inline]
+    fn get(self) -> *mut i64 {
+        self.0
+    }
+}
+
+/// Four tokens against one weight row, sharing every weight load.
+///
+/// This is the batching win in one function: the row is loaded once per 16-byte
+/// vector and feeds four independent SDOT accumulator chains. Each returned
+/// value is bit-identical to `dot_limbs_dotprod` for that token.
+///
+/// # Safety
+/// `row` valid for `len` reads; each `planes[q]` valid for `LIMB_COUNT * len`
+/// bytes; `used <= LIMB_COUNT`; `len <= MAX_COLS_FOR_I32`; `dotprod` available.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn dot_limbs_x4(
+    row: *const i8,
+    planes: &[*const i8; 4],
+    len: usize,
+    used: usize,
+) -> [i64; 4] {
+    // SAFETY: wrapped for `unsafe_op_in_unsafe_fn`; caller's contract unchanged.
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut total = [0i64; 4];
+        for l in 0..used {
+            let off = l * len;
+            let mut a0 = [vdupq_n_s32(0); 4];
+            let mut a1 = [vdupq_n_s32(0); 4];
+            let mut j = 0usize;
+            while j + 32 <= len {
+                let w0 = vld1q_s8(row.add(j));
+                let w1 = vld1q_s8(row.add(j + 16));
+                for q in 0..4 {
+                    let c = planes[q].add(off + j);
+                    a0[q] = sdot(a0[q], w0, vld1q_s8(c));
+                    a1[q] = sdot(a1[q], w1, vld1q_s8(c.add(16)));
+                }
+                j += 32;
+            }
+            for q in 0..4 {
+                let mut acc = vaddvq_s32(vaddq_s32(a0[q], a1[q])) as i64;
+                let c = planes[q].add(off);
+                let mut jj = j;
+                while jj < len {
+                    acc += (*row.add(jj) as i64) * (*c.add(jj) as i64);
+                    jj += 1;
+                }
+                total[q] += acc * (1i64 << (8 * l));
+            }
+        }
+        total
+    }
+}
+
 /// Vectorised canonical row projection.
 ///
 /// Returns `true` if it computed `output` exactly, `false` if it refused; on
@@ -487,20 +565,158 @@ pub fn matmul_i8_canonical_rows_fast(
     }
 }
 
+/// Batched form of [`matmul_i8_canonical_rows_fast`]: `n_tokens` activations
+/// against the same weight matrix.
+///
+/// Exactness is unchanged and is trivial to see: output `[t][i]` is
+/// `(dot(row_i, x_t) * scale_i) >> FRAC_BITS`, the same expression the
+/// single-token path computes, with no cross-token coupling anywhere. Nothing
+/// is shared between tokens except the weights, which are read-only. Batching
+/// therefore cannot change a value - only how many times the weights are read.
+///
+/// `inputs` is `n_tokens * in_size`, `output` is `n_tokens * n_rows`, both
+/// token-major. Returns `false` and writes nothing if it refuses.
+pub fn matmul_i8_batched_fast(
+    weights: &I8Weights,
+    inputs: &[i64],
+    n_tokens: usize,
+    in_size: usize,
+    output: &mut [i64],
+) -> bool {
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (weights, inputs, n_tokens, in_size, output);
+        record_attempt();
+        record_refusal(Refusal::Unavailable)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        record_attempt();
+        if !dotprod_available() {
+            return record_refusal(Refusal::Unavailable);
+        }
+        if in_size == 0
+            || n_tokens == 0
+            || n_tokens > MAX_BATCH_TOKENS
+            || inputs.len() != n_tokens.saturating_mul(in_size)
+            || weights.n_cols != in_size
+            || weights.n_rows == 0
+            || weights.data.len() != weights.n_rows.saturating_mul(in_size)
+            || weights.scales.len() != weights.n_rows
+            || output.len() != n_tokens.saturating_mul(weights.n_rows)
+        {
+            return record_refusal(Refusal::Shape);
+        }
+        if in_size > MAX_COLS_FOR_I32 {
+            return record_refusal(Refusal::InnerDimAboveI32Bound);
+        }
+        // The post-dot bound must hold for EVERY token, so it is checked
+        // against every token's own activation before anything is written.
+        for t in 0..n_tokens {
+            if !post_scale_bound_holds(&inputs[t * in_size..(t + 1) * in_size], &weights.scales) {
+                return record_refusal(Refusal::ScaleMultiplyWouldOverflow);
+            }
+        }
+        let mut limbs = vec![0i8; n_tokens * LIMB_COUNT * in_size];
+        let mut used = vec![0usize; n_tokens];
+        for t in 0..n_tokens {
+            let lo = t * LIMB_COUNT * in_size;
+            match split_limbs(
+                &inputs[t * in_size..(t + 1) * in_size],
+                &mut limbs[lo..lo + LIMB_COUNT * in_size],
+            ) {
+                Some(u) => used[t] = u,
+                None => return record_refusal(Refusal::ActivationOutOfDomain),
+            }
+        }
+        let data = &weights.data;
+        let scales = &weights.scales;
+        let n_rows = weights.n_rows;
+        let limbs = &limbs[..];
+        let used_max = used.iter().copied().max().unwrap_or(1);
+        // Using more digit planes than a token needs is still exact - the extra
+        // planes are zero - so one `used` for the quad keeps the inner loop
+        // branch-free.
+        //
+        // Tiling. `row_block` keeps a block of weight rows inside L1
+        // (~128 KiB), and tokens are processed four at a time so ONE weight
+        // vector load feeds four SDOT chains. DRAM weight traffic therefore
+        // falls from once-per-token to once-per-matmul, which is the entire
+        // point of batching; the per-(row, token) arithmetic is untouched.
+        let row_block = (131_072 / in_size).clamp(1, n_rows.max(1));
+        let n_blocks = n_rows.div_ceil(row_block);
+        let out_ptr = SendPtr(output.as_mut_ptr());
+        (0..n_blocks).into_par_iter().for_each(|b| {
+            let r0 = b * row_block;
+            let r1 = (r0 + row_block).min(n_rows);
+            let mut t = 0usize;
+            while t < n_tokens {
+                let quad = (n_tokens - t).min(4);
+                // Short final quad repeats the first token's planes so the
+                // inner kernel stays branch-free; those lanes are discarded.
+                let plane_of = |q: usize| {
+                    let tok = t + q.min(quad - 1);
+                    // SAFETY: `tok < n_tokens`, and `limbs` holds
+                    // `n_tokens * LIMB_COUNT * in_size` bytes.
+                    unsafe { limbs.as_ptr().add(tok * LIMB_COUNT * in_size) }
+                };
+                let planes = [plane_of(0), plane_of(1), plane_of(2), plane_of(3)];
+                for i in r0..r1 {
+                    // SAFETY: `i < n_rows` and `data` holds `n_rows * in_size`
+                    // bytes. Each rayon task owns a disjoint row range, and for
+                    // a given row it writes only `out[(t+q) * n_rows + i]`, so
+                    // no two tasks ever touch the same output element.
+                    let acc = unsafe {
+                        dot_limbs_x4(data.as_ptr().add(i * in_size), &planes, in_size, used_max)
+                    };
+                    let sc = scales[i];
+                    for (q, a) in acc.iter().enumerate().take(quad) {
+                        unsafe { *out_ptr.get().add((t + q) * n_rows + i) = (*a * sc) >> FRAC_BITS };
+                    }
+                }
+                t += quad;
+            }
+        });
+        record_accept();
+        true
+    }
+}
+
+/// Serialises every test that observes or mutates the process-global kernel
+/// switches: `FAST_CANONICAL`, `CENSUS_ON`, the projection counters and the
+/// prefill counters in [`crate::canonical_prefill`].
+///
+/// These switches are deliberately process-wide — that is what makes them
+/// usable as an operator control — but the test harness runs tests in parallel
+/// threads of one process, so a test that asserts "off by default" will observe
+/// another test's opt-in unless both serialise. That is exactly how
+/// `disabled_unless_explicitly_requested` failed the first time the batched
+/// prefill conformance tests were ever executed: `run_batched_conformance`
+/// enables the kernel, restores it correctly afterwards, and the default-off
+/// assertion still ran inside that window.
+///
+/// The lock lives outside `mod tests` because the prefill conformance tests sit
+/// in `cached_integer_model`, a different module, and must take the same one.
+#[cfg(test)]
+pub(crate) static KERNEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Guard for [`KERNEL_SWITCH_TEST_LOCK`]. Poison is ignored deliberately: a
+/// panicking test must not cascade into unrelated failures in every other test
+/// that touches a switch.
+#[cfg(test)]
+pub(crate) fn kernel_switch_guard() -> std::sync::MutexGuard<'static, ()> {
+    KERNEL_SWITCH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::integer_lut::FRAC_BITS;
-    use std::sync::Mutex;
-
-    /// The census flag and counters are process-global while the harness runs
-    /// tests in parallel, so the two tests that OBSERVE the flag must not run
-    /// while the other is toggling it. Without this,
-    /// `census_is_off_by_default` failed roughly 1 run in 30.
-    static CENSUS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn census_guard() -> std::sync::MutexGuard<'static, ()> {
-        CENSUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        kernel_switch_guard()
     }
 
     fn scalar_dot(row: &[i8], input: &[i64]) -> i64 {
@@ -757,6 +973,7 @@ mod tests {
     #[test]
     fn disabled_unless_explicitly_requested() {
         // Off unless the operator opted in; never on by default.
+        let _guard = kernel_switch_guard();
         if std::env::var("ARC_FAST_CANONICAL_KERNEL").as_deref() == Ok("1") {
             assert!(fast_canonical_kernel_enabled() || !dotprod_available());
         } else {

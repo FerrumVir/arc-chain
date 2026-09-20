@@ -988,6 +988,111 @@ fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &m
         });
 }
 
+/// Four tokens against one weight row, sharing every weight load.
+///
+/// Scalar counterpart of the vectorised batched kernel. `row[j]` is loaded once
+/// and multiplied into four independent accumulators, so a batch of tokens
+/// reads the weights once instead of once per token. Each result is identical
+/// to `dot_i8_i64` for that token.
+///
+/// # Safety
+/// `row` valid for `len` reads; each `inputs[q]` valid for `len` reads.
+#[inline]
+unsafe fn dot_i8_i64_x4(row: *const i8, inputs: &[*const i64; 4], len: usize) -> [i64; 4] {
+    // SAFETY: wrapped for `unsafe_op_in_unsafe_fn`; caller guarantees the reads.
+    unsafe {
+        let mut acc = [0i64; 4];
+        for j in 0..len {
+            let w = *row.add(j) as i64;
+            for q in 0..4 {
+                acc[q] += w * *inputs[q].add(j);
+            }
+        }
+        acc
+    }
+}
+
+/// Batched per-row I8 projection: `n_tokens` activations against one matrix.
+///
+/// Token-major in (`n_tokens * in_size`) and out (`n_tokens * n_rows`). Every
+/// output is `(dot(row_i, x_t) * scale_i) >> FRAC_BITS`, exactly what
+/// [`matmul_i8_into`] computes one token at a time. Batching changes only how
+/// often the weights are read, never a value; there is no cross-token
+/// reduction and no batch-dependent quantisation in this profile.
+///
+/// When the opt-in vectorised kernel is enabled it is tried first and this
+/// falls back to the scalar path on refusal, exactly as the unbatched entry
+/// point does.
+pub fn matmul_i8_into_batched(
+    weights: &I8Weights,
+    inputs: &[i64],
+    n_tokens: usize,
+    in_size: usize,
+    output: &mut [i64],
+) {
+    if weights.n_rows == 0 || weights.data.is_empty() {
+        for o in output.iter_mut() {
+            *o = 0;
+        }
+        return;
+    }
+    debug_assert_eq!(output.len(), n_tokens * weights.n_rows);
+    debug_assert_eq!(inputs.len(), n_tokens * in_size);
+    if crate::canonical_simd::fast_canonical_kernel_enabled()
+        && crate::canonical_simd::matmul_i8_batched_fast(
+            weights, inputs, n_tokens, in_size, output,
+        )
+    {
+        return;
+    }
+    let data = &weights.data;
+    let scales = &weights.scales;
+    let n_rows = weights.n_rows;
+    // Same L1-resident row block and 4-token tile as the vectorised path, so
+    // the scalar batched baseline is a fair comparison rather than a straw man.
+    let row_block = (131_072 / in_size.max(1)).clamp(1, n_rows);
+    let n_blocks = n_rows.div_ceil(row_block);
+    let out = BatchOutPtr(output.as_mut_ptr());
+    (0..n_blocks).into_par_iter().for_each(|b| {
+        let r0 = b * row_block;
+        let r1 = (r0 + row_block).min(n_rows);
+        let mut t = 0usize;
+        while t < n_tokens {
+            let quad = (n_tokens - t).min(4);
+            let src = |q: usize| {
+                let tok = t + q.min(quad - 1);
+                // SAFETY: `tok < n_tokens` and `inputs` holds n_tokens*in_size.
+                unsafe { inputs.as_ptr().add(tok * in_size) }
+            };
+            let ins = [src(0), src(1), src(2), src(3)];
+            for i in r0..r1 {
+                // SAFETY: `i < n_rows`, `data` holds n_rows*in_size. Each task
+                // owns a disjoint row range and writes only
+                // `out[(t+q) * n_rows + i]`, so writes never alias.
+                let acc = unsafe { dot_i8_i64_x4(data.as_ptr().add(i * in_size), &ins, in_size) };
+                let sc = scales[i];
+                for (q, a) in acc.iter().enumerate().take(quad) {
+                    unsafe { *out.get().add((t + q) * n_rows + i) = (*a * sc) >> FRAC_BITS };
+                }
+            }
+            t += quad;
+        }
+    });
+}
+
+/// Disjoint-range output pointer for the batched matmul. See the identical
+/// wrapper in `canonical_simd` for why a field accessor is used.
+#[derive(Clone, Copy)]
+struct BatchOutPtr(*mut i64);
+unsafe impl Send for BatchOutPtr {}
+unsafe impl Sync for BatchOutPtr {}
+impl BatchOutPtr {
+    #[inline]
+    fn get(self) -> *mut i64 {
+        self.0
+    }
+}
+
 /// Canonical per-row I8 projection for a worker-owned row shard.
 ///
 /// This intentionally reaches the same raw I8×i64 dot product and Q16
@@ -3306,6 +3411,214 @@ impl CachedIntegerModel {
         matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
     }
 
+    /// Batched multi-token prefill for the canonical per-row I8 profile.
+    ///
+    /// Semantics are identical to calling [`Self::forward_one_token`] for each
+    /// token in order: the same layer norms, the same RoPE positions, the same
+    /// causal attention over the same KV-cache ordering, the same activation,
+    /// the same residuals and the same output projection. Only the seven
+    /// per-layer projections and the output projection are batched, and
+    /// batching cannot change a value in this profile — see
+    /// [`crate::canonical_prefill`]. Attention is ~1% of prefill arithmetic and
+    /// stays strictly per position, so causality is structurally preserved.
+    ///
+    /// Returns `None` **without touching `cache`** if it refuses; the caller
+    /// must then use the token-at-a-time path. Refusal is a capability
+    /// decision: no admission bound is relaxed.
+    ///
+    /// With `all_positions` the logits of every token are returned, which is
+    /// the verification shape. Otherwise only the final token's logits are
+    /// computed, which is all prefill actually needs.
+    pub fn prefill_canonical_i8_batched(
+        &self,
+        tokens: &[u32],
+        cache: &mut KVCache,
+        chunk_size: usize,
+        all_positions: bool,
+    ) -> Option<Vec<Vec<i64>>> {
+        use crate::canonical_prefill::{PrefillRefusal, record_chunk, record_prefill_refusal};
+        let cfg = &self.config;
+        let (d, dkv, dff, dh) = (cfg.d_model, cfg.d_kv, cfg.d_ff, cfg.d_head);
+        if !self.has_canonical_i8_profile() || !self.has_all_transformer_layers() {
+            record_prefill_refusal(PrefillRefusal::NotCanonicalProfile);
+            return None;
+        }
+        if tokens.is_empty()
+            || chunk_size == 0
+            || d == 0
+            || dh == 0
+            || cfg.n_heads == 0
+            || cfg.n_kv_heads == 0
+            || cfg.vocab_size == 0
+            || cache.k_data.len() != cfg.n_layers
+            || cache.v_data.len() != cfg.n_layers
+            || self.layers.len() != cfg.n_layers
+        {
+            record_prefill_refusal(PrefillRefusal::Shape);
+            return None;
+        }
+        // `forward_one_token` returns an empty vector when the embedding table
+        // is too small for the raw token id. Rather than reproduce that
+        // degenerate result here, refuse and let the token-at-a-time path
+        // produce exactly what it produces today.
+        if tokens
+            .iter()
+            .any(|t| self.embedding_q16.len() < (*t as usize + 1).saturating_mul(d))
+        {
+            record_prefill_refusal(PrefillRefusal::Shape);
+            return None;
+        }
+        let base = cache.seq_len;
+        if base
+            .checked_add(tokens.len())
+            .is_none_or(|end| end > cfg.max_seq)
+        {
+            record_prefill_refusal(PrefillRefusal::ContextWindowExceeded);
+            return None;
+        }
+        let chunk_size = chunk_size.min(crate::canonical_simd::MAX_BATCH_TOKENS);
+
+        let total = tokens.len();
+        let mut out: Vec<Vec<i64>> = Vec::new();
+        let mut done = 0usize;
+        while done < total {
+            let t_n = chunk_size.min(total - done);
+            let chunk = &tokens[done..done + t_n];
+
+            let mut hidden = vec![0i64; t_n * d];
+            for (ti, &tok) in chunk.iter().enumerate() {
+                let idx = (tok as usize).min(cfg.vocab_size - 1);
+                hidden[ti * d..(ti + 1) * d]
+                    .copy_from_slice(&self.embedding_q16[idx * d..(idx + 1) * d]);
+            }
+            let mut normed = vec![0i64; t_n * d];
+            let mut q = vec![0i64; t_n * d];
+            let mut k = vec![0i64; t_n * dkv];
+            let mut v = vec![0i64; t_n * dkv];
+            let mut attn = vec![0i64; t_n * d];
+            let mut proj = vec![0i64; t_n * d];
+            let mut gate = vec![0i64; t_n * dff];
+            let mut up = vec![0i64; t_n * dff];
+            let mut ffo = vec![0i64; t_n * d];
+
+            for (li, layer) in self.layers.iter().enumerate() {
+                for ti in 0..t_n {
+                    normed[ti * d..(ti + 1) * d].copy_from_slice(&layernorm(
+                        &hidden[ti * d..(ti + 1) * d],
+                        &layer.attn_norm,
+                    ));
+                }
+                matmul_i8_into_batched(&layer.wq, &normed, t_n, d, &mut q);
+                matmul_i8_into_batched(&layer.wk, &normed, t_n, d, &mut k);
+                matmul_i8_into_batched(&layer.wv, &normed, t_n, d, &mut v);
+
+                // RoPE at each token's absolute position, then K/V appended in
+                // position order. Pushing the whole chunk before attention is
+                // safe because each token attends over `pos + 1` entries only.
+                for ti in 0..t_n {
+                    let pos = base + done + ti;
+                    for h in 0..cfg.n_heads {
+                        apply_rope(
+                            &mut q[ti * d + h * dh..ti * d + (h + 1) * dh],
+                            pos,
+                            dh,
+                            &cfg.rope_cos,
+                            &cfg.rope_sin,
+                        );
+                    }
+                    for h in 0..cfg.n_kv_heads {
+                        apply_rope(
+                            &mut k[ti * dkv + h * dh..ti * dkv + (h + 1) * dh],
+                            pos,
+                            dh,
+                            &cfg.rope_cos,
+                            &cfg.rope_sin,
+                        );
+                    }
+                    cache.push_k(li, &k[ti * dkv..(ti + 1) * dkv]);
+                    cache.push_v(li, &v[ti * dkv..(ti + 1) * dkv]);
+                }
+
+                {
+                    let kd = &cache.k_data[li];
+                    let vd = &cache.v_data[li];
+                    let heads = cfg.n_heads;
+                    let results: Vec<Vec<i64>> = (0..t_n * heads)
+                        .into_par_iter()
+                        .map(|x| {
+                            let ti = x / heads;
+                            let h = x % heads;
+                            let pos = base + done + ti;
+                            let kv_h = h * cfg.n_kv_heads / heads;
+                            flash_attention_i64(
+                                &q[ti * d + h * dh..ti * d + (h + 1) * dh],
+                                kd,
+                                vd,
+                                dkv,
+                                kv_h,
+                                dh,
+                                pos + 1,
+                                cfg.attn_scale,
+                            )
+                        })
+                        .collect();
+                    for (x, r) in results.iter().enumerate() {
+                        let ti = x / heads;
+                        let h = x % heads;
+                        attn[ti * d + h * dh..ti * d + (h + 1) * dh].copy_from_slice(r);
+                    }
+                }
+
+                matmul_i8_into_batched(&layer.wo, &attn, t_n, d, &mut proj);
+                for i in 0..t_n * d {
+                    hidden[i] += proj[i];
+                }
+                for ti in 0..t_n {
+                    normed[ti * d..(ti + 1) * d].copy_from_slice(&layernorm(
+                        &hidden[ti * d..(ti + 1) * d],
+                        &layer.ffn_norm,
+                    ));
+                }
+                matmul_i8_into_batched(&layer.w_gate, &normed, t_n, d, &mut gate);
+                matmul_i8_into_batched(&layer.w_up, &normed, t_n, d, &mut up);
+                for j in 0..t_n * dff {
+                    gate[j] = (silu_i64(gate[j]) * up[j]) >> FRAC_BITS;
+                }
+                matmul_i8_into_batched(&layer.w_down, &gate, t_n, dff, &mut ffo);
+                for i in 0..t_n * d {
+                    hidden[i] += ffo[i];
+                }
+            }
+            cache.seq_len = base + done + t_n;
+
+            let want: Vec<usize> = if all_positions {
+                (0..t_n).collect()
+            } else if done + t_n == total {
+                vec![t_n - 1]
+            } else {
+                Vec::new()
+            };
+            if !want.is_empty() {
+                let cnt = want.len();
+                let mut fin = vec![0i64; cnt * d];
+                for (o, &ti) in want.iter().enumerate() {
+                    fin[o * d..(o + 1) * d].copy_from_slice(&layernorm(
+                        &hidden[ti * d..(ti + 1) * d],
+                        &self.final_norm,
+                    ));
+                }
+                let mut logits = vec![0i64; cnt * cfg.vocab_size];
+                matmul_i8_into_batched(&self.output_weight, &fin, cnt, d, &mut logits);
+                for o in 0..cnt {
+                    out.push(logits[o * cfg.vocab_size..(o + 1) * cfg.vocab_size].to_vec());
+                }
+            }
+            record_chunk(t_n, 7 * cfg.n_layers + usize::from(!want.is_empty()));
+            done += t_n;
+        }
+        Some(out)
+    }
+
     /// Canonical-I8 whole-token forward whose projections are supplied by a
     /// fallible row-partition backend.  Norms, RoPE, KV cache, attention,
     /// residuals, activation, and ordered output assembly remain local.  This
@@ -5587,6 +5900,182 @@ mod tests {
         assert_eq!(worker, 2);
         assert_eq!(distributed_verifier, worker);
         assert_eq!(worker_logits, distributed_verifier_logits);
+    }
+
+    // ── Batched prefill conformance ─────────────────────────────────────────
+    //
+    // Batched prefill must be indistinguishable from calling forward_one_token
+    // once per token: same logits at every position, same KV cache bytes, same
+    // seq_len, and the same continuation decode afterwards.
+
+    fn token_at_a_time(
+        model: &CachedIntegerModel,
+        tokens: &[u32],
+        cache: &mut KVCache,
+    ) -> Vec<Vec<i64>> {
+        tokens
+            .iter()
+            .map(|t| model.forward_one_token(*t, cache))
+            .collect()
+    }
+
+    fn clone_cache(c: &KVCache) -> KVCache {
+        KVCache {
+            k_data: c.k_data.clone(),
+            v_data: c.v_data.clone(),
+            seq_len: c.seq_len,
+        }
+    }
+
+    fn assert_same_cache(a: &KVCache, b: &KVCache, case: &str) {
+        assert_eq!(a.seq_len, b.seq_len, "seq_len differs ({case})");
+        assert_eq!(a.k_data.len(), b.k_data.len(), "layer count differs ({case})");
+        for l in 0..a.k_data.len() {
+            assert_eq!(a.k_data[l], b.k_data[l], "K cache differs at layer {l} ({case})");
+            assert_eq!(a.v_data[l], b.v_data[l], "V cache differs at layer {l} ({case})");
+        }
+    }
+
+    fn run_batched_conformance(simd: bool) {
+        // The kernel switch is process-global and the harness is parallel, so
+        // opting in here is visible to every other test until it is restored.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
+        crate::canonical_simd::set_fast_canonical_kernel(simd);
+        let model = build_test_model(64, 32, 4, 64, 3);
+        assert!(model.has_canonical_i8_profile());
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1],
+            vec![1, 2],
+            vec![1, 2, 3],
+            vec![5, 9, 13, 21, 34, 55, 2],
+            (0..8u32).collect(),
+            (0..9u32).collect(),
+            (0..15u32).collect(),
+            (0..16u32).collect(),
+            (0..17u32).collect(),
+            (0..33u32).collect(),
+        ];
+        for prompt in &prompts {
+            let mut ref_cache = KVCache::new(model.config.n_layers);
+            let reference = token_at_a_time(&model, prompt, &mut ref_cache);
+            for &chunk in &[1usize, 2, 3, 4, 5, 7, 8, 16, 64] {
+                let mut cache = KVCache::new(model.config.n_layers);
+                let got = model
+                    .prefill_canonical_i8_batched(prompt, &mut cache, chunk, true)
+                    .unwrap_or_else(|| panic!("refused len={} chunk={chunk}", prompt.len()));
+                let case = format!("simd={simd} len={} chunk={chunk}", prompt.len());
+                assert_eq!(got.len(), reference.len(), "position count ({case})");
+                for (p, (a, b)) in reference.iter().zip(got.iter()).enumerate() {
+                    assert_eq!(a, b, "logits differ at position {p} ({case})");
+                }
+                assert_same_cache(&ref_cache, &cache, &case);
+
+                // Continuation decode must also match, which is what proves the
+                // persisted KV state is byte-correct and not merely consistent
+                // within the prefill itself.
+                let mut ref_cont = clone_cache(&ref_cache);
+                let mut got_cont = clone_cache(&cache);
+                for step in 0..3u32 {
+                    let a = model.forward_one_token(7 + step, &mut ref_cont);
+                    let b = model.forward_one_token(7 + step, &mut got_cont);
+                    assert_eq!(a, b, "continuation logits differ at step {step} ({case})");
+                }
+                assert_same_cache(&ref_cont, &got_cont, &format!("{case} after decode"));
+            }
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(prev);
+    }
+
+    #[test]
+    fn batched_prefill_matches_token_at_a_time_scalar() {
+        run_batched_conformance(false);
+    }
+
+    #[test]
+    fn batched_prefill_matches_token_at_a_time_simd() {
+        if !crate::canonical_simd::dotprod_available() {
+            return;
+        }
+        run_batched_conformance(true);
+    }
+
+    #[test]
+    fn batched_prefill_resumes_from_a_nonempty_cache() {
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let head: Vec<u32> = vec![1, 4, 9];
+        let tail: Vec<u32> = vec![16, 25, 36, 49, 64 - 1];
+        let mut ref_cache = KVCache::new(model.config.n_layers);
+        let _ = token_at_a_time(&model, &head, &mut ref_cache);
+        let reference = token_at_a_time(&model, &tail, &mut ref_cache);
+
+        for &chunk in &[1usize, 2, 3, 8] {
+            let mut cache = KVCache::new(model.config.n_layers);
+            let _ = token_at_a_time(&model, &head, &mut cache);
+            assert_eq!(cache.seq_len, head.len());
+            let got = model
+                .prefill_canonical_i8_batched(&tail, &mut cache, chunk, true)
+                .expect("must accept a resumed prefill");
+            for (p, (a, b)) in reference.iter().zip(got.iter()).enumerate() {
+                assert_eq!(a, b, "resumed prefill differs at position {p}, chunk={chunk}");
+            }
+            assert_same_cache(&ref_cache, &cache, &format!("resumed chunk={chunk}"));
+        }
+    }
+
+    #[test]
+    fn batched_prefill_last_position_only_matches_final_logits() {
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let prompt: Vec<u32> = (0..11u32).collect();
+        let mut ref_cache = KVCache::new(model.config.n_layers);
+        let reference = token_at_a_time(&model, &prompt, &mut ref_cache);
+        for &chunk in &[1usize, 3, 4, 16] {
+            let mut cache = KVCache::new(model.config.n_layers);
+            let got = model
+                .prefill_canonical_i8_batched(&prompt, &mut cache, chunk, false)
+                .expect("must accept");
+            assert_eq!(got.len(), 1, "production shape returns one logit vector");
+            assert_eq!(got[0], *reference.last().unwrap(), "chunk={chunk}");
+            assert_same_cache(&ref_cache, &cache, &format!("last-only chunk={chunk}"));
+        }
+    }
+
+    #[test]
+    fn batched_prefill_refuses_without_touching_the_cache() {
+        use crate::canonical_prefill::{prefill_census, reset_prefill_census};
+        // The prefill counters are process-global too: without this, a
+        // concurrent `reset_prefill_census` zeroes the counts between the
+        // refusals below and the assertions on them.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let max_seq = model.config.max_seq;
+        reset_prefill_census();
+
+        // empty prompt
+        let mut cache = KVCache::new(model.config.n_layers);
+        assert!(model.prefill_canonical_i8_batched(&[], &mut cache, 8, true).is_none());
+        assert_eq!(cache.seq_len, 0);
+        assert!(cache.k_data.iter().all(|k| k.is_empty()));
+
+        // zero chunk size
+        assert!(model.prefill_canonical_i8_batched(&[1, 2], &mut cache, 0, true).is_none());
+        assert_eq!(cache.seq_len, 0);
+        assert!(cache.k_data.iter().all(|k| k.is_empty()));
+
+        // beyond the context window: admission is NOT relaxed
+        let too_long: Vec<u32> = vec![1; max_seq + 1];
+        assert!(model.prefill_canonical_i8_batched(&too_long, &mut cache, 8, true).is_none());
+        assert_eq!(cache.seq_len, 0);
+        assert!(cache.k_data.iter().all(|k| k.is_empty()));
+
+        // exactly at the window is still admitted
+        let exact: Vec<u32> = vec![1; 4];
+        assert!(model.prefill_canonical_i8_batched(&exact, &mut cache, 4, false).is_some());
+
+        let c = prefill_census();
+        assert!(c.refused_shape >= 2, "{c:?}");
+        assert!(c.refused_context_window >= 1, "{c:?}");
+        reset_prefill_census();
     }
 
     fn build_test_model(

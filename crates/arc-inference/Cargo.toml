@@ -95,6 +95,9 @@ required-features = ["candle"]
 [[example]]
 name = "canonical_kernel_conformance"
 required-features = ["candle"]
+[[example]]
+name = "batched_prefill_experiment"
+required-features = ["candle"]
 # These five were missing from this list, so `--all-targets` (and plain
 # `cargo test -p arc-inference`) tried to build them without the candle
 # dependency and failed on unresolved `candle_core`/`candle_transformers`

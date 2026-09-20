@@ -101,7 +101,7 @@ fn main() -> Result<(), String> {
 
     // One pass = `repeats` rounds; the kernel ORDER ALTERNATES between rounds,
     // so a fixed scalar-first ordering cannot be what produces the difference.
-    let mut one_pass = |census: bool,
+    let one_pass = |census: bool,
                         scalar_ms: &mut Vec<f64>,
                         fast_ms: &mut Vec<f64>,
                         compared_positions: &mut usize,
