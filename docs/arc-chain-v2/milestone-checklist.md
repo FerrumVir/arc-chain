@@ -1,13 +1,13 @@
 # ARC Chain V2 milestone checklist
 
 - [ ] **1. Real INT8 correctness, resources, and quality — IN PROGRESS**
-  - Acceptance requires a same-model Fireworks benchmark covering quality, reliability, speed, and total cost; deterministic token/hash output alone is insufficient.
+  - Acceptance requires comparable quality, reliability, latency, and total-cost evidence; deterministic token/hash output alone is insufficient. Published provider figures are projection context, not a like-for-like paid benchmark.
   - [x] Artifact identity and canonical harness checks passed.
   - [x] The first 8-token real generation was deterministic with matching token-byte/output hashes, but echoed prompt-like text.
-  - [ ] Quality gate: subsequent 3 checks × 6 generations × 32 tokens failed Paris, arithmetic, and greeting coherence checks. Source Llama2 Q4_K_M→INT8 is diagnostic evidence, not a paid API benchmark.
-  - [ ] Interleaved GGUF RoPE versus split-half kernel mismatch is the current suspected cause; a new profile and reference implementation are pending. No fix is claimed.
-  - [x] One corrected ARC minimal-Paris 8-token run matched the same-GGUF llama.cpp reference's exact eight completion IDs (including BOS); this is a single-prompt correctness subgate only.
-  - [x] Reference llama.cpp tokenization matches ARC IDs for three vectors; this is limited tokenization proof only.
+  - [ ] Historical quality run: 3 checks × 6 generations × 32 tokens failed Paris, arithmetic, and greeting coherence; this is superseded by the current bounded 6/6 content checks and 5/6 direct sampled-sequence matches. Source Llama2 Q4_K_M→INT8 remains diagnostic evidence, not a paid API benchmark.
+  - [x] The versioned interleaved-RoPE profile and reference implementation are present; broad model qualification remains open.
+  - [ ] Direct same-GGUF traces match 5/6 sampled greedy sequences. Paris matches the first eight content IDs, then llama.cpp emits EOG while ARC continues to its bound; this is not an exact sampled-ID match.
+  - [x] Reference llama.cpp tokenization matches ARC IDs for 11/11 vectors; this is profile evidence, not full tokenizer qualification.
 
 - [ ] **2. Paid canonical integration — IN PROGRESS**
   - [x] Candidate state is private genesis-only protocol 4; protocol 3/default admission rejects native families.
@@ -18,7 +18,8 @@
 
 - [ ] **3. Distributed work sharing — IN PROGRESS**
   - [x] Six live gateway probes returned HTTP 200 and collectively advertised layer ranges 0–32.
-  - [ ] All six reported the same holder `arc-68b19960` and `0.0.0.0:9944`; `profile_bound=false`, `fully_covered=false`, and `dispatch=false`. Authenticated distinct holders, network-parallel querying, and speedup remain unproven.
+  - [x] Bounded two-machine forward query matched exact logits for 3/3 inputs.
+  - [ ] Performance/fleet gate: partitioned execution was 34.05× slower than local; five other gateway hosts remain inaccessible by configured SSH identities. Authenticated distinct holders, arbitrary-WAN speedup, and production worker inference remain unproven.
 
 - [ ] **4. Resilience and recovery — TODO**
   - [ ] Failure, retry, replay, checkpoint, finality, snapshot, and live-P2P acceptance remain pending; evidence is private-WAL-only.
@@ -29,4 +30,4 @@
 - [ ] **6. Release and soak — TODO**
   - [ ] Signed release builds, long-duration soak, resource limits, upgrade/restart drills, and release review remain pending.
 
-Account-wide usage was last observed at 84% used / 16% remaining; this is not attributable per task. No competitor benchmark has run.
+Account-wide usage was last observed at 90% used / 10% remaining; this is not attributable per task. No competitor benchmark has run.
