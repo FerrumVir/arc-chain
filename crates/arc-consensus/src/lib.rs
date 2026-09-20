@@ -3251,10 +3251,18 @@ impl ConsensusEngine {
     /// is less than PRUNE_DEPTH, no pruning occurs. Returns the number of
     /// blocks pruned.
     pub fn prune_below_round(&self, committed_round: u64) -> usize {
-        if committed_round < PRUNE_DEPTH {
+        // Retention, not the reorg floor. This is the prune path that actually
+        // runs on a live node, and it decides how far back a rejoining peer can
+        // still be served - so it has to honour the same setting
+        // `prune_old_rounds` does. It previously used PRUNE_DEPTH directly,
+        // which kept 100 rounds no matter what retention said, and a restarted
+        // node asking for round 0 was told "Cannot serve" 162 times while the
+        // configured window was 4096.
+        let retained = self.retained_rounds();
+        if committed_round < retained {
             return 0;
         }
-        let cutoff = committed_round - PRUNE_DEPTH;
+        let cutoff = committed_round - retained;
 
         let mut pruned_count = 0usize;
 
@@ -5718,7 +5726,18 @@ mod tests {
         let initial_dag_size = engine.dag_size();
         assert!(initial_dag_size > 0);
 
-        // Prune with committed_round = 110 - should remove rounds < 110 - 100 = 10
+        // Retention decides the cutoff, not a hardcoded depth. With the
+        // default 4096 rounds nothing here is old enough to prune, which is
+        // the point: this is the path that determines how far back a
+        // rejoining peer can still be served.
+        assert_eq!(
+            engine.prune_below_round(110),
+            0,
+            "with the default retention, 110 rounds of history are all still needed"
+        );
+
+        // Ask for a 100-round window explicitly and the old behaviour returns.
+        engine.set_retained_rounds(100);
         let pruned = engine.prune_below_round(110);
         assert!(pruned > 0, "should have pruned some blocks");
 
