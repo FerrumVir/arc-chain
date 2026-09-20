@@ -73,6 +73,7 @@ button.secondary:hover{border-color:#6366f1;color:#fff}
   <div class="card">
     <h2>Balance</h2>
     <div class="balance" id="bal">0 <small>ARC</small></div>
+    <div id="balStatus"></div>
     <div class="addr" id="myAddr" onclick="copyAddr()" title="Click to copy"></div>
   </div>
 
@@ -138,13 +139,21 @@ let wallet = null; // {version, privKey, pubKey, address}
     try {
       const r = await fetch(`http://${n.ip}:9090/health`, {signal: AbortSignal.timeout(3000)});
       if (r.ok) { RPC = `http://${n.ip}:9090`; break; }
-    } catch(e) {}
+    } catch(e) { /* probing: an unreachable seed is the expected case, try the next */ }
   }
   if (RPC) {
-    document.getElementById('netDot').className = 'dot';
-    const h = await (await fetch(RPC+'/health')).json();
-    document.getElementById('netStatus').textContent =
-      `Connected to ARC Testnet (${h.validators} validators, round ${h.dag_round.toLocaleString()})`;
+    try {
+      const h = await (await fetch(RPC+'/health')).json();
+      document.getElementById('netDot').className = 'dot';
+      document.getElementById('netStatus').textContent =
+        `Connected to ARC Testnet (${h.validators} validators, round ${h.dag_round.toLocaleString()})`;
+    } catch (e) {
+      // Reachable a moment ago, unreadable now. Say which, rather than
+      // leaving the header on "Connecting..." forever.
+      document.getElementById('netDot').className = 'dot off';
+      document.getElementById('netStatus').textContent =
+        `Reached ${RPC} but could not read /health: ${e.message}`;
+    }
   } else {
     document.getElementById('netDot').className = 'dot off';
     document.getElementById('netStatus').textContent = 'Testnet unreachable';
@@ -273,14 +282,18 @@ function copyAddr() {
 // ── Balance ──
 async function refreshBalance() {
   if (!wallet || !RPC) return;
+  const note = document.getElementById('balStatus');
   try {
     const r = await fetch(`${RPC}/account/${wallet.address}`);
-    if (r.ok) {
-      const d = await r.json();
-      document.getElementById('bal').innerHTML =
-        `${(d.balance||0).toLocaleString()} <small>ARC</small>`;
-    }
-  } catch(e) {}
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    document.getElementById('bal').innerHTML =
+      `${(d.balance||0).toLocaleString()} <small>ARC</small>`;
+    note.innerHTML = '';
+  } catch(e) {
+    document.getElementById('bal').innerHTML = '&mdash; <small>ARC</small>';
+    note.innerHTML = `<div class="status err">Balance unavailable: ${e.message}</div>`;
+  }
 }
 setInterval(refreshBalance, 5000);
 
