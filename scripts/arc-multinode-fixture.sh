@@ -22,6 +22,18 @@
 #   6. kill one node, restart it, require it to rejoin and catch up
 #
 # usage: arc-multinode-fixture.sh [--nodes N] [--binary PATH] [--settle SECONDS]
+#
+# NOTE, 2026-09-20: the restart stage currently cannot pass at ANY committee
+# size, and the two reasons are different:
+#   N = 3  survivors hold 13,333,334 against a quorum of 13,333,335 - one base
+#          unit short - so a stall there measures the committee, not recovery.
+#          The premise check below reports this instead of proceeding quietly.
+#   N >= 4 the survivor arithmetic works, but the chain cannot commit at all:
+#          a node can advance a round without one member's block, and if that
+#          member is the round leader the commit cursor halts for good. See
+#          outputs/.../round3/d6-committee-size-sweep.txt and the two
+#          arc-consensus unit tests named there.
+# Stages 1-5b remain meaningful at N = 3 and are the agreement evidence.
 set -uo pipefail
 
 # Default 4, not 3, and the reason is arithmetic rather than taste.
