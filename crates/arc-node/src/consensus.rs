@@ -1033,6 +1033,9 @@ impl ConsensusManager {
         // enters a transcript; this only paces how long a late block is waited
         // for, and a wrong pace cannot make an unsafe skip safe.
         let absence_clock = std::time::Instant::now();
+        // Set while this node is filling an empty DAG in from genesis; None
+        // once it has caught up with its own round cursor.
+        let mut bootstrap_watermark: Option<u64> = None;
         let mut last_round_seen = self.engine.current_round();
         let mut last_round_change = std::time::Instant::now();
         let mut history_clock = std::time::Instant::now()
@@ -1884,18 +1887,48 @@ impl ConsensusManager {
                     // produces a run whose very first round can never be
                     // validated, which is why a restarted node sent 252
                     // history requests and imported nothing.
-                    // Ask from the first round this node is actually missing,
-                    // walking up from 0. Block validation is recursive -
-                    // inserting a block at round R needs its parents at R-1 -
-                    // so a DAG with a hole at round G cannot use anything above
-                    // G, whatever the cursors say. Asking from a cursor instead
-                    // either re-requests what is already held or skips the gap;
-                    // a restarted node did the former 267 times and imported
-                    // nothing.
-                    let from_round = self
-                        .engine
-                        .first_missing_round(0, self.engine.retained_rounds())
-                        .min(now_round);
+                    // Where to ask from depends on whether this node is
+                    // BOOTSTRAPPING or merely lagging, and the two need
+                    // opposite answers.
+                    //
+                    // Bootstrapping - the DAG was empty, which is every node
+                    // just after a restart - means validation has to start at
+                    // round 0, because inserting a block at round R needs its
+                    // parents at R-1 and the recursion only bottoms out at
+                    // genesis. A watermark walks up from there as rounds fill
+                    // in, so the node never re-requests what it already has.
+                    //
+                    // Merely lagging is different: a healthy node legitimately
+                    // holds gaps, because it only ever needed a quorum of each
+                    // round. Hunting its earliest gap would make it re-request
+                    // ancient history forever - which is what an earlier
+                    // version of this did, and it left a node stuck below its
+                    // peers even before it was killed.
+                    let from_round = match bootstrap_watermark {
+                        Some(mark) => {
+                            let next = self
+                                .engine
+                                .first_missing_round(mark, HISTORY_MAX_ROUNDS)
+                                .min(now_round);
+                            bootstrap_watermark = Some(next);
+                            if next >= now_round {
+                                // Caught up with the round cursor; from here on
+                                // this node is an ordinary lagging peer.
+                                bootstrap_watermark = None;
+                                info!(round = next, "DAG bootstrap complete");
+                            }
+                            next
+                        }
+                        None => {
+                            if self.engine.dag_is_empty() {
+                                bootstrap_watermark = Some(0);
+                                info!("DAG is empty; bootstrapping history from round 0");
+                                0
+                            } else {
+                                self.engine.last_committed_round().min(now_round)
+                            }
+                        }
+                    };
                     history_requests_broadcast = Some(from_round);
                 }
             }
