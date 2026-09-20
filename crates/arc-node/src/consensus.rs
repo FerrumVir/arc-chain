@@ -916,8 +916,13 @@ impl ConsensusManager {
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
             if let Some(parent) = path.parent() {
+                // The rename is only durable once the DIRECTORY entry is, so a
+                // failure here is a failure of the whole write. Swallowing it
+                // would report a decision as persisted that a crash could
+                // still lose, which is the one thing this record exists to
+                // prevent.
                 let dir = std::fs::File::open(parent)?;
-                let _ = dir.sync_all();
+                dir.sync_all()?;
             }
             Ok(())
         })();
@@ -1987,14 +1992,8 @@ impl ConsensusManager {
                     // Re-apply every refusal the record carries before this
                     // node can reference or count anything.
                     for (round, members) in &record.skipped_rounds {
-                        for (member, reason) in members {
-                            // The reason decides the excusal, exactly as it did
-                            // when the attestation was first made.
-                            self.engine.note_refused_leader_block(
-                                *round,
-                                *member,
-                                *reason == arc_consensus::view_change::AbsenceReason::NoBlock,
-                            );
+                        for member in members.keys() {
+                            self.engine.note_certified_absent(*round, *member);
                         }
                     }
                     skip_tracker = Some(arc_consensus::view_change::SkipTracker::new(
@@ -2027,18 +2026,6 @@ impl ConsensusManager {
                     if stake < vs.quorum {
                         continue;
                     }
-                    // The round's deterministic leader, whose block is the
-                    // only one that moves the commit cursor.
-                    let round_leader = {
-                        let mut addrs: Vec<Hash256> =
-                            vs.validators.iter().map(|v| v.address).collect();
-                        addrs.sort_by_key(|a| a.0);
-                        if addrs.is_empty() {
-                            None
-                        } else {
-                            Some(addrs[round as usize % addrs.len()])
-                        }
-                    };
                     for validator in vs.validators.iter().filter(|v| v.stake > 0) {
                         let member = validator.address;
                         if self.engine.has_skip_certificate(round, &member) {
@@ -2073,86 +2060,12 @@ impl ConsensusManager {
                                 );
                                 continue;
                             }
-                            self.engine.note_refused_leader_block(round, member, true);
+                            self.engine.note_certified_absent(round, member);
                             info!(
                                 round,
                                 %member,
                                 observed_round_stake = stake,
                                 "Signed an absence attestation (no block)"
-                            );
-                            if let Some(ref tx_chan) = outbound_tx {
-                                let _ =
-                                    tx_chan.try_send(OutboundMessage::BroadcastAbsenceVote(vote));
-                            }
-                            continue;
-                        }
-
-                        // (b) the leader's block exists but can never be
-                        // certified. Only the leader is worth attesting: no
-                        // other member's block moves the commit cursor.
-                        if !present || round_leader != Some(member) {
-                            continue;
-                        }
-                        let Some(block_hash) = hashes.iter().copied().find(|hash| {
-                            self.engine
-                                .get_block(hash)
-                                .map(|block| block.author == member)
-                                .unwrap_or(false)
-                        }) else {
-                            continue;
-                        };
-                        // Both later rounds must be quorum-complete before
-                        // "cannot be certified" is a conclusion rather than a
-                        // guess about blocks that have not arrived.
-                        let later_complete = [round + 1, round + 2].iter().all(|later| {
-                            let mut authors = std::collections::HashSet::new();
-                            let mut later_stake = 0u64;
-                            for hash in self.engine.blocks_in_round(*later) {
-                                if let Some(block) = self.engine.get_block(&hash)
-                                    && authors.insert(block.author)
-                                    && let Some(v) = vs.get_validator(&block.author)
-                                {
-                                    later_stake = later_stake.saturating_add(v.stake);
-                                }
-                            }
-                            later_stake >= vs.quorum
-                        });
-                        let unsupported = self
-                            .engine
-                            .leader_commit_support(&block_hash, round)
-                            .is_none();
-                        tracker.observe(
-                            round,
-                            &member,
-                            arc_consensus::view_change::AbsenceReason::NoQuorumSupport,
-                            if later_complete { stake } else { 0 },
-                            unsupported,
-                            vs.quorum,
-                            now_ms,
-                        );
-                        if let Ok(vote) = tracker.sign_if_permitted(
-                            round,
-                            member,
-                            arc_consensus::view_change::AbsenceReason::NoQuorumSupport,
-                            cursor,
-                            vs.quorum,
-                            now_ms,
-                            keypair,
-                        ) {
-                            if !self.persist_signing_record(tracker.record()) {
-                                tracing::error!(
-                                    round,
-                                    %member,
-                                    "Withholding a no-support vote: its decision is not durable"
-                                );
-                                continue;
-                            }
-                            // NOT excused from participation: the block exists.
-                            self.engine.note_refused_leader_block(round, member, false);
-                            info!(
-                                round,
-                                leader = %member,
-                                "Signed an absence attestation (leader block cannot be certified)"
                             );
                             if let Some(ref tx_chan) = outbound_tx {
                                 let _ =
@@ -2998,10 +2911,14 @@ impl ConsensusManager {
                                         ),
                                     }
                                 } else {
+                                    // Allow the next tick to try again rather
+                                    // than dropping this height's vote for the
+                                    // life of the process.
+                                    finality_signed_heights.remove(&height);
                                     tracing::error!(
                                         height,
                                         "Withholding a finality attestation: its decision is \
-                                         not durable"
+                                         not durable; will retry"
                                     );
                                 }
                             }

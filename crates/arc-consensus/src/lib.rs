@@ -757,15 +757,11 @@ pub struct ConsensusEngine {
     /// may be passed by the commit cursor without committing its leader; see
     /// `view_change` for why that is safe.
     skip_certificates: DashMap<(u64, Address), view_change::SkipCertificate>,
-    /// `(round, member)` pairs this node has permanently refused, either by
-    /// attesting itself or by adopting a peer's certificate. A refused block is
-    /// never used as a parent and never counted in commit support.
-    refused_leader_blocks: DashMap<(u64, Address), ()>,
     /// `(round, member)` pairs excused from the recovery domain's
-    /// full-participation requirement. Only a `NoBlock` certificate lands here:
-    /// a `NoQuorumSupport` certificate is about a block that EXISTS, so
-    /// excusing its author from participation would weaken the guard for no
-    /// reason.
+    /// full-participation requirement by a verified absence certificate. This
+    /// is the certificate's ONLY effect: it relaxes one round's participation
+    /// requirement to the ordinary quorum rule. It never touches the commit
+    /// rule, refuses no block, and carries no safety weight.
     excused_participation: DashMap<(u64, Address), ()>,
     /// Verified committed-block finality certificates, by height.
     finality_certificates: DashMap<u64, view_change::FinalityCertificate>,
@@ -824,7 +820,6 @@ impl ConsensusEngine {
             consensus_domain: RwLock::new(None),
             certificate_domain: RwLock::new(None),
             skip_certificates: DashMap::new(),
-            refused_leader_blocks: DashMap::new(),
             excused_participation: DashMap::new(),
             finality_certificates: DashMap::new(),
             recovery_bootstrap_round: RwLock::new(None),
@@ -872,7 +867,6 @@ impl ConsensusEngine {
             consensus_domain: RwLock::new(None),
             certificate_domain: RwLock::new(None),
             skip_certificates: DashMap::new(),
-            refused_leader_blocks: DashMap::new(),
             excused_participation: DashMap::new(),
             finality_certificates: DashMap::new(),
             recovery_bootstrap_round: RwLock::new(None),
@@ -1478,12 +1472,6 @@ impl ConsensusEngine {
             for hash in &prev_hashes {
                 if let Some(block) = self.dag.get(hash)
                     && let Some(validator) = vs.get_validator(&block.author)
-                    // Having signed or adopted a skip for this block, this node
-                    // permanently refuses to reference it. That refusal is what
-                    // makes the skip certificate safe: it is why a quorum of
-                    // skip signers can never also supply the support a commit
-                    // of the same block would need.
-                    && !self.refuses_leader_block(block.round, &block.author)
                     && seen_parent_authors.insert(block.author)
                 {
                     selected_parents.push(*hash);
@@ -1891,7 +1879,6 @@ impl ConsensusEngine {
                 if let Some(certifier) = self.dag.get(&certifier_hash)
                     && certifier.parents.contains(&child_hash)
                     && let Some(validator) = validator_set.get_validator(&certifier.author)
-                    && !self.refuses_leader_block(certifier.round, &certifier.author)
                     && seen_certifiers.insert(certifier.author)
                 {
                     supporting_stake = supporting_stake
@@ -1928,10 +1915,7 @@ impl ConsensusEngine {
         };
         let round = certificate.round;
         let absentee = certificate.absentee;
-        self.refused_leader_blocks.insert((round, absentee), ());
-        if certificate.reason == view_change::AbsenceReason::NoBlock {
-            self.excused_participation.insert((round, absentee), ());
-        }
+        self.excused_participation.insert((round, absentee), ());
         self.skip_certificates.insert((round, absentee), certificate);
         info!(
             round,
@@ -2000,24 +1984,16 @@ impl ConsensusEngine {
             .map(|c| c.value().clone())
     }
 
-    /// True when this node has permanently refused a specific leader block.
-    pub fn refuses_leader_block(&self, round: u64, author: &Address) -> bool {
-        self.refused_leader_blocks.contains_key(&(round, *author))
+    /// Record an excusal taken locally (this node signed the attestation and
+    /// is waiting for its peers' votes to form the certificate).
+    pub fn note_certified_absent(&self, round: u64, member: Address) {
+        self.excused_participation.insert((round, member), ());
     }
 
-    /// Record a refusal taken locally (this node signed the attestation).
-    ///
-    /// `excuse_participation` must be true only for a `NoBlock` attestation.
-    pub fn note_refused_leader_block(
-        &self,
-        round: u64,
-        member: Address,
-        excuse_participation: bool,
-    ) {
-        self.refused_leader_blocks.insert((round, member), ());
-        if excuse_participation {
-            self.excused_participation.insert((round, member), ());
-        }
+    /// True when a member is excused from this round's participation
+    /// requirement. Informational; nothing in the commit rule consults it.
+    pub fn is_certified_absent(&self, round: u64, member: &Address) -> bool {
+        self.excused_participation.contains_key(&(round, *member))
     }
 
     /// Import a contiguous, ascending run of history from a peer.
@@ -2166,6 +2142,44 @@ impl ConsensusEngine {
         view_change::validator_set_hash(&self.frozen_validator_set.read())
     }
 
+    /// Is `target` in the causal history of `from`?
+    ///
+    /// Walks parents breadth-first, never below `floor_round`, so the work is
+    /// bounded by the rounds between them. This is what makes a retroactive
+    /// anchor decision deterministic: every honest node that holds `from` also
+    /// holds its whole causal history, because a block cannot be validated
+    /// without its parents, so they all compute the same answer.
+    fn causal_history_contains(
+        &self,
+        from: &Hash256,
+        target: &Hash256,
+        floor_round: u64,
+    ) -> bool {
+        if from == target {
+            return true;
+        }
+        let mut seen: HashSet<Hash256> = HashSet::new();
+        let mut frontier = vec![*from];
+        seen.insert(*from);
+        while let Some(hash) = frontier.pop() {
+            let Some(block) = self.dag.get(&hash) else {
+                continue;
+            };
+            if block.round < floor_round {
+                continue;
+            }
+            for parent in &block.parents {
+                if parent == target {
+                    return true;
+                }
+                if seen.insert(*parent) {
+                    frontier.push(*parent);
+                }
+            }
+        }
+        false
+    }
+
     /// Try to commit blocks using the two-round commit rule.
     ///
     /// # Commit Rule
@@ -2215,109 +2229,134 @@ impl ConsensusEngine {
         // Scan uncommitted rounds. Start from last_committed_round to skip
         // rounds that are already finalized (was scanning from 0 every time).
         let scan_start = self.last_committed_round.load(Ordering::SeqCst);
-        for r in scan_start..=(current.saturating_sub(2)) {
-            let round_leader = if frozen_vals.is_empty() {
-                None
-            } else {
-                Some(frozen_vals[r as usize % frozen_vals.len()])
-            };
+        let scan_end = current.saturating_sub(2);
 
-            // An authenticated quorum certificate naming this round's LEADER as
-            // absent is the one thing that may advance this cursor without a
-            // commit. It proves no honest node can ever certify that leader's
-            // block, so passing the round cannot diverge from a node that is
-            // still waiting. A certificate naming anyone else only excuses
-            // participation; it never moves the cursor.
-            if let Some(leader_addr) = round_leader
-                && self.has_skip_certificate(r, &leader_addr)
-            {
-                debug!(
+        // Every block this node holds from a round's deterministic leader.
+        // More than one means the leader equivocated, which the recovery domain
+        // fences rather than resolves.
+        let anchors_of = |round: u64| -> Vec<Hash256> {
+            let Some(leader) = frozen_vals.get(round as usize % frozen_vals.len().max(1)) else {
+                return Vec::new();
+            };
+            let mut found: Vec<Hash256> = self
+                .blocks_in_round(round)
+                .into_iter()
+                .filter(|hash| {
+                    self.dag
+                        .get(hash)
+                        .map(|block| block.author == *leader)
+                        .unwrap_or(false)
+                })
+                .collect();
+            found.sort_by_key(|hash| hash.0);
+            found.dedup();
+            found
+        };
+
+        let mut r = scan_start;
+        while r <= scan_end {
+            if frozen_vals.is_empty() {
+                break;
+            }
+            let anchor_candidates = anchors_of(r);
+            if domain_bound && anchor_candidates.len() > 1 {
+                tracing::error!(
                     round = r,
-                    leader = %leader_addr,
-                    "Commit cursor passing a certified absent leader"
+                    hashes = ?anchor_candidates,
+                    "Ambiguous recovery-domain leader round; commit cursor is fenced"
                 );
+                break;
+            }
+            let anchor = anchor_candidates.first().copied();
+            let certified = anchor.and_then(|hash| {
+                self.two_round_commit_support(&hash, r, &vs).map(|stake| (hash, stake))
+            });
+
+            // Straightforward case: this round's anchor is certified here.
+            if let Some((hash, supporting_stake)) = certified {
+                if !committed_set.contains(&hash)
+                    && let Some(block) = self.dag.get(&hash)
+                {
+                    info!(
+                        round = r,
+                        hash = %block.hash,
+                        "Block committed via two-round rule"
+                    );
+                    debug!(
+                        hash = %block.hash,
+                        signing_stake = supporting_stake,
+                        total_stake = vs.total_stake,
+                        "Commit support observed; proof export remains disabled because D-block signatures do not sign a canonical B-finality transcript"
+                    );
+                    newly_committed.push(block.clone());
+                }
                 self.last_committed_round.store(r + 1, Ordering::SeqCst);
+                r += 1;
                 continue;
             }
 
-            let round_r_blocks = self.blocks_in_round(r);
-            if round_r_blocks.is_empty() {
-                // A locally empty round may still contain a delayed leader
-                // block in another honest view. Only a certified skip/view
-                // change may advance this cursor.
+            // Undecided in this view. A LATER certified anchor decides it, and
+            // decides it identically on every honest node, because the decision
+            // is read from that anchor's causal history rather than from local
+            // timing or a local absence.
+            //
+            // The decider must be at least three rounds later. An anchor at
+            // r2 references r2-1 blocks carrying quorum stake, so only from
+            // r2 >= r+3 does its history necessarily reach round r+2 - the
+            // round whose quorum would have certified r's anchor. Two quorums
+            // intersect, so a certified anchor is in EVERY later anchor's
+            // history, and this rule can therefore never skip a round another
+            // node committed.
+            let mut decider = None;
+            let mut ambiguous_ahead = false;
+            for r2 in (r + 3)..=scan_end {
+                let candidates = anchors_of(r2);
+                if domain_bound && candidates.len() > 1 {
+                    // An equivocating leader ahead cannot decide anything.
+                    ambiguous_ahead = true;
+                    break;
+                }
+                if let Some(hash) = candidates.first()
+                    && self.two_round_commit_support(hash, r2, &vs).is_some()
+                {
+                    decider = Some((r2, *hash));
+                    break;
+                }
+            }
+            if ambiguous_ahead {
                 break;
             }
+            let Some((decider_round, decider_hash)) = decider else {
+                // Nothing decides this round yet. Waiting is the only safe
+                // action: a locally empty or locally uncertified round may be
+                // committed in another honest view.
+                break;
+            };
 
-            let leader = round_leader;
-
-            let mut certified_leader_blocks = Vec::<(DagBlock, u64)>::new();
-            for block_b_hash in &round_r_blocks {
-                // Skip if already committed
-                if committed_set.contains(block_b_hash) {
-                    continue;
+            match anchor {
+                Some(hash) if self.causal_history_contains(&decider_hash, &hash, r) => {
+                    if !committed_set.contains(&hash)
+                        && let Some(block) = self.dag.get(&hash)
+                    {
+                        info!(
+                            round = r,
+                            hash = %block.hash,
+                            decided_by = decider_round,
+                            "Block committed via a later anchor's causal history"
+                        );
+                        newly_committed.push(block.clone());
+                    }
                 }
-
-                // Only commit the leader's block for this round.
-                // Other blocks are valid DAG nodes (needed for parent references)
-                // but only the leader's block carries transactions to the chain.
-                if let Some(leader_addr) = leader
-                    && let Some(block_b) = self.dag.get(block_b_hash)
-                    && block_b.author != leader_addr
-                {
-                    continue; // Not the leader - skip
-                }
-
-                if let Some(supporting_stake) = self.two_round_commit_support(block_b_hash, r, &vs)
-                    && let Some(block) = self.dag.get(block_b_hash)
-                {
-                    certified_leader_blocks.push((block.clone(), supporting_stake));
-                }
-            }
-
-            certified_leader_blocks.sort_by_key(|(block, _)| block.hash.0);
-            certified_leader_blocks.dedup_by_key(|(block, _)| block.hash.0);
-
-            if domain_bound && certified_leader_blocks.len() != 1 {
-                if certified_leader_blocks.len() > 1 {
-                    let hashes: Vec<_> = certified_leader_blocks
-                        .iter()
-                        .map(|(block, _)| block.hash)
-                        .collect();
-                    tracing::error!(
+                _ => {
+                    debug!(
                         round = r,
-                        leader = ?leader,
-                        ?hashes,
-                        "Ambiguous certified recovery-domain leader round; commit cursor is fenced"
+                        decided_by = decider_round,
+                        "Round skipped: its anchor is absent from a later committed anchor's history"
                     );
                 }
-                break;
             }
-
-            for (block, supporting_stake) in certified_leader_blocks {
-                info!(
-                    round = block.round,
-                    hash = %block.hash,
-                    "Block committed via two-round rule"
-                );
-                debug!(
-                    hash = %block.hash,
-                    signing_stake = supporting_stake,
-                    total_stake = vs.total_stake,
-                    "Commit support observed; proof export remains disabled because D-block signatures do not sign a canonical B-finality transcript"
-                );
-                newly_committed.push(block);
-            }
-
-            let leader_block_committed = newly_committed.iter().any(|b| b.round == r);
-            if leader_block_committed {
-                // Leader's block committed - advance scan past this round
-                self.last_committed_round.store(r + 1, Ordering::SeqCst);
-            } else {
-                // Never skip a leader round from local absence, elapsed lag,
-                // or quorum participation alone. Those observations are not a
-                // deterministic skip certificate and can differ by node.
-                break;
-            }
+            self.last_committed_round.store(r + 1, Ordering::SeqCst);
+            r += 1;
         }
 
         // Add newly committed blocks to the committed list
@@ -4374,45 +4413,89 @@ mod tests {
     }
 
     #[test]
-    fn commit_rule_halts_permanently_when_one_leader_block_is_missing_locally() {
-        // A committee of four or more with equal stake has quorum SMALLER than
-        // the committee, so a node can advance a round without one member's
-        // block. If that member is the round's deterministic leader, its block
-        // is never referenced by the next round, the two-round rule can never
-        // certify it, and the commit cursor stops there for good - the code
-        // says as much: "Only a certified skip/view change may advance this
-        // cursor", and no such protocol exists yet.
+    fn commit_rule_passes_a_missing_anchor_once_a_later_anchor_decides_it() {
+        // This used to be the defect: a committee whose quorum is smaller than
+        // its membership (equal stake, n >= 4) could advance a round without
+        // one member's block, and if that member was the round's deterministic
+        // leader the commit cursor stopped there for good.
         //
-        // n=2 and n=3 cannot reach this state: quorum IS the whole committee,
-        // so advance_round refuses until every block is in.
-        for n in 4..=5 {
-            // Choose the author that leads round 2, and drop it from round 2 on.
-            // Rounds 0 and 1 stay complete so the chain demonstrably starts.
+        // The cursor now passes such a round, but only once a LATER anchor is
+        // certified, and only because that anchor's causal history - which is
+        // identical on every node that holds it - does not contain the missing
+        // one. No timing, no local absence and no vote is involved.
+        for n in 4..=5usize {
             let absent = leader_index_for_round(n, 2);
             let committed = commits_over_rounds(n, 12, false, Some((absent, 2)));
-            assert!(
-                committed <= 2,
-                "n={n}: expected the commit cursor to halt at the missing leader's round, \
-                 but {committed} blocks committed in 12 rounds"
-            );
-            // The same run with every block present keeps committing.
             let healthy = commits_over_rounds(n, 12, false, None);
             assert!(
-                healthy > committed,
-                "n={n}: a complete committee ({healthy}) must outrun one with a missing \
-                 leader ({committed})"
+                committed > 2,
+                "n={n}: the cursor stopped at the missing anchor again ({committed} commits)"
+            );
+            assert!(
+                healthy >= committed,
+                "n={n}: a complete committee ({healthy}) should not commit less than one \
+                 missing a member ({committed})"
             );
         }
-        for n in 2..=3 {
-            // Quorum equals the committee here, so dropping a member stops
-            // round advancement outright rather than silently stalling commits.
-            let absent = leader_index_for_round(n, 2);
+        for n in 2..=3usize {
+            // Quorum IS the whole committee here, so dropping a member stops
+            // round advancement outright and there is nothing to decide.
             assert_eq!(
-                commits_over_rounds(n, 12, false, Some((absent, 2))),
+                commits_over_rounds(n, 12, false, Some((leader_index_for_round(n, 2), 2))),
                 commits_over_rounds(n, 2, false, None),
-                "n={n}: a committee whose quorum is the whole set must stop advancing, \
-                 not keep advancing while committing nothing"
+                "n={n}: a committee whose quorum is the whole set must fail-stop"
             );
+        }
+    }
+
+    #[test]
+    fn a_certified_anchor_is_never_skipped_by_the_retroactive_rule() {
+        // The safety property the retroactive rule rests on: an anchor that any
+        // node could certify is in EVERY later anchor's causal history, because
+        // its supporters and the later anchor's parents are two quorums and
+        // they intersect. If this ever fails, one node commits a round another
+        // skips.
+        let n = 4usize;
+        let vs = test_validator_set(n);
+        let engine = ConsensusEngine::new(vs.clone(), test_addr(0));
+        let mut previous: Vec<Hash256> = Vec::new();
+        let mut anchors: Vec<(u64, Hash256)> = Vec::new();
+        for round in 0..10u64 {
+            let mut current = Vec::new();
+            for author in 0..n {
+                let block = make_block(
+                    test_addr(author as u8),
+                    round,
+                    previous.clone(),
+                    vec![],
+                    2_000 + round * 10 + author as u64,
+                );
+                engine.receive_block(&block).unwrap();
+                let leader = leader_index_for_round(n, round);
+                if author == leader {
+                    anchors.push((round, block.hash));
+                }
+                current.push(block.hash);
+            }
+            assert!(engine.advance_round());
+            previous = current;
+        }
+        // Every certified anchor must appear in the causal history of every
+        // later anchor.
+        for (round, hash) in &anchors {
+            if engine.leader_commit_support(hash, *round).is_none() {
+                continue;
+            }
+            for (later_round, later_hash) in &anchors {
+                if later_round <= round {
+                    continue;
+                }
+                assert!(
+                    engine.causal_history_contains(later_hash, hash, *round),
+                    "certified anchor at round {round} is missing from the history of the \
+                     anchor at round {later_round}"
+                );
+            }
         }
     }
 

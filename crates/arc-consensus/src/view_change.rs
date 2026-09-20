@@ -1,30 +1,36 @@
-//! Authenticated absence certificates: round skip (view change) and
-//! committed-block finality.
+//! Authenticated absence certificates for the recovery domain's participation
+//! requirement.
 //!
-//! Design: `claude-reviews/consensus-view-change-finality-v1.md`. The short
-//! version:
+//! Protocol-v3's recovery domain refuses to advance a round until EVERY fixed
+//! validator has contributed a block to it. That is deliberately fail-closed,
+//! and it means one member being down halts the chain. This module lets a
+//! quorum attest that a named member produced no block in a round - after that
+//! round already carried a quorum of stake from others - and that certificate
+//! excuses the member from the requirement for that one round, leaving the
+//! ordinary quorum rule that every non-recovery chain already uses.
 //!
-//! A quorum of validators can attest that one member produced no block in a
-//! given round, after that round already carried a quorum of stake. That
-//! certificate has exactly two effects, and no others:
+//! **This certificate has no safety role.** It cannot cause or prevent a
+//! commit, it does not refuse any block, and it does not enter the commit rule.
+//! The worst a false certificate can do is relax one round's participation
+//! requirement to quorum, so `observed_round_stake` being self-reported costs
+//! nothing that an equal amount of Byzantine stake could not already do.
 //!
-//! 1. **Participation.** The recovery domain otherwise requires a block from
-//!    every fixed validator before a round advances. A certified absentee is
-//!    excused for that one round, so the chain keeps moving on quorum stake
-//!    instead of waiting for a member the committee has proven absent.
-//! 2. **Commit cursor.** When the certified absentee is also that round's
-//!    deterministic leader, the commit cursor may pass the round without
-//!    committing it. Without this, one missing leader block halted commits
-//!    permanently wherever quorum is smaller than the membership (N >= 4).
+//! An earlier draft gave this certificate a safety role: signers permanently
+//! refused to reference or count the attested block, and a quorum of refusals
+//! was supposed to make committing it impossible. An independent adversarial
+//! review found that unsound and unsafe in four separate ways - the refusal was
+//! direct-parent only while commit support is transitive, and nothing bounded
+//! how much stake could be certified absent in one round, which could take
+//! block production below quorum permanently. The commit cursor now decides an
+//! undecided round retroactively from a later committed anchor's causal
+//! history (`ConsensusEngine::try_commit`), which is common knowledge and needs
+//! no certificate at all. The review is in
+//! `outputs/.../round4/c1-adversarial-consensus-review.md`.
 //!
-//! Skipping without proof would be unsafe, because another node may already
-//! have committed that leader's block. The certificate closes that: a validator
-//! signs only after seeing a quorum of the round's stake without the block, and
-//! having signed it **permanently refuses** to reference or count that block.
-//! Two quorums always intersect in honest stake (`S - 2f > f`), so a
-//! certificate and a commit of the same block cannot both exist.
-//!
-//! Nothing here lowers quorum, widens a round window, or trusts a peer's tip.
+//! Committed-block finality transcripts also live here. They are genuinely
+//! safety-relevant and unchanged: a validator signs at most one per height,
+//! persists that decision first, and a DAG block signature is never re-labelled
+//! as one.
 
 use std::collections::{HashMap, HashSet};
 
@@ -104,21 +110,25 @@ fn domain_bytes(domain: &ConsensusDomain) -> [u8; 48] {
 
 // ── Skip votes ───────────────────────────────────────────────────────────────
 
-/// Why a validator attests that a round's leader cannot be committed.
+/// Why a validator attests about a member of a round.
 ///
-/// Both reasons carry the same permanent refusal and the same safety argument.
-/// They differ in one effect only: `NoBlock` also excuses the member from the
-/// recovery domain's participation requirement, because there genuinely is no
-/// block; `NoQuorumSupport` does not, because the block exists.
+/// One reason, kept as an enum so the transcript stays extensible and a future
+/// meaning cannot be confused with this one.
+///
+/// An earlier draft carried a second reason, `NoQuorumSupport`, meant to let a
+/// quorum declare that a block that EXISTS could never gather support. An
+/// independent adversarial review showed it was unsound: "rounds r+1 and r+2
+/// are quorum-complete" bounds how many AUTHORS are missing, not how many
+/// SUPPORTERS, and the gap between the two is exactly f - so at n=7 with no
+/// Byzantine node at all, six nodes could certify "no support" for a block the
+/// seventh had already committed. It was removed rather than tuned, and the
+/// commit cursor now decides such rounds retroactively from a later committed
+/// anchor's causal history instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AbsenceReason {
     /// The member produced no block in that round, observed after the round
     /// already carried a quorum of stake from others.
     NoBlock,
-    /// The member's block exists, but the two rounds that could certify it are
-    /// quorum-complete and no child of it reaches quorum support. The block can
-    /// therefore never be committed by anyone.
-    NoQuorumSupport,
 }
 
 /// One validator's attestation that a round's leader cannot be committed.
@@ -158,7 +168,6 @@ pub fn skip_vote_transcript(
     bytes.extend_from_slice(&voter.0);
     bytes.push(match reason {
         AbsenceReason::NoBlock => 0,
-        AbsenceReason::NoQuorumSupport => 1,
     });
     bytes.extend_from_slice(&observed_round_stake.to_le_bytes());
     hash_bytes(&bytes)
@@ -486,8 +495,6 @@ pub struct ConsensusSigningRecord {
     pub skipped_rounds: HashMap<u64, HashMap<Address, AbsenceReason>>,
     /// Heights this validator has signed a finality transcript for.
     pub finality_votes: HashMap<u64, (Hash256, Hash256, Hash256)>,
-    /// Rounds whose leader block this validator has committed.
-    pub committed_leader_rounds: HashSet<u64>,
 }
 
 impl ConsensusSigningRecord {
@@ -513,8 +520,6 @@ pub enum SkipRefusal {
     AbsenteeBlockPresent,
     /// S3: the grace period since S1 first held has not elapsed.
     WithinGrace,
-    /// S4: this validator already committed that round's leader block.
-    AlreadyCommitted,
     /// S4: this validator already signed a conflicting attestation.
     ConflictingSkip,
     /// The round is already behind the commit cursor; nothing to skip.
@@ -584,10 +589,8 @@ impl SkipTracker {
         &self.record
     }
 
-    /// True when this validator has permanently refused a specific member's
-    /// block in a specific round.
-    /// Callers must consult this before using the block as a parent or counting
-    /// it in commit support; that refusal is what makes the skip safe.
+    /// True when this validator has already attested about a member in a round.
+    /// Informational: nothing in the commit rule consults it.
     pub fn refuses(&self, round: u64, absentee: &Address) -> bool {
         self.refused.contains(&(round, *absentee))
     }
@@ -600,12 +603,6 @@ impl SkipTracker {
         identity: (Hash256, Hash256, Hash256),
     ) {
         self.record.finality_votes.insert(height, identity);
-    }
-
-    /// Note that this validator committed a round's leader, which permanently
-    /// bars it from signing a skip for that round (S4).
-    pub fn note_committed_leader_round(&mut self, round: u64) {
-        self.record.committed_leader_rounds.insert(round);
     }
 
     /// Feed the current view of one round for one (member, reason) pair.
@@ -660,9 +657,6 @@ impl SkipTracker {
     ) -> Result<SkipVote, SkipRefusal> {
         if round < commit_cursor {
             return Err(SkipRefusal::RoundAlreadyPassed);
-        }
-        if self.record.committed_leader_rounds.contains(&round) {
-            return Err(SkipRefusal::AlreadyCommitted);
         }
         let observation = self
             .observations
@@ -1236,23 +1230,16 @@ mod tests {
     }
 
     #[test]
-    fn s4_a_committed_leader_round_can_never_be_skipped() {
-        let (set, keys) = committee(4);
-        let mut tracker = tracker(&set);
-        let leader = keys[0].address();
-        tracker.note_committed_leader_round(5);
-        tracker.observe(5, &leader, AbsenceReason::NoBlock, set.quorum, true, set.quorum, 0);
-        assert_eq!(
-            tracker.sign_if_permitted(5, leader, AbsenceReason::NoBlock, 0, set.quorum, 100_000, &keys[1]),
-            Err(SkipRefusal::AlreadyCommitted)
-        );
-    }
-
-    #[test]
     fn two_members_of_one_round_can_both_be_attested() {
         // More than one member of a round can legitimately be absent, so an
         // attestation about one must not block an attestation about another.
-        // What is refused is contradicting YOURSELF about the same member.
+        //
+        // The earlier design made this dangerous: each attestation refused a
+        // block as a parent, so enough of them in one round could take a
+        // proposer's usable parent stake below quorum and stop block
+        // production for good. The certificate no longer refuses anything, so
+        // the only cost of several attestations in one round is that those
+        // members are excused from that round's participation requirement.
         let (set, keys) = committee(4);
         let mut tracker = tracker(&set);
         let first = keys[0].address();
@@ -1271,89 +1258,7 @@ mod tests {
         assert!(!tracker.refuses(5, &keys[3].address()));
     }
 
-    #[test]
-    fn a_no_support_attestation_is_about_a_block_that_exists() {
-        // NoQuorumSupport is the other half of the protocol: the block is
-        // present, but the rounds that could certify it are quorum-complete and
-        // it never reaches quorum support. Seeing the block must NOT rule this
-        // out, and support appearing must.
-        let (set, keys) = committee(4);
-        let mut tracker = tracker(&set);
-        let leader = keys[0].address();
-        tracker.observe(
-            5,
-            &leader,
-            AbsenceReason::NoQuorumSupport,
-            set.quorum,
-            true,
-            set.quorum,
-            0,
-        );
-        let vote = tracker
-            .sign_if_permitted(
-                5,
-                leader,
-                AbsenceReason::NoQuorumSupport,
-                0,
-                set.quorum,
-                100_000,
-                &keys[1],
-            )
-            .expect("no-support attestation");
-        assert_eq!(vote.reason, AbsenceReason::NoQuorumSupport);
-
-        // A second validator that DID observe support can never attest it.
-        let mut other = tracker_for(&set);
-        other.observe(
-            5,
-            &leader,
-            AbsenceReason::NoQuorumSupport,
-            set.quorum,
-            false,
-            set.quorum,
-            0,
-        );
-        assert_eq!(
-            other.sign_if_permitted(
-                5,
-                leader,
-                AbsenceReason::NoQuorumSupport,
-                0,
-                set.quorum,
-                100_000,
-                &keys[2],
-            ),
-            Err(SkipRefusal::AbsenteeBlockPresent)
-        );
-    }
-
-    #[test]
-    fn the_two_reasons_produce_different_transcripts() {
-        let (set, keys) = committee(4);
-        let set_hash = validator_set_hash(&set);
-        let a = skip_vote_transcript(
-            &domain(),
-            &set_hash,
-            3,
-            &keys[0].address(),
-            &keys[1].address(),
-            AbsenceReason::NoBlock,
-            set.quorum,
-        );
-        let b = skip_vote_transcript(
-            &domain(),
-            &set_hash,
-            3,
-            &keys[0].address(),
-            &keys[1].address(),
-            AbsenceReason::NoQuorumSupport,
-            set.quorum,
-        );
-        assert_ne!(a, b, "the reason must be bound into the signature");
-    }
-
-    #[test]
-    fn signing_a_skip_creates_a_permanent_refusal_that_survives_restart() {
+    fn an_attestation_records_an_excusal_that_survives_restart() {
         let (set, keys) = committee(4);
         let mut tracker = tracker(&set);
         let leader = keys[0].address();

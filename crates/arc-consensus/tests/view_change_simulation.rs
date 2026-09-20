@@ -135,12 +135,8 @@ impl Node {
         // Re-apply the refusals the reloaded record carries, so a restarted
         // node cannot help certify a block it already voted to skip.
         for (round, members) in &record.skipped_rounds {
-            for (member, reason) in members {
-                engine.note_refused_leader_block(
-                    *round,
-                    *member,
-                    *reason == AbsenceReason::NoBlock,
-                );
+            for member in members.keys() {
+                engine.note_certified_absent(*round, *member);
             }
         }
         self.engine = engine;
@@ -291,67 +287,9 @@ impl Sim {
                         // fsyncs it here, before the vote leaves the process.
                         self.nodes[index]
                             .engine
-                            .note_refused_leader_block(round, member, true);
+                            .note_certified_absent(round, member);
                         outbox.push((index, Msg::Skip(vote)));
                         continue;
-                    }
-                    // (b) the LEADER's block exists but cannot be certified.
-                    // Only the leader matters here: no other member's block
-                    // moves the commit cursor.
-                    if !seen || member != leader_for_round(&self.set, round) {
-                        continue;
-                    }
-                    let hashes = self.nodes[index].engine.blocks_in_round(round);
-                    let Some(block_hash) = hashes.iter().copied().find(|hash| {
-                        self.nodes[index]
-                            .engine
-                            .get_block(hash)
-                            .map(|block| block.author == member)
-                            .unwrap_or(false)
-                    }) else {
-                        continue;
-                    };
-                    // The two later rounds must be quorum-complete before an
-                    // absent certificate can be concluded from their contents.
-                    let later_complete = [round + 1, round + 2].iter().all(|later| {
-                        let mut authors = HashSet::new();
-                        let mut later_stake = 0u64;
-                        for hash in self.nodes[index].engine.blocks_in_round(*later) {
-                            if let Some(block) = self.nodes[index].engine.get_block(&hash)
-                                && authors.insert(block.author)
-                                && let Some(validator) = self.set.get_validator(&block.author)
-                            {
-                                later_stake += validator.stake;
-                            }
-                        }
-                        later_stake >= quorum
-                    });
-                    let unsupported = self.nodes[index]
-                        .engine
-                        .leader_commit_support(&block_hash, round)
-                        .is_none();
-                    self.nodes[index].tracker.observe(
-                        round,
-                        &member,
-                        AbsenceReason::NoQuorumSupport,
-                        if later_complete { stake } else { 0 },
-                        unsupported,
-                        quorum,
-                        now,
-                    );
-                    if let Ok(vote) = self.nodes[index].tracker.sign_if_permitted(
-                        round,
-                        member,
-                        AbsenceReason::NoQuorumSupport,
-                        cursor,
-                        quorum,
-                        now,
-                        &keypair,
-                    ) {
-                        self.nodes[index]
-                            .engine
-                            .note_refused_leader_block(round, member, false);
-                        outbox.push((index, Msg::Skip(vote)));
                     }
                 }
             }
@@ -493,9 +431,6 @@ impl Sim {
             let committed = self.nodes[index].engine.try_commit();
             for block in &committed {
                 self.nodes[index].committed.insert(block.round, block.hash);
-                self.nodes[index]
-                    .tracker
-                    .note_committed_leader_round(block.round);
                 // Finality is signed only after the commit condition holds.
                 let vote = FinalityVote::sign(
                     domain(),
@@ -824,8 +759,8 @@ fn a_restarted_node_keeps_its_refusals_and_rejoins_without_conflicting() {
         assert!(
             sim.nodes[restart_index]
                 .engine
-                .refuses_leader_block(*round, leader),
-            "a restarted engine forgot its refusal for round {round}"
+                .is_certified_absent(*round, leader),
+            "a restarted engine forgot its excusal for round {round}"
         );
     }
 
@@ -1102,4 +1037,76 @@ fn history_import_refuses_a_gap_a_jump_and_a_thin_round() {
         .import_history(&all, HISTORY_SPAN)
         .expect("a complete contiguous run imports");
     assert!(reached > 1, "import reached only round {reached}");
+}
+
+#[test]
+fn many_absences_in_one_round_cannot_stop_block_production() {
+    // Regression for the CRITICAL liveness defect an independent adversarial
+    // review found in the first design: attestations refused blocks as parents,
+    // nothing bounded how much stake could be attested absent in one round, and
+    // once the refused stake exceeded f every proposer failed with
+    // InsufficientParents - permanently, since the record forbids forgetting.
+    //
+    // Certificates no longer refuse anything, so this drives the same shape and
+    // requires the chain to keep producing AND committing.
+    let n = 4usize;
+    let mut sim = Sim::new(n);
+    sim.run(6, &Faults::default());
+
+    // Force the precondition directly: excuse every member of several rounds,
+    // which is strictly more than the review's interleaving could achieve.
+    let members: Vec<Address> = sim.set.validators.iter().map(|v| v.address).collect();
+    for round in 0..6u64 {
+        for node in &sim.nodes {
+            for member in &members {
+                node.engine.note_certified_absent(round, *member);
+            }
+        }
+    }
+
+    let before = sim.cursors();
+    sim.run(30, &Faults::default());
+    sim.assert_safety("many absences");
+    let after = sim.cursors();
+    assert!(
+        after.iter().min().unwrap() > before.iter().min().unwrap(),
+        "block production stopped after many absences in one round: {before:?} -> {after:?}"
+    );
+}
+
+#[test]
+fn an_anchor_one_node_certifies_is_never_skipped_by_another() {
+    // The other CRITICAL finding: honest nodes could disagree about whether a
+    // block could ever be committed, because that judgement was made from a
+    // local view. The retroactive rule makes it from a later committed anchor's
+    // causal history instead, which every node that holds the anchor computes
+    // identically. Drive a network with delay, reorder and duplication - the
+    // conditions that produced divergent views - and require every node's
+    // commit decisions to agree wherever they overlap.
+    for n in [4usize, 7] {
+        let mut sim = Sim::new(n);
+        let hostile = Faults {
+            duplicate: true,
+            reorder: true,
+            ..Default::default()
+        };
+        for tick in 0..24 {
+            let faults = if tick % 3 == 0 {
+                Faults {
+                    delay: true,
+                    ..hostile.clone()
+                }
+            } else {
+                hostile.clone()
+            };
+            sim.tick(&faults);
+        }
+        sim.run(30, &Faults::default());
+        sim.assert_safety("divergent views");
+        // And the chain actually got somewhere, so this is not a vacuous pass.
+        assert!(
+            sim.cursors().iter().max().unwrap() > &2,
+            "n={n}: no progress under hostile delivery"
+        );
+    }
 }
