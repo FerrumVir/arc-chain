@@ -60,14 +60,15 @@ HOURS=$((DURATION / 3600)); MINS=$(( (DURATION % 3600) / 60 ))
 PIDS=(); RPC_PORTS=(); START_TIME=0; STARTUP_OK=0
 # Declared up front: generate_report runs from an EXIT trap that can fire before
 # the capability probe below assigns it, and `set -u` would abort there.
-BENCH_ARGS=()
+BENCH_ARGS=(); NODE_ARGS=(--stake 0); NEEDS_SEED=0; PEER_LIST=""
 
 rss_mb() { ps -o rss= -p "$1" 2>/dev/null | awk '{printf "%.0f", $1/1024}'; }
 node_json() { curl -s --max-time 3 "http://127.0.0.1:$1$2" 2>/dev/null; }
 
 generate_report() {
     local end_time total_time rc=0
-    end_time=$(date +%s); total_time=$(( end_time - ${START_TIME:-end_time} ))
+    end_time=$(date +%s)
+    if [[ "${START_TIME:-0}" -gt 0 ]]; then total_time=$(( end_time - START_TIME )); else total_time=0; fi
     {
       echo ""
       echo "================================================================"
@@ -78,6 +79,19 @@ generate_report() {
       echo "  Duration:   $((total_time / 3600))h $(( (total_time % 3600) / 60 ))m ${total_time}s"
       echo "  Ended:      $(date)"
       echo "  Startup:    $([ "$STARTUP_OK" = 1 ] && echo "all nodes answered /health" || echo "DID NOT COMPLETE")"
+      echo "  Peering:    ${PEER_LIST:-none (independent chains)}"
+      if [[ -n "$PEER_LIST" ]]; then
+          local dialfail
+          dialfail=$(cat "$LOG_DIR"/node-*.log 2>/dev/null | grep -c "Timeout connecting" || true)
+          echo "  Peer dials: $(cat "$LOG_DIR/peers.observed" 2>/dev/null || echo '?') peers observed, ${dialfail:-0} dial timeouts"
+          if [[ "$(cat "$LOG_DIR/peers.observed" 2>/dev/null || echo 0)" = "0" ]]; then
+              echo "    NOTE: peering was requested and NO peer ever connected, so this"
+              echo "          ran as independent chains. --benchmark forbids --genesis"
+              echo "          (main.rs:5566), so each node seeds its own single-validator"
+              echo "          set and the transport refuses the mismatch."
+              rc=1
+          fi
+      fi
       echo "  Workload:   $([ ${#BENCH_ARGS[@]:-0} -gt 0 ] && echo "--benchmark --bench-batch $BATCH_SIZE" || echo "NONE (idle soak)")"
       echo ""
       echo "  Per-node outcome:"
@@ -85,7 +99,10 @@ generate_report() {
           local log="$LOG_DIR/node-${i}.log" errs lines alive
           errs=0; lines=0
           [[ -f "$log" ]] && { errs=$(grep -c -i -E "error|panic|fatal" "$log" 2>/dev/null || true); lines=$(wc -l < "$log" | tr -d ' '); }
-          alive=no; [[ ${#PIDS[@]} -gt $i ]] && kill -0 "${PIDS[$i]}" 2>/dev/null && alive=yes
+          # Read the liveness snapshot taken at loop exit, BEFORE cleanup
+          # killed anything. Probing kill -0 here would always say "no",
+          # because this function runs from the shutdown trap.
+          alive=$(cat "$LOG_DIR/node-${i}.alive" 2>/dev/null || echo unknown)
           printf "    node %d: alive=%-3s errors=%-5s log_lines=%-7s peak_rss=%s MB\n" \
                  "$i" "$alive" "${errs:-0}" "$lines" "$(cat "$LOG_DIR/node-${i}.peakrss" 2>/dev/null || echo '?')"
           [[ "$alive" = no ]] && rc=1
@@ -93,12 +110,34 @@ generate_report() {
       done
       echo ""
       echo "  Height / state-root agreement (last sample):"
-      if [[ -s "$LOG_DIR/roots.csv" ]]; then
-          tail -1 "$LOG_DIR/roots.csv"
-          local distinct
-          distinct=$(tail -1 "$LOG_DIR/roots.csv" | cut -d, -f3- | tr ',' '\n' | grep -v '^$' | sort -u | wc -l | tr -d ' ')
-          echo "    distinct state roots across nodes: $distinct"
-          [[ "$distinct" != "1" ]] && echo "    NOTE: nodes do not agree on a single state root."
+      if [[ $(wc -l < "$LOG_DIR/roots.csv" 2>/dev/null || echo 0) -gt 1 ]]; then
+          local last distinct heights
+          last=$(tail -n +2 "$LOG_DIR/roots.csv" | awk -F, 'END{print $1}')
+          awk -F, -v L="$last" 'NR>1 && $1==L {printf "    node %s: height=%s root=%s\n", $2, $3, substr($4,1,18)"..."}' "$LOG_DIR/roots.csv"
+          distinct=$(awk -F, -v L="$last" 'NR>1 && $1==L && $4!="" {print $4}' "$LOG_DIR/roots.csv" | sort -u | wc -l | tr -d ' ')
+          heights=$(awk -F, -v L="$last" 'NR>1 && $1==L {print $3}' "$LOG_DIR/roots.csv" | sort -u | tr '\n' ' ')
+          echo "    distinct state roots across nodes: $distinct    heights seen: $heights"
+          if [[ "$distinct" != "1" ]]; then
+              if [[ -n "$PEER_LIST" ]]; then
+                  echo "    NOTE: peered nodes do NOT agree on a single state root."
+                  rc=1
+              else
+                  echo "    NOTE: nodes were not peered, so they are independent chains"
+                  echo "          and divergence here is expected, not a consensus failure."
+              fi
+          elif [[ -z "$PEER_LIST" ]]; then
+              echo "    NOTE: nodes were not peered. Matching roots across independent"
+              echo "          chains is determinism, not consensus agreement."
+          fi
+          # Identical roots across unpeered single-validator chains is
+          # determinism, not consensus. Say so rather than implying agreement.
+          local maxh
+          maxh=$(awk -F, 'NR>1 && $3!="" {if ($3+0>m) m=$3+0} END{print m+0}' "$LOG_DIR/roots.csv")
+          if [[ "$maxh" -eq 0 ]]; then
+              echo "    NOTE: height never left 0 - no block was produced, so this run"
+              echo "          exercised startup, liveness and memory but NOT the block path."
+              rc=1
+          fi
       else
           echo "    no samples recorded"
           rc=1
@@ -150,7 +189,51 @@ if ! "$BINARY" --help 2>&1 | grep -q -- "--benchmark"; then
     echo "       ALLOW_IDLE_SOAK=1 set - continuing WITHOUT a workload."
     BENCH_ARGS=()
 else
-    BENCH_ARGS=(--benchmark --bench-batch "$BATCH_SIZE")
+    # arc-node gates --benchmark behind its own isolation contract
+    # (crates/arc-node/src/main.rs:5566): a positive stake, the explicit dev
+    # seed, and NO --genesis. It separately refuses any non-loopback benchmark
+    # peer. Those three together are the definition of a disposable local
+    # devnet, which is what a soak needs and is why this is safe here: no
+    # --peers, no --seeds-file, no ARC_COMMUNITY_RPC_URLS, loopback enforced by
+    # the binary. This must never be pointed at a public seed.
+    BENCH_ARGS=(--benchmark --bench-batch "$BATCH_SIZE"
+                --insecure-dev-validator-seed --stake "${SOAK_STAKE:-5000000}")
+    # The dev-seed flag is refused on its own: the binary demands an explicit
+    # --validator-seed alongside it. Each node gets a distinct deterministic
+    # one so identities do not collide, appended per node below.
+    #
+    # Stake must reach the Arc tier or the soak never exercises the block path.
+    # --stake is denominated in whole ARC while the tier constants are in base
+    # units (arc-types/src/economics.rs:196-198: MIN_STAKE_ARC = 5M ARC), and
+    # StakeTier::can_propose() (:274) admits only Arc | Core. At 1,000,000 the
+    # node comes up Spark tier and logs "observing only (cannot produce
+    # blocks)": it stays alive with flat memory and zero errors for the whole
+    # run while height never leaves 0. config.toml:18 already uses 5_000_000.
+    NEEDS_SEED=1
+fi
+
+# One array, so an empty BENCH_ARGS cannot inject a stray empty argument.
+if [[ ${#BENCH_ARGS[@]:-0} -gt 0 ]]; then
+    NODE_ARGS=("${BENCH_ARGS[@]}")
+else
+    NODE_ARGS=(--stake 0)
+fi
+
+# Hard stop: a soak must never be aimed at a real network.
+if [[ -n "${ARC_COMMUNITY_RPC_URLS:-}" ]]; then
+    echo "ERROR: ARC_COMMUNITY_RPC_URLS is set. Unset it; a soak runs isolated."; exit 1
+fi
+
+# Build the loopback peer list once. Without this the nodes are N independent
+# single-validator chains that each seal their own blocks, and their state roots
+# diverge by construction - which says nothing about consensus either way. The
+# binary requires benchmark peers to be numeric loopback (main.rs:5560), which
+# these are, and no seed or public address is involved.
+PEER_LIST=""
+if [[ "${SOAK_PEERED:-1}" = "1" && $NODES -gt 1 ]]; then
+    for i in $(seq 0 $((NODES - 1))); do PEER_LIST="${PEER_LIST}127.0.0.1:$((9100 + i)),"; done
+    PEER_LIST="${PEER_LIST%,}"
+    echo "  peering: $PEER_LIST"
 fi
 
 echo ""
@@ -163,8 +246,9 @@ for i in $(seq 0 $((NODES - 1))); do
         --rpc "127.0.0.1:$PORT_RPC" \
         --p2p-port "$PORT_P2P" \
         --data-dir "$DATA" \
-        --stake 0 \
-        ${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"} \
+        ${NODE_ARGS[@]+"${NODE_ARGS[@]}"} \
+        $([ "${NEEDS_SEED:-0}" = 1 ] && echo "--validator-seed soak-node-$i") \
+        $([ -n "$PEER_LIST" ] && echo "--peers $PEER_LIST") \
         > "$LOG_DIR/node-${i}.log" 2>&1 &
     PIDS+=($!); RPC_PORTS+=("$PORT_RPC")
 done
@@ -194,7 +278,10 @@ echo ""
 echo "[3/3] Monitoring for ${HOURS}h ${MINS}m (Ctrl+C stops early and still reports)..."
 START_TIME=$(date +%s)
 echo "timestamp,elapsed_s,alive_nodes,total_errors,total_rss_mb" > "$LOG_DIR/aggregate.csv"
-echo "elapsed_s,heights,state_roots" > "$LOG_DIR/roots.csv"
+# One row per node per sample. The previous single-row-per-sample layout put a
+# variable number of height and root columns in one line, which made any fixed
+# column offset wrong as soon as NODES changed.
+echo "elapsed_s,node,height,state_root" > "$LOG_DIR/roots.csv"
 
 while true; do
     now=$(date +%s); elapsed=$(( now - START_TIME ))
@@ -213,17 +300,24 @@ while true; do
     errors=$(cat "$LOG_DIR"/node-*.log 2>/dev/null | grep -c -i -E "error|panic|fatal" || true)
     echo "$now,$elapsed,$alive,${errors:-0},$total_rss" >> "$LOG_DIR/aggregate.csv"
 
-    heights=""; roots=""
-    for p in "${RPC_PORTS[@]}"; do
-        j=$(node_json "$p" /sync/snapshot/info)
-        heights="$heights$(echo "$j" | sed -nE 's/.*"height":([0-9]+).*/\1/p'),"
-        roots="$roots$(echo "$j" | sed -nE 's/.*"state_root":"([^"]*)".*/\1/p'),"
+    if [[ -n "$PEER_LIST" ]]; then
+        node_json "${RPC_PORTS[0]}" /health \
+            | sed -nE 's/.*"peers":([0-9]+).*/\1/p' > "$LOG_DIR/peers.observed" || true
+    fi
+    for n in $(seq 0 $((NODES - 1))); do
+        j=$(node_json "${RPC_PORTS[$n]}" /sync/snapshot/info)
+        h=$(echo "$j" | sed -nE 's/.*"height":([0-9]+).*/\1/p')
+        r=$(echo "$j" | sed -nE 's/.*"state_root":"([^"]*)".*/\1/p')
+        echo "$elapsed,$n,${h:-},${r:-}" >> "$LOG_DIR/roots.csv"
     done
-    echo "$elapsed,${heights%,},${roots%,}" >> "$LOG_DIR/roots.csv"
 
     if [[ $alive -lt $NODES ]]; then
         echo ""; echo "ERROR: only $alive/$NODES nodes alive at ${elapsed}s - stopping early."; break
     fi
     printf "\r  [%5ds] alive %d/%d | errors %s | rss %d MB      " "$elapsed" "$alive" "$NODES" "${errors:-0}" "$total_rss"
+    for i in $(seq 0 $((NODES - 1))); do
+        kill -0 "${PIDS[$i]}" 2>/dev/null && echo yes > "$LOG_DIR/node-${i}.alive" \
+                                          || echo no  > "$LOG_DIR/node-${i}.alive"
+    done
     sleep 10
 done

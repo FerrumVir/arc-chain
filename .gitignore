@@ -7,6 +7,12 @@
 target/
 **/*.rs.bk
 
+# Soak-test working directories. scripts/soak_test.sh writes
+# logs/soak-<timestamp>/ containing per-node data dirs, WALs and logs - runtime
+# output of a disposable local devnet, never source. Durable soak evidence is
+# copied to work/outputs/ instead.
+logs/
+
 # Cargo.lock is intentionally NOT ignored.
 # This workspace ships binaries (arc-node) to third-party operators, and
 # binary-producing workspaces commit their lockfile; only libraries omit it.
