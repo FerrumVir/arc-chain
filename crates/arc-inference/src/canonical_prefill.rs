@@ -56,6 +56,15 @@ pub const MIN_PROFITABLE_BATCH_TOKENS: usize = 4;
 /// is the difference between serving and swapping.
 pub const MAX_PREFILL_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
 
+/// Chunk size a serving path requests.
+///
+/// 64 is the size every E1(b) conformance and timing observation used, so it is
+/// the size with evidence behind it rather than a round number. It is clamped
+/// by [`max_chunk_within_scratch_budget`] at the call site, so a model geometry
+/// that cannot afford 64 tokens of scratch gets a smaller chunk rather than a
+/// refusal. Chunk size cannot change an output.
+pub const SERVING_PREFILL_CHUNK: usize = 64;
+
 /// Should a caller holding `n_tokens` use the batched path at all?
 ///
 /// Capability question, not an admission question: a `false` here means "this
