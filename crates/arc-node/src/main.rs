@@ -7684,17 +7684,29 @@ async fn run_arc_node() -> Result<()> {
             let dag_wal_path = Path::new(&data_dir).join("dag-wal");
             let recovered_round = restore_legacy_dag_wal_and_read_round(&dag_wal_path)?;
             if recovered_round > 0 {
-                // The highest WAL round does not prove that any earlier leader was
-                // committed. Preserve the commit cursor until an exact local commit
-                // record or quorum-certified checkpoint recovery path is available.
-                let recovered_committed = 0;
+                // The highest WAL round does not prove that any earlier leader
+                // was committed, so the cursor is NOT taken from it. It comes
+                // from this node's own durable commit record - written only
+                // after a committed block crossed the durability barrier - which
+                // is the "exact local commit record" this path was waiting for.
+                //
+                // Without it the cursor stayed fail-closed at 0 forever: the
+                // scan restarted at a round whose blocks are no longer in
+                // memory, broke there, and the node rejoined the mesh, accepted
+                // transactions, and never committed another block. The 4-node
+                // fixture measured exactly that - "before kill=511 after
+                // recovery=511" with peers at 649.
+                let recovered_committed = {
+                    let record = consensus.load_signing_record();
+                    record.durable_commit_round.min(recovered_round)
+                };
                 consensus
                     .engine
                     .restore_round_from_local_wal(recovered_round, recovered_committed);
                 tracing::info!(
                     recovered_round,
                     recovered_committed,
-                    "DAG WAL round restored from local disk; commit cursor remains fail-closed pending certified recovery"
+                    "DAG WAL round restored from local disk; commit cursor restored from this node's own durable commit record"
                 );
             } else {
                 tracing::info!("DAG WAL is empty - starting fresh from round 0");

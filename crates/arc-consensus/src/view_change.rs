@@ -495,6 +495,17 @@ pub struct ConsensusSigningRecord {
     pub skipped_rounds: HashMap<u64, HashMap<Address, AbsenceReason>>,
     /// Heights this validator has signed a finality transcript for.
     pub finality_votes: HashMap<u64, (Hash256, Hash256, Hash256)>,
+    /// The highest DAG round whose committed block this node has DURABLY
+    /// applied to its own state.
+    ///
+    /// This is the "exact local commit record" that restart recovery needs. It
+    /// trusts nobody: it is this node's own statement about work it already
+    /// performed and fsynced, so restoring the commit cursor from it cannot
+    /// accept anything new. It is written only after the block crossed the
+    /// durability barrier, so a crash can leave it behind the true cursor -
+    /// which is safe - but never ahead of it.
+    #[serde(default)]
+    pub durable_commit_round: u64,
 }
 
 impl ConsensusSigningRecord {
@@ -593,6 +604,14 @@ impl SkipTracker {
     /// Informational: nothing in the commit rule consults it.
     pub fn refuses(&self, round: u64, absentee: &Address) -> bool {
         self.refused.contains(&(round, *absentee))
+    }
+
+    /// Record that a committed block at this DAG round has been durably
+    /// applied. Monotonic: a later crash cannot lower it.
+    pub fn note_durable_commit_round(&mut self, round: u64) {
+        if round > self.record.durable_commit_round {
+            self.record.durable_commit_round = round;
+        }
     }
 
     /// Record that this validator signed a finality transcript for a height.
@@ -1227,6 +1246,39 @@ mod tests {
             .expect("grace elapsed");
         assert_eq!(vote.round, 5);
         assert_eq!(vote.absentee, leader);
+    }
+
+    #[test]
+    fn the_durable_commit_round_is_monotonic_and_survives_restart() {
+        // This is what restores the commit cursor after a crash. It must never
+        // go backwards: a later crash cannot make the node re-decide rounds it
+        // already committed and durably applied.
+        let (set, _) = committee(4);
+        let mut tracker = tracker(&set);
+        assert_eq!(tracker.record().durable_commit_round, 0);
+        tracker.note_durable_commit_round(40);
+        tracker.note_durable_commit_round(12);
+        assert_eq!(
+            tracker.record().durable_commit_round,
+            40,
+            "an earlier round must not lower the record"
+        );
+        tracker.note_durable_commit_round(41);
+        assert_eq!(tracker.record().durable_commit_round, 41);
+
+        let encoded = tracker.record().encode();
+        let restored = ConsensusSigningRecord::decode(&encoded).expect("decodes");
+        assert_eq!(restored.durable_commit_round, 41);
+
+        // A record written before this field existed decodes as 0, which is
+        // exactly the fail-closed value the old behaviour used.
+        let legacy = ConsensusSigningRecord::default();
+        assert_eq!(
+            ConsensusSigningRecord::decode(&legacy.encode())
+                .unwrap()
+                .durable_commit_round,
+            0
+        );
     }
 
     #[test]

@@ -1874,7 +1874,13 @@ impl ConsensusManager {
                     && last_round_change.elapsed() >= HISTORY_STUCK_AFTER
                     && connected_validators.iter().any(|(_, g)| g.connected)
                 {
-                    history_requests_broadcast = Some(now_round);
+                    // Ask from the OLDEST round this node still needs, not from
+                    // its current one. After a restart the commit cursor can be
+                    // far behind the round cursor, and history that starts at
+                    // the round cursor leaves the gap the commit rule is
+                    // actually waiting on.
+                    history_requests_broadcast =
+                        Some(self.engine.last_committed_round().min(now_round));
                 }
             }
 
@@ -2869,6 +2875,25 @@ impl ConsensusManager {
                         },
                         "Block produced and durably bound to DAG commit"
                     );
+
+                    // ── the exact local commit record ────────────────────
+                    // Written only now, after this committed block crossed the
+                    // durability barrier. On restart it is what lets the commit
+                    // cursor come back instead of being fail-closed at 0, and
+                    // it trusts nobody: it is this node's own statement about
+                    // work it already performed and fsynced. A crash can leave
+                    // it behind the true cursor, which is safe; it can never be
+                    // ahead.
+                    if let Some(tracker) = skip_tracker.as_mut() {
+                        tracker.note_durable_commit_round(dag_block.round);
+                        if !self.persist_signing_record(tracker.record()) {
+                            tracing::error!(
+                                round = dag_block.round,
+                                "Could not persist the local commit record; a restart will \
+                                 resume from an earlier round"
+                            );
+                        }
+                    }
 
                     // ── finality attestation ─────────────────────────────
                     // Signed only now: after the two-round commit rule
