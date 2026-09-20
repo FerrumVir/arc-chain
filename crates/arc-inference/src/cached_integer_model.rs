@@ -3429,6 +3429,17 @@ impl CachedIntegerModel {
     /// With `all_positions` the logits of every token are returned, which is
     /// the verification shape. Otherwise only the final token's logits are
     /// computed, which is all prefill actually needs.
+    ///
+    /// # Resource note
+    ///
+    /// `all_positions` accumulates `tokens.len() * vocab_size` i64 values in the
+    /// returned vector — 1.05 GB at the canonical 4096-token context window, and
+    /// the one allocation here that scales with the caller's prompt rather than
+    /// with `chunk_size`. It exists to let a verifier compare every position and
+    /// **must not be used on a request-serving path**; serving passes `false`
+    /// and gets one logit vector. A verifier that needs every position on a long
+    /// prompt should drive this in slices, as `examples/batched_prefill_experiment.rs`
+    /// does, so the logits never accumulate.
     pub fn prefill_canonical_i8_batched(
         &self,
         tokens: &[u32],
@@ -3476,7 +3487,19 @@ impl CachedIntegerModel {
             record_prefill_refusal(PrefillRefusal::ContextWindowExceeded);
             return None;
         }
-        let chunk_size = chunk_size.min(crate::canonical_simd::MAX_BATCH_TOKENS);
+        // Two ceilings, both capability decisions rather than admission ones.
+        // The first bounds the digit scratch the vectorised kernel splits into;
+        // the second bounds the ten per-chunk activation buffers below. Chunk
+        // size cannot change any output — the conformance tests run every
+        // prompt across nine chunk sizes and require bit-identical logits and
+        // an identical KV cache — so clamping is free of semantic effect and no
+        // request that the token-at-a-time path would serve is refused here.
+        let chunk_size = chunk_size
+            .min(crate::canonical_simd::MAX_BATCH_TOKENS)
+            .min(crate::canonical_prefill::max_chunk_within_scratch_budget(
+                d, dkv, dff,
+            ))
+            .max(1);
 
         let total = tokens.len();
         let mut out: Vec<Vec<i64>> = Vec::new();
