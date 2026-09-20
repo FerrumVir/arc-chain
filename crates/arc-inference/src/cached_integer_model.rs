@@ -959,6 +959,15 @@ fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &m
         weights.scales.len(),
         "matmul output/scales mismatch"
     );
+    // Opt-in bit-exact vectorised path. Default OFF, so the scalar datapath
+    // below is unchanged unless a caller explicitly enables it. The fast path
+    // refuses any input it cannot prove exact and returns false, leaving the
+    // scalar kernel to run. See `crate::canonical_simd`.
+    if crate::canonical_simd::fast_canonical_kernel_enabled()
+        && crate::canonical_simd::matmul_i8_canonical_rows_fast(weights, input, in_size, output)
+    {
+        return;
+    }
     let data = &weights.data;
     let scales = &weights.scales;
     // Chunk width 256, matching matmul_i16_into. At 512 a 4096-row output
