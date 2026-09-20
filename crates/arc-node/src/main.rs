@@ -209,6 +209,15 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     native_inference_artifact: Option<PathBuf>,
 
+    /// Explicit reference-qualification record for REAL-model execution, bound
+    /// to one execution identity (see `NativeQualificationRecord`).
+    ///
+    /// Required for the real executor. Startup does not infer qualification:
+    /// matching artifact/profile/generation hashes establish execution
+    /// identity, not that the execution passed reference qualification.
+    #[arg(long, value_name = "PATH")]
+    native_inference_qualification: Option<PathBuf>,
+
     /// INTEGRATION TESTING ONLY: run the native worker with a deterministic
     /// executor that loads no model. Compiled in only with the
     /// `native-test-executor` cargo feature, so a default build cannot enable
@@ -7113,14 +7122,17 @@ async fn run_arc_node() -> Result<()> {
             ));
             Ok((signer, sink, store))
         };
-        let qualification = ni::CanonicalI8Qualification {
+        // The deterministic test executor loads no model and never consults
+        // this field; it is carried only so its output is domain-separated by
+        // execution identity. It is `false` because nothing here qualified
+        // anything, and writing `true` next to a comment saying startup cannot
+        // decide that is exactly the defect being removed.
+        #[cfg(feature = "native-test-executor")]
+        let test_identity = ni::CanonicalI8Qualification {
             artifact_hash: allowed.model_hash,
             profile_hash: allowed.profile_hash,
             generation_hash: allowed.generation_hash,
-            // Never inferred: the executor refuses unless reference
-            // qualification is an explicit release decision, and it is not one
-            // this flag can make.
-            reference_generation_qualified: true,
+            reference_generation_qualified: false,
         };
 
         #[cfg(feature = "native-test-executor")]
@@ -7130,7 +7142,7 @@ async fn run_arc_node() -> Result<()> {
                  loaded. This is integration coverage and qualifies nothing."
             );
             let (signer, sink, store) = native_parts()?;
-            let executor = Arc::new(ni::DeterministicTestExecutor::new(qualification));
+            let executor = Arc::new(ni::DeterministicTestExecutor::new(test_identity));
             let runtime =
                 ni::NativeWorkerRuntime::from_active(state.clone(), executor, signer, sink, store)
                     .map_err(|e| anyhow::anyhow!("native worker runtime: {e}"))?;
@@ -7148,12 +7160,24 @@ async fn run_arc_node() -> Result<()> {
         native_runtime_handle = match started {
             Some(handle) => Some(handle),
             None => {
+                // Resolve qualification FIRST. A missing or mismatched decision
+                // must cost nothing - it is rejected before the artifact is
+                // hashed or a multi-gigabyte model is loaded.
+                let qualification = ni::resolve_real_execution_qualification(
+                    cli.native_inference_qualification.as_deref(),
+                    &allowed,
+                )
+                .map_err(|e| anyhow::anyhow!("real-model execution refused: {e}"))?;
                 let artifact = cli.native_inference_artifact.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "--native-inference-runtime needs --native-inference-artifact \
                          (the qualified canonical-I8 GGUF)"
                     )
                 })?;
+                tracing::warn!(
+                    "real-model execution starting under an explicit reference-qualification \
+                     record. That record is an operator decision, not proof of model quality."
+                );
                 let executor = Arc::new(
                     ni::CanonicalI8NativeExecutor::load_qualified(artifact, qualification)
                         .map_err(|e| {

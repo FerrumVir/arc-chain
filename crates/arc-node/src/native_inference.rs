@@ -1315,6 +1315,157 @@ where
     }
 }
 
+// ── Reference qualification (real-model execution only) ─────────────────────
+//
+// `CanonicalI8Qualification::reference_generation_qualified` is defined above as
+// a release decision made only after independent reference-output evidence.
+// Startup previously constructed it with `true` unconditionally, next to a
+// comment claiming it could not make that decision. That is a fabricated
+// attestation: matching artifact/profile/generation hashes establish execution
+// IDENTITY, not qualification, and a constructor's boolean check cannot protect
+// anything when its caller always passes true.
+//
+// It is now supplied as an explicit record, bound to one execution identity, or
+// real-model execution does not start. The record is an operator decision, not
+// a cryptographic proof and not evidence of model quality; it exists so the
+// decision is made deliberately, by a named party, with a stated basis, rather
+// than inferred from a flag.
+
+/// Why a reference-qualification record was rejected.
+#[derive(Debug)]
+pub enum QualificationError {
+    /// No record was supplied.
+    Missing,
+    /// The file could not be read.
+    Unreadable(String),
+    /// The file is not valid JSON for a [`NativeQualificationRecord`].
+    Malformed(String),
+    /// The record declares the execution NOT qualified.
+    NotQualified,
+    /// The record is bound to a different execution identity.
+    IdentityMismatch { field: String, expected: String, found: String },
+    /// The record omits who decided, when, or on what basis.
+    Incomplete(String),
+}
+
+impl std::fmt::Display for QualificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(
+                f,
+                "real-model execution requires an explicit reference-qualification record \
+                 (--native-inference-qualification). Matching model/profile/generation hashes \
+                 establish execution identity, not qualification, and startup will not assume it. \
+                 Use --native-inference-test-executor for protocol testing instead."
+            ),
+            Self::Unreadable(e) => write!(f, "cannot read qualification record: {e}"),
+            Self::Malformed(e) => write!(f, "qualification record is not valid JSON: {e}"),
+            Self::NotQualified => write!(
+                f,
+                "the qualification record states reference_generation_qualified = false; \
+                 real-model execution stays unavailable"
+            ),
+            Self::IdentityMismatch { field, expected, found } => write!(
+                f,
+                "the qualification record is bound to a different execution identity: {field} is \
+                 {found} in the record but {expected} in the activated allowlist. A qualification \
+                 decision is valid only for the identity it was made against."
+            ),
+            Self::Incomplete(what) => write!(
+                f,
+                "the qualification record is missing {what}; an explicit decision needs a named \
+                 decider, a date, and the evidence it rests on"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QualificationError {}
+
+/// An operator's explicit reference-qualification decision for ONE execution
+/// identity.
+///
+/// ```json
+/// {
+///   "model_hash": "<64 hex>", "profile_hash": "<64 hex>",
+///   "generation_hash": "<64 hex>",
+///   "reference_generation_qualified": true,
+///   "decided_by": "release engineering",
+///   "decided_at": "2026-09-20",
+///   "evidence": "path or reference to the reference-output comparison"
+/// }
+/// ```
+///
+/// This is a decision record, not a proof. It does not make a model good; it
+/// records that a named party decided, on a stated basis, that this exact
+/// execution identity passed reference qualification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeQualificationRecord {
+    pub model_hash: Hash256,
+    pub profile_hash: Hash256,
+    pub generation_hash: Hash256,
+    pub reference_generation_qualified: bool,
+    #[serde(default)]
+    pub decided_by: String,
+    #[serde(default)]
+    pub decided_at: String,
+    #[serde(default)]
+    pub evidence: String,
+}
+
+/// Resolve the qualification for REAL-model execution, bound to `allowed`.
+///
+/// Returns `Err` for every path that is not an explicit, complete, matching,
+/// affirmative decision. Callers must run this **before** hashing or loading an
+/// artifact, so a missing decision costs nothing.
+pub fn resolve_real_execution_qualification(
+    path: Option<&std::path::Path>,
+    allowed: &AllowedExecution,
+) -> Result<CanonicalI8Qualification, QualificationError> {
+    let path = path.ok_or(QualificationError::Missing)?;
+    let raw = fs::read_to_string(path)
+        .map_err(|e| QualificationError::Unreadable(format!("{}: {e}", path.display())))?;
+    let record: NativeQualificationRecord =
+        serde_json::from_str(&raw).map_err(|e| QualificationError::Malformed(e.to_string()))?;
+
+    if !record.reference_generation_qualified {
+        return Err(QualificationError::NotQualified);
+    }
+    for (field, expected, found) in [
+        ("model_hash", allowed.model_hash, record.model_hash),
+        ("profile_hash", allowed.profile_hash, record.profile_hash),
+        ("generation_hash", allowed.generation_hash, record.generation_hash),
+    ] {
+        if expected != found {
+            return Err(QualificationError::IdentityMismatch {
+                field: field.to_string(),
+                expected: expected.to_hex(),
+                found: found.to_hex(),
+            });
+        }
+    }
+    let mut missing = Vec::new();
+    if record.decided_by.trim().is_empty() {
+        missing.push("decided_by");
+    }
+    if record.decided_at.trim().is_empty() {
+        missing.push("decided_at");
+    }
+    if record.evidence.trim().is_empty() {
+        missing.push("evidence");
+    }
+    if !missing.is_empty() {
+        return Err(QualificationError::Incomplete(missing.join(", ")));
+    }
+
+    Ok(CanonicalI8Qualification {
+        artifact_hash: record.model_hash,
+        profile_hash: record.profile_hash,
+        generation_hash: record.generation_hash,
+        reference_generation_qualified: true,
+    })
+}
+
 /// Why an operator activation config was rejected.
 #[derive(Debug)]
 pub enum ActivationConfigError {
