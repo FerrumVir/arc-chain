@@ -227,6 +227,20 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     native_inference_test_executor: bool,
 
+    /// DEVELOPMENT START BARRIER, default off: while still at round 0, wait
+    /// for every genesis validator with stake to be connected before
+    /// proposing, instead of the usual quorum of connected stake.
+    ///
+    /// With equal stake and four or more validators, quorum is smaller than
+    /// the committee, so the nodes that start first advance without the last
+    /// one; the last node is then permanently behind (there is no
+    /// authenticated history transfer) and the commit rule halts at the first
+    /// round it was due to lead. This barrier is strictly stronger than the
+    /// quorum rule and only delays the first proposal. It is not a substitute
+    /// for history transfer and does nothing after round 0.
+    #[arg(long, default_value_t = false)]
+    require_full_committee_at_genesis: bool,
+
     /// Enable continuous transaction generation (testnet benchmark mode).
     /// Generates transfers between genesis accounts to keep the chain busy.
     #[cfg(feature = "benchmark-tools")]
@@ -7506,6 +7520,14 @@ async fn run_arc_node() -> Result<()> {
             &peer_vals,
             validator_keypair.clone(),
         );
+        consensus.require_full_committee_at_genesis = cli.require_full_committee_at_genesis;
+        if consensus.require_full_committee_at_genesis {
+            tracing::warn!(
+                "DEVELOPMENT START BARRIER: round-0 proposals wait for the FULL genesis \
+                 committee, not a quorum. This is stricter than the protocol requires and is \
+                 intended for local multi-node experiments."
+            );
+        }
         if let Some(context) = state.recovery_context() {
             let domain = arc_consensus::ConsensusDomain::new(
                 context.domain_hash(),

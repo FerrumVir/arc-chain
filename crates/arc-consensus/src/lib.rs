@@ -3923,6 +3923,135 @@ mod tests {
         assert_eq!(engine_reverse.validator_set().total_stake, 6 * STAKE_ARC);
     }
 
+        /// Drive `rounds` rounds of a synthetic DAG with `n` equal-stake authors
+    /// and return how many blocks committed.
+    ///
+    /// No network, no node process, no timing. `link_all` selects whether each
+    /// proposal references every block of the previous round or exactly a
+    /// quorum of them (the minimum a proposer waits for), rotating which ones.
+    /// `missing` names an author whose blocks are never delivered locally from
+    /// round `missing_from` onward, modelling a node whose block did not
+    /// arrive before its peers advanced.
+    fn commits_over_rounds(
+        n: usize,
+        rounds: u64,
+        link_all: bool,
+        missing: Option<(usize, u64)>,
+    ) -> usize {
+        let vs = test_validator_set(n);
+        let per = vs.total_stake / n as u64;
+        let quorum_authors = vs.quorum.div_ceil(per) as usize;
+        let engine = ConsensusEngine::new(vs, test_addr(0));
+        let mut previous: Vec<Hash256> = Vec::new();
+        let mut committed = 0usize;
+        for round in 0..rounds {
+            let mut current = Vec::new();
+            for author in 0..n {
+                if let Some((absent, from)) = missing
+                    && author == absent
+                    && round >= from
+                {
+                    continue; // this author's block never reaches the local view
+                }
+                let parents: Vec<Hash256> = if previous.is_empty() {
+                    Vec::new()
+                } else if link_all || quorum_authors >= previous.len() {
+                    previous.clone()
+                } else {
+                    let start = (author + round as usize) % previous.len();
+                    (0..quorum_authors)
+                        .map(|k| previous[(start + k) % previous.len()])
+                        .collect()
+                };
+                let block = make_block(
+                    test_addr(author as u8),
+                    round,
+                    parents,
+                    vec![],
+                    1000 + round * 10 + author as u64,
+                );
+                engine.receive_block(&block).unwrap();
+                current.push(block.hash);
+            }
+            if !engine.advance_round() {
+                break; // no quorum this round; the caller asserts on the count
+            }
+            committed += engine.try_commit().len();
+            previous = current;
+        }
+        committed
+    }
+
+    /// The deterministic round leader, as `try_commit` computes it.
+    fn leader_index_for_round(n: usize, round: u64) -> usize {
+        let mut order: Vec<(Address, usize)> =
+            (0..n).map(|i| (test_addr(i as u8), i)).collect();
+        order.sort_by_key(|(address, _)| address.0);
+        order[round as usize % n].1
+    }
+
+    #[test]
+    fn commit_rule_commits_at_every_committee_size_when_every_leader_block_is_present() {
+        // The live sweep (scripts/arc-committee-size-sweep.sh) saw four and
+        // five validators advance DAG rounds indefinitely with committed height
+        // flat. This isolates the commit rule itself: with every author's block
+        // present locally, every committee size commits - whether proposals
+        // carry all parents or only a quorum of them. So the rule is not what
+        // stalls, and the next test shows what does.
+        for n in 2..=5 {
+            for link_all in [true, false] {
+                let committed = commits_over_rounds(n, 8, link_all, None);
+                assert!(
+                    committed > 0,
+                    "n={n} link_all={link_all}: committed nothing in 8 rounds"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn commit_rule_halts_permanently_when_one_leader_block_is_missing_locally() {
+        // A committee of four or more with equal stake has quorum SMALLER than
+        // the committee, so a node can advance a round without one member's
+        // block. If that member is the round's deterministic leader, its block
+        // is never referenced by the next round, the two-round rule can never
+        // certify it, and the commit cursor stops there for good - the code
+        // says as much: "Only a certified skip/view change may advance this
+        // cursor", and no such protocol exists yet.
+        //
+        // n=2 and n=3 cannot reach this state: quorum IS the whole committee,
+        // so advance_round refuses until every block is in.
+        for n in 4..=5 {
+            // Choose the author that leads round 2, and drop it from round 2 on.
+            // Rounds 0 and 1 stay complete so the chain demonstrably starts.
+            let absent = leader_index_for_round(n, 2);
+            let committed = commits_over_rounds(n, 12, false, Some((absent, 2)));
+            assert!(
+                committed <= 2,
+                "n={n}: expected the commit cursor to halt at the missing leader's round, \
+                 but {committed} blocks committed in 12 rounds"
+            );
+            // The same run with every block present keeps committing.
+            let healthy = commits_over_rounds(n, 12, false, None);
+            assert!(
+                healthy > committed,
+                "n={n}: a complete committee ({healthy}) must outrun one with a missing \
+                 leader ({committed})"
+            );
+        }
+        for n in 2..=3 {
+            // Quorum equals the committee here, so dropping a member stops
+            // round advancement outright rather than silently stalling commits.
+            let absent = leader_index_for_round(n, 2);
+            assert_eq!(
+                commits_over_rounds(n, 12, false, Some((absent, 2))),
+                commits_over_rounds(n, 2, false, None),
+                "n={n}: a committee whose quorum is the whole set must stop advancing, \
+                 not keep advancing while committing nothing"
+            );
+        }
+    }
+
     #[test]
     fn test_commit_rule_two_round() {
         // Setup: 4 validators with equal 5M stake each (total 20M, quorum ~13.3M)

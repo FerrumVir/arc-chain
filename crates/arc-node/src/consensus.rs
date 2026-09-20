@@ -503,6 +503,26 @@ pub struct ConsensusManager {
     /// Strictly verified transaction bodies restored from the bound recovery
     /// DAG WAL before the live loop starts.
     recovered_preimages: Vec<arc_types::Transaction>,
+    /// DEVELOPMENT/TEST START BARRIER, default off.
+    ///
+    /// While this node is still at round 0, wait for EVERY genesis validator
+    /// with stake to be connected before proposing, instead of the usual
+    /// quorum of connected stake.
+    ///
+    /// This exists because of a measured startup race. With equal stake and
+    /// four or more validators, quorum is smaller than the committee, so the
+    /// nodes that start first reach quorum without the last one and advance
+    /// immediately. The last node is then permanently behind - it rejects
+    /// every peer block as "round N is too far ahead (current=0)" because
+    /// there is no authenticated history transfer - never proposes again, and
+    /// the commit rule, which commits only the round leader's block and has no
+    /// certified skip, halts at the first round that node was due to lead.
+    ///
+    /// The barrier is STRICTLY STRONGER than the quorum rule, so it weakens
+    /// nothing; it only delays the first proposal. It is not a substitute for
+    /// history transfer, and it does nothing for a node that falls behind
+    /// after round 0.
+    pub require_full_committee_at_genesis: bool,
 }
 
 impl ConsensusManager {
@@ -557,6 +577,7 @@ impl ConsensusManager {
             ),
             stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()),
             recovered_preimages: Vec::new(),
+            require_full_committee_at_genesis: false,
         }
     }
 
@@ -610,6 +631,7 @@ impl ConsensusManager {
             ),
             stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()),
             recovered_preimages: Vec::new(),
+            require_full_committee_at_genesis: false,
         }
     }
 
@@ -1602,7 +1624,9 @@ impl ConsensusManager {
                             .expect("unique connected stake cannot exceed validator-set total");
                     }
                 }
-                if self.engine.requires_full_round_participation() {
+                let genesis_barrier =
+                    self.require_full_committee_at_genesis && current_round == 0;
+                if self.engine.requires_full_round_participation() || genesis_barrier {
                     vs.validators
                         .iter()
                         .filter(|validator| validator.stake > 0)

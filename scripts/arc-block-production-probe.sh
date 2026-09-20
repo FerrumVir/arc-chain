@@ -7,10 +7,18 @@
 # once (explicit genesis AND activation AND no --benchmark, against self-genesis
 # AND --benchmark AND no activation).
 #
-# The staged lifecycle diagnostic has since removed one candidate outright: a
-# single validator with an explicit genesis was given VALID PAID WORK, admitted
-# it with HTTP 200, and still never left height 0. Idle blocks are therefore not
-# the missing ingredient - work was pending and nothing committed.
+# RESULT (2026-09-20, recorded in outputs/.../round3/d7-block-production-probe.txt):
+# A=NO_COMMIT, B=NO_COMMIT, C=COMMITS. The genesis source makes no difference.
+# Arms A and B carry no workload, and consensus.rs:1640-1643 states the rule
+# directly - multi-validator mode proposes every round so the DAG advances,
+# single-validator mode proposes only when it has transactions - so an idle
+# single-validator chain not committing is designed behaviour, not a defect.
+#
+# The staged lifecycle diagnostic that originally claimed a single validator
+# "never leaves height 0 even with work pending" was wrong, and its own node log
+# disproved it: the node produced height 1, executed the paid request, and then
+# shut itself down on a preimage it had deleted. See the commit "Stop the first
+# transaction from killing a single-validator node".
 #
 # This holds everything else constant and varies ONE thing at a time:
 #

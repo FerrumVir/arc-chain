@@ -264,6 +264,18 @@ nget() { # port path -> body; fails unless HTTP 200 AND valid JSON
 
 nfield() { json_field "$@"; }
 
+# A node that does not answer is not a node at height 0. Defaulting the two to
+# the same value is how a dead process reads as "no progress"; every comparison
+# built on it then describes something that was not measured.
+height_or_fail() { # port label
+  local h; h=$(nfield "$1" /health height)
+  if [[ -z "$h" || ! "$h" =~ ^[0-9]+$ ]]; then
+    fail "node on port $1 ($2) did not report a height; it is unreachable, not at height 0"
+    printf '0'; return 1
+  fi
+  printf '%s' "$h"
+}
+
 wait_healthy() { # port timeout
   local deadline=$(( $(date +%s) + $2 ))
   while [[ $(date +%s) -lt $deadline ]]; do
@@ -568,7 +580,7 @@ else
 say nothing about recovery. Use more validators rather than lowering the threshold."
 fi
 
-BEFORE=$(nfield "$((BASE_RPC+LAST))" /health height); BEFORE=${BEFORE:-0}
+BEFORE=$(height_or_fail "$((BASE_RPC+LAST))" "node $LAST before SIGKILL")
 kill -9 "${PIDS[$LAST]}" 2>/dev/null
 gone=0
 for _ in $(seq 1 15); do
@@ -580,7 +592,7 @@ done
 
 # The survivors must keep making progress without it.
 sleep 20
-SURV=$(nfield "$BASE_RPC" /health height); SURV=${SURV:-0}
+SURV=$(height_or_fail "$BASE_RPC" "surviving node 0")
 [[ "$SURV" -gt "$BEFORE" ]] && ok "surviving quorum kept advancing while node $LAST was down ($BEFORE -> $SURV)" \
   || fail "chain stalled while one of $NODES nodes was down ($BEFORE -> $SURV)"
 
