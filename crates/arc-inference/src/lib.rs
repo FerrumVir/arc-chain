@@ -14,9 +14,13 @@ pub mod gas;
 pub mod gguf_integer;
 pub mod integer_engine;
 pub mod integer_lut;
+pub mod llama_spm_tokenizer;
 pub mod model_artifact;
 pub mod q4_engine;
 pub mod streaming;
+/// Private-cohort, within-query tensor row partitioning.  This deliberately
+/// has no dependency on validator RPC or the public layer-pipeline endpoint.
+pub mod tensor_parallel;
 
 #[cfg(test)]
 mod golden_vectors;

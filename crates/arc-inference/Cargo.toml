@@ -57,6 +57,15 @@ required-features = ["candle"]
 name = "validate_canonical_artifact"
 required-features = ["candle"]
 [[example]]
+name = "compare_same_gguf_quality"
+required-features = ["candle"]
+[[example]]
+name = "validate_llama_spm_tokenizer"
+required-features = ["candle"]
+[[example]]
+name = "capture_llama_simple_trace"
+required-features = ["candle"]
+[[example]]
 name = "bench_gpu_forward"
 required-features = ["candle"]
 [[example]]
@@ -79,6 +88,9 @@ name = "debug_generation"
 required-features = ["candle"]
 [[example]]
 name = "eval_perplexity"
+required-features = ["candle"]
+[[example]]
+name = "tensor_parallel_oracle"
 required-features = ["candle"]
 # These five were missing from this list, so `--all-targets` (and plain
 # `cargo test -p arc-inference`) tried to build them without the candle

@@ -88,6 +88,29 @@ impl I8Weights {
             n_cols: 0,
         }
     }
+
+    /// Copy an exact, half-open output-row range.  The per-row Q16 scales are
+    /// inseparable from the rows: exporting data without its matching scales
+    /// would silently change canonical-I8 arithmetic.
+    pub fn copy_rows(&self, start: usize, end: usize) -> Result<Self, String> {
+        if start >= end
+            || end > self.n_rows
+            || self.n_cols == 0
+            || self.data.len() != self.n_rows.saturating_mul(self.n_cols)
+            || self.scales.len() != self.n_rows
+        {
+            return Err(format!(
+                "invalid I8 row range [{start}, {end}) for {}x{} matrix",
+                self.n_rows, self.n_cols
+            ));
+        }
+        Ok(Self {
+            data: self.data[start * self.n_cols..end * self.n_cols].to_vec(),
+            scales: self.scales[start..end].to_vec(),
+            n_rows: end - start,
+            n_cols: self.n_cols,
+        })
+    }
 }
 
 // ─── INT16 Weight Storage (Per-Row Quantization, Feature-Gated) ──────────────
@@ -450,6 +473,11 @@ pub const CANONICAL_REWARD_INFERENCE_PROFILE: &str =
 /// an unversioned `ARC-INT8` cache file.
 pub const GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE: &str =
     arc_types::transaction::GGUF_LLAMA_I8_INTERLEAVED_ROPE_PROFILE_V1;
+/// Diagnostic-only sampling identity used for same-GGUF source comparisons.
+/// Unlike protocol v2, this selects raw greedy argmax at every step and never
+/// applies ARC's generated-token repetition penalty.
+pub const GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1: &str =
+    arc_types::transaction::GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1;
 pub const I16_INFERENCE_PROFILE: &str = "INT16 integer (per-row, cross-platform deterministic)";
 pub const BLOCK_I8_INFERENCE_PROFILE: &str =
     "block-INT8 integer (32-weight blocks, cross-platform deterministic)";
@@ -949,6 +977,59 @@ fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &m
                 *out = (acc * scales[i]) >> FRAC_BITS;
             }
         });
+}
+
+/// Canonical per-row I8 projection for a worker-owned row shard.
+///
+/// This intentionally reaches the same raw I8×i64 dot product and Q16
+/// per-row scale operation as `matmul_fast_preq`; no synthetic matrix or
+/// altered accumulation order is introduced for tensor-parallel workers.
+pub fn matmul_i8_canonical_rows(
+    weights: &I8Weights,
+    input: &[i64],
+    output: &mut [i64],
+) -> Result<(), String> {
+    if weights.n_rows == 0
+        || weights.n_cols == 0
+        || weights.data.len() != weights.n_rows.saturating_mul(weights.n_cols)
+        || weights.scales.len() != weights.n_rows
+    {
+        return Err("invalid canonical I8 row shard".into());
+    }
+    if input.len() != weights.n_cols || output.len() != weights.n_rows {
+        return Err(format!(
+            "canonical I8 row projection shape mismatch: input {}, output {}, weights {}x{}",
+            input.len(),
+            output.len(),
+            weights.n_rows,
+            weights.n_cols
+        ));
+    }
+    // `matmul_i8_into` is the established hot kernel and deliberately uses
+    // native integer arithmetic.  Before exposing it to a framed sidecar
+    // request, prove the untrusted activation cannot overflow either its dot
+    // accumulation or the exact post-dot Q16 scale multiply.  Valid model
+    // activations take the unchanged production kernel below.
+    let input_abs_sum = input
+        .iter()
+        .try_fold(0i64, |sum, value| {
+            sum.checked_add(value.checked_abs().ok_or(())?).ok_or(())
+        })
+        .map_err(|_| "canonical I8 input magnitude overflows accumulator".to_string())?;
+    let dot_bound = input_abs_sum
+        .checked_mul(128)
+        .ok_or_else(|| "canonical I8 dot bound overflows".to_string())?;
+    if weights.scales.iter().any(|scale| {
+        scale
+            .checked_abs()
+            .and_then(|s| dot_bound.checked_mul(s))
+            .is_none()
+    }) {
+        return Err("canonical I8 scale multiply would overflow".into());
+    }
+    let input_q = QuantizedInput::from_i64(input);
+    matmul_fast_preq(weights, &input_q, input, weights.n_cols, output);
+    Ok(())
 }
 
 /// Allocating matmul (for compatibility and small outputs).
@@ -2804,6 +2885,56 @@ impl CachedIntegerModel {
         text
     }
 
+    /// Decode generated content for v2-style APIs without rendering protocol
+    /// controls. The token trace still retains terminal EOS for deterministic
+    /// comparisons; this method stops before it and suppresses BOS/control
+    /// pieces from the user-visible completion. `decode_v2` remains the
+    /// legacy-compatible literal token decoder.
+    pub fn decode_v2_content(&self, tokens: &[u32]) -> String {
+        let mut text = String::new();
+        let mut fallback = Vec::new();
+        let flush = |text: &mut String, fallback: &mut Vec<u8>| {
+            if !fallback.is_empty() {
+                text.push_str(&String::from_utf8_lossy(fallback));
+                fallback.clear();
+            }
+        };
+        for &id in tokens {
+            if self.config.eos_tokens.contains(&id) {
+                break;
+            }
+            if id == self.config.bos_token {
+                continue;
+            }
+            let Some(piece) = self.vocab.get(id as usize) else {
+                flush(&mut text, &mut fallback);
+                text.push_str(&format!("[{id}]"));
+                continue;
+            };
+            // GGUF control pieces are not a part of a content completion.
+            // This covers common LLaMA controls even when an older artifact
+            // omitted token-type metadata from its in-memory cache.
+            if matches!(piece.as_str(), "<s>" | "</s>") {
+                continue;
+            }
+            if let Some(hex) = piece
+                .strip_prefix("<0x")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                if hex.len() == 2 {
+                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                        fallback.push(byte);
+                        continue;
+                    }
+                }
+            }
+            flush(&mut text, &mut fallback);
+            text.push_str(&piece.replace('▁', " "));
+        }
+        flush(&mut text, &mut fallback);
+        text
+    }
+
     pub fn encode(&self, text: &str) -> Vec<u32> {
         if self.vocab.is_empty() {
             return vec![];
@@ -3166,6 +3297,131 @@ impl CachedIntegerModel {
         matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
     }
 
+    /// Canonical-I8 whole-token forward whose projections are supplied by a
+    /// fallible row-partition backend.  Norms, RoPE, KV cache, attention,
+    /// residuals, activation, and ordered output assembly remain local.  This
+    /// is deliberately separate from `forward_one_token`, preserving every
+    /// existing production dispatch profile and public validator route.
+    pub fn forward_one_token_canonical_i8_with_backend(
+        &self,
+        token: u32,
+        cache: &mut KVCache,
+        call_id: Hash256,
+        backend: &impl crate::tensor_parallel::ProjectionBackend,
+    ) -> Result<Vec<i64>, crate::tensor_parallel::TensorParallelError> {
+        use crate::tensor_parallel::{TensorKey, TensorParallelError};
+        if self.canonical_execution_profile().is_none() || !self.has_all_transformer_layers() {
+            return Err(TensorParallelError::WrongIdentity);
+        }
+        let cfg = &self.config;
+        let d = cfg.d_model;
+        let pos = cache.seq_len;
+        if pos >= cfg.max_seq || self.embedding_q16.len() < (token as usize + 1).saturating_mul(d) {
+            return Err(TensorParallelError::WrongShape);
+        }
+        let emb_start = (token as usize).min(cfg.vocab_size.saturating_sub(1)) * d;
+        let mut hidden = self.embedding_q16[emb_start..emb_start + d].to_vec();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let normed = layernorm(&hidden, &layer.attn_norm);
+            let mut qkv = backend.project_group(
+                call_id,
+                Some(layer_idx),
+                &[
+                    (TensorKey::Wq, d),
+                    (TensorKey::Wk, cfg.d_kv),
+                    (TensorKey::Wv, cfg.d_kv),
+                ],
+                &normed,
+            )?;
+            let mut q = qkv.remove(0);
+            let mut k_buf = qkv.remove(0);
+            let v_buf = qkv.remove(0);
+            if q.len() != d || k_buf.len() != cfg.d_kv || v_buf.len() != cfg.d_kv {
+                return Err(TensorParallelError::WrongShape);
+            }
+            for h in 0..cfg.n_heads {
+                apply_rope(
+                    &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
+                    pos,
+                    cfg.d_head,
+                    &cfg.rope_cos,
+                    &cfg.rope_sin,
+                );
+            }
+            for h in 0..cfg.n_kv_heads {
+                apply_rope(
+                    &mut k_buf[h * cfg.d_head..(h + 1) * cfg.d_head],
+                    pos,
+                    cfg.d_head,
+                    &cfg.rope_cos,
+                    &cfg.rope_sin,
+                );
+            }
+            cache.push_k(layer_idx, &k_buf);
+            cache.push_v(layer_idx, &v_buf);
+            let full_seq = pos + 1;
+            let heads: Vec<Vec<i64>> = (0..cfg.n_heads)
+                .into_par_iter()
+                .map(|h| {
+                    let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
+                    flash_attention_i64(
+                        &q[h * cfg.d_head..(h + 1) * cfg.d_head],
+                        &cache.k_data[layer_idx],
+                        &cache.v_data[layer_idx],
+                        cfg.d_kv,
+                        kv_h,
+                        cfg.d_head,
+                        full_seq,
+                        cfg.attn_scale,
+                    )
+                })
+                .collect();
+            let mut attn_out = vec![0; d];
+            for (h, value) in heads.iter().enumerate() {
+                attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(value);
+            }
+            let projected =
+                backend.project_rows(call_id, Some(layer_idx), TensorKey::Wo, &attn_out, d)?;
+            if projected.len() != d {
+                return Err(TensorParallelError::WrongShape);
+            }
+            for (out, projection) in hidden.iter_mut().zip(projected) {
+                *out += projection;
+            }
+            let normed_ff = layernorm(&hidden, &layer.ffn_norm);
+            let mut gate_up = backend.project_group(
+                call_id,
+                Some(layer_idx),
+                &[(TensorKey::WGate, cfg.d_ff), (TensorKey::WUp, cfg.d_ff)],
+                &normed_ff,
+            )?;
+            let mut gate = gate_up.remove(0);
+            let up = gate_up.remove(0);
+            if gate.len() != cfg.d_ff || up.len() != cfg.d_ff {
+                return Err(TensorParallelError::WrongShape);
+            }
+            for (g, u) in gate.iter_mut().zip(up) {
+                *g = (silu_i64(*g) * u) >> FRAC_BITS;
+            }
+            let ff_out =
+                backend.project_rows(call_id, Some(layer_idx), TensorKey::WDown, &gate, d)?;
+            if ff_out.len() != d {
+                return Err(TensorParallelError::WrongShape);
+            }
+            for (out, projection) in hidden.iter_mut().zip(ff_out) {
+                *out += projection;
+            }
+        }
+        cache.seq_len = pos + 1;
+        let normed = layernorm(&hidden, &self.final_norm);
+        let logits =
+            backend.project_rows(call_id, None, TensorKey::LmHead, &normed, cfg.vocab_size)?;
+        if logits.len() != cfg.vocab_size {
+            return Err(TensorParallelError::WrongShape);
+        }
+        Ok(logits)
+    }
+
     /// Generate with fallible context-window admission for untrusted callers.
     ///
     /// The complete request is preflighted before allocating a KV cache or
@@ -3221,6 +3477,21 @@ impl CachedIntegerModel {
             .expect("trusted v2 generation request must fit the model context window")
     }
 
+    /// Same context/BOS/final-prompt-logit semantics as [`Self::try_generate_v2`],
+    /// with raw greedy argmax instead of the protocol-v2 repetition penalty.
+    /// This exists only to compare an ARC arithmetic profile with a reference
+    /// implementation configured for greedy sampling. Production requests
+    /// must retain their separately committed generation semantics.
+    pub fn try_generate_v2_greedy(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> Result<(Vec<u32>, Hash256), GenerationError> {
+        let _admission = self.preflight_generation(prompt.len(), max_tokens)?;
+        Ok(self.generate_preflighted_v2_with_sampling(prompt, max_tokens, eos_tokens, false))
+    }
+
     fn generate_preflighted(
         &self,
         prompt: &[u32],
@@ -3263,6 +3534,16 @@ impl CachedIntegerModel {
         max_tokens: u32,
         eos_tokens: &[u32],
     ) -> (Vec<u32>, Hash256) {
+        self.generate_preflighted_v2_with_sampling(prompt, max_tokens, eos_tokens, true)
+    }
+
+    fn generate_preflighted_v2_with_sampling(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+        repetition_penalty: bool,
+    ) -> (Vec<u32>, Hash256) {
         let mut cache = KVCache::new(self.config.n_layers);
         let mut logits = self.forward_one_token(self.config.bos_token, &mut cache);
         for &tok in prompt {
@@ -3271,7 +3552,11 @@ impl CachedIntegerModel {
 
         let mut generated = Vec::new();
         for _ in 0..max_tokens {
-            let next = select_next_token_with_repetition_penalty(&mut logits, &generated);
+            let next = if repetition_penalty {
+                select_next_token_with_repetition_penalty(&mut logits, &generated)
+            } else {
+                argmax_i64(&logits) as u32
+            };
             generated.push(next);
             if eos_tokens.contains(&next) {
                 break;
@@ -5256,6 +5541,11 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor_parallel::{
+        LocalRowWorker, PartitionedProjectionBackend, RowAssignment, RowWorker, TensorKey,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     #[test]
     fn interleaved_rope_matches_candle_rope_i_pairing() {
@@ -5584,10 +5874,44 @@ mod tests {
     }
 
     #[test]
+    fn generation_v2_greedy_matches_raw_argmax_single_bos_oracle() {
+        let model = build_test_model(32, 16, 2, 32, 1);
+        let prompt = [3u32, 4u32];
+        let eos = [u32::MAX];
+        let mut cache = KVCache::new(model.config.n_layers);
+        let mut logits = model.forward_one_token(model.config.bos_token, &mut cache);
+        for &token in &prompt {
+            logits = model.forward_one_token(token, &mut cache);
+        }
+        let mut expected = Vec::new();
+        for _ in 0..3 {
+            let next = argmax_i64(&logits) as u32;
+            expected.push(next);
+            logits = model.forward_one_token(next, &mut cache);
+        }
+        let (actual, _) = model
+            .try_generate_v2_greedy(&prompt, 3, &eos)
+            .expect("small test prompt fits context");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn v2_decoder_reconstructs_byte_fallback_utf8() {
         let mut model = build_test_model(32, 16, 2, 32, 1);
         model.vocab[13] = "<0x0A>".into();
         assert_eq!(model.decode_v2(&[13, 13]), "\n\n");
+    }
+
+    #[test]
+    fn v2_content_decoder_stops_before_eos_and_suppresses_bos() {
+        let mut model = build_test_model(32, 16, 2, 32, 1);
+        model.vocab[1] = "<s>".into();
+        model.vocab[2] = "</s>".into();
+        model.vocab[3] = "▁Hello".into();
+        model.vocab[4] = "<0x21>".into();
+        model.config.eos_tokens = vec![2];
+        assert_eq!(model.decode_v2(&[3, 4, 2]), " Hello!</s>");
+        assert_eq!(model.decode_v2_content(&[1, 3, 4, 2, 3]), " Hello!");
     }
 
     #[test]
@@ -5640,6 +5964,138 @@ mod tests {
         assert_eq!(q.data[8], 127, "Row 1 outlier should be 127");
         // Per-row means row 0 is NOT affected by row 1's outlier
         assert!(q.scales[0] < q.scales[1], "Row 0 should have smaller scale");
+    }
+
+    #[test]
+    fn tensor_row_backend_matches_canonical_whole_token_across_positions() {
+        fn add_rows(
+            assignments: &mut Vec<RowAssignment>,
+            workers: &mut BTreeMap<String, Arc<dyn RowWorker>>,
+            artifact: Hash256,
+            profile: &str,
+            layer: Option<usize>,
+            tensor: TensorKey,
+            weights: &I8Weights,
+        ) {
+            let split = weights.n_rows / 2;
+            for (start, end) in [(0, split), (split, weights.n_rows)] {
+                let worker_id = format!("{layer:?}-{tensor:?}-{start}");
+                let assignment = RowAssignment {
+                    artifact_id: artifact,
+                    execution_profile: profile.into(),
+                    layer,
+                    tensor,
+                    row_start: start,
+                    row_end: end,
+                    worker_id: worker_id.clone(),
+                };
+                let shard = weights.copy_rows(start, end).unwrap();
+                workers.insert(
+                    worker_id.clone(),
+                    Arc::new(LocalRowWorker {
+                        worker_id,
+                        assignment: assignment.clone(),
+                        weights: shard,
+                    }),
+                );
+                assignments.push(assignment);
+            }
+        }
+        let model = build_test_model(16, 32, 2, 64, 3);
+        assert!(model.has_canonical_i8_profile());
+        let artifact = Hash256([77; 32]);
+        let profile = model.effective_precision_label().to_string();
+        let mut assignments = Vec::new();
+        let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
+        for (i, layer) in model.layers.iter().enumerate() {
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::Wq,
+                &layer.wq,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::Wk,
+                &layer.wk,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::Wv,
+                &layer.wv,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::Wo,
+                &layer.wo,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::WGate,
+                &layer.w_gate,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::WUp,
+                &layer.w_up,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::WDown,
+                &layer.w_down,
+            );
+        }
+        add_rows(
+            &mut assignments,
+            &mut workers,
+            artifact,
+            &profile,
+            None,
+            TensorKey::LmHead,
+            &model.output_weight,
+        );
+        let backend = PartitionedProjectionBackend::new(artifact, profile, assignments, workers);
+        let mut local_cache = KVCache::new(model.config.n_layers);
+        let mut rows_cache = KVCache::new(model.config.n_layers);
+        for token in [1u32, 2u32] {
+            let local = model.forward_one_token(token, &mut local_cache);
+            let rows = model
+                .forward_one_token_canonical_i8_with_backend(
+                    token,
+                    &mut rows_cache,
+                    Hash256([token as u8; 32]),
+                    &backend,
+                )
+                .unwrap();
+            assert_eq!(rows, local, "row backend diverged at token {token}");
+        }
     }
 
     #[test]

@@ -1363,6 +1363,17 @@ pub struct InferenceFinalizeBody {
 pub const GGUF_LLAMA_I8_INTERLEAVED_ROPE_PROFILE_V1: &str =
     "arc.gguf-llama.i8-per-row.rope-interleaved.v1";
 
+/// Diagnostic sampling identity for same-artifact reference comparisons.
+/// This selects raw greedy argmax and intentionally excludes the protocol-v2
+/// generated-token repetition penalty.
+pub const GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1: &str =
+    "arc.whole-model-generation.greedy.v1";
+/// Header-only tokenizer identity for the LLaMA GGUF score-ordered
+/// SentencePiece merge implementation. It is intentionally distinct from
+/// ARC's legacy longest-piece encoder.
+pub const GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1: &str =
+    "arc.gguf-llama.spm-score-merge.v1";
+
 /// Candidate protocol-4 native request. The signed immutable job is the
 /// economic and execution commitment; the bounded blob is carried so every
 /// validator can reconstruct the same input without consulting a caller.
