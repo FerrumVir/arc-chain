@@ -461,6 +461,9 @@ fn should_execute_local_benchmark(
 const HISTORY_MAX_ROUNDS: u64 = 256;
 /// Hard cap on blocks in one history response, whatever the round span.
 const HISTORY_MAX_BLOCKS: usize = 4_096;
+/// Rounds of parent context served before the requested round, so the first
+/// round's blocks can have their parents validated from the same payload.
+const HISTORY_PARENT_CONTEXT: u64 = 2;
 /// Minimum gap between history requests from this node, so a persistent gap
 /// cannot turn into a request storm against its peers.
 const HISTORY_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1919,8 +1922,14 @@ impl ConsensusManager {
             // trust decision; the bound is a resource decision.
             for (source, from_round, max_rounds) in inbound_history_requests {
                 let span = max_rounds.min(HISTORY_MAX_ROUNDS);
+                // Serve a little BEFORE the requested round. A block at the
+                // first served round references parents in the round before it,
+                // and a requester that holds only a quorum subset of that round
+                // cannot validate them - which pinned a node at one round while
+                // it asked 162 times and imported once.
+                let first = from_round.saturating_sub(HISTORY_PARENT_CONTEXT);
                 let mut blocks = Vec::new();
-                for round in from_round..from_round.saturating_add(span) {
+                for round in first..first.saturating_add(span) {
                     for hash in self.engine.blocks_in_round(round) {
                         if let Some(block) = self.engine.get_block(&hash) {
                             blocks.push(block);
@@ -1990,7 +1999,10 @@ impl ConsensusManager {
                         info!(%source, reached, "Joined a running chain from authenticated history");
                     }
                     Err(error) => {
-                        warn!(%source, %error, "Rejected a history response");
+                        // Common and harmless: several peers answer one
+                        // request, and by the time the later answers arrive
+                        // this node has already moved past their start round.
+                        debug!(%source, %error, "History response not usable");
                     }
                 }
             }

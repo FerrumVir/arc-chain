@@ -1412,3 +1412,249 @@ mod tests {
         ));
     }
 }
+
+// ── Authenticated checkpoints ────────────────────────────────────────────────
+
+/// Domain tag for the checkpoint transcript.
+pub const CHECKPOINT_DOMAIN: &[u8] = b"arc.consensus.checkpoint.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CheckpointError {
+    #[error("the finality certificate is not valid: {0}")]
+    Certificate(#[from] CertificateError),
+    #[error("snapshot digest {found} does not match the authorised {expected}")]
+    DigestMismatch { expected: Hash256, found: Hash256 },
+    #[error("snapshot declares state root {found}, certificate authorises {expected}")]
+    StateRootMismatch { expected: Hash256, found: Hash256 },
+    #[error("snapshot declares height {found}, certificate authorises {expected}")]
+    HeightMismatch { expected: u64, found: u64 },
+    #[error("installing checkpoint state is not implemented")]
+    InstallNotImplemented,
+}
+
+/// What a snapshot must say about itself for a checkpoint to authorise it.
+///
+/// Deliberately minimal and separate from any concrete snapshot format: the
+/// checkpoint authorises an identity, and whatever carries the bytes must prove
+/// it matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotIdentity {
+    pub height: u64,
+    pub state_root: Hash256,
+    /// BLAKE3 over the exact bytes of the snapshot payload.
+    pub digest: Hash256,
+}
+
+/// A quorum-authenticated statement that one state root is canonical at one
+/// height, and that a specific snapshot payload is the one being authorised.
+///
+/// This is the trust boundary for importing state a node did not compute
+/// itself, and it is deliberately separate from loading a node's own validated
+/// local snapshot. Its authority comes entirely from the finality certificate:
+/// a quorum of the frozen committee that each independently committed and
+/// executed that exact block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointEnvelope {
+    pub certificate: FinalityCertificate,
+    pub snapshot: SnapshotIdentity,
+}
+
+impl CheckpointEnvelope {
+    /// Verify everything that can be checked without the payload: the
+    /// certificate against the frozen committee, and that the snapshot identity
+    /// is the one the certificate authorises.
+    pub fn verify(
+        &self,
+        expected_domain: &ConsensusDomain,
+        set: &ValidatorSet,
+    ) -> Result<u64, CheckpointError> {
+        let signing = self.certificate.verify(expected_domain, set)?;
+        if self.snapshot.height != self.certificate.height {
+            return Err(CheckpointError::HeightMismatch {
+                expected: self.certificate.height,
+                found: self.snapshot.height,
+            });
+        }
+        if self.snapshot.state_root != self.certificate.state_root {
+            return Err(CheckpointError::StateRootMismatch {
+                expected: self.certificate.state_root,
+                found: self.snapshot.state_root,
+            });
+        }
+        Ok(signing)
+    }
+
+    /// Verify the envelope AND that these bytes are the payload it authorises.
+    ///
+    /// The caller must not touch the payload before this returns `Ok`.
+    pub fn verify_payload(
+        &self,
+        payload: &[u8],
+        expected_domain: &ConsensusDomain,
+        set: &ValidatorSet,
+    ) -> Result<u64, CheckpointError> {
+        let signing = self.verify(expected_domain, set)?;
+        let digest = hash_bytes(payload);
+        if digest != self.snapshot.digest {
+            return Err(CheckpointError::DigestMismatch {
+                expected: self.snapshot.digest,
+                found: digest,
+            });
+        }
+        Ok(signing)
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use crate::{STAKE_ARC, Validator};
+
+    fn domain() -> ConsensusDomain {
+        ConsensusDomain::new(hash_bytes(b"arc.checkpoint.test"), 1, 1)
+    }
+
+    fn committee(n: usize) -> (ValidatorSet, Vec<KeyPair>) {
+        let keys: Vec<KeyPair> = (0..n)
+            .map(|i| {
+                KeyPair::from_ed25519_secret_bytes(
+                    &hash_bytes(format!("checkpoint-{i}").as_bytes()).0,
+                )
+            })
+            .collect();
+        let validators: Vec<Validator> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| Validator::new(key.address(), STAKE_ARC, i as u16).unwrap())
+            .collect();
+        (ValidatorSet::new(validators, 1), keys)
+    }
+
+    fn envelope(
+        set: &ValidatorSet,
+        keys: &[KeyPair],
+        signers: usize,
+        payload: &[u8],
+        state_root: Hash256,
+    ) -> CheckpointEnvelope {
+        let set_hash = validator_set_hash(set);
+        let block = hash_bytes(b"checkpoint-block");
+        let tx = hash_bytes(b"checkpoint-tx-root");
+        let votes: Vec<FinalityVote> = keys[..signers]
+            .iter()
+            .map(|key| {
+                FinalityVote::sign(domain(), set_hash, 900, block, state_root, tx, key).unwrap()
+            })
+            .collect();
+        CheckpointEnvelope {
+            certificate: FinalityCertificate {
+                domain: domain(),
+                validator_set_hash: set_hash,
+                height: 900,
+                block_hash: block,
+                state_root,
+                tx_root: tx,
+                votes,
+            },
+            snapshot: SnapshotIdentity {
+                height: 900,
+                state_root,
+                digest: hash_bytes(payload),
+            },
+        }
+    }
+
+    #[test]
+    fn a_quorum_signed_checkpoint_over_the_exact_payload_verifies() {
+        let (set, keys) = committee(4);
+        let payload = b"the state at height 900";
+        let root = hash_bytes(b"state-900");
+        let checkpoint = envelope(&set, &keys, 3, payload, root);
+        let signing = checkpoint
+            .verify_payload(payload, &domain(), &set)
+            .expect("valid checkpoint");
+        assert!(signing >= set.quorum);
+    }
+
+    #[test]
+    fn a_checkpoint_below_quorum_is_refused() {
+        let (set, keys) = committee(4);
+        let payload = b"state";
+        let checkpoint = envelope(&set, &keys, 2, payload, hash_bytes(b"r"));
+        assert!(matches!(
+            checkpoint.verify_payload(payload, &domain(), &set),
+            Err(CheckpointError::Certificate(CertificateError::BelowQuorum { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_from_another_committee_is_refused() {
+        let (set, keys) = committee(4);
+        let (other, _) = committee(5);
+        let payload = b"state";
+        let checkpoint = envelope(&set, &keys, 3, payload, hash_bytes(b"r"));
+        assert!(matches!(
+            checkpoint.verify_payload(payload, &domain(), &other),
+            Err(CheckpointError::Certificate(CertificateError::WrongValidatorSet))
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_for_another_chain_is_refused() {
+        let (set, keys) = committee(4);
+        let payload = b"state";
+        let checkpoint = envelope(&set, &keys, 3, payload, hash_bytes(b"r"));
+        let elsewhere = ConsensusDomain::new(hash_bytes(b"another.chain"), 1, 1);
+        assert!(matches!(
+            checkpoint.verify_payload(payload, &elsewhere, &set),
+            Err(CheckpointError::Certificate(CertificateError::WrongDomain { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_payload_that_is_not_the_authorised_one_is_refused() {
+        let (set, keys) = committee(4);
+        let payload = b"the state at height 900";
+        let checkpoint = envelope(&set, &keys, 3, payload, hash_bytes(b"r"));
+        assert!(matches!(
+            checkpoint.verify_payload(b"a different state", &domain(), &set),
+            Err(CheckpointError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_snapshot_claiming_a_root_the_committee_did_not_sign_is_refused() {
+        let (set, keys) = committee(4);
+        let payload = b"state";
+        let mut checkpoint = envelope(&set, &keys, 3, payload, hash_bytes(b"r"));
+        checkpoint.snapshot.state_root = hash_bytes(b"a root nobody signed");
+        assert!(matches!(
+            checkpoint.verify_payload(payload, &domain(), &set),
+            Err(CheckpointError::StateRootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_snapshot_claiming_another_height_is_refused() {
+        let (set, keys) = committee(4);
+        let payload = b"state";
+        let mut checkpoint = envelope(&set, &keys, 3, payload, hash_bytes(b"r"));
+        checkpoint.snapshot.height = 901;
+        assert!(matches!(
+            checkpoint.verify_payload(payload, &domain(), &set),
+            Err(CheckpointError::HeightMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unsigned_checkpoint_is_refused() {
+        let (set, keys) = committee(4);
+        let payload = b"state";
+        let mut checkpoint = envelope(&set, &keys, 3, payload, hash_bytes(b"r"));
+        checkpoint.certificate.votes.clear();
+        assert!(matches!(
+            checkpoint.verify_payload(payload, &domain(), &set),
+            Err(CheckpointError::Certificate(CertificateError::Empty))
+        ));
+    }
+}

@@ -2098,14 +2098,29 @@ impl ConsensusEngine {
         }
         // Apply in ascending round order, advancing one round at a time so the
         // ordinary per-block validation applies to every single block.
+        //
+        // A block this node cannot validate stops the import AT THAT ROUND and
+        // keeps everything already applied. Aborting the whole run instead
+        // would throw away good rounds because of one later one, and the node
+        // would ask for the same range again and fail at the same place - which
+        // is exactly what the fixture showed: 162 requests, 1 import, and a
+        // node pinned at round 77 while its peers reached 838. Nothing is
+        // weakened by stopping early: every applied block passed the same
+        // validation as a live one, and `advance_round` still re-checks stake
+        // and participation for each round.
         let mut reached = start;
-        for (round, round_blocks) in by_round {
+        'rounds: for (round, round_blocks) in by_round {
             for block in round_blocks {
                 match self.receive_block(block) {
                     Ok(()) | Err(ConsensusError::DuplicateBlock) => {}
                     Err(error) => {
-                        warn!(round, ?error, "History import rejected a block");
-                        return Err(error);
+                        debug!(
+                            round,
+                            ?error,
+                            reached,
+                            "History import stopped here; keeping what was applied"
+                        );
+                        break 'rounds;
                     }
                 }
             }
@@ -2115,6 +2130,11 @@ impl ConsensusEngine {
                     reached = self.current_round.load(Ordering::SeqCst);
                 }
             }
+        }
+        if reached == start {
+            return Err(ConsensusError::InvalidBlock(
+                "history did not advance this node".into(),
+            ));
         }
         info!(
             from = start,
