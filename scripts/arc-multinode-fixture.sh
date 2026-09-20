@@ -303,6 +303,22 @@ echo "work dir: $WORK"
 
 # ── Phase 1: derive validator addresses from deterministic dev seeds ─────────
 echo ""
+# A stale binary silently tests the wrong code. `cargo test --lib` does not
+# build the arc-node BINARY, so a fix can be committed, the suite can pass, and
+# this fixture can still exercise the previous build - which cost one full run
+# and produced a verdict identical to the one before it.
+if [[ -f "$BINARY" ]]; then
+  newest_source=$(find crates -name '*.rs' -newer "$BINARY" -print -quit 2>/dev/null)
+  if [[ -n "$newest_source" ]]; then
+    echo "REFUSING TO RUN: $BINARY is older than $newest_source"
+    echo "  build it first:  cargo build -p arc-node"
+    exit 2
+  fi
+else
+  echo "REFUSING TO RUN: $BINARY does not exist; build it first"
+  exit 2
+fi
+
 echo "[1/6] deriving validator addresses from dev seeds"
 for i in $(seq 0 $((NODES-1))); do
   d="$WORK/probe-$i"; mkdir -p "$d"
