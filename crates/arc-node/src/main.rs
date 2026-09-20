@@ -184,6 +184,18 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     archive: bool,
 
+    /// PRIVATE PROTOCOL 4: activate the native inference contract from an
+    /// operator-supplied context file (JSON), on a FRESH private genesis only.
+    ///
+    /// Default off. This configures and activates the contract; it does NOT
+    /// enable production model execution, which stays behind
+    /// `CanonicalI8NativeExecutor::load_qualified` (artifact hash, versioned
+    /// profile/generation commitments, explicit reference qualification).
+    /// Activation is refused on any chain past height 0, so it cannot be
+    /// applied to an existing chain.
+    #[arg(long, value_name = "PATH")]
+    native_inference_activation: Option<PathBuf>,
+
     /// Enable continuous transaction generation (testnet benchmark mode).
     /// Generates transfers between genesis accounts to keep the chain busy.
     #[cfg(feature = "benchmark-tools")]
@@ -6994,6 +7006,40 @@ async fn run_arc_node() -> Result<()> {
         &desktop_shutdown_receipt,
     )? {
         return Ok(());
+    }
+
+    // ── Private protocol-4 native inference activation (default OFF) ────────
+    //
+    // Previously nothing in this binary referenced the native contract at all:
+    // every caller of `activate_native_inference` was in `#[cfg(test)]`, so the
+    // contract could not be configured, activated or exercised outside unit
+    // tests. This is the operator seam.
+    //
+    // Fail-closed in both directions: an absent flag never touches the
+    // contract, and a present flag that cannot be satisfied aborts startup
+    // rather than continuing half-configured. It does NOT enable production
+    // model execution - the executor's own qualification gate is untouched.
+    if let Some(activation_path) = cli.native_inference_activation.as_ref() {
+        match arc_node::native_inference::activate_native_inference_from_config(
+            state.as_ref(),
+            activation_path,
+        ) {
+            Ok(commitment) => {
+                tracing::warn!(
+                    "PRIVATE protocol-4 native inference ACTIVATED from {} (commitment {}). \
+                     Private genesis-only capability; production model execution remains \
+                     behind separate artifact qualification.",
+                    activation_path.display(),
+                    commitment.to_hex()
+                );
+            }
+            Err(error) => {
+                bail!(
+                    "--native-inference-activation {}: {error}",
+                    activation_path.display()
+                );
+            }
+        }
     }
 
     let mempool = Arc::new(Mempool::new(10_000_000));

@@ -7,7 +7,11 @@
 use arc_crypto::signature::{KeyPair, Signature};
 use arc_crypto::{Hash256, hash_bytes};
 use arc_mempool::Mempool;
-use arc_types::inference_contract::{InferenceCertificate, InferenceVote, sign_vote};
+use arc_state::inference_contract_state::{AllowedExecution, InferenceAdmissionContext};
+use arc_types::inference_contract::{
+    InferenceCertificate, InferenceDomain, InferenceVote, ValidatorMember, sign_vote,
+    validator_set_commitment,
+};
 use arc_types::transaction::{
     NativeInferenceFinalizeBody, TIER1_INPUT_BLOB_MAX, TIER1_MAX_TOKENS, TIER1_OUTPUT_BLOB_MAX,
     Transaction, TxBody, TxType, gas_costs,
@@ -1127,6 +1131,228 @@ fn verify_vote(vote: &InferenceVote, request_id: Hash256, tokens: &[u32]) -> boo
         .is_ok()
 }
 
+// ── Operator activation config (private protocol 4) ─────────────────────────
+//
+// The startup constructor was previously absent entirely: every caller of
+// `StateDB::activate_native_inference` lived in `#[cfg(test)]`, and nothing in
+// the node binary mentioned it. `docs/arc-chain-v2/native-runtime-candidate.md`
+// holds production EXECUTION behind model-quality qualification, which is a
+// different thing from having no way to configure or test activation at all.
+//
+// This adds the missing operator-facing seam. It introduces no new commitment
+// scheme, no new admission rule and no protocol surface: it deserialises the
+// EXISTING `InferenceAdmissionContext` and then defers entirely to the existing
+// `commitment()` validation and `activate_native_inference()` gate, which still
+// require an unused private genesis at height 0, a healthy persistent WAL and
+// the canonical account-root backend.
+
+/// Why an operator activation config was rejected.
+#[derive(Debug)]
+pub enum ActivationConfigError {
+    /// The file could not be read.
+    Unreadable(String),
+    /// The file is not valid JSON for a [`NativeActivationRequest`].
+    Malformed(String),
+    /// The assembled context failed the existing commitment validation.
+    InvalidContext(String),
+    /// The chain is not a fresh private genesis.
+    ChainNotEmpty(u64),
+    /// The node could not determine its own genesis binding or validator set.
+    StateUnavailable(String),
+    /// An operator-supplied pin did not match what the node actually has.
+    ExpectationMismatch { field: String, expected: String, actual: String },
+    /// Activation itself refused.
+    Refused(String),
+}
+
+impl std::fmt::Display for ActivationConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(e) => write!(f, "cannot read activation config: {e}"),
+            Self::Malformed(e) => write!(f, "activation config is not valid JSON: {e}"),
+            Self::InvalidContext(e) => write!(f, "assembled activation context failed validation: {e}"),
+            Self::ChainNotEmpty(h) => write!(
+                f,
+                "native inference activation requires an unused private genesis, but this chain \
+                 is at height {h}. It cannot be enabled on an existing chain."
+            ),
+            Self::StateUnavailable(e) => write!(f, "node state cannot supply the activation domain: {e}"),
+            Self::ExpectationMismatch { field, expected, actual } => write!(
+                f,
+                "activation config pinned {field}={expected} but this node has {actual}. \
+                 Refusing rather than activating a context the operator did not approve."
+            ),
+            Self::Refused(e) => write!(f, "activation refused: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ActivationConfigError {}
+
+/// Optional operator pins. When present, the context the node assembles must
+/// match these exactly or activation is refused.
+///
+/// This exists so an approved activation is reproducible: an operator who has
+/// reviewed a specific validator set and genesis can require the node to
+/// confirm it rather than silently activating against whatever it happens to
+/// hold. Every pin is optional; pinning nothing is allowed but unreviewed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivationExpectations {
+    #[serde(default)]
+    pub chain_genesis: Option<Hash256>,
+    #[serde(default)]
+    pub validator_set_hash: Option<Hash256>,
+    #[serde(default)]
+    pub members: Option<Vec<ValidatorMember>>,
+}
+
+/// The operator-facing activation request.
+///
+/// Deliberately NOT the full `InferenceAdmissionContext`. Three of that type's
+/// four inputs - the genesis binding, the member list and the validator-set
+/// hash - are facts the node already holds authoritatively, and requiring an
+/// operator to transcribe them produces exactly one outcome: transcription
+/// errors that surface as an opaque refusal at activation time. The node fills
+/// those in and the operator declares the one thing only they can decide, the
+/// execution allowlist, plus optional pins to make the result reviewable.
+///
+/// This introduces no commitment scheme and relaxes no admission rule: the
+/// assembled context goes through the same `commitment()` and the same
+/// `activate_native_inference()` gate as before.
+///
+/// ```json
+/// {
+///   "recovery_epoch": 0,
+///   "allowed_executions": [{
+///     "model_hash": "<64 hex>", "profile_hash": "<64 hex>",
+///     "generation_hash": "<64 hex>", "assignment_hash": "<64 hex>"
+///   }],
+///   "expect": { "chain_genesis": "<64 hex>" }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeActivationRequest {
+    pub allowed_executions: Vec<AllowedExecution>,
+    #[serde(default)]
+    pub recovery_epoch: u64,
+    #[serde(default)]
+    pub expect: Option<ActivationExpectations>,
+}
+
+/// Parse an operator activation request from JSON.
+pub fn load_activation_request(
+    path: &std::path::Path,
+) -> Result<NativeActivationRequest, ActivationConfigError> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| ActivationConfigError::Unreadable(format!("{}: {e}", path.display())))?;
+    serde_json::from_str(&raw).map_err(|e| ActivationConfigError::Malformed(e.to_string()))
+}
+
+/// Assemble the full admission context from node state plus the operator's
+/// allowlist, checking any pins the operator supplied.
+pub fn assemble_activation_context(
+    state: &arc_state::StateDB,
+    request: &NativeActivationRequest,
+) -> Result<InferenceAdmissionContext, ActivationConfigError> {
+    let dir = state
+        .persistence_dir()
+        .ok_or_else(|| ActivationConfigError::StateUnavailable("state is not persistent".into()))?;
+    let binding = dir.join("genesis.network-hash");
+    let chain_genesis = fs::read_to_string(&binding)
+        .map_err(|e| ActivationConfigError::StateUnavailable(format!("{}: {e}", binding.display())))
+        .and_then(|v| {
+            Hash256::from_hex(v.trim())
+                .map_err(|e| ActivationConfigError::StateUnavailable(format!("invalid genesis binding: {e}")))
+        })?;
+
+    let mut members: Vec<ValidatorMember> = state
+        .active_validators()
+        .into_iter()
+        .map(|(address, stake)| ValidatorMember { address, stake })
+        .collect();
+    members.sort_by_key(|m| m.address.0);
+    if members.is_empty() {
+        return Err(ActivationConfigError::StateUnavailable(
+            "this node has no active validators, so there is no committee to bind. A stake-0 \
+             observer cannot activate the contract."
+                .into(),
+        ));
+    }
+    let validator_set_hash = validator_set_commitment(&members)
+        .map_err(|e| ActivationConfigError::InvalidContext(format!("{e:?}")))?;
+
+    if let Some(expect) = &request.expect {
+        if let Some(pin) = expect.chain_genesis {
+            if pin != chain_genesis {
+                return Err(ActivationConfigError::ExpectationMismatch {
+                    field: "chain_genesis".into(),
+                    expected: pin.to_hex(),
+                    actual: chain_genesis.to_hex(),
+                });
+            }
+        }
+        if let Some(pin) = expect.validator_set_hash {
+            if pin != validator_set_hash {
+                return Err(ActivationConfigError::ExpectationMismatch {
+                    field: "validator_set_hash".into(),
+                    expected: pin.to_hex(),
+                    actual: validator_set_hash.to_hex(),
+                });
+            }
+        }
+        if let Some(pin) = &expect.members {
+            if pin != &members {
+                return Err(ActivationConfigError::ExpectationMismatch {
+                    field: "members".into(),
+                    expected: format!("{} member(s)", pin.len()),
+                    actual: format!("{} member(s)", members.len()),
+                });
+            }
+        }
+    }
+
+    let context = InferenceAdmissionContext {
+        domain: InferenceDomain {
+            chain_genesis,
+            recovery_epoch: request.recovery_epoch,
+            validator_set_hash,
+        },
+        members,
+        allowed_executions: request.allowed_executions.clone(),
+    };
+    context
+        .commitment()
+        .map_err(|e| ActivationConfigError::InvalidContext(e.to_string()))?;
+    Ok(context)
+}
+
+/// Activate the private native-inference contract from an operator config.
+///
+/// **Default off.** Nothing calls this unless the operator passes
+/// `--native-inference-activation <PATH>`. It does not enable production model
+/// execution: `CanonicalI8NativeExecutor::load_qualified` still enforces the
+/// artifact hash, versioned profile/generation commitments and the explicit
+/// reference-qualification flag independently of this.
+///
+/// The height check is redundant with the one inside
+/// `activate_native_inference`, deliberately: the real gate reports "requires
+/// unused private genesis", which does not tell an operator which of their
+/// assumptions was wrong. This reports the observed height.
+pub fn activate_native_inference_from_config(
+    state: &arc_state::StateDB,
+    path: &std::path::Path,
+) -> Result<Hash256, ActivationConfigError> {
+    let request = load_activation_request(path)?;
+    let height = state.height();
+    if height != 0 {
+        return Err(ActivationConfigError::ChainNotEmpty(height));
+    }
+    let context = assemble_activation_context(state, &request)?;
+    state
+        .activate_native_inference(context)
+        .map_err(|e| ActivationConfigError::Refused(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1418,6 +1644,208 @@ mod tests {
         };
         state.sign_transaction(&mut transaction, signer).unwrap();
         transaction
+    }
+
+    // ── Operator activation config ──────────────────────────────────────────
+
+    fn marker() -> AllowedExecution {
+        let m = hash_bytes(b"activation-config-test-marker");
+        AllowedExecution {
+            model_hash: m,
+            profile_hash: m,
+            generation_hash: m,
+            assignment_hash: m,
+        }
+    }
+
+    /// A persistent StateDB with a seeded validator registry, which is what the
+    /// activation domain binds to.
+    fn activatable_state(dir: &std::path::Path) -> (arc_state::StateDB, Vec<ValidatorMember>) {
+        let genesis = hash_bytes(b"activation-config-test-genesis");
+        let mut members: Vec<ValidatorMember> = (0u8..6)
+            .map(|i| ValidatorMember {
+                address: hash_bytes(&[i; 4]),
+                stake: 1_000_000,
+            })
+            .collect();
+        // validate_members requires strictly ascending addresses
+        // (arc-types/src/inference_contract.rs:173).
+        members.sort_by_key(|m| m.address.0);
+        let prefunded: Vec<(Hash256, u64)> = members.iter().map(|m| (m.address, 0)).collect();
+        let state =
+            arc_state::StateDB::with_genesis_persistent(&prefunded, dir, genesis).unwrap();
+        state.seed_genesis_validators(
+            &members.iter().map(|m| (m.address, m.stake)).collect::<Vec<_>>(),
+        );
+        (state, members)
+    }
+
+    fn write_request(path: &std::path::Path, req: &NativeActivationRequest) {
+        fs::write(path, serde_json::to_string_pretty(req).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn activation_request_round_trips_and_is_hex_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("activation.json");
+        let req = NativeActivationRequest {
+            allowed_executions: vec![marker()],
+            recovery_epoch: 0,
+            expect: Some(ActivationExpectations {
+                chain_genesis: Some(hash_bytes(b"pin")),
+                ..Default::default()
+            }),
+        };
+        write_request(&path, &req);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(&hash_bytes(b"pin").to_hex()),
+            "hashes must serialise as hex so the file is reviewable"
+        );
+        assert_eq!(load_activation_request(&path).unwrap(), req);
+    }
+
+    #[test]
+    fn activation_request_rejects_unreadable_and_malformed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            load_activation_request(&dir.path().join("nope.json")),
+            Err(ActivationConfigError::Unreadable(_))
+        ));
+        let bad = dir.path().join("bad.json");
+        fs::write(&bad, "{ not json").unwrap();
+        assert!(matches!(
+            load_activation_request(&bad),
+            Err(ActivationConfigError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn activation_assembles_the_domain_from_state_and_activates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, members) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: None,
+            },
+        );
+
+        assert!(state.native_inference_context().is_none(), "inert before activation");
+        let commitment =
+            activate_native_inference_from_config(&state, &path).expect("activation must succeed");
+
+        let active = state.native_inference_context().expect("context must be readable back");
+        assert_eq!(active.members, members, "members must come from the node's own registry");
+        assert_eq!(active.allowed_executions, vec![marker()], "allowlist is the operator's input");
+        assert_eq!(
+            active.domain.validator_set_hash,
+            validator_set_commitment(&members).unwrap(),
+            "validator-set hash must be computed, not transcribed"
+        );
+        assert_eq!(commitment, active.commitment().unwrap());
+    }
+
+    #[test]
+    fn activation_refuses_when_an_operator_pin_does_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: Some(ActivationExpectations {
+                    chain_genesis: Some(hash_bytes(b"a genesis this node does not have")),
+                    ..Default::default()
+                }),
+            },
+        );
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::ExpectationMismatch { field, .. }) => {
+                assert_eq!(field, "chain_genesis");
+            }
+            other => panic!("expected ExpectationMismatch, got {other:?}"),
+        }
+        assert!(
+            state.native_inference_context().is_none(),
+            "a refused activation must leave the contract inert"
+        );
+    }
+
+    #[test]
+    fn activation_refuses_an_empty_allowlist_and_a_committee_less_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("empty.json");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![],
+                recovery_epoch: 0,
+                expect: None,
+            },
+        );
+        assert!(
+            matches!(
+                activate_native_inference_from_config(&state, &path),
+                Err(ActivationConfigError::InvalidContext(_))
+            ),
+            "the existing allowlist bound must still apply"
+        );
+
+        // A stake-0 observer has no committee to bind, and must say so rather
+        // than producing an opaque refusal deeper in the stack.
+        let obs_dir = dir.path().join("observer");
+        let observer = arc_state::StateDB::with_genesis_persistent(
+            &[(hash_bytes(b"x"), 0)],
+            &obs_dir,
+            hash_bytes(b"observer-genesis"),
+        )
+        .unwrap();
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: None,
+            },
+        );
+        assert!(matches!(
+            activate_native_inference_from_config(&observer, &path),
+            Err(ActivationConfigError::StateUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn activation_refuses_a_chain_that_is_not_a_fresh_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: None,
+            },
+        );
+        // Advance the chain with an empty block; there is deliberately no
+        // height setter on StateDB.
+        state
+            .execute_block_verified_at(&[], Hash256::ZERO, 1)
+            .expect("empty block must apply");
+        assert_eq!(state.height(), 1);
+
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::ChainNotEmpty(h)) => assert_eq!(h, 1),
+            other => panic!("expected ChainNotEmpty(1), got {other:?}"),
+        }
+        assert!(state.native_inference_context().is_none(), "must stay inert");
     }
 
     #[test]
