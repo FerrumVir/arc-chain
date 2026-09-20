@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="ARC LOCAL DEVELOPMENT explorer view. Disposable chain data only; never canonical or production history." />
+    <meta name="theme-color" content="#080a12" />
+    <!-- Default RPC for a network started by scripts/arc-localdev-network.sh.
+         Override per page load with ?rpc=http://127.0.0.1:PORT -->
+    <meta name="arc-localdev-rpc" content="http://127.0.0.1:9990" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:*; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
+    <title>ARC Local Development Explorer</title>
+    <link rel="stylesheet" href="./styles.css?v=3" />
+    <link rel="stylesheet" href="./localdev.css?v=1" />
+    <script src="./localdev.js?v=1" defer></script>
+  </head>
+  <body>
+    <!--
+      This route is deliberately SEPARATE from /explorer/index.html.
+
+      index.html is the canonical composite explorer. It resolves an approved
+      recovery checkpoint and refuses to publish canonical block data until the
+      production maintenance interlock is configured. That refusal is a safety
+      property and this page does not touch it: nothing here loads
+      shared/frontend/arc-network.js, reads arc-network.json, or produces any
+      document that the canonical path would consume.
+
+      This page talks straight to one local node's RPC and labels every number
+      on it as disposable local-development data.
+    -->
+    <div id="localdev-banner" class="localdev-banner" role="alert">
+      <strong>LOCAL DEVELOPMENT VIEW — DISPOSABLE CHAIN</strong>
+      <span>Not canonical. Not production. Not a recovery claim. Reads one local node directly at
+        <code id="localdev-rpc-label">—</code>.</span>
+    </div>
+
+    <header class="topbar">
+      <span class="brand" aria-label="ARC local development explorer">
+        <span class="brand-mark" aria-hidden="true"><span>A</span></span>
+        <span class="brand-copy"><strong>ARC</strong><small id="localdev-network-label">LOCAL DEV / CONNECTING</small></span>
+      </span>
+      <button id="localdev-refresh" class="icon-button" type="button" aria-label="Refresh">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.2 9A7 7 0 0 0 6.7 6.7L4 9m16 6-2.7 2.3A7 7 0 0 1 5.8 15" /></svg>
+      </button>
+    </header>
+
+    <main>
+      <section class="metrics" aria-label="Local chain status">
+        <article class="metric-card"><p>Committed height</p><strong id="localdev-height">—</strong><small id="localdev-height-note">Waiting for the node</small></article>
+        <article class="metric-card"><p>Validators</p><strong id="localdev-validators">—</strong><small>Genesis committee on this disposable chain</small></article>
+        <article class="metric-card"><p>Accounts</p><strong id="localdev-accounts">—</strong><small>State entries</small></article>
+        <article class="metric-card"><p>Mempool</p><strong id="localdev-mempool">—</strong><small>Admitted, not yet committed</small></article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel blocks-panel">
+          <div class="panel-heading">
+            <div><span class="micro-label">Disposable local chain</span><h2>Recent blocks</h2></div>
+            <span id="localdev-blocks-status" class="quiet-pill">Waiting</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>Height</th><th>Transactions</th><th>Producer</th><th>Block hash</th></tr></thead>
+              <tbody id="localdev-blocks-body">
+                <tr><td colspan="4" class="empty-cell">Connecting to the local node…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <aside class="panel facts-panel">
+          <div class="panel-heading"><div><span class="micro-label">Selected block</span><h2>Transaction detail</h2></div></div>
+          <div class="localdev-balance-row">
+            <label class="sr-only" for="localdev-block-input">Block height</label>
+            <input id="localdev-block-input" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="open a specific block height" />
+            <button id="localdev-block-button" type="button">Open block</button>
+          </div>
+          <div id="localdev-block-detail" class="localdev-detail">
+            <p class="empty-cell">Select a block to see its transactions.</p>
+          </div>
+          <ul id="localdev-tx-list" class="localdev-tx-list"></ul>
+        </aside>
+      </section>
+
+      <section class="panel" aria-labelledby="localdev-balance-title">
+        <div class="panel-heading"><div><span class="micro-label">State query</span><h2 id="localdev-balance-title">Account balance</h2></div></div>
+        <div class="localdev-balance-row">
+          <label class="sr-only" for="localdev-account-input">Account address</label>
+          <input id="localdev-account-input" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="64-hex account address" />
+          <button id="localdev-balance-button" type="button">Look up</button>
+        </div>
+        <dl class="localdev-balance">
+          <dt>Address</dt><dd id="localdev-balance-address">—</dd>
+          <dt>Balance</dt><dd id="localdev-balance-value">—</dd>
+          <dt>Nonce</dt><dd id="localdev-balance-nonce">—</dd>
+        </dl>
+        <p id="localdev-balance-note" class="empty-cell">The first genesis validator is loaded automatically.</p>
+      </section>
+    </main>
+  </body>
+</html>

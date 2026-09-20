@@ -115,6 +115,30 @@ for _ in $(seq 1 40); do
   sleep 3
 done
 echo "  height=${h:-0}"
+# Put at least one real transaction on the chain. An all-empty chain is still a
+# working chain, but "transaction details" is part of what the local-development
+# explorer view is supposed to demonstrate, and the faucet is the only signed
+# transaction this script can produce without holding a user key.
+DEV_RECIPIENT="1111111111111111111111111111111111111111111111111111111111111111"
+echo "submitting one faucet transaction so a block carries transaction detail..."
+claim=$(curl -s --max-time 10 -X POST "http://127.0.0.1:$BASE_RPC/faucet/claim" \
+        -H 'content-type: application/json' \
+        -d "{\"address\":\"$DEV_RECIPIENT\"}" 2>/dev/null || true)
+tx=$(printf '%s' "$claim" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("tx_hash",""))
+except Exception: print("")' 2>/dev/null || echo "")
+if [[ -n "$tx" ]]; then
+  for _ in $(seq 1 30); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+           "http://127.0.0.1:$BASE_RPC/tx/$tx" 2>/dev/null || echo 000)
+    [[ "$code" == "200" ]] && break
+    sleep 2
+  done
+  echo "  faucet tx $tx -> /tx lookup HTTP $code"
+else
+  echo "  WARNING: no faucet tx was created; response: ${claim:0:200}"
+fi
+
 echo ""
 echo "ARC_LOCALDEV_RPC=http://127.0.0.1:$BASE_RPC"
 echo "stop with: $0 --stop"
