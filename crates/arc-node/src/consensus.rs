@@ -2048,11 +2048,27 @@ impl ConsensusManager {
                                 }
                             }
 
-                            // Clean up pending index after the synchronous
-                            // executor has either durably committed or failed.
-                            for tx in &transactions {
-                                pending_txs.remove(&tx.hash.0);
-                            }
+                            // The preimage index is NOT cleaned up here.
+                            //
+                            // Single-validator mode runs both paths over the
+                            // same drained transactions: these were proposed
+                            // into this round's DAG block a few lines above,
+                            // and `retain_dag_preimages` registered them
+                            // against that round. Deleting them once the
+                            // synchronous executor finished removed bodies that
+                            // the two-round commit rule still needed: two
+                            // rounds later `exact_dag_preimages` reported
+                            // Missing for the very transaction that had just
+                            // executed, which is a fatal consensus-loop exit,
+                            // so the first transaction on a single-validator
+                            // chain shut the node down.
+                            //
+                            // `prune_irreversible_preimages` owns this
+                            // lifecycle and already drops a body only once
+                            // every DAG round referencing it is behind the
+                            // commit cursor. Duplicate execution is prevented
+                            // by the receipt filter on the commit path, not by
+                            // discarding evidence early.
                         }
                     }
                 }
