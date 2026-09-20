@@ -2038,7 +2038,9 @@ impl ConsensusManager {
                     });
                 }
             }
+            let mut bootstrap_reject_logged = false;
             for (source, blocks, transactions) in inbound_history {
+                let block_count = blocks.len();
                 // Retain the bodies first: a block that commits without its
                 // exact preimage is a fatal consensus-loop exit, so the bodies
                 // must be in hand before the blocks can be stepped over.
@@ -2054,10 +2056,25 @@ impl ConsensusManager {
                         info!(%source, reached, "Joined a running chain from authenticated history");
                     }
                     Err(error) => {
-                        // Common and harmless: several peers answer one
-                        // request, and by the time the later answers arrive
-                        // this node has already moved past their start round.
-                        debug!(%source, %error, "History response not usable");
+                        // Several peers answer one request, so by the time the
+                        // later answers arrive this node has usually moved past
+                        // their start round - common and harmless, hence debug.
+                        //
+                        // While BOOTSTRAPPING it is neither. A node filling an
+                        // empty DAG that rejects everything is stuck, and the
+                        // reason is the only thing that can say why, so it is
+                        // logged once per cycle at warn.
+                        if bootstrap_watermark.is_some() && !bootstrap_reject_logged {
+                            bootstrap_reject_logged = true;
+                            warn!(
+                                %source,
+                                %error,
+                                blocks = block_count,
+                                "Bootstrap history rejected"
+                            );
+                        } else {
+                            debug!(%source, %error, "History response not usable");
+                        }
                     }
                 }
             }
