@@ -60,57 +60,147 @@ ok()   { echo "  ok: $1"; }
 
 # ── agreement selector (shared by the live run and the self-test) ───────────
 #
-# Counted ROWS per height before, not distinct node identities, so two samples
-# from ONE node satisfied "a common height". It also correlated a height from
-# one snapshot request with a root from another. Both are false-pass paths.
+# Rewritten after review found three false-pass paths in the previous version,
+# all reproduced on small inputs with no node running:
 #
-# Now: one explicit target height, one coherent /block/{target} response per
-# node, and every intended replica must appear by DISTINCT node index.
-# agreement_verdict FILE EXPECTED_NODES -> "OK <hash>" | "BAD <reason>"
+#   the saved three-node CSV with ALL ROOT FIELDS BLANK          -> OK
+#   three rows carrying three DIFFERENT heights                  -> OK
+#   identities 8, 9, 10 when the intended nodes are 0, 1, 2      -> OK
+#
+# The blank roots were not a fluke. `GET /block/{height}` returns a raw
+# `arc_types::Block`, so `height`, `tx_root` and `state_root` live under
+# `header`; the old extractor read them from the TOP level, got empty strings
+# every time, and the selector counted one shared empty value as agreement.
+#
+# Now every row must carry the requested height, three well-formed 32-byte
+# hashes, and a node identity from exactly the intended set, and all three
+# committed values must agree. An absent field fails; it never becomes shared
+# evidence.
+#
+# agreement_verdict FILE EXPECTED_NODES TARGET -> "OK <hash>" | "BAD <reason>"
 agreement_verdict() {
-    awk -F, -v want="$2" '
-        NR > 1 && $2 != "" && $3 != "" {
-            if (!($2 in seen)) { seen[$2] = 1; nodes++ }
-            hashes[$3] = 1; roots[$4] = 1; rows++
+    awk -F, -v want="$2" -v target="$3" '
+        function bad(msg) { printf "BAD %s\n", msg; aborted = 1; exit }
+        NR == 1 { next }
+        {
+            rows++
+            node = $2; height = $3; hash = $4; txroot = $5; stateroot = $6
+            if (node == "" || node !~ /^[0-9]+$/) bad("row " rows " has no usable node identity")
+            if (node + 0 >= want)                 bad("row " rows " reports identity " node " which is not in the intended set 0.." want - 1)
+            if (node in seen)                     bad("identity " node " reported more than once")
+            seen[node] = 1; nodes++
+            if (height == "" || height + 0 != target + 0) bad("identity " node " returned height " (height == "" ? "MISSING" : height) " for target " target)
+            if (hash !~ /^[0-9a-f]{64}$/)      bad("identity " node " returned a malformed or empty block hash")
+            if (txroot !~ /^[0-9a-f]{64}$/)    bad("identity " node " returned a malformed or empty tx_root")
+            if (stateroot !~ /^[0-9a-f]{64}$/) bad("identity " node " returned a malformed or empty state_root")
+            hashes[hash] = 1; txroots[txroot] = 1; stateroots[stateroot] = 1
         }
         END {
+            if (aborted) exit
+            if (rows == 0) bad("no evidence rows at all")
+            if (nodes < want) bad("only " nodes " of " want " intended replicas reported")
             nh = 0; for (h in hashes) nh++
-            nr = 0; for (r in roots) nr++
-            if (nodes < want) { printf "BAD only %d distinct node(s) of %d reported (rows=%d)\n", nodes, want, rows; exit }
-            if (nh != 1)      { printf "BAD %d distinct block hashes at the target height\n", nh; exit }
-            if (nr != 1)      { printf "BAD %d distinct tx roots at the target height\n", nr; exit }
+            nt = 0; for (t in txroots) nt++
+            ns = 0; for (r in stateroots) ns++
+            if (nh != 1) { printf "BAD %d distinct block hashes at height %s\n", nh, target; exit }
+            if (nt != 1) { printf "BAD %d distinct tx_roots at height %s\n", nt, target; exit }
+            if (ns != 1) { printf "BAD %d distinct state_roots at height %s\n", ns, target; exit }
             for (h in hashes) { printf "OK %s\n", h }
         }' "$1"
 }
 
+# Collect one coherent /block/{target} response per node into FILE.
+# The response is parsed ONCE per node, so a height can never be paired with a
+# root taken from a different request. The node identity written here is the
+# loop index, which phase 4 has already bound to a verified validator address.
+collect_agreement() { # FILE TARGET
+    local file="$1" target="$2" i body
+    echo "target,node,height,hash,tx_root,state_root" > "$file"
+    for i in $(seq 0 $((NODES-1))); do
+        if ! body=$(nget "$((BASE_RPC+i))" "/block/$target"); then
+            echo "$target,$i,,,," >> "$file"
+            echo "    node $i: no usable /block/$target response"
+            continue
+        fi
+        printf '%s' "$body" | python3 -c '
+import sys, json
+target = sys.argv[1]; node = sys.argv[2]
+try:
+    d = json.load(sys.stdin)
+    h = d.get("header") or {}
+    strip = lambda v: str(v or "").replace("0x", "")
+    print("%s,%s,%s,%s,%s,%s" % (target, node,
+        h.get("height", ""), strip(d.get("hash")),
+        strip(h.get("tx_root")), strip(h.get("state_root"))))
+except Exception:
+    print("%s,%s,,,," % (target, node))
+' "$target" "$i" >> "$file"
+        tail -1 "$file" | awk -F, '{printf "    node %s: height=%s hash=%.18s... tx_root=%.18s... state_root=%.18s...\n", $2, ($3==""?"MISSING":$3), $4, $5, $6}'
+    done
+}
+
 if [[ "${1:-}" == "--self-test" ]]; then
-    echo "self-test: agreement selector cannot be satisfied by one node"
+    echo "self-test: agreement selector"
     t=$(mktemp)
-    printf 'target,node,hash,tx_root\n900,0,0xaaa,0xttt\n900,1,0xaaa,0xttt\n900,2,0xaaa,0xttt\n' > "$t"
-    v=$(agreement_verdict "$t" 3)
-    [[ "$v" == OK* ]] && echo "  PASS A: three distinct nodes, one hash -> $v" \
+    H="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    T="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    R="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    hdr="target,node,height,hash,tx_root,state_root"
+
+    printf '%s\n900,0,900,%s,%s,%s\n900,1,900,%s,%s,%s\n900,2,900,%s,%s,%s\n' \
+        "$hdr" "$H" "$T" "$R" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
+    v=$(agreement_verdict "$t" 3 900)
+    [[ "$v" == OK* ]] && echo "  PASS A: three intended replicas, one hash/tx_root/state_root -> $v" \
         || { echo "  FAIL A: $v"; rm -f "$t"; exit 1; }
 
-    # The exact defect Codex reproduced: repeated rows from a single node.
-    printf 'target,node,hash,tx_root\n900,1,0xaaa,0xttt\n900,1,0xaaa,0xttt\n900,1,0xaaa,0xttt\n' > "$t"
-    v=$(agreement_verdict "$t" 3)
-    [[ "$v" == BAD*distinct\ node* ]] && echo "  PASS B: repeated samples from one node rejected -> $v" \
-        || { echo "  FAIL B: expected a distinct-node rejection, got: $v"; rm -f "$t"; exit 1; }
+    # The exact defect from the review: the saved CSV with blank roots.
+    printf '%s\n801,0,801,%s,,\n801,1,801,%s,,\n801,2,801,%s,,\n' "$hdr" "$H" "$H" "$H" > "$t"
+    v=$(agreement_verdict "$t" 3 801)
+    [[ "$v" == BAD*tx_root* ]] && echo "  PASS B: blank roots rejected -> $v" \
+        || { echo "  FAIL B: expected a blank-root rejection, got: $v"; rm -f "$t"; exit 1; }
 
-    printf 'target,node,hash,tx_root\n900,0,0xaaa,0xttt\n900,1,0xbbb,0xttt\n900,2,0xaaa,0xttt\n' > "$t"
-    v=$(agreement_verdict "$t" 3)
-    [[ "$v" == BAD*block\ hashes* ]] && echo "  PASS C: disagreeing block hashes rejected -> $v" \
+    # Rows for three different heights.
+    printf '%s\n900,0,900,%s,%s,%s\n900,1,901,%s,%s,%s\n900,2,902,%s,%s,%s\n' \
+        "$hdr" "$H" "$T" "$R" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
+    v=$(agreement_verdict "$t" 3 900)
+    [[ "$v" == BAD*height* ]] && echo "  PASS C: wrong reported height rejected -> $v" \
         || { echo "  FAIL C: $v"; rm -f "$t"; exit 1; }
 
-    printf 'target,node,hash,tx_root\n900,0,0xaaa,0xttt\n900,1,0xaaa,0xuuu\n900,2,0xaaa,0xttt\n' > "$t"
-    v=$(agreement_verdict "$t" 3)
-    [[ "$v" == BAD*tx\ roots* ]] && echo "  PASS D: disagreeing tx roots rejected -> $v" \
+    # Identities outside the intended set.
+    printf '%s\n900,8,900,%s,%s,%s\n900,9,900,%s,%s,%s\n900,10,900,%s,%s,%s\n' \
+        "$hdr" "$H" "$T" "$R" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
+    v=$(agreement_verdict "$t" 3 900)
+    [[ "$v" == BAD*intended\ set* ]] && echo "  PASS D: identities outside the intended set rejected -> $v" \
         || { echo "  FAIL D: $v"; rm -f "$t"; exit 1; }
 
-    printf 'target,node,hash,tx_root\n900,0,0xaaa,0xttt\n900,1,0xaaa,0xttt\n' > "$t"
-    v=$(agreement_verdict "$t" 3)
-    [[ "$v" == BAD*distinct\ node* ]] && echo "  PASS E: a missing replica rejected -> $v" \
+    # Repeated samples from one node.
+    printf '%s\n900,1,900,%s,%s,%s\n900,1,900,%s,%s,%s\n900,1,900,%s,%s,%s\n' \
+        "$hdr" "$H" "$T" "$R" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
+    v=$(agreement_verdict "$t" 3 900)
+    [[ "$v" == BAD*more\ than\ once* ]] && echo "  PASS E: duplicate identity rejected -> $v" \
         || { echo "  FAIL E: $v"; rm -f "$t"; exit 1; }
+
+    # A missing replica.
+    printf '%s\n900,0,900,%s,%s,%s\n900,1,900,%s,%s,%s\n' "$hdr" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
+    v=$(agreement_verdict "$t" 3 900)
+    [[ "$v" == BAD*intended\ replicas* ]] && echo "  PASS F: missing replica rejected -> $v" \
+        || { echo "  FAIL F: $v"; rm -f "$t"; exit 1; }
+
+    # Malformed hash.
+    printf '%s\n900,0,900,not-a-hash,%s,%s\n900,1,900,%s,%s,%s\n900,2,900,%s,%s,%s\n' \
+        "$hdr" "$T" "$R" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
+    v=$(agreement_verdict "$t" 3 900)
+    [[ "$v" == BAD*block\ hash* ]] && echo "  PASS G: malformed block hash rejected -> $v" \
+        || { echo "  FAIL G: $v"; rm -f "$t"; exit 1; }
+
+    # Disagreeing state roots with matching hashes: block-hash equality alone
+    # must not be accepted as a root comparison.
+    R2="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    printf '%s\n900,0,900,%s,%s,%s\n900,1,900,%s,%s,%s\n900,2,900,%s,%s,%s\n' \
+        "$hdr" "$H" "$T" "$R" "$H" "$T" "$R2" "$H" "$T" "$R" > "$t"
+    v=$(agreement_verdict "$t" 3 900)
+    [[ "$v" == BAD*state_roots* ]] && echo "  PASS H: disagreeing state_roots rejected -> $v" \
+        || { echo "  FAIL H: $v"; rm -f "$t"; exit 1; }
     rm -f "$t"
     echo "SELF-TEST OK"; exit 0
 fi
@@ -374,15 +464,8 @@ done
 [[ $allthere -eq 1 ]] && ok "every replica reached height $TARGET" \
   || fail "not every replica reached the target height $TARGET within 180s"
 
-echo "target,node,hash,tx_root" > "$WORK/agreement.csv"
-for i in $(seq 0 $((NODES-1))); do
-  B=$(nget "$((BASE_RPC+i))" "/block/$TARGET") || { fail "node $i could not serve block $TARGET"; continue; }
-  BH=$(printf '%s' "$B" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("hash",""))' 2>/dev/null)
-  BT=$(printf '%s' "$B" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("tx_root",""))' 2>/dev/null)
-  echo "$TARGET,$i,$BH,$BT" >> "$WORK/agreement.csv"
-  echo "    node $i: block $TARGET hash=${BH:0:18}... tx_root=${BT:0:18}..."
-done
-VERDICT=$(agreement_verdict "$WORK/agreement.csv" "$NODES")
+collect_agreement "$WORK/agreement.csv" "$TARGET"
+VERDICT=$(agreement_verdict "$WORK/agreement.csv" "$NODES" "$TARGET")
 if [[ "$VERDICT" == OK* ]]; then
   ok "all $NODES replicas report the SAME committed block at height $TARGET (${VERDICT#OK })"
 else
@@ -560,14 +643,8 @@ while [[ $(date +%s) -lt $deadline ]]; do
   sleep 3
 done
 if [[ $allthere -eq 1 ]]; then
-  echo "target,node,hash,tx_root" > "$WORK/agreement-after-restart.csv"
-  for i in $(seq 0 $((NODES-1))); do
-    B=$(nget "$((BASE_RPC+i))" "/block/$TARGET2") || continue
-    BH=$(printf '%s' "$B" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("hash",""))' 2>/dev/null)
-    BT=$(printf '%s' "$B" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("tx_root",""))' 2>/dev/null)
-    echo "$TARGET2,$i,$BH,$BT" >> "$WORK/agreement-after-restart.csv"
-  done
-  V2=$(agreement_verdict "$WORK/agreement-after-restart.csv" "$NODES")
+  collect_agreement "$WORK/agreement-after-restart.csv" "$TARGET2"
+  V2=$(agreement_verdict "$WORK/agreement-after-restart.csv" "$NODES" "$TARGET2")
   [[ "$V2" == OK* ]] && ok "all $NODES replicas agree at height $TARGET2 AFTER the restart (${V2#OK })" \
     || fail "post-restart agreement at $TARGET2: ${V2#BAD }"
 else
