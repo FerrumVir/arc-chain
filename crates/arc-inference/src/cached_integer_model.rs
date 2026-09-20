@@ -322,6 +322,23 @@ pub struct ModelConfig {
     /// <|start_header_id|>user<|end_header_id|> for LLaMA-3, etc.).
     /// Empty string means no template - use raw input.
     pub chat_template: String,
+    /// Arithmetic identity of the Q/K layout consumed by the fixed-point
+    /// forward path. This is deliberately part of loaded model state: the
+    /// legacy split-half cache layout and the GGUF-interleaved compatibility
+    /// layout produce different outputs from identical source bytes.
+    pub arithmetic_profile: ArithmeticProfile,
+}
+
+/// Versioned Q/K/RoPE arithmetic layouts supported by this binary.
+///
+/// `LegacySplitHalfV0` is retained for existing ARC-INT8 cache files and
+/// protocol identities. `GgufInterleavedRowsV1` permutes the Q and K output
+/// rows at load time, so the existing split-half hot path is mathematically
+/// equivalent to GGUF/Candle's adjacent-pair RoPE convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArithmeticProfile {
+    LegacySplitHalfV0,
+    GgufInterleavedRowsV1,
 }
 
 /// Pre-converted Q4 layer weights (optional, converted at runtime).
@@ -428,6 +445,11 @@ pub struct CachedIntegerModel {
 /// quantization path, not merely start from the same GGUF bytes.
 pub const CANONICAL_REWARD_INFERENCE_PROFILE: &str =
     arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
+/// A new, incompatible execution identity for GGUF Q/K row canonicalization.
+/// It must never be substituted for the legacy canonical profile or stored in
+/// an unversioned `ARC-INT8` cache file.
+pub const GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE: &str =
+    arc_types::transaction::GGUF_LLAMA_I8_INTERLEAVED_ROPE_PROFILE_V1;
 pub const I16_INFERENCE_PROFILE: &str = "INT16 integer (per-row, cross-platform deterministic)";
 pub const BLOCK_I8_INFERENCE_PROFILE: &str =
     "block-INT8 integer (32-weight blocks, cross-platform deterministic)";
@@ -443,6 +465,7 @@ pub fn is_supported_inference_profile(profile: &str) -> bool {
     matches!(
         profile,
         CANONICAL_REWARD_INFERENCE_PROFILE
+            | GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
             | I16_INFERENCE_PROFILE
             | BLOCK_I8_INFERENCE_PROFILE
             | Q4_INFERENCE_PROFILE
@@ -530,6 +553,80 @@ impl std::fmt::Display for GenerationError {
 impl std::error::Error for GenerationError {}
 
 impl CachedIntegerModel {
+    /// Exact Q/K/RoPE arithmetic identity for this resident model. This does
+    /// not by itself identify the dispatched weight precision.
+    pub fn arithmetic_profile(&self) -> &'static str {
+        match self.config.arithmetic_profile {
+            ArithmeticProfile::LegacySplitHalfV0 => CANONICAL_REWARD_INFERENCE_PROFILE,
+            ArithmeticProfile::GgufInterleavedRowsV1 => GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+        }
+    }
+
+    /// The complete identity eligible for canonical I8 execution claims.
+    /// Optional I16, block-I8, Q4, or experimental copies deliberately yield
+    /// `None`: they must never be represented by either canonical I8 profile.
+    pub fn canonical_execution_profile(&self) -> Option<&'static str> {
+        self.has_canonical_i8_profile()
+            .then(|| self.arithmetic_profile())
+    }
+
+    /// Convert the resident I8 Q/K projections from GGUF's adjacent-pair
+    /// feature order to the legacy split-half feature order. Applying the
+    /// existing split-half RoPE afterwards is then exactly the permuted
+    /// representation of interleaved RoPE, and Q·K attention scores are
+    /// unchanged by the shared permutation.
+    ///
+    /// This only supports the canonical per-row I8 path. Optional precision
+    /// copies would need the same row permutation, so callers must load via
+    /// `load_cached_model_canonical_i8_interleaved_rope` rather than mutate a
+    /// general-purpose model after optional profiles are materialized.
+    fn canonicalize_gguf_interleaved_rope_rows(&mut self) -> Result<(), crate::InferenceError> {
+        if self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
+            return Err(crate::InferenceError::Runtime(
+                "GGUF interleaved-RoPE canonicalization was requested twice".into(),
+            ));
+        }
+        if !self.has_canonical_i8_profile() {
+            return Err(crate::InferenceError::Runtime(
+                "GGUF interleaved-RoPE canonicalization requires the canonical per-row INT8 profile".into(),
+            ));
+        }
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
+            if !layer.is_loaded() {
+                return Err(crate::InferenceError::Runtime(format!(
+                    "GGUF interleaved-RoPE canonicalization requires complete layers; layer {layer_index} is absent"
+                )));
+            }
+            permute_interleaved_rows_to_split_half(
+                &mut layer.wq,
+                self.config.n_heads,
+                self.config.d_head,
+                "wq",
+            )?;
+            permute_interleaved_rows_to_split_half(
+                &mut layer.wk,
+                self.config.n_kv_heads,
+                self.config.d_head,
+                "wk",
+            )?;
+        }
+        self.config.arithmetic_profile = ArithmeticProfile::GgufInterleavedRowsV1;
+        Ok(())
+    }
+
+    /// Historical Llama-2 system-message adapter retained for callers that
+    /// explicitly commit this text. It is not used by the reference-qualified
+    /// minimal diagnostic prompt path and must not be inferred from a GGUF.
+    pub const LLAMA2_CHAT_SYSTEM_PROMPT: &'static str = "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not contain harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure your responses are socially unbiased and positive in nature. If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.";
+
+    pub fn apply_llama2_chat_template(user_input: &str) -> String {
+        format!(
+            "[INST] <<SYS>>\n{}\n<</SYS>>\n{} [/INST]",
+            Self::LLAMA2_CHAT_SYSTEM_PROMPT,
+            user_input
+        )
+    }
+
     /// Validate a whole-model generation request before any model compute.
     ///
     /// This is the central admission check for untrusted prompts. The exact
@@ -2138,6 +2235,86 @@ pub fn apply_rope(vec: &mut [i64], pos: usize, d_head: usize, cos: &[i64], sin: 
     }
 }
 
+/// Apply the interleaved RoPE layout used by Candle's `rope_i` and the Llama
+/// GGUF reference path. The legacy [`apply_rope`] split-half layout remains
+/// unchanged for compatibility; callers must bind this helper to a new
+/// arithmetic profile before using it in production inference.
+pub fn apply_rope_interleaved(
+    vec: &mut [i64],
+    pos: usize,
+    d_head: usize,
+    cos: &[i64],
+    sin: &[i64],
+) {
+    let half = d_head / 2;
+    for i in 0..half {
+        let cos_val = cos[pos * half + i];
+        let sin_val = sin[pos * half + i];
+        let even = 2 * i;
+        let odd = even + 1;
+        let x0 = vec[even];
+        let x1 = vec[odd];
+        vec[even] = ((x0 * cos_val) >> FRAC_BITS) - ((x1 * sin_val) >> FRAC_BITS);
+        vec[odd] = ((x0 * sin_val) >> FRAC_BITS) + ((x1 * cos_val) >> FRAC_BITS);
+    }
+}
+
+/// Reorder an output-projection matrix from GGUF's adjacent RoPE pairs to the
+/// split-half representation consumed by [`apply_rope`]. Rows and their
+/// per-row scales are moved together, preserving the exact I8 dequantization.
+///
+/// For one four-wide head this maps source rows `[e0, o0, e1, o1]` to
+/// `[e0, e1, o0, o1]`. The same permutation is applied independently to every
+/// Q or K head. It is intentionally loader-only: changing these rows under an
+/// existing legacy cache would silently change that cache's arithmetic.
+fn permute_interleaved_rows_to_split_half(
+    weights: &mut I8Weights,
+    n_heads: usize,
+    d_head: usize,
+    matrix_name: &str,
+) -> Result<(), crate::InferenceError> {
+    if d_head == 0 || !d_head.is_multiple_of(2) || n_heads == 0 {
+        return Err(crate::InferenceError::Runtime(format!(
+            "{matrix_name}: RoPE row permutation requires a nonzero even head dimension and head count"
+        )));
+    }
+    let expected_rows = n_heads.checked_mul(d_head).ok_or_else(|| {
+        crate::InferenceError::Runtime(format!("{matrix_name}: RoPE row count overflow"))
+    })?;
+    if weights.n_rows != expected_rows
+        || weights.scales.len() != expected_rows
+        || weights.data.len() != expected_rows.saturating_mul(weights.n_cols)
+    {
+        return Err(crate::InferenceError::Runtime(format!(
+            "{matrix_name}: expected {expected_rows} complete output rows for {n_heads} heads of width {d_head}, got rows={}, cols={}, scales={}, data={}",
+            weights.n_rows,
+            weights.n_cols,
+            weights.scales.len(),
+            weights.data.len(),
+        )));
+    }
+
+    let source_data = weights.data.clone();
+    let source_scales = weights.scales.clone();
+    let half = d_head / 2;
+    for head in 0..n_heads {
+        let base = head * d_head;
+        for pair in 0..half {
+            for (destination, source) in [
+                (base + pair, base + 2 * pair),
+                (base + half + pair, base + 2 * pair + 1),
+            ] {
+                let dst = destination * weights.n_cols;
+                let src = source * weights.n_cols;
+                weights.data[dst..dst + weights.n_cols]
+                    .copy_from_slice(&source_data[src..src + weights.n_cols]);
+                weights.scales[destination] = source_scales[source];
+            }
+        }
+    }
+    Ok(())
+}
+
 /// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
 /// Uses the integer exp LUT for sigmoid computation.
 pub fn silu_i64(x: i64) -> i64 {
@@ -2592,6 +2769,41 @@ impl CachedIntegerModel {
             .collect::<String>()
     }
 
+    /// Decode v2 output, reconstructing GGUF byte-fallback tokens such as
+    /// `<0x0A>` into their UTF-8 text. The legacy decoder remains unchanged.
+    pub fn decode_v2(&self, tokens: &[u32]) -> String {
+        let mut text = String::new();
+        let mut fallback = Vec::new();
+        let flush = |text: &mut String, fallback: &mut Vec<u8>| {
+            if !fallback.is_empty() {
+                text.push_str(&String::from_utf8_lossy(fallback));
+                fallback.clear();
+            }
+        };
+        for &id in tokens {
+            let Some(piece) = self.vocab.get(id as usize) else {
+                flush(&mut text, &mut fallback);
+                text.push_str(&format!("[{id}]"));
+                continue;
+            };
+            if let Some(hex) = piece
+                .strip_prefix("<0x")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                if hex.len() == 2 {
+                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                        fallback.push(byte);
+                        continue;
+                    }
+                }
+            }
+            flush(&mut text, &mut fallback);
+            text.push_str(&piece.replace('▁', " "));
+        }
+        flush(&mut text, &mut fallback);
+        text
+    }
+
     pub fn encode(&self, text: &str) -> Vec<u32> {
         if self.vocab.is_empty() {
             return vec![];
@@ -2605,12 +2817,12 @@ impl CachedIntegerModel {
             let mut best_id = 0u32;
             let max_try = (bytes.len() - pos).min(32);
             for try_len in (1..=max_try).rev() {
-                if let Ok(candidate) = std::str::from_utf8(&bytes[pos..pos + try_len])
-                    && let Some(id) = self.vocab.iter().position(|v| v == candidate)
-                {
-                    best_len = try_len;
-                    best_id = id as u32;
-                    break;
+                if let Ok(candidate) = std::str::from_utf8(&bytes[pos..pos + try_len]) {
+                    if let Some(id) = self.vocab.iter().position(|v| v == candidate) {
+                        best_len = try_len;
+                        best_id = id as u32;
+                        break;
+                    }
                 }
             }
             if best_len > 0 {
@@ -2939,12 +3151,12 @@ impl CachedIntegerModel {
             matmul_i16_into(i16_out, &normed, d, &mut logits);
             return logits;
         }
-        if let Some(blk_out) = &self.block_i8_output
-            && blk_out.n_rows > 0
-        {
-            let mut logits = vec![0i64; cfg.vocab_size];
-            crate::block_i8::matmul_block_i8_into(blk_out, &normed, &mut logits);
-            return logits;
+        if let Some(blk_out) = &self.block_i8_output {
+            if blk_out.n_rows > 0 {
+                let mut logits = vec![0i64; cfg.vocab_size];
+                crate::block_i8::matmul_block_i8_into(blk_out, &normed, &mut logits);
+                return logits;
+            }
         }
         if let Some(q4_out) = &self.q4_output {
             let mut logits = vec![0i64; cfg.vocab_size];
@@ -2985,6 +3197,30 @@ impl CachedIntegerModel {
             .expect("trusted generation request must fit the model context window")
     }
 
+    /// Corrected whole-model generation semantics. The legacy `generate` API
+    /// is intentionally preserved for existing protocol identities; v2 owns
+    /// the single BOS forward and reuses the final prompt logits instead of
+    /// forwarding the last prompt token twice.
+    pub fn try_generate_v2(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> Result<(Vec<u32>, Hash256), GenerationError> {
+        let _admission = self.preflight_generation(prompt.len(), max_tokens)?;
+        Ok(self.generate_preflighted_v2(prompt, max_tokens, eos_tokens))
+    }
+
+    pub fn generate_v2(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> (Vec<u32>, Hash256) {
+        self.try_generate_v2(prompt, max_tokens, eos_tokens)
+            .expect("trusted v2 generation request must fit the model context window")
+    }
+
     fn generate_preflighted(
         &self,
         prompt: &[u32],
@@ -3021,9 +3257,42 @@ impl CachedIntegerModel {
         (generated, hash)
     }
 
+    fn generate_preflighted_v2(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> (Vec<u32>, Hash256) {
+        let mut cache = KVCache::new(self.config.n_layers);
+        let mut logits = self.forward_one_token(self.config.bos_token, &mut cache);
+        for &tok in prompt {
+            logits = self.forward_one_token(tok, &mut cache);
+        }
+
+        let mut generated = Vec::new();
+        for _ in 0..max_tokens {
+            let next = select_next_token_with_repetition_penalty(&mut logits, &generated);
+            generated.push(next);
+            if eos_tokens.contains(&next) {
+                break;
+            }
+            logits = self.forward_one_token(next, &mut cache);
+        }
+
+        let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let hash = arc_crypto::hash_bytes(&output_bytes);
+        (generated, hash)
+    }
+
     /// Save weights to binary .arc-int8 file for cross-platform distribution.
     pub fn save_weights(&self, path: &str) -> std::io::Result<()> {
         use std::io::Write;
+        if self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ARC-INT8 v2 cache has no arithmetic-profile tag; refusing to serialize GGUF interleaved-RoPE rows as a legacy cache",
+            ));
+        }
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         f.write_all(b"ARC-INT8\x02\x00")?; // v2: per-row scales
 
@@ -3903,6 +4172,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             eos_tokens: eos_tokens.clone(),
             bos_token,
             chat_template: chat_template.clone(),
+            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
         },
         embedding_q16,
         embedding_i8,
@@ -4062,6 +4332,7 @@ pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::Infe
         eos_tokens,
         bos_token,
         chat_template,
+        arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
         max_seq,
     };
 
@@ -4129,6 +4400,62 @@ pub fn load_cached_model_canonical_i8(
     debug_assert!(model.has_all_transformer_layers());
     debug_assert!(model.has_canonical_i8_profile());
     Ok(model)
+}
+
+/// Load the pinned Llama-family GGUF with the versioned interleaved-RoPE
+/// compatibility profile. The source artifact stores Q/K features as adjacent
+/// pairs; this loader rewrites only the resident per-row-I8 Q/K rows into the
+/// legacy split-half representation before any request is served.
+///
+/// This is intentionally not a generic GGUF switch. It admits only
+/// `general.architecture = llama`, requires complete canonical I8 weights, and
+/// carries a distinct execution identity so it cannot join legacy caches or
+/// validator claims by accident.
+#[cfg(feature = "candle")]
+pub fn load_cached_model_canonical_i8_interleaved_rope(
+    path: &str,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    validate_llama_gguf_for_interleaved_rope(path)?;
+    let mut model = load_cached_model_canonical_i8(path)?;
+    if model.config.d_model != model.config.n_heads.saturating_mul(model.config.d_head)
+        || model.config.d_kv != model.config.n_kv_heads.saturating_mul(model.config.d_head)
+        || !model.config.d_head.is_multiple_of(2)
+    {
+        return Err(crate::InferenceError::Runtime(format!(
+            "interleaved-RoPE Llama profile requires d_model=n_heads*d_head, d_kv=n_kv_heads*d_head, and even d_head; got d_model={}, n_heads={}, n_kv_heads={}, d_head={}, d_kv={}",
+            model.config.d_model,
+            model.config.n_heads,
+            model.config.n_kv_heads,
+            model.config.d_head,
+            model.config.d_kv,
+        )));
+    }
+    model.canonicalize_gguf_interleaved_rope_rows()?;
+    debug_assert_eq!(
+        model.arithmetic_profile(),
+        GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+    );
+    Ok(model)
+}
+
+#[cfg(feature = "candle")]
+fn validate_llama_gguf_for_interleaved_rope(path: &str) -> Result<(), crate::InferenceError> {
+    use candle_core::quantized::gguf_file;
+    let mut reader = std::fs::File::open(path)
+        .map_err(|error| crate::InferenceError::Runtime(format!("open GGUF: {error}")))?;
+    let content = gguf_file::Content::read(&mut reader)
+        .map_err(|error| crate::InferenceError::Runtime(format!("read GGUF: {error}")))?;
+    match content.metadata.get("general.architecture") {
+        Some(gguf_file::Value::String(architecture)) if architecture == "llama" => Ok(()),
+        Some(gguf_file::Value::String(architecture)) => {
+            Err(crate::InferenceError::Runtime(format!(
+                "GGUF interleaved-RoPE profile is pinned to Llama architecture, not {architecture}"
+            )))
+        }
+        _ => Err(crate::InferenceError::Runtime(
+            "GGUF interleaved-RoPE profile requires general.architecture=llama".into(),
+        )),
+    }
 }
 
 #[cfg(feature = "candle")]
@@ -4582,6 +4909,7 @@ fn load_cached_model_shard_profile(
             eos_tokens: eos_tokens.clone(),
             bos_token,
             chat_template: chat_template.clone(),
+            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
         },
         embedding_q16,
         embedding_i8,
@@ -4617,6 +4945,15 @@ pub fn load_cached_model_shard(
 
 #[cfg(not(feature = "candle"))]
 pub fn load_cached_model_canonical_i8(
+    _path: &str,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    Err(crate::InferenceError::Runtime(
+        "candle feature not enabled".into(),
+    ))
+}
+
+#[cfg(not(feature = "candle"))]
+pub fn load_cached_model_canonical_i8_interleaved_rope(
     _path: &str,
 ) -> Result<CachedIntegerModel, crate::InferenceError> {
     Err(crate::InferenceError::Runtime(
@@ -4893,6 +5230,7 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
             eos_tokens,
             bos_token: 1,
             chat_template: String::new(),
+            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
         },
         embedding_q16,
         embedding_i8,
@@ -4918,6 +5256,19 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleaved_rope_matches_candle_rope_i_pairing() {
+        let half = ONE / 2;
+        let mut actual = vec![ONE, 2 * ONE, 3 * ONE, 4 * ONE];
+        // One position with the same cos/sin for both pairs. Candle's rope_i
+        // pairs (0,1) and (2,3), unlike the legacy split-half (0,2)/(1,3).
+        apply_rope_interleaved(&mut actual, 0, 4, &[half, half], &[half, half]);
+        assert_eq!(
+            actual,
+            vec![-(ONE / 2), 3 * ONE / 2, -(ONE / 2), 7 * ONE / 2]
+        );
+    }
 
     #[test]
     fn shared_repetition_penalty_changes_a_repeated_raw_argmax() {
@@ -5016,6 +5367,7 @@ mod tests {
                 eos_tokens: vec![2, 128001, 128009],
                 bos_token: 1,
                 chat_template: String::new(),
+                arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
             },
             embedding_q16,
             embedding_i8,
@@ -5104,6 +5456,80 @@ mod tests {
     }
 
     #[test]
+    fn q_and_k_row_permutation_matches_interleaved_rope_oracle_for_multihead_gqa() {
+        // Two Q heads and one KV head exercise both dimensions independently.
+        // Each row contains its source row id so data and scale movement are
+        // observable together.
+        let mut q = I8Weights {
+            data: (0i8..8).flat_map(|row| [row, -row]).collect(),
+            scales: (0i64..8).collect(),
+            n_rows: 8,
+            n_cols: 2,
+        };
+        let mut k = I8Weights {
+            data: (20i8..24).flat_map(|row| [row, -row]).collect(),
+            scales: (20i64..24).collect(),
+            n_rows: 4,
+            n_cols: 2,
+        };
+        permute_interleaved_rows_to_split_half(&mut q, 2, 4, "q").unwrap();
+        permute_interleaved_rows_to_split_half(&mut k, 1, 4, "k").unwrap();
+        assert_eq!(q.scales, vec![0, 2, 1, 3, 4, 6, 5, 7]);
+        assert_eq!(k.scales, vec![20, 22, 21, 23]);
+        assert_eq!(
+            q.data,
+            vec![0, 0, 2, -2, 1, -1, 3, -3, 4, -4, 6, -6, 5, -5, 7, -7]
+        );
+
+        let (cos, sin) = compute_rope_tables(4, 2, 10_000.0);
+        let original = vec![11 * ONE, 13 * ONE, 17 * ONE, 19 * ONE];
+        let mut reference = original.clone();
+        apply_rope_interleaved(&mut reference, 1, 4, &cos, &sin);
+
+        // The loader has already applied P to Q/K rows. Existing split-half
+        // RoPE computes P·R_interleaved; undo P only for this direct oracle.
+        let mut split = vec![original[0], original[2], original[1], original[3]];
+        apply_rope(&mut split, 1, 4, &cos, &sin);
+        let restored = vec![split[0], split[2], split[1], split[3]];
+        assert_eq!(restored, reference);
+
+        // Orthogonal P preserves the attention score once both Q and K use
+        // the same per-head permutation.
+        let original_k = vec![23 * ONE, 29 * ONE, 31 * ONE, 37 * ONE];
+        let mut reference_k = original_k.clone();
+        apply_rope_interleaved(&mut reference_k, 1, 4, &cos, &sin);
+        let mut split_k = vec![original_k[0], original_k[2], original_k[1], original_k[3]];
+        apply_rope(&mut split_k, 1, 4, &cos, &sin);
+        let dot = |left: &[i64], right: &[i64]| -> i128 {
+            left.iter()
+                .zip(right)
+                .map(|(a, b)| *a as i128 * *b as i128)
+                .sum()
+        };
+        assert_eq!(dot(&reference, &reference_k), dot(&split, &split_k));
+    }
+
+    #[test]
+    fn interleaved_rope_profile_is_versioned_and_legacy_cache_export_is_refused() {
+        let mut legacy = build_test_model(16, 8, 2, 16, 1);
+        assert_eq!(
+            legacy.arithmetic_profile(),
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        legacy.canonicalize_gguf_interleaved_rope_rows().unwrap();
+        assert_eq!(
+            legacy.arithmetic_profile(),
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+        );
+        assert!(legacy.has_canonical_i8_profile());
+        let error = legacy
+            .save_weights("/definitely-not-written/arc-interleaved-v1.arc-int8")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("arithmetic-profile tag"));
+    }
+
+    #[test]
     fn generation_preflight_rejects_position_count_overflow() {
         let model = build_test_model(32, 16, 2, 32, 1);
         let err = model
@@ -5118,6 +5544,50 @@ mod tests {
                 max_tokens: 0,
             }
         );
+    }
+
+    #[test]
+    fn generation_v2_matches_explicit_single_bos_prompt_logit_oracle() {
+        let model = build_test_model(32, 16, 2, 32, 1);
+        let prompt = [3u32, 4u32];
+        let eos = [u32::MAX];
+
+        let mut cache = KVCache::new(model.config.n_layers);
+        let mut logits = model.forward_one_token(model.config.bos_token, &mut cache);
+        for &token in &prompt {
+            logits = model.forward_one_token(token, &mut cache);
+        }
+        let mut expected = Vec::new();
+        for _ in 0..3 {
+            let next = select_next_token_with_repetition_penalty(&mut logits, &expected);
+            expected.push(next);
+            if eos.contains(&next) {
+                break;
+            }
+            logits = model.forward_one_token(next, &mut cache);
+        }
+
+        let (actual, _) = model.generate_v2(&prompt, 3, &eos);
+        assert_eq!(
+            actual, expected,
+            "v2 must reuse final prompt logits exactly"
+        );
+
+        let (empty, _) = model.generate_v2(&[], 1, &eos);
+        assert_eq!(
+            empty.len(),
+            1,
+            "empty prompt still uses the single BOS logits"
+        );
+        let (zero, _) = model.generate_v2(&prompt, 0, &eos);
+        assert!(zero.is_empty(), "zero token budget must produce no output");
+    }
+
+    #[test]
+    fn v2_decoder_reconstructs_byte_fallback_utf8() {
+        let mut model = build_test_model(32, 16, 2, 32, 1);
+        model.vocab[13] = "<0x0A>".into();
+        assert_eq!(model.decode_v2(&[13, 13]), "\n\n");
     }
 
     #[test]
@@ -5955,6 +6425,7 @@ mod int16_tests {
                     eos_tokens: vec![2, 128001, 128009],
                     bos_token: 1,
                     chat_template: String::new(),
+                    arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
                 },
                 embedding_q16,
                 embedding_i8,

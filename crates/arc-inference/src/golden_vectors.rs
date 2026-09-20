@@ -7,7 +7,8 @@
 //! against the same reviewed constants.
 
 use crate::cached_integer_model::{
-    CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig, ShardInput, ShardOutput,
+    ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig,
+    ShardInput, ShardOutput,
 };
 use crate::integer_lut::ONE;
 use arc_crypto::hash_bytes;
@@ -188,6 +189,7 @@ fn build_fixture_model(fixture: &GoldenFixture) -> CachedIntegerModel {
             eos_tokens: Vec::new(),
             bos_token: 1,
             chat_template: String::new(),
+            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
         },
         embedding_q16,
         embedding_i8,

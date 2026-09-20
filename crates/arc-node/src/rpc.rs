@@ -19409,7 +19409,9 @@ mod tests {
     }
 
     fn test_inference_model() -> Arc<arc_inference::cached_integer_model::CachedIntegerModel> {
-        use arc_inference::cached_integer_model::{CachedIntegerModel, I8Weights, ModelConfig};
+        use arc_inference::cached_integer_model::{
+            ArithmeticProfile, CachedIntegerModel, I8Weights, ModelConfig,
+        };
 
         let mut vocab = vec!["<unk>".to_string(), "▁x".to_string()];
         vocab.extend((0u16..=255).map(|byte| format!("<0x{byte:02X}>")));
@@ -19430,6 +19432,7 @@ mod tests {
                 eos_tokens: Vec::new(),
                 bos_token: 0,
                 chat_template: String::new(),
+                arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
             },
             embedding_q16: Vec::new(),
             embedding_i8: I8Weights::empty(),
@@ -19452,7 +19455,7 @@ mod tests {
 
     fn test_reward_inference_model() -> arc_inference::cached_integer_model::CachedIntegerModel {
         use arc_inference::cached_integer_model::{
-            CachedIntegerModel, CachedLayer, I8Weights, ModelConfig,
+            ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, ModelConfig,
         };
 
         const ONE: i64 = 1 << 16;
@@ -19490,6 +19493,7 @@ mod tests {
                 eos_tokens: Vec::new(),
                 bos_token: 1,
                 chat_template: String::new(),
+                arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
             },
             embedding_q16,
             embedding_i8,

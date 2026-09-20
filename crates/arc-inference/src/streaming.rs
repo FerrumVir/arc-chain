@@ -114,11 +114,12 @@ impl MemoryTierConfig {
                 .args(["-n", "hw.memsize"])
                 .output()
                 .ok();
-            if let Some(out) = output
-                && let Ok(s) = String::from_utf8(out.stdout)
-                && let Ok(bytes) = s.trim().parse::<u64>()
-            {
-                return bytes;
+            if let Some(out) = output {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    if let Ok(bytes) = s.trim().parse::<u64>() {
+                        return bytes;
+                    }
+                }
             }
             16 * 1024 * 1024 * 1024 // default 16GB
         }
@@ -632,6 +633,7 @@ mod tests {
             eos_tokens: vec![2],
             bos_token: 1,
             chat_template: String::new(),
+            arithmetic_profile: crate::cached_integer_model::ArithmeticProfile::LegacySplitHalfV0,
         }
     }
 
