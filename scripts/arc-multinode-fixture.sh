@@ -615,9 +615,29 @@ for j in $(seq 0 $((LAST-1))); do plist="${plist}127.0.0.1:$((BASE_P2P+j)),"; do
           --insecure-dev-validator-seed --validator-seed "fixture-node-$LAST" \
           --stake "$STAKE" > "$WORK/node-$LAST.restart.log" 2>&1 &
 PIDS[$LAST]=$!
-if wait_healthy "$((BASE_RPC+LAST))" 90; then ok "node $LAST restarted from its persisted store"; else
-  fail "node $LAST did not come back after restart"
-  tail -15 "$WORK/node-$LAST.restart.log" | sed 's/^/      /'
+# A healthy port is NOT proof that OUR process came back. A leaked node from an
+# earlier run, started from the same dev seed, presents the same validator
+# identity on the same port - so the identity check below passes while every
+# height read afterwards describes a stranger. That is exactly what happened on
+# 2026-09-20: the restarted node refused to start because it could not bind
+# 9183, and the fixture went on to report "reopened at 439" about a process from
+# a previous run. The PID is the only thing that distinguishes them.
+RESTART_PID=${PIDS[$LAST]}
+RESTART_ALIVE=0
+if wait_healthy "$((BASE_RPC+LAST))" 90 && kill -0 "$RESTART_PID" 2>/dev/null; then
+  RESTART_ALIVE=1
+  ok "node $LAST restarted from its persisted store (pid $RESTART_PID alive)"
+else
+  if ! kill -0 "$RESTART_PID" 2>/dev/null; then
+    fail "node $LAST exited during restart; anything answering on $((BASE_RPC+LAST)) is NOT this node"
+    echo "      last lines of its own log:"
+    sed 's/\x1b\[[0-9;]*m//g' "$WORK/node-$LAST.restart.log" | tail -6 | sed 's/^/        /'
+    holder=$(lsof -nP -iUDP:"$((BASE_P2P+LAST))" 2>/dev/null | awk 'NR==2{print $2}')
+    [[ -n "$holder" ]] && echo "        UDP $((BASE_P2P+LAST)) is held by pid $holder: $(ps -o args= -p "$holder" 2>/dev/null | grep -oE 'data-dir [^ ]+')"
+  else
+    fail "node $LAST did not come back after restart"
+    tail -15 "$WORK/node-$LAST.restart.log" | sed 's/^/      /'
+  fi
 fi
 # Identity must still be the fixture's node, not some other local listener.
 RID=$(nfield "$((BASE_RPC+LAST))" /node/info validator)
