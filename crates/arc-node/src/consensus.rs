@@ -1931,6 +1931,22 @@ impl ConsensusManager {
                     }
                 }
                 if blocks.is_empty() {
+                    // The requester is behind this node's DAG prune horizon
+                    // (PRUNE_DEPTH rounds below the commit cursor). DAG history
+                    // cannot rescue it and pretending otherwise by serving a
+                    // non-contiguous run would be worse than saying so: it
+                    // needs an authenticated checkpoint/snapshot, which is a
+                    // separate trust boundary and is not implemented yet.
+                    warn!(
+                        %source,
+                        from_round,
+                        oldest_retained = self
+                            .engine
+                            .last_committed_round()
+                            .saturating_sub(arc_consensus::PRUNE_DEPTH),
+                        "Cannot serve DAG history: the requested round is below this node's \
+                         prune horizon. The peer needs an authenticated checkpoint."
+                    );
                     continue;
                 }
                 let wanted: std::collections::HashSet<[u8; 32]> = blocks
