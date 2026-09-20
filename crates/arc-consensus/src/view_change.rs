@@ -104,9 +104,24 @@ fn domain_bytes(domain: &ConsensusDomain) -> [u8; 48] {
 
 // ── Skip votes ───────────────────────────────────────────────────────────────
 
-/// One validator's attestation that a named committee member produced nothing
-/// it could see in a round, taken after that round already carried a quorum of
-/// stake from other members.
+/// Why a validator attests that a round's leader cannot be committed.
+///
+/// Both reasons carry the same permanent refusal and the same safety argument.
+/// They differ in one effect only: `NoBlock` also excuses the member from the
+/// recovery domain's participation requirement, because there genuinely is no
+/// block; `NoQuorumSupport` does not, because the block exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AbsenceReason {
+    /// The member produced no block in that round, observed after the round
+    /// already carried a quorum of stake from others.
+    NoBlock,
+    /// The member's block exists, but the two rounds that could certify it are
+    /// quorum-complete and no child of it reaches quorum support. The block can
+    /// therefore never be committed by anyone.
+    NoQuorumSupport,
+}
+
+/// One validator's attestation that a round's leader cannot be committed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkipVote {
     pub domain: ConsensusDomain,
@@ -114,6 +129,8 @@ pub struct SkipVote {
     pub round: u64,
     pub absentee: Address,
     pub voter: Address,
+    /// Why this attestation was made; bound into the signature.
+    pub reason: AbsenceReason,
     /// Stake of the distinct round authors the voter had seen. Recorded so an
     /// auditor can check the voter's own claim, and so a vote that claims less
     /// than quorum is rejected on its face.
@@ -129,15 +146,20 @@ pub fn skip_vote_transcript(
     round: u64,
     absentee: &Address,
     voter: &Address,
+    reason: AbsenceReason,
     observed_round_stake: u64,
 ) -> Hash256 {
-    let mut bytes = Vec::with_capacity(SKIP_VOTE_DOMAIN.len() + 48 + 32 + 8 + 32 + 32 + 8);
+    let mut bytes = Vec::with_capacity(SKIP_VOTE_DOMAIN.len() + 48 + 32 + 8 + 32 + 32 + 9);
     bytes.extend_from_slice(SKIP_VOTE_DOMAIN);
     bytes.extend_from_slice(&domain_bytes(domain));
     bytes.extend_from_slice(&validator_set_hash.0);
     bytes.extend_from_slice(&round.to_le_bytes());
     bytes.extend_from_slice(&absentee.0);
     bytes.extend_from_slice(&voter.0);
+    bytes.push(match reason {
+        AbsenceReason::NoBlock => 0,
+        AbsenceReason::NoQuorumSupport => 1,
+    });
     bytes.extend_from_slice(&observed_round_stake.to_le_bytes());
     hash_bytes(&bytes)
 }
@@ -150,6 +172,7 @@ impl SkipVote {
             self.round,
             &self.absentee,
             &self.voter,
+            self.reason,
             self.observed_round_stake,
         )
     }
@@ -161,6 +184,7 @@ impl SkipVote {
         validator_set_hash: Hash256,
         round: u64,
         absentee: Address,
+        reason: AbsenceReason,
         observed_round_stake: u64,
         keypair: &KeyPair,
     ) -> Result<Self, arc_crypto::SignatureError> {
@@ -171,6 +195,7 @@ impl SkipVote {
             round,
             &absentee,
             &voter,
+            reason,
             observed_round_stake,
         );
         let signature = keypair.sign(&transcript)?;
@@ -180,6 +205,7 @@ impl SkipVote {
             round,
             absentee,
             voter,
+            reason,
             observed_round_stake,
             signature,
         })
@@ -206,6 +232,7 @@ pub struct SkipCertificate {
     pub validator_set_hash: Hash256,
     pub round: u64,
     pub absentee: Address,
+    pub reason: AbsenceReason,
     pub votes: Vec<SkipVote>,
 }
 
@@ -217,6 +244,7 @@ impl SkipCertificate {
         validator_set_hash: Hash256,
         round: u64,
         absentee: Address,
+        reason: AbsenceReason,
         votes: Vec<SkipVote>,
     ) -> Self {
         Self {
@@ -224,6 +252,7 @@ impl SkipCertificate {
             validator_set_hash,
             round,
             absentee,
+            reason,
             votes,
         }
     }
@@ -258,6 +287,7 @@ impl SkipCertificate {
                 || vote.validator_set_hash != self.validator_set_hash
                 || vote.round != self.round
                 || vote.absentee != self.absentee
+                || vote.reason != self.reason
             {
                 return Err(CertificateError::InconsistentVote { index });
             }
@@ -449,8 +479,11 @@ impl FinalityCertificate {
 /// startup failure rather than a fresh start.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusSigningRecord {
-    /// Rounds this validator has certified an absence in, and who was absent.
-    pub skipped_rounds: HashMap<u64, Address>,
+    /// Rounds this validator has attested about, which members it named, and
+    /// why. More than one member of a round can legitimately be attested, and
+    /// the reason decides whether the member is also excused from the
+    /// participation requirement, so both are recorded.
+    pub skipped_rounds: HashMap<u64, HashMap<Address, AbsenceReason>>,
     /// Heights this validator has signed a finality transcript for.
     pub finality_votes: HashMap<u64, (Hash256, Hash256, Hash256)>,
     /// Rounds whose leader block this validator has committed.
@@ -475,13 +508,14 @@ impl ConsensusSigningRecord {
 pub enum SkipRefusal {
     /// S1: the round has not yet carried a quorum of stake.
     RoundBelowQuorum,
-    /// S2: this validator holds the named member's block for that round.
+    /// S2: the attestable condition was falsified in this validator's view -
+    /// the block turned up, or it reached quorum support.
     AbsenteeBlockPresent,
     /// S3: the grace period since S1 first held has not elapsed.
     WithinGrace,
     /// S4: this validator already committed that round's leader block.
     AlreadyCommitted,
-    /// S4: this validator already signed an absence naming someone else.
+    /// S4: this validator already signed a conflicting attestation.
     ConflictingSkip,
     /// The round is already behind the commit cursor; nothing to skip.
     RoundAlreadyPassed,
@@ -492,10 +526,14 @@ pub enum SkipRefusal {
 struct RoundObservation {
     /// Stake of the distinct round authors seen so far.
     stake: u64,
-    /// Whether the named member's own block has been seen for this round.
-    absentee_seen: bool,
-    /// Monotonic milliseconds at which quorum-without-absentee first held.
-    quorum_without_absentee_since: Option<u64>,
+    /// Sticky: the attestable condition was falsified at least once, so this
+    /// validator can never attest it. For `NoBlock` that means the member's
+    /// block was seen; for `NoQuorumSupport` that its block reached quorum
+    /// support. Stickiness is what stops a later, narrower view from reopening
+    /// an attestation the validator has already ruled out.
+    condition_broken: bool,
+    /// Monotonic milliseconds at which the condition first held with a quorum.
+    holding_since: Option<u64>,
 }
 
 /// Tracks, per round, whether this validator may sign a skip vote — and records
@@ -512,7 +550,7 @@ pub struct SkipTracker {
     /// Keyed by `(round, absentee)`. Keying by round alone would let an
     /// observation about a member that IS present poison the observation about
     /// one that is absent, since `absentee_seen` is deliberately sticky.
-    observations: HashMap<(u64, Address), RoundObservation>,
+    observations: HashMap<(u64, Address, AbsenceReason), RoundObservation>,
     record: ConsensusSigningRecord,
     /// Leader blocks this validator has permanently refused, as
     /// `(round, absentee)`. Once present, the block is never referenced as a
@@ -530,7 +568,7 @@ impl SkipTracker {
         let refused = record
             .skipped_rounds
             .iter()
-            .map(|(round, absentee)| (*round, *absentee))
+            .flat_map(|(round, members)| members.keys().map(move |member| (*round, *member)))
             .collect();
         Self {
             domain,
@@ -554,49 +592,67 @@ impl SkipTracker {
         self.refused.contains(&(round, *absentee))
     }
 
+    /// Record that this validator signed a finality transcript for a height.
+    /// One per height, ever: the record is what makes that survive a restart.
+    pub fn note_finality_vote(
+        &mut self,
+        height: u64,
+        identity: (Hash256, Hash256, Hash256),
+    ) {
+        self.record.finality_votes.insert(height, identity);
+    }
+
     /// Note that this validator committed a round's leader, which permanently
     /// bars it from signing a skip for that round (S4).
     pub fn note_committed_leader_round(&mut self, round: u64) {
         self.record.committed_leader_rounds.insert(round);
     }
 
-    /// Feed the current view of one round: the stake of distinct authors seen,
-    /// and whether the leader's own block is among them.
-    pub fn observe_round(
+    /// Feed the current view of one round for one (member, reason) pair.
+    ///
+    /// `condition_holds` is the attestable claim as this validator currently
+    /// sees it: for [`AbsenceReason::NoBlock`], that the member produced no
+    /// block; for [`AbsenceReason::NoQuorumSupport`], that no child of its
+    /// block reaches quorum support. `distinct_author_stake` is the stake of
+    /// distinct authors in the round, which is what makes the round
+    /// quorum-complete enough to judge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe(
         &mut self,
         round: u64,
-        absentee: &Address,
+        member: &Address,
+        reason: AbsenceReason,
         distinct_author_stake: u64,
-        absentee_block_seen: bool,
+        condition_holds: bool,
         quorum: u64,
         now_ms: u64,
     ) {
         let entry = self
             .observations
-            .entry((round, *absentee))
+            .entry((round, *member, reason))
             .or_insert(RoundObservation {
                 stake: 0,
-                absentee_seen: false,
-                quorum_without_absentee_since: None,
+                condition_broken: false,
+                holding_since: None,
             });
         entry.stake = entry.stake.max(distinct_author_stake);
-        // Seeing the leader's block is sticky: a later view that happens to
-        // omit it must not reopen the possibility of skipping.
-        entry.absentee_seen |= absentee_block_seen;
-        if entry.stake >= quorum && !entry.absentee_seen {
-            entry.quorum_without_absentee_since.get_or_insert(now_ms);
+        entry.condition_broken |= !condition_holds;
+        if entry.stake >= quorum && !entry.condition_broken {
+            entry.holding_since.get_or_insert(now_ms);
         } else {
-            entry.quorum_without_absentee_since = None;
+            entry.holding_since = None;
         }
     }
 
     /// Decide whether to sign, and sign if permitted. On success the decision is
     /// already recorded in [`Self::record`]; the caller must persist that record
     /// **before** the returned vote leaves the process (S5).
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_if_permitted(
         &mut self,
         round: u64,
         absentee: Address,
+        reason: AbsenceReason,
         commit_cursor: u64,
         quorum: u64,
         now_ms: u64,
@@ -608,24 +664,19 @@ impl SkipTracker {
         if self.record.committed_leader_rounds.contains(&round) {
             return Err(SkipRefusal::AlreadyCommitted);
         }
-        if let Some(existing) = self.record.skipped_rounds.get(&round) {
-            if *existing != absentee {
-                return Err(SkipRefusal::ConflictingSkip);
-            }
-        }
         let observation = self
             .observations
-            .get(&(round, absentee))
+            .get(&(round, absentee, reason))
             .copied()
             .ok_or(SkipRefusal::RoundBelowQuorum)?;
-        if observation.absentee_seen {
+        if observation.condition_broken {
             return Err(SkipRefusal::AbsenteeBlockPresent);
         }
         if observation.stake < quorum {
             return Err(SkipRefusal::RoundBelowQuorum);
         }
         let since = observation
-            .quorum_without_absentee_since
+            .holding_since
             .ok_or(SkipRefusal::RoundBelowQuorum)?;
         if now_ms.saturating_sub(since) < self.grace_ms {
             return Err(SkipRefusal::WithinGrace);
@@ -635,11 +686,16 @@ impl SkipTracker {
             self.validator_set_hash,
             round,
             absentee,
+            reason,
             observation.stake,
             keypair,
         )
         .map_err(|_| SkipRefusal::ConflictingSkip)?;
-        self.record.skipped_rounds.insert(round, absentee);
+        self.record
+            .skipped_rounds
+            .entry(round)
+            .or_default()
+            .insert(absentee, reason);
         self.refused.insert((round, absentee));
         Ok(vote)
     }
@@ -649,7 +705,9 @@ impl SkipTracker {
     pub fn adopt_certificate(&mut self, certificate: &SkipCertificate) {
         self.record
             .skipped_rounds
-            .insert(certificate.round, certificate.absentee);
+            .entry(certificate.round)
+            .or_default()
+            .insert(certificate.absentee, certificate.reason);
         self.refused
             .insert((certificate.round, certificate.absentee));
     }
@@ -658,14 +716,15 @@ impl SkipTracker {
     /// record is NOT pruned here: forgetting a decision is the equivocation this
     /// type exists to prevent.
     pub fn prune_observations_below(&mut self, round: u64) {
-        self.observations.retain(|(tracked, _), _| *tracked >= round);
+        self.observations
+            .retain(|(tracked, _, _), _| *tracked >= round);
     }
 }
 
 /// Collects skip votes from peers until a quorum exists for a round.
 #[derive(Debug, Default)]
 pub struct SkipVoteCollector {
-    by_round: HashMap<(u64, Address), HashMap<Address, SkipVote>>,
+    by_round: HashMap<(u64, Address, AbsenceReason), HashMap<Address, SkipVote>>,
 }
 
 impl SkipVoteCollector {
@@ -694,7 +753,7 @@ impl SkipVoteCollector {
             return Err(CertificateError::InconsistentVote { index: 0 });
         }
         vote.verify_against(set)?;
-        let key = (vote.round, vote.absentee);
+        let key = (vote.round, vote.absentee, vote.reason);
         let round_votes = self.by_round.entry(key).or_default();
         round_votes.insert(vote.voter, vote);
         let mut signing = 0u64;
@@ -710,6 +769,7 @@ impl SkipVoteCollector {
                 validator_set_hash(set),
                 key.0,
                 key.1,
+                key.2,
                 votes,
             );
             return Ok(Some(certificate));
@@ -718,7 +778,7 @@ impl SkipVoteCollector {
     }
 
     pub fn prune_below(&mut self, round: u64) {
-        self.by_round.retain(|(tracked, _), _| *tracked >= round);
+        self.by_round.retain(|(tracked, _, _), _| *tracked >= round);
     }
 }
 
@@ -833,7 +893,8 @@ mod tests {
         keys.iter()
             .take(count)
             .map(|key| {
-                SkipVote::sign(domain(), set_hash, round, leader, set.quorum, key).unwrap()
+                SkipVote::sign(domain(), set_hash, round, leader, AbsenceReason::NoBlock, set.quorum, key)
+                    .unwrap()
             })
             .collect()
     }
@@ -878,7 +939,14 @@ mod tests {
         let leader = keys[0].address();
         let votes = skip_votes(&set, &keys, 7, leader, 3);
         let certificate =
-            SkipCertificate::new(domain(), validator_set_hash(&set), 7, leader, votes);
+            SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            7,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
         let signing = certificate.verify(&domain(), &set).expect("valid");
         assert!(signing >= set.quorum);
     }
@@ -889,7 +957,14 @@ mod tests {
         let leader = keys[0].address();
         let votes = skip_votes(&set, &keys, 7, leader, 2);
         let certificate =
-            SkipCertificate::new(domain(), validator_set_hash(&set), 7, leader, votes);
+            SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            7,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
         assert!(matches!(
             certificate.verify(&domain(), &set),
             Err(CertificateError::BelowQuorum { .. })
@@ -904,7 +979,14 @@ mod tests {
         votes.push(votes[0].clone());
         votes.push(votes[0].clone());
         let certificate =
-            SkipCertificate::new(domain(), validator_set_hash(&set), 7, leader, votes);
+            SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            7,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
         assert!(matches!(
             certificate.verify(&domain(), &set),
             Err(CertificateError::DuplicateVoter(_))
@@ -917,7 +999,14 @@ mod tests {
         let leader = keys[0].address();
         let votes = skip_votes(&set, &keys, 7, leader, 3);
         let certificate =
-            SkipCertificate::new(domain(), validator_set_hash(&set), 7, leader, votes);
+            SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            7,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
         let other = ConsensusDomain::new(hash_bytes(b"another.chain"), 1, 1);
         assert!(matches!(
             certificate.verify(&other, &set),
@@ -932,7 +1021,14 @@ mod tests {
         let leader = keys[0].address();
         let votes = skip_votes(&set, &keys, 7, leader, 3);
         let certificate =
-            SkipCertificate::new(domain(), validator_set_hash(&set), 7, leader, votes);
+            SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            7,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
         assert!(matches!(
             certificate.verify(&domain(), &other_set),
             Err(CertificateError::WrongValidatorSet)
@@ -951,13 +1047,21 @@ mod tests {
                 validator_set_hash(&set),
                 7,
                 leader,
+                AbsenceReason::NoBlock,
                 set.quorum,
                 &outsider,
             )
             .unwrap(),
         );
         let certificate =
-            SkipCertificate::new(domain(), validator_set_hash(&set), 7, leader, votes);
+            SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            7,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
         assert!(matches!(
             certificate.verify(&domain(), &set),
             Err(CertificateError::UnknownVoter(_))
@@ -975,13 +1079,21 @@ mod tests {
             validator_set_hash(&set),
             8,
             leader,
+            AbsenceReason::NoBlock,
             set.quorum,
             &keys[2],
         )
         .unwrap();
         votes[2].signature = wrong.signature;
         let certificate =
-            SkipCertificate::new(domain(), validator_set_hash(&set), 7, leader, votes);
+            SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            7,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
         assert!(matches!(
             certificate.verify(&domain(), &set),
             Err(CertificateError::BadSignature(_))
@@ -995,7 +1107,14 @@ mod tests {
         let mut votes = skip_votes(&set, &keys, 7, leader, 2);
         votes.extend(skip_votes(&set, &keys[2..], 9, leader, 1));
         let certificate =
-            SkipCertificate::new(domain(), validator_set_hash(&set), 7, leader, votes);
+            SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            7,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
         assert!(matches!(
             certificate.verify(&domain(), &set),
             Err(CertificateError::InconsistentVote { .. })
@@ -1012,10 +1131,19 @@ mod tests {
         let votes: Vec<SkipVote> = keys[..3]
             .iter()
             .map(|key| {
-                SkipVote::sign(domain(), set_hash, 7, leader, set.quorum - 1, key).unwrap()
+                SkipVote::sign(
+                    domain(),
+                    set_hash,
+                    7,
+                    leader,
+                    AbsenceReason::NoBlock,
+                    set.quorum - 1,
+                    key,
+                )
+                .unwrap()
             })
             .collect();
-        let certificate = SkipCertificate::new(domain(), set_hash, 7, leader, votes);
+        let certificate = SkipCertificate::new(domain(), set_hash, 7, leader, AbsenceReason::NoBlock, votes);
         assert!(matches!(
             certificate.verify(&domain(), &set),
             Err(CertificateError::InconsistentVote { .. })
@@ -1028,7 +1156,15 @@ mod tests {
         // vote could be replayed as finality evidence.
         let (set, keys) = committee(4);
         let set_hash = validator_set_hash(&set);
-        let skip = skip_vote_transcript(&domain(), &set_hash, 3, &keys[0].address(), &keys[1].address(), set.quorum);
+        let skip = skip_vote_transcript(
+            &domain(),
+            &set_hash,
+            3,
+            &keys[0].address(),
+            &keys[1].address(),
+            AbsenceReason::NoBlock,
+            set.quorum,
+        );
         let finality = finality_vote_transcript(
             &domain(),
             &set_hash,
@@ -1042,6 +1178,10 @@ mod tests {
     }
 
     // ── the S1..S5 state machine ────────────────────────────────────────────
+
+    fn tracker_for(set: &ValidatorSet) -> SkipTracker {
+        tracker(set)
+    }
 
     fn tracker(set: &ValidatorSet) -> SkipTracker {
         SkipTracker::new(
@@ -1057,9 +1197,9 @@ mod tests {
         let (set, keys) = committee(4);
         let mut tracker = tracker(&set);
         let leader = keys[0].address();
-        tracker.observe_round(5, &leader, set.quorum - 1, false, set.quorum, 0);
+        tracker.observe(5, &leader, AbsenceReason::NoBlock, set.quorum - 1, true, set.quorum, 0);
         assert_eq!(
-            tracker.sign_if_permitted(5, leader, 0, set.quorum, 10_000, &keys[1]),
+            tracker.sign_if_permitted(5, leader, AbsenceReason::NoBlock, 0, set.quorum, 10_000, &keys[1]),
             Err(SkipRefusal::RoundBelowQuorum)
         );
     }
@@ -1069,11 +1209,11 @@ mod tests {
         let (set, keys) = committee(4);
         let mut tracker = tracker(&set);
         let leader = keys[0].address();
-        tracker.observe_round(5, &leader, set.quorum, true, set.quorum, 0);
+        tracker.observe(5, &leader, AbsenceReason::NoBlock, set.quorum, false, set.quorum, 0);
         // A later view that omits the leader must not reopen the skip.
-        tracker.observe_round(5, &leader, set.quorum, false, set.quorum, 5_000);
+        tracker.observe(5, &leader, AbsenceReason::NoBlock, set.quorum, true, set.quorum, 5_000);
         assert_eq!(
-            tracker.sign_if_permitted(5, leader, 0, set.quorum, 10_000, &keys[1]),
+            tracker.sign_if_permitted(5, leader, AbsenceReason::NoBlock, 0, set.quorum, 10_000, &keys[1]),
             Err(SkipRefusal::AbsenteeBlockPresent)
         );
     }
@@ -1083,13 +1223,13 @@ mod tests {
         let (set, keys) = committee(4);
         let mut tracker = tracker(&set);
         let leader = keys[0].address();
-        tracker.observe_round(5, &leader, set.quorum, false, set.quorum, 1_000);
+        tracker.observe(5, &leader, AbsenceReason::NoBlock, set.quorum, true, set.quorum, 1_000);
         assert_eq!(
-            tracker.sign_if_permitted(5, leader, 0, set.quorum, 1_500, &keys[1]),
+            tracker.sign_if_permitted(5, leader, AbsenceReason::NoBlock, 0, set.quorum, 1_500, &keys[1]),
             Err(SkipRefusal::WithinGrace)
         );
         let vote = tracker
-            .sign_if_permitted(5, leader, 0, set.quorum, 1_000 + DEFAULT_SKIP_GRACE_MS, &keys[1])
+            .sign_if_permitted(5, leader, AbsenceReason::NoBlock, 0, set.quorum, 1_000 + DEFAULT_SKIP_GRACE_MS, &keys[1])
             .expect("grace elapsed");
         assert_eq!(vote.round, 5);
         assert_eq!(vote.absentee, leader);
@@ -1101,26 +1241,115 @@ mod tests {
         let mut tracker = tracker(&set);
         let leader = keys[0].address();
         tracker.note_committed_leader_round(5);
-        tracker.observe_round(5, &leader, set.quorum, false, set.quorum, 0);
+        tracker.observe(5, &leader, AbsenceReason::NoBlock, set.quorum, true, set.quorum, 0);
         assert_eq!(
-            tracker.sign_if_permitted(5, leader, 0, set.quorum, 100_000, &keys[1]),
+            tracker.sign_if_permitted(5, leader, AbsenceReason::NoBlock, 0, set.quorum, 100_000, &keys[1]),
             Err(SkipRefusal::AlreadyCommitted)
         );
     }
 
     #[test]
-    fn s4_a_second_skip_naming_a_different_leader_is_refused() {
+    fn two_members_of_one_round_can_both_be_attested() {
+        // More than one member of a round can legitimately be absent, so an
+        // attestation about one must not block an attestation about another.
+        // What is refused is contradicting YOURSELF about the same member.
+        let (set, keys) = committee(4);
+        let mut tracker = tracker(&set);
+        let first = keys[0].address();
+        let second = keys[2].address();
+        tracker.observe(5, &first, AbsenceReason::NoBlock, set.quorum, true, set.quorum, 0);
+        tracker.observe(5, &second, AbsenceReason::NoBlock, set.quorum, true, set.quorum, 0);
+        tracker
+            .sign_if_permitted(5, first, AbsenceReason::NoBlock, 0, set.quorum, 100_000, &keys[1])
+            .expect("first attestation");
+        tracker
+            .sign_if_permitted(5, second, AbsenceReason::NoBlock, 0, set.quorum, 100_000, &keys[1])
+            .expect("a different member of the same round");
+        assert!(tracker.refuses(5, &first));
+        assert!(tracker.refuses(5, &second));
+        // And a member that was never attested is not refused.
+        assert!(!tracker.refuses(5, &keys[3].address()));
+    }
+
+    #[test]
+    fn a_no_support_attestation_is_about_a_block_that_exists() {
+        // NoQuorumSupport is the other half of the protocol: the block is
+        // present, but the rounds that could certify it are quorum-complete and
+        // it never reaches quorum support. Seeing the block must NOT rule this
+        // out, and support appearing must.
         let (set, keys) = committee(4);
         let mut tracker = tracker(&set);
         let leader = keys[0].address();
-        tracker.observe_round(5, &leader, set.quorum, false, set.quorum, 0);
-        tracker
-            .sign_if_permitted(5, leader, 0, set.quorum, 100_000, &keys[1])
-            .expect("first skip");
-        assert_eq!(
-            tracker.sign_if_permitted(5, keys[2].address(), 0, set.quorum, 100_000, &keys[1]),
-            Err(SkipRefusal::ConflictingSkip)
+        tracker.observe(
+            5,
+            &leader,
+            AbsenceReason::NoQuorumSupport,
+            set.quorum,
+            true,
+            set.quorum,
+            0,
         );
+        let vote = tracker
+            .sign_if_permitted(
+                5,
+                leader,
+                AbsenceReason::NoQuorumSupport,
+                0,
+                set.quorum,
+                100_000,
+                &keys[1],
+            )
+            .expect("no-support attestation");
+        assert_eq!(vote.reason, AbsenceReason::NoQuorumSupport);
+
+        // A second validator that DID observe support can never attest it.
+        let mut other = tracker_for(&set);
+        other.observe(
+            5,
+            &leader,
+            AbsenceReason::NoQuorumSupport,
+            set.quorum,
+            false,
+            set.quorum,
+            0,
+        );
+        assert_eq!(
+            other.sign_if_permitted(
+                5,
+                leader,
+                AbsenceReason::NoQuorumSupport,
+                0,
+                set.quorum,
+                100_000,
+                &keys[2],
+            ),
+            Err(SkipRefusal::AbsenteeBlockPresent)
+        );
+    }
+
+    #[test]
+    fn the_two_reasons_produce_different_transcripts() {
+        let (set, keys) = committee(4);
+        let set_hash = validator_set_hash(&set);
+        let a = skip_vote_transcript(
+            &domain(),
+            &set_hash,
+            3,
+            &keys[0].address(),
+            &keys[1].address(),
+            AbsenceReason::NoBlock,
+            set.quorum,
+        );
+        let b = skip_vote_transcript(
+            &domain(),
+            &set_hash,
+            3,
+            &keys[0].address(),
+            &keys[1].address(),
+            AbsenceReason::NoQuorumSupport,
+            set.quorum,
+        );
+        assert_ne!(a, b, "the reason must be bound into the signature");
     }
 
     #[test]
@@ -1128,9 +1357,9 @@ mod tests {
         let (set, keys) = committee(4);
         let mut tracker = tracker(&set);
         let leader = keys[0].address();
-        tracker.observe_round(5, &leader, set.quorum, false, set.quorum, 0);
+        tracker.observe(5, &leader, AbsenceReason::NoBlock, set.quorum, true, set.quorum, 0);
         tracker
-            .sign_if_permitted(5, leader, 0, set.quorum, 100_000, &keys[1])
+            .sign_if_permitted(5, leader, AbsenceReason::NoBlock, 0, set.quorum, 100_000, &keys[1])
             .expect("skip");
         assert!(tracker.refuses(5, &leader));
 
@@ -1153,16 +1382,20 @@ mod tests {
         let leader = keys[0].address();
         let votes = skip_votes(&set, &keys, 11, leader, 3);
         let certificate =
-            SkipCertificate::new(domain(), validator_set_hash(&set), 11, leader, votes);
+            SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            11,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
         certificate.verify(&domain(), &set).expect("valid");
         tracker.adopt_certificate(&certificate);
         assert!(tracker.refuses(11, &leader));
-        // And having adopted it, this validator can no longer commit that round
-        // by signing a conflicting skip for a different leader.
-        assert_eq!(
-            tracker.sign_if_permitted(11, keys[2].address(), 0, set.quorum, 100_000, &keys[1]),
-            Err(SkipRefusal::ConflictingSkip)
-        );
+        // The refusal is specific to the member the certificate names.
+        assert!(!tracker.refuses(11, &keys[2].address()));
+        assert!(!tracker.refuses(12, &leader));
     }
 
     // ── collectors ──────────────────────────────────────────────────────────

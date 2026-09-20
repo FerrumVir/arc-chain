@@ -7520,6 +7520,27 @@ async fn run_arc_node() -> Result<()> {
             &peer_vals,
             validator_keypair.clone(),
         );
+        // Anti-equivocation decisions live next to the node's other durable
+        // state. Without a home for them this validator refuses to sign
+        // absence or finality transcripts at all, which is the safe default.
+        consensus.signing_record_path =
+            Some(Path::new(&data_dir).join("consensus-signing-record.bin"));
+        // Absence and finality transcripts need domain separation on EVERY
+        // chain, not only one with a recovery context. A from-genesis chain
+        // binds them to its own genesis identity and frozen validator epoch;
+        // a recovery chain re-binds them to its recovery domain below, and
+        // rebinding to a different domain is refused.
+        {
+            let epoch = consensus.engine.frozen_validator_set().epoch;
+            let certificate_domain =
+                arc_consensus::ConsensusDomain::new(genesis_hash, 0, epoch);
+            if let Err(error) = consensus
+                .engine
+                .install_certificate_domain(certificate_domain)
+            {
+                tracing::warn!(%error, "Could not bind the certificate domain");
+            }
+        }
         consensus.require_full_committee_at_genesis = cli.require_full_committee_at_genesis;
         if consensus.require_full_committee_at_genesis {
             tracing::warn!(

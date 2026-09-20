@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arc_consensus::view_change::{
-    ConsensusSigningRecord, DEFAULT_SKIP_GRACE_MS, FinalityCertificate, FinalityVote,
+    AbsenceReason, ConsensusSigningRecord, DEFAULT_SKIP_GRACE_MS, FinalityCertificate, FinalityVote,
     FinalityVoteCollector, SkipCertificate, SkipTracker, SkipVote, SkipVoteCollector,
     validator_set_hash,
 };
@@ -30,6 +30,8 @@ use arc_types::Address;
 const GRACE: u64 = DEFAULT_SKIP_GRACE_MS;
 /// Simulated milliseconds per tick. Two ticks clear the grace period.
 const TICK_MS: u64 = GRACE;
+/// How many of its own recent blocks each node re-gossips per tick.
+const GOSSIP_REPEAT: usize = 6;
 
 fn domain() -> ConsensusDomain {
     ConsensusDomain::new(hash_bytes(b"arc.sim.domain.v1"), 1, 1)
@@ -72,6 +74,11 @@ struct Node {
     skipped: HashSet<u64>,
     /// Certificates this node holds and will gossip.
     held_certificates: Vec<SkipCertificate>,
+    /// This node's own recent blocks, re-gossiped each tick. A real transport
+    /// re-sends on reconnect and peers re-request; without modelling that, a
+    /// node that was down for one tick would never learn a block at all, and
+    /// the scenario would be testing the simulation rather than the protocol.
+    own_blocks: Vec<DagBlock>,
     finality: BTreeMap<u64, FinalityCertificate>,
     /// Set to false to model a crashed or partitioned-away node.
     online: bool,
@@ -101,6 +108,7 @@ impl Node {
             committed: BTreeMap::new(),
             skipped: HashSet::new(),
             held_certificates: Vec::new(),
+            own_blocks: Vec::new(),
             finality: BTreeMap::new(),
             online: true,
         }
@@ -120,8 +128,14 @@ impl Node {
             .expect("fresh engine binds its domain");
         // Re-apply the refusals the reloaded record carries, so a restarted
         // node cannot help certify a block it already voted to skip.
-        for (round, leader) in &record.skipped_rounds {
-            engine.note_refused_leader_block(*round, *leader);
+        for (round, members) in &record.skipped_rounds {
+            for (member, reason) in members {
+                engine.note_refused_leader_block(
+                    *round,
+                    *member,
+                    *reason == AbsenceReason::NoBlock,
+                );
+            }
         }
         self.engine = engine;
         self.tracker = SkipTracker::new(domain(), validator_set_hash(set), GRACE, record);
@@ -197,6 +211,13 @@ impl Sim {
             // Proposing for the node's own current round; the engine decides it.
             let timestamp = 1_000_000 + self.now_ms + index as u64;
             if let Ok(block) = self.nodes[index].engine.propose_block(vec![], timestamp) {
+                self.nodes[index].own_blocks.push(block.clone());
+                outbox.push((index, Msg::Block(block)));
+            }
+            // Gossip redundancy: re-send this node's recent blocks so a peer
+            // that was offline or slow can still receive them.
+            let recent = self.nodes[index].own_blocks.len().saturating_sub(GOSSIP_REPEAT);
+            for block in self.nodes[index].own_blocks[recent..].to_vec() {
                 outbox.push((index, Msg::Block(block)));
             }
         }
@@ -233,26 +254,95 @@ impl Sim {
                 // the certificate is what excuses one.
                 let members: Vec<Address> =
                     self.set.validators.iter().map(|v| v.address).collect();
-                for absentee in members {
-                    if self.nodes[index]
-                        .engine
-                        .has_skip_certificate(round, &absentee)
-                    {
+                for member in members {
+                    if self.nodes[index].engine.has_skip_certificate(round, &member) {
                         continue;
                     }
-                    let seen = seen_authors.contains(&absentee);
-                    self.nodes[index]
-                        .tracker
-                        .observe_round(round, &absentee, stake, seen, quorum, now);
+                    let seen = seen_authors.contains(&member);
                     let keypair = self.nodes[index].keypair.clone();
+                    // (a) the member produced nothing this round
+                    self.nodes[index].tracker.observe(
+                        round,
+                        &member,
+                        AbsenceReason::NoBlock,
+                        stake,
+                        !seen,
+                        quorum,
+                        now,
+                    );
                     if let Ok(vote) = self.nodes[index].tracker.sign_if_permitted(
-                        round, absentee, cursor, quorum, now, &keypair,
+                        round,
+                        member,
+                        AbsenceReason::NoBlock,
+                        cursor,
+                        quorum,
+                        now,
+                        &keypair,
                     ) {
                         // S5: the decision is already in the record; a real node
                         // fsyncs it here, before the vote leaves the process.
                         self.nodes[index]
                             .engine
-                            .note_refused_leader_block(round, absentee);
+                            .note_refused_leader_block(round, member, true);
+                        outbox.push((index, Msg::Skip(vote)));
+                        continue;
+                    }
+                    // (b) the LEADER's block exists but cannot be certified.
+                    // Only the leader matters here: no other member's block
+                    // moves the commit cursor.
+                    if !seen || member != leader_for_round(&self.set, round) {
+                        continue;
+                    }
+                    let hashes = self.nodes[index].engine.blocks_in_round(round);
+                    let Some(block_hash) = hashes.iter().copied().find(|hash| {
+                        self.nodes[index]
+                            .engine
+                            .get_block(hash)
+                            .map(|block| block.author == member)
+                            .unwrap_or(false)
+                    }) else {
+                        continue;
+                    };
+                    // The two later rounds must be quorum-complete before an
+                    // absent certificate can be concluded from their contents.
+                    let later_complete = [round + 1, round + 2].iter().all(|later| {
+                        let mut authors = HashSet::new();
+                        let mut later_stake = 0u64;
+                        for hash in self.nodes[index].engine.blocks_in_round(*later) {
+                            if let Some(block) = self.nodes[index].engine.get_block(&hash)
+                                && authors.insert(block.author)
+                                && let Some(validator) = self.set.get_validator(&block.author)
+                            {
+                                later_stake += validator.stake;
+                            }
+                        }
+                        later_stake >= quorum
+                    });
+                    let unsupported = self.nodes[index]
+                        .engine
+                        .leader_commit_support(&block_hash, round)
+                        .is_none();
+                    self.nodes[index].tracker.observe(
+                        round,
+                        &member,
+                        AbsenceReason::NoQuorumSupport,
+                        if later_complete { stake } else { 0 },
+                        unsupported,
+                        quorum,
+                        now,
+                    );
+                    if let Ok(vote) = self.nodes[index].tracker.sign_if_permitted(
+                        round,
+                        member,
+                        AbsenceReason::NoQuorumSupport,
+                        cursor,
+                        quorum,
+                        now,
+                        &keypair,
+                    ) {
+                        self.nodes[index]
+                            .engine
+                            .note_refused_leader_block(round, member, false);
                         outbox.push((index, Msg::Skip(vote)));
                     }
                 }
@@ -570,8 +660,16 @@ fn an_equivocating_skip_voter_cannot_forge_a_certificate() {
 
     let mut collector = SkipVoteCollector::new();
     for _ in 0..10 {
-        let vote =
-            SkipVote::sign(domain(), set_hash, 5, fake_leader, set.quorum, liar).unwrap();
+        let vote = SkipVote::sign(
+            domain(),
+            set_hash,
+            5,
+            fake_leader,
+            AbsenceReason::NoBlock,
+            set.quorum,
+            liar,
+        )
+        .unwrap();
         let outcome = collector.add(vote, &domain(), &set).unwrap();
         assert!(
             outcome.is_none(),
@@ -582,8 +680,16 @@ fn an_equivocating_skip_voter_cannot_forge_a_certificate() {
     // Two honest voters plus the liar's vote for a DIFFERENT leader must not
     // combine: the collector keys by (round, leader), so they never mix.
     for key in keys.iter().take(2) {
-        let vote =
-            SkipVote::sign(domain(), set_hash, 5, real_leader, set.quorum, key).unwrap();
+        let vote = SkipVote::sign(
+            domain(),
+            set_hash,
+            5,
+            real_leader,
+            AbsenceReason::NoBlock,
+            set.quorum,
+            key,
+        )
+        .unwrap();
         assert!(collector.add(vote, &domain(), &set).unwrap().is_none());
     }
 }
@@ -603,6 +709,7 @@ fn a_stale_certificate_from_another_committee_is_rejected_by_every_node() {
                 validator_set_hash(&other_set),
                 2,
                 leader,
+                AbsenceReason::NoBlock,
                 other_set.quorum,
                 key,
             )
@@ -610,7 +717,14 @@ fn a_stale_certificate_from_another_committee_is_rejected_by_every_node() {
         })
         .collect();
     let forged =
-        SkipCertificate::new(domain(), validator_set_hash(&other_set), 2, leader, votes);
+        SkipCertificate::new(
+            domain(),
+            validator_set_hash(&other_set),
+            2,
+            leader,
+            AbsenceReason::NoBlock,
+            votes,
+        );
     for node in &mut sim.nodes {
         assert!(
             node.engine.register_skip_certificate(forged.clone()).is_err(),
@@ -644,7 +758,7 @@ fn a_restarted_node_keeps_its_refusals_and_rejoins_without_conflicting() {
         .record()
         .skipped_rounds
         .iter()
-        .map(|(round, leader)| (*round, *leader))
+        .flat_map(|(round, members)| members.keys().map(move |member| (*round, *member)))
         .collect();
     assert!(
         !refusals_before.is_empty(),
@@ -763,5 +877,78 @@ fn diagnostic_silent_leader_trace() {
             })
             .collect();
         eprintln!("tick {tick}: {}", states.join(" "));
+    }
+}
+
+#[test]
+fn a_staggered_start_still_commits() {
+    // Real nodes do not start at the same instant: the fixture starts node i
+    // after node i-1 so that simultaneous mutual dialling cannot deadlock
+    // (defect D1). That makes the first few rounds ragged - a leader's block
+    // exists but only a minority of the next round references it - which is a
+    // different situation from an absent leader and is NOT covered by an
+    // absence certificate. This asserts the chain still reaches a commit.
+    for n in [4usize, 6] {
+        let mut sim = Sim::new(n);
+        for started in 1..=n {
+            let offline: HashSet<usize> = (started..n).collect();
+            sim.run(
+                2,
+                &Faults {
+                    offline,
+                    ..Default::default()
+                },
+            );
+        }
+        sim.run(40, &Faults::default());
+        sim.assert_safety("staggered start");
+        let cursors = sim.cursors();
+        assert!(
+            cursors.iter().all(|cursor| *cursor > 0),
+            "n={n}: a staggered start never reached a commit: {cursors:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "diagnostic: staggered-start commit state"]
+fn diagnostic_staggered_trace() {
+    let n = 4usize;
+    let mut sim = Sim::new(n);
+    for started in 1..=n {
+        let offline: HashSet<usize> = (started..n).collect();
+        sim.run(2, &Faults { offline, ..Default::default() });
+    }
+    sim.run(20, &Faults::default());
+    for (i, node) in sim.nodes.iter().enumerate() {
+        let r = node.engine.current_round();
+        let c = node.engine.last_committed_round();
+        let counts: Vec<usize> = (0..4).map(|k| node.engine.blocks_in_round(k).len()).collect();
+        eprintln!("n{i}: round={r} cursor={c} blocks(0..4)={counts:?} certs={}", node.tracker.record().skipped_rounds.len());
+    }
+    let node = &sim.nodes[0];
+    for round in 0..4u64 {
+        let leader = leader_for_round(&sim.set, round);
+        let hashes = node.engine.blocks_in_round(round);
+        let leader_block = hashes.iter().copied().find(|h| {
+            node.engine.get_block(h).map(|b| b.author == leader).unwrap_or(false)
+        });
+        match leader_block {
+            Some(hash) => {
+                let support = node.engine.leader_commit_support(&hash, round);
+                let parents_of_next: Vec<usize> = node
+                    .engine
+                    .blocks_in_round(round + 1)
+                    .iter()
+                    .filter_map(|h| node.engine.get_block(h))
+                    .map(|b| b.parents.len())
+                    .collect();
+                eprintln!(
+                    "round {round}: leader block present, support={support:?} quorum={} next-round parent counts={parents_of_next:?}",
+                    sim.set.quorum
+                );
+            }
+            None => eprintln!("round {round}: leader block ABSENT"),
+        }
     }
 }

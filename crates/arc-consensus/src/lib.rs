@@ -745,14 +745,28 @@ pub struct ConsensusEngine {
     /// and only non-zero round allowed to start without legacy DAG parents.
     /// Ordinary parent rules apply to every later round; retaining this value
     /// also permits strict replay of late bootstrap-round blocks after restart.
+    /// Domain that absence and finality transcripts are signed under.
+    ///
+    /// Separate from `consensus_domain` on purpose. `consensus_domain` is the
+    /// protocol-v3 RECOVERY domain, and its presence also switches on the
+    /// all-validator participation guard. Certificates need domain separation
+    /// on every chain, including a plain from-genesis one that has no recovery
+    /// context, so they carry their own binding.
+    certificate_domain: RwLock<Option<ConsensusDomain>>,
     /// Verified round-skip certificates, by round. A round with a certificate
     /// may be passed by the commit cursor without committing its leader; see
     /// `view_change` for why that is safe.
     skip_certificates: DashMap<(u64, Address), view_change::SkipCertificate>,
-    /// `(round, leader)` pairs this node has permanently refused, either by
-    /// signing a skip itself or by adopting a peer's certificate. A refused
-    /// block is never used as a parent and never counted in commit support.
+    /// `(round, member)` pairs this node has permanently refused, either by
+    /// attesting itself or by adopting a peer's certificate. A refused block is
+    /// never used as a parent and never counted in commit support.
     refused_leader_blocks: DashMap<(u64, Address), ()>,
+    /// `(round, member)` pairs excused from the recovery domain's
+    /// full-participation requirement. Only a `NoBlock` certificate lands here:
+    /// a `NoQuorumSupport` certificate is about a block that EXISTS, so
+    /// excusing its author from participation would weaken the guard for no
+    /// reason.
+    excused_participation: DashMap<(u64, Address), ()>,
     /// Verified committed-block finality certificates, by height.
     finality_certificates: DashMap<u64, view_change::FinalityCertificate>,
     recovery_bootstrap_round: RwLock<Option<u64>>,
@@ -808,8 +822,10 @@ impl ConsensusEngine {
             node_role: NodeRole::Full,
             testnet_mode: false,
             consensus_domain: RwLock::new(None),
+            certificate_domain: RwLock::new(None),
             skip_certificates: DashMap::new(),
             refused_leader_blocks: DashMap::new(),
+            excused_participation: DashMap::new(),
             finality_certificates: DashMap::new(),
             recovery_bootstrap_round: RwLock::new(None),
             local_recovery_boundary_round: RwLock::new(None),
@@ -854,8 +870,10 @@ impl ConsensusEngine {
             node_role: NodeRole::Full,
             testnet_mode: false,
             consensus_domain: RwLock::new(None),
+            certificate_domain: RwLock::new(None),
             skip_certificates: DashMap::new(),
             refused_leader_blocks: DashMap::new(),
+            excused_participation: DashMap::new(),
             finality_certificates: DashMap::new(),
             recovery_bootstrap_round: RwLock::new(None),
             local_recovery_boundary_round: RwLock::new(None),
@@ -909,6 +927,7 @@ impl ConsensusEngine {
                 "consensus recovery domain is already bound to another epoch/set".into(),
             ));
         }
+        let _ = self.install_certificate_domain(domain);
         if !self.dag.is_empty()
             || self.current_round.load(Ordering::SeqCst) != 0
             || self.last_committed_round.load(Ordering::SeqCst) != 0
@@ -1049,10 +1068,12 @@ impl ConsensusEngine {
         self.recovery_bootstrap_round.read().as_ref() == Some(&round)
     }
 
-    /// Recovery-domain v3 deliberately pauses unless every fixed positive-
-    /// stake validator has contributed to the round. Until ARC has a signed
-    /// skip/view-change certificate, advancing on a quorum can permanently
-    /// skip the deterministic leader of an offline validator's round.
+    /// Recovery-domain v3 pauses unless every fixed positive-stake validator
+    /// has contributed to the round, EXCEPT where an authenticated absence
+    /// certificate excuses one for that round (`is_excused_for_round`). The
+    /// certificate is the signed replacement this guard was waiting for:
+    /// advancing on a bare quorum could permanently skip an offline
+    /// validator's leader round, advancing on a certificate cannot.
     pub fn requires_full_round_participation(&self) -> bool {
         self.consensus_domain.read().is_some()
     }
@@ -1899,8 +1920,7 @@ impl ConsensusEngine {
         certificate: view_change::SkipCertificate,
     ) -> Result<u64, view_change::CertificateError> {
         let domain = self
-            .consensus_domain
-            .read()
+            .certificate_domain()
             .ok_or(view_change::CertificateError::WrongValidatorSet)?;
         let signing = {
             let vs = self.frozen_validator_set.read();
@@ -1909,6 +1929,9 @@ impl ConsensusEngine {
         let round = certificate.round;
         let absentee = certificate.absentee;
         self.refused_leader_blocks.insert((round, absentee), ());
+        if certificate.reason == view_change::AbsenceReason::NoBlock {
+            self.excused_participation.insert((round, absentee), ());
+        }
         self.skip_certificates.insert((round, absentee), certificate);
         info!(
             round,
@@ -1926,7 +1949,39 @@ impl ConsensusEngine {
     /// not certified as absent, and the certificate is what makes "absent"
     /// something a node proves rather than assumes.
     fn is_excused_for_round(&self, round: u64, address: &Address) -> bool {
-        self.refused_leader_blocks.contains_key(&(round, *address))
+        self.excused_participation.contains_key(&(round, *address))
+    }
+
+    /// Bind the domain that absence and finality transcripts are signed under.
+    ///
+    /// Idempotent for the same domain; rebinding to a different one is refused,
+    /// because the signatures already emitted would become ambiguous.
+    pub fn install_certificate_domain(&self, domain: ConsensusDomain) -> Result<(), ConsensusError> {
+        let mut active = self.certificate_domain.write();
+        match active.as_ref() {
+            Some(existing) if existing == &domain => Ok(()),
+            Some(_) => Err(ConsensusError::InvalidBlock(
+                "certificate domain is already bound to another chain/epoch".into(),
+            )),
+            None => {
+                *active = Some(domain);
+                Ok(())
+            }
+        }
+    }
+
+    /// The domain absence and finality certificates are bound to.
+    pub fn certificate_domain(&self) -> Option<ConsensusDomain> {
+        *self.certificate_domain.read()
+    }
+
+    /// This validator's signing key, when the engine was built with one.
+    ///
+    /// Exposed so the node's absence/finality signing path can use exactly the
+    /// key that signs this engine's blocks; a second key would make the two
+    /// identities diverge.
+    pub fn local_keypair(&self) -> Option<&KeyPair> {
+        self.local_keypair.as_ref()
     }
 
     /// True when a verified absence certificate covers this member in this
@@ -1950,9 +2005,28 @@ impl ConsensusEngine {
         self.refused_leader_blocks.contains_key(&(round, *author))
     }
 
-    /// Record a refusal taken locally (this node signed the skip vote itself).
-    pub fn note_refused_leader_block(&self, round: u64, leader: Address) {
-        self.refused_leader_blocks.insert((round, leader), ());
+    /// Record a refusal taken locally (this node signed the attestation).
+    ///
+    /// `excuse_participation` must be true only for a `NoBlock` attestation.
+    pub fn note_refused_leader_block(
+        &self,
+        round: u64,
+        member: Address,
+        excuse_participation: bool,
+    ) {
+        self.refused_leader_blocks.insert((round, member), ());
+        if excuse_participation {
+            self.excused_participation.insert((round, member), ());
+        }
+    }
+
+    /// Commit support for a specific block at a round, as the two-round rule
+    /// computes it. `None` means no child of it reaches quorum support in this
+    /// node's view, which is the observation a `NoQuorumSupport` attestation is
+    /// made from.
+    pub fn leader_commit_support(&self, block_hash: &Hash256, round: u64) -> Option<u64> {
+        let vs = self.frozen_validator_set.read();
+        self.two_round_commit_support(block_hash, round, &vs)
     }
 
     /// Verify and store a committed-block finality certificate.
@@ -1961,8 +2035,7 @@ impl ConsensusEngine {
         certificate: view_change::FinalityCertificate,
     ) -> Result<u64, view_change::CertificateError> {
         let domain = self
-            .consensus_domain
-            .read()
+            .certificate_domain()
             .ok_or(view_change::CertificateError::WrongValidatorSet)?;
         let signing = {
             let vs = self.frozen_validator_set.read();
@@ -2859,19 +2932,60 @@ impl ConsensusEngine {
 
     // ── A8: Finality Proof Generation ───────────────────────────────────────
 
-    /// Finality-proof export is fail-closed until validators sign a canonical,
-    /// domain-separated finality transcript for the committed block.
+    /// Export a finality proof for a committed block, if a verified
+    /// certificate over that exact block exists.
     ///
-    /// Existing round-R+2 block signatures authorize each D block's own hash;
-    /// relabeling those bytes as signatures over B would be invalid. Commit
-    /// support remains internal to DAG consensus and this method returns
-    /// `None` until the dedicated signing protocol is implemented.
+    /// The signatures are over the dedicated, domain-separated finality
+    /// transcript (`view_change::FINALITY_VOTE_DOMAIN`), never re-labelled DAG
+    /// block signatures: a DAG signature authorises its own block's hash, and
+    /// presenting those bytes as evidence about another block would be
+    /// invalid. A caller holding only the frozen committee can re-verify the
+    /// underlying certificate with
+    /// [`view_change::FinalityCertificate::verify`]; this projection exists for
+    /// the existing light-client shape and carries the same signatures.
     pub fn generate_finality_proof(
         &self,
-        _block_hash: &Hash256,
-        _height: u64,
+        block_hash: &Hash256,
+        height: u64,
     ) -> Option<FinalityProof> {
-        None
+        let certificate = self.finality_certificates.get(&height)?;
+        let certificate = certificate.value();
+        if &certificate.block_hash != block_hash {
+            return None;
+        }
+        let vs = self.frozen_validator_set.read();
+        let mut quorum_signatures = Vec::with_capacity(certificate.votes.len());
+        let mut signing_stake = 0u64;
+        for vote in &certificate.votes {
+            let Some(validator) = vs.get_validator(&vote.voter) else {
+                return None;
+            };
+            // Re-verify at export: a stored certificate is not a licence to
+            // publish signatures nobody checked on the way out.
+            if vote
+                .signature
+                .verify(&vote.transcript(), &vote.voter)
+                .is_err()
+            {
+                return None;
+            }
+            signing_stake = signing_stake.checked_add(validator.stake)?;
+            quorum_signatures.push((
+                vote.voter,
+                bincode::serialize(&vote.signature).ok()?,
+            ));
+        }
+        if signing_stake < vs.quorum {
+            return None;
+        }
+        Some(FinalityProof {
+            block_hash: *block_hash,
+            round: height,
+            height,
+            quorum_signatures,
+            signing_stake,
+            total_stake: vs.total_stake,
+        })
     }
 
     /// Get a stored finality proof by block hash.

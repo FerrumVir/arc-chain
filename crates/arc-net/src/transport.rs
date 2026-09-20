@@ -162,6 +162,27 @@ pub enum InboundMessage {
         current_round: u64,
         last_committed_round: u64,
     },
+    /// A peer's absence attestation. Self-authenticating; `source` is recorded
+    /// for diagnostics only and is never the authorisation boundary.
+    ConsensusAbsenceVote {
+        source: Hash256,
+        vote: arc_consensus::view_change::SkipVote,
+    },
+    /// A peer's complete absence certificate.
+    ConsensusAbsenceCertificate {
+        source: Hash256,
+        certificate: arc_consensus::view_change::SkipCertificate,
+    },
+    /// A peer's finality attestation over a committed block.
+    ConsensusFinalityVote {
+        source: Hash256,
+        vote: arc_consensus::view_change::FinalityVote,
+    },
+    /// A peer's complete finality certificate.
+    ConsensusFinalityCertificate {
+        source: Hash256,
+        certificate: arc_consensus::view_change::FinalityCertificate,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -172,6 +193,14 @@ pub enum OutboundMessage {
         transactions: Vec<Transaction>,
     },
     BroadcastTransactions(Vec<Vec<u8>>),
+    /// Gossip this node's absence attestation to every peer.
+    BroadcastAbsenceVote(arc_consensus::view_change::SkipVote),
+    /// Gossip a complete absence certificate to every peer.
+    BroadcastAbsenceCertificate(arc_consensus::view_change::SkipCertificate),
+    /// Gossip this node's finality attestation to every peer.
+    BroadcastFinalityVote(arc_consensus::view_change::FinalityVote),
+    /// Gossip a complete finality certificate to every peer.
+    BroadcastFinalityCertificate(arc_consensus::view_change::FinalityCertificate),
     /// Broadcast a state diff (Propose-Verify protocol).
     BroadcastStateDiff {
         block_hash: Hash256,
@@ -1403,6 +1432,40 @@ async fn run_transport_inner(
                             .await;
                     }
                 }
+                OutboundMessage::BroadcastAbsenceVote(vote) => {
+                    let payload = crate::protocol::ConsensusAbsenceVoteMessage { vote };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::ConsensusAbsenceVote, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::BroadcastAbsenceCertificate(certificate) => {
+                    let payload =
+                        crate::protocol::ConsensusAbsenceCertificateMessage { certificate };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::ConsensusAbsenceCertificate, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::BroadcastFinalityVote(vote) => {
+                    let payload = crate::protocol::ConsensusFinalityVoteMessage { vote };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::ConsensusFinalityVote, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::BroadcastFinalityCertificate(certificate) => {
+                    let payload =
+                        crate::protocol::ConsensusFinalityCertificateMessage { certificate };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::ConsensusFinalityCertificate, &bytes)
+                            .await;
+                    }
+                }
                 OutboundMessage::BroadcastTransactions(txs) => {
                     for batch in txs.chunks(crate::MAX_TX_PER_GOSSIP) {
                         let payload = crate::protocol::TxGossipMessage {
@@ -2545,6 +2608,66 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => warn!("Bad ShardAnnounce from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::ConsensusAbsenceVote => {
+                match deserialize_message::<crate::protocol::ConsensusAbsenceVoteMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::ConsensusAbsenceVote {
+                                source: peer_address,
+                                vote: msg.vote,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad ConsensusAbsenceVote from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::ConsensusAbsenceCertificate => {
+                match deserialize_message::<crate::protocol::ConsensusAbsenceCertificateMessage>(
+                    &data,
+                ) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::ConsensusAbsenceCertificate {
+                                source: peer_address,
+                                certificate: msg.certificate,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("Bad ConsensusAbsenceCertificate from {}: {}", peer_address, e)
+                    }
+                }
+            }
+            MessageType::ConsensusFinalityVote => {
+                match deserialize_message::<crate::protocol::ConsensusFinalityVoteMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::ConsensusFinalityVote {
+                                source: peer_address,
+                                vote: msg.vote,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad ConsensusFinalityVote from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::ConsensusFinalityCertificate => {
+                match deserialize_message::<crate::protocol::ConsensusFinalityCertificateMessage>(
+                    &data,
+                ) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::ConsensusFinalityCertificate {
+                                source: peer_address,
+                                certificate: msg.certificate,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("Bad ConsensusFinalityCertificate from {}: {}", peer_address, e)
+                    }
                 }
             }
             MessageType::RoundSyncRequest => {

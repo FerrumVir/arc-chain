@@ -456,6 +456,11 @@ fn should_execute_local_benchmark(
 }
 
 /// Orchestrates DAG consensus for a single validator node.
+/// How many rounds back the absence scan looks each tick. The cursor only
+/// falls behind when it is stuck, which is exactly when the scan is needed, but
+/// the work still has to be bounded.
+const ABSENCE_SCAN_ROUNDS: u64 = 64;
+
 pub struct ConsensusManager {
     /// The underlying DAG consensus engine.
     pub engine: Arc<ConsensusEngine>,
@@ -503,6 +508,12 @@ pub struct ConsensusManager {
     /// Strictly verified transaction bodies restored from the bound recovery
     /// DAG WAL before the live loop starts.
     recovered_preimages: Vec<arc_types::Transaction>,
+    /// Where this validator's anti-equivocation record lives. Absence and
+    /// finality decisions are fsynced here BEFORE the signature leaves the
+    /// process; forgetting one is exactly the equivocation the protocol is
+    /// built to prevent, so a record that exists but cannot be read is a hard
+    /// startup failure rather than a fresh start.
+    pub signing_record_path: Option<std::path::PathBuf>,
     /// DEVELOPMENT/TEST START BARRIER, default off.
     ///
     /// While this node is still at round 0, wait for EVERY genesis validator
@@ -577,6 +588,7 @@ impl ConsensusManager {
             ),
             stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()),
             recovered_preimages: Vec::new(),
+            signing_record_path: None,
             require_full_committee_at_genesis: false,
         }
     }
@@ -631,6 +643,7 @@ impl ConsensusManager {
             ),
             stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()),
             recovered_preimages: Vec::new(),
+            signing_record_path: None,
             require_full_committee_at_genesis: false,
         }
     }
@@ -803,6 +816,111 @@ impl ConsensusManager {
         Some(ProposerSelector::new(vrf_validators))
     }
 
+    /// Verify a certificate, register it, inherit its refusal, and re-gossip.
+    ///
+    /// Returns false when the certificate does not verify; nothing is adopted
+    /// in that case.
+    fn adopt_absence_certificate(
+        &self,
+        certificate: &arc_consensus::view_change::SkipCertificate,
+        tracker: &mut Option<arc_consensus::view_change::SkipTracker>,
+        outbound: Option<&tokio::sync::mpsc::Sender<OutboundMessage>>,
+    ) -> bool {
+        if self
+            .engine
+            .register_skip_certificate(certificate.clone())
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(tracker) = tracker.as_mut() {
+            tracker.adopt_certificate(certificate);
+            // Adopting inherits the permanent refusal, so it must be durable
+            // before this node acts on it.
+            let _ = self.persist_signing_record(tracker.record());
+        }
+        if let Some(tx_chan) = outbound {
+            let _ = tx_chan.try_send(OutboundMessage::BroadcastAbsenceCertificate(
+                certificate.clone(),
+            ));
+        }
+        true
+    }
+
+    /// Load this validator's durable anti-equivocation record.
+    ///
+    /// A missing file is a first run. A file that exists but will not parse is
+    /// fatal: continuing would mean signing without knowing what this key has
+    /// already promised.
+    pub fn load_signing_record(&self) -> arc_consensus::view_change::ConsensusSigningRecord {
+        let Some(path) = self.signing_record_path.as_ref() else {
+            return Default::default();
+        };
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                match arc_consensus::view_change::ConsensusSigningRecord::decode(&bytes) {
+                    Ok(record) => {
+                        info!(
+                            path = %path.display(),
+                            absences = record.skipped_rounds.len(),
+                            finality = record.finality_votes.len(),
+                            "Loaded consensus anti-equivocation record"
+                        );
+                        record
+                    }
+                    Err(error) => panic!(
+                        "consensus signing record at {} is unreadable ({error}); refusing to \
+                         sign without knowing what this key already promised",
+                        path.display()
+                    ),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(error) => panic!(
+                "consensus signing record at {} could not be read ({error})",
+                path.display()
+            ),
+        }
+    }
+
+    /// Persist the record and fsync it. Returns false when the write failed, in
+    /// which case the caller must NOT emit the signature it was about to make.
+    pub fn persist_signing_record(
+        &self,
+        record: &arc_consensus::view_change::ConsensusSigningRecord,
+    ) -> bool {
+        let Some(path) = self.signing_record_path.as_ref() else {
+            // No durable home configured (legacy/dev): refuse to sign rather
+            // than sign something this node could forget.
+            return false;
+        };
+        let bytes = record.encode();
+        let temporary = path.with_extension("tmp");
+        let write = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            if let Some(parent) = path.parent() {
+                let dir = std::fs::File::open(parent)?;
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        })();
+        match write {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(
+                    path = %path.display(),
+                    %error,
+                    "Could not persist the consensus signing record; withholding the signature"
+                );
+                false
+            }
+        }
+    }
+
     /// Returns whether the validator set has more than one validator,
     /// meaning multi-validator DAG commit should be used instead of
     /// the single-validator fast path.
@@ -881,6 +999,19 @@ impl ConsensusManager {
             validators = self.engine.validator_set().len(),
             "Consensus loop started"
         );
+
+        // Authenticated absence / finality state. The tracker is created lazily
+        // because the recovery domain is installed after this manager is built.
+        let mut skip_tracker: Option<arc_consensus::view_change::SkipTracker> = None;
+        let mut skip_vote_collector = arc_consensus::view_change::SkipVoteCollector::new();
+        let mut finality_vote_collector = arc_consensus::view_change::FinalityVoteCollector::new();
+        let mut finality_signed_heights: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+
+        // Monotonic clock for the absence grace period. Wall-clock time never
+        // enters a transcript; this only paces how long a late block is waited
+        // for, and a wrong pace cannot make an unsafe skip safe.
+        let absence_clock = std::time::Instant::now();
 
         let can_produce = self.tier.can_produce_blocks();
         if !can_produce {
@@ -1029,6 +1160,22 @@ impl ConsensusManager {
             }
 
             // ── 0. Process inbound network messages ─────────────────────
+            // Certificate traffic is buffered rather than handled inline so the
+            // borrow of `inbound_rx` ends before it is verified and registered.
+            let mut inbound_absence_votes: Vec<(Hash256, arc_consensus::view_change::SkipVote)> =
+                Vec::new();
+            let mut inbound_absence_certificates: Vec<(
+                Hash256,
+                arc_consensus::view_change::SkipCertificate,
+            )> = Vec::new();
+            let mut inbound_finality_votes: Vec<(
+                Hash256,
+                arc_consensus::view_change::FinalityVote,
+            )> = Vec::new();
+            let mut inbound_finality_certificates: Vec<(
+                Hash256,
+                arc_consensus::view_change::FinalityCertificate,
+            )> = Vec::new();
             if let Some(ref mut rx) = inbound_rx {
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
@@ -1532,6 +1679,29 @@ impl ConsensusManager {
                                 "Received shard result"
                             );
                         }
+                        // ── Authenticated absence / finality certificates ──
+                        // These payloads carry their own signatures, consensus
+                        // domain and committee commitment, so the transport
+                        // identity that delivered them is never the
+                        // authorisation boundary. `source` is diagnostics only.
+                        InboundMessage::ConsensusAbsenceVote { source, vote } => {
+                            inbound_absence_votes.push((source, vote));
+                        }
+                        InboundMessage::ConsensusAbsenceCertificate {
+                            source,
+                            certificate,
+                        } => {
+                            inbound_absence_certificates.push((source, certificate));
+                        }
+                        InboundMessage::ConsensusFinalityVote { source, vote } => {
+                            inbound_finality_votes.push((source, vote));
+                        }
+                        InboundMessage::ConsensusFinalityCertificate {
+                            source,
+                            certificate,
+                        } => {
+                            inbound_finality_certificates.push((source, certificate));
+                        }
                         InboundMessage::ShardAnnounce {
                             model_id,
                             start_layer,
@@ -1552,6 +1722,276 @@ impl ConsensusManager {
                         }
                     }
                 }
+            }
+
+            // ── 0b. Absence and finality certificates ───────────────────
+            // Every one of these is verified against the frozen committee and
+            // the bound consensus domain before it can affect anything; an
+            // invalid one is dropped with a log and never retried.
+            for (source, vote) in inbound_absence_votes {
+                let Some(domain) = self.engine.certificate_domain() else {
+                    continue;
+                };
+                let set = self.engine.validator_set();
+                match skip_vote_collector.add(vote, &domain, &set) {
+                    Ok(Some(certificate)) => {
+                        if self.adopt_absence_certificate(
+                            &certificate,
+                            &mut skip_tracker,
+                            outbound_tx.as_ref(),
+                        ) {
+                            info!(
+                                round = certificate.round,
+                                absentee = %certificate.absentee,
+                                "Assembled an absence certificate from peer votes"
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        debug!(%source, ?error, "Rejected an absence vote");
+                    }
+                }
+            }
+            for (source, certificate) in inbound_absence_certificates {
+                if self.engine.has_skip_certificate(certificate.round, &certificate.absentee) {
+                    continue;
+                }
+                if !self.adopt_absence_certificate(
+                    &certificate,
+                    &mut skip_tracker,
+                    outbound_tx.as_ref(),
+                ) {
+                    debug!(%source, "Rejected a peer absence certificate");
+                }
+            }
+            for (source, vote) in inbound_finality_votes {
+                let Some(domain) = self.engine.certificate_domain() else {
+                    continue;
+                };
+                let set = self.engine.validator_set();
+                match finality_vote_collector.add(vote, &domain, &set) {
+                    Ok(Some(certificate)) => {
+                        let height = certificate.height;
+                        match self.engine.register_finality_certificate(certificate.clone()) {
+                            Ok(signing) => {
+                                info!(
+                                    height,
+                                    signing_stake = signing,
+                                    "Committed-block finality certificate assembled"
+                                );
+                                if let Some(ref tx_chan) = outbound_tx {
+                                    let _ = tx_chan.try_send(
+                                        OutboundMessage::BroadcastFinalityCertificate(certificate),
+                                    );
+                                }
+                            }
+                            Err(error) => debug!(?error, "Rejected a finality certificate"),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => debug!(%source, ?error, "Rejected a finality vote"),
+                }
+            }
+            for (source, certificate) in inbound_finality_certificates {
+                if self.engine.finality_certificate(certificate.height).is_some() {
+                    continue;
+                }
+                if let Err(error) = self.engine.register_finality_certificate(certificate) {
+                    debug!(%source, ?error, "Rejected a peer finality certificate");
+                }
+            }
+
+            // ── 0c. Decide and sign absence votes ───────────────────────
+            // A round that already carries a quorum of stake, but no block from
+            // some fixed member, is a round this node can attest about. The
+            // tracker enforces S1-S5; this only supplies observations and
+            // persists the decision before the signature leaves the process.
+            if self.is_multi_validator()
+                && let Some(domain) = self.engine.certificate_domain()
+                && let Some(keypair) = self.engine.local_keypair()
+            {
+                if skip_tracker.is_none() {
+                    let record = self.load_signing_record();
+                    // Re-apply every refusal the record carries before this
+                    // node can reference or count anything.
+                    for (round, members) in &record.skipped_rounds {
+                        for (member, reason) in members {
+                            // The reason decides the excusal, exactly as it did
+                            // when the attestation was first made.
+                            self.engine.note_refused_leader_block(
+                                *round,
+                                *member,
+                                *reason == arc_consensus::view_change::AbsenceReason::NoBlock,
+                            );
+                        }
+                    }
+                    skip_tracker = Some(arc_consensus::view_change::SkipTracker::new(
+                        domain,
+                        self.engine.frozen_validator_set_hash(),
+                        arc_consensus::view_change::DEFAULT_SKIP_GRACE_MS,
+                        record,
+                    ));
+                }
+                let tracker = skip_tracker.as_mut().expect("initialised just above");
+                let vs = self.engine.validator_set();
+                let cursor = self.engine.last_committed_round();
+                let now_ms = absence_clock.elapsed().as_millis() as u64;
+                let scan_round = self.engine.current_round();
+                // Bounded: only the rounds the cursor is actually waiting on,
+                // and never more than a fixed window of them.
+                let window_start = cursor.max(scan_round.saturating_sub(ABSENCE_SCAN_ROUNDS));
+                for round in window_start..=scan_round {
+                    let hashes = self.engine.blocks_in_round(round);
+                    let mut seen = std::collections::HashSet::new();
+                    let mut stake = 0u64;
+                    for hash in &hashes {
+                        if let Some(block) = self.engine.get_block(hash)
+                            && seen.insert(block.author)
+                            && let Some(validator) = vs.get_validator(&block.author)
+                        {
+                            stake = stake.saturating_add(validator.stake);
+                        }
+                    }
+                    if stake < vs.quorum {
+                        continue;
+                    }
+                    // The round's deterministic leader, whose block is the
+                    // only one that moves the commit cursor.
+                    let round_leader = {
+                        let mut addrs: Vec<Hash256> =
+                            vs.validators.iter().map(|v| v.address).collect();
+                        addrs.sort_by_key(|a| a.0);
+                        if addrs.is_empty() {
+                            None
+                        } else {
+                            Some(addrs[round as usize % addrs.len()])
+                        }
+                    };
+                    for validator in vs.validators.iter().filter(|v| v.stake > 0) {
+                        let member = validator.address;
+                        if self.engine.has_skip_certificate(round, &member) {
+                            continue;
+                        }
+                        let present = seen.contains(&member);
+                        // (a) the member produced no block in this round
+                        tracker.observe(
+                            round,
+                            &member,
+                            arc_consensus::view_change::AbsenceReason::NoBlock,
+                            stake,
+                            !present,
+                            vs.quorum,
+                            now_ms,
+                        );
+                        if let Ok(vote) = tracker.sign_if_permitted(
+                            round,
+                            member,
+                            arc_consensus::view_change::AbsenceReason::NoBlock,
+                            cursor,
+                            vs.quorum,
+                            now_ms,
+                            keypair,
+                        ) {
+                            // S5: durable BEFORE the signature is emitted.
+                            if !self.persist_signing_record(tracker.record()) {
+                                tracing::error!(
+                                    round,
+                                    %member,
+                                    "Withholding an absence vote: its decision is not durable"
+                                );
+                                continue;
+                            }
+                            self.engine.note_refused_leader_block(round, member, true);
+                            info!(
+                                round,
+                                %member,
+                                observed_round_stake = stake,
+                                "Signed an absence attestation (no block)"
+                            );
+                            if let Some(ref tx_chan) = outbound_tx {
+                                let _ =
+                                    tx_chan.try_send(OutboundMessage::BroadcastAbsenceVote(vote));
+                            }
+                            continue;
+                        }
+
+                        // (b) the leader's block exists but can never be
+                        // certified. Only the leader is worth attesting: no
+                        // other member's block moves the commit cursor.
+                        if !present || round_leader != Some(member) {
+                            continue;
+                        }
+                        let Some(block_hash) = hashes.iter().copied().find(|hash| {
+                            self.engine
+                                .get_block(hash)
+                                .map(|block| block.author == member)
+                                .unwrap_or(false)
+                        }) else {
+                            continue;
+                        };
+                        // Both later rounds must be quorum-complete before
+                        // "cannot be certified" is a conclusion rather than a
+                        // guess about blocks that have not arrived.
+                        let later_complete = [round + 1, round + 2].iter().all(|later| {
+                            let mut authors = std::collections::HashSet::new();
+                            let mut later_stake = 0u64;
+                            for hash in self.engine.blocks_in_round(*later) {
+                                if let Some(block) = self.engine.get_block(&hash)
+                                    && authors.insert(block.author)
+                                    && let Some(v) = vs.get_validator(&block.author)
+                                {
+                                    later_stake = later_stake.saturating_add(v.stake);
+                                }
+                            }
+                            later_stake >= vs.quorum
+                        });
+                        let unsupported = self
+                            .engine
+                            .leader_commit_support(&block_hash, round)
+                            .is_none();
+                        tracker.observe(
+                            round,
+                            &member,
+                            arc_consensus::view_change::AbsenceReason::NoQuorumSupport,
+                            if later_complete { stake } else { 0 },
+                            unsupported,
+                            vs.quorum,
+                            now_ms,
+                        );
+                        if let Ok(vote) = tracker.sign_if_permitted(
+                            round,
+                            member,
+                            arc_consensus::view_change::AbsenceReason::NoQuorumSupport,
+                            cursor,
+                            vs.quorum,
+                            now_ms,
+                            keypair,
+                        ) {
+                            if !self.persist_signing_record(tracker.record()) {
+                                tracing::error!(
+                                    round,
+                                    %member,
+                                    "Withholding a no-support vote: its decision is not durable"
+                                );
+                                continue;
+                            }
+                            // NOT excused from participation: the block exists.
+                            self.engine.note_refused_leader_block(round, member, false);
+                            info!(
+                                round,
+                                leader = %member,
+                                "Signed an absence attestation (leader block cannot be certified)"
+                            );
+                            if let Some(ref tx_chan) = outbound_tx {
+                                let _ =
+                                    tx_chan.try_send(OutboundMessage::BroadcastAbsenceVote(vote));
+                            }
+                        }
+                    }
+                }
+                tracker.prune_observations_below(cursor.saturating_sub(ABSENCE_SCAN_ROUNDS));
+                skip_vote_collector.prune_below(cursor.saturating_sub(ABSENCE_SCAN_ROUNDS));
             }
 
             // A PeerConnected event can discover backpressure while enqueueing
@@ -2316,6 +2756,86 @@ impl ConsensusManager {
                         },
                         "Block produced and durably bound to DAG commit"
                     );
+
+                    // ── finality attestation ─────────────────────────────
+                    // Signed only now: after the two-round commit rule
+                    // certified the DAG block AND its transactions executed
+                    // durably. A DAG signature authorises its own block hash;
+                    // this transcript is a different, domain-separated
+                    // statement about a committed linear block.
+                    if self.is_multi_validator()
+                        && let Some(domain) = self.engine.certificate_domain()
+                        && let Some(keypair) = self.engine.local_keypair()
+                        && let Some(tracker) = skip_tracker.as_mut()
+                        && finality_signed_heights.insert(block.header.height)
+                    {
+                        let height = block.header.height;
+                        let identity = (
+                            block.hash,
+                            block.header.state_root,
+                            block.header.tx_root,
+                        );
+                        // One transcript per height, ever. A restart reloads
+                        // this record, so the promise survives the process.
+                        let previous = tracker
+                            .record()
+                            .finality_votes
+                            .get(&height)
+                            .copied();
+                        match previous {
+                            Some(existing) if existing != identity => {
+                                tracing::error!(
+                                    height,
+                                    "Refusing to sign a second, different finality transcript \
+                                     for one height"
+                                );
+                            }
+                            _ => {
+                                tracker.note_finality_vote(height, identity);
+                                if self.persist_signing_record(tracker.record()) {
+                                    match arc_consensus::view_change::FinalityVote::sign(
+                                        domain,
+                                        self.engine.frozen_validator_set_hash(),
+                                        height,
+                                        identity.0,
+                                        identity.1,
+                                        identity.2,
+                                        keypair,
+                                    ) {
+                                        Ok(vote) => {
+                                            if let Some(ref tx_chan) = outbound_tx {
+                                                let _ = tx_chan.try_send(
+                                                    OutboundMessage::BroadcastFinalityVote(
+                                                        vote.clone(),
+                                                    ),
+                                                );
+                                            }
+                                            // Count this node's own vote too.
+                                            let set = self.engine.validator_set();
+                                            if let Ok(Some(certificate)) =
+                                                finality_vote_collector.add(vote, &domain, &set)
+                                            {
+                                                let _ = self
+                                                    .engine
+                                                    .register_finality_certificate(certificate);
+                                            }
+                                        }
+                                        Err(error) => tracing::error!(
+                                            height,
+                                            %error,
+                                            "Could not sign the finality transcript"
+                                        ),
+                                    }
+                                } else {
+                                    tracing::error!(
+                                        height,
+                                        "Withholding a finality attestation: its decision is \
+                                         not durable"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

@@ -51,6 +51,15 @@ pub enum MessageType {
     RoundSyncRequest = 0x11,
     /// DAG round sync response - reply with current round and committed round.
     RoundSyncResponse = 0x12,
+    /// One validator's attestation that a committee member produced no block in
+    /// a round (see `arc_consensus::view_change`).
+    ConsensusAbsenceVote = 0x13,
+    /// A quorum of absence attestations for one (round, member).
+    ConsensusAbsenceCertificate = 0x14,
+    /// One validator's attestation that it committed and executed a block.
+    ConsensusFinalityVote = 0x15,
+    /// A quorum of finality attestations over one committed block.
+    ConsensusFinalityCertificate = 0x16,
 }
 
 impl MessageType {
@@ -74,6 +83,10 @@ impl MessageType {
             0x10 => Some(Self::ShardAnnounce),
             0x11 => Some(Self::RoundSyncRequest),
             0x12 => Some(Self::RoundSyncResponse),
+            0x13 => Some(Self::ConsensusAbsenceVote),
+            0x14 => Some(Self::ConsensusAbsenceCertificate),
+            0x15 => Some(Self::ConsensusFinalityVote),
+            0x16 => Some(Self::ConsensusFinalityCertificate),
             _ => None,
         }
     }
@@ -145,6 +158,34 @@ pub struct HandshakeMessage {
 pub struct DagBlockWithTxsMessage {
     pub block: DagBlock,
     pub transactions: Vec<Transaction>,
+}
+
+/// One validator's absence attestation, gossiped so peers can assemble a
+/// quorum certificate. The payload is self-authenticating: it carries its own
+/// signature, consensus domain and committee commitment, so transport identity
+/// is never an authorisation boundary for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusAbsenceVoteMessage {
+    pub vote: arc_consensus::view_change::SkipVote,
+}
+
+/// A complete absence certificate, gossiped so a node that missed individual
+/// votes still learns the committee's decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusAbsenceCertificateMessage {
+    pub certificate: arc_consensus::view_change::SkipCertificate,
+}
+
+/// One validator's finality attestation over a committed block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusFinalityVoteMessage {
+    pub vote: arc_consensus::view_change::FinalityVote,
+}
+
+/// A complete finality certificate over a committed block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusFinalityCertificateMessage {
+    pub certificate: arc_consensus::view_change::FinalityCertificate,
 }
 
 /// Gossip batch of serialized transactions.
