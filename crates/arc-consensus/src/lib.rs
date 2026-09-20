@@ -637,6 +637,22 @@ impl FinalityProof {
 /// Number of rounds to keep for reorg safety during DAG pruning.
 pub const PRUNE_DEPTH: u64 = 100;
 
+/// Default number of DAG rounds retained below the commit cursor.
+///
+/// This is the operator-facing meaning of DAG retention: **how far behind a
+/// validator may fall and still rejoin by authenticated history transfer**.
+/// Beyond it, its peers no longer hold the rounds it needs and it requires an
+/// authenticated checkpoint instead - a different trust boundary.
+///
+/// It is a resource choice, not a safety one: every block a rejoining node
+/// receives is validated exactly as if it had arrived live, so retaining more
+/// history relaxes nothing. At six validators and a few hundred bytes per
+/// block this is single-digit megabytes.
+///
+/// `PRUNE_DEPTH` remains the reorg-safety floor; retention can never go below
+/// it.
+pub const DEFAULT_RETAINED_ROUNDS: u64 = 4_096;
+
 /// Rounds of local security-detector history the engine retains.
 ///
 /// `WithholdingDetector` and `StakeTracker` are appended on every accepted
@@ -765,6 +781,9 @@ pub struct ConsensusEngine {
     excused_participation: DashMap<(u64, Address), ()>,
     /// Verified committed-block finality certificates, by height.
     finality_certificates: DashMap<u64, view_change::FinalityCertificate>,
+    /// How many rounds of DAG history this node keeps below the commit cursor.
+    /// See [`DEFAULT_RETAINED_ROUNDS`].
+    retained_rounds: AtomicU64,
     recovery_bootstrap_round: RwLock<Option<u64>>,
     /// First retained round in an independently pinned, content-addressed local
     /// recovery generation. Its missing parents are covered by that durable
@@ -821,6 +840,7 @@ impl ConsensusEngine {
             certificate_domain: RwLock::new(None),
             skip_certificates: DashMap::new(),
             excused_participation: DashMap::new(),
+            retained_rounds: AtomicU64::new(DEFAULT_RETAINED_ROUNDS),
             finality_certificates: DashMap::new(),
             recovery_bootstrap_round: RwLock::new(None),
             local_recovery_boundary_round: RwLock::new(None),
@@ -868,6 +888,7 @@ impl ConsensusEngine {
             certificate_domain: RwLock::new(None),
             skip_certificates: DashMap::new(),
             excused_participation: DashMap::new(),
+            retained_rounds: AtomicU64::new(DEFAULT_RETAINED_ROUNDS),
             finality_certificates: DashMap::new(),
             recovery_bootstrap_round: RwLock::new(None),
             local_recovery_boundary_round: RwLock::new(None),
@@ -2452,12 +2473,34 @@ impl ConsensusEngine {
         self.stake_tracker.lock().prune_votes(before_round);
     }
 
-    /// Prune DAG data older than PRUNE_DEPTH rounds behind the current round.
+    /// How many rounds of DAG history this node retains below the commit
+    /// cursor, and therefore how far behind a peer may fall and still rejoin by
+    /// history transfer.
+    pub fn retained_rounds(&self) -> u64 {
+        self.retained_rounds.load(Ordering::Relaxed)
+    }
+
+    /// Set DAG retention. Clamped up to `PRUNE_DEPTH`, which is the reorg
+    /// safety floor and is not an operator choice.
+    pub fn set_retained_rounds(&self, rounds: u64) {
+        let clamped = rounds.max(PRUNE_DEPTH);
+        if clamped != rounds {
+            warn!(
+                requested = rounds,
+                floor = PRUNE_DEPTH,
+                "DAG retention raised to the reorg-safety floor"
+            );
+        }
+        self.retained_rounds.store(clamped, Ordering::Relaxed);
+    }
+
+    /// Prune DAG data older than the retained window behind the current round.
     /// Keeps recent rounds for reorg safety. Removes blocks, round index entries,
     /// committed hashes, and author-round tracking for pruned rounds.
     fn prune_old_rounds(&self) {
         let current = self.current_round.load(Ordering::SeqCst);
-        if current <= PRUNE_DEPTH {
+        let retained = self.retained_rounds();
+        if current <= retained {
             return;
         }
         // Never prune at or above the commit cursor. `try_commit` scans from
@@ -2469,7 +2512,7 @@ impl ConsensusEngine {
         // later call, and the commit cursor is fenced permanently while
         // `advance_round` keeps turning rounds.
         let prune_below =
-            (current - PRUNE_DEPTH).min(self.last_committed_round.load(Ordering::SeqCst));
+            (current - retained).min(self.last_committed_round.load(Ordering::SeqCst));
 
         let mut pruned_blocks = 0usize;
         let mut pruned_rounds = 0usize;
@@ -4446,6 +4489,60 @@ mod tests {
                 "n={n}: a committee whose quorum is the whole set must fail-stop"
             );
         }
+    }
+
+    #[test]
+    fn dag_retention_is_configurable_but_never_below_the_reorg_floor() {
+        let engine = ConsensusEngine::new(test_validator_set(4), test_addr(0));
+        assert_eq!(engine.retained_rounds(), DEFAULT_RETAINED_ROUNDS);
+        engine.set_retained_rounds(50_000);
+        assert_eq!(engine.retained_rounds(), 50_000);
+        // Below the reorg-safety floor is not an operator choice.
+        engine.set_retained_rounds(1);
+        assert_eq!(engine.retained_rounds(), PRUNE_DEPTH);
+        engine.set_retained_rounds(0);
+        assert_eq!(engine.retained_rounds(), PRUNE_DEPTH);
+    }
+
+    #[test]
+    fn retention_decides_how_far_back_history_can_be_served() {
+        // The whole point of the setting: a peer that fell this far behind can
+        // still be served, and one that fell further cannot. Built as a pure
+        // DAG so it needs no network.
+        let vs = test_validator_set(4);
+        let engine = ConsensusEngine::new(vs, test_addr(0));
+        engine.set_retained_rounds(PRUNE_DEPTH);
+        let mut previous: Vec<Hash256> = Vec::new();
+        for round in 0..(PRUNE_DEPTH + 40) {
+            let mut current = Vec::new();
+            for author in 0..4u8 {
+                let block = make_block(
+                    test_addr(author),
+                    round,
+                    previous.clone(),
+                    vec![],
+                    5_000 + round * 10 + author as u64,
+                );
+                engine.receive_block(&block).unwrap();
+                current.push(block.hash);
+            }
+            assert!(engine.advance_round());
+            let _ = engine.try_commit();
+            previous = current;
+        }
+        let cursor = engine.last_committed_round();
+        assert!(cursor > PRUNE_DEPTH, "the chain must have committed past the window");
+        // Recent rounds are still servable.
+        assert!(
+            !engine.blocks_in_round(cursor - 1).is_empty(),
+            "a round just below the cursor must still be retained"
+        );
+        // Rounds far below the retention window are gone, which is exactly the
+        // condition that makes an authenticated checkpoint necessary.
+        assert!(
+            engine.blocks_in_round(0).is_empty(),
+            "round 0 should have been pruned once the cursor passed the window"
+        );
     }
 
     #[test]

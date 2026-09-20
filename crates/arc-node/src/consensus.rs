@@ -1931,8 +1931,8 @@ impl ConsensusManager {
                     }
                 }
                 if blocks.is_empty() {
-                    // The requester is behind this node's DAG prune horizon
-                    // (PRUNE_DEPTH rounds below the commit cursor). DAG history
+                    // The requester is behind this node's DAG retention window
+                    // (see --dag-retained-rounds). DAG history
                     // cannot rescue it and pretending otherwise by serving a
                     // non-contiguous run would be worse than saying so: it
                     // needs an authenticated checkpoint/snapshot, which is a
@@ -1943,7 +1943,8 @@ impl ConsensusManager {
                         oldest_retained = self
                             .engine
                             .last_committed_round()
-                            .saturating_sub(arc_consensus::PRUNE_DEPTH),
+                            .saturating_sub(self.engine.retained_rounds()),
+                        retained_rounds = self.engine.retained_rounds(),
                         "Cannot serve DAG history: the requested round is below this node's \
                          prune horizon. The peer needs an authenticated checkpoint."
                     );

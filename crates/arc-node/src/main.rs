@@ -227,6 +227,16 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     native_inference_test_executor: bool,
 
+    /// How many rounds of DAG history this node keeps below its commit cursor.
+    ///
+    /// Operator meaning: how far behind a validator may fall and still rejoin
+    /// by authenticated history transfer. Beyond it, its peers no longer hold
+    /// the rounds it needs and it requires an authenticated checkpoint - a
+    /// different trust boundary. This is a memory choice, not a safety one:
+    /// every rejoining block is validated exactly as a live one.
+    #[arg(long, value_name = "ROUNDS")]
+    dag_retained_rounds: Option<u64>,
+
     /// DEVELOPMENT START BARRIER, default off: while still at round 0, wait
     /// for every genesis validator with stake to be connected before
     /// proposing, instead of the usual quorum of connected stake.
@@ -7541,6 +7551,14 @@ async fn run_arc_node() -> Result<()> {
                 tracing::warn!(%error, "Could not bind the certificate domain");
             }
         }
+        if let Some(rounds) = cli.dag_retained_rounds {
+            consensus.engine.set_retained_rounds(rounds);
+        }
+        tracing::info!(
+            retained_rounds = consensus.engine.retained_rounds(),
+            "DAG retention: how far behind a validator may fall and still rejoin \
+             by history transfer"
+        );
         consensus.require_full_committee_at_genesis = cli.require_full_committee_at_genesis;
         if consensus.require_full_committee_at_genesis {
             tracing::warn!(
