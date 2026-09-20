@@ -456,6 +456,19 @@ fn should_execute_local_benchmark(
 }
 
 /// Orchestrates DAG consensus for a single validator node.
+/// Bounds on one history transfer. A request cannot make a peer serve more than
+/// this, and an importer will not step over more than this in one go.
+const HISTORY_MAX_ROUNDS: u64 = 256;
+/// Hard cap on blocks in one history response, whatever the round span.
+const HISTORY_MAX_BLOCKS: usize = 4_096;
+/// Minimum gap between history requests from this node, so a persistent gap
+/// cannot turn into a request storm against its peers.
+const HISTORY_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a node sits at one round, with peers connected, before it concludes
+/// it is behind and asks for history rather than waiting for gossip it can
+/// never accept.
+const HISTORY_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// How many rounds back the absence scan looks each tick. The cursor only
 /// falls behind when it is stuck, which is exactly when the scan is needed, but
 /// the work still has to be bounded.
@@ -1012,6 +1025,11 @@ impl ConsensusManager {
         // enters a transcript; this only paces how long a late block is waited
         // for, and a wrong pace cannot make an unsafe skip safe.
         let absence_clock = std::time::Instant::now();
+        let mut last_round_seen = self.engine.current_round();
+        let mut last_round_change = std::time::Instant::now();
+        let mut history_clock = std::time::Instant::now()
+            .checked_sub(HISTORY_REQUEST_INTERVAL)
+            .unwrap_or_else(std::time::Instant::now);
 
         let can_produce = self.tier.can_produce_blocks();
         if !can_produce {
@@ -1176,6 +1194,11 @@ impl ConsensusManager {
                 Hash256,
                 arc_consensus::view_change::FinalityCertificate,
             )> = Vec::new();
+            let mut inbound_history_requests: Vec<(Hash256, u64, u64)> = Vec::new();
+            let mut history_requests: Vec<(Hash256, u64)> = Vec::new();
+            let mut history_requests_broadcast: Option<u64> = None;
+            let mut inbound_history: Vec<(Hash256, Vec<arc_consensus::DagBlock>, Vec<arc_types::Transaction>)> =
+                Vec::new();
             if let Some(ref mut rx) = inbound_rx {
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
@@ -1579,6 +1602,13 @@ impl ConsensusManager {
                             committed_round,
                         } => {
                             let my_round = self.engine.current_round();
+                            // A peer more than one round ahead is a peer this
+                            // node cannot follow by gossip alone, because a
+                            // block more than one round ahead is refused. Ask
+                            // for the contiguous history instead of guessing.
+                            if dag_round > my_round.saturating_add(1) {
+                                history_requests.push((peer, my_round));
+                            }
                             if dag_round.saturating_sub(my_round) > 10_000 {
                                 warn!(
                                     "PARTITION DETECTED: peer {} at round {} but we are at {} (gap: {}). Authenticated checkpoint sync is required.",
@@ -1638,6 +1668,13 @@ impl ConsensusManager {
                             last_committed_round,
                         } => {
                             let my_round = self.engine.current_round();
+                            if current_round > my_round.saturating_add(1) {
+                                // The round-sync peer is not identified in this
+                                // message, so ask every connected peer; the
+                                // first usable answer wins and the rest are
+                                // rejected as duplicates.
+                                history_requests_broadcast = Some(my_round);
+                            }
                             if current_round.saturating_sub(my_round) > 1000 {
                                 info!(
                                     "Round sync hint: peer at round {}, we are at {}; authenticated checkpoint sync required",
@@ -1701,6 +1738,20 @@ impl ConsensusManager {
                             certificate,
                         } => {
                             inbound_finality_certificates.push((source, certificate));
+                        }
+                        InboundMessage::DagHistoryRequest {
+                            source,
+                            from_round,
+                            max_rounds,
+                        } => {
+                            inbound_history_requests.push((source, from_round, max_rounds));
+                        }
+                        InboundMessage::DagHistoryResponse {
+                            source,
+                            blocks,
+                            transactions,
+                        } => {
+                            inbound_history.push((source, blocks, transactions));
                         }
                         InboundMessage::ShardAnnounce {
                             model_id,
@@ -1799,6 +1850,126 @@ impl ConsensusManager {
                 }
                 if let Err(error) = self.engine.register_finality_certificate(certificate) {
                     debug!(%source, ?error, "Rejected a peer finality certificate");
+                }
+            }
+
+            // Being stuck at one round while peers are connected is itself a
+            // reason to ask for history: a node that fell behind never receives
+            // another block it can accept, so no gossip event will ever tell it
+            // that it is behind. Heartbeat cadence is far too slow to rely on.
+            {
+                let now_round = self.engine.current_round();
+                if now_round != last_round_seen {
+                    last_round_seen = now_round;
+                    last_round_change = std::time::Instant::now();
+                } else if self.is_multi_validator()
+                    && last_round_change.elapsed() >= HISTORY_STUCK_AFTER
+                    && connected_validators.iter().any(|(_, g)| g.connected)
+                {
+                    history_requests_broadcast = Some(now_round);
+                }
+            }
+
+            // Ask the peers that are ahead for history, at most once per
+            // interval so a persistent gap cannot turn into a request storm.
+            if (!history_requests.is_empty() || history_requests_broadcast.is_some())
+                && history_clock.elapsed() >= HISTORY_REQUEST_INTERVAL
+            {
+                history_clock = std::time::Instant::now();
+                let mut asked: std::collections::HashSet<Hash256> =
+                    std::collections::HashSet::new();
+                for (peer, from_round) in history_requests.drain(..) {
+                    if !asked.insert(peer) {
+                        continue;
+                    }
+                    info!(%peer, from_round, "Requesting bounded DAG history");
+                    if let Some(ref tx_chan) = outbound_tx {
+                        let _ = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
+                            target: peer,
+                            from_round,
+                            max_rounds: HISTORY_MAX_ROUNDS,
+                        });
+                    }
+                }
+                if let Some(from_round) = history_requests_broadcast {
+                    for (peer, generation) in connected_validators.iter() {
+                        if !generation.connected || !asked.insert(*peer) {
+                            continue;
+                        }
+                        info!(%peer, from_round, "Requesting bounded DAG history");
+                        if let Some(ref tx_chan) = outbound_tx {
+                            let _ = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
+                                target: *peer,
+                                from_round,
+                                max_rounds: HISTORY_MAX_ROUNDS,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // ── 0b2. Bounded authenticated history transfer ─────────────
+            // Answer a peer's request from what this node actually holds. The
+            // requester re-validates everything, so serving history is not a
+            // trust decision; the bound is a resource decision.
+            for (source, from_round, max_rounds) in inbound_history_requests {
+                let span = max_rounds.min(HISTORY_MAX_ROUNDS);
+                let mut blocks = Vec::new();
+                for round in from_round..from_round.saturating_add(span) {
+                    for hash in self.engine.blocks_in_round(round) {
+                        if let Some(block) = self.engine.get_block(&hash) {
+                            blocks.push(block);
+                        }
+                    }
+                    if blocks.len() >= HISTORY_MAX_BLOCKS {
+                        break;
+                    }
+                }
+                if blocks.is_empty() {
+                    continue;
+                }
+                let wanted: std::collections::HashSet<[u8; 32]> = blocks
+                    .iter()
+                    .flat_map(|block| block.transactions.iter().map(|hash| hash.0))
+                    .collect();
+                let transactions: Vec<arc_types::Transaction> = pending_txs
+                    .iter()
+                    .filter(|entry| wanted.contains(entry.key()))
+                    .map(|entry| entry.value().clone())
+                    .collect();
+                info!(
+                    %source,
+                    from_round,
+                    blocks = blocks.len(),
+                    bodies = transactions.len(),
+                    "Serving bounded DAG history"
+                );
+                if let Some(ref tx_chan) = outbound_tx {
+                    let _ = tx_chan.try_send(OutboundMessage::SendDagHistoryResponse {
+                        target: source,
+                        blocks,
+                        transactions,
+                    });
+                }
+            }
+            for (source, blocks, transactions) in inbound_history {
+                // Retain the bodies first: a block that commits without its
+                // exact preimage is a fatal consensus-loop exit, so the bodies
+                // must be in hand before the blocks can be stepped over.
+                for transaction in transactions {
+                    if transaction.hash.0 != transaction.compute_hash().0 {
+                        warn!(%source, "History supplied a transaction whose hash does not match");
+                        continue;
+                    }
+                    pending_txs.insert(transaction.hash.0, transaction);
+                }
+                match self.engine.import_history(&blocks, HISTORY_MAX_ROUNDS) {
+                    Ok(reached) => {
+                        info!(%source, reached, "Joined a running chain from authenticated history");
+                    }
+                    Err(error) => {
+                        warn!(%source, %error, "Rejected a history response");
+                    }
                 }
             }
 

@@ -32,6 +32,8 @@ const GRACE: u64 = DEFAULT_SKIP_GRACE_MS;
 const TICK_MS: u64 = GRACE;
 /// How many of its own recent blocks each node re-gossips per tick.
 const GOSSIP_REPEAT: usize = 6;
+/// Bound on one history transfer in the simulation.
+const HISTORY_SPAN: u64 = 256;
 
 fn domain() -> ConsensusDomain {
     ConsensusDomain::new(hash_bytes(b"arc.sim.domain.v1"), 1, 1)
@@ -82,6 +84,9 @@ struct Node {
     finality: BTreeMap<u64, FinalityCertificate>,
     /// Set to false to model a crashed or partitioned-away node.
     online: bool,
+    /// The round this node was at on the previous tick, used to notice that it
+    /// is stuck and should ask for history.
+    stuck_at: Option<u64>,
 }
 
 impl Node {
@@ -111,6 +116,7 @@ impl Node {
             own_blocks: Vec::new(),
             finality: BTreeMap::new(),
             online: true,
+            stuck_at: None,
         }
     }
 
@@ -148,6 +154,8 @@ impl Node {
 #[derive(Clone)]
 enum Msg {
     Block(DagBlock),
+    /// A node that is behind asks everyone for history from a round.
+    HistoryRequest { from_round: u64 },
     Skip(SkipVote),
     Cert(SkipCertificate),
     Finality(FinalityVote),
@@ -349,6 +357,21 @@ impl Sim {
             }
         }
 
+        // ── a node that is behind asks for history ───────────────────────────
+        // A node whose round has not moved while peers are live cannot be
+        // helped by gossip: a block more than one round ahead is refused. This
+        // is the same trigger the node implements.
+        for index in 0..self.nodes.len() {
+            if faults.offline.contains(&index) || !self.nodes[index].online {
+                continue;
+            }
+            let round = self.nodes[index].engine.current_round();
+            if self.nodes[index].stuck_at == Some(round) {
+                outbox.push((index, Msg::HistoryRequest { from_round: round }));
+            }
+            self.nodes[index].stuck_at = Some(round);
+        }
+
         // ── certificates this node already holds get re-gossiped ─────────────
         for index in 0..self.nodes.len() {
             if faults.offline.contains(&index) || !self.nodes[index].online {
@@ -373,6 +396,7 @@ impl Sim {
         }
 
         // ── deliver ──────────────────────────────────────────────────────────
+        let mut responses: Vec<(usize, usize, Vec<DagBlock>)> = Vec::new();
         for (from, msg) in &outbox {
             for to in 0..self.nodes.len() {
                 if faults.offline.contains(&to) || !self.nodes[to].online {
@@ -384,6 +408,20 @@ impl Sim {
                 match msg {
                     Msg::Block(block) => {
                         let _ = self.nodes[to].engine.receive_block(block);
+                    }
+                    Msg::HistoryRequest { from_round } => {
+                        // Serve from what this node actually holds, bounded.
+                        let mut blocks = Vec::new();
+                        for round in *from_round..from_round.saturating_add(HISTORY_SPAN) {
+                            for hash in self.nodes[to].engine.blocks_in_round(round) {
+                                if let Some(block) = self.nodes[to].engine.get_block(&hash) {
+                                    blocks.push(block);
+                                }
+                            }
+                        }
+                        if !blocks.is_empty() {
+                            responses.push((to, *from, blocks));
+                        }
                     }
                     Msg::Skip(vote) => {
                         let set = self.set.clone();
@@ -430,6 +468,18 @@ impl Sim {
                     }
                 }
             }
+        }
+
+        // History answers are delivered on the same tick, which models a
+        // request/response exchange rather than gossip.
+        for (from, to, blocks) in responses {
+            if faults.offline.contains(&to) || !self.nodes[to].online {
+                continue;
+            }
+            if from != to && faults.cut.contains(&(from, to)) {
+                continue;
+            }
+            let _ = self.nodes[to].engine.import_history(&blocks, HISTORY_SPAN);
         }
 
         // ── advance, commit, finalise ────────────────────────────────────────
@@ -951,4 +1001,105 @@ fn diagnostic_staggered_trace() {
             None => eprintln!("round {round}: leader block ABSENT"),
         }
     }
+}
+
+#[test]
+fn a_node_that_starts_late_joins_the_running_chain() {
+    // Defect D5: a node that falls behind rejects every live block as "round N
+    // is too far ahead" and never rejoins, because gossip can only carry it one
+    // round. The gossip window here is deliberately exhausted before the late
+    // node appears, so ONLY authenticated history transfer can rescue it.
+    for n in [4usize, 6] {
+        let mut sim = Sim::new(n);
+        let late = n - 1;
+        let faults = Faults {
+            offline: HashSet::from([late]),
+            ..Default::default()
+        };
+        // Run long enough that the late node's peers are far past the one-round
+        // window AND past the re-gossip window.
+        sim.run(60, &faults);
+        let ahead = sim.nodes[0].engine.current_round();
+        assert!(
+            ahead > GOSSIP_REPEAT as u64 + 1,
+            "n={n}: the chain did not get far enough ahead to make this a real test"
+        );
+
+        sim.nodes[late].online = true;
+        sim.run(30, &Faults::default());
+        sim.assert_safety("late join");
+
+        let joined = sim.nodes[late].engine.current_round();
+        assert!(
+            joined > 1,
+            "n={n}: the late node never joined - it is still at round {joined} while its \
+             peers are at {}",
+            sim.nodes[0].engine.current_round()
+        );
+        assert!(
+            sim.nodes[late].engine.last_committed_round() > 0,
+            "n={n}: the late node caught up on rounds but committed nothing"
+        );
+    }
+}
+
+#[test]
+fn history_import_refuses_a_gap_a_jump_and_a_thin_round() {
+    // The import path is the only one that may carry a node forward by more
+    // than one round, so its refusals are load-bearing.
+    let mut sim = Sim::new(4);
+    sim.run(12, &Faults::default());
+    let source = &sim.nodes[0];
+    let mut all = Vec::new();
+    for round in 0..=source.engine.current_round() {
+        for hash in source.engine.blocks_in_round(round) {
+            if let Some(block) = source.engine.get_block(&hash) {
+                all.push(block);
+            }
+        }
+    }
+    assert!(all.len() > 8);
+
+    let fresh = Sim::new(4);
+    let importer = &fresh.nodes[0].engine;
+
+    // A run that starts above the round this node is waiting for.
+    let ahead: Vec<DagBlock> = all.iter().filter(|b| b.round >= 3).cloned().collect();
+    assert!(
+        importer.import_history(&ahead, HISTORY_SPAN).is_err(),
+        "history that starts above the waiting round must be refused"
+    );
+
+    // A run with a hole in the middle.
+    let holed: Vec<DagBlock> = all.iter().filter(|b| b.round != 2).cloned().collect();
+    assert!(
+        importer.import_history(&holed, HISTORY_SPAN).is_err(),
+        "history with a gap must be refused"
+    );
+
+    // A round carrying less than quorum stake.
+    let mut thin: Vec<DagBlock> = Vec::new();
+    for round in 0..=2u64 {
+        let mut taken = 0;
+        for block in all.iter().filter(|b| b.round == round) {
+            if round == 1 && taken >= 1 {
+                break;
+            }
+            thin.push(block.clone());
+            taken += 1;
+        }
+    }
+    assert!(
+        importer.import_history(&thin, HISTORY_SPAN).is_err(),
+        "a round below quorum stake must be refused"
+    );
+
+    // Nothing above was imported.
+    assert_eq!(importer.current_round(), 0);
+
+    // The complete, contiguous run is accepted.
+    let reached = importer
+        .import_history(&all, HISTORY_SPAN)
+        .expect("a complete contiguous run imports");
+    assert!(reached > 1, "import reached only round {reached}");
 }

@@ -60,6 +60,10 @@ pub enum MessageType {
     ConsensusFinalityVote = 0x15,
     /// A quorum of finality attestations over one committed block.
     ConsensusFinalityCertificate = 0x16,
+    /// Ask a peer for a bounded, contiguous run of DAG history.
+    DagHistoryRequest = 0x17,
+    /// A bounded, contiguous run of DAG history with transaction bodies.
+    DagHistoryResponse = 0x18,
 }
 
 impl MessageType {
@@ -87,6 +91,8 @@ impl MessageType {
             0x14 => Some(Self::ConsensusAbsenceCertificate),
             0x15 => Some(Self::ConsensusFinalityVote),
             0x16 => Some(Self::ConsensusFinalityCertificate),
+            0x17 => Some(Self::DagHistoryRequest),
+            0x18 => Some(Self::DagHistoryResponse),
             _ => None,
         }
     }
@@ -157,6 +163,27 @@ pub struct HandshakeMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DagBlockWithTxsMessage {
     pub block: DagBlock,
+    pub transactions: Vec<Transaction>,
+}
+
+/// Ask a peer for DAG history starting at a round, bounded by the requester.
+///
+/// The request is a hint only: the responder decides what it actually has, and
+/// the requester re-validates every block it receives. Neither side trusts the
+/// other's claimed height.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagHistoryRequestMessage {
+    pub from_round: u64,
+    pub max_rounds: u64,
+}
+
+/// A bounded, contiguous run of DAG history with the transaction bodies its
+/// blocks reference. Self-authenticating: every block carries its author's
+/// signature, and the importer checks contiguity and per-round quorum stake
+/// before stepping over anything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagHistoryResponseMessage {
+    pub blocks: Vec<DagBlock>,
     pub transactions: Vec<Transaction>,
 }
 

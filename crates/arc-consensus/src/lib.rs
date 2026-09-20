@@ -2020,6 +2020,114 @@ impl ConsensusEngine {
         }
     }
 
+    /// Import a contiguous, ascending run of history from a peer.
+    ///
+    /// This is the ONLY path that may carry a node forward by more than one
+    /// round, and it is not a shortcut around the guard that forbids that. The
+    /// guard exists so a peer cannot teleport a node to a tip it has no
+    /// evidence for; a contiguous run of signed blocks whose parents carry
+    /// quorum stake IS that evidence, and it is exactly what the node would
+    /// have received had it been online. Nothing here trusts a peer's claimed
+    /// height, a diagnostic snapshot, or an unsigned summary.
+    ///
+    /// Rejects, without importing anything: a run that does not start at the
+    /// round this node is actually waiting for, a gap or a step backwards, a
+    /// round whose blocks do not carry quorum stake from distinct known
+    /// authors, and any individual block the normal validation refuses. Returns
+    /// the round this node reached.
+    pub fn import_history(
+        &self,
+        blocks: &[DagBlock],
+        max_rounds: u64,
+    ) -> Result<u64, ConsensusError> {
+        if blocks.is_empty() {
+            return Err(ConsensusError::InvalidBlock("empty history".into()));
+        }
+        let start = self.current_round.load(Ordering::SeqCst);
+        let mut by_round: std::collections::BTreeMap<u64, Vec<&DagBlock>> =
+            std::collections::BTreeMap::new();
+        for block in blocks {
+            by_round.entry(block.round).or_default().push(block);
+        }
+        let first = *by_round.keys().next().expect("non-empty");
+        let last = *by_round.keys().next_back().expect("non-empty");
+        if first > start {
+            return Err(ConsensusError::InvalidBlock(format!(
+                "history starts at round {first} but this node is waiting at {start}"
+            )));
+        }
+        if last.saturating_sub(start) > max_rounds {
+            return Err(ConsensusError::InvalidBlock(format!(
+                "history spans {} rounds, above the {max_rounds} bound",
+                last.saturating_sub(first)
+            )));
+        }
+        // Contiguity: every round from the first to the last must be present.
+        for round in first..=last {
+            if !by_round.contains_key(&round) {
+                return Err(ConsensusError::InvalidBlock(format!(
+                    "history has a gap at round {round}"
+                )));
+            }
+        }
+        let quorum = {
+            let vs = self.validator_set.read();
+            vs.quorum
+        };
+        // Each round must carry quorum stake from distinct known authors before
+        // this node will step over it. A round that does not is the point where
+        // the import stops, not a reason to accept the rest.
+        for (round, round_blocks) in &by_round {
+            let vs = self.validator_set.read();
+            let mut authors = HashSet::new();
+            let mut stake = 0u64;
+            for block in round_blocks {
+                if let Some(validator) = vs.get_validator(&block.author)
+                    && authors.insert(block.author)
+                {
+                    stake = stake.saturating_add(validator.stake);
+                }
+            }
+            let excused = vs
+                .validators
+                .iter()
+                .filter(|v| v.stake > 0)
+                .all(|v| authors.contains(&v.address) || self.is_excused_for_round(*round, &v.address));
+            if stake < quorum && !excused {
+                return Err(ConsensusError::InvalidBlock(format!(
+                    "history round {round} carries {stake} stake, below quorum {quorum}"
+                )));
+            }
+        }
+        // Apply in ascending round order, advancing one round at a time so the
+        // ordinary per-block validation applies to every single block.
+        let mut reached = start;
+        for (round, round_blocks) in by_round {
+            for block in round_blocks {
+                match self.receive_block(block) {
+                    Ok(()) | Err(ConsensusError::DuplicateBlock) => {}
+                    Err(error) => {
+                        warn!(round, ?error, "History import rejected a block");
+                        return Err(error);
+                    }
+                }
+            }
+            if round >= reached {
+                // advance_round re-checks stake and participation itself.
+                if self.advance_round() {
+                    reached = self.current_round.load(Ordering::SeqCst);
+                }
+            }
+        }
+        info!(
+            from = start,
+            to = reached,
+            blocks = blocks.len(),
+            "Imported authenticated history"
+        );
+        Ok(reached)
+    }
+
     /// Commit support for a specific block at a round, as the two-round rule
     /// computes it. `None` means no child of it reaches quorum support in this
     /// node's view, which is the observation a `NoQuorumSupport` attestation is

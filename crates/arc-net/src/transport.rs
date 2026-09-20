@@ -183,6 +183,18 @@ pub enum InboundMessage {
         source: Hash256,
         certificate: arc_consensus::view_change::FinalityCertificate,
     },
+    /// A peer is asking this node for a bounded run of DAG history.
+    DagHistoryRequest {
+        source: Hash256,
+        from_round: u64,
+        max_rounds: u64,
+    },
+    /// A peer supplied a bounded run of DAG history.
+    DagHistoryResponse {
+        source: Hash256,
+        blocks: Vec<DagBlock>,
+        transactions: Vec<Transaction>,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -201,6 +213,18 @@ pub enum OutboundMessage {
     BroadcastFinalityVote(arc_consensus::view_change::FinalityVote),
     /// Gossip a complete finality certificate to every peer.
     BroadcastFinalityCertificate(arc_consensus::view_change::FinalityCertificate),
+    /// Ask one peer for a bounded run of DAG history.
+    SendDagHistoryRequest {
+        target: Hash256,
+        from_round: u64,
+        max_rounds: u64,
+    },
+    /// Answer one peer's history request.
+    SendDagHistoryResponse {
+        target: Hash256,
+        blocks: Vec<DagBlock>,
+        transactions: Vec<Transaction>,
+    },
     /// Broadcast a state diff (Propose-Verify protocol).
     BroadcastStateDiff {
         block_hash: Hash256,
@@ -1466,6 +1490,36 @@ async fn run_transport_inner(
                             .await;
                     }
                 }
+                OutboundMessage::SendDagHistoryRequest {
+                    target,
+                    from_round,
+                    max_rounds,
+                } => {
+                    let payload = crate::protocol::DagHistoryRequestMessage {
+                        from_round,
+                        max_rounds,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .send_to(&target, MessageType::DagHistoryRequest, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::SendDagHistoryResponse {
+                    target,
+                    blocks,
+                    transactions,
+                } => {
+                    let payload = crate::protocol::DagHistoryResponseMessage {
+                        blocks,
+                        transactions,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .send_to(&target, MessageType::DagHistoryResponse, &bytes)
+                            .await;
+                    }
+                }
                 OutboundMessage::BroadcastTransactions(txs) => {
                     for batch in txs.chunks(crate::MAX_TX_PER_GOSSIP) {
                         let payload = crate::protocol::TxGossipMessage {
@@ -2668,6 +2722,34 @@ async fn handle_peer_recv(
                     Err(e) => {
                         warn!("Bad ConsensusFinalityCertificate from {}: {}", peer_address, e)
                     }
+                }
+            }
+            MessageType::DagHistoryRequest => {
+                match deserialize_message::<crate::protocol::DagHistoryRequestMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::DagHistoryRequest {
+                                source: peer_address,
+                                from_round: msg.from_round,
+                                max_rounds: msg.max_rounds,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad DagHistoryRequest from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::DagHistoryResponse => {
+                match deserialize_message::<crate::protocol::DagHistoryResponseMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::DagHistoryResponse {
+                                source: peer_address,
+                                blocks: msg.blocks,
+                                transactions: msg.transactions,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad DagHistoryResponse from {}: {}", peer_address, e),
                 }
             }
             MessageType::RoundSyncRequest => {
