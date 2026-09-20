@@ -1146,6 +1146,175 @@ fn verify_vote(vote: &InferenceVote, request_id: Hash256, tokens: &[u32]) -> boo
 // require an unused private genesis at height 0, a healthy persistent WAL and
 // the canonical account-root backend.
 
+// ── Bounded native worker runtime ───────────────────────────────────────────
+//
+// Activating the contract is not the same as running it: a request could be
+// admitted with no node process executing it and no finalization produced, so
+// settlement could never happen. This is the missing lifecycle.
+//
+// Default disabled, bounded, and cancellable. It runs only when the operator
+// asked for it AND the contract is actually activated, it sleeps between empty
+// polls rather than spinning, it backs off on error instead of hot-looping a
+// failing dependency, and it stops promptly on shutdown. Durability is the
+// `DecisionStore`'s: a vote persisted before a crash is re-emitted on restart
+// without recomputing, which `durable_vote_is_verified_and_reemitted_without_recompute`
+// already covers.
+
+/// A deterministic executor for integration testing ONLY.
+///
+/// It loads no model and produces output derived from the job's own committed
+/// fields, so the request → vote → finalize → receipt protocol can be exercised
+/// end to end without loading several multi-gigabyte models.
+///
+/// It is behind the `native-test-executor` cargo feature precisely so it cannot
+/// exist in a default build. **Evidence produced with it is integration
+/// coverage of the protocol. It qualifies no model and says nothing about
+/// production inference quality.**
+#[cfg(feature = "native-test-executor")]
+pub struct DeterministicTestExecutor {
+    qualification: CanonicalI8Qualification,
+}
+
+#[cfg(feature = "native-test-executor")]
+impl DeterministicTestExecutor {
+    pub fn new(qualification: CanonicalI8Qualification) -> Self {
+        Self { qualification }
+    }
+}
+
+#[cfg(feature = "native-test-executor")]
+impl NativeExecutor for DeterministicTestExecutor {
+    fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+        // Domain-separated so this output can never collide with a real one.
+        let mut seed = Vec::new();
+        seed.extend_from_slice(b"ARC-DETERMINISTIC-TEST-EXECUTOR-v1");
+        seed.extend_from_slice(&self.qualification.artifact_hash.0);
+        seed.extend_from_slice(&job.request_id.0);
+        let digest = hash_bytes(&seed);
+        let tokens: Vec<u32> = digest.0[..8]
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        Ok(ExecutionOutput {
+            tokens,
+            output_hash: hash_bytes(&bytes),
+        })
+    }
+}
+
+/// Handle to a running native worker loop.
+pub struct NativeRuntimeHandle {
+    cancel: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl NativeRuntimeHandle {
+    /// Signal the loop to stop and wait for it. Safe to call once; dropping the
+    /// handle without calling this also cancels, so a panicking caller cannot
+    /// leave the loop running.
+    pub fn shutdown(mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.cancel.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for NativeRuntimeHandle {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Bounds for the polling loop.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeRuntimeBounds {
+    /// Sleep between polls that found nothing.
+    pub idle_interval: std::time::Duration,
+    /// Sleep after a poll error, so a failing dependency is not hot-looped.
+    pub error_backoff: std::time::Duration,
+    /// Stop the loop after this many consecutive errors. `None` = never stop.
+    pub max_consecutive_errors: Option<u32>,
+}
+
+impl Default for NativeRuntimeBounds {
+    fn default() -> Self {
+        Self {
+            idle_interval: std::time::Duration::from_millis(500),
+            error_backoff: std::time::Duration::from_secs(2),
+            max_consecutive_errors: Some(60),
+        }
+    }
+}
+
+/// Spawn the bounded worker loop. The caller owns the cancellation flag, so a
+/// node shutdown path can stop it without owning the handle.
+pub fn spawn_native_runtime<E, G, V>(
+    runtime: NativeWorkerRuntime<E, G, V>,
+    bounds: NativeRuntimeBounds,
+    cancel: Arc<AtomicBool>,
+) -> NativeRuntimeHandle
+where
+    E: NativeExecutor + Send + Sync + 'static,
+    G: VoteSigner + Send + Sync + 'static,
+    V: VoteSink + Send + Sync + 'static,
+{
+    let flag = cancel.clone();
+    let join = std::thread::Builder::new()
+        .name("arc-native-worker".into())
+        .spawn(move || {
+            let mut consecutive_errors: u32 = 0;
+            while !flag.load(Ordering::Acquire) {
+                match runtime.poll_once() {
+                    Ok(Some(vote)) => {
+                        consecutive_errors = 0;
+                        tracing::info!(
+                            request = %vote.request_id.to_hex(),
+                            "native worker produced a signed decision"
+                        );
+                    }
+                    Ok(None) => {
+                        consecutive_errors = 0;
+                        std::thread::sleep(bounds.idle_interval);
+                    }
+                    Err(error) => {
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        tracing::warn!(
+                            %error,
+                            consecutive_errors,
+                            "native worker poll failed"
+                        );
+                        if let Some(limit) = bounds.max_consecutive_errors {
+                            if consecutive_errors >= limit {
+                                tracing::error!(
+                                    limit,
+                                    "native worker stopping after repeated failures; \
+                                     the contract stays activated but no further work is done"
+                                );
+                                break;
+                            }
+                        }
+                        std::thread::sleep(bounds.error_backoff);
+                    }
+                }
+            }
+            tracing::info!("native worker loop stopped");
+        })
+        .expect("spawning the native worker thread must succeed");
+    NativeRuntimeHandle {
+        cancel,
+        join: Some(join),
+    }
+}
+
 /// Why an operator activation config was rejected.
 #[derive(Debug)]
 pub enum ActivationConfigError {
@@ -1161,6 +1330,12 @@ pub enum ActivationConfigError {
     StateUnavailable(String),
     /// An operator-supplied pin did not match what the node actually has.
     ExpectationMismatch { field: String, expected: String, actual: String },
+    /// An operator config differs from the already-persisted activation.
+    ReconfigurationRejected {
+        field: String,
+        persisted: String,
+        requested: String,
+    },
     /// Activation itself refused.
     Refused(String),
 }
@@ -1181,6 +1356,12 @@ impl std::fmt::Display for ActivationConfigError {
                 f,
                 "activation config pinned {field}={expected} but this node has {actual}. \
                  Refusing rather than activating a context the operator did not approve."
+            ),
+            Self::ReconfigurationRejected { field, persisted, requested } => write!(
+                f,
+                "native inference is already activated and cannot be reconfigured: {field} is \
+                 {persisted} in the persisted binding but {requested} in this config. Restart \
+                 with the original activation file, or start a new private genesis."
             ),
             Self::Refused(e) => write!(f, "activation refused: {e}"),
         }
@@ -1343,6 +1524,25 @@ pub fn activate_native_inference_from_config(
     path: &std::path::Path,
 ) -> Result<Hash256, ActivationConfigError> {
     let request = load_activation_request(path)?;
+
+    // RESTART PATH. A persisted context already exists, so this is a reopen,
+    // not a new activation.
+    //
+    // The first version of this function checked the height before looking for
+    // an existing context, which made an activated node unable to restart the
+    // moment it committed block 1: the operator's own flag became fatal. The
+    // fresh-genesis restriction belongs to a NEW activation only.
+    //
+    // On this path the PERSISTED binding is authoritative and the live
+    // committee is not consulted at all. Re-deriving members from
+    // `active_validators()` here would let a changed committee silently replace
+    // a frozen, operator-approved binding — which is the opposite of what
+    // freezing it is for.
+    if let Some(persisted) = state.native_inference_context() {
+        return resume_persisted_activation(state, &request, &persisted);
+    }
+
+    // FRESH ACTIVATION. Unused private genesis only.
     let height = state.height();
     if height != 0 {
         return Err(ActivationConfigError::ChainNotEmpty(height));
@@ -1350,6 +1550,82 @@ pub fn activate_native_inference_from_config(
     let context = assemble_activation_context(state, &request)?;
     state
         .activate_native_inference(context)
+        .map_err(|e| ActivationConfigError::Refused(e.to_string()))
+}
+
+/// Validate an operator config against an already-persisted activation and
+/// resume it.
+///
+/// Every field the operator can state is compared against the frozen binding.
+/// Anything that differs is a reconfiguration attempt and is refused: the
+/// contract is explicitly not changeable after activation
+/// (`activate_native_inference` returns "native inference activation cannot
+/// change"), so the only honest outcomes here are "resume" or "refuse".
+fn resume_persisted_activation(
+    state: &arc_state::StateDB,
+    request: &NativeActivationRequest,
+    persisted: &InferenceAdmissionContext,
+) -> Result<Hash256, ActivationConfigError> {
+    let mismatch = |field: &str, persisted_value: String, requested: String| {
+        ActivationConfigError::ReconfigurationRejected {
+            field: field.to_string(),
+            persisted: persisted_value,
+            requested,
+        }
+    };
+
+    if request.recovery_epoch != persisted.domain.recovery_epoch {
+        return Err(mismatch(
+            "recovery_epoch",
+            persisted.domain.recovery_epoch.to_string(),
+            request.recovery_epoch.to_string(),
+        ));
+    }
+    if request.allowed_executions != persisted.allowed_executions {
+        return Err(mismatch(
+            "allowed_executions",
+            format!("{} entry/entries", persisted.allowed_executions.len()),
+            format!("{} entry/entries", request.allowed_executions.len()),
+        ));
+    }
+
+    // Operator pins are compared against the PERSISTED binding, so a pin that
+    // matches the live committee but not the frozen one still fails.
+    if let Some(expect) = &request.expect {
+        if let Some(pin) = expect.chain_genesis {
+            if pin != persisted.domain.chain_genesis {
+                return Err(mismatch(
+                    "expect.chain_genesis",
+                    persisted.domain.chain_genesis.to_hex(),
+                    pin.to_hex(),
+                ));
+            }
+        }
+        if let Some(pin) = expect.validator_set_hash {
+            if pin != persisted.domain.validator_set_hash {
+                return Err(mismatch(
+                    "expect.validator_set_hash",
+                    persisted.domain.validator_set_hash.to_hex(),
+                    pin.to_hex(),
+                ));
+            }
+        }
+        if let Some(pin) = &expect.members {
+            if pin != &persisted.members {
+                return Err(mismatch(
+                    "expect.members",
+                    format!("{} member(s)", persisted.members.len()),
+                    format!("{} member(s)", pin.len()),
+                ));
+            }
+        }
+    }
+
+    // Hands the persisted context straight back, which lands on the idempotent
+    // branch of `activate_native_inference` and revalidates the binding against
+    // the chain rather than trusting this function.
+    state
+        .activate_native_inference(persisted.clone())
         .map_err(|e| ActivationConfigError::Refused(e.to_string()))
 }
 
@@ -1819,6 +2095,167 @@ mod tests {
             activate_native_inference_from_config(&observer, &path),
             Err(ActivationConfigError::StateUnavailable(_))
         ));
+    }
+
+    #[test]
+    fn activation_resumes_after_a_committed_block_with_the_same_config() {
+        // The regression this exists for: the first version of the wrapper
+        // checked the height before looking for an existing context, so a node
+        // that activated at genesis and then committed block 1 could never be
+        // restarted with its own activation file.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, members) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: None,
+            },
+        );
+
+        let first = activate_native_inference_from_config(&state, &path).expect("fresh activation");
+        state
+            .execute_block_verified_at(&[], Hash256::ZERO, 1)
+            .expect("empty block must apply");
+        assert_eq!(state.height(), 1, "the chain must have moved past genesis");
+
+        let resumed = activate_native_inference_from_config(&state, &path)
+            .expect("a restart with the SAME config must resume, not abort");
+        assert_eq!(first, resumed, "the commitment must be unchanged across restart");
+        assert_eq!(
+            state.native_inference_context().unwrap().members,
+            members,
+            "the frozen binding must survive the restart intact"
+        );
+    }
+
+    #[test]
+    fn activation_restart_refuses_a_changed_allowlist_or_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        let original = NativeActivationRequest {
+            allowed_executions: vec![marker()],
+            recovery_epoch: 0,
+            expect: None,
+        };
+        write_request(&path, &original);
+        activate_native_inference_from_config(&state, &path).expect("fresh activation");
+        state.execute_block_verified_at(&[], Hash256::ZERO, 1).unwrap();
+
+        // A different allowlist is a reconfiguration attempt, not a restart.
+        let other = hash_bytes(b"a different allowed execution");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![AllowedExecution {
+                    model_hash: other,
+                    profile_hash: other,
+                    generation_hash: other,
+                    assignment_hash: other,
+                }],
+                recovery_epoch: 0,
+                expect: None,
+            },
+        );
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::ReconfigurationRejected { field, .. }) => {
+                assert_eq!(field, "allowed_executions");
+            }
+            other => panic!("expected ReconfigurationRejected, got {other:?}"),
+        }
+
+        // A pin that does not match the FROZEN binding is refused too.
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: Some(ActivationExpectations {
+                    chain_genesis: Some(hash_bytes(b"not this chain")),
+                    ..Default::default()
+                }),
+            },
+        );
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::ReconfigurationRejected { field, .. }) => {
+                assert_eq!(field, "expect.chain_genesis");
+            }
+            other => panic!("expected ReconfigurationRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activation_restart_never_absorbs_a_drifted_committee() {
+        // The dangerous case: the live validator registry moves on, and a
+        // restart re-derives members from it, silently replacing an
+        // operator-approved binding.
+        //
+        // That cannot happen, and the refusal comes from two independent
+        // places. The restart path here never consults `active_validators()`
+        // at all, and `validate_native_inference_activation` re-checks the
+        // context against the live registry BEFORE the idempotent branch, so
+        // even handing back the persisted context is refused once the registry
+        // has drifted.
+        //
+        // The operational consequence is worth stating plainly: changing the
+        // validator registry after activation makes the node unable to restart
+        // with its activation file. That is arc-state's existing fail-closed
+        // behaviour, not something this wrapper can or should paper over - a
+        // binding that no longer describes the chain should not be resumed.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, original_members) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: None,
+            },
+        );
+        activate_native_inference_from_config(&state, &path).expect("fresh activation");
+
+        let intruder = hash_bytes(b"validator that joined after activation");
+        let mut drifted: Vec<(Hash256, u64)> = original_members
+            .iter()
+            .map(|m| (m.address, m.stake))
+            .collect();
+        drifted.push((intruder, 1_000_000));
+        drifted.sort_by_key(|(a, _)| a.0);
+        state.seed_genesis_validators(&drifted);
+
+        // The drift is refused at the first point it matters: block execution
+        // itself fails once the live registry no longer matches the frozen
+        // binding. The chain cannot quietly move on under a committee the
+        // contract was not bound to.
+        let block = state.execute_block_verified_at(&[], Hash256::ZERO, 1);
+        assert!(
+            block.is_err(),
+            "block execution must refuse to proceed under a drifted committee, got {block:?}"
+        );
+
+        // And a restart attempt is refused as well, rather than re-deriving
+        // members from the drifted registry.
+        let outcome = activate_native_inference_from_config(&state, &path);
+        assert!(
+            outcome.is_err(),
+            "a drifted committee must refuse the restart, not absorb the new set"
+        );
+
+        // Whatever happened, the frozen binding is untouched: the intruder
+        // never appears in it.
+        let active = state.native_inference_context().unwrap();
+        assert_eq!(
+            active.members, original_members,
+            "the persisted binding must NOT absorb the drifted committee"
+        );
+        assert!(
+            !active.members.iter().any(|m| m.address == intruder),
+            "a validator that joined after activation must never enter the frozen binding"
+        );
     }
 
     #[test]

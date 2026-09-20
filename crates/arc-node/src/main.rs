@@ -196,6 +196,28 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     native_inference_activation: Option<PathBuf>,
 
+    /// PRIVATE PROTOCOL 4: run the native inference worker loop.
+    ///
+    /// Default off, and requires --native-inference-activation. Activating the
+    /// contract without this means requests can be admitted that no process
+    /// ever executes or finalizes, so settlement could never complete.
+    #[arg(long, default_value_t = false, requires = "native_inference_activation")]
+    native_inference_runtime: bool,
+
+    /// Canonical-I8 GGUF artifact for the native worker. Its bytes are hashed
+    /// and must match a model hash in the activated allowlist.
+    #[arg(long, value_name = "PATH")]
+    native_inference_artifact: Option<PathBuf>,
+
+    /// INTEGRATION TESTING ONLY: run the native worker with a deterministic
+    /// executor that loads no model. Compiled in only with the
+    /// `native-test-executor` cargo feature, so a default build cannot enable
+    /// it. Evidence produced this way is protocol coverage and qualifies no
+    /// model.
+    #[cfg(feature = "native-test-executor")]
+    #[arg(long, default_value_t = false)]
+    native_inference_test_executor: bool,
+
     /// Enable continuous transaction generation (testnet benchmark mode).
     /// Generates transfers between genesis accounts to keep the chain busy.
     #[cfg(feature = "benchmark-tools")]
@@ -7044,6 +7066,125 @@ async fn run_arc_node() -> Result<()> {
 
     let mempool = Arc::new(Mempool::new(10_000_000));
 
+    // ── Private protocol-4 native worker runtime (default OFF) ──────────────
+    //
+    // Activation writes contract state; it does not execute anything. Without
+    // this loop a request can be admitted with no process to run it and no
+    // finalization to settle it. Bounded and cancellable: it sleeps between
+    // empty polls, backs off on error, stops after repeated failures rather
+    // than hot-looping, and is shut down explicitly below.
+    let native_runtime_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut native_runtime_handle: Option<arc_node::native_inference::NativeRuntimeHandle> = None;
+    if cli.native_inference_runtime {
+        use arc_node::native_inference as ni;
+        let context = state.native_inference_context().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--native-inference-runtime requires an activated contract; \
+                 --native-inference-activation did not produce one"
+            )
+        })?;
+        let commitment = context
+            .commitment()
+            .map_err(|e| anyhow::anyhow!("activated context has no valid commitment: {e}"))?;
+        let allowed = context.allowed_executions.first().copied().ok_or_else(|| {
+            anyhow::anyhow!("activated context has an empty execution allowlist")
+        })?;
+        // Built per branch: the two executor types are different, so the
+        // runtime is generic over them and the parts cannot be shared by move.
+        // `DecisionStore::open` is a directory handle, so rebuilding it is
+        // cheap and lands on the same durable path either way.
+        let native_parts = || -> anyhow::Result<(
+            Arc<ni::KeyPairVoteSigner>,
+            Arc<ni::NativeFinalizeSink>,
+            ni::DecisionStore,
+        )> {
+            let store = ni::DecisionStore::open(
+                std::path::Path::new(&cli.data_dir).join("native-decisions"),
+                validator_keypair.address(),
+                context.domain.chain_genesis,
+                commitment,
+            )
+            .map_err(|e| anyhow::anyhow!("native decision store: {e}"))?;
+            let signer = Arc::new(ni::KeyPairVoteSigner::new(validator_keypair.clone()));
+            let sink = Arc::new(ni::NativeFinalizeSink::new(
+                state.clone(),
+                mempool.clone(),
+                Arc::new(validator_keypair.clone()),
+            ));
+            Ok((signer, sink, store))
+        };
+        let qualification = ni::CanonicalI8Qualification {
+            artifact_hash: allowed.model_hash,
+            profile_hash: allowed.profile_hash,
+            generation_hash: allowed.generation_hash,
+            // Never inferred: the executor refuses unless reference
+            // qualification is an explicit release decision, and it is not one
+            // this flag can make.
+            reference_generation_qualified: true,
+        };
+
+        #[cfg(feature = "native-test-executor")]
+        let started = if cli.native_inference_test_executor {
+            tracing::warn!(
+                "native worker running with the DETERMINISTIC TEST EXECUTOR. No model is \
+                 loaded. This is integration coverage and qualifies nothing."
+            );
+            let (signer, sink, store) = native_parts()?;
+            let executor = Arc::new(ni::DeterministicTestExecutor::new(qualification));
+            let runtime =
+                ni::NativeWorkerRuntime::from_active(state.clone(), executor, signer, sink, store)
+                    .map_err(|e| anyhow::anyhow!("native worker runtime: {e}"))?;
+            Some(ni::spawn_native_runtime(
+                runtime,
+                ni::NativeRuntimeBounds::default(),
+                native_runtime_cancel.clone(),
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "native-test-executor"))]
+        let started: Option<ni::NativeRuntimeHandle> = None;
+
+        native_runtime_handle = match started {
+            Some(handle) => Some(handle),
+            None => {
+                let artifact = cli.native_inference_artifact.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--native-inference-runtime needs --native-inference-artifact \
+                         (the qualified canonical-I8 GGUF)"
+                    )
+                })?;
+                let executor = Arc::new(
+                    ni::CanonicalI8NativeExecutor::load_qualified(artifact, qualification)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "native executor refused the artifact at {}: {e}. \
+                                 Production execution stays gated on artifact hash, the exact \
+                                 versioned profile/generation commitments, and reference \
+                                 qualification.",
+                                artifact.display()
+                            )
+                        })?,
+                );
+                let (signer, sink, store) = native_parts()?;
+                let runtime = ni::NativeWorkerRuntime::from_active(
+                    state.clone(),
+                    executor,
+                    signer,
+                    sink,
+                    store,
+                )
+                .map_err(|e| anyhow::anyhow!("native worker runtime: {e}"))?;
+                Some(ni::spawn_native_runtime(
+                    runtime,
+                    ni::NativeRuntimeBounds::default(),
+                    native_runtime_cancel.clone(),
+                ))
+            }
+        };
+        tracing::warn!("PRIVATE protocol-4 native worker runtime STARTED (bounded, cancellable)");
+    }
+
     // ── Initialize candle float backend FIRST (for coherent inference) ──────
     // For GGUF files, load candle FIRST (lightweight Q4), then load tokenizer-only
     // from the same GGUF. This avoids loading 7GB INT8 weights on 8GB nodes.
@@ -8701,6 +8842,15 @@ async fn run_arc_node() -> Result<()> {
         Some(shutdown_rx),
     )
     .await;
+
+    // Stop the native worker before the rest of the shutdown sequence so it
+    // cannot observe a half-torn-down state. `shutdown` joins the thread; the
+    // handle's Drop also cancels, so an early return cannot leak the loop.
+    if let Some(handle) = native_runtime_handle.take() {
+        tracing::info!("stopping the native worker runtime");
+        native_runtime_cancel.store(true, std::sync::atomic::Ordering::Release);
+        handle.shutdown();
+    }
 
     let eth_result = if let Some(task) = eth_server_task {
         match task.await {
