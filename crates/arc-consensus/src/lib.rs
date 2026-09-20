@@ -2386,6 +2386,13 @@ impl ConsensusEngine {
             TxBody::InferenceRequest(_) => false,
             TxBody::InferenceVote(_) => false,
             TxBody::InferenceFinalize(_) => false,
+            // Candidate native protocol-4 transitions are globally ordered
+            // because they freeze the validator set and may credit multiple
+            // payees. They are rejected unless the private activation gate is
+            // present in state.
+            TxBody::NativeInferenceRequest(_)
+            | TxBody::NativeInferenceFinalize(_)
+            | TxBody::NativeInferenceRefund(_) => true,
         }
     }
 

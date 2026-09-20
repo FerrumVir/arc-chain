@@ -232,6 +232,32 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             accounts.insert(escrow_addr.0);
             accounts.insert(arc_types::transaction::faucet_pool_address().0);
         }
+        TxBody::NativeInferenceRequest(body) => {
+            // Shared serialization key; native protocol blocks additionally
+            // reject Block-STM and mixed transaction batches at admission.
+            accounts.insert(validator_set_access_key());
+            accounts.insert(
+                crate::inference_contract_state::escrow_address(body.request.job.request_id()).0,
+            );
+        }
+        TxBody::NativeInferenceFinalize(body) => {
+            accounts.insert(validator_set_access_key());
+            accounts.insert(
+                crate::inference_contract_state::escrow_address(arc_crypto::Hash256(
+                    body.request_id,
+                ))
+                .0,
+            );
+        }
+        TxBody::NativeInferenceRefund(body) => {
+            accounts.insert(validator_set_access_key());
+            accounts.insert(
+                crate::inference_contract_state::escrow_address(arc_crypto::Hash256(
+                    body.request_id,
+                ))
+                .0,
+            );
+        }
     }
 
     TxAccessSet { accounts }

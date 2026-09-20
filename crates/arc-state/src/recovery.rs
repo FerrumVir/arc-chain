@@ -2452,6 +2452,9 @@ impl StateDB {
     }
 
     pub fn active_protocol_version(&self) -> ProtocolVersion {
+        if self.native_inference_context.read().is_some() {
+            return ProtocolVersion::new(4, 0, 0);
+        }
         self.recovery_context()
             .map(|context| context.protocol_version)
             .unwrap_or(ProtocolVersion::GENESIS)

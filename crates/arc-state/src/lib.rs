@@ -1,6 +1,11 @@
 pub mod block_stm;
 pub mod gpu_state;
 pub mod inference_contract_state;
+pub use inference_contract_state::{
+    AllowedExecution, InferenceAdmissionContext, IsolatedInferenceLedger, IsolatedTransitionResult,
+    NativeInferencePendingSnapshot, NativeInferenceReceiptSnapshot, NativeInferenceTransactionLink,
+    validate_native_inference_activation,
+};
 pub mod io_backend;
 pub mod jmt_store;
 pub mod light_client;
@@ -662,6 +667,10 @@ pub struct StateDB {
     recovery_context: RwLock<Option<recovery::RecoveryContext>>,
     /// Exact operator-approved manifest that established `recovery_context`.
     recovery_manifest_hash: RwLock<Option<Hash256>>,
+    native_inference_context: RwLock<Option<InferenceAdmissionContext>>,
+    native_inference_pending: DashMap<[u8; 32], u64>,
+    native_inference_execution: parking_lot::Mutex<()>,
+    native_inference_publication: RwLock<()>,
 }
 
 impl StateDB {
@@ -690,6 +699,7 @@ impl StateDB {
         &self,
         transactions: &[Transaction],
     ) -> Result<(), StateError> {
+        self.validate_native_inference_block_admission(transactions)?;
         if self.active_protocol_version().major == 3 {
             let height = self.height().checked_add(1).ok_or_else(|| {
                 StateError::ExecutionError("prospective v3 block height overflow".to_string())
@@ -742,6 +752,10 @@ impl StateDB {
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
             recovery_context: RwLock::new(None),
             recovery_manifest_hash: RwLock::new(None),
+            native_inference_context: RwLock::new(None),
+            native_inference_pending: DashMap::new(),
+            native_inference_execution: parking_lot::Mutex::new(()),
+            native_inference_publication: RwLock::new(()),
         }
     }
 
@@ -790,6 +804,10 @@ impl StateDB {
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
             recovery_context: RwLock::new(None),
             recovery_manifest_hash: RwLock::new(None),
+            native_inference_context: RwLock::new(None),
+            native_inference_pending: DashMap::new(),
+            native_inference_execution: parking_lot::Mutex::new(()),
+            native_inference_publication: RwLock::new(()),
         })
     }
 
@@ -902,6 +920,7 @@ impl StateDB {
                 state.height()
             );
 
+            state.restore_native_inference_context()?;
             Ok(state)
         } else {
             // Build the complete genesis WAL at an inert staging name. The
@@ -1236,6 +1255,15 @@ impl StateDB {
 
     /// Recover state from a snapshot and WAL replay.
     pub fn recover(snapshot: Snapshot, wal_path: impl AsRef<Path>) -> Result<Self, StateError> {
+        if snapshot.storage.iter().any(|(_, entries)| {
+            entries
+                .iter()
+                .any(|(key, _)| *key == inference_contract_state::activation_key())
+        }) {
+            return Err(StateError::PersistenceError(
+                "native inference state requires genesis-bound checkpointed WAL recovery".into(),
+            ));
+        }
         let state = Self::with_persistence(&wal_path)?;
 
         // Load snapshot state
@@ -1266,6 +1294,16 @@ impl StateDB {
             state.height()
         );
 
+        if state.storage.iter().any(|entries| {
+            entries
+                .value()
+                .contains_key(&inference_contract_state::activation_key())
+        }) {
+            return Err(StateError::PersistenceError(
+                "native inference state requires genesis-bound checkpointed WAL recovery".into(),
+            ));
+        }
+        state.restore_native_inference_context()?;
         Ok(state)
     }
 
@@ -1348,6 +1386,15 @@ impl StateDB {
                 for (address, account) in &record.account_updates {
                     self.accounts.insert(address.0, account.clone());
                     self.dirty_accounts.insert(address.0);
+                    if let Some(cache) = &self.gpu_cache {
+                        cache.put_account(account);
+                    }
+                }
+                if record.metadata.status == wal::InferenceTransitionStatus::Pending {
+                    self.native_inference_pending
+                        .insert(record.request_id.0, record.admission_height);
+                } else {
+                    self.native_inference_pending.remove(&record.request_id.0);
                 }
                 for (address, key, value) in &record.storage_updates {
                     self.storage
@@ -1599,6 +1646,7 @@ impl StateDB {
 
     /// Get a storage value for a contract.
     pub fn get_storage(&self, contract: &Address, key: &Hash256) -> Option<Vec<u8>> {
+        let _publication = self.native_inference_publication.read();
         self.storage
             .get(&contract.0)
             .and_then(|map| map.get(key).map(|v| v.clone()))
@@ -1626,6 +1674,7 @@ impl StateDB {
     /// When a GPU state cache is enabled, checks GPU memory first for ~40x
     /// bandwidth improvement on hot accounts.
     pub fn get_account(&self, addr: &Address) -> Option<Account> {
+        let _publication = self.native_inference_publication.read();
         // Fast path: check GPU cache first.
         if let Some(ref cache) = self.gpu_cache
             && let Some(acct) = cache.get_account_fast(&addr.0)
@@ -1668,7 +1717,10 @@ impl StateDB {
     /// Store event logs for a specific block height.
     pub fn store_event_logs(&self, height: u64, logs: Vec<arc_types::EventLog>) {
         if !logs.is_empty() {
-            if self.is_persistent() && self.recovery_context().is_some() {
+            if self.is_persistent()
+                && (self.recovery_context().is_some()
+                    || self.native_inference_context.read().is_some())
+            {
                 // Recovery replay currently accepts only signed transition
                 // state followed by canonical SetBlock+Checkpoint boundaries.
                 // Do not emit a standalone durable record that this stricter
@@ -2633,7 +2685,10 @@ impl StateDB {
             | TxBody::ShardAssignmentProposal(_)
             | TxBody::InferenceRequest(_)
             | TxBody::InferenceVote(_)
-            | TxBody::InferenceFinalize(_) => Err(StateError::ExecutionError(
+            | TxBody::InferenceFinalize(_)
+            | TxBody::NativeInferenceRequest(_)
+            | TxBody::NativeInferenceFinalize(_)
+            | TxBody::NativeInferenceRefund(_) => Err(StateError::ExecutionError(
                 "transaction family has no protocol-v3 admission handler".to_string(),
             )),
         }
@@ -2696,6 +2751,7 @@ impl StateDB {
 
     /// Get current block height.
     pub fn height(&self) -> u64 {
+        let _publication = self.native_inference_publication.read();
         *self.height.read()
     }
 
@@ -2745,6 +2801,7 @@ impl StateDB {
 
     /// Get a block by height.
     pub fn get_block(&self, height: u64) -> Option<Block> {
+        let _publication = self.native_inference_publication.read();
         self.blocks.get(&height).map(|b| b.clone())
     }
 
@@ -2768,6 +2825,9 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return self.execute_block_verified(transactions, producer);
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         let mut receipts = Vec::with_capacity(transactions.len());
@@ -3030,6 +3090,11 @@ impl StateDB {
         timestamp: u64,
         proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         use rayon::prelude::*;
@@ -3199,6 +3264,15 @@ impl StateDB {
         timestamp: u64,
         proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        let _native_guard = self.native_inference_execution.lock();
+        if self.native_inference_context.read().is_some() {
+            return self.execute_native_inference_block_at(
+                transactions,
+                producer,
+                timestamp,
+                proof_hash,
+            );
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         let mut receipts = Vec::with_capacity(transactions.len());
@@ -3411,6 +3485,11 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         use arc_gpu::metal_verify::{MetalVerifier, VerifyTask};
@@ -3657,6 +3736,11 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         let height = {
@@ -3785,6 +3869,11 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         let height = {
@@ -4014,6 +4103,11 @@ impl StateDB {
         producer: Address,
         nonce_base: &mut u64,
     ) -> Result<Block, StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         if self.active_protocol_version().major == 3 {
             return Err(StateError::ExecutionError(
                 "unsigned benchmark execution is unavailable in recovery protocol v3".to_string(),
@@ -4164,6 +4258,11 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<Block, StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         if self.active_protocol_version().major == 3 {
             return Err(StateError::ExecutionError(
@@ -4604,6 +4703,9 @@ impl StateDB {
             TxBody::InferenceRequest(_) => gas_costs::TIER1_INFERENCE_REQUEST,
             TxBody::InferenceVote(_) => gas_costs::TIER1_INFERENCE_VOTE,
             TxBody::InferenceFinalize(_) => gas_costs::TIER1_INFERENCE_FINALIZE,
+            TxBody::NativeInferenceRequest(_) => gas_costs::NATIVE_INFERENCE_REQUEST,
+            TxBody::NativeInferenceFinalize(_) => gas_costs::NATIVE_INFERENCE_FINALIZE,
+            TxBody::NativeInferenceRefund(_) => gas_costs::NATIVE_INFERENCE_REFUND,
         }
     }
 
@@ -4653,7 +4755,10 @@ impl StateDB {
             | TxType::ShardAssignmentProposal
             | TxType::InferenceRequest
             | TxType::InferenceVote
-            | TxType::InferenceFinalize => V3TransactionFamilyPolicy::Denied,
+            | TxType::InferenceFinalize
+            | TxType::NativeInferenceRequest
+            | TxType::NativeInferenceFinalize
+            | TxType::NativeInferenceRefund => V3TransactionFamilyPolicy::Denied,
         }
     }
 
@@ -8030,6 +8135,11 @@ impl StateDB {
 
                 Ok(gas.consumed)
             }
+            TxBody::NativeInferenceRequest(_)
+            | TxBody::NativeInferenceFinalize(_)
+            | TxBody::NativeInferenceRefund(_) => Err(StateError::ExecutionError(
+                "native inference requires the canonical block publisher".into(),
+            )),
         }
     }
 
@@ -8041,6 +8151,11 @@ impl StateDB {
     /// execute stage which runs on a dedicated thread.
     /// Returns gas consumed on success.
     pub fn execute_tx_pub(&self, tx: &Transaction) -> Result<u64, StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         if self.active_protocol_version().major == 3 {
             return Err(StateError::ExecutionError(
                 "pipeline/direct transaction execution is unavailable in recovery protocol v3"
@@ -8066,6 +8181,11 @@ impl StateDB {
         receipt_success: &[bool],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         if self.active_protocol_version().major == 3 {
             return Err(StateError::ExecutionError(
@@ -8558,11 +8678,13 @@ impl StateDB {
 
     /// Look up a transaction receipt by tx hash.
     pub fn get_receipt(&self, tx_hash: &[u8; 32]) -> Option<TxReceipt> {
+        let _publication = self.native_inference_publication.read();
         self.receipts.get(tx_hash).map(|r| r.clone())
     }
 
     /// Look up transaction location (block_height, tx_index) by tx hash.
     pub fn get_tx_location(&self, tx_hash: &[u8; 32]) -> Option<(u64, u32)> {
+        let _publication = self.native_inference_publication.read();
         self.tx_index.get(tx_hash).map(|r| *r)
     }
 
@@ -8901,6 +9023,32 @@ impl StateDB {
                     .or_default()
                     .push(tx.hash);
             }
+            TxBody::NativeInferenceRequest(body) => {
+                let escrow_addr =
+                    inference_contract_state::escrow_address(body.request.job.request_id());
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
+            TxBody::NativeInferenceFinalize(body) => {
+                self.index_native_inference_payees(Hash256(body.request_id), tx);
+                let escrow_addr =
+                    inference_contract_state::escrow_address(Hash256(body.request_id));
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
+            TxBody::NativeInferenceRefund(body) => {
+                self.index_native_inference_payees(Hash256(body.request_id), tx);
+                let escrow_addr =
+                    inference_contract_state::escrow_address(Hash256(body.request_id));
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
         }
     }
 
@@ -9124,6 +9272,25 @@ impl StateDB {
                 let treasury_addr = arc_types::transaction::faucet_pool_address();
                 self.dirty_accounts.insert(treasury_addr.0);
             }
+            TxBody::NativeInferenceRequest(body) => {
+                let escrow_addr =
+                    inference_contract_state::escrow_address(body.request.job.request_id());
+                self.dirty_accounts.insert(escrow_addr.0);
+            }
+            TxBody::NativeInferenceFinalize(body) => {
+                let escrow_addr =
+                    inference_contract_state::escrow_address(Hash256(body.request_id));
+                self.dirty_accounts.insert(escrow_addr.0);
+                self.dirty_accounts
+                    .insert(arc_types::transaction::faucet_pool_address().0);
+            }
+            TxBody::NativeInferenceRefund(body) => {
+                let escrow_addr =
+                    inference_contract_state::escrow_address(Hash256(body.request_id));
+                self.dirty_accounts.insert(escrow_addr.0);
+                self.dirty_accounts
+                    .insert(arc_types::transaction::faucet_pool_address().0);
+            }
         }
     }
 
@@ -9270,6 +9437,12 @@ impl StateDB {
     /// `compute_state_root_jmt()` instead of using IncrementalMerkle.
     /// Initializes the JMT with all existing accounts on first call.
     pub fn enable_jmt(&mut self) {
+        // Native protocol-4 WAL recovery has one fixed account-root backend.
+        // Switching an active chain's hash algorithm is not a cache toggle.
+        if self.native_inference_context.read().is_some() {
+            tracing::warn!("JMT root switch ignored for the activated native protocol-4 candidate");
+            return;
+        }
         self.use_jmt = true;
         // Initialize JMT with all existing accounts.
         let mut jmt = self.jmt.lock();
@@ -9480,7 +9653,9 @@ impl StateDB {
     pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Result<Hash256, StateError> {
         use std::collections::HashSet;
 
-        if self.is_persistent() && self.recovery_context().is_some() {
+        if self.is_persistent()
+            && (self.recovery_context().is_some() || self.native_inference_context.read().is_some())
+        {
             return Err(StateError::PersistenceError(
                 "standalone state-diff persistence is unavailable on recovery-bound state; authenticate and commit the matching canonical block"
                     .into(),
@@ -9629,6 +9804,7 @@ impl StateDB {
     /// Accounts are serialised with bincode, hashed, then sorted to ensure a
     /// deterministic tree regardless of DashMap iteration order.
     pub fn get_state_root(&self) -> Hash256 {
+        let _publication = self.native_inference_publication.read();
         self.compute_state_root()
     }
 

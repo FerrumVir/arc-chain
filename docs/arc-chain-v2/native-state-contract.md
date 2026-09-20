@@ -1,0 +1,22 @@
+# Private native-inference state candidate
+
+This implementation is a local protocol-4 candidate. It is not a production activation or a model-quality qualification. The model, arithmetic profile, generation parameters and assignment must match one exact four-hash entry in the persisted allowlist. The state layer does not select an INT8 implementation or substitute a profile.
+
+`StateDB::activate_native_inference(context)` is an explicit setup operation on a persistent, unrecovered, unused height-zero state. Seed its actual genesis validator registry first. Activation checks `genesis.network-hash`, the sorted active validator/stake registry, the validator-set commitment and the execution allowlist. It persists the context, its rooted commitment and the registry at the genesis WAL checkpoint. A changed context, recovery-bound state, nonpersistent state or occupied context pin is rejected.
+
+The canonical verified/adaptive block API accepts either an empty block or one signed native request, finalize or refund. Other transaction families, mixed batches, Block-STM, direct transaction execution and pre-executed pipeline commits are unavailable in this private mode. Outer fees must be zero; operation gas and the block gas ceiling are enforced. Actual signatures are verified even when `sig_verified` is set.
+
+Request admission checks the signed input and execution tuple, consumes the requester's nonce once and reserves the signed maximum payment. Finalize checks the full certificate against the frozen validator stakes and requires strictly more than two-thirds. Refund requires expiry. Finalize/refund consume the outer caller's nonce once; when that caller is also a settlement payee, credit and nonce replacements are coalesced. Zero-price jobs are rejected by the contract; positive tiny prices conserve the reserve. Duplicate terminal submissions do not move funds or consume another nonce.
+
+Both canonical state and `IsolatedInferenceLedger` use the same borrowed pure planner. The isolated adapter retains its independent transition barriers and cannot wrap an activated canonical state. Canonical execution projects the resulting account root without mutating shared state, then writes one typed economic transition plus the complete block, transactions, receipts and checkpoint. Only a successful block fsync permits publication. Account/storage/height/block/receipt/root getters use a publication read gate; they cannot observe intermediate account replacements. An fsync failure leaves live financial state at its previous published block, poisons subsequent block writes and makes native read APIs return an error. A process restart can recover either complete checkpoint when an unsuccessful fsync nevertheless wrote the full block, never a partial settlement. No per-transaction checkpoint can seal an incomplete canonical block.
+
+Native pending and request-keyed receipt accessors wait for the canonical execution boundary and reject an unhealthy WAL. Pending discovery uses a derived index capped at 1,024 open requests; it does not scan every account on each worker poll. The index and native transaction/payee histories are rebuilt from committed metadata and transaction records on restart. `try_native_inference_context` reports persistence errors; its Option convenience counterpart returns `None` on unhealthy WAL.
+
+Candidate limits are deliberate:
+
+- Restart uses `with_genesis_persistent` and complete checkpointed WAL replay. Generic legacy snapshot recovery is rejected for native state; authenticated snapshot migration remains separate work.
+- Root projection currently costs O(accounts) per native block. This is suitable for the private candidate, not a throughput claim.
+- The default account-root backend is fixed. Activation with JMT roots is rejected, and enabling JMT after activation leaves the native root backend unchanged. Alternate root-mode persistence requires an explicit protocol extension.
+- Off-chain model execution, vote transport, live multi-process/P2P agreement and cross-platform model reproducibility require separate evidence. Signed six-validator state fixtures do not prove those properties.
+
+Validation: `cargo test -p arc-state --lib` passes 371 tests, including 16 inference adapter tests spanning actual signed canonical transactions, strict quorum, malformed certificates, domain/tuple/input bounds, zero/tiny prices, caller/payee aliasing, arithmetic overflow, expiry/refund, default/v3 rejection, queue bounds, duplicate settlement, restart and injected WAL failure.
