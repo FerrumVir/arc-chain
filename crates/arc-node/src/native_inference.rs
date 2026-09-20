@@ -1,0 +1,1573 @@
+//! Private milestone-2 native inference worker seam.
+//!
+//! The worker accepts request IDs only. It fetches the canonical pending job
+//! through `PendingSource`, computes once through an injected executor, and
+//! persists a signed output decision before a vote sink can observe it.
+
+use arc_crypto::signature::{KeyPair, Signature};
+use arc_crypto::{Hash256, hash_bytes};
+use arc_mempool::Mempool;
+use arc_types::inference_contract::{InferenceCertificate, InferenceVote, sign_vote};
+use arc_types::transaction::{
+    NativeInferenceFinalizeBody, TIER1_INPUT_BLOB_MAX, TIER1_MAX_TOKENS, TIER1_OUTPUT_BLOB_MAX,
+    Transaction, TxBody, TxType, gas_costs,
+};
+use dashmap::DashSet;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use thiserror::Error;
+
+pub const MAX_QUEUE: usize = 32;
+pub const MAX_INPUT_BYTES: usize = TIER1_INPUT_BLOB_MAX;
+pub const MAX_OUTPUT_BYTES: usize = TIER1_OUTPUT_BLOB_MAX;
+pub const MAX_TOKENS: usize = TIER1_MAX_TOKENS as usize;
+const MAX_CERTIFICATE_CANDIDATES: usize = 1024;
+const CANONICAL_I8_V2_GENERATION_SEMANTICS: &[u8] =
+    b"ARC-native-inference/gguf-llama-i8-interleaved-rope/generation-v2/bos-once/le-u32/v1";
+
+/// Commitments required in the activated execution tuple for the corrected
+/// per-row-I8 worker.  They are deliberately derived from versioned shared
+/// strings rather than accepted as caller-selected labels.
+pub fn canonical_i8_profile_commitment() -> Hash256 {
+    hash_bytes(
+        arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.as_bytes(),
+    )
+}
+
+pub fn canonical_i8_generation_commitment() -> Hash256 {
+    hash_bytes(CANONICAL_I8_V2_GENERATION_SEMANTICS)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingJob {
+    pub request_id: Hash256,
+    pub genesis: Hash256,
+    pub context: Hash256,
+    pub expires_at: u64,
+    pub artifact: Hash256,
+    pub generation_semantics: String,
+    pub model_hash: Hash256,
+    pub profile_hash: Hash256,
+    pub input_hash: Hash256,
+    pub generation_hash: Hash256,
+    pub assignment_hash: Hash256,
+    pub max_tokens: usize,
+    pub max_output_bytes: usize,
+    pub input: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionOutput {
+    pub tokens: Vec<u32>,
+    pub output_hash: Hash256,
+}
+
+/// The complete domain-bound payload presented to the signer.  Signing only
+/// the output would allow the same signature to be replayed for another
+/// request, artifact, or execution context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecisionMaterial {
+    pub request_id: Hash256,
+    pub genesis: Hash256,
+    pub context: Hash256,
+    pub artifact: Hash256,
+    pub generation_semantics: String,
+    pub model_hash: Hash256,
+    pub profile_hash: Hash256,
+    pub input_hash: Hash256,
+    pub generation_hash: Hash256,
+    pub assignment_hash: Hash256,
+    pub max_tokens: usize,
+    pub max_output_bytes: usize,
+    pub tokens: Vec<u32>,
+    pub output_hash: Hash256,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredDecision {
+    request_id: Hash256,
+    genesis: Hash256,
+    context: Hash256,
+    artifact: Hash256,
+    generation_semantics: String,
+    model_hash: Hash256,
+    profile_hash: Hash256,
+    input_hash: Hash256,
+    generation_hash: Hash256,
+    assignment_hash: Hash256,
+    max_tokens: usize,
+    max_output_bytes: usize,
+    tokens: Vec<u32>,
+    output_hash: Hash256,
+    validator: Hash256,
+    signature: Signature,
+}
+
+#[derive(Debug, Error)]
+pub enum NativeInferenceError {
+    #[error("worker queue is full")]
+    QueueFull,
+    #[error("worker is cancelled")]
+    Cancelled,
+    #[error("request expired")]
+    Expired,
+    #[error("input exceeds bounded worker limit")]
+    InputTooLarge,
+    #[error("output exceeds bounded worker limit")]
+    OutputTooLarge,
+    #[error("pending request context does not match worker context")]
+    ContextMismatch,
+    #[error("decision conflicts with durable prior output")]
+    Equivocation,
+    #[error("durable decision store is corrupt")]
+    CorruptStore,
+    #[error("durable decision store is poisoned after an uncertain publication")]
+    StorePoisoned,
+    #[error("source: {0}")]
+    Source(String),
+    #[error("executor: {0}")]
+    Executor(String),
+    #[error("signer: {0}")]
+    Signer(String),
+    #[error("vote sink: {0}")]
+    Sink(String),
+    #[error("io: {0}")]
+    Io(#[from] io::Error),
+}
+
+pub trait PendingSource: Send + Sync {
+    fn load_pending(&self, request_id: Hash256) -> Result<PendingJob, NativeInferenceError>;
+
+    /// Re-read the canonical source immediately before a durable decision is
+    /// exposed. The default preserves the labelled test-source seam.
+    fn ensure_live(&self, job: &PendingJob, now: u64) -> Result<(), NativeInferenceError> {
+        if now >= job.expires_at || self.load_pending(job.request_id)? != *job {
+            return Err(NativeInferenceError::Expired);
+        }
+        Ok(())
+    }
+}
+
+/// Canonical pending source backed by the bounded StateDB index. It never
+/// accepts a caller-supplied request body and rejects a context mismatch.
+pub struct StatePendingSource {
+    state: Arc<arc_state::StateDB>,
+    context_commitment: Hash256,
+}
+
+impl StatePendingSource {
+    pub fn new(state: Arc<arc_state::StateDB>, context_commitment: Hash256) -> Self {
+        Self {
+            state,
+            context_commitment,
+        }
+    }
+
+    /// Bind to the only context StateDB currently considers live. A caller
+    /// cannot manufacture a context commitment for a different frozen set.
+    pub fn from_active(state: Arc<arc_state::StateDB>) -> Result<Self, NativeInferenceError> {
+        let context = state
+            .try_native_inference_context()
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?
+            .ok_or_else(|| {
+                NativeInferenceError::Source("native inference is not activated".into())
+            })?;
+        let context_commitment = context
+            .commitment()
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
+        Ok(Self::new(state, context_commitment))
+    }
+}
+
+impl PendingSource for StatePendingSource {
+    fn load_pending(&self, request_id: Hash256) -> Result<PendingJob, NativeInferenceError> {
+        let pending = self
+            .state
+            .native_inference_pending_requests(self.context_commitment)
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?
+            .into_iter()
+            .find(|snapshot| snapshot.request_id == request_id)
+            .ok_or_else(|| {
+                NativeInferenceError::Source("canonical pending request missing".into())
+            })?;
+        let job = pending.request.job;
+        Ok(PendingJob {
+            request_id,
+            genesis: job.domain.chain_genesis,
+            context: pending.context_commitment,
+            expires_at: job.expires_at,
+            artifact: job.model_hash,
+            generation_semantics: format!(
+                "profile:{:?}:generation:{:?}",
+                job.profile_hash.0, job.generation_hash.0
+            ),
+            model_hash: job.model_hash,
+            profile_hash: job.profile_hash,
+            input_hash: job.input_hash,
+            generation_hash: job.generation_hash,
+            assignment_hash: job.assignment_hash,
+            max_tokens: job.max_tokens as usize,
+            max_output_bytes: job.max_output_bytes as usize,
+            input: pending.input_blob,
+        })
+    }
+
+    fn ensure_live(&self, job: &PendingJob, _now: u64) -> Result<(), NativeInferenceError> {
+        let context = self
+            .state
+            .try_native_inference_context()
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?
+            .ok_or(NativeInferenceError::ContextMismatch)?;
+        let commitment = context
+            .commitment()
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
+        if commitment != self.context_commitment || job.context != commitment {
+            return Err(NativeInferenceError::ContextMismatch);
+        }
+        // Expiry is evaluated at the next canonical block, not wall clock.
+        // A terminal receipt has no entry in this bounded pending view.
+        let next_height = self.state.height().saturating_add(1);
+        if next_height >= job.expires_at || self.load_pending(job.request_id)? != *job {
+            return Err(NativeInferenceError::Expired);
+        }
+        Ok(())
+    }
+}
+
+pub trait NativeExecutor: Send + Sync {
+    fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError>;
+}
+
+/// A reviewed binding for the private canonical-I8 worker.  The three hashes
+/// are the activation's immutable model/profile/generation tuple; the
+/// generation commitment must include the independently qualified tokenizer
+/// and prompt-template contract.  Setting `reference_generation_qualified`
+/// is an explicit release decision made only after reference-output evidence,
+/// never an optimistic default at node startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalI8Qualification {
+    pub artifact_hash: Hash256,
+    pub profile_hash: Hash256,
+    pub generation_hash: Hash256,
+    pub reference_generation_qualified: bool,
+}
+
+/// Concrete adapter for the corrected GGUF Llama per-row-I8 execution path.
+/// It intentionally accepts pre-qualified LE-u32 prompt IDs only.  The legacy
+/// greedy `CachedIntegerModel::encode` tokenizer is never called here, so raw
+/// UTF-8 cannot become a paid output before tokenizer/template qualification.
+pub struct CanonicalI8NativeExecutor {
+    model: Arc<arc_inference::cached_integer_model::CachedIntegerModel>,
+    qualification: CanonicalI8Qualification,
+}
+
+impl CanonicalI8NativeExecutor {
+    /// Load the artifact and prove its byte commitment before model loading.
+    /// This is the production-facing constructor; it cannot be pointed at an
+    /// already-resident arbitrary model with a claimed source hash.
+    pub fn load_qualified(
+        path: impl AsRef<Path>,
+        qualification: CanonicalI8Qualification,
+    ) -> Result<Self, NativeInferenceError> {
+        let path = path.as_ref();
+        let actual = artifact_hash(path)?;
+        if actual != qualification.artifact_hash {
+            return Err(NativeInferenceError::Executor(
+                "canonical I8 artifact bytes do not match the pinned model hash".into(),
+            ));
+        }
+        let path = path.to_str().ok_or_else(|| {
+            NativeInferenceError::Executor("canonical I8 artifact path is not valid UTF-8".into())
+        })?;
+        let model = Arc::new(
+            arc_inference::cached_integer_model::load_cached_model_canonical_i8_interleaved_rope(
+                path,
+            )
+            .map_err(|error| NativeInferenceError::Executor(error.to_string()))?,
+        );
+        Self::from_model(model, qualification)
+    }
+
+    // Kept private for module-level fixtures. Production construction must go
+    // through `load_qualified`, which hashes the actual source artifact.
+    fn from_model(
+        model: Arc<arc_inference::cached_integer_model::CachedIntegerModel>,
+        qualification: CanonicalI8Qualification,
+    ) -> Result<Self, NativeInferenceError> {
+        use arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE;
+        if !qualification.reference_generation_qualified {
+            return Err(NativeInferenceError::Executor(
+                "canonical I8 generation has not passed reference qualification".into(),
+            ));
+        }
+        if qualification.profile_hash != canonical_i8_profile_commitment()
+            || qualification.generation_hash != canonical_i8_generation_commitment()
+        {
+            return Err(NativeInferenceError::Executor(
+                "canonical I8 activation does not use the exact versioned profile/generation commitments".into(),
+            ));
+        }
+        if model.canonical_execution_profile() != Some(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
+            || !model.has_all_transformer_layers()
+        {
+            return Err(NativeInferenceError::Executor(
+                "model is not the complete corrected GGUF interleaved-RoPE canonical I8 profile"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            model,
+            qualification,
+        })
+    }
+
+    fn prequalified_prompt(
+        job: &PendingJob,
+        bos_token: u32,
+    ) -> Result<Vec<u32>, NativeInferenceError> {
+        // The signed input hash was checked by StatePendingSource and again by
+        // NativeWorker. This wire form prevents a hidden text tokenizer from
+        // changing a request after its generation commitment was signed.
+        if job.input.is_empty() || job.input.len() % std::mem::size_of::<u32>() != 0 {
+            return Err(NativeInferenceError::Executor(
+                "native canonical I8 input must be non-empty little-endian u32 token IDs".into(),
+            ));
+        }
+        let tokens: Vec<u32> = job
+            .input
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        if tokens.len() > MAX_INPUT_BYTES / 4 || tokens.first() == Some(&bos_token) {
+            return Err(NativeInferenceError::Executor(
+                "native canonical I8 prompt is oversized or includes BOS owned by generation v2"
+                    .into(),
+            ));
+        }
+        Ok(tokens)
+    }
+}
+
+fn artifact_hash(path: &Path) -> Result<Hash256, NativeInferenceError> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(NativeInferenceError::Executor(
+            "canonical I8 artifact path is not a regular file".into(),
+        ));
+    }
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Hash256(*hasher.finalize().as_bytes()))
+}
+
+impl NativeExecutor for CanonicalI8NativeExecutor {
+    fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+        if job.model_hash != self.qualification.artifact_hash
+            || job.artifact != self.qualification.artifact_hash
+            || job.profile_hash != self.qualification.profile_hash
+            || job.generation_hash != self.qualification.generation_hash
+        {
+            return Err(NativeInferenceError::ContextMismatch);
+        }
+        let prompt = Self::prequalified_prompt(job, self.model.config.bos_token)?;
+        let max_tokens =
+            u32::try_from(job.max_tokens).map_err(|_| NativeInferenceError::OutputTooLarge)?;
+        let (tokens, output_hash) = self
+            .model
+            .try_generate_v2(&prompt, max_tokens, &self.model.config.eos_tokens)
+            .map_err(|error| NativeInferenceError::Executor(error.to_string()))?;
+        if tokens.is_empty()
+            || tokens.len() > job.max_tokens
+            || tokens.len() * std::mem::size_of::<u32>() > job.max_output_bytes
+        {
+            return Err(NativeInferenceError::OutputTooLarge);
+        }
+        if token_hash(&tokens) != output_hash {
+            return Err(NativeInferenceError::Executor(
+                "canonical I8 generation returned a non-canonical token hash".into(),
+            ));
+        }
+        Ok(ExecutionOutput {
+            tokens,
+            output_hash,
+        })
+    }
+}
+
+pub trait VoteSigner: Send + Sync {
+    fn sign(&self, decision: &DecisionMaterial) -> Result<InferenceVote, NativeInferenceError>;
+}
+
+pub struct KeyPairVoteSigner {
+    keypair: KeyPair,
+}
+
+impl KeyPairVoteSigner {
+    pub fn new(keypair: KeyPair) -> Self {
+        Self { keypair }
+    }
+}
+
+impl VoteSigner for KeyPairVoteSigner {
+    fn sign(&self, decision: &DecisionMaterial) -> Result<InferenceVote, NativeInferenceError> {
+        sign_vote(
+            decision.request_id,
+            &token_bytes(&decision.tokens),
+            &self.keypair,
+        )
+        .map_err(|error| NativeInferenceError::Signer(error.to_string()))
+    }
+}
+
+pub trait VoteSink: Send + Sync {
+    fn emit(&self, decision: &StoredVote) -> Result<(), NativeInferenceError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredVote {
+    pub request_id: Hash256,
+    pub output_hash: Hash256,
+    pub tokens: Vec<u32>,
+    pub vote: InferenceVote,
+}
+
+/// Collects independently signed native votes and submits exactly one ordinary
+/// signed `NativeInferenceFinalize` transaction once the frozen membership has
+/// a strict >2/3 stake certificate. This is intentionally a local relay, not
+/// a consensus shortcut: the StateDB preflight and later block execution both
+/// verify every vote and the canonical pending request again.
+pub struct NativeFinalizeSink {
+    state: Arc<arc_state::StateDB>,
+    mempool: Arc<Mempool>,
+    submitter: Arc<KeyPair>,
+    candidates: Mutex<BTreeMap<[u8; 32], CandidateVotes>>,
+    emission_gate: Mutex<()>,
+}
+
+#[derive(Default)]
+struct CandidateVotes {
+    output: Vec<u8>,
+    votes: BTreeMap<[u8; 32], InferenceVote>,
+    submitted: Option<Hash256>,
+}
+
+impl NativeFinalizeSink {
+    pub fn new(
+        state: Arc<arc_state::StateDB>,
+        mempool: Arc<Mempool>,
+        submitter: Arc<KeyPair>,
+    ) -> Self {
+        Self {
+            state,
+            mempool,
+            submitter,
+            candidates: Mutex::new(BTreeMap::new()),
+            emission_gate: Mutex::new(()),
+        }
+    }
+
+    fn pending_and_context(
+        &self,
+        request_id: Hash256,
+    ) -> Result<
+        (
+            arc_state::InferenceAdmissionContext,
+            arc_state::NativeInferencePendingSnapshot,
+        ),
+        NativeInferenceError,
+    > {
+        let context = self
+            .state
+            .try_native_inference_context()
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?
+            .ok_or_else(|| {
+                NativeInferenceError::Source("native inference is not activated".into())
+            })?;
+        let commitment = context
+            .commitment()
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
+        let pending = self
+            .state
+            .native_inference_pending_requests(commitment)
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?
+            .into_iter()
+            .find(|item| item.request_id == request_id)
+            .ok_or_else(|| {
+                NativeInferenceError::Source("native request is no longer pending".into())
+            })?;
+        if self.state.height().saturating_add(1) >= pending.request.job.expires_at {
+            return Err(NativeInferenceError::Expired);
+        }
+        Ok((context, pending))
+    }
+
+    fn certificate_has_threshold(
+        context: &arc_state::InferenceAdmissionContext,
+        certificate: &InferenceCertificate,
+    ) -> Result<bool, NativeInferenceError> {
+        let mut total = 0u64;
+        let mut signed = 0u64;
+        for member in &context.members {
+            total = total.checked_add(member.stake).ok_or_else(|| {
+                NativeInferenceError::Source("native member stake overflow".into())
+            })?;
+            if certificate
+                .votes
+                .iter()
+                .any(|vote| vote.validator == member.address)
+            {
+                signed = signed.checked_add(member.stake).ok_or_else(|| {
+                    NativeInferenceError::Source("native signed stake overflow".into())
+                })?;
+            }
+        }
+        Ok(signed >= arc_types::strict_supermajority_threshold(total))
+    }
+}
+
+impl VoteSink for NativeFinalizeSink {
+    fn emit(&self, decision: &StoredVote) -> Result<(), NativeInferenceError> {
+        // The submitter has one outer nonce. Serialize collection, preflight,
+        // signing and insertion so concurrent worker completions cannot create
+        // competing finalizer transactions at that nonce.
+        let _emission = self.emission_gate.lock();
+        let (context, pending) = self.pending_and_context(decision.request_id)?;
+        let output = token_bytes(&decision.tokens);
+        if output.is_empty()
+            || output.len() > pending.request.job.max_output_bytes as usize
+            || hash_bytes(&output) != decision.output_hash
+            || !verify_vote(&decision.vote, decision.request_id, &decision.tokens)
+        {
+            return Err(NativeInferenceError::Signer(
+                "invalid native vote/output binding".into(),
+            ));
+        }
+        if !context
+            .members
+            .iter()
+            .any(|member| member.address == decision.vote.validator)
+        {
+            return Err(NativeInferenceError::Signer(
+                "native vote is not from a frozen member".into(),
+            ));
+        }
+
+        let certificate = {
+            let mut candidates = self.candidates.lock();
+            let commitment = context
+                .commitment()
+                .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
+            let active: BTreeSet<_> = self
+                .state
+                .native_inference_pending_requests(commitment)
+                .map_err(|error| NativeInferenceError::Source(error.to_string()))?
+                .into_iter()
+                .map(|pending| pending.request_id.0)
+                .collect();
+            // Terminal requests never remain resident. This keeps the
+            // collector bounded by StateDB's bounded pending index.
+            candidates.retain(|request_id, _| active.contains(request_id));
+            if !candidates.contains_key(&decision.request_id.0)
+                && candidates.len() >= MAX_CERTIFICATE_CANDIDATES
+            {
+                return Err(NativeInferenceError::QueueFull);
+            }
+            let candidate = candidates.entry(decision.request_id.0).or_default();
+            if candidate.submitted.is_some() {
+                return Ok(());
+            }
+            if candidate.output.is_empty() {
+                candidate.output = output;
+            } else if candidate.output != output {
+                // One local collector must never combine two deterministic
+                // results into a misleading certificate.
+                return Err(NativeInferenceError::Equivocation);
+            }
+            match candidate.votes.get(&decision.vote.validator.0) {
+                Some(existing) if existing != &decision.vote => {
+                    return Err(NativeInferenceError::Equivocation);
+                }
+                Some(_) => {}
+                None => {
+                    candidate
+                        .votes
+                        .insert(decision.vote.validator.0, decision.vote.clone());
+                }
+            }
+            InferenceCertificate {
+                output: candidate.output.clone(),
+                votes: candidate.votes.values().cloned().collect(),
+            }
+        };
+        if !Self::certificate_has_threshold(&context, &certificate)? {
+            return Ok(());
+        }
+
+        // Re-read immediately before signing/admitting. The state preflight
+        // supplies the same check under its canonical native execution lock.
+        let (current_context, current_pending) = self.pending_and_context(decision.request_id)?;
+        if current_context != context || current_pending != pending {
+            return Err(NativeInferenceError::ContextMismatch);
+        }
+        let nonce = self
+            .state
+            .get_account(&self.submitter.address())
+            .ok_or_else(|| {
+                NativeInferenceError::Source("native finalizer has no canonical account".into())
+            })?
+            .nonce;
+        let mut tx = Transaction {
+            tx_type: TxType::NativeInferenceFinalize,
+            from: self.submitter.address(),
+            nonce,
+            body: TxBody::NativeInferenceFinalize(NativeInferenceFinalizeBody {
+                request_id: decision.request_id.0,
+                certificate,
+            }),
+            fee: 0,
+            gas_limit: gas_costs::NATIVE_INFERENCE_FINALIZE,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: false,
+        };
+        self.state
+            .sign_transaction(&mut tx, &self.submitter)
+            .map_err(|error| NativeInferenceError::Signer(error.to_string()))?;
+        self.state
+            .validate_native_inference_transaction_admission_at(
+                &tx,
+                &context,
+                self.state.height().saturating_add(1),
+            )
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
+        if !self.mempool.contains(&tx.hash) {
+            self.mempool
+                .insert(tx.clone())
+                .map_err(|error| NativeInferenceError::Sink(error.to_string()))?;
+        }
+        let mut candidates = self.candidates.lock();
+        if let Some(candidate) = candidates.get_mut(&decision.request_id.0) {
+            candidate.submitted = Some(tx.hash);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DecisionStore {
+    root: PathBuf,
+    validator: Hash256,
+    genesis: Hash256,
+    context: Hash256,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl DecisionStore {
+    pub fn open(
+        root: impl AsRef<Path>,
+        validator: Hash256,
+        genesis: Hash256,
+        context: Hash256,
+    ) -> Result<Self, NativeInferenceError> {
+        fs::create_dir_all(root.as_ref())?;
+        Ok(Self {
+            root: root.as_ref().to_path_buf(),
+            validator,
+            genesis,
+            context,
+            poisoned: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn path(&self, request_id: Hash256) -> PathBuf {
+        let mut bytes = Vec::with_capacity(128);
+        bytes.extend_from_slice(&self.validator.0);
+        bytes.extend_from_slice(&self.genesis.0);
+        bytes.extend_from_slice(&self.context.0);
+        bytes.extend_from_slice(&request_id.0);
+        self.root.join(format!(
+            "{}.decision",
+            hex::encode(blake3::hash(&bytes).as_bytes())
+        ))
+    }
+
+    fn load(&self, request_id: Hash256) -> Result<Option<StoredDecision>, NativeInferenceError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(NativeInferenceError::StorePoisoned);
+        }
+        let path = self.path(request_id);
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        const MAX_DECISION_BYTES: usize = 256 * 1024;
+        if file.metadata()?.len() > MAX_DECISION_BYTES as u64 {
+            return Err(NativeInferenceError::CorruptStore);
+        }
+        // A file can grow after metadata is checked. Read through Take so the
+        // store never turns a corrupted decision file into an unbounded heap
+        // allocation.
+        let mut bytes = Vec::with_capacity(MAX_DECISION_BYTES.min(8192));
+        file.take(MAX_DECISION_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_DECISION_BYTES {
+            return Err(NativeInferenceError::CorruptStore);
+        }
+        bincode::deserialize_limited_exact::<StoredDecision, { 256 * 1024 }>(&bytes)
+            .map(Some)
+            .map_err(|_| NativeInferenceError::CorruptStore)
+    }
+
+    fn sync_published(&self, request_id: Hash256) -> Result<(), NativeInferenceError> {
+        let file = File::open(self.path(request_id))?;
+        file.sync_all()?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
+
+    fn load_existing_valid(
+        &self,
+        job: &PendingJob,
+    ) -> Result<Option<StoredVote>, NativeInferenceError> {
+        let Some(stored) = self.load(job.request_id)? else {
+            return Ok(None);
+        };
+        if stored.request_id != job.request_id
+            || stored.validator != self.validator
+            || stored.genesis != job.genesis
+            || stored.context != job.context
+            || stored.artifact != job.artifact
+            || stored.generation_semantics != job.generation_semantics
+            || stored.model_hash != job.model_hash
+            || stored.profile_hash != job.profile_hash
+            || stored.input_hash != job.input_hash
+            || stored.generation_hash != job.generation_hash
+            || stored.assignment_hash != job.assignment_hash
+            || stored.max_tokens != job.max_tokens
+            || stored.max_output_bytes != job.max_output_bytes
+            || stored.tokens.is_empty()
+            || stored.tokens.len() > job.max_tokens
+            || stored.tokens.len() > MAX_TOKENS
+            || stored.tokens.len() * std::mem::size_of::<u32>() > job.max_output_bytes
+            || stored.tokens.len() * std::mem::size_of::<u32>() > MAX_OUTPUT_BYTES
+            || stored.output_hash != token_hash(&stored.tokens)
+        {
+            return Err(NativeInferenceError::Equivocation);
+        }
+        let vote = InferenceVote {
+            validator: stored.validator,
+            output_hash: stored.output_hash,
+            signature: stored.signature,
+        };
+        if !verify_vote(&vote, job.request_id, &stored.tokens) {
+            return Err(NativeInferenceError::CorruptStore);
+        }
+        Ok(Some(StoredVote {
+            request_id: job.request_id,
+            output_hash: stored.output_hash,
+            tokens: stored.tokens,
+            vote,
+        }))
+    }
+
+    pub fn persist_signed(
+        &self,
+        decision: StoredVote,
+        job: &PendingJob,
+    ) -> Result<StoredVote, NativeInferenceError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(NativeInferenceError::StorePoisoned);
+        }
+        if job.genesis != self.genesis || job.context != self.context {
+            return Err(NativeInferenceError::ContextMismatch);
+        }
+        if decision.request_id != job.request_id {
+            return Err(NativeInferenceError::ContextMismatch);
+        }
+        if job.max_tokens == 0
+            || job.max_tokens > MAX_TOKENS
+            || job.max_output_bytes == 0
+            || job.max_output_bytes > MAX_OUTPUT_BYTES
+        {
+            return Err(NativeInferenceError::OutputTooLarge);
+        }
+        if decision.tokens.is_empty()
+            || decision.tokens.len() > job.max_tokens
+            || decision.tokens.len() > MAX_TOKENS
+        {
+            return Err(NativeInferenceError::OutputTooLarge);
+        }
+        if decision.tokens.len() * std::mem::size_of::<u32>() > job.max_output_bytes
+            || decision.tokens.len() * std::mem::size_of::<u32>() > MAX_OUTPUT_BYTES
+            || token_hash(&decision.tokens) != decision.output_hash
+        {
+            return Err(NativeInferenceError::Executor(
+                "output hash does not match canonical token bytes".into(),
+            ));
+        }
+        if decision.vote.validator != self.validator
+            || decision.vote.output_hash != decision.output_hash
+            || !verify_vote(&decision.vote, job.request_id, &decision.tokens)
+        {
+            return Err(NativeInferenceError::Signer(
+                "invalid typed inference vote".into(),
+            ));
+        }
+        let stored = StoredDecision {
+            request_id: job.request_id,
+            genesis: job.genesis,
+            context: job.context,
+            artifact: job.artifact,
+            generation_semantics: job.generation_semantics.clone(),
+            model_hash: job.model_hash,
+            profile_hash: job.profile_hash,
+            input_hash: job.input_hash,
+            generation_hash: job.generation_hash,
+            assignment_hash: job.assignment_hash,
+            max_tokens: job.max_tokens,
+            max_output_bytes: job.max_output_bytes,
+            tokens: decision.tokens.clone(),
+            output_hash: decision.output_hash,
+            validator: decision.vote.validator,
+            signature: decision.vote.signature.clone(),
+        };
+        if let Some(existing) = self.load(job.request_id)? {
+            self.sync_published(job.request_id)?;
+            if existing == stored {
+                return Ok(decision);
+            }
+            return Err(NativeInferenceError::Equivocation);
+        }
+        let bytes = bincode::serialize(&stored).map_err(|_| NativeInferenceError::CorruptStore)?;
+        let tmp = self.root.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        match fs::hard_link(&tmp, self.path(job.request_id)) {
+            Ok(()) => {
+                fs::remove_file(&tmp)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&tmp);
+                self.sync_published(job.request_id)?;
+                return match self.load(job.request_id)? {
+                    Some(existing) if existing == stored => Ok(decision),
+                    _ => Err(NativeInferenceError::Equivocation),
+                };
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                self.poisoned.store(true, Ordering::Release);
+                return Err(e.into());
+            }
+        }
+        if let Err(error) = self.sync_published(job.request_id) {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
+        Ok(decision)
+    }
+}
+
+pub struct NativeWorker<S, E, G, V> {
+    source: Arc<S>,
+    executor: Arc<E>,
+    signer: Arc<G>,
+    sink: Arc<V>,
+    store: DecisionStore,
+    queue: crossbeam::channel::Sender<Hash256>,
+    receiver: crossbeam::channel::Receiver<Hash256>,
+    queued: DashSet<[u8; 32]>,
+    cancelled: Arc<AtomicBool>,
+    compute_permit: Mutex<()>,
+}
+
+impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorker<S, E, G, V> {
+    pub fn new(
+        source: Arc<S>,
+        executor: Arc<E>,
+        signer: Arc<G>,
+        sink: Arc<V>,
+        store: DecisionStore,
+    ) -> Self {
+        let (queue, receiver) = crossbeam::channel::bounded(MAX_QUEUE);
+        Self {
+            source,
+            executor,
+            signer,
+            sink,
+            store,
+            queue,
+            receiver,
+            queued: DashSet::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            compute_permit: Mutex::new(()),
+        }
+    }
+
+    pub fn submit(&self, request_id: Hash256) -> Result<(), NativeInferenceError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(NativeInferenceError::Cancelled);
+        }
+        // Pollers may observe the same persisted request many times while a
+        // model run is in flight. Keep one queue slot per request so a slow
+        // job cannot fill the bounded queue with duplicates.
+        if !self.queued.insert(request_id.0) {
+            return Ok(());
+        }
+        self.queue.try_send(request_id).map_err(|error| {
+            self.queued.remove(&request_id.0);
+            if error.is_full() {
+                NativeInferenceError::QueueFull
+            } else {
+                NativeInferenceError::Cancelled
+            }
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn run_one(&self, now: u64) -> Result<StoredVote, NativeInferenceError> {
+        let _permit = self.compute_permit.lock();
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(NativeInferenceError::Cancelled);
+        }
+        let request_id = self
+            .receiver
+            .try_recv()
+            .map_err(|_| NativeInferenceError::QueueFull)?;
+        self.queued.remove(&request_id.0);
+        let job = self.source.load_pending(request_id)?;
+        if now >= job.expires_at {
+            return Err(NativeInferenceError::Expired);
+        }
+        if job.input.len() > MAX_INPUT_BYTES {
+            return Err(NativeInferenceError::InputTooLarge);
+        }
+        if job.max_tokens == 0 || job.max_tokens > MAX_TOKENS {
+            return Err(NativeInferenceError::OutputTooLarge);
+        }
+        if job.max_output_bytes == 0 || job.max_output_bytes > MAX_OUTPUT_BYTES {
+            return Err(NativeInferenceError::OutputTooLarge);
+        }
+        if arc_crypto::hash_bytes(&job.input) != job.input_hash {
+            return Err(NativeInferenceError::ContextMismatch);
+        }
+        if let Some(vote) = self.store.load_existing_valid(&job)? {
+            self.source.ensure_live(&job, now)?;
+            self.sink.emit(&vote)?;
+            return Ok(vote);
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(NativeInferenceError::Cancelled);
+        }
+        let output = self.executor.execute(&job)?;
+        if output.tokens.is_empty()
+            || output.tokens.len() > job.max_tokens
+            || output.tokens.len() > MAX_TOKENS
+        {
+            return Err(NativeInferenceError::OutputTooLarge);
+        }
+        if output.tokens.len() * std::mem::size_of::<u32>() > job.max_output_bytes
+            || output.tokens.len() * std::mem::size_of::<u32>() > MAX_OUTPUT_BYTES
+            || token_hash(&output.tokens) != output.output_hash
+        {
+            return Err(NativeInferenceError::Executor(
+                "output hash does not match canonical token bytes".into(),
+            ));
+        }
+        let material = DecisionMaterial {
+            request_id: job.request_id,
+            genesis: job.genesis,
+            context: job.context,
+            artifact: job.artifact,
+            generation_semantics: job.generation_semantics.clone(),
+            model_hash: job.model_hash,
+            profile_hash: job.profile_hash,
+            input_hash: job.input_hash,
+            generation_hash: job.generation_hash,
+            assignment_hash: job.assignment_hash,
+            max_tokens: job.max_tokens,
+            max_output_bytes: job.max_output_bytes,
+            tokens: output.tokens.clone(),
+            output_hash: output.output_hash,
+        };
+        self.source.ensure_live(&job, now)?;
+        let signature = self.signer.sign(&material)?;
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(NativeInferenceError::Cancelled);
+        }
+        let vote = StoredVote {
+            request_id,
+            output_hash: output.output_hash,
+            tokens: output.tokens,
+            vote: signature,
+        };
+        let vote = self.store.persist_signed(vote, &job)?;
+        // Persist before emission, then re-read canonical terminal state so a
+        // concurrent finalize/refund never receives a newly emitted vote.
+        self.source.ensure_live(&job, now)?;
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(NativeInferenceError::Cancelled);
+        }
+        self.sink.emit(&vote)?;
+        Ok(vote)
+    }
+}
+
+/// Polling bridge for the real StateDB bounded pending index.  It is suitable
+/// for the node's background task and deliberately does not accept a request
+/// body or arbitrary trait-source job.  A restart simply re-enqueues the
+/// still-pending canonical entries; DecisionStore makes the second pass reuse
+/// its exact durable signed vote instead of re-signing it.
+pub struct NativeWorkerRuntime<E, G, V> {
+    state: Arc<arc_state::StateDB>,
+    source: Arc<StatePendingSource>,
+    worker: NativeWorker<StatePendingSource, E, G, V>,
+}
+
+impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V> {
+    pub fn from_active(
+        state: Arc<arc_state::StateDB>,
+        executor: Arc<E>,
+        signer: Arc<G>,
+        sink: Arc<V>,
+        store: DecisionStore,
+    ) -> Result<Self, NativeInferenceError> {
+        let source = Arc::new(StatePendingSource::from_active(state.clone())?);
+        let worker = NativeWorker::new(source.clone(), executor, signer, sink, store);
+        Ok(Self {
+            state,
+            source,
+            worker,
+        })
+    }
+
+    /// Enqueue every bounded canonical pending request and execute at most one.
+    /// The caller supplies no height: StateDB determines the canonical next
+    /// block height at each validation point.
+    pub fn poll_once(&self) -> Result<Option<StoredVote>, NativeInferenceError> {
+        let context = self
+            .state
+            .try_native_inference_context()
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?
+            .ok_or_else(|| {
+                NativeInferenceError::Source("native inference is not activated".into())
+            })?;
+        let commitment = context
+            .commitment()
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
+        for pending in self
+            .state
+            .native_inference_pending_requests(commitment)
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?
+        {
+            self.worker.submit(pending.request_id)?;
+        }
+        if self.worker.receiver.is_empty() {
+            return Ok(None);
+        }
+        self.worker
+            .run_one(self.state.height().saturating_add(1))
+            .map(Some)
+    }
+
+    pub fn cancel(&self) {
+        self.worker.cancel();
+    }
+
+    pub fn source(&self) -> &Arc<StatePendingSource> {
+        &self.source
+    }
+}
+
+fn token_hash(tokens: &[u32]) -> Hash256 {
+    hash_bytes(&token_bytes(tokens))
+}
+
+fn token_bytes(tokens: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(tokens.len() * std::mem::size_of::<u32>());
+    for token in tokens {
+        bytes.extend_from_slice(&token.to_le_bytes());
+    }
+    bytes
+}
+
+fn verify_vote(vote: &InferenceVote, request_id: Hash256, tokens: &[u32]) -> bool {
+    let output = token_bytes(tokens);
+    let output_hash = hash_bytes(&output);
+    if vote.output_hash != output_hash {
+        return false;
+    }
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-native-inference-vote-signature-v1");
+    hasher.update(request_id.as_ref());
+    hasher.update(output_hash.as_ref());
+    hasher.update(&(output.len() as u64).to_le_bytes());
+    vote.signature
+        .verify(&Hash256(*hasher.finalize().as_bytes()), &vote.validator)
+        .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_state::{AllowedExecution, InferenceAdmissionContext, StateDB};
+    use arc_types::inference_contract::{
+        INFERENCE_CONTRACT_VERSION, InferenceDomain, InferenceJob, InferenceRequest,
+        ValidatorMember, validator_set_commitment,
+    };
+    use arc_types::transaction::NativeInferenceRequestBody;
+    use tempfile::tempdir;
+    struct Source(PendingJob);
+    impl PendingSource for Source {
+        fn load_pending(&self, id: Hash256) -> Result<PendingJob, NativeInferenceError> {
+            if id == self.0.request_id {
+                Ok(self.0.clone())
+            } else {
+                Err(NativeInferenceError::Source("missing".into()))
+            }
+        }
+    }
+    struct Exec;
+    impl NativeExecutor for Exec {
+        fn execute(&self, _: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+            Ok(ExecutionOutput {
+                tokens: vec![1, 2],
+                output_hash: token_hash(&[1, 2]),
+            })
+        }
+    }
+    struct Sign;
+    impl VoteSigner for Sign {
+        fn sign(&self, decision: &DecisionMaterial) -> Result<InferenceVote, NativeInferenceError> {
+            sign_vote(
+                decision.request_id,
+                &token_bytes(&decision.tokens),
+                &KeyPair::generate_ed25519(),
+            )
+            .map_err(|error| NativeInferenceError::Signer(error.to_string()))
+        }
+    }
+    struct Sink;
+    impl VoteSink for Sink {
+        fn emit(&self, _: &StoredVote) -> Result<(), NativeInferenceError> {
+            Ok(())
+        }
+    }
+    fn job() -> PendingJob {
+        PendingJob {
+            request_id: Hash256([1; 32]),
+            genesis: Hash256([2; 32]),
+            context: Hash256([3; 32]),
+            expires_at: 100,
+            artifact: Hash256([4; 32]),
+            generation_semantics: "test.synthetic.v1".into(),
+            model_hash: Hash256([5; 32]),
+            profile_hash: Hash256([6; 32]),
+            input_hash: arc_crypto::hash_bytes(b"input"),
+            generation_hash: Hash256([7; 32]),
+            assignment_hash: Hash256([8; 32]),
+            max_tokens: 2,
+            max_output_bytes: 128,
+            input: b"input".to_vec(),
+        }
+    }
+    #[test]
+    fn restart_and_conflict_are_idempotent() {
+        let dir = tempdir().unwrap();
+        let j = job();
+        let v = StoredVote {
+            request_id: j.request_id,
+            output_hash: token_hash(&[1, 2]),
+            tokens: vec![1, 2],
+            vote: sign_vote(
+                j.request_id,
+                &token_bytes(&[1, 2]),
+                &KeyPair::generate_ed25519(),
+            )
+            .unwrap(),
+        };
+        let s = DecisionStore::open(dir.path(), v.vote.validator, j.genesis, j.context).unwrap();
+        assert_eq!(s.persist_signed(v.clone(), &j).unwrap(), v);
+        drop(s);
+        let s = DecisionStore::open(dir.path(), v.vote.validator, j.genesis, j.context).unwrap();
+        assert_eq!(s.persist_signed(v.clone(), &j).unwrap(), v);
+        let bad = StoredVote {
+            vote: sign_vote(
+                j.request_id,
+                &token_bytes(&[1, 2]),
+                &KeyPair::generate_ed25519(),
+            )
+            .unwrap(),
+            ..v
+        };
+        // A different validator's otherwise valid vote cannot be written in
+        // this validator-scoped anti-equivocation store.
+        assert!(s.persist_signed(bad, &j).is_err());
+    }
+    #[test]
+    fn corrupt_store_is_rejected() {
+        let dir = tempdir().unwrap();
+        let j = job();
+        let v = StoredVote {
+            request_id: j.request_id,
+            output_hash: token_hash(&[1]),
+            tokens: vec![1],
+            vote: sign_vote(
+                j.request_id,
+                &token_bytes(&[1]),
+                &KeyPair::generate_ed25519(),
+            )
+            .unwrap(),
+        };
+        let s = DecisionStore::open(dir.path(), v.vote.validator, j.genesis, j.context).unwrap();
+        fs::write(s.path(j.request_id), b"bad").unwrap();
+        assert!(matches!(
+            s.persist_signed(v, &j),
+            Err(NativeInferenceError::CorruptStore)
+        ));
+    }
+    #[test]
+    fn cancellation_and_expiry_prevent_execution() {
+        let dir = tempdir().unwrap();
+        let j = job();
+        let w = NativeWorker::new(
+            Arc::new(Source(j.clone())),
+            Arc::new(Exec),
+            Arc::new(Sign),
+            Arc::new(Sink),
+            DecisionStore::open(dir.path(), Hash256([8; 32]), j.genesis, j.context).unwrap(),
+        );
+        w.cancel();
+        assert!(matches!(
+            w.submit(j.request_id),
+            Err(NativeInferenceError::Cancelled)
+        ));
+    }
+
+    struct CountingExec(std::sync::atomic::AtomicUsize);
+    impl NativeExecutor for CountingExec {
+        fn execute(&self, _: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ExecutionOutput {
+                tokens: vec![1, 2],
+                output_hash: token_hash(&[1, 2]),
+            })
+        }
+    }
+
+    #[test]
+    fn durable_vote_is_verified_and_reemitted_without_recompute() {
+        let dir = tempdir().unwrap();
+        let j = job();
+        let key = KeyPair::generate_ed25519();
+        let validator = key.address();
+        let executor = Arc::new(CountingExec(std::sync::atomic::AtomicUsize::new(0)));
+        let worker = NativeWorker::new(
+            Arc::new(Source(j.clone())),
+            executor.clone(),
+            Arc::new(KeyPairVoteSigner::new(key)),
+            Arc::new(Sink),
+            DecisionStore::open(dir.path(), validator, j.genesis, j.context).unwrap(),
+        );
+        worker.submit(j.request_id).unwrap();
+        worker.run_one(1).unwrap();
+        worker.submit(j.request_id).unwrap();
+        worker.run_one(1).unwrap();
+        assert_eq!(executor.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// Synthetic CI-only executor. It proves the signed StateDB/mempool
+    /// settlement path; it is explicitly not a model-quality or P2P proof.
+    struct FixtureExecutor;
+    impl NativeExecutor for FixtureExecutor {
+        fn execute(&self, _: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+            Ok(ExecutionOutput {
+                tokens: vec![71, 72],
+                output_hash: token_hash(&[71, 72]),
+            })
+        }
+    }
+
+    struct NativeFixture {
+        directory: tempfile::TempDir,
+        state_dir: PathBuf,
+        genesis: Hash256,
+        state: Arc<StateDB>,
+        requester: KeyPair,
+        finalizer: Arc<KeyPair>,
+        validators: Vec<KeyPair>,
+        context: InferenceAdmissionContext,
+        prefunded: Vec<(Hash256, u64)>,
+    }
+
+    fn native_fixture() -> NativeFixture {
+        let directory = tempdir().unwrap();
+        let state_dir = directory.path().join("state");
+        let genesis = hash_bytes(b"native-worker-synthetic-fixture-genesis");
+        let requester = KeyPair::generate_ed25519();
+        let finalizer = Arc::new(KeyPair::generate_ed25519());
+        let validators: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
+        let mut members: Vec<_> = validators
+            .iter()
+            .map(|key| ValidatorMember::new(key.address(), StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        members.sort_by_key(|member| member.address.0);
+        let marker = hash_bytes(b"native-worker-synthetic-fixture-tuple");
+        let context = InferenceAdmissionContext {
+            domain: InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 0,
+                validator_set_hash: validator_set_commitment(&members).unwrap(),
+            },
+            members: members.clone(),
+            allowed_executions: vec![AllowedExecution {
+                model_hash: marker,
+                profile_hash: marker,
+                generation_hash: marker,
+                assignment_hash: marker,
+            }],
+        };
+        let mut prefunded = vec![(requester.address(), 1_000), (finalizer.address(), 0)];
+        prefunded.extend(members.iter().map(|member| (member.address, 0)));
+        let state =
+            Arc::new(StateDB::with_genesis_persistent(&prefunded, &state_dir, genesis).unwrap());
+        state.seed_genesis_validators(
+            &members
+                .iter()
+                .map(|member| (member.address, member.stake))
+                .collect::<Vec<_>>(),
+        );
+        state.activate_native_inference(context.clone()).unwrap();
+        NativeFixture {
+            directory,
+            state_dir,
+            genesis,
+            state,
+            requester,
+            finalizer,
+            validators,
+            context,
+            prefunded,
+        }
+    }
+
+    fn request_for(fixture: &NativeFixture, nonce: u64, expires_at: u64) -> InferenceRequest {
+        let tuple = fixture.context.allowed_executions[0];
+        // Fixture input uses the same pre-qualified LE-u32 wire shape required
+        // by CanonicalI8NativeExecutor, although this test uses FixtureExecutor.
+        let input = token_bytes(&[11, 12]);
+        InferenceRequest::sign(
+            InferenceJob {
+                version: INFERENCE_CONTRACT_VERSION,
+                domain: fixture.context.domain,
+                requester: fixture.requester.address(),
+                nonce,
+                model_hash: tuple.model_hash,
+                profile_hash: tuple.profile_hash,
+                input_hash: hash_bytes(&input),
+                generation_hash: tuple.generation_hash,
+                assignment_hash: tuple.assignment_hash,
+                max_tokens: 8,
+                max_output_bytes: 128,
+                execution_price: 10,
+                reserved_max_payment: 100,
+                expires_at,
+            },
+            &fixture.requester,
+        )
+        .unwrap()
+    }
+
+    fn signed_native(
+        state: &StateDB,
+        signer: &KeyPair,
+        nonce: u64,
+        body: TxBody,
+        gas_limit: u64,
+    ) -> Transaction {
+        let mut transaction = Transaction {
+            tx_type: body.tx_type(),
+            from: signer.address(),
+            nonce,
+            body,
+            fee: 0,
+            gas_limit,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: false,
+        };
+        state.sign_transaction(&mut transaction, signer).unwrap();
+        transaction
+    }
+
+    #[test]
+    fn synthetic_private_signed_mempool_worker_finalize_and_reopen() {
+        let mut fixture = native_fixture();
+        let request = request_for(&fixture, 0, 10);
+        let request_id = request.job.request_id();
+        let mempool = Arc::new(Mempool::new(16));
+        let request_tx = signed_native(
+            &fixture.state,
+            &fixture.requester,
+            0,
+            TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: token_bytes(&[11, 12]),
+            }),
+            gas_costs::NATIVE_INFERENCE_REQUEST,
+        );
+        mempool.insert(request_tx).unwrap();
+        fixture
+            .state
+            .execute_block_verified(&mempool.drain(1), fixture.finalizer.address())
+            .unwrap();
+
+        let sink = Arc::new(NativeFinalizeSink::new(
+            fixture.state.clone(),
+            mempool.clone(),
+            fixture.finalizer.clone(),
+        ));
+        let commitment = fixture.context.commitment().unwrap();
+        // `remove` transfers each secret key into its independent worker while
+        // retaining the fixture's persistent-state metadata for reopen checks.
+        for index in 0..5 {
+            let validator = fixture.validators.remove(0);
+            let address = validator.address();
+            let worker = NativeWorker::new(
+                Arc::new(StatePendingSource::new(fixture.state.clone(), commitment)),
+                Arc::new(FixtureExecutor),
+                Arc::new(KeyPairVoteSigner::new(validator)),
+                sink.clone(),
+                DecisionStore::open(
+                    fixture.directory.path().join(format!("vote-{index}")),
+                    address,
+                    fixture.genesis,
+                    commitment,
+                )
+                .unwrap(),
+            );
+            worker.submit(request_id).unwrap();
+            worker
+                .run_one(fixture.state.height().saturating_add(1))
+                .unwrap();
+        }
+        assert_eq!(
+            mempool.len(),
+            1,
+            "5/6 synthetic validator votes produced one finalizer tx"
+        );
+        fixture
+            .state
+            .execute_block_verified(&mempool.drain(1), fixture.requester.address())
+            .unwrap();
+        let receipt = fixture
+            .state
+            .native_inference_receipt(request_id, commitment)
+            .unwrap()
+            .unwrap();
+        assert_eq!(format!("{:?}", receipt.metadata.status), "Finalized");
+        assert!(receipt.admission_transaction.is_some());
+        assert!(receipt.terminal_transaction.is_some());
+
+        let state_dir = fixture.state_dir.clone();
+        let prefunded = fixture.prefunded.clone();
+        let genesis = fixture.genesis;
+        drop(sink);
+        drop(fixture.state);
+        let reopened = StateDB::with_genesis_persistent(&prefunded, state_dir, genesis).unwrap();
+        let reopened_context = reopened.try_native_inference_context().unwrap().unwrap();
+        assert!(
+            reopened
+                .native_inference_pending_requests(reopened_context.commitment().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                reopened
+                    .native_inference_receipt(request_id, reopened_context.commitment().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .metadata
+                    .status
+            ),
+            "Finalized"
+        );
+    }
+
+    #[test]
+    fn synthetic_private_signed_refund_is_terminal_and_replay_rejects() {
+        let fixture = native_fixture();
+        let request = request_for(&fixture, 0, 2);
+        let request_id = request.job.request_id();
+        let request_tx = signed_native(
+            &fixture.state,
+            &fixture.requester,
+            0,
+            TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: token_bytes(&[11, 12]),
+            }),
+            gas_costs::NATIVE_INFERENCE_REQUEST,
+        );
+        fixture
+            .state
+            .execute_block_verified(&[request_tx], fixture.finalizer.address())
+            .unwrap();
+        let refund = signed_native(
+            &fixture.state,
+            &fixture.requester,
+            1,
+            TxBody::NativeInferenceRefund(arc_types::transaction::NativeInferenceRefundBody {
+                request_id: request_id.0,
+            }),
+            gas_costs::NATIVE_INFERENCE_REFUND,
+        );
+        fixture
+            .state
+            .execute_block_verified(std::slice::from_ref(&refund), fixture.finalizer.address())
+            .unwrap();
+        let commitment = fixture.context.commitment().unwrap();
+        assert_eq!(
+            format!(
+                "{:?}",
+                fixture
+                    .state
+                    .native_inference_receipt(request_id, commitment)
+                    .unwrap()
+                    .unwrap()
+                    .metadata
+                    .status
+            ),
+            "Refunded"
+        );
+        // A byte-for-byte replay cannot produce a second terminal receipt.
+        assert!(
+            fixture
+                .state
+                .execute_block_verified(&[refund], fixture.finalizer.address())
+                .is_err()
+        );
+    }
+}

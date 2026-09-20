@@ -7,6 +7,7 @@ pub mod coalesce;
 pub mod consensus;
 pub mod inference_validator;
 pub mod legacy_archive;
+pub mod native_inference;
 pub mod pipeline;
 pub mod planner;
 pub mod producer;

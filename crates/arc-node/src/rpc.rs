@@ -8,7 +8,7 @@ use arc_types::economics::RoleRevenueConfig;
 use arc_types::*;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Query, State as AxumState},
+    extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     routing::{get, post},
 };
@@ -2154,6 +2154,15 @@ pub async fn serve(
             post(submit_signed_tx)
                 .layer(DefaultBodyLimit::max(PUBLIC_TX_SUBMISSION_BODY_LIMIT_BYTES)),
         )
+        // Protocol-4 is activated only by a fresh, private genesis. Its
+        // request/finalize/refund envelopes still use the shared signed
+        // transaction ingress; this receipt view is read-only evidence of
+        // canonical settlement, never a finality claim.
+        .route("/native-inference/context", get(native_inference_context))
+        .route(
+            "/native-inference/receipt/{request_id}",
+            get(native_inference_receipt),
+        )
         .route(
             "/tx/submit_batch",
             post(submit_batch).layer(DefaultBodyLimit::max(PUBLIC_TX_SUBMISSION_BODY_LIMIT_BYTES)),
@@ -2780,6 +2789,21 @@ async fn submit_tx(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<SubmitTxRequest>,
 ) -> Result<Json<SubmitTxResponse>, (StatusCode, String)> {
+    if match node.state.try_native_inference_context() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native inference state is unhealthy".to_string(),
+            ));
+        }
+    } {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "private protocol-4 accepts only signed native inference transactions".to_string(),
+        ));
+    }
     let from = Hash256::from_hex(&req.from)
         .map_err(|_| (StatusCode::BAD_REQUEST, "invalid from address".to_string()))?;
     let to = Hash256::from_hex(&req.to)
@@ -2883,6 +2907,21 @@ async fn submit_batch(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<SubmitBatchRequest>,
 ) -> Result<Json<SubmitBatchResponse>, (StatusCode, Json<ApiError>)> {
+    if match node.state.try_native_inference_context() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native inference state is unhealthy",
+            ));
+        }
+    } {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "private protocol-4 accepts only signed native inference transactions",
+        ));
+    }
     // Reject before parsing addresses, verifying signatures, consulting state,
     // or mutating the sender limiter/mempool. This is both the resource bound
     // and the externally probed public contract.
@@ -3008,6 +3047,102 @@ fn uses_unready_paid_inference_protocol(tx: &Transaction) -> bool {
     restricted(tx.tx_type) || restricted(tx.body.tx_type())
 }
 
+fn is_native_inference_transaction(tx: &Transaction) -> bool {
+    matches!(
+        tx.tx_type,
+        TxType::NativeInferenceRequest
+            | TxType::NativeInferenceFinalize
+            | TxType::NativeInferenceRefund
+    ) || matches!(
+        tx.body,
+        TxBody::NativeInferenceRequest(_)
+            | TxBody::NativeInferenceFinalize(_)
+            | TxBody::NativeInferenceRefund(_)
+    )
+}
+
+/// Publicly describable, read-only protocol-4 activation binding.  Activation
+/// itself deliberately has no HTTP route: it can only occur at fresh private
+/// genesis through StateDB's durable activation path.
+async fn native_inference_context(
+    AxumState(node): AxumState<NodeState>,
+) -> Result<Json<Value>, StatusCode> {
+    let context = node
+        .state
+        .try_native_inference_context()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let commitment = context
+        .commitment()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(Json(json!({
+        "candidate_protocol": 4,
+        "context_commitment": commitment.to_hex(),
+        "chain_genesis": context.domain.chain_genesis.to_hex(),
+        "recovery_epoch": context.domain.recovery_epoch,
+        "validator_set_hash": context.domain.validator_set_hash.to_hex(),
+        "members": context.members.iter().map(|member| json!({
+            "address": member.address.to_hex(), "stake": member.stake,
+        })).collect::<Vec<_>>(),
+        "allowed_execution_count": context.allowed_executions.len(),
+    })))
+}
+
+/// Return the persisted request-keyed receipt.  `observed_status` describes
+/// local canonical StateDB observation only; consensus-finality proofs remain
+/// a later milestone and are not implied by this endpoint.
+async fn native_inference_receipt(
+    AxumState(node): AxumState<NodeState>,
+    AxumPath(request_id): AxumPath<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let request_id = Hash256::from_hex(request_id.trim_start_matches("0x"))
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let context = node
+        .state
+        .try_native_inference_context()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let commitment = context
+        .commitment()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let receipt = node
+        .state
+        .native_inference_receipt(request_id, commitment)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let metadata = receipt.metadata;
+    let transaction_link = |link: arc_state::NativeInferenceTransactionLink| {
+        json!({
+            "tx_hash": link.tx_hash.to_hex(),
+            "block_height": link.block_height,
+            "block_hash": link.block_hash.to_hex(),
+            "transaction": format!("/tx/{}", link.tx_hash.to_hex()),
+            "block": format!("/block/{}", link.block_height),
+        })
+    };
+    Ok(Json(json!({
+        "candidate_protocol": 4,
+        "request_id": request_id.to_hex(),
+        "context_commitment": metadata.context_commitment.to_hex(),
+        "admission_height": receipt.admission_height,
+        "admission_transaction": receipt.admission_transaction.map(&transaction_link),
+        "terminal_transaction": receipt.terminal_transaction.map(transaction_link),
+        "observed_status": format!("{:?}", metadata.status),
+        "model_hash": metadata.request.job.model_hash.to_hex(),
+        "profile_hash": metadata.request.job.profile_hash.to_hex(),
+        "generation_hash": metadata.request.job.generation_hash.to_hex(),
+        "assignment_hash": metadata.request.job.assignment_hash.to_hex(),
+        "execution_price": metadata.request.job.execution_price,
+        "reserved_max_payment": metadata.request.job.reserved_max_payment,
+        "output_hash": metadata.output_hash.map(|hash| hash.to_hex()),
+        "certificate_votes": metadata.certificate.as_ref().map(|certificate| certificate.votes.len()),
+        "settlement_credits": metadata.credits.iter().map(|credit| json!({
+            "payee": credit.payee.to_hex(), "amount": credit.amount,
+        })).collect::<Vec<_>>(),
+        "consensus_finality": "not asserted by milestone-2 receipt",
+    })))
+}
+
 async fn submit_signed_tx(
     AxumState(node): AxumState<NodeState>,
     Json(mut tx): Json<Transaction>,
@@ -3016,7 +3151,7 @@ async fn submit_signed_tx(
     // Its wire deserializer now forces false; verify both type/body integrity
     // and the cryptographic signature before anything enters the mempool.
     tx.sig_verified = false;
-    if uses_unready_paid_inference_protocol(&tx) {
+    if uses_unready_paid_inference_protocol(&tx) && !is_native_inference_transaction(&tx) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     if let TxBody::WasmCall(body) = &tx.body
@@ -3029,6 +3164,34 @@ async fn submit_signed_tx(
     }
     if node.state.verify_transaction_signature(&tx).is_err() {
         return Err(StatusCode::BAD_REQUEST);
+    }
+    if is_native_inference_transaction(&tx) {
+        let context = match node.state.try_native_inference_context() {
+            Ok(Some(context)) => context,
+            Ok(None) | Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        // This pure preflight is the same state admission used by the
+        // canonical executor. It rejects type/body disguises, stale nonce,
+        // unfrozen members, bad certificates, expired requests and every
+        // non-private activation before the mempool mutates.
+        if node
+            .state
+            .validate_native_inference_transaction_admission_at(
+                &tx,
+                &context,
+                node.state.height().saturating_add(1),
+            )
+            .is_err()
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    } else if match node.state.try_native_inference_context() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+    } {
+        // Private protocol-4 blocks permit one native transition only.
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     // The issuance switch gates every public mempool ingress, not just the
     // coordinator helper. Otherwise a caller holding any validator key could
@@ -4255,6 +4418,29 @@ async fn get_full_transaction(
             "max_tokens": b.max_tokens,
             "expires_at_height": b.expires_at_height,
             "worker_attestation_hash": b.worker_certificate.attestation_hash.to_hex(),
+        }),
+        TxBody::NativeInferenceRequest(b) => json!({
+            "type": "NativeInferenceRequest",
+            "request_id": b.request.job.request_id().to_hex(),
+            "model_hash": b.request.job.model_hash.to_hex(),
+            "profile_hash": b.request.job.profile_hash.to_hex(),
+            "input_hash": b.request.job.input_hash.to_hex(),
+            "execution_price": b.request.job.execution_price,
+            "reserved_max_payment": b.request.job.reserved_max_payment,
+            "input_bytes": b.input_blob.len(),
+            "candidate_protocol": 4,
+        }),
+        TxBody::NativeInferenceFinalize(b) => json!({
+            "type": "NativeInferenceFinalize",
+            "request_id": hex::encode(b.request_id),
+            "output_bytes": b.certificate.output.len(),
+            "votes": b.certificate.votes.len(),
+            "candidate_protocol": 4,
+        }),
+        TxBody::NativeInferenceRefund(b) => json!({
+            "type": "NativeInferenceRefund",
+            "request_id": hex::encode(b.request_id),
+            "candidate_protocol": 4,
         }),
     };
 
@@ -22588,6 +22774,162 @@ mod tests {
             .await
             .expect("valid signed transaction");
         assert_eq!(node.mempool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_rpc_requires_private_activation_and_returns_observed_receipt_links() {
+        // A cryptographically signed native envelope remains unavailable until
+        // the rooted private activation exists.
+        let inactive = fake_node_with_workers(vec![]);
+        let inactive_key = KeyPair::generate_ed25519();
+        let mut inactive_tx = Transaction {
+            tx_type: TxType::NativeInferenceRefund,
+            from: inactive_key.address(),
+            nonce: 0,
+            body: TxBody::NativeInferenceRefund(NativeInferenceRefundBody {
+                request_id: [7; 32],
+            }),
+            fee: 0,
+            gas_limit: gas_costs::NATIVE_INFERENCE_REFUND,
+            hash: Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        inactive_tx.sign(&inactive_key).unwrap();
+        assert_eq!(
+            submit_signed_tx(AxumState(inactive), Json(inactive_tx))
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let genesis = arc_crypto::hash_bytes(b"native-rpc-private-fixture");
+        let requester = KeyPair::generate_ed25519();
+        let mut validators: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
+        let mut members: Vec<_> = validators
+            .iter()
+            .map(|key| {
+                arc_types::inference_contract::ValidatorMember::new(
+                    key.address(),
+                    StateDB::MIN_VALIDATOR_STAKE,
+                )
+            })
+            .collect();
+        members.sort_by_key(|member| member.address.0);
+        let tuple = arc_crypto::hash_bytes(b"native-rpc-private-fixture-tuple");
+        let context = arc_state::InferenceAdmissionContext {
+            domain: arc_types::inference_contract::InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 0,
+                validator_set_hash: arc_types::inference_contract::validator_set_commitment(
+                    &members,
+                )
+                .unwrap(),
+            },
+            members: members.clone(),
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: tuple,
+                profile_hash: tuple,
+                generation_hash: tuple,
+                assignment_hash: tuple,
+            }],
+        };
+        let mut prefunded = vec![(requester.address(), 1_000)];
+        prefunded.extend(members.iter().map(|member| (member.address, 0)));
+        let state =
+            Arc::new(StateDB::with_genesis_persistent(&prefunded, &state_dir, genesis).unwrap());
+        state.seed_genesis_validators(
+            &members
+                .iter()
+                .map(|member| (member.address, member.stake))
+                .collect::<Vec<_>>(),
+        );
+        state.activate_native_inference(context.clone()).unwrap();
+        let producer = validators.remove(0);
+        let mempool = Arc::new(Mempool::new(16));
+        let node = build_node_state(
+            state.clone(),
+            mempool.clone(),
+            producer.address(),
+            Some(Arc::new(producer)),
+            StateDB::MIN_VALIDATOR_STAKE,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let input = [11u32, 12]
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        let request = arc_types::inference_contract::InferenceRequest::sign(
+            arc_types::inference_contract::InferenceJob {
+                version: arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+                domain: context.domain,
+                requester: requester.address(),
+                nonce: 0,
+                model_hash: tuple,
+                profile_hash: tuple,
+                input_hash: arc_crypto::hash_bytes(&input),
+                generation_hash: tuple,
+                assignment_hash: tuple,
+                max_tokens: 8,
+                max_output_bytes: 128,
+                execution_price: 10,
+                reserved_max_payment: 100,
+                expires_at: 10,
+            },
+            &requester,
+        )
+        .unwrap();
+        let request_id = request.job.request_id();
+        let mut tx = Transaction {
+            tx_type: TxType::NativeInferenceRequest,
+            from: requester.address(),
+            nonce: 0,
+            body: TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: input,
+            }),
+            fee: 0,
+            gas_limit: gas_costs::NATIVE_INFERENCE_REQUEST,
+            hash: Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        state.sign_transaction(&mut tx, &requester).unwrap();
+        assert_eq!(
+            submit_signed_tx(AxumState(node.clone()), Json(tx))
+                .await
+                .unwrap()
+                .status,
+            "pending"
+        );
+        state
+            .execute_block_verified(&mempool.drain(1), node.validator_address)
+            .unwrap();
+
+        let Json(context_json) = native_inference_context(AxumState(node.clone()))
+            .await
+            .unwrap();
+        assert_eq!(context_json["candidate_protocol"], 4);
+        assert_eq!(context_json["allowed_execution_count"], 1);
+        let Json(receipt) =
+            native_inference_receipt(AxumState(node), AxumPath(request_id.to_hex()))
+                .await
+                .unwrap();
+        assert_eq!(receipt["observed_status"], "Pending");
+        assert!(receipt["admission_transaction"]["tx_hash"].is_string());
+        assert!(receipt["admission_transaction"]["block"].is_string());
+        assert!(receipt["terminal_transaction"].is_null());
+        assert_eq!(
+            receipt["consensus_finality"],
+            "not asserted by milestone-2 receipt"
+        );
     }
 
     #[tokio::test]
