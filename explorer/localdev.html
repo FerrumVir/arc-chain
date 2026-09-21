@@ -12,7 +12,8 @@
     <title>ARC Local Development Explorer</title>
     <link rel="stylesheet" href="./styles.css?v=3" />
     <link rel="stylesheet" href="./localdev.css?v=1" />
-    <script src="./localdev.js?v=1" defer></script>
+    <script src="./localdev-native.js?v=1" defer></script>
+    <script src="./localdev.js?v=2" defer></script>
   </head>
   <body>
     <!--
@@ -97,6 +98,27 @@
           <dt>Nonce</dt><dd id="localdev-balance-nonce">—</dd>
         </dl>
         <p id="localdev-balance-note" class="empty-cell">The first genesis validator is loaded automatically.</p>
+      </section>
+      <section class="panel" aria-labelledby="localdev-native-title">
+        <div class="panel-heading"><div><span class="micro-label">Protocol 4 - paid inference</span><h2 id="localdev-native-title">Native inference request</h2></div></div>
+        <div class="localdev-balance-row">
+          <label class="sr-only" for="localdev-native-input">Request id</label>
+          <input id="localdev-native-input" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="64-hex request id" />
+          <button id="localdev-native-button" type="button">Open receipt</button>
+        </div>
+        <dl class="localdev-balance" id="localdev-native-detail">
+          <dt>Status</dt><dd id="localdev-native-status">-</dd>
+          <dt>Price / reserved</dt><dd id="localdev-native-amounts">-</dd>
+          <dt>Credited</dt><dd id="localdev-native-credited">-</dd>
+          <dt>Admitted at</dt><dd id="localdev-native-admitted">-</dd>
+          <dt>Settled at</dt><dd id="localdev-native-settled">-</dd>
+          <dt>Output hash</dt><dd><code id="localdev-native-output">-</code></dd>
+          <dt>Certificate votes</dt><dd id="localdev-native-votes">-</dd>
+          <dt>Replicas</dt><dd id="localdev-native-replicas">-</dd>
+        </dl>
+        <ul id="localdev-native-credits" class="localdev-tx-list"></ul>
+        <p id="localdev-native-note" class="empty-cell">A request's record is its canonical receipt; a transaction hash alone proves neither finality nor payment.</p>
       </section>
     </main>
   </body>

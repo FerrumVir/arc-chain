@@ -22,6 +22,12 @@
   }
 
   const BASE = rpcBase();
+  // Other replicas to cross-check a native receipt against: ?replicas=a,b
+  const REPLICAS = (new URLSearchParams(window.location.search).get("replicas") || "")
+    .split(",")
+    .map((s) => s.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  const NATIVE = window.ArcLocalDevNative;
 
   async function rpc(path) {
     const response = await fetch(`${BASE}${path}`, { headers: { accept: "application/json" } });
@@ -149,9 +155,83 @@
     for (const tx of txs) {
       const item = document.createElement("li");
       item.className = "localdev-tx";
-      item.innerHTML = `<span class="localdev-tx-index">#${tx.index}</span> <code>${SHORT(tx.hash, 16, 8)}</code>`;
+      item.dataset.hash = tx.hash;
+      item.innerHTML = `<span class="localdev-tx-index">#${tx.index}</span> <code>${SHORT(tx.hash, 16, 8)}</code> <span class="localdev-tx-type"></span>`;
       list.appendChild(item);
+      // The type and outcome come from the transaction itself; a native one
+      // links to its request's receipt.
+      rpc(`/tx/${tx.hash}/full`)
+        .then((full) => {
+          const d = NATIVE.describeTransaction(full);
+          const label = item.querySelector(".localdev-tx-type");
+          label.textContent = `${d.type}${d.success ? "" : " (failed)"}`;
+          if (d.native && d.requestId) {
+            const open = document.createElement("button");
+            open.type = "button";
+            open.className = "localdev-native-open";
+            open.textContent = "Open request";
+            open.addEventListener("click", () => void lookupNative(d.requestId));
+            item.appendChild(open);
+          }
+        })
+        .catch(() => {});
     }
+  }
+
+  async function receiptFrom(base, id) {
+    try {
+      const response = await fetch(`${base}/native-inference/receipt/${id}`, {
+        headers: { accept: "application/json" },
+      });
+      return response.ok ? await response.json() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function lookupNative(requestId) {
+    const clean = String(requestId || "").trim().replace(/^0x/, "");
+    const note = $("localdev-native-note");
+    $("localdev-native-input").value = clean;
+    if (!/^[0-9a-fA-F]{64}$/.test(clean)) {
+      note.textContent = "Enter a 64-character hex request id.";
+      return;
+    }
+    const sources = [BASE, ...REPLICAS];
+    const answers = await Promise.all(
+      sources.map(async (source) => ({ source, receipt: await receiptFrom(source, clean) })),
+    );
+    const comparison = NATIVE.compareReplicas(answers);
+    const own = comparison.rows[0].summary;
+    const credits = $("localdev-native-credits");
+    credits.textContent = "";
+    if (!own.known) {
+      $("localdev-native-status").textContent = "No receipt on this node";
+      note.textContent = "This node records no such request (not admitted, or not yet applied here).";
+      return;
+    }
+    $("localdev-native-status").textContent = own.status;
+    $("localdev-native-status").dataset.status = own.status;
+    $("localdev-native-amounts").textContent = `${own.price} / ${own.reserved}`;
+    $("localdev-native-credited").textContent = own.terminal
+      ? `${own.credited} - ${own.reconciled ? "reconciles with the reservation" : "DOES NOT reconcile with the reservation"}`
+      : "not settled";
+    $("localdev-native-credited").dataset.reconciled = String(own.reconciled);
+    $("localdev-native-admitted").textContent = own.admissionHeight ?? "-";
+    $("localdev-native-settled").textContent = own.terminalHeight ?? "-";
+    $("localdev-native-output").textContent = own.outputHash ? SHORT(own.outputHash, 16, 8) : "-";
+    $("localdev-native-votes").textContent = own.votes ?? "-";
+    $("localdev-native-replicas").textContent = REPLICAS.length
+      ? `${comparison.answered} of ${comparison.asked} answered - ${comparison.agree ? "all agree" : "DISAGREE"}`
+      : "not cross-checked (add ?replicas=)";
+    $("localdev-native-replicas").dataset.agree = String(comparison.agree);
+    for (const c of own.credits) {
+      const item = document.createElement("li");
+      item.className = "localdev-native-credit";
+      item.innerHTML = `<code>${SHORT(c.payee, 12, 8)}</code> <span>${c.amount}</span>`;
+      credits.appendChild(item);
+    }
+    note.textContent = "Read from the canonical receipt on each node; nothing here is inferred from a transaction hash.";
   }
 
   async function lookupBalance(address) {
@@ -211,6 +291,11 @@
     $("localdev-block-button").addEventListener("click", () =>
       void openBlockByHeight($("localdev-block-input").value),
     );
+    $("localdev-native-button").addEventListener("click", () =>
+      void lookupNative($("localdev-native-input").value),
+    );
+    const deepLinked = new URLSearchParams(window.location.search).get("request");
+    if (deepLinked) void lookupNative(deepLinked);
     if (PINNED_HEIGHT) $("localdev-block-input").value = PINNED_HEIGHT;
     void refresh();
     window.setInterval(() => void refresh(), 5000);
