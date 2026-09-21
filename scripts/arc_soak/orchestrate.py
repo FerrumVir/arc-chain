@@ -161,7 +161,11 @@ class Node:
                 "--genesis", genesis, "--peers", peers,
                 "--insecure-dev-validator-seed", "--validator-seed", f"soak-node-{self.index}",
                 "--stake", str(self.cfg.stake),
-                "--snapshot-every-blocks", str(self.cfg.snapshot_every)]
+                "--snapshot-every-blocks", str(self.cfg.snapshot_every)] + (
+                    ["--native-inference-activation",
+                     os.path.join(self.cfg.work, "activation.json"),
+                     "--native-inference-runtime", "--native-inference-test-executor"]
+                    if self.cfg.workload == "native" else [])
 
     def start(self, genesis: str) -> None:
         os.makedirs(self.data_dir, exist_ok=True)
@@ -277,6 +281,12 @@ class Config:
         self.rust_log = a.rust_log
         self.workload = a.workload
         self.faucet_rate = a.faucet_rate
+        self.native_rate = a.native_rate
+        self.native_requesters = a.native_requesters
+        self.load_driver = os.path.abspath(a.load_driver) if a.load_driver else None
+        # A fixed execution tuple the activation allows and every request uses.
+        self.native_tuple = [hashlib.sha256(f"arc-soak-{k}".encode()).hexdigest()
+                             for k in ("model", "profile", "generation", "assignment")]
         self.work = os.path.abspath(a.work or f"/tmp/arc-soak-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
 
 
@@ -348,10 +358,21 @@ class Soak:
             "harness": {
                 "orchestrate_sha256": sha256_file(os.path.abspath(__file__)),
                 "analyze_sha256": sha256_file(os.path.abspath(analyze.__file__)),
+                # The workload is evidence too: bind the exact driver binary.
+                "load_driver": cfg.load_driver,
+                "load_driver_sha256": (sha256_file(cfg.load_driver)
+                                       if cfg.load_driver else None),
             },
             "rust_log": cfg.rust_log,
             "workload": {"profile": cfg.workload, "required": cfg.workload != "none",
-                         "faucet_rate_per_s": cfg.faucet_rate if cfg.workload == "faucet" else None},
+                         "faucet_rate_per_s": cfg.faucet_rate if cfg.workload == "faucet" else None,
+                         "native_rate_per_s": cfg.native_rate if cfg.workload == "native" else None,
+                         "native_requesters": (cfg.native_requesters
+                                               if cfg.workload == "native" else None),
+                         # Deterministic-executor evidence exercises protocol and
+                         # settlement and qualifies nothing about model quality.
+                         "executor": ("deterministic-test-executor"
+                                      if cfg.workload == "native" else None)},
             "thresholds": {"recovery_budget_s": cfg.recovery_budget_s},
             "nodes": [],
         }
@@ -377,8 +398,32 @@ class Soak:
             fh.write(f'[[accounts]]\naddress = "{FAUCET_POOL}"\nbalance = 1_000_000_000_000\n\n')
             for n in self.nodes:
                 fh.write(f'[[accounts]]\naddress = "{n.identity}"\nbalance = 1_000_000_000_000\n\n')
+            if cfg.workload == "native":
+                for requester in self.native_requesters():
+                    fh.write(f'[[accounts]]\naddress = "{requester}"\nbalance = 1_000_000_000_000\n\n')
             for n in self.nodes:
                 fh.write(f'[[validators]]\naddress = "{n.identity}"\nstake = {cfg.stake}\n\n')
+        if cfg.workload == "native":
+            t = cfg.native_tuple
+            with open(os.path.join(cfg.work, "activation.json"), "w") as fh:
+                json.dump({"recovery_epoch": 0, "allowed_executions": [{
+                    "model_hash": t[0], "profile_hash": t[1],
+                    "generation_hash": t[2], "assignment_hash": t[3]}]}, fh)
+
+    def native_requesters(self) -> List[str]:
+        """The driver's requester accounts, one per concurrent request, which
+        genesis must fund. Asked of the driver itself so the two can never
+        disagree about the derivation."""
+        cfg = self.cfg
+        out = subprocess.run(
+            [cfg.load_driver, "--print-requester", "--requester-seed", "soak",
+             "--requesters", str(cfg.native_requesters)],
+            capture_output=True, text=True, timeout=30).stdout.split()
+        if len(out) != cfg.native_requesters or not all(HEX64.match(a) for a in out):
+            raise Abort(f"load driver did not report {cfg.native_requesters} requester "
+                        f"addresses: {out!r}")
+        self.run["workload"]["requesters"] = out
+        return out
 
     def note(self, text: str) -> None:
         line = f"{time.strftime('%H:%M:%SZ', time.gmtime())} {text}"
@@ -556,7 +601,18 @@ class Soak:
                         f["caught_up_t"] = now()
                 # New work, submitted AFTER the restart through another node,
                 # seen from the restarted node's own state.
-                if not f.get("first_new_work_t"):
+                if not f.get("first_new_work_t") and self.cfg.workload == "native":
+                    # A protocol-4 chain refuses the faucet; use the workload's
+                    # own requests instead: one submitted after the restart,
+                    # finalized, and visible on the restarted node.
+                    rid = self._native_request_settled_after(f["restart_t"])
+                    if rid is not None:
+                        code, receipt = http_json(victim.rpc, f"/native-inference/receipt/{rid}",
+                                                  timeout=3)
+                        if isinstance(receipt, dict) and receipt.get("observed_status") == "Finalized":
+                            f["first_new_work_t"] = now()
+                            f["probe_request_id"] = rid
+                elif not f.get("first_new_work_t"):
                     if probe_recipient is None:
                         candidate = "".join(random.choice("0123456789abcdef") for _ in range(64))
                         for other in self.nodes:
@@ -590,6 +646,22 @@ class Soak:
                            for p in ("process_ready_t", "first_peer_t", "caught_up_t",
                                      "first_new_work_t", "agreement_t") if f.get(p))
         self.note(f"fault {k}: {f['outcome']} ({phases})")
+
+    def _native_request_settled_after(self, t: float) -> Optional[str]:
+        """A native request the driver submitted after `t` that has settled."""
+        try:
+            with open(os.path.join(self.cfg.work, "workload.jsonl")) as fh:
+                for line in fh:
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (item.get("final_status") == "finalized"
+                            and (analyze._finite(item.get("submitted_t")) or 0) > t):
+                        return item.get("request_id")
+        except OSError:
+            return None
+        return None
 
     # -- workload --------------------------------------------------------
     def faucet_workload(self) -> None:
@@ -665,6 +737,20 @@ class Soak:
         self.run["started_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.started_t))
         self.write_run()
         workload_thread = None
+        driver = None
+        if cfg.workload == "native":
+            ports = ",".join(str(n.rpc) for n in self.nodes)
+            # The driver runs for the planned duration and then drains itself,
+            # so the last items are settled or explicitly left pending - never
+            # cut off mid-flight by the orchestrator.
+            driver = subprocess.Popen(
+                [cfg.load_driver, "--rpc", ports, "--rate", str(cfg.native_rate),
+                 "--duration", str(int(cfg.duration)),
+                 "--out", os.path.join(cfg.work, "workload.jsonl"),
+                 "--requester-seed", "soak", "--requesters", str(cfg.native_requesters),
+                 "--tuple", ",".join(cfg.native_tuple)],
+                stdout=open(os.path.join(cfg.work, "load-driver.log"), "ab"),
+                stderr=subprocess.STDOUT, start_new_session=True)
         if cfg.workload == "faucet":
             workload_thread = threading.Thread(target=self.faucet_workload, daemon=True)
             workload_thread.start()
@@ -693,6 +779,12 @@ class Soak:
             fault_thread.join(timeout=cfg.recovery_budget_s + 60)
         if workload_thread is not None:
             workload_thread.join(timeout=120)
+        if driver is not None:
+            try:
+                driver.wait(timeout=150)
+            except subprocess.TimeoutExpired:
+                driver.kill()
+                self.note("load driver did not finish draining; killed")
         self.run["completed"] = True
         self.run["abort_reason"] = None
         self.run["actual_duration_s"] = now() - self.started_t
@@ -727,11 +819,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--sample-secs", type=float, default=15.0)
     p.add_argument("--fault-every-secs", type=float, default=3600.0)
     p.add_argument("--snapshot-every", type=int, default=500)
-    p.add_argument("--workload", choices=["none", "faucet"], default="faucet")
+    p.add_argument("--workload", choices=["none", "faucet", "native"], default="faucet")
+    p.add_argument("--native-rate", type=float, default=0.2,
+                   help="native-inference requests per second offered (workload=native)")
+    p.add_argument("--native-requesters", type=int, default=4,
+                   help="requester accounts, i.e. the most requests in flight at once")
+    p.add_argument("--load-driver",
+                   help="soak_native_load binary (workload=native); must be built with the "
+                        "native-test-executor feature alongside --binary")
     p.add_argument("--faucet-rate", type=float, default=0.5, help="claims per second offered")
     p.add_argument("--rust-log", default="info")
     p.add_argument("--work")
     a = p.parse_args(argv)
+    if a.workload == "native" and not a.load_driver:
+        raise SystemExit("--workload native needs --load-driver")
     cfg = Config(a)
     soak = Soak(cfg)
     soak.prepare()

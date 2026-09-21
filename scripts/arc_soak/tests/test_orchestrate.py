@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +56,40 @@ class JsonlFreshness(unittest.TestCase):
         open(path, "w").write('{"stale": true}\n')
         with self.assertRaises(FileExistsError):
             orchestrate.JsonlWriter(path)
+
+
+class NativeRequesterFunding(unittest.TestCase):
+    """Genesis must fund exactly the accounts the load driver will sign with."""
+
+    def _fake_driver(self, lines):
+        path = os.path.join(tempfile.mkdtemp(), "driver")
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\n" + "".join(f"echo {line}\n" for line in lines))
+        os.chmod(path, 0o755)
+        return path
+
+    def _soak(self, driver, count):
+        cfg = types.SimpleNamespace(load_driver=driver, native_requesters=count,
+                                    nodes=0, work=tempfile.mkdtemp())
+        soak = orchestrate.Soak(cfg)
+        soak.run = {"workload": {}}
+        return soak
+
+    def test_every_requester_the_driver_reports_is_returned_and_recorded(self):
+        addresses = [c * 64 for c in "abc"]
+        soak = self._soak(self._fake_driver(addresses), 3)
+        self.assertEqual(soak.native_requesters(), addresses)
+        self.assertEqual(soak.run["workload"]["requesters"], addresses)
+
+    def test_a_driver_reporting_the_wrong_number_of_requesters_aborts(self):
+        soak = self._soak(self._fake_driver(["a" * 64]), 2)
+        with self.assertRaises(orchestrate.Abort):
+            soak.native_requesters()
+
+    def test_a_driver_reporting_something_that_is_not_an_address_aborts(self):
+        soak = self._soak(self._fake_driver(["a" * 64, "not-an-address"]), 2)
+        with self.assertRaises(orchestrate.Abort):
+            soak.native_requesters()
 
 
 if __name__ == "__main__":
