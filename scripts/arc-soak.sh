@@ -226,6 +226,7 @@ except Exception: print('')" 2>/dev/null
     victim=$(( KILLS % NODES ))
     note "killing node $victim (kill #$((KILLS+1)))"
     kill_at=$(date +%s)
+    [[ -z ${SOAK_FIRST_KILL_ELAPSED:-} ]] && export SOAK_FIRST_KILL_ELAPSED=$(( kill_at - START ))
     kill -9 "${PIDS[$victim]}" 2>/dev/null || true
     wait "${PIDS[$victim]}" 2>/dev/null || true
     KILLS=$(( KILLS + 1 ))
@@ -310,6 +311,32 @@ for a, b in zip(times, times[1:]):
 print()
 print(f"longest network-wide stall: {longest} consecutive samples with no height advancing")
 open(sys.argv[1] + ".stall", "w").write(str(longest))
+
+# Throughput after the first controlled fault, against the rate before it.
+# "Still advancing" is not "recovered": the first post-fix self-test advanced
+# the whole time and still ran about fifteen times slower after one restart
+# than before it, for as long as it was observed. A soak that reports only
+# advance-or-not would call that a pass.
+import os
+kill_at = os.environ.get("SOAK_FIRST_KILL_ELAPSED")
+rate_before = rate_after = None
+if kill_at and times:
+    k = int(kill_at)
+    pre = [t for t in times if t <= k and max(by_time[t], default=0) > 0]
+    post = [t for t in times if t > k + 30]
+    if len(pre) >= 2:
+        a, b = pre[0], pre[-1]
+        rate_before = (max(by_time[b]) - max(by_time[a])) / max(1, b - a)
+    if len(post) >= 2:
+        a, b = post[0], post[-1]
+        rate_after = (max(by_time[b]) - max(by_time[a])) / max(1, b - a)
+if rate_before and rate_after is not None:
+    ratio = rate_after / rate_before if rate_before > 0 else 0.0
+    print(f"throughput: {rate_before:.2f} heights/s before the first fault, "
+          f"{rate_after:.2f} after it ({ratio:.0%} of baseline)")
+    open(sys.argv[1] + ".ratio", "w").write(f"{ratio:.4f}")
+else:
+    print("throughput: not enough samples either side of the first fault to compare")
 down = sum(1 for r in rows if r.get("alive") == "0")
 print(f"samples that observed a node down: {down} of {len(rows)}")
 print("  (sampling pauses during a controlled kill, so controlled downtime is")
@@ -347,6 +374,9 @@ PYEOF
     echo "VERDICT: FAIL - replicas disagreed on canonical history during the run"
   elif [[ ${STALL:-0} -ge ${STALL_LIMIT_SAMPLES:-6} ]]; then
     echo "VERDICT: FAIL - the whole network stopped advancing for $STALL consecutive samples"
+  elif python3 -c "import sys; r=float(open('$SAMPLES.ratio').read()); sys.exit(0 if r < ${MIN_RECOVERED_RATIO:-0.5} else 1)" 2>/dev/null; then
+    echo "VERDICT: FAIL - throughput after a controlled fault stayed below ${MIN_RECOVERED_RATIO:-0.5}x baseline"
+    echo "         (advancing is not the same as recovered)"
   elif [[ $KILLS -gt 0 && $REJOINS -lt $KILLS ]]; then
     echo "VERDICT: FAIL - a killed node did not come back"
   else
