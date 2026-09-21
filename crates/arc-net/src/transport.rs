@@ -195,6 +195,20 @@ pub enum InboundMessage {
         blocks: Vec<DagBlock>,
         transactions: Vec<Transaction>,
     },
+    /// A peer has fallen below every peer's retention window and is asking
+    /// for an authenticated state checkpoint.
+    CheckpointRequest {
+        source: Hash256,
+        needed_below_height: u64,
+    },
+    /// A checkpoint envelope and the payload bytes it authorises. Nothing here
+    /// is trusted: the receiver verifies the envelope against its own frozen
+    /// committee and chain domain before decoding the payload.
+    CheckpointResponse {
+        source: Hash256,
+        envelope: Box<arc_consensus::view_change::CheckpointEnvelope>,
+        payload: Vec<u8>,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -224,6 +238,15 @@ pub enum OutboundMessage {
         target: Hash256,
         blocks: Vec<DagBlock>,
         transactions: Vec<Transaction>,
+    },
+    SendCheckpointRequest {
+        target: Hash256,
+        needed_below_height: u64,
+    },
+    SendCheckpointResponse {
+        target: Hash256,
+        envelope: Box<arc_consensus::view_change::CheckpointEnvelope>,
+        payload: Vec<u8>,
     },
     /// Broadcast a state diff (Propose-Verify protocol).
     BroadcastStateDiff {
@@ -1520,6 +1543,34 @@ async fn run_transport_inner(
                             .await;
                     }
                 }
+                OutboundMessage::SendCheckpointRequest {
+                    target,
+                    needed_below_height,
+                } => {
+                    let payload = crate::protocol::CheckpointRequestMessage {
+                        needed_below_height,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .send_to(&target, MessageType::CheckpointRequest, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::SendCheckpointResponse {
+                    target,
+                    envelope,
+                    payload,
+                } => {
+                    let message = crate::protocol::CheckpointResponseMessage {
+                        envelope: *envelope,
+                        payload,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&message) {
+                        conn_out
+                            .send_to(&target, MessageType::CheckpointResponse, &bytes)
+                            .await;
+                    }
+                }
                 OutboundMessage::BroadcastTransactions(txs) => {
                     for batch in txs.chunks(crate::MAX_TX_PER_GOSSIP) {
                         let payload = crate::protocol::TxGossipMessage {
@@ -2750,6 +2801,33 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => warn!("Bad DagHistoryResponse from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::CheckpointRequest => {
+                match deserialize_message::<crate::protocol::CheckpointRequestMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::CheckpointRequest {
+                                source: peer_address,
+                                needed_below_height: msg.needed_below_height,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad CheckpointRequest from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::CheckpointResponse => {
+                match deserialize_message::<crate::protocol::CheckpointResponseMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::CheckpointResponse {
+                                source: peer_address,
+                                envelope: Box::new(msg.envelope),
+                                payload: msg.payload,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad CheckpointResponse from {}: {}", peer_address, e),
                 }
             }
             MessageType::RoundSyncRequest => {

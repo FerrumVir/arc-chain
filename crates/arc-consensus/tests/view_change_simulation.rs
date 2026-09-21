@@ -1244,3 +1244,89 @@ fn conflicting_finality_certificates_at_one_height_are_detected_not_overwritten(
         "the held certificate must not be replaced by the conflicting one"
     );
 }
+
+/// What `/finality/{height}` serves must be verifiable by someone who does not
+/// trust the server - that is the entire difference between it and
+/// `/block/{height}`, which reports one node's own observation.
+///
+/// This exercises the round trip a light client performs: take the encoded
+/// certificate, decode it, and verify it against the committee and chain
+/// domain the client already trusts.
+#[test]
+fn a_served_finality_certificate_verifies_against_an_independently_held_committee() {
+    let (set, keys) = committee(4);
+    let set_hash = validator_set_hash(&set);
+    let engine = ConsensusEngine::new_with_keypair(set.clone(), keys[0].address(), keys[0].clone());
+    engine
+        .install_consensus_domain(domain())
+        .expect("fresh engine binds its domain");
+
+    let block = hash_bytes(b"final-block");
+    let state_root = hash_bytes(b"final-state");
+    let tx_root = hash_bytes(b"final-txs");
+    let mut collector = FinalityVoteCollector::new();
+    let mut certificate = None;
+    for key in keys.iter().take(3) {
+        let vote =
+            FinalityVote::sign(domain(), set_hash, 12, block, state_root, tx_root, key).unwrap();
+        if let Some(assembled) = collector.add(vote, &domain(), &set).unwrap() {
+            certificate = Some(assembled);
+        }
+    }
+    let certificate = certificate.expect("quorum reached");
+    engine
+        .register_finality_certificate(certificate)
+        .expect("accepted");
+
+    // The server side: fetch and encode exactly what the endpoint returns.
+    let served = engine
+        .finality_certificate(12)
+        .expect("the node holds a certificate at this height");
+    let encoded = bincode::serialize(&served).expect("certificate encodes");
+
+    // The client side. It holds the committee and the chain domain from its
+    // own trusted source, NOT from the response.
+    let decoded: FinalityCertificate = bincode::deserialize(&encoded).expect("decodes");
+    let signing = decoded
+        .verify(&domain(), &set)
+        .expect("a served certificate must verify against the real committee");
+    assert!(signing >= set.quorum);
+    assert_eq!(decoded.block_hash, block);
+    assert_eq!(decoded.state_root, state_root);
+
+    // The same bytes must NOT verify against a different committee or a
+    // different chain - otherwise the certificate would prove nothing about
+    // which chain the client is on.
+    let (other_set, _) = {
+        let keys: Vec<KeyPair> = (0..4)
+            .map(|i| {
+                KeyPair::from_ed25519_secret_bytes(
+                    &hash_bytes(format!("arc.sim.other.{i}").as_bytes()).0,
+                )
+            })
+            .collect();
+        let validators: Vec<Validator> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| Validator::new(key.address(), STAKE_ARC, i as u16).expect("valid"))
+            .collect();
+        (ValidatorSet::new(validators, 1), keys)
+    };
+    assert!(
+        decoded.verify(&domain(), &other_set).is_err(),
+        "a certificate must not verify against a committee that did not sign it"
+    );
+    let other_domain = ConsensusDomain::new(hash_bytes(b"arc.sim.other.chain"), 1, 1);
+    assert!(
+        decoded.verify(&other_domain, &set).is_err(),
+        "a certificate must not verify against a different chain domain"
+    );
+
+    // A node-observed commit is a different fact. The engine holds no
+    // certificate at a height it merely committed, and the endpoint must not
+    // invent one.
+    assert!(
+        engine.finality_certificate(13).is_none(),
+        "an uncertified height must have no certificate to serve"
+    );
+}

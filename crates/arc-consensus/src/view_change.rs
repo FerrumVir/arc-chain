@@ -1693,8 +1693,6 @@ pub enum CheckpointError {
     StateRootMismatch { expected: Hash256, found: Hash256 },
     #[error("snapshot declares height {found}, certificate authorises {expected}")]
     HeightMismatch { expected: u64, found: u64 },
-    #[error("installing checkpoint state is not implemented")]
-    InstallNotImplemented,
 }
 
 /// What a snapshot must say about itself for a checkpoint to authorise it.

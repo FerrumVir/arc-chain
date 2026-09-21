@@ -7527,6 +7527,10 @@ async fn run_arc_node() -> Result<()> {
     let dag_validators = Arc::new(parking_lot::RwLock::new(all_vals));
     let dag_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Set when a consensus engine is actually started. A process without one
+    // must report that it holds no certificates rather than a 404 that reads
+    // as "not final".
+    let mut rpc_consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>> = None;
 
     if runtime_roles.chain_participation {
         let recovery_dag_startup = prepare_recovery_dag_startup(Path::new(&data_dir), &state)?;
@@ -7611,6 +7615,10 @@ async fn run_arc_node() -> Result<()> {
         consensus.dag_validators = Some(dag_validators.clone());
         consensus.dag_round = Some(dag_round.clone());
         consensus.dag_committed = Some(dag_committed.clone());
+        // Share the engine with the RPC surface so `/finality/{height}` can
+        // serve the committee's signed statement rather than this node's own
+        // claim about it.
+        rpc_consensus_engine = Some(consensus.engine.clone());
         if let Some(startup) = recovery_dag_startup.as_ref() {
             // Protocol v3 never opens the legacy segmented WAL. Select an
             // independently pinned content-addressed generation, stage its
@@ -8979,6 +8987,7 @@ async fn run_arc_node() -> Result<()> {
         Some(dag_validators),
         Some(dag_round),
         Some(dag_committed),
+        rpc_consensus_engine,
         shard_infos,
         coordinator_seed_rpcs,
         community_rpc_bases,
@@ -9805,6 +9814,7 @@ mod tests {
                     None,
                     None,
                     Some(model_id),
+                    None,
                     None,
                     None,
                     None,

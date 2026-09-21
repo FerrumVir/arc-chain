@@ -64,6 +64,10 @@ pub enum MessageType {
     DagHistoryRequest = 0x17,
     /// A bounded, contiguous run of DAG history with transaction bodies.
     DagHistoryResponse = 0x18,
+    /// Ask a peer for an authenticated state checkpoint.
+    CheckpointRequest = 0x19,
+    /// A checkpoint envelope and the snapshot payload it authorises.
+    CheckpointResponse = 0x1A,
 }
 
 impl MessageType {
@@ -93,6 +97,8 @@ impl MessageType {
             0x16 => Some(Self::ConsensusFinalityCertificate),
             0x17 => Some(Self::DagHistoryRequest),
             0x18 => Some(Self::DagHistoryResponse),
+            0x19 => Some(Self::CheckpointRequest),
+            0x1A => Some(Self::CheckpointResponse),
             _ => None,
         }
     }
@@ -185,6 +191,32 @@ pub struct DagHistoryRequestMessage {
 pub struct DagHistoryResponseMessage {
     pub blocks: Vec<DagBlock>,
     pub transactions: Vec<Transaction>,
+}
+
+/// Ask a peer for an authenticated state checkpoint.
+///
+/// Sent only by a node whose needed history is below what any peer still
+/// retains. Installing a checkpoint is a DIFFERENT trust boundary from
+/// importing history: history is self-authenticating block by block, while a
+/// checkpoint is a committee's signed claim about a state this node will adopt
+/// without replaying how it got there. The request therefore carries nothing
+/// the responder is expected to trust.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointRequestMessage {
+    /// The height below which this node cannot make progress. A hint only.
+    pub needed_below_height: u64,
+}
+
+/// A checkpoint envelope and the exact payload bytes it authorises.
+///
+/// The envelope is a quorum finality certificate plus the snapshot identity it
+/// covers. The payload is unstructured here on purpose: the receiver must
+/// verify the envelope against its OWN frozen committee and chain domain, and
+/// that these bytes hash to the authorised digest, before decoding anything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointResponseMessage {
+    pub envelope: arc_consensus::view_change::CheckpointEnvelope,
+    pub payload: Vec<u8>,
 }
 
 /// One validator's absence attestation, gossiped so peers can assemble a

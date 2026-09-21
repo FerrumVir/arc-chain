@@ -239,3 +239,73 @@ fn a_snapshot_from_an_unknown_version_is_ignored_not_guessed_at() {
     let recovered = open(&path);
     assert_eq!(observable(&recovered), expected);
 }
+
+#[test]
+fn a_torn_wal_tail_after_a_snapshot_still_recovers_to_the_repaired_state() {
+    // A snapshot bounds what replay applies; it must not change what replay
+    // DECIDES. If the tail beyond the snapshot is torn, recovery has to reach
+    // the same state a full replay of the repaired log reaches - not the
+    // snapshot's own height, and not a mixture.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+
+    let state = open(&path);
+    advance(&state, 10);
+    state.publish_durable_snapshot().expect("snapshot published");
+    advance(&state, 6);
+    drop(state);
+
+    // Tear the final frame, the way a crash mid-append leaves it.
+    let wal = path.join("state.wal");
+    let bytes = std::fs::read(&wal).unwrap();
+    assert!(bytes.len() > 64);
+    std::fs::write(&wal, &bytes[..bytes.len() - 17]).unwrap();
+
+    let with_snapshot = open(&path);
+    let from_snapshot = observable(&with_snapshot);
+    assert!(
+        from_snapshot.0 >= 10,
+        "recovery fell back below the snapshot's own height: {}",
+        from_snapshot.0
+    );
+    drop(with_snapshot);
+
+    // The same torn log, replayed in full, must agree.
+    snapshot::remove(&path).expect("snapshot removed");
+    let full_replay = open(&path);
+    assert_eq!(
+        from_snapshot,
+        observable(&full_replay),
+        "a snapshot changed what a torn WAL tail recovers to"
+    );
+}
+
+#[test]
+fn a_snapshot_ahead_of_the_wal_is_refused() {
+    // A snapshot naming a resume point beyond anything in the log would skip
+    // every remaining record. The state root check is what catches it: the
+    // installed payload describes a height the log never reached.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let state = open(&path);
+    advance(&state, 6);
+    let expected = observable(&state);
+    let loaded_root = state.get_state_root();
+    drop(state);
+
+    let mut forged = snapshot::SnapshotPayload {
+        height: 9_999,
+        ..Default::default()
+    };
+    forged.canonicalize();
+    snapshot::publish(&path, forged, loaded_root, u64::MAX, Hash256::ZERO)
+        .expect("forged snapshot written");
+
+    let recovered = open(&path);
+    assert_eq!(
+        observable(&recovered),
+        expected,
+        "a snapshot that does not reproduce the state it claims must be backed \
+         out, and full replay must still reach the right state"
+    );
+}

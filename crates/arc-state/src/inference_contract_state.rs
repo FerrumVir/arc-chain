@@ -1946,7 +1946,8 @@ mod tests {
         };
         assert!(fixture.ledger.admit(crossed, b"input", 4).is_err());
         assert_eq!(fixture.ledger.state_root().unwrap(), root);
-        drop(admitted);
+        // `admitted` holds no borrow of the ledger, so dropping it explicitly
+        // does nothing except extend its lifetime to this point.
         drop(fixture.ledger);
         std::fs::remove_dir_all(fixture.dir).unwrap();
     }

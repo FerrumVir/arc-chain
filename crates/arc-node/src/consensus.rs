@@ -466,6 +466,15 @@ const DECISION_REPLAY_SCAN_BLOCKS: u64 = 256;
 /// commit path in practice.
 pub const DEFAULT_SNAPSHOT_EVERY_BLOCKS: u64 = 1024;
 
+/// How many consecutive history requests may buy nothing before the node asks
+/// for a checkpoint instead.
+///
+/// Deliberately not one. A single unproductive request is ordinary - a peer
+/// may simply not have answered yet - and adopting a peer's state is a
+/// strictly stronger trust decision than importing self-authenticating
+/// history, so it is the last resort rather than the first.
+const UNPRODUCTIVE_REQUESTS_BEFORE_CHECKPOINT: u32 = 8;
+
 /// Bounds on one history transfer. A request cannot make a peer serve more than
 /// this, and an importer will not step over more than this in one go.
 const HISTORY_MAX_ROUNDS: u64 = 256;
@@ -1074,6 +1083,11 @@ impl ConsensusManager {
         // Set while this node is filling an empty DAG in from genesis; None
         // once it has caught up with its own round cursor.
         let mut bootstrap_watermark: Option<u64> = None;
+        // Consecutive history requests that moved the bootstrap watermark
+        // nowhere. Past a bound, DAG history cannot rescue this node and it
+        // needs an authenticated checkpoint instead.
+        let mut unproductive_bootstrap_requests: u32 = 0;
+        let mut checkpoint_requested = false;
         let mut last_round_seen = self.engine.current_round();
         let mut last_round_change = std::time::Instant::now();
         let mut history_clock = std::time::Instant::now()
@@ -1244,6 +1258,12 @@ impl ConsensusManager {
                 arc_consensus::view_change::FinalityCertificate,
             )> = Vec::new();
             let mut inbound_history_requests: Vec<(Hash256, u64, u64)> = Vec::new();
+            let mut inbound_checkpoint_requests: Vec<(Hash256, u64)> = Vec::new();
+            let mut inbound_checkpoints: Vec<(
+                Hash256,
+                Box<arc_consensus::view_change::CheckpointEnvelope>,
+                Vec<u8>,
+            )> = Vec::new();
             let mut history_requests: Vec<(Hash256, u64)> = Vec::new();
             let mut history_requests_broadcast: Option<u64> = None;
             let mut inbound_history: Vec<(Hash256, Vec<arc_consensus::DagBlock>, Vec<arc_types::Transaction>)> =
@@ -1802,6 +1822,19 @@ impl ConsensusManager {
                         } => {
                             inbound_history.push((source, blocks, transactions));
                         }
+                        InboundMessage::CheckpointRequest {
+                            source,
+                            needed_below_height,
+                        } => {
+                            inbound_checkpoint_requests.push((source, needed_below_height));
+                        }
+                        InboundMessage::CheckpointResponse {
+                            source,
+                            envelope,
+                            payload,
+                        } => {
+                            inbound_checkpoints.push((source, envelope, payload));
+                        }
                         InboundMessage::ShardAnnounce {
                             model_id,
                             start_layer,
@@ -1973,6 +2006,18 @@ impl ConsensusManager {
                                 .engine
                                 .first_missing_round(mark, HISTORY_MAX_ROUNDS)
                                 .min(now_round);
+                            // A watermark that has not moved means the last
+                            // request bought nothing. Peers legitimately refuse
+                            // when the round is below their prune horizon, and
+                            // no number of further requests will change that -
+                            // so count the unproductive ones instead of asking
+                            // forever.
+                            if next == mark {
+                                unproductive_bootstrap_requests =
+                                    unproductive_bootstrap_requests.saturating_add(1);
+                            } else {
+                                unproductive_bootstrap_requests = 0;
+                            }
                             bootstrap_watermark = Some(next);
                             if next >= now_round {
                                 // Caught up with the round cursor; from here on
@@ -2028,6 +2073,34 @@ impl ConsensusManager {
                                 target: *peer,
                                 from_round,
                                 max_rounds: HISTORY_MAX_ROUNDS,
+                            });
+                        }
+                    }
+                }
+
+                // Escalate to a checkpoint only once, and only after history
+                // has demonstrably failed. Asking earlier would adopt a peer's
+                // state while self-authenticating history was still available,
+                // and adopting state is the strictly stronger trust decision.
+                if unproductive_bootstrap_requests >= UNPRODUCTIVE_REQUESTS_BEFORE_CHECKPOINT
+                    && !checkpoint_requested
+                {
+                    checkpoint_requested = true;
+                    let needed_below_height = state.height();
+                    warn!(
+                        attempts = unproductive_bootstrap_requests,
+                        needed_below_height,
+                        "DAG history is not rescuing this node; requesting an authenticated \
+                         checkpoint, which is a different and stronger trust boundary"
+                    );
+                    for (peer, generation) in connected_validators.iter() {
+                        if !generation.connected {
+                            continue;
+                        }
+                        if let Some(ref tx_chan) = outbound_tx {
+                            let _ = tx_chan.try_send(OutboundMessage::SendCheckpointRequest {
+                                target: *peer,
+                                needed_below_height,
                             });
                         }
                     }
@@ -2139,6 +2212,167 @@ impl ConsensusManager {
                             debug!(%source, %error, "History response not usable");
                         }
                     }
+                }
+            }
+
+            // ── 0b3. Authenticated checkpoint transfer ──────────────────
+            // A SEPARATE trust boundary from history import. History is
+            // self-authenticating block by block and the importer re-validates
+            // everything, so serving it is not a trust decision. A checkpoint
+            // is a committee's signed claim about a state this node will adopt
+            // WITHOUT replaying how it got there - so it is accepted only on a
+            // quorum finality certificate bound to this node's own frozen
+            // committee and chain domain, and only for bytes that hash to the
+            // digest that certificate authorises.
+            for (source, needed_below_height) in inbound_checkpoint_requests {
+                let Some(dir) = state.persistence_dir() else {
+                    warn!(%source, "Cannot serve a checkpoint: this node has no durable state");
+                    continue;
+                };
+                let snapshot = match arc_state::snapshot::load(&dir) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        warn!(%source, %error, "Cannot serve a checkpoint: no usable local snapshot");
+                        continue;
+                    }
+                };
+                let height = snapshot.manifest.identity.height;
+                // The certificate must cover THIS snapshot's height, and must
+                // agree with it about the state root. A certificate for a
+                // different height, or one naming a different root, authorises
+                // nothing about these bytes.
+                let Some(certificate) = self.engine.finality_certificate(height) else {
+                    warn!(
+                        %source, height,
+                        "Cannot serve a checkpoint: no finality certificate at the snapshot's height"
+                    );
+                    continue;
+                };
+                if certificate.state_root != snapshot.manifest.identity.state_root {
+                    warn!(
+                        %source, height,
+                        "Refusing to serve a checkpoint: the finality certificate and the local \
+                         snapshot disagree about the state root"
+                    );
+                    continue;
+                }
+                let payload = match std::fs::read(dir.join(arc_state::snapshot::PAYLOAD_FILE)) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        warn!(%source, %error, "Cannot serve a checkpoint: payload unreadable");
+                        continue;
+                    }
+                };
+                let envelope = arc_consensus::view_change::CheckpointEnvelope {
+                    certificate,
+                    snapshot: arc_consensus::view_change::SnapshotIdentity {
+                        height,
+                        state_root: snapshot.manifest.identity.state_root,
+                        digest: snapshot.manifest.identity.digest,
+                    },
+                };
+                info!(
+                    %source, height, needed_below_height, bytes = payload.len(),
+                    "Serving an authenticated state checkpoint"
+                );
+                if let Some(ref tx_chan) = outbound_tx {
+                    let _ = tx_chan.try_send(OutboundMessage::SendCheckpointResponse {
+                        target: source,
+                        envelope: Box::new(envelope),
+                        payload,
+                    });
+                }
+            }
+
+            for (source, envelope, payload) in inbound_checkpoints {
+                // Nothing below touches the payload until the envelope has
+                // been verified against THIS node's committee and domain.
+                let Some(domain) = self.engine.certificate_domain() else {
+                    warn!(%source, "Refusing a checkpoint: this node has no certificate domain");
+                    continue;
+                };
+                let verified = {
+                    let set = self.engine.frozen_validator_set();
+                    envelope.verify_payload(&payload, &domain, &set)
+                };
+                if let Err(error) = verified {
+                    warn!(
+                        %source, %error,
+                        "REFUSED an unauthenticated checkpoint; nothing was installed"
+                    );
+                    continue;
+                }
+                if state.height() >= envelope.snapshot.height {
+                    debug!(
+                        %source,
+                        offered = envelope.snapshot.height,
+                        local = state.height(),
+                        "Ignoring a checkpoint this node is already past"
+                    );
+                    continue;
+                }
+                let Ok(decoded) = arc_state::snapshot::SnapshotPayload::decode(&payload) else {
+                    warn!(
+                        %source,
+                        "A certified checkpoint payload would not decode; nothing was installed"
+                    );
+                    continue;
+                };
+
+                // Verify in a SCRATCH state first. An envelope can be
+                // internally consistent - right committee, right chain, right
+                // digest - and still name a root its payload does not produce.
+                // Installing into the live state to find that out would leave
+                // this node inconsistent at the moment it discovered the
+                // problem, so the check happens somewhere disposable.
+                let scratch = arc_state::StateDB::with_genesis(&[]);
+                scratch.install_durable_snapshot(&decoded);
+                let produced = scratch.get_state_root();
+                if produced != envelope.snapshot.state_root {
+                    error!(
+                        %source,
+                        expected = %envelope.snapshot.state_root,
+                        produced = %produced,
+                        "REFUSED a certified checkpoint: its payload does not produce the state \
+                         root the committee signed. Nothing was installed."
+                    );
+                    continue;
+                }
+
+                // Adopting is safe only where there is no canonical history to
+                // destroy. A node that already has one would need its durable
+                // WAL rebased onto the checkpoint, which is the production
+                // recovery path's job and is NOT done here - merging a peer's
+                // state into an existing one produces neither state.
+                if state.height() > 0 {
+                    warn!(
+                        %source,
+                        height = envelope.snapshot.height,
+                        local_height = state.height(),
+                        "Verified an authenticated checkpoint but did NOT install it: this node \
+                         already has canonical history, and rebasing a durable store onto a \
+                         checkpoint is not implemented. Recover it through the production \
+                         checkpoint path instead."
+                    );
+                    continue;
+                }
+
+                state.install_durable_snapshot(&decoded);
+                let installed = state.get_state_root();
+                if installed == envelope.snapshot.state_root {
+                    info!(
+                        %source,
+                        height = envelope.snapshot.height,
+                        "Installed an authenticated state checkpoint into an empty node"
+                    );
+                } else {
+                    error!(
+                        %source,
+                        expected = %envelope.snapshot.state_root,
+                        found = %installed,
+                        "A checkpoint that verified in isolation did not reproduce its root in \
+                         this node; restart from the durable store"
+                    );
                 }
             }
 

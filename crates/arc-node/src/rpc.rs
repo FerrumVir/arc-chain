@@ -430,6 +430,14 @@ pub struct NodeState {
     /// shard execution, caches, verification, and attestations.
     pub model_artifact_id: Option<arc_crypto::Hash256>,
     /// Live DAG validator set (updated by consensus loop via PeerConnected).
+    /// The live consensus engine, when this process runs one.
+    ///
+    /// Needed so the RPC can serve a finality CERTIFICATE rather than a claim
+    /// about one. A node's own observation that it committed a block and a
+    /// quorum's signed statement that the block is final are different facts,
+    /// and only the second is checkable by someone who does not trust this
+    /// node.
+    pub consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>>,
     pub dag_validators: SharedValidators,
     /// Per-sender rate limiter for tx submission: sender_address → last submit time.
     /// Limits to 10 tx/sec per sender to prevent mempool flood DoS.
@@ -1424,6 +1432,7 @@ pub fn build_node_state(
         candle_engine,
         candle_model_id,
         model_artifact_id,
+        consensus_engine: None,
         dag_validators: Arc::new(parking_lot::RwLock::new(vec![(validator_address, stake)])),
         tx_rate_limit: Arc::new(dashmap::DashMap::new()),
         dag_round: Arc::new(AtomicU64::new(0)),
@@ -1882,6 +1891,7 @@ pub async fn serve(
     dag_validators: Option<SharedValidators>,
     dag_round: Option<Arc<AtomicU64>>,
     dag_committed: Option<Arc<AtomicU64>>,
+    consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>>,
     shard_infos: Vec<ShardInfo>,
     // seed_rpc_addrs: configured absolute RPC origins used only to authorize
     //   destinations subsequently bound by signed shard announcements. Seed
@@ -1924,6 +1934,7 @@ pub async fn serve(
     node.runtime_shutdown = shutdown.clone();
     node.chain_identity = chain_identity;
     node.community_rewards_v1_enabled = community_rewards_v1_enabled;
+    node.consensus_engine = consensus_engine;
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
     }
@@ -2185,6 +2196,7 @@ pub async fn serve(
         .route("/faucet/status", get(faucet_status))
         // Light Client Finality Proofs (A8)
         .route("/light/snapshot", get(light_snapshot))
+        .route("/finality/{height}", get(get_finality_certificate))
         // State Sync Protocol (A5) - snapshot bootstrap for new nodes
         .route("/sync/snapshot", get(sync_snapshot))
         .route("/sync/snapshot/info", get(sync_snapshot_info))
@@ -4102,6 +4114,72 @@ async fn sync_status(AxumState(node): AxumState<NodeState>) -> Json<Value> {
             "total_accounts": manifest.total_accounts,
         },
     }))
+}
+
+/// GET /finality/{height} - the quorum finality certificate for a height.
+///
+/// This is deliberately a different endpoint from `/block/{height}`. That one
+/// reports what THIS node committed - a local observation, believable only to
+/// someone who already trusts this node. This one returns a committee's signed
+/// statement, which a client can check for itself against the validator set
+/// and the chain domain without trusting the server at all.
+///
+/// A 404 means "this node holds no certificate at that height", which is not
+/// the same as "the block is not final": certificates are gossiped and this
+/// node may simply not have assembled one.
+async fn get_finality_certificate(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(height): axum::extract::Path<u64>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let Some(engine) = node.consensus_engine.as_ref() else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this process runs no consensus engine, so it holds no finality certificates"
+                .to_string(),
+        ));
+    };
+    let Some(certificate) = engine.finality_certificate(height) else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no finality certificate at height {height} on this node; it may exist elsewhere"
+            ),
+        ));
+    };
+    let set = engine.frozen_validator_set();
+    // Re-verify on the way out. A stored certificate is not a licence to
+    // publish signatures nobody checked, and a client that cannot verify
+    // should be told by the server that the server could not either.
+    let domain = engine.certificate_domain();
+    let signing_stake = match domain.as_ref() {
+        Some(domain) => certificate.verify(domain, &set).ok(),
+        None => None,
+    };
+    // Hex rather than base64: the rest of this API is hex, and the point is
+    // that a client can decode and verify it, not that it is compact.
+    let encoded = bincode::serialize(&certificate)
+        .ok()
+        .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+
+    Ok(Json(json!({
+        "height": certificate.height,
+        "block_hash": certificate.block_hash.to_hex(),
+        "state_root": certificate.state_root.to_hex(),
+        "tx_root": certificate.tx_root.to_hex(),
+        "validator_set_hash": certificate.validator_set_hash.to_hex(),
+        "voters": certificate.votes.iter().map(|v| v.voter.to_hex()).collect::<Vec<_>>(),
+        "signing_stake": signing_stake,
+        "quorum": set.quorum,
+        "total_stake": set.total_stake,
+        // What the client should do with this: verify the encoded certificate
+        // against the committee and domain it independently trusts. The fields
+        // above are a convenience, not the proof.
+        "certificate_bincode_hex": encoded,
+        "verified_by_server": signing_stake.is_some(),
+        "note": "a node-observed commit and a verified quorum certificate are \
+                 different facts; only this certificate is checkable without \
+                 trusting this node",
+    })))
 }
 
 /// GET /sync/dag_state - Returns the current DAG consensus round state.
@@ -19781,6 +19859,7 @@ mod tests {
             candle_engine: None,
             candle_model_id: None,
             model_artifact_id: parse_hash256_hex(&test_model_id(), "test model_id").ok(),
+            consensus_engine: None,
             dag_validators: Arc::new(parking_lot::RwLock::new(Vec::new())),
             tx_rate_limit: Arc::new(dashmap::DashMap::new()),
             dag_round: Arc::new(AtomicU64::new(0)),
@@ -24502,6 +24581,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Vec::new(),
                     vec![poison_origin],
                     Vec::new(),
@@ -24577,6 +24657,7 @@ mod tests {
                 arc_state::StateDB::MIN_VALIDATOR_STAKE,
                 Instant::now(),
                 Arc::new(AtomicU32::new(0)),
+                None,
                 None,
                 None,
                 None,
