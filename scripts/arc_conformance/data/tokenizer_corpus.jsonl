@@ -1,0 +1,38 @@
+{"id": 0, "text": "Hello world"}
+{"id": 1, "text": " Hello world"}
+{"id": 2, "text": "  two leading spaces"}
+{"id": 3, "text": "trailing spaces   "}
+{"id": 4, "text": "tabs\tbetween\twords"}
+{"id": 5, "text": "multiple\n\nnewlines\n"}
+{"id": 6, "text": "The capital of France is Paris."}
+{"id": 7, "text": "What is 2 + 2? Answer with just the number."}
+{"id": 8, "text": "Numbers: 0 7 42 1234567890 3.14159 -273.15 1e-9 0x1F"}
+{"id": 9, "text": "Punctuation: ,.;:!?¡¿…—–-'\"()[]{}<>/\\|@#$%^&*_=+~`"}
+{"id": 10, "text": "Accented Latin: café naïve façade Ångström Łódź Ærø"}
+{"id": 11, "text": "German: Größenwahn Übermäßigkeit Straße"}
+{"id": 12, "text": "Greek: Καλημέρα κόσμε"}
+{"id": 13, "text": "Cyrillic: Съешь же ещё этих мягких французских булок"}
+{"id": 14, "text": "Arabic: مرحبا بالعالم"}
+{"id": 15, "text": "Hebrew: שלום עולם"}
+{"id": 16, "text": "Hindi: नमस्ते दुनिया"}
+{"id": 17, "text": "Chinese: 你好，世界。机器学习"}
+{"id": 18, "text": "Japanese: こんにちは世界、カタカナ"}
+{"id": 19, "text": "Korean: 안녕하세요 세계"}
+{"id": 20, "text": "Thai: สวัสดีชาวโลก"}
+{"id": 21, "text": "Emoji: 🙂 🚀 👩‍💻 🇫🇷 ❤️"}
+{"id": 22, "text": "Math: ∑ ∫ √ ∞ ≠ ≤ ≥ ∈ ∀ ∃ π"}
+{"id": 23, "text": "Private use (byte fallback): "}
+{"id": 24, "text": "Rare symbol (byte fallback): 🧪🫠"}
+{"id": 25, "text": "Zero width joiner and space: a‍b a​b"}
+{"id": 26, "text": "Code: fn main() { println!(\"{}\", 1 + 1); }"}
+{"id": 27, "text": "Code: def f(x):\n    return x ** 2  # square"}
+{"id": 28, "text": "JSON: {\"key\": [1, 2, 3], \"nested\": {\"a\": null}}"}
+{"id": 29, "text": "URL: https://example.com/path?query=1&x=y#frag"}
+{"id": 30, "text": "Template: [INST] What is the capital of France? [/INST]"}
+{"id": 31, "text": "Template with system: [INST] <<SYS>>\nBe brief.\n<</SYS>>\n\nHi [/INST]"}
+{"id": 32, "text": "Literal special tokens: <s> </s> <unk>"}
+{"id": 33, "text": "Repeated: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+{"id": 34, "text": "Mixed case: iPhone eBay McDonald's O'Neill"}
+{"id": 35, "text": "Hyphenation: state-of-the-art well-known e-mail"}
+{"id": 36, "text": "Contractions: don't can't won't I'm you're they've"}
+{"id": 37, "text": "Long word: pneumonoultramicroscopicsilicovolcanoconiosis"}
