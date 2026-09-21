@@ -199,3 +199,209 @@ fn a_block_with_a_wrong_round_parent_is_never_held() {
     }
     assert!(pending.is_empty());
 }
+
+// ─── Restart past the retention window ─────────────────────────────────────
+//
+// A restarted node's DAG is empty. It used to rebuild it from round 0, the
+// only round whose blocks validate without parents. Once the chain ran past
+// the retention window, peers had pruned round 0 and served their oldest
+// retained rounds instead - all below the node's own commit cursor - and it
+// refused every batch as adding nothing. A 20-minute native-workload run hit
+// exactly that on its first fault: killed at round 4291 with 4096 retained,
+// 38 refused batches, never caught up.
+
+/// The retention floor (`PRUNE_DEPTH`): the smallest window an engine keeps.
+const RETAINED: u64 = 100;
+
+/// Run rounds as a live node does - proposing, receiving, advancing and
+/// committing, which also prunes. Each engine's committed anchors are
+/// appended to the matching entry of `committed`.
+fn run_committing(
+    engines: &[&ConsensusEngine],
+    rounds: u64,
+    ts: &mut u64,
+    committed: &mut [Vec<(u64, arc_crypto::Hash256)>],
+) {
+    for _ in 0..rounds {
+        let mut this_round = Vec::new();
+        for e in engines {
+            *ts += 1;
+            if let Ok(b) = e.propose_block(vec![], *ts) {
+                this_round.push(b);
+            }
+        }
+        for b in &this_round {
+            for e in engines {
+                let _ = e.receive_block(b);
+            }
+        }
+        for (i, e) in engines.iter().enumerate() {
+            e.advance_round();
+            committed[i].extend(e.try_commit().into_iter().map(|b| (b.round, b.hash)));
+        }
+    }
+}
+
+/// Everything a peer still holds from `from` to its tip, as it would serve it.
+fn served_from(peer: &ConsensusEngine, from: u64) -> Vec<DagBlock> {
+    (from..=peer.current_round())
+        .flat_map(|round| peer.blocks_in_round(round))
+        .filter_map(|hash| peer.get_block(&hash))
+        .collect()
+}
+
+#[test]
+fn a_restarted_node_rejoins_from_its_own_commit_cursor_after_peers_pruned_round_zero() {
+    let (set, keys) = committee();
+    let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
+    for x in &e {
+        x.set_retained_rounds(RETAINED);
+    }
+    let mut ts = 1_700_000_000_000u64;
+    let mut committed = vec![Vec::new(); 4];
+
+    // All four run together well past the retention window.
+    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 3 * RETAINED, &mut ts, &mut committed);
+    // Validator 3 is killed. Its durable records keep its round and cursor.
+    let crashed_round = e[3].current_round();
+    let cursor = e[3].last_committed_round();
+    assert!(cursor > RETAINED, "the cursor must be past the window for this to test anything");
+    // The other three carry on, for less than their retention window.
+    run_committing(&[&e[0], &e[1], &e[2]], RETAINED / 2, &mut ts, &mut committed[..3]);
+    assert!(e[0].blocks_in_round(0).is_empty(), "peers pruned round 0");
+    assert!(
+        !e[0].blocks_in_round(cursor).is_empty(),
+        "peers still hold the restarted node's cursor round"
+    );
+
+    // The restarted process: an empty DAG, cursors from its own records.
+    let restarted = engine(&set, &keys[3]);
+    restarted.restore_round_from_local_wal(crashed_round, cursor);
+
+    // What it used to ask for - "from round 0" - is served from the peers'
+    // oldest retained round, whose parents nobody has any more.
+    let oldest = served_from(&e[0], 0);
+    assert!(oldest.iter().all(|b| b.round > 0));
+    assert!(
+        restarted.import_history(&oldest, u64::MAX).is_err(),
+        "history from the oldest retained round cannot validate on an empty DAG"
+    );
+    // From its own cursor, but without the base round, the first round
+    // cannot validate either.
+    assert!(restarted.import_history(&served_from(&e[0], cursor), u64::MAX).is_err());
+    assert!(restarted.dag_is_empty(), "a refused import leaves nothing behind");
+
+    // Only at its own cursor, only on an empty DAG.
+    assert!(restarted.set_restart_base_round(cursor + 1).is_err());
+    restarted
+        .set_restart_base_round(cursor)
+        .expect("an empty DAG at its own commit cursor");
+    let imported = restarted
+        .import_history(&served_from(&e[0], cursor), u64::MAX)
+        .expect("history from the cursor imports with the base round open");
+    assert!(imported >= e[0].current_round().saturating_sub(1));
+    assert!(
+        restarted.set_restart_base_round(cursor).is_err(),
+        "a base round can be opened only on an empty DAG"
+    );
+
+    // Rejoin. From here the restarted node must commit exactly what its peers
+    // commit, and never anything below its cursor again.
+    let mut rejoined = vec![Vec::new(); 4];
+    run_committing(&[&e[0], &e[1], &e[2], &restarted], 30, &mut ts, &mut rejoined);
+    let mine = &rejoined[3];
+    assert!(mine.len() >= 5, "the restarted node committed {} anchors", mine.len());
+    assert!(
+        mine.iter().all(|(round, _)| *round >= cursor),
+        "a round below the durable cursor was committed again: {mine:?}"
+    );
+    let peers: std::collections::HashMap<u64, arc_crypto::Hash256> = committed[0]
+        .iter()
+        .chain(rejoined[0].iter())
+        .copied()
+        .collect();
+    for (round, hash) in mine {
+        assert_eq!(
+            peers.get(round),
+            Some(hash),
+            "the restarted node committed a different anchor at round {round}"
+        );
+    }
+    assert_eq!(restarted.restart_base_round(), None, "the base round closed itself");
+}
+
+#[test]
+fn a_restart_base_round_admits_only_well_formed_signed_blocks() {
+    let (set, keys) = committee();
+    let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
+    for x in &e {
+        x.set_retained_rounds(RETAINED);
+    }
+    let mut ts = 1_700_000_000_000u64;
+    let mut committed = vec![Vec::new(); 4];
+    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 2 * RETAINED, &mut ts, &mut committed);
+    let cursor = e[3].last_committed_round();
+    let restarted = engine(&set, &keys[3]);
+    restarted.restore_round_from_local_wal(e[3].current_round(), cursor);
+    restarted.set_restart_base_round(cursor).unwrap();
+
+    let real = e[0]
+        .get_block(&e[0].blocks_in_round(cursor)[0])
+        .expect("a block at the base round");
+    // A parentless block, a zero parent and a duplicated parent are refused
+    // even at the base round: only the parents' presence is excused.
+    for parents in [
+        vec![],
+        vec![arc_crypto::Hash256::ZERO],
+        vec![real.parents[0], real.parents[0]],
+    ] {
+        let mut forged = DagBlock {
+            parents,
+            hash: arc_crypto::Hash256::ZERO,
+            signature: vec![],
+            ..real.clone()
+        };
+        forged.hash = forged.compute_hash();
+        let author = keys.iter().find(|k| k.address() == real.author).unwrap();
+        forged.signature = bincode::serialize(&author.sign(&forged.hash).unwrap()).unwrap();
+        assert!(restarted.receive_block(&forged).is_err(), "{:?}", forged.parents);
+    }
+    // An unsigned copy of a real block is refused: the excuse is for missing
+    // parents, not for authorship.
+    let mut unsigned = real.clone();
+    unsigned.signature = vec![];
+    assert!(restarted.receive_block(&unsigned).is_err());
+    // The real block is admitted.
+    restarted.receive_block(&real).expect("an authentic base-round block");
+}
+
+#[test]
+fn history_served_from_below_the_base_round_still_reaches_it() {
+    // Peers may answer "from the cursor" with a batch that starts a few rounds
+    // lower. Those rounds are below the restarting node's cursor - decided
+    // already - and their parents are gone; they must be skipped, not allowed
+    // to stop the import before it reaches the base.
+    let (set, keys) = committee();
+    let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
+    for x in &e {
+        x.set_retained_rounds(RETAINED);
+    }
+    let mut ts = 1_700_000_000_000u64;
+    let mut committed = vec![Vec::new(); 4];
+    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 2 * RETAINED, &mut ts, &mut committed);
+    let crashed_round = e[3].current_round();
+    let cursor = e[3].last_committed_round();
+    run_committing(&[&e[0], &e[1], &e[2]], 10, &mut ts, &mut committed[..3]);
+
+    let restarted = engine(&set, &keys[3]);
+    restarted.restore_round_from_local_wal(crashed_round, cursor);
+    restarted.set_restart_base_round(cursor).unwrap();
+    let from_below = served_from(&e[0], cursor - 3);
+    assert!(from_below.iter().any(|b| b.round < cursor), "the batch starts below the base");
+    restarted
+        .import_history(&from_below, u64::MAX)
+        .expect("rounds below the base are skipped, and the base onwards imports");
+    assert!(restarted.blocks_in_round(cursor - 1).is_empty(), "nothing below the base was taken");
+    assert!(!restarted.blocks_in_round(cursor).is_empty());
+    assert!(restarted.current_round() >= e[0].current_round().saturating_sub(1));
+}

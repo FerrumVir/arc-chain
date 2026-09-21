@@ -812,6 +812,13 @@ pub struct ConsensusEngine {
     /// See [`DEFAULT_RETAINED_ROUNDS`].
     retained_rounds: AtomicU64,
     recovery_bootstrap_round: RwLock<Option<u64>>,
+    /// A restarted node's single parentless round: its own durable commit
+    /// cursor, while it rebuilds its DAG from peers. See
+    /// [`Self::set_restart_base_round`].
+    restart_base_round: RwLock<Option<u64>>,
+    /// True while the node rebuilds its DAG from peers (after a restart or a
+    /// late join). Reported so ingress can refuse work it cannot propose yet.
+    dag_bootstrapping: std::sync::atomic::AtomicBool,
     /// First retained round in an independently pinned, content-addressed local
     /// recovery generation. Its missing parents are covered by that durable
     /// checkpoint boundary only while startup replay is explicitly active.
@@ -872,6 +879,8 @@ impl ConsensusEngine {
             highest_finalized_height: AtomicU64::new(0),
             retained_finality_heights: AtomicU64::new(DEFAULT_RETAINED_FINALITY_HEIGHTS),
             recovery_bootstrap_round: RwLock::new(None),
+            restart_base_round: RwLock::new(None),
+            dag_bootstrapping: std::sync::atomic::AtomicBool::new(false),
             local_recovery_boundary_round: RwLock::new(None),
             local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
         }
@@ -922,6 +931,8 @@ impl ConsensusEngine {
             highest_finalized_height: AtomicU64::new(0),
             retained_finality_heights: AtomicU64::new(DEFAULT_RETAINED_FINALITY_HEIGHTS),
             recovery_bootstrap_round: RwLock::new(None),
+            restart_base_round: RwLock::new(None),
+            dag_bootstrapping: std::sync::atomic::AtomicBool::new(false),
             local_recovery_boundary_round: RwLock::new(None),
             local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1112,6 +1123,81 @@ impl ConsensusEngine {
     /// recovered DAG domain.
     pub fn is_recovery_bootstrap_round(&self, round: u64) -> bool {
         self.recovery_bootstrap_round.read().as_ref() == Some(&round)
+    }
+
+    /// Let a restarted node rebuild its DAG from its own durable commit
+    /// cursor instead of from round 0.
+    ///
+    /// After a restart the DAG is empty and block validation is recursive:
+    /// a block at round R needs its parents at R-1, which bottoms out only at
+    /// round 0. So a restarted node used to ask peers for history from round
+    /// 0 - and once the chain ran past the DAG retention window, peers had
+    /// pruned it. They served their oldest retained rounds instead, all below
+    /// the node's own commit cursor, the node refused each batch as adding
+    /// nothing, and it never rejoined. Measured in a fault-free-until-then
+    /// run: killed at round 4291 with 4096 rounds retained, refused 38
+    /// batches, never caught up.
+    ///
+    /// Nothing below the cursor is needed. Every round under it is already
+    /// decided by this node's own durable record - its canonical blocks are
+    /// applied and the commit scan starts at the cursor - and deciding the
+    /// anchors at and above it needs only blocks at and above it: support for
+    /// the anchor at `r` comes from round `r + 1`, and the retroactive rule
+    /// only walks back to anchors not yet decided, all at or above the
+    /// cursor. So exactly one round, the cursor itself, is admitted without
+    /// its parents being present; every block in it must still be signed by
+    /// a committee member and carry a well-formed parent list, and every
+    /// later round is validated normally. A block forged at that round cannot
+    /// become canonical: committing it would need quorum support from honest
+    /// blocks in the next round, which only reference blocks they validated.
+    ///
+    /// Only on an empty DAG, only at the restored commit cursor, and never on
+    /// a recovery-domain engine, which has its own signed bootstrap.
+    pub fn set_restart_base_round(&self, round: u64) -> Result<(), ConsensusError> {
+        if round == 0
+            || !self.dag.is_empty()
+            || self.recovery_bootstrap_round.read().is_some()
+            || round != self.last_committed_round.load(Ordering::SeqCst)
+        {
+            return Err(ConsensusError::InvalidBlock(
+                "a restart base round needs an empty DAG and must be this node's own commit \
+                 cursor"
+                    .into(),
+            ));
+        }
+        *self.restart_base_round.write() = Some(round);
+        Ok(())
+    }
+
+    /// Mark the DAG bootstrap as running or finished (the consensus manager
+    /// owns the bootstrap and sets this).
+    pub fn set_dag_bootstrapping(&self, active: bool) {
+        self.dag_bootstrapping.store(active, Ordering::SeqCst);
+    }
+
+    /// True while this node is rebuilding its DAG from peers. It cannot
+    /// propose until that finishes, so work submitted to it would sit here.
+    pub fn dag_bootstrapping(&self) -> bool {
+        self.dag_bootstrapping.load(Ordering::SeqCst)
+    }
+
+    /// The restart base round, while it is still open.
+    pub fn restart_base_round(&self) -> Option<u64> {
+        let base = (*self.restart_base_round.read())?;
+        self.is_restart_base_round(base).then_some(base)
+    }
+
+    /// Close the restart base round: from here on every block, including a
+    /// late one at that round, needs its parents present.
+    pub fn close_restart_base_round(&self) {
+        *self.restart_base_round.write() = None;
+    }
+
+    /// True for the open restart base round. It closes by itself once the
+    /// commit cursor is past it, when nothing at that round can matter.
+    fn is_restart_base_round(&self, round: u64) -> bool {
+        self.restart_base_round.read().as_ref() == Some(&round)
+            && self.last_committed_round.load(Ordering::SeqCst) <= round.saturating_add(1)
     }
 
     /// Recovery-domain v3 pauses unless every fixed positive-stake validator
@@ -1715,6 +1801,20 @@ impl ConsensusEngine {
                     "bootstrap block must not have parents".into(),
                 ));
             }
+        } else if self.is_restart_base_round(block.round) {
+            // A restarted node's own durable commit cursor: its parents are
+            // below everything this node still has to decide. See
+            // `set_restart_base_round`. The list must still be well formed.
+            if block.parents.is_empty()
+                || block.parents.contains(&Hash256::ZERO)
+                || block.parents.iter().copied().collect::<HashSet<_>>().len()
+                    != block.parents.len()
+            {
+                return Err(ConsensusError::InvalidBlock(
+                    "restart base round block has an empty, zero, or duplicate parent list"
+                        .into(),
+                ));
+            }
         } else if self.local_recovery_replay_active.load(Ordering::SeqCst)
             && self.local_recovery_boundary_round.read().as_ref() == Some(&block.round)
         {
@@ -2076,6 +2176,20 @@ impl ConsensusEngine {
             std::collections::BTreeMap::new();
         for block in blocks {
             by_round.entry(block.round).or_default().push(block);
+        }
+        // A restarting node needs nothing below its base round - it is this
+        // node's own commit cursor, and every round under it is already
+        // decided here. Peers may still serve from lower down, and the import
+        // stops at the first block it cannot validate: left in, those rounds'
+        // missing parents stopped it before it ever reached the base (seen
+        // live: base 296, a batch from 294, every batch refused).
+        if let Some(base) = self.restart_base_round() {
+            by_round.retain(|round, _| *round >= base);
+            if by_round.is_empty() {
+                return Err(ConsensusError::InvalidBlock(
+                    "history is entirely below this node's commit cursor".into(),
+                ));
+            }
         }
         let first = *by_round.keys().next().expect("non-empty");
         let last = *by_round.keys().next_back().expect("non-empty");

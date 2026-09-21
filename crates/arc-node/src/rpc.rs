@@ -2550,6 +2550,9 @@ struct HealthResponse {
     /// Whether the chain this node serves is still sealing blocks.
     /// `null` when `last_block_age_secs` is unknown.
     chain_advancing: Option<bool>,
+    /// True while this node rebuilds its DAG from peers after a restart or a
+    /// late join. It accepts no submissions then (they would sit unproposed).
+    dag_bootstrapping: bool,
     /// Populated only when `status != "ok"`, so an operator reading a
     /// degraded response is told what specifically is degraded.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2642,6 +2645,10 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
         validators,
         last_block_age_secs,
         chain_advancing,
+        dag_bootstrapping: node
+            .consensus_engine
+            .as_ref()
+            .is_some_and(|engine| engine.dag_bootstrapping()),
         degraded_reason,
     })
 }
@@ -3201,6 +3208,20 @@ async fn submit_signed_tx(
     // Its wire deserializer now forces false; verify both type/body integrity
     // and the cryptographic signature before anything enters the mempool.
     tx.sig_verified = false;
+    if node
+        .consensus_engine
+        .as_ref()
+        .is_some_and(|engine| engine.dag_bootstrapping())
+    {
+        // A restarted or late-joining validator cannot propose until its DAG
+        // is rebuilt; a transaction accepted now would sit in this mempool,
+        // unannounced, while the client waits. Say so, so it goes elsewhere.
+        return Err(SubmitRefusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node is rebuilding its DAG from its peers and cannot propose yet; \
+             submit to another validator",
+        ));
+    }
     if uses_unready_paid_inference_protocol(&tx) && !is_native_inference_transaction(&tx) {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
@@ -3504,6 +3525,19 @@ async fn faucet_claim(
         ));
     }
 
+    if node
+        .consensus_engine
+        .as_ref()
+        .is_some_and(|engine| engine.dag_bootstrapping())
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(FaucetErrorResponse {
+                error: "this node is rebuilding its DAG from its peers and cannot propose yet"
+                    .into(),
+            }),
+        ));
+    }
     // A faucet claim is an ordinary transfer, which a protocol-4 block can
     // never carry. Refuse it rather than return a hash that will never land.
     if node.state.native_inference_context().is_some() {

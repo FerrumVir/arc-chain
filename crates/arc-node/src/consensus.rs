@@ -1236,6 +1236,7 @@ impl ConsensusManager {
         // Set while this node is filling an empty DAG in from genesis; None
         // once it has caught up with its own round cursor.
         let mut bootstrap_watermark: Option<u64> = None;
+        let mut bootstrap_checked_at: Option<Instant> = None;
         // Consecutive history requests that moved the bootstrap watermark
         // nowhere. Past a bound, DAG history cannot rescue this node and it
         // needs an authenticated checkpoint instead.
@@ -1253,6 +1254,9 @@ impl ConsensusManager {
         let mut targeted_fetch_at: std::collections::HashMap<Hash256, Instant> =
             std::collections::HashMap::new();
         let mut unproductive_bootstrap_requests: u32 = 0;
+        // The bootstrap round last actually requested, to tell a request that
+        // bought nothing (same round asked again) from progress.
+        let mut last_bootstrap_request: Option<u64> = None;
         let mut iteration_started: Option<Instant> = None;
         let mut gauges_published_at: Option<Instant> = None;
         // Committed DAG blocks waiting for transaction bodies, in round order.
@@ -1271,7 +1275,18 @@ impl ConsensusManager {
             std::time::Instant,
         > = std::collections::HashMap::new();
         let mut last_round_seen = self.engine.current_round();
-        let mut last_round_change = std::time::Instant::now();
+        // A node that restored a commit cursor but holds no DAG cannot make
+        // progress until its bootstrap runs, so it starts at once rather than
+        // after the stall timer.
+        let mut last_round_change = if self.engine.dag_is_empty()
+            && self.engine.last_committed_round() > 0
+        {
+            std::time::Instant::now()
+                .checked_sub(HISTORY_STUCK_AFTER)
+                .unwrap_or_else(std::time::Instant::now)
+        } else {
+            std::time::Instant::now()
+        };
         let mut history_clock = std::time::Instant::now()
             .checked_sub(HISTORY_REQUEST_INTERVAL)
             .unwrap_or_else(std::time::Instant::now);
@@ -2372,6 +2387,29 @@ impl ConsensusManager {
                 }
             }
 
+            // A bootstrap also finishes when live gossip, not history, closes
+            // the last gap - which is the usual way. The check below only runs
+            // while the round is stalled, so on its own it never noticed, and
+            // ingress stayed closed on a node that had long caught up.
+            if let Some(mark) = bootstrap_watermark
+                && bootstrap_checked_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(250))
+            {
+                bootstrap_checked_at = Some(Instant::now());
+                let now_round = self.engine.current_round();
+                let next = self
+                    .engine
+                    .first_missing_round(mark, HISTORY_MAX_ROUNDS)
+                    .min(now_round);
+                if next >= now_round {
+                    bootstrap_watermark = None;
+                    self.engine.close_restart_base_round();
+                    self.engine.set_dag_bootstrapping(false);
+                    info!(round = next, "DAG bootstrap complete");
+                } else if next > mark {
+                    bootstrap_watermark = Some(next);
+                }
+            }
+
             // Being stuck at one round while peers are connected is itself a
             // reason to ask for history: a node that fell behind never receives
             // another block it can accept, so no gossip event will ever tell it
@@ -2400,11 +2438,20 @@ impl ConsensusManager {
                     // opposite answers.
                     //
                     // Bootstrapping - the DAG was empty, which is every node
-                    // just after a restart - means validation has to start at
-                    // round 0, because inserting a block at round R needs its
-                    // parents at R-1 and the recursion only bottoms out at
-                    // genesis. A watermark walks up from there as rounds fill
-                    // in, so the node never re-requests what it already has.
+                    // just after a restart - used to mean validation had to
+                    // start at round 0, because inserting a block at round R
+                    // needs its parents at R-1 and the recursion only bottoms
+                    // out at genesis. That stops working the moment the chain
+                    // runs past the DAG retention window: peers have pruned
+                    // round 0, serve their oldest retained rounds instead - all
+                    // below this node's commit cursor - and every batch is
+                    // refused as adding nothing. A node restarted after that
+                    // point never rejoined. So a node that restored a durable
+                    // commit cursor bootstraps from THAT round, admitted as its
+                    // one parentless round (`set_restart_base_round` states why
+                    // that is safe); a node with no cursor still starts at 0.
+                    // A watermark walks up from there as rounds fill in, so the
+                    // node never re-requests what it already has.
                     //
                     // Merely lagging is different: a healthy node legitimately
                     // holds gaps, because it only ever needed a quorum of each
@@ -2418,30 +2465,40 @@ impl ConsensusManager {
                                 .engine
                                 .first_missing_round(mark, HISTORY_MAX_ROUNDS)
                                 .min(now_round);
-                            // A watermark that has not moved means the last
-                            // request bought nothing. Peers legitimately refuse
-                            // when the round is below their prune horizon, and
-                            // no number of further requests will change that -
-                            // so count the unproductive ones instead of asking
-                            // forever.
-                            if next == mark {
-                                unproductive_bootstrap_requests =
-                                    unproductive_bootstrap_requests.saturating_add(1);
-                            } else {
-                                unproductive_bootstrap_requests = 0;
-                            }
+                            // Whether this bought anything is judged where a
+                            // request is actually sent (below): this branch runs
+                            // every loop iteration while stalled, and counting
+                            // here escalated to a checkpoint about two seconds
+                            // after any restart.
                             bootstrap_watermark = Some(next);
                             if next >= now_round {
                                 // Caught up with the round cursor; from here on
-                                // this node is an ordinary lagging peer.
+                                // this node is an ordinary lagging peer, and
+                                // every block needs its parents again.
                                 bootstrap_watermark = None;
+                                self.engine.close_restart_base_round();
+                                self.engine.set_dag_bootstrapping(false);
                                 info!(round = next, "DAG bootstrap complete");
                             }
                             next
                         }
                         None => {
-                            if self.engine.dag_is_empty() {
+                            let cursor = self.engine.last_committed_round();
+                            if self.engine.dag_is_empty()
+                                && cursor > 0
+                                && self.engine.set_restart_base_round(cursor).is_ok()
+                            {
+                                bootstrap_watermark = Some(cursor);
+                                self.engine.set_dag_bootstrapping(true);
+                                info!(
+                                    round = cursor,
+                                    "DAG is empty after a restart; bootstrapping history from \
+                                     this node's durable commit cursor"
+                                );
+                                cursor.min(now_round)
+                            } else if self.engine.dag_is_empty() {
                                 bootstrap_watermark = Some(0);
+                                self.engine.set_dag_bootstrapping(true);
                                 info!("DAG is empty; bootstrapping history from round 0");
                                 0
                             } else {
@@ -2477,6 +2534,20 @@ impl ConsensusManager {
                     }
                 }
                 if let Some(from_round) = history_requests_broadcast {
+                    // A watermark that has not moved since the last request
+                    // means that request bought nothing. Peers legitimately
+                    // refuse when the round is below their prune horizon, and
+                    // no number of further requests will change that - so the
+                    // unproductive ones are counted instead of asking forever.
+                    if bootstrap_watermark.is_some() {
+                        if last_bootstrap_request == Some(from_round) {
+                            unproductive_bootstrap_requests =
+                                unproductive_bootstrap_requests.saturating_add(1);
+                        } else {
+                            unproductive_bootstrap_requests = 0;
+                        }
+                        last_bootstrap_request = Some(from_round);
+                    }
                     for (peer, generation) in connected_validators.iter() {
                         if !generation.connected || !asked.insert(*peer) {
                             continue;

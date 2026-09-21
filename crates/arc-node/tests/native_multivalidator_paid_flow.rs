@@ -27,8 +27,6 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 const NODES: usize = 4;
-const BASE_RPC: u16 = 9940;
-const BASE_P2P: u16 = 9140;
 const STAKE: u64 = 6_666_667;
 
 fn validator_keypair(seed: &str) -> KeyPair {
@@ -98,6 +96,10 @@ impl Drop for NodeProcess {
 }
 
 struct Fixture {
+    base_rpc: u16,
+    base_p2p: u16,
+    /// Extra arguments every node is started with.
+    node_args: Vec<String>,
     dir: tempfile::TempDir,
     genesis: PathBuf,
     activation: PathBuf,
@@ -109,7 +111,8 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    /// Tests in this file run concurrently, so each uses its own ports.
+    fn new(base_rpc: u16, base_p2p: u16, node_args: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let requesters = [requester_keypair("p5"), requester_keypair("p5-second")];
         let tuple = [
@@ -158,6 +161,9 @@ impl Fixture {
         )
         .unwrap();
         Self {
+            base_rpc,
+            base_p2p,
+            node_args: node_args.iter().map(|a| a.to_string()).collect(),
             dir,
             genesis: genesis_path,
             activation,
@@ -166,21 +172,27 @@ impl Fixture {
         }
     }
 
+    /// Start node `index`, or restart it on the data directory it had.
     fn spawn(&self, index: usize) -> NodeProcess {
-        let port = BASE_RPC + index as u16;
+        let port = self.base_rpc + index as u16;
         let data_dir = self.dir.path().join(format!("node-{index}"));
         std::fs::create_dir_all(&data_dir).unwrap();
         let peers: Vec<String> = (0..NODES)
             .filter(|j| *j != index)
-            .map(|j| format!("127.0.0.1:{}", BASE_P2P + j as u16))
+            .map(|j| format!("127.0.0.1:{}", self.base_p2p + j as u16))
             .collect();
-        let log = std::fs::File::create(data_dir.join("node.log")).unwrap();
+        // Appended, so a restarted node's log follows its first life's.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("node.log"))
+            .unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_arc-node"))
             .args([
                 "--rpc",
                 &format!("127.0.0.1:{port}"),
                 "--p2p-port",
-                &(BASE_P2P + index as u16).to_string(),
+                &(self.base_p2p + index as u16).to_string(),
                 "--data-dir",
                 data_dir.to_str().unwrap(),
                 "--genesis",
@@ -197,7 +209,12 @@ impl Fixture {
                 "--native-inference-runtime",
                 "--native-inference-test-executor",
             ])
-            .env("RUST_LOG", "info")
+            .args(&self.node_args)
+            // ARC_TEST_NODE_LOG raises the nodes' log level when diagnosing.
+            .env(
+                "RUST_LOG",
+                std::env::var("ARC_TEST_NODE_LOG").unwrap_or_else(|_| "info".into()),
+            )
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
@@ -289,7 +306,7 @@ fn heights(nodes: &[NodeProcess]) -> Vec<Option<u64>> {
 
 #[test]
 fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
-    let fx = Fixture::new();
+    let fx = Fixture::new(9940, 9140, &[]);
     let nodes: Vec<NodeProcess> = (0..NODES).map(|i| fx.spawn(i)).collect();
 
     // All four start at the same instant. Before the transport served inbound
@@ -477,4 +494,135 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
         );
     }
     let _: &Path = fx.dir.path();
+}
+
+/// Wait until `id` is Finalized on every listed node.
+fn wait_finalized(nodes: &[&NodeProcess], id: Hash256, timeout: Duration, label: &str) {
+    wait_for(timeout, label, || {
+        nodes.iter().all(|n| {
+            settlement(n.port, id).is_some_and(|(status, ..)| status == "Finalized")
+        })
+    });
+}
+
+fn block_hash(port: u16, height: u64) -> Option<String> {
+    get_json(port, &format!("/block/{height}"))
+        .and_then(|b| b["hash"].as_str().map(str::to_string))
+}
+
+/// A validator killed after the chain ran past its DAG retention window must
+/// rejoin by history from its own durable commit cursor.
+///
+/// It used to ask peers for history from round 0 - the only round whose
+/// blocks validate on an empty DAG. Past the retention window peers had pruned
+/// it and served their oldest retained rounds instead, all below the node's
+/// cursor, which it refused as adding nothing, forever. A 20-minute native
+/// run hit exactly that on its first fault (killed at round 4291, 4096
+/// retained). Here the window is the 100-round floor, so the chain passes it
+/// in well under a minute.
+#[test]
+fn a_validator_restarted_past_the_retention_window_rejoins_and_settles_new_work() {
+    let fx = Fixture::new(
+        9950,
+        9150,
+        &["--dag-retained-rounds", "100", "--snapshot-every-blocks", "50"],
+    );
+    let mut nodes: Vec<NodeProcess> = (0..NODES).map(|i| fx.spawn(i)).collect();
+    wait_for(Duration::from_secs(40), "every node healthy and fully peered", || {
+        nodes.iter().all(|n| {
+            get_json(n.port, "/health")
+                .and_then(|h| h["peers"].as_u64())
+                .is_some_and(|p| p >= (NODES - 1) as u64)
+        })
+    });
+    let ctx = get_json(nodes[0].port, "/native-inference/context").expect("activated");
+    let domain = InferenceDomain {
+        chain_genesis: Hash256::from_hex(ctx["chain_genesis"].as_str().unwrap()).unwrap(),
+        recovery_epoch: ctx["recovery_epoch"].as_u64().unwrap(),
+        validator_set_hash: Hash256::from_hex(ctx["validator_set_hash"].as_str().unwrap()).unwrap(),
+    };
+    let expiry = 1_000_000;
+
+    // Run well past the retention window, so round 0 is pruned everywhere.
+    let round = |port: u16| {
+        get_json(port, "/health")
+            .and_then(|h| h["dag_round"].as_u64())
+            .unwrap_or(0)
+    };
+    wait_for(Duration::from_secs(300), "the chain to pass 3x the retention window", || {
+        round(nodes[0].port) >= 300
+    });
+
+    // Kill validator 3 (SIGKILL: a crash, not a shutdown).
+    let victim = 3;
+    {
+        let process = &mut nodes[victim];
+        process.child.kill().unwrap();
+        process.child.wait().unwrap();
+    }
+    let killed_at = get_json(nodes[0].port, "/health").unwrap()["height"]
+        .as_u64()
+        .unwrap();
+
+    // The other three keep working - exactly a quorum of stake. The request
+    // is not awaited here: history can rejoin a node only while its peers
+    // still hold its commit cursor round, so the downtime must stay well
+    // inside the (deliberately tiny) retention window. Longer downtime needs
+    // a checkpoint rebase, which is a different mechanism.
+    let (tx, while_down) = fx.request(1, domain, 0, expiry);
+    assert_eq!(submit(nodes[0].port, &tx).0, 200);
+    std::thread::sleep(Duration::from_secs(5));
+    let up: Vec<&NodeProcess> = nodes.iter().take(3).collect();
+    wait_for(Duration::from_secs(5), "the three to keep committing", || {
+        up.iter().all(|n| {
+            get_json(n.port, "/health")
+                .and_then(|h| h["height"].as_u64())
+                .is_some_and(|h| h > killed_at)
+        })
+    });
+
+    // Restart it on the same data directory.
+    let old = std::mem::replace(&mut nodes[victim], fx.spawn(victim));
+    std::mem::forget(old); // already reaped above; its Drop would kill nothing useful
+    let victim_port = nodes[victim].port;
+
+    // It must catch up past the height it was killed at and agree with its
+    // peers block for block at a common height.
+    wait_for(Duration::from_secs(180), "the restarted validator to catch up", || {
+        let mine = get_json(victim_port, "/health").and_then(|h| h["height"].as_u64());
+        let theirs = get_json(nodes[0].port, "/health").and_then(|h| h["height"].as_u64());
+        matches!((mine, theirs), (Some(m), Some(t)) if m >= killed_at + 20 && m + 10 >= t)
+    });
+    let common = get_json(victim_port, "/health").unwrap()["height"].as_u64().unwrap() - 5;
+    let reference = block_hash(nodes[0].port, common).expect("peer block");
+    for n in &nodes {
+        assert_eq!(
+            block_hash(n.port, common).as_deref(),
+            Some(reference.as_str()),
+            "node on port {} disagrees at height {common}",
+            n.port
+        );
+    }
+    // The work submitted while it was down settles, identically, on it too.
+    let all: Vec<&NodeProcess> = nodes.iter().collect();
+    wait_finalized(&all, while_down, Duration::from_secs(120), "work from the downtime settles everywhere");
+    assert_eq!(settlement(victim_port, while_down), settlement(nodes[0].port, while_down));
+
+    // New work submitted THROUGH the restarted node settles everywhere.
+    let (tx, after) = fx.request(1, domain, 1, expiry);
+    wait_for(Duration::from_secs(60), "the restarted node to accept new work", || {
+        submit(victim_port, &tx).0 == 200
+    });
+    wait_finalized(&all, after, Duration::from_secs(120), "new work through the restarted node");
+
+    // And it got there by the new path, not by luck.
+    let log = std::fs::read_to_string(nodes[victim].data_dir.join("node.log")).unwrap();
+    assert!(
+        log.contains("bootstrapping history from this node's durable commit cursor"),
+        "the restarted node did not bootstrap from its commit cursor"
+    );
+    assert!(
+        log.contains("DAG bootstrap complete"),
+        "the restarted node never finished its bootstrap, so ingress stayed closed"
+    );
 }
