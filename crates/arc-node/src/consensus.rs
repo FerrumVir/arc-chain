@@ -1194,6 +1194,7 @@ impl ConsensusManager {
         let mut targeted_fetch_at: std::collections::HashMap<Hash256, Instant> =
             std::collections::HashMap::new();
         let mut unproductive_bootstrap_requests: u32 = 0;
+        let mut iteration_started: Option<Instant> = None;
         let mut checkpoint_requested = false;
         // When this node last gossiped each absence attestation it has made.
         let mut absence_gossiped_at: std::collections::HashMap<
@@ -1296,6 +1297,19 @@ impl ConsensusManager {
             // (~100-200ms cross-continent = 5-10 rounds/sec actual).
             let tick = if self.is_multi_validator() { 50 } else { 1 };
             let tick_delay = tokio::time::Duration::from_millis(tick);
+            // Busy time of the PREVIOUS iteration: everything since it began,
+            // minus the tick it slept. This is the ground truth for "the loop
+            // was blocked" - a phase that `continue`s can hide from the phase
+            // markers below, but not from this.
+            if let Some(started) = iteration_started.take() {
+                let busy = started.elapsed().saturating_sub(tick_delay);
+                let busy_us = busy.as_micros() as u64;
+                crate::consensus_diagnostics::DIAG.loop_busy_us.fetch_add(busy_us, std::sync::atomic::Ordering::Relaxed);
+                crate::consensus_diagnostics::DIAG.loop_max_iteration_us.fetch_max(busy_us, std::sync::atomic::Ordering::Relaxed);
+                if busy >= std::time::Duration::from_secs(1) {
+                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.loop_slow_iterations);
+                }
+            }
             let shutdown_before_tick = if let Some(receiver) = shutdown.as_mut() {
                 if *receiver.borrow() {
                     true
@@ -1312,6 +1326,7 @@ impl ConsensusManager {
                 tokio::time::sleep(tick_delay).await;
                 false
             };
+            iteration_started = Some(Instant::now().checked_sub(tick_delay).unwrap_or_else(Instant::now));
             if shutdown_before_tick {
                 info!(
                     round = self.engine.current_round(),
@@ -1352,6 +1367,7 @@ impl ConsensusManager {
                 }
             }
 
+            let mut phase_mark = Instant::now();
             // ── 0. Process inbound network messages ─────────────────────
             // Certificate traffic is buffered rather than handled inline so the
             // borrow of `inbound_rx` ends before it is verified and registered.
@@ -2082,6 +2098,7 @@ impl ConsensusManager {
                 }
             }
 
+            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_inbound_us, phase_mark);
             // ── 0b. Absence and finality certificates ───────────────────
             // Every one of these is verified against the frozen committee and
             // the bound consensus domain before it can affect anything; an
@@ -2336,6 +2353,7 @@ impl ConsensusManager {
                 }
             }
 
+            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_certificates_us, phase_mark);
             // ── 0b2. Bounded authenticated history transfer ─────────────
             // Answer a peer's request from what this node actually holds. The
             // requester re-validates everything, so serving history is not a
@@ -2490,6 +2508,7 @@ impl ConsensusManager {
                 }
             }
 
+            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_history_us, phase_mark);
             // ── 0b3. Authenticated checkpoint transfer ──────────────────
             // A SEPARATE trust boundary from history import. History is
             // self-authenticating block by block and the importer re-validates
@@ -2651,6 +2670,7 @@ impl ConsensusManager {
                 }
             }
 
+            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_checkpoint_us, phase_mark);
             // ── 0c. Decide and sign absence votes ───────────────────────
             // A round that already carries a quorum of stake, but no block from
             // some fixed member, is a round this node can attest about. The
@@ -2872,6 +2892,7 @@ impl ConsensusManager {
                 true
             };
 
+            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_absence_us, phase_mark);
             // ── Pre-feed benchmark transactions into mempool ──────────────
             // Do this BEFORE the propose check so transactions are always
             // available regardless of round/parent state.
@@ -3341,6 +3362,7 @@ impl ConsensusManager {
                 let _ = self.engine.advance_round();
             }
 
+            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_propose_us, phase_mark);
             // ── 2. Try to commit finalized DAG blocks (multi-validator) ──────
             let mut committed = self.engine.try_commit();
             // Sort by round to ensure all nodes process in the same order.
@@ -3498,12 +3520,18 @@ impl ConsensusManager {
                     // Every committed DAG leader maps to exactly one canonical
                     // state block, including an empty block when all envelopes
                     // were previously receipted or became state-stale.
-                    let (block, receipts) = match state.execute_block_adaptive_at_with_proof(
+                    let execute_started = Instant::now();
+                    let executed = state.execute_block_adaptive_at_with_proof(
                         &committed_txs,
                         dag_block.author,
                         dag_block.timestamp,
                         decision_proof,
-                    ) {
+                    );
+                    crate::consensus_diagnostics::add_elapsed(
+                        &crate::consensus_diagnostics::DIAG.commit_execute_us,
+                        execute_started,
+                    );
+                    let (block, receipts) = match executed {
                         Ok(result) => result,
                         Err(error) => {
                             tracing::error!(
@@ -3621,7 +3649,13 @@ impl ConsensusManager {
                     if self.snapshot_every_blocks > 0 {
                         let height = state.height();
                         if height > 0 && height % self.snapshot_every_blocks == 0 {
-                            match state.publish_durable_snapshot() {
+                            let snapshot_started = Instant::now();
+                            let published = state.publish_durable_snapshot();
+                            crate::consensus_diagnostics::add_elapsed(
+                                &crate::consensus_diagnostics::DIAG.state_snapshot_publish_us,
+                                snapshot_started,
+                            );
+                            match published {
                                 Ok(manifest) => info!(
                                     height = manifest.identity.height,
                                     resume_from = manifest.resume_from_sequence,
@@ -3747,6 +3781,7 @@ impl ConsensusManager {
                 }
             }
 
+            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_commit_us, phase_mark);
             // ── Update shared health counters for /health endpoint ─────────
             if let Some(ref r) = self.dag_round {
                 r.store(current_round, std::sync::atomic::Ordering::Relaxed);

@@ -360,6 +360,9 @@ class Soak:
         self.agreement = JsonlWriter(os.path.join(cfg.work, "agreement.jsonl"))
         self.faults = JsonlWriter(os.path.join(cfg.work, "faults.jsonl"))
         self.workload_log = JsonlWriter(os.path.join(cfg.work, "workload.jsonl"))
+        # Bounded per-node consensus counters at every tick, so a throughput
+        # question is answered from a timeline rather than from log lines.
+        self.diag = JsonlWriter(os.path.join(cfg.work, "diag.jsonl"))
         self.events = open(os.path.join(cfg.work, "events.log"), "a")
         for node in self.nodes:
             node.identity = derive_identity(cfg, node.index)
@@ -425,6 +428,10 @@ class Soak:
                     rec["cpu_pct"] = float(out[1])
             except (subprocess.SubprocessError, ValueError):
                 pass
+            code, diag = http_json(node.rpc, "/consensus/diagnostics", timeout=4)
+            if isinstance(diag, dict):
+                self.diag.write({"t": t, "node": node.index, "incarnation": node.incarnation,
+                                 "diag": diag})
         rec["disk_bytes"] = dir_bytes(node.data_dir)
         rec["log_bytes"] = sum(os.path.getsize(os.path.join(self.cfg.work, f))
                                for f in os.listdir(self.cfg.work)

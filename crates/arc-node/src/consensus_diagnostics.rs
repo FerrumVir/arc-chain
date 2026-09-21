@@ -71,6 +71,19 @@ counters!(
     pending_blocks_expired,
     pending_blocks_now,
     targeted_history_requests,
+    // where the consensus loop's time goes
+    loop_busy_us,
+    loop_max_iteration_us,
+    loop_slow_iterations,
+    phase_inbound_us,
+    phase_certificates_us,
+    phase_history_us,
+    phase_checkpoint_us,
+    phase_absence_us,
+    phase_propose_us,
+    phase_commit_us,
+    commit_execute_us,
+    state_snapshot_publish_us,
 );
 
 pub static DIAG: ConsensusDiagnostics = ConsensusDiagnostics::new();
@@ -122,4 +135,10 @@ pub fn note_send<T, E>(result: &Result<T, E>) {
     if result.is_err() {
         bump(&DIAG.outbound_dropped);
     }
+}
+
+/// Add the time since `mark` to `counter` and return a fresh mark.
+pub fn phase(counter: &AtomicU64, mark: std::time::Instant) -> std::time::Instant {
+    add_elapsed(counter, mark);
+    std::time::Instant::now()
 }
