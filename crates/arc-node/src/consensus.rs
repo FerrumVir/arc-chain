@@ -457,7 +457,13 @@ fn should_execute_local_benchmark(
 
 /// Orchestrates DAG consensus for a single validator node.
 /// How far back the duplicate-decision check looks in canonical history.
-const DECISION_REPLAY_SCAN_BLOCKS: u64 = 256;
+/// Extra canonical blocks indexed beyond the DAG retention window.
+///
+/// The window has to cover every anchor a peer could still serve, because that
+/// is exactly the set that can be re-offered to the commit path. Peers serve
+/// history only within their retention window, so retention bounds the
+/// exposure; this margin covers retention changing between runs.
+const DECISION_INDEX_MARGIN_BLOCKS: u64 = 512;
 
 /// How often a node publishes a state snapshot, in canonical blocks.
 ///
@@ -474,6 +480,12 @@ pub const DEFAULT_SNAPSHOT_EVERY_BLOCKS: u64 = 1024;
 /// strictly stronger trust decision than importing self-authenticating
 /// history, so it is the last resort rather than the first.
 const UNPRODUCTIVE_REQUESTS_BEFORE_CHECKPOINT: u32 = 8;
+
+/// How often an already-made absence attestation is re-gossiped.
+///
+/// Often enough that a peer which missed it still gets it within a few rounds;
+/// rarely enough that re-sending is no longer the dominant cost of the loop.
+const ABSENCE_REGOSSIP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Bounds on one history transfer. A request cannot make a peer serve more than
 /// this, and an importer will not step over more than this in one go.
@@ -553,6 +565,12 @@ pub struct ConsensusManager {
     /// disables snapshots, which is correct but leaves recovery replaying the
     /// whole WAL.
     pub snapshot_every_blocks: u64,
+    /// DAG decision commitment -> the canonical height it produced, over the
+    /// window of anchors a peer could still serve. This is what makes applying
+    /// an anchor idempotent across a lost commit record.
+    applied_decisions: dashmap::DashMap<Hash256, u64>,
+    /// The canonical height the index currently covers.
+    decisions_indexed_through: std::sync::atomic::AtomicU64,
     /// DEVELOPMENT/TEST START BARRIER, default off.
     ///
     /// While this node is still at round 0, wait for EVERY genesis validator
@@ -629,6 +647,8 @@ impl ConsensusManager {
             recovered_preimages: Vec::new(),
             signing_record_path: None,
             snapshot_every_blocks: DEFAULT_SNAPSHOT_EVERY_BLOCKS,
+            applied_decisions: dashmap::DashMap::new(),
+            decisions_indexed_through: std::sync::atomic::AtomicU64::new(0),
             require_full_committee_at_genesis: false,
         }
     }
@@ -685,6 +705,8 @@ impl ConsensusManager {
             recovered_preimages: Vec::new(),
             signing_record_path: None,
             snapshot_every_blocks: DEFAULT_SNAPSHOT_EVERY_BLOCKS,
+            applied_decisions: dashmap::DashMap::new(),
+            decisions_indexed_through: std::sync::atomic::AtomicU64::new(0),
             require_full_committee_at_genesis: false,
         }
     }
@@ -891,23 +913,74 @@ impl ConsensusManager {
     /// The canonical height whose block was produced by this exact DAG
     /// decision, if this node already applied it.
     ///
-    /// Bounded: only the recent tail is scanned, which is where a repeat can
-    /// occur. Re-application happens when the commit cursor resumes at or below
-    /// an anchor already applied - off by a small number of rounds - so an
-    /// unbounded scan would buy nothing.
+    /// Backed by an index rather than a backward scan. The first version
+    /// scanned the last 256 blocks on the reasoning that a re-offered anchor
+    /// is only a few rounds stale - true when the durable record survives, and
+    /// false when it does not. A node whose record was lost or migrated to
+    /// "nothing applied" resumes its scan at round 0 and is re-offered every
+    /// anchor its peers can still serve, which is `--dag-retained-rounds`
+    /// (4096 by default) - sixteen times the old window. Anything outside it
+    /// would have been applied a second time.
+    ///
+    /// So the window is the retention window plus a margin, and it is an index
+    /// because scanning thousands of blocks per offered anchor is not viable.
     pub fn canonical_height_for_decision(&self, state: &StateDB, decision: Hash256) -> Option<u64> {
+        self.ensure_decision_index(state);
+        self.applied_decisions
+            .get(&decision)
+            .map(|entry| *entry.value())
+    }
+
+    /// How many canonical blocks the index must cover: everything a peer could
+    /// still serve history for, since that is exactly what can be re-offered.
+    fn decision_index_span(&self) -> u64 {
+        self.engine
+            .retained_rounds()
+            .saturating_add(DECISION_INDEX_MARGIN_BLOCKS)
+    }
+
+    /// Build the index once from durable state, then keep it current.
+    ///
+    /// Reading it from the blocks themselves rather than persisting it means
+    /// there is no second durable thing to keep in step - the block IS the
+    /// record, and it became durable at the same instant the effects did.
+    fn ensure_decision_index(&self, state: &StateDB) {
         let top = state.height();
-        let floor = top.saturating_sub(DECISION_REPLAY_SCAN_BLOCKS);
-        let mut height = top;
-        while height > floor {
-            if let Some(block) = state.get_block(height)
-                && block.header.proof_hash == decision
-            {
-                return Some(height);
-            }
-            height -= 1;
+        let span = self.decision_index_span();
+        let floor = top.saturating_sub(span);
+        let indexed_through = self.decisions_indexed_through.load(std::sync::atomic::Ordering::Acquire);
+        if indexed_through >= top && indexed_through > 0 {
+            return;
         }
-        None
+        // On the first pass this walks the whole window; afterwards only the
+        // blocks added since.
+        let start = if indexed_through == 0 {
+            floor.saturating_add(1)
+        } else {
+            indexed_through.saturating_add(1)
+        };
+        let mut added = 0usize;
+        for height in start..=top {
+            if let Some(block) = state.get_block(height) {
+                self.applied_decisions.insert(block.header.proof_hash, height);
+                added += 1;
+            }
+        }
+        // Drop entries that have fallen out of the window, so the index cannot
+        // grow without bound on a long-running node.
+        if floor > 0 {
+            self.applied_decisions.retain(|_, height| *height > floor);
+        }
+        self.decisions_indexed_through.store(top, std::sync::atomic::Ordering::Release);
+        if added > 0 {
+            debug!(
+                added,
+                top,
+                span,
+                size = self.applied_decisions.len(),
+                "Indexed canonical blocks by the DAG decision that produced them"
+            );
+        }
     }
 
     /// Load this validator's durable anti-equivocation record.
@@ -1088,6 +1161,11 @@ impl ConsensusManager {
         // needs an authenticated checkpoint instead.
         let mut unproductive_bootstrap_requests: u32 = 0;
         let mut checkpoint_requested = false;
+        // When this node last gossiped each absence attestation it has made.
+        let mut absence_gossiped_at: std::collections::HashMap<
+            (u64, Hash256),
+            std::time::Instant,
+        > = std::collections::HashMap::new();
         let mut last_round_seen = self.engine.current_round();
         let mut last_round_change = std::time::Instant::now();
         let mut history_clock = std::time::Instant::now()
@@ -2131,23 +2209,34 @@ impl ConsensusManager {
                     }
                 }
                 if blocks.is_empty() {
-                    // The requester is behind this node's DAG retention window
-                    // (see --dag-retained-rounds). DAG history
-                    // cannot rescue it and pretending otherwise by serving a
-                    // non-contiguous run would be worse than saying so: it
-                    // needs an authenticated checkpoint/snapshot, which is a
-                    // separate trust boundary and is not implemented yet.
-                    warn!(
-                        %source,
-                        from_round,
-                        oldest_retained = self
-                            .engine
-                            .last_committed_round()
-                            .saturating_sub(self.engine.retained_rounds()),
-                        retained_rounds = self.engine.retained_rounds(),
-                        "Cannot serve DAG history: the requested round is below this node's \
-                         prune horizon. The peer needs an authenticated checkpoint."
-                    );
+                    // An empty result has two different causes, and the old
+                    // message named only one of them. It said "below this
+                    // node's prune horizon" at round ~460 with 4096-round
+                    // retention, where nothing can have been pruned - the node
+                    // simply did not hold those rounds. That sent the soak
+                    // investigation the wrong way. Say which one it is.
+                    let oldest_retained = self
+                        .engine
+                        .last_committed_round()
+                        .saturating_sub(self.engine.retained_rounds());
+                    if from_round < oldest_retained {
+                        warn!(
+                            %source,
+                            from_round,
+                            oldest_retained,
+                            retained_rounds = self.engine.retained_rounds(),
+                            "Cannot serve DAG history: the requested round was PRUNED here. \
+                             The peer needs an authenticated checkpoint."
+                        );
+                    } else {
+                        debug!(
+                            %source,
+                            from_round,
+                            local_round = self.engine.current_round(),
+                            "Cannot serve DAG history: this node does not hold that round \
+                             (not pruned - never received, or not yet reached)"
+                        );
+                    }
                     continue;
                 }
                 let wanted: std::collections::HashSet<[u8; 32]> = blocks
@@ -2440,6 +2529,35 @@ impl ConsensusManager {
                             vs.quorum,
                             now_ms,
                         );
+                        // Already decided AND recently gossiped: nothing to do.
+                        //
+                        // Re-signing an identical decision is correct for
+                        // safety, and the record permits it. But nothing
+                        // remembered that the decision had already been SENT,
+                        // so every loop iteration signed it again, rewrote and
+                        // fsynced the record, and gossiped it - 1,171 times in
+                        // ninety seconds for one (round, member) in the soak
+                        // self-test. The re-gossip is still needed, because a
+                        // peer may have missed it, so it is rate-limited rather
+                        // than removed.
+                        let already_durable = tracker
+                            .record()
+                            .skipped_rounds
+                            .get(&round)
+                            .and_then(|members| members.get(&member))
+                            .is_some_and(|reason| {
+                                *reason == arc_consensus::view_change::AbsenceReason::NoBlock
+                            });
+                        let gossip_key = (round, member);
+                        if already_durable
+                            && absence_gossiped_at
+                                .get(&gossip_key)
+                                .is_some_and(|at: &std::time::Instant| {
+                                    at.elapsed() < ABSENCE_REGOSSIP_INTERVAL
+                                })
+                        {
+                            continue;
+                        }
                         if let Ok(vote) = tracker.sign_if_permitted(
                             round,
                             member,
@@ -2449,8 +2567,11 @@ impl ConsensusManager {
                             now_ms,
                             keypair,
                         ) {
-                            // S5: durable BEFORE the signature is emitted.
-                            if !self.persist_signing_record(tracker.record()) {
+                            // S5: durable BEFORE the signature is emitted. A
+                            // decision that is already in the record is already
+                            // durable, so it is not rewritten - that fsync was
+                            // the expensive half of the loop.
+                            if !already_durable && !self.persist_signing_record(tracker.record()) {
                                 tracing::error!(
                                     round,
                                     %member,
@@ -2459,12 +2580,17 @@ impl ConsensusManager {
                                 continue;
                             }
                             self.engine.note_certified_absent(round, member);
-                            info!(
-                                round,
-                                %member,
-                                observed_round_stake = stake,
-                                "Signed an absence attestation (no block)"
-                            );
+                            if already_durable {
+                                debug!(round, %member, "Re-gossiping an absence attestation");
+                            } else {
+                                info!(
+                                    round,
+                                    %member,
+                                    observed_round_stake = stake,
+                                    "Signed an absence attestation (no block)"
+                                );
+                            }
+                            absence_gossiped_at.insert(gossip_key, std::time::Instant::now());
                             if let Some(ref tx_chan) = outbound_tx {
                                 let _ =
                                     tx_chan.try_send(OutboundMessage::BroadcastAbsenceVote(vote));

@@ -1012,7 +1012,16 @@ fn history_import_refuses_a_gap_a_jump_and_a_thin_round() {
         "history with a gap must be refused"
     );
 
-    // A round carrying less than quorum stake.
+    // Nothing above was imported.
+    assert_eq!(importer.current_round(), 0);
+
+    // A round carrying less than quorum stake is never stepped OVER.
+    //
+    // This used to assert that the whole run was refused. That was the
+    // behaviour, and it was the defect: refusing the run also discarded the
+    // complete rounds before the thin one, which is what wedged the R8 soak.
+    // The property that actually matters for safety is narrower and is what
+    // this asserts - the importer may stop AT a thin round but never beyond it.
     let mut thin: Vec<DagBlock> = Vec::new();
     for round in 0..=2u64 {
         let mut taken = 0;
@@ -1024,13 +1033,35 @@ fn history_import_refuses_a_gap_a_jump_and_a_thin_round() {
             taken += 1;
         }
     }
+    let thin_importer_sim = Sim::new(4);
+    let thin_importer = &thin_importer_sim.nodes[0].engine;
+    let _ = thin_importer.import_history(&thin, HISTORY_SPAN);
     assert!(
-        importer.import_history(&thin, HISTORY_SPAN).is_err(),
-        "a round below quorum stake must be refused"
+        thin_importer.current_round() <= 1,
+        "the importer reached round {} - past round 1, which carries less than \
+         quorum stake",
+        thin_importer.current_round()
+    );
+    assert!(
+        thin_importer.blocks_in_round(2).is_empty(),
+        "nothing above the thin round may be imported"
     );
 
-    // Nothing above was imported.
-    assert_eq!(importer.current_round(), 0);
+    // A run whose FIRST round is thin has nothing before it to keep, so it is
+    // refused outright.
+    let thin_first: Vec<DagBlock> = all
+        .iter()
+        .filter(|b| b.round == 0)
+        .take(1)
+        .cloned()
+        .collect();
+    assert!(
+        Sim::new(4).nodes[0]
+            .engine
+            .import_history(&thin_first, HISTORY_SPAN)
+            .is_err(),
+        "a run that is thin from its first round must be refused"
+    );
 
     // The complete, contiguous run is accepted.
     let reached = importer
@@ -1328,5 +1359,70 @@ fn a_served_finality_certificate_verifies_against_an_independently_held_committe
     assert!(
         engine.finality_certificate(13).is_none(),
         "an uncertified height must have no certificate to serve"
+    );
+}
+
+/// Regression for the liveness wedge the R8 soak self-test found.
+///
+/// A history response always includes the live tip round, and at a stalled tip
+/// that round is BELOW quorum by definition - that is what "stalled" means.
+/// The import pre-check rejected the ENTIRE run whenever any round in it was
+/// thin, so a node that had fallen behind rejected every response it was ever
+/// sent: the complete rounds it needed were discarded along with the one
+/// incomplete round at the end.
+///
+/// In the soak that turned one crash plus one slow node into a permanent halt
+/// at N=4. The restarted node rejected the same response 118 times, the laggard
+/// could not catch up, and the two of them were exactly the validators whose
+/// blocks the tip round needed to reach quorum.
+///
+/// The comment on the check already said the right thing - a thin round "is
+/// the point where the import stops, not a reason to accept the rest" - while
+/// the code returned an error. This pins the behaviour to the comment.
+#[test]
+fn a_thin_tip_round_does_not_discard_the_complete_rounds_before_it() {
+    let mut sim = Sim::new(4);
+    sim.run(12, &Faults::default());
+    let source = &sim.nodes[0];
+    let tip = source.engine.current_round();
+    assert!(tip >= 4, "need several complete rounds, got tip {tip}");
+
+    // Every complete round, then a final round cut down to ONE block - the
+    // shape a peer serves when the tip has stalled below quorum.
+    let thin_round = tip - 1;
+    let mut run: Vec<DagBlock> = Vec::new();
+    for round in 0..thin_round {
+        for hash in source.engine.blocks_in_round(round) {
+            if let Some(block) = source.engine.get_block(&hash) {
+                run.push(block);
+            }
+        }
+    }
+    let thin_block = source
+        .engine
+        .blocks_in_round(thin_round)
+        .into_iter()
+        .find_map(|hash| source.engine.get_block(&hash))
+        .expect("the thin round has at least one block");
+    run.push(thin_block);
+
+    let fresh = Sim::new(4);
+    let importer = &fresh.nodes[0].engine;
+    let reached = importer
+        .import_history(&run, HISTORY_SPAN)
+        .expect("the complete rounds before a thin tip must import, not be discarded with it");
+
+    assert!(
+        reached >= thin_round.saturating_sub(1),
+        "import stopped at round {reached}; every complete round below {thin_round} \
+         should have been kept"
+    );
+    // The safety half: a thin round is never stepped OVER. The importer may
+    // stand AT it, waiting for its missing blocks, but may not be beyond it.
+    assert!(
+        importer.current_round() <= thin_round,
+        "the importer advanced to round {} - past thin round {thin_round}, which \
+         carries less than quorum stake",
+        importer.current_round()
     );
 }

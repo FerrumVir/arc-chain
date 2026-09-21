@@ -2073,7 +2073,21 @@ impl ConsensusEngine {
         };
         // Each round must carry quorum stake from distinct known authors before
         // this node will step over it. A round that does not is the point where
-        // the import stops, not a reason to accept the rest.
+        // the import stops, not a reason to discard the rounds before it.
+        //
+        // This used to `return Err` - rejecting the WHOLE run - while this
+        // comment said "stops". The difference is a permanent halt. A history
+        // response always includes the live tip, and at a stalled tip that
+        // round is below quorum by definition, so every response a lagging node
+        // was sent was refused in full. The R8 soak self-test hit exactly that
+        // at N=4: one crashed validator plus one slow one, the restarted node
+        // refusing the same response 118 times, and the two nodes whose blocks
+        // the tip round needed unable ever to reach it.
+        //
+        // Truncating is exactly as safe as refusing: a thin round is never
+        // stepped OVER, because nothing at or above it is imported. What changes
+        // is only that the complete rounds before it are kept.
+        let mut first_thin: Option<u64> = None;
         for (round, round_blocks) in &by_round {
             let vs = self.validator_set.read();
             let mut authors = HashSet::new();
@@ -2091,10 +2105,18 @@ impl ConsensusEngine {
                 .filter(|v| v.stake > 0)
                 .all(|v| authors.contains(&v.address) || self.is_excused_for_round(*round, &v.address));
             if stake < quorum && !excused {
-                return Err(ConsensusError::InvalidBlock(format!(
-                    "history round {round} carries {stake} stake, below quorum {quorum}"
-                )));
+                first_thin = Some(*round);
+                if *round == first {
+                    // Nothing before it to keep, so this is a refusal after all.
+                    return Err(ConsensusError::InvalidBlock(format!(
+                        "history round {round} carries {stake} stake, below quorum {quorum}"
+                    )));
+                }
+                break;
             }
+        }
+        if let Some(thin) = first_thin {
+            by_round.retain(|round, _| *round < thin);
         }
         // Apply in ascending round order, advancing one round at a time so the
         // ordinary per-block validation applies to every single block.

@@ -139,7 +139,15 @@ GEN="$WORK/genesis.toml"
 } > "$GEN"
 
 start_node() { # INDEX
-  local i=$1 d="$WORK/node-$i" peers="" j
+  # `local a=$1 b="$WORK/node-$a"` does NOT work: `local` is a builtin and its
+  # arguments are expanded before it runs, so `$a` there is whatever the CALLER
+  # had - in the sampling loop, the last node index. The self-test caught this
+  # by restarting node 0 against node 3's data directory, which then refused to
+  # start on the lock and left the node down for the rest of the run.
+  local i=$1
+  local d="$WORK/node-$i"
+  local peers=""
+  local j
   mkdir -p "$d"
   for j in $(seq 0 $((NODES-1))); do
     [[ $j -eq $i ]] && continue
@@ -217,16 +225,30 @@ except Exception: print('')" 2>/dev/null
   if [[ $(( now - LAST_KILL )) -ge $KILL_EVERY_SECS ]]; then
     victim=$(( KILLS % NODES ))
     note "killing node $victim (kill #$((KILLS+1)))"
+    kill_at=$(date +%s)
     kill -9 "${PIDS[$victim]}" 2>/dev/null || true
     wait "${PIDS[$victim]}" 2>/dev/null || true
     KILLS=$(( KILLS + 1 ))
     sleep 20
     start_node "$victim"
-    for _ in $(seq 1 90); do
-      [[ -n "$(nfield "$((BASE_RPC+victim))" /health status)" ]] && { REJOINS=$((REJOINS+1)); break; }
-      sleep 1
+    # Bound the wait in WALL CLOCK, not iterations. Each probe of a node that
+    # is not up costs a curl timeout, so "90 attempts" was nine minutes, not
+    # ninety seconds - long enough to look like the whole harness had hung.
+    rejoin_deadline=$(( $(date +%s) + 120 ))
+    rejoined=0
+    while [[ $(date +%s) -lt $rejoin_deadline ]]; do
+      if [[ -n "$(nfield "$((BASE_RPC+victim))" /health status)" ]]; then
+        rejoined=1; REJOINS=$(( REJOINS + 1 )); break
+      fi
+      sleep 2
     done
-    note "node $victim restarted (rejoins so far: $REJOINS)"
+    DOWNTIME_TOTAL=$(( ${DOWNTIME_TOTAL:-0} + $(date +%s) - kill_at ))
+    if [[ $rejoined -eq 1 ]]; then
+      note "node $victim restarted and answering after $(( $(date +%s) - kill_at ))s (rejoins so far: $REJOINS)"
+    else
+      note "NODE $victim DID NOT COME BACK within 120s; its last lines:"
+      sed 's/\x1b\[[0-9;]*m//g' "$WORK/node-$victim.log" | tail -4 | tee -a "$EVENTS"
+    fi
     LAST_KILL=$(date +%s)
   fi
 
@@ -244,6 +266,7 @@ done
   echo "controlled kills:   $KILLS"
   echo "observed rejoins:   $REJOINS"
   echo "agreement checks:   ok=$AGREE_OK  DISAGREEING=$AGREE_BAD"
+  echo "controlled downtime: ${DOWNTIME_TOTAL:-0}s total across $KILLS kills"
   echo
   python3 - "$SAMPLES" "$NODES" <<'PYEOF'
 import csv, sys
@@ -267,29 +290,63 @@ for n in range(nodes):
           f"   rss {rss[0]/1024:.0f} -> {rss[-1]/1024:.0f} MB (max {max(rss)/1024:.0f})"
           f"   disk {disk[0]/1024:.0f} -> {disk[-1]/1024:.0f} MB" if rss and disk else
           f"  node {n}: height {h[0]:.0f} -> {h[-1]:.0f}")
-stalled = []
-for n in range(nodes):
-    h = nums("height", n)
-    if len(h) > 3 and h[-1] <= h[max(0, len(h)-4)]:
-        stalled.append(n)
+# Longest run of consecutive samples in which NO node's height advanced. A
+# network-wide stall is the failure a soak exists to find, so it is measured
+# directly instead of glanced at over the last few samples.
+by_time = {}
+for r in rows:
+    try:
+        by_time.setdefault(int(r["elapsed_s"]), []).append(float(r["height"]))
+    except (ValueError, KeyError):
+        pass
+times = sorted(by_time)
+longest = run = 0
+for a, b in zip(times, times[1:]):
+    if max(by_time[b], default=0) <= max(by_time[a], default=0):
+        run += 1
+        longest = max(longest, run)
+    else:
+        run = 0
 print()
-print(f"nodes whose height did not advance over the last samples: {stalled or 'none'}")
+print(f"longest network-wide stall: {longest} consecutive samples with no height advancing")
+open(sys.argv[1] + ".stall", "w").write(str(longest))
 down = sum(1 for r in rows if r.get("alive") == "0")
-print(f"samples where a node was down: {down} of {len(rows)} "
-      f"(controlled kills account for some of these)")
+print(f"samples that observed a node down: {down} of {len(rows)}")
+print("  (sampling pauses during a controlled kill, so controlled downtime is")
+print("   reported separately below rather than inferred from samples)")
 PYEOF
   echo
-  echo "error/warn classes in node logs (top 10):"
-  cat "$WORK"/node-*.log 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
-    | grep -E "^\S+\s+(ERROR|WARN)" \
-    | sed -E 's/^\S+\s+(ERROR|WARN)\s+\S+:\s*//' | cut -c1-90 \
-    | sort | uniq -c | sort -rn | head -10 | sed 's/^/  /'
+  echo "error/warn classes in node logs (top 10, grouped by message shape):"
+  # Grouped in python, not sed: macOS sed has no \S or \s, so the first
+  # version never stripped the timestamps and every line counted once - a
+  # "top 10" of ten singletons that told you nothing.
+  python3 - "$WORK" <<'PYEOF'
+import glob, re, collections, sys
+ansi = re.compile(r"\x1b\[[0-9;]*m")
+line_re = re.compile(r"^\S+\s+(ERROR|WARN)\s+\S+:\s*(.*)$")
+counts = collections.Counter()
+for path in glob.glob(sys.argv[1] + "/node-*.log"):
+    for raw in open(path, errors="replace"):
+        m = line_re.match(ansi.sub("", raw).strip())
+        if not m:
+            continue
+        shape = re.sub(r"0x[0-9a-f]+|\b[0-9a-f]{16,}\b", "<h>", m.group(2))
+        shape = re.sub(r"=\S+", "=N", shape)[:100]
+        counts[(m.group(1), shape)] += 1
+for (level, shape), n in counts.most_common(10):
+    print(f"  {n:>6}  {level:<5} {shape}")
+if not counts:
+    print("  none")
+PYEOF
   echo
   echo "SAFETY VIOLATION lines (must be zero):"
   printf '  %s\n' "$(cat "$WORK"/node-*.log 2>/dev/null | grep -c 'SAFETY VIOLATION' || echo 0)"
   echo
+  STALL=$(cat "$SAMPLES.stall" 2>/dev/null || echo 0)
   if [[ $AGREE_BAD -gt 0 ]]; then
     echo "VERDICT: FAIL - replicas disagreed on canonical history during the run"
+  elif [[ ${STALL:-0} -ge ${STALL_LIMIT_SAMPLES:-6} ]]; then
+    echo "VERDICT: FAIL - the whole network stopped advancing for $STALL consecutive samples"
   elif [[ $KILLS -gt 0 && $REJOINS -lt $KILLS ]]; then
     echo "VERDICT: FAIL - a killed node did not come back"
   else

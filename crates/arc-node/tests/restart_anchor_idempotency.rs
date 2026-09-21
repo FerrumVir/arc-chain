@@ -13,6 +13,7 @@
 //! repeated restarts, and a crash at each of the three durability boundaries.
 
 use arc_consensus::{ConsensusDomain, DagBlock, view_change::ConsensusSigningRecord};
+use arc_node::consensus::ConsensusManager;
 use arc_crypto::{Hash256, hash_bytes};
 use arc_state::StateDB;
 use arc_types::Address;
@@ -44,6 +45,8 @@ fn anchor(round: u64, author: u8) -> DagBlock {
 struct Node {
     dir: tempfile::TempDir,
     state: StateDB,
+    /// A real manager, so the recognition window under test ships.
+    manager: ConsensusManager,
 }
 
 impl Node {
@@ -55,7 +58,11 @@ impl Node {
             Hash256::ZERO,
         )
         .expect("persistent state");
-        Self { dir, state }
+        Self {
+            dir,
+            state,
+            manager: ConsensusManager::new(addr(1), arc_consensus::STAKE_ARC, 4, false, &[]),
+        }
     }
 
     /// Reopen the same store, the way a restart does.
@@ -68,7 +75,11 @@ impl Node {
             Hash256::ZERO,
         )
         .expect("reopened state");
-        Self { dir, state }
+        Self {
+            dir,
+            state,
+            manager: ConsensusManager::new(addr(1), arc_consensus::STAKE_ARC, 4, false, &[]),
+        }
     }
 
     /// Apply one committed anchor exactly as the consensus loop does.
@@ -81,22 +92,14 @@ impl Node {
         block.header.height
     }
 
-    /// The height produced by this exact decision, if any - the same query the
-    /// node uses to refuse a second application.
+    /// The height produced by this exact decision, if any.
+    ///
+    /// This calls the NODE's own helper rather than reimplementing it, so the
+    /// recognition window under test is the one that ships. A local copy would
+    /// have kept passing when the real window was too narrow.
     fn height_for(&self, anchor: &DagBlock) -> Option<u64> {
         let decision = anchor.state_decision_commitment(&domain());
-        let top = self.state.height();
-        let floor = top.saturating_sub(256);
-        let mut height = top;
-        while height > floor {
-            if let Some(block) = self.state.get_block(height)
-                && block.header.proof_hash == decision
-            {
-                return Some(height);
-            }
-            height -= 1;
-        }
-        None
+        self.manager.canonical_height_for_decision(&self.state, decision)
     }
 }
 
@@ -319,5 +322,89 @@ fn balances_are_unchanged_by_replaying_an_applied_anchor() {
         node.state.get_account(&addr(9)).map(|a| a.balance),
         before,
         "replaying applied anchors changed a balance"
+    );
+}
+
+// ── the window an already-applied anchor must be recognised over ────────────
+
+/// The recognition window has to cover every anchor a peer could still serve,
+/// not just the most recent handful.
+///
+/// The first version of this guard scanned the last 256 canonical blocks, on
+/// the reasoning that a re-offered anchor is only a few rounds stale. That
+/// holds while the durable commit record survives. It does NOT hold when the
+/// record is lost, or migrated from a v1 file whose zero is ambiguous: such a
+/// node resumes its scan at round 0 and is re-offered every anchor its peers
+/// still retain - `--dag-retained-rounds`, 4096 by default. Sixteen times the
+/// old window; everything outside it would have produced a second block.
+#[test]
+fn an_anchor_is_recognised_across_the_whole_retention_window() {
+    let node = Node::fresh();
+
+    // Far more than the old 256-block window, and spread so the oldest entry
+    // is well outside it.
+    let rounds: Vec<DagBlock> = (0..400).map(|r| anchor(r, 1)).collect();
+    let mut heights = Vec::new();
+    for a in &rounds {
+        heights.push(node.apply(a));
+    }
+
+    let oldest = &rounds[0];
+    let oldest_height = heights[0];
+    assert!(
+        node.state.height() - oldest_height > 256,
+        "the oldest anchor must be outside the old 256-block window for this \
+         test to mean anything (distance {})",
+        node.state.height() - oldest_height
+    );
+
+    assert_eq!(
+        node.height_for(oldest),
+        Some(oldest_height),
+        "an anchor applied {} blocks ago must still be recognised; if it is \
+         not, replaying it appends a second canonical block",
+        node.state.height() - oldest_height
+    );
+
+    // And every one in between.
+    for (a, height) in rounds.iter().zip(&heights) {
+        assert_eq!(node.height_for(a), Some(*height));
+    }
+}
+
+/// A node that lost its record entirely resumes from round 0 and is re-offered
+/// everything. None of it may be applied twice.
+#[test]
+fn a_node_that_lost_its_record_reapplies_nothing() {
+    let mut node = Node::fresh();
+    let rounds: Vec<DagBlock> = (0..300).map(|r| anchor(r, 1)).collect();
+    for a in &rounds {
+        node.apply(a);
+    }
+    let height_before = node.state.height();
+    let balance_before = node.state.get_account(&addr(9)).map(|a| a.balance);
+
+    node = node.reopen();
+    let lost = ConsensusSigningRecord::default();
+    assert_eq!(
+        lost.next_round_to_scan(),
+        0,
+        "a lost record resumes at 0, which is only safe because every anchor \
+         it then re-offers is recognised"
+    );
+
+    // Replay the whole run, exactly as a scan from round 0 would offer it.
+    for a in &rounds {
+        assert!(
+            node.height_for(a).is_some(),
+            "round {} was not recognised after the record was lost",
+            a.round
+        );
+    }
+    assert_eq!(node.state.height(), height_before, "no block was appended");
+    assert_eq!(
+        node.state.get_account(&addr(9)).map(|a| a.balance),
+        balance_before,
+        "a lost record changed a balance"
     );
 }
