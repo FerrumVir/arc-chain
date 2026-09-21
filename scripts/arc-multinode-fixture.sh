@@ -121,6 +121,101 @@ agreement_verdict() {
         }' "$1"
 }
 
+# Walk EVERY height from 1 to TARGET on every replica and compare the full
+# header, not a sample. A sampled height is exactly what hid the round-575
+# duplicate: node 3 produced two canonical blocks for one anchor, so every
+# later height on that replica was offset by one, and a single late sample
+# showed a differing hash with a matching state root - which is unreadable as
+# evidence. Comparing hash AND parent at every height names the FIRST
+# divergence instead of a symptom far above it.
+full_history_agreement() { # TARGET FILE
+    local target="$1" file="$2" i from to
+    for i in $(seq 0 $((NODES-1))); do
+        : > "$file.node-$i.ndjson"
+        from=1
+        while [[ $from -le $target ]]; do
+            to=$(( from + 99 )); [[ $to -gt $target ]] && to=$target
+            curl -s --max-time 20 \
+                "http://127.0.0.1:$((BASE_RPC+i))/blocks?from=$from&to=$to&limit=100" \
+                >> "$file.node-$i.ndjson" 2>/dev/null || true
+            printf '\n' >> "$file.node-$i.ndjson"
+            from=$(( to + 1 ))
+        done
+    done
+    python3 - "$target" "$NODES" "$file" <<'PYEOF'
+import json, sys
+target, nodes, base = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+
+chains = {}
+for n in range(nodes):
+    chain = {}
+    try:
+        with open(f"{base}.node-{n}.ndjson") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                page = json.loads(line)
+                for b in page.get("blocks", []):
+                    height = b.get("height")
+                    if height is None:
+                        continue
+                    strip = lambda v: str(v or "").replace("0x", "")
+                    # The block hash commits to the whole header, state root
+                    # included, so hash + parent is the canonical-chain test.
+                    chain[int(height)] = (
+                        strip(b.get("hash")),
+                        strip(b.get("parent_hash")),
+                        strip(b.get("tx_root")),
+                    )
+    except Exception as exc:
+        print(f"UNAVAILABLE node {n}: {exc}")
+        sys.exit(3)
+    if not chain:
+        print(f"UNAVAILABLE node {n}: the block listing returned nothing")
+        sys.exit(3)
+    chains[n] = chain
+
+covered = set(chains[0])
+for n in range(1, nodes):
+    covered &= set(chains[n])
+covered = {h for h in covered if 1 <= h <= target}
+if not covered:
+    print("UNAVAILABLE: no height is present on every replica")
+    sys.exit(3)
+
+# A replica missing heights the others have is itself a divergence, not a
+# reason to compare only the intersection.
+missing = []
+for n in range(nodes):
+    gap = sorted(h for h in range(1, target + 1) if h not in chains[n])
+    if gap:
+        missing.append((n, len(gap), gap[:5]))
+
+first_bad = None
+for height in sorted(covered):
+    if len({chains[n][height] for n in range(nodes)}) > 1:
+        first_bad = height
+        break
+
+if first_bad is None and not missing:
+    print(f"OK {len(covered)} heights compared on {nodes} replicas, "
+          f"{min(covered)}..{max(covered)}, identical hash/parent/tx_root at every one")
+    sys.exit(0)
+
+if first_bad is not None:
+    print(f"BAD first divergence at height {first_bad} of {len(covered)} compared")
+    for n in range(nodes):
+        h, parent, tx = chains[n][first_bad]
+        print(f"  node {n}: hash={h[:18]}... parent={parent[:18]}... tx_root={tx[:18]}...")
+else:
+    print(f"BAD {len(covered)} heights agree, but a replica is missing heights")
+for n, count, sample in missing:
+    print(f"  node {n} is missing {count} heights in 1..{target}, first: {sample}")
+sys.exit(1)
+PYEOF
+}
+
 # Collect one coherent /block/{target} response per node into FILE.
 # The response is parsed ONCE per node, so a height can never be paired with a
 # root taken from a different request. The node identity written here is the
@@ -707,6 +802,21 @@ if [[ $allthere -eq 1 ]]; then
   V2=$(agreement_verdict "$WORK/agreement-after-restart.csv" "$NODES" "$TARGET2")
   [[ "$V2" == OK* ]] && ok "all $NODES replicas agree at height $TARGET2 AFTER the restart (${V2#OK })" \
     || fail "post-restart agreement at $TARGET2: ${V2#BAD }"
+
+  # One height is a sample. The gate is every height.
+  echo "  comparing the FULL canonical history on all $NODES replicas (1..$TARGET2)"
+  FULL=$(full_history_agreement "$TARGET2" "$WORK/full-history" 2>&1) || true
+  case "$FULL" in
+    OK*) ok "full canonical history agrees: ${FULL#OK }" ;;
+    UNAVAILABLE*)
+      echo "  SKIPPED: ${FULL#UNAVAILABLE}"
+      echo "    a bulk range endpoint is needed to compare every height; the"
+      echo "    single-height check above is NOT a substitute and this run does"
+      echo "    not establish full-history agreement."
+      ;;
+    *) printf '%s\n' "$FULL" | sed 's/^/    /'
+       fail "full canonical history DIVERGES across replicas" ;;
+  esac
 else
   fail "not every replica reached $TARGET2 after the restart, so post-recovery agreement is untested"
 fi
