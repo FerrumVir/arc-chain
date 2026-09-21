@@ -1,0 +1,241 @@
+//! A snapshot plus the WAL tail after it must reach exactly the state that
+//! replaying the whole WAL reaches.
+//!
+//! That equivalence is the entire justification for skipping records at open.
+//! It is asserted here against real `StateDB` instances over real files rather
+//! than argued for, and the failure modes a snapshot introduces - a corrupt
+//! payload, a lost manifest, an interrupted write, a snapshot that does not
+//! reproduce its own state root - each get a test that the node still recovers.
+
+use arc_crypto::{Hash256, hash_bytes};
+use arc_state::StateDB;
+use arc_state::snapshot::{self, SnapshotError};
+use arc_types::Address;
+
+fn addr(n: u8) -> Address {
+    hash_bytes(&[n])
+}
+
+fn prefunded() -> Vec<(Address, u64)> {
+    vec![(addr(1), 1_000_000), (addr(2), 500_000)]
+}
+
+fn open(dir: &std::path::Path) -> StateDB {
+    StateDB::with_genesis_persistent(&prefunded(), dir, Hash256::ZERO).expect("persistent state")
+}
+
+/// Produce `count` canonical blocks, so the WAL has a tail worth skipping.
+fn advance(state: &StateDB, count: u64) {
+    for i in 0..count {
+        state
+            .execute_block_adaptive_at_with_proof(
+                &[],
+                addr(1),
+                1_700_000_000_000 + i,
+                hash_bytes(&i.to_le_bytes()),
+            )
+            .expect("canonical execution");
+    }
+}
+
+/// Everything an observer can read back, used to compare two recovered states.
+fn observable(state: &StateDB) -> (u64, Hash256, Vec<(u64, Hash256, Hash256)>, Vec<u64>) {
+    let height = state.height();
+    let chain = (0..=height)
+        .filter_map(|h| {
+            state
+                .get_block(h)
+                .map(|b| (h, b.hash, b.header.parent_hash))
+        })
+        .collect();
+    let balances = prefunded()
+        .iter()
+        .map(|(a, _)| state.get_account(a).map(|acct| acct.balance).unwrap_or(0))
+        .collect();
+    (height, state.get_state_root(), chain, balances)
+}
+
+#[test]
+fn a_snapshot_plus_the_tail_equals_a_full_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+
+    // Build a chain, snapshot partway, then keep going.
+    let state = open(&path);
+    advance(&state, 12);
+    let manifest = state.publish_durable_snapshot().expect("snapshot published");
+    assert_eq!(manifest.identity.height, state.height());
+    advance(&state, 9);
+    let expected = observable(&state);
+    drop(state);
+
+    // Reopen WITH the snapshot: only the tail is applied.
+    let with_snapshot = open(&path);
+    let from_snapshot = observable(&with_snapshot);
+    drop(with_snapshot);
+
+    // Reopen WITHOUT it: the whole WAL is applied.
+    snapshot::remove(&path).expect("snapshot removed");
+    let full_replay = open(&path);
+    let from_replay = observable(&full_replay);
+
+    assert_eq!(
+        from_snapshot, from_replay,
+        "a snapshot plus its tail reached a different state than a full replay"
+    );
+    assert_eq!(
+        from_snapshot, expected,
+        "recovery did not reproduce the state that was durable before the restart"
+    );
+}
+
+#[test]
+fn a_snapshot_taken_at_the_tip_needs_no_tail_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let state = open(&path);
+    advance(&state, 7);
+    let expected = observable(&state);
+    state.publish_durable_snapshot().expect("snapshot published");
+    drop(state);
+
+    let reopened = open(&path);
+    assert_eq!(observable(&reopened), expected);
+}
+
+#[test]
+fn repeated_snapshots_and_restarts_stay_equivalent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let mut expected;
+    {
+        let state = open(&path);
+        advance(&state, 5);
+        state.publish_durable_snapshot().unwrap();
+        expected = observable(&state);
+    }
+    for round in 0..4 {
+        let state = open(&path);
+        assert_eq!(
+            observable(&state),
+            expected,
+            "restart {round} did not reproduce the previous state"
+        );
+        advance(&state, 3);
+        state.publish_durable_snapshot().unwrap();
+        expected = observable(&state);
+    }
+    let final_state = open(&path);
+    assert_eq!(observable(&final_state), expected);
+}
+
+#[test]
+fn a_corrupt_snapshot_is_refused_and_the_node_still_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let state = open(&path);
+    advance(&state, 10);
+    state.publish_durable_snapshot().unwrap();
+    advance(&state, 4);
+    let expected = observable(&state);
+    drop(state);
+
+    // Flip a byte in the payload. The digest no longer matches.
+    let payload = path.join(snapshot::PAYLOAD_FILE);
+    let mut bytes = std::fs::read(&payload).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&payload, &bytes).unwrap();
+    assert!(matches!(
+        snapshot::load(&path),
+        Err(SnapshotError::DigestMismatch { .. })
+    ));
+
+    // The node opens anyway, by replaying everything.
+    let recovered = open(&path);
+    assert_eq!(
+        observable(&recovered),
+        expected,
+        "a corrupt snapshot must cost recovery time, not correctness"
+    );
+}
+
+#[test]
+fn an_interrupted_snapshot_write_leaves_the_previous_state_recoverable() {
+    // The shape a crash between the payload write and the manifest write
+    // leaves: a payload with no manifest naming it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let state = open(&path);
+    advance(&state, 8);
+    state.publish_durable_snapshot().unwrap();
+    advance(&state, 5);
+    let expected = observable(&state);
+    drop(state);
+
+    std::fs::remove_file(path.join(snapshot::MANIFEST_FILE)).unwrap();
+    assert!(matches!(snapshot::load(&path), Err(SnapshotError::Absent)));
+
+    let recovered = open(&path);
+    assert_eq!(observable(&recovered), expected);
+}
+
+#[test]
+fn a_snapshot_that_does_not_reproduce_its_state_root_is_backed_out() {
+    // A digest proves the bytes are the ones written. It does not prove they
+    // describe the state they claim to - so the root is recomputed after
+    // installing, and a mismatch must discard the install rather than build
+    // the tail on top of it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let state = open(&path);
+    advance(&state, 6);
+    state.publish_durable_snapshot().unwrap();
+    advance(&state, 3);
+    let expected = observable(&state);
+    drop(state);
+
+    // Rewrite the manifest with a state root that is not the payload's, and
+    // re-point its digest at the untouched payload so only the ROOT is wrong.
+    let loaded = snapshot::load(&path).expect("snapshot loads");
+    snapshot::publish(
+        &path,
+        loaded.payload.clone(),
+        hash_bytes(b"not-the-real-root"),
+        loaded.manifest.resume_from_sequence,
+        loaded.manifest.block_hash,
+    )
+    .expect("republished with a wrong root");
+
+    let recovered = open(&path);
+    assert_eq!(
+        observable(&recovered),
+        expected,
+        "a snapshot whose root does not verify must be backed out, and full \
+         replay must still reach the right state"
+    );
+}
+
+#[test]
+fn a_snapshot_from_an_unknown_version_is_ignored_not_guessed_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let state = open(&path);
+    advance(&state, 4);
+    state.publish_durable_snapshot().unwrap();
+    let expected = observable(&state);
+    drop(state);
+
+    let manifest_path = path.join(snapshot::MANIFEST_FILE);
+    let mut bytes = std::fs::read(&manifest_path).unwrap();
+    // The version byte sits immediately after the magic.
+    bytes[b"ARC-SNAPSHOT".len()] = 99;
+    std::fs::write(&manifest_path, &bytes).unwrap();
+    assert!(matches!(
+        snapshot::load(&path),
+        Err(SnapshotError::UnknownVersion(99))
+    ));
+
+    let recovered = open(&path);
+    assert_eq!(observable(&recovered), expected);
+}

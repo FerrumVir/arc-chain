@@ -12,6 +12,7 @@ pub mod light_client;
 pub mod mmap_state;
 pub mod recovery;
 pub mod simd_parse;
+pub mod snapshot;
 pub mod wal;
 
 use arc_crypto::{Hash256, IncrementalMerkle, MerkleTree, hash_bytes, hash_pair};
@@ -900,12 +901,22 @@ impl StateDB {
         Self::verify_or_create_genesis_binding(wal_dir, wal_path.exists(), expected_genesis_hash)?;
 
         if wal_path.exists() {
-            // WAL exists - replay to recover state
+            // WAL exists - replay to recover state. Validation still walks the
+            // whole log: it checks the genesis prefix, block/checkpoint
+            // pairing and chain linkage, and a snapshot does not make earlier
+            // records trustworthy. What the snapshot bounds is the far more
+            // expensive part - APPLYING every record ever written.
             let entries = Self::prepare_normal_wal_replay(&wal_path, prefunded)?;
             let state = Self::with_persistence(&wal_path)?;
-            let entry_count = entries.len();
+            let adopted = state.adopt_snapshot_if_trustworthy(wal_dir);
+            let resume_from = adopted.map(|manifest| manifest.resume_from_sequence);
+            let mut entry_count = 0usize;
             for entry in &entries {
+                if resume_from.is_some_and(|first| entry.sequence < first) {
+                    continue;
+                }
                 state.apply_wal_op(&entry.op);
+                entry_count += 1;
             }
 
             // Insert genesis block if not already present from WAL replay
@@ -914,10 +925,12 @@ impl StateDB {
             }
 
             tracing::info!(
-                "WAL recovery complete: replayed {} entries, {} accounts, height {}",
-                entry_count,
-                state.accounts.len(),
-                state.height()
+                replayed = entry_count,
+                of_total = entries.len(),
+                from_snapshot_height = ?adopted.map(|m| m.identity.height),
+                accounts = state.accounts.len(),
+                height = state.height(),
+                "WAL recovery complete"
             );
 
             state.restore_native_inference_context()?;
@@ -9516,6 +9529,230 @@ impl StateDB {
 
     /// Export the current state as a snapshot for state sync.
     /// New nodes can download this to bootstrap without replaying from genesis.
+    /// Capture exactly the state that WAL replay reconstructs, so a snapshot
+    /// plus the WAL tail after it reaches the same state as replaying
+    /// everything. Anything `apply_wal_op` does not write is deliberately
+    /// excluded - including it would make the two paths disagree.
+    pub fn export_durable_snapshot(&self) -> snapshot::SnapshotPayload {
+        let mut payload = snapshot::SnapshotPayload {
+            height: self.height(),
+            accounts: self
+                .accounts
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect(),
+            storage: self
+                .storage
+                .iter()
+                .map(|e| {
+                    (
+                        Hash256(*e.key()),
+                        e.value()
+                            .iter()
+                            .map(|i| (*i.key(), i.value().clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            contracts: self
+                .contracts
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect(),
+            identities: self
+                .identities
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect(),
+            blocks: self
+                .blocks
+                .iter()
+                .map(|e| (*e.key(), e.value().clone()))
+                .collect(),
+            receipts: self
+                .receipts
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect(),
+            full_transactions: self
+                .full_transactions
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect(),
+            event_logs: self
+                .event_logs
+                .iter()
+                .map(|e| (*e.key(), e.value().clone()))
+                .collect(),
+            validators: self
+                .validators
+                .iter()
+                .map(|e| (Hash256(*e.key()), *e.value()))
+                .collect(),
+            staking_pool: self.staking_pool.load(Ordering::Acquire),
+            recovery_context: self.recovery_context.read().clone(),
+            community_rewards_activation_height: self
+                .community_rewards_v1_activation_height
+                .load(Ordering::Acquire),
+            native_inference_pending: self
+                .native_inference_pending
+                .iter()
+                .map(|e| (Hash256(*e.key()), *e.value()))
+                .collect(),
+        };
+        payload.canonicalize();
+        payload
+    }
+
+    /// Install a verified snapshot into this (empty) state.
+    ///
+    /// Every row is applied through the SAME `apply_wal_op` path that replay
+    /// uses, so there is one implementation of what each record means. A
+    /// second implementation here would be a second thing to keep in step,
+    /// and the whole point of the snapshot is that it agrees with replay.
+    pub fn install_durable_snapshot(&self, payload: &snapshot::SnapshotPayload) {
+        for (address, account) in &payload.accounts {
+            self.apply_wal_op(&WalOp::SetAccount(*address, account.clone()));
+        }
+        for (address, entries) in &payload.storage {
+            for (key, value) in entries {
+                self.apply_wal_op(&WalOp::SetStorage(*address, *key, value.clone()));
+            }
+        }
+        for (address, bytecode) in &payload.contracts {
+            self.apply_wal_op(&WalOp::SetContract(*address, bytecode.clone()));
+        }
+        for (address, identity) in &payload.identities {
+            self.apply_wal_op(&WalOp::SetIdentity(*address, identity.clone()));
+        }
+        for (height, block) in &payload.blocks {
+            self.apply_wal_op(&WalOp::SetBlock(*height, block.clone()));
+        }
+        for (hash, receipt) in &payload.receipts {
+            self.apply_wal_op(&WalOp::SetReceipt(*hash, receipt.clone()));
+        }
+        for (hash, transaction) in &payload.full_transactions {
+            self.apply_wal_op(&WalOp::SetFullTransaction(
+                *hash,
+                Box::new(transaction.clone()),
+            ));
+        }
+        for (height, logs) in &payload.event_logs {
+            self.apply_wal_op(&WalOp::SetEventLogs(*height, logs.clone()));
+        }
+        if !payload.validators.is_empty() || payload.staking_pool != 0 {
+            self.apply_wal_op(&WalOp::SetValidatorState(
+                payload.validators.clone(),
+                payload.staking_pool,
+            ));
+        }
+        if let Some(context) = &payload.recovery_context {
+            let activation = (payload.community_rewards_activation_height != u64::MAX)
+                .then_some(payload.community_rewards_activation_height);
+            self.apply_wal_op(&WalOp::SetRecoveryContext(context.clone(), activation));
+        }
+        for (request_id, admission_height) in &payload.native_inference_pending {
+            self.native_inference_pending
+                .insert(request_id.0, *admission_height);
+        }
+        // `height` is raised by each SetBlock, but a snapshot taken with no
+        // block at the tip must still report its own height.
+        let mut height = self.height.write();
+        if payload.height > *height {
+            *height = payload.height;
+        }
+    }
+
+    /// Empty everything a snapshot or replay would repopulate.
+    ///
+    /// Used to back out a snapshot whose state root did not verify, so a
+    /// refused snapshot leaves no residue for the full replay that follows.
+    fn clear_replayable_state(&self) {
+        self.accounts.clear();
+        self.storage.clear();
+        self.contracts.clear();
+        self.identities.clear();
+        self.blocks.clear();
+        self.receipts.clear();
+        self.tx_index.clear();
+        self.full_transactions.clear();
+        self.event_logs.clear();
+        self.validators.clear();
+        self.native_inference_pending.clear();
+        self.dirty_accounts.clear();
+        self.staking_pool.store(0, Ordering::Release);
+        self.community_rewards_v1_activation_height
+            .store(u64::MAX, Ordering::Release);
+        *self.recovery_context.write() = None;
+        *self.height.write() = 0;
+        *self.incremental_merkle.lock() = IncrementalMerkle::new();
+    }
+
+    /// Install the snapshot in `dir`, if there is one that verifies.
+    ///
+    /// Returns the WAL sequence already contained in it, so replay can resume
+    /// strictly after that point. `None` means "replay everything", which is
+    /// always correct - a snapshot is an optimisation over a durable log, so
+    /// refusing one can never cost correctness.
+    fn adopt_snapshot_if_trustworthy(&self, dir: &Path) -> Option<snapshot::SnapshotManifestV1> {
+        let verified = match snapshot::load(dir) {
+            Ok(verified) => verified,
+            Err(snapshot::SnapshotError::Absent) => return None,
+            Err(error) => {
+                tracing::warn!(%error, "Ignoring an unusable state snapshot; replaying the full WAL");
+                return None;
+            }
+        };
+        self.install_durable_snapshot(&verified.payload);
+        let found = self.get_state_root();
+        if found == verified.manifest.identity.state_root {
+            tracing::info!(
+                height = verified.manifest.identity.height,
+                resume_from = verified.manifest.resume_from_sequence,
+                "Installed a verified state snapshot; replaying only the WAL tail"
+            );
+            return Some(verified.manifest);
+        }
+        // A digest proves the bytes are the ones that were written. It does
+        // not prove they describe the state they claim to, which is why the
+        // root is recomputed here - and why a mismatch backs the install out
+        // entirely rather than continuing on top of it.
+        tracing::error!(
+            expected = %verified.manifest.identity.state_root,
+            %found,
+            "State snapshot does not reproduce its own state root; discarding it"
+        );
+        self.clear_replayable_state();
+        None
+    }
+
+    /// Publish a snapshot of this state next to its WAL.
+    ///
+    /// The resume point is read AFTER the state is captured, never before: a
+    /// sequence taken first could name a record the capture did not include,
+    /// and replay would then skip it. `sequence()` is the NEXT number to hand
+    /// out, so it is exactly "the first record this snapshot does not
+    /// contain". Reading it after the capture can only make it too LOW, which
+    /// re-applies a record the snapshot already had - and every WAL op is
+    /// idempotent, so that direction is safe. Too high would lose a block.
+    pub fn publish_durable_snapshot(
+        &self,
+    ) -> Result<snapshot::SnapshotManifestV1, snapshot::SnapshotError> {
+        let dir = self.persistence_dir().ok_or_else(|| {
+            snapshot::SnapshotError::Io("state has no persistence directory".into())
+        })?;
+        self.try_sync_wal()
+            .map_err(|error| snapshot::SnapshotError::Io(error.to_string()))?;
+        let payload = self.export_durable_snapshot();
+        let height = payload.height;
+        let block_hash = self
+            .get_block(height)
+            .map(|block| block.hash)
+            .unwrap_or(Hash256::ZERO);
+        let sequence = self.wal.sequence();
+        snapshot::publish(&dir, payload, self.get_state_root(), sequence, block_hash)
+    }
+
     pub fn export_snapshot(&self) -> Snapshot {
         let accounts: Vec<(Address, Account)> = self
             .accounts

@@ -527,6 +527,7 @@ dependencies = [
  "parking_lot",
  "rayon",
  "serde",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "uuid",
