@@ -100,6 +100,15 @@ pub enum IsolatedTransitionResult {
 }
 
 /// Read-only pending request view reconstructed from bounded escrow metadata.
+
+/// How many native candidates one committed block's selection examines, in
+/// hash order. See `select_native_block_transactions`.
+pub const MAX_NATIVE_CANDIDATES_PER_BLOCK: usize = 64;
+
+/// How far ahead of its sender's account nonce a native transaction may be
+/// and still be kept for a later block.
+pub const NATIVE_FUTURE_NONCE_WINDOW: u64 = 8;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeInferencePendingSnapshot {
     pub request_id: Hash256,
@@ -601,7 +610,12 @@ impl StateDB {
             .filter(|tx| is_native_body(&tx.body))
             .collect();
         ordered.sort_by_key(|tx| tx.hash.0);
-        for tx in ordered {
+        // Each candidate costs a full admission check - signature included -
+        // on every node. A leader block packed with junk would otherwise cost
+        // all of them that much inside the commit path. The first N in hash
+        // order are examined, identically everywhere; a block whose first N
+        // hold nothing admissible carries nothing.
+        for tx in ordered.into_iter().take(MAX_NATIVE_CANDIDATES_PER_BLOCK) {
             if self
                 .validate_native_inference_block_admission(std::slice::from_ref(tx))
                 .is_ok()
@@ -631,6 +645,14 @@ impl StateDB {
     /// pending, and becomes admissible once that one executes. So a
     /// transaction whose nonce is AHEAD of its sender's account is kept; one
     /// at or behind it that still fails can never succeed and is dropped.
+    ///
+    /// "Ahead" is bounded, or it is an invitation: a transaction failing for
+    /// any reason at all, from a key with no account, was kept forever as long
+    /// as its nonce was above zero, so anyone could fill every mempool with
+    /// junk that each proposal re-validates. A future transaction is kept only
+    /// if its sender has an account, its nonce is within
+    /// `NATIVE_FUTURE_NONCE_WINDOW` of that account's, it is correctly
+    /// signed, and - for a request - the sender can cover its reservation.
     pub fn native_transaction_still_admissible(&self, tx: &arc_types::Transaction) -> bool {
         if !is_native_body(&tx.body) {
             return false;
@@ -641,8 +663,20 @@ impl StateDB {
         {
             return true;
         }
-        let account_nonce = self.get_account(&tx.from).map(|a| a.nonce).unwrap_or(0);
-        tx.nonce > account_nonce
+        let Some(account) = self.get_account(&tx.from) else {
+            return false;
+        };
+        if tx.nonce <= account.nonce
+            || tx.nonce > account.nonce.saturating_add(NATIVE_FUTURE_NONCE_WINDOW)
+        {
+            return false;
+        }
+        if let arc_types::TxBody::NativeInferenceRequest(body) = &tx.body
+            && account.balance < body.request.job.reserved_max_payment
+        {
+            return false;
+        }
+        self.verify_transaction_signature(tx).is_ok()
     }
 
     pub(crate) fn validate_native_inference_block_admission(
@@ -2633,6 +2667,78 @@ mod tests {
         assert_eq!(
             hashes(state.select_native_block_transactions(&[fin_b.clone(), r1.clone()])),
             vec![r1.hash]
+        );
+        let dir = f.dir.clone();
+        drop(f);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_bounded_payable_future_transaction_is_kept_for_later() {
+        let f = fixture("still-admissible");
+        let state = &f.ledger.state;
+        state.activate_native_inference(f.context.clone()).unwrap();
+        // Nonce 1 while the account is at 0: a real future transaction.
+        let next = native_request(state, &f.requester, request(&f, 1, 100));
+        assert!(state.native_transaction_still_admissible(&next));
+        // Far ahead of the account: never kept.
+        let far = native_request(
+            state,
+            &f.requester,
+            request(&f, NATIVE_FUTURE_NONCE_WINDOW + 1, 100),
+        );
+        assert!(!state.native_transaction_still_admissible(&far));
+        // A key with no account at all: junk, however it is signed.
+        let stranger = KeyPair::generate_ed25519();
+        let mut foreign = request(&f, 1, 100).job;
+        foreign.requester = stranger.address();
+        let foreign = InferenceRequest::sign(foreign, &stranger).unwrap();
+        let junk = native_request(state, &stranger, foreign);
+        assert!(!state.native_transaction_still_admissible(&junk));
+        // A request its sender cannot pay for (fixture balance is 1,000).
+        let mut costly = request(&f, 1, 100).job;
+        costly.reserved_max_payment = 5_000;
+        let costly = InferenceRequest::sign(costly, &f.requester).unwrap();
+        let unpayable = native_request(state, &f.requester, costly);
+        assert!(!state.native_transaction_still_admissible(&unpayable));
+        let dir = f.dir.clone();
+        drop(f);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn selection_examines_a_bounded_number_of_candidates_per_block() {
+        let f = fixture("selection-cap");
+        let state = &f.ledger.state;
+        state.activate_native_inference(f.context.clone()).unwrap();
+        let valid = native_request(state, &f.requester, request(&f, 0, 100));
+        // Junk from fresh keys whose hashes sort before the valid request.
+        let mut junk = Vec::new();
+        while junk.len() < MAX_NATIVE_CANDIDATES_PER_BLOCK {
+            let stranger = KeyPair::generate_ed25519();
+            let mut job = request(&f, 0, 100).job;
+            job.requester = stranger.address();
+            let signed = InferenceRequest::sign(job, &stranger).unwrap();
+            let tx = native_request(state, &stranger, signed);
+            if tx.hash.0 < valid.hash.0 {
+                junk.push(tx);
+            }
+        }
+        let mut candidates = junk.clone();
+        candidates.push(valid.clone());
+        assert!(
+            state.select_native_block_transactions(&candidates).is_empty(),
+            "the first {MAX_NATIVE_CANDIDATES_PER_BLOCK} in hash order are all junk"
+        );
+        // One fewer junk candidate and the valid request is reached.
+        candidates.remove(0);
+        assert_eq!(
+            state
+                .select_native_block_transactions(&candidates)
+                .iter()
+                .map(|t| t.hash)
+                .collect::<Vec<_>>(),
+            vec![valid.hash]
         );
         let dir = f.dir.clone();
         drop(f);

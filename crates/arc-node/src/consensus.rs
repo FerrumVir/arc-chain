@@ -285,6 +285,23 @@ fn try_drain_recovery_reconnect_replay(
 /// asking every peer for a body none of them held. So a never-executed body
 /// is kept until `unexecuted_floor` - the DAG retention horizon, the same
 /// window the blocks naming it are served from.
+/// How long a native transaction may keep being put back for a later block.
+/// A future-nonce transaction becomes admissible within blocks of its
+/// predecessor executing; one still waiting after this long never will.
+const NATIVE_REQUEUE_LIFETIME: Duration = Duration::from_secs(120);
+
+/// Whether `transaction` may be put back for a later block once more: true
+/// until it has been waiting `NATIVE_REQUEUE_LIFETIME`, then false for good.
+fn requeue_native(
+    requeued_since: &mut std::collections::HashMap<[u8; 32], Instant>,
+    transaction: &arc_types::Transaction,
+) -> bool {
+    let first = *requeued_since
+        .entry(transaction.hash.0)
+        .or_insert_with(Instant::now);
+    first.elapsed() < NATIVE_REQUEUE_LIFETIME
+}
+
 fn prune_irreversible_preimages(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     latest_round: &dashmap::DashMap<[u8; 32], u64>,
@@ -1277,6 +1294,11 @@ impl ConsensusManager {
         let mut last_bootstrap_request: Option<u64> = None;
         let mut iteration_started: Option<Instant> = None;
         let mut gauges_published_at: Option<Instant> = None;
+        // When each native transaction was first put back for a later block.
+        // Admissible-later is not forever: past NATIVE_REQUEUE_LIFETIME it is
+        // dropped (see `requeue_native`).
+        let mut requeued_since: std::collections::HashMap<[u8; 32], Instant> =
+            std::collections::HashMap::new();
         // Committed DAG blocks waiting for transaction bodies, in round order.
         let mut commit_backlog: Vec<arc_consensus::DagBlock> = Vec::new();
         let mut commit_stall_fetch_at: Option<Instant> = None;
@@ -1994,8 +2016,12 @@ impl ConsensusManager {
                                     // resident set, so accepting this retry does
                                     // not create a wire echo loop.
                                     if state.native_inference_context().is_some()
-                                        && !arc_state::StateDB::is_native_inference_transaction(&tx)
+                                        && (!arc_state::StateDB::is_native_inference_transaction(&tx)
+                                            || !state.native_transaction_still_admissible(&tx))
                                     {
+                                        // Not native, or native but neither
+                                        // admissible now nor a bounded future
+                                        // transaction of a funded sender.
                                         continue;
                                     }
                                     // Already executed: re-admitting it is how
@@ -3323,6 +3349,7 @@ impl ConsensusManager {
                         for transaction in transactions.drain(..) {
                             if !selected.iter().any(|kept| kept.hash == transaction.hash)
                                 && state.native_transaction_still_admissible(&transaction)
+                                && requeue_native(&mut requeued_since, &transaction)
                             {
                                 let _ = mempool.insert(transaction);
                             }
@@ -3788,6 +3815,7 @@ impl ConsensusManager {
                                 if !selected.iter().any(|kept| kept.hash == transaction.hash)
                                     && !state.receipts.contains_key(&transaction.hash.0)
                                     && state.native_transaction_still_admissible(transaction)
+                                    && requeue_native(&mut requeued_since, transaction)
                                 {
                                     let _ = mempool.insert(transaction.clone());
                                 }
@@ -4340,6 +4368,7 @@ impl ConsensusManager {
                         "Pruned irreversibly obsolete DAG transaction preimages"
                     );
                 }
+                requeued_since.retain(|_, since| since.elapsed() < NATIVE_REQUEUE_LIFETIME * 2);
                 if self.pending_diffs.len() > 10_000 {
                     let keys: Vec<[u8; 32]> = self
                         .pending_diffs
@@ -4583,6 +4612,22 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn a_native_transaction_is_put_back_only_until_its_lifetime_ends() {
+        let key = KeyPair::generate_ed25519();
+        let tx = signed_transfer(&key, 41, 0);
+        let mut since = std::collections::HashMap::new();
+        assert!(requeue_native(&mut since, &tx));
+        assert!(requeue_native(&mut since, &tx), "still inside its lifetime");
+        since.insert(
+            tx.hash.0,
+            Instant::now()
+                .checked_sub(NATIVE_REQUEUE_LIFETIME + Duration::from_secs(1))
+                .unwrap(),
+        );
+        assert!(!requeue_native(&mut since, &tx), "past its lifetime it is dropped");
     }
 
     #[test]
