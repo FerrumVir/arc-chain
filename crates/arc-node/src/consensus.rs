@@ -91,13 +91,49 @@ fn exact_dag_preimages(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     hashes: &[Hash256],
 ) -> Result<Vec<arc_types::Transaction>, DagPreimageError> {
+    exact_dag_preimages_from(pending, None, hashes)
+}
+
+/// The bodies a history response carries for `wanted` transaction hashes: from
+/// the pending cache, or - once executed - from the canonical state.
+fn history_bodies(
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    state: &StateDB,
+    wanted: &std::collections::HashSet<[u8; 32]>,
+) -> Vec<arc_types::Transaction> {
+    wanted
+        .iter()
+        .filter_map(|hash| {
+            pending
+                .get(hash)
+                .map(|entry| entry.value().clone())
+                .or_else(|| state.full_transactions.get(hash).map(|t| t.clone()))
+        })
+        .collect()
+}
+
+/// As [`exact_dag_preimages`], also accepting a body this node's canonical
+/// state already holds.
+///
+/// The pending cache drops a body once its transaction executes. A committed
+/// DAG block can still name it - a transaction re-proposed before its receipt
+/// was seen - and a restarted node's cache is empty. The canonical state keeps
+/// every executed body, and the hash binds the body exactly, so it is an
+/// equally authentic source.
+fn exact_dag_preimages_from(
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    state: Option<&StateDB>,
+    hashes: &[Hash256],
+) -> Result<Vec<arc_types::Transaction>, DagPreimageError> {
     hashes
         .iter()
         .map(|expected| {
-            let transaction = pending
-                .get(&expected.0)
-                .ok_or(DagPreimageError::Missing(*expected))?
-                .clone();
+            let transaction = match pending.get(&expected.0) {
+                Some(found) => found.clone(),
+                None => state
+                    .and_then(|state| state.full_transactions.get(&expected.0).map(|t| t.clone()))
+                    .ok_or(DagPreimageError::Missing(*expected))?,
+            };
             if transaction.hash != *expected {
                 return Err(DagPreimageError::HashMismatch {
                     expected: *expected,
@@ -1213,6 +1249,9 @@ impl ConsensusManager {
             std::collections::HashMap::new();
         let mut unproductive_bootstrap_requests: u32 = 0;
         let mut iteration_started: Option<Instant> = None;
+        // Committed DAG blocks waiting for transaction bodies, in round order.
+        let mut commit_backlog: Vec<arc_consensus::DagBlock> = Vec::new();
+        let mut commit_stall_fetch_at: Option<Instant> = None;
         let mut checkpoint_requested = false;
         // When this node last gossiped each absence attestation it has made.
         let mut absence_gossiped_at: std::collections::HashMap<
@@ -2456,11 +2495,13 @@ impl ConsensusManager {
                     .iter()
                     .flat_map(|block| block.transactions.iter().map(|hash| hash.0))
                     .collect();
-                let transactions: Vec<arc_types::Transaction> = pending_txs
-                    .iter()
-                    .filter(|entry| wanted.contains(entry.key()))
-                    .map(|entry| entry.value().clone())
-                    .collect();
+                // Bodies come from the pending cache OR the canonical state. The
+                // cache drops a body once its transaction executes, so a peer
+                // that needs to apply an older committed block - a restarted
+                // node above all - used to receive the block without the body
+                // it names, and its consensus loop exited on the missing
+                // preimage. The state keeps every executed body.
+                let transactions = history_bodies(&pending_txs, &state, &wanted);
                 crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_served);
                 crate::consensus_diagnostics::DIAG.history_blocks_served.fetch_add(
                     blocks.len() as u64,
@@ -3414,11 +3455,58 @@ impl ConsensusManager {
 
             phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_propose_us, phase_mark);
             // ── 2. Try to commit finalized DAG blocks (multi-validator) ──────
-            let mut committed = self.engine.try_commit();
+            let mut committed: Vec<arc_consensus::DagBlock> = std::mem::take(&mut commit_backlog);
+            committed.extend(self.engine.try_commit());
             // Sort by round to ensure all nodes process in the same order.
             // Without this, nodes discover committed blocks at different times
             // and produce chain blocks in different sequences.
             committed.sort_by_key(|b| b.round);
+            // A committed block whose bodies are not all here yet is not a
+            // reason to stop the process. It used to be: the loop exited on the
+            // missing preimage, and a restarted node - which re-imports the
+            // same block with the same missing body - would crash-loop. Apply
+            // the fully available prefix, keep the rest IN ORDER for the next
+            // iteration, and ask for the history behind the first stalled one.
+            // The durable record only ever advances past applied rounds, so a
+            // backlog never skips anything.
+            if let Some(first_missing) = committed.iter().position(|block| {
+                exact_dag_preimages_from(&pending_txs, Some(&state), &block.transactions).is_err()
+            }) {
+                let stalled = committed.split_off(first_missing);
+                let round = stalled[0].round;
+                crate::consensus_diagnostics::DIAG
+                    .commit_stalled_blocks
+                    .store(stalled.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                if commit_stall_fetch_at
+                    .is_none_or(|at: Instant| at.elapsed() >= TARGETED_FETCH_INTERVAL * 4)
+                {
+                    commit_stall_fetch_at = Some(Instant::now());
+                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.commit_stalls);
+                    warn!(
+                        round,
+                        block = %stalled[0].hash,
+                        waiting = stalled.len(),
+                        "Commit waiting for transaction bodies; requesting the history behind it"
+                    );
+                    if let Some(ref tx_chan) = outbound_tx {
+                        for (peer, generation) in connected_validators.iter() {
+                            if generation.connected {
+                                let sent = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
+                                    target: *peer,
+                                    from_round: round,
+                                    max_rounds: 4,
+                                });
+                                crate::consensus_diagnostics::note_send(&sent);
+                            }
+                        }
+                    }
+                }
+                commit_backlog = stalled;
+            } else {
+                crate::consensus_diagnostics::DIAG
+                    .commit_stalled_blocks
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             if !committed.is_empty() {
                 for dag_block in &committed {
                     info!(
@@ -3433,7 +3521,7 @@ impl ConsensusManager {
                     // missing preimage: stop this loop before state or the
                     // durable commit cursor can move.
                     let all_preimages =
-                        match exact_dag_preimages(&pending_txs, &dag_block.transactions) {
+                        match exact_dag_preimages_from(&pending_txs, Some(&state), &dag_block.transactions) {
                             Ok(transactions) => transactions,
                             Err(error) => {
                                 tracing::error!(
@@ -3976,6 +4064,58 @@ impl ConsensusManager {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_committed_block_s_executed_body_is_found_in_state_when_the_cache_dropped_it() {
+        // The restart crash: a committed DAG block named a transaction the
+        // pending cache no longer held (it had executed), a restarted node had
+        // no cache at all, and the consensus loop exited on the missing body.
+        let sender = arc_crypto::signature::KeyPair::from_ed25519_secret_bytes(
+            &arc_crypto::hash_bytes(b"preimage sender").0,
+        );
+        let state = StateDB::with_genesis(&[(sender.address(), 1_000_000)]);
+        let mut executed = arc_types::Transaction::new_transfer(
+            sender.address(),
+            arc_crypto::hash_bytes(b"to"),
+            5,
+            0,
+        );
+        executed.sign(&sender).unwrap();
+        state
+            .execute_block_verified_at(&[executed.clone()], sender.address(), 1)
+            .expect("executes");
+        let pending: dashmap::DashMap<[u8; 32], arc_types::Transaction> = dashmap::DashMap::new();
+
+        // Cache-only lookup: missing - the old, fatal behaviour.
+        assert!(matches!(
+            exact_dag_preimages(&pending, &[executed.hash]),
+            Err(DagPreimageError::Missing(_))
+        ));
+        // State-aware lookup: found, and it is the exact body.
+        let found = exact_dag_preimages_from(&pending, Some(&state), &[executed.hash])
+            .expect("the canonical state holds the executed body");
+        assert_eq!(found[0].hash, executed.hash);
+
+        // And a responder now serves it.
+        let wanted: std::collections::HashSet<[u8; 32]> = [executed.hash.0].into_iter().collect();
+        let served = history_bodies(&pending, &state, &wanted);
+        assert_eq!(served.len(), 1, "a peer must be able to fetch an executed body");
+        assert_eq!(served[0].hash, executed.hash);
+    }
+
+    #[test]
+    fn a_body_nobody_holds_is_still_reported_missing() {
+        // The state fallback must not invent anything: a hash that is in
+        // neither place stays Missing, which now stalls the commit rather than
+        // exiting.
+        let state = StateDB::with_genesis(&[]);
+        let pending: dashmap::DashMap<[u8; 32], arc_types::Transaction> = dashmap::DashMap::new();
+        let unknown = arc_crypto::hash_bytes(b"nobody has this");
+        assert!(matches!(
+            exact_dag_preimages_from(&pending, Some(&state), &[unknown]),
+            Err(DagPreimageError::Missing(h)) if h == unknown
+        ));
+    }
 
     #[test]
     fn a_receipted_transaction_is_never_offered_again() {
