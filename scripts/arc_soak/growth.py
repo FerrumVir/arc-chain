@@ -29,6 +29,7 @@ HISTORY = {"state_blocks", "state_receipts", "state_tx_index", "state_full_trans
            "state_account_txs_entries", "state_event_log_heights", "state_event_log_entries"}
 PREFIXES = ("gauge_", "engine_", "state_", "mempool_", "dag_blocks", "finality_certificates_held",
             "pending_blocks_now")
+COUNTER_SUFFIXES = ("_us", "_total")
 
 
 def _read(path: str) -> List[dict]:
@@ -79,7 +80,10 @@ def series(run_dir: str, skip_s: float) -> Dict[Tuple[int, int], Dict[str, List[
         if not isinstance(h, (int, float)) or rec.get("t", 0) < first_t[key] + skip_s:
             continue
         for name, value in d.items():
-            if name.startswith(PREFIXES) and isinstance(value, (int, float)):
+            # Sizes only: a cumulative counter (a `_us` time total, say) grows
+            # by definition and is not a collection.
+            if (name.startswith(PREFIXES) and not name.endswith(COUNTER_SUFFIXES)
+                    and isinstance(value, (int, float))):
                 out[key][name].append((float(h), float(value)))
     for rec in samples:
         key = (rec.get("node"), rec.get("incarnation", 0))

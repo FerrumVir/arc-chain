@@ -39,7 +39,8 @@ class Report(unittest.TestCase):
             base = 0 if inc == 0 else 5000  # a restart resets in-memory sizes
             diag.append({"t": t, "node": 0, "incarnation": inc,
                          "diag": {"height": h, "engine_da_commitments": base + 3 * h,
-                                  "engine_dag_blocks": 4000, "state_blocks": h}})
+                                  "engine_dag_blocks": 4000, "state_blocks": h,
+                                  "state_snapshot_publish_us": 100 * h}})
             samples.append({"t": t, "node": 0, "incarnation": inc, "height": h,
                             "rss_kb": 100_000 + 2 * h * 1024 / 1000})
         write(d, "diag.jsonl", diag)
@@ -52,6 +53,7 @@ class Report(unittest.TestCase):
         self.assertIn("3000.00/1k", leak)
         self.assertIn("LEAK?", leak)
         self.assertNotIn("engine_dag_blocks", out)
+        self.assertNotIn("state_snapshot_publish_us", out, "a cumulative counter is not a size")
         self.assertIn("history", [l for l in out.splitlines() if "state_blocks" in l][0])
         rss = [l for l in out.splitlines() if "rss_mb" in l][0]
         self.assertIn("2.00/1k", rss)
