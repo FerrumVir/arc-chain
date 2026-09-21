@@ -811,7 +811,14 @@ struct PeerConnection<S> {
     dial_addr: SocketAddr,
     /// The peer's self-reported stake.
     stake: u64,
+    /// Whether THIS node dialed the connection (false: the peer did).
+    initiated_locally: bool,
+    installed_at: std::time::Instant,
 }
+
+/// Two connections to one peer installed within this window are treated as a
+/// simultaneous dial, and resolved by the tie-break in `install_directed`.
+const SIMULTANEOUS_DIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Tracks active peer send streams and metadata for outbound broadcast.
 struct PeerConnections<S = quinn::SendStream> {
@@ -833,7 +840,9 @@ impl<S> PeerConnections<S> {
     }
 
     /// Atomically install the newest authenticated connection generation for
-    /// one fixed validator identity.
+    /// one fixed validator identity, resolving a simultaneous dial
+    /// deterministically. Returns `None` when the new connection loses the
+    /// tie-break and must be closed.
     ///
     /// A clean process restart can leave the remote QUIC generation writable
     /// in the kernel for substantially longer than the validator process is
@@ -843,36 +852,63 @@ impl<S> PeerConnections<S> {
     /// so replacing this one identity's slot cannot admit a new member or grow
     /// the fixed connection set. Generation-checked cleanup below prevents the
     /// superseded reader from removing its replacement.
-    fn install_generation(
+    ///
+    /// Last-writer-wins was the rule, and under a simultaneous dial it let
+    /// each side keep a DIFFERENT connection and then drop the one the other
+    /// side kept - so both died. Both sides now compute the same answer:
+    /// within `SIMULTANEOUS_DIAL_WINDOW`, the connection initiated by the
+    /// lower validator address is the one kept. Outside the window the newer
+    /// connection still wins, which is the reconnect case.
+    fn install_directed(
         &self,
         key: [u8; 32],
+        local_key: [u8; 32],
         send: S,
         dial_addr: SocketAddr,
         stake: u64,
-    ) -> (u64, Option<u64>) {
+        initiated_locally: bool,
+    ) -> Option<(u64, Option<u64>)> {
         use dashmap::mapref::entry::Entry;
-
-        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::Instant::now();
+        // The initiator of the preferred connection is the lower address.
+        let preferred_initiator_is_local = local_key < key;
         match self.peers.entry(key) {
             Entry::Occupied(mut entry) => {
-                let previous_id = entry.get().connection_id;
+                let existing = entry.get();
+                let simultaneous =
+                    now.saturating_duration_since(existing.installed_at) < SIMULTANEOUS_DIAL_WINDOW;
+                if simultaneous
+                    && existing.initiated_locally == preferred_initiator_is_local
+                    && initiated_locally != preferred_initiator_is_local
+                {
+                    // The existing connection is the preferred one; so is the
+                    // peer's view of it. Keep it and drop the newcomer.
+                    return None;
+                }
+                let previous_id = existing.connection_id;
+                let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
                 entry.insert(PeerConnection {
                     connection_id,
                     send,
                     dial_addr,
                     stake,
+                    initiated_locally,
+                    installed_at: now,
                 });
-                (connection_id, Some(previous_id))
+                Some((connection_id, Some(previous_id)))
             }
             Entry::Vacant(entry) => {
+                let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
                 entry.insert(PeerConnection {
                     connection_id,
                     send,
                     dial_addr,
                     stake,
+                    initiated_locally,
+                    installed_at: now,
                 });
                 self.peer_count.fetch_add(1, Ordering::Relaxed);
-                (connection_id, None)
+                Some((connection_id, None))
             }
         }
     }
@@ -1414,14 +1450,25 @@ async fn run_transport_inner(
                 }
             }));
         }
-        // Wait for all dials to complete (or timeout)
-        for h in dial_handles {
-            let _ = h.await;
-        }
-        info!(
-            "Bootstrap dial phase complete, {} peers connected",
-            peer_count.load(Ordering::Relaxed)
-        );
+        // Do NOT wait for the dials here. This used to await every dial
+        // before the function reached its accept loop, so a node could not
+        // answer anyone's handshake while its own dials were in flight. Four
+        // nodes started together each waited on acceptors that did not exist
+        // yet: every dial timed out (3 x 15 s), the queued inbound handshakes
+        // were then abandoned "during the handshake", and the 30 s reconnect
+        // timer finally connected them - D1's "simultaneous mutual dialling
+        // deadlocks until timeout", which staggered startup had only avoided.
+        // The dials now finish in the background while inbound is served.
+        let dial_phase_peer_count = peer_count.clone();
+        tokio::spawn(async move {
+            for h in dial_handles {
+                let _ = h.await;
+            }
+            info!(
+                "Bootstrap dial phase complete, {} peers connected",
+                dial_phase_peer_count.load(Ordering::Relaxed)
+            );
+        });
     }
 
     // ── Dial persisted peers (from previous sessions) ───────────────────
@@ -1445,10 +1492,18 @@ async fn run_transport_inner(
             &rate_limiter,
             &allowed_validators,
         );
-        match dial_peer(&endpoint, *peer_addr, &ctx).await {
-            Ok(()) => info!("Connected to persisted peer {}", peer_addr),
-            Err(e) => debug!("Failed to connect to persisted peer {}: {}", peer_addr, e),
-        }
+        // In the background, like the bootstrap dials. Awaited here, one
+        // dead persisted address held back the outbound fanout and the accept
+        // loop - neither exists until this section finishes - for a full dial
+        // timeout, so a restarted validator could neither gossip nor accept.
+        let ep = endpoint.clone();
+        let addr = *peer_addr;
+        tokio::spawn(async move {
+            match dial_peer(&ep, addr, &ctx).await {
+                Ok(()) => info!("Connected to persisted peer {}", addr),
+                Err(e) => debug!("Failed to connect to persisted peer {}: {}", addr, e),
+            }
+        });
     }
 
     // ── Spawn outbound fanout task ──────────────────────────────────────
@@ -2120,8 +2175,21 @@ async fn dial_peer(
     // Atomically install the newest authenticated generation. A delayed reader
     // cleanup from the old generation is generation-checked below and cannot
     // remove this replacement.
-    let (connection_id, replaced_generation) =
-        connections.install_generation(remote.validator_address.0, send, dial_addr, remote.stake);
+    let Some((connection_id, replaced_generation)) = connections.install_directed(
+        remote.validator_address.0,
+        local_address.0,
+        send,
+        dial_addr,
+        remote.stake,
+        true,
+    ) else {
+        info!(
+            peer = %remote.validator_address,
+            "Simultaneous dial: keeping the connection the lower address initiated; closing this one"
+        );
+        conn.close(0u32.into(), b"simultaneous dial duplicate");
+        return Ok(());
+    };
     if let Some(replaced_generation) = replaced_generation {
         info!(
             peer = %remote.validator_address,
@@ -2238,8 +2306,21 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
     // Replace only this already-authenticated validator identity's generation.
     // The fixed allowlist above bounds the address map; replacement keeps the
     // peer count constant and makes a clean rolling restart immediately usable.
-    let (connection_id, replaced_generation) =
-        connections.install_generation(remote.validator_address.0, send, dial_addr, remote.stake);
+    let Some((connection_id, replaced_generation)) = connections.install_directed(
+        remote.validator_address.0,
+        local_address.0,
+        send,
+        dial_addr,
+        remote.stake,
+        false,
+    ) else {
+        info!(
+            peer = %remote.validator_address,
+            "Simultaneous dial: keeping the connection the lower address initiated; closing this one"
+        );
+        conn.close(0u32.into(), b"simultaneous dial duplicate");
+        return Ok(());
+    };
     if let Some(replaced_generation) = replaced_generation {
         info!(
             peer = %remote.validator_address,
@@ -3222,7 +3303,7 @@ mod tests {
         assert!(limiter.allow_at(&peer, MAX_PAYLOAD_SIZE, now + RATE_LIMIT_WINDOW_SECS));
     }
 
-    fn test_connections() -> (PeerConnections<()>, Arc<AtomicU32>) {
+    fn test_connections<S>() -> (PeerConnections<S>, Arc<AtomicU32>) {
         let (inbound_tx, _inbound_rx) = mpsc::channel(8);
         let peer_count = Arc::new(AtomicU32::new(0));
         (
@@ -3237,10 +3318,13 @@ mod tests {
         let peer = [3_u8; 32];
         let dial_addr: SocketAddr = "127.0.0.1:7331".parse().unwrap();
 
-        let (first_id, replaced) = connections.install_generation(peer, (), dial_addr, 500_000);
+        let (first_id, replaced) = connections
+            .install_directed(peer, LOCAL, (), dial_addr, 500_000, true)
+            .unwrap();
         assert_eq!(replaced, None);
-        let (replacement_id, replaced) =
-            connections.install_generation(peer, (), dial_addr, 500_000);
+        let (replacement_id, replaced) = connections
+            .install_directed(peer, LOCAL, (), dial_addr, 500_000, true)
+            .unwrap();
         assert_eq!(replaced, Some(first_id));
         assert!(replacement_id > first_id);
         assert_eq!(connections.peers.len(), 1);
@@ -3260,11 +3344,14 @@ mod tests {
         let peer = [9_u8; 32];
         let dial_addr: SocketAddr = "127.0.0.1:7332".parse().unwrap();
 
-        let (old_id, replaced) = connections.install_generation(peer, (), dial_addr, 500_000);
+        let (old_id, replaced) = connections
+            .install_directed(peer, LOCAL, (), dial_addr, 500_000, true)
+            .unwrap();
         assert_eq!(replaced, None);
         assert!(connections.remove_if_current(&peer, old_id));
-        let (replacement_id, replaced) =
-            connections.install_generation(peer, (), dial_addr, 500_000);
+        let (replacement_id, replaced) = connections
+            .install_directed(peer, LOCAL, (), dial_addr, 500_000, true)
+            .unwrap();
         assert_eq!(replaced, None);
         assert!(replacement_id > old_id);
 
@@ -3279,5 +3366,103 @@ mod tests {
 
         assert!(connections.remove_if_current(&peer, replacement_id));
         assert_eq!(peer_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// A local identity for the single-map tests (the lower of the pair).
+    const LOCAL: [u8; 32] = [1_u8; 32];
+
+    /// Replays one simultaneous dial between a lower address A and a higher
+    /// address B, with each side's two handshakes finishing in the given
+    /// order, and returns which connection each side kept. "A->B" is the one
+    /// A initiated.
+    fn simultaneous_dial(a_accepts_first: bool, b_accepts_first: bool) -> (&'static str, &'static str) {
+        let a = [1_u8; 32];
+        let b = [2_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7333".parse().unwrap();
+        let (a_view, _) = test_connections::<&'static str>();
+        let (b_view, _) = test_connections::<&'static str>();
+        // On A: "A->B" is a dial, "B->A" an accept. On B, the reverse.
+        let a_steps = [("A->B", true), ("B->A", false)];
+        let b_steps = [("B->A", true), ("A->B", false)];
+        for (view, local, remote, steps, accepts_first) in [
+            (&a_view, a, b, a_steps, a_accepts_first),
+            (&b_view, b, a, b_steps, b_accepts_first),
+        ] {
+            let mut order = steps.to_vec();
+            if accepts_first {
+                order.reverse();
+            }
+            for (label, dialed) in order {
+                let _ = view.install_directed(remote, local, label, addr, 500_000, dialed);
+            }
+        }
+        let kept = |view: &PeerConnections<&'static str>, remote: [u8; 32]| {
+            assert_eq!(view.peers.len(), 1, "exactly one connection per peer");
+            view.peers.get(&remote).unwrap().send
+        };
+        (kept(&a_view, b), kept(&b_view, a))
+    }
+
+    #[test]
+    fn a_simultaneous_dial_converges_on_one_connection_in_every_completion_order() {
+        // Under last-writer-wins, A could keep "B->A" while B kept "A->B",
+        // each then closing the connection the other side kept. Every order
+        // must now land both sides on the SAME connection.
+        for a_accepts_first in [false, true] {
+            for b_accepts_first in [false, true] {
+                let (a_kept, b_kept) = simultaneous_dial(a_accepts_first, b_accepts_first);
+                assert_eq!(
+                    (a_kept, b_kept),
+                    ("A->B", "A->B"),
+                    "order a_accepts_first={a_accepts_first} b_accepts_first={b_accepts_first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_losing_duplicate_neither_bumps_the_peer_count_nor_replaces_the_winner() {
+        let (connections, peer_count) = test_connections::<&'static str>();
+        let local = [1_u8; 32];
+        let remote = [2_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7334".parse().unwrap();
+        let (kept_id, _) = connections
+            .install_directed(remote, local, "A->B", addr, 500_000, true)
+            .unwrap();
+        assert!(
+            connections
+                .install_directed(remote, local, "B->A", addr, 500_000, false)
+                .is_none()
+        );
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+        assert_eq!(connections.peers.get(&remote).unwrap().connection_id, kept_id);
+        assert_eq!(connections.peers.get(&remote).unwrap().send, "A->B");
+    }
+
+    #[test]
+    fn outside_the_window_a_reconnect_replaces_the_old_connection_in_either_direction() {
+        // A restarted peer's new connection must win over a stale one even
+        // when the stale one had the preferred direction - otherwise a
+        // rolling restart would look like a partition until QUIC timed out.
+        let (connections, peer_count) = test_connections::<&'static str>();
+        let local = [1_u8; 32];
+        let remote = [2_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7335".parse().unwrap();
+        let (old_id, _) = connections
+            .install_directed(remote, local, "A->B (stale)", addr, 500_000, true)
+            .unwrap();
+        {
+            let mut entry = connections.peers.get_mut(&remote).unwrap();
+            entry.installed_at = entry
+                .installed_at
+                .checked_sub(SIMULTANEOUS_DIAL_WINDOW + std::time::Duration::from_secs(1))
+                .expect("monotonic clock far enough from boot");
+        }
+        let (new_id, replaced) = connections
+            .install_directed(remote, local, "B->A (restart)", addr, 500_000, false)
+            .expect("a reconnect outside the window replaces");
+        assert_eq!(replaced, Some(old_id));
+        assert_eq!(connections.peers.get(&remote).unwrap().connection_id, new_id);
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
     }
 }
