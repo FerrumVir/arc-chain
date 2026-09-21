@@ -6242,8 +6242,11 @@ fn main() -> Result<()> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn run_arc_node() -> Result<()> {
+    // Colour codes only for a person at a terminal; in a log file they are
+    // bytes on every line that every reader has to strip.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("arc=info".parse()?))
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     let mut cli = Cli::parse();

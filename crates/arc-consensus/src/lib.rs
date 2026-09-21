@@ -2587,7 +2587,7 @@ impl ConsensusEngine {
                 if !committed_set.contains(&hash)
                     && let Some(block) = self.dag.get(&hash)
                 {
-                    info!(
+                    debug!(
                         round = r,
                         hash = %block.hash,
                         "Block committed via two-round rule"
@@ -2978,7 +2978,7 @@ impl ConsensusEngine {
             // restoring strict parent validation for subsequent rounds.
             self.force_advanced.store(false, Ordering::SeqCst);
             self.reset_round_timer();
-            info!(
+            debug!(
                 old_round = current,
                 new_round = new_round,
                 blocks = round_blocks.len(),

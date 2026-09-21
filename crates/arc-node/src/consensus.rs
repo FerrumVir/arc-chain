@@ -2335,7 +2335,7 @@ impl ConsensusManager {
                         let height = certificate.height;
                         match self.engine.register_finality_certificate(certificate.clone()) {
                             Ok(signing) => {
-                                info!(
+                                debug!(
                                     height,
                                     block = %certificate.block_hash,
                                     state_root = %certificate.state_root,
@@ -3364,7 +3364,7 @@ impl ConsensusManager {
                         }
                     }
                     if !transactions.is_empty() {
-                        info!(
+                        debug!(
                             "Drained {} txs from mempool for DAG proposal",
                             transactions.len()
                         );
@@ -3378,9 +3378,13 @@ impl ConsensusManager {
                             );
                         }
                     } else if mempool_len_pre > 0 {
-                        warn!(
+                        // Routine, not a fault: everything drained was either
+                        // already receipted, not admissible yet, or not the
+                        // one transaction a protocol-4 block may carry.
+                        debug!(
                             mempool_len = mempool_len_pre,
-                            "Mempool reported entries but drain returned none"
+                            stale,
+                            "Nothing proposable after filtering the drained mempool"
                         );
                     }
 
@@ -3454,7 +3458,7 @@ impl ConsensusManager {
                                     );
                                     return;
                                 }
-                                info!(
+                                debug!(
                                     round = block.round,
                                     txs = block.transactions.len(),
                                     hash = %block.hash,
@@ -3680,7 +3684,7 @@ impl ConsensusManager {
             }
             if !committed.is_empty() {
                 for dag_block in &committed {
-                    info!(
+                    debug!(
                         round = dag_block.round,
                         hash = %dag_block.hash,
                         txs = dag_block.transactions.len(),
@@ -3945,18 +3949,39 @@ impl ConsensusManager {
 
                     let elapsed = started.elapsed();
                     let success = receipts.iter().filter(|receipt| receipt.success).count();
-                    info!(
-                        height = block.header.height,
-                        txs = committed_txs.len(),
-                        success,
-                        elapsed_ms = elapsed.as_millis(),
-                        mode = if self.proposer_mode {
-                            "proposer"
-                        } else {
-                            "full"
-                        },
-                        "Block produced and durably bound to DAG commit"
-                    );
+                    // Per block at debug: at info this and its neighbours were
+                    // about seven lines per height, ~1 GB per node per day. A
+                    // block that carries transactions is still worth a line,
+                    // and so is a progress mark every 1,000 heights.
+                    let height_now = block.header.height;
+                    if committed_txs.is_empty() {
+                        debug!(
+                            height = height_now,
+                            elapsed_ms = elapsed.as_millis(),
+                            "Block produced and durably bound to DAG commit"
+                        );
+                    } else {
+                        info!(
+                            height = height_now,
+                            txs = committed_txs.len(),
+                            success,
+                            elapsed_ms = elapsed.as_millis(),
+                            mode = if self.proposer_mode {
+                                "proposer"
+                            } else {
+                                "full"
+                            },
+                            "Block produced and durably bound to DAG commit"
+                        );
+                    }
+                    if height_now.is_multiple_of(1_000) {
+                        info!(
+                            height = height_now,
+                            dag_round = self.engine.current_round(),
+                            committed_round = self.engine.last_committed_round(),
+                            "Canonical progress"
+                        );
+                    }
                     crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.canonical_blocks_produced);
 
                     // ── the exact local commit record ────────────────────
