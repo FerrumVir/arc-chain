@@ -86,6 +86,12 @@ counters!(
     state_snapshot_publish_us,
     // already-receipted transactions refused re-proposal / re-admission
     stale_transactions_dropped,
+    // protocol 4: committed transactions a canonical block could not carry
+    protocol4_omitted_transactions,
+    // native-inference vote exchange between validators
+    native_votes_gossiped,
+    native_votes_accepted,
+    native_votes_refused,
     // legacy DAG WAL retention
     dag_wal_segments_deleted,
     dag_wal_prune_us,

@@ -571,6 +571,80 @@ impl StateDB {
         Ok(())
     }
 
+    /// The subset of `candidates` a protocol-4 block may carry, chosen the
+    /// same way by every node.
+    ///
+    /// A protocol-4 block carries at most ONE native-inference transaction and
+    /// nothing else. The multi-validator commit path used to hand every
+    /// committed transaction to block execution, which refuses anything else -
+    /// and it treats an execution refusal as fatal. Two native requests in one
+    /// DAG block, or one ordinary transfer, would therefore have stopped every
+    /// node's consensus loop at the same committed block.
+    ///
+    /// Selection is deterministic, so all nodes, which hold the same committed
+    /// preimages and the same state, pick the same transaction: candidates are
+    /// considered in hash order, and the first native transaction that passes
+    /// the full block-admission check wins. Everything else is omitted - never
+    /// executed, never turned into a failed receipt - and a byzantine proposer
+    /// who packs a block with junk can at worst make it carry nothing.
+    ///
+    /// Off protocol 4 this returns every candidate unchanged.
+    pub fn select_native_block_transactions(
+        &self,
+        candidates: &[arc_types::Transaction],
+    ) -> Vec<arc_types::Transaction> {
+        if self.native_inference_context().is_none() {
+            return candidates.to_vec();
+        }
+        let mut ordered: Vec<&arc_types::Transaction> = candidates
+            .iter()
+            .filter(|tx| is_native_body(&tx.body))
+            .collect();
+        ordered.sort_by_key(|tx| tx.hash.0);
+        for tx in ordered {
+            if self
+                .validate_native_inference_block_admission(std::slice::from_ref(tx))
+                .is_ok()
+            {
+                return vec![tx.clone()];
+            }
+        }
+        Vec::new()
+    }
+
+    /// True for a native-inference transaction body.
+    pub fn is_native_inference_transaction(tx: &arc_types::Transaction) -> bool {
+        is_native_body(&tx.body)
+    }
+
+    /// True if `tx` could be carried by the next protocol-4 block on its own -
+    /// i.e. it is worth keeping for a later proposal.
+    ///
+    /// Several validators may each reach the vote threshold and submit a
+    /// finalize for the same request; once one executes, the others can never
+    /// be admitted. Re-queueing every unselected native transaction would make
+    /// those circulate forever - exactly the defect already fixed for receipted
+    /// transfers - so only transactions that are still admissible go back.
+    ///
+    /// "Not admissible right now" is not the same as "never": a requester's
+    /// nonce-2 request is inadmissible while its nonce-1 request is still
+    /// pending, and becomes admissible once that one executes. So a
+    /// transaction whose nonce is AHEAD of its sender's account is kept; one
+    /// at or behind it that still fails can never succeed and is dropped.
+    pub fn native_transaction_still_admissible(&self, tx: &arc_types::Transaction) -> bool {
+        if !is_native_body(&tx.body) {
+            return false;
+        }
+        if self
+            .validate_native_inference_block_admission(std::slice::from_ref(tx))
+            .is_ok()
+        {
+            return true;
+        }
+        let account_nonce = self.get_account(&tx.from).map(|a| a.nonce).unwrap_or(0);
+        tx.nonce > account_nonce
+    }
+
     pub(crate) fn validate_native_inference_block_admission(
         &self,
         transactions: &[arc_types::Transaction],
@@ -852,6 +926,23 @@ impl StateDB {
                 "native ingress preflight requires the next canonical block height".into(),
             ));
         }
+        self.plan_native_transaction(tx, context, execution_height)
+            .map(|_| ())
+    }
+
+    /// The ingress preflight: `validate_native_inference_transaction_admission_at`
+    /// for the next canonical height, read under the same lock. A caller that
+    /// read the height itself could lose a race with block application and be
+    /// refused for a height that had just moved on - a spurious rejection of
+    /// a valid request whenever blocks are fast.
+    pub fn validate_native_inference_transaction_admission_next(
+        &self,
+        tx: &arc_types::Transaction,
+        context: &InferenceAdmissionContext,
+    ) -> Result<(), StateError> {
+        let _guard = self.native_inference_execution.lock();
+        self.require_healthy_wal()?;
+        let execution_height = self.height().saturating_add(1);
         self.plan_native_transaction(tx, context, execution_height)
             .map(|_| ())
     }
@@ -2417,6 +2508,131 @@ mod tests {
         );
         assert_eq!(receipt.metadata.output, b"deterministic output");
         drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn protocol4_commit_selection_is_one_admissible_native_transaction_in_hash_order() {
+        let f = fixture("select-native");
+        let state = &f.ledger.state;
+        let hashes = |txs: Vec<arc_types::Transaction>| -> Vec<Hash256> {
+            txs.iter().map(|tx| tx.hash).collect()
+        };
+        let mut transfer = arc_types::Transaction::new_transfer(
+            f.requester.address(),
+            f.validators[0].address(),
+            1,
+            0,
+        );
+        state.sign_transaction(&mut transfer, &f.requester).unwrap();
+        // Off protocol 4, selection is the identity.
+        assert_eq!(
+            hashes(state.select_native_block_transactions(&[transfer.clone()])),
+            vec![transfer.hash]
+        );
+
+        state.activate_native_inference(f.context.clone()).unwrap();
+        let first = request(&f, 0, 100);
+        let id = first.job.request_id();
+        let r0 = native_request(state, &f.requester, first);
+        let r1 = native_request(state, &f.requester, request(&f, 1, 100));
+        // Whatever order the DAG block listed them in: the transfer can never
+        // ride a protocol-4 block and nonce 1 is not admissible yet, so the
+        // nonce-0 request alone is selected.
+        for candidates in [
+            vec![transfer.clone(), r0.clone(), r1.clone()],
+            vec![r1.clone(), r0.clone(), transfer.clone()],
+        ] {
+            assert_eq!(
+                hashes(state.select_native_block_transactions(&candidates)),
+                vec![r0.hash]
+            );
+        }
+        assert!(
+            state
+                .select_native_block_transactions(&[transfer.clone()])
+                .is_empty(),
+            "junk alone makes an empty block, not a failed one"
+        );
+        assert!(state.native_transaction_still_admissible(&r0));
+        assert!(
+            state.native_transaction_still_admissible(&r1),
+            "a nonce ahead of its account is kept for a later block"
+        );
+        assert!(!state.native_transaction_still_admissible(&transfer));
+
+        state
+            .execute_block_adaptive_at(&[r0.clone()], f.validators[0].address(), 10)
+            .unwrap();
+        assert!(
+            !state.native_transaction_still_admissible(&r0),
+            "an executed request can never be admitted again, so it is not re-queued"
+        );
+
+        // Two validators each reach the threshold and submit a finalize for
+        // the same request. Every node must pick the same single transaction:
+        // the lowest hash among the admissible ones, in any candidate order.
+        let fin_a = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
+        let fin_b = native_finalize(state, &f.validators[1], 0, id, certificate(&f, id));
+        let expected = [fin_a.hash, fin_b.hash, r1.hash]
+            .into_iter()
+            .min_by_key(|hash| hash.0)
+            .unwrap();
+        for candidates in [
+            vec![fin_a.clone(), fin_b.clone(), r1.clone()],
+            vec![r1.clone(), fin_b.clone(), fin_a.clone()],
+        ] {
+            assert_eq!(
+                hashes(state.select_native_block_transactions(&candidates)),
+                vec![expected]
+            );
+        }
+        state
+            .execute_block_adaptive_at(&[fin_a.clone()], f.validators[0].address(), 20)
+            .unwrap();
+        assert!(
+            !state.native_transaction_still_admissible(&fin_b),
+            "the losing finalize is dead once the request settled; it must not circulate"
+        );
+        assert!(state.native_transaction_still_admissible(&r1));
+        assert_eq!(
+            hashes(state.select_native_block_transactions(&[fin_b.clone(), r1.clone()])),
+            vec![r1.hash]
+        );
+        let dir = f.dir.clone();
+        drop(f);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_ingress_preflight_admits_exactly_the_next_heights_nonce() {
+        let f = fixture("admission-next");
+        let state = &f.ledger.state;
+        let context = f.context.clone();
+        state.activate_native_inference(context.clone()).unwrap();
+        let r0 = native_request(state, &f.requester, request(&f, 0, 100));
+        let r1 = native_request(state, &f.requester, request(&f, 1, 100));
+        state
+            .validate_native_inference_transaction_admission_next(&r0, &context)
+            .unwrap();
+        let refused = state
+            .validate_native_inference_transaction_admission_next(&r1, &context)
+            .unwrap_err()
+            .to_string();
+        assert!(!refused.is_empty(), "the refusal must carry a reason");
+        state
+            .execute_block_adaptive_at(&[r0.clone()], f.validators[0].address(), 10)
+            .unwrap();
+        state
+            .validate_native_inference_transaction_admission_next(&r1, &context)
+            .unwrap();
+        assert!(
+            state
+                .validate_native_inference_transaction_admission_next(&r0, &context)
+                .is_err()
+        );
+        let dir = f.dir.clone();
+        drop(f);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

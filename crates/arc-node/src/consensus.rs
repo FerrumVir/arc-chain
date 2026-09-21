@@ -637,6 +637,9 @@ pub struct ConsensusManager {
     /// disables snapshots, which is correct but leaves recovery replaying the
     /// whole WAL.
     pub snapshot_every_blocks: u64,
+    /// The native-inference vote relay, when this node runs the native worker:
+    /// its own votes go out through the loop, and peers' votes come back in.
+    pub native_vote_relay: Option<Arc<crate::native_inference::NativeFinalizeSink>>,
     /// DAG decision commitment -> the canonical height it produced, over the
     /// window of anchors a peer could still serve. This is what makes applying
     /// an anchor idempotent across a lost commit record.
@@ -719,6 +722,7 @@ impl ConsensusManager {
             recovered_preimages: Vec::new(),
             signing_record_path: None,
             snapshot_every_blocks: DEFAULT_SNAPSHOT_EVERY_BLOCKS,
+            native_vote_relay: None,
             applied_decisions: dashmap::DashMap::new(),
             decisions_indexed_through: std::sync::atomic::AtomicU64::new(0),
             require_full_committee_at_genesis: false,
@@ -777,6 +781,7 @@ impl ConsensusManager {
             recovered_preimages: Vec::new(),
             signing_record_path: None,
             snapshot_every_blocks: DEFAULT_SNAPSHOT_EVERY_BLOCKS,
+            native_vote_relay: None,
             applied_decisions: dashmap::DashMap::new(),
             decisions_indexed_through: std::sync::atomic::AtomicU64::new(0),
             require_full_committee_at_genesis: false,
@@ -1252,6 +1257,7 @@ impl ConsensusManager {
         // Committed DAG blocks waiting for transaction bodies, in round order.
         let mut commit_backlog: Vec<arc_consensus::DagBlock> = Vec::new();
         let mut commit_stall_fetch_at: Option<Instant> = None;
+        let mut vote_refusal_logged_at: Option<Instant> = None;
         // (committed DAG round, legacy DAG WAL sequence) pairs, so segments
         // wholly below the retention horizon can be deleted. See the pruning
         // step in the commit path.
@@ -1929,6 +1935,11 @@ impl ConsensusManager {
                                     // re-broadcast, and Mempool deduplicates its
                                     // resident set, so accepting this retry does
                                     // not create a wire echo loop.
+                                    if state.native_inference_context().is_some()
+                                        && !arc_state::StateDB::is_native_inference_transaction(&tx)
+                                    {
+                                        continue;
+                                    }
                                     // Already executed: re-admitting it is how
                                     // a transaction circulated forever.
                                     if state.receipts.contains_key(&tx.hash.0) {
@@ -2149,6 +2160,43 @@ impl ConsensusManager {
                         } => {
                             inbound_history.push((source, blocks, transactions));
                         }
+                        InboundMessage::NativeInferenceVote {
+                            source,
+                            request_id,
+                            tokens,
+                            vote,
+                        } => {
+                            if let Some(relay) = self.native_vote_relay.as_ref() {
+                                let output_hash = vote.output_hash;
+                                let decision = crate::native_inference::StoredVote {
+                                    request_id,
+                                    output_hash,
+                                    tokens,
+                                    vote,
+                                };
+                                match relay.accept_peer_vote(&decision) {
+                                    Ok(()) => crate::consensus_diagnostics::bump(
+                                        &crate::consensus_diagnostics::DIAG.native_votes_accepted,
+                                    ),
+                                    Err(error) => {
+                                        crate::consensus_diagnostics::bump(
+                                            &crate::consensus_diagnostics::DIAG.native_votes_refused,
+                                        );
+                                        // Refusals are normal after a request
+                                        // finalizes, so they are rate-limited -
+                                        // but the reason must be visible, or a
+                                        // certificate that never forms cannot
+                                        // be explained.
+                                        if vote_refusal_logged_at
+                                            .is_none_or(|at: Instant| at.elapsed() >= std::time::Duration::from_secs(2))
+                                        {
+                                            vote_refusal_logged_at = Some(Instant::now());
+                                            warn!(%source, %request_id, ?error, "Native vote not counted");
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         InboundMessage::CheckpointRequest {
                             source,
                             needed_below_height,
@@ -2184,6 +2232,17 @@ impl ConsensusManager {
                 }
             }
 
+            if let (Some(relay), Some(tx_chan)) = (self.native_vote_relay.as_ref(), outbound_tx.as_ref()) {
+                for decision in relay.take_outbound_votes(64) {
+                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.native_votes_gossiped);
+                    let sent = tx_chan.try_send(OutboundMessage::BroadcastNativeInferenceVote {
+                        request_id: decision.request_id,
+                        tokens: decision.tokens,
+                        vote: decision.vote,
+                    });
+                    crate::consensus_diagnostics::note_send(&sent);
+                }
+            }
             phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_inbound_us, phase_mark);
             // ── 0b. Absence and finality certificates ───────────────────
             // Every one of these is verified against the frozen committee and
@@ -3139,6 +3198,17 @@ impl ConsensusManager {
                     let mempool_len_pre = mempool.len();
                     let mut transactions = mempool.drain(drain_limit);
                     let stale = retain_unreceipted(&state, &mut transactions);
+                    if state.active_protocol_version().major == 4 && !transactions.is_empty() {
+                        let selected = state.select_native_block_transactions(&transactions);
+                        for transaction in transactions.drain(..) {
+                            if !selected.iter().any(|kept| kept.hash == transaction.hash)
+                                && state.native_transaction_still_admissible(&transaction)
+                            {
+                                let _ = mempool.insert(transaction);
+                            }
+                        }
+                        transactions = selected;
+                    }
                     if stale > 0 {
                         crate::consensus_diagnostics::DIAG
                             .stale_transactions_dropped
@@ -3576,6 +3646,39 @@ impl ConsensusManager {
                             omitted = original.saturating_sub(committed_txs.len()),
                             "Omitted state-stale v3 DAG envelopes without creating failed history"
                         );
+                    }
+
+                    // Protocol 4: at most one native-inference transaction per
+                    // canonical block, chosen deterministically. Without this,
+                    // execution refused the block and the refusal is fatal
+                    // below - so two requests in one committed DAG block would
+                    // have stopped every node at the same place.
+                    if state.active_protocol_version().major == 4 {
+                        let selected = state.select_native_block_transactions(&committed_txs);
+                        let omitted = committed_txs.len().saturating_sub(selected.len());
+                        if omitted > 0 {
+                            // Native envelopes that lost the one slot stay
+                            // eligible for a later leader; anything else can
+                            // never execute on this chain and is dropped.
+                            for transaction in committed_txs.iter() {
+                                if !selected.iter().any(|kept| kept.hash == transaction.hash)
+                                    && !state.receipts.contains_key(&transaction.hash.0)
+                                    && state.native_transaction_still_admissible(transaction)
+                                {
+                                    let _ = mempool.insert(transaction.clone());
+                                }
+                            }
+                            debug!(
+                                block = %dag_block.hash,
+                                omitted,
+                                "Protocol-4 block carries one native transaction; the rest stay \
+                                 eligible or are dropped"
+                            );
+                            crate::consensus_diagnostics::DIAG
+                                .protocol4_omitted_transactions
+                                .fetch_add(omitted as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        committed_txs = selected;
                     }
 
                     let cross_shard_hashes: Vec<Hash256> = committed_txs

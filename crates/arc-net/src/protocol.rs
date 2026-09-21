@@ -68,6 +68,8 @@ pub enum MessageType {
     CheckpointRequest = 0x19,
     /// A checkpoint envelope and the snapshot payload it authorises.
     CheckpointResponse = 0x1A,
+    /// One validator's signed vote on a native-inference result.
+    NativeInferenceVote = 0x1B,
 }
 
 impl MessageType {
@@ -99,6 +101,7 @@ impl MessageType {
             0x18 => Some(Self::DagHistoryResponse),
             0x19 => Some(Self::CheckpointRequest),
             0x1A => Some(Self::CheckpointResponse),
+            0x1B => Some(Self::NativeInferenceVote),
             _ => None,
         }
     }
@@ -218,6 +221,26 @@ pub struct CheckpointResponseMessage {
     pub envelope: arc_consensus::view_change::CheckpointEnvelope,
     pub payload: Vec<u8>,
 }
+
+/// One validator's signed vote on a native-inference result, with the output it
+/// signed.
+///
+/// Votes used to stay inside the process that made them, and a finalize
+/// transaction needs a strict supermajority of stake - so on any committee
+/// larger than one, no request could ever finalize. The vote is
+/// self-authenticating: its signature commits to the request, the output hash
+/// and the output length, and the receiver checks it against the frozen
+/// committee and the pending request before it counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeInferenceVoteMessage {
+    pub request_id: arc_crypto::Hash256,
+    pub tokens: Vec<u32>,
+    pub vote: arc_types::inference_contract::InferenceVote,
+}
+
+/// Output tokens a gossiped vote may carry. The receiver also enforces the
+/// request's own `max_output_bytes`; this is the transport-level bound.
+pub const MAX_NATIVE_VOTE_TOKENS: usize = 65_536;
 
 /// One validator's absence attestation, gossiped so peers can assemble a
 /// quorum certificate. The payload is self-authenticating: it carries its own

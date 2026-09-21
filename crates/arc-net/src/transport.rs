@@ -209,6 +209,14 @@ pub enum InboundMessage {
         envelope: Box<arc_consensus::view_change::CheckpointEnvelope>,
         payload: Vec<u8>,
     },
+    /// A validator's signed native-inference vote. Self-authenticating; the
+    /// receiver verifies it before it counts.
+    NativeInferenceVote {
+        source: Hash256,
+        request_id: Hash256,
+        tokens: Vec<u32>,
+        vote: arc_types::inference_contract::InferenceVote,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -247,6 +255,11 @@ pub enum OutboundMessage {
         target: Hash256,
         envelope: Box<arc_consensus::view_change::CheckpointEnvelope>,
         payload: Vec<u8>,
+    },
+    BroadcastNativeInferenceVote {
+        request_id: Hash256,
+        tokens: Vec<u32>,
+        vote: arc_types::inference_contract::InferenceVote,
     },
     /// Broadcast a state diff (Propose-Verify protocol).
     BroadcastStateDiff {
@@ -1598,6 +1611,22 @@ async fn run_transport_inner(
                             .await;
                     }
                 }
+                OutboundMessage::BroadcastNativeInferenceVote {
+                    request_id,
+                    tokens,
+                    vote,
+                } => {
+                    let payload = crate::protocol::NativeInferenceVoteMessage {
+                        request_id,
+                        tokens,
+                        vote,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::NativeInferenceVote, &bytes)
+                            .await;
+                    }
+                }
                 OutboundMessage::SendCheckpointRequest {
                     target,
                     needed_below_height,
@@ -2882,6 +2911,22 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => warn!("Bad DagHistoryResponse from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::NativeInferenceVote => {
+                match deserialize_message::<crate::protocol::NativeInferenceVoteMessage>(&data) {
+                    Ok(msg) if msg.tokens.len() <= crate::protocol::MAX_NATIVE_VOTE_TOKENS => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::NativeInferenceVote {
+                                source: peer_address,
+                                request_id: msg.request_id,
+                                tokens: msg.tokens,
+                                vote: msg.vote,
+                            })
+                            .await;
+                    }
+                    Ok(_) => warn!("Oversized NativeInferenceVote from {}", peer_address),
+                    Err(e) => warn!("Bad NativeInferenceVote from {}: {}", peer_address, e),
                 }
             }
             MessageType::CheckpointRequest => {

@@ -7128,6 +7128,9 @@ async fn run_arc_node() -> Result<()> {
     // than hot-looping, and is shut down explicitly below.
     let native_runtime_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut native_runtime_handle: Option<arc_node::native_inference::NativeRuntimeHandle> = None;
+    // The finalize sink is shared: the runtime emits this validator's votes into
+    // it, and the consensus loop gossips them and feeds peers' votes back in.
+    let mut native_vote_relay: Option<Arc<arc_node::native_inference::NativeFinalizeSink>> = None;
     if cli.native_inference_runtime {
         use arc_node::native_inference as ni;
         let context = state.native_inference_context().ok_or_else(|| {
@@ -7146,6 +7149,12 @@ async fn run_arc_node() -> Result<()> {
         // runtime is generic over them and the parts cannot be shared by move.
         // `DecisionStore::open` is a directory handle, so rebuilding it is
         // cheap and lands on the same durable path either way.
+        let shared_sink = Arc::new(ni::NativeFinalizeSink::new(
+            state.clone(),
+            mempool.clone(),
+            Arc::new(validator_keypair.clone()),
+        ));
+        native_vote_relay = Some(shared_sink.clone());
         let native_parts = || -> anyhow::Result<(
             Arc<ni::KeyPairVoteSigner>,
             Arc<ni::NativeFinalizeSink>,
@@ -7159,12 +7168,7 @@ async fn run_arc_node() -> Result<()> {
             )
             .map_err(|e| anyhow::anyhow!("native decision store: {e}"))?;
             let signer = Arc::new(ni::KeyPairVoteSigner::new(validator_keypair.clone()));
-            let sink = Arc::new(ni::NativeFinalizeSink::new(
-                state.clone(),
-                mempool.clone(),
-                Arc::new(validator_keypair.clone()),
-            ));
-            Ok((signer, sink, store))
+            Ok((signer, shared_sink.clone(), store))
         };
         // The deterministic test executor loads no model and never consults
         // this field; it is carried only so its output is domain-separated by
@@ -7581,6 +7585,7 @@ async fn run_arc_node() -> Result<()> {
         if let Some(blocks) = cli.snapshot_every_blocks {
             consensus.snapshot_every_blocks = blocks;
         }
+        consensus.native_vote_relay = native_vote_relay.clone();
         if consensus.snapshot_every_blocks == 0 {
             tracing::warn!(
                 "State snapshots are DISABLED; every restart replays the entire WAL, and that \

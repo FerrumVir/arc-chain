@@ -3157,16 +3157,52 @@ async fn native_inference_receipt(
     })))
 }
 
+/// Why `/tx/submit_signed` refused a transaction. Most refusals carry only a
+/// status; the native-inference preflight also says which admission rule
+/// failed, so a client can tell "not yet" (a future nonce) from "never".
+#[derive(Debug)]
+pub(crate) struct SubmitRefusal {
+    status: StatusCode,
+    reason: String,
+}
+
+impl SubmitRefusal {
+    fn new(status: StatusCode, reason: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<StatusCode> for SubmitRefusal {
+    fn from(status: StatusCode) -> Self {
+        Self::new(status, String::new())
+    }
+}
+
+impl PartialEq<StatusCode> for SubmitRefusal {
+    fn eq(&self, status: &StatusCode) -> bool {
+        self.status == *status
+    }
+}
+
+impl axum::response::IntoResponse for SubmitRefusal {
+    fn into_response(self) -> axum::response::Response {
+        (self.status, self.reason).into_response()
+    }
+}
+
 async fn submit_signed_tx(
     AxumState(node): AxumState<NodeState>,
     Json(mut tx): Json<Transaction>,
-) -> Result<Json<SubmitTxResponse>, StatusCode> {
+) -> Result<Json<SubmitTxResponse>, SubmitRefusal> {
     // `sig_verified` is a process-local cache hint, never caller authority.
     // Its wire deserializer now forces false; verify both type/body integrity
     // and the cryptographic signature before anything enters the mempool.
     tx.sig_verified = false;
     if uses_unready_paid_inference_protocol(&tx) && !is_native_inference_transaction(&tx) {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     if let TxBody::WasmCall(body) = &tx.body
         && node.state.is_evm_contract(&body.contract)
@@ -3174,10 +3210,10 @@ async fn submit_signed_tx(
         // Read-only eth_call remains available. State-changing EVM calls are
         // rejected at ingress as well as by the canonical executor so clients
         // never receive a misleading pending transaction for a disabled path.
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     if node.state.verify_transaction_signature(&tx).is_err() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
     // A native-inference chain's committee is frozen by its binding. The
     // executor refuses a registry change too (so a transaction that slips in
@@ -3187,35 +3223,39 @@ async fn submit_signed_tx(
     if arc_state::StateDB::is_registry_change(&tx)
         && node.state.refuse_registry_change_under_native_binding().is_err()
     {
-        return Err(StatusCode::CONFLICT);
+        return Err(StatusCode::CONFLICT.into());
+    }
+    // A protocol-4 block carries only a native-inference transaction, so
+    // anything else can never be included. Accepting it would hand the client
+    // a hash for a transaction that will never exist - refuse it here, as
+    // `submit_tx` already does.
+    if node.state.native_inference_context().is_some()
+        && !arc_state::StateDB::is_native_inference_transaction(&tx)
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     if is_native_inference_transaction(&tx) {
         let context = match node.state.try_native_inference_context() {
             Ok(Some(context)) => context,
-            Ok(None) | Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            Ok(None) | Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into()),
         };
         // This pure preflight is the same state admission used by the
         // canonical executor. It rejects type/body disguises, stale nonce,
         // unfrozen members, bad certificates, expired requests and every
         // non-private activation before the mempool mutates.
-        if node
+        if let Err(error) = node
             .state
-            .validate_native_inference_transaction_admission_at(
-                &tx,
-                &context,
-                node.state.height().saturating_add(1),
-            )
-            .is_err()
+            .validate_native_inference_transaction_admission_next(&tx, &context)
         {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(SubmitRefusal::new(StatusCode::BAD_REQUEST, error.to_string()));
         }
     } else if match node.state.try_native_inference_context() {
         Ok(Some(_)) => true,
         Ok(None) => false,
-        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into()),
     } {
         // Private protocol-4 blocks permit one native transition only.
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     // The issuance switch gates every public mempool ingress, not just the
     // coordinator helper. Otherwise a caller holding any validator key could
@@ -3225,19 +3265,19 @@ async fn submit_signed_tx(
     if tx.tx_type == TxType::CommunityInferenceReward
         && !community_rewards_v1_protocol_active(&node)
     {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     tx.sig_verified = true;
     if node.state.active_protocol_version().major == 3
         && node.state.validate_v3_transaction_admission(&tx).is_err()
     {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
     if node.mempool.contains(&tx.hash) {
-        return Err(StatusCode::CONFLICT);
+        return Err(StatusCode::CONFLICT.into());
     }
     if !consume_tx_sender_allowance(&node, &tx.from) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return Err(StatusCode::TOO_MANY_REQUESTS.into());
     }
     let hash = tx.hash.to_hex();
     tracing::debug!(
@@ -3262,7 +3302,7 @@ async fn submit_signed_tx(
         }
         Err(e) => {
             tracing::debug!(tx_hash = %hash, error = ?e, "Rejected signed transaction");
-            Err(StatusCode::CONFLICT)
+            Err(StatusCode::CONFLICT.into())
         }
     }
 }
@@ -3464,6 +3504,18 @@ async fn faucet_claim(
         ));
     }
 
+    // A faucet claim is an ordinary transfer, which a protocol-4 block can
+    // never carry. Refuse it rather than return a hash that will never land.
+    if node.state.native_inference_context().is_some() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(FaucetErrorResponse {
+                error: "this chain is a private native-inference (protocol-4) chain; its blocks \
+                        carry only native inference transactions, so the faucet is unavailable"
+                    .into(),
+            }),
+        ));
+    }
     let marker = if node.state.active_protocol_version().major == 3 {
         arc_types::transaction::FaucetClaimBody::v3_marker_address(&to)
     } else {

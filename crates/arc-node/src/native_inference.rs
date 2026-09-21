@@ -460,7 +460,14 @@ pub struct NativeFinalizeSink {
     submitter: Arc<KeyPair>,
     candidates: Mutex<BTreeMap<[u8; 32], CandidateVotes>>,
     emission_gate: Mutex<()>,
+    /// This validator's OWN votes, waiting for the consensus loop to gossip
+    /// them. Bounded: a vote that cannot be sent is not a correctness problem
+    /// (other members' votes can still reach threshold), only a delay.
+    outbound: Mutex<std::collections::VecDeque<StoredVote>>,
 }
+
+/// Votes queued for gossip at once.
+const MAX_OUTBOUND_NATIVE_VOTES: usize = 1_024;
 
 #[derive(Default)]
 struct CandidateVotes {
@@ -481,7 +488,23 @@ impl NativeFinalizeSink {
             submitter,
             candidates: Mutex::new(BTreeMap::new()),
             emission_gate: Mutex::new(()),
+            outbound: Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// This validator's own votes, for the consensus loop to gossip.
+    pub fn take_outbound_votes(&self, max: usize) -> Vec<StoredVote> {
+        let mut queue = self.outbound.lock();
+        let n = max.min(queue.len());
+        queue.drain(..n).collect()
+    }
+
+    /// A vote another validator gossiped. Verified exactly as a local one -
+    /// signature, output binding, frozen membership, pending request - by the
+    /// same `accept`, and never re-broadcast: gossip carries each vote from its
+    /// signer, not in an echo loop.
+    pub fn accept_peer_vote(&self, decision: &StoredVote) -> Result<(), NativeInferenceError> {
+        self.accept(decision)
     }
 
     fn pending_and_context(
@@ -544,7 +567,23 @@ impl NativeFinalizeSink {
 }
 
 impl VoteSink for NativeFinalizeSink {
+    /// This validator's own vote: queue it for gossip, then count it.
     fn emit(&self, decision: &StoredVote) -> Result<(), NativeInferenceError> {
+        {
+            let mut queue = self.outbound.lock();
+            if queue.len() >= MAX_OUTBOUND_NATIVE_VOTES {
+                queue.pop_front();
+            }
+            queue.push_back(decision.clone());
+        }
+        self.accept(decision)
+    }
+}
+
+impl NativeFinalizeSink {
+    /// Count a verified vote toward its request's certificate and, at a strict
+    /// supermajority, submit the finalize transaction.
+    fn accept(&self, decision: &StoredVote) -> Result<(), NativeInferenceError> {
         // The submitter has one outer nonce. Serialize collection, preflight,
         // signing and insertion so concurrent worker completions cannot create
         // competing finalizer transactions at that nonce.
@@ -652,11 +691,7 @@ impl VoteSink for NativeFinalizeSink {
             .sign_transaction(&mut tx, &self.submitter)
             .map_err(|error| NativeInferenceError::Signer(error.to_string()))?;
         self.state
-            .validate_native_inference_transaction_admission_at(
-                &tx,
-                &context,
-                self.state.height().saturating_add(1),
-            )
+            .validate_native_inference_transaction_admission_next(&tx, &context)
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
         if !self.mempool.contains(&tx.hash) {
             self.mempool
@@ -1047,7 +1082,20 @@ pub struct NativeWorkerRuntime<E, G, V> {
     state: Arc<arc_state::StateDB>,
     source: Arc<StatePendingSource>,
     worker: NativeWorker<StatePendingSource, E, G, V>,
+    /// When this validator last emitted its vote for each still-pending request.
+    last_emitted: Mutex<BTreeMap<[u8; 32], std::time::Instant>>,
 }
+
+/// How often an already-cast vote for a still-pending request is emitted again.
+///
+/// The runtime was built around a single validator, whose own vote finalizes a
+/// request at once. On a committee the request stays pending until a
+/// supermajority of votes arrives, and `poll_once` - which re-submits every
+/// pending request - re-emitted the stored vote in a tight loop: the four-node
+/// paid-flow test logged 59,000-80,000 identical decisions per validator for a
+/// single request. Re-emitting occasionally is still useful (a peer that missed
+/// the gossip gets it again); continuously is not.
+pub const NATIVE_VOTE_REEMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V> {
     pub fn from_active(
@@ -1063,6 +1111,7 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
             state,
             source,
             worker,
+            last_emitted: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1080,19 +1129,33 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
         let commitment = context
             .commitment()
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
-        for pending in self
+        let pending: Vec<_> = self
             .state
             .native_inference_pending_requests(commitment)
-            .map_err(|error| NativeInferenceError::Source(error.to_string()))?
+            .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
         {
-            self.worker.submit(pending.request_id)?;
+            let mut last = self.last_emitted.lock();
+            // Terminal requests leave the map, so it stays bounded by the
+            // state's own bounded pending index.
+            let live: BTreeSet<[u8; 32]> = pending.iter().map(|p| p.request_id.0).collect();
+            last.retain(|id, _| live.contains(id));
+            for item in &pending {
+                let due = last
+                    .get(&item.request_id.0)
+                    .is_none_or(|at| at.elapsed() >= NATIVE_VOTE_REEMIT_INTERVAL);
+                if due {
+                    self.worker.submit(item.request_id)?;
+                }
+            }
         }
         if self.worker.receiver.is_empty() {
             return Ok(None);
         }
-        self.worker
-            .run_one(self.state.height().saturating_add(1))
-            .map(Some)
+        let vote = self.worker.run_one(self.state.height().saturating_add(1))?;
+        self.last_emitted
+            .lock()
+            .insert(vote.request_id.0, std::time::Instant::now());
+        Ok(Some(vote))
     }
 
     pub fn cancel(&self) {
