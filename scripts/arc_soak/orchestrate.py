@@ -37,7 +37,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from arc_soak import analyze
 
@@ -243,7 +243,23 @@ def derive_identity(cfg: "Config", index: int) -> str:
 
 # ── configuration ────────────────────────────────────────────────────────────
 
+def parse_fault_indices(text: Optional[str]) -> Set[int]:
+    """`"1,3"` -> {1, 3}. Empty or None -> no long faults."""
+    if not text:
+        return set()
+    try:
+        indices = {int(part) for part in text.split(",") if part.strip()}
+    except ValueError:
+        raise SystemExit(f"--long-faults must be comma-separated fault indices, not {text!r}")
+    if any(i < 0 for i in indices):
+        raise SystemExit("--long-faults indices must be non-negative")
+    return indices
+
+
 class Config:
+    def down_secs_for(self, k: int) -> float:
+        return self.long_down_s if k in self.long_faults else self.down_s
+
     def __init__(self, a: argparse.Namespace):
         self.mode = "self-test" if a.self_test else "soak"
         if a.self_test:
@@ -280,8 +296,15 @@ class Config:
         self.base_p2p = a.base_p2p
         self.stake = 6666667
         self.snapshot_every = a.snapshot_every
-        self.down_s = 20.0
-        self.recovery_budget_s = 180.0
+        self.down_s = a.down_secs
+        # Faults listed here stay down for long_down_s instead: long enough
+        # to outlast the peers' DAG retention, so the victim cannot rejoin
+        # from history and must adopt an authenticated checkpoint (C11).
+        self.long_down_s = a.long_down_secs
+        self.long_faults = parse_fault_indices(a.long_faults)
+        if self.long_faults and self.long_down_s <= 0:
+            raise SystemExit("--long-faults needs --long-down-secs")
+        self.recovery_budget_s = a.recovery_budget_secs
         self.rust_log = a.rust_log
         self.workload = a.workload
         self.faucet_rate = a.faucet_rate
@@ -564,8 +587,11 @@ class Soak:
 
     def run_fault(self, k: int) -> None:
         victim, roles = self.pick_victim(k)
+        down_s = self.cfg.down_secs_for(k)
+        if k in self.cfg.long_faults:
+            roles = roles + ["long-downtime"]
         f: Dict[str, Any] = {"index": k, "node": victim.index, "identity": victim.identity,
-                             "roles": roles}
+                             "roles": roles, "down_s": down_s}
         others = {i: h for i, h in self.last_heights.items() if i != victim.index}
         f["pre_kill_height"] = self.last_heights.get(victim.index, 0)
         f["lag_before_kill"] = (max(others.values()) - f["pre_kill_height"]
@@ -577,7 +603,7 @@ class Soak:
         f["reaped_t"] = now()
         with self.fault_lock:
             self.fault_state = f
-        time.sleep(self.cfg.down_s)
+        self.stop_event.wait(down_s)
         victim.start(self.genesis)
         f["restart_t"] = now()
         self.note(f"fault {k}: node {victim.index} restarted (incarnation {victim.incarnation})")
@@ -826,6 +852,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="schedule no fault at all (measurement runs); otherwise the first fault "
                         "comes after the baseline and one every --fault-every-secs")
     p.add_argument("--snapshot-every", type=int, default=500)
+    p.add_argument("--down-secs", type=float, default=20.0,
+                   help="how long a killed node stays down before it is restarted")
+    p.add_argument("--long-down-secs", type=float, default=0.0,
+                   help="downtime for the faults named by --long-faults")
+    p.add_argument("--long-faults", default="",
+                   help="comma-separated fault indices (0-based) that use --long-down-secs")
+    p.add_argument("--recovery-budget-secs", type=float, default=180.0,
+                   help="time after a restart within which recovery must complete")
     p.add_argument("--workload", choices=["none", "faucet", "native"], default="faucet")
     p.add_argument("--native-rate", type=float, default=0.2,
                    help="native-inference requests per second offered (workload=native)")

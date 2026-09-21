@@ -106,6 +106,17 @@ class FaultPlanning(unittest.TestCase):
     def test_no_faults_means_none(self):
         self.assertEqual(self.config("--no-faults").planned_faults, 0)
 
+    def test_named_faults_outlast_retention_and_the_rest_keep_the_short_downtime(self):
+        cfg = self.config("--long-down-secs", "900", "--long-faults", "1,3")
+        self.assertEqual([cfg.down_secs_for(k) for k in range(5)], [20.0, 900.0, 20.0, 900.0, 20.0])
+        self.assertEqual(self.config("--down-secs", "5").down_secs_for(0), 5.0)
+
+    def test_long_faults_without_a_long_downtime_are_refused(self):
+        with self.assertRaises(SystemExit):
+            self.config("--long-faults", "1")
+        with self.assertRaises(SystemExit):
+            self.config("--long-down-secs", "900", "--long-faults", "one")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
