@@ -1,8 +1,11 @@
 # Checkpoint rejoin (C11): design
 
-Status: design, 2026-09-21. Not implemented. Scope: a validator whose peers no
-longer hold the DAG rounds it needs - it was down longer than their DAG
-retention window - and a node joining a chain whose round 0 is pruned.
+Status: **design v2, 2026-09-21. Not implemented.** The v1 design below
+was drafted in code; an independent adversarial review found it unsafe (see
+"Review of the v1 draft"), and v2 replaces it. The v1 draft must not be
+committed. Scope: a validator whose peers no longer hold the DAG rounds it
+needs (it was down longer than their DAG retention window), and a node
+joining a chain whose round 0 is pruned.
 
 ## Why history transfer is not enough
 
@@ -120,3 +123,102 @@ The same path replaces today's memory-only empty-node install.
 - The duplicate-anchor index expects retention + 512 heights of history
   (`consensus.rs`); a rebased node has 256. Bound the index by what the node
   holds, or carry more window in checkpoints served for rebase.
+
+## Review of the v1 draft (2026-09-21)
+
+An independent read-only review of the uncompiled v1 draft found the
+following. Each was re-checked against the code before being accepted.
+
+1. **Only the tip is authenticated.** Window blocks were linked by their
+   self-declared `hash`, never recomputed; `tx_hashes` were never checked
+   against `tx_root`. Receipts, bodies and logs were installed with no
+   binding. Worst, **on a chain without a recovery context the state root
+   commits to accounts only** (`compute_state_root`: legacy account-only
+   Merkle root; `compute_recovery_state_root` covers accounts, storage,
+   contracts, identities, validators and the staking pool). So storage,
+   contracts, identities, validators and staking in the payload were adopted on
+   the server's word. Concrete attack: a forged window block carrying a later
+   anchor's decision commitment makes the victim skip that anchor as "already
+   applied" and fork silently.
+2. **Unsolicited checkpoints were adopted.** The receive path never checked
+   that a request was outstanding, so any validator could push one at a node
+   briefly behind and reset its DAG.
+3. **State moved durably before the engine could refuse.** `rebase_to` refused
+   recovery-domain engines after the Rebase record was already fsynced,
+   leaving state at H and the consensus cursor behind it.
+4. **Live adoption and restart disagreed** on derived indexes
+   (`pending_bond_releases`, `tier1_pending`, `native_inference_pending`, the
+   community-reward activation height).
+5. Smaller issues: a gap in receipt-based duplicate filtering on non-v3 chains,
+   serving cost on the consensus thread, unbounded decode, a 16 MiB wire cap,
+   a backward `rebase_to` accepted, and ignored `persist_signing_record` errors.
+
+The review confirmed the tip chain itself (certificate → tip → `proof_hash` →
+anchor → cursor), forward-only state movement, crash replay on the legacy path,
+and the absence of any re-signing path.
+
+## Where adoption can be authenticated at all
+
+A checkpoint can be adopted only if the certified state root commits to
+**every** domain the node adopts. That holds only on chains with a recovery
+context (protocol-v3). It is also where adoption is needed: recovery-domain
+consensus requires every validator in each round **unless an absence
+certificate excuses it**, so a v3 chain keeps advancing while a validator is
+down, and that validator can fall past retention.
+
+On an account-only-root chain, which includes the private protocol-4 test
+chains, adoption is **refused**. The remedy there is a backup restore (R6), or
+a protocol decision to give new chains a full-domain root, which is an owner
+decision because it changes consensus.
+
+## Design v2
+
+1. **Gate.** Adopt only when the local state has a recovery context and the
+   engine has a consensus domain. Otherwise log why, and do not adopt.
+2. **Solicited only.** Accept a response only while a request is outstanding,
+   only from a peer it went to, and only after history bootstrap has proved
+   unproductive (the condition that sends the request). Run every cheap check
+   (tip, anchor, window) before decoding the state into a scratch store.
+3. **Window.** For every window block: recompute the header hash; require the
+   map key to equal `header.height`; require `tx_root` to equal the root over the
+   carried bodies' hashes; require parent linkage by **recomputed** hashes. Do
+   not adopt receipts or logs; they are unbound. The node has no receipts below
+   H+1, which recovery chains tolerate because their duplicate filter is
+   nonce/state based.
+4. **No write before the engine agrees.** Add a pure
+   `ConsensusEngine::check_rebase(anchor_round)`: it refuses a backward move and
+   a cursor below the proposal floor. It must pass before the Rebase record is
+   written. After the append, any failure stops the node with an explicit error.
+   Restart then recovers from the Rebase record, so state and cursor cannot
+   stay split.
+5. **Recovery-engine rebase.** `rebase_to` works on a recovery engine. It
+   keeps `recovery_bootstrap_round` (the domain's genesis round), opens the
+   restart base round at `anchor_round + 1`, and raises the proposal floor. The
+   recovery startup branch honours the durable rebase anchor as the legacy
+   branch does. The post-recovery WAL validator validates Rebase records
+   (forward move, tip self-consistency, root, linkage) instead of skipping them.
+6. **One post-install routine** rebuilds every derived index. Startup replay
+   and live adoption both call it, so a live rebase equals a restart of the
+   same WAL.
+7. **Bounds.** Serve at most one checkpoint per peer per interval, off the
+   consensus thread; decode with an explicit size limit and no trailing bytes.
+   Refuse to serve, with a log, a snapshot above the wire cap.
+8. **Signing record.** Persist it before the engine moves; a failure is fatal
+   like any post-append failure.
+
+## Tests required (v2)
+
+The v1 list, plus the review's missing negatives:
+
+* a forged non-tip header whose `hash` field is self-consistent;
+* tip `tx_hashes` that do not match `tx_root`;
+* a non-account field tampered with while the account root is preserved (must
+  be refused because account-only roots are refused);
+* an unsolicited response;
+* a recovery-domain node that cannot rebase refusing before any write;
+* at open: a Rebase with a mismatched root, a backward Rebase, and a wrong
+  parent after a Rebase;
+* a crash between the append and the engine move;
+* live-adopted state equal to reopened state for every derived index;
+* the process-level test on a **recovery-context** fixture: four validators,
+  one down past retention while absence certificates keep the rest going.
