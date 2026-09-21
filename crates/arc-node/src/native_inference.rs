@@ -824,6 +824,61 @@ impl DecisionStore {
         }))
     }
 
+    /// Delete this validator's decisions for requests that are terminal.
+    ///
+    /// A decision file is the validator's anti-equivocation record for one
+    /// request: it must never sign a second output for it, even across a
+    /// restart. That matters only while the request can still be finalized.
+    /// Once the chain has settled it - finalized or refunded - no vote for it
+    /// is admissible ever again, so the file protects nothing, and it was the
+    /// one per-request artefact that grew for the life of the node (one file,
+    /// about 4 KB of disk, per request).
+    ///
+    /// `is_terminal` must answer from canonical state. A request that is
+    /// merely absent from the pending index is NOT terminal - it may have been
+    /// admitted a moment ago - so the caller asks for an explicit settled
+    /// receipt. Files that cannot be read, or that belong to another
+    /// validator, chain or activation, are kept: an unreadable record is not
+    /// evidence that it is safe to forget.
+    pub fn prune_terminal(
+        &self,
+        is_terminal: impl Fn(Hash256) -> bool,
+    ) -> Result<usize, NativeInferenceError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(NativeInferenceError::StorePoisoned);
+        }
+        let mut removed = 0usize;
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("decision") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(stored) =
+                bincode::deserialize_limited_exact::<StoredDecision, { 256 * 1024 }>(&bytes)
+            else {
+                continue;
+            };
+            if stored.validator != self.validator
+                || stored.genesis != self.genesis
+                || stored.context != self.context
+                || path != self.path(stored.request_id)
+            {
+                continue;
+            }
+            if is_terminal(stored.request_id) {
+                fs::remove_file(&path)?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(removed)
+    }
+
     pub fn persist_signed(
         &self,
         decision: StoredVote,
@@ -1084,7 +1139,12 @@ pub struct NativeWorkerRuntime<E, G, V> {
     worker: NativeWorker<StatePendingSource, E, G, V>,
     /// When this validator last emitted its vote for each still-pending request.
     last_emitted: Mutex<BTreeMap<[u8; 32], std::time::Instant>>,
+    /// When settled requests' decision files were last pruned.
+    pruned_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// How often the runtime deletes decision files of settled requests.
+pub const NATIVE_DECISION_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How often an already-cast vote for a still-pending request is emitted again.
 ///
@@ -1112,6 +1172,7 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
             source,
             worker,
             last_emitted: Mutex::new(BTreeMap::new()),
+            pruned_at: Mutex::new(None),
         })
     }
 
@@ -1148,6 +1209,7 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
                 }
             }
         }
+        self.prune_settled_decisions(commitment);
         if self.worker.receiver.is_empty() {
             return Ok(None);
         }
@@ -1156,6 +1218,32 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
             .lock()
             .insert(vote.request_id.0, std::time::Instant::now());
         Ok(Some(vote))
+    }
+
+    /// At most once per `NATIVE_DECISION_PRUNE_INTERVAL`, delete decision
+    /// files whose request has a settled canonical receipt. A failure is
+    /// logged and retried next interval: keeping a file is always safe.
+    fn prune_settled_decisions(&self, commitment: Hash256) {
+        {
+            let mut at = self.pruned_at.lock();
+            if at.is_some_and(|t| t.elapsed() < NATIVE_DECISION_PRUNE_INTERVAL) {
+                return;
+            }
+            *at = Some(std::time::Instant::now());
+        }
+        let state = self.state.clone();
+        let settled = move |request_id: Hash256| {
+            matches!(
+                state.native_inference_receipt(request_id, commitment),
+                Ok(Some(receipt)) if receipt.metadata.status
+                    != arc_state::wal::InferenceTransitionStatus::Pending
+            )
+        };
+        match self.worker.store.prune_terminal(settled) {
+            Ok(0) => {}
+            Ok(removed) => tracing::debug!(removed, "Pruned decision files of settled requests"),
+            Err(error) => tracing::warn!(%error, "Could not prune settled decision files"),
+        }
     }
 
     pub fn cancel(&self) {
@@ -1939,6 +2027,55 @@ mod tests {
         // A different validator's otherwise valid vote cannot be written in
         // this validator-scoped anti-equivocation store.
         assert!(s.persist_signed(bad, &j).is_err());
+    }
+    #[test]
+    fn only_settled_requests_decisions_are_pruned() {
+        let dir = tempdir().unwrap();
+        let key = KeyPair::generate_ed25519();
+        let decide = |id: u8| {
+            let mut j = job();
+            j.request_id = Hash256([id; 32]);
+            let v = StoredVote {
+                request_id: j.request_id,
+                output_hash: token_hash(&[id as u32]),
+                tokens: vec![id as u32],
+                vote: sign_vote(j.request_id, &token_bytes(&[id as u32]), &key).unwrap(),
+            };
+            (j, v)
+        };
+        let (j0, v0) = decide(10);
+        let s = DecisionStore::open(dir.path(), v0.vote.validator, j0.genesis, j0.context).unwrap();
+        let (settled, still_pending) = (decide(10), decide(11));
+        s.persist_signed(settled.1.clone(), &settled.0).unwrap();
+        s.persist_signed(still_pending.1.clone(), &still_pending.0).unwrap();
+        // An unreadable record is kept: it is not evidence of anything.
+        fs::write(dir.path().join("unreadable.decision"), b"bad").unwrap();
+
+        let removed = s
+            .prune_terminal(|id| id == settled.0.request_id)
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!s.path(settled.0.request_id).exists(), "the settled request's file is gone");
+        assert!(s.path(still_pending.0.request_id).exists(), "a pending request keeps its record");
+        assert!(dir.path().join("unreadable.decision").exists());
+        // The kept record still protects: a different output for the pending
+        // request is refused as equivocation.
+        let conflicting = StoredVote {
+            output_hash: token_hash(&[99]),
+            tokens: vec![99],
+            vote: sign_vote(still_pending.0.request_id, &token_bytes(&[99]), &key).unwrap(),
+            ..still_pending.1.clone()
+        };
+        assert!(matches!(
+            s.persist_signed(conflicting, &still_pending.0),
+            Err(NativeInferenceError::Equivocation)
+        ));
+        // Another validator's store over the same directory prunes nothing of
+        // this validator's.
+        let other = DecisionStore::open(dir.path(), Hash256([0xEE; 32]), j0.genesis, j0.context)
+            .unwrap();
+        assert_eq!(other.prune_terminal(|_| true).unwrap(), 0);
+        assert!(s.path(still_pending.0.request_id).exists());
     }
     #[test]
     fn corrupt_store_is_rejected() {
