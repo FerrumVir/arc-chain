@@ -2414,9 +2414,14 @@ impl ConsensusManager {
             {
                 bootstrap_checked_at = Some(Instant::now());
                 let now_round = self.engine.current_round();
+                // Scan from the commit cursor at the lowest: rounds below it
+                // may already be pruned (a big catch-up batch commits and
+                // prunes in one iteration), and a pruned round reads as a gap
+                // that would keep the bootstrap - and ingress - open forever.
+                let from = mark.max(self.engine.last_committed_round());
                 let next = self
                     .engine
-                    .first_missing_round(mark, HISTORY_MAX_ROUNDS)
+                    .first_missing_round(from, HISTORY_MAX_ROUNDS)
                     .min(now_round);
                 if next >= now_round {
                     bootstrap_watermark = None;
@@ -2479,9 +2484,10 @@ impl ConsensusManager {
                     // peers even before it was killed.
                     let from_round = match bootstrap_watermark {
                         Some(mark) => {
+                            let from = mark.max(self.engine.last_committed_round());
                             let next = self
                                 .engine
-                                .first_missing_round(mark, HISTORY_MAX_ROUNDS)
+                                .first_missing_round(from, HISTORY_MAX_ROUNDS)
                                 .min(now_round);
                             // Whether this bought anything is judged where a
                             // request is actually sent (below): this branch runs

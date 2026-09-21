@@ -348,8 +348,14 @@ fn a_restart_base_round_admits_only_well_formed_signed_blocks() {
     let real = e[0]
         .get_block(&e[0].blocks_in_round(cursor)[0])
         .expect("a block at the base round");
-    // A parentless block, a zero parent and a duplicated parent are refused
-    // even at the base round: only the parents' presence is excused.
+    // The excuse is for missing parents during a history import, never for
+    // live gossip - even for an authentic block.
+    assert!(restarted.receive_block(&real).is_err());
+
+    // Parentless, zero-parent, duplicated-parent and unsigned variants of a
+    // real block: none is imported, whatever else the batch carries.
+    let author = keys.iter().find(|k| k.address() == real.author).unwrap();
+    let mut variants = Vec::new();
     for parents in [
         vec![],
         vec![arc_crypto::Hash256::ZERO],
@@ -362,17 +368,24 @@ fn a_restart_base_round_admits_only_well_formed_signed_blocks() {
             ..real.clone()
         };
         forged.hash = forged.compute_hash();
-        let author = keys.iter().find(|k| k.address() == real.author).unwrap();
         forged.signature = bincode::serialize(&author.sign(&forged.hash).unwrap()).unwrap();
-        assert!(restarted.receive_block(&forged).is_err(), "{:?}", forged.parents);
+        variants.push(forged);
     }
-    // An unsigned copy of a real block is refused: the excuse is for missing
-    // parents, not for authorship.
     let mut unsigned = real.clone();
+    unsigned.timestamp += 1;
+    unsigned.hash = unsigned.compute_hash();
     unsigned.signature = vec![];
-    assert!(restarted.receive_block(&unsigned).is_err());
-    // The real block is admitted.
-    restarted.receive_block(&real).expect("an authentic base-round block");
+    variants.push(unsigned);
+
+    let mut batch = variants.clone();
+    batch.extend(served_from(&e[0], cursor));
+    restarted
+        .import_history(&batch, u64::MAX)
+        .expect("the real history imports");
+    for v in &variants {
+        assert!(restarted.get_block(&v.hash).is_none(), "{:?} was imported", v.parents);
+    }
+    assert!(restarted.get_block(&real.hash).is_some(), "the authentic base block is admitted");
 }
 
 #[test]
@@ -404,4 +417,63 @@ fn history_served_from_below_the_base_round_still_reaches_it() {
     assert!(restarted.blocks_in_round(cursor - 1).is_empty(), "nothing below the base was taken");
     assert!(!restarted.blocks_in_round(cursor).is_empty());
     assert!(restarted.current_round() >= e[0].current_round().saturating_sub(1));
+}
+
+#[test]
+fn a_base_round_block_nothing_in_the_next_round_supports_is_not_imported() {
+    // A byzantine peer's fabricated base block - committee-signed, garbage
+    // parents - must not become part of a restarting node's DAG, and live
+    // gossip never gets the missing-parents excuse at all.
+    let (set, keys) = committee();
+    let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
+    for x in &e {
+        x.set_retained_rounds(RETAINED);
+    }
+    let mut ts = 1_700_000_000_000u64;
+    let mut committed = vec![Vec::new(); 4];
+    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 2 * RETAINED, &mut ts, &mut committed);
+    let crashed_round = e[3].current_round();
+    let cursor = e[3].last_committed_round();
+
+    let restarted = engine(&set, &keys[3]);
+    restarted.restore_round_from_local_wal(crashed_round, cursor);
+    restarted.set_restart_base_round(cursor).unwrap();
+
+    // Validator 1 signs a second block at the base round with invented parents.
+    let real = e[0]
+        .get_block(
+            &e[0]
+                .blocks_in_round(cursor)
+                .into_iter()
+                .find(|h| e[0].get_block(h).unwrap().author == keys[1].address())
+                .unwrap(),
+        )
+        .unwrap();
+    let mut fabricated = DagBlock {
+        parents: vec![hash_bytes(b"invented-1"), hash_bytes(b"invented-2"), hash_bytes(b"invented-3")],
+        timestamp: real.timestamp + 1,
+        hash: arc_crypto::Hash256::ZERO,
+        signature: vec![],
+        ..real.clone()
+    };
+    fabricated.hash = fabricated.compute_hash();
+    fabricated.signature = bincode::serialize(&keys[1].sign(&fabricated.hash).unwrap()).unwrap();
+
+    // Live gossip: no excuse, so its missing parents refuse it.
+    assert!(restarted.receive_block(&fabricated).is_err());
+    // A batch carrying it next to the real history: only the base blocks the
+    // next round names are admitted.
+    let mut batch = vec![fabricated.clone()];
+    batch.extend(served_from(&e[0], cursor));
+    restarted
+        .import_history(&batch, u64::MAX)
+        .expect("the supported history imports");
+    assert!(restarted.get_block(&fabricated.hash).is_none(), "the fabricated block was imported");
+    assert!(restarted.get_block(&real.hash).is_some());
+    // A batch whose base round nothing supports is refused outright.
+    let fresh = engine(&set, &keys[3]);
+    fresh.restore_round_from_local_wal(crashed_round, cursor);
+    fresh.set_restart_base_round(cursor).unwrap();
+    assert!(fresh.import_history(&[fabricated], u64::MAX).is_err());
+    assert!(fresh.dag_is_empty());
 }

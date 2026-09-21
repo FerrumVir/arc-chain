@@ -816,6 +816,11 @@ pub struct ConsensusEngine {
     /// cursor, while it rebuilds its DAG from peers. See
     /// [`Self::set_restart_base_round`].
     restart_base_round: RwLock<Option<u64>>,
+    /// The highest round restored from this node's own durable DAG record.
+    /// Nothing is proposed at or below it after a restart: the node may have
+    /// signed a block there that no peer ever received and that its empty
+    /// DAG no longer remembers.
+    proposal_floor: AtomicU64,
     /// True while the node rebuilds its DAG from peers (after a restart or a
     /// late join). Reported so ingress can refuse work it cannot propose yet.
     dag_bootstrapping: std::sync::atomic::AtomicBool,
@@ -880,6 +885,7 @@ impl ConsensusEngine {
             retained_finality_heights: AtomicU64::new(DEFAULT_RETAINED_FINALITY_HEIGHTS),
             recovery_bootstrap_round: RwLock::new(None),
             restart_base_round: RwLock::new(None),
+            proposal_floor: AtomicU64::new(0),
             dag_bootstrapping: std::sync::atomic::AtomicBool::new(false),
             local_recovery_boundary_round: RwLock::new(None),
             local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
@@ -932,6 +938,7 @@ impl ConsensusEngine {
             retained_finality_heights: AtomicU64::new(DEFAULT_RETAINED_FINALITY_HEIGHTS),
             recovery_bootstrap_round: RwLock::new(None),
             restart_base_round: RwLock::new(None),
+            proposal_floor: AtomicU64::new(0),
             dag_bootstrapping: std::sync::atomic::AtomicBool::new(false),
             local_recovery_boundary_round: RwLock::new(None),
             local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
@@ -1233,6 +1240,11 @@ impl ConsensusEngine {
             return;
         }
         let current = self.current_round.load(Ordering::SeqCst);
+        // The restored round may hold this node's own last proposal - signed,
+        // fsynced, and perhaps never received by anyone. After a restart the
+        // DAG is empty, so the duplicate check below would not see it, and a
+        // second, different block for that round would be an equivocation.
+        self.proposal_floor.fetch_max(round, Ordering::SeqCst);
         if round > current {
             self.current_round.store(round, Ordering::SeqCst);
             self.last_committed_round.store(committed, Ordering::SeqCst);
@@ -1588,6 +1600,11 @@ impl ConsensusEngine {
             // block after the first proposal was restored from local WAL.
             return Err(ConsensusError::DuplicateBlock);
         }
+        let floor = self.proposal_floor.load(Ordering::SeqCst);
+        if floor > 0 && round <= floor {
+            // See `proposal_floor`: this node may already have signed here.
+            return Err(ConsensusError::DuplicateBlock);
+        }
 
         // Collect parents from the previous round (round - 1).
         // For round 0, there are no parents.
@@ -1715,6 +1732,46 @@ impl ConsensusEngine {
     /// # Returns
     /// `Ok(())` if the block was accepted, or an appropriate error.
     pub fn receive_block(&self, block: &DagBlock) -> Result<(), ConsensusError> {
+        self.receive_block_inner(block, false)
+    }
+
+    /// True when `block` is authored and signed by a committee member and
+    /// its hash matches its contents - the checks a block must pass before
+    /// it may count as evidence about another block.
+    fn is_authentic_committee_block(&self, block: &DagBlock) -> bool {
+        if !self.validator_set.read().can_produce_blocks(&block.author) {
+            return false;
+        }
+        let valid_hash = match self.consensus_domain.read().as_ref() {
+            Some(domain) => block.verify_hash_in_domain(domain),
+            None => block.verify_hash(),
+        };
+        if !valid_hash || block.signature.is_empty() {
+            return false;
+        }
+        let Ok(sig) = bincode::deserialize::<CryptoSignature>(&block.signature) else {
+            return false;
+        };
+        if sig.verify(&block.hash, &block.author).is_err() {
+            return false;
+        }
+        if let Some(registered_key) = self.validator_keys.get(&block.author)
+            && let CryptoSignature::Ed25519 { public_key, .. } = &sig
+            && public_key != registered_key.value()
+        {
+            return false;
+        }
+        true
+    }
+
+    /// `receive_block`, optionally excusing missing parents at the open
+    /// restart base round. Only `import_history` passes `true`, and only for
+    /// base-round blocks the same batch shows honest support for.
+    fn receive_block_inner(
+        &self,
+        block: &DagBlock,
+        base_exception: bool,
+    ) -> Result<(), ConsensusError> {
         let vs = self.validator_set.read();
 
         // 1. Author must be a registered validator that can produce blocks.
@@ -1801,7 +1858,7 @@ impl ConsensusEngine {
                     "bootstrap block must not have parents".into(),
                 ));
             }
-        } else if self.is_restart_base_round(block.round) {
+        } else if base_exception && self.is_restart_base_round(block.round) {
             // A restarted node's own durable commit cursor: its parents are
             // below everything this node still has to decide. See
             // `set_restart_base_round`. The list must still be well formed.
@@ -2183,12 +2240,56 @@ impl ConsensusEngine {
         // stops at the first block it cannot validate: left in, those rounds'
         // missing parents stopped it before it ever reached the base (seen
         // live: base 296, a batch from 294, every batch refused).
-        if let Some(base) = self.restart_base_round() {
+        let base = self.restart_base_round();
+        if let Some(base) = base {
             by_round.retain(|round, _| *round >= base);
             if by_round.is_empty() {
                 return Err(ConsensusError::InvalidBlock(
                     "history is entirely below this node's commit cursor".into(),
                 ));
+            }
+            // A base-round block is admitted without its parents, so it has to
+            // earn that some other way: authentic next-round blocks in this
+            // batch, from at least f+1 stake of distinct authors, must name it.
+            // At least one of those is honest, and an honest validator only
+            // references a block it validated. Without this a single byzantine
+            // peer could hand a restarting node a fabricated base block and a
+            // private chain on top of it, and the node's own proposals would
+            // then reference blocks nobody else can validate - shutting it out.
+            if let Some(base_blocks) = by_round.get(&base) {
+                let vs = self.validator_set.read();
+                let one_honest = vs.total_stake.saturating_sub(vs.quorum).saturating_add(1);
+                let next: Vec<&DagBlock> = by_round
+                    .get(&base.saturating_add(1))
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .copied()
+                            .filter(|b| self.is_authentic_committee_block(b))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let supported: Vec<&DagBlock> = base_blocks
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        let mut authors = HashSet::new();
+                        let stake: u64 = next
+                            .iter()
+                            .filter(|b| b.parents.contains(&candidate.hash))
+                            .filter(|b| authors.insert(b.author))
+                            .filter_map(|b| vs.get_validator(&b.author).map(|v| v.stake))
+                            .sum();
+                        stake >= one_honest
+                    })
+                    .collect();
+                drop(vs);
+                if supported.is_empty() {
+                    return Err(ConsensusError::InvalidBlock(
+                        "history names no base-round block its next round supports".into(),
+                    ));
+                }
+                by_round.insert(base, supported);
             }
         }
         let first = *by_round.keys().next().expect("non-empty");
@@ -2279,7 +2380,7 @@ impl ConsensusEngine {
         let mut inserted = 0usize;
         'rounds: for (round, round_blocks) in by_round {
             for block in round_blocks {
-                match self.receive_block(block) {
+                match self.receive_block_inner(block, base == Some(round)) {
                     Ok(()) => inserted += 1,
                     Err(ConsensusError::DuplicateBlock) => {}
                     Err(error) => {
@@ -2577,10 +2678,29 @@ impl ConsensusEngine {
                 );
                 break;
             }
-            let anchor = anchor_candidates.first().copied();
-            let certified = anchor.and_then(|hash| {
-                self.two_round_commit_support(&hash, r, &vs).map(|stake| (hash, stake))
-            });
+            // Every block this node holds from the leader is checked, not just
+            // the lowest hash. With an equivocating leader the lowest-hash twin
+            // can be the UNcertified one: taking only it, a node that held both
+            // twins skipped the round while nodes holding only the certified
+            // twin committed it - a fork. Exactly one certified candidate is
+            // committed; two are fenced, as the recovery domain already does,
+            // because neither can then be committed identically everywhere.
+            let certified_all: Vec<(Hash256, u64)> = anchor_candidates
+                .iter()
+                .filter_map(|hash| {
+                    self.two_round_commit_support(hash, r, &vs)
+                        .map(|stake| (*hash, stake))
+                })
+                .collect();
+            if certified_all.len() > 1 {
+                tracing::error!(
+                    round = r,
+                    hashes = ?anchor_candidates,
+                    "Two certified blocks from one leader round; commit cursor is fenced"
+                );
+                break;
+            }
+            let certified = certified_all.first().copied();
 
             // Straightforward case: this round's anchor is certified here.
             if let Some((hash, supporting_stake)) = certified {
@@ -2626,9 +2746,16 @@ impl ConsensusEngine {
                     ambiguous_ahead = true;
                     break;
                 }
-                if let Some(hash) = candidates.first()
-                    && self.two_round_commit_support(hash, r2, &vs).is_some()
-                {
+                let certified_ahead: Vec<Hash256> = candidates
+                    .iter()
+                    .filter(|hash| self.two_round_commit_support(hash, r2, &vs).is_some())
+                    .copied()
+                    .collect();
+                if certified_ahead.len() > 1 {
+                    ambiguous_ahead = true;
+                    break;
+                }
+                if let Some(hash) = certified_ahead.first() {
                     decider = Some((r2, *hash));
                     break;
                 }
@@ -2643,8 +2770,25 @@ impl ConsensusEngine {
                 break;
             };
 
-            match anchor {
-                Some(hash) if self.causal_history_contains(&decider_hash, &hash, r) => {
+            // The decider's history decides among ALL of this round's
+            // candidates: exactly one in it is committed, none is a skip, and
+            // more than one cannot be decided identically, so it fences.
+            let in_history: Vec<Hash256> = anchor_candidates
+                .iter()
+                .filter(|hash| self.causal_history_contains(&decider_hash, hash, r))
+                .copied()
+                .collect();
+            if in_history.len() > 1 {
+                tracing::error!(
+                    round = r,
+                    decided_by = decider_round,
+                    "A later anchor's history holds two blocks from one leader round; \
+                     commit cursor is fenced"
+                );
+                break;
+            }
+            match in_history.first().copied() {
+                Some(hash) => {
                     if !committed_set.contains(&hash)
                         && let Some(block) = self.dag.get(&hash)
                     {

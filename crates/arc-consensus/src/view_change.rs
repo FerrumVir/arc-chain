@@ -1377,10 +1377,6 @@ mod tests {
 
     // ── the S1..S5 state machine ────────────────────────────────────────────
 
-    fn tracker_for(set: &ValidatorSet) -> SkipTracker {
-        tracker(set)
-    }
-
     fn tracker(set: &ValidatorSet) -> SkipTracker {
         SkipTracker::new(
             domain(),
@@ -1686,6 +1682,7 @@ mod tests {
         assert!(!tracker.refuses(5, &keys[3].address()));
     }
 
+    #[test]
     fn an_attestation_records_an_excusal_that_survives_restart() {
         let (set, keys) = committee(4);
         let mut tracker = tracker(&set);
