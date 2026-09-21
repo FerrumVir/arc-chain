@@ -211,6 +211,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-assign"
+version = "0.8.0"
+dependencies = [
+ "arc-bincode",
+ "arc-crypto",
+ "blake3",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "arc-bench"
 version = "0.8.0"
 dependencies = [
