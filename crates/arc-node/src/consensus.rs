@@ -1252,6 +1252,11 @@ impl ConsensusManager {
         // Committed DAG blocks waiting for transaction bodies, in round order.
         let mut commit_backlog: Vec<arc_consensus::DagBlock> = Vec::new();
         let mut commit_stall_fetch_at: Option<Instant> = None;
+        // (committed DAG round, legacy DAG WAL sequence) pairs, so segments
+        // wholly below the retention horizon can be deleted. See the pruning
+        // step in the commit path.
+        let mut dag_wal_checkpoints: std::collections::VecDeque<(u64, u64)> =
+            std::collections::VecDeque::new();
         let mut checkpoint_requested = false;
         // When this node last gossiped each absence attestation it has made.
         let mut absence_gossiped_at: std::collections::HashMap<
@@ -3830,6 +3835,44 @@ impl ConsensusManager {
                             finality_vote_collector.prune_below(finality_floor);
                             finality_signed_heights.retain(|h| *h >= finality_floor);
                             absence_gossiped_at.retain(|(round, _), _| *round >= absence_floor);
+
+                            // The legacy DAG WAL's segments were never deleted:
+                            // 64 MB segments accumulated for the life of the
+                            // node. Its only use at restart is the highest
+                            // round it holds (bootstrap comes from peers), and
+                            // that is always in the newest entries - so
+                            // segments wholly below the DAG retention horizon
+                            // are deleted. The writer keeps at least two.
+                            if let Some(wal) = &self.dag_wal {
+                                let committed_round = self.engine.last_committed_round();
+                                dag_wal_checkpoints.push_back((committed_round, wal.sequence()));
+                                let horizon =
+                                    committed_round.saturating_sub(self.engine.retained_rounds());
+                                let mut prune_before = None;
+                                while dag_wal_checkpoints
+                                    .front()
+                                    .is_some_and(|(round, _)| *round <= horizon)
+                                {
+                                    prune_before = dag_wal_checkpoints.pop_front().map(|(_, seq)| seq);
+                                }
+                                if let Some(sequence) = prune_before {
+                                    let pruned_started = Instant::now();
+                                    match wal.delete_segments_before(sequence) {
+                                        Ok(deleted) if deleted > 0 => {
+                                            crate::consensus_diagnostics::DIAG
+                                                .dag_wal_segments_deleted
+                                                .fetch_add(deleted as u64, std::sync::atomic::Ordering::Relaxed);
+                                            debug!(deleted, horizon, "Pruned legacy DAG WAL segments");
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => warn!(%error, "Could not prune legacy DAG WAL segments"),
+                                    }
+                                    crate::consensus_diagnostics::add_elapsed(
+                                        &crate::consensus_diagnostics::DIAG.dag_wal_prune_us,
+                                        pruned_started,
+                                    );
+                                }
+                            }
                         }
                     }
 

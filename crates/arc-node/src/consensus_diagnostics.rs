@@ -86,6 +86,9 @@ counters!(
     state_snapshot_publish_us,
     // already-receipted transactions refused re-proposal / re-admission
     stale_transactions_dropped,
+    // legacy DAG WAL retention
+    dag_wal_segments_deleted,
+    dag_wal_prune_us,
     // commits waiting for transaction bodies instead of exiting the process
     commit_stalls,
     commit_stalled_blocks,
