@@ -526,6 +526,43 @@ pub struct ConsensusSigningRecord {
 }
 
 impl ConsensusSigningRecord {
+    /// Forget decisions this validator can provably never be asked to make
+    /// again, so the record stays bounded on a long-running node.
+    ///
+    /// Unbounded, this record grew by one finality vote per height and one
+    /// entry per attested round for the life of the process, and it is
+    /// rewritten and fsynced in full before every signature - so both its size
+    /// and the cost of every vote grew without limit. A day at the fixture's
+    /// block rate is ~430,000 finality entries per node.
+    ///
+    /// Why dropping below the floors is not the equivocation this record
+    /// prevents:
+    ///
+    /// * **Finality votes.** A validator signs a finality transcript only for a
+    ///   height it has just durably produced. Each height is produced once -
+    ///   every canonical block commits to the anchor that produced it, and a
+    ///   re-offered anchor is refused - and the produced height is restored
+    ///   from the durable store on restart, so production resumes ABOVE it. A
+    ///   height at or below the durable height is therefore never voted on
+    ///   again, and if it were, the durable block at that height would itself
+    ///   decide the only transcript this validator could sign. The caller
+    ///   passes a floor comfortably below its durable height.
+    /// * **Absence attestations.** A validator attests only about rounds at or
+    ///   above its durable commit cursor (`last_applied_round`, kept in this
+    ///   same file and never pruned). Rounds below the floor are decided, and
+    ///   under the v2 design an absence certificate carries no safety weight in
+    ///   the commit rule, so a forgotten attestation cannot yield conflicting
+    ///   commits.
+    ///
+    /// `last_applied_round` is never pruned: it is what keeps the cursor, and
+    /// with it the absence floor, from going backwards.
+    pub fn prune(&mut self, finality_floor_height: u64, absence_floor_round: u64) {
+        self.finality_votes
+            .retain(|height, _| *height >= finality_floor_height);
+        self.skipped_rounds
+            .retain(|round, _| *round >= absence_floor_round);
+    }
+
     /// The round `try_commit` should resume scanning from.
     ///
     /// The engine's cursor is the NEXT round to scan, while the record holds
@@ -838,12 +875,18 @@ impl SkipTracker {
             .insert((certificate.round, certificate.absentee));
     }
 
-    /// Drop observations for rounds the commit cursor has passed. The signing
-    /// record is NOT pruned here: forgetting a decision is the equivocation this
-    /// type exists to prevent.
+    /// Drop observations for rounds the commit cursor has passed.
     pub fn prune_observations_below(&mut self, round: u64) {
         self.observations
             .retain(|(tracked, _, _), _| *tracked >= round);
+        self.refused.retain(|(tracked, _)| *tracked >= round);
+    }
+
+    /// Bound the durable record. See [`ConsensusSigningRecord::prune`] for why
+    /// this does not forget any decision this validator could be asked to make
+    /// again.
+    pub fn prune_record(&mut self, finality_floor_height: u64, absence_floor_round: u64) {
+        self.record.prune(finality_floor_height, absence_floor_round);
     }
 }
 
@@ -1481,6 +1524,97 @@ mod tests {
         assert!(
             matches!(error, SigningRecordError::UnknownVersion(v) if v == SIGNING_RECORD_VERSION + 1),
             "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_every_decision_at_or_above_the_floors() {
+        let mut record = ConsensusSigningRecord::default();
+        for h in 0..1000u64 {
+            record.finality_votes.insert(
+                h,
+                (hash_bytes(&h.to_le_bytes()), Hash256::ZERO, Hash256::ZERO),
+            );
+            record
+                .skipped_rounds
+                .entry(h)
+                .or_default()
+                .insert(hash_bytes(b"m"), AbsenceReason::NoBlock);
+        }
+        record.last_applied_round = Some(999);
+        record.prune(900, 800);
+        assert_eq!(record.finality_votes.len(), 100);
+        assert!(record.finality_votes.keys().all(|h| *h >= 900));
+        assert_eq!(record.skipped_rounds.len(), 200);
+        assert!(record.skipped_rounds.keys().all(|r| *r >= 800));
+        assert_eq!(
+            record.last_applied_round,
+            Some(999),
+            "the cursor is never pruned; it is what keeps the floors from moving back"
+        );
+    }
+
+    #[test]
+    fn a_retained_finality_vote_still_refuses_a_conflicting_transcript() {
+        // Pruning must not weaken the check for heights it keeps.
+        let mut tracker = SkipTracker::new(
+            domain(),
+            Hash256::ZERO,
+            DEFAULT_SKIP_GRACE_MS,
+            ConsensusSigningRecord::default(),
+        );
+        let first = (hash_bytes(b"block-a"), Hash256::ZERO, Hash256::ZERO);
+        for h in 0..500u64 {
+            tracker.note_finality_vote(h, first);
+        }
+        tracker.prune_record(400, 0);
+        assert_eq!(
+            tracker.record().finality_votes.get(&450),
+            Some(&first),
+            "a vote above the floor must survive, so a second transcript for \
+             that height can still be refused"
+        );
+        assert!(tracker.record().finality_votes.get(&10).is_none());
+    }
+
+    #[test]
+    fn a_long_run_record_stays_bounded_when_pruned() {
+        // The shape of a day: one vote per height, pruned periodically with a
+        // fixed margin. The encoded size must stop growing.
+        let mut tracker = SkipTracker::new(
+            domain(),
+            Hash256::ZERO,
+            DEFAULT_SKIP_GRACE_MS,
+            ConsensusSigningRecord::default(),
+        );
+        let margin = 256u64;
+        let every = 128u64;
+        // Sample at the SAME phase of every prune cycle - just before a prune,
+        // where the record is largest. (An earlier version sampled every 5,000
+        // heights, which lands at a phase that drifts through the 128-height
+        // cycle, and reported bounded growth as a leak.)
+        let mut sizes = Vec::new();
+        let mut max_entries = 0usize;
+        for h in 0..20_000u64 {
+            tracker.note_finality_vote(h, (hash_bytes(&h.to_le_bytes()), Hash256::ZERO, Hash256::ZERO));
+            tracker.note_durable_commit_round(h);
+            if h % every == 0 {
+                tracker.prune_record(h.saturating_sub(margin), h.saturating_sub(margin));
+            }
+            max_entries = max_entries.max(tracker.record().finality_votes.len());
+            if h > 2_000 && h % every == every - 1 {
+                sizes.push(tracker.record().encode().len());
+            }
+        }
+        let (lo, hi) = (*sizes.iter().min().unwrap(), *sizes.iter().max().unwrap());
+        assert_eq!(
+            lo, hi,
+            "at the same point of every prune cycle the record must be the same size"
+        );
+        assert!(
+            max_entries <= (margin + every) as usize,
+            "{max_entries} finality entries were retained at peak; the bound is {}",
+            margin + every
         );
     }
 

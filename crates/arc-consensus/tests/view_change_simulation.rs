@@ -1426,3 +1426,68 @@ fn a_thin_tip_round_does_not_discard_the_complete_rounds_before_it() {
         importer.current_round()
     );
 }
+
+/// Finality certificates are retained for a bounded window of heights.
+///
+/// Unbounded, the map grew by one ~1.2 KB certificate per height for the life
+/// of the process - roughly half a gigabyte per node per day at the fixture's
+/// block rate, which a 24-hour soak would have found the slow way.
+#[test]
+fn finality_certificates_are_retained_for_a_bounded_window() {
+    let (set, keys) = committee(4);
+    let set_hash = validator_set_hash(&set);
+    let engine = ConsensusEngine::new_with_keypair(set.clone(), keys[0].address(), keys[0].clone());
+    engine
+        .install_consensus_domain(domain())
+        .expect("fresh engine binds its domain");
+    engine.set_retained_finality_heights(256);
+
+    let certify = |height: u64, label: &[u8]| -> FinalityCertificate {
+        let block = hash_bytes(label);
+        let mut collector = FinalityVoteCollector::new();
+        let mut out = None;
+        for key in keys.iter().take(3) {
+            let vote = FinalityVote::sign(
+                domain(),
+                set_hash,
+                height,
+                block,
+                hash_bytes(b"state"),
+                hash_bytes(b"txs"),
+                key,
+            )
+            .unwrap();
+            if let Some(c) = collector.add(vote, &domain(), &set).unwrap() {
+                out = Some(c);
+            }
+        }
+        out.expect("quorum")
+    };
+
+    for height in 1..=2_000u64 {
+        engine
+            .register_finality_certificate(certify(height, &height.to_le_bytes()))
+            .expect("accepted");
+    }
+    assert_eq!(engine.highest_finalized_height(), Some(2_000));
+    let held = engine.finality_certificate_count();
+    assert!(
+        held <= 256 + 256,
+        "{held} certificates held; the window is 256 heights plus one prune interval"
+    );
+    assert!(
+        engine.finality_certificate(2_000).is_some(),
+        "the newest certificate must be held"
+    );
+    assert!(
+        engine.finality_certificate(10).is_none(),
+        "a certificate far below the window must have been pruned"
+    );
+
+    // Conflict detection still works for every height the window retains.
+    let conflicting = certify(1_990, b"a-different-block");
+    assert!(matches!(
+        engine.register_finality_certificate(conflicting),
+        Err(arc_consensus::view_change::CertificateError::ConflictingFinality { .. })
+    ));
+}

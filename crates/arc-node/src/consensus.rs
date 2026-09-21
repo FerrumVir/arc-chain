@@ -487,6 +487,18 @@ const UNPRODUCTIVE_REQUESTS_BEFORE_CHECKPOINT: u32 = 8;
 /// rarely enough that re-sending is no longer the dominant cost of the loop.
 const ABSENCE_REGOSSIP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Bounded retention runs once every this many canonical heights.
+const RECORD_PRUNE_EVERY: u64 = 128;
+
+/// Finality votes kept below the current canonical height. A validator votes
+/// only on heights it has just produced, so anything this far below the tip is
+/// settled by the durable chain itself.
+const FINALITY_RECORD_MARGIN: u64 = 256;
+
+/// Absence attestations kept below the commit cursor. Twice the window the
+/// node can attest in at all.
+const ABSENCE_RECORD_MARGIN: u64 = 2 * ABSENCE_SCAN_ROUNDS;
+
 /// Bounds on one history transfer. A request cannot make a peer serve more than
 /// this, and an importer will not step over more than this in one go.
 const HISTORY_MAX_ROUNDS: u64 = 256;
@@ -1030,6 +1042,8 @@ impl ConsensusManager {
             // than sign something this node could forget.
             return false;
         };
+        let persist_started = std::time::Instant::now();
+        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.signing_record_persists);
         let bytes = record.encode();
         let temporary = path.with_extension("tmp");
         let write = (|| -> std::io::Result<()> {
@@ -1049,6 +1063,7 @@ impl ConsensusManager {
             }
             Ok(())
         })();
+        crate::consensus_diagnostics::add_elapsed(&crate::consensus_diagnostics::DIAG.signing_record_persist_us, persist_started);
         match write {
             Ok(()) => true,
             Err(error) => {
@@ -1536,13 +1551,21 @@ impl ConsensusManager {
                                 continue;
                             }
                             // Feed block into consensus engine
-                            match self.engine.receive_block(&block) {
+                            crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.live_blocks_received);
+                            let validate_started = std::time::Instant::now();
+                            let received = self.engine.receive_block(&block);
+                            crate::consensus_diagnostics::add_elapsed(&crate::consensus_diagnostics::DIAG.live_block_validate_us, validate_started);
+                            match received {
                                 Ok(()) => {
+                                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.live_blocks_accepted);
                                     // Availability precedes visibility to the
                                     // commit loop: persist exact bodies + block
                                     // and fsync before retaining them in memory.
-                                    if let Err(error) =
-                                        self.persist_dag_block(&state, &block, &verified)
+                                    let persist_started = std::time::Instant::now();
+                                    let persisted =
+                                        self.persist_dag_block(&state, &block, &verified);
+                                    crate::consensus_diagnostics::add_elapsed(&crate::consensus_diagnostics::DIAG.dag_block_persist_us, persist_started);
+                                    if let Err(error) = persisted
                                     {
                                         tracing::error!(
                                             block = %block.hash,
@@ -1605,6 +1628,9 @@ impl ConsensusManager {
                                     }
                                     let round_before = self.engine.current_round();
                                     let advanced = self.engine.advance_round();
+                                    if advanced {
+                                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.rounds_advanced);
+                                    }
                                     // Only reset the view-change timer if the
                                     // round actually advanced or the block is
                                     // for our current round. Resetting on every
@@ -1621,12 +1647,28 @@ impl ConsensusManager {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(
-                                        author = %block.author,
-                                        round = block.round,
-                                        "Rejected DAG block: {}",
-                                        e
-                                    );
+                                    let message = e.to_string();
+                                    crate::consensus_diagnostics::classify_live_rejection(&message);
+                                    // Missing parents is the ordinary state of a
+                                    // node that is behind; it is counted above
+                                    // and would otherwise be tens of thousands of
+                                    // WARN lines a day. Everything else still
+                                    // warns.
+                                    if message.contains("missing or wrong-round parents") {
+                                        debug!(
+                                            author = %block.author,
+                                            round = block.round,
+                                            "Rejected DAG block: {}",
+                                            message
+                                        );
+                                    } else {
+                                        warn!(
+                                            author = %block.author,
+                                            round = block.round,
+                                            "Rejected DAG block: {}",
+                                            message
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1754,6 +1796,9 @@ impl ConsensusManager {
                             // block more than one round ahead is refused. Ask
                             // for the contiguous history instead of guessing.
                             if dag_round > my_round.saturating_add(1) {
+                                if history_clock.elapsed() < HISTORY_REQUEST_INTERVAL {
+                                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_throttled);
+                                }
                                 history_requests.push((peer, my_round));
                             }
                             if dag_round.saturating_sub(my_round) > 10_000 {
@@ -2133,11 +2178,13 @@ impl ConsensusManager {
                     }
                     info!(%peer, from_round, "Requesting bounded DAG history");
                     if let Some(ref tx_chan) = outbound_tx {
-                        let _ = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
+                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_sent);
+                        let sent = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
                             target: peer,
                             from_round,
                             max_rounds: HISTORY_MAX_ROUNDS,
                         });
+                        crate::consensus_diagnostics::note_send(&sent);
                     }
                 }
                 if let Some(from_round) = history_requests_broadcast {
@@ -2147,11 +2194,13 @@ impl ConsensusManager {
                         }
                         info!(%peer, from_round, "Requesting bounded DAG history");
                         if let Some(ref tx_chan) = outbound_tx {
-                            let _ = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
+                            crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_sent);
+                            let sent = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
                                 target: *peer,
                                 from_round,
                                 max_rounds: HISTORY_MAX_ROUNDS,
                             });
+                            crate::consensus_diagnostics::note_send(&sent);
                         }
                     }
                 }
@@ -2220,6 +2269,7 @@ impl ConsensusManager {
                         .last_committed_round()
                         .saturating_sub(self.engine.retained_rounds());
                     if from_round < oldest_retained {
+                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_empty_pruned);
                         warn!(
                             %source,
                             from_round,
@@ -2229,6 +2279,7 @@ impl ConsensusManager {
                              The peer needs an authenticated checkpoint."
                         );
                     } else {
+                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_empty_not_held);
                         debug!(
                             %source,
                             from_round,
@@ -2248,6 +2299,11 @@ impl ConsensusManager {
                     .filter(|entry| wanted.contains(entry.key()))
                     .map(|entry| entry.value().clone())
                     .collect();
+                crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_served);
+                crate::consensus_diagnostics::DIAG.history_blocks_served.fetch_add(
+                    blocks.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 info!(
                     %source,
                     from_round,
@@ -2276,8 +2332,27 @@ impl ConsensusManager {
                     }
                     pending_txs.insert(transaction.hash.0, transaction);
                 }
-                match self.engine.import_history(&blocks, HISTORY_MAX_ROUNDS) {
+                crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_responses_received);
+                let round_before_import = self.engine.current_round();
+                let blocks_before_import = self.engine.dag_block_count();
+                let import_started = std::time::Instant::now();
+                let imported = self.engine.import_history(&blocks, HISTORY_MAX_ROUNDS);
+                crate::consensus_diagnostics::add_elapsed(&crate::consensus_diagnostics::DIAG.history_import_us, import_started);
+                if let Err(error) = &imported {
+                    crate::consensus_diagnostics::classify_import_rejection(&error.to_string());
+                }
+                match imported {
                     Ok(reached) => {
+                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_imports_ok);
+                        crate::consensus_diagnostics::DIAG.history_import_rounds_advanced.fetch_add(
+                            self.engine.current_round().saturating_sub(round_before_import),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        crate::consensus_diagnostics::DIAG.history_import_blocks_inserted.fetch_add(
+                            self.engine.dag_block_count().saturating_sub(blocks_before_import)
+                                as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         info!(%source, reached, "Joined a running chain from authenticated history");
                     }
                     Err(error) => {
@@ -3401,6 +3476,7 @@ impl ConsensusManager {
                         },
                         "Block produced and durably bound to DAG commit"
                     );
+                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.canonical_blocks_produced);
 
                     // ── the exact local commit record ────────────────────
                     // Written only now, after this committed block crossed the
@@ -3447,6 +3523,30 @@ impl ConsensusManager {
                                      more of the WAL"
                                 ),
                             }
+                        }
+                    }
+
+                    // ── bounded retention ────────────────────────────────
+                    // Everything below keyed by height or round used to grow
+                    // for the life of the process - the durable signing record
+                    // most expensively, since it is rewritten and fsynced in
+                    // full before every signature. The floors are chosen so
+                    // nothing this validator could still be asked to decide is
+                    // forgotten; `ConsensusSigningRecord::prune` states why.
+                    {
+                        let height = state.height();
+                        if height > 0 && height % RECORD_PRUNE_EVERY == 0 {
+                            let finality_floor = height.saturating_sub(FINALITY_RECORD_MARGIN);
+                            let absence_floor = self
+                                .engine
+                                .last_committed_round()
+                                .saturating_sub(ABSENCE_RECORD_MARGIN);
+                            if let Some(tracker) = skip_tracker.as_mut() {
+                                tracker.prune_record(finality_floor, absence_floor);
+                            }
+                            finality_vote_collector.prune_below(finality_floor);
+                            finality_signed_heights.retain(|h| *h >= finality_floor);
+                            absence_gossiped_at.retain(|(round, _), _| *round >= absence_floor);
                         }
                     }
 

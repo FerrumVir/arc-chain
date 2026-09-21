@@ -2196,7 +2196,9 @@ pub async fn serve(
         .route("/faucet/status", get(faucet_status))
         // Light Client Finality Proofs (A8)
         .route("/light/snapshot", get(light_snapshot))
+        .route("/finality/latest", get(get_finality_latest))
         .route("/finality/{height}", get(get_finality_certificate))
+        .route("/consensus/diagnostics", get(consensus_diagnostics))
         // State Sync Protocol (A5) - snapshot bootstrap for new nodes
         .route("/sync/snapshot", get(sync_snapshot))
         .route("/sync/snapshot/info", get(sync_snapshot_info))
@@ -4114,6 +4116,55 @@ async fn sync_status(AxumState(node): AxumState<NodeState>) -> Json<Value> {
             "total_accounts": manifest.total_accounts,
         },
     }))
+}
+
+/// GET /finality/latest - the highest height this node holds a quorum finality
+/// certificate for, next to its committed height, so finality lag is one read.
+///
+/// This is a node's own view. Anyone who does not trust it should fetch
+/// `/finality/{height}` and verify the certificate.
+async fn get_finality_latest(
+    AxumState(node): AxumState<NodeState>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let Some(engine) = node.consensus_engine.as_ref() else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this process runs no consensus engine, so it holds no finality certificates"
+                .to_string(),
+        ));
+    };
+    let committed = node.state.height();
+    let finalized = engine.highest_finalized_height();
+    Ok(Json(json!({
+        "finalized_height": finalized,
+        "committed_height": committed,
+        "finality_lag": finalized.map(|f| committed.saturating_sub(f)),
+        "certificates_held": engine.finality_certificate_count(),
+        "retained_heights": engine.retained_finality_heights(),
+    })))
+}
+
+/// GET /consensus/diagnostics - bounded process-wide consensus counters.
+///
+/// Fixed-size atomics: they answer "where did the time go" for a throughput
+/// question without a log line per event, and cost the same after a day as
+/// after a minute.
+async fn consensus_diagnostics(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let mut map = crate::consensus_diagnostics::DIAG.snapshot();
+    if let Some(engine) = node.consensus_engine.as_ref() {
+        map.insert("current_round".into(), Value::from(engine.current_round()));
+        map.insert(
+            "last_committed_round".into(),
+            Value::from(engine.last_committed_round()),
+        );
+        map.insert("dag_blocks".into(), Value::from(engine.dag_block_count() as u64));
+        map.insert(
+            "finality_certificates_held".into(),
+            Value::from(engine.finality_certificate_count() as u64),
+        );
+    }
+    map.insert("height".into(), Value::from(node.state.height()));
+    Json(Value::Object(map))
 }
 
 /// GET /finality/{height} - the quorum finality certificate for a height.

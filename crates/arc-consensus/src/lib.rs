@@ -637,6 +637,16 @@ impl FinalityProof {
 /// Number of rounds to keep for reorg safety during DAG pruning.
 pub const PRUNE_DEPTH: u64 = 100;
 
+/// Finality certificates retained below the highest held height.
+///
+/// Twice the default DAG retention, and far above any snapshot interval, so a
+/// checkpoint can always be served from a recent snapshot's certificate.
+pub const DEFAULT_RETAINED_FINALITY_HEIGHTS: u64 = 8192;
+
+/// Certificates are pruned once every this many heights rather than on every
+/// insert, so the O(n) retain stays off the per-block path.
+const FINALITY_PRUNE_EVERY: u64 = 256;
+
 /// Default number of DAG rounds retained below the commit cursor.
 ///
 /// This is the operator-facing meaning of DAG retention: **how far behind a
@@ -781,6 +791,10 @@ pub struct ConsensusEngine {
     excused_participation: DashMap<(u64, Address), ()>,
     /// Verified committed-block finality certificates, by height.
     finality_certificates: DashMap<u64, view_change::FinalityCertificate>,
+    /// Highest height with a held finality certificate.
+    highest_finalized_height: AtomicU64,
+    /// Heights of finality certificates retained below the highest one.
+    retained_finality_heights: AtomicU64,
     /// How many rounds of DAG history this node keeps below the commit cursor.
     /// See [`DEFAULT_RETAINED_ROUNDS`].
     retained_rounds: AtomicU64,
@@ -842,6 +856,8 @@ impl ConsensusEngine {
             excused_participation: DashMap::new(),
             retained_rounds: AtomicU64::new(DEFAULT_RETAINED_ROUNDS),
             finality_certificates: DashMap::new(),
+            highest_finalized_height: AtomicU64::new(0),
+            retained_finality_heights: AtomicU64::new(DEFAULT_RETAINED_FINALITY_HEIGHTS),
             recovery_bootstrap_round: RwLock::new(None),
             local_recovery_boundary_round: RwLock::new(None),
             local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
@@ -890,6 +906,8 @@ impl ConsensusEngine {
             excused_participation: DashMap::new(),
             retained_rounds: AtomicU64::new(DEFAULT_RETAINED_ROUNDS),
             finality_certificates: DashMap::new(),
+            highest_finalized_height: AtomicU64::new(0),
+            retained_finality_heights: AtomicU64::new(DEFAULT_RETAINED_FINALITY_HEIGHTS),
             recovery_bootstrap_round: RwLock::new(None),
             local_recovery_boundary_round: RwLock::new(None),
             local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
@@ -2212,9 +2230,50 @@ impl ConsensusEngine {
                 offered: certificate.block_hash,
             });
         }
-        self.finality_certificates
-            .insert(certificate.height, certificate);
+        let height = certificate.height;
+        self.finality_certificates.insert(height, certificate);
+        let highest = self
+            .highest_finalized_height
+            .fetch_max(height, Ordering::AcqRel)
+            .max(height);
+        // Bounded retention. A certificate is ~1.2 KB and one forms per
+        // height, so an unpruned map grows by roughly half a gigabyte per node
+        // per day at the fixture's block rate. The window still covers every
+        // height a checkpoint can be served from (snapshots are taken far more
+        // often than this) and every height a conflict could plausibly be
+        // re-offered for; a conflicting certificate for a height below it can
+        // no longer be compared, which is the price of a bounded node.
+        if height % FINALITY_PRUNE_EVERY == 0 {
+            let floor = highest.saturating_sub(self.retained_finality_heights());
+            self.finality_certificates.retain(|h, _| *h >= floor);
+        }
         Ok(signing)
+    }
+
+    /// The highest height this node holds a quorum finality certificate for,
+    /// or `None` if it holds none. Finality lag is the committed height minus
+    /// this.
+    pub fn highest_finalized_height(&self) -> Option<u64> {
+        let h = self.highest_finalized_height.load(Ordering::Acquire);
+        (h > 0 || self.finality_certificates.contains_key(&0)).then_some(h)
+    }
+
+    /// How many heights of finality certificates this node keeps.
+    pub fn retained_finality_heights(&self) -> u64 {
+        self.retained_finality_heights.load(Ordering::Acquire)
+    }
+
+    /// Set the finality-certificate retention window. Never below the prune
+    /// interval, so a prune can never empty the map it is bounding.
+    pub fn set_retained_finality_heights(&self, heights: u64) {
+        self.retained_finality_heights
+            .store(heights.max(FINALITY_PRUNE_EVERY), Ordering::Release);
+    }
+
+    /// How many finality certificates are currently held (for bounded-growth
+    /// checks and diagnostics).
+    pub fn finality_certificate_count(&self) -> usize {
+        self.finality_certificates.len()
     }
 
     /// The block this node holds a quorum finality certificate for at `height`.
@@ -2571,6 +2630,11 @@ impl ConsensusEngine {
     /// whose DAG is empty can only be bootstrapped from round 0, where parents
     /// are empty by definition. Asking for history from anywhere else produces
     /// a run whose first round can never be validated.
+    /// How many blocks the DAG currently holds (diagnostics).
+    pub fn dag_block_count(&self) -> usize {
+        self.dag.len()
+    }
+
     pub fn dag_is_empty(&self) -> bool {
         self.dag.is_empty()
     }
@@ -3337,6 +3401,14 @@ impl ConsensusEngine {
                 self.author_round_blocks.remove(&key);
             }
         }
+
+        // The other round-keyed maps age out on the same horizon. They were
+        // never pruned at all: skip certificates and excused participation
+        // accumulated one entry per attested (round, member) for the life of
+        // the process, which a day-long soak would have turned into a slow
+        // leak with nothing else wrong.
+        self.skip_certificates.retain(|(round, _), _| *round >= cutoff);
+        self.excused_participation.retain(|(round, _), _| *round >= cutoff);
 
         // Prune committed hashes that are no longer in the DAG
         if pruned_count > 0 {

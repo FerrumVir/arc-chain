@@ -5,6 +5,7 @@ pub mod block_stm;
 pub mod chunk_cache;
 pub mod coalesce;
 pub mod consensus;
+pub mod consensus_diagnostics;
 pub mod inference_validator;
 pub mod legacy_archive;
 pub mod native_inference;
