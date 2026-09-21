@@ -102,6 +102,61 @@ class BinarySelfReport(unittest.TestCase):
             orchestrate.binary_self_report({"binary_sha256": "cd" * 32}, digest)
 
 
+class Drills(unittest.TestCase):
+    """The R6 drill step on a real (stopped) store, without starting nodes."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.work = self.tmp.name
+        self.soak = object.__new__(orchestrate.Soak)
+        self.soak.cfg = orchestrate.Config(orchestrate.build_parser().parse_args(
+            ["--binary", "/bin/sh", "--provenance", "/dev/null", "--minutes", "20",
+             "--work", os.path.join(self.work, "run"),
+             "--upgrade-binary", "/bin/echo", "--upgrade-provenance", "/dev/null",
+             "--fault-kinds", "restore,upgrade,rollback"]))
+        self.soak.cfg.work = self.work
+        self.soak.note = lambda text: None
+        self.soak.upgrade_sha256 = "b" * 64
+        self.soak.pre_upgrade = None
+        self.soak.upgraded = None
+        self.node = orchestrate.Node(self.soak.cfg, 0)
+        self.node.binary_sha256 = "a" * 64
+        os.makedirs(self.node.data_dir)
+        with open(os.path.join(self.node.data_dir, "state.wal"), "wb") as fh:
+            fh.write(b"wal-bytes-v1")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def wal(self):
+        with open(os.path.join(self.node.data_dir, "state.wal"), "rb") as fh:
+            return fh.read()
+
+    def test_restore_upgrade_and_rollback_move_store_and_binary_as_recorded(self):
+        f = {}
+        self.soak.drill(0, "restore", self.node, f)
+        self.assertEqual(self.wal(), b"wal-bytes-v1", "a restore brings back the same bytes")
+        self.assertTrue(os.path.exists(f["backup_archive"]))
+
+        f = {}
+        self.soak.drill(1, "upgrade", self.node, f)
+        self.assertEqual(self.node.binary, "/bin/echo")
+        self.assertEqual(self.node.binary_sha256, "b" * 64)
+        self.assertIs(self.soak.upgraded, self.node)
+        # The upgraded binary writes to the store...
+        with open(os.path.join(self.node.data_dir, "state.wal"), "ab") as fh:
+            fh.write(b"+written-by-v2")
+
+        f = {}
+        self.soak.drill(2, "rollback", self.node, f)
+        self.assertEqual(self.wal(), b"wal-bytes-v1", "rollback restores the pre-upgrade store")
+        self.assertEqual((self.node.binary, self.node.binary_sha256), ("/bin/sh", "a" * 64))
+        self.assertIsNone(self.soak.upgraded)
+        self.assertTrue(os.path.isdir(self.node.data_dir + ".before-rollback-2"),
+                        "the upgraded store is kept aside as evidence")
+
+
 class FaultPlanning(unittest.TestCase):
     ARGS = ["--binary", "/bin/sh", "--provenance", "/dev/null", "--minutes", "20"]
 
@@ -120,6 +175,20 @@ class FaultPlanning(unittest.TestCase):
         cfg = self.config("--long-down-secs", "900", "--long-faults", "1,3")
         self.assertEqual([cfg.down_secs_for(k) for k in range(5)], [20.0, 900.0, 20.0, 900.0, 20.0])
         self.assertEqual(self.config("--down-secs", "5").down_secs_for(0), 5.0)
+
+    def test_drill_kinds_are_per_fault_and_validated(self):
+        cfg = self.config("--fault-kinds", "restore,kill", "--minutes", "30")
+        self.assertEqual([cfg.fault_kind(k) for k in range(4)], ["restore", "kill", "kill", "kill"])
+        with self.assertRaises(SystemExit):
+            self.config("--fault-kinds", "upgrade")  # no upgrade binary
+        with self.assertRaises(SystemExit):
+            self.config("--fault-kinds", "rollback,upgrade",
+                        "--upgrade-binary", "/bin/sh", "--upgrade-provenance", "/dev/null")
+        with self.assertRaises(SystemExit):
+            self.config("--fault-kinds", "kill,explode")
+        ok = self.config("--fault-kinds", "upgrade,rollback",
+                         "--upgrade-binary", "/bin/sh", "--upgrade-provenance", "/dev/null")
+        self.assertEqual(ok.fault_kind(1), "rollback")
 
     def test_long_faults_without_a_long_downtime_are_refused(self):
         with self.assertRaises(SystemExit):

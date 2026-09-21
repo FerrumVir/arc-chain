@@ -40,6 +40,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from arc_soak import analyze
+from arc_ops import backup as node_backup
 
 FAUCET_POOL = "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -152,11 +153,15 @@ class Node:
         self.proc: Optional[subprocess.Popen] = None
         self.incarnation = 0
         self.scheduled_down = False
+        # The binary this node runs, and its recorded digest. An upgrade
+        # drill changes them for one node; everything else runs cfg.binary.
+        self.binary = cfg.binary
+        self.binary_sha256: Optional[str] = None
 
     def args(self, genesis: str) -> List[str]:
         peers = ",".join(f"127.0.0.1:{self.cfg.base_p2p + j}"
                          for j in range(self.cfg.nodes) if j != self.index)
-        return [self.cfg.binary, "--rpc", f"127.0.0.1:{self.rpc}",
+        return [self.binary, "--rpc", f"127.0.0.1:{self.rpc}",
                 "--p2p-port", str(self.p2p), "--data-dir", self.data_dir,
                 "--genesis", genesis, "--peers", peers,
                 "--insecure-dev-validator-seed", "--validator-seed", f"soak-node-{self.index}",
@@ -259,6 +264,30 @@ def derive_identity(cfg: "Config", index: int) -> str:
 
 # ── configuration ────────────────────────────────────────────────────────────
 
+FAULT_KINDS = ("kill", "restore", "upgrade", "rollback")
+
+
+def parse_fault_kinds(text: Optional[str]) -> List[str]:
+    """`"kill,restore,upgrade,rollback"` -> one kind per fault index (R6 drills).
+
+    kill: SIGKILL and restart (the default for every unlisted index);
+    restore: SIGKILL, back the store up, wipe it, restore it, restart;
+    upgrade: SIGKILL, back the store up, restart on --upgrade-binary;
+    rollback: SIGKILL the upgraded node, restore its pre-upgrade backup, and
+    restart it on the original binary.
+    """
+    if not text:
+        return []
+    kinds = [part.strip() for part in text.split(",") if part.strip()]
+    unknown = [kind for kind in kinds if kind not in FAULT_KINDS]
+    if unknown:
+        raise SystemExit(f"--fault-kinds: unknown kind(s) {unknown}; use {', '.join(FAULT_KINDS)}")
+    for index, kind in enumerate(kinds):
+        if kind == "rollback" and "upgrade" not in kinds[:index]:
+            raise SystemExit("--fault-kinds: a rollback needs an earlier upgrade")
+    return kinds
+
+
 def parse_fault_indices(text: Optional[str]) -> Set[int]:
     """`"1,3"` -> {1, 3}. Empty or None -> no long faults."""
     if not text:
@@ -275,6 +304,9 @@ def parse_fault_indices(text: Optional[str]) -> Set[int]:
 class Config:
     def down_secs_for(self, k: int) -> float:
         return self.long_down_s if k in self.long_faults else self.down_s
+
+    def fault_kind(self, k: int) -> str:
+        return self.fault_kinds[k] if k < len(self.fault_kinds) else "kill"
 
     def __init__(self, a: argparse.Namespace):
         self.mode = "self-test" if a.self_test else "soak"
@@ -321,6 +353,12 @@ class Config:
         if self.long_faults and self.long_down_s <= 0:
             raise SystemExit("--long-faults needs --long-down-secs")
         self.recovery_budget_s = a.recovery_budget_secs
+        self.fault_kinds = parse_fault_kinds(a.fault_kinds)
+        self.upgrade_binary = os.path.abspath(a.upgrade_binary) if a.upgrade_binary else None
+        self.upgrade_provenance = (os.path.abspath(a.upgrade_provenance)
+                                   if a.upgrade_provenance else None)
+        if "upgrade" in self.fault_kinds and not (self.upgrade_binary and self.upgrade_provenance):
+            raise SystemExit("an upgrade drill needs --upgrade-binary and --upgrade-provenance")
         self.rust_log = a.rust_log
         self.workload = a.workload
         self.faucet_rate = a.faucet_rate
@@ -376,6 +414,20 @@ class Soak:
                 f"REFUSING: the build record at {cfg.provenance} names binary {recorded[:16] or '?'}..., "
                 f"but {cfg.binary} is {used[:16]}.... A soak result must be about the binary "
                 "the record describes.")
+        for node in self.nodes:
+            node.binary_sha256 = used
+        # An upgrade drill's binary is held to the same rule as the main one.
+        self.upgrade_sha256: Optional[str] = None
+        self.pre_upgrade: Optional[Tuple[int, str, str, str]] = None
+        self.upgraded: Optional[Node] = None
+        if cfg.upgrade_binary:
+            upgrade_used = sha256_file(cfg.upgrade_binary)
+            upgrade_recorded = read_provenance(cfg.upgrade_provenance).get("binary_sha256", "").lower()
+            if upgrade_recorded != upgrade_used:
+                raise SystemExit(
+                    f"REFUSING: the upgrade build record names {upgrade_recorded[:16] or '?'}..., "
+                    f"but {cfg.upgrade_binary} is {upgrade_used[:16]}....")
+            self.upgrade_sha256 = upgrade_used
         busy = [p for i in range(cfg.nodes)
                 for p in (cfg.base_rpc + i, cfg.base_p2p + i) if port_busy(p)]
         if busy:
@@ -487,7 +539,7 @@ class Soak:
                 raise Abort(f"node {node.index} never answered with its own identity")
             code, health = http_json(node.rpc, "/health", timeout=3)
             self.run.setdefault("binary_self_report", {})[str(node.index)] = \
-                binary_self_report(health, self.run["binary_sha256"])
+                binary_self_report(health, node.binary_sha256 or self.run["binary_sha256"])
         self.note("all validators answering with their own identities")
 
     # -- sampling --------------------------------------------------------
@@ -604,13 +656,48 @@ class Soak:
         n = self.nodes[k % self.cfg.nodes]
         return n, ["seed" if n.index == 0 else "member"]
 
+    def drill(self, k: int, kind: str, victim: Node, f: Dict[str, Any]) -> None:
+        """What happens to a killed node's store and binary before it restarts
+        (R6). The node is dead, so its store lock is free for the backup tool."""
+        if kind == "kill":
+            return
+        archive = os.path.join(self.cfg.work, f"backup-fault-{k}-node-{victim.index}.tar.gz")
+        node_backup.backup(victim.data_dir, archive, victim.binary)
+        f["backup_archive"] = archive
+        if kind == "restore":
+            os.replace(victim.data_dir, f"{victim.data_dir}.before-restore-{k}")
+            node_backup.restore(archive, victim.data_dir)
+            self.note(f"fault {k}: node {victim.index} restored from a verified backup")
+        elif kind == "upgrade":
+            self.pre_upgrade = (victim.index, archive, victim.binary, victim.binary_sha256 or "")
+            f["upgrade"] = {"from_sha256": victim.binary_sha256, "to_sha256": self.upgrade_sha256}
+            victim.binary = self.cfg.upgrade_binary
+            victim.binary_sha256 = self.upgrade_sha256
+            self.upgraded = victim
+            self.note(f"fault {k}: node {victim.index} upgraded to {self.upgrade_sha256[:16]}...")
+        elif kind == "rollback":
+            _, pre_archive, binary, sha = self.pre_upgrade
+            os.replace(victim.data_dir, f"{victim.data_dir}.before-rollback-{k}")
+            node_backup.restore(pre_archive, victim.data_dir)
+            f["rollback"] = {"restored": pre_archive, "to_sha256": sha}
+            victim.binary = binary
+            victim.binary_sha256 = sha
+            self.upgraded = None
+            self.note(f"fault {k}: node {victim.index} rolled back to its pre-upgrade store and binary")
+
     def run_fault(self, k: int) -> None:
-        victim, roles = self.pick_victim(k)
+        kind = self.cfg.fault_kind(k)
+        if kind == "rollback":
+            if self.upgraded is None or self.pre_upgrade is None:
+                raise Abort(f"fault {k}: a rollback with no upgraded node")
+            victim, roles = self.upgraded, ["upgraded"]
+        else:
+            victim, roles = self.pick_victim(k)
         down_s = self.cfg.down_secs_for(k)
         if k in self.cfg.long_faults:
             roles = roles + ["long-downtime"]
         f: Dict[str, Any] = {"index": k, "node": victim.index, "identity": victim.identity,
-                             "roles": roles, "down_s": down_s}
+                             "roles": roles, "down_s": down_s, "kind": kind}
         others = {i: h for i, h in self.last_heights.items() if i != victim.index}
         f["pre_kill_height"] = self.last_heights.get(victim.index, 0)
         f["lag_before_kill"] = (max(others.values()) - f["pre_kill_height"]
@@ -622,6 +709,7 @@ class Soak:
         f["reaped_t"] = now()
         with self.fault_lock:
             self.fault_state = f
+        self.drill(k, kind, victim, f)
         self.stop_event.wait(down_s)
         victim.start(self.genesis)
         f["restart_t"] = now()
@@ -636,7 +724,8 @@ class Soak:
                     f["process_ready_t"] = now()
                     victim.scheduled_down = False
                     code, health = http_json(victim.rpc, "/health", timeout=3)
-                    f["binary_self_report"] = binary_self_report(health, self.run["binary_sha256"])
+                    f["binary_self_report"] = binary_self_report(
+                        health, victim.binary_sha256 or self.run["binary_sha256"])
             else:
                 code, health = http_json(victim.rpc, "/health", timeout=3)
                 if isinstance(health, dict):
@@ -881,6 +970,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="comma-separated fault indices (0-based) that use --long-down-secs")
     p.add_argument("--recovery-budget-secs", type=float, default=180.0,
                    help="time after a restart within which recovery must complete")
+    p.add_argument("--fault-kinds", default="",
+                   help="comma-separated kind per fault index: kill, restore, upgrade, rollback "
+                        "(R6 drills); unlisted faults are kills")
+    p.add_argument("--upgrade-binary", help="binary an upgrade drill restarts its node on")
+    p.add_argument("--upgrade-provenance",
+                   help="build record for --upgrade-binary (checked like --provenance)")
     p.add_argument("--workload", choices=["none", "faucet", "native"], default="faucet")
     p.add_argument("--native-rate", type=float, default=0.2,
                    help="native-inference requests per second offered (workload=native)")
