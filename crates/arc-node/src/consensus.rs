@@ -459,6 +459,13 @@ fn should_execute_local_benchmark(
 /// How far back the duplicate-decision check looks in canonical history.
 const DECISION_REPLAY_SCAN_BLOCKS: u64 = 256;
 
+/// How often a node publishes a state snapshot, in canonical blocks.
+///
+/// Chosen so a restart applies at most this many blocks' worth of WAL
+/// records, while the copy itself stays infrequent enough not to sit on the
+/// commit path in practice.
+pub const DEFAULT_SNAPSHOT_EVERY_BLOCKS: u64 = 1024;
+
 /// Bounds on one history transfer. A request cannot make a peer serve more than
 /// this, and an importer will not step over more than this in one go.
 const HISTORY_MAX_ROUNDS: u64 = 256;
@@ -533,6 +540,10 @@ pub struct ConsensusManager {
     /// built to prevent, so a record that exists but cannot be read is a hard
     /// startup failure rather than a fresh start.
     pub signing_record_path: Option<std::path::PathBuf>,
+    /// Publish a state snapshot every this many canonical blocks. Zero
+    /// disables snapshots, which is correct but leaves recovery replaying the
+    /// whole WAL.
+    pub snapshot_every_blocks: u64,
     /// DEVELOPMENT/TEST START BARRIER, default off.
     ///
     /// While this node is still at round 0, wait for EVERY genesis validator
@@ -608,6 +619,7 @@ impl ConsensusManager {
             stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()),
             recovered_preimages: Vec::new(),
             signing_record_path: None,
+            snapshot_every_blocks: DEFAULT_SNAPSHOT_EVERY_BLOCKS,
             require_full_committee_at_genesis: false,
         }
     }
@@ -663,6 +675,7 @@ impl ConsensusManager {
             stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()),
             recovered_preimages: Vec::new(),
             signing_record_path: None,
+            snapshot_every_blocks: DEFAULT_SNAPSHOT_EVERY_BLOCKS,
             require_full_committee_at_genesis: false,
         }
     }
@@ -3045,6 +3058,35 @@ impl ConsensusManager {
                                 "Could not persist the local commit record; a restart will \
                                  resume from an earlier round"
                             );
+                        }
+                    }
+
+                    // ── periodic state snapshot ──────────────────────────
+                    // Bounds how much of the WAL a restart has to apply. Taken
+                    // only AFTER the block is durable, so the snapshot can
+                    // never describe state the log has not recorded.
+                    //
+                    // Cost is real: it copies live state, so the interval is
+                    // an operator choice and zero disables it. A failure here
+                    // is logged and nothing else - the WAL alone still
+                    // recovers the node, which is exactly why a snapshot is
+                    // allowed to fail.
+                    if self.snapshot_every_blocks > 0 {
+                        let height = state.height();
+                        if height > 0 && height % self.snapshot_every_blocks == 0 {
+                            match state.publish_durable_snapshot() {
+                                Ok(manifest) => info!(
+                                    height = manifest.identity.height,
+                                    resume_from = manifest.resume_from_sequence,
+                                    "Published a durable state snapshot"
+                                ),
+                                Err(error) => warn!(
+                                    %error,
+                                    height,
+                                    "Could not publish a state snapshot; recovery will replay \
+                                     more of the WAL"
+                                ),
+                            }
                         }
                     }
 

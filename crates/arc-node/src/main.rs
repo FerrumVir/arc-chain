@@ -237,6 +237,14 @@ struct Cli {
     #[arg(long, value_name = "ROUNDS")]
     dag_retained_rounds: Option<u64>,
 
+    /// Publish a state snapshot every this many canonical blocks; 0 disables.
+    ///
+    /// Operator meaning: the upper bound on how much of the WAL a restart has
+    /// to apply. Disabling it is correct - the WAL alone recovers the node -
+    /// but recovery time then grows with the chain forever.
+    #[arg(long, value_name = "BLOCKS")]
+    snapshot_every_blocks: Option<u64>,
+
     /// DEVELOPMENT START BARRIER, default off: while still at round 0, wait
     /// for every genesis validator with stake to be connected before
     /// proposing, instead of the usual quorum of connected stake.
@@ -7553,6 +7561,20 @@ async fn run_arc_node() -> Result<()> {
         }
         if let Some(rounds) = cli.dag_retained_rounds {
             consensus.engine.set_retained_rounds(rounds);
+        }
+        if let Some(blocks) = cli.snapshot_every_blocks {
+            consensus.snapshot_every_blocks = blocks;
+        }
+        if consensus.snapshot_every_blocks == 0 {
+            tracing::warn!(
+                "State snapshots are DISABLED; every restart replays the entire WAL, and that \
+                 cost grows with the chain"
+            );
+        } else {
+            tracing::info!(
+                every_blocks = consensus.snapshot_every_blocks,
+                "State snapshot interval: the upper bound on WAL records a restart must apply"
+            );
         }
         tracing::info!(
             retained_rounds = consensus.engine.retained_rounds(),

@@ -51,6 +51,10 @@ set -uo pipefail
 # the premise holds.
 NODES=${NODES:-4}
 BINARY=${BINARY:-target/debug/arc-node}
+# Snapshot often enough that the restart stage actually recovers FROM one
+# rather than only from a full WAL replay. The gate should exercise the path a
+# long-running node uses, not the empty-chain special case.
+SNAPSHOT_EVERY=${SNAPSHOT_EVERY:-100}
 SETTLE=${SETTLE:-45}
 WORKLOAD=${WORKLOAD:-12}
 RECOVER=${RECOVER:-120}
@@ -501,7 +505,7 @@ for i in $(seq 0 $((NODES-1))); do
             --data-dir "$d" --genesis "$GEN" \
             ${PEER_ARGS[@]+"${PEER_ARGS[@]}"} \
             --insecure-dev-validator-seed --validator-seed "fixture-node-$i" \
-            --stake "$STAKE" \
+            --stake "$STAKE" --snapshot-every-blocks "$SNAPSHOT_EVERY" \
             > "$WORK/node-$i.log" 2>&1 &
   PIDS+=($!)
   echo "  node $i pid=${PIDS[$i]} rpc=$((BASE_RPC+i)) p2p=$((BASE_P2P+i)) $([ $i -eq 0 ] && echo '(seed)' || echo "-> ${PEER_ARGS[1]}")"
@@ -724,7 +728,8 @@ for j in $(seq 0 $((LAST-1))); do plist="${plist}127.0.0.1:$((BASE_P2P+j)),"; do
 "$BINARY" --rpc "127.0.0.1:$((BASE_RPC+LAST))" --p2p-port "$((BASE_P2P+LAST))" \
           --data-dir "$WORK/node-$LAST" --genesis "$GEN" --peers "${plist%,}" \
           --insecure-dev-validator-seed --validator-seed "fixture-node-$LAST" \
-          --stake "$STAKE" > "$WORK/node-$LAST.restart.log" 2>&1 &
+          --stake "$STAKE" --snapshot-every-blocks "$SNAPSHOT_EVERY" \
+          > "$WORK/node-$LAST.restart.log" 2>&1 &
 PIDS[$LAST]=$!
 # A healthy port is NOT proof that OUR process came back. A leaked node from an
 # earlier run, started from the same dev seed, presents the same validator
@@ -817,6 +822,21 @@ if [[ $allthere -eq 1 ]]; then
     *) printf '%s\n' "$FULL" | sed 's/^/    /'
        fail "full canonical history DIVERGES across replicas" ;;
   esac
+
+  # Snapshot-backed recovery, stated from the restarted node's own log. If it
+  # replayed the whole WAL instead, the restart stage above passed without ever
+  # exercising the snapshot path.
+  RLOG="$WORK/node-$LAST.restart.log"
+  if grep -q "Installed a verified state snapshot" "$RLOG" 2>/dev/null; then
+    ok "the restarted node recovered FROM a verified snapshot, replaying only the WAL tail"
+    sed 's/\x1b\[[0-9;]*m//g' "$RLOG" | grep -m1 -E "Installed a verified state snapshot|WAL recovery complete" | sed 's/^/    /'
+    sed 's/\x1b\[[0-9;]*m//g' "$RLOG" | grep -m1 "WAL recovery complete" | sed 's/^/    /'
+  elif grep -q "Published a durable state snapshot" "$WORK/node-$LAST.log" 2>/dev/null; then
+    fail "node $LAST published a snapshot before the kill but did not recover from one"
+  else
+    echo "  NOTE: no snapshot was published before the kill (chain shorter than"
+    echo "    the $SNAPSHOT_EVERY-block interval), so snapshot-backed recovery is untested here."
+  fi
 else
   fail "not every replica reached $TARGET2 after the restart, so post-recovery agreement is untested"
 fi
