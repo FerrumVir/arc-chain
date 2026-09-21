@@ -459,6 +459,9 @@ pub struct NativeFinalizeSink {
     mempool: Arc<Mempool>,
     submitter: Arc<KeyPair>,
     candidates: Mutex<BTreeMap<[u8; 32], CandidateVotes>>,
+    /// This validator's one finalize transaction in flight, if any. See
+    /// `accept`.
+    in_flight: Mutex<Option<InFlightFinalize>>,
     emission_gate: Mutex<()>,
     /// This validator's OWN votes, waiting for the consensus loop to gossip
     /// them. Bounded: a vote that cannot be sent is not a correctness problem
@@ -469,12 +472,33 @@ pub struct NativeFinalizeSink {
 /// Votes queued for gossip at once.
 const MAX_OUTBOUND_NATIVE_VOTES: usize = 1_024;
 
+/// Votes for one request, kept per output. A single "the output" per request
+/// let the first vote to arrive decide what every later vote was compared
+/// against: one byzantine member voting first for invented tokens made every
+/// honest vote an "equivocation", no certificate could ever form, and each
+/// refused local vote counted as a worker failure until the worker stopped.
 #[derive(Default)]
 struct CandidateVotes {
-    output: Vec<u8>,
-    votes: BTreeMap<[u8; 32], InferenceVote>,
-    submitted: Option<Hash256>,
+    /// output hash -> (output bytes, validator -> vote)
+    outputs: BTreeMap<[u8; 32], (Vec<u8>, BTreeMap<[u8; 32], InferenceVote>)>,
+    /// validator -> the output hash it voted for (a second, different output
+    /// from the same validator is its equivocation, never counted).
+    voted: BTreeMap<[u8; 32], [u8; 32]>,
+    submitted: Option<InFlightFinalize>,
 }
+
+/// A finalize this validator signed and handed to its mempool.
+#[derive(Clone, Copy, Debug)]
+struct InFlightFinalize {
+    request_id: [u8; 32],
+    tx_hash: Hash256,
+    nonce: u64,
+    at: std::time::Instant,
+}
+
+/// How long a finalize may sit neither executed nor visibly dead before this
+/// validator stops waiting on it (it was omitted from a block, or dropped).
+const FINALIZE_IN_FLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl NativeFinalizeSink {
     pub fn new(
@@ -487,6 +511,7 @@ impl NativeFinalizeSink {
             mempool,
             submitter,
             candidates: Mutex::new(BTreeMap::new()),
+            in_flight: Mutex::new(None),
             emission_gate: Mutex::new(()),
             outbound: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -529,10 +554,8 @@ impl NativeFinalizeSink {
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
         let pending = self
             .state
-            .native_inference_pending_requests(commitment)
+            .native_inference_pending_request(request_id, commitment)
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?
-            .into_iter()
-            .find(|item| item.request_id == request_id)
             .ok_or_else(|| {
                 NativeInferenceError::Source("native request is no longer pending".into())
             })?;
@@ -576,88 +599,188 @@ impl VoteSink for NativeFinalizeSink {
             }
             queue.push_back(decision.clone());
         }
-        self.accept(decision)
+        match self.accept(decision) {
+            // The request settled or expired while this vote was being made -
+            // another validator's finalize won, which is the system working.
+            // Counting it as a worker failure stopped the worker for good
+            // after enough of them in a row.
+            Err(NativeInferenceError::Expired) => Ok(()),
+            Err(NativeInferenceError::Source(message)) if message.contains("no longer pending") => {
+                Ok(())
+            }
+            other => other,
+        }
     }
 }
 
 impl NativeFinalizeSink {
-    /// Count a verified vote toward its request's certificate and, at a strict
-    /// supermajority, submit the finalize transaction.
-    fn accept(&self, decision: &StoredVote) -> Result<(), NativeInferenceError> {
-        // The submitter has one outer nonce. Serialize collection, preflight,
-        // signing and insertion so concurrent worker completions cannot create
-        // competing finalizer transactions at that nonce.
-        let _emission = self.emission_gate.lock();
-        let (context, pending) = self.pending_and_context(decision.request_id)?;
-        let output = token_bytes(&decision.tokens);
-        if output.is_empty()
-            || output.len() > pending.request.job.max_output_bytes as usize
-            || hash_bytes(&output) != decision.output_hash
-            || !verify_vote(&decision.vote, decision.request_id, &decision.tokens)
-        {
-            return Err(NativeInferenceError::Signer(
-                "invalid native vote/output binding".into(),
-            ));
+    /// Whether `flight` can still execute: not yet executed, its nonce not yet
+    /// consumed by another of this validator's transactions, its request
+    /// still pending, and not older than `FINALIZE_IN_FLIGHT_TIMEOUT`.
+    fn still_in_flight(&self, flight: &InFlightFinalize) -> bool {
+        if self.state.receipts.contains_key(&flight.tx_hash.0) {
+            return false;
         }
-        if !context
-            .members
-            .iter()
-            .any(|member| member.address == decision.vote.validator)
-        {
-            return Err(NativeInferenceError::Signer(
-                "native vote is not from a frozen member".into(),
-            ));
+        let account_nonce = self
+            .state
+            .get_account(&self.submitter.address())
+            .map(|account| account.nonce)
+            .unwrap_or(0);
+        if account_nonce > flight.nonce {
+            return false;
         }
+        let pending = self
+            .state
+            .try_native_inference_context()
+            .ok()
+            .flatten()
+            .and_then(|context| context.commitment().ok())
+            .and_then(|commitment| {
+                self.state
+                    .native_inference_pending_request(Hash256(flight.request_id), commitment)
+                    .ok()
+                    .flatten()
+            })
+            .is_some();
+        pending && flight.at.elapsed() < FINALIZE_IN_FLIGHT_TIMEOUT
+    }
 
-        let certificate = {
+    /// Count a verified vote toward its request's certificate and, at a strict
+    /// supermajority for one output, submit the finalize transaction.
+    ///
+    /// Votes are counted per output: a vote for a different output is not an
+    /// error for anyone else's vote, only a different candidate certificate.
+    /// A validator voting for two outputs is refused on its second.
+    ///
+    /// This validator keeps ONE finalize in flight. Each is signed at the
+    /// account's current nonce, so two signed together collided on it: one
+    /// executed, the other was dropped, and its request - marked submitted -
+    /// was never re-signed. Later certificates wait for the one in flight to
+    /// execute or die, and a submitted finalize that died is re-signed.
+    fn accept(&self, decision: &StoredVote) -> Result<(), NativeInferenceError> {
+        let _emission = self.emission_gate.lock();
+        // A vote already counted costs nothing more: no state read, no
+        // signature check. (Each validator re-sends its vote every few
+        // seconds while a request is pending.)
+        let already_counted = self
+            .candidates
+            .lock()
+            .get(&decision.request_id.0)
+            .and_then(|candidate| candidate.outputs.get(&decision.output_hash.0))
+            .and_then(|(_, votes)| votes.get(&decision.vote.validator.0))
+            .is_some_and(|existing| existing == &decision.vote);
+        let (context, pending) = self.pending_and_context(decision.request_id)?;
+        if !already_counted {
+            let output = token_bytes(&decision.tokens);
+            if output.is_empty()
+                || output.len() > pending.request.job.max_output_bytes as usize
+                || hash_bytes(&output) != decision.output_hash
+                || !verify_vote(&decision.vote, decision.request_id, &decision.tokens)
+            {
+                return Err(NativeInferenceError::Signer(
+                    "invalid native vote/output binding".into(),
+                ));
+            }
+            if !context
+                .members
+                .iter()
+                .any(|member| member.address == decision.vote.validator)
+            {
+                return Err(NativeInferenceError::Signer(
+                    "native vote is not from a frozen member".into(),
+                ));
+            }
             let mut candidates = self.candidates.lock();
-            let commitment = context
-                .commitment()
-                .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
-            let active: BTreeSet<_> = self
-                .state
-                .native_inference_pending_requests(commitment)
-                .map_err(|error| NativeInferenceError::Source(error.to_string()))?
-                .into_iter()
-                .map(|pending| pending.request_id.0)
-                .collect();
-            // Terminal requests never remain resident. This keeps the
-            // collector bounded by StateDB's bounded pending index.
-            candidates.retain(|request_id, _| active.contains(request_id));
             if !candidates.contains_key(&decision.request_id.0)
                 && candidates.len() >= MAX_CERTIFICATE_CANDIDATES
             {
-                return Err(NativeInferenceError::QueueFull);
+                // Only now pay for a sweep: drop requests that are no longer
+                // pending. Bounded by the state's own bounded pending index.
+                let commitment = context
+                    .commitment()
+                    .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
+                candidates.retain(|request_id, _| {
+                    self.state
+                        .native_inference_pending_request(Hash256(*request_id), commitment)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                });
+                if candidates.len() >= MAX_CERTIFICATE_CANDIDATES {
+                    return Err(NativeInferenceError::QueueFull);
+                }
             }
             let candidate = candidates.entry(decision.request_id.0).or_default();
-            if candidate.submitted.is_some() {
-                return Ok(());
-            }
-            if candidate.output.is_empty() {
-                candidate.output = output;
-            } else if candidate.output != output {
-                // One local collector must never combine two deterministic
-                // results into a misleading certificate.
-                return Err(NativeInferenceError::Equivocation);
-            }
-            match candidate.votes.get(&decision.vote.validator.0) {
-                Some(existing) if existing != &decision.vote => {
+            match candidate.voted.get(&decision.vote.validator.0) {
+                Some(voted) if *voted != decision.output_hash.0 => {
+                    // This member already voted for a different output.
                     return Err(NativeInferenceError::Equivocation);
                 }
                 Some(_) => {}
                 None => {
                     candidate
-                        .votes
+                        .voted
+                        .insert(decision.vote.validator.0, decision.output_hash.0);
+                }
+            }
+            let entry = candidate
+                .outputs
+                .entry(decision.output_hash.0)
+                .or_insert_with(|| (output, BTreeMap::new()));
+            match entry.1.get(&decision.vote.validator.0) {
+                Some(existing) if existing != &decision.vote => {
+                    return Err(NativeInferenceError::Equivocation);
+                }
+                Some(_) => {}
+                None => {
+                    entry
+                        .1
                         .insert(decision.vote.validator.0, decision.vote.clone());
                 }
             }
-            InferenceCertificate {
-                output: candidate.output.clone(),
-                votes: candidate.votes.values().cloned().collect(),
+        }
+
+        // Is there a certificate, and is there a finalize to send for it?
+        let certificate = {
+            let mut candidates = self.candidates.lock();
+            let Some(candidate) = candidates.get_mut(&decision.request_id.0) else {
+                return Ok(());
+            };
+            if let Some(flight) = candidate.submitted {
+                if self.still_in_flight(&flight) || self.state.receipts.contains_key(&flight.tx_hash.0) {
+                    return Ok(());
+                }
+                // It died without executing (omitted, dropped, or its nonce
+                // was taken): sign again.
+                candidate.submitted = None;
+            }
+            let mut found = None;
+            for (output, votes) in candidate.outputs.values() {
+                let certificate = InferenceCertificate {
+                    output: output.clone(),
+                    votes: votes.values().cloned().collect(),
+                };
+                if Self::certificate_has_threshold(&context, &certificate)? {
+                    found = Some(certificate);
+                    break;
+                }
+            }
+            match found {
+                Some(certificate) => certificate,
+                None => return Ok(()),
             }
         };
-        if !Self::certificate_has_threshold(&context, &certificate)? {
-            return Ok(());
+
+        // One finalize in flight per validator; a later one waits (the vote
+        // re-emission calls back here every few seconds).
+        {
+            let mut flight = self.in_flight.lock();
+            if let Some(current) = *flight {
+                if current.request_id != decision.request_id.0 && self.still_in_flight(&current) {
+                    return Ok(());
+                }
+                *flight = None;
+            }
         }
 
         // Re-read immediately before signing/admitting. The state preflight
@@ -698,9 +821,15 @@ impl NativeFinalizeSink {
                 .insert(tx.clone())
                 .map_err(|error| NativeInferenceError::Sink(error.to_string()))?;
         }
-        let mut candidates = self.candidates.lock();
-        if let Some(candidate) = candidates.get_mut(&decision.request_id.0) {
-            candidate.submitted = Some(tx.hash);
+        let flight = InFlightFinalize {
+            request_id: decision.request_id.0,
+            tx_hash: tx.hash,
+            nonce,
+            at: std::time::Instant::now(),
+        };
+        *self.in_flight.lock() = Some(flight);
+        if let Some(candidate) = self.candidates.lock().get_mut(&decision.request_id.0) {
+            candidate.submitted = Some(flight);
         }
         Ok(())
     }
@@ -2813,6 +2942,132 @@ mod tests {
             ),
             "Finalized"
         );
+    }
+
+    /// Admit `requests` (one per block, as protocol 4 requires) and return
+    /// their ids.
+    fn admit_requests(fixture: &NativeFixture, nonces: &[u64]) -> Vec<Hash256> {
+        nonces
+            .iter()
+            .map(|nonce| {
+                let request = request_for(fixture, *nonce, 50);
+                let id = request.job.request_id();
+                let tx = signed_native(
+                    &fixture.state,
+                    &fixture.requester,
+                    *nonce,
+                    TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                        request,
+                        input_blob: token_bytes(&[11, 12]),
+                    }),
+                    gas_costs::NATIVE_INFERENCE_REQUEST,
+                );
+                fixture
+                    .state
+                    .execute_block_verified(&[tx], fixture.finalizer.address())
+                    .unwrap();
+                id
+            })
+            .collect()
+    }
+
+    fn vote(request_id: Hash256, tokens: &[u32], key: &KeyPair) -> StoredVote {
+        StoredVote {
+            request_id,
+            output_hash: token_hash(tokens),
+            tokens: tokens.to_vec(),
+            vote: sign_vote(request_id, &token_bytes(tokens), key).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_byzantine_vote_for_an_invented_output_cannot_block_the_honest_certificate() {
+        // The collector used to keep ONE output per request, set by whichever
+        // vote arrived first. A byzantine member voting first for invented
+        // tokens made every honest vote an "equivocation": no certificate,
+        // and every honest node's own vote refused.
+        let fixture = native_fixture();
+        let [request_id] = admit_requests(&fixture, &[0])[..] else { unreachable!() };
+        let mempool = Arc::new(Mempool::new(16));
+        let sink = NativeFinalizeSink::new(
+            fixture.state.clone(),
+            mempool.clone(),
+            fixture.finalizer.clone(),
+        );
+        let byzantine = &fixture.validators[5];
+        sink.accept_peer_vote(&vote(request_id, &[99, 98], byzantine))
+            .expect("a well-formed vote for another output is counted, not an error");
+        // The honest five agree on the real output: a strict supermajority of six.
+        for honest in &fixture.validators[..5] {
+            sink.accept_peer_vote(&vote(request_id, &[71, 72], honest))
+                .expect("an honest vote is never refused because of someone else's");
+        }
+        assert_eq!(mempool.len(), 1, "the honest certificate produced one finalize");
+        // The byzantine member changing its vote is its own equivocation.
+        assert!(matches!(
+            sink.accept_peer_vote(&vote(request_id, &[71, 72], byzantine)),
+            Err(NativeInferenceError::Equivocation)
+        ));
+        fixture
+            .state
+            .execute_block_verified(&mempool.drain(1), fixture.requester.address())
+            .unwrap();
+        let receipt = fixture
+            .state
+            .native_inference_receipt(request_id, fixture.context.commitment().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(format!("{:?}", receipt.metadata.status), "Finalized");
+        assert_eq!(receipt.metadata.output, token_bytes(&[71, 72]));
+    }
+
+    #[test]
+    fn two_requests_certified_together_both_finalize_from_one_finalizer() {
+        // Both finalizes used to be signed at the finalizer's current nonce:
+        // one executed, the other was dropped as stale, and its request -
+        // marked submitted - was never signed again.
+        let fixture = native_fixture();
+        let ids = admit_requests(&fixture, &[0, 1]);
+        let mempool = Arc::new(Mempool::new(16));
+        let sink = NativeFinalizeSink::new(
+            fixture.state.clone(),
+            mempool.clone(),
+            fixture.finalizer.clone(),
+        );
+        for id in &ids {
+            for key in &fixture.validators[..5] {
+                sink.accept_peer_vote(&vote(*id, &[71, 72], key)).unwrap();
+            }
+        }
+        assert_eq!(mempool.len(), 1, "one finalize in flight at a time");
+        fixture
+            .state
+            .execute_block_verified(&mempool.drain(1), fixture.requester.address())
+            .unwrap();
+        // The second request's votes come round again (they are re-emitted
+        // every few seconds); its finalize now goes out at the next nonce.
+        for id in &ids {
+            sink.accept_peer_vote(&vote(*id, &[71, 72], &fixture.validators[0]))
+                .or_else(|error| match error {
+                    NativeInferenceError::Source(m) if m.contains("no longer pending") => Ok(()),
+                    other => Err(other),
+                })
+                .unwrap();
+        }
+        assert_eq!(mempool.len(), 1, "the waiting certificate's finalize was sent");
+        fixture
+            .state
+            .execute_block_verified(&mempool.drain(1), fixture.requester.address())
+            .unwrap();
+        let commitment = fixture.context.commitment().unwrap();
+        for id in &ids {
+            let receipt = fixture
+                .state
+                .native_inference_receipt(*id, commitment)
+                .unwrap()
+                .unwrap();
+            assert_eq!(format!("{:?}", receipt.metadata.status), "Finalized", "{id}");
+        }
     }
 
     #[test]

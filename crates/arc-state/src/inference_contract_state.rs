@@ -1065,6 +1065,41 @@ impl StateDB {
         Ok(requests)
     }
 
+    /// One pending request, read directly: `None` when it is not pending.
+    ///
+    /// The vote path used to call `native_inference_pending_requests` and
+    /// search the result - decoding every pending request's metadata, input
+    /// included, for each vote it handled. With every validator re-sending
+    /// each pending vote every few seconds, that is quadratic in the number of
+    /// pending requests, on the consensus thread.
+    pub fn native_inference_pending_request(
+        &self,
+        request_id: Hash256,
+        context_commitment: Hash256,
+    ) -> Result<Option<NativeInferencePendingSnapshot>, StateError> {
+        let _guard = self.native_inference_execution.lock();
+        self.require_healthy_wal()?;
+        if !self.native_inference_pending.contains_key(&request_id.0) {
+            return Ok(None);
+        }
+        let receipt =
+            read_native_metadata(self, request_id, context_commitment)?.ok_or_else(|| {
+                StateError::ExecutionError("native pending index references missing receipt".into())
+            })?;
+        if receipt.metadata.status != InferenceTransitionStatus::Pending {
+            return Err(StateError::ExecutionError(
+                "native pending index references terminal receipt".into(),
+            ));
+        }
+        Ok(Some(NativeInferencePendingSnapshot {
+            request_id,
+            request: receipt.metadata.request,
+            input_blob: receipt.metadata.input_blob,
+            admission_height: receipt.admission_height,
+            context_commitment,
+        }))
+    }
+
     /// Read a request-keyed native receipt after checking its escrow
     /// commitment. Terminal status is returned unchanged; no payment action
     /// occurs in this accessor.
