@@ -142,3 +142,66 @@ pub fn phase(counter: &AtomicU64, mark: std::time::Instant) -> std::time::Instan
     add_elapsed(counter, mark);
     std::time::Instant::now()
 }
+
+/// Inbound message kinds timed individually, so "the inbound phase took most
+/// of the loop" can say WHICH messages.
+pub const INBOUND_KINDS: [&str; 12] = [
+    "dag_block",
+    "transactions",
+    "finality_vote",
+    "finality_certificate",
+    "absence_vote",
+    "absence_certificate",
+    "history_request",
+    "history_response",
+    "heartbeat",
+    "peer_connected",
+    "peer_disconnected",
+    "other",
+];
+
+pub struct KindCounters {
+    pub count: [AtomicU64; 12],
+    pub us: [AtomicU64; 12],
+}
+
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO: AtomicU64 = AtomicU64::new(0);
+
+pub static INBOUND: KindCounters = KindCounters {
+    count: [ZERO; 12],
+    us: [ZERO; 12],
+};
+
+/// Records one inbound message's handling time when dropped - including when
+/// the handler leaves early with `continue`, which is most of them.
+pub struct InboundTimer {
+    kind: usize,
+    started: std::time::Instant,
+}
+
+impl InboundTimer {
+    pub fn start(kind: usize) -> Self {
+        Self {
+            kind: kind.min(INBOUND_KINDS.len() - 1),
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for InboundTimer {
+    fn drop(&mut self) {
+        INBOUND.count[self.kind].fetch_add(1, Relaxed);
+        INBOUND.us[self.kind].fetch_add(self.started.elapsed().as_micros() as u64, Relaxed);
+    }
+}
+
+/// The inbound counters, by name.
+pub fn inbound_snapshot() -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for (i, name) in INBOUND_KINDS.iter().enumerate() {
+        map.insert(format!("inbound_{name}_count"), INBOUND.count[i].load(Relaxed).into());
+        map.insert(format!("inbound_{name}_us"), INBOUND.us[i].load(Relaxed).into());
+    }
+    map
+}

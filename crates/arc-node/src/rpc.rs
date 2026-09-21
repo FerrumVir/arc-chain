@@ -4151,6 +4151,7 @@ async fn get_finality_latest(
 /// after a minute.
 async fn consensus_diagnostics(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut map = crate::consensus_diagnostics::DIAG.snapshot();
+    map.extend(crate::consensus_diagnostics::inbound_snapshot());
     if let Some(engine) = node.consensus_engine.as_ref() {
         map.insert("current_round".into(), Value::from(engine.current_round()));
         map.insert(

@@ -1416,6 +1416,22 @@ impl ConsensusManager {
                             Err(_) => break,
                         },
                     };
+                    let _inbound_timer = crate::consensus_diagnostics::InboundTimer::start(
+                        match &msg {
+                            InboundMessage::DagBlockWithTxs { .. } => 0,
+                            InboundMessage::Transactions { .. } => 1,
+                            InboundMessage::ConsensusFinalityVote { .. } => 2,
+                            InboundMessage::ConsensusFinalityCertificate { .. } => 3,
+                            InboundMessage::ConsensusAbsenceVote { .. } => 4,
+                            InboundMessage::ConsensusAbsenceCertificate { .. } => 5,
+                            InboundMessage::DagHistoryRequest { .. } => 6,
+                            InboundMessage::DagHistoryResponse { .. } => 7,
+                            InboundMessage::HeartbeatWithRound { .. } => 8,
+                            InboundMessage::PeerConnected { .. } => 9,
+                            InboundMessage::PeerDisconnected { .. } => 10,
+                            _ => 11,
+                        },
+                    );
                     match msg {
                         InboundMessage::PeerConnected {
                             address,
