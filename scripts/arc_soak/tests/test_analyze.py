@@ -170,6 +170,23 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(v["status"], "PASS", v)
         self.assertEqual(code, 0)
 
+    def test_per_node_probe_jitter_does_not_split_a_sample(self):
+        # The live orchestrator probes each node at a slightly different
+        # instant. Grouping by that per-probe time made the chain series
+        # alternate between nodes and the baseline dispersion undefined; the
+        # tick identity must hold a sample together.
+        d = passing()
+        for s in d.samples:
+            s["tick_t"] = s["t"]
+            s["t"] = s["t"] + 0.013 * s["node"]
+        # a laggard, so alternating between nodes WOULD matter
+        for s in d.samples:
+            if s["node"] == 3 and s["height"] is not None:
+                s["height"] = max(0, s["height"] - 40)
+        code, v = self.run_case(d)
+        self.assertEqual(v["status"], "PASS", v)
+        self.assertIsNotNone(v["facts"]["throughput"]["baseline"]["cv"])
+
     # ── Codex item 1: a printed failure must change the exit status ─────────
     def test_agreement_failure_exits_nonzero(self):
         d = passing()

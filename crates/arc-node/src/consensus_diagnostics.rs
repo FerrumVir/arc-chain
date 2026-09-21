@@ -65,6 +65,12 @@ counters!(
     dag_block_persist_us,
     // outbound messages the transport refused (channel full or closed)
     outbound_dropped,
+    // early blocks: held instead of dropped (arc_consensus::pending)
+    pending_blocks_held,
+    pending_blocks_released,
+    pending_blocks_expired,
+    pending_blocks_now,
+    targeted_history_requests,
 );
 
 pub static DIAG: ConsensusDiagnostics = ConsensusDiagnostics::new();

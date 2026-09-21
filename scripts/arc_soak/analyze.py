@@ -291,9 +291,21 @@ def check_safety(run_dir: str, v: Verdict) -> None:
 
 
 def _samples_by_time(ev: Evidence) -> Dict[float, List[Dict[str, Any]]]:
+    """Group samples by the TICK they belong to, keyed by the tick's time.
+
+    Each node is probed at a slightly different instant, so grouping by the
+    per-probe timestamp put every node's sample in its own group - and the
+    "chain" series then alternated between individual nodes, laggards
+    included, which made the baseline's dispersion meaningless. The first live
+    run of this analyzer exposed it; the synthetic tests, which gave all nodes
+    one timestamp, could not. Records carry `tick_t`; older ones fall back to
+    `t`.
+    """
     by: Dict[float, List[Dict[str, Any]]] = {}
     for s in ev.samples:
-        t = _finite(s.get("t"))
+        t = _finite(s.get("tick_t"))
+        if t is None:
+            t = _finite(s.get("t"))
         if t is None:
             continue
         by.setdefault(t, []).append(s)

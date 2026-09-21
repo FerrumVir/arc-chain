@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+pub mod pending;
 pub mod beacon;
 pub mod data_availability;
 pub mod security;
@@ -53,6 +54,18 @@ pub const STAKE_CORE: u64 = 50_000_000;
 pub enum ConsensusError {
     #[error("invalid block: {0}")]
     InvalidBlock(String),
+
+    /// A parent this node does not hold yet. Not evidence against the block:
+    /// block validation is recursive, so this is an arrival-order fact about
+    /// the local DAG. Display text is unchanged from the untyped form.
+    #[error("invalid block: block {hash} has {missing} missing or wrong-round parents")]
+    MissingParents { hash: Hash256, missing: usize },
+
+    /// More than one round ahead of this node. Also a fact about the local
+    /// node rather than the block; the block may become acceptable once this
+    /// node has caught up by authenticated means.
+    #[error("invalid block: round {round} is too far ahead (current={current}); authenticated state sync required")]
+    RoundTooFarAhead { round: u64, current: u64 },
 
     #[error("insufficient parents: need >= 2f+1 references from previous round")]
     InsufficientParents,
@@ -1687,10 +1700,10 @@ impl ConsensusEngine {
         let current = self.current_round.load(Ordering::SeqCst);
         let round_gap = block.round.saturating_sub(current);
         if round_gap > 1 {
-            return Err(ConsensusError::InvalidBlock(format!(
-                "round {} is too far ahead (current={}); authenticated state sync required",
-                block.round, current
-            )));
+            return Err(ConsensusError::RoundTooFarAhead {
+                round: block.round,
+                current,
+            });
         }
 
         // 5. Parent validation
@@ -1749,10 +1762,10 @@ impl ConsensusEngine {
             }
 
             if missing_parents > 0 {
-                return Err(ConsensusError::InvalidBlock(format!(
-                    "block {} has {} missing or wrong-round parents",
-                    block.hash, missing_parents
-                )));
+                return Err(ConsensusError::MissingParents {
+                    hash: block.hash,
+                    missing: missing_parents,
+                });
             }
 
             let parent_round = block.round.saturating_sub(1);
@@ -2630,6 +2643,22 @@ impl ConsensusEngine {
     /// whose DAG is empty can only be bootstrapped from round 0, where parents
     /// are empty by definition. Asking for history from anywhere else produces
     /// a run whose first round can never be validated.
+    /// The parents of `block` this node does not hold, or `None` if any
+    /// parent it DOES hold is from the wrong round - which makes the block
+    /// malformed rather than early, so it must never be held for later.
+    pub fn absent_parents(&self, block: &DagBlock) -> Option<Vec<Hash256>> {
+        let expected = block.round.checked_sub(1)?;
+        let mut absent = Vec::new();
+        for parent in &block.parents {
+            match self.dag.get(parent) {
+                Some(held) if held.round != expected => return None,
+                Some(_) => {}
+                None => absent.push(*parent),
+            }
+        }
+        Some(absent)
+    }
+
     /// How many blocks the DAG currently holds (diagnostics).
     pub fn dag_block_count(&self) -> usize {
         self.dag.len()
@@ -4317,9 +4346,10 @@ mod tests {
         );
         assert!(matches!(
             engine.receive_block(&missing),
-            Err(ConsensusError::InvalidBlock(message))
-                if message.contains("missing or wrong-round parents")
+            Err(ConsensusError::MissingParents { missing: 1, .. })
         ));
+        // An absent parent is an arrival-order fact: the block may be held.
+        assert_eq!(engine.absent_parents(&missing), Some(vec![hash_bytes(b"missing-parent")]));
 
         let old_parent = make_block(test_addr(0), 0, vec![], vec![], 1002);
         engine.receive_block(&old_parent).unwrap();
@@ -4327,9 +4357,11 @@ mod tests {
         let wrong_round = make_block(test_addr(1), 2, vec![old_parent.hash], vec![], 1003);
         assert!(matches!(
             engine.receive_block(&wrong_round),
-            Err(ConsensusError::InvalidBlock(message))
-                if message.contains("missing or wrong-round parents")
+            Err(ConsensusError::MissingParents { .. })
         ));
+        // A PRESENT parent from the wrong round makes the block malformed, so
+        // it must never be classified as merely early.
+        assert_eq!(engine.absent_parents(&wrong_round), None);
         assert_eq!(
             engine.current_round(),
             1,
@@ -4373,7 +4405,7 @@ mod tests {
         let block = make_block(test_addr(1), 5, vec![], vec![], 1000);
         let result = engine.receive_block(&block);
         assert!(
-            matches!(&result, Err(ConsensusError::InvalidBlock(msg)) if msg.contains("authenticated state sync required")),
+            matches!(&result, Err(ConsensusError::RoundTooFarAhead { round: 5, current: 0 })),
             "single-peer future block must not move consensus state: {result:?}"
         );
         assert_eq!(engine.current_round(), 0);
@@ -6261,7 +6293,7 @@ mod tests {
         block.signature = bincode::serialize(&peer_key.sign(&block.hash).unwrap()).unwrap();
         let result = engine.receive_block(&block);
         assert!(
-            matches!(&result, Err(ConsensusError::InvalidBlock(msg)) if msg.contains("too far ahead")),
+            matches!(&result, Err(ConsensusError::RoundTooFarAhead { .. })),
             "fresh node must reject attacker-controlled round movement; got {:?}",
             result
         );
@@ -6296,13 +6328,10 @@ mod tests {
             result
         );
         match result {
-            Err(ConsensusError::InvalidBlock(msg)) => {
-                assert!(
-                    msg.contains("too far ahead"),
-                    "expected 'too far ahead' error, got: {msg}"
-                );
+            Err(ConsensusError::RoundTooFarAhead { round, current }) => {
+                assert!(round > current + 1, "round {round} vs current {current}");
             }
-            _ => panic!("expected InvalidBlock"),
+            other => panic!("expected RoundTooFarAhead, got {other:?}"),
         }
     }
 

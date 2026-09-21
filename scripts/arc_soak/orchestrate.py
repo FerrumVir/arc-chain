@@ -118,7 +118,10 @@ def read_provenance(path: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     with open(path) as fh:
         for line in fh:
-            m = re.match(r"^([a-z_]+):\s*(.*?)\s*$", line)
+            # Keys contain digits (`binary_sha256`); an earlier `[a-z_]+`
+            # could not match that key, and the guard refused a correct
+            # record - failing closed, but for the wrong reason.
+            m = re.match(r"^([a-z0-9_]+):\s*(.*?)\s*$", line)
             if m:
                 out[m.group(1)] = m.group(2).split()[0] if m.group(2) else ""
     return out
@@ -340,6 +343,12 @@ class Soak:
                            "input_digest": prov.get("input_digest"),
                            "command": prov.get("command")},
             "host": " ".join(os.uname()),
+            # Which harness recorded and judged this run. A verdict is only as
+            # good as the code that reached it.
+            "harness": {
+                "orchestrate_sha256": sha256_file(os.path.abspath(__file__)),
+                "analyze_sha256": sha256_file(os.path.abspath(analyze.__file__)),
+            },
             "rust_log": cfg.rust_log,
             "workload": {"profile": cfg.workload, "required": cfg.workload != "none",
                          "faucet_rate_per_s": cfg.faucet_rate if cfg.workload == "faucet" else None},
@@ -423,8 +432,13 @@ class Soak:
         return rec
 
     def sample(self) -> List[Dict[str, Any]]:
+        tick_t = now()
+        self.tick = getattr(self, "tick", -1) + 1
         recs = list(self.pool.map(self.probe, self.nodes))
         for r in recs:
+            # One shared tick identity per sample: the analyzer groups by it.
+            r["tick"] = self.tick
+            r["tick_t"] = tick_t
             self.samples.write(r)
             h = analyze._int(r.get("height"))
             if h is not None:

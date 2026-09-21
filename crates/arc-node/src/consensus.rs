@@ -510,6 +510,12 @@ const HISTORY_PARENT_CONTEXT: u64 = 2;
 /// Minimum gap between history requests from this node, so a persistent gap
 /// cannot turn into a request storm against its peers.
 const HISTORY_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often this node may ask one author for the history behind a block it
+/// is holding. Much shorter than the heartbeat-driven interval above: a held
+/// block is direct evidence of exactly what is missing and who has it, so the
+/// request is small and targeted rather than a blind re-sync.
+const TARGETED_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 /// How long a node sits at one round, with peers connected, before it concludes
 /// it is behind and asks for history rather than waiting for gossip it can
 /// never accept.
@@ -1174,6 +1180,19 @@ impl ConsensusManager {
         // Consecutive history requests that moved the bootstrap watermark
         // nowhere. Past a bound, DAG history cannot rescue this node and it
         // needs an authenticated checkpoint instead.
+        // Authenticated blocks that arrived early - parents not here yet, or
+        // more than one round ahead. See arc_consensus::pending for why they
+        // are held rather than dropped.
+        let mut pending_blocks = arc_consensus::pending::PendingBlocks::new();
+        // Blocks released from `pending_blocks`, re-offered through the SAME
+        // inbound path in the same drain, so there is one implementation of
+        // what receiving a block means.
+        let mut replay: std::collections::VecDeque<InboundMessage> =
+            std::collections::VecDeque::new();
+        // When this node last asked each author for the history behind a held
+        // block, so a burst of early blocks becomes one request per author.
+        let mut targeted_fetch_at: std::collections::HashMap<Hash256, Instant> =
+            std::collections::HashMap::new();
         let mut unproductive_bootstrap_requests: u32 = 0;
         let mut checkpoint_requested = false;
         // When this node last gossiped each absence attestation it has made.
@@ -1361,8 +1380,26 @@ impl ConsensusManager {
             let mut history_requests_broadcast: Option<u64> = None;
             let mut inbound_history: Vec<(Hash256, Vec<arc_consensus::DagBlock>, Vec<arc_types::Transaction>)> =
                 Vec::new();
+            {
+                let expired = pending_blocks.expire(Instant::now());
+                if expired > 0 {
+                    crate::consensus_diagnostics::DIAG
+                        .pending_blocks_expired
+                        .fetch_add(expired as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                crate::consensus_diagnostics::DIAG
+                    .pending_blocks_now
+                    .store(pending_blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(ref mut rx) = inbound_rx {
-                while let Ok(msg) = rx.try_recv() {
+                loop {
+                    let msg = match replay.pop_front() {
+                        Some(released) => released,
+                        None => match rx.try_recv() {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        },
+                    };
                     match msg {
                         InboundMessage::PeerConnected {
                             address,
@@ -1555,6 +1592,52 @@ impl ConsensusManager {
                             let validate_started = std::time::Instant::now();
                             let received = self.engine.receive_block(&block);
                             crate::consensus_diagnostics::add_elapsed(&crate::consensus_diagnostics::DIAG.live_block_validate_us, validate_started);
+                            // An early block - parents not here yet, or more
+                            // than one round ahead - is authenticated already
+                            // and is held, not dropped. `hold_if_early` is the
+                            // same decision the regression test exercises.
+                            let received = match received {
+                                Err(error @ (arc_consensus::ConsensusError::MissingParents { .. }
+                                    | arc_consensus::ConsensusError::RoundTooFarAhead { .. })) => {
+                                    crate::consensus_diagnostics::classify_live_rejection(&error.to_string());
+                                    match arc_consensus::pending::hold_if_early(
+                                        &self.engine,
+                                        &mut pending_blocks,
+                                        &block,
+                                        &verified,
+                                        error,
+                                        Instant::now(),
+                                    ) {
+                                        arc_consensus::pending::Offered::Held => {
+                                            crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.pending_blocks_held);
+                                            // Ask the author - it certainly holds
+                                            // its own parents - for the history
+                                            // behind it, once per author per
+                                            // interval.
+                                            let due = targeted_fetch_at
+                                                .get(&block.author)
+                                                .is_none_or(|at| at.elapsed() >= TARGETED_FETCH_INTERVAL);
+                                            if due && let Some(ref tx_chan) = outbound_tx {
+                                                targeted_fetch_at.insert(block.author, Instant::now());
+                                                crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.targeted_history_requests);
+                                                let sent = tx_chan.try_send(
+                                                    OutboundMessage::SendDagHistoryRequest {
+                                                        target: block.author,
+                                                        from_round: self.engine.current_round(),
+                                                        max_rounds: HISTORY_MAX_ROUNDS,
+                                                    },
+                                                );
+                                                crate::consensus_diagnostics::note_send(&sent);
+                                            }
+                                            continue;
+                                        }
+                                        arc_consensus::pending::Offered::NotHeld(error)
+                                        | arc_consensus::pending::Offered::Rejected(error) => Err(error),
+                                        arc_consensus::pending::Offered::Accepted(..) => Ok(()),
+                                    }
+                                }
+                                other => other,
+                            };
                             match received {
                                 Ok(()) => {
                                     crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.live_blocks_accepted);
@@ -1631,6 +1714,21 @@ impl ConsensusManager {
                                     if advanced {
                                         crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.rounds_advanced);
                                     }
+                                    // Blocks that were waiting on this one, and
+                                    // blocks that were only too far ahead and
+                                    // are now within one round, go back through
+                                    // this same path.
+                                    let mut released = pending_blocks.release_on(&block.hash);
+                                    released.extend(
+                                        pending_blocks.release_up_to_round(self.engine.current_round()),
+                                    );
+                                    for (early, transactions) in released {
+                                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.pending_blocks_released);
+                                        replay.push_back(InboundMessage::DagBlockWithTxs {
+                                            block: early,
+                                            transactions,
+                                        });
+                                    }
                                     // Only reset the view-change timer if the
                                     // round actually advanced or the block is
                                     // for our current round. Resetting on every
@@ -1648,7 +1746,11 @@ impl ConsensusManager {
                                 }
                                 Err(e) => {
                                     let message = e.to_string();
-                                    crate::consensus_diagnostics::classify_live_rejection(&message);
+                                    if !message.contains("missing or wrong-round parents")
+                                        && !message.contains("too far ahead")
+                                    {
+                                        crate::consensus_diagnostics::classify_live_rejection(&message);
+                                    }
                                     // Missing parents is the ordinary state of a
                                     // node that is behind; it is counted above
                                     // and would otherwise be tens of thousands of
@@ -2344,6 +2446,15 @@ impl ConsensusManager {
                 match imported {
                     Ok(reached) => {
                         crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_imports_ok);
+                        // An import can fill many parents at once; offer every
+                        // held block again. Anything still early is held again.
+                        for (early, transactions) in pending_blocks.drain_all() {
+                            crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.pending_blocks_released);
+                            replay.push_back(InboundMessage::DagBlockWithTxs {
+                                block: early,
+                                transactions,
+                            });
+                        }
                         crate::consensus_diagnostics::DIAG.history_import_rounds_advanced.fetch_add(
                             self.engine.current_round().saturating_sub(round_before_import),
                             std::sync::atomic::Ordering::Relaxed,
