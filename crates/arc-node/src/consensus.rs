@@ -408,6 +408,24 @@ fn verify_peer_dag_transactions(
     verify_peer_dag_transactions_in_domain(committed_hashes, transactions, None)
 }
 
+/// Keep only transactions that have NOT yet produced a canonical receipt.
+///
+/// Only the round leader's DAG block becomes canonical here, so a transaction
+/// carried by a non-leader block is re-proposed until it lands in a leader's -
+/// "until it has a canonical receipt", as the proposal path says. Nothing
+/// actually checked the receipt, so every transaction ever submitted kept
+/// being re-proposed, re-gossiped and re-persisted after it had executed: the
+/// soak self-test found 242 transactions written to the DAG WAL ~75 times each
+/// in nine minutes, ~165 per block, growing with every transaction ever
+/// offered. Execution was never duplicated (the commit path filters receipted
+/// bodies), but disk, bandwidth and per-block signature verification all grew
+/// without bound.
+fn retain_unreceipted(state: &StateDB, transactions: &mut Vec<arc_types::Transaction>) -> usize {
+    let before = transactions.len();
+    transactions.retain(|transaction| !state.receipts.contains_key(&transaction.hash.0));
+    before - transactions.len()
+}
+
 fn verify_peer_dag_transactions_in_domain(
     committed_hashes: &[Hash256],
     transactions: &[arc_types::Transaction],
@@ -1867,6 +1885,14 @@ impl ConsensusManager {
                                     // re-broadcast, and Mempool deduplicates its
                                     // resident set, so accepting this retry does
                                     // not create a wire echo loop.
+                                    // Already executed: re-admitting it is how
+                                    // a transaction circulated forever.
+                                    if state.receipts.contains_key(&tx.hash.0) {
+                                        crate::consensus_diagnostics::bump(
+                                            &crate::consensus_diagnostics::DIAG.stale_transactions_dropped,
+                                        );
+                                        continue;
+                                    }
                                     if mempool.insert(tx).is_ok() {
                                         inserted += 1;
                                     }
@@ -3066,6 +3092,12 @@ impl ConsensusManager {
                     };
                     let mempool_len_pre = mempool.len();
                     let mut transactions = mempool.drain(drain_limit);
+                    let stale = retain_unreceipted(&state, &mut transactions);
+                    if stale > 0 {
+                        crate::consensus_diagnostics::DIAG
+                            .stale_transactions_dropped
+                            .fetch_add(stale as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // Recovery protocol v3 never proposes a transaction that
                     // would become a failed canonical history entry. Validate
                     // the complete candidate first; on a conflicting batch,
@@ -3269,7 +3301,9 @@ impl ConsensusManager {
                                 // include it would strand it forever in the DAG
                                 // preimage cache.
                                 for transaction in transactions.iter().cloned() {
-                                    let _ = mempool.insert(transaction);
+                                    if !state.receipts.contains_key(&transaction.hash.0) {
+                                        let _ = mempool.insert(transaction);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -3942,6 +3976,39 @@ impl ConsensusManager {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_receipted_transaction_is_never_offered_again() {
+        // Regression for the circulation defect: a transaction that already has
+        // a canonical receipt must be dropped at every re-proposal point.
+        let sender = arc_crypto::signature::KeyPair::from_ed25519_secret_bytes(
+            &arc_crypto::hash_bytes(b"circulating sender").0,
+        );
+        let state = StateDB::with_genesis(&[(sender.address(), 1_000_000)]);
+        let make = |nonce: u64| {
+            let mut tx = arc_types::Transaction::new_transfer(
+                sender.address(),
+                arc_crypto::hash_bytes(b"recipient"),
+                10,
+                nonce,
+            );
+            tx.sign(&sender).unwrap();
+            tx
+        };
+        let executed = make(0);
+        let pending = make(1);
+        state
+            .execute_block_verified_at(&[executed.clone()], sender.address(), 1)
+            .expect("executes");
+        assert!(state.receipts.contains_key(&executed.hash.0), "it now has a receipt");
+
+        let mut offered = vec![executed.clone(), pending.clone()];
+        let dropped = retain_unreceipted(&state, &mut offered);
+        assert_eq!(dropped, 1);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].hash, pending.hash, "only the unexecuted one remains eligible");
+    }
+
     use super::*;
     use arc_crypto::{KeyPair, Signature, hash_bytes};
     use arc_types::{Account, AccountChange, StateDiff, Transaction, TxType};

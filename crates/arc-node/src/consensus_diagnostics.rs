@@ -84,6 +84,8 @@ counters!(
     phase_commit_us,
     commit_execute_us,
     state_snapshot_publish_us,
+    // already-receipted transactions refused re-proposal / re-admission
+    stale_transactions_dropped,
 );
 
 pub static DIAG: ConsensusDiagnostics = ConsensusDiagnostics::new();
