@@ -4225,7 +4225,14 @@ async fn consensus_diagnostics(AxumState(node): AxumState<NodeState>) -> Json<Va
             "finality_certificates_held".into(),
             Value::from(engine.finality_certificate_count() as u64),
         );
+        for (name, len) in engine.memory_gauges() {
+            map.insert(name.into(), Value::from(len));
+        }
     }
+    for (name, len) in node.state.memory_gauges() {
+        map.insert(name.into(), Value::from(len));
+    }
+    map.insert("mempool_len".into(), Value::from(node.mempool.len() as u64));
     map.insert("height".into(), Value::from(node.state.height()));
     Json(Value::Object(map))
 }

@@ -98,6 +98,22 @@ counters!(
     // commits waiting for transaction bodies instead of exiting the process
     commit_stalls,
     commit_stalled_blocks,
+    // GAUGES (current sizes, not totals) of the consensus loop's own
+    // collections, published about once a second. Every one should plateau.
+    gauge_pending_txs,
+    gauge_pending_tx_latest_round,
+    gauge_replay_queue,
+    gauge_targeted_fetch,
+    gauge_commit_backlog,
+    gauge_dag_wal_checkpoints,
+    gauge_absence_gossiped,
+    gauge_finality_signed_heights,
+    gauge_skip_vote_slots,
+    gauge_finality_vote_slots,
+    gauge_skip_observations,
+    gauge_skip_refused,
+    gauge_record_skipped_rounds,
+    gauge_record_finality_votes,
 );
 
 pub static DIAG: ConsensusDiagnostics = ConsensusDiagnostics::new();
@@ -109,6 +125,11 @@ pub fn add_elapsed(counter: &AtomicU64, start: std::time::Instant) {
 
 pub fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Relaxed);
+}
+
+/// Set a gauge to a collection's current size.
+pub fn set(gauge: &AtomicU64, len: usize) {
+    gauge.store(len as u64, Relaxed);
 }
 
 /// Classify a live-block insertion error by its cause, so "missing parents"

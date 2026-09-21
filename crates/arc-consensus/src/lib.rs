@@ -2289,6 +2289,36 @@ impl ConsensusEngine {
         self.finality_certificates.len()
     }
 
+    /// Entry counts of every collection the engine holds. A day-long run
+    /// needs every one of these flat once retention is reached; one that
+    /// climbs with height is a leak, and this names it.
+    pub fn memory_gauges(&self) -> Vec<(&'static str, u64)> {
+        let withholding = self.withholding_detector.lock().entry_count();
+        let (stake_votes, penalties) = self.stake_tracker.lock().sizes();
+        let checkpoints = self.checkpoint_registry.lock().len();
+        [
+            ("engine_dag_blocks", self.dag.len()),
+            ("engine_rounds", self.rounds.len()),
+            ("engine_committed_hashes", self.committed.read().len()),
+            ("engine_author_round_blocks", self.author_round_blocks.len()),
+            ("engine_da_commitments", self.da_commitments.len()),
+            ("engine_pending_cross_shard", self.pending_cross_shard.len()),
+            ("engine_completed_cross_shard", self.completed_cross_shard.len()),
+            ("engine_finality_proofs", self.finality_proofs.len()),
+            ("engine_skip_certificates", self.skip_certificates.len()),
+            ("engine_excused_participation", self.excused_participation.len()),
+            ("engine_finality_certificates", self.finality_certificates.len()),
+            ("engine_validator_keys", self.validator_keys.len()),
+            ("engine_withholding_entries", withholding),
+            ("engine_stake_votes", stake_votes),
+            ("engine_penalties", penalties),
+            ("engine_checkpoints", checkpoints),
+        ]
+        .into_iter()
+        .map(|(name, len)| (name, len as u64))
+        .collect()
+    }
+
     /// The block this node holds a quorum finality certificate for at `height`.
     pub fn finalized_block_at(&self, height: u64) -> Option<Hash256> {
         self.finality_certificates

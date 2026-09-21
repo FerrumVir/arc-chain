@@ -725,6 +725,17 @@ pub struct SkipTracker {
 }
 
 impl SkipTracker {
+    /// (observations, refused, record skipped rounds, record finality votes)
+    /// held, for resource diagnostics.
+    pub fn sizes(&self) -> (usize, usize, usize, usize) {
+        (
+            self.observations.len(),
+            self.refused.len(),
+            self.record.skipped_rounds.len(),
+            self.record.finality_votes.len(),
+        )
+    }
+
     pub fn new(
         domain: ConsensusDomain,
         validator_set_hash: Hash256,
@@ -897,6 +908,15 @@ pub struct SkipVoteCollector {
 }
 
 impl SkipVoteCollector {
+    /// (round, member, reason) slots being collected, for diagnostics.
+    pub fn len(&self) -> usize {
+        self.by_round.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_round.is_empty()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -958,6 +978,15 @@ pub struct FinalityVoteCollector {
 }
 
 impl FinalityVoteCollector {
+    /// (height, block) slots being collected, for diagnostics.
+    pub fn len(&self) -> usize {
+        self.by_block.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_block.is_empty()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

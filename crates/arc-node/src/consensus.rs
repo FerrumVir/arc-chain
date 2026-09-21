@@ -1254,6 +1254,7 @@ impl ConsensusManager {
             std::collections::HashMap::new();
         let mut unproductive_bootstrap_requests: u32 = 0;
         let mut iteration_started: Option<Instant> = None;
+        let mut gauges_published_at: Option<Instant> = None;
         // Committed DAG blocks waiting for transaction bodies, in round order.
         let mut commit_backlog: Vec<arc_consensus::DagBlock> = Vec::new();
         let mut commit_stall_fetch_at: Option<Instant> = None;
@@ -1376,6 +1377,30 @@ impl ConsensusManager {
                 crate::consensus_diagnostics::DIAG.loop_max_iteration_us.fetch_max(busy_us, std::sync::atomic::Ordering::Relaxed);
                 if busy >= std::time::Duration::from_secs(1) {
                     crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.loop_slow_iterations);
+                }
+            }
+            // Sizes of this loop's own collections, about once a second. The
+            // engine's and state's maps are read by the diagnostics endpoint
+            // itself; these live only here.
+            if gauges_published_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                gauges_published_at = Some(Instant::now());
+                use crate::consensus_diagnostics::{DIAG, set};
+                set(&DIAG.gauge_pending_txs, pending_txs.len());
+                set(&DIAG.gauge_pending_tx_latest_round, pending_tx_latest_round.len());
+                set(&DIAG.gauge_replay_queue, replay.len());
+                set(&DIAG.gauge_targeted_fetch, targeted_fetch_at.len());
+                set(&DIAG.gauge_commit_backlog, commit_backlog.len());
+                set(&DIAG.gauge_dag_wal_checkpoints, dag_wal_checkpoints.len());
+                set(&DIAG.gauge_absence_gossiped, absence_gossiped_at.len());
+                set(&DIAG.gauge_finality_signed_heights, finality_signed_heights.len());
+                set(&DIAG.gauge_skip_vote_slots, skip_vote_collector.len());
+                set(&DIAG.gauge_finality_vote_slots, finality_vote_collector.len());
+                if let Some(tracker) = skip_tracker.as_ref() {
+                    let (observations, refused, skipped, finality) = tracker.sizes();
+                    set(&DIAG.gauge_skip_observations, observations);
+                    set(&DIAG.gauge_skip_refused, refused);
+                    set(&DIAG.gauge_record_skipped_rounds, skipped);
+                    set(&DIAG.gauge_record_finality_votes, finality);
                 }
             }
             let shutdown_before_tick = if let Some(receiver) = shutdown.as_mut() {

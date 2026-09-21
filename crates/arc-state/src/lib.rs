@@ -2763,6 +2763,37 @@ impl StateDB {
     }
 
     /// Get current block height.
+    /// Entry counts of the in-memory collections, for resource diagnostics.
+    /// Blocks, receipts, transaction bodies and indexes are the chain's own
+    /// history and grow with it by design; everything else should plateau.
+    /// `/consensus/diagnostics` reports these so a soak can tell the two apart.
+    pub fn memory_gauges(&self) -> Vec<(&'static str, u64)> {
+        let account_tx_entries: usize = self.account_txs.iter().map(|e| e.value().len()).sum();
+        let event_log_entries: usize = self.event_logs.iter().map(|e| e.value().len()).sum();
+        [
+            ("state_accounts", self.accounts.len()),
+            ("state_storage_contracts", self.storage.len()),
+            ("state_blocks", self.blocks.len()),
+            ("state_receipts", self.receipts.len()),
+            ("state_tx_index", self.tx_index.len()),
+            ("state_full_transactions", self.full_transactions.len()),
+            ("state_account_txs_addresses", self.account_txs.len()),
+            ("state_account_txs_entries", account_tx_entries),
+            ("state_event_log_heights", self.event_logs.len()),
+            ("state_event_log_entries", event_log_entries),
+            ("state_contracts", self.contracts.len()),
+            ("state_identities", self.identities.len()),
+            ("state_signed_block_data", self.signed_block_data.len()),
+            ("state_dirty_accounts", self.dirty_accounts.len()),
+            ("state_validators", self.validators.len()),
+            ("state_native_pending", self.native_inference_pending.len()),
+            ("state_pending_bond_release_heights", self.pending_bond_releases.lock().len()),
+        ]
+        .into_iter()
+        .map(|(name, len)| (name, len as u64))
+        .collect()
+    }
+
     pub fn height(&self) -> u64 {
         let _publication = self.native_inference_publication.read();
         *self.height.read()
