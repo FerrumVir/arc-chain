@@ -21,10 +21,14 @@
 //!   this is. That binding belongs to the checkpoint envelope, which is a
 //!   separate trust boundary.
 //!
-//! The payload covers exactly the state that WAL replay reconstructs, so
-//! "install the snapshot, then replay the tail" and "replay everything" reach
-//! the same state. That equivalence is asserted directly by test rather than
-//! argued for.
+//! The payload covers the state that WAL replay reconstructs and the most
+//! recent window of history; older history is rebuilt at open from the WAL
+//! records below the snapshot, which are decoded and validated anyway. So
+//! "install the snapshot, rebuild history from the prefix, then replay the
+//! tail" and "replay everything" reach the same state and the same history,
+//! while the snapshot itself stays the size of the state rather than the
+//! length of the chain. That equivalence is asserted directly by test rather
+//! than argued for.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,7 +43,17 @@ use crate::recovery::RecoveryContext;
 /// an unreadable snapshot must be recognised as such rather than decoded into
 /// something plausible.
 const SNAPSHOT_MAGIC: &[u8] = b"ARC-SNAPSHOT";
-const SNAPSHOT_VERSION: u8 = 1;
+/// Version 2: the history collections carry a recent window only; the rest is
+/// rebuilt from the WAL at open. A version-1 reader would install such a
+/// snapshot and replay only the tail, silently missing the older history, so
+/// the version is bumped and each side refuses the other's snapshot - which
+/// costs one full replay, never correctness.
+const SNAPSHOT_VERSION: u8 = 2;
+
+/// Heights of history a snapshot carries by default: enough for the chain
+/// linkage of the next block and for recent receipt lookups on a node that
+/// was bootstrapped from a checkpoint, and nothing that grows with the chain.
+pub const DEFAULT_HISTORY_WINDOW: u64 = 256;
 
 pub const PAYLOAD_FILE: &str = "state-snapshot.bin";
 pub const MANIFEST_FILE: &str = "state-snapshot.manifest";
@@ -76,6 +90,11 @@ pub struct SnapshotManifestV1 {
 /// Every piece of state that `apply_wal_op` reconstructs. Anything replay does
 /// not write is deliberately absent: including it would make the snapshot and
 /// a full replay disagree, which is the one thing that must not happen.
+///
+/// The history collections (`blocks`, `receipts`, `full_transactions`,
+/// `event_logs`) hold only the most recent window of heights - see
+/// `DEFAULT_HISTORY_WINDOW` - and opening a node rebuilds the rest from the
+/// WAL.
 ///
 /// Every collection is ordered by key so the encoding - and therefore the
 /// digest - is reproducible from the same state.

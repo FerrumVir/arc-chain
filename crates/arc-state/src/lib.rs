@@ -593,6 +593,9 @@ pub struct StateDB {
     pub full_transactions: DashMap<[u8; 32], Transaction>,
     /// Blocks since last snapshot.
     snapshot_counter: AtomicU64,
+    /// How many of the most recent heights a durable snapshot carries the
+    /// history of. See `export_durable_snapshot`.
+    snapshot_history_window: AtomicU64,
     /// Total benchmark transactions executed (atomic counter for /stats).
     pub benchmark_tx_count: AtomicU64,
     /// Async indexer channel - sends batches to background threads.
@@ -725,6 +728,7 @@ impl StateDB {
             identities: DashMap::new(),
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
+            snapshot_history_window: AtomicU64::new(snapshot::DEFAULT_HISTORY_WINDOW),
             benchmark_tx_count: AtomicU64::new(0),
             #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
@@ -777,6 +781,7 @@ impl StateDB {
             identities: DashMap::new(),
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
+            snapshot_history_window: AtomicU64::new(snapshot::DEFAULT_HISTORY_WINDOW),
             benchmark_tx_count: AtomicU64::new(0),
             #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
@@ -911,8 +916,18 @@ impl StateDB {
             let adopted = state.adopt_snapshot_if_trustworthy(wal_dir);
             let resume_from = adopted.map(|manifest| manifest.resume_from_sequence);
             let mut entry_count = 0usize;
+            let mut history_rebuilt = 0usize;
             for entry in &entries {
                 if resume_from.is_some_and(|first| entry.sequence < first) {
+                    // Before the snapshot: its state is already installed, but
+                    // a snapshot carries only a recent window of history. The
+                    // rest is rebuilt here from the records that were just
+                    // decoded and validated anyway - insertion, never
+                    // execution, so the cost is the same order as reading.
+                    if Self::is_history_op(&entry.op) {
+                        state.apply_wal_op(&entry.op);
+                        history_rebuilt += 1;
+                    }
                     continue;
                 }
                 state.apply_wal_op(&entry.op);
@@ -926,6 +941,7 @@ impl StateDB {
 
             tracing::info!(
                 replayed = entry_count,
+                history_rebuilt,
                 of_total = entries.len(),
                 from_snapshot_height = ?adopted.map(|m| m.identity.height),
                 accounts = state.accounts.len(),
@@ -1321,6 +1337,27 @@ impl StateDB {
     }
 
     /// Apply a WAL operation to in-memory state (used during recovery replay).
+    /// Records that describe the chain's history - blocks, receipts, bodies,
+    /// event logs - as opposed to its state. Replaying one below a snapshot
+    /// rebuilds history the snapshot deliberately does not carry.
+    fn is_history_op(op: &WalOp) -> bool {
+        matches!(
+            op,
+            WalOp::SetBlock(..)
+                | WalOp::SetReceipt(..)
+                | WalOp::SetFullTransaction(..)
+                | WalOp::SetEventLogs(..)
+        )
+    }
+
+    /// How many of the most recent heights a durable snapshot carries the
+    /// history of (at least 1: the tip block anchors the chain linkage of
+    /// whatever is applied next).
+    pub fn set_snapshot_history_window(&self, heights: u64) {
+        self.snapshot_history_window
+            .store(heights.max(1), Ordering::Release);
+    }
+
     fn apply_wal_op(&self, op: &WalOp) {
         match op {
             WalOp::SetAccount(addr, account) => {
@@ -9609,9 +9646,27 @@ impl StateDB {
     /// plus the WAL tail after it reaches the same state as replaying
     /// everything. Anything `apply_wal_op` does not write is deliberately
     /// excluded - including it would make the two paths disagree.
+    ///
+    /// History - blocks, receipts, bodies, event logs - is captured for the
+    /// most recent `snapshot_history_window` heights only. Capturing all of it
+    /// made every snapshot proportional to the length of the chain, and one
+    /// is rewritten every interval inside the consensus loop: quadratic I/O
+    /// over a node's life, and a stall that grew with every snapshot. The
+    /// older history is not lost - it is in the WAL, and opening a node
+    /// rebuilds it from there (see `is_history_op`).
     pub fn export_durable_snapshot(&self) -> snapshot::SnapshotPayload {
+        let height = self.height();
+        let window = self.snapshot_history_window.load(Ordering::Acquire).max(1);
+        let first = height.saturating_sub(window - 1);
+        let blocks: Vec<(u64, Block)> = (first..=height)
+            .filter_map(|h| self.blocks.get(&h).map(|b| (h, b.value().clone())))
+            .collect();
+        let in_window: Vec<[u8; 32]> = blocks
+            .iter()
+            .flat_map(|(_, block)| block.tx_hashes.iter().map(|hash| hash.0))
+            .collect();
         let mut payload = snapshot::SnapshotPayload {
-            height: self.height(),
+            height,
             accounts: self
                 .accounts
                 .iter()
@@ -9640,26 +9695,26 @@ impl StateDB {
                 .iter()
                 .map(|e| (Hash256(*e.key()), e.value().clone()))
                 .collect(),
-            blocks: self
-                .blocks
+            receipts: in_window
                 .iter()
-                .map(|e| (*e.key(), e.value().clone()))
+                .filter_map(|hash| {
+                    self.receipts
+                        .get(hash)
+                        .map(|r| (Hash256(*hash), r.value().clone()))
+                })
                 .collect(),
-            receipts: self
-                .receipts
+            full_transactions: in_window
                 .iter()
-                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .filter_map(|hash| {
+                    self.full_transactions
+                        .get(hash)
+                        .map(|t| (Hash256(*hash), t.value().clone()))
+                })
                 .collect(),
-            full_transactions: self
-                .full_transactions
-                .iter()
-                .map(|e| (Hash256(*e.key()), e.value().clone()))
+            event_logs: (first..=height)
+                .filter_map(|h| self.event_logs.get(&h).map(|l| (h, l.value().clone())))
                 .collect(),
-            event_logs: self
-                .event_logs
-                .iter()
-                .map(|e| (*e.key(), e.value().clone()))
-                .collect(),
+            blocks,
             validators: self
                 .validators
                 .iter()

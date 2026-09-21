@@ -89,6 +89,90 @@ fn a_snapshot_plus_the_tail_equals_a_full_replay() {
     );
 }
 
+fn transfer(from: Address, to: Address, amount: u64, nonce: u64) -> arc_types::Transaction {
+    let mut tx = arc_types::Transaction::new_transfer(from, to, amount, nonce);
+    tx.sig_verified = true;
+    tx
+}
+
+/// Every transaction's receipt outcome and whether its body is held.
+fn history(state: &StateDB, hashes: &[Hash256]) -> Vec<(Hash256, Option<bool>, bool)> {
+    hashes
+        .iter()
+        .map(|h| {
+            (
+                *h,
+                state.get_receipt(&h.0).map(|r| r.success),
+                state.get_transaction(&h.0).is_some(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_snapshot_carries_only_a_recent_history_window_and_open_rebuilds_the_rest() {
+    // A snapshot used to capture every block, receipt and body, so each one
+    // grew with the chain. It now carries a recent window; the rest must come
+    // back from the WAL records below it - with every receipt and body, not
+    // just the block headers.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state");
+    let state = open(&path);
+    state.set_snapshot_history_window(4);
+    let mut hashes = Vec::new();
+    let mut execute = |state: &StateDB, nonce: u64| {
+        let tx = transfer(addr(1), addr(3), 10, nonce);
+        hashes.push(tx.hash);
+        state
+            .execute_block_adaptive_at_with_proof(
+                &[tx],
+                addr(1),
+                1_700_000_000_000 + nonce,
+                hash_bytes(&nonce.to_le_bytes()),
+            )
+            .expect("canonical execution");
+    };
+    for nonce in 0..12 {
+        execute(&state, nonce);
+    }
+    state.publish_durable_snapshot().expect("snapshot published");
+    let verified = snapshot::load(&path).expect("the snapshot verifies");
+    assert!(
+        verified.payload.blocks.len() <= 4
+            && verified.payload.receipts.len() <= 4
+            && verified.payload.full_transactions.len() <= 4,
+        "the snapshot carried more than its window: {} blocks, {} receipts, {} bodies",
+        verified.payload.blocks.len(),
+        verified.payload.receipts.len(),
+        verified.payload.full_transactions.len()
+    );
+    assert_eq!(
+        verified.payload.blocks.last().map(|(h, _)| *h),
+        Some(state.height()),
+        "the window ends at the tip, whose block anchors what comes next"
+    );
+    for nonce in 12..15 {
+        execute(&state, nonce);
+    }
+    let expected = (observable(&state), history(&state, &hashes));
+    drop(state);
+
+    let with_snapshot = open(&path);
+    let from_snapshot = (observable(&with_snapshot), history(&with_snapshot, &hashes));
+    drop(with_snapshot);
+    snapshot::remove(&path).expect("snapshot removed");
+    let full_replay = open(&path);
+    let from_replay = (observable(&full_replay), history(&full_replay, &hashes));
+
+    assert_eq!(from_snapshot, from_replay, "snapshot + prefix history + tail != full replay");
+    assert_eq!(from_snapshot, expected, "recovery lost something that was durable");
+    assert!(
+        from_snapshot.1.iter().all(|(_, receipt, body)| *receipt == Some(true) && *body),
+        "a receipt or body below the window was not rebuilt: {:?}",
+        from_snapshot.1
+    );
+}
+
 #[test]
 fn a_snapshot_taken_at_the_tip_needs_no_tail_at_all() {
     let dir = tempfile::tempdir().unwrap();
