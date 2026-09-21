@@ -700,12 +700,17 @@ echo "[5c/6] a quorum finality certificate a client can verify without trusting 
 FH=$(nfield "$BASE_RPC" /health height); FH=${FH:-0}
 FTARGET=$(( FH > 8 ? FH - 4 : 0 ))
 if [[ $FTARGET -gt 0 ]]; then
-  FBODY=$(curl -s -m 6 "http://127.0.0.1:$BASE_RPC/finality/$FTARGET" || true)
-  FVERDICT=$(printf '%s' "$FBODY" | python3 - "$FTARGET" <<'PYEOF'
+  # The body goes to a FILE, not a pipe: `python3 -` reads its program from
+  # stdin, so a heredoc and a pipe cannot both feed it. Piping the body while
+  # heredoc-ing the script silently gave python an empty stdin and reported
+  # "response was not JSON" about a response that was perfectly fine.
+  curl -s -m 6 "http://127.0.0.1:$BASE_RPC/finality/$FTARGET" > "$WORK/finality.json" || true
+  FVERDICT=$(python3 - "$FTARGET" "$WORK/finality.json" <<'PYEOF'
 import json, sys
 target = int(sys.argv[1])
 try:
-    d = json.load(sys.stdin)
+    with open(sys.argv[2]) as fh:
+        d = json.load(fh)
 except Exception as exc:
     print(f"BAD response was not JSON ({exc})"); sys.exit(0)
 if "certificate_bincode_hex" not in d:
