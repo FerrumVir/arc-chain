@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import assert from "node:assert/strict";
 
 const require = createRequire(import.meta.url);
-const native = require("./localdev-native.js");
+const native = require("./native-receipts.js");
 
 let passed = 0;
 const check = (name, fn) => {

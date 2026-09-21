@@ -1,13 +1,15 @@
 (function (root, factory) {
   const network = root?.ArcNetwork || (typeof require === "function" ? require("../shared/frontend/arc-network.js") : null);
-  const api = factory(network);
+  const receipts = root?.ArcNativeReceipts || (typeof require === "function" ? require("./native-receipts.js") : null);
+  const api = factory(network, receipts);
   if (typeof module === "object" && module.exports) module.exports = api;
   if (root) root.ArcExplorer = api;
   if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", api.boot, { once: true });
-})(typeof globalThis !== "undefined" ? globalThis : this, function (network) {
+})(typeof globalThis !== "undefined" ? globalThis : this, function (network, nativeReceipts) {
   "use strict";
 
   if (!network) throw new Error("ARC network resolver did not load");
+  if (!nativeReceipts) throw new Error("ARC native receipt rules did not load");
 
   const REFRESH_INTERVAL_MS = 30_000;
   const REQUEST_TIMEOUT_MS = 8_000;
@@ -32,8 +34,8 @@
       return { kind: "block", value: String(height) };
     }
     const normalized = network.normalizeHex(value, 32);
-    if (!normalized) return { error: "Transactions and addresses must be 32-byte hexadecimal values." };
-    if (kind === "tx" || kind === "address") return { kind, value: normalized };
+    if (!normalized) return { error: "Transactions, native requests and addresses must be 32-byte hexadecimal values." };
+    if (kind === "tx" || kind === "address" || kind === "request") return { kind, value: normalized };
     return { kind: "lookup", value: normalized };
   }
 
@@ -315,6 +317,35 @@
       return { source, found, account: account.ok ? account.value : null, history: historyValue, provenance, archiveVerification };
     }));
     return { records: attempts.filter((attempt) => attempt.found), failures: attempts.filter((attempt) => !attempt.found) };
+  }
+
+  // A native paid-inference request (protocol 4) is identified by its request
+  // id; its canonical record is the receipt each validator serves. Every
+  // permitted source is asked, and the page shows whether the ones that
+  // answer record the same settlement - a disagreement is shown, never
+  // averaged away - and whether each settlement's credits reconcile.
+  async function queryNativeRequest(options) {
+    const { resolver, fetchImpl, requestId, sourceId, signal } = options;
+    const id = network.normalizeHex(requestId, 32);
+    if (!id) throw new RpcError("Native request ids must be 32-byte hexadecimal values", 0, null);
+    // Canonical view: every enabled replica of the current network, since the
+    // point is whether they agree. An explicitly selected source: that one.
+    const planned = sourceId && sourceId !== "canonical"
+      ? resolver.lookupSources({ sourceId })
+      : resolver.v3Replicas().map((source) => ({ source, sourceId: source.id }));
+    const answers = await Promise.all(planned.map(async ({ source }) => {
+      const result = await optionalRequest(fetchImpl, source, `/native-inference/receipt/${id}`, { signal });
+      return { source, receipt: result.ok ? result.value : null, error: result.ok ? null : result.error };
+    }));
+    const answered = answers.filter((answer) => answer.receipt);
+    return {
+      requestId: id,
+      answers,
+      comparison: nativeReceipts.compareReplicas(
+        answered.map((answer) => ({ source: answer.source.id, receipt: answer.receipt })),
+      ),
+      plannedSources: planned.map((entry) => entry.sourceId),
+    };
   }
 
   function boot() {
@@ -782,9 +813,51 @@
       }
     }
 
+    async function inspectNativeRequest(requestId) {
+      state.lookupController?.abort();
+      const controller = new AbortController();
+      state.lookupController = controller;
+      inspectorLoading("Native request", network.formatHash(requestId, 14, 12));
+      try {
+        const result = await queryNativeRequest({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), requestId, sourceId: state.sourceId, signal: controller.signal });
+        const { comparison } = result;
+        if (!comparison.answered) return inspectorError("Native request", "Request not found", `None of ${result.plannedSources.length} permitted source(s) holds a receipt for this request id.`);
+        setInspector("Native request · per-source receipts", network.formatHash(requestId, 14, 12));
+        elements.inspectorContent.append(create(
+          "p",
+          `inspector-note ${comparison.agree ? "good" : "error"}`,
+          comparison.agree
+            ? `All ${comparison.answered} answering source(s) record the same settlement.`
+            : `Sources DISAGREE about this request (${comparison.answered} answered). Nothing is averaged; each record is shown as served.`,
+        ));
+        for (const row of comparison.rows) {
+          const summary = row.summary;
+          const card = create("article", "occurrence-card");
+          const reconciled = summary.reconciled === null ? "Not settled yet" : summary.reconciled ? "Credits equal the reservation" : "Credits do NOT equal the reservation";
+          card.append(create("h3", "", row.source), detailGrid([
+            ["Chain status", summary.status],
+            ["Settlement", reconciled],
+            ["Price / reserved", `${formatInteger(summary.price)} / ${formatInteger(summary.reserved)}`],
+            ["Credited", formatInteger(summary.credited)],
+            ["Certificate votes", formatInteger(summary.votes)],
+            ["Output hash", summary.outputHash ? `0x${summary.outputHash}` : "None", true],
+            ["Admitted at", formatInteger(summary.admissionHeight)],
+            ["Terminal at", formatInteger(summary.terminalHeight)],
+          ]));
+          const served = result.answers.find((answer) => answer.source.id === row.source);
+          if (served?.receipt) card.append(rawSection("Receipt", served.receipt));
+          elements.inspectorContent.append(card);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) inspectorError("Native request", "Lookup failed", error.message);
+      }
+    }
+
     async function inspectAutoHash(hash) {
       const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId, checkpointAudit: state.checkpointAudit });
       if (result.occurrences.length) return inspectTransaction(hash);
+      const native = await queryNativeRequest({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), requestId: hash, sourceId: state.sourceId });
+      if (native.comparison.answered) return inspectNativeRequest(hash);
       return inspectAddress(hash);
     }
 
@@ -812,8 +885,9 @@
       if (route.kind === "block") inspectBlock(route.value);
       else if (route.kind === "tx") inspectTransaction(route.value);
       else if (route.kind === "address") inspectAddress(route.value);
+      else if (route.kind === "request") inspectNativeRequest(route.value);
       else if (route.kind === "lookup") inspectAutoHash(route.value).catch((error) => inspectorError("Lookup", "Lookup failed", error.message));
-      else inspectorError("Lookup", "Unsupported route", "Use a block, transaction, or address search.");
+      else inspectorError("Lookup", "Unsupported route", "Use a block, transaction, native request, or address search.");
     }
 
     function navigate(kind, value) {
@@ -878,6 +952,7 @@
     queryBlock,
     queryTransaction,
     queryAddress,
+    queryNativeRequest,
     boot,
   });
 });

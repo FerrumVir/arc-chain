@@ -1,4 +1,5 @@
-// ARC LOCAL DEVELOPMENT explorer: native paid inference (protocol 4).
+// ARC explorer: native paid inference (protocol 4) receipt rules, shared by
+// the production explorer (app.js) and the local-development view.
 //
 // Pure functions only - no DOM, no fetch - so the rules that decide what a
 // receipt SAYS are tested without a browser (test-localdev-native.mjs) and
@@ -93,4 +94,6 @@
   const api = { summarize, compareReplicas, describeTransaction, fingerprint };
   if (typeof module === "object" && module && module.exports) module.exports = api;
   root.ArcLocalDevNative = api;
+  // The production explorer reads the same receipt rules under this name.
+  root.ArcNativeReceipts = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -467,7 +467,8 @@ await test("latest block fallback rejects non-404 errors, unsafe heights, and mi
 });
 
 await test("lookup failures use their own abort controller and render the intended error", () => {
-  assert.equal((source.match(/state\.lookupController = controller;/g) || []).length, 3);
+  // Block, transaction, native request and address inspectors each own one.
+  assert.equal((source.match(/state\.lookupController = controller;/g) || []).length, 4);
   assert.doesNotMatch(source, /signal: state\.lookupController\.signal/);
   assert.doesNotMatch(source, /if \(!signal\.aborted\) inspectorError\("Block"/);
   assert.match(source, /if \(!controller\.signal\.aborted\) inspectorError\("Block", "Block unavailable", error\.message\)/);
@@ -728,6 +729,70 @@ await test("a failed refresh clears canonical evidence instead of leaving stale 
   assert.equal(dom.said("inference-status"), "Unavailable");
   assert.equal(dom.said("rewards-status"), "Unavailable");
   assert.equal(dom.said("last-refreshed"), "Refresh failed");
+});
+
+await test("native requests are compared across replicas and a disagreement is reported", async () => {
+  assert.ok(html.indexOf("./native-receipts.js") < html.indexOf("./app.js"), "receipt rules load first");
+  const id = hex("e");
+  assert.deepEqual(app.classifyLookup(id, "request"), { kind: "request", value: id });
+  const replicaResolver = network.createCanonicalResolver({
+    schema: "arc.frontend.network.v1",
+    state: "recovered",
+    network: { name: "ARC native fixture", chainId: "arc-native-fixture" },
+    checkpoint: {
+      height: H, recoveryHeight: H + 1, legacyPublicMaxHeight: H + 10,
+      blockHash: hex("a"), stateRoot: hex("b"), manifestHash: hex("c"),
+      boundaryBlockHash: hex("d"), boundaryStateRoot: hex("e"), recoveryDomain: hex("f"),
+      recoveryEpoch: 7, validatorSetId: 9, protocolVersion: "3.0.0",
+      legacySourceId: "legacy", v3SourceId: "r1",
+    },
+    sources: [
+      { id: "legacy", name: "Legacy", kind: "legacy-canonical", baseUrl: "https://legacy.example.test" },
+      { id: "r1", name: "Replica 1", kind: "v3", baseUrl: "https://r1.example.test" },
+      { id: "r2", name: "Replica 2", kind: "v3", baseUrl: "https://r2.example.test" },
+    ],
+  });
+  const settled = (credits) => ({
+    request_id: id, observed_status: "Finalized", execution_price: 10, reserved_max_payment: 100,
+    output_hash: hex("1"), certificate_votes: 3, settlement_credits: credits,
+    admission_transaction: { block_height: H + 3 }, terminal_transaction: { block_height: H + 5 },
+  });
+  const paid = [{ payee: hex("2"), amount: 10 }, { payee: hex("3"), amount: 90 }];
+  const receiptPath = (base) => `${base}/native-inference/receipt/${id}`;
+
+  const agreeing = await app.queryNativeRequest({
+    resolver: replicaResolver, requestId: id, sourceId: "canonical",
+    fetchImpl: mockFetch({
+      [receiptPath("https://r1.example.test")]: { body: settled(paid) },
+      [receiptPath("https://r2.example.test")]: { body: settled(paid) },
+    }),
+  });
+  assert.deepEqual(agreeing.plannedSources, ["r1", "r2"], "every replica is asked, not the legacy archive");
+  assert.equal(agreeing.comparison.answered, 2);
+  assert.equal(agreeing.comparison.agree, true);
+  assert.ok(agreeing.comparison.rows.every((row) => row.summary.reconciled === true));
+
+  const disagreeing = await app.queryNativeRequest({
+    resolver: replicaResolver, requestId: id, sourceId: "canonical",
+    fetchImpl: mockFetch({
+      [receiptPath("https://r1.example.test")]: { body: settled(paid) },
+      [receiptPath("https://r2.example.test")]: { body: settled([{ payee: hex("2"), amount: 50 }]) },
+    }),
+  });
+  assert.equal(disagreeing.comparison.agree, false, "a different settlement is a disagreement");
+  assert.equal(disagreeing.comparison.rows.find((row) => row.source === "r2").summary.reconciled, false);
+
+  const partial = await app.queryNativeRequest({
+    resolver: replicaResolver, requestId: id, sourceId: "canonical",
+    fetchImpl: mockFetch({ [receiptPath("https://r1.example.test")]: { body: settled(paid) } }),
+  });
+  assert.equal(partial.comparison.asked, 1, "only answering replicas are compared");
+  assert.equal(partial.answers.filter((answer) => answer.error).length, 1, "the silent replica is recorded");
+
+  await assert.rejects(
+    app.queryNativeRequest({ resolver: replicaResolver, requestId: "../../admin", fetchImpl: mockFetch({}) }),
+    /32-byte/,
+  );
 });
 
 process.stdout.write(`\nARC composite explorer contract: ${count}/${count} checks passed\n`);

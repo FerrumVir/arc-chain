@@ -51,7 +51,7 @@ fi
 
 for required in \
     dashboard/index.html dashboard/tailwind.css dashboard/app.css dashboard/app.js \
-    explorer/index.html explorer/app.js explorer/styles.css \
+    explorer/index.html explorer/app.js explorer/native-receipts.js explorer/styles.css \
     shared/frontend/arc-network.js shared/frontend/arc-network.json \
     shared/frontend/production-status.json; do
     [ -f "$required" ] && [ ! -L "$required" ] && [ -s "$required" ] \
@@ -107,7 +107,7 @@ grep -Fq './explorer/#/tx/' "$OUTPUT_DIR/app.js" \
 if grep -Fq '../explorer/' "$OUTPUT_DIR/app.js"; then
     die "dashboard retained a source-tree-only receipt URL"
 fi
-cp -- explorer/index.html explorer/app.js explorer/styles.css "$OUTPUT_DIR/explorer/"
+cp -- explorer/index.html explorer/app.js explorer/native-receipts.js explorer/styles.css "$OUTPUT_DIR/explorer/"
 cp -- shared/frontend/arc-network.js shared/frontend/arc-network.json \
     shared/frontend/production-status.json \
     "$OUTPUT_DIR/shared/frontend/"
