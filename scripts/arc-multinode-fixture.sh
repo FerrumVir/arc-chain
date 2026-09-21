@@ -690,6 +690,52 @@ MISSING=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://127.0.0.1:
 # is expected to keep moving while the node is down. No threshold is weakened
 # to make this pass.
 echo ""
+echo
+echo "[5c/6] a quorum finality certificate a client can verify without trusting the server"
+# /block/{h} reports what THIS node committed - a local observation. A client
+# that does not already trust the node cannot check it. /finality/{h} returns
+# the committee's signed certificate, which is checkable against a validator
+# set and chain domain the client holds independently. They are different
+# facts and the fixture asserts the difference rather than assuming it.
+FH=$(nfield "$BASE_RPC" /health height); FH=${FH:-0}
+FTARGET=$(( FH > 8 ? FH - 4 : 0 ))
+if [[ $FTARGET -gt 0 ]]; then
+  FBODY=$(curl -s -m 6 "http://127.0.0.1:$BASE_RPC/finality/$FTARGET" || true)
+  FVERDICT=$(printf '%s' "$FBODY" | python3 - "$FTARGET" <<'PYEOF'
+import json, sys
+target = int(sys.argv[1])
+try:
+    d = json.load(sys.stdin)
+except Exception as exc:
+    print(f"BAD response was not JSON ({exc})"); sys.exit(0)
+if "certificate_bincode_hex" not in d:
+    print(f"BAD no certificate served at height {target}: {str(d)[:160]}"); sys.exit(0)
+if d.get("height") != target:
+    print(f"BAD served height {d.get('height')}, asked for {target}"); sys.exit(0)
+if not d.get("verified_by_server"):
+    print("BAD the server could not verify the certificate it served"); sys.exit(0)
+signing, quorum = d.get("signing_stake"), d.get("quorum")
+if signing is None or quorum is None or signing < quorum:
+    print(f"BAD signing stake {signing} below quorum {quorum}"); sys.exit(0)
+raw = d.get("certificate_bincode_hex") or ""
+if len(raw) < 64 or any(c not in "0123456789abcdef" for c in raw):
+    print("BAD the encoded certificate is missing or not hex"); sys.exit(0)
+print(f"OK height {target}, {len(d.get('voters', []))} voters, signing {signing} of quorum "
+      f"{quorum}/{d.get('total_stake')}, {len(raw)//2} verifiable bytes")
+PYEOF
+)
+  case "$FVERDICT" in
+    OK*) ok "finality certificate served and re-verified: ${FVERDICT#OK }" ;;
+    *)   fail "finality endpoint: ${FVERDICT#BAD }" ;;
+  esac
+  FCODE=$(curl -s -o /dev/null -w '%{http_code}' -m 6 "http://127.0.0.1:$BASE_RPC/finality/99999999")
+  [[ "$FCODE" == 404 ]] \
+    && ok "a height with no certificate is refused (HTTP 404), not fabricated" \
+    || fail "finality endpoint answered HTTP $FCODE for a height it cannot have certified"
+else
+  echo "  SKIPPED: the chain is too short to have a certified height behind the tip"
+fi
+
 echo "[6/6] killing node $((NODES-1)), restarting it, and requiring recovery"
 LAST=$((NODES-1))
 
