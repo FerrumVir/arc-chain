@@ -92,6 +92,16 @@ class NativeRequesterFunding(unittest.TestCase):
             soak.native_requesters()
 
 
+class BinarySelfReport(unittest.TestCase):
+    def test_a_node_reporting_another_build_aborts_the_run(self):
+        digest = "ab" * 32
+        self.assertEqual(orchestrate.binary_self_report({"binary_sha256": digest.upper()}, digest), "match")
+        self.assertEqual(orchestrate.binary_self_report({"status": "ok"}, digest), "absent")
+        self.assertEqual(orchestrate.binary_self_report(None, digest), "absent")
+        with self.assertRaises(orchestrate.Abort):
+            orchestrate.binary_self_report({"binary_sha256": "cd" * 32}, digest)
+
+
 class FaultPlanning(unittest.TestCase):
     ARGS = ["--binary", "/bin/sh", "--provenance", "/dev/null", "--minutes", "20"]
 

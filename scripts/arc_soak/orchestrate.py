@@ -213,6 +213,22 @@ class Node:
         return ident if HEX64.match(ident) else None
 
 
+def binary_self_report(health: Any, expected_sha256: str) -> str:
+    """Compare a node's self-reported executable digest with the recorded one.
+
+    "match" or "absent" (a binary that predates the field). A different
+    digest means the process under test is not the recorded build, and the
+    run's evidence would describe the wrong binary: that aborts the run.
+    """
+    reported = health.get("binary_sha256") if isinstance(health, dict) else None
+    if not reported:
+        return "absent"
+    if str(reported).lower() != expected_sha256.lower():
+        raise Abort(f"a node reports binary {str(reported)[:16]}..., "
+                    f"not the recorded {expected_sha256[:16]}...")
+    return "match"
+
+
 def derive_identity(cfg: "Config", index: int) -> str:
     """Start the binary briefly and read the validator address it prints."""
     d = os.path.join(cfg.work, f"ident-{index}")
@@ -469,6 +485,9 @@ class Soak:
                 time.sleep(1)
             else:
                 raise Abort(f"node {node.index} never answered with its own identity")
+            code, health = http_json(node.rpc, "/health", timeout=3)
+            self.run.setdefault("binary_self_report", {})[str(node.index)] = \
+                binary_self_report(health, self.run["binary_sha256"])
         self.note("all validators answering with their own identities")
 
     # -- sampling --------------------------------------------------------
@@ -616,6 +635,8 @@ class Soak:
                     f["identity_verified"] = ident == victim.identity
                     f["process_ready_t"] = now()
                     victim.scheduled_down = False
+                    code, health = http_json(victim.rpc, "/health", timeout=3)
+                    f["binary_self_report"] = binary_self_report(health, self.run["binary_sha256"])
             else:
                 code, health = http_json(victim.rpc, "/health", timeout=3)
                 if isinstance(health, dict):
