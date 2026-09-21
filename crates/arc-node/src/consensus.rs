@@ -272,14 +272,32 @@ fn try_drain_recovery_reconnect_replay(
     Ok(RecoveryReplayDrain::Complete)
 }
 
+/// Drop preimages no committed or retained DAG block can still need.
+///
+/// A body whose transaction EXECUTED goes once every round naming it is behind
+/// the commit cursor: the canonical state keeps it and serves it from there.
+/// A body that never executed has no such home. Under protocol 4 that is the
+/// common case for an omitted transaction - several validators each submit a
+/// finalize, one wins the block's single slot, the rest are dropped - and a
+/// restarted node re-running the commit-time selection needs EVERY body the
+/// committed block names. Pruned at the commit cursor, those bodies existed
+/// nowhere: a restarted validator sat on one committed block for minutes,
+/// asking every peer for a body none of them held. So a never-executed body
+/// is kept until `unexecuted_floor` - the DAG retention horizon, the same
+/// window the blocks naming it are served from.
 fn prune_irreversible_preimages(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     latest_round: &dashmap::DashMap<[u8; 32], u64>,
     committed_round_exclusive: u64,
+    unexecuted_floor: u64,
+    executed: impl Fn(&[u8; 32]) -> bool,
 ) -> usize {
     let obsolete: Vec<_> = latest_round
         .iter()
-        .filter(|entry| *entry.value() < committed_round_exclusive)
+        .filter(|entry| {
+            *entry.value() < committed_round_exclusive
+                && (*entry.value() < unexecuted_floor || executed(entry.key()))
+        })
         .map(|entry| *entry.key())
         .collect();
     for hash in &obsolete {
@@ -4301,10 +4319,13 @@ impl ConsensusManager {
                 // Transaction preimages are pruned only after every DAG round
                 // known to reference them is irreversibly behind the contiguous
                 // commit cursor. Never use arbitrary DashMap iteration here.
+                let committed_round = self.engine.last_committed_round();
                 let pruned = prune_irreversible_preimages(
                     &pending_txs,
                     &pending_tx_latest_round,
-                    self.engine.last_committed_round(),
+                    committed_round,
+                    committed_round.saturating_sub(self.engine.retained_rounds()),
+                    |hash| state.receipts.contains_key(hash),
                 );
                 if pruned > 0 {
                     debug!(
@@ -4546,7 +4567,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(prune_irreversible_preimages(&pending, &latest, 5), 1);
+        // Executed (as far as this test's `executed` says): pruned at the
+        // commit cursor.
+        assert_eq!(prune_irreversible_preimages(&pending, &latest, 5, 0, |_| true), 1);
         assert!(!pending.contains_key(&obsolete.hash.0));
         assert_eq!(
             exact_dag_preimages(&pending, &[future_commit.hash])
@@ -4554,6 +4577,38 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn a_body_that_never_executed_is_kept_for_the_retention_window() {
+        // The omitted finalize: named by a committed block, never executed.
+        // A restarted peer re-running the selection needs it, and nothing but
+        // this cache holds it.
+        let key = KeyPair::generate_ed25519();
+        let omitted = signed_transfer(&key, 31, 0);
+        let executed = signed_transfer(&key, 32, 1);
+        let pending = dashmap::DashMap::new();
+        let latest = dashmap::DashMap::new();
+        retain_dag_preimages(&pending, &latest, 100, &[omitted.clone(), executed.clone()])
+            .unwrap();
+        let ran = |hash: &[u8; 32]| *hash == executed.hash.0;
+
+        // The commit cursor passed round 100, the retention horizon has not.
+        assert_eq!(prune_irreversible_preimages(&pending, &latest, 150, 50, ran), 1);
+        assert!(!pending.contains_key(&executed.hash.0), "the state serves executed bodies");
+        let state = StateDB::new();
+        let wanted = std::collections::HashSet::from([omitted.hash.0]);
+        assert_eq!(
+            history_bodies(&pending, &state, &wanted)
+                .iter()
+                .map(|t| t.hash)
+                .collect::<Vec<_>>(),
+            vec![omitted.hash],
+            "a peer can still be served the omitted body"
+        );
+        // Once the retention horizon passes the round, it goes too.
+        assert_eq!(prune_irreversible_preimages(&pending, &latest, 5_000, 101, ran), 1);
+        assert!(pending.is_empty());
     }
 
     #[test]
