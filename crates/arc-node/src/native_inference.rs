@@ -2410,6 +2410,89 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_with_a_drifted_genesis_committee_is_refused_with_the_difference_and_a_remedy() {
+        // D2 in its real form. On a native-inference chain a block may carry
+        // only one native transaction, so a staking transaction can never move
+        // the registry. What CAN move it is a restart: the registry is
+        // re-seeded from the genesis file on every ordinary start. The check
+        // refuses a differing genesis before that re-seed, names each
+        // difference, and says what fixes it.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, original_members) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: None,
+            },
+        );
+        activate_native_inference_from_config(&state, &path).expect("fresh activation");
+        let bound = state.native_inference_context().unwrap().members;
+        let as_genesis = |members: &[ValidatorMember]| -> Vec<(Hash256, u64)> {
+            members.iter().map(|m| (m.address, m.stake)).collect()
+        };
+
+        // The activation-time committee is accepted, in any order.
+        let mut shuffled = as_genesis(&original_members);
+        shuffled.reverse();
+        arc_state::inference_contract_state::genesis_committee_matches_binding(&shuffled, &bound)
+            .expect("the same committee must be accepted");
+
+        // A member added, one removed, and one stake changed - all named.
+        let intruder = hash_bytes(b"validator that joined after activation");
+        let mut drifted = as_genesis(&original_members);
+        let removed = drifted.remove(0).0;
+        drifted[0].1 += 5;
+        let changed = drifted[0].0;
+        drifted.push((intruder, 1_000_000));
+        let message = arc_state::inference_contract_state::genesis_committee_matches_binding(
+            &drifted, &bound,
+        )
+        .expect_err("a drifted committee must be refused");
+        assert!(message.contains(&format!("added {}", intruder.to_hex())), "{message}");
+        assert!(message.contains(&format!("removed {}", removed.to_hex())), "{message}");
+        assert!(message.contains(&changed.to_hex()), "{message}");
+        assert!(message.contains("Restart with the genesis file that was used at activation"));
+
+        // Refusing touched nothing: the binding still resumes.
+        assert_eq!(state.native_inference_context().unwrap().members, original_members);
+        activate_native_inference_from_config(&state, &path)
+            .expect("the unchanged state still resumes its binding");
+    }
+
+    #[test]
+    fn a_registry_change_is_refused_by_the_executor_while_a_binding_is_active() {
+        // Defence in depth. On today's protocol-4 chains block admission
+        // refuses any non-native transaction first, so this guard cannot fire
+        // there; it exists so that a future admission change cannot quietly
+        // turn a staking transaction back into a chain-wide wedge.
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: None,
+            },
+        );
+        assert!(state.refuse_registry_change_under_native_binding().is_ok());
+        activate_native_inference_from_config(&state, &path).expect("fresh activation");
+        assert!(state.refuse_registry_change_under_native_binding().is_err());
+    }
+
+    #[test]
+    fn staking_is_unaffected_on_a_chain_without_a_native_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = activatable_state(&dir.path().join("state"));
+        assert!(state.native_inference_context().is_none());
+        assert!(state.refuse_registry_change_under_native_binding().is_ok());
+    }
+
+    #[test]
     fn activation_refuses_a_chain_that_is_not_a_fresh_genesis() {
         let dir = tempfile::tempdir().unwrap();
         let (state, _) = activatable_state(&dir.path().join("state"));

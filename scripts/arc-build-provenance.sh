@@ -39,8 +39,12 @@ revision=$(git rev-parse HEAD 2>/dev/null || echo "not-a-git-checkout")
 dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
 # A revision alone does not identify a dirty tree, so hash the exact inputs.
 # Content, not timestamps: a restored mtime cannot forge this.
-input_digest=$( { find crates scripts -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.sh' \) -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256; \
-                  shasum -a 256 Cargo.toml Cargo.lock 2>/dev/null; } | shasum -a 256 | cut -d' ' -f1)
+digest_inputs() {
+  { find crates scripts -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.sh' -o -name '*.py' \) -print0 2>/dev/null \
+      | sort -z | xargs -0 shasum -a 256; \
+    shasum -a 256 Cargo.toml Cargo.lock 2>/dev/null; } | shasum -a 256 | cut -d' ' -f1
+}
+input_digest=$(digest_inputs)
 
 echo "=== ARC build provenance ===" | tee "$manifest"
 {
@@ -67,6 +71,19 @@ if [[ $build_exit -ne 0 ]]; then
   tail -20 "$OUT/build-$stamp.log" | tee -a "$manifest"
   exit $build_exit
 fi
+
+# The digest above was taken BEFORE the build. If any input changed while
+# Cargo ran, the binary may have been built from a mixture, and labelling it
+# with the pre-build digest would be a false provenance record. That happened
+# once: sources were edited during a release build, which then failed to
+# compile - but a build that happened to succeed would have been mislabelled.
+after_digest=$(digest_inputs)
+if [[ $after_digest != "$input_digest" ]]; then
+  echo "INPUTS CHANGED DURING THE BUILD: $input_digest -> $after_digest" | tee -a "$manifest"
+  echo "refusing to label this binary; rebuild without editing sources" | tee -a "$manifest"
+  exit 3
+fi
+echo "input_digest_after_build: $after_digest   (unchanged)" | tee -a "$manifest"
 
 built="target/$PROFILE/arc-node"
 [[ -f $built ]] || { echo "built binary missing at $built" | tee -a "$manifest"; exit 1; }

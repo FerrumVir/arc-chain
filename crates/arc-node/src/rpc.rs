@@ -3179,6 +3179,16 @@ async fn submit_signed_tx(
     if node.state.verify_transaction_signature(&tx).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    // A native-inference chain's committee is frozen by its binding. The
+    // executor refuses a registry change too (so a transaction that slips in
+    // another way fails with a receipt instead of wedging every later block);
+    // refusing it here tells the submitter now, rather than via a failed
+    // receipt later.
+    if arc_state::StateDB::is_registry_change(&tx)
+        && node.state.refuse_registry_change_under_native_binding().is_err()
+    {
+        return Err(StatusCode::CONFLICT);
+    }
     if is_native_inference_transaction(&tx) {
         let context = match node.state.try_native_inference_context() {
             Ok(Some(context)) => context,

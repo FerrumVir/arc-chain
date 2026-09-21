@@ -4787,6 +4787,42 @@ impl StateDB {
     /// Returns the gas consumed on success. When `gas_limit == 0` (backward
     /// compat / benchmark mode), an effectively unlimited gas budget is used
     /// so that no existing transaction can fail due to gas exhaustion.
+    /// Refuse a validator-registry change while a native inference binding
+    /// is active.
+    ///
+    /// The binding freezes the committee it was activated for, and every block
+    /// re-checks that the live registry still matches it. Before this guard, a
+    /// Stake, JoinValidator or UpdateStake transaction was simply executed, the
+    /// registry moved, and from then on EVERY block failed that check - one
+    /// transaction wedged the chain, and a restart could not recover because
+    /// activation re-checks the same thing (D2).
+    ///
+    /// Refusing here keeps both guarantees and removes the wedge: the offending
+    /// transaction fails with a receipt, the registry does not move, the binding
+    /// is never silently rebound, and the next block executes normally.
+    ///
+    /// The committee of a native-inference chain is therefore fixed for the life
+    /// of its binding. Changing it is an explicit migration - a new activation
+    /// on a fresh genesis - never a side effect of a staking transaction.
+    pub fn refuse_registry_change_under_native_binding(&self) -> Result<(), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "the validator registry is frozen by the active native inference binding; \
+                 changing the committee requires an explicit migration to a fresh activation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// True for transactions that would change the validator registry.
+    pub fn is_registry_change(tx: &Transaction) -> bool {
+        matches!(
+            tx.body,
+            TxBody::Stake(_) | TxBody::JoinValidator(_) | TxBody::UpdateStake(_)
+        )
+    }
+
     fn execute_tx(&self, tx: &Transaction) -> Result<u64, StateError> {
         if tx.tx_type != tx.body.tx_type() {
             return Err(StateError::ExecutionError(format!(
@@ -5041,6 +5077,9 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::Stake(body) => {
+                // The native inference binding froze this committee; see
+                // `refuse_registry_change_under_native_binding`.
+                self.refuse_registry_change_under_native_binding()?;
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -5858,6 +5897,9 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::JoinValidator(body) => {
+                // The native inference binding froze this committee; see
+                // `refuse_registry_change_under_native_binding`.
+                self.refuse_registry_change_under_native_binding()?;
                 // Deduct initial stake from sender's balance and register as validator
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
@@ -5992,6 +6034,9 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::UpdateStake(body) => {
+                // The native inference binding froze this committee; see
+                // `refuse_registry_change_under_native_binding`.
+                self.refuse_registry_change_under_native_binding()?;
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {

@@ -2221,6 +2221,18 @@ fn prepare_replayed_consensus_state(
             "Recovered validator/state replay rechecked against its canonical block"
         );
     } else if !genesis_validators.is_empty() {
+        // A native-inference chain's committee is frozen by its binding, which
+        // is restored from the WAL when the state opens - before this point.
+        // Refuse a genesis whose committee differs, naming the difference,
+        // BEFORE re-seeding: the persistent state is fine, and the remedy is to
+        // restore the activation-time genesis (D2).
+        if let Some(binding) = state.native_inference_context() {
+            arc_state::inference_contract_state::genesis_committee_matches_binding(
+                genesis_validators,
+                &binding.members,
+            )
+            .map_err(|message| anyhow::anyhow!(message))?;
+        }
         state.seed_genesis_validators(genesis_validators);
         tracing::info!(
             "Seeded {} genesis validators into StateDB.validators",

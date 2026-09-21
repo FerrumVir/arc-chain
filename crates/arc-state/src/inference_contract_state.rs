@@ -171,6 +171,71 @@ fn members_from_state(state: &StateDB) -> Vec<ValidatorMember> {
     members
 }
 
+/// Compare a genesis validator list with the committee a native binding froze.
+///
+/// Returns `Ok` when they are the same committee (the genesis list counts only
+/// entries at or above the minimum validator stake, exactly as the live
+/// registry does). Otherwise returns a message naming every difference - added,
+/// removed, and changed-stake members - and the remedy.
+///
+/// This exists because the validator registry is re-seeded from the genesis
+/// file on every ordinary start. A restart with a genesis whose committee
+/// differs from the one bound at activation used to surface only later, as an
+/// opaque activation failure, and the node could not start (D2). Nothing in the
+/// persistent state is wrong in that case - the re-seed is in memory - so the
+/// correct remedy is to restore the genesis used at activation, and the check
+/// runs BEFORE the re-seed so it is refused without touching anything.
+pub fn genesis_committee_matches_binding(
+    genesis_validators: &[(Hash256, u64)],
+    bound: &[ValidatorMember],
+) -> Result<(), String> {
+    let mut genesis: Vec<ValidatorMember> = genesis_validators
+        .iter()
+        .filter(|(_, stake)| *stake >= StateDB::MIN_VALIDATOR_STAKE)
+        .map(|(address, stake)| ValidatorMember {
+            address: *address,
+            stake: *stake,
+        })
+        .collect();
+    genesis.sort_by_key(|member| member.address.0);
+    if genesis.as_slice() == bound {
+        return Ok(());
+    }
+    let bound_map: std::collections::BTreeMap<[u8; 32], u64> =
+        bound.iter().map(|m| (m.address.0, m.stake)).collect();
+    let genesis_map: std::collections::BTreeMap<[u8; 32], u64> =
+        genesis.iter().map(|m| (m.address.0, m.stake)).collect();
+    let mut differences = Vec::new();
+    for (address, stake) in &genesis_map {
+        match bound_map.get(address) {
+            None => differences.push(format!(
+                "added {} (stake {stake})",
+                Hash256(*address).to_hex()
+            )),
+            Some(bound_stake) if bound_stake != stake => differences.push(format!(
+                "{} stake {bound_stake} -> {stake}",
+                Hash256(*address).to_hex()
+            )),
+            Some(_) => {}
+        }
+    }
+    for (address, stake) in &bound_map {
+        if !genesis_map.contains_key(address) {
+            differences.push(format!(
+                "removed {} (stake {stake})",
+                Hash256(*address).to_hex()
+            ));
+        }
+    }
+    Err(format!(
+        "the genesis validator set differs from the committee frozen by this chain's native \
+         inference binding: {}. The persistent state is unchanged. Restart with the genesis \
+         file that was used at activation; changing a native-inference committee is an \
+         explicit migration to a fresh activation, never a genesis edit.",
+        differences.join("; ")
+    ))
+}
+
 /// Validate the private native-inference activation boundary without mutating
 /// state. Recovery-bound state and non-persistent state are never eligible.
 pub fn validate_native_inference_activation(
