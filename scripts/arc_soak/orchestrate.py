@@ -269,6 +269,10 @@ class Config:
             # the recovery that follows.
             usable = self.duration - self.warmup_s - self.baseline_s - 300
             self.planned_faults = max(0, int(usable // self.fault_every_s) + 1) if usable > 0 else 0
+            if a.no_faults:
+                # A measurement run (growth, throughput) - never a soak: the
+                # analyzer cannot pass a run that recovered from nothing.
+                self.planned_faults = 0
         self.binary = os.path.abspath(a.binary)
         self.provenance = os.path.abspath(a.provenance)
         self.nodes = a.nodes
@@ -804,7 +808,7 @@ class Soak:
         self.write_run()
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Recorded ARC soak (checklist R8)")
     p.add_argument("--self-test", action="store_true",
                    help="7 minutes, one fault on the seed: exercises the harness, is not a soak")
@@ -818,6 +822,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--base-p2p", type=int, default=9160)
     p.add_argument("--sample-secs", type=float, default=15.0)
     p.add_argument("--fault-every-secs", type=float, default=3600.0)
+    p.add_argument("--no-faults", action="store_true",
+                   help="schedule no fault at all (measurement runs); otherwise the first fault "
+                        "comes after the baseline and one every --fault-every-secs")
     p.add_argument("--snapshot-every", type=int, default=500)
     p.add_argument("--workload", choices=["none", "faucet", "native"], default="faucet")
     p.add_argument("--native-rate", type=float, default=0.2,
@@ -830,7 +837,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--faucet-rate", type=float, default=0.5, help="claims per second offered")
     p.add_argument("--rust-log", default="info")
     p.add_argument("--work")
-    a = p.parse_args(argv)
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    a = build_parser().parse_args(argv)
     if a.workload == "native" and not a.load_driver:
         raise SystemExit("--workload native needs --load-driver")
     cfg = Config(a)

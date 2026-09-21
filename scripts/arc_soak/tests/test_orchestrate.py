@@ -92,5 +92,20 @@ class NativeRequesterFunding(unittest.TestCase):
             soak.native_requesters()
 
 
+class FaultPlanning(unittest.TestCase):
+    ARGS = ["--binary", "/bin/sh", "--provenance", "/dev/null", "--minutes", "20"]
+
+    def config(self, *extra):
+        return orchestrate.Config(orchestrate.build_parser().parse_args(self.ARGS + list(extra)))
+
+    def test_a_short_run_still_gets_one_fault_after_its_baseline(self):
+        # A huge interval does not mean "no faults": the first one always
+        # comes once the baseline is measured, if there is time to recover.
+        self.assertEqual(self.config("--fault-every-secs", "100000").planned_faults, 1)
+
+    def test_no_faults_means_none(self):
+        self.assertEqual(self.config("--no-faults").planned_faults, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
