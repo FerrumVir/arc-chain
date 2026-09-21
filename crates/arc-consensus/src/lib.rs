@@ -2175,9 +2175,31 @@ impl ConsensusEngine {
             let vs = self.frozen_validator_set.read();
             certificate.verify(&domain, &vs)?
         };
+        // A second certificate at a height this node already holds one for is
+        // only benign when it names the same block. When it does not, a quorum
+        // certified two different blocks at one height - and because any two
+        // quorums intersect in more than f validators, some validator signed
+        // both. Overwriting the held certificate would erase the proof, so the
+        // conflict is returned to the caller to record and alarm on.
+        if let Some(held) = self.finality_certificates.get(&certificate.height)
+            && held.block_hash != certificate.block_hash
+        {
+            return Err(view_change::CertificateError::ConflictingFinality {
+                height: certificate.height,
+                held: held.block_hash,
+                offered: certificate.block_hash,
+            });
+        }
         self.finality_certificates
             .insert(certificate.height, certificate);
         Ok(signing)
+    }
+
+    /// The block this node holds a quorum finality certificate for at `height`.
+    pub fn finalized_block_at(&self, height: u64) -> Option<Hash256> {
+        self.finality_certificates
+            .get(&height)
+            .map(|certificate| certificate.block_hash)
     }
 
     pub fn finality_certificate(&self, height: u64) -> Option<view_change::FinalityCertificate> {

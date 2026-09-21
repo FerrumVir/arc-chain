@@ -1165,3 +1165,82 @@ fn a_node_with_an_empty_dag_fills_it_in_from_the_first_missing_round() {
         "the DAG did not fill in any further"
     );
 }
+
+/// Two quorum certificates at one height naming different blocks is a
+/// committee-level safety violation. The engine must surface it, because
+/// overwriting the held certificate destroys the only evidence it happened.
+///
+/// This is the check the C14 divergence could not be evaluated against: the
+/// node held certificates in a map keyed by height alone, a second certificate
+/// for a height already held was skipped unread, and the evidence line did not
+/// name the block.
+#[test]
+fn conflicting_finality_certificates_at_one_height_are_detected_not_overwritten() {
+    let (set, keys) = committee(4);
+    let set_hash = validator_set_hash(&set);
+    let engine = ConsensusEngine::new_with_keypair(set.clone(), keys[0].address(), keys[0].clone());
+    engine
+        .install_consensus_domain(domain())
+        .expect("fresh engine binds its domain");
+
+    let certify = |block_label: &[u8], voters: &[usize]| -> FinalityCertificate {
+        let block = hash_bytes(block_label);
+        let state = hash_bytes(b"state-root");
+        let tx = hash_bytes(b"tx-root");
+        let mut collector = FinalityVoteCollector::new();
+        let mut out = None;
+        for index in voters {
+            let vote =
+                FinalityVote::sign(domain(), set_hash, 77, block, state, tx, &keys[*index]).unwrap();
+            if let Some(certificate) = collector.add(vote, &domain(), &set).unwrap() {
+                out = Some(certificate);
+            }
+        }
+        out.expect("quorum reached")
+    };
+
+    // Quorum A certifies one block at height 77.
+    let first = certify(b"block-A", &[0, 1, 2]);
+    assert_eq!(
+        engine
+            .register_finality_certificate(first.clone())
+            .map(|_| ()),
+        Ok(()),
+        "the first certificate at a height must be accepted"
+    );
+    assert_eq!(engine.finalized_block_at(77), Some(first.block_hash));
+
+    // Re-delivering the SAME certificate is benign and must stay accepted -
+    // peers legitimately re-gossip, and a restarted node re-emits its votes.
+    engine
+        .register_finality_certificate(first.clone())
+        .expect("a repeat of the held certificate is not a conflict");
+    assert_eq!(engine.finalized_block_at(77), Some(first.block_hash));
+
+    // Quorum B - overlapping, as any two quorums must - certifies a different
+    // block at the same height.
+    let second = certify(b"block-B", &[1, 2, 3]);
+    assert_ne!(first.block_hash, second.block_hash);
+    let error = engine
+        .register_finality_certificate(second.clone())
+        .expect_err("a conflicting certificate must not be accepted");
+    match error {
+        arc_consensus::view_change::CertificateError::ConflictingFinality {
+            height,
+            held,
+            offered,
+        } => {
+            assert_eq!(height, 77);
+            assert_eq!(held, first.block_hash);
+            assert_eq!(offered, second.block_hash);
+        }
+        other => panic!("expected a conflict report, got {other:?}"),
+    }
+
+    // The evidence must survive the conflict.
+    assert_eq!(
+        engine.finalized_block_at(77),
+        Some(first.block_hash),
+        "the held certificate must not be replaced by the conflicting one"
+    );
+}

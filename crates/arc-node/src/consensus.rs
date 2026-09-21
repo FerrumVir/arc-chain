@@ -14,7 +14,7 @@ use arc_state::StateDB;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Transaction bodies retained between DAG availability and canonical commit.
 /// Backpressure is safer than deleting an arbitrary body that a later leader
@@ -456,6 +456,9 @@ fn should_execute_local_benchmark(
 }
 
 /// Orchestrates DAG consensus for a single validator node.
+/// How far back the duplicate-decision check looks in canonical history.
+const DECISION_REPLAY_SCAN_BLOCKS: u64 = 256;
+
 /// Bounds on one history transfer. A request cannot make a peer serve more than
 /// this, and an importer will not step over more than this in one go.
 const HISTORY_MAX_ROUNDS: u64 = 256;
@@ -861,6 +864,28 @@ impl ConsensusManager {
             ));
         }
         true
+    }
+
+    /// The canonical height whose block was produced by this exact DAG
+    /// decision, if this node already applied it.
+    ///
+    /// Bounded: only the recent tail is scanned, which is where a repeat can
+    /// occur. Re-application happens when the commit cursor resumes at or below
+    /// an anchor already applied - off by a small number of rounds - so an
+    /// unbounded scan would buy nothing.
+    pub fn canonical_height_for_decision(&self, state: &StateDB, decision: Hash256) -> Option<u64> {
+        let top = state.height();
+        let floor = top.saturating_sub(DECISION_REPLAY_SCAN_BLOCKS);
+        let mut height = top;
+        while height > floor {
+            if let Some(block) = state.get_block(height)
+                && block.header.proof_hash == decision
+            {
+                return Some(height);
+            }
+            height -= 1;
+        }
+        None
     }
 
     /// Load this validator's durable anti-equivocation record.
@@ -1839,6 +1864,8 @@ impl ConsensusManager {
                             Ok(signing) => {
                                 info!(
                                     height,
+                                    block = %certificate.block_hash,
+                                    state_root = %certificate.state_root,
                                     signing_stake = signing,
                                     "Committed-block finality certificate assembled"
                                 );
@@ -1848,6 +1875,15 @@ impl ConsensusManager {
                                     );
                                 }
                             }
+                            Err(
+                                conflict @ arc_consensus::view_change::CertificateError::ConflictingFinality { .. },
+                            ) => {
+                                error!(
+                                    %conflict,
+                                    "SAFETY VIOLATION: two quorum finality certificates at one \
+                                     height name different blocks"
+                                );
+                            }
                             Err(error) => debug!(?error, "Rejected a finality certificate"),
                         }
                     }
@@ -1856,11 +1892,25 @@ impl ConsensusManager {
                 }
             }
             for (source, certificate) in inbound_finality_certificates {
-                if self.engine.finality_certificate(certificate.height).is_some() {
-                    continue;
-                }
-                if let Err(error) = self.engine.register_finality_certificate(certificate) {
-                    debug!(%source, ?error, "Rejected a peer finality certificate");
+                // A certificate for a height already held is NOT skipped. It is
+                // the only way to observe a committee that certified two
+                // different blocks at one height, and skipping it was a blind
+                // spot: the conflicting evidence arrived and was discarded
+                // unread. Registration is idempotent for a matching block and
+                // returns `ConflictingFinality` for a differing one.
+                match self.engine.register_finality_certificate(certificate) {
+                    Ok(_) => {}
+                    Err(
+                        conflict @ arc_consensus::view_change::CertificateError::ConflictingFinality { .. },
+                    ) => {
+                        error!(
+                            %source,
+                            %conflict,
+                            "SAFETY VIOLATION: a peer holds a quorum finality certificate for a \
+                             different block at a height this node has already finalised"
+                        );
+                    }
+                    Err(error) => debug!(%source, ?error, "Rejected a peer finality certificate"),
                 }
             }
 
@@ -2837,7 +2887,19 @@ impl ConsensusManager {
 
                     let started = std::time::Instant::now();
                     let received_diff = self.pending_diffs.remove(&dag_block.hash.0);
-                    let decision_proof = match self.engine.consensus_domain() {
+                    // Bind the anchor into the canonical block on EVERY chain,
+                    // not only one with a recovery domain. This commitment
+                    // covers the chain domain, the anchor's hash and its round,
+                    // so the resulting block carries a durable, domain-
+                    // separated statement of which decision produced it - and
+                    // it is durable at exactly the moment the block is, with no
+                    // window between applying a block and recording what it
+                    // came from.
+                    let decision_proof = match self
+                        .engine
+                        .consensus_domain()
+                        .or_else(|| self.engine.certificate_domain())
+                    {
                         Some(domain) => dag_block.state_decision_commitment(&domain),
                         None if state.active_protocol_version().major == 3 => {
                             tracing::error!(
@@ -2849,6 +2911,31 @@ impl ConsensusManager {
                         }
                         None => Hash256::ZERO,
                     };
+
+                    // Idempotency, derived from state rather than from a
+                    // separate record. Re-applying an anchor appends a second
+                    // canonical block for one decision: the transaction filter
+                    // makes it empty, but it still takes a height, and every
+                    // later height on this replica is then offset from its
+                    // peers. Because the commitment above is in the header, an
+                    // anchor this node already applied is recognisable in its
+                    // own recent history.
+                    if decision_proof != Hash256::ZERO
+                        && let Some(existing) =
+                            self.canonical_height_for_decision(&state, decision_proof)
+                    {
+                        warn!(
+                            round = dag_block.round,
+                            anchor = %dag_block.hash,
+                            existing_height = existing,
+                            "Anchor already applied; not appending a second canonical block"
+                        );
+                        if let Some(tracker) = skip_tracker.as_mut() {
+                            tracker.note_durable_commit_round(dag_block.round);
+                            let _ = self.persist_signing_record(tracker.record());
+                        }
+                        continue;
+                    }
                     // Every committed DAG leader maps to exactly one canonical
                     // state block, including an empty block when all envelopes
                     // were previously receipted or became state-stale.

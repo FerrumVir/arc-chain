@@ -7696,9 +7696,20 @@ async fn run_arc_node() -> Result<()> {
                 // transactions, and never committed another block. The 4-node
                 // fixture measured exactly that - "before kill=511 after
                 // recovery=511" with peers at 649.
+                // The record holds the LAST APPLIED round; the engine's cursor
+                // is the NEXT round to scan. Converting between them is the
+                // whole point of `next_round_to_scan` - restoring the applied
+                // round verbatim re-scanned it and appended a second canonical
+                // block for the same anchor, with no crash required.
                 let recovered_committed = {
                     let record = consensus.load_signing_record();
-                    record.durable_commit_round.min(recovered_round)
+                    let next = record.next_round_to_scan();
+                    tracing::info!(
+                        last_applied = ?record.last_applied_round,
+                        next_round_to_scan = next,
+                        "Local commit record read"
+                    );
+                    next.min(recovered_round)
                 };
                 consensus
                     .engine

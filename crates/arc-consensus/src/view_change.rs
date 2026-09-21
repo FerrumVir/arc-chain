@@ -76,6 +76,20 @@ pub enum CertificateError {
     BelowQuorum { signing: u64, quorum: u64 },
     #[error("certificate carries no votes")]
     Empty,
+    /// Two quorum certificates for one height naming different blocks. This is
+    /// a safety violation by the committee, not a local error: with quorum
+    /// intersection at more than the Byzantine bound, at least one validator
+    /// signed both. It is surfaced rather than resolved - overwriting one with
+    /// the other would destroy the only evidence that it happened.
+    #[error(
+        "conflicting finality certificates at height {height}: already hold {held}, \
+         offered {offered}"
+    )]
+    ConflictingFinality {
+        height: u64,
+        held: Hash256,
+        offered: Hash256,
+    },
 }
 
 /// Commitment over the exact frozen membership and voting power.
@@ -496,27 +510,126 @@ pub struct ConsensusSigningRecord {
     /// Heights this validator has signed a finality transcript for.
     pub finality_votes: HashMap<u64, (Hash256, Hash256, Hash256)>,
     /// The highest DAG round whose committed block this node has DURABLY
-    /// applied to its own state.
+    /// applied to its own state, or `None` if it has never applied one.
     ///
-    /// This is the "exact local commit record" that restart recovery needs. It
-    /// trusts nobody: it is this node's own statement about work it already
-    /// performed and fsynced, so restoring the commit cursor from it cannot
-    /// accept anything new. It is written only after the block crossed the
-    /// durability barrier, so a crash can leave it behind the true cursor -
-    /// which is safe - but never ahead of it.
+    /// `None` and `Some(0)` are different and must stay different: a node that
+    /// has committed nothing is not a node that has committed round 0.
+    ///
+    /// **This is the LAST APPLIED round, not the next round to scan.** The
+    /// engine's commit cursor means "next round to scan" - `try_commit` starts
+    /// at it and stores `r + 1` after committing `r` - so restoring this value
+    /// verbatim re-scanned the round just applied and appended a second
+    /// canonical block for the same anchor. That off-by-one needed no crash to
+    /// occur; `next_round_to_scan` is the only correct way to read it.
     #[serde(default)]
-    pub durable_commit_round: u64,
+    pub last_applied_round: Option<u64>,
 }
 
 impl ConsensusSigningRecord {
-    pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("signing record is serialisable")
+    /// The round `try_commit` should resume scanning from.
+    ///
+    /// The engine's cursor is the NEXT round to scan, while the record holds
+    /// the LAST round applied, so this is the conversion between the two. A
+    /// node that has applied nothing resumes at 0; one that applied round 0
+    /// resumes at 1.
+    pub fn next_round_to_scan(&self) -> u64 {
+        match self.last_applied_round {
+            Some(applied) => applied.saturating_add(1),
+            None => 0,
+        }
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
+    /// Serialise with an explicit version tag.
+    ///
+    /// The record is bincode-encoded, and bincode is NOT self-describing:
+    /// `#[serde(default)]` cannot rescue a changed field type, and the v1 -> v2
+    /// change of `durable_commit_round: u64` into `last_applied_round:
+    /// Option<u64>` silently altered the byte layout. Without this tag an
+    /// existing v1 file decodes as a tag byte plus trailing garbage and
+    /// `load_signing_record` panics the node at startup. The tag makes the
+    /// format change explicit and keeps v1 files readable.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(SIGNING_RECORD_MAGIC);
+        bytes.push(SIGNING_RECORD_VERSION);
+        bytes.extend_from_slice(
+            &bincode::serialize(self).expect("signing record is serialisable"),
+        );
+        bytes
+    }
+
+    /// Read either format. A v1 file is migrated; anything else is an error,
+    /// never a silent fresh start.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SigningRecordError> {
+        if let Some(rest) = bytes.strip_prefix(SIGNING_RECORD_MAGIC) {
+            let (version, payload) = rest.split_first().ok_or(SigningRecordError::Truncated)?;
+            if *version != SIGNING_RECORD_VERSION {
+                return Err(SigningRecordError::UnknownVersion(*version));
+            }
+            return bincode::deserialize(payload).map_err(SigningRecordError::Malformed);
+        }
+        // No magic: a v1 file, written before the format was tagged.
+        let legacy: LegacySigningRecordV1 =
+            bincode::deserialize(bytes).map_err(SigningRecordError::Malformed)?;
+        Ok(legacy.migrate())
     }
 }
+
+/// Magic + version prefix on a v2 record.
+const SIGNING_RECORD_MAGIC: &[u8] = b"ARC-SIGNREC";
+const SIGNING_RECORD_VERSION: u8 = 2;
+
+/// The v1 on-disk shape. Kept only so an existing file can be migrated.
+#[derive(Deserialize)]
+struct LegacySigningRecordV1 {
+    skipped_rounds: HashMap<u64, HashMap<Address, AbsenceReason>>,
+    finality_votes: HashMap<u64, (Hash256, Hash256, Hash256)>,
+    /// v1 stored the last applied round in a bare `u64`, so it could not tell
+    /// "nothing applied" from "applied round 0". Both were written as 0.
+    durable_commit_round: u64,
+}
+
+impl LegacySigningRecordV1 {
+    fn migrate(self) -> ConsensusSigningRecord {
+        ConsensusSigningRecord {
+            skipped_rounds: self.skipped_rounds,
+            finality_votes: self.finality_votes,
+            // A v1 zero is genuinely ambiguous, so it resolves to `None` - this
+            // node rescans from round 0 rather than claiming it applied
+            // genesis. Adding one to that zero would assert an application that
+            // may never have happened. Rescanning is safe because every
+            // canonical block commits to the anchor that produced it, so an
+            // already-applied anchor is recognised and not applied twice.
+            last_applied_round: (self.durable_commit_round > 0)
+                .then_some(self.durable_commit_round),
+        }
+    }
+}
+
+/// Why a durable signing record could not be read. Every variant is fatal at
+/// startup: a record that cannot be understood must not become a fresh start.
+#[derive(Debug)]
+pub enum SigningRecordError {
+    Truncated,
+    UnknownVersion(u8),
+    Malformed(bincode::Error),
+}
+
+impl std::fmt::Display for SigningRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "record ends before its version tag"),
+            Self::UnknownVersion(version) => write!(
+                f,
+                "record is version {version}, but this build understands up to \
+                 {SIGNING_RECORD_VERSION}; a newer node wrote it"
+            ),
+            Self::Malformed(error) => write!(f, "record body is malformed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SigningRecordError {}
 
 // ── The skip state machine ───────────────────────────────────────────────────
 
@@ -609,8 +722,8 @@ impl SkipTracker {
     /// Record that a committed block at this DAG round has been durably
     /// applied. Monotonic: a later crash cannot lower it.
     pub fn note_durable_commit_round(&mut self, round: u64) {
-        if round > self.record.durable_commit_round {
-            self.record.durable_commit_round = round;
+        if self.record.last_applied_round.is_none_or(|applied| round > applied) {
+            self.record.last_applied_round = Some(round);
         }
     }
 
@@ -1249,36 +1362,136 @@ mod tests {
     }
 
     #[test]
-    fn the_durable_commit_round_is_monotonic_and_survives_restart() {
-        // This is what restores the commit cursor after a crash. It must never
-        // go backwards: a later crash cannot make the node re-decide rounds it
-        // already committed and durably applied.
+    fn the_applied_round_is_monotonic_and_converts_to_a_scan_cursor() {
+        // Two separate obligations, and the second is the one that was wrong.
+        //
+        // 1. The record must never go backwards: a later crash cannot make the
+        //    node re-decide rounds it already committed and applied.
+        // 2. The record holds the LAST APPLIED round; the engine's cursor is
+        //    the NEXT round to scan. Restoring the former verbatim as the
+        //    latter re-scanned the round just applied and appended a second
+        //    canonical block for one anchor - no crash required.
         let (set, _) = committee(4);
         let mut tracker = tracker(&set);
-        assert_eq!(tracker.record().durable_commit_round, 0);
+        assert_eq!(tracker.record().last_applied_round, None);
+        assert_eq!(
+            tracker.record().next_round_to_scan(),
+            0,
+            "a node that has applied nothing resumes at 0"
+        );
+
         tracker.note_durable_commit_round(40);
         tracker.note_durable_commit_round(12);
         assert_eq!(
-            tracker.record().durable_commit_round,
-            40,
+            tracker.record().last_applied_round,
+            Some(40),
             "an earlier round must not lower the record"
         );
-        tracker.note_durable_commit_round(41);
-        assert_eq!(tracker.record().durable_commit_round, 41);
+        assert_eq!(tracker.record().next_round_to_scan(), 41);
 
         let encoded = tracker.record().encode();
         let restored = ConsensusSigningRecord::decode(&encoded).expect("decodes");
-        assert_eq!(restored.durable_commit_round, 41);
+        assert_eq!(restored.last_applied_round, Some(40));
+        assert_eq!(restored.next_round_to_scan(), 41);
+    }
 
-        // A record written before this field existed decodes as 0, which is
-        // exactly the fail-closed value the old behaviour used.
-        let legacy = ConsensusSigningRecord::default();
+    #[test]
+    fn having_applied_round_zero_is_not_the_same_as_having_applied_nothing() {
+        // The distinction a bare `u64` could not make, and the reason the field
+        // is an Option: adding one to a default zero would resume a fresh node
+        // at round 1 and silently skip genesis.
+        let (set, _) = committee(4);
+        let fresh = tracker(&set);
+        assert_eq!(fresh.record().last_applied_round, None);
+        assert_eq!(fresh.record().next_round_to_scan(), 0);
+
+        let mut applied_genesis = tracker(&set);
+        applied_genesis.note_durable_commit_round(0);
+        assert_eq!(applied_genesis.record().last_applied_round, Some(0));
         assert_eq!(
-            ConsensusSigningRecord::decode(&legacy.encode())
-                .unwrap()
-                .durable_commit_round,
-            0
+            applied_genesis.record().next_round_to_scan(),
+            1,
+            "a node that applied round 0 must not be asked to apply it again"
         );
+
+        // And the distinction survives a restart in both directions.
+        for record in [fresh.record().clone(), applied_genesis.record().clone()] {
+            let round_tripped =
+                ConsensusSigningRecord::decode(&record.encode()).expect("decodes");
+            assert_eq!(round_tripped.last_applied_round, record.last_applied_round);
+            assert_eq!(round_tripped.next_round_to_scan(), record.next_round_to_scan());
+        }
+    }
+
+    /// The v1 shape, reproduced exactly so the migration is tested against
+    /// real legacy bytes rather than against a description of them.
+    #[derive(Serialize)]
+    struct LegacyV1ForTest {
+        skipped_rounds: HashMap<u64, HashMap<Address, AbsenceReason>>,
+        finality_votes: HashMap<u64, (Hash256, Hash256, Hash256)>,
+        durable_commit_round: u64,
+    }
+
+    fn legacy_v1_bytes(durable_commit_round: u64) -> Vec<u8> {
+        bincode::serialize(&LegacyV1ForTest {
+            skipped_rounds: HashMap::new(),
+            finality_votes: HashMap::new(),
+            durable_commit_round,
+        })
+        .expect("legacy record serialises")
+    }
+
+    #[test]
+    fn a_v1_record_is_migrated_rather_than_panicking_the_node() {
+        // Changing the field type changed the bincode layout. Reading a v1
+        // file as v2 fails, and `load_signing_record` treats a failure as
+        // fatal - so without migration every node holding a record would
+        // refuse to start.
+        let raw = legacy_v1_bytes(575);
+        assert!(
+            bincode::deserialize::<ConsensusSigningRecord>(&raw).is_err(),
+            "if v1 bytes still parsed as v2 this migration would be unnecessary"
+        );
+
+        let migrated = ConsensusSigningRecord::decode(&raw).expect("v1 migrates");
+        assert_eq!(migrated.last_applied_round, Some(575));
+        assert_eq!(
+            migrated.next_round_to_scan(),
+            576,
+            "a migrated v1 record must resume AFTER the round it applied"
+        );
+    }
+
+    #[test]
+    fn a_v1_zero_is_ambiguous_and_resolves_to_nothing_applied() {
+        // v1 wrote 0 both for "nothing applied" and for "applied round 0".
+        // Adding one to it would assert an application that may never have
+        // happened, so it resolves to None and the node rescans from 0.
+        let migrated = ConsensusSigningRecord::decode(&legacy_v1_bytes(0)).expect("v1 migrates");
+        assert_eq!(migrated.last_applied_round, None);
+        assert_eq!(migrated.next_round_to_scan(), 0);
+    }
+
+    #[test]
+    fn a_record_from_a_newer_build_is_refused_not_silently_reset() {
+        let mut bytes = ConsensusSigningRecord::default().encode();
+        let version_at = SIGNING_RECORD_MAGIC.len();
+        bytes[version_at] = SIGNING_RECORD_VERSION + 1;
+        let error = ConsensusSigningRecord::decode(&bytes).expect_err("must refuse");
+        assert!(
+            matches!(error, SigningRecordError::UnknownVersion(v) if v == SIGNING_RECORD_VERSION + 1),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_v2_record_is_self_identifying() {
+        let mut record = ConsensusSigningRecord::default();
+        record.last_applied_round = Some(9);
+        let bytes = record.encode();
+        assert!(bytes.starts_with(SIGNING_RECORD_MAGIC));
+        assert_eq!(bytes[SIGNING_RECORD_MAGIC.len()], SIGNING_RECORD_VERSION);
+        assert_eq!(ConsensusSigningRecord::decode(&bytes).unwrap(), record);
     }
 
     #[test]
