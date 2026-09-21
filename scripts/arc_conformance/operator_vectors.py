@@ -17,6 +17,7 @@ import sys
 
 from arc_conformance import integer_reference as ref
 from arc_conformance import kat
+from arc_conformance import preparation
 
 ONE = ref.ONE
 DEFAULT_PATH = kat.REPO / "crates/arc-inference/tests/fixtures/integer_operator_kat.json"
@@ -233,6 +234,7 @@ def build_document():
         "repetition_penalty": penalty_cases(),
         "argmax": argmax_cases(),
         "interleaved_generation_v2": interleaved_v2_section(fixture),
+        "gguf_preparation": preparation.section(),
     }
 
 

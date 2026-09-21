@@ -2552,5 +2552,83 @@
     "output_hash": "7ccb3ff686d2fa0ca4404079b6a945037cee6d7bbe6c8dbac1239f13b8f57578"
    }
   ]
+ },
+ "gguf_preparation": {
+  "recipe": {
+   "shape": {
+    "vocab_size": 12,
+    "d_model": 8,
+    "n_heads": 2,
+    "n_kv_heads": 1,
+    "d_ff": 16,
+    "n_layers": 1,
+    "max_seq": 4096,
+    "rope_base": 10000.0
+   },
+   "seed": 1886545264,
+   "values": "per tensor, in draw order: weights k/2^22 with k = (next >> 40) - 2^23; norms (k + 2^22)/2^22 with k = (next >> 43) - 2^20; token_embd row 0 then set to zero",
+   "tensor_order": [
+    "token_embd.weight",
+    "output.weight",
+    "output_norm.weight",
+    "blk.0.attn_q.weight",
+    "blk.0.attn_k.weight",
+    "blk.0.attn_v.weight",
+    "blk.0.attn_output.weight",
+    "blk.0.ffn_gate.weight",
+    "blk.0.ffn_up.weight",
+    "blk.0.ffn_down.weight",
+    "blk.0.attn_norm.weight",
+    "blk.0.ffn_norm.weight"
+   ]
+  },
+  "f32_1e_10_bits": 786163455,
+  "prepared_state_blake3": "ed78723f64ab992929a2e235ea51eaff58bf3da9bd96d3ea0d602ead67a31f6b",
+  "embedding_row0_scale": 1,
+  "attn_scale": 32768,
+  "sequence_tokens": [
+   1,
+   5,
+   9,
+   3,
+   11,
+   0
+  ],
+  "next_tokens": [
+   6,
+   6,
+   6,
+   0,
+   9,
+   10
+  ],
+  "logits_hashes": [
+   "35d1bac3dcab783eaf5cb6e66e48adff57e0eadbfcde7619e25fbee0097bc2ac",
+   "221b40a6f82cd459286ad07e175569f6abf4fe99d31920116e64a02b0b26a076",
+   "8188ae27e6a91d8d9c1250e3a09db87e23f35d35f4c498f763a82688a32929d2",
+   "c65d90c9a795b89caff628af550db2ee91d5655ef0ca101023d190ba0912629a",
+   "d8f6ee598e6f390c64c50bc469839db27884ae81341a0a49a3457f3412196d57",
+   "1b99a1d784dcc29245e969fe8a53594355b899270f9ec98ba841ba28eefed6a5"
+  ],
+  "generation_v2": {
+   "prompt": [
+    5,
+    9,
+    3
+   ],
+   "max_tokens": 6,
+   "eos_tokens": [
+    2
+   ],
+   "tokens": [
+    0,
+    8,
+    9,
+    6,
+    6,
+    10
+   ],
+   "output_hash": "d5ec3ba043da9a5fb12ec81a48d4975227e6a5b8c7b71dc42ace92b9ff6c8041"
+  }
  }
 }

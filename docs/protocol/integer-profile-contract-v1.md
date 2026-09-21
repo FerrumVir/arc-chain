@@ -304,6 +304,16 @@ float steps, are what execution consumes. The rules are:
   rows (and their scales) from `[e0, o0, e1, o1, …]` to
   `[e0, e1, …, o0, o1, …]`.
 
+**Prepared-state digest (v1).** Two preparers agree when this digest matches.
+It is BLAKE3 over, in order: `n_layers, d_model, n_heads, n_kv_heads, d_ff,
+vocab_size, max_seq` as u64; `attn_scale`; the RoPE cos table, then the sin
+table; the Q16 embedding table; then the INT8 embedding, the output matrix and
+the final norm; then, per layer, `wq, wk, wv, wo, w_gate, w_up, w_down,
+attn_norm, ffn_norm`. A matrix is its INT8 bytes followed by its i64 scales,
+in executed row order (after the interleaved rewrite). All integers are
+little-endian. The artifact identity stays the BLAKE3 of the GGUF bytes. This
+digest is a conformance check on preparation, not a new identity (M1).
+
 ## 9. Domain
 
 The profile is defined only where every intermediate fits its declared width:
@@ -329,13 +339,17 @@ it is not identical.
 | **Independent reproduction** | the Python executor, written from this document, reproduces **7/7** of those fields | `python3 -m arc_conformance.kat` |
 | Operator vectors | exp (63 inputs), isqrt (18), RMS norm (8), SiLU (54), projections (3), RoPE both layouts (8), attention (7, incl. rising/falling scores, negative values, >32-bit elements), penalty (8), argmax (5), interleaved profile + generation v2 sequences | `crates/arc-inference/tests/fixtures/integer_operator_kat.json` |
 | Mutation coverage | 15 single-clause mutations of the reference; every one is caught by at least one of the two files. 4 (penalty multiplicity, penalty window ×2, argmax ties) are caught **only** by the operator vectors | `python3 -m arc_conformance.mutations` |
+| Preparation vectors | a 1-layer GGUF recipe (12-token vocabulary, grouped-query 2:1, one all-zero embedding row) prepared under §8: prepared-state digest, 6 logits digests, a generation-v2 run. The Rust side writes the same GGUF with candle and loads it through `load_cached_model_canonical_i8_interleaved_rope` | `integer_operator_kat.json` → `gguf_preparation`; `python3 -m arc_conformance.preparation` is imported by the vector generator |
 | RoPE portability margin | §8 | `python3 -m arc_conformance.rope_margin` |
 | Python unit tests | 11 tests, including domain refusals | `python3 -m unittest arc_conformance.tests.test_integer_reference` |
 
 **Not yet executed:** the Rust engine has not been run against
 `integer_operator_kat.json`. Until it has, the operator vectors are one
-implementation's answers, and the interleaved/v2 section is an expectation,
-not a cross-check. Also not covered here: the real 7B artifact end to end (M4),
+implementation's answers, and the interleaved/v2 and preparation sections are
+expectations, not cross-checks. The Rust tests are written
+(`golden_vectors.rs`: `integer_operators_match_the_independent_reference`,
+`interleaved_profile_and_generation_v2_match_the_independent_reference`,
+`gguf_preparation::*` under `--features candle`) and wait for a build window. Also not covered here: the real 7B artifact end to end (M4),
 the preparation float steps on the real GGUF, and any non-ARM host.
 
 ## 11. Profiles outside this contract
