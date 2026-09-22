@@ -1,8 +1,10 @@
 pub mod block_stm;
+pub mod checkpoint_adoption;
 pub mod gpu_state;
 pub mod inference_contract_state;
 pub use inference_contract_state::{
     AllowedExecution, InferenceAdmissionContext, IsolatedInferenceLedger, IsolatedTransitionResult,
+    NativeSelectionRule,
     NativeInferencePendingSnapshot, NativeInferenceReceiptSnapshot, NativeInferenceTransactionLink,
     validate_native_inference_activation,
 };
@@ -596,6 +598,9 @@ pub struct StateDB {
     /// How many of the most recent heights a durable snapshot carries the
     /// history of. See `export_durable_snapshot`.
     snapshot_history_window: AtomicU64,
+    /// The anchor round of the latest checkpoint this node adopted (0: none).
+    /// Consensus resumes scanning at the round after it.
+    rebase_anchor_round: AtomicU64,
     /// Total benchmark transactions executed (atomic counter for /stats).
     pub benchmark_tx_count: AtomicU64,
     /// Async indexer channel - sends batches to background threads.
@@ -729,6 +734,7 @@ impl StateDB {
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
             snapshot_history_window: AtomicU64::new(snapshot::DEFAULT_HISTORY_WINDOW),
+            rebase_anchor_round: AtomicU64::new(0),
             benchmark_tx_count: AtomicU64::new(0),
             #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
@@ -782,6 +788,7 @@ impl StateDB {
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
             snapshot_history_window: AtomicU64::new(snapshot::DEFAULT_HISTORY_WINDOW),
+            rebase_anchor_round: AtomicU64::new(0),
             benchmark_tx_count: AtomicU64::new(0),
             #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
@@ -926,6 +933,16 @@ impl StateDB {
                     // execution, so the cost is the same order as reading.
                     if Self::is_history_op(&entry.op) {
                         state.apply_wal_op(&entry.op);
+                        history_rebuilt += 1;
+                    } else if let WalOp::Rebase(record) = &entry.op {
+                        // A rebase below the snapshot: its state is already
+                        // in the snapshot, its history window and its resume
+                        // round are not.
+                        state.install_history_window(&record.state);
+                        state.apply_wal_op(&WalOp::SetBlock(record.height, record.tip.clone()));
+                        state
+                            .rebase_anchor_round
+                            .fetch_max(record.anchor_round, Ordering::AcqRel);
                         history_rebuilt += 1;
                     }
                     continue;
@@ -1233,6 +1250,42 @@ impl StateDB {
                     }
                     accepted_entries = index + 1;
                 }
+                WalOp::Rebase(record) => {
+                    // An adopted checkpoint: it must move the chain forward to
+                    // a self-consistent tip, and its state must reproduce the
+                    // root that tip's header carries - the root a quorum
+                    // certified when it was adopted. Contiguity and linkage
+                    // then continue from the tip.
+                    if pending_block.is_some()
+                        || record.height <= last_checkpoint_height
+                        || !record.state.receipts.is_empty()
+                        || !record.state.event_logs.is_empty()
+                        || !record.state.full_transactions.is_empty()
+                        || !record.state.native_inference_pending.is_empty()
+                        || record.state.recovery_context.is_some()
+                        || record.state.height != record.height
+                        || record.tip.header.height != record.height
+                        || Block::compute_hash(&record.tip.header) != record.tip.hash
+                        || checkpoint_adoption::accounts_bound_to_keys(&record.state).is_err()
+                    {
+                        return Err(StateError::PersistenceError(format!(
+                            "state WAL rebase to height {} is not a forward move to a \
+                             self-consistent tip",
+                            record.height
+                        )));
+                    }
+                    validation.apply_wal_op(&entry.op);
+                    let actual_root = validation.get_state_root();
+                    if actual_root != record.tip.header.state_root {
+                        return Err(StateError::PersistenceError(format!(
+                            "state WAL rebase root mismatch: tip {} carries {}, state replays {actual_root}",
+                            record.height, record.tip.header.state_root
+                        )));
+                    }
+                    previous_block_hash = record.tip.hash;
+                    last_checkpoint_height = record.height;
+                    accepted_entries = index + 1;
+                }
                 _ => validation.apply_wal_op(&entry.op),
             }
         }
@@ -1455,6 +1508,16 @@ impl StateDB {
             }
             WalOp::Checkpoint(_) => {
                 // Checkpoints are informational - no state change
+            }
+            WalOp::Rebase(record) => {
+                // The state is replaced wholesale. History this node already
+                // holds below the checkpoint stays: it is the canonical
+                // chain's own prefix.
+                self.clear_state_for_rebase();
+                self.install_durable_snapshot(&record.state);
+                self.apply_wal_op(&WalOp::SetBlock(record.height, record.tip.clone()));
+                self.rebase_anchor_round
+                    .fetch_max(record.anchor_round, Ordering::AcqRel);
             }
             WalOp::SetDagBlock(_, _) | WalOp::SetDagRound(_) | WalOp::CommitDagBlock(_) => {
                 // DAG operations are replayed by the consensus engine, not StateDB.
@@ -9756,21 +9819,7 @@ impl StateDB {
         for (address, identity) in &payload.identities {
             self.apply_wal_op(&WalOp::SetIdentity(*address, identity.clone()));
         }
-        for (height, block) in &payload.blocks {
-            self.apply_wal_op(&WalOp::SetBlock(*height, block.clone()));
-        }
-        for (hash, receipt) in &payload.receipts {
-            self.apply_wal_op(&WalOp::SetReceipt(*hash, receipt.clone()));
-        }
-        for (hash, transaction) in &payload.full_transactions {
-            self.apply_wal_op(&WalOp::SetFullTransaction(
-                *hash,
-                Box::new(transaction.clone()),
-            ));
-        }
-        for (height, logs) in &payload.event_logs {
-            self.apply_wal_op(&WalOp::SetEventLogs(*height, logs.clone()));
-        }
+        self.install_history_window(payload);
         if !payload.validators.is_empty() || payload.staking_pool != 0 {
             self.apply_wal_op(&WalOp::SetValidatorState(
                 payload.validators.clone(),
@@ -9792,6 +9841,164 @@ impl StateDB {
         if payload.height > *height {
             *height = payload.height;
         }
+    }
+
+    /// The history part of a snapshot payload: its blocks, receipts, bodies
+    /// and event logs, through `apply_wal_op` like everything else.
+    fn install_history_window(&self, payload: &snapshot::SnapshotPayload) {
+        for (height, block) in &payload.blocks {
+            self.apply_wal_op(&WalOp::SetBlock(*height, block.clone()));
+        }
+        for (hash, receipt) in &payload.receipts {
+            self.apply_wal_op(&WalOp::SetReceipt(*hash, receipt.clone()));
+        }
+        for (hash, transaction) in &payload.full_transactions {
+            self.apply_wal_op(&WalOp::SetFullTransaction(
+                *hash,
+                Box::new(transaction.clone()),
+            ));
+        }
+        for (height, logs) in &payload.event_logs {
+            self.apply_wal_op(&WalOp::SetEventLogs(*height, logs.clone()));
+        }
+    }
+
+    /// The anchor round of the latest adopted checkpoint, if this node ever
+    /// adopted one: consensus must never resume scanning below the round
+    /// after it, whatever its other records say.
+    pub fn rebase_anchor_round(&self) -> Option<u64> {
+        let round = self.rebase_anchor_round.load(Ordering::Acquire);
+        (round > 0).then_some(round)
+    }
+
+    /// Empty the STATE a rebase replaces - accounts, storage, contracts,
+    /// identities, validators, native pending, staking pool - but not the
+    /// history this node already holds, its height, or configuration
+    /// (recovery context, reward activation), which adoption requires to be
+    /// unchanged.
+    fn clear_state_for_rebase(&self) {
+        self.accounts.clear();
+        self.storage.clear();
+        self.contracts.clear();
+        self.identities.clear();
+        self.validators.clear();
+        self.native_inference_pending.clear();
+        self.dirty_accounts.clear();
+        self.staking_pool.store(0, Ordering::Release);
+        // The community-reward activation height is configuration on an
+        // account-only-root chain (set from genesis at startup); adoption
+        // requires the checkpoint to carry this node's own value, so it is
+        // left as it is rather than reset to "disabled".
+        *self.incremental_merkle.lock() = IncrementalMerkle::new();
+    }
+
+    /// Rebuild every index a rebase cannot carry, from the adopted state, so
+    /// that a live rebase leaves memory as a restart of the same WAL would:
+    /// the open path rebuilds the native pending index from storage, and
+    /// startup rebuilds the Tier 1 and bond-release indexes.
+    pub fn rebuild_after_rebase(&self) -> Result<(), StateError> {
+        if let Some(context) = self.native_inference_context.read().clone() {
+            self.rebuild_native_inference_pending(context.commitment()?)?;
+        }
+        // Unlike the bond-release rebuild, this one only inserts.
+        self.tier1_pending.clear();
+        self.rebuild_tier1_pending();
+        self.rebuild_pending_bond_releases();
+        Ok(())
+    }
+
+    /// Adopt a certified checkpoint, durably, before anything in memory moves.
+    ///
+    /// The caller has already verified the checkpoint envelope against this
+    /// node's own committee and domain, the payload digest, and that `tip`
+    /// is the certified block (see `CheckpointEnvelope::verify_resume_point`).
+    /// This proves again, in a scratch state, that the payload reproduces the
+    /// root `tip` carries - a record that would not replay must never be
+    /// written - then appends and fsyncs a `WalOp::Rebase` and applies it.
+    ///
+    /// It replaces the memory-only install a checkpoint used to get (lost at
+    /// the next restart, with no durable trace), and it is what lets a node
+    /// that already has history - one down longer than its peers' DAG
+    /// retention - rejoin at all. `payload` must be the output of
+    /// [`Self::plan_checkpoint_adoption`]: only what the certificate covers.
+    pub fn rebase_onto_checkpoint(
+        &self,
+        payload: &snapshot::SnapshotPayload,
+        tip: &Block,
+        anchor_hash: Hash256,
+        anchor_round: u64,
+    ) -> Result<(), StateError> {
+        let _guard = self.native_inference_execution.lock();
+        self.require_healthy_wal()?;
+        // Only a planned adoption (`plan_checkpoint_adoption`) is written: the
+        // same shape open-time validation requires of a Rebase record, so a
+        // payload that skipped planning cannot break the next open.
+        if !payload.receipts.is_empty()
+            || !payload.event_logs.is_empty()
+            || !payload.full_transactions.is_empty()
+            || !payload.native_inference_pending.is_empty()
+            || payload.recovery_context.is_some()
+        {
+            return Err(StateError::PersistenceError(
+                "a rebase carries only planned state and verified blocks".into(),
+            ));
+        }
+        let height = payload.height;
+        if tip.header.height != height || Block::compute_hash(&tip.header) != tip.hash {
+            return Err(StateError::PersistenceError(
+                "checkpoint tip does not describe the checkpoint height".into(),
+            ));
+        }
+        if height <= self.height() {
+            return Err(StateError::PersistenceError(format!(
+                "a checkpoint at height {height} does not move this node (at {}) forward",
+                self.height()
+            )));
+        }
+        // The planner's preconditions again, immediately before the write:
+        // protocol 4 with selection rule v2, strict ordering, and every
+        // account filed under its own address.
+        checkpoint_adoption::adoption_preconditions(self, payload)?;
+        let scratch = Self::new();
+        scratch.install_durable_snapshot(payload);
+        if scratch.get_state_root() != tip.header.state_root {
+            return Err(StateError::PersistenceError(
+                "checkpoint payload does not reproduce its tip's state root".into(),
+            ));
+        }
+        // Everything the rebuild after the write will check, checked here
+        // first: every native metadata row decodes, belongs to its escrow and
+        // matches that escrow's certified storage root. A failure after the
+        // record is durable would stop this node on every restart.
+        if let Some(context) = self.native_inference_context.read().clone() {
+            let commitment = context.commitment()?;
+            *scratch.native_inference_context.write() = Some(context);
+            scratch.rebuild_native_inference_pending(commitment)?;
+        }
+        let record = wal::RebaseRecord {
+            height,
+            tip: tip.clone(),
+            state: payload.clone(),
+            anchor_hash,
+            anchor_round,
+        };
+        self.wal
+            .append(WalOp::Rebase(Box::new(record.clone())), height);
+        self.durable_wal_barrier()?;
+        // Readers of native state (RPC, the worker) see the state before the
+        // rebase or after it, never the cleared or half-installed state.
+        let _publication = self.native_inference_publication.write();
+        self.apply_wal_op(&WalOp::Rebase(Box::new(record)));
+        let adopted = self.get_state_root();
+        if adopted != tip.header.state_root {
+            // Durable and verified in scratch, so this cannot happen short of
+            // a bug; refuse loudly rather than run on a state nobody certified.
+            return Err(StateError::PersistenceError(format!(
+                "adopted checkpoint produced root {adopted}, expected {}",
+                tip.header.state_root
+            )));
+        }
+        self.rebuild_after_rebase()
     }
 
     /// Empty everything a snapshot or replay would repopulate.

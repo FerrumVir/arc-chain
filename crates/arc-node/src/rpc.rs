@@ -3106,6 +3106,8 @@ async fn native_inference_context(
             "address": member.address.to_hex(), "stake": member.stake,
         })).collect::<Vec<_>>(),
         "allowed_execution_count": context.allowed_executions.len(),
+        // Commit-time selection rule fixed at activation (decision D20).
+        "selection_rule": context.selection_rule.as_str(),
     })))
 }
 
@@ -23069,6 +23071,7 @@ mod tests {
                 generation_hash: tuple,
                 assignment_hash: tuple,
             }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
         };
         let mut prefunded = vec![(requester.address(), 1_000)];
         prefunded.extend(members.iter().map(|member| (member.address, 0)));

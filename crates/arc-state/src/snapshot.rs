@@ -87,6 +87,9 @@ pub struct SnapshotManifestV1 {
     pub block_hash: Hash256,
 }
 
+/// The largest checkpoint payload a peer may send: the transport's frame cap.
+pub const MAX_PEER_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 /// Every piece of state that `apply_wal_op` reconstructs. Anything replay does
 /// not write is deliberately absent: including it would make the snapshot and
 /// a full replay disagree, which is the one thing that must not happen.
@@ -143,6 +146,21 @@ impl SnapshotPayload {
         bytes.extend_from_slice(&bincode::serialize(self).expect("payload is serialisable"));
         let digest = hash_bytes(&bytes);
         (bytes, digest)
+    }
+
+    /// Decode a payload received from a peer: bounded by the transport's
+    /// frame cap and refusing trailing bytes. `decode` reads this node's own
+    /// snapshot file and is not bounded this way.
+    pub fn decode_from_peer(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let rest = bytes
+            .strip_prefix(SNAPSHOT_MAGIC)
+            .ok_or(SnapshotError::NotASnapshot)?;
+        let (version, body) = rest.split_first().ok_or(SnapshotError::Truncated)?;
+        if *version != SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnknownVersion(*version));
+        }
+        bincode::deserialize_limited_exact::<Self, MAX_PEER_PAYLOAD_BYTES>(body)
+            .map_err(|error| SnapshotError::Malformed(error.to_string()))
     }
 
     /// Decode a payload file body. The digest is checked by the caller against

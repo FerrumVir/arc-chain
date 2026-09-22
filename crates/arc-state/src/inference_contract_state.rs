@@ -26,6 +26,85 @@ pub struct InferenceAdmissionContext {
     pub domain: InferenceDomain,
     pub members: Vec<ValidatorMember>,
     pub allowed_executions: Vec<AllowedExecution>,
+    /// How commit-time selection counts candidates (decision D20). Fixed at
+    /// activation and part of the commitment.
+    pub selection_rule: NativeSelectionRule,
+}
+
+/// How commit-time selection treats a candidate whose sender has already
+/// used its nonce (decision D20). A chain's rule is fixed at activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum NativeSelectionRule {
+    /// Chains activated before D20: every examined candidate counts toward
+    /// the per-block cap. Recorded in the original activation layout, so the
+    /// record and its commitment are byte-identical to what older binaries
+    /// wrote and read.
+    #[serde(rename = "count-every-candidate-v1")]
+    CountEveryCandidateV1,
+    /// D20: a candidate whose sender has already used its nonce is skipped
+    /// without counting. Binaries without D20 cannot decode this record and
+    /// refuse to open the chain, so a network never mixes the two rules.
+    #[serde(rename = "skip-used-nonces-v2")]
+    SkipUsedNoncesV2,
+}
+
+impl NativeSelectionRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CountEveryCandidateV1 => "count-every-candidate-v1",
+            Self::SkipUsedNoncesV2 => "skip-used-nonces-v2",
+        }
+    }
+}
+
+/// The activation record layout from before D20. Selection-rule v1 chains
+/// keep exactly these bytes.
+#[derive(Serialize, Deserialize)]
+struct LegacyAdmissionContext {
+    domain: InferenceDomain,
+    members: Vec<ValidatorMember>,
+    allowed_executions: Vec<AllowedExecution>,
+}
+
+/// Encode an activation record: the original layout for rule v1, the
+/// extended one (with the rule) for v2. One encoding per context.
+pub(crate) fn encode_activation(context: &InferenceAdmissionContext) -> Result<Vec<u8>, StateError> {
+    let encoded = match context.selection_rule {
+        NativeSelectionRule::CountEveryCandidateV1 => bincode::serialize(&LegacyAdmissionContext {
+            domain: context.domain,
+            members: context.members.clone(),
+            allowed_executions: context.allowed_executions.clone(),
+        }),
+        NativeSelectionRule::SkipUsedNoncesV2 => bincode::serialize(context),
+    };
+    encoded.map_err(|error| StateError::ExecutionError(error.to_string()))
+}
+
+/// Decode an activation record written by [`encode_activation`] or by a
+/// binary from before D20. Both layouts decode exactly (no trailing bytes),
+/// so neither can be mistaken for the other.
+pub(crate) fn decode_activation(encoded: &[u8]) -> Result<InferenceAdmissionContext, StateError> {
+    if let Ok(context) =
+        bincode::deserialize_limited_exact::<InferenceAdmissionContext, MAX_CONTEXT_BYTES>(encoded)
+    {
+        if context.selection_rule == NativeSelectionRule::CountEveryCandidateV1 {
+            return Err(StateError::ExecutionError(
+                "invalid native activation: a selection-rule v1 context is recorded only in the \
+                 original layout"
+                    .into(),
+            ));
+        }
+        return Ok(context);
+    }
+    let legacy =
+        bincode::deserialize_limited_exact::<LegacyAdmissionContext, MAX_CONTEXT_BYTES>(encoded)
+            .map_err(|e| StateError::ExecutionError(format!("invalid native activation: {e}")))?;
+    Ok(InferenceAdmissionContext {
+        domain: legacy.domain,
+        members: legacy.members,
+        allowed_executions: legacy.allowed_executions,
+        selection_rule: NativeSelectionRule::CountEveryCandidateV1,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -71,6 +150,11 @@ impl InferenceAdmissionContext {
             bytes.extend_from_slice(&execution.profile_hash.0);
             bytes.extend_from_slice(&execution.generation_hash.0);
             bytes.extend_from_slice(&execution.assignment_hash.0);
+        }
+        // Rule v1 keeps the original commitment. The v2 marker cannot be
+        // mistaken for more allowlist entries: they come in 128-byte units.
+        if self.selection_rule == NativeSelectionRule::SkipUsedNoncesV2 {
+            bytes.extend_from_slice(b"selection-rule-v2");
         }
         Ok(domain_hash(CONTEXT_DOMAIN, &bytes))
     }
@@ -160,6 +244,41 @@ fn context_account() -> arc_types::Address {
 
 fn context_key() -> Hash256 {
     hash_bytes(CONTEXT_KEY_DOMAIN)
+}
+
+/// Whether `value` at (`address`, `key`) is committed by `account`, the
+/// certified account at that address (C11 checkpoint adoption).
+///
+/// Native inference keeps its state in two kinds of row, both bound to a
+/// field of the account the state root covers: an escrow's metadata row
+/// hashes to that escrow account's `storage_root`, and the context pin row
+/// equals the pin account's `storage_root`. No other row is committed by the
+/// account-only root.
+pub(crate) fn native_storage_row_committed(
+    account: Option<&arc_types::Account>,
+    address: &arc_types::Address,
+    key: &Hash256,
+    value: &[u8],
+) -> bool {
+    let Some(account) = account else {
+        return false;
+    };
+    if *key == metadata_key() {
+        return value.len() <= MAX_METADATA_BYTES && account.storage_root == hash_bytes(value);
+    }
+    *address == context_account() && *key == context_key() && value == account.storage_root.as_ref()
+}
+
+/// Whether (`address`, `key`) is a row a certified account commits, rather
+/// than one that must simply be unchanged: a native escrow's metadata row, or
+/// the context pin row. Such a row is adopted from a checkpoint only if its
+/// certified account commits it; being equal to this node's own copy is not
+/// enough, because this node's copy may be the stale one.
+pub(crate) fn native_storage_row_is_committable(
+    address: &arc_types::Address,
+    key: &Hash256,
+) -> bool {
+    *key == metadata_key() || (*address == context_account() && *key == context_key())
 }
 
 pub(crate) fn escrow_address(request_id: Hash256) -> arc_types::Address {
@@ -450,8 +569,7 @@ impl StateDB {
                 "native inference activation requires unused private genesis".into(),
             ));
         }
-        let encoded =
-            bincode::serialize(&context).map_err(|e| StateError::ExecutionError(e.to_string()))?;
+        let encoded = encode_activation(&context)?;
         if encoded.len() > MAX_CONTEXT_BYTES {
             return Err(StateError::ExecutionError(
                 "native context exceeds bound".into(),
@@ -507,27 +625,14 @@ impl StateDB {
         Ok(self.native_inference_context.read().clone())
     }
 
-    pub(crate) fn restore_native_inference_context(&self) -> Result<(), StateError> {
-        let Some(encoded) = self.get_storage(&context_account(), &activation_key()) else {
-            if self
-                .blocks
-                .iter()
-                .any(|block| block.header.protocol_version.major == 4)
-            {
-                return Err(StateError::ExecutionError(
-                    "protocol-4 history has no rooted activation context".into(),
-                ));
-            }
-            return Ok(());
-        };
-        let context = bincode::deserialize_limited_exact::<
-            InferenceAdmissionContext,
-            MAX_CONTEXT_BYTES,
-        >(&encoded)
-        .map_err(|e| StateError::ExecutionError(format!("invalid native activation: {e}")))?;
-        let commitment = validate_native_inference_activation(self, &context)?;
-        *self.native_inference_context.write() = Some(context);
-        // Snapshot recovery can omit the derived index. Rebuild once, never per poll.
+    /// Rebuild the native pending index from certified storage: every escrow
+    /// metadata row is decoded, checked against its escrow account's
+    /// `storage_root`, and indexed if still pending. Used on reopen and after
+    /// a checkpoint rebase, never per poll.
+    pub(crate) fn rebuild_native_inference_pending(
+        &self,
+        commitment: Hash256,
+    ) -> Result<(), StateError> {
         self.native_inference_pending.clear();
         for entry in self.storage.iter() {
             let Some(bytes) = entry.value().get(&metadata_key()).map(|v| v.clone()) else {
@@ -562,6 +667,27 @@ impl StateDB {
                     .insert(request_id.0, receipt.admission_height);
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn restore_native_inference_context(&self) -> Result<(), StateError> {
+        let Some(encoded) = self.get_storage(&context_account(), &activation_key()) else {
+            if self
+                .blocks
+                .iter()
+                .any(|block| block.header.protocol_version.major == 4)
+            {
+                return Err(StateError::ExecutionError(
+                    "protocol-4 history has no rooted activation context".into(),
+                ));
+            }
+            return Ok(());
+        };
+        let context = decode_activation(&encoded)?;
+        let commitment = validate_native_inference_activation(self, &context)?;
+        *self.native_inference_context.write() = Some(context);
+        // Snapshot recovery can omit the derived index. Rebuild once, never per poll.
+        self.rebuild_native_inference_pending(commitment)?;
         let mut native_txs: Vec<_> = self
             .full_transactions
             .iter()
@@ -615,7 +741,35 @@ impl StateDB {
         // all of them that much inside the commit path. The first N in hash
         // order are examined, identically everywhere; a block whose first N
         // hold nothing admissible carries nothing.
-        for tx in ordered.into_iter().take(MAX_NATIVE_CANDIDATES_PER_BLOCK) {
+        //
+        // A candidate whose nonce its sender has already used can never be
+        // admitted, and it is skipped WITHOUT counting toward N. On protocol 4
+        // a transaction was applied exactly when its nonce was consumed, so
+        // this is the same set whether or not a node holds the receipts that
+        // the commit path otherwise filters on. A node that rebased onto a
+        // checkpoint holds none below it, and without this rule a leader
+        // packing N already-applied transactions ahead of a live one would
+        // make that node select differently from its peers.
+        //
+        // The rule is the chain's, fixed at activation: rule-v1 chains keep
+        // counting every candidate, so an upgraded binary selects exactly as
+        // the binaries it runs beside.
+        let skip_used = self.native_inference_context().is_some_and(|context| {
+            context.selection_rule == NativeSelectionRule::SkipUsedNoncesV2
+        });
+        let mut examined = 0usize;
+        for tx in ordered {
+            if skip_used
+                && self
+                    .get_account(&tx.from)
+                    .is_some_and(|account| tx.nonce < account.nonce)
+            {
+                continue;
+            }
+            if examined == MAX_NATIVE_CANDIDATES_PER_BLOCK {
+                break;
+            }
+            examined += 1;
             if self
                 .validate_native_inference_block_admission(std::slice::from_ref(tx))
                 .is_ok()
@@ -1954,6 +2108,7 @@ mod tests {
                     assignment_hash: alternate,
                 },
             ],
+            selection_rule: NativeSelectionRule::SkipUsedNoncesV2,
         };
         let mut prefunded = vec![(requester.address(), 1_000)];
         prefunded.extend(validator_members.iter().map(|member| (member.address, 0)));
@@ -2824,6 +2979,400 @@ mod tests {
         let dir = f.dir.clone();
         drop(f);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A second store with the fixture's genesis, committee and activation,
+    /// still at height 0: a node that missed everything after activation.
+    fn lagging_twin(f: &Fixture, suffix: &str) -> (StateDB, std::path::PathBuf) {
+        let dir = f.dir.with_extension(suffix);
+        let node = StateDB::with_genesis_persistent(&f.prefunded, &dir, f.genesis).unwrap();
+        node.seed_genesis_validators(
+            &f.context
+                .members
+                .iter()
+                .map(|member| (member.address, member.stake))
+                .collect::<Vec<_>>(),
+        );
+        node.activate_native_inference(f.context.clone()).unwrap();
+        (node, dir)
+    }
+
+    #[test]
+    fn checkpoint_adoption_takes_only_committed_native_rows() {
+        // The twin saw request A admitted (Pending) and then went down. The
+        // peer finalized A and admitted B. A's escrow row therefore changed,
+        // B's is new, and the twin's own copy of A's row is now stale.
+        let f = fixture("adopt-native");
+        let peer = &f.ledger.state;
+        let c = peer.activate_native_inference(f.context.clone()).unwrap();
+        let (twin, twin_dir) = lagging_twin(&f, "twin");
+        let (other, other_dir) = lagging_twin(&f, "other");
+        let req_a = request(&f, 0, 100);
+        let id_a = req_a.job.request_id();
+        let admit_a = native_request(peer, &f.requester, req_a);
+        for state in [peer, &twin, &other] {
+            state
+                .execute_block_verified_at(std::slice::from_ref(&admit_a), Hash256::ZERO, 1)
+                .unwrap();
+        }
+        assert_eq!(twin.get_block(1).unwrap().hash, peer.get_block(1).unwrap().hash);
+        let stale_a = twin.get_storage(&escrow_address(id_a), &metadata_key()).unwrap();
+        peer.execute_block_verified_at(
+            &[native_finalize(peer, &f.validators[0], 0, id_a, certificate(&f, id_a))],
+            Hash256::ZERO,
+            2,
+        )
+        .unwrap();
+        let req_b = request(&f, 1, 100);
+        let id_b = req_b.job.request_id();
+        peer.execute_block_verified_at(&[native_request(peer, &f.requester, req_b)], Hash256::ZERO, 3)
+            .unwrap();
+        let payload = peer.export_durable_snapshot();
+        let tip = peer.get_block(peer.height()).unwrap();
+
+        // Honest: A's new row and B's row are committed by their certified
+        // escrow accounts; the pending index is rebuilt from them.
+        let adopted = twin.plan_checkpoint_adoption(&payload, &tip).expect("adoptable");
+        assert!(adopted.full_transactions.is_empty() && adopted.receipts.is_empty());
+        twin.rebase_onto_checkpoint(&adopted, &tip, Hash256::ZERO, 9).unwrap();
+        assert_eq!(twin.get_state_root(), peer.get_state_root());
+        let pending: Vec<_> = twin
+            .native_inference_pending_requests(c)
+            .unwrap()
+            .into_iter()
+            .map(|request| request.request_id)
+            .collect();
+        assert_eq!(pending, vec![id_b], "A finalized, B pending");
+        let live = bincode::serialize(&twin.export_durable_snapshot()).unwrap();
+        drop(twin);
+        let reopened = StateDB::with_genesis_persistent(&f.prefunded, &twin_dir, f.genesis).unwrap();
+        assert_eq!(
+            bincode::serialize(&reopened.export_durable_snapshot()).unwrap(),
+            live,
+            "a live rebase equals a restart of the same WAL"
+        );
+
+        let escrow_a = escrow_address(id_a);
+        let with_rows = |rows: Vec<(Hash256, Vec<u8>)>| {
+            let mut forged = payload.clone();
+            for (address, held) in forged.storage.iter_mut() {
+                if *address == escrow_a {
+                    *held = rows.clone();
+                }
+            }
+            forged
+        };
+        let fresh_a = peer.get_storage(&escrow_a, &metadata_key()).unwrap();
+        // The twin's own (stale) copy of A's row: equal to "ours", NOT committed.
+        let stale = with_rows(vec![(metadata_key(), stale_a.clone())]);
+        assert!(other.plan_checkpoint_adoption(&stale, &tip).is_err(), "stale row");
+        // Two versions of the row, the stale one last.
+        let duplicated = with_rows(vec![(metadata_key(), fresh_a), (metadata_key(), stale_a)]);
+        assert!(other.plan_checkpoint_adoption(&duplicated, &tip).is_err(), "duplicate row");
+        // B's committed row left out.
+        let mut omitted = payload.clone();
+        omitted.storage.retain(|(address, _)| *address != escrow_address(id_b));
+        assert!(other.plan_checkpoint_adoption(&omitted, &tip).is_err(), "omitted row");
+        // A domain nothing certifies, changed.
+        let mut contracts = payload.clone();
+        contracts.contracts.push((hash_bytes(b"planted"), vec![0x60]));
+        assert!(other.plan_checkpoint_adoption(&contracts, &tip).is_err(), "contracts");
+        let mut staking = payload.clone();
+        staking.staking_pool += 1;
+        assert!(other.plan_checkpoint_adoption(&staking, &tip).is_err(), "staking pool");
+        // Rows nothing commits must equal this node's: the activation record.
+        let context_holder = context_account();
+        let mut activation = payload.clone();
+        for (address, rows) in activation.storage.iter_mut() {
+            if *address == context_holder {
+                for (key, value) in rows.iter_mut() {
+                    if *key == activation_key() {
+                        value.push(0);
+                    }
+                }
+            }
+        }
+        assert!(other.plan_checkpoint_adoption(&activation, &tip).is_err(), "activation row");
+        // The pin row is committed by the context account: a changed value is not.
+        let mut pin = payload.clone();
+        for (address, rows) in pin.storage.iter_mut() {
+            if *address == context_holder {
+                for (key, value) in rows.iter_mut() {
+                    if *key == context_key() {
+                        value[0] ^= 1;
+                    }
+                }
+            }
+        }
+        assert!(other.plan_checkpoint_adoption(&pin, &tip).is_err(), "pin row");
+        // Entries below the minimum stake depend on when a node last
+        // restarted (activation records only members; a restart re-seeds the
+        // genesis list), so they are not compared. A member's stake is.
+        let mut below_minimum = payload.clone();
+        below_minimum.validators.push((hash_bytes(b"below-minimum"), 1));
+        below_minimum.validators.sort_by_key(|(address, _)| address.0);
+        assert!(
+            other.plan_checkpoint_adoption(&below_minimum, &tip).is_ok(),
+            "below-minimum registry entries"
+        );
+        let mut member_stake = payload.clone();
+        member_stake.validators[0].1 += 1;
+        assert!(other.plan_checkpoint_adoption(&member_stake, &tip).is_err(), "member stake");
+
+        // An account filed under another key between the same neighbours.
+        // The account-only root hashes contents in key order, not keys, so
+        // the root still verifies - which is why the key is checked.
+        let wal_before = std::fs::read(other_dir.join("state.wal")).unwrap();
+        let requester = f.requester.address();
+        let relabel = |accounts: &mut Vec<(arc_types::Address, arc_types::Account)>| {
+            let index = accounts
+                .iter()
+                .position(|(address, _)| *address == requester)
+                .unwrap();
+            let mut moved = accounts[index].0;
+            for byte in moved.0.iter_mut().rev() {
+                let (next, carry) = byte.overflowing_add(1);
+                *byte = next;
+                if !carry {
+                    break;
+                }
+            }
+            if let Some((after, _)) = accounts.get(index + 1) {
+                assert!(moved.0 < after.0, "the relabelled key keeps the order");
+            }
+            accounts[index].0 = moved;
+        };
+        let mut relabelled = payload.clone();
+        relabel(&mut relabelled.accounts);
+        let scratch = StateDB::new();
+        scratch.install_durable_snapshot(&relabelled);
+        assert_eq!(scratch.get_state_root(), tip.header.state_root, "the root alone does not see it");
+        assert!(other.plan_checkpoint_adoption(&relabelled, &tip).is_err(), "relabelled account");
+        let mut planned = other.plan_checkpoint_adoption(&payload, &tip).expect("honest plan");
+        relabel(&mut planned.accounts);
+        assert!(
+            other.rebase_onto_checkpoint(&planned, &tip, Hash256::ZERO, 9).is_err(),
+            "a relabelled account is refused again before the write"
+        );
+        // An escrow moved to another address with its rows: the planned
+        // shape is fine, but the state no longer reproduces the certified
+        // root, so the scratch install refuses it before the write.
+        let mut moved = other.plan_checkpoint_adoption(&payload, &tip).expect("honest plan");
+        let elsewhere = hash_bytes(b"moved escrow");
+        for (address, account) in moved.accounts.iter_mut() {
+            if *address == escrow_a {
+                *address = elsewhere;
+                account.address = elsewhere;
+            }
+        }
+        for (address, _) in moved.storage.iter_mut() {
+            if *address == escrow_a {
+                *address = elsewhere;
+            }
+        }
+        moved.canonicalize();
+        assert!(other.rebase_onto_checkpoint(&moved, &tip, Hash256::ZERO, 9).is_err(), "moved escrow");
+        assert_eq!(
+            std::fs::read(other_dir.join("state.wal")).unwrap(),
+            wal_before,
+            "nothing refused reached the WAL"
+        );
+        assert_eq!(other.height(), 1);
+
+        let dir = f.dir.clone();
+        drop(f);
+        drop(reopened);
+        drop(other);
+        for path in [dir, twin_dir, other_dir] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn already_used_nonces_do_not_consume_the_candidate_cap() {
+        // A node that rebased onto a checkpoint holds no receipts below it,
+        // so the commit path hands it already-applied transactions its peers
+        // filtered out. They must not push a live candidate out of the
+        // examined window, or that node would select differently.
+        let f = fixture("selection-stale");
+        let state = &f.ledger.state;
+        state.activate_native_inference(f.context.clone()).unwrap();
+        state
+            .execute_block_verified_at(
+                &[native_request(state, &f.requester, request(&f, 0, 100))],
+                Hash256::ZERO,
+                1,
+            )
+            .unwrap();
+        // The live candidate (nonce 1) with the largest hash of a few tries,
+        // so plenty of stale ones sort before it.
+        let valid = (200..208)
+            .map(|expires| native_request(state, &f.requester, request(&f, 1, expires)))
+            .max_by_key(|tx| tx.hash.0)
+            .unwrap();
+        let mut stale = Vec::new();
+        let mut expires = 1_000;
+        while stale.len() < MAX_NATIVE_CANDIDATES_PER_BLOCK + 1 {
+            let tx = native_request(state, &f.requester, request(&f, 0, expires));
+            expires += 1;
+            if tx.hash.0 < valid.hash.0 {
+                stale.push(tx);
+            }
+        }
+        let mut candidates = stale;
+        candidates.push(valid.clone());
+        assert_eq!(
+            state
+                .select_native_block_transactions(&candidates)
+                .iter()
+                .map(|tx| tx.hash)
+                .collect::<Vec<_>>(),
+            vec![valid.hash],
+            "stale nonces are skipped without counting toward the cap"
+        );
+        let dir = f.dir.clone();
+        drop(f);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_rule_v1_chain_keeps_counting_used_nonces() {
+        // The same candidates as above on a chain activated with rule v1:
+        // every examined candidate counts, so the stale ones fill the cap and
+        // nothing is selected - exactly what binaries without D20 do beside it.
+        let mut f = fixture("selection-v1");
+        f.context.selection_rule = NativeSelectionRule::CountEveryCandidateV1;
+        let state = &f.ledger.state;
+        state.activate_native_inference(f.context.clone()).unwrap();
+        state
+            .execute_block_verified_at(
+                &[native_request(state, &f.requester, request(&f, 0, 100))],
+                Hash256::ZERO,
+                1,
+            )
+            .unwrap();
+        let valid = (200..208)
+            .map(|expires| native_request(state, &f.requester, request(&f, 1, expires)))
+            .max_by_key(|tx| tx.hash.0)
+            .unwrap();
+        let mut candidates = Vec::new();
+        let mut expires = 1_000;
+        while candidates.len() < MAX_NATIVE_CANDIDATES_PER_BLOCK {
+            let tx = native_request(state, &f.requester, request(&f, 0, expires));
+            expires += 1;
+            if tx.hash.0 < valid.hash.0 {
+                candidates.push(tx);
+            }
+        }
+        candidates.push(valid);
+        assert!(state.select_native_block_transactions(&candidates).is_empty());
+        let dir = f.dir.clone();
+        drop(f);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_rule_v1_chain_never_adopts_a_checkpoint() {
+        let mut f = fixture("adopt-v1");
+        f.context.selection_rule = NativeSelectionRule::CountEveryCandidateV1;
+        let peer = &f.ledger.state;
+        peer.activate_native_inference(f.context.clone()).unwrap();
+        let (twin, twin_dir) = lagging_twin(&f, "twin-v1");
+        peer.execute_block_verified_at(
+            &[native_request(peer, &f.requester, request(&f, 0, 100))],
+            Hash256::ZERO,
+            1,
+        )
+        .unwrap();
+        let payload = peer.export_durable_snapshot();
+        let tip = peer.get_block(1).unwrap();
+        let refusal = twin.plan_checkpoint_adoption(&payload, &tip).unwrap_err();
+        assert!(refusal.to_string().contains("selection rule v1"), "{refusal}");
+        let dir = f.dir.clone();
+        drop(f);
+        drop(twin);
+        for path in [dir, twin_dir] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn each_selection_rule_has_one_activation_layout_and_its_own_commitment() {
+        let f = fixture("activation-layouts");
+        let mut v1 = f.context.clone();
+        v1.selection_rule = NativeSelectionRule::CountEveryCandidateV1;
+        let v2 = f.context.clone();
+        assert_eq!(v2.selection_rule, NativeSelectionRule::SkipUsedNoncesV2);
+
+        // Rule v1 is the original record, byte for byte, and its original
+        // commitment: an upgraded binary reads and writes exactly what the
+        // binaries beside it do.
+        let legacy = bincode::serialize(&LegacyAdmissionContext {
+            domain: v1.domain,
+            members: v1.members.clone(),
+            allowed_executions: v1.allowed_executions.clone(),
+        })
+        .unwrap();
+        assert_eq!(encode_activation(&v1).unwrap(), legacy);
+        assert_eq!(decode_activation(&legacy).unwrap(), v1);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&v1.domain.chain_genesis.0);
+        bytes.extend_from_slice(&v1.domain.recovery_epoch.to_le_bytes());
+        bytes.extend_from_slice(&v1.domain.validator_set_hash.0);
+        bytes.extend_from_slice(&(v1.members.len() as u32).to_le_bytes());
+        for member in &v1.members {
+            bytes.extend_from_slice(&member.address.0);
+            bytes.extend_from_slice(&member.stake.to_le_bytes());
+        }
+        let mut sorted = v1.allowed_executions.clone();
+        sorted.sort_by_key(|e| (e.model_hash.0, e.profile_hash.0, e.generation_hash.0, e.assignment_hash.0));
+        sorted.dedup();
+        bytes.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+        for e in &sorted {
+            for hash in [e.model_hash, e.profile_hash, e.generation_hash, e.assignment_hash] {
+                bytes.extend_from_slice(&hash.0);
+            }
+        }
+        assert_eq!(v1.commitment().unwrap(), domain_hash(CONTEXT_DOMAIN, &bytes));
+
+        // Rule v2 is a different record and commitment. A binary without D20
+        // decodes records exactly, so it refuses this one instead of running
+        // the chain under the old rule.
+        let extended = encode_activation(&v2).unwrap();
+        assert_ne!(extended, legacy);
+        assert_eq!(decode_activation(&extended).unwrap(), v2);
+        assert!(
+            bincode::deserialize_limited_exact::<LegacyAdmissionContext, MAX_CONTEXT_BYTES>(&extended)
+                .is_err()
+        );
+        assert_ne!(v1.commitment().unwrap(), v2.commitment().unwrap());
+        // One encoding per context: rule v1 in the extended layout is refused.
+        assert!(decode_activation(&bincode::serialize(&v1).unwrap()).is_err());
+
+        let dir = f.dir.clone();
+        drop(f);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_storage_row_is_committed_only_through_its_certified_account() {
+        let value = b"metadata".to_vec();
+        let mut account = arc_types::Account::new(hash_bytes(b"escrow"), 0);
+        account.storage_root = hash_bytes(&value);
+        let escrow = hash_bytes(b"escrow");
+        assert!(native_storage_row_committed(Some(&account), &escrow, &metadata_key(), &value));
+        assert!(!native_storage_row_committed(Some(&account), &escrow, &metadata_key(), b"other"));
+        assert!(!native_storage_row_committed(None, &escrow, &metadata_key(), &value));
+        assert!(!native_storage_row_committed(Some(&account), &escrow, &hash_bytes(b"k"), &value));
+        let mut pin = arc_types::Account::new(context_account(), 0);
+        pin.storage_root = hash_bytes(b"commitment");
+        assert!(native_storage_row_committed(
+            Some(&pin),
+            &context_account(),
+            &context_key(),
+            pin.storage_root.as_ref()
+        ));
+        assert!(!native_storage_row_committed(Some(&pin), &escrow, &context_key(), pin.storage_root.as_ref()));
     }
 
     #[test]

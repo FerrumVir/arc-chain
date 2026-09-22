@@ -512,12 +512,19 @@ impl DagBlock {
     /// gives the state layer a purpose-specific commitment which cannot be
     /// replayed across chains, recovery epochs, validator sets, or DAG rounds.
     pub fn state_decision_commitment(&self, domain: &ConsensusDomain) -> Hash256 {
+        Self::decision_commitment(domain, &self.hash, self.round)
+    }
+
+    /// `state_decision_commitment` for an anchor known only by hash and
+    /// round - how a checkpoint's resume point is checked against the
+    /// certified header that carries it.
+    pub fn decision_commitment(domain: &ConsensusDomain, anchor: &Hash256, round: u64) -> Hash256 {
         let mut hasher = blake3::Hasher::new_derive_key("ARC-dag-state-decision-v3");
         hasher.update(domain.domain_hash.as_ref());
         hasher.update(&domain.recovery_epoch.to_be_bytes());
         hasher.update(&domain.validator_set_id.to_be_bytes());
-        hasher.update(self.hash.as_ref());
-        hasher.update(&self.round.to_be_bytes());
+        hasher.update(anchor.as_ref());
+        hasher.update(&round.to_be_bytes());
         Hash256(*hasher.finalize().as_bytes())
     }
 
@@ -1198,6 +1205,69 @@ impl ConsensusEngine {
     /// late one at that round, needs its parents present.
     pub fn close_restart_base_round(&self) {
         *self.restart_base_round.write() = None;
+    }
+
+    /// The retained DAG block whose decision commitment is `proof_hash`, as
+    /// (hash, round): the anchor that produced a canonical block, found from
+    /// that block's header. Used to state a checkpoint's resume point; the
+    /// receiver checks it against the certified header, so nothing here is
+    /// trusted. A linear scan of the retained DAG - fine for a rare request.
+    pub fn find_committed_anchor(
+        &self,
+        proof_hash: &Hash256,
+        domain: &ConsensusDomain,
+    ) -> Option<(Hash256, u64)> {
+        self.dag
+            .iter()
+            .find(|entry| entry.value().state_decision_commitment(domain) == *proof_hash)
+            .map(|entry| (entry.value().hash, entry.value().round))
+    }
+
+    /// Whether [`Self::rebase_to`] would accept `anchor_round`, without
+    /// changing anything: the node asks before it writes the checkpoint to
+    /// its WAL, so a refusal can never leave state and cursor apart.
+    /// Returns the commit cursor the rebase would set.
+    pub fn check_rebase(&self, anchor_round: u64) -> Result<u64, ConsensusError> {
+        let cursor = anchor_round.checked_add(1).ok_or_else(|| {
+            ConsensusError::InvalidBlock("checkpoint anchor round overflows".into())
+        })?;
+        if self.recovery_bootstrap_round.read().is_some() {
+            return Err(ConsensusError::InvalidBlock(
+                "a recovery-domain engine is repositioned by its signed recovery path".into(),
+            ));
+        }
+        if cursor <= self.last_committed_round.load(Ordering::SeqCst) {
+            return Err(ConsensusError::InvalidBlock(
+                "a checkpoint must move the commit cursor forward".into(),
+            ));
+        }
+        Ok(cursor)
+    }
+
+    /// Move to the DAG position of an adopted checkpoint.
+    ///
+    /// Everything this node held below it is irrelevant - the checkpoint's
+    /// state already includes every decision up to `anchor_round` - so the DAG
+    /// is cleared, the commit cursor becomes `anchor_round + 1`, and the
+    /// restart base round opens there so the DAG can be rebuilt from peers as
+    /// after any restart. The proposal floor is raised to the round this node
+    /// had reached: it may already have signed blocks up to there.
+    pub fn rebase_to(&self, anchor_round: u64) -> Result<u64, ConsensusError> {
+        let cursor = self.check_rebase(anchor_round)?;
+        let reached = self.current_round.load(Ordering::SeqCst);
+        self.dag.clear();
+        self.rounds.clear();
+        self.committed.write().clear();
+        self.author_round_blocks.clear();
+        self.da_commitments.clear();
+        self.finality_proofs.clear();
+        self.proposal_floor.fetch_max(reached, Ordering::SeqCst);
+        self.current_round
+            .store(reached.max(cursor), Ordering::SeqCst);
+        self.last_committed_round.store(cursor, Ordering::SeqCst);
+        *self.restart_base_round.write() = Some(cursor);
+        self.reset_round_timer();
+        Ok(cursor)
     }
 
     /// True for the open restart base round. It closes by itself once the

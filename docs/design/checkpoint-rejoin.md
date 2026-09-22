@@ -166,10 +166,156 @@ consensus requires every validator in each round **unless an absence
 certificate excuses it**, so a v3 chain keeps advancing while a validator is
 down, and that validator can fall past retention.
 
-On an account-only-root chain, which includes the private protocol-4 test
-chains, adoption is **refused**. The remedy there is a backup restore (R6), or
-a protocol decision to give new chains a full-domain root, which is an owner
-decision because it changes consensus.
+On an account-only-root chain, which includes the private protocol-4 chains,
+the root does not cover the other domains. Adoption is still possible there
+under a stricter rule (v2.1, below), because a protocol-4 chain cannot change
+those domains after genesis, and its native state is bound through fields of
+certified accounts. Any other account-only chain whose payload differs from
+the node in an uncovered domain is refused. The remedy there is a backup
+restore (R6), or an owner decision to give new chains a full-domain root.
+
+## v2.3: third review applied (not compiled)
+
+A third independent review of v2.2 (read-only, 2026-09-22) found one high,
+one medium and three low defects. Each was re-checked in the code before
+fixing.
+
+1. **High: account keys were not authenticated.** The account-only root
+   hashes each account's contents in key order, not the key. A peer could
+   file an account under another key between the same neighbours: the root
+   still verifies, and the owner's account disappears on the adopting node,
+   which then forks from its peers at that owner's next transaction. Now
+   every adopted account must be filed under its own address
+   (`accounts_bound_to_keys`), checked when planning, again immediately
+   before the durable write, and again when a Rebase record is replayed at
+   open. Honest state never files an account elsewhere (the native record
+   validator already requires it).
+2. **Medium: D20 had no activation.** Old and new binaries would select
+   differently under a proposer packing used-nonce candidates, and a mixed
+   network could split. The rule is now fixed per chain at activation and
+   bound into the activation record and commitment (decision record D20).
+   Existing chains keep rule v1 byte for byte; new activations use v2; a
+   binary without D20 refuses a v2 chain at open. Adoption requires v2,
+   because the defect D20 fixes applies to rebased nodes.
+3. **Low: the checkpoint request did not close on every history advance.**
+   The stalled branch moved the bootstrap watermark without closing it. It
+   now closes wherever the watermark advances.
+4. **Low: validator comparison depended on restart history.** Activation
+   records only the members; each restart re-seeds the full genesis list, so
+   entries below the minimum stake differ between nodes that restarted and
+   nodes that did not. Only validators at or above the minimum are compared.
+5. **Low: the rebase was applied without the native publication lock, and
+   `rebase_onto_checkpoint` re-checked only the payload's shape.** The apply
+   now holds the publication write lock (as activation and block execution
+   do), and the adoption preconditions are checked again before the write.
+
+Also fixed: an iterator call on a trait object that would not have compiled,
+and three doc comments attached to the wrong items.
+
+New tests: a relabelled account (asserting the root alone accepts it and the
+plan and the rebase refuse it), a moved escrow refused by the scratch root
+check with the WAL unchanged, tampered activation and pin rows, a changed
+staking pool, a changed member stake, below-minimum registry entries
+accepted, rule-v1 chains refusing adoption and keeping the counting rule, and
+one activation layout and commitment per rule.
+
+## v2.2: what is implemented (not compiled; second review applied)
+
+This supersedes "Design v2" and "v2.1" above wherever they differ. A second
+independent review of v2.1 found four more defects: duplicate rows, legacy
+chains, receipt knowledge, and a gate that never closed. Each was re-checked
+in code, and this is the result.
+
+**Scope: protocol-4 chains only.** Adoption is refused unless native inference
+is activated and there is no recovery context. On a legacy account-only chain,
+contract storage and stake change without touching anything the root
+certifies, so "equal to this node's" would adopt stale state. A recovery-
+context chain's engine is repositioned only by its signed recovery path.
+
+**What is adopted (`StateDB::plan_checkpoint_adoption`), and why each part is
+bound:**
+
+* **Accounts:** the certified account-only root, recomputed in a scratch store.
+* **Rows a certified account commits:** a native escrow's metadata row (hash =
+  the escrow account's `storage_root`) and the context pin row (= the pin
+  account's `storage_root`). Such a row is adopted **only** if its certified
+  account commits it. Equality with this node's copy does not count, because
+  that copy may be the stale one.
+* **Every other row, plus contracts, identities, validators, the staking pool
+  and the reward activation height:** byte-identical to this node's own. On
+  protocol 4 nothing but native inference runs after activation, so none of
+  these can change.
+* **Shape:** accounts, storage holders and each holder's rows are strictly
+  increasing by key, so there is one version of anything. A row this node holds
+  that the payload lacks is refused, since nothing certifies a deletion. So is
+  a certified account with a new or changed `storage_root` whose committed row
+  is missing.
+* **History:** window blocks are re-hashed from the certified tip, with height
+  keys, contiguity, `tx_count` and `tx_root` checked. Transaction bodies are
+  **not** adopted (a body's hash excludes its signature), and neither are
+  receipts, logs or the pending index.
+* **Before any write:** the scratch store rebuilds the native pending index,
+  which decodes every metadata row and checks it against its escrow. So nothing
+  the post-write rebuild checks can fail after the record is durable.
+  `rebase_onto_checkpoint` refuses any payload that still carries receipts,
+  logs, bodies, a pending index or a recovery context, and so does the
+  open-time check of a Rebase record.
+
+**Receipt knowledge (new protocol-4 rule, decision D20):** a rebased node holds
+no receipts below the checkpoint, and the commit path filters candidates by
+receipts. `select_native_block_transactions` therefore skips any candidate
+whose nonce its sender has already used **without counting it** toward the
+64-candidate cap. On protocol 4 a transaction was applied exactly when its
+nonce was consumed, so every node skips the same set whatever receipts it
+holds. Without this rule, a leader packing 64 already-applied transactions
+ahead of a live one would make the rebased node select differently from its
+peers. The rule applies to every node, which is acceptable because protocol 4
+is unreleased.
+
+**Node:** a response is considered only while this node's own request is
+outstanding, only from a peer it asked, and at most once per peer per request.
+The request is closed as soon as history bootstrap makes progress or completes.
+The node calls `check_rebase` before writing and panics (aborts) if anything
+fails after the durable write; restart recovers from the record.
+
+**Remaining limits:** serving still runs on the consensus thread. A state above
+the 16 MiB wire cap cannot be served. Peers can feed stale but certified,
+forward-moving checkpoints, which is bounded by solicitation. Live adoption keeps
+its pre-rebase mempool and does not re-index `account_txs` (display only).
+
+## v2.1 (superseded by v2.2 above)
+
+`StateDB::plan_checkpoint_adoption` returns the only part of a payload a node
+may adopt. Otherwise it refuses:
+
+* **Covered by the root:** accounts.
+* **Bound through a certified account:** a native escrow's metadata row, which
+  hashes to that escrow account's `storage_root`, and the context pin row,
+  which equals the pin account's `storage_root` (`native_storage_row_committed`).
+  Every other storage row must equal this node's own. A row this node holds
+  that the payload lacks is refused, because nothing certifies a deletion. So is a
+  certified account whose `storage_root` is new or changed without the row it
+  commits, because this node would later refuse a transition its peers apply.
+* **Not covered, so must be unchanged:** contracts, identities, validators,
+  staking pool, reward activation height and recovery context, each
+  byte-identical to this node's own. Adopting them is then a no-op.
+* **History:** window blocks re-hashed from the tip, with height keys,
+  contiguity, `tx_count` and `tx_root` checked. Only bodies those blocks list,
+  hashing to their key, are kept. Receipts and logs are dropped.
+* **Derived indexes:** none are adopted. `rebuild_after_rebase` rebuilds the
+  native pending index from certified storage (the admission height is the
+  certified escrow account's nonce), plus Tier 1 and bond releases. Startup
+  does the same, so live adoption equals a restart of the same WAL.
+* **Refused outright:** recovery-context chains (the engine is repositioned
+  only by the signed recovery path), and stores with a GPU account cache or a
+  JMT root, which a rebase cannot rebuild.
+
+The node accepts a response only while its own request is outstanding and
+only from a peer it asked. It asks `ConsensusEngine::check_rebase` before
+writing. It stops with a fatal error if anything fails after the Rebase record
+is durable, and restart recovers from the record. It decodes peer payloads
+within the 16 MiB wire cap and serves each peer at most one checkpoint per
+30 s.
 
 ## Design v2
 

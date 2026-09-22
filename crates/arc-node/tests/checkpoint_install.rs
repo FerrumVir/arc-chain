@@ -103,6 +103,8 @@ fn envelope_for(
             state_root,
             digest,
         },
+        anchor_hash: Hash256::ZERO,
+        anchor_round: 0,
     }
 }
 
@@ -200,6 +202,8 @@ fn a_certificate_below_quorum_authorises_nothing() {
             state_root: root,
             digest,
         },
+        anchor_hash: Hash256::ZERO,
+        anchor_round: 0,
     };
     match envelope.verify_payload(&bytes, &d, &set) {
         Err(CheckpointError::Certificate(_)) => {}
