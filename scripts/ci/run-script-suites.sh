@@ -57,12 +57,13 @@ run_unittest "arc_ops: operational checks (R7)"          arc_ops.tests.test_chec
 run_unittest "arc_ops: conservation audit (P7)"          arc_ops.tests.test_conservation
 run_unittest "arc_ops: receipt reconciliation (P9)"     arc_ops.tests.test_receipts
 
-# scripts/release/tests is not a package (no __init__.py): test_sbom.py loads
-# sbom.py by file path via importlib, and test_signing_fixtures.py only
-# shells out to ssh-keygen - both run fine addressed by file path from the
-# repo root instead of a dotted module name.
+# scripts/release/tests is not a package (no __init__.py): test_sbom.py and
+# test_verify_local_artifacts.py load their module by file path via importlib,
+# and test_signing_fixtures.py only shells out to ssh-keygen - all run fine
+# addressed by file path from the repo root instead of a dotted module name.
 cd "$REPO_ROOT" || exit 1
 run_unittest "release: SBOM builder (R2)"                    scripts/release/tests/test_sbom.py
 run_unittest "release: signing-path FIXTURE tests (R3/U7)"   scripts/release/tests/test_signing_fixtures.py
+run_unittest "release: local artifact verifier (R2)"         scripts/release/tests/test_verify_local_artifacts.py
 
 exit "$failed"
