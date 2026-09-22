@@ -51,6 +51,7 @@ run_unittest "arc_conformance: model-package manifest"   arc_conformance.tests.t
 run_unittest "arc_soak: analyzer (verdict/exit-status)"  arc_soak.tests.test_analyze
 run_unittest "arc_soak: growth fitter"                   arc_soak.tests.test_growth
 run_unittest "arc_soak: orchestrator pure helpers"       arc_soak.tests.test_orchestrate
+run_unittest "arc_soak: post-soak evidence collector"    arc_soak.tests.test_collect_evidence
 run_unittest "arc_ops: backup/verify/restore"            arc_ops.tests.test_backup
 run_unittest "arc_ops: operational checks (R7)"          arc_ops.tests.test_check
 run_unittest "arc_ops: conservation audit (P7)"          arc_ops.tests.test_conservation
