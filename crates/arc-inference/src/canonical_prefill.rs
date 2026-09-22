@@ -20,8 +20,8 @@
 //! unchanged. Batching applies only to the projections, which are ~99% of
 //! prefill arithmetic.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static BATCHED_PREFILL: AtomicBool = AtomicBool::new(false);
 
@@ -281,7 +281,10 @@ mod tests {
         record_chunk(8, 225);
         record_chunk(4, 225);
         let c = prefill_census();
-        assert!(c.chunks >= 2 && c.tokens >= 12 && c.batched_projections >= 450, "{c:?}");
+        assert!(
+            c.chunks >= 2 && c.tokens >= 12 && c.batched_projections >= 450,
+            "{c:?}"
+        );
         reset_prefill_census();
     }
 }

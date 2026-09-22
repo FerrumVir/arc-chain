@@ -2851,7 +2851,10 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Bad ConsensusAbsenceCertificate from {}: {}", peer_address, e)
+                        warn!(
+                            "Bad ConsensusAbsenceCertificate from {}: {}",
+                            peer_address, e
+                        )
                     }
                 }
             }
@@ -2881,7 +2884,10 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Bad ConsensusFinalityCertificate from {}: {}", peer_address, e)
+                        warn!(
+                            "Bad ConsensusFinalityCertificate from {}: {}",
+                            peer_address, e
+                        )
                     }
                 }
             }
@@ -3420,7 +3426,10 @@ mod tests {
     /// address B, with each side's two handshakes finishing in the given
     /// order, and returns which connection each side kept. "A->B" is the one
     /// A initiated.
-    fn simultaneous_dial(a_accepts_first: bool, b_accepts_first: bool) -> (&'static str, &'static str) {
+    fn simultaneous_dial(
+        a_accepts_first: bool,
+        b_accepts_first: bool,
+    ) -> (&'static str, &'static str) {
         let a = [1_u8; 32];
         let b = [2_u8; 32];
         let addr: SocketAddr = "127.0.0.1:7333".parse().unwrap();
@@ -3480,7 +3489,10 @@ mod tests {
                 .is_none()
         );
         assert_eq!(peer_count.load(Ordering::Relaxed), 1);
-        assert_eq!(connections.peers.get(&remote).unwrap().connection_id, kept_id);
+        assert_eq!(
+            connections.peers.get(&remote).unwrap().connection_id,
+            kept_id
+        );
         assert_eq!(connections.peers.get(&remote).unwrap().send, "A->B");
     }
 
@@ -3507,7 +3519,10 @@ mod tests {
             .install_directed(remote, local, "B->A (restart)", addr, 500_000, false)
             .expect("a reconnect outside the window replaces");
         assert_eq!(replaced, Some(old_id));
-        assert_eq!(connections.peers.get(&remote).unwrap().connection_id, new_id);
+        assert_eq!(
+            connections.peers.get(&remote).unwrap().connection_id,
+            new_id
+        );
         assert_eq!(peer_count.load(Ordering::Relaxed), 1);
     }
 }

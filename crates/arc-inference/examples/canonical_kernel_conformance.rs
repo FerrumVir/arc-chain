@@ -55,14 +55,17 @@ fn main() -> Result<(), String> {
     let repeats: usize = args.get(3).map(|s| s.parse().unwrap_or(3)).unwrap_or(3);
 
     // Fixed real Llama-2 token ids, independent of either kernel's output.
-    let base: [u32; 12] = [1, 6324, 29892, 306, 29915, 29885, 263, 1243, 310, 278, 1904, 29889];
+    let base: [u32; 12] = [
+        1, 6324, 29892, 306, 29915, 29885, 263, 1243, 310, 278, 1904, 29889,
+    ];
     let tokens: Vec<u32> = (0..n_pos).map(|i| base[i % base.len()]).collect();
 
     let t0 = Instant::now();
-    let model = arc_inference::cached_integer_model::load_cached_model_canonical_i8_interleaved_rope(
-        &args[1],
-    )
-    .map_err(|e| e.to_string())?;
+    let model =
+        arc_inference::cached_integer_model::load_cached_model_canonical_i8_interleaved_rope(
+            &args[1],
+        )
+        .map_err(|e| e.to_string())?;
     let load_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     let profile = model
@@ -102,19 +105,23 @@ fn main() -> Result<(), String> {
     // One pass = `repeats` rounds; the kernel ORDER ALTERNATES between rounds,
     // so a fixed scalar-first ordering cannot be what produces the difference.
     let one_pass = |census: bool,
-                        scalar_ms: &mut Vec<f64>,
-                        fast_ms: &mut Vec<f64>,
-                        compared_positions: &mut usize,
-                        compared_logits: &mut usize,
-                        max_abs_diff: &mut i64,
-                        first_mismatch: &mut Option<(usize, usize, i64, i64)>,
-                        reference: &mut Option<Vec<Vec<i64>>>,
-                        order_log: &mut Vec<&'static str>|
+                    scalar_ms: &mut Vec<f64>,
+                    fast_ms: &mut Vec<f64>,
+                    compared_positions: &mut usize,
+                    compared_logits: &mut usize,
+                    max_abs_diff: &mut i64,
+                    first_mismatch: &mut Option<(usize, usize, i64, i64)>,
+                    reference: &mut Option<Vec<Vec<i64>>>,
+                    order_log: &mut Vec<&'static str>|
      -> Result<(), String> {
         canonical_simd::set_projection_census_enabled(census);
         for r in 0..repeats {
             let scalar_first = r % 2 == 0;
-            order_log.push(if scalar_first { "scalar-first" } else { "vectorised-first" });
+            order_log.push(if scalar_first {
+                "scalar-first"
+            } else {
+                "vectorised-first"
+            });
             let (s_logits, s_ms, f_logits, f_ms) = if scalar_first {
                 canonical_simd::set_fast_canonical_kernel(false);
                 let (sl, sm) = run(&model, &tokens);
@@ -151,7 +158,9 @@ fn main() -> Result<(), String> {
                 Some(ref0) => {
                     for (p, (a, b)) in ref0.iter().zip(s_logits.iter()).enumerate() {
                         if a != b {
-                            return Err(format!("scalar run {r} diverged from run 0 at position {p}"));
+                            return Err(format!(
+                                "scalar run {r} diverged from run 0 at position {p}"
+                            ));
                         }
                     }
                 }
@@ -167,15 +176,33 @@ fn main() -> Result<(), String> {
     // conformance run rather than a separate synthetic one.
     canonical_simd::reset_projection_census();
     let (mut sa_ms, mut fa_ms) = (Vec::new(), Vec::new());
-    one_pass(true, &mut sa_ms, &mut fa_ms, &mut compared_positions, &mut compared_logits,
-             &mut max_abs_diff, &mut first_mismatch, &mut reference, &mut order_log)?;
+    one_pass(
+        true,
+        &mut sa_ms,
+        &mut fa_ms,
+        &mut compared_positions,
+        &mut compared_logits,
+        &mut max_abs_diff,
+        &mut first_mismatch,
+        &mut reference,
+        &mut order_log,
+    )?;
     let census = canonical_simd::projection_census();
 
     // Pass B: counting OFF. These are the headline timings; the difference
     // between the two passes IS the measured cost of the diagnostics.
     let (mut scalar_ms, mut fast_ms) = (Vec::new(), Vec::new());
-    one_pass(false, &mut scalar_ms, &mut fast_ms, &mut compared_positions, &mut compared_logits,
-             &mut max_abs_diff, &mut first_mismatch, &mut reference, &mut order_log)?;
+    one_pass(
+        false,
+        &mut scalar_ms,
+        &mut fast_ms,
+        &mut compared_positions,
+        &mut compared_logits,
+        &mut max_abs_diff,
+        &mut first_mismatch,
+        &mut reference,
+        &mut order_log,
+    )?;
 
     let (sa_min, sa_med, _) = stats(&sa_ms);
     let (fa_min, fa_med, _) = stats(&fa_ms);

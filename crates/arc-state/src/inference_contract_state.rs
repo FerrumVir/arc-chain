@@ -2725,7 +2725,9 @@ mod tests {
         let mut candidates = junk.clone();
         candidates.push(valid.clone());
         assert!(
-            state.select_native_block_transactions(&candidates).is_empty(),
+            state
+                .select_native_block_transactions(&candidates)
+                .is_empty(),
             "the first {MAX_NATIVE_CANDIDATES_PER_BLOCK} in hash order are all junk"
         );
         // One fewer junk candidate and the valid request is reached.

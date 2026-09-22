@@ -3427,7 +3427,10 @@ async fn submit_signed_tx(
     // refusing it here tells the submitter now, rather than via a failed
     // receipt later.
     if arc_state::StateDB::is_registry_change(&tx)
-        && node.state.refuse_registry_change_under_native_binding().is_err()
+        && node
+            .state
+            .refuse_registry_change_under_native_binding()
+            .is_err()
     {
         return Err(StatusCode::CONFLICT.into());
     }
@@ -3453,7 +3456,10 @@ async fn submit_signed_tx(
             .state
             .validate_native_inference_transaction_admission_next(&tx, &context)
         {
-            return Err(SubmitRefusal::new(StatusCode::BAD_REQUEST, error.to_string()));
+            return Err(SubmitRefusal::new(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+            ));
         }
     } else if match node.state.try_native_inference_context() {
         Ok(Some(_)) => true,
@@ -4439,7 +4445,10 @@ async fn consensus_diagnostics(AxumState(node): AxumState<NodeState>) -> Json<Va
             "last_committed_round".into(),
             Value::from(engine.last_committed_round()),
         );
-        map.insert("dag_blocks".into(), Value::from(engine.dag_block_count() as u64));
+        map.insert(
+            "dag_blocks".into(),
+            Value::from(engine.dag_block_count() as u64),
+        );
         map.insert(
             "finality_certificates_held".into(),
             Value::from(engine.finality_certificate_count() as u64),

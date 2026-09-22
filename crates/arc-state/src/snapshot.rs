@@ -379,7 +379,11 @@ mod tests {
         // Another context, or none in the payload: refused.
         assert!(payload.root_covers_everything_under(Some(&other)).is_err());
         payload.recovery_context = None;
-        assert!(payload.root_covers_everything_under(Some(&context)).is_err());
+        assert!(
+            payload
+                .root_covers_everything_under(Some(&context))
+                .is_err()
+        );
     }
 
     #[test]
@@ -425,7 +429,14 @@ mod tests {
     #[test]
     fn a_corrupt_payload_is_refused_rather_than_decoded() {
         let dir = tempfile::tempdir().unwrap();
-        publish(dir.path(), payload_at(5), hash_bytes(b"r"), 1, hash_bytes(b"b")).unwrap();
+        publish(
+            dir.path(),
+            payload_at(5),
+            hash_bytes(b"r"),
+            1,
+            hash_bytes(b"b"),
+        )
+        .unwrap();
         let payload_path = dir.path().join(PAYLOAD_FILE);
         let mut bytes = std::fs::read(&payload_path).unwrap();
         let last = bytes.len() - 1;
@@ -441,7 +452,14 @@ mod tests {
     #[test]
     fn a_truncated_payload_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        publish(dir.path(), payload_at(5), hash_bytes(b"r"), 1, hash_bytes(b"b")).unwrap();
+        publish(
+            dir.path(),
+            payload_at(5),
+            hash_bytes(b"r"),
+            1,
+            hash_bytes(b"b"),
+        )
+        .unwrap();
         let payload_path = dir.path().join(PAYLOAD_FILE);
         let bytes = std::fs::read(&payload_path).unwrap();
         std::fs::write(&payload_path, &bytes[..bytes.len() / 2]).unwrap();
@@ -456,7 +474,14 @@ mod tests {
         // The shape a crash between the two writes leaves. It must read as
         // "no snapshot", so the node falls back to full replay.
         let dir = tempfile::tempdir().unwrap();
-        publish(dir.path(), payload_at(5), hash_bytes(b"r"), 1, hash_bytes(b"b")).unwrap();
+        publish(
+            dir.path(),
+            payload_at(5),
+            hash_bytes(b"r"),
+            1,
+            hash_bytes(b"b"),
+        )
+        .unwrap();
         std::fs::remove_file(dir.path().join(MANIFEST_FILE)).unwrap();
         assert!(matches!(load(dir.path()), Err(SnapshotError::Absent)));
     }
@@ -464,7 +489,14 @@ mod tests {
     #[test]
     fn a_manifest_without_its_payload_is_not_a_snapshot() {
         let dir = tempfile::tempdir().unwrap();
-        publish(dir.path(), payload_at(5), hash_bytes(b"r"), 1, hash_bytes(b"b")).unwrap();
+        publish(
+            dir.path(),
+            payload_at(5),
+            hash_bytes(b"r"),
+            1,
+            hash_bytes(b"b"),
+        )
+        .unwrap();
         std::fs::remove_file(dir.path().join(PAYLOAD_FILE)).unwrap();
         assert!(matches!(load(dir.path()), Err(SnapshotError::Absent)));
     }
@@ -472,7 +504,14 @@ mod tests {
     #[test]
     fn a_snapshot_from_a_newer_build_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        publish(dir.path(), payload_at(5), hash_bytes(b"r"), 1, hash_bytes(b"b")).unwrap();
+        publish(
+            dir.path(),
+            payload_at(5),
+            hash_bytes(b"r"),
+            1,
+            hash_bytes(b"b"),
+        )
+        .unwrap();
         let manifest_path = dir.path().join(MANIFEST_FILE);
         let mut bytes = std::fs::read(&manifest_path).unwrap();
         bytes[SNAPSHOT_MAGIC.len()] = SNAPSHOT_VERSION + 1;
@@ -486,9 +525,22 @@ mod tests {
     #[test]
     fn republishing_replaces_the_previous_snapshot_atomically() {
         let dir = tempfile::tempdir().unwrap();
-        publish(dir.path(), payload_at(5), hash_bytes(b"r1"), 1, hash_bytes(b"b1")).unwrap();
-        let second =
-            publish(dir.path(), payload_at(50), hash_bytes(b"r2"), 500, hash_bytes(b"b2")).unwrap();
+        publish(
+            dir.path(),
+            payload_at(5),
+            hash_bytes(b"r1"),
+            1,
+            hash_bytes(b"b1"),
+        )
+        .unwrap();
+        let second = publish(
+            dir.path(),
+            payload_at(50),
+            hash_bytes(b"r2"),
+            500,
+            hash_bytes(b"b2"),
+        )
+        .unwrap();
         let loaded = load(dir.path()).unwrap();
         assert_eq!(loaded.manifest, second);
         assert_eq!(loaded.payload.height, 50);
@@ -499,7 +551,14 @@ mod tests {
     #[test]
     fn removing_a_snapshot_leaves_nothing_loadable() {
         let dir = tempfile::tempdir().unwrap();
-        publish(dir.path(), payload_at(5), hash_bytes(b"r"), 1, hash_bytes(b"b")).unwrap();
+        publish(
+            dir.path(),
+            payload_at(5),
+            hash_bytes(b"r"),
+            1,
+            hash_bytes(b"b"),
+        )
+        .unwrap();
         remove(dir.path()).unwrap();
         assert!(matches!(load(dir.path()), Err(SnapshotError::Absent)));
         remove(dir.path()).expect("removing twice is not an error");

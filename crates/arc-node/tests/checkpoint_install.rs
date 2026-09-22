@@ -42,7 +42,10 @@ fn snapshot_bytes(height: u64) -> (Vec<u8>, Hash256, SnapshotPayload) {
     let mut payload = SnapshotPayload {
         height,
         accounts: vec![
-            (hash_bytes(b"alice"), Account::new(hash_bytes(b"alice"), 900)),
+            (
+                hash_bytes(b"alice"),
+                Account::new(hash_bytes(b"alice"), 900),
+            ),
             (hash_bytes(b"bob"), Account::new(hash_bytes(b"bob"), 100)),
         ],
         ..Default::default()

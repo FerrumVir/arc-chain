@@ -79,8 +79,8 @@ use crate::integer_lut::FRAC_BITS;
 use rayon::prelude::*;
 #[cfg(target_arch = "aarch64")]
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Balanced base-256 digits used by the vectorised path.
 pub const LIMB_COUNT: usize = 4;
@@ -111,9 +111,7 @@ const _: () = assert!(LIMB_MIN == derive_limb_bound(-128));
 const _: () = assert!(16_384i64 * (MAX_COLS_FOR_I32 as i64) <= i32::MAX as i64);
 const _: () = assert!(16_384i64 * (MAX_COLS_FOR_I32 as i64 + 1) > i32::MAX as i64);
 // The dot itself cannot overflow i64 anywhere inside the accepted domain.
-const _: () = assert!(
-    (MAX_COLS_FOR_I32 as i128) * 128 * (-LIMB_MIN as i128) < i64::MAX as i128
-);
+const _: () = assert!((MAX_COLS_FOR_I32 as i128) * 128 * (-LIMB_MIN as i128) < i64::MAX as i128);
 
 static FAST_KERNEL: AtomicBool = AtomicBool::new(false);
 
@@ -171,7 +169,13 @@ pub fn set_projection_census_enabled(on: bool) {
 
 pub fn reset_projection_census() {
     for c in [
-        &N_ATTEMPTED, &N_ACCEPTED, &N_UNAVAILABLE, &N_SHAPE, &N_K_BOUND, &N_DOMAIN, &N_SCALE,
+        &N_ATTEMPTED,
+        &N_ACCEPTED,
+        &N_UNAVAILABLE,
+        &N_SHAPE,
+        &N_K_BOUND,
+        &N_DOMAIN,
+        &N_SCALE,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -331,7 +335,11 @@ pub fn split_limbs(input: &[i64], limbs: &mut [i8]) -> Option<usize> {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon,dotprod")]
 #[inline]
-unsafe fn sdot(acc: std::arch::aarch64::int32x4_t, a: std::arch::aarch64::int8x16_t, b: std::arch::aarch64::int8x16_t) -> std::arch::aarch64::int32x4_t {
+unsafe fn sdot(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
     // SAFETY: wrapped for `unsafe_op_in_unsafe_fn`. The instruction reads no
     // memory and has no side effects; operands are register values.
     unsafe {
@@ -401,9 +409,11 @@ fn post_scale_bound_holds(input: &[i64], scales: &[i64]) -> bool {
     let Some(dot_bound) = input_abs_sum.checked_mul(128) else {
         return false;
     };
-    scales
-        .iter()
-        .all(|s| s.checked_abs().and_then(|a| dot_bound.checked_mul(a)).is_some())
+    scales.iter().all(|s| {
+        s.checked_abs()
+            .and_then(|a| dot_bound.checked_mul(a))
+            .is_some()
+    })
 }
 
 /// Raw output pointer shared across rayon tasks that own disjoint row ranges.
@@ -671,7 +681,9 @@ pub fn matmul_i8_batched_fast(
                     };
                     let sc = scales[i];
                     for (q, a) in acc.iter().enumerate().take(quad) {
-                        unsafe { *out_ptr.get().add((t + q) * n_rows + i) = (*a * sc) >> FRAC_BITS };
+                        unsafe {
+                            *out_ptr.get().add((t + q) * n_rows + i) = (*a * sc) >> FRAC_BITS
+                        };
                     }
                 }
                 t += quad;
@@ -751,8 +763,27 @@ mod tests {
     #[test]
     fn split_is_exact_or_refuses() {
         let edges: Vec<i64> = vec![
-            0, 1, -1, 127, 128, -128, -129, 255, 256, -256, 32767, 32768, -32768, 65535, 65536,
-            16_777_215, 16_777_216, LIMB_MAX, LIMB_MIN, LIMB_MAX - 1, LIMB_MIN + 1,
+            0,
+            1,
+            -1,
+            127,
+            128,
+            -128,
+            -129,
+            255,
+            256,
+            -256,
+            32767,
+            32768,
+            -32768,
+            65535,
+            65536,
+            16_777_215,
+            16_777_216,
+            LIMB_MAX,
+            LIMB_MIN,
+            LIMB_MAX - 1,
+            LIMB_MIN + 1,
         ];
         let mut limbs = vec![0i8; LIMB_COUNT * edges.len()];
         let used = split_limbs(&edges, &mut limbs).expect("edge values are in domain");
@@ -764,7 +795,13 @@ mod tests {
             }
             assert_eq!(r, x, "digit reconstruction must be exact for {x}");
         }
-        for bad in [LIMB_MAX + 1, LIMB_MIN - 1, i32::MAX as i64, i64::MAX, i64::MIN] {
+        for bad in [
+            LIMB_MAX + 1,
+            LIMB_MIN - 1,
+            i32::MAX as i64,
+            i64::MAX,
+            i64::MIN,
+        ] {
             let v = vec![1i64, bad, 3];
             let mut l = vec![0i8; LIMB_COUNT * v.len()];
             assert!(split_limbs(&v, &mut l).is_none(), "{bad} must be refused");
@@ -785,7 +822,9 @@ mod tests {
             seed
         };
         // Real projection widths plus every SIMD tail around 16/32.
-        for &cols in &[1usize, 7, 15, 16, 17, 31, 32, 33, 63, 65, 255, 4096, 4097, 11008] {
+        for &cols in &[
+            1usize, 7, 15, 16, 17, 31, 32, 33, 63, 65, 255, 4096, 4097, 11008,
+        ] {
             for rows in [1usize, 3, 256, 257] {
                 let w = weights_from(rows, cols, |_, _| (next() % 256) as u8 as i8);
                 // Include the untrusted raw -128 explicitly.
@@ -905,7 +944,9 @@ mod tests {
         let mut bad_input = good.clone();
         bad_input[cols / 2] = LIMB_MAX + 1;
         let mut out = vec![SENTINEL; 4];
-        assert!(!matmul_i8_canonical_rows_fast(&w, &bad_input, cols, &mut out));
+        assert!(!matmul_i8_canonical_rows_fast(
+            &w, &bad_input, cols, &mut out
+        ));
         assert_untouched(&out, "activation out of domain");
 
         // 3. inner dimension above the derived i32 bound
@@ -941,11 +982,15 @@ mod tests {
         let mut bad_input = good.clone();
         bad_input[0] = LIMB_MIN - 1;
         let mut out = vec![SENTINEL; 4];
-        assert!(!matmul_i8_canonical_rows_fast(&w, &bad_input, cols, &mut out));
+        assert!(!matmul_i8_canonical_rows_fast(
+            &w, &bad_input, cols, &mut out
+        ));
 
         let w_bad = weights_with_scale(4, cols, i64::MAX);
         let mut out = vec![SENTINEL; 4];
-        assert!(!matmul_i8_canonical_rows_fast(&w_bad, &good, cols, &mut out));
+        assert!(!matmul_i8_canonical_rows_fast(
+            &w_bad, &good, cols, &mut out
+        ));
 
         let c = projection_census();
         set_projection_census_enabled(false);

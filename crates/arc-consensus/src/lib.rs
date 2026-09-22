@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-pub mod pending;
 pub mod beacon;
 pub mod data_availability;
+pub mod pending;
 pub mod security;
 pub mod subnet;
 pub mod view_change;
@@ -64,7 +64,9 @@ pub enum ConsensusError {
     /// More than one round ahead of this node. Also a fact about the local
     /// node rather than the block; the block may become acceptable once this
     /// node has caught up by authenticated means.
-    #[error("invalid block: round {round} is too far ahead (current={current}); authenticated state sync required")]
+    #[error(
+        "invalid block: round {round} is too far ahead (current={current}); authenticated state sync required"
+    )]
     RoundTooFarAhead { round: u64, current: u64 },
 
     #[error("insufficient parents: need >= 2f+1 references from previous round")]
@@ -1637,10 +1639,14 @@ impl ConsensusEngine {
             }
 
             let full_recovery_participation = !self.requires_full_round_participation()
-                || vs.validators.iter().filter(|v| v.stake > 0).all(|validator| {
-                    seen_parent_authors.contains(&validator.address)
-                        || self.is_excused_for_round(prev_round, &validator.address)
-                });
+                || vs
+                    .validators
+                    .iter()
+                    .filter(|v| v.stake > 0)
+                    .all(|validator| {
+                        seen_parent_authors.contains(&validator.address)
+                            || self.is_excused_for_round(prev_round, &validator.address)
+                    });
             // A local timeout or testnet flag is still not a quorum
             // certificate. The only thing that excuses a missing fixed
             // validator parent is an authenticated quorum skip certificate for
@@ -1868,8 +1874,7 @@ impl ConsensusEngine {
                     != block.parents.len()
             {
                 return Err(ConsensusError::InvalidBlock(
-                    "restart base round block has an empty, zero, or duplicate parent list"
-                        .into(),
+                    "restart base round block has an empty, zero, or duplicate parent list".into(),
                 ));
             }
         } else if self.local_recovery_replay_active.load(Ordering::SeqCst)
@@ -1927,10 +1932,14 @@ impl ConsensusEngine {
 
             let parent_round = block.round.saturating_sub(1);
             let full_recovery_participation = !self.requires_full_round_participation()
-                || vs.validators.iter().filter(|v| v.stake > 0).all(|validator| {
-                    seen_parent_authors.contains(&validator.address)
-                        || self.is_excused_for_round(parent_round, &validator.address)
-                });
+                || vs
+                    .validators
+                    .iter()
+                    .filter(|v| v.stake > 0)
+                    .all(|validator| {
+                        seen_parent_authors.contains(&validator.address)
+                            || self.is_excused_for_round(parent_round, &validator.address)
+                    });
             // A local timeout or testnet flag is still not a parent
             // certificate. Recovery blocks must carry one known prior-round
             // parent author for every fixed positive-stake validator that an
@@ -2125,7 +2134,8 @@ impl ConsensusEngine {
         let round = certificate.round;
         let absentee = certificate.absentee;
         self.excused_participation.insert((round, absentee), ());
-        self.skip_certificates.insert((round, absentee), certificate);
+        self.skip_certificates
+            .insert((round, absentee), certificate);
         info!(
             round,
             %absentee,
@@ -2149,7 +2159,10 @@ impl ConsensusEngine {
     ///
     /// Idempotent for the same domain; rebinding to a different one is refused,
     /// because the signatures already emitted would become ambiguous.
-    pub fn install_certificate_domain(&self, domain: ConsensusDomain) -> Result<(), ConsensusError> {
+    pub fn install_certificate_domain(
+        &self,
+        domain: ConsensusDomain,
+    ) -> Result<(), ConsensusError> {
         let mut active = self.certificate_domain.write();
         match active.as_ref() {
             Some(existing) if existing == &domain => Ok(()),
@@ -2345,11 +2358,9 @@ impl ConsensusEngine {
                     stake = stake.saturating_add(validator.stake);
                 }
             }
-            let excused = vs
-                .validators
-                .iter()
-                .filter(|v| v.stake > 0)
-                .all(|v| authors.contains(&v.address) || self.is_excused_for_round(*round, &v.address));
+            let excused = vs.validators.iter().filter(|v| v.stake > 0).all(|v| {
+                authors.contains(&v.address) || self.is_excused_for_round(*round, &v.address)
+            });
             if stake < quorum && !excused {
                 first_thin = Some(*round);
                 if *round == first {
@@ -2518,11 +2529,20 @@ impl ConsensusEngine {
             ("engine_author_round_blocks", self.author_round_blocks.len()),
             ("engine_da_commitments", self.da_commitments.len()),
             ("engine_pending_cross_shard", self.pending_cross_shard.len()),
-            ("engine_completed_cross_shard", self.completed_cross_shard.len()),
+            (
+                "engine_completed_cross_shard",
+                self.completed_cross_shard.len(),
+            ),
             ("engine_finality_proofs", self.finality_proofs.len()),
             ("engine_skip_certificates", self.skip_certificates.len()),
-            ("engine_excused_participation", self.excused_participation.len()),
-            ("engine_finality_certificates", self.finality_certificates.len()),
+            (
+                "engine_excused_participation",
+                self.excused_participation.len(),
+            ),
+            (
+                "engine_finality_certificates",
+                self.finality_certificates.len(),
+            ),
             ("engine_validator_keys", self.validator_keys.len()),
             ("engine_withholding_entries", withholding),
             ("engine_stake_votes", stake_votes),
@@ -2560,12 +2580,7 @@ impl ConsensusEngine {
     /// anchor decision deterministic: every honest node that holds `from` also
     /// holds its whole causal history, because a block cannot be validated
     /// without its parents, so they all compute the same answer.
-    fn causal_history_contains(
-        &self,
-        from: &Hash256,
-        target: &Hash256,
-        floor_round: u64,
-    ) -> bool {
+    fn causal_history_contains(&self, from: &Hash256, target: &Hash256, floor_round: u64) -> bool {
         if from == target {
             return true;
         }
@@ -3108,10 +3123,14 @@ impl ConsensusEngine {
         }
 
         let full_recovery_participation = !self.requires_full_round_participation()
-            || vs.validators.iter().filter(|v| v.stake > 0).all(|validator| {
-                seen_authors.contains(&validator.address)
-                    || self.is_excused_for_round(current, &validator.address)
-            });
+            || vs
+                .validators
+                .iter()
+                .filter(|v| v.stake > 0)
+                .all(|validator| {
+                    seen_authors.contains(&validator.address)
+                        || self.is_excused_for_round(current, &validator.address)
+                });
         if round_stake >= vs.quorum && full_recovery_participation {
             let Some(new_round) = current.checked_add(1) else {
                 warn!(round = current, "Cannot advance beyond u64::MAX round");
@@ -3643,10 +3662,7 @@ impl ConsensusEngine {
                 return None;
             }
             signing_stake = signing_stake.checked_add(validator.stake)?;
-            quorum_signatures.push((
-                vote.voter,
-                bincode::serialize(&vote.signature).ok()?,
-            ));
+            quorum_signatures.push((vote.voter, bincode::serialize(&vote.signature).ok()?));
         }
         if signing_stake < vs.quorum {
             return None;
@@ -3724,8 +3740,10 @@ impl ConsensusEngine {
         // accumulated one entry per attested (round, member) for the life of
         // the process, which a day-long soak would have turned into a slow
         // leak with nothing else wrong.
-        self.skip_certificates.retain(|(round, _), _| *round >= cutoff);
-        self.excused_participation.retain(|(round, _), _| *round >= cutoff);
+        self.skip_certificates
+            .retain(|(round, _), _| *round >= cutoff);
+        self.excused_participation
+            .retain(|(round, _), _| *round >= cutoff);
 
         // Prune committed hashes that are no longer in the DAG
         if pruned_count > 0 {
@@ -4637,7 +4655,10 @@ mod tests {
             Err(ConsensusError::MissingParents { missing: 1, .. })
         ));
         // An absent parent is an arrival-order fact: the block may be held.
-        assert_eq!(engine.absent_parents(&missing), Some(vec![hash_bytes(b"missing-parent")]));
+        assert_eq!(
+            engine.absent_parents(&missing),
+            Some(vec![hash_bytes(b"missing-parent")])
+        );
 
         let old_parent = make_block(test_addr(0), 0, vec![], vec![], 1002);
         engine.receive_block(&old_parent).unwrap();
@@ -4693,7 +4714,13 @@ mod tests {
         let block = make_block(test_addr(1), 5, vec![], vec![], 1000);
         let result = engine.receive_block(&block);
         assert!(
-            matches!(&result, Err(ConsensusError::RoundTooFarAhead { round: 5, current: 0 })),
+            matches!(
+                &result,
+                Err(ConsensusError::RoundTooFarAhead {
+                    round: 5,
+                    current: 0
+                })
+            ),
             "single-peer future block must not move consensus state: {result:?}"
         );
         assert_eq!(engine.current_round(), 0);
@@ -4871,7 +4898,7 @@ mod tests {
         assert_eq!(engine_reverse.validator_set().total_stake, 6 * STAKE_ARC);
     }
 
-        /// Drive `rounds` rounds of a synthetic DAG with `n` equal-stake authors
+    /// Drive `rounds` rounds of a synthetic DAG with `n` equal-stake authors
     /// and return how many blocks committed.
     ///
     /// No network, no node process, no timing. `link_all` selects whether each
@@ -4932,8 +4959,7 @@ mod tests {
 
     /// The deterministic round leader, as `try_commit` computes it.
     fn leader_index_for_round(n: usize, round: u64) -> usize {
-        let mut order: Vec<(Address, usize)> =
-            (0..n).map(|i| (test_addr(i as u8), i)).collect();
+        let mut order: Vec<(Address, usize)> = (0..n).map(|i| (test_addr(i as u8), i)).collect();
         order.sort_by_key(|(address, _)| address.0);
         order[round as usize % n].1
     }
@@ -5033,7 +5059,10 @@ mod tests {
             previous = current;
         }
         let cursor = engine.last_committed_round();
-        assert!(cursor > PRUNE_DEPTH, "the chain must have committed past the window");
+        assert!(
+            cursor > PRUNE_DEPTH,
+            "the chain must have committed past the window"
+        );
         // Recent rounds are still servable.
         assert!(
             !engine.blocks_in_round(cursor - 1).is_empty(),

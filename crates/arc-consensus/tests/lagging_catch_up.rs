@@ -80,7 +80,11 @@ fn history() -> (ValidatorSet, Vec<KeyPair>, Vec<DagBlock>, Vec<DagBlock>) {
     let mut ts = 1_700_000_000_000u64;
     let early = run_rounds(&[&e[0], &e[1], &e[2], &e[3]], K + 1, &mut ts);
     let late = run_rounds(&[&e[0], &e[1], &e[2]], R - K, &mut ts);
-    assert!(e[0].current_round() >= R, "the three kept going: {}", e[0].current_round());
+    assert!(
+        e[0].current_round() >= R,
+        "the three kept going: {}",
+        e[0].current_round()
+    );
     (set, keys, early, late)
 }
 
@@ -177,7 +181,11 @@ fn a_block_with_a_wrong_round_parent_is_never_held() {
     let mut pending = PendingBlocks::new();
 
     // Build a block for round K+2 whose parent is a real round-0 block.
-    let round0 = early.iter().find(|b| b.round == 0).expect("round 0 exists").hash;
+    let round0 = early
+        .iter()
+        .find(|b| b.round == 0)
+        .expect("round 0 exists")
+        .hash;
     let proposer = engine(&set, &keys[1]);
     let mut forged = DagBlock {
         author: keys[1].address(),
@@ -261,13 +269,26 @@ fn a_restarted_node_rejoins_from_its_own_commit_cursor_after_peers_pruned_round_
     let mut committed = vec![Vec::new(); 4];
 
     // All four run together well past the retention window.
-    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 3 * RETAINED, &mut ts, &mut committed);
+    run_committing(
+        &[&e[0], &e[1], &e[2], &e[3]],
+        3 * RETAINED,
+        &mut ts,
+        &mut committed,
+    );
     // Validator 3 is killed. Its durable records keep its round and cursor.
     let crashed_round = e[3].current_round();
     let cursor = e[3].last_committed_round();
-    assert!(cursor > RETAINED, "the cursor must be past the window for this to test anything");
+    assert!(
+        cursor > RETAINED,
+        "the cursor must be past the window for this to test anything"
+    );
     // The other three carry on, for less than their retention window.
-    run_committing(&[&e[0], &e[1], &e[2]], RETAINED / 2, &mut ts, &mut committed[..3]);
+    run_committing(
+        &[&e[0], &e[1], &e[2]],
+        RETAINED / 2,
+        &mut ts,
+        &mut committed[..3],
+    );
     assert!(e[0].blocks_in_round(0).is_empty(), "peers pruned round 0");
     assert!(
         !e[0].blocks_in_round(cursor).is_empty(),
@@ -288,8 +309,15 @@ fn a_restarted_node_rejoins_from_its_own_commit_cursor_after_peers_pruned_round_
     );
     // From its own cursor, but without the base round, the first round
     // cannot validate either.
-    assert!(restarted.import_history(&served_from(&e[0], cursor), u64::MAX).is_err());
-    assert!(restarted.dag_is_empty(), "a refused import leaves nothing behind");
+    assert!(
+        restarted
+            .import_history(&served_from(&e[0], cursor), u64::MAX)
+            .is_err()
+    );
+    assert!(
+        restarted.dag_is_empty(),
+        "a refused import leaves nothing behind"
+    );
 
     // Only at its own cursor, only on an empty DAG.
     assert!(restarted.set_restart_base_round(cursor + 1).is_err());
@@ -308,9 +336,18 @@ fn a_restarted_node_rejoins_from_its_own_commit_cursor_after_peers_pruned_round_
     // Rejoin. From here the restarted node must commit exactly what its peers
     // commit, and never anything below its cursor again.
     let mut rejoined = vec![Vec::new(); 4];
-    run_committing(&[&e[0], &e[1], &e[2], &restarted], 30, &mut ts, &mut rejoined);
+    run_committing(
+        &[&e[0], &e[1], &e[2], &restarted],
+        30,
+        &mut ts,
+        &mut rejoined,
+    );
     let mine = &rejoined[3];
-    assert!(mine.len() >= 5, "the restarted node committed {} anchors", mine.len());
+    assert!(
+        mine.len() >= 5,
+        "the restarted node committed {} anchors",
+        mine.len()
+    );
     assert!(
         mine.iter().all(|(round, _)| *round >= cursor),
         "a round below the durable cursor was committed again: {mine:?}"
@@ -327,7 +364,11 @@ fn a_restarted_node_rejoins_from_its_own_commit_cursor_after_peers_pruned_round_
             "the restarted node committed a different anchor at round {round}"
         );
     }
-    assert_eq!(restarted.restart_base_round(), None, "the base round closed itself");
+    assert_eq!(
+        restarted.restart_base_round(),
+        None,
+        "the base round closed itself"
+    );
 }
 
 #[test]
@@ -339,7 +380,12 @@ fn a_restart_base_round_admits_only_well_formed_signed_blocks() {
     }
     let mut ts = 1_700_000_000_000u64;
     let mut committed = vec![Vec::new(); 4];
-    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 2 * RETAINED, &mut ts, &mut committed);
+    run_committing(
+        &[&e[0], &e[1], &e[2], &e[3]],
+        2 * RETAINED,
+        &mut ts,
+        &mut committed,
+    );
     let cursor = e[3].last_committed_round();
     let restarted = engine(&set, &keys[3]);
     restarted.restore_round_from_local_wal(e[3].current_round(), cursor);
@@ -383,9 +429,16 @@ fn a_restart_base_round_admits_only_well_formed_signed_blocks() {
         .import_history(&batch, u64::MAX)
         .expect("the real history imports");
     for v in &variants {
-        assert!(restarted.get_block(&v.hash).is_none(), "{:?} was imported", v.parents);
+        assert!(
+            restarted.get_block(&v.hash).is_none(),
+            "{:?} was imported",
+            v.parents
+        );
     }
-    assert!(restarted.get_block(&real.hash).is_some(), "the authentic base block is admitted");
+    assert!(
+        restarted.get_block(&real.hash).is_some(),
+        "the authentic base block is admitted"
+    );
 }
 
 #[test]
@@ -401,7 +454,12 @@ fn history_served_from_below_the_base_round_still_reaches_it() {
     }
     let mut ts = 1_700_000_000_000u64;
     let mut committed = vec![Vec::new(); 4];
-    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 2 * RETAINED, &mut ts, &mut committed);
+    run_committing(
+        &[&e[0], &e[1], &e[2], &e[3]],
+        2 * RETAINED,
+        &mut ts,
+        &mut committed,
+    );
     let crashed_round = e[3].current_round();
     let cursor = e[3].last_committed_round();
     run_committing(&[&e[0], &e[1], &e[2]], 10, &mut ts, &mut committed[..3]);
@@ -410,11 +468,17 @@ fn history_served_from_below_the_base_round_still_reaches_it() {
     restarted.restore_round_from_local_wal(crashed_round, cursor);
     restarted.set_restart_base_round(cursor).unwrap();
     let from_below = served_from(&e[0], cursor - 3);
-    assert!(from_below.iter().any(|b| b.round < cursor), "the batch starts below the base");
+    assert!(
+        from_below.iter().any(|b| b.round < cursor),
+        "the batch starts below the base"
+    );
     restarted
         .import_history(&from_below, u64::MAX)
         .expect("rounds below the base are skipped, and the base onwards imports");
-    assert!(restarted.blocks_in_round(cursor - 1).is_empty(), "nothing below the base was taken");
+    assert!(
+        restarted.blocks_in_round(cursor - 1).is_empty(),
+        "nothing below the base was taken"
+    );
     assert!(!restarted.blocks_in_round(cursor).is_empty());
     assert!(restarted.current_round() >= e[0].current_round().saturating_sub(1));
 }
@@ -431,7 +495,12 @@ fn a_base_round_block_nothing_in_the_next_round_supports_is_not_imported() {
     }
     let mut ts = 1_700_000_000_000u64;
     let mut committed = vec![Vec::new(); 4];
-    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 2 * RETAINED, &mut ts, &mut committed);
+    run_committing(
+        &[&e[0], &e[1], &e[2], &e[3]],
+        2 * RETAINED,
+        &mut ts,
+        &mut committed,
+    );
     let crashed_round = e[3].current_round();
     let cursor = e[3].last_committed_round();
 
@@ -450,7 +519,11 @@ fn a_base_round_block_nothing_in_the_next_round_supports_is_not_imported() {
         )
         .unwrap();
     let mut fabricated = DagBlock {
-        parents: vec![hash_bytes(b"invented-1"), hash_bytes(b"invented-2"), hash_bytes(b"invented-3")],
+        parents: vec![
+            hash_bytes(b"invented-1"),
+            hash_bytes(b"invented-2"),
+            hash_bytes(b"invented-3"),
+        ],
         timestamp: real.timestamp + 1,
         hash: arc_crypto::Hash256::ZERO,
         signature: vec![],
@@ -468,7 +541,10 @@ fn a_base_round_block_nothing_in_the_next_round_supports_is_not_imported() {
     restarted
         .import_history(&batch, u64::MAX)
         .expect("the supported history imports");
-    assert!(restarted.get_block(&fabricated.hash).is_none(), "the fabricated block was imported");
+    assert!(
+        restarted.get_block(&fabricated.hash).is_none(),
+        "the fabricated block was imported"
+    );
     assert!(restarted.get_block(&real.hash).is_some());
     // A batch whose base round nothing supports is refused outright.
     let fresh = engine(&set, &keys[3]);

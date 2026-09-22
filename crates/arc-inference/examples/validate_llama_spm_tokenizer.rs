@@ -86,7 +86,12 @@ fn main() {
         let body = std::fs::read_to_string(&path).expect("read --corpus");
         for line in body.lines().filter(|line| !line.trim().is_empty()) {
             let case: serde_json::Value = serde_json::from_str(line).expect("corpus line is JSON");
-            texts.push(case["text"].as_str().expect("corpus case has a text").to_string());
+            texts.push(
+                case["text"]
+                    .as_str()
+                    .expect("corpus case has a text")
+                    .to_string(),
+            );
         }
     }
     let model = model.expect("--model is required");

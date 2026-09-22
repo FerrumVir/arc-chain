@@ -1133,7 +1133,9 @@ impl ConsensusManager {
         let top = state.height();
         let span = self.decision_index_span();
         let floor = top.saturating_sub(span);
-        let indexed_through = self.decisions_indexed_through.load(std::sync::atomic::Ordering::Acquire);
+        let indexed_through = self
+            .decisions_indexed_through
+            .load(std::sync::atomic::Ordering::Acquire);
         if indexed_through >= top && indexed_through > 0 {
             return;
         }
@@ -1147,7 +1149,8 @@ impl ConsensusManager {
         let mut added = 0usize;
         for height in start..=top {
             if let Some(block) = state.get_block(height) {
-                self.applied_decisions.insert(block.header.proof_hash, height);
+                self.applied_decisions
+                    .insert(block.header.proof_hash, height);
                 added += 1;
             }
         }
@@ -1156,7 +1159,8 @@ impl ConsensusManager {
         if floor > 0 {
             self.applied_decisions.retain(|_, height| *height > floor);
         }
-        self.decisions_indexed_through.store(top, std::sync::atomic::Ordering::Release);
+        self.decisions_indexed_through
+            .store(top, std::sync::atomic::Ordering::Release);
         if added > 0 {
             debug!(
                 added,
@@ -1178,24 +1182,22 @@ impl ConsensusManager {
             return Default::default();
         };
         match std::fs::read(path) {
-            Ok(bytes) => {
-                match arc_consensus::view_change::ConsensusSigningRecord::decode(&bytes) {
-                    Ok(record) => {
-                        info!(
-                            path = %path.display(),
-                            absences = record.skipped_rounds.len(),
-                            finality = record.finality_votes.len(),
-                            "Loaded consensus anti-equivocation record"
-                        );
-                        record
-                    }
-                    Err(error) => panic!(
-                        "consensus signing record at {} is unreadable ({error}); refusing to \
-                         sign without knowing what this key already promised",
-                        path.display()
-                    ),
+            Ok(bytes) => match arc_consensus::view_change::ConsensusSigningRecord::decode(&bytes) {
+                Ok(record) => {
+                    info!(
+                        path = %path.display(),
+                        absences = record.skipped_rounds.len(),
+                        finality = record.finality_votes.len(),
+                        "Loaded consensus anti-equivocation record"
+                    );
+                    record
                 }
-            }
+                Err(error) => panic!(
+                    "consensus signing record at {} is unreadable ({error}); refusing to \
+                         sign without knowing what this key already promised",
+                    path.display()
+                ),
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
             Err(error) => panic!(
                 "consensus signing record at {} could not be read ({error})",
@@ -1216,7 +1218,9 @@ impl ConsensusManager {
             return false;
         };
         let persist_started = std::time::Instant::now();
-        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.signing_record_persists);
+        crate::consensus_diagnostics::bump(
+            &crate::consensus_diagnostics::DIAG.signing_record_persists,
+        );
         let bytes = record.encode();
         let temporary = path.with_extension("tmp");
         let write = (|| -> std::io::Result<()> {
@@ -1236,7 +1240,10 @@ impl ConsensusManager {
             }
             Ok(())
         })();
-        crate::consensus_diagnostics::add_elapsed(&crate::consensus_diagnostics::DIAG.signing_record_persist_us, persist_started);
+        crate::consensus_diagnostics::add_elapsed(
+            &crate::consensus_diagnostics::DIAG.signing_record_persist_us,
+            persist_started,
+        );
         match write {
             Ok(()) => true,
             Err(error) => {
@@ -1383,23 +1390,20 @@ impl ConsensusManager {
             std::collections::VecDeque::new();
         let mut checkpoint_requested = false;
         // When this node last gossiped each absence attestation it has made.
-        let mut absence_gossiped_at: std::collections::HashMap<
-            (u64, Hash256),
-            std::time::Instant,
-        > = std::collections::HashMap::new();
+        let mut absence_gossiped_at: std::collections::HashMap<(u64, Hash256), std::time::Instant> =
+            std::collections::HashMap::new();
         let mut last_round_seen = self.engine.current_round();
         // A node that restored a commit cursor but holds no DAG cannot make
         // progress until its bootstrap runs, so it starts at once rather than
         // after the stall timer.
-        let mut last_round_change = if self.engine.dag_is_empty()
-            && self.engine.last_committed_round() > 0
-        {
-            std::time::Instant::now()
-                .checked_sub(HISTORY_STUCK_AFTER)
-                .unwrap_or_else(std::time::Instant::now)
-        } else {
-            std::time::Instant::now()
-        };
+        let mut last_round_change =
+            if self.engine.dag_is_empty() && self.engine.last_committed_round() > 0 {
+                std::time::Instant::now()
+                    .checked_sub(HISTORY_STUCK_AFTER)
+                    .unwrap_or_else(std::time::Instant::now)
+            } else {
+                std::time::Instant::now()
+            };
         let mut history_clock = std::time::Instant::now()
             .checked_sub(HISTORY_REQUEST_INTERVAL)
             .unwrap_or_else(std::time::Instant::now);
@@ -1501,10 +1505,16 @@ impl ConsensusManager {
             if let Some(started) = iteration_started.take() {
                 let busy = started.elapsed().saturating_sub(tick_delay);
                 let busy_us = busy.as_micros() as u64;
-                crate::consensus_diagnostics::DIAG.loop_busy_us.fetch_add(busy_us, std::sync::atomic::Ordering::Relaxed);
-                crate::consensus_diagnostics::DIAG.loop_max_iteration_us.fetch_max(busy_us, std::sync::atomic::Ordering::Relaxed);
+                crate::consensus_diagnostics::DIAG
+                    .loop_busy_us
+                    .fetch_add(busy_us, std::sync::atomic::Ordering::Relaxed);
+                crate::consensus_diagnostics::DIAG
+                    .loop_max_iteration_us
+                    .fetch_max(busy_us, std::sync::atomic::Ordering::Relaxed);
                 if busy >= std::time::Duration::from_secs(1) {
-                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.loop_slow_iterations);
+                    crate::consensus_diagnostics::bump(
+                        &crate::consensus_diagnostics::DIAG.loop_slow_iterations,
+                    );
                 }
             }
             // Sizes of this loop's own collections, about once a second. The
@@ -1514,15 +1524,24 @@ impl ConsensusManager {
                 gauges_published_at = Some(Instant::now());
                 use crate::consensus_diagnostics::{DIAG, set};
                 set(&DIAG.gauge_pending_txs, pending_txs.len());
-                set(&DIAG.gauge_pending_tx_latest_round, pending_tx_latest_round.len());
+                set(
+                    &DIAG.gauge_pending_tx_latest_round,
+                    pending_tx_latest_round.len(),
+                );
                 set(&DIAG.gauge_replay_queue, replay.len());
                 set(&DIAG.gauge_targeted_fetch, targeted_fetch_at.len());
                 set(&DIAG.gauge_commit_backlog, commit_backlog.len());
                 set(&DIAG.gauge_dag_wal_checkpoints, dag_wal_checkpoints.len());
                 set(&DIAG.gauge_absence_gossiped, absence_gossiped_at.len());
-                set(&DIAG.gauge_finality_signed_heights, finality_signed_heights.len());
+                set(
+                    &DIAG.gauge_finality_signed_heights,
+                    finality_signed_heights.len(),
+                );
                 set(&DIAG.gauge_skip_vote_slots, skip_vote_collector.len());
-                set(&DIAG.gauge_finality_vote_slots, finality_vote_collector.len());
+                set(
+                    &DIAG.gauge_finality_vote_slots,
+                    finality_vote_collector.len(),
+                );
                 if let Some(tracker) = skip_tracker.as_ref() {
                     let (observations, refused, skipped, finality) = tracker.sizes();
                     set(&DIAG.gauge_skip_observations, observations);
@@ -1547,7 +1566,11 @@ impl ConsensusManager {
                 tokio::time::sleep(tick_delay).await;
                 false
             };
-            iteration_started = Some(Instant::now().checked_sub(tick_delay).unwrap_or_else(Instant::now));
+            iteration_started = Some(
+                Instant::now()
+                    .checked_sub(tick_delay)
+                    .unwrap_or_else(Instant::now),
+            );
             if shutdown_before_tick {
                 info!(
                     round = self.engine.current_round(),
@@ -1615,8 +1638,11 @@ impl ConsensusManager {
             )> = Vec::new();
             let mut history_requests: Vec<(Hash256, u64)> = Vec::new();
             let mut history_requests_broadcast: Option<u64> = None;
-            let mut inbound_history: Vec<(Hash256, Vec<arc_consensus::DagBlock>, Vec<arc_types::Transaction>)> =
-                Vec::new();
+            let mut inbound_history: Vec<(
+                Hash256,
+                Vec<arc_consensus::DagBlock>,
+                Vec<arc_types::Transaction>,
+            )> = Vec::new();
             {
                 let expired = pending_blocks.expire(Instant::now());
                 if expired > 0 {
@@ -1624,9 +1650,10 @@ impl ConsensusManager {
                         .pending_blocks_expired
                         .fetch_add(expired as u64, std::sync::atomic::Ordering::Relaxed);
                 }
-                crate::consensus_diagnostics::DIAG
-                    .pending_blocks_now
-                    .store(pending_blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                crate::consensus_diagnostics::DIAG.pending_blocks_now.store(
+                    pending_blocks.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             if let Some(ref mut rx) = inbound_rx {
                 loop {
@@ -1637,8 +1664,8 @@ impl ConsensusManager {
                             Err(_) => break,
                         },
                     };
-                    let _inbound_timer = crate::consensus_diagnostics::InboundTimer::start(
-                        match &msg {
+                    let _inbound_timer =
+                        crate::consensus_diagnostics::InboundTimer::start(match &msg {
                             InboundMessage::DagBlockWithTxs { .. } => 0,
                             InboundMessage::Transactions { .. } => 1,
                             InboundMessage::ConsensusFinalityVote { .. } => 2,
@@ -1651,8 +1678,7 @@ impl ConsensusManager {
                             InboundMessage::PeerConnected { .. } => 9,
                             InboundMessage::PeerDisconnected { .. } => 10,
                             _ => 11,
-                        },
-                    );
+                        });
                     match msg {
                         InboundMessage::PeerConnected {
                             address,
@@ -1841,18 +1867,31 @@ impl ConsensusManager {
                                 continue;
                             }
                             // Feed block into consensus engine
-                            crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.live_blocks_received);
+                            crate::consensus_diagnostics::bump(
+                                &crate::consensus_diagnostics::DIAG.live_blocks_received,
+                            );
                             let validate_started = std::time::Instant::now();
                             let received = self.engine.receive_block(&block);
-                            crate::consensus_diagnostics::add_elapsed(&crate::consensus_diagnostics::DIAG.live_block_validate_us, validate_started);
+                            crate::consensus_diagnostics::add_elapsed(
+                                &crate::consensus_diagnostics::DIAG.live_block_validate_us,
+                                validate_started,
+                            );
                             // An early block - parents not here yet, or more
                             // than one round ahead - is authenticated already
                             // and is held, not dropped. `hold_if_early` is the
                             // same decision the regression test exercises.
                             let received = match received {
-                                Err(error @ (arc_consensus::ConsensusError::MissingParents { .. }
-                                    | arc_consensus::ConsensusError::RoundTooFarAhead { .. })) => {
-                                    crate::consensus_diagnostics::classify_live_rejection(&error.to_string());
+                                Err(
+                                    error @ (arc_consensus::ConsensusError::MissingParents {
+                                        ..
+                                    }
+                                    | arc_consensus::ConsensusError::RoundTooFarAhead {
+                                        ..
+                                    }),
+                                ) => {
+                                    crate::consensus_diagnostics::classify_live_rejection(
+                                        &error.to_string(),
+                                    );
                                     match arc_consensus::pending::hold_if_early(
                                         &self.engine,
                                         &mut pending_blocks,
@@ -1862,17 +1901,25 @@ impl ConsensusManager {
                                         Instant::now(),
                                     ) {
                                         arc_consensus::pending::Offered::Held => {
-                                            crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.pending_blocks_held);
+                                            crate::consensus_diagnostics::bump(
+                                                &crate::consensus_diagnostics::DIAG
+                                                    .pending_blocks_held,
+                                            );
                                             // Ask the author - it certainly holds
                                             // its own parents - for the history
                                             // behind it, once per author per
                                             // interval.
-                                            let due = targeted_fetch_at
-                                                .get(&block.author)
-                                                .is_none_or(|at| at.elapsed() >= TARGETED_FETCH_INTERVAL);
+                                            let due =
+                                                targeted_fetch_at.get(&block.author).is_none_or(
+                                                    |at| at.elapsed() >= TARGETED_FETCH_INTERVAL,
+                                                );
                                             if due && let Some(ref tx_chan) = outbound_tx {
-                                                targeted_fetch_at.insert(block.author, Instant::now());
-                                                crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.targeted_history_requests);
+                                                targeted_fetch_at
+                                                    .insert(block.author, Instant::now());
+                                                crate::consensus_diagnostics::bump(
+                                                    &crate::consensus_diagnostics::DIAG
+                                                        .targeted_history_requests,
+                                                );
                                                 let sent = tx_chan.try_send(
                                                     OutboundMessage::SendDagHistoryRequest {
                                                         target: block.author,
@@ -1885,7 +1932,9 @@ impl ConsensusManager {
                                             continue;
                                         }
                                         arc_consensus::pending::Offered::NotHeld(error)
-                                        | arc_consensus::pending::Offered::Rejected(error) => Err(error),
+                                        | arc_consensus::pending::Offered::Rejected(error) => {
+                                            Err(error)
+                                        }
                                         arc_consensus::pending::Offered::Accepted(..) => Ok(()),
                                     }
                                 }
@@ -1893,16 +1942,20 @@ impl ConsensusManager {
                             };
                             match received {
                                 Ok(()) => {
-                                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.live_blocks_accepted);
+                                    crate::consensus_diagnostics::bump(
+                                        &crate::consensus_diagnostics::DIAG.live_blocks_accepted,
+                                    );
                                     // Availability precedes visibility to the
                                     // commit loop: persist exact bodies + block
                                     // and fsync before retaining them in memory.
                                     let persist_started = std::time::Instant::now();
                                     let persisted =
                                         self.persist_dag_block(&state, &block, &verified);
-                                    crate::consensus_diagnostics::add_elapsed(&crate::consensus_diagnostics::DIAG.dag_block_persist_us, persist_started);
-                                    if let Err(error) = persisted
-                                    {
+                                    crate::consensus_diagnostics::add_elapsed(
+                                        &crate::consensus_diagnostics::DIAG.dag_block_persist_us,
+                                        persist_started,
+                                    );
+                                    if let Err(error) = persisted {
                                         tracing::error!(
                                             block = %block.hash,
                                             error = %error,
@@ -1965,7 +2018,9 @@ impl ConsensusManager {
                                     let round_before = self.engine.current_round();
                                     let advanced = self.engine.advance_round();
                                     if advanced {
-                                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.rounds_advanced);
+                                        crate::consensus_diagnostics::bump(
+                                            &crate::consensus_diagnostics::DIAG.rounds_advanced,
+                                        );
                                     }
                                     // Blocks that were waiting on this one, and
                                     // blocks that were only too far ahead and
@@ -1973,10 +2028,14 @@ impl ConsensusManager {
                                     // this same path.
                                     let mut released = pending_blocks.release_on(&block.hash);
                                     released.extend(
-                                        pending_blocks.release_up_to_round(self.engine.current_round()),
+                                        pending_blocks
+                                            .release_up_to_round(self.engine.current_round()),
                                     );
                                     for (early, transactions) in released {
-                                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.pending_blocks_released);
+                                        crate::consensus_diagnostics::bump(
+                                            &crate::consensus_diagnostics::DIAG
+                                                .pending_blocks_released,
+                                        );
                                         replay.push_back(InboundMessage::DagBlockWithTxs {
                                             block: early,
                                             transactions,
@@ -2002,7 +2061,9 @@ impl ConsensusManager {
                                     if !message.contains("missing or wrong-round parents")
                                         && !message.contains("too far ahead")
                                     {
-                                        crate::consensus_diagnostics::classify_live_rejection(&message);
+                                        crate::consensus_diagnostics::classify_live_rejection(
+                                            &message,
+                                        );
                                     }
                                     // Missing parents is the ordinary state of a
                                     // node that is behind; it is counted above
@@ -2089,8 +2150,9 @@ impl ConsensusManager {
                                     // resident set, so accepting this retry does
                                     // not create a wire echo loop.
                                     if state.native_inference_context().is_some()
-                                        && (!arc_state::StateDB::is_native_inference_transaction(&tx)
-                                            || !state.native_transaction_still_admissible(&tx))
+                                        && (!arc_state::StateDB::is_native_inference_transaction(
+                                            &tx,
+                                        ) || !state.native_transaction_still_admissible(&tx))
                                     {
                                         // Not native, or native but neither
                                         // admissible now nor a bounded future
@@ -2101,7 +2163,8 @@ impl ConsensusManager {
                                     // a transaction circulated forever.
                                     if state.receipts.contains_key(&tx.hash.0) {
                                         crate::consensus_diagnostics::bump(
-                                            &crate::consensus_diagnostics::DIAG.stale_transactions_dropped,
+                                            &crate::consensus_diagnostics::DIAG
+                                                .stale_transactions_dropped,
                                         );
                                         continue;
                                     }
@@ -2169,7 +2232,10 @@ impl ConsensusManager {
                             // for the contiguous history instead of guessing.
                             if dag_round > my_round.saturating_add(1) {
                                 if history_clock.elapsed() < HISTORY_REQUEST_INTERVAL {
-                                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_throttled);
+                                    crate::consensus_diagnostics::bump(
+                                        &crate::consensus_diagnostics::DIAG
+                                            .history_requests_throttled,
+                                    );
                                 }
                                 history_requests.push((peer, my_round));
                             }
@@ -2337,16 +2403,17 @@ impl ConsensusManager {
                                     ),
                                     Err(error) => {
                                         crate::consensus_diagnostics::bump(
-                                            &crate::consensus_diagnostics::DIAG.native_votes_refused,
+                                            &crate::consensus_diagnostics::DIAG
+                                                .native_votes_refused,
                                         );
                                         // Refusals are normal after a request
                                         // finalizes, so they are rate-limited -
                                         // but the reason must be visible, or a
                                         // certificate that never forms cannot
                                         // be explained.
-                                        if vote_refusal_logged_at
-                                            .is_none_or(|at: Instant| at.elapsed() >= std::time::Duration::from_secs(2))
-                                        {
+                                        if vote_refusal_logged_at.is_none_or(|at: Instant| {
+                                            at.elapsed() >= std::time::Duration::from_secs(2)
+                                        }) {
                                             vote_refusal_logged_at = Some(Instant::now());
                                             warn!(%source, %request_id, ?error, "Native vote not counted");
                                         }
@@ -2389,9 +2456,13 @@ impl ConsensusManager {
                 }
             }
 
-            if let (Some(relay), Some(tx_chan)) = (self.native_vote_relay.as_ref(), outbound_tx.as_ref()) {
+            if let (Some(relay), Some(tx_chan)) =
+                (self.native_vote_relay.as_ref(), outbound_tx.as_ref())
+            {
                 for decision in relay.take_outbound_votes(64) {
-                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.native_votes_gossiped);
+                    crate::consensus_diagnostics::bump(
+                        &crate::consensus_diagnostics::DIAG.native_votes_gossiped,
+                    );
                     let sent = tx_chan.try_send(OutboundMessage::BroadcastNativeInferenceVote {
                         request_id: decision.request_id,
                         tokens: decision.tokens,
@@ -2400,7 +2471,10 @@ impl ConsensusManager {
                     crate::consensus_diagnostics::note_send(&sent);
                 }
             }
-            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_inbound_us, phase_mark);
+            phase_mark = crate::consensus_diagnostics::phase(
+                &crate::consensus_diagnostics::DIAG.phase_inbound_us,
+                phase_mark,
+            );
             // ── 0b. Absence and finality certificates ───────────────────
             // Every one of these is verified against the frozen committee and
             // the bound consensus domain before it can affect anything; an
@@ -2431,7 +2505,10 @@ impl ConsensusManager {
                 }
             }
             for (source, certificate) in inbound_absence_certificates {
-                if self.engine.has_skip_certificate(certificate.round, &certificate.absentee) {
+                if self
+                    .engine
+                    .has_skip_certificate(certificate.round, &certificate.absentee)
+                {
                     continue;
                 }
                 if !self.adopt_absence_certificate(
@@ -2659,7 +2736,9 @@ impl ConsensusManager {
                     }
                     info!(%peer, from_round, "Requesting bounded DAG history");
                     if let Some(ref tx_chan) = outbound_tx {
-                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_sent);
+                        crate::consensus_diagnostics::bump(
+                            &crate::consensus_diagnostics::DIAG.history_requests_sent,
+                        );
                         let sent = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
                             target: peer,
                             from_round,
@@ -2689,7 +2768,9 @@ impl ConsensusManager {
                         }
                         info!(%peer, from_round, "Requesting bounded DAG history");
                         if let Some(ref tx_chan) = outbound_tx {
-                            crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_sent);
+                            crate::consensus_diagnostics::bump(
+                                &crate::consensus_diagnostics::DIAG.history_requests_sent,
+                            );
                             let sent = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
                                 target: *peer,
                                 from_round,
@@ -2729,7 +2810,10 @@ impl ConsensusManager {
                 }
             }
 
-            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_certificates_us, phase_mark);
+            phase_mark = crate::consensus_diagnostics::phase(
+                &crate::consensus_diagnostics::DIAG.phase_certificates_us,
+                phase_mark,
+            );
             // ── 0b2. Bounded authenticated history transfer ─────────────
             // Answer a peer's request from what this node actually holds. The
             // requester re-validates everything, so serving history is not a
@@ -2765,7 +2849,9 @@ impl ConsensusManager {
                         .last_committed_round()
                         .saturating_sub(self.engine.retained_rounds());
                     if from_round < oldest_retained {
-                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_empty_pruned);
+                        crate::consensus_diagnostics::bump(
+                            &crate::consensus_diagnostics::DIAG.history_requests_empty_pruned,
+                        );
                         warn!(
                             %source,
                             from_round,
@@ -2775,7 +2861,9 @@ impl ConsensusManager {
                              The peer needs an authenticated checkpoint."
                         );
                     } else {
-                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_empty_not_held);
+                        crate::consensus_diagnostics::bump(
+                            &crate::consensus_diagnostics::DIAG.history_requests_empty_not_held,
+                        );
                         debug!(
                             %source,
                             from_round,
@@ -2797,11 +2885,12 @@ impl ConsensusManager {
                 // it names, and its consensus loop exited on the missing
                 // preimage. The state keeps every executed body.
                 let transactions = history_bodies(&pending_txs, &state, &wanted);
-                crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_requests_served);
-                crate::consensus_diagnostics::DIAG.history_blocks_served.fetch_add(
-                    blocks.len() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
+                crate::consensus_diagnostics::bump(
+                    &crate::consensus_diagnostics::DIAG.history_requests_served,
                 );
+                crate::consensus_diagnostics::DIAG
+                    .history_blocks_served
+                    .fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 info!(
                     %source,
                     from_round,
@@ -2830,36 +2919,53 @@ impl ConsensusManager {
                     }
                     pending_txs.insert(transaction.hash.0, transaction);
                 }
-                crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_responses_received);
+                crate::consensus_diagnostics::bump(
+                    &crate::consensus_diagnostics::DIAG.history_responses_received,
+                );
                 let round_before_import = self.engine.current_round();
                 let blocks_before_import = self.engine.dag_block_count();
                 let import_started = std::time::Instant::now();
                 let imported = self.engine.import_history(&blocks, HISTORY_MAX_ROUNDS);
-                crate::consensus_diagnostics::add_elapsed(&crate::consensus_diagnostics::DIAG.history_import_us, import_started);
+                crate::consensus_diagnostics::add_elapsed(
+                    &crate::consensus_diagnostics::DIAG.history_import_us,
+                    import_started,
+                );
                 if let Err(error) = &imported {
                     crate::consensus_diagnostics::classify_import_rejection(&error.to_string());
                 }
                 match imported {
                     Ok(reached) => {
-                        crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.history_imports_ok);
+                        crate::consensus_diagnostics::bump(
+                            &crate::consensus_diagnostics::DIAG.history_imports_ok,
+                        );
                         // An import can fill many parents at once; offer every
                         // held block again. Anything still early is held again.
                         for (early, transactions) in pending_blocks.drain_all() {
-                            crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.pending_blocks_released);
+                            crate::consensus_diagnostics::bump(
+                                &crate::consensus_diagnostics::DIAG.pending_blocks_released,
+                            );
                             replay.push_back(InboundMessage::DagBlockWithTxs {
                                 block: early,
                                 transactions,
                             });
                         }
-                        crate::consensus_diagnostics::DIAG.history_import_rounds_advanced.fetch_add(
-                            self.engine.current_round().saturating_sub(round_before_import),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        crate::consensus_diagnostics::DIAG.history_import_blocks_inserted.fetch_add(
-                            self.engine.dag_block_count().saturating_sub(blocks_before_import)
-                                as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        crate::consensus_diagnostics::DIAG
+                            .history_import_rounds_advanced
+                            .fetch_add(
+                                self.engine
+                                    .current_round()
+                                    .saturating_sub(round_before_import),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        crate::consensus_diagnostics::DIAG
+                            .history_import_blocks_inserted
+                            .fetch_add(
+                                self.engine
+                                    .dag_block_count()
+                                    .saturating_sub(blocks_before_import)
+                                    as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         info!(%source, reached, "Joined a running chain from authenticated history");
                     }
                     Err(error) => {
@@ -2886,7 +2992,10 @@ impl ConsensusManager {
                 }
             }
 
-            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_history_us, phase_mark);
+            phase_mark = crate::consensus_diagnostics::phase(
+                &crate::consensus_diagnostics::DIAG.phase_history_us,
+                phase_mark,
+            );
             // ── 0b3. Authenticated checkpoint transfer ──────────────────
             // A SEPARATE trust boundary from history import. History is
             // self-authenticating block by block and the importer re-validates
@@ -3057,7 +3166,10 @@ impl ConsensusManager {
                 }
             }
 
-            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_checkpoint_us, phase_mark);
+            phase_mark = crate::consensus_diagnostics::phase(
+                &crate::consensus_diagnostics::DIAG.phase_checkpoint_us,
+                phase_mark,
+            );
             // ── 0c. Decide and sign absence votes ───────────────────────
             // A round that already carries a quorum of stake, but no block from
             // some fixed member, is a round this node can attest about. The
@@ -3143,11 +3255,9 @@ impl ConsensusManager {
                             });
                         let gossip_key = (round, member);
                         if already_durable
-                            && absence_gossiped_at
-                                .get(&gossip_key)
-                                .is_some_and(|at: &std::time::Instant| {
-                                    at.elapsed() < ABSENCE_REGOSSIP_INTERVAL
-                                })
+                            && absence_gossiped_at.get(&gossip_key).is_some_and(
+                                |at: &std::time::Instant| at.elapsed() < ABSENCE_REGOSSIP_INTERVAL,
+                            )
                         {
                             continue;
                         }
@@ -3265,8 +3375,7 @@ impl ConsensusManager {
                             .expect("unique connected stake cannot exceed validator-set total");
                     }
                 }
-                let genesis_barrier =
-                    self.require_full_committee_at_genesis && current_round == 0;
+                let genesis_barrier = self.require_full_committee_at_genesis && current_round == 0;
                 if self.engine.requires_full_round_participation() || genesis_barrier {
                     vs.validators
                         .iter()
@@ -3279,7 +3388,10 @@ impl ConsensusManager {
                 true
             };
 
-            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_absence_us, phase_mark);
+            phase_mark = crate::consensus_diagnostics::phase(
+                &crate::consensus_diagnostics::DIAG.phase_absence_us,
+                phase_mark,
+            );
             // ── Pre-feed benchmark transactions into mempool ──────────────
             // Do this BEFORE the propose check so transactions are always
             // available regardless of round/parent state.
@@ -3528,8 +3640,7 @@ impl ConsensusManager {
                         // one transaction a protocol-4 block may carry.
                         debug!(
                             mempool_len = mempool_len_pre,
-                            stale,
-                            "Nothing proposable after filtering the drained mempool"
+                            stale, "Nothing proposable after filtering the drained mempool"
                         );
                     }
 
@@ -3773,7 +3884,10 @@ impl ConsensusManager {
                 let _ = self.engine.advance_round();
             }
 
-            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_propose_us, phase_mark);
+            phase_mark = crate::consensus_diagnostics::phase(
+                &crate::consensus_diagnostics::DIAG.phase_propose_us,
+                phase_mark,
+            );
             // ── 2. Try to commit finalized DAG blocks (multi-validator) ──────
             let mut committed: Vec<arc_consensus::DagBlock> = std::mem::take(&mut commit_backlog);
             committed.extend(self.engine.try_commit());
@@ -3801,7 +3915,9 @@ impl ConsensusManager {
                     .is_none_or(|at: Instant| at.elapsed() >= TARGETED_FETCH_INTERVAL * 4)
                 {
                     commit_stall_fetch_at = Some(Instant::now());
-                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.commit_stalls);
+                    crate::consensus_diagnostics::bump(
+                        &crate::consensus_diagnostics::DIAG.commit_stalls,
+                    );
                     warn!(
                         round,
                         block = %stalled[0].hash,
@@ -3811,11 +3927,12 @@ impl ConsensusManager {
                     if let Some(ref tx_chan) = outbound_tx {
                         for (peer, generation) in connected_validators.iter() {
                             if generation.connected {
-                                let sent = tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
-                                    target: *peer,
-                                    from_round: round,
-                                    max_rounds: 4,
-                                });
+                                let sent =
+                                    tx_chan.try_send(OutboundMessage::SendDagHistoryRequest {
+                                        target: *peer,
+                                        from_round: round,
+                                        max_rounds: 4,
+                                    });
                                 crate::consensus_diagnostics::note_send(&sent);
                             }
                         }
@@ -3840,19 +3957,22 @@ impl ConsensusManager {
                     // body is not executable consensus. Never silently skip a
                     // missing preimage: stop this loop before state or the
                     // durable commit cursor can move.
-                    let all_preimages =
-                        match exact_dag_preimages_from(&pending_txs, Some(&state), &dag_block.transactions) {
-                            Ok(transactions) => transactions,
-                            Err(error) => {
-                                tracing::error!(
-                                    block = %dag_block.hash,
-                                    round = dag_block.round,
-                                    ?error,
-                                    "Fatal committed DAG transaction-preimage failure"
-                                );
-                                return;
-                            }
-                        };
+                    let all_preimages = match exact_dag_preimages_from(
+                        &pending_txs,
+                        Some(&state),
+                        &dag_block.transactions,
+                    ) {
+                        Ok(transactions) => transactions,
+                        Err(error) => {
+                            tracing::error!(
+                                block = %dag_block.hash,
+                                round = dag_block.round,
+                                ?error,
+                                "Fatal committed DAG transaction-preimage failure"
+                            );
+                            return;
+                        }
+                    };
                     if state.active_protocol_version().major == 3
                         && self.recovery_dag_writer.is_none()
                     {
@@ -4128,7 +4248,9 @@ impl ConsensusManager {
                             "Canonical progress"
                         );
                     }
-                    crate::consensus_diagnostics::bump(&crate::consensus_diagnostics::DIAG.canonical_blocks_produced);
+                    crate::consensus_diagnostics::bump(
+                        &crate::consensus_diagnostics::DIAG.canonical_blocks_produced,
+                    );
 
                     // ── the exact local commit record ────────────────────
                     // Written only now, after this committed block crossed the
@@ -4223,7 +4345,8 @@ impl ConsensusManager {
                                     .front()
                                     .is_some_and(|(round, _)| *round <= horizon)
                                 {
-                                    prune_before = dag_wal_checkpoints.pop_front().map(|(_, seq)| seq);
+                                    prune_before =
+                                        dag_wal_checkpoints.pop_front().map(|(_, seq)| seq);
                                 }
                                 if let Some(sequence) = prune_before {
                                     let pruned_started = Instant::now();
@@ -4231,11 +4354,19 @@ impl ConsensusManager {
                                         Ok(deleted) if deleted > 0 => {
                                             crate::consensus_diagnostics::DIAG
                                                 .dag_wal_segments_deleted
-                                                .fetch_add(deleted as u64, std::sync::atomic::Ordering::Relaxed);
-                                            debug!(deleted, horizon, "Pruned legacy DAG WAL segments");
+                                                .fetch_add(
+                                                    deleted as u64,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            debug!(
+                                                deleted,
+                                                horizon, "Pruned legacy DAG WAL segments"
+                                            );
                                         }
                                         Ok(_) => {}
-                                        Err(error) => warn!(%error, "Could not prune legacy DAG WAL segments"),
+                                        Err(error) => {
+                                            warn!(%error, "Could not prune legacy DAG WAL segments")
+                                        }
                                     }
                                     crate::consensus_diagnostics::add_elapsed(
                                         &crate::consensus_diagnostics::DIAG.dag_wal_prune_us,
@@ -4269,18 +4400,10 @@ impl ConsensusManager {
                         && finality_signed_heights.insert(block.header.height)
                     {
                         let height = block.header.height;
-                        let identity = (
-                            block.hash,
-                            block.header.state_root,
-                            block.header.tx_root,
-                        );
+                        let identity = (block.hash, block.header.state_root, block.header.tx_root);
                         // One transcript per height, ever. A restart reloads
                         // this record, so the promise survives the process.
-                        let previous = tracker
-                            .record()
-                            .finality_votes
-                            .get(&height)
-                            .copied();
+                        let previous = tracker.record().finality_votes.get(&height).copied();
                         match previous {
                             Some(existing) if existing != identity => {
                                 tracing::error!(
@@ -4342,7 +4465,10 @@ impl ConsensusManager {
                 }
             }
 
-            phase_mark = crate::consensus_diagnostics::phase(&crate::consensus_diagnostics::DIAG.phase_commit_us, phase_mark);
+            phase_mark = crate::consensus_diagnostics::phase(
+                &crate::consensus_diagnostics::DIAG.phase_commit_us,
+                phase_mark,
+            );
             // ── Update shared health counters for /health endpoint ─────────
             if let Some(ref r) = self.dag_round {
                 r.store(current_round, std::sync::atomic::Ordering::Relaxed);
@@ -4567,7 +4693,11 @@ mod tests {
         // And a responder now serves it.
         let wanted: std::collections::HashSet<[u8; 32]> = [executed.hash.0].into_iter().collect();
         let served = history_bodies(&pending, &state, &wanted);
-        assert_eq!(served.len(), 1, "a peer must be able to fetch an executed body");
+        assert_eq!(
+            served.len(),
+            1,
+            "a peer must be able to fetch an executed body"
+        );
         assert_eq!(served[0].hash, executed.hash);
     }
 
@@ -4608,13 +4738,19 @@ mod tests {
         state
             .execute_block_verified_at(&[executed.clone()], sender.address(), 1)
             .expect("executes");
-        assert!(state.receipts.contains_key(&executed.hash.0), "it now has a receipt");
+        assert!(
+            state.receipts.contains_key(&executed.hash.0),
+            "it now has a receipt"
+        );
 
         let mut offered = vec![executed.clone(), pending.clone()];
         let dropped = retain_unreceipted(&state, &mut offered);
         assert_eq!(dropped, 1);
         assert_eq!(offered.len(), 1);
-        assert_eq!(offered[0].hash, pending.hash, "only the unexecuted one remains eligible");
+        assert_eq!(
+            offered[0].hash, pending.hash,
+            "only the unexecuted one remains eligible"
+        );
     }
 
     use super::*;
@@ -4749,7 +4885,10 @@ mod tests {
 
         // Executed (as far as this test's `executed` says): pruned at the
         // commit cursor.
-        assert_eq!(prune_irreversible_preimages(&pending, &latest, 5, 0, |_| true), 1);
+        assert_eq!(
+            prune_irreversible_preimages(&pending, &latest, 5, 0, |_| true),
+            1
+        );
         assert!(!pending.contains_key(&obsolete.hash.0));
         assert_eq!(
             exact_dag_preimages(&pending, &[future_commit.hash])
@@ -4772,7 +4911,10 @@ mod tests {
                 .checked_sub(NATIVE_REQUEUE_LIFETIME + Duration::from_secs(1))
                 .unwrap(),
         );
-        assert!(!requeue_native(&mut since, &tx), "past its lifetime it is dropped");
+        assert!(
+            !requeue_native(&mut since, &tx),
+            "past its lifetime it is dropped"
+        );
     }
 
     #[test]
@@ -4785,13 +4927,18 @@ mod tests {
         let executed = signed_transfer(&key, 32, 1);
         let pending = dashmap::DashMap::new();
         let latest = dashmap::DashMap::new();
-        retain_dag_preimages(&pending, &latest, 100, &[omitted.clone(), executed.clone()])
-            .unwrap();
+        retain_dag_preimages(&pending, &latest, 100, &[omitted.clone(), executed.clone()]).unwrap();
         let ran = |hash: &[u8; 32]| *hash == executed.hash.0;
 
         // The commit cursor passed round 100, the retention horizon has not.
-        assert_eq!(prune_irreversible_preimages(&pending, &latest, 150, 50, ran), 1);
-        assert!(!pending.contains_key(&executed.hash.0), "the state serves executed bodies");
+        assert_eq!(
+            prune_irreversible_preimages(&pending, &latest, 150, 50, ran),
+            1
+        );
+        assert!(
+            !pending.contains_key(&executed.hash.0),
+            "the state serves executed bodies"
+        );
         let state = StateDB::new();
         let wanted = std::collections::HashSet::from([omitted.hash.0]);
         assert_eq!(
@@ -4803,7 +4950,10 @@ mod tests {
             "a peer can still be served the omitted body"
         );
         // Once the retention horizon passes the round, it goes too.
-        assert_eq!(prune_irreversible_preimages(&pending, &latest, 5_000, 101, ran), 1);
+        assert_eq!(
+            prune_irreversible_preimages(&pending, &latest, 5_000, 101, ran),
+            1
+        );
         assert!(pending.is_empty());
     }
 

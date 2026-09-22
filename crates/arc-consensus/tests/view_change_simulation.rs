@@ -17,8 +17,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arc_consensus::view_change::{
-    AbsenceReason, ConsensusSigningRecord, DEFAULT_SKIP_GRACE_MS, FinalityCertificate, FinalityVote,
-    FinalityVoteCollector, SkipCertificate, SkipTracker, SkipVote, SkipVoteCollector,
+    AbsenceReason, ConsensusSigningRecord, DEFAULT_SKIP_GRACE_MS, FinalityCertificate,
+    FinalityVote, FinalityVoteCollector, SkipCertificate, SkipTracker, SkipVote, SkipVoteCollector,
     validator_set_hash,
 };
 use arc_consensus::{
@@ -151,7 +151,9 @@ impl Node {
 enum Msg {
     Block(DagBlock),
     /// A node that is behind asks everyone for history from a round.
-    HistoryRequest { from_round: u64 },
+    HistoryRequest {
+        from_round: u64,
+    },
     Skip(SkipVote),
     Cert(SkipCertificate),
     Finality(FinalityVote),
@@ -220,7 +222,10 @@ impl Sim {
             }
             // Gossip redundancy: re-send this node's recent blocks so a peer
             // that was offline or slow can still receive them.
-            let recent = self.nodes[index].own_blocks.len().saturating_sub(GOSSIP_REPEAT);
+            let recent = self.nodes[index]
+                .own_blocks
+                .len()
+                .saturating_sub(GOSSIP_REPEAT);
             for block in self.nodes[index].own_blocks[recent..].to_vec() {
                 outbox.push((index, Msg::Block(block)));
             }
@@ -256,10 +261,12 @@ impl Sim {
                 // not only the leader: the recovery domain requires a block
                 // from every fixed validator before the round can advance, and
                 // the certificate is what excuses one.
-                let members: Vec<Address> =
-                    self.set.validators.iter().map(|v| v.address).collect();
+                let members: Vec<Address> = self.set.validators.iter().map(|v| v.address).collect();
                 for member in members {
-                    if self.nodes[index].engine.has_skip_certificate(round, &member) {
+                    if self.nodes[index]
+                        .engine
+                        .has_skip_certificate(round, &member)
+                    {
                         continue;
                     }
                     let seen = seen_authors.contains(&member);
@@ -701,18 +708,19 @@ fn a_stale_certificate_from_another_committee_is_rejected_by_every_node() {
             .unwrap()
         })
         .collect();
-    let forged =
-        SkipCertificate::new(
-            domain(),
-            validator_set_hash(&other_set),
-            2,
-            leader,
-            AbsenceReason::NoBlock,
-            votes,
-        );
+    let forged = SkipCertificate::new(
+        domain(),
+        validator_set_hash(&other_set),
+        2,
+        leader,
+        AbsenceReason::NoBlock,
+        votes,
+    );
     for node in &mut sim.nodes {
         assert!(
-            node.engine.register_skip_certificate(forged.clone()).is_err(),
+            node.engine
+                .register_skip_certificate(forged.clone())
+                .is_err(),
             "a certificate from another committee must never register"
         );
         assert!(!node.engine.has_skip_certificate(2, &leader));
@@ -902,21 +910,35 @@ fn diagnostic_staggered_trace() {
     let mut sim = Sim::new(n);
     for started in 1..=n {
         let offline: HashSet<usize> = (started..n).collect();
-        sim.run(2, &Faults { offline, ..Default::default() });
+        sim.run(
+            2,
+            &Faults {
+                offline,
+                ..Default::default()
+            },
+        );
     }
     sim.run(20, &Faults::default());
     for (i, node) in sim.nodes.iter().enumerate() {
         let r = node.engine.current_round();
         let c = node.engine.last_committed_round();
-        let counts: Vec<usize> = (0..4).map(|k| node.engine.blocks_in_round(k).len()).collect();
-        eprintln!("n{i}: round={r} cursor={c} blocks(0..4)={counts:?} certs={}", node.tracker.record().skipped_rounds.len());
+        let counts: Vec<usize> = (0..4)
+            .map(|k| node.engine.blocks_in_round(k).len())
+            .collect();
+        eprintln!(
+            "n{i}: round={r} cursor={c} blocks(0..4)={counts:?} certs={}",
+            node.tracker.record().skipped_rounds.len()
+        );
     }
     let node = &sim.nodes[0];
     for round in 0..4u64 {
         let leader = leader_for_round(&sim.set, round);
         let hashes = node.engine.blocks_in_round(round);
         let leader_block = hashes.iter().copied().find(|h| {
-            node.engine.get_block(h).map(|b| b.author == leader).unwrap_or(false)
+            node.engine
+                .get_block(h)
+                .map(|b| b.author == leader)
+                .unwrap_or(false)
         });
         match leader_block {
             Some(hash) => {
@@ -1221,8 +1243,8 @@ fn conflicting_finality_certificates_at_one_height_are_detected_not_overwritten(
         let mut collector = FinalityVoteCollector::new();
         let mut out = None;
         for index in voters {
-            let vote =
-                FinalityVote::sign(domain(), set_hash, 77, block, state, tx, &keys[*index]).unwrap();
+            let vote = FinalityVote::sign(domain(), set_hash, 77, block, state, tx, &keys[*index])
+                .unwrap();
             if let Some(certificate) = collector.add(vote, &domain(), &set).unwrap() {
                 out = Some(certificate);
             }

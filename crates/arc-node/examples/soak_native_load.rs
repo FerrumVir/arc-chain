@@ -150,8 +150,8 @@ impl Driver {
         let path = format!("/native-inference/receipt/{}", request_id.to_hex());
         let mut seen: Option<String> = None;
         for port in &self.ports {
-            if let Some(status) =
-                get_json(*port, &path).and_then(|r| r["observed_status"].as_str().map(str::to_string))
+            if let Some(status) = get_json(*port, &path)
+                .and_then(|r| r["observed_status"].as_str().map(str::to_string))
             {
                 // A terminal status on any replica wins over "Pending".
                 if status != "Pending" {
@@ -225,7 +225,10 @@ impl Driver {
         let key = self.requesters[slot].key.clone();
         let mut nonce = self.requesters[slot].next_nonce;
         let mut record = serde_json::Map::new();
-        record.insert("id".into(), format!("native-{}-{slot}-{nonce}", self.offered).into());
+        record.insert(
+            "id".into(),
+            format!("native-{}-{slot}-{nonce}", self.offered).into(),
+        );
         record.insert("kind".into(), "native_inference".into());
         record.insert("executor".into(), self.executor.clone().into());
         record.insert("requester_slot".into(), (slot as u64).into());
@@ -311,7 +314,8 @@ impl Driver {
         item.record.insert("final_status".into(), status.into());
         item.record.insert("settled_t".into(), settled.into());
         let submitted = item.record["submitted_t"].as_f64().unwrap_or(settled);
-        item.record.insert("latency_s".into(), (settled - submitted).into());
+        item.record
+            .insert("latency_s".into(), (settled - submitted).into());
         self.write(&item.record);
     }
 
@@ -331,7 +335,8 @@ impl Driver {
                 _ => None,
             };
             if let Some(final_status) = terminal {
-                let Slot::InFlight(item) = std::mem::replace(&mut self.requesters[slot].slot, Slot::Idle)
+                let Slot::InFlight(item) =
+                    std::mem::replace(&mut self.requesters[slot].slot, Slot::Idle)
                 else {
                     unreachable!()
                 };
@@ -422,11 +427,8 @@ fn main() {
         .map(|p| p.parse().expect("port"))
         .collect();
     let rate: f64 = arg("--rate").map(|r| r.parse().unwrap()).unwrap_or(0.2);
-    let duration = Duration::from_secs(
-        arg("--duration")
-            .map(|d| d.parse().unwrap())
-            .unwrap_or(600),
-    );
+    let duration =
+        Duration::from_secs(arg("--duration").map(|d| d.parse().unwrap()).unwrap_or(600));
     let lost_after: f64 = arg("--lost-after")
         .map(|s| s.parse().unwrap())
         .unwrap_or(300.0);
@@ -449,7 +451,10 @@ fn main() {
     let max_tokens: u32 = arg("--max-tokens")
         .map(|v| v.parse().expect("--max-tokens"))
         .unwrap_or(8);
-    assert!((1..=2048).contains(&max_tokens), "--max-tokens must be 1..=2048");
+    assert!(
+        (1..=2048).contains(&max_tokens),
+        "--max-tokens must be 1..=2048"
+    );
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

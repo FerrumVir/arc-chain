@@ -63,7 +63,9 @@ fn a_snapshot_plus_the_tail_equals_a_full_replay() {
     // Build a chain, snapshot partway, then keep going.
     let state = open(&path);
     advance(&state, 12);
-    let manifest = state.publish_durable_snapshot().expect("snapshot published");
+    let manifest = state
+        .publish_durable_snapshot()
+        .expect("snapshot published");
     assert_eq!(manifest.identity.height, state.height());
     advance(&state, 9);
     let expected = observable(&state);
@@ -135,7 +137,9 @@ fn a_snapshot_carries_only_a_recent_history_window_and_open_rebuilds_the_rest() 
     for nonce in 0..12 {
         execute(&state, nonce);
     }
-    state.publish_durable_snapshot().expect("snapshot published");
+    state
+        .publish_durable_snapshot()
+        .expect("snapshot published");
     let verified = snapshot::load(&path).expect("the snapshot verifies");
     assert!(
         verified.payload.blocks.len() <= 4
@@ -164,10 +168,19 @@ fn a_snapshot_carries_only_a_recent_history_window_and_open_rebuilds_the_rest() 
     let full_replay = open(&path);
     let from_replay = (observable(&full_replay), history(&full_replay, &hashes));
 
-    assert_eq!(from_snapshot, from_replay, "snapshot + prefix history + tail != full replay");
-    assert_eq!(from_snapshot, expected, "recovery lost something that was durable");
+    assert_eq!(
+        from_snapshot, from_replay,
+        "snapshot + prefix history + tail != full replay"
+    );
+    assert_eq!(
+        from_snapshot, expected,
+        "recovery lost something that was durable"
+    );
     assert!(
-        from_snapshot.1.iter().all(|(_, receipt, body)| *receipt == Some(true) && *body),
+        from_snapshot
+            .1
+            .iter()
+            .all(|(_, receipt, body)| *receipt == Some(true) && *body),
         "a receipt or body below the window was not rebuilt: {:?}",
         from_snapshot.1
     );
@@ -180,7 +193,9 @@ fn a_snapshot_taken_at_the_tip_needs_no_tail_at_all() {
     let state = open(&path);
     advance(&state, 7);
     let expected = observable(&state);
-    state.publish_durable_snapshot().expect("snapshot published");
+    state
+        .publish_durable_snapshot()
+        .expect("snapshot published");
     drop(state);
 
     let reopened = open(&path);
@@ -335,7 +350,9 @@ fn a_torn_wal_tail_after_a_snapshot_still_recovers_to_the_repaired_state() {
 
     let state = open(&path);
     advance(&state, 10);
-    state.publish_durable_snapshot().expect("snapshot published");
+    state
+        .publish_durable_snapshot()
+        .expect("snapshot published");
     advance(&state, 6);
     drop(state);
 

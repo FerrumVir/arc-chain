@@ -14,7 +14,9 @@
 //! networks run.) Also here: a restarted node never proposes at or below the
 //! round it restored, since it may already have signed a block there.
 
-use arc_consensus::{ConsensusEngine, ConsensusError, DagBlock, STAKE_ARC, Validator, ValidatorSet};
+use arc_consensus::{
+    ConsensusEngine, ConsensusError, DagBlock, STAKE_ARC, Validator, ValidatorSet,
+};
 use arc_crypto::{Hash256, KeyPair, hash_bytes};
 
 fn committee() -> (ValidatorSet, Vec<KeyPair>) {
@@ -75,7 +77,10 @@ fn a_node_holding_both_twins_never_commits_the_one_the_majority_did_not() {
     }
     let r = e[0].current_round();
     let leader_addr = leader_of(&set, r);
-    let leader = keys.iter().position(|k| k.address() == leader_addr).unwrap();
+    let leader = keys
+        .iter()
+        .position(|k| k.address() == leader_addr)
+        .unwrap();
     assert_ne!(leader, observer, "pick a round the observer does not lead");
 
     // Round r and the rounds after it run normally: everyone, the observer
@@ -106,17 +111,33 @@ fn a_node_holding_both_twins_never_commits_the_one_the_majority_did_not() {
         })
         .find(|t| t.hash.0 < real.hash.0)
         .expect("a twin with a lower hash");
-    e[observer].receive_block(&twin).expect("the twin is inserted as evidence");
+    e[observer]
+        .receive_block(&twin)
+        .expect("the twin is inserted as evidence");
 
     // Every node decides round r now. The observer holds both twins; the
     // lowest-hash one is the twin, which nothing certifies.
     let decided: Vec<Vec<(u64, Hash256)>> = all
         .iter()
-        .map(|x| x.try_commit().into_iter().map(|b| (b.round, b.hash)).collect())
+        .map(|x| {
+            x.try_commit()
+                .into_iter()
+                .map(|b| (b.round, b.hash))
+                .collect()
+        })
         .collect();
-    let at_r = |i: usize| decided[i].iter().find(|(round_, _)| *round_ == r).map(|(_, h)| *h);
+    let at_r = |i: usize| {
+        decided[i]
+            .iter()
+            .find(|(round_, _)| *round_ == r)
+            .map(|(_, h)| *h)
+    };
     for honest in 0..3 {
-        assert_eq!(at_r(honest), Some(real.hash), "honest node {honest} commits the real block");
+        assert_eq!(
+            at_r(honest),
+            Some(real.hash),
+            "honest node {honest} commits the real block"
+        );
     }
     // Taking only the lowest hash, the observer skipped round r - a chain one
     // block shorter than everyone else's from here on. It must commit the one
@@ -126,7 +147,10 @@ fn a_node_holding_both_twins_never_commits_the_one_the_majority_did_not() {
         Some(real.hash),
         "the observer did not commit the certified block at round {r}: a fork"
     );
-    assert_eq!(decided[observer], decided[0], "the observer's chain differs from node 0's");
+    assert_eq!(
+        decided[observer], decided[0],
+        "the observer's chain differs from node 0's"
+    );
 }
 
 #[test]

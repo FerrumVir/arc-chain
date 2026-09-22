@@ -67,7 +67,13 @@ impl Fixture {
         )
         .unwrap();
 
-        Self { dir, genesis, activation, allowed: [m, p, g, a], seed: tag.to_string() }
+        Self {
+            dir,
+            genesis,
+            activation,
+            allowed: [m, p, g, a],
+            seed: tag.to_string(),
+        }
     }
 
     fn write_qualification(&self, name: &str, value: serde_json::Value) -> PathBuf {
@@ -87,16 +93,24 @@ impl Fixture {
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_arc-node"));
         cmd.args([
-            "--rpc", &format!("127.0.0.1:{port}"),
-            "--p2p-port", &p2p.to_string(),
-            "--data-dir", data.to_str().unwrap(),
-            "--genesis", self.genesis.to_str().unwrap(),
+            "--rpc",
+            &format!("127.0.0.1:{port}"),
+            "--p2p-port",
+            &p2p.to_string(),
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--genesis",
+            self.genesis.to_str().unwrap(),
             "--insecure-dev-validator-seed",
-            "--validator-seed", &self.seed,
-            "--stake", "6666667",
-            "--native-inference-activation", self.activation.to_str().unwrap(),
+            "--validator-seed",
+            &self.seed,
+            "--stake",
+            "6666667",
+            "--native-inference-activation",
+            self.activation.to_str().unwrap(),
             "--native-inference-runtime",
-            "--native-inference-artifact", missing_artifact.to_str().unwrap(),
+            "--native-inference-artifact",
+            missing_artifact.to_str().unwrap(),
         ]);
         if let Some(q) = qualification {
             cmd.args(["--native-inference-qualification", q.to_str().unwrap()]);

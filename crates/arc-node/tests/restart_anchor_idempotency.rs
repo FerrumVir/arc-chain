@@ -13,8 +13,8 @@
 //! repeated restarts, and a crash at each of the three durability boundaries.
 
 use arc_consensus::{ConsensusDomain, DagBlock, view_change::ConsensusSigningRecord};
-use arc_node::consensus::ConsensusManager;
 use arc_crypto::{Hash256, hash_bytes};
+use arc_node::consensus::ConsensusManager;
 use arc_state::StateDB;
 use arc_types::Address;
 
@@ -99,7 +99,8 @@ impl Node {
     /// have kept passing when the real window was too narrow.
     fn height_for(&self, anchor: &DagBlock) -> Option<u64> {
         let decision = anchor.state_decision_commitment(&domain());
-        self.manager.canonical_height_for_decision(&self.state, decision)
+        self.manager
+            .canonical_height_for_decision(&self.state, decision)
     }
 }
 
@@ -251,7 +252,11 @@ fn a_crash_between_two_anchors_omits_neither_and_duplicates_neither() {
 
     node = node.reopen();
     assert_eq!(node.height_for(&first), Some(after_first));
-    assert_eq!(node.height_for(&second), None, "the second was never applied");
+    assert_eq!(
+        node.height_for(&second),
+        None,
+        "the second was never applied"
+    );
 
     // Resuming applies only the one that is missing.
     let second_height = node.apply(&second);

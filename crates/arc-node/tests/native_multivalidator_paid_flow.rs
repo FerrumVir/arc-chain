@@ -35,7 +35,10 @@ fn validator_keypair(seed: &str) -> KeyPair {
 }
 
 fn requester_keypair(seed: &str) -> KeyPair {
-    let bytes = blake3::derive_key("ARC-native-multivalidator-test-requester-v1", seed.as_bytes());
+    let bytes = blake3::derive_key(
+        "ARC-native-multivalidator-test-requester-v1",
+        seed.as_bytes(),
+    );
     KeyPair::Ed25519(ed25519_dalek::SigningKey::from_bytes(&bytes))
 }
 
@@ -52,7 +55,9 @@ fn curl(args: &[&str]) -> (u32, String) {
 
 fn get_json(port: u16, path: &str) -> Option<serde_json::Value> {
     let (code, body) = curl(&[&format!("http://127.0.0.1:{port}{path}")]);
-    (code == 200).then(|| serde_json::from_str(&body).ok()).flatten()
+    (code == 200)
+        .then(|| serde_json::from_str(&body).ok())
+        .flatten()
 }
 
 fn submit(port: u16, tx: &Transaction) -> (u32, String) {
@@ -132,7 +137,9 @@ impl Fixture {
             ));
         }
         for i in 0..NODES {
-            let v = validator_keypair(&format!("p5-validator-{i}")).address().to_hex();
+            let v = validator_keypair(&format!("p5-validator-{i}"))
+                .address()
+                .to_hex();
             // Validators need canonical accounts: any of them may submit the
             // finalize transaction once it holds a supermajority certificate.
             genesis.push_str(&format!(
@@ -140,8 +147,12 @@ impl Fixture {
             ));
         }
         for i in 0..NODES {
-            let v = validator_keypair(&format!("p5-validator-{i}")).address().to_hex();
-            genesis.push_str(&format!("[[validators]]\naddress = \"{v}\"\nstake = {STAKE}\n\n"));
+            let v = validator_keypair(&format!("p5-validator-{i}"))
+                .address()
+                .to_hex();
+            genesis.push_str(&format!(
+                "[[validators]]\naddress = \"{v}\"\nstake = {STAKE}\n\n"
+            ));
         }
         let genesis_path = dir.path().join("genesis.toml");
         std::fs::write(&genesis_path, genesis).unwrap();
@@ -276,9 +287,14 @@ impl Fixture {
 
 /// The receipt fields that must be identical on every replica.
 fn settlement(port: u16, request_id: Hash256) -> Option<(String, u64, String, Vec<(String, u64)>)> {
-    let r = get_json(port, &format!("/native-inference/receipt/{}", request_id.to_hex()))?;
+    let r = get_json(
+        port,
+        &format!("/native-inference/receipt/{}", request_id.to_hex()),
+    )?;
     let status = r["observed_status"].as_str()?.to_string();
-    let height = r["terminal_transaction"]["block_height"].as_u64().unwrap_or(0);
+    let height = r["terminal_transaction"]["block_height"]
+        .as_u64()
+        .unwrap_or(0);
     let output = r["output_hash"].as_str().unwrap_or("").to_string();
     let mut credits: Vec<(String, u64)> = r["settlement_credits"]
         .as_array()
@@ -313,16 +329,22 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
     // handshakes while its own bootstrap dials were in flight (D1), this took
     // at least 45 s of dial timeouts plus the 30 s reconnect timer; 40 s is a
     // regression bound with slack for a loaded debug build.
-    wait_for(Duration::from_secs(40), "every node healthy and fully peered", || {
-        nodes.iter().all(|n| {
-            get_json(n.port, "/health")
-                .and_then(|h| h["peers"].as_u64())
-                .is_some_and(|p| p >= (NODES - 1) as u64)
-        })
-    });
-    wait_for(Duration::from_secs(120), "the committee to commit blocks", || {
-        heights(&nodes).iter().all(|h| h.unwrap_or(0) >= 3)
-    });
+    wait_for(
+        Duration::from_secs(40),
+        "every node healthy and fully peered",
+        || {
+            nodes.iter().all(|n| {
+                get_json(n.port, "/health")
+                    .and_then(|h| h["peers"].as_u64())
+                    .is_some_and(|p| p >= (NODES - 1) as u64)
+            })
+        },
+    );
+    wait_for(
+        Duration::from_secs(120),
+        "the committee to commit blocks",
+        || heights(&nodes).iter().all(|h| h.unwrap_or(0) >= 3),
+    );
 
     let ctx = get_json(nodes[0].port, "/native-inference/context").expect("activated");
     assert_eq!(ctx["candidate_protocol"], 4);
@@ -342,7 +364,10 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
     // ── one request, submitted to one node, settled everywhere ─────────────
     let (tx, first) = fx.request(0, domain, 0, expiry);
     let (code, body) = submit(nodes[0].port, &tx);
-    assert_eq!(code, 200, "a signed native request must be admitted: {body}");
+    assert_eq!(
+        code, 200,
+        "a signed native request must be admitted: {body}"
+    );
 
     let mut settled = Vec::new();
     let finalized = {
@@ -389,7 +414,10 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
     let (_, terminal_height, output_hash, credits) = reference;
     assert!(terminal_height > 0 && !output_hash.is_empty());
     let paid: u64 = credits.iter().map(|(_, a)| a).sum();
-    assert_eq!(paid, 100, "settlement must drain the reserved escrow exactly: {credits:?}");
+    assert_eq!(
+        paid, 100,
+        "settlement must drain the reserved escrow exactly: {credits:?}"
+    );
     // The reserve (100) minus the execution price (10) goes back to the
     // requester, once.
     let requester_hex = fx.requesters[0].address().to_hex();
@@ -398,18 +426,29 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
         .filter(|(payee, _)| *payee == requester_hex)
         .map(|(_, amount)| *amount)
         .collect();
-    assert_eq!(refunds, vec![90], "the unused reserve is refunded exactly once: {credits:?}");
+    assert_eq!(
+        refunds,
+        vec![90],
+        "the unused reserve is refunded exactly once: {credits:?}"
+    );
     // The price is split pro rata by stake across the signers of the matching
     // output (plan_finalize: floor shares, remainder units one each to the
     // first). Equal stakes here, so every share is floor or floor + 1.
     let committee: Vec<String> = (0..NODES)
-        .map(|i| validator_keypair(&format!("p5-validator-{i}")).address().to_hex())
+        .map(|i| {
+            validator_keypair(&format!("p5-validator-{i}"))
+                .address()
+                .to_hex()
+        })
         .collect();
     let shares: Vec<u64> = credits
         .iter()
         .filter(|(payee, _)| *payee != requester_hex)
         .map(|(payee, amount)| {
-            assert!(committee.contains(payee), "{payee} is paid but is not a committee member");
+            assert!(
+                committee.contains(payee),
+                "{payee} is paid but is not a committee member"
+            );
             *amount
         })
         .collect();
@@ -418,10 +457,16 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
         "only a strict supermajority certificate can finalize: {} signers paid",
         shares.len()
     );
-    assert_eq!(shares.iter().sum::<u64>(), 10, "exactly the price reaches the signers: {credits:?}");
+    assert_eq!(
+        shares.iter().sum::<u64>(),
+        10,
+        "exactly the price reaches the signers: {credits:?}"
+    );
     let floor = 10 / shares.len() as u64;
     assert!(
-        shares.iter().all(|share| *share == floor || *share == floor + 1),
+        shares
+            .iter()
+            .all(|share| *share == floor || *share == floor + 1),
         "equal stakes split the price evenly: {credits:?}"
     );
 
@@ -430,7 +475,11 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
     // executor's own admission check, and a native request is not admissible
     // until its predecessor has been included.
     let (future, _) = fx.request(0, domain, 2, expiry);
-    assert_eq!(submit(nodes[1].port, &future).0, 400, "a future nonce is not admissible yet");
+    assert_eq!(
+        submit(nodes[1].port, &future).0,
+        400,
+        "a future nonce is not admissible yet"
+    );
 
     // ── two requesters' requests into one node back-to-back ────────────────
     // Before the fix both could land in one DAG block, which block execution
@@ -440,15 +489,23 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
     let (tx2, third) = fx.request(1, domain, 0, expiry);
     for tx in [&tx1, &tx2] {
         let (code, body) = submit(nodes[1].port, tx);
-        assert_eq!(code, 200, "back-to-back request from {} refused: {body}", tx.from);
+        assert_eq!(
+            code, 200,
+            "back-to-back request from {} refused: {body}",
+            tx.from
+        );
     }
-    wait_for(Duration::from_secs(240), "both back-to-back requests to be Finalized everywhere", || {
-        [second, third].iter().all(|id| {
-            nodes.iter().all(|n| {
-                settlement(n.port, *id).is_some_and(|(status, ..)| status == "Finalized")
+    wait_for(
+        Duration::from_secs(240),
+        "both back-to-back requests to be Finalized everywhere",
+        || {
+            [second, third].iter().all(|id| {
+                nodes.iter().all(|n| {
+                    settlement(n.port, *id).is_some_and(|(status, ..)| status == "Finalized")
+                })
             })
-        })
-    });
+        },
+    );
     let before = heights(&nodes);
     std::thread::sleep(Duration::from_secs(6));
     let after = heights(&nodes);
@@ -460,12 +517,8 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
     }
 
     // ── a non-native transaction is refused at ingress ─────────────────────
-    let mut transfer = Transaction::new_transfer(
-        fx.requesters[0].address(),
-        hash_bytes(b"somebody"),
-        1,
-        3,
-    );
+    let mut transfer =
+        Transaction::new_transfer(fx.requesters[0].address(), hash_bytes(b"somebody"), 1, 3);
     transfer.sign(&fx.requesters[0]).unwrap();
     let (code, _) = submit(nodes[2].port, &transfer);
     assert_eq!(
@@ -478,19 +531,30 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
         "-H",
         "Content-Type: application/json",
         "-d",
-        &format!("{{\"address\":\"{}\"}}", hash_bytes(b"faucet-target").to_hex()),
+        &format!(
+            "{{\"address\":\"{}\"}}",
+            hash_bytes(b"faucet-target").to_hex()
+        ),
         &format!("http://127.0.0.1:{}/faucet/claim", nodes[2].port),
     ]);
-    assert_eq!(code, 503, "the faucet cannot be offered on a protocol-4 chain");
+    assert_eq!(
+        code, 503,
+        "the faucet cannot be offered on a protocol-4 chain"
+    );
 
     // Nobody's consensus loop exited along the way.
     for (i, n) in nodes.iter().enumerate() {
-        assert!(get_json(n.port, "/health").is_some(), "node {i} stopped answering");
+        assert!(
+            get_json(n.port, "/health").is_some(),
+            "node {i} stopped answering"
+        );
         let diag = get_json(n.port, "/consensus/diagnostics").unwrap();
         eprintln!(
             "node {i}: votes gossiped={} accepted={} refused={} protocol4_omitted={}",
-            diag["native_votes_gossiped"], diag["native_votes_accepted"],
-            diag["native_votes_refused"], diag["protocol4_omitted_transactions"]
+            diag["native_votes_gossiped"],
+            diag["native_votes_accepted"],
+            diag["native_votes_refused"],
+            diag["protocol4_omitted_transactions"]
         );
     }
     let _: &Path = fx.dir.path();
@@ -499,15 +563,14 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
 /// Wait until `id` is Finalized on every listed node.
 fn wait_finalized(nodes: &[&NodeProcess], id: Hash256, timeout: Duration, label: &str) {
     wait_for(timeout, label, || {
-        nodes.iter().all(|n| {
-            settlement(n.port, id).is_some_and(|(status, ..)| status == "Finalized")
-        })
+        nodes
+            .iter()
+            .all(|n| settlement(n.port, id).is_some_and(|(status, ..)| status == "Finalized"))
     });
 }
 
 fn block_hash(port: u16, height: u64) -> Option<String> {
-    get_json(port, &format!("/block/{height}"))
-        .and_then(|b| b["hash"].as_str().map(str::to_string))
+    get_json(port, &format!("/block/{height}")).and_then(|b| b["hash"].as_str().map(str::to_string))
 }
 
 /// A validator killed after the chain ran past its DAG retention window must
@@ -525,16 +588,25 @@ fn a_validator_restarted_past_the_retention_window_rejoins_and_settles_new_work(
     let fx = Fixture::new(
         9950,
         9150,
-        &["--dag-retained-rounds", "100", "--snapshot-every-blocks", "50"],
+        &[
+            "--dag-retained-rounds",
+            "100",
+            "--snapshot-every-blocks",
+            "50",
+        ],
     );
     let mut nodes: Vec<NodeProcess> = (0..NODES).map(|i| fx.spawn(i)).collect();
-    wait_for(Duration::from_secs(40), "every node healthy and fully peered", || {
-        nodes.iter().all(|n| {
-            get_json(n.port, "/health")
-                .and_then(|h| h["peers"].as_u64())
-                .is_some_and(|p| p >= (NODES - 1) as u64)
-        })
-    });
+    wait_for(
+        Duration::from_secs(40),
+        "every node healthy and fully peered",
+        || {
+            nodes.iter().all(|n| {
+                get_json(n.port, "/health")
+                    .and_then(|h| h["peers"].as_u64())
+                    .is_some_and(|p| p >= (NODES - 1) as u64)
+            })
+        },
+    );
     let ctx = get_json(nodes[0].port, "/native-inference/context").expect("activated");
     let domain = InferenceDomain {
         chain_genesis: Hash256::from_hex(ctx["chain_genesis"].as_str().unwrap()).unwrap(),
@@ -549,9 +621,11 @@ fn a_validator_restarted_past_the_retention_window_rejoins_and_settles_new_work(
             .and_then(|h| h["dag_round"].as_u64())
             .unwrap_or(0)
     };
-    wait_for(Duration::from_secs(300), "the chain to pass 3x the retention window", || {
-        round(nodes[0].port) >= 300
-    });
+    wait_for(
+        Duration::from_secs(300),
+        "the chain to pass 3x the retention window",
+        || round(nodes[0].port) >= 300,
+    );
 
     // Kill validator 3 (SIGKILL: a crash, not a shutdown).
     let victim = 3;
@@ -573,13 +647,17 @@ fn a_validator_restarted_past_the_retention_window_rejoins_and_settles_new_work(
     assert_eq!(submit(nodes[0].port, &tx).0, 200);
     std::thread::sleep(Duration::from_secs(5));
     let up: Vec<&NodeProcess> = nodes.iter().take(3).collect();
-    wait_for(Duration::from_secs(5), "the three to keep committing", || {
-        up.iter().all(|n| {
-            get_json(n.port, "/health")
-                .and_then(|h| h["height"].as_u64())
-                .is_some_and(|h| h > killed_at)
-        })
-    });
+    wait_for(
+        Duration::from_secs(5),
+        "the three to keep committing",
+        || {
+            up.iter().all(|n| {
+                get_json(n.port, "/health")
+                    .and_then(|h| h["height"].as_u64())
+                    .is_some_and(|h| h > killed_at)
+            })
+        },
+    );
 
     // Restart it on the same data directory.
     let old = std::mem::replace(&mut nodes[victim], fx.spawn(victim));
@@ -588,12 +666,19 @@ fn a_validator_restarted_past_the_retention_window_rejoins_and_settles_new_work(
 
     // It must catch up past the height it was killed at and agree with its
     // peers block for block at a common height.
-    wait_for(Duration::from_secs(180), "the restarted validator to catch up", || {
-        let mine = get_json(victim_port, "/health").and_then(|h| h["height"].as_u64());
-        let theirs = get_json(nodes[0].port, "/health").and_then(|h| h["height"].as_u64());
-        matches!((mine, theirs), (Some(m), Some(t)) if m >= killed_at + 20 && m + 10 >= t)
-    });
-    let common = get_json(victim_port, "/health").unwrap()["height"].as_u64().unwrap() - 5;
+    wait_for(
+        Duration::from_secs(180),
+        "the restarted validator to catch up",
+        || {
+            let mine = get_json(victim_port, "/health").and_then(|h| h["height"].as_u64());
+            let theirs = get_json(nodes[0].port, "/health").and_then(|h| h["height"].as_u64());
+            matches!((mine, theirs), (Some(m), Some(t)) if m >= killed_at + 20 && m + 10 >= t)
+        },
+    );
+    let common = get_json(victim_port, "/health").unwrap()["height"]
+        .as_u64()
+        .unwrap()
+        - 5;
     let reference = block_hash(nodes[0].port, common).expect("peer block");
     for n in &nodes {
         assert_eq!(
@@ -605,15 +690,30 @@ fn a_validator_restarted_past_the_retention_window_rejoins_and_settles_new_work(
     }
     // The work submitted while it was down settles, identically, on it too.
     let all: Vec<&NodeProcess> = nodes.iter().collect();
-    wait_finalized(&all, while_down, Duration::from_secs(120), "work from the downtime settles everywhere");
-    assert_eq!(settlement(victim_port, while_down), settlement(nodes[0].port, while_down));
+    wait_finalized(
+        &all,
+        while_down,
+        Duration::from_secs(120),
+        "work from the downtime settles everywhere",
+    );
+    assert_eq!(
+        settlement(victim_port, while_down),
+        settlement(nodes[0].port, while_down)
+    );
 
     // New work submitted THROUGH the restarted node settles everywhere.
     let (tx, after) = fx.request(1, domain, 1, expiry);
-    wait_for(Duration::from_secs(60), "the restarted node to accept new work", || {
-        submit(victim_port, &tx).0 == 200
-    });
-    wait_finalized(&all, after, Duration::from_secs(120), "new work through the restarted node");
+    wait_for(
+        Duration::from_secs(60),
+        "the restarted node to accept new work",
+        || submit(victim_port, &tx).0 == 200,
+    );
+    wait_finalized(
+        &all,
+        after,
+        Duration::from_secs(120),
+        "new work through the restarted node",
+    );
 
     // And it got there by the new path, not by luck.
     let log = std::fs::read_to_string(nodes[victim].data_dir.join("node.log")).unwrap();

@@ -239,8 +239,14 @@ impl Drop for InboundTimer {
 pub fn inbound_snapshot() -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
     for (i, name) in INBOUND_KINDS.iter().enumerate() {
-        map.insert(format!("inbound_{name}_count"), INBOUND.count[i].load(Relaxed).into());
-        map.insert(format!("inbound_{name}_us"), INBOUND.us[i].load(Relaxed).into());
+        map.insert(
+            format!("inbound_{name}_count"),
+            INBOUND.count[i].load(Relaxed).into(),
+        );
+        map.insert(
+            format!("inbound_{name}_us"),
+            INBOUND.us[i].load(Relaxed).into(),
+        );
     }
     map
 }

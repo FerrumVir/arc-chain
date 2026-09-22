@@ -67,10 +67,11 @@ fn main() -> Result<(), String> {
     let repeats: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(2);
 
     let t0 = Instant::now();
-    let model = arc_inference::cached_integer_model::load_cached_model_canonical_i8_interleaved_rope(
-        &args[1],
-    )
-    .map_err(|e| e.to_string())?;
+    let model =
+        arc_inference::cached_integer_model::load_cached_model_canonical_i8_interleaved_rope(
+            &args[1],
+        )
+        .map_err(|e| e.to_string())?;
     let load_ms = t0.elapsed().as_secs_f64() * 1e3;
     let profile = model
         .canonical_execution_profile()
@@ -213,7 +214,8 @@ fn main() -> Result<(), String> {
     let cont_cache_same = cache_digest(&bat_cache) == ref_final_cache;
     drop(bat_cache);
 
-    let exact = digest_mismatch.is_none() && max_abs == 0 && cache_same && cont_ok && cont_cache_same;
+    let exact =
+        digest_mismatch.is_none() && max_abs == 0 && cache_same && cont_ok && cont_cache_same;
     eprintln!(
         "exactness: digests_all_positions={} tail_elementwise_max_diff={} kv={} continuation={} ({cont_steps} steps)",
         digest_mismatch.is_none(),
@@ -222,7 +224,9 @@ fn main() -> Result<(), String> {
         cont_ok
     );
     if !exact {
-        eprintln!("first digest mismatch at position {digest_mismatch:?}; first value mismatch {first_bad:?}");
+        eprintln!(
+            "first digest mismatch at position {digest_mismatch:?}; first value mismatch {first_bad:?}"
+        );
         return Err("EXACTNESS FAILURE - batched prefill is not conformant".into());
     }
 
@@ -244,9 +248,7 @@ fn main() -> Result<(), String> {
     ];
     let mut order_log: Vec<&'static str> = Vec::new();
 
-    let sample = |i: usize,
-                      obs: &mut Vec<(&str, Vec<f64>)>|
-     -> Result<(), String> {
+    let sample = |i: usize, obs: &mut Vec<(&str, Vec<f64>)>| -> Result<(), String> {
         let (simd, batched) = match i {
             0 => (false, false),
             1 => (false, true),
@@ -277,7 +279,11 @@ fn main() -> Result<(), String> {
 
     for r in 0..repeats {
         let taat_first = r % 2 == 0;
-        order_log.push(if taat_first { "taat-first" } else { "batched-first" });
+        order_log.push(if taat_first {
+            "taat-first"
+        } else {
+            "batched-first"
+        });
         if taat_first {
             sample(2, &mut obs)?;
             sample(3, &mut obs)?;

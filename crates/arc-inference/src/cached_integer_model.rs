@@ -1141,9 +1141,7 @@ pub(crate) fn matmul_i8_into_batched(
         output.len()
     );
     if crate::canonical_simd::fast_canonical_kernel_enabled()
-        && crate::canonical_simd::matmul_i8_batched_fast(
-            weights, inputs, n_tokens, in_size, output,
-        )
+        && crate::canonical_simd::matmul_i8_batched_fast(weights, inputs, n_tokens, in_size, output)
     {
         return;
     }
@@ -1436,10 +1434,9 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
         let b_values = std::slice::from_raw_parts(b, len);
         // Branch-free, so it vectorises: x fits in i32 exactly when
         // (x + 2^31) as u64 is below 2^32, i.e. its top 32 bits are zero.
-        let outside_i32 = a_values
-            .iter()
-            .chain(b_values)
-            .fold(0u64, |acc, &x| acc | ((x.wrapping_add(1 << 31) as u64) >> 32));
+        let outside_i32 = a_values.iter().chain(b_values).fold(0u64, |acc, &x| {
+            acc | ((x.wrapping_add(1 << 31) as u64) >> 32)
+        });
         if outside_i32 != 0 {
             return dot_i64xi64_exact(a_values, b_values);
         }
@@ -4023,11 +4020,7 @@ impl CachedIntegerModel {
     /// lengths across nine chunk sizes, plus KV bytes and continuation decode),
     /// and it returns `None` **without touching `cache`** when it refuses. So
     /// which branch runs changes latency and scratch, never an output.
-    fn prefill_prompt_into_cache(
-        &self,
-        prompt: &[u32],
-        cache: &mut KVCache,
-    ) -> Option<Vec<i64>> {
+    fn prefill_prompt_into_cache(&self, prompt: &[u32], cache: &mut KVCache) -> Option<Vec<i64>> {
         if prompt.is_empty() {
             return None;
         }
@@ -6214,10 +6207,20 @@ mod tests {
 
     fn assert_same_cache(a: &KVCache, b: &KVCache, case: &str) {
         assert_eq!(a.seq_len, b.seq_len, "seq_len differs ({case})");
-        assert_eq!(a.k_data.len(), b.k_data.len(), "layer count differs ({case})");
+        assert_eq!(
+            a.k_data.len(),
+            b.k_data.len(),
+            "layer count differs ({case})"
+        );
         for l in 0..a.k_data.len() {
-            assert_eq!(a.k_data[l], b.k_data[l], "K cache differs at layer {l} ({case})");
-            assert_eq!(a.v_data[l], b.v_data[l], "V cache differs at layer {l} ({case})");
+            assert_eq!(
+                a.k_data[l], b.k_data[l],
+                "K cache differs at layer {l} ({case})"
+            );
+            assert_eq!(
+                a.v_data[l], b.v_data[l],
+                "V cache differs at layer {l} ({case})"
+            );
         }
     }
 
@@ -6302,7 +6305,10 @@ mod tests {
                 .prefill_canonical_i8_batched(&tail, &mut cache, chunk, true)
                 .expect("must accept a resumed prefill");
             for (p, (a, b)) in reference.iter().zip(got.iter()).enumerate() {
-                assert_eq!(a, b, "resumed prefill differs at position {p}, chunk={chunk}");
+                assert_eq!(
+                    a, b,
+                    "resumed prefill differs at position {p}, chunk={chunk}"
+                );
             }
             assert_same_cache(&ref_cache, &cache, &format!("resumed chunk={chunk}"));
         }
@@ -6338,24 +6344,40 @@ mod tests {
 
         // empty prompt
         let mut cache = KVCache::new(model.config.n_layers);
-        assert!(model.prefill_canonical_i8_batched(&[], &mut cache, 8, true).is_none());
+        assert!(
+            model
+                .prefill_canonical_i8_batched(&[], &mut cache, 8, true)
+                .is_none()
+        );
         assert_eq!(cache.seq_len, 0);
         assert!(cache.k_data.iter().all(|k| k.is_empty()));
 
         // zero chunk size
-        assert!(model.prefill_canonical_i8_batched(&[1, 2], &mut cache, 0, true).is_none());
+        assert!(
+            model
+                .prefill_canonical_i8_batched(&[1, 2], &mut cache, 0, true)
+                .is_none()
+        );
         assert_eq!(cache.seq_len, 0);
         assert!(cache.k_data.iter().all(|k| k.is_empty()));
 
         // beyond the context window: admission is NOT relaxed
         let too_long: Vec<u32> = vec![1; max_seq + 1];
-        assert!(model.prefill_canonical_i8_batched(&too_long, &mut cache, 8, true).is_none());
+        assert!(
+            model
+                .prefill_canonical_i8_batched(&too_long, &mut cache, 8, true)
+                .is_none()
+        );
         assert_eq!(cache.seq_len, 0);
         assert!(cache.k_data.iter().all(|k| k.is_empty()));
 
         // exactly at the window is still admitted
         let exact: Vec<u32> = vec![1; 4];
-        assert!(model.prefill_canonical_i8_batched(&exact, &mut cache, 4, false).is_some());
+        assert!(
+            model
+                .prefill_canonical_i8_batched(&exact, &mut cache, 4, false)
+                .is_some()
+        );
 
         let c = prefill_census();
         assert!(c.refused_shape >= 2, "{c:?}");
@@ -6412,7 +6434,13 @@ mod tests {
         };
         assert!(!batched_shape_is_valid(&scales, &good_in, 3, 4, &good_out));
         // Declared inner dimension disagreeing with the matrix.
-        assert!(!batched_shape_is_valid(&w, &vec![0i64; 3 * 5], 3, 5, &good_out));
+        assert!(!batched_shape_is_valid(
+            &w,
+            &vec![0i64; 3 * 5],
+            3,
+            5,
+            &good_out
+        ));
         // Degenerate counts.
         assert!(!batched_shape_is_valid(&w, &good_in, 0, 4, &good_out));
         assert!(!batched_shape_is_valid(&w, &good_in, 3, 0, &good_out));
@@ -6532,7 +6560,10 @@ mod tests {
             let on_census = crate::canonical_prefill::prefill_census();
 
             assert_eq!(off_tokens, on_tokens, "served tokens differ (simd={simd})");
-            assert_eq!(off_hash, on_hash, "served output hash differs (simd={simd})");
+            assert_eq!(
+                off_hash, on_hash,
+                "served output hash differs (simd={simd})"
+            );
             assert!(
                 on_census.chunks > 0 && on_census.tokens as usize >= prompt.len(),
                 "the serving path did not actually use batched prefill (simd={simd}): {on_census:?}"
@@ -6569,7 +6600,8 @@ mod tests {
         }
 
         // At the floor it engages, which is what makes the bound a bound.
-        let prompt: Vec<u32> = (1..=crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS as u32).collect();
+        let prompt: Vec<u32> =
+            (1..=crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS as u32).collect();
         crate::canonical_prefill::reset_prefill_census();
         let _ = model.generate_v2(&prompt, 3, &[63u32]);
         assert!(

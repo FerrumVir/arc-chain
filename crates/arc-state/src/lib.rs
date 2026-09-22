@@ -2824,7 +2824,10 @@ impl StateDB {
             ("state_dirty_accounts", self.dirty_accounts.len()),
             ("state_validators", self.validators.len()),
             ("state_native_pending", self.native_inference_pending.len()),
-            ("state_pending_bond_release_heights", self.pending_bond_releases.lock().len()),
+            (
+                "state_pending_bond_release_heights",
+                self.pending_bond_releases.lock().len(),
+            ),
         ]
         .into_iter()
         .map(|(name, len)| (name, len as u64))

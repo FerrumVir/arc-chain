@@ -1176,7 +1176,9 @@ impl NativeFinalizeSink {
                 return Ok(());
             };
             if let Some(flight) = candidate.submitted {
-                if self.still_in_flight(&flight) || self.state.receipts.contains_key(&flight.tx_hash.0) {
+                if self.still_in_flight(&flight)
+                    || self.state.receipts.contains_key(&flight.tx_hash.0)
+                {
                     return Ok(());
                 }
                 // It died without executing (omitted, dropped, or its nonce
@@ -2179,7 +2181,11 @@ pub enum QualificationError {
     /// The record declares the execution NOT qualified.
     NotQualified,
     /// The record is bound to a different execution identity.
-    IdentityMismatch { field: String, expected: String, found: String },
+    IdentityMismatch {
+        field: String,
+        expected: String,
+        found: String,
+    },
     /// The record omits who decided, when, or on what basis.
     Incomplete(String),
 }
@@ -2201,7 +2207,11 @@ impl std::fmt::Display for QualificationError {
                 "the qualification record states reference_generation_qualified = false; \
                  real-model execution stays unavailable"
             ),
-            Self::IdentityMismatch { field, expected, found } => write!(
+            Self::IdentityMismatch {
+                field,
+                expected,
+                found,
+            } => write!(
                 f,
                 "the qualification record is bound to a different execution identity: {field} is \
                  {found} in the record but {expected} in the activated allowlist. A qualification \
@@ -2293,7 +2303,11 @@ pub fn resolve_real_execution_decision(
     for (field, expected, found) in [
         ("model_hash", allowed.model_hash, record.model_hash),
         ("profile_hash", allowed.profile_hash, record.profile_hash),
-        ("generation_hash", allowed.generation_hash, record.generation_hash),
+        (
+            "generation_hash",
+            allowed.generation_hash,
+            record.generation_hash,
+        ),
     ] {
         if expected != found {
             return Err(QualificationError::IdentityMismatch {
@@ -2346,7 +2360,11 @@ pub enum ActivationConfigError {
     /// The node could not determine its own genesis binding or validator set.
     StateUnavailable(String),
     /// An operator-supplied pin did not match what the node actually has.
-    ExpectationMismatch { field: String, expected: String, actual: String },
+    ExpectationMismatch {
+        field: String,
+        expected: String,
+        actual: String,
+    },
     /// An operator config differs from the already-persisted activation.
     ReconfigurationRejected {
         field: String,
@@ -2362,19 +2380,31 @@ impl std::fmt::Display for ActivationConfigError {
         match self {
             Self::Unreadable(e) => write!(f, "cannot read activation config: {e}"),
             Self::Malformed(e) => write!(f, "activation config is not valid JSON: {e}"),
-            Self::InvalidContext(e) => write!(f, "assembled activation context failed validation: {e}"),
+            Self::InvalidContext(e) => {
+                write!(f, "assembled activation context failed validation: {e}")
+            }
             Self::ChainNotEmpty(h) => write!(
                 f,
                 "native inference activation requires an unused private genesis, but this chain \
                  is at height {h}. It cannot be enabled on an existing chain."
             ),
-            Self::StateUnavailable(e) => write!(f, "node state cannot supply the activation domain: {e}"),
-            Self::ExpectationMismatch { field, expected, actual } => write!(
+            Self::StateUnavailable(e) => {
+                write!(f, "node state cannot supply the activation domain: {e}")
+            }
+            Self::ExpectationMismatch {
+                field,
+                expected,
+                actual,
+            } => write!(
                 f,
                 "activation config pinned {field}={expected} but this node has {actual}. \
                  Refusing rather than activating a context the operator did not approve."
             ),
-            Self::ReconfigurationRejected { field, persisted, requested } => write!(
+            Self::ReconfigurationRejected {
+                field,
+                persisted,
+                requested,
+            } => write!(
                 f,
                 "native inference is already activated and cannot be reconfigured: {field} is \
                  {persisted} in the persisted binding but {requested} in this config. Restart \
@@ -2459,8 +2489,9 @@ pub fn assemble_activation_context(
     let chain_genesis = fs::read_to_string(&binding)
         .map_err(|e| ActivationConfigError::StateUnavailable(format!("{}: {e}", binding.display())))
         .and_then(|v| {
-            Hash256::from_hex(v.trim())
-                .map_err(|e| ActivationConfigError::StateUnavailable(format!("invalid genesis binding: {e}")))
+            Hash256::from_hex(v.trim()).map_err(|e| {
+                ActivationConfigError::StateUnavailable(format!("invalid genesis binding: {e}"))
+            })
         })?;
 
     let mut members: Vec<ValidatorMember> = state
@@ -2804,7 +2835,10 @@ mod tests {
         // execution but not tokenization.
         let canonical = NativeServing::canonical(None, Some(2_048));
         assert_eq!(canonical.max_positions, Some(2_048));
-        assert_eq!(canonical.executor.input_format(), "le_u32_token_ids_without_bos");
+        assert_eq!(
+            canonical.executor.input_format(),
+            "le_u32_token_ids_without_bos"
+        );
         assert!(canonical.tokenize_prompt("hello").is_err());
     }
 
@@ -2878,16 +2912,21 @@ mod tests {
         let s = DecisionStore::open(dir.path(), v0.vote.validator, j0.genesis, j0.context).unwrap();
         let (settled, still_pending) = (decide(10), decide(11));
         s.persist_signed(settled.1.clone(), &settled.0).unwrap();
-        s.persist_signed(still_pending.1.clone(), &still_pending.0).unwrap();
+        s.persist_signed(still_pending.1.clone(), &still_pending.0)
+            .unwrap();
         // An unreadable record is kept: it is not evidence of anything.
         fs::write(dir.path().join("unreadable.decision"), b"bad").unwrap();
 
-        let removed = s
-            .prune_terminal(|id| id == settled.0.request_id)
-            .unwrap();
+        let removed = s.prune_terminal(|id| id == settled.0.request_id).unwrap();
         assert_eq!(removed, 1);
-        assert!(!s.path(settled.0.request_id).exists(), "the settled request's file is gone");
-        assert!(s.path(still_pending.0.request_id).exists(), "a pending request keeps its record");
+        assert!(
+            !s.path(settled.0.request_id).exists(),
+            "the settled request's file is gone"
+        );
+        assert!(
+            s.path(still_pending.0.request_id).exists(),
+            "a pending request keeps its record"
+        );
         assert!(dir.path().join("unreadable.decision").exists());
         // The kept record still protects: a different output for the pending
         // request is refused as equivocation.
@@ -2903,8 +2942,8 @@ mod tests {
         ));
         // Another validator's store over the same directory prunes nothing of
         // this validator's.
-        let other = DecisionStore::open(dir.path(), Hash256([0xEE; 32]), j0.genesis, j0.context)
-            .unwrap();
+        let other =
+            DecisionStore::open(dir.path(), Hash256([0xEE; 32]), j0.genesis, j0.context).unwrap();
         assert_eq!(other.prune_terminal(|_| true).unwrap(), 0);
         assert!(s.path(still_pending.0.request_id).exists());
     }
@@ -2939,8 +2978,7 @@ mod tests {
             Arc::new(Exec),
             Arc::new(Sign),
             Arc::new(Sink),
-            DecisionStore::open(dir.path(), test_signer().address(), j.genesis, j.context)
-                .unwrap(),
+            DecisionStore::open(dir.path(), test_signer().address(), j.genesis, j.context).unwrap(),
         );
         w.cancel();
         assert!(matches!(
@@ -2957,14 +2995,17 @@ mod tests {
             executor.clone(),
             Arc::new(Sign),
             Arc::new(Sink),
-            DecisionStore::open(dir.path(), test_signer().address(), j.genesis, j.context)
-                .unwrap(),
+            DecisionStore::open(dir.path(), test_signer().address(), j.genesis, j.context).unwrap(),
         );
         for now in [j.expires_at, j.expires_at + 5] {
             w.submit(j.request_id).unwrap();
             assert!(matches!(w.run_one(now), Err(NativeInferenceError::Expired)));
         }
-        assert_eq!(executor.0.load(Ordering::SeqCst), 0, "an expired job never executes");
+        assert_eq!(
+            executor.0.load(Ordering::SeqCst),
+            0,
+            "an expired job never executes"
+        );
     }
 
     struct Jobs(std::collections::HashMap<[u8; 32], PendingJob>);
@@ -3031,14 +3072,26 @@ mod tests {
         }
         assert_eq!(
             *executor.0.lock(),
-            vec![Hash256([1; 32]), Hash256([4; 32]), Hash256([2; 32]), Hash256([3; 32])]
+            vec![
+                Hash256([1; 32]),
+                Hash256([4; 32]),
+                Hash256([2; 32]),
+                Hash256([3; 32])
+            ]
         );
         // At its expiry height a queued request is dropped unrun and frees
         // its slot; nothing else was queued, so the worker is idle.
         w.submit_for(Hash256([5; 32]), bob, 20).unwrap();
-        assert!(matches!(w.run_one(20), Err(NativeInferenceError::QueueFull)));
+        assert!(matches!(
+            w.run_one(20),
+            Err(NativeInferenceError::QueueFull)
+        ));
         assert!(w.is_idle());
-        assert_eq!(executor.0.lock().len(), 4, "the expired request never executed");
+        assert_eq!(
+            executor.0.lock().len(),
+            4,
+            "the expired request never executed"
+        );
         w.submit_for(Hash256([5; 32]), bob, 30).unwrap();
         w.run_one(21).unwrap();
         assert_eq!(executor.0.lock().last(), Some(&Hash256([5; 32])));
@@ -3251,10 +3304,12 @@ mod tests {
         // (arc-types/src/inference_contract.rs:173).
         members.sort_by_key(|m| m.address.0);
         let prefunded: Vec<(Hash256, u64)> = members.iter().map(|m| (m.address, 0)).collect();
-        let state =
-            arc_state::StateDB::with_genesis_persistent(&prefunded, dir, genesis).unwrap();
+        let state = arc_state::StateDB::with_genesis_persistent(&prefunded, dir, genesis).unwrap();
         state.seed_genesis_validators(
-            &members.iter().map(|m| (m.address, m.stake)).collect::<Vec<_>>(),
+            &members
+                .iter()
+                .map(|m| (m.address, m.stake))
+                .collect::<Vec<_>>(),
         );
         (state, members)
     }
@@ -3313,13 +3368,25 @@ mod tests {
             },
         );
 
-        assert!(state.native_inference_context().is_none(), "inert before activation");
+        assert!(
+            state.native_inference_context().is_none(),
+            "inert before activation"
+        );
         let commitment =
             activate_native_inference_from_config(&state, &path).expect("activation must succeed");
 
-        let active = state.native_inference_context().expect("context must be readable back");
-        assert_eq!(active.members, members, "members must come from the node's own registry");
-        assert_eq!(active.allowed_executions, vec![marker()], "allowlist is the operator's input");
+        let active = state
+            .native_inference_context()
+            .expect("context must be readable back");
+        assert_eq!(
+            active.members, members,
+            "members must come from the node's own registry"
+        );
+        assert_eq!(
+            active.allowed_executions,
+            vec![marker()],
+            "allowlist is the operator's input"
+        );
         assert_eq!(
             active.domain.validator_set_hash,
             validator_set_commitment(&members).unwrap(),
@@ -3426,7 +3493,10 @@ mod tests {
 
         let resumed = activate_native_inference_from_config(&state, &path)
             .expect("a restart with the SAME config must resume, not abort");
-        assert_eq!(first, resumed, "the commitment must be unchanged across restart");
+        assert_eq!(
+            first, resumed,
+            "the commitment must be unchanged across restart"
+        );
         assert_eq!(
             state.native_inference_context().unwrap().members,
             members,
@@ -3446,7 +3516,9 @@ mod tests {
         };
         write_request(&path, &original);
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
-        state.execute_block_verified_at(&[], Hash256::ZERO, 1).unwrap();
+        state
+            .execute_block_verified_at(&[], Hash256::ZERO, 1)
+            .unwrap();
 
         // A different allowlist is a reconfiguration attempt, not a restart.
         let other = hash_bytes(b"a different allowed execution");
@@ -3603,13 +3675,22 @@ mod tests {
             &drifted, &bound,
         )
         .expect_err("a drifted committee must be refused");
-        assert!(message.contains(&format!("added {}", intruder.to_hex())), "{message}");
-        assert!(message.contains(&format!("removed {}", removed.to_hex())), "{message}");
+        assert!(
+            message.contains(&format!("added {}", intruder.to_hex())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("removed {}", removed.to_hex())),
+            "{message}"
+        );
         assert!(message.contains(&changed.to_hex()), "{message}");
         assert!(message.contains("Restart with the genesis file that was used at activation"));
 
         // Refusing touched nothing: the binding still resumes.
-        assert_eq!(state.native_inference_context().unwrap().members, original_members);
+        assert_eq!(
+            state.native_inference_context().unwrap().members,
+            original_members
+        );
         activate_native_inference_from_config(&state, &path)
             .expect("the unchanged state still resumes its binding");
     }
@@ -3668,7 +3749,10 @@ mod tests {
             Err(ActivationConfigError::ChainNotEmpty(h)) => assert_eq!(h, 1),
             other => panic!("expected ChainNotEmpty(1), got {other:?}"),
         }
-        assert!(state.native_inference_context().is_none(), "must stay inert");
+        assert!(
+            state.native_inference_context().is_none(),
+            "must stay inert"
+        );
     }
 
     #[test]
@@ -3810,7 +3894,9 @@ mod tests {
         // tokens made every honest vote an "equivocation": no certificate,
         // and every honest node's own vote refused.
         let fixture = native_fixture();
-        let [request_id] = admit_requests(&fixture, &[0])[..] else { unreachable!() };
+        let [request_id] = admit_requests(&fixture, &[0])[..] else {
+            unreachable!()
+        };
         let mempool = Arc::new(Mempool::new(16));
         let sink = NativeFinalizeSink::new(
             fixture.state.clone(),
@@ -3825,7 +3911,11 @@ mod tests {
             sink.accept_peer_vote(&vote(request_id, &[71, 72], honest))
                 .expect("an honest vote is never refused because of someone else's");
         }
-        assert_eq!(mempool.len(), 1, "the honest certificate produced one finalize");
+        assert_eq!(
+            mempool.len(),
+            1,
+            "the honest certificate produced one finalize"
+        );
         // The byzantine member changing its vote is its own equivocation.
         assert!(matches!(
             sink.accept_peer_vote(&vote(request_id, &[71, 72], byzantine)),
@@ -3851,7 +3941,9 @@ mod tests {
         // declared output hash, and signed over exactly those tokens, by a
         // frozen member. A refused vote leaves no trace.
         let fixture = native_fixture();
-        let [request_id] = admit_requests(&fixture, &[0])[..] else { unreachable!() };
+        let [request_id] = admit_requests(&fixture, &[0])[..] else {
+            unreachable!()
+        };
         let mempool = Arc::new(Mempool::new(16));
         let sink = NativeFinalizeSink::new(
             fixture.state.clone(),
@@ -3867,13 +3959,19 @@ mod tests {
         let outsider = KeyPair::generate_ed25519();
         for (label, bad) in [
             ("empty output", vote(request_id, &[], member)),
-            ("output over max_output_bytes", vote(request_id, &[7; 33], member)),
+            (
+                "output over max_output_bytes",
+                vote(request_id, &[7; 33], member),
+            ),
             ("output hash mismatch", mismatched),
             ("tokens the vote did not sign", unsigned_tokens),
             ("non-member", vote(request_id, &[71, 72], &outsider)),
         ] {
             assert!(
-                matches!(sink.accept_peer_vote(&bad), Err(NativeInferenceError::Signer(_))),
+                matches!(
+                    sink.accept_peer_vote(&bad),
+                    Err(NativeInferenceError::Signer(_))
+                ),
                 "{label} must be refused"
             );
         }
@@ -4126,7 +4224,11 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(mempool.len(), 1, "the waiting certificate's finalize was sent");
+        assert_eq!(
+            mempool.len(),
+            1,
+            "the waiting certificate's finalize was sent"
+        );
         fixture
             .state
             .execute_block_verified(&mempool.drain(1), fixture.requester.address())
@@ -4138,7 +4240,11 @@ mod tests {
                 .native_inference_receipt(*id, commitment)
                 .unwrap()
                 .unwrap();
-            assert_eq!(format!("{:?}", receipt.metadata.status), "Finalized", "{id}");
+            assert_eq!(
+                format!("{:?}", receipt.metadata.status),
+                "Finalized",
+                "{id}"
+            );
         }
     }
 

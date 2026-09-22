@@ -201,7 +201,11 @@ struct Cli {
     /// Default off, and requires --native-inference-activation. Activating the
     /// contract without this means requests can be admitted that no process
     /// ever executes or finalizes, so settlement could never complete.
-    #[arg(long, default_value_t = false, requires = "native_inference_activation")]
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "native_inference_activation"
+    )]
     native_inference_runtime: bool,
 
     /// Largest KV cache (bytes) one native job may use on this node. A job
@@ -7221,9 +7225,10 @@ async fn run_arc_node() -> Result<()> {
         let commitment = context
             .commitment()
             .map_err(|e| anyhow::anyhow!("activated context has no valid commitment: {e}"))?;
-        let allowed = context.allowed_executions.first().copied().ok_or_else(|| {
-            anyhow::anyhow!("activated context has an empty execution allowlist")
-        })?;
+        let allowed =
+            context.allowed_executions.first().copied().ok_or_else(|| {
+                anyhow::anyhow!("activated context has an empty execution allowlist")
+            })?;
         // Built per branch: the two executor types are different, so the
         // runtime is generic over them and the parts cannot be shared by move.
         // `DecisionStore::open` is a directory handle, so rebuilding it is
@@ -7726,8 +7731,7 @@ async fn run_arc_node() -> Result<()> {
         // rebinding to a different domain is refused.
         {
             let epoch = consensus.engine.frozen_validator_set().epoch;
-            let certificate_domain =
-                arc_consensus::ConsensusDomain::new(genesis_hash, 0, epoch);
+            let certificate_domain = arc_consensus::ConsensusDomain::new(genesis_hash, 0, epoch);
             if let Err(error) = consensus
                 .engine
                 .install_certificate_domain(certificate_domain)

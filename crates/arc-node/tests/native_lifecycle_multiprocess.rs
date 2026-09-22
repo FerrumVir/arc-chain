@@ -312,7 +312,10 @@ fn consensus_trace(data_dir: &Path) -> String {
         kept.extend(tail);
     }
     if kept.is_empty() {
-        format!("<node.log had {} lines, none consensus-relevant>", text.lines().count())
+        format!(
+            "<node.log had {} lines, none consensus-relevant>",
+            text.lines().count()
+        )
     } else {
         kept.join("\n")
     }
@@ -368,9 +371,8 @@ fn native_request_lifecycle_stages_against_a_real_node_process() {
     };
 
     // Some(h) = the node answered; None = it did not answer at all.
-    let height = |port: u16| -> Option<u64> {
-        get_json(port, "/health").and_then(|h| h["height"].as_u64())
-    };
+    let height =
+        |port: u16| -> Option<u64> { get_json(port, "/health").and_then(|h| h["height"].as_u64()) };
     report.baseline_height = height(node.port).expect("node must answer /health at baseline");
 
     // STAGE 1 - admission. Submit immediately after readiness; do not wait for
@@ -490,7 +492,11 @@ fn native_request_lifecycle_stages_against_a_real_node_process() {
         !report.settlement_credits.is_empty(),
         "settlement produced no credits, so nothing was actually paid: {report:#?}"
     );
-    let paid: u64 = report.settlement_credits.iter().map(|(_, amount)| amount).sum();
+    let paid: u64 = report
+        .settlement_credits
+        .iter()
+        .map(|(_, amount)| amount)
+        .sum();
     let reserved = report
         .reserved_max_payment
         .expect("the receipt must report what the requester reserved");
@@ -584,7 +590,10 @@ struct Settlement {
 }
 
 fn settlement(port: u16, request_id: Hash256) -> Option<Settlement> {
-    let r = get_json(port, &format!("/native-inference/receipt/{}", request_id.to_hex()))?;
+    let r = get_json(
+        port,
+        &format!("/native-inference/receipt/{}", request_id.to_hex()),
+    )?;
     let mut credits: Vec<(String, u64)> = r["settlement_credits"]
         .as_array()?
         .iter()
@@ -600,7 +609,9 @@ fn settlement(port: u16, request_id: Hash256) -> Option<Settlement> {
     Some(Settlement {
         status: r["observed_status"].as_str().unwrap_or("").to_string(),
         credits,
-        terminal_tx: r["terminal_transaction"]["tx_hash"].as_str().map(str::to_string),
+        terminal_tx: r["terminal_transaction"]["tx_hash"]
+            .as_str()
+            .map(str::to_string),
         terminal_height: r["terminal_transaction"]["block_height"].as_u64(),
         output_hash: r["output_hash"].as_str().map(str::to_string),
     })
@@ -645,10 +656,21 @@ fn paid_flow_across_concurrent_independent_stores() {
 
     let (tx_a, id_a) = fx_a.signed_request(domain_of(node_a.port), 0, u64::MAX / 2, fx_a.allowed);
     let (tx_b, id_b) = fx_b.signed_request(domain_of(node_b.port), 0, u64::MAX / 2, fx_b.allowed);
-    assert_ne!(id_a, id_b, "the two stores must not produce the same request id");
+    assert_ne!(
+        id_a, id_b,
+        "the two stores must not produce the same request id"
+    );
 
-    assert_eq!(submit(node_a.port, &tx_a).0, 200, "store A must admit its own request");
-    assert_eq!(submit(node_b.port, &tx_b).0, 200, "store B must admit its own request");
+    assert_eq!(
+        submit(node_a.port, &tx_a).0,
+        200,
+        "store A must admit its own request"
+    );
+    assert_eq!(
+        submit(node_b.port, &tx_b).0,
+        200,
+        "store B must admit its own request"
+    );
 
     let finalized = |port: u16, id: Hash256| -> Settlement {
         let mut last = None;
@@ -661,7 +683,10 @@ fn paid_flow_across_concurrent_independent_stores() {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        panic!("no Finalized receipt on port {port} for {}: {last:?}", id.to_hex());
+        panic!(
+            "no Finalized receipt on port {port} for {}: {last:?}",
+            id.to_hex()
+        );
     };
     let settled_a = finalized(node_a.port, id_a);
     let settled_b = finalized(node_b.port, id_b);
@@ -670,10 +695,20 @@ fn paid_flow_across_concurrent_independent_stores() {
     for (label, s) in [("A", &settled_a), ("B", &settled_b)] {
         let total: u64 = s.credits.iter().map(|(_, amount)| amount).sum();
         assert!(total > 0, "store {label} settled nothing: {s:?}");
-        assert!(s.terminal_tx.is_some(), "store {label} has no terminal transaction: {s:?}");
-        assert!(s.output_hash.is_some(), "store {label} has no output hash: {s:?}");
+        assert!(
+            s.terminal_tx.is_some(),
+            "store {label} has no terminal transaction: {s:?}"
+        );
+        assert!(
+            s.output_hash.is_some(),
+            "store {label} has no output hash: {s:?}"
+        );
         let payees: std::collections::HashSet<_> = s.credits.iter().map(|(p, _)| p).collect();
-        assert_eq!(payees.len(), s.credits.len(), "store {label} credits a payee twice: {s:?}");
+        assert_eq!(
+            payees.len(),
+            s.credits.len(),
+            "store {label} credits a payee twice: {s:?}"
+        );
     }
 
     // ── receipt identity ─────────────────────────────────────────────────────
@@ -723,11 +758,13 @@ fn paid_flow_across_concurrent_independent_stores() {
     node_a.kill();
     std::thread::sleep(Duration::from_secs(1));
     let mut node_a = fx_a.spawn("store-a", 9963, 9163, &data_a);
-    wait_for(Duration::from_secs(90), "store A health after restart", || {
-        get_json(node_a.port, "/health").is_some()
-    });
-    let after_restart = settlement(node_a.port, id_a)
-        .expect("store A must still hold its receipt after a restart");
+    wait_for(
+        Duration::from_secs(90),
+        "store A health after restart",
+        || get_json(node_a.port, "/health").is_some(),
+    );
+    let after_restart =
+        settlement(node_a.port, id_a).expect("store A must still hold its receipt after a restart");
     assert_eq!(
         after_restart, settled_a,
         "the receipt, its settlement credits and its terminal transaction must survive a restart \

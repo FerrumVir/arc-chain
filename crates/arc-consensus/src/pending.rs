@@ -330,7 +330,10 @@ mod tests {
         let mut p = PendingBlocks::new();
         let b = block(10, b"ahead", vec![]);
         assert!(p.hold(b.clone(), vec![], vec![], Instant::now()));
-        assert!(p.release_up_to_round(7).is_empty(), "round 10 is not reachable from 7");
+        assert!(
+            p.release_up_to_round(7).is_empty(),
+            "round 10 is not reachable from 7"
+        );
         let ready = p.release_up_to_round(9);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0.hash, b.hash);
@@ -344,7 +347,12 @@ mod tests {
             let parent = hash_bytes(&(i as u64).to_le_bytes());
             // distinct authors so the per-author cap is not what bounds it
             let b = block(i as u64 + 1, &(i as u64).to_be_bytes(), vec![parent]);
-            p.hold(b, vec![], vec![parent], t0 + Duration::from_micros(i as u64));
+            p.hold(
+                b,
+                vec![],
+                vec![parent],
+                t0 + Duration::from_micros(i as u64),
+            );
         }
         assert_eq!(p.len(), MAX_PENDING_BLOCKS);
         assert_eq!(p.evicted_full, 10);
@@ -386,7 +394,10 @@ mod tests {
         p.hold(block(9, b"late", vec![root]), vec![], vec![root], t);
         p.hold(block(7, b"early", vec![root]), vec![], vec![root], t);
         let ready = p.release_on(&root);
-        assert_eq!(ready.iter().map(|(b, _)| b.round).collect::<Vec<_>>(), vec![7, 9]);
+        assert_eq!(
+            ready.iter().map(|(b, _)| b.round).collect::<Vec<_>>(),
+            vec![7, 9]
+        );
     }
 
     #[test]

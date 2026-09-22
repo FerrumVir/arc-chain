@@ -20,7 +20,9 @@ use arc_inference::cached_integer_model::{
     GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, KVCache,
     load_cached_model_canonical_i8_interleaved_rope,
 };
-use arc_inference::llama_spm_tokenizer::{GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1, LlamaGgufSpmTokenizer};
+use arc_inference::llama_spm_tokenizer::{
+    GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1, LlamaGgufSpmTokenizer,
+};
 use arc_inference::model_artifact::ModelArtifactCommitment;
 use serde_json::json;
 use std::io::Write;
@@ -48,7 +50,10 @@ fn main() {
     let text_path = arg(&args, "--text").expect("--text PATH");
     let n_ctx: usize = arg(&args, "--ctx").map_or(512, |v| v.parse().expect("--ctx"));
     let max_chunks: usize = arg(&args, "--chunks").map_or(20, |v| v.parse().expect("--chunks"));
-    assert!(n_ctx >= 4 && n_ctx % 2 == 0, "--ctx must be even and at least 4");
+    assert!(
+        n_ctx >= 4 && n_ctx % 2 == 0,
+        "--ctx must be even and at least 4"
+    );
 
     let artifact = ModelArtifactCommitment::from_path(&model_path).expect("hash artifact");
     let tokenizer = LlamaGgufSpmTokenizer::from_gguf(&model_path).expect("tokenizer");
@@ -67,7 +72,10 @@ fn main() {
         model.canonical_execution_profile(),
         Some(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
     );
-    assert!(n_ctx <= model.config.max_seq, "--ctx exceeds the model window");
+    assert!(
+        n_ctx <= model.config.max_seq,
+        "--ctx exceeds the model window"
+    );
     let load_s = load.elapsed().as_secs_f64();
     let bos = tokens[0];
 
@@ -100,7 +108,9 @@ fn main() {
         total_nll += chunk_nll;
         scored += count;
         let running = (total_nll / scored as f64).exp();
-        per_chunk.push(json!({"chunk": chunk, "nll_mean": chunk_nll / count as f64, "running_ppl": running}));
+        per_chunk.push(
+            json!({"chunk": chunk, "nll_mean": chunk_nll / count as f64, "running_ppl": running}),
+        );
         eprintln!("[{}/{}] running PPL {running:.4}", chunk + 1, chunks);
     }
     let ppl = (total_nll / scored.max(1) as f64).exp();
