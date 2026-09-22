@@ -117,6 +117,30 @@ pub struct SnapshotPayload {
 }
 
 impl SnapshotPayload {
+    /// Whether a certified state root over this payload authenticates
+    /// everything in it, on a chain whose own recovery context is `local`.
+    ///
+    /// Only the recovery state root commits to every consensus domain
+    /// (accounts, storage, contracts, identities, validators, staking). On a
+    /// chain without a recovery context the root is the legacy account-only
+    /// Merkle root, so the rest of a checkpoint would be taken on the
+    /// serving peer's word. A payload from a different recovery context is
+    /// another chain's state. Both are refused; see
+    /// docs/design/checkpoint-rejoin.md.
+    pub fn root_covers_everything_under(
+        &self,
+        local: Option<&RecoveryContext>,
+    ) -> Result<(), &'static str> {
+        match (local, self.recovery_context.as_ref()) {
+            (None, _) => Err(
+                "this chain's state root commits to accounts only; a checkpoint cannot \
+                 authenticate its other domains",
+            ),
+            (Some(local), Some(payload)) if local == payload => Ok(()),
+            (Some(_), _) => Err("the checkpoint belongs to a different recovery context"),
+        }
+    }
+
     /// Put every collection in key order. Called before encoding so two nodes
     /// holding the same state produce the same bytes and the same digest.
     pub fn canonicalize(&mut self) {
@@ -339,6 +363,23 @@ mod tests {
             staking_pool: 7,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn only_a_full_domain_root_under_the_same_context_authenticates_a_checkpoint() {
+        let context = RecoveryContext::new("test", hash_bytes(b"genesis"), 1, 1);
+        let other = RecoveryContext::new("test", hash_bytes(b"genesis"), 2, 1);
+        let mut payload = payload_at(10);
+        // Account-only root: refused whatever the payload claims.
+        assert!(payload.root_covers_everything_under(None).is_err());
+        payload.recovery_context = Some(context.clone());
+        assert!(payload.root_covers_everything_under(None).is_err());
+        // Full-domain root, same context: authenticated.
+        assert!(payload.root_covers_everything_under(Some(&context)).is_ok());
+        // Another context, or none in the payload: refused.
+        assert!(payload.root_covers_everything_under(Some(&other)).is_err());
+        payload.recovery_context = None;
+        assert!(payload.root_covers_everything_under(Some(&context)).is_err());
     }
 
     #[test]

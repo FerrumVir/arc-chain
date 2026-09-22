@@ -99,8 +99,6 @@ pub enum IsolatedTransitionResult {
     },
 }
 
-/// Read-only pending request view reconstructed from bounded escrow metadata.
-
 /// How many native candidates one committed block's selection examines, in
 /// hash order. See `select_native_block_transactions`.
 pub const MAX_NATIVE_CANDIDATES_PER_BLOCK: usize = 64;
@@ -2123,7 +2121,7 @@ mod tests {
                 )
                 .is_err()
         );
-        let admitted = fixture.ledger.admit(request.clone(), b"input", 1).unwrap();
+        let _admitted = fixture.ledger.admit(request.clone(), b"input", 1).unwrap();
         let pending_root = fixture.ledger.state_root().unwrap();
         assert!(matches!(
             fixture.ledger.refund(request_id, 1),
@@ -2171,7 +2169,7 @@ mod tests {
         };
         assert!(fixture.ledger.admit(crossed, b"input", 4).is_err());
         assert_eq!(fixture.ledger.state_root().unwrap(), root);
-        // `admitted` holds no borrow of the ledger, so dropping it explicitly
+        // `_admitted` holds no borrow of the ledger, so dropping it explicitly
         // does nothing except extend its lifetime to this point.
         drop(fixture.ledger);
         std::fs::remove_dir_all(fixture.dir).unwrap();
@@ -2810,19 +2808,35 @@ mod tests {
                 .status,
             InferenceTransitionStatus::Refunded
         );
-        assert_rejected_unchanged(state, &[native_refund(state, &f.requester, 2, id)]);
-        assert_rejected_unchanged(
-            state,
-            &[native_finalize(
-                state,
-                &f.requester,
-                2,
-                id,
-                certificate(&f, id),
-            )],
-        );
+        let replayed_refund = native_refund(state, &f.requester, 2, id);
+        let late_finalize = native_finalize(state, &f.requester, 2, id, certificate(&f, id));
+        assert_rejected_unchanged(state, std::slice::from_ref(&replayed_refund));
+        assert_rejected_unchanged(state, std::slice::from_ref(&late_finalize));
+
+        // The refund survives a restart: same root, same Refunded receipt,
+        // same balance and nonce, and neither replay is admitted afterwards.
+        let root = state.get_state_root();
         let dir = f.dir.clone();
+        let prefunded = f.prefunded.clone();
+        let genesis = f.genesis;
+        let requester = f.requester.address();
         drop(f);
+        let reopened = StateDB::with_genesis_persistent(&prefunded, &dir, genesis).unwrap();
+        assert_eq!(reopened.get_state_root(), root);
+        assert_eq!(
+            reopened
+                .native_inference_receipt(id, c)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .status,
+            InferenceTransitionStatus::Refunded
+        );
+        let caller = reopened.get_account(&requester).unwrap();
+        assert_eq!((caller.balance, caller.nonce), (1000, 2));
+        assert_rejected_unchanged(&reopened, &[replayed_refund]);
+        assert_rejected_unchanged(&reopened, &[late_finalize]);
+        drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2841,7 +2855,7 @@ mod tests {
         *state.recovery_context.write() = None;
         state.activate_native_inference(f.context.clone()).unwrap();
         let mut variants = Vec::new();
-        for change in 0..8 {
+        for change in 0..12 {
             let mut job = req.job.clone();
             match change {
                 0 => job.domain.chain_genesis = Hash256::ZERO,
@@ -2851,6 +2865,13 @@ mod tests {
                 4 => job.max_tokens = 0,
                 5 => job.max_output_bytes = u32::MAX,
                 6 => job.expires_at = 1,
+                // Cross-domain replay: each domain component alone, signed
+                // afresh by the requester, is another chain's request.
+                7 => job.domain.recovery_epoch += 1,
+                8 => job.domain.validator_set_hash = Hash256([9; 32]),
+                // Each execution-tuple component alone.
+                9 => job.generation_hash = Hash256::ZERO,
+                10 => job.assignment_hash = Hash256::ZERO,
                 _ => job.nonce = 1,
             }
             let signed = InferenceRequest::sign(job, &f.requester).unwrap();
