@@ -16,8 +16,11 @@ pub const ONE: i64 = 1 << FRAC_BITS; // 65536
 /// small per-position errors compound into distribution noise that
 /// inflates PPL without affecting argmax.
 ///
-/// EXP_LUT[i] = round(exp(-(4096 - i) * 16.0 / 4096.0) * ONE)
-/// Entry 4096 is exp(0) = ONE. Entry 0 is exp(-16) ≈ 0.
+/// The table is defined by its recurrence, not by rounding exp():
+/// EXP_LUT[4096] = ONE and EXP_LUT[i] = (EXP_LUT[i + 1] * 65281) >> 16.
+/// Truncation accumulates, so entries sit up to 142 Q16 units below
+/// round(exp(-(4096 - i) / 256) * ONE); leading entries reach 0.
+/// Integer profile contract v1 §3.1 pins the recurrence and its digest.
 /// Memory: 4097 × 8 bytes ≈ 32 KB (fits L1 cache).
 pub const EXP_LUT_SIZE: usize = 4096;
 pub const EXP_LUT_RANGE: i64 = 16 * ONE; // covers [-16*ONE, 0]
@@ -41,9 +44,9 @@ pub static EXP_LUT: [i64; 4097] = {
     table
 };
 
-/// Integer exp for x <= 0 (Q16 fixed-point).
-/// Returns round(exp(x_real) * ONE) where x_real = x / ONE.
-/// Uses lookup table with linear interpolation. Deterministic on all platforms.
+/// Integer exp for x <= 0 (Q16 fixed-point): linear interpolation in
+/// [`EXP_LUT`], truncating. An approximation of exp(x / ONE) * ONE, not the
+/// rounded value. Deterministic on all platforms.
 pub fn integer_exp(x: i64) -> i64 {
     if x >= 0 {
         return ONE;
@@ -114,9 +117,11 @@ pub fn relu_i64(x: i64) -> i64 {
     if x > 0 { x } else { 0 }
 }
 
-/// Integer inverse square root: returns round(ONE / sqrt(x)) where x is Q16.
-/// Uses Newton-Raphson iteration starting from a rough estimate.
-/// Deterministic across all platforms (integer-only).
+/// Integer inverse square root of a Q16 value: exactly five Newton-Raphson
+/// steps from a bit-length estimate. The result is that iterate, not the
+/// rounded 1/sqrt (isqrt(128 * ONE) = 5795 where rounding gives 5793); the
+/// integer profile contract defines the algorithm. Integer-only and
+/// deterministic across all platforms.
 pub fn integer_isqrt(x: i64) -> i64 {
     if x <= 0 {
         return ONE * 100;

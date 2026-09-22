@@ -15,6 +15,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -27,7 +28,10 @@ pub const MAX_ROW_ID_BYTES: usize = 256;
 /// the worker, input frame, and OS.  A deployment must split a larger slice.
 pub const MAX_CANONICAL_ROW_FILE_BYTES: usize = 1_073_741_824;
 const ROW_FILE_MAGIC: &[u8; 8] = b"ARCROW01";
+/// Request frames carry `ROW_FRAME_MAGIC`, responses `ROW_RESPONSE_MAGIC`, so a
+/// request frame (or a worker that echoes one) is never read as a response.
 const ROW_FRAME_MAGIC: &[u8; 8] = b"ARCTP001";
+const ROW_RESPONSE_MAGIC: &[u8; 8] = b"ARCTR001";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +102,9 @@ pub enum TensorParallelError {
     MissingWorker(String),
     #[error("worker rejected row projection: {0}")]
     Worker(String),
+    /// The worker's connection had already closed: nothing was sent.
+    #[error("the row worker's connection is closed")]
+    Closed,
 }
 
 /// Validate that a stage has exactly one owner for every output row.  This is
@@ -162,6 +169,13 @@ pub trait RowWorker: Send + Sync {
         &self,
         request: RowProjectionRequest,
     ) -> Result<RowProjectionResponse, TensorParallelError>;
+
+    /// Whether the worker can still take a call. A transport that closes
+    /// itself after a failure (as [`SshStdioRowWorker`] does) says so here,
+    /// so its owner can reconnect it.
+    fn is_open(&self) -> bool {
+        true
+    }
 }
 
 /// Fallible projection interface consumed by the canonical-I8 forward adapter.
@@ -312,10 +326,35 @@ struct SshChild {
     stdout: ChildStdout,
 }
 
+/// The longest a single call to an SSH row worker may take, whatever it is
+/// configured with.
+pub const MAX_SSH_CALL_TIMEOUT_MS: u64 = 3_600_000;
+
 pub struct SshStdioRowWorker {
     worker_id: String,
     child: Mutex<Option<SshChild>>,
-    timeout: Duration,
+    timeout_ms: AtomicU64,
+    /// Set when the worker closes itself; read without waiting on a call.
+    closed: AtomicBool,
+}
+
+/// The remote command as the one string OpenSSH hands the remote shell: each
+/// argv element single-quoted, an embedded `'` written as `'\''` (close,
+/// escaped quote, reopen), so no element can end its quoting.
+fn remote_shell_command(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An absolute path of letters, digits and `._/-` only: OpenSSH reads it
+/// verbatim in a file-name option, with nothing to split, expand or unescape.
+pub fn is_plain_absolute_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
 }
 
 impl SshStdioRowWorker {
@@ -334,24 +373,38 @@ impl SshStdioRowWorker {
         if config.remote_command.iter().any(|arg| arg.contains('\0')) {
             return Err(TensorParallelError::Bounds);
         }
-        // OpenSSH hands the remote command to the remote shell as one string;
-        // quote each reviewed argv element here rather than claiming local
-        // Command argv semantics extend across SSH.
-        let remote = config
-            .remote_command
-            .iter()
-            .map(|arg| format!("'{}'", arg.replace('\'', "'\\\"'\\\"'")))
-            .collect::<Vec<_>>()
-            .join(" ");
+        // ssh splits UserKnownHostsFile on whitespace, expands `%`, `~` and
+        // `${VAR}`, and collapses backslashes: accept only a plain absolute
+        // path it reads as exactly this one file.
+        let known_hosts = config
+            .known_hosts
+            .to_str()
+            .filter(|path| is_plain_absolute_path(path))
+            .ok_or(TensorParallelError::Bounds)?;
+        let remote = remote_shell_command(&config.remote_command);
         let mut command = Command::new(&config.ssh_program);
         command
+            // No configuration file: a ControlMaster, ProxyCommand,
+            // KnownHostsCommand or host-key setting there could widen or
+            // bypass the pin. The target names the user (and, as
+            // ssh://user@host:port, the port); the key comes from ssh's
+            // default identities or an agent.
+            .arg("-F")
+            .arg("none")
             .arg("-oBatchMode=yes")
             .arg("-oStrictHostKeyChecking=yes")
-            .arg(format!(
-                "-oUserKnownHostsFile={}",
-                config.known_hosts.display()
-            ))
+            .arg(format!("-oUserKnownHostsFile={known_hosts}"))
+            .arg("-oGlobalKnownHostsFile=/dev/null")
+            .arg("-oUpdateHostKeys=no")
+            .arg("-oCheckHostIP=no")
+            .arg("-oControlPath=none")
             .arg("-oPasswordAuthentication=no")
+            // Bounded without a config file: an unreachable host fails within
+            // 10 s, a dead session within about 45 s (15 s keepalives, 2 missed
+            // before the next one fails).
+            .arg("-oConnectTimeout=10")
+            .arg("-oServerAliveInterval=15")
+            .arg("-oServerAliveCountMax=2")
             .arg("--")
             .arg(&config.target)
             .arg(remote)
@@ -378,11 +431,30 @@ impl SshStdioRowWorker {
                 stdin,
                 stdout,
             })),
-            timeout: config.timeout,
+            timeout_ms: AtomicU64::new(
+                u64::try_from(config.timeout.as_millis()).unwrap_or(u64::MAX),
+            ),
+            closed: AtomicBool::new(false),
         })
     }
 
-    fn fail_closed(slot: &mut Option<SshChild>, message: impl Into<String>) -> TensorParallelError {
+    /// Change the per-call timeout, e.g. after a first call that had to cover
+    /// the remote model load.
+    pub fn set_timeout(&self, timeout: Duration) {
+        self.timeout_ms.store(
+            u64::try_from(timeout.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    fn fail_closed(
+        &self,
+        slot: &mut Option<SshChild>,
+        message: impl Into<String>,
+    ) -> TensorParallelError {
+        self.closed.store(true, AtomicOrdering::Release);
         if let Some(mut child) = slot.take() {
             let _ = child.child.kill();
             let _ = child.child.wait();
@@ -393,16 +465,24 @@ impl SshStdioRowWorker {
 
 impl Drop for SshStdioRowWorker {
     fn drop(&mut self) {
-        if let Ok(slot) = self.child.get_mut() {
-            if let Some(mut c) = slot.take() {
-                let _ = c.child.kill();
-                let _ = c.child.wait();
-            }
+        // Even after a panic poisoned the lock, the ssh child is killed and
+        // reaped rather than leaked.
+        let slot = match self.child.get_mut() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(mut c) = slot.take() {
+            let _ = c.child.kill();
+            let _ = c.child.wait();
         }
     }
 }
 
 impl RowWorker for SshStdioRowWorker {
+    fn is_open(&self) -> bool {
+        !self.closed.load(AtomicOrdering::Acquire)
+    }
+
     fn project(
         &self,
         request: RowProjectionRequest,
@@ -413,34 +493,35 @@ impl RowWorker for SshStdioRowWorker {
             return Err(TensorParallelError::WrongCall);
         }
         let frame = encode_row_request(&request)?;
-        let mut slot = self
-            .child
-            .lock()
-            .map_err(|_| TensorParallelError::Worker("SSH worker mutex poisoned".into()))?;
-        let child = slot
-            .as_mut()
-            .ok_or_else(|| TensorParallelError::Worker("SSH worker is closed".into()))?;
-        let deadline = Instant::now() + self.timeout;
+        let mut slot = self.child.lock().map_err(|_| {
+            // A panic during a call left the session unusable, and this call
+            // sends nothing: the connection is closed.
+            self.closed.store(true, AtomicOrdering::Release);
+            TensorParallelError::Closed
+        })?;
+        let child = slot.as_mut().ok_or(TensorParallelError::Closed)?;
+        // Clamped, so no configured timeout can overflow the deadline.
+        let timeout = self
+            .timeout_ms
+            .load(AtomicOrdering::Relaxed)
+            .min(MAX_SSH_CALL_TIMEOUT_MS);
+        let deadline = Instant::now() + Duration::from_millis(timeout);
         let mut framed = Vec::with_capacity(frame.len() + 4);
         framed.extend_from_slice(&(frame.len() as u32).to_le_bytes());
         framed.extend_from_slice(&frame);
         if let Err(e) = write_timeout(&mut child.stdin, &framed, deadline) {
-            return Err(Self::fail_closed(
-                &mut slot,
-                format!("write SSH row frame: {e}"),
-            ));
+            return Err(self.fail_closed(&mut slot, format!("write SSH row frame: {e}")));
         }
         let raw = match read_framed_timeout(&mut child.stdout, deadline) {
             Ok(value) => value,
-            Err(error) => return Err(Self::fail_closed(&mut slot, error)),
+            Err(error) => return Err(self.fail_closed(&mut slot, error)),
         };
         let response = match decode_row_response(&raw) {
             Ok(value) => value,
             Err(error) => {
-                return Err(Self::fail_closed(
-                    &mut slot,
-                    format!("decode SSH row response: {error}"),
-                ));
+                return Err(
+                    self.fail_closed(&mut slot, format!("decode SSH row response: {error}"))
+                );
             }
         };
         if response.call_id != request.call_id
@@ -448,7 +529,7 @@ impl RowWorker for SshStdioRowWorker {
             || response.assignment != request.assignment
             || response.values.len() != request.assignment.rows()
         {
-            return Err(Self::fail_closed(
+            return Err(self.fail_closed(
                 &mut slot,
                 "SSH row response did not bind the request exactly",
             ));
@@ -518,7 +599,8 @@ fn tensor_from_byte(byte: u8) -> Result<TensorKey, TensorParallelError> {
     }
 }
 
-fn encode_row_request(request: &RowProjectionRequest) -> Result<Vec<u8>, TensorParallelError> {
+/// Encode a row request frame (coordinator to worker).
+pub fn encode_row_request(request: &RowProjectionRequest) -> Result<Vec<u8>, TensorParallelError> {
     if request.input.len() > MAX_ROW_INPUT_ELEMENTS {
         return Err(TensorParallelError::Bounds);
     }
@@ -549,9 +631,10 @@ fn encode_row_request(request: &RowProjectionRequest) -> Result<Vec<u8>, TensorP
     Ok(out)
 }
 
-fn decode_row_response(raw: &[u8]) -> Result<RowProjectionResponse, TensorParallelError> {
+/// Decode a row response frame (worker to coordinator).
+pub fn decode_row_response(raw: &[u8]) -> Result<RowProjectionResponse, TensorParallelError> {
     let mut bytes = raw;
-    if pull(&mut bytes, 8)? != ROW_FRAME_MAGIC {
+    if pull(&mut bytes, 8)? != ROW_RESPONSE_MAGIC {
         return Err(TensorParallelError::WrongIdentity);
     }
     let call_id = Hash256(
@@ -610,6 +693,238 @@ fn decode_row_response(raw: &[u8]) -> Result<RowProjectionResponse, TensorParall
         },
         values,
     })
+}
+
+/// Largest frame either side sends; the SSH reader refuses anything larger.
+pub const MAX_ROW_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// The header both frame directions carry: the call, the input it binds and
+/// the exact assignment. Byte layout identical to [`encode_row_request`].
+fn push_frame_header(
+    out: &mut Vec<u8>,
+    magic: &[u8; 8],
+    call_id: &Hash256,
+    input_hash: &Hash256,
+    a: &RowAssignment,
+) -> Result<(), TensorParallelError> {
+    push_bytes(out, magic);
+    push_bytes(out, &call_id.0);
+    push_bytes(out, &input_hash.0);
+    push_bytes(out, &a.artifact_id.0);
+    push_short(out, a.execution_profile.as_bytes())?;
+    push_bytes(
+        out,
+        &(a.layer.map(|v| v as i64).unwrap_or(-1)).to_le_bytes(),
+    );
+    out.push(a.tensor as u8);
+    push_bytes(out, &(a.row_start as u64).to_le_bytes());
+    push_bytes(out, &(a.row_end as u64).to_le_bytes());
+    push_short(out, a.worker_id.as_bytes())
+}
+
+fn pull_hash(bytes: &mut &[u8]) -> Result<Hash256, TensorParallelError> {
+    Ok(Hash256(
+        pull(bytes, 32)?
+            .try_into()
+            .map_err(|_| TensorParallelError::WrongShape)?,
+    ))
+}
+
+/// Inverse of [`push_frame_header`], with the same checks as
+/// [`decode_row_response`].
+fn pull_frame_header(
+    bytes: &mut &[u8],
+    magic: &[u8; 8],
+) -> Result<(Hash256, Hash256, RowAssignment), TensorParallelError> {
+    if pull(bytes, 8)? != magic {
+        return Err(TensorParallelError::WrongIdentity);
+    }
+    let call_id = pull_hash(bytes)?;
+    let input_hash = pull_hash(bytes)?;
+    let artifact_id = pull_hash(bytes)?;
+    let profile_len = pull_u16(bytes)?;
+    let execution_profile = std::str::from_utf8(pull(bytes, profile_len)?)
+        .map_err(|_| TensorParallelError::WrongShape)?
+        .to_string();
+    let layer = pull_i64(bytes)?;
+    let tensor = tensor_from_byte(pull(bytes, 1)?[0])?;
+    let row_start = pull_u64(bytes)? as usize;
+    let row_end = pull_u64(bytes)? as usize;
+    let worker_len = pull_u16(bytes)?;
+    let worker_id = std::str::from_utf8(pull(bytes, worker_len)?)
+        .map_err(|_| TensorParallelError::WrongShape)?
+        .to_string();
+    if execution_profile.len() > MAX_ROW_ID_BYTES || worker_id.len() > MAX_ROW_ID_BYTES {
+        return Err(TensorParallelError::WrongShape);
+    }
+    let assignment = RowAssignment {
+        artifact_id,
+        execution_profile,
+        layer: (layer >= 0).then_some(layer as usize),
+        tensor,
+        row_start,
+        row_end,
+        worker_id,
+    };
+    Ok((call_id, input_hash, assignment))
+}
+
+/// Decode a row request frame (the worker's side of [`encode_row_request`]).
+pub fn decode_row_request(raw: &[u8]) -> Result<RowProjectionRequest, TensorParallelError> {
+    let mut bytes = raw;
+    let (call_id, input_hash, assignment) = pull_frame_header(&mut bytes, ROW_FRAME_MAGIC)?;
+    let count = pull_u32(&mut bytes)?;
+    if count > MAX_ROW_INPUT_ELEMENTS || assignment.row_end <= assignment.row_start {
+        return Err(TensorParallelError::WrongShape);
+    }
+    let mut input = Vec::with_capacity(count);
+    for _ in 0..count {
+        input.push(pull_i64(&mut bytes)?);
+    }
+    if !bytes.is_empty() {
+        return Err(TensorParallelError::WrongShape);
+    }
+    Ok(RowProjectionRequest {
+        call_id,
+        input_hash,
+        assignment,
+        input,
+    })
+}
+
+/// Encode a row response frame (the worker's side of [`decode_row_response`]).
+pub fn encode_row_response(
+    response: &RowProjectionResponse,
+) -> Result<Vec<u8>, TensorParallelError> {
+    let a = &response.assignment;
+    if response.values.len() > MAX_ROW_OUTPUT_ELEMENTS || response.values.len() != a.rows() {
+        return Err(TensorParallelError::Bounds);
+    }
+    let mut out = Vec::with_capacity(
+        128 + a.execution_profile.len() + a.worker_id.len() + response.values.len() * 8,
+    );
+    push_frame_header(
+        &mut out,
+        ROW_RESPONSE_MAGIC,
+        &response.call_id,
+        &response.input_hash,
+        a,
+    )?;
+    push_bytes(&mut out, &(response.values.len() as u32).to_le_bytes());
+    for value in &response.values {
+        push_bytes(&mut out, &value.to_le_bytes());
+    }
+    if out.len() > MAX_ROW_FRAME_BYTES {
+        return Err(TensorParallelError::Bounds);
+    }
+    Ok(out)
+}
+
+/// The resident matrix of one projection of `model`.
+pub fn model_projection_weights(
+    model: &crate::cached_integer_model::CachedIntegerModel,
+    layer: Option<usize>,
+    tensor: TensorKey,
+) -> Option<&I8Weights> {
+    match (layer, tensor) {
+        (Some(layer), TensorKey::Wq) => model.layers.get(layer).map(|l| &l.wq),
+        (Some(layer), TensorKey::Wk) => model.layers.get(layer).map(|l| &l.wk),
+        (Some(layer), TensorKey::Wv) => model.layers.get(layer).map(|l| &l.wv),
+        (Some(layer), TensorKey::Wo) => model.layers.get(layer).map(|l| &l.wo),
+        (Some(layer), TensorKey::WGate) => model.layers.get(layer).map(|l| &l.w_gate),
+        (Some(layer), TensorKey::WUp) => model.layers.get(layer).map(|l| &l.w_up),
+        (Some(layer), TensorKey::WDown) => model.layers.get(layer).map(|l| &l.w_down),
+        (None, TensorKey::LmHead) => Some(&model.output_weight),
+        _ => None,
+    }
+}
+
+/// Rows `[start, end)` of `weights` applied to `input`, exactly as the
+/// canonical kernel computes them. Copies the rows first: correct, not yet
+/// fast (a row-range kernel entry is S11 work).
+fn rows_of(
+    weights: &I8Weights,
+    start: usize,
+    end: usize,
+    input: &[i64],
+) -> Result<Vec<i64>, TensorParallelError> {
+    let shard = weights
+        .copy_rows(start, end)
+        .map_err(|_| TensorParallelError::WrongShape)?;
+    if shard.n_cols != input.len() {
+        return Err(TensorParallelError::WrongShape);
+    }
+    let mut values = vec![0; shard.n_rows];
+    matmul_i8_canonical_rows(&shard, input, &mut values)
+        .map_err(|_| TensorParallelError::WrongShape)?;
+    Ok(values)
+}
+
+/// Serve row projections of a resident canonical model over length-prefixed
+/// frames: the private-cohort protocol [`SshStdioRowWorker`] speaks, for any
+/// assignment of this artifact and profile. For an operator's own machine
+/// that holds the whole artifact (the `tensor_row_model_worker` example), so
+/// a coordinator can place any rows on it. Returns at a clean end of input;
+/// the first malformed or mismatched request ends the session with an error,
+/// which the coordinator sees as a closed worker.
+pub fn serve_row_frames(
+    model: &crate::cached_integer_model::CachedIntegerModel,
+    artifact_id: Hash256,
+    input: &mut impl std::io::Read,
+    output: &mut impl std::io::Write,
+) -> Result<(), TensorParallelError> {
+    let io_error =
+        |what: &str, error: std::io::Error| TensorParallelError::Worker(format!("{what}: {error}"));
+    let profile = model
+        .canonical_execution_profile()
+        .ok_or(TensorParallelError::WrongIdentity)?;
+    loop {
+        let mut length = [0u8; 4];
+        let first = loop {
+            match input.read(&mut length[..1]) {
+                Ok(read) => break read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(io_error("read frame length", error)),
+            }
+        };
+        if first == 0 {
+            return Ok(());
+        }
+        input
+            .read_exact(&mut length[1..])
+            .map_err(|error| io_error("read frame length", error))?;
+        let length = u32::from_le_bytes(length) as usize;
+        if length == 0 || length > MAX_ROW_FRAME_BYTES {
+            return Err(TensorParallelError::Bounds);
+        }
+        let mut frame = vec![0u8; length];
+        input
+            .read_exact(&mut frame)
+            .map_err(|error| io_error("read frame", error))?;
+        let request = decode_row_request(&frame)?;
+        let a = &request.assignment;
+        if a.artifact_id != artifact_id || a.execution_profile != profile {
+            return Err(TensorParallelError::WrongIdentity);
+        }
+        if hash_i64(&request.input) != request.input_hash {
+            return Err(TensorParallelError::WrongCall);
+        }
+        let weights = model_projection_weights(model, a.layer, a.tensor)
+            .ok_or(TensorParallelError::WrongIdentity)?;
+        let values = rows_of(weights, a.row_start, a.row_end, &request.input)?;
+        let response = RowProjectionResponse {
+            call_id: request.call_id,
+            input_hash: request.input_hash,
+            assignment: request.assignment,
+            values,
+        };
+        let frame = encode_row_response(&response)?;
+        output
+            .write_all(&(frame.len() as u32).to_le_bytes())
+            .and_then(|()| output.write_all(&frame))
+            .and_then(|()| output.flush())
+            .map_err(|error| io_error("write frame", error))?;
+    }
 }
 
 #[cfg(unix)]
@@ -836,6 +1151,397 @@ impl ProjectionBackend for PartitionedProjectionBackend {
     }
 }
 
+/// Who computes one slice of a placed projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SliceOwner {
+    /// The coordinator, from its own resident rows.
+    Local,
+    /// A pinned worker, by its transport identity.
+    Remote(String),
+}
+
+/// One slice of a placed projection, and how it is checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedSlice {
+    pub owner: SliceOwner,
+    pub row_start: usize,
+    pub row_end: usize,
+    /// A second participant that recomputes this slice at every call. Any
+    /// difference is a fault (a duplicate check).
+    pub duplicate_on: Option<SliceOwner>,
+}
+
+/// A placed projection: slices in row order that cover every output row
+/// once, and the rows the coordinator recomputes itself at every call (spot
+/// checks).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProjectionPlan {
+    pub slices: Vec<PlannedSlice>,
+    pub spot_rows: Vec<usize>,
+}
+
+/// What the coordinator saw a remote worker do. Every fallback and every
+/// fault is reported; none is silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowEvent {
+    /// The worker answered a call: a timing sample for link measurement.
+    Answered {
+        worker: String,
+        rows: usize,
+        bytes: usize,
+        elapsed: Duration,
+    },
+    /// The worker is excluded for the epoch, or its connection is closed, so
+    /// the coordinator computed its slice without calling it. Reported, but
+    /// not a failure: a closed connection's calls would all fail at once.
+    Skipped {
+        worker: String,
+        layer: Option<usize>,
+        tensor: TensorKey,
+    },
+    /// The call failed, timed out or was refused; the coordinator computed
+    /// the slice from its own rows.
+    Fallback {
+        worker: String,
+        layer: Option<usize>,
+        tensor: TensorKey,
+        error: String,
+    },
+    /// Exact arithmetic disagreed on a checked slice or row; the coordinator
+    /// recomputed the slice and used its own rows.
+    Fault {
+        worker: String,
+        layer: Option<usize>,
+        tensor: TensorKey,
+        row_start: usize,
+        row_end: usize,
+        expected: Hash256,
+        found: Hash256,
+    },
+}
+
+/// Receives a backend's events and says which workers to skip.
+pub trait RowEventSink: Send + Sync {
+    fn record(&self, event: RowEvent);
+    /// Excluded for the rest of the epoch: its slices are computed locally.
+    fn is_excluded(&self, worker: &str) -> bool;
+}
+
+/// Row-partitioned projections with exact checks and per-call fallback (S5,
+/// S7 and S8 in the running node). A remote slice that fails is computed from
+/// the coordinator's own rows. A duplicate or spot check that disagrees makes
+/// the coordinator recompute the slice and use its own rows. Both are
+/// reported through the sink, so the output equals the local forward whenever
+/// every row that fed it passed its checks or was computed locally. Rows that
+/// no check covered are trusted, which is why only this operator's own
+/// machines may feed a vote (docs/design/assignment-node-integration.md,
+/// trust model).
+pub struct VerifiedPartitionBackend<'a> {
+    model: &'a crate::cached_integer_model::CachedIntegerModel,
+    artifact_id: Hash256,
+    profile: String,
+    plans: BTreeMap<(Option<usize>, TensorKey), ProjectionPlan>,
+    workers: BTreeMap<String, Arc<dyn RowWorker>>,
+    events: &'a dyn RowEventSink,
+}
+
+impl<'a> VerifiedPartitionBackend<'a> {
+    pub fn new(
+        model: &'a crate::cached_integer_model::CachedIntegerModel,
+        artifact_id: Hash256,
+        plans: BTreeMap<(Option<usize>, TensorKey), ProjectionPlan>,
+        workers: BTreeMap<String, Arc<dyn RowWorker>>,
+        events: &'a dyn RowEventSink,
+    ) -> Result<Self, TensorParallelError> {
+        let profile = model
+            .canonical_execution_profile()
+            .ok_or(TensorParallelError::WrongIdentity)?
+            .to_string();
+        Ok(Self {
+            model,
+            artifact_id,
+            profile,
+            plans,
+            workers,
+            events,
+        })
+    }
+
+    fn local(
+        &self,
+        layer: Option<usize>,
+        tensor: TensorKey,
+        start: usize,
+        end: usize,
+        input: &[i64],
+    ) -> Result<Vec<i64>, TensorParallelError> {
+        let weights = model_projection_weights(self.model, layer, tensor)
+            .ok_or(TensorParallelError::WrongIdentity)?;
+        rows_of(weights, start, end, input)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remote(
+        &self,
+        worker: &str,
+        call_id: Hash256,
+        input_hash: Hash256,
+        layer: Option<usize>,
+        tensor: TensorKey,
+        start: usize,
+        end: usize,
+        input: &[i64],
+    ) -> Result<Vec<i64>, TensorParallelError> {
+        let client = self
+            .workers
+            .get(worker)
+            .ok_or_else(|| TensorParallelError::MissingWorker(worker.to_string()))?;
+        let assignment = RowAssignment {
+            artifact_id: self.artifact_id,
+            execution_profile: self.profile.clone(),
+            layer,
+            tensor,
+            row_start: start,
+            row_end: end,
+            worker_id: worker.to_string(),
+        };
+        let started = Instant::now();
+        let response = client.project(RowProjectionRequest {
+            call_id,
+            input_hash,
+            assignment: assignment.clone(),
+            input: input.to_vec(),
+        })?;
+        if response.call_id != call_id || response.input_hash != input_hash {
+            return Err(TensorParallelError::WrongCall);
+        }
+        if response.assignment != assignment || response.values.len() != end - start {
+            return Err(TensorParallelError::WrongShape);
+        }
+        self.events.record(RowEvent::Answered {
+            worker: worker.to_string(),
+            rows: end - start,
+            bytes: (input.len() + (end - start)) * std::mem::size_of::<i64>(),
+            elapsed: started.elapsed(),
+        });
+        Ok(response.values)
+    }
+
+    /// One participant's rows for a slice: `Ok(None)` when a remote call
+    /// failed (reported as a fallback), so the caller computes it locally.
+    #[allow(clippy::too_many_arguments)]
+    fn attempt(
+        &self,
+        owner: &SliceOwner,
+        call_id: Hash256,
+        input_hash: Hash256,
+        layer: Option<usize>,
+        tensor: TensorKey,
+        start: usize,
+        end: usize,
+        input: &[i64],
+    ) -> Result<Option<Vec<i64>>, TensorParallelError> {
+        match owner {
+            SliceOwner::Local => self.local(layer, tensor, start, end, input).map(Some),
+            SliceOwner::Remote(worker)
+                if self.events.is_excluded(worker)
+                    || !self
+                        .workers
+                        .get(worker)
+                        .is_some_and(|client| client.is_open()) =>
+            {
+                self.events.record(RowEvent::Skipped {
+                    worker: worker.clone(),
+                    layer,
+                    tensor,
+                });
+                Ok(None)
+            }
+            SliceOwner::Remote(worker) => {
+                match self.remote(
+                    worker, call_id, input_hash, layer, tensor, start, end, input,
+                ) {
+                    Ok(values) => Ok(Some(values)),
+                    // The connection closed between the check and the call:
+                    // nothing was sent, so this is a skip, not a failure.
+                    Err(TensorParallelError::Closed) => {
+                        self.events.record(RowEvent::Skipped {
+                            worker: worker.clone(),
+                            layer,
+                            tensor,
+                        });
+                        Ok(None)
+                    }
+                    Err(error) => {
+                        self.events.record(RowEvent::Fallback {
+                            worker: worker.clone(),
+                            layer,
+                            tensor,
+                            error: error.to_string(),
+                        });
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    /// A slice's rows after its checks.
+    #[allow(clippy::too_many_arguments)]
+    fn slice_rows(
+        &self,
+        slice: &PlannedSlice,
+        spot_rows: &[usize],
+        call_id: Hash256,
+        input_hash: Hash256,
+        layer: Option<usize>,
+        tensor: TensorKey,
+        input: &[i64],
+    ) -> Result<Vec<i64>, TensorParallelError> {
+        let (start, end) = (slice.row_start, slice.row_end);
+        let Some(values) = self.attempt(
+            &slice.owner,
+            call_id,
+            input_hash,
+            layer,
+            tensor,
+            start,
+            end,
+            input,
+        )?
+        else {
+            return self.local(layer, tensor, start, end, input);
+        };
+        let SliceOwner::Remote(worker) = &slice.owner else {
+            // The coordinator's own rows need no check.
+            return Ok(values);
+        };
+        let fault = |expected: &[i64]| {
+            self.events.record(RowEvent::Fault {
+                worker: worker.clone(),
+                layer,
+                tensor,
+                row_start: start,
+                row_end: end,
+                expected: hash_i64(expected),
+                found: hash_i64(&values),
+            });
+        };
+        if let Some(checker) = &slice.duplicate_on {
+            let second = self.attempt(
+                checker, call_id, input_hash, layer, tensor, start, end, input,
+            )?;
+            if second.as_deref() != Some(values.as_slice()) {
+                // Disagreement, or no second answer: the coordinator's own
+                // rows decide, and are what the forward uses.
+                let own = self.local(layer, tensor, start, end, input)?;
+                if own != values {
+                    fault(&own);
+                }
+                if let (Some(second), SliceOwner::Remote(checker_id)) = (&second, checker)
+                    && *second != own
+                {
+                    self.events.record(RowEvent::Fault {
+                        worker: checker_id.clone(),
+                        layer,
+                        tensor,
+                        row_start: start,
+                        row_end: end,
+                        expected: hash_i64(&own),
+                        found: hash_i64(second),
+                    });
+                }
+                return Ok(own);
+            }
+        }
+        for &row in spot_rows.iter().filter(|row| (start..end).contains(*row)) {
+            let own_row = self.local(layer, tensor, row, row + 1, input)?;
+            if own_row[0] != values[row - start] {
+                let own = self.local(layer, tensor, start, end, input)?;
+                fault(&own);
+                return Ok(own);
+            }
+        }
+        Ok(values)
+    }
+}
+
+impl ProjectionBackend for VerifiedPartitionBackend<'_> {
+    fn project_rows(
+        &self,
+        call_id: Hash256,
+        layer: Option<usize>,
+        tensor: TensorKey,
+        input: &[i64],
+        output_rows: usize,
+    ) -> Result<Vec<i64>, TensorParallelError> {
+        if input.len() > MAX_ROW_INPUT_ELEMENTS || output_rows > MAX_ROW_OUTPUT_ELEMENTS {
+            return Err(TensorParallelError::Bounds);
+        }
+        let plan =
+            self.plans
+                .get(&(layer, tensor))
+                .ok_or(TensorParallelError::IncompleteCoverage {
+                    expected: output_rows,
+                    covered: 0,
+                })?;
+        let mut cursor = 0usize;
+        for slice in &plan.slices {
+            if slice.row_end <= slice.row_start {
+                return Err(TensorParallelError::InvalidRange {
+                    start: slice.row_start,
+                    end: slice.row_end,
+                });
+            }
+            if slice.row_start != cursor {
+                return Err(TensorParallelError::Overlap {
+                    row: slice.row_start,
+                });
+            }
+            cursor = slice.row_end;
+        }
+        if cursor != output_rows {
+            return Err(TensorParallelError::IncompleteCoverage {
+                expected: output_rows,
+                covered: cursor,
+            });
+        }
+        let input_hash = hash_i64(input);
+        let results: Vec<Result<Vec<i64>, TensorParallelError>> = std::thread::scope(|scope| {
+            let joins: Vec<_> = plan
+                .slices
+                .iter()
+                .map(|slice| {
+                    scope.spawn(move || {
+                        self.slice_rows(
+                            slice,
+                            &plan.spot_rows,
+                            call_id,
+                            input_hash,
+                            layer,
+                            tensor,
+                            input,
+                        )
+                    })
+                })
+                .collect();
+            joins
+                .into_iter()
+                .map(|join| {
+                    join.join()
+                        .map_err(|_| TensorParallelError::Worker("slice task panicked".into()))
+                        .and_then(|rows| rows)
+                })
+                .collect()
+        });
+        let mut values = Vec::with_capacity(output_rows);
+        for rows in results {
+            values.extend(rows?);
+        }
+        Ok(values)
+    }
+}
+
 pub fn hash_i64(values: &[i64]) -> Hash256 {
     let mut hasher = blake3::Hasher::new();
     for value in values {
@@ -937,6 +1643,242 @@ pub fn export_verified_model_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_frames_round_trip_in_both_directions() {
+        let input = vec![3, -4, 5];
+        let request = RowProjectionRequest {
+            call_id: Hash256([1; 32]),
+            input_hash: hash_i64(&input),
+            assignment: RowAssignment {
+                artifact_id: Hash256([7; 32]),
+                execution_profile: "canonical".into(),
+                layer: Some(2),
+                tensor: TensorKey::Wq,
+                row_start: 2,
+                row_end: 5,
+                worker_id: "worker-a".into(),
+            },
+            input,
+        };
+        let frame = encode_row_request(&request).unwrap();
+        let decoded = decode_row_request(&frame).unwrap();
+        assert_eq!(
+            (
+                decoded.call_id,
+                decoded.input_hash,
+                &decoded.assignment,
+                &decoded.input
+            ),
+            (
+                request.call_id,
+                request.input_hash,
+                &request.assignment,
+                &request.input
+            )
+        );
+        assert!(decode_row_request(&frame[..frame.len() - 1]).is_err());
+        let mut longer = frame.clone();
+        longer.push(0);
+        assert!(decode_row_request(&longer).is_err());
+
+        let response = RowProjectionResponse {
+            call_id: request.call_id,
+            input_hash: request.input_hash,
+            assignment: request.assignment.clone(),
+            values: vec![7, 8, -9],
+        };
+        let decoded = decode_row_response(&encode_row_response(&response).unwrap()).unwrap();
+        assert_eq!(
+            (
+                decoded.call_id,
+                decoded.input_hash,
+                &decoded.assignment,
+                &decoded.values
+            ),
+            (
+                response.call_id,
+                response.input_hash,
+                &response.assignment,
+                &response.values
+            )
+        );
+        // A response must carry exactly its assignment's rows.
+        let mut short = response.clone();
+        short.values.pop();
+        assert!(encode_row_response(&short).is_err());
+        // A request frame is not a response frame, nor the other way round,
+        // even when its payload has exactly the assignment's row count.
+        assert!(decode_row_response(&frame).is_err());
+        assert!(decode_row_request(&encode_row_response(&response).unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_remote_command_reaches_the_remote_shell_exactly() {
+        // OpenSSH hands the remote shell one string; a POSIX shell parses it
+        // back. Every argument must come back byte for byte, and nothing in
+        // one may run: apostrophes, command substitution, quotes, spaces.
+        let args: Vec<String> = [
+            "/opt/arc/tensor_row_model_worker",
+            "--model",
+            "/data/it's a model.gguf",
+            "x';echo INJECTED;'",
+            "$(echo substituted)",
+            "a\"b",
+            "''",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        let script = format!("printf '%s\\n' {}", remote_shell_command(&args));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let printed: Vec<String> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(printed, args);
+    }
+
+    /// A throwaway "ssh" program: it ignores its arguments, waits
+    /// `delay_secs`, writes `replies` (length-prefixed frames) to stdout and
+    /// then holds the session open. Returns the worker and the directory.
+    #[cfg(unix)]
+    fn fake_ssh_worker(
+        name: &str,
+        replies: &[u8],
+        delay_secs: u32,
+        timeout: Duration,
+    ) -> (SshStdioRowWorker, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("arc-row-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let known_hosts = dir.join("known_hosts");
+        std::fs::write(&known_hosts, "").unwrap();
+        let replies_path = dir.join("replies");
+        std::fs::write(&replies_path, replies).unwrap();
+        let program = dir.join("fake-ssh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nsleep {delay_secs}\ncat '{}'\nexec sleep 30\n",
+                replies_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worker = SshStdioRowWorker::connect(
+            name.into(),
+            SshStdioConfig {
+                ssh_program: program,
+                target: "worker.invalid".into(),
+                known_hosts,
+                remote_command: vec!["/opt/arc/tensor_row_model_worker".into()],
+                timeout,
+            },
+        )
+        .unwrap();
+        (worker, dir)
+    }
+
+    #[cfg(unix)]
+    fn framed(response: &RowProjectionResponse, copies: usize) -> Vec<u8> {
+        let frame = encode_row_response(response).unwrap();
+        let mut out = Vec::new();
+        for _ in 0..copies {
+            out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame);
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replayed_answer_is_refused_and_the_session_closes() {
+        // A misbehaving worker answers the first call, then sends the same
+        // answer again. The next call reads that copy: it binds another call,
+        // so it is refused, the session is closed, and nothing further is
+        // sent or read.
+        let a = assignment(0, 2, "replay");
+        let input = vec![3i64, -4];
+        let first = RowProjectionRequest {
+            call_id: id(1),
+            input_hash: hash_i64(&input),
+            assignment: a.clone(),
+            input,
+        };
+        let answer = RowProjectionResponse {
+            call_id: first.call_id,
+            input_hash: first.input_hash,
+            assignment: a,
+            values: vec![5, 6],
+        };
+        let (worker, dir) =
+            fake_ssh_worker("replay", &framed(&answer, 2), 0, Duration::from_secs(10));
+        assert_eq!(worker.project(first.clone()).unwrap().values, vec![5, 6]);
+        let second = RowProjectionRequest {
+            call_id: id(2),
+            ..first
+        };
+        let refused = worker.project(second.clone()).unwrap_err();
+        assert!(
+            matches!(&refused, TensorParallelError::Worker(message) if message.contains("did not bind")),
+            "{refused:?}"
+        );
+        assert!(!worker.is_open());
+        assert_eq!(
+            worker.project(second).unwrap_err(),
+            TensorParallelError::Closed
+        );
+        drop(worker);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_late_answer_is_never_read_by_a_later_call() {
+        // The answer arrives after the call's deadline. The call fails and
+        // the session is killed, so the late answer can never be taken as the
+        // answer to the next call.
+        let a = assignment(0, 2, "late");
+        let input = vec![1i64, 2];
+        let request = RowProjectionRequest {
+            call_id: id(3),
+            input_hash: hash_i64(&input),
+            assignment: a.clone(),
+            input,
+        };
+        let answer = RowProjectionResponse {
+            call_id: request.call_id,
+            input_hash: request.input_hash,
+            assignment: a,
+            values: vec![7, 8],
+        };
+        let (worker, dir) =
+            fake_ssh_worker("late", &framed(&answer, 1), 2, Duration::from_millis(200));
+        let started = Instant::now();
+        assert!(matches!(
+            worker.project(request.clone()).unwrap_err(),
+            TensorParallelError::Worker(_)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the deadline, not the answer, ended the call"
+        );
+        assert!(!worker.is_open());
+        assert_eq!(
+            worker.project(request).unwrap_err(),
+            TensorParallelError::Closed
+        );
+        drop(worker);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn id(value: u8) -> Hash256 {
         Hash256([value; 32])

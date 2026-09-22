@@ -62,19 +62,31 @@ fn main() {
     let mut model = None;
     let mut reference_bin = None;
     let mut output_jsonl = None;
+    let mut corpus = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--model" => model = args.next(),
             "--reference-bin" => reference_bin = args.next(),
             "--output-jsonl" => output_jsonl = args.next(),
+            // One JSON object per line with a "text" field, e.g.
+            // scripts/arc_conformance/data/tokenizer_corpus.jsonl (M3).
+            "--corpus" => corpus = args.next(),
             "--help" | "-h" => {
                 println!(
-                    "usage: validate_llama_spm_tokenizer --model GGUF --reference-bin LLAMA_TOKENIZE [--output-jsonl PATH]"
+                    "usage: validate_llama_spm_tokenizer --model GGUF --reference-bin LLAMA_TOKENIZE [--corpus JSONL] [--output-jsonl PATH]"
                 );
                 return;
             }
             _ => panic!("unknown argument: {flag}"),
+        }
+    }
+    let mut texts: Vec<String> = VECTORS.iter().map(|text| (*text).to_string()).collect();
+    if let Some(path) = corpus {
+        let body = std::fs::read_to_string(&path).expect("read --corpus");
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            let case: serde_json::Value = serde_json::from_str(line).expect("corpus line is JSON");
+            texts.push(case["text"].as_str().expect("corpus case has a text").to_string());
         }
     }
     let model = model.expect("--model is required");
@@ -83,7 +95,7 @@ fn main() {
         LlamaGgufSpmTokenizer::from_gguf(&model).expect("load header-only LLaMA SPM tokenizer");
     assert_eq!(tokenizer.profile(), GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1);
     let mut records = Vec::new();
-    for text in VECTORS {
+    for text in &texts {
         let reference =
             reference_ids(&reference_bin, &model, text).expect("reference tokenization");
         let arc = tokenizer.encode_prompt(text).expect("ARC SPM tokenization");

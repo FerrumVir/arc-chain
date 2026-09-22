@@ -14,10 +14,12 @@ pub mod committee;
 pub mod distributed;
 pub mod gas;
 pub mod gguf_integer;
+pub mod gguf_meta;
 pub mod integer_engine;
 pub mod integer_lut;
 pub mod llama_spm_tokenizer;
 pub mod model_artifact;
+pub mod model_package;
 pub mod q4_engine;
 pub mod streaming;
 /// Private-cohort, within-query tensor row partitioning.  This deliberately

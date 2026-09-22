@@ -172,6 +172,35 @@ impl LlamaGgufSpmTokenizer {
         GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1
     }
 
+    /// The BOS id that [`Self::encode_prompt`] prepends.
+    pub fn bos_token(&self) -> u32 {
+        self.bos_token
+    }
+
+    /// Number of pieces in the vocabulary.
+    pub fn vocab_len(&self) -> usize {
+        self.pieces.len()
+    }
+
+    /// BLAKE3 over the vocabulary, as the package manifest records it
+    /// (`tokenizer.vocab_blake3`): for each id in order, the piece's UTF-8
+    /// length (u32 LE) and bytes, its score (f32 LE) and its type (i32 LE).
+    pub fn vocabulary_digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        for ((piece, score), kind) in self.pieces.iter().zip(&self.scores).zip(&self.types) {
+            hasher.update(&(piece.len() as u32).to_le_bytes());
+            hasher.update(piece.as_bytes());
+            hasher.update(&score.to_le_bytes());
+            hasher.update(&kind.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    /// End-of-generation ids, as read from the file.
+    pub fn eos_tokens(&self) -> &[u32] {
+        &self.eos_tokens
+    }
+
     /// Decode generated content while stopping before EOG and suppressing
     /// BOS/control pieces. This is the content-facing companion to token
     /// trace APIs, which retain the terminal EOG for exact comparisons.

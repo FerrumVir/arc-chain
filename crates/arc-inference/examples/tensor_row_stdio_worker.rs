@@ -14,6 +14,8 @@ use std::io::{self, Read, Write};
 
 const FILE_MAGIC: &[u8; 8] = b"ARCROW01";
 const FRAME_MAGIC: &[u8; 8] = b"ARCTP001";
+/// Responses carry their own magic, so a request can never be read as one.
+const RESPONSE_MAGIC: &[u8; 8] = b"ARCTR001";
 const MAX_FILE: usize = 1_073_741_824;
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 fn hash_values(values: &[i64]) -> [u8; 32] {
@@ -291,7 +293,7 @@ fn main() -> io::Result<()> {
                 + 4
                 + values.len() * 8,
         );
-        reply.extend_from_slice(FRAME_MAGIC);
+        reply.extend_from_slice(RESPONSE_MAGIC);
         reply.extend_from_slice(&call);
         reply.extend_from_slice(&input_hash);
         reply.extend_from_slice(&shard.artifact);

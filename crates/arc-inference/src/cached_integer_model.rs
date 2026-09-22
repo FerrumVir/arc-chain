@@ -580,6 +580,49 @@ impl std::fmt::Display for GenerationError {
 
 impl std::error::Error for GenerationError {}
 
+/// Why a generation whose projections come from a backend stopped.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackendGenerationError {
+    /// Refused before any compute, exactly as
+    /// [`CachedIntegerModel::try_generate_v2`] refuses.
+    Generation(GenerationError),
+    /// The backend could not supply exact rows for a projection.
+    Projection(crate::tensor_parallel::TensorParallelError),
+}
+
+impl std::fmt::Display for BackendGenerationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Generation(error) => write!(f, "{error}"),
+            Self::Projection(error) => write!(f, "row projection failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for BackendGenerationError {}
+
+impl From<GenerationError> for BackendGenerationError {
+    fn from(error: GenerationError) -> Self {
+        Self::Generation(error)
+    }
+}
+
+impl From<crate::tensor_parallel::TensorParallelError> for BackendGenerationError {
+    fn from(error: crate::tensor_parallel::TensorParallelError) -> Self {
+        Self::Projection(error)
+    }
+}
+
+/// The call id of the forward at `position` of one backend generation: it
+/// binds the request and the position, so a worker's answer for one position
+/// is never accepted for another.
+fn backend_call_id(request: &Hash256, position: usize) -> Hash256 {
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-backend-generation-call-v1");
+    hasher.update(&request.0);
+    hasher.update(&(position as u64).to_le_bytes());
+    Hash256(*hasher.finalize().as_bytes())
+}
+
 impl CachedIntegerModel {
     /// Exact Q/K/RoPE arithmetic identity for this resident model. This does
     /// not by itself identify the dispatched weight precision.
@@ -608,7 +651,9 @@ impl CachedIntegerModel {
     /// copies would need the same row permutation, so callers must load via
     /// `load_cached_model_canonical_i8_interleaved_rope` rather than mutate a
     /// general-purpose model after optional profiles are materialized.
-    fn canonicalize_gguf_interleaved_rope_rows(&mut self) -> Result<(), crate::InferenceError> {
+    pub(crate) fn canonicalize_gguf_interleaved_rope_rows(
+        &mut self,
+    ) -> Result<(), crate::InferenceError> {
         if self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
             return Err(crate::InferenceError::Runtime(
                 "GGUF interleaved-RoPE canonicalization was requested twice".into(),
@@ -1369,10 +1414,12 @@ unsafe fn dot_i16_i64(row: *const i16, input: *const i64, len: usize) -> i64 {
 // ─── NEON attention Q·K / attention·V SIMD ────────────────────────────────────
 
 /// NEON dot product of two i64 arrays. Used by the attention inner loop
-/// for Q · K_cache scoring. The i64 inputs are truncated to i32 with the
-/// same assumption as dot_i16_i64_neon (hidden state magnitudes bounded
-/// by Q16 fixed-point ~ 2^28), then multiplied pairwise to i64
-/// accumulators via vmlal_s32. Processes 4 lanes per iteration.
+/// for Q · K_cache scoring. The lanes multiply the low 32 bits of each
+/// element pairwise into i64 accumulators via vmlal_s32, 4 lanes per
+/// iteration. That equals the exact product only while every element fits
+/// in i32, so a wider element takes [`dot_i64xi64_exact`], the loop every
+/// other target runs. Without that check ARM and x86 disagree once a Q or K
+/// value passes ±32768.0 (integer profile contract v1, deviation D1).
 ///
 /// Speedup vs scalar i64×i64 dot: ~2.5× on M2 Ultra for d_head=128.
 /// Called 32 heads × seq_len times per layer, so even marginal
@@ -1385,6 +1432,17 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
     // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         use std::arch::aarch64::*;
+        let a_values = std::slice::from_raw_parts(a, len);
+        let b_values = std::slice::from_raw_parts(b, len);
+        // Branch-free, so it vectorises: x fits in i32 exactly when
+        // (x + 2^31) as u64 is below 2^32, i.e. its top 32 bits are zero.
+        let outside_i32 = a_values
+            .iter()
+            .chain(b_values)
+            .fold(0u64, |acc, &x| acc | ((x.wrapping_add(1 << 31) as u64) >> 32));
+        if outside_i32 != 0 {
+            return dot_i64xi64_exact(a_values, b_values);
+        }
         let mut acc = vdupq_n_s64(0);
         let simd_len = len / 4 * 4;
         let mut j = 0usize;
@@ -1394,7 +1452,7 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
             let a1 = vld1q_s64(a.add(j + 2)); // a[j+2..j+4]
             let b0 = vld1q_s64(b.add(j));
             let b1 = vld1q_s64(b.add(j + 2));
-            // Narrow to i32 (truncate - values are bounded by Q16)
+            // Narrow to i32: lossless, every element was checked above.
             let a32 = vcombine_s32(vmovn_s64(a0), vmovn_s64(a1));
             let b32 = vcombine_s32(vmovn_s64(b0), vmovn_s64(b1));
             // Multiply i32×i32 → i64 via vmull
@@ -1409,6 +1467,18 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
         }
         sum
     }
+}
+
+/// The attention dot product the integer profile defines: exact i64
+/// products, summed in order.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn dot_i64xi64_exact(a: &[i64], b: &[i64]) -> i64 {
+    let mut sum: i64 = 0;
+    for (x, y) in a.iter().zip(b) {
+        sum += x * y;
+    }
+    sum
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -2765,7 +2835,7 @@ fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
 
 /// Flash attention for a single query head against i8-quantized KV cache.
 /// Uses online softmax: processes KV in streaming fashion, never allocates O(n²).
-/// Numerically equivalent to standard attention (within integer rounding).
+/// Not bit-equal to a two-pass softmax: rescaling truncates.
 ///
 /// NOTE: This i8-quantized variant is available for future use with i8 KV caches.
 /// The production path uses flash_attention_i64() which operates directly on the
@@ -2857,8 +2927,10 @@ fn flash_attention_i8(
 
 /// Flash attention for a single query head against the i64 KV cache.
 /// Uses online softmax: processes KV in streaming fashion, O(d_head) memory
-/// instead of O(full_seq) for the scores array. Numerically equivalent to the
-/// standard softmax(Q·K)·V path (same integer_exp + shift arithmetic).
+/// instead of O(full_seq) for the scores array. The rescaling on each new
+/// maximum truncates, so the result is NOT bit-equal to a two-pass softmax.
+/// This sequential form, in position order, is what the integer profile
+/// contract (docs/protocol/integer-profile-contract-v1.md §3.7) defines.
 ///
 /// This is the production attention path as of v0.5.3. It replaces the standard
 /// path that allocated a scores Vec<i64> of size full_seq per head.
@@ -2869,7 +2941,7 @@ fn flash_attention_i8(
 // indirection in the hottest integer kernel in the crate, so the count stays.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn flash_attention_i64(
+pub(crate) fn flash_attention_i64(
     q_head: &[i64],  // [d_head] i64 Q16
     k_cache: &[i64], // flat i64 [full_seq * d_kv]
     v_cache: &[i64], // flat i64 [full_seq * d_kv]
@@ -3339,8 +3411,9 @@ impl CachedIntegerModel {
 
             // Flash attention with online softmax - NEON-vectorized Q·K dot product.
             // Processes KV cache in streaming fashion: O(d_head) memory instead of
-            // O(full_seq) for the scores array. Numerically equivalent to standard
-            // softmax(Q·K)·V (same integer_exp + shift arithmetic).
+            // O(full_seq) for the scores array. Its rescaling truncates, so it is
+            // NOT bit-equal to a two-pass softmax; this sequential form is the
+            // one the integer profile defines.
             let full_seq = pos + 1;
             let k_layer_data = &cache.k_data[layer_idx];
             let v_layer_data = &cache.v_data[layer_idx];
@@ -3892,6 +3965,43 @@ impl CachedIntegerModel {
     ) -> Result<(Vec<u32>, Hash256), GenerationError> {
         let _admission = self.preflight_generation(prompt.len(), max_tokens)?;
         Ok(self.generate_preflighted_v2_with_sampling(prompt, max_tokens, eos_tokens, false))
+    }
+
+    /// [`Self::try_generate_v2`] with every projection supplied by `backend`
+    /// (row-partitioned work, S5): the same BOS, prompt, repetition-penalty
+    /// and EOS semantics as `generate_preflighted_v2_with_sampling`, one token
+    /// at a time (the reference path batched prefill must equal), so the tokens
+    /// and hash equal the local path's whenever the backend returns exact rows.
+    /// Norms, RoPE, the KV cache, attention and token selection stay local.
+    pub fn try_generate_v2_with_backend(
+        &self,
+        request: Hash256,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+        backend: &impl crate::tensor_parallel::ProjectionBackend,
+    ) -> Result<(Vec<u32>, Hash256), BackendGenerationError> {
+        let _admission = self.preflight_generation(prompt.len(), max_tokens)?;
+        let forward = |token: u32, cache: &mut KVCache| {
+            let call_id = backend_call_id(&request, cache.seq_len);
+            self.forward_one_token_canonical_i8_with_backend(token, cache, call_id, backend)
+        };
+        let mut cache = KVCache::new(self.config.n_layers);
+        let mut logits = forward(self.config.bos_token, &mut cache)?;
+        for &token in prompt {
+            logits = forward(token, &mut cache)?;
+        }
+        let mut generated = Vec::new();
+        for _ in 0..max_tokens {
+            let next = select_next_token_with_repetition_penalty(&mut logits, &generated);
+            generated.push(next);
+            if eos_tokens.contains(&next) {
+                break;
+            }
+            logits = forward(next, &mut cache)?;
+        }
+        let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
+        Ok((generated, arc_crypto::hash_bytes(&output_bytes)))
     }
 
     /// Prefill `prompt` into `cache` and return the final position's logits.
@@ -4715,14 +4825,25 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         Ok((i8, i16, block))
     };
 
+    // As in the shard loader: a norm weight that is missing or the wrong
+    // length makes the artifact malformed, and substituting ONE would serve
+    // a different model under the same file (deviation D3).
     let extract_norm = |reader: &mut std::fs::File,
                         content: &gguf_file::Content,
                         name: &str,
                         size: usize|
-     -> Vec<i64> {
-        extract_f32(reader, content, name)
-            .map(|f| f.iter().map(|&x| (x * ONE as f32).round() as i64).collect())
-            .unwrap_or_else(|_| vec![ONE; size])
+     -> Result<Vec<i64>, InferenceError> {
+        let values = extract_f32(reader, content, name)?;
+        if values.len() != size {
+            return Err(InferenceError::Runtime(format!(
+                "{name}: expected {size} norm weights, found {}",
+                values.len()
+            )));
+        }
+        Ok(values
+            .iter()
+            .map(|&x| (x * ONE as f32).round() as i64)
+            .collect())
     };
 
     // Embedding: single f32 extraction → I8 + full-precision Q16 vector.
@@ -4770,7 +4891,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
                 )
             }
         };
-    let final_norm = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
+    let final_norm = extract_norm(&mut reader, &content, "output_norm.weight", d_model)?;
 
     let mut layers = Vec::with_capacity(n_layers);
     let mut i16_layers_vec: Vec<I16Layer> = Vec::with_capacity(n_layers);
@@ -4844,13 +4965,13 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
                 &content,
                 &format!("{p}.attn_norm.weight"),
                 d_model,
-            ),
+            )?,
             ffn_norm: extract_norm(
                 &mut reader,
                 &content,
                 &format!("{p}.ffn_norm.weight"),
                 d_model,
-            ),
+            )?,
         });
         i16_layers_vec.push(I16Layer {
             wq: wq16,
@@ -5380,14 +5501,26 @@ fn load_cached_model_shard_profile(
         Ok((i8w, i16w))
     };
 
+    // A norm weight that is missing or the wrong length makes the artifact
+    // malformed. Substituting ONE, as this loader once did, served a
+    // different model under the same identity (integer profile contract v1,
+    // deviation D3).
     let extract_norm = |reader: &mut std::fs::File,
                         content: &gguf_file::Content,
                         name: &str,
                         size: usize|
-     -> Vec<i64> {
-        extract_f32(reader, content, name)
-            .map(|f| f.iter().map(|&x| (x * ONE as f32).round() as i64).collect())
-            .unwrap_or_else(|_| vec![ONE; size])
+     -> Result<Vec<i64>, InferenceError> {
+        let values = extract_f32(reader, content, name)?;
+        if values.len() != size {
+            return Err(InferenceError::Runtime(format!(
+                "{name}: expected {size} norm weights, found {}",
+                values.len()
+            )));
+        }
+        Ok(values
+            .iter()
+            .map(|&x| (x * ONE as f32).round() as i64)
+            .collect())
     };
 
     // ── Embeddings: ONLY on first shard ──────────────────────────────────────
@@ -5416,7 +5549,7 @@ fn load_cached_model_shard_profile(
         let i8w = I8Weights::quantize_f32(&f, vocab_size, d_model);
         let i16w = include_optional_quantizations
             .then(|| I16Weights::quantize_f32(&f, vocab_size, d_model));
-        let fn_ = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
+        let fn_ = extract_norm(&mut reader, &content, "output_norm.weight", d_model)?;
         info!("Shard last: output head + final_norm loaded");
         (i8w, i16w, fn_)
     } else {
@@ -5556,13 +5689,13 @@ fn load_cached_model_shard_profile(
                 &content,
                 &format!("{p}.attn_norm.weight"),
                 d_model,
-            ),
+            )?,
             ffn_norm: extract_norm(
                 &mut reader,
                 &content,
                 &format!("{p}.ffn_norm.weight"),
                 d_model,
-            ),
+            )?,
         };
         i16_layers_vec[l] = I16Layer {
             wq: wq16,
@@ -5912,8 +6045,23 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
     };
     let output_weight =
         I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("Out: {e}")))?;
-    let final_norm =
-        read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("Norm: {e}")))?;
+    // Every norm vector must hold exactly d_model weights: `layernorm` pads a
+    // short one with ONE, which would serve a different model under the same
+    // file (deviation D3).
+    let checked_norm = |name: String, values: Vec<i64>| -> Result<Vec<i64>, InferenceError> {
+        if values.len() == d_model {
+            Ok(values)
+        } else {
+            Err(InferenceError::Runtime(format!(
+                "{name}: expected {d_model} norm weights, found {}",
+                values.len()
+            )))
+        }
+    };
+    let final_norm = checked_norm(
+        "final norm".into(),
+        read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("Norm: {e}")))?,
+    )?;
 
     let mut layers = Vec::with_capacity(n_layers);
     for l in 0..n_layers {
@@ -5932,10 +6080,14 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
                 .map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
             w_down: I8Weights::read_from(&mut f)
                 .map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
-            attn_norm: read_i64_vec(&mut f)
-                .map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
-            ffn_norm: read_i64_vec(&mut f)
-                .map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
+            attn_norm: checked_norm(
+                format!("L{l} attention norm"),
+                read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
+            )?,
+            ffn_norm: checked_norm(
+                format!("L{l} FFN norm"),
+                read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
+            )?,
         });
     }
 
@@ -6669,6 +6821,41 @@ mod tests {
     }
 
     #[test]
+    fn a_binary_cache_with_a_short_or_empty_norm_is_refused() {
+        // Deviation D3 in the ARC-INT8 loader: `layernorm` pads a short gamma
+        // with ONE, so a cache whose norm vector lost entries used to load and
+        // serve a different model under the same file.
+        let path = std::env::temp_dir().join(format!(
+            "arc-d3-binary-norm-{}.arc-int8",
+            std::process::id()
+        ));
+        let path = path.to_str().unwrap();
+        let model = build_test_model(16, 32, 2, 64, 2);
+        model.save_weights(path).unwrap();
+        assert!(
+            load_cached_model_binary(path).is_ok(),
+            "an intact cache loads"
+        );
+
+        let mut short = build_test_model(16, 32, 2, 64, 2);
+        short.layers[1].ffn_norm.truncate(1);
+        short.save_weights(path).unwrap();
+        let error = load_cached_model_binary(path)
+            .err()
+            .expect("a short norm is refused");
+        assert!(error.to_string().contains("L1 FFN norm"), "{error}");
+
+        let mut empty = build_test_model(16, 32, 2, 64, 2);
+        empty.final_norm.clear();
+        empty.save_weights(path).unwrap();
+        let error = load_cached_model_binary(path)
+            .err()
+            .expect("an empty final norm is refused");
+        assert!(error.to_string().contains("final norm"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn generation_preflight_rejects_position_count_overflow() {
         let model = build_test_model(32, 16, 2, 32, 1);
         let err = model
@@ -6813,6 +7000,446 @@ mod tests {
         assert_eq!(q.data[8], 127, "Row 1 outlier should be 127");
         // Per-row means row 0 is NOT affected by row 1's outlier
         assert!(q.scales[0] < q.scales[1], "Row 0 should have smaller scale");
+    }
+
+    /// Every projection of `model`, in forward order.
+    fn projection_keys(model: &CachedIntegerModel) -> Vec<(Option<usize>, TensorKey)> {
+        let mut keys = Vec::new();
+        for layer in 0..model.layers.len() {
+            for tensor in [
+                TensorKey::Wq,
+                TensorKey::Wk,
+                TensorKey::Wv,
+                TensorKey::Wo,
+                TensorKey::WGate,
+                TensorKey::WUp,
+                TensorKey::WDown,
+            ] {
+                keys.push((Some(layer), tensor));
+            }
+        }
+        keys.push((None, TensorKey::LmHead));
+        keys
+    }
+
+    /// Every projection split in two halves, each a `LocalRowWorker`.
+    fn halved_row_backend(
+        model: &CachedIntegerModel,
+        artifact: Hash256,
+    ) -> PartitionedProjectionBackend {
+        let profile = model.effective_precision_label().to_string();
+        let mut assignments = Vec::new();
+        let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
+        for (layer, tensor) in projection_keys(model) {
+            let weights =
+                crate::tensor_parallel::model_projection_weights(model, layer, tensor).unwrap();
+            let split = weights.n_rows / 2;
+            for (start, end) in [(0, split), (split, weights.n_rows)] {
+                let worker_id = format!("{layer:?}-{tensor:?}-{start}");
+                let assignment = RowAssignment {
+                    artifact_id: artifact,
+                    execution_profile: profile.clone(),
+                    layer,
+                    tensor,
+                    row_start: start,
+                    row_end: end,
+                    worker_id: worker_id.clone(),
+                };
+                workers.insert(
+                    worker_id.clone(),
+                    Arc::new(LocalRowWorker {
+                        worker_id,
+                        assignment: assignment.clone(),
+                        weights: weights.copy_rows(start, end).unwrap(),
+                    }),
+                );
+                assignments.push(assignment);
+            }
+        }
+        PartitionedProjectionBackend::new(artifact, profile, assignments, workers)
+    }
+
+    #[test]
+    fn generation_on_a_row_backend_equals_local_generation_token_for_token() {
+        let model = build_test_model(16, 32, 2, 64, 3);
+        let backend = halved_row_backend(&model, Hash256([77; 32]));
+        let request = Hash256([5; 32]);
+        let prompt = [1u32, 2, 3];
+        let local = model.try_generate_v2(&prompt, 4, &[99]).unwrap();
+        let rows = model
+            .try_generate_v2_with_backend(request, &prompt, 4, &[99], &backend)
+            .unwrap();
+        assert_eq!(rows, local);
+        // EOS stops both paths at the same token (99 is outside this
+        // vocabulary, so the case above never stops early). The second token
+        // the model generates with no stop token serves as the EOS.
+        let (open_ended, _) = model.try_generate_v2(&prompt, 6, &[]).unwrap();
+        let eos = [open_ended[1]];
+        let local = model.try_generate_v2(&prompt, 6, &eos).unwrap();
+        assert!(local.0.len() <= 2, "EOS stopped the local generation");
+        let rows = model
+            .try_generate_v2_with_backend(request, &prompt, 6, &eos, &backend)
+            .unwrap();
+        assert_eq!(rows, local);
+        // An empty prompt (BOS alone) and a request for no tokens.
+        for (prompt, max_tokens) in [(&[][..], 3), (&prompt[..], 0)] {
+            let local = model.try_generate_v2(prompt, max_tokens, &[99]).unwrap();
+            let rows = model
+                .try_generate_v2_with_backend(request, prompt, max_tokens, &[99], &backend)
+                .unwrap();
+            assert_eq!(rows, local);
+        }
+        // The same context refusal as the local path, before any projection.
+        let too_long = vec![1u32; model.config.max_seq];
+        assert!(matches!(
+            model.try_generate_v2_with_backend(request, &too_long, 4, &[99], &backend),
+            Err(BackendGenerationError::Generation(_))
+        ));
+        // A backend that cannot supply exact rows stops the generation.
+        let empty = PartitionedProjectionBackend::new(
+            Hash256([77; 32]),
+            model.effective_precision_label().to_string(),
+            Vec::new(),
+            BTreeMap::new(),
+        );
+        assert!(matches!(
+            model.try_generate_v2_with_backend(request, &prompt, 4, &[99], &empty),
+            Err(BackendGenerationError::Projection(_))
+        ));
+    }
+
+    /// A worker holding the whole model that serves any assignment, like the
+    /// `tensor_row_model_worker` example; it can be told to fail or to lie.
+    struct WholeModelWorker {
+        model: Arc<CachedIntegerModel>,
+        fail: bool,
+        lie: bool,
+        /// A connection that has closed itself, as the SSH worker does.
+        closed: bool,
+        /// Answer this many calls, then fail every later one: a machine that
+        /// drops out part-way through a query.
+        fail_after: Option<usize>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WholeModelWorker {
+        fn new(model: &Arc<CachedIntegerModel>, fail: bool, lie: bool) -> Self {
+            Self {
+                model: model.clone(),
+                fail,
+                lie,
+                closed: false,
+                fail_after: None,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RowWorker for WholeModelWorker {
+        fn is_open(&self) -> bool {
+            !self.closed
+        }
+
+        fn project(
+            &self,
+            request: crate::tensor_parallel::RowProjectionRequest,
+        ) -> Result<
+            crate::tensor_parallel::RowProjectionResponse,
+            crate::tensor_parallel::TensorParallelError,
+        > {
+            use crate::tensor_parallel::TensorParallelError;
+            let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail || self.fail_after.is_some_and(|after| index >= after) {
+                return Err(TensorParallelError::Worker("unreachable".into()));
+            }
+            let a = &request.assignment;
+            let weights =
+                crate::tensor_parallel::model_projection_weights(&self.model, a.layer, a.tensor)
+                    .ok_or(TensorParallelError::WrongIdentity)?;
+            let shard = weights
+                .copy_rows(a.row_start, a.row_end)
+                .map_err(|_| TensorParallelError::WrongShape)?;
+            let mut values = vec![0; shard.n_rows];
+            matmul_i8_canonical_rows(&shard, &request.input, &mut values)
+                .map_err(|_| TensorParallelError::WrongShape)?;
+            if self.lie {
+                values[0] += 1;
+            }
+            Ok(crate::tensor_parallel::RowProjectionResponse {
+                call_id: request.call_id,
+                input_hash: request.input_hash,
+                assignment: request.assignment,
+                values,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct Events {
+        seen: std::sync::Mutex<Vec<crate::tensor_parallel::RowEvent>>,
+        excluded: std::collections::BTreeSet<String>,
+    }
+
+    impl crate::tensor_parallel::RowEventSink for Events {
+        fn record(&self, event: crate::tensor_parallel::RowEvent) {
+            self.seen.lock().unwrap().push(event);
+        }
+        fn is_excluded(&self, worker: &str) -> bool {
+            self.excluded.contains(worker)
+        }
+    }
+
+    /// Plans that give the first half of every projection to the coordinator
+    /// and the second half to worker "w", checked as asked.
+    fn half_remote_plans(
+        model: &CachedIntegerModel,
+        duplicate_on: Option<crate::tensor_parallel::SliceOwner>,
+        spot_first_remote_row: bool,
+    ) -> BTreeMap<(Option<usize>, TensorKey), crate::tensor_parallel::ProjectionPlan> {
+        use crate::tensor_parallel::{PlannedSlice, ProjectionPlan, SliceOwner};
+        let mut plans = BTreeMap::new();
+        for (layer, tensor) in projection_keys(model) {
+            let rows = crate::tensor_parallel::model_projection_weights(model, layer, tensor)
+                .unwrap()
+                .n_rows;
+            let split = rows / 2;
+            plans.insert(
+                (layer, tensor),
+                ProjectionPlan {
+                    slices: vec![
+                        PlannedSlice {
+                            owner: SliceOwner::Local,
+                            row_start: 0,
+                            row_end: split,
+                            duplicate_on: None,
+                        },
+                        PlannedSlice {
+                            owner: SliceOwner::Remote("w".into()),
+                            row_start: split,
+                            row_end: rows,
+                            duplicate_on: duplicate_on.clone(),
+                        },
+                    ],
+                    spot_rows: if spot_first_remote_row {
+                        vec![split]
+                    } else {
+                        Vec::new()
+                    },
+                },
+            );
+        }
+        plans
+    }
+
+    /// One generation on a verified backend with worker "w": the output,
+    /// every event and how many calls reached the worker.
+    fn run_verified(
+        model: &Arc<CachedIntegerModel>,
+        worker: WholeModelWorker,
+        plans: BTreeMap<(Option<usize>, TensorKey), crate::tensor_parallel::ProjectionPlan>,
+        excluded: &[&str],
+    ) -> (
+        (Vec<u32>, Hash256),
+        Vec<crate::tensor_parallel::RowEvent>,
+        usize,
+    ) {
+        let events = Events {
+            excluded: excluded.iter().map(|w| w.to_string()).collect(),
+            ..Default::default()
+        };
+        let worker = Arc::new(worker);
+        let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
+        workers.insert("w".into(), worker.clone());
+        let backend = crate::tensor_parallel::VerifiedPartitionBackend::new(
+            model,
+            Hash256([77; 32]),
+            plans,
+            workers,
+            &events,
+        )
+        .unwrap();
+        let output = model
+            .try_generate_v2_with_backend(Hash256([5; 32]), &[1, 2, 3], 4, &[99], &backend)
+            .unwrap();
+        drop(backend);
+        let calls = worker.calls.load(std::sync::atomic::Ordering::SeqCst);
+        (output, events.seen.into_inner().unwrap(), calls)
+    }
+
+    #[test]
+    fn a_verified_partition_backend_keeps_the_output_exact_and_reports_every_fallback_and_fault() {
+        use crate::tensor_parallel::{RowEvent, SliceOwner};
+        let model = Arc::new(build_test_model(16, 32, 2, 64, 3));
+        let local = model.try_generate_v2(&[1, 2, 3], 4, &[99]).unwrap();
+        let is_fault = |event: &RowEvent| matches!(event, RowEvent::Fault { .. });
+        let is_fallback = |event: &RowEvent| matches!(event, RowEvent::Fallback { .. });
+
+        // An honest worker: the same tokens, and only timing samples.
+        let (output, events, calls) = run_verified(
+            &model,
+            WholeModelWorker::new(&model, false, false),
+            half_remote_plans(&model, Some(SliceOwner::Local), true),
+            &[],
+        );
+        assert_eq!(output, local);
+        assert!(calls > 0);
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e, RowEvent::Answered { .. }))
+        );
+
+        // A worker that is gone: every call falls back to the coordinator's
+        // rows, each fallback is reported, and the tokens do not change.
+        let (output, events, calls) = run_verified(
+            &model,
+            WholeModelWorker::new(&model, true, false),
+            half_remote_plans(&model, None, false),
+            &[],
+        );
+        assert_eq!(output, local);
+        assert_eq!(events.iter().filter(|e| is_fallback(e)).count(), calls);
+        assert!(!events.iter().any(is_fault));
+
+        // A worker that drops out part-way through the query: the five calls
+        // it answered count, every later call falls back, and the tokens
+        // still do not change.
+        let dropout = WholeModelWorker {
+            fail_after: Some(5),
+            ..WholeModelWorker::new(&model, false, false)
+        };
+        let (output, events, calls) =
+            run_verified(&model, dropout, half_remote_plans(&model, None, false), &[]);
+        assert_eq!(output, local);
+        assert!(calls > 5, "the query outlived the worker");
+        let answered = events
+            .iter()
+            .filter(|e| matches!(e, RowEvent::Answered { .. }))
+            .count();
+        assert_eq!(answered, 5);
+        assert_eq!(events.iter().filter(|e| is_fallback(e)).count(), calls - 5);
+        assert!(!events.iter().any(is_fault));
+
+        // A lying worker caught by a duplicate, then by a spot row: faults
+        // are reported, and the coordinator's own rows keep the tokens exact.
+        for (duplicate, spot) in [(Some(SliceOwner::Local), false), (None, true)] {
+            let (output, events, _) = run_verified(
+                &model,
+                WholeModelWorker::new(&model, false, true),
+                half_remote_plans(&model, duplicate, spot),
+                &[],
+            );
+            assert_eq!(output, local);
+            assert!(events.iter().any(is_fault));
+        }
+
+        // Unchecked, the same lie reaches the logits: rows no check covers are
+        // trusted, which is why only an operator's own machines may feed a
+        // vote. (Logits, not tokens: a small lie need not change an argmax.)
+        let events = Events::default();
+        let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
+        workers.insert(
+            "w".into(),
+            Arc::new(WholeModelWorker::new(&model, false, true)),
+        );
+        let backend = crate::tensor_parallel::VerifiedPartitionBackend::new(
+            &model,
+            Hash256([77; 32]),
+            half_remote_plans(&model, None, false),
+            workers,
+            &events,
+        )
+        .unwrap();
+        let mut local_cache = KVCache::new(model.config.n_layers);
+        let mut lied_cache = KVCache::new(model.config.n_layers);
+        let local_logits = model.forward_one_token(model.config.bos_token, &mut local_cache);
+        let lied_logits = model
+            .forward_one_token_canonical_i8_with_backend(
+                model.config.bos_token,
+                &mut lied_cache,
+                Hash256([1; 32]),
+                &backend,
+            )
+            .unwrap();
+        assert_ne!(lied_logits, local_logits);
+        drop(backend);
+
+        // An excluded worker is never called.
+        let (output, events, calls) = run_verified(
+            &model,
+            WholeModelWorker::new(&model, false, true),
+            half_remote_plans(&model, None, false),
+            &["w"],
+        );
+        assert_eq!(output, local);
+        assert_eq!(calls, 0);
+        // Every one of its slices is reported as skipped: none moves silently.
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|e| matches!(e, RowEvent::Skipped { .. })));
+
+        // A closed connection is skipped the same way, without a call and
+        // without counting as a failure.
+        let mut closed = WholeModelWorker::new(&model, false, false);
+        closed.closed = true;
+        let (output, events, calls) =
+            run_verified(&model, closed, half_remote_plans(&model, None, false), &[]);
+        assert_eq!(output, local);
+        assert_eq!(calls, 0);
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|e| matches!(e, RowEvent::Skipped { .. })));
+    }
+
+    #[test]
+    fn the_row_frame_server_answers_any_assignment_with_the_models_own_rows() {
+        use crate::tensor_parallel::{
+            RowProjectionRequest, decode_row_response, encode_row_request, hash_i64,
+            model_projection_weights, serve_row_frames,
+        };
+        let model = build_test_model(16, 32, 2, 64, 3);
+        let artifact = Hash256([77; 32]);
+        let profile = model.canonical_execution_profile().unwrap().to_string();
+        let input: Vec<i64> = (0..model.config.d_model as i64)
+            .map(|i| (i - 7) << 12)
+            .collect();
+        let request = RowProjectionRequest {
+            call_id: Hash256([9; 32]),
+            input_hash: hash_i64(&input),
+            assignment: RowAssignment {
+                artifact_id: artifact,
+                execution_profile: profile.clone(),
+                layer: Some(1),
+                tensor: TensorKey::Wv,
+                row_start: 1,
+                row_end: 3,
+                worker_id: "machine-2".into(),
+            },
+            input: input.clone(),
+        };
+        let frame = encode_row_request(&request).unwrap();
+        let mut stream = (frame.len() as u32).to_le_bytes().to_vec();
+        stream.extend_from_slice(&frame);
+        let mut answer: Vec<u8> = Vec::new();
+        serve_row_frames(&model, artifact, &mut stream.as_slice(), &mut answer).unwrap();
+        let length = u32::from_le_bytes(answer[..4].try_into().unwrap()) as usize;
+        assert_eq!(answer.len(), 4 + length, "one response for one request");
+        let response = decode_row_response(&answer[4..]).unwrap();
+        assert_eq!(response.assignment, request.assignment);
+        let weights = model_projection_weights(&model, Some(1), TensorKey::Wv).unwrap();
+        let shard = weights.copy_rows(1, 3).unwrap();
+        let mut expected = vec![0; 2];
+        matmul_i8_canonical_rows(&shard, &input, &mut expected).unwrap();
+        assert_eq!(response.values, expected);
+
+        // Another artifact ends the session; an empty stream is a clean end.
+        let mut other = request.clone();
+        other.assignment.artifact_id = Hash256([1; 32]);
+        let frame = encode_row_request(&other).unwrap();
+        let mut stream = (frame.len() as u32).to_le_bytes().to_vec();
+        stream.extend_from_slice(&frame);
+        let mut sink: Vec<u8> = Vec::new();
+        assert!(serve_row_frames(&model, artifact, &mut stream.as_slice(), &mut sink).is_err());
+        let mut empty: &[u8] = &[];
+        assert!(serve_row_frames(&model, artifact, &mut empty, &mut sink).is_ok());
     }
 
     #[test]
