@@ -54,6 +54,7 @@ run_unittest "arc_soak: orchestrator pure helpers"       arc_soak.tests.test_orc
 run_unittest "arc_ops: backup/verify/restore"            arc_ops.tests.test_backup
 run_unittest "arc_ops: operational checks (R7)"          arc_ops.tests.test_check
 run_unittest "arc_ops: conservation audit (P7)"          arc_ops.tests.test_conservation
+run_unittest "arc_ops: receipt reconciliation (P9)"     arc_ops.tests.test_receipts
 
 # scripts/release/tests is not a package (no __init__.py): test_sbom.py loads
 # sbom.py by file path via importlib, and test_signing_fixtures.py only

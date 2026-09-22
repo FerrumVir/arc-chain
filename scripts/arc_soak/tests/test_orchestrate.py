@@ -92,6 +92,24 @@ class NativeRequesterFunding(unittest.TestCase):
             soak.native_requesters()
 
 
+class ExtraFunding(unittest.TestCase):
+    """`--fund` adds a genesis account, e.g. a desktop wallet for a journey."""
+
+    def test_addresses_and_amounts_are_parsed_and_defaulted(self):
+        wallet = "AB" * 32
+        self.assertEqual(
+            orchestrate.parse_funding([f"0x{wallet}", "cd" * 32 + ":5_000"]),
+            [("ab" * 32, orchestrate.DEFAULT_FUND_BASE_UNITS), ("cd" * 32, 5000)],
+        )
+        self.assertEqual(orchestrate.parse_funding(None), [])
+
+    def test_bad_addresses_amounts_and_repeats_are_refused(self):
+        for values in (["not-an-address"], ["ab" * 32 + ":0"], ["ab" * 32 + ":x"],
+                       ["ab" * 32, "0x" + "AB" * 32]):
+            with self.assertRaises(SystemExit, msg=values):
+                orchestrate.parse_funding(values)
+
+
 class BinarySelfReport(unittest.TestCase):
     def test_a_node_reporting_another_build_aborts_the_run(self):
         digest = "ab" * 32

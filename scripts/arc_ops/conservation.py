@@ -28,13 +28,29 @@ from arc_ops.check import http_fetch
 
 def accounts_from_run(run: Dict[str, Any]) -> List[str]:
     nodes = [n.get("identity") for n in run.get("nodes", []) if n.get("identity")]
-    requesters = (run.get("workload") or {}).get("requesters") or []
-    return [a for a in nodes + list(requesters) if a]
+    workload = run.get("workload") or {}
+    requesters = workload.get("requesters") or []
+    extra = [e.get("address") for e in workload.get("extra_funded") or []]
+    return [a for a in nodes + list(requesters) + extra if a]
+
+
+def genesis_from_run(run: Dict[str, Any], each: int) -> Dict[str, int]:
+    """Every funded account's genesis balance: `each` for the harness's own
+    accounts, the stated amount for an account added with `--fund` (for
+    example a desktop wallet), which pays validators like any requester."""
+    genesis = {a: each for a in accounts_from_run(run)}
+    for entry in (run.get("workload") or {}).get("extra_funded") or []:
+        genesis[entry["address"]] = int(entry["base_units"])
+    return genesis
 
 
 def audit(nodes: List[str], accounts: List[str], genesis_each: int, reservation: int,
-          fetch=http_fetch) -> Dict[str, Any]:
-    expected = genesis_each * len(accounts)
+          fetch=http_fetch, genesis: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+    # `reservation * pending` assumes every pending request reserved the same
+    # amount (the load driver's). Audit a mixed workload, such as a desktop
+    # journey beside the driver, once the other requests have settled.
+    expected = (sum(genesis[a] for a in accounts) if genesis is not None
+                else genesis_each * len(accounts))
     per_node: Dict[str, Any] = {}
     for node in nodes:
         # Read pending BEFORE and AFTER the balances: if a request settled in
@@ -84,7 +100,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     with open(os.path.join(a.run, "run.json")) as fh:
         run = json.load(fh)
     nodes = [f"127.0.0.1:{n['rpc']}" for n in run.get("nodes", [])]
-    result = audit(nodes, accounts_from_run(run), a.genesis_balance, a.reservation)
+    result = audit(nodes, accounts_from_run(run), a.genesis_balance, a.reservation,
+                   genesis=genesis_from_run(run, a.genesis_balance))
     print(json.dumps(result, indent=2, sort_keys=True))
     return {"PASS": 0, "FAIL": 1, "INCOMPLETE": 2}[result["status"]]
 

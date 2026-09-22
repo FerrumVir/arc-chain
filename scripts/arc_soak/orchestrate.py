@@ -288,6 +288,35 @@ def parse_fault_kinds(text: Optional[str]) -> List[str]:
     return kinds
 
 
+# 100 ARC in base units: enough for many paid requests at the desktop's defaults.
+DEFAULT_FUND_BASE_UNITS = 100_000_000_000
+
+
+def parse_funding(values: Optional[List[str]]) -> List[Tuple[str, int]]:
+    """`--fund ADDRESS[:BASE_UNITS]` accounts genesis also funds - for
+    example a desktop wallet for a product journey on a protocol-4 chain,
+    which admits no transfers. Refuses anything that is not a 32-byte hex
+    address, a non-positive amount, or an address listed twice."""
+    out: List[Tuple[str, int]] = []
+    for value in values or []:
+        address, _, amount = value.partition(":")
+        address = address.strip().lower()
+        if address.startswith("0x"):
+            address = address[2:]
+        if not HEX64.match(address):
+            raise SystemExit(f"--fund {value}: not a 32-byte hex address")
+        try:
+            units = int(amount.replace("_", "")) if amount else DEFAULT_FUND_BASE_UNITS
+        except ValueError:
+            raise SystemExit(f"--fund {value}: the amount is not an integer of base units")
+        if units <= 0:
+            raise SystemExit(f"--fund {value}: the amount must be positive")
+        out.append((address, units))
+    if len({address for address, _ in out}) != len(out):
+        raise SystemExit("--fund lists an address twice")
+    return out
+
+
 def parse_fault_indices(text: Optional[str]) -> Set[int]:
     """`"1,3"` -> {1, 3}. Empty or None -> no long faults."""
     if not text:
@@ -364,6 +393,7 @@ class Config:
         self.faucet_rate = a.faucet_rate
         self.native_rate = a.native_rate
         self.native_requesters = a.native_requesters
+        self.fund = parse_funding(getattr(a, "fund", None))
         self.load_driver = os.path.abspath(a.load_driver) if a.load_driver else None
         # A fixed execution tuple the activation allows and every request uses.
         self.native_tuple = [hashlib.sha256(f"arc-soak-{k}".encode()).hexdigest()
@@ -493,9 +523,18 @@ class Soak:
             fh.write(f'[[accounts]]\naddress = "{FAUCET_POOL}"\nbalance = 1_000_000_000_000\n\n')
             for n in self.nodes:
                 fh.write(f'[[accounts]]\naddress = "{n.identity}"\nbalance = 1_000_000_000_000\n\n')
+            funded = {FAUCET_POOL} | {n.identity for n in self.nodes}
             if cfg.workload == "native":
                 for requester in self.native_requesters():
                     fh.write(f'[[accounts]]\naddress = "{requester}"\nbalance = 1_000_000_000_000\n\n')
+                    funded.add(requester)
+            for address, units in getattr(cfg, "fund", []):
+                if address in funded:
+                    raise Abort(f"--fund {address} is already an account the harness funds")
+                fh.write(f'[[accounts]]\naddress = "{address}"\nbalance = {units}\n\n')
+            self.run["workload"]["extra_funded"] = [
+                {"address": address, "base_units": units}
+                for address, units in getattr(cfg, "fund", [])]
             for n in self.nodes:
                 fh.write(f'[[validators]]\naddress = "{n.identity}"\nstake = {cfg.stake}\n\n')
         if cfg.workload == "native":
@@ -985,6 +1024,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="soak_native_load binary (workload=native); must be built with the "
                         "native-test-executor feature alongside --binary")
     p.add_argument("--faucet-rate", type=float, default=0.5, help="claims per second offered")
+    p.add_argument("--fund", action="append", default=[], metavar="ADDRESS[:BASE_UNITS]",
+                   help="also fund this account in genesis (repeatable; default 100 ARC), e.g. a "
+                        "desktop wallet for a product journey")
     p.add_argument("--rust-log", default="info")
     p.add_argument("--work")
     return p

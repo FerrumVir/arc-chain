@@ -45,6 +45,21 @@ class Audit(unittest.TestCase):
         r = self.run_audit({"n0": state}, {"n0": 0})
         self.assertEqual(r["status"], "FAIL")
 
+    def test_an_extra_funded_account_is_counted_at_its_own_genesis_balance(self):
+        run = {"nodes": [{"identity": "a"}], "workload": {
+            "requesters": ["b"], "extra_funded": [{"address": "w", "base_units": 50}]}}
+        self.assertEqual(conservation.accounts_from_run(run), ["a", "b", "w"])
+        genesis = conservation.genesis_from_run(run, 1_000)
+        self.assertEqual(genesis, {"a": 1_000, "b": 1_000, "w": 50})
+        # The wallet paid 20 to validator a: moved, not created.
+        fetch = replicas({"n0": {"a": 1_020, "b": 1_000, "w": 30}}, {"n0": 0})
+        r = conservation.audit(["n0"], ["a", "b", "w"], 1_000, 100, fetch, genesis=genesis)
+        self.assertEqual(r["status"], "PASS")
+        self.assertEqual(r["expected_total"], 2_050)
+        # Counted at the uniform balance instead, the same state looks created.
+        r = conservation.audit(["n0"], ["a", "b", "w"], 1_000, 100, fetch)
+        self.assertEqual(r["status"], "FAIL")
+
     def test_replicas_with_different_balances_are_not_identical(self):
         r = self.run_audit({"n0": {"a": 900, "b": 1_100, "c": 1_000},
                             "n1": {"a": 1_000, "b": 1_000, "c": 1_000}}, {"n0": 0, "n1": 0})
