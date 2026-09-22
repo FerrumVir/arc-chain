@@ -61,3 +61,33 @@ pub fn summarize(probes: &[Probe], measured_at: u64, simulated: bool) -> Option<
         simulated,
     })
 }
+
+/// Cumulative path counters from one transport connection (quinn's
+/// `Connection::stats().path`), tagged with that connection's generation so
+/// that a reconnect is never read as a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathCounters {
+    pub generation: u64,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
+}
+
+/// Loss per mille over the window between two snapshots of the SAME
+/// connection. quinn's counters are cumulative for the life of a connection,
+/// so only a delta says anything about the recent path. `None` when the
+/// snapshots come from different connections (a reconnect starts a new
+/// window), when a counter went backwards, or when nothing was sent in
+/// between. Packets sent before the window can be declared lost inside it,
+/// so the figure is capped at 1000.
+pub fn windowed_loss_per_mille(earlier: &PathCounters, later: &PathCounters) -> Option<u32> {
+    if earlier.generation != later.generation {
+        return None;
+    }
+    let sent = later.sent_packets.checked_sub(earlier.sent_packets)?;
+    let lost = later.lost_packets.checked_sub(earlier.lost_packets)?;
+    if sent == 0 {
+        return None;
+    }
+    let per_mille = (u128::from(lost) * 1000 / u128::from(sent)).min(1000);
+    u32::try_from(per_mille).ok()
+}

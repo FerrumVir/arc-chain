@@ -224,11 +224,11 @@ pub fn place(
         for c in chosen {
             rates.push(c.macs_per_s);
             links.push(Some(&c.link));
-            let cap = if total_weight_bytes == 0 {
-                1_000_000
-            } else {
-                ((c.ram_headroom_bytes as u128 * 1_000_000) / total_weight_bytes).min(1_000_000)
-            };
+            // No weights to hold: memory caps nothing. Otherwise the share
+            // of all rows this machine's headroom can hold, in ppm.
+            let cap = (c.ram_headroom_bytes as u128 * 1_000_000)
+                .checked_div(total_weight_bytes)
+                .map_or(1_000_000, |share| share.min(1_000_000));
             caps.push(cap);
         }
         // Weights proportional to rate, each capped by what fits in memory;

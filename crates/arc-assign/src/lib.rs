@@ -13,11 +13,13 @@
 //! across calls. That is what makes per-call reassignment safe and redundancy
 //! exactly checkable.
 
+pub mod book;
 pub mod certificate;
 pub mod lease;
 pub mod link;
 pub mod placement;
 pub mod queue;
+pub mod reservation;
 pub mod verify;
 
 pub use arc_crypto::Hash256;

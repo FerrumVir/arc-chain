@@ -100,3 +100,23 @@ pub enum Finding {
         found_digest: Hash256,
     },
 }
+
+/// Compare a checked slice or row. Equal digests agree; anything else is a
+/// fault by `participant`, because the arithmetic is exact.
+pub fn compare(
+    stage: usize,
+    participant: Participant,
+    expected_digest: Hash256,
+    found_digest: Hash256,
+) -> Finding {
+    if expected_digest == found_digest {
+        Finding::Agrees
+    } else {
+        Finding::Fault {
+            stage,
+            participant,
+            expected_digest,
+            found_digest,
+        }
+    }
+}
