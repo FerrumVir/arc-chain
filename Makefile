@@ -1,6 +1,6 @@
 .PHONY: build test test-fast test-integration node join inference inference-node \
         explorer faucet bench stats health eval-perplexity clean \
-        fmt fmt-check lint audit desktop-test ci help
+        fmt fmt-check lint audit desktop-test test-scripts ci help
 
 # Default target: show what's available rather than silently building.
 help:
@@ -71,6 +71,18 @@ audit:
 desktop-test:
 	cd desktop && npm ci && npx tsc --noEmit && npx playwright install chromium && CI=true npx playwright test --config playwright.gate.config.ts
 	cargo +stable test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked
+
+# The non-Rust suites that .github/workflows/ci.yml's `script-suites` job
+# runs: arc_conformance/arc_soak/arc_ops/scripts-release Python tests, the
+# explorer local-dev contract, and desktop's pure-logic Playwright specs.
+# Needs network the first time (pip install, npm ci). If you change one of
+# the three commands here, change scripts/ci/run-script-suites.sh and the
+# `script-suites` job to match.
+test-scripts:
+	python3 -m pip install --quiet "blake3>=1.0" "numpy>=1.26"
+	bash scripts/ci/run-script-suites.sh
+	node explorer/test-localdev-native.mjs
+	cd desktop && npm ci && npm run test:unit
 
 # The single source of truth for every required local gate.
 ci:
