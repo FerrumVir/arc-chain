@@ -28,6 +28,10 @@
     .map((s) => s.trim().replace(/\/+$/, ""))
     .filter(Boolean);
   const NATIVE = window.ArcLocalDevNative;
+  // Tracked so a native-request lookup - triggered independently of the
+  // periodic refresh, e.g. from the deep link on page load - can still judge
+  // Pending expiry against this node's own most recently observed height.
+  let lastKnownHeight = null;
 
   async function rpc(path) {
     const response = await fetch(`${BASE}${path}`, { headers: { accept: "application/json" } });
@@ -59,6 +63,7 @@
     $("localdev-mempool").textContent =
       info?.mempool_size !== undefined ? String(info.mempool_size) : "—";
     $("localdev-network-label").textContent = `LOCAL DEV / HEIGHT ${height}`;
+    lastKnownHeight = height;
     return { height, validators: validators?.validators ?? [] };
   }
 
@@ -205,9 +210,11 @@
     const own = comparison.rows[0].summary;
     const credits = $("localdev-native-credits");
     credits.textContent = "";
+    const expiryNote = $("localdev-native-expiry");
     if (!own.known) {
       $("localdev-native-status").textContent = "No receipt on this node";
       note.textContent = "This node records no such request (not admitted, or not yet applied here).";
+      expiryNote.hidden = true;
       return;
     }
     $("localdev-native-status").textContent = own.status;
@@ -219,8 +226,27 @@
     $("localdev-native-credited").dataset.reconciled = String(own.reconciled);
     $("localdev-native-admitted").textContent = own.admissionHeight ?? "-";
     $("localdev-native-settled").textContent = own.terminalHeight ?? "-";
+    $("localdev-native-expires").textContent = own.expiresAt ?? "unavailable from this node";
+    $("localdev-native-requester").textContent = own.requester ? SHORT(own.requester, 12, 8) : "-";
     $("localdev-native-output").textContent = own.outputHash ? SHORT(own.outputHash, 16, 8) : "-";
+    $("localdev-native-output-hex").textContent = own.outputCertified ? SHORT(own.outputHex, 16, 8) : "empty - not finalized yet";
+    $("localdev-native-output-text").textContent = own.outputText !== null ? own.outputText : "unavailable (display-only, never certified)";
     $("localdev-native-votes").textContent = own.votes ?? "-";
+    // Read this node's OWN reported height, not another replica's, so the
+    // expiry judgment matches whichever chain view is on screen.
+    const expiry = NATIVE.classifyExpiry(own, lastKnownHeight);
+    if (expiry.applicable && expiry.expired === true) {
+      expiryNote.hidden = false;
+      expiryNote.className = "truth-warn";
+      expiryNote.textContent = "Expired without a certificate: refundable by a refund transaction. Not refunded yet - that happens only once such a transaction is mined.";
+    } else if (expiry.applicable && expiry.expired === null) {
+      expiryNote.hidden = false;
+      expiryNote.className = "";
+      expiryNote.textContent = "This node's current height is unavailable, so expiry cannot be evaluated.";
+    } else {
+      expiryNote.hidden = true;
+      expiryNote.textContent = "";
+    }
     $("localdev-native-replicas").textContent = REPLICAS.length
       ? `${comparison.answered} of ${comparison.asked} answered - ${comparison.agree ? "all agree" : "DISAGREE"}`
       : "not cross-checked (add ?replicas=)";

@@ -295,6 +295,81 @@ await test("canonical labels fail closed without a complete checkpoint audit", a
   assert.equal(result.route.configuredCanonical, true);
 });
 
+await test("a paged blocks window entirely on v3 is fetched from the v3 source in one request", async () => {
+  const calls = [];
+  const fetchImpl = mockFetch({
+    "https://v3.example.test/blocks?from=131&to=150&limit=20": {
+      body: { blocks: [{ header: { height: 150, hash: hex("1") } }, { header: { height: 131, hash: hex("2") } }] },
+    },
+  }, calls);
+  const result = await app.queryBlocksPage({ resolver, fetchImpl, startHeight: 150, sourceId: "canonical" });
+  assert.equal(result.from, 131);
+  assert.equal(result.to, 150);
+  assert.equal(result.pageSize, 20);
+  assert.deepEqual(result.rows.map((row) => network.blockHeight(row.block)), [150, 131]);
+  assert.ok(result.rows.every((row) => row.source.id === "v3"));
+  assert.ok(calls.every((call) => call.url.startsWith("https://v3.example.test/")));
+});
+
+await test("a paged blocks window crossing the checkpoint is split and merged from both segments", async () => {
+  const fetchImpl = mockFetch({
+    "https://legacy.example.test/blocks?from=76&to=88&limit=13": { body: { blocks: [{ header: { height: 80, hash: hex("3") } }] } },
+    "https://v3.example.test/blocks?from=89&to=95&limit=7": { body: { blocks: [{ header: { height: 90, hash: hex("4") } }] } },
+  });
+  const result = await app.queryBlocksPage({ resolver, fetchImpl, startHeight: 95, sourceId: "canonical" });
+  assert.equal(result.from, 76);
+  assert.equal(result.to, 95);
+  assert.deepEqual(result.rows.map((row) => [network.blockHeight(row.block), row.source.id]), [[90, "v3"], [80, "legacy"]]);
+});
+
+await test("an explicit alternate source serves a whole blocks page without checkpoint splitting, after its provenance verifies", async () => {
+  const calls = [];
+  const fetchImpl = mockFetch({
+    "https://fork.example.test/provenance": { body: forkProvenance },
+    "https://fork.example.test/blocks?from=76&to=95&limit=20": { body: { blocks: [{ header: { height: 90, hash: hex("5") } }] } },
+  }, calls);
+  const result = await app.queryBlocksPage({ resolver, fetchImpl, startHeight: 95, sourceId: "fork" });
+  assert.equal(result.from, 76);
+  assert.equal(result.rows.length, 1);
+  assert.equal(result.rows[0].source.id, "fork");
+  assert.ok(calls.every((call) => call.url.startsWith("https://fork.example.test/")));
+});
+
+await test("an explicit fork blocks page fails closed on archive provenance mismatch", async () => {
+  const fetchImpl = mockFetch({
+    "https://fork.example.test/provenance": { body: { ...forkProvenance, checkpoint_sha256: hex("f") } },
+    "https://fork.example.test/blocks?from=76&to=95&limit=20": { body: { blocks: [] } },
+  });
+  await assert.rejects(app.queryBlocksPage({ resolver, fetchImpl, startHeight: 95, sourceId: "fork" }), /provenance rejected/);
+});
+
+await test("a blocks page rejects an unsafe or negative start height before any request", async () => {
+  const calls = [];
+  const fetchImpl = mockFetch({}, calls);
+  for (const startHeight of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN]) {
+    await assert.rejects(app.queryBlocksPage({ resolver, fetchImpl, startHeight, sourceId: "canonical" }), /outside the supported range/);
+  }
+  assert.equal(calls.length, 0);
+});
+
+await test("a blocks page cannot be resolved without a configured recovery checkpoint", async () => {
+  const noCheckpointResolver = network.createCanonicalResolver({
+    schema: "arc.frontend.network.v1",
+    state: "maintenance",
+    network: { name: "ARC Testnet", chainId: "arc-testnet-v3" },
+    sources: [{ id: "v3", name: "v3", kind: "v3", baseUrl: "https://v3.example.test" }],
+  });
+  await assert.rejects(
+    app.queryBlocksPage({ resolver: noCheckpointResolver, fetchImpl: mockFetch({}), startHeight: 10, sourceId: "canonical" }),
+    /recovery-checkpoint-unavailable/,
+  );
+});
+
+await test("the blocks route is dispatched to its own inspector, distinct from a single block", () => {
+  assert.match(source, /route\.kind === "blocks"\) inspectBlocksPage\(route\.value\)/);
+  assert.ok(source.includes('navigate("blocks", String('), "a deep link is built the same way other routes are");
+});
+
 await test("full explorer checkpoint audit checks H, H+1, and network identity", async () => {
   const routes = {
     "https://legacy.example.test/block/88": { body: { header: { height: H, hash: hex("a"), state_root: hex("b") } } },
@@ -427,6 +502,42 @@ await test("address responses stay separated by source", async () => {
   assert.deepEqual(result.records.map((record) => record.account.balance), [7, 4]);
 });
 
+await test("address transaction history is bounded and paged only when the node actually serves it", async () => {
+  const address = hex("9");
+  const fetchImpl = mockFetch({
+    [`https://v3.example.test/account/${address}`]: { body: { balance: 1, nonce: 1 } },
+    [`https://v3.example.test/account/${address}/txs`]: { body: { tx_hashes: [hex("1"), hex("2"), hex("3")] } },
+    [`https://legacy.example.test/account/${address}`]: { body: { balance: 2, nonce: 2 } },
+    [`https://legacy.example.test/account/${address}/txs`]: { status: 404, body: {} },
+  });
+  const result = await app.queryAddress({ resolver, fetchImpl, address, sourceId: "canonical", checkpointAudit: verifiedAudit });
+  const v3Record = result.records.find((record) => record.source.id === "v3");
+  const legacyRecord = result.records.find((record) => record.source.id === "legacy");
+  assert.equal(v3Record.historyState, "served");
+  assert.deepEqual(v3Record.txHashes, [hex("1"), hex("2"), hex("3")]);
+  // A 404 on this specific route means the route itself is absent on that
+  // node - an older version - never "this address has no history".
+  assert.equal(legacyRecord.historyState, "not-served");
+  assert.deepEqual(legacyRecord.txHashes, []);
+});
+
+await test("address history distinguishes an unreachable node from a non-200 node response", async () => {
+  const address = hex("a");
+  const unreachableFetch = async (url) => {
+    if (String(url).endsWith("/txs")) throw new Error("network down");
+    return response(200, { balance: 1, nonce: 1 });
+  };
+  const unreachable = await app.queryAddress({ resolver, fetchImpl: unreachableFetch, address, sourceId: "v3", checkpointAudit: verifiedAudit });
+  assert.equal(unreachable.records[0].historyState, "unreachable");
+
+  const serverErrorFetch = mockFetch({
+    [`https://v3.example.test/account/${address}`]: { body: { balance: 1, nonce: 1 } },
+    [`https://v3.example.test/account/${address}/txs`]: { status: 500, body: { error: "boom" } },
+  });
+  const serverError = await app.queryAddress({ resolver, fetchImpl: serverErrorFetch, address, sourceId: "v3", checkpointAudit: verifiedAudit });
+  assert.equal(serverError.records[0].historyState, "error");
+});
+
 await test("request helper performs only source-relative GET requests", async () => {
   const calls = [];
   const sourceConfig = resolver.source("v3");
@@ -467,8 +578,8 @@ await test("latest block fallback rejects non-404 errors, unsafe heights, and mi
 });
 
 await test("lookup failures use their own abort controller and render the intended error", () => {
-  // Block, transaction, native request and address inspectors each own one.
-  assert.equal((source.match(/state\.lookupController = controller;/g) || []).length, 4);
+  // Block, blocks-page, transaction, native request and address inspectors each own one.
+  assert.equal((source.match(/state\.lookupController = controller;/g) || []).length, 5);
   assert.doesNotMatch(source, /signal: state\.lookupController\.signal/);
   assert.doesNotMatch(source, /if \(!signal\.aborted\) inspectorError\("Block"/);
   assert.match(source, /if \(!controller\.signal\.aborted\) inspectorError\("Block", "Block unavailable", error\.message\)/);
@@ -508,7 +619,11 @@ await test("remote values are rendered without HTML injection sinks", () => {
 });
 
 await test("new continuity and evidence UI has explicit styling", () => {
-  for (const selector of [".recovery-ribbon", ".continuity-track", ".activity-grid", ".occurrence-card", ".truth-bad"]) assert.ok(css.includes(selector));
+  for (const selector of [".recovery-ribbon", ".continuity-track", ".activity-grid", ".occurrence-card", ".truth-bad", ".history-nav"]) assert.ok(css.includes(selector));
+});
+
+await test("the public site declares the paged blocks history entry point", () => {
+  assert.match(html, /id="blocks-page-link"/);
 });
 
 await test("legacy explorer entry redirects to the composite explorer", () => {
@@ -793,6 +908,45 @@ await test("native requests are compared across replicas and a disagreement is r
     app.queryNativeRequest({ resolver: replicaResolver, requestId: "../../admin", fetchImpl: mockFetch({}) }),
     /32-byte/,
   );
+});
+
+await test("native request answers carry each source's own reported height, never another source's", async () => {
+  const id = hex("f");
+  const heightResolver = network.createCanonicalResolver({
+    schema: "arc.frontend.network.v1",
+    state: "recovered",
+    network: { name: "ARC native height fixture", chainId: "arc-native-height-fixture" },
+    checkpoint: {
+      height: H, recoveryHeight: H + 1, legacyPublicMaxHeight: H + 10,
+      blockHash: hex("a"), stateRoot: hex("b"), manifestHash: hex("c"),
+      boundaryBlockHash: hex("d"), boundaryStateRoot: hex("e"), recoveryDomain: hex("f"),
+      recoveryEpoch: 7, validatorSetId: 9, protocolVersion: "3.0.0",
+      legacySourceId: "legacy", v3SourceId: "r1",
+    },
+    sources: [
+      { id: "legacy", name: "Legacy", kind: "legacy-canonical", baseUrl: "https://legacy.example.test" },
+      { id: "r1", name: "Replica 1", kind: "v3", baseUrl: "https://r1.example.test" },
+      { id: "r2", name: "Replica 2", kind: "v3", baseUrl: "https://r2.example.test" },
+    ],
+  });
+  const pendingReceipt = {
+    request_id: id, observed_status: "Pending", execution_price: 10, reserved_max_payment: 100,
+    settlement_credits: [], admission_transaction: { block_height: H + 1 }, expires_at: H + 5,
+  };
+  const result = await app.queryNativeRequest({
+    resolver: heightResolver, requestId: id, sourceId: "canonical",
+    fetchImpl: mockFetch({
+      [`https://r1.example.test/native-inference/receipt/${id}`]: { body: pendingReceipt },
+      "https://r1.example.test/health": { body: { height: H + 4 } },
+      [`https://r2.example.test/native-inference/receipt/${id}`]: { body: pendingReceipt },
+      // r2's /health is deliberately unmocked (404): its height must read as
+      // unavailable, never silently borrowed from r1.
+    }),
+  });
+  const r1 = result.answers.find((answer) => answer.source.id === "r1");
+  const r2 = result.answers.find((answer) => answer.source.id === "r2");
+  assert.equal(r1.height, H + 4);
+  assert.equal(r2.height, null);
 });
 
 process.stdout.write(`\nARC composite explorer contract: ${count}/${count} checks passed\n`);

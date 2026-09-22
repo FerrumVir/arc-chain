@@ -661,6 +661,10 @@ tbody tr.data-row:hover { background: rgba(184, 255, 90, 0.035); }
 
 .chip-list button:hover { border-color: var(--line-bright); color: var(--lime); }
 
+.history-nav { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.text-button:disabled { opacity: 0.4; cursor: not-allowed; }
+.text-button:disabled:hover { color: var(--muted); }
+
 .raw-data {
   max-height: 390px;
   margin: 0;

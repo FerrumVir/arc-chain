@@ -226,6 +226,59 @@
     };
   }
 
+  const BLOCKS_PAGE_SIZE = 20;
+
+  // A bounded, paged window of recent blocks, newest end first. Canonical mode
+  // routes each side of the page the same way a single block does
+  // (`resolver.routeBlock`); a page that straddles the signed checkpoint is
+  // split into its legacy and v3 segments and each is fetched from its own
+  // configured source, never blended into one request. An explicit source
+  // bypasses that split entirely and serves the whole page, like
+  // `queryTransaction`/`queryAddress` do.
+  async function queryBlocksPage(options) {
+    const { resolver, fetchImpl, startHeight, sourceId, signal } = options;
+    if (!Number.isSafeInteger(startHeight) || startHeight < 0) {
+      throw new RpcError("Block height is outside the supported range.", 0, null);
+    }
+    const from = Math.max(0, startHeight - BLOCKS_PAGE_SIZE + 1);
+    const to = startHeight;
+    const explicitId = sourceId && sourceId !== "canonical" ? sourceId : null;
+    let segments;
+    if (explicitId) {
+      const selected = resolver.source(explicitId);
+      if (!selected) throw new RpcError("Cannot resolve blocks: selected-source-unavailable", 0, explicitId);
+      segments = [{ from, to, source: selected }];
+    } else {
+      const topRoute = resolver.routeBlock(to, {});
+      if (!topRoute.ok) throw new RpcError(`Cannot resolve blocks: ${topRoute.reason}`, 0, null);
+      const checkpoint = resolver.config.checkpoint;
+      const crossesBoundary = checkpoint && from <= checkpoint.height && to > checkpoint.height;
+      if (!crossesBoundary) {
+        segments = [{ from, to, source: topRoute.source }];
+      } else {
+        const bottomRoute = resolver.routeBlock(checkpoint.height, {});
+        if (!bottomRoute.ok) throw new RpcError(`Cannot resolve blocks: ${bottomRoute.reason}`, 0, null);
+        segments = [
+          { from, to: checkpoint.height, source: bottomRoute.source },
+          { from: checkpoint.height + 1, to, source: topRoute.source },
+        ];
+      }
+    }
+    const fetched = await Promise.all(segments.map(async (segment) => {
+      // Same rule as every other query: an explicitly selected preserved fork
+      // is trusted only after its own provenance verifies, never on request
+      // shape alone. A no-op for the legacy-canonical/v3 sources the
+      // canonical split always uses.
+      await requireLegacyArchiveProvenance(segment.source, fetchImpl, signal);
+      const limit = segment.to - segment.from + 1;
+      const result = await optionalRequest(fetchImpl, segment.source, `/blocks?from=${segment.from}&to=${segment.to}&limit=${limit}`, { signal });
+      if (!result.ok) throw result.error;
+      return extractBlocks(result.value).map((block) => ({ block, source: segment.source }));
+    }));
+    const rows = fetched.flat().sort((a, b) => (network.blockHeight(b.block) ?? -1) - (network.blockHeight(a.block) ?? -1));
+    return { from, to, pageSize: BLOCKS_PAGE_SIZE, rows };
+  }
+
   async function queryTransaction(options) {
     const { resolver, fetchImpl, hash, sourceId, signal, checkpointAudit } = options;
     // The hash reaches this function straight from the URL fragment, so it is
@@ -306,15 +359,30 @@
         optionalRequest(fetchImpl, source, `/account/${accountAddress}/txs`, { signal }),
       ]);
       const historyValue = history.ok ? history.value : null;
-      const txHashes = historyValue?.tx_hashes ?? historyValue?.transactions ?? [];
-      const found = account.ok || (Array.isArray(txHashes) && txHashes.length > 0);
+      const txHashes = Array.isArray(historyValue?.tx_hashes) ? historyValue.tx_hashes : [];
+      const found = account.ok || txHashes.length > 0;
+      // `/account/{address}/txs` never 404s for a well-formed address on a node
+      // that implements it (an unused address just gets an empty list back),
+      // so a 404 here means the route itself is absent - an older node, not
+      // "no history". Any other failure is a genuine reachability problem.
+      // Each gets its own message; none is silently treated as "no history".
+      const historyState = history.ok ? "served" : history.error?.status === 404 ? "not-served" : history.error?.status ? "error" : "unreachable";
       const configuredCanonical = sourceId === "canonical"
         && (source.id === resolver.config.checkpoint?.v3SourceId || source.id === resolver.config.checkpoint?.legacySourceId);
       const provenance = network.gateCanonical(
         configuredCanonical ? { canonical: true, segment: "canonical-segment-source" } : { canonical: false, segment: "alternate-source" },
         checkpointAudit,
       );
-      return { source, found, account: account.ok ? account.value : null, history: historyValue, provenance, archiveVerification };
+      return {
+        source, found,
+        account: account.ok ? account.value : null,
+        history: historyValue,
+        historyState,
+        historyError: history.ok ? null : (history.error?.message || null),
+        txHashes,
+        provenance,
+        archiveVerification,
+      };
     }));
     return { records: attempts.filter((attempt) => attempt.found), failures: attempts.filter((attempt) => !attempt.found) };
   }
@@ -334,8 +402,20 @@
       ? resolver.lookupSources({ sourceId })
       : resolver.v3Replicas().map((source) => ({ source, sourceId: source.id }));
     const answers = await Promise.all(planned.map(async ({ source }) => {
-      const result = await optionalRequest(fetchImpl, source, `/native-inference/receipt/${id}`, { signal });
-      return { source, receipt: result.ok ? result.value : null, error: result.ok ? null : result.error };
+      // `/health` is fetched from the same source as the receipt, never a
+      // different one: whether a Pending request has passed its expiry is a
+      // claim about that source's own view of the chain, not a claim merged
+      // across sources.
+      const [result, health] = await Promise.all([
+        optionalRequest(fetchImpl, source, `/native-inference/receipt/${id}`, { signal }),
+        optionalRequest(fetchImpl, source, "/health", { signal }),
+      ]);
+      return {
+        source,
+        receipt: result.ok ? result.value : null,
+        error: result.ok ? null : result.error,
+        height: health.ok ? integerOrNull(health.value?.height) : null,
+      };
     }));
     const answered = answers.filter((answer) => answer.receipt);
     return {
@@ -355,10 +435,10 @@
       banner: $("connection-banner"), bannerTitle: $("banner-title"), bannerDetail: $("banner-detail"), sourceName: $("source-name"), sourceEndpoint: $("source-endpoint"), lastRefreshed: $("last-refreshed"), sourceHelp: $("source-help"),
       recoveryTitle: $("recovery-title"), recoverySummary: $("recovery-summary"), checkpointHeight: $("checkpoint-height"), checkpointHash: $("checkpoint-hash"), boundaryHeight: $("boundary-height"), boundaryState: $("boundary-state"), continuationLabel: $("continuation-label"), manifestHash: $("manifest-hash"),
       metricHeight: $("metric-height"), metricHeightNote: $("metric-height-note"), metricStoredHeight: $("metric-stored-height"), metricStoredNote: $("metric-stored-note"), metricBlockAge: $("metric-block-age"), metricLivenessNote: $("metric-liveness-note"), metricTransactions: $("metric-transactions"), metricPeers: $("metric-peers"), metricValidators: $("metric-validators"), metricValidatorNote: $("metric-validator-note"),
-      blocksStatus: $("blocks-status"), blocksBody: $("blocks-body"), sourceFacts: $("source-facts"), inferenceStatus: $("inference-status"), inferenceList: $("inference-list"), rewardsStatus: $("rewards-status"), rewardsList: $("rewards-list"),
+      blocksStatus: $("blocks-status"), blocksBody: $("blocks-body"), blocksPageLink: $("blocks-page-link"), sourceFacts: $("source-facts"), inferenceStatus: $("inference-status"), inferenceList: $("inference-list"), rewardsStatus: $("rewards-status"), rewardsList: $("rewards-list"),
       searchForm: $("search-form"), searchInput: $("search-input"), searchKind: $("search-kind"), searchError: $("search-error"), inspector: $("inspector"), inspectorKicker: $("inspector-kicker"), inspectorTitle: $("inspector-title"), inspectorClose: $("inspector-close"), inspectorContent: $("inspector-content"),
     };
-    const state = { config: null, resolver: null, sourceId: "canonical", checkpointAudit: { state: "unknown", reason: "not-audited" }, refreshController: null, lookupController: null, timer: null };
+    const state = { config: null, resolver: null, sourceId: "canonical", checkpointAudit: { state: "unknown", reason: "not-audited" }, refreshController: null, lookupController: null, timer: null, lastKnownHeight: null };
 
     const text = (node, value) => { if (node) node.textContent = value == null ? "" : String(value); };
     const clear = (node) => { if (node) node.replaceChildren(); };
@@ -480,6 +560,15 @@
       if (Array.isArray(block?.transactions)) return block.transactions.length;
       if (Array.isArray(block?.tx_hashes)) return block.tx_hashes.length;
       return null;
+    }
+
+    // The rows a `/block/{height}/txs` response actually carries, reduced to
+    // just what is needed to link each one to its own transaction lookup.
+    function transactionEntries(payload) {
+      const rows = Array.isArray(payload?.transactions) ? payload.transactions : [];
+      return rows
+        .map((row) => ({ index: integerOrNull(row?.index), hash: network.normalizeHex(row?.hash, 32) }))
+        .filter((row) => row.hash);
     }
 
     function renderBlocks(blocks, source) {
@@ -633,6 +722,7 @@
         state.checkpointAudit = checkpointAudit;
         const snapshot = snapshotResult.value;
         const height = reportedHeight(snapshot);
+        if (height !== null) state.lastKnownHeight = height;
         const liveness = network.evaluateLiveness(snapshot.health, snapshot.latest);
         text(elements.metricHeight, formatInteger(height));
         text(elements.metricHeightNote, state.sourceId === "canonical" ? "Protocol-v3 current source" : "Explicit source report");
@@ -741,9 +831,90 @@
           ["State root", network.stateRoot(result.block) ? `0x${network.stateRoot(result.block)}` : "Unavailable", true],
           ["Transactions", formatInteger(txCount(result.block))],
         ]), rawSection("Block response", result.block));
-        if (result.transactions) elements.inspectorContent.append(rawSection("Transaction index response", result.transactions));
+        if (result.transactions) {
+          const entries = transactionEntries(result.transactions);
+          const section = create("section", "detail-section");
+          const totalKnown = integerOrNull(result.transactions?.tx_count);
+          section.append(create("h3", "", `Transactions in this block${entries.length ? ` (${formatInteger(entries.length)}${totalKnown !== null && totalKnown > entries.length ? ` of ${formatInteger(totalKnown)}` : ""})` : ""}`));
+          if (entries.length) {
+            const list = create("ul", "chip-list");
+            for (const entry of entries) {
+              const li = create("li");
+              const button = create("button", "", network.formatHash(entry.hash, 10, 8));
+              button.type = "button";
+              button.title = `0x${entry.hash}`;
+              button.addEventListener("click", () => navigate("tx", entry.hash));
+              li.append(button);
+              list.append(li);
+            }
+            section.append(list);
+          } else {
+            section.append(create("p", "", "This block's transaction index returned no linkable entries."));
+          }
+          elements.inspectorContent.append(section, rawSection("Transaction index response", result.transactions));
+        }
       } catch (error) {
         if (!controller.signal.aborted) inspectorError("Block", "Block unavailable", error.message);
+      }
+    }
+
+    async function inspectBlocksPage(rawStart) {
+      const parsed = classifyLookup(rawStart, "block");
+      if (parsed.error) return inspectorError("Blocks", "Invalid start height", parsed.error);
+      const startHeight = Number(parsed.value);
+      state.lookupController?.abort();
+      const controller = new AbortController();
+      state.lookupController = controller;
+      inspectorLoading("Blocks", `Heights up to #${formatInteger(startHeight)}`);
+      try {
+        const result = await queryBlocksPage({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), startHeight, sourceId: state.sourceId, signal: controller.signal });
+        setInspector("Blocks · paged history", `Heights #${formatInteger(result.from)} – #${formatInteger(result.to)}`);
+        const nav = create("div", "history-nav");
+        const olderButton = create("button", "text-button", "← Older");
+        olderButton.type = "button";
+        olderButton.disabled = result.from === 0;
+        olderButton.addEventListener("click", () => navigate("blocks", String(Math.max(0, result.from - 1))));
+        const newerButton = create("button", "text-button", "Newer →");
+        newerButton.type = "button";
+        newerButton.addEventListener("click", () => navigate("blocks", String(result.to + result.pageSize)));
+        nav.append(olderButton, create("span", "quiet-pill", `${formatInteger(result.rows.length)} block(s) · page size ${result.pageSize}`), newerButton);
+        elements.inspectorContent.append(nav);
+        if (!result.rows.length) {
+          elements.inspectorContent.append(create("p", "empty-cell", "No retained blocks were returned in this range."));
+          return;
+        }
+        const tableWrap = create("div", "table-scroll");
+        const table = create("table");
+        const thead = create("thead");
+        const headRow = create("tr");
+        for (const label of ["Height", "Segment", "Transactions", "Block hash", "Source"]) headRow.append(create("th", "", label));
+        thead.append(headRow);
+        const tbody = create("tbody");
+        for (const row of result.rows) {
+          const height = network.blockHeight(row.block);
+          const configured = height === null ? { canonical: false, segment: "unverified" } : state.resolver.classifyOccurrence(row.source.id, height);
+          const canonical = network.gateCanonical(configured, state.checkpointAudit);
+          const tr = create("tr");
+          const heightCell = create("td");
+          const button = create("button", "table-link", height === null ? "Unknown" : `#${formatInteger(height)}`);
+          button.type = "button";
+          if (height !== null) button.addEventListener("click", () => navigate("block", String(height)));
+          heightCell.append(button);
+          const segment = canonical.canonical ? canonical.segment.replaceAll("-", " ") : "non-canonical / unverified";
+          tr.append(
+            heightCell,
+            create("td", canonical.canonical ? "truth-good" : "truth-warn", segment),
+            create("td", "", formatInteger(txCount(row.block))),
+            create("td", "", network.formatHash(network.blockHash(row.block))),
+            create("td", "", sourceDisplay(row.source)),
+          );
+          tbody.append(tr);
+        }
+        table.append(thead, tbody);
+        tableWrap.append(table);
+        elements.inspectorContent.append(tableWrap);
+      } catch (error) {
+        if (!controller.signal.aborted) inspectorError("Blocks", "Blocks unavailable", error.message);
       }
     }
 
@@ -789,6 +960,52 @@
       }
     }
 
+    // A bounded, paged, client-side view over the tx hashes a source already
+    // returned in full: `/account/{address}/txs` has no offset/limit of its
+    // own, so pagination here is display-only - it never issues another
+    // request. Newest first, since the node appends hashes as it applies them.
+    function buildHashPager(hashes) {
+      const pageSize = 20;
+      const wrap = create("div", "detail-section");
+      wrap.append(create("h3", "", `Indexed transactions (${formatInteger(hashes.length)})`));
+      if (!hashes.length) {
+        wrap.append(create("p", "", "No indexed transactions for this address."));
+        return wrap;
+      }
+      const newestFirst = hashes.slice().reverse();
+      const pageCount = Math.max(1, Math.ceil(newestFirst.length / pageSize));
+      let page = 0;
+      const nav = create("div", "history-nav");
+      const newerButton = create("button", "text-button", "Newer →");
+      const status = create("span", "quiet-pill");
+      const olderButton = create("button", "text-button", "← Older");
+      newerButton.type = "button";
+      olderButton.type = "button";
+      const list = create("ul", "chip-list");
+      function renderPage() {
+        clear(list);
+        const start = page * pageSize;
+        for (const hash of newestFirst.slice(start, start + pageSize)) {
+          const li = create("li");
+          const button = create("button", "", network.formatHash(hash, 10, 8));
+          button.type = "button";
+          button.title = `0x${hash}`;
+          button.addEventListener("click", () => navigate("tx", hash));
+          li.append(button);
+          list.append(li);
+        }
+        text(status, `Page ${page + 1} of ${pageCount} · newest first`);
+        newerButton.disabled = page <= 0;
+        olderButton.disabled = page >= pageCount - 1;
+      }
+      newerButton.addEventListener("click", () => { if (page > 0) { page -= 1; renderPage(); } });
+      olderButton.addEventListener("click", () => { if (page < pageCount - 1) { page += 1; renderPage(); } });
+      nav.append(newerButton, status, olderButton);
+      renderPage();
+      wrap.append(nav, list);
+      return wrap;
+    }
+
     async function inspectAddress(address) {
       state.lookupController?.abort();
       const controller = new AbortController();
@@ -802,8 +1019,18 @@
         for (const record of result.records) {
           const card = create("article", "occurrence-card");
           card.append(create("h3", "", sourceDisplay(record.source)), detailGrid([
-            ["Balance (raw)", formatInteger(record.account?.balance)], ["Nonce", formatInteger(record.account?.nonce)], ["Indexed transactions", formatInteger(record.history?.tx_count ?? record.history?.tx_hashes?.length)],
+            ["Balance (raw)", formatInteger(record.account?.balance)],
+            ["Nonce", formatInteger(record.account?.nonce)],
           ]));
+          if (record.historyState === "served") {
+            card.append(buildHashPager(record.txHashes));
+          } else if (record.historyState === "not-served") {
+            card.append(create("p", "inspector-note", "Transaction history is not served by this node (no /account/{address}/txs route)."));
+          } else if (record.historyState === "unreachable") {
+            card.append(create("p", "inspector-note error", `Transaction history unreachable: ${record.historyError || "no response"}.`));
+          } else {
+            card.append(create("p", "inspector-note error", `Transaction history request failed: ${record.historyError || "unexpected response"}.`));
+          }
           if (record.account) card.append(rawSection("Account response", record.account));
           if (record.history) card.append(rawSection("Address history", record.history));
           elements.inspectorContent.append(card);
@@ -832,6 +1059,8 @@
         ));
         for (const row of comparison.rows) {
           const summary = row.summary;
+          const answer = result.answers.find((item) => item.source.id === row.source);
+          const expiry = nativeReceipts.classifyExpiry(summary, answer?.height ?? null);
           const card = create("article", "occurrence-card");
           const reconciled = summary.reconciled === null ? "Not settled yet" : summary.reconciled ? "Credits equal the reservation" : "Credits do NOT equal the reservation";
           card.append(create("h3", "", row.source), detailGrid([
@@ -843,9 +1072,17 @@
             ["Output hash", summary.outputHash ? `0x${summary.outputHash}` : "None", true],
             ["Admitted at", formatInteger(summary.admissionHeight)],
             ["Terminal at", formatInteger(summary.terminalHeight)],
+            ["Expires at", summary.expiresAt === null ? "Unavailable from this node" : `Height ${formatInteger(summary.expiresAt)}`],
+            ["Requester", summary.requester ? `0x${summary.requester}` : "Unavailable", true],
+            ["Certified output (hex)", summary.outputCertified ? summary.outputHex : "Empty · not finalized yet", true],
+            ["Display text — NOT certified", summary.outputText !== null ? summary.outputText : "Unavailable · display-only, never part of the certificate", true],
           ]));
-          const served = result.answers.find((answer) => answer.source.id === row.source);
-          if (served?.receipt) card.append(rawSection("Receipt", served.receipt));
+          if (expiry.applicable && expiry.expired === true) {
+            card.append(create("p", "inspector-note error", "Expired without a certificate: refundable by a refund transaction. No refund has happened yet - the chain only refunds once that transaction is mined."));
+          } else if (expiry.applicable && expiry.expired === null) {
+            card.append(create("p", "inspector-note", `${row.source}'s current height is unavailable, so expiry cannot be evaluated against it.`));
+          }
+          if (answer?.receipt) card.append(rawSection("Receipt", answer.receipt));
           elements.inspectorContent.append(card);
         }
       } catch (error) {
@@ -883,6 +1120,7 @@
       }
       if (!state.resolver) return inspectorError("Lookup", "Configuration unavailable", "The canonical resolver has not loaded.");
       if (route.kind === "block") inspectBlock(route.value);
+      else if (route.kind === "blocks") inspectBlocksPage(route.value);
       else if (route.kind === "tx") inspectTransaction(route.value);
       else if (route.kind === "address") inspectAddress(route.value);
       else if (route.kind === "request") inspectNativeRequest(route.value);
@@ -903,6 +1141,7 @@
       handleRoute();
     });
     elements.refreshButton.addEventListener("click", refresh);
+    elements.blocksPageLink.addEventListener("click", () => navigate("blocks", String(state.lastKnownHeight ?? 0)));
     elements.searchForm.addEventListener("submit", (event) => {
       event.preventDefault();
       const parsed = classifyLookup(elements.searchInput.value, elements.searchKind.value);
@@ -950,6 +1189,7 @@
     requestLatestBlock,
     verifyRecoveryCheckpoint,
     queryBlock,
+    queryBlocksPage,
     queryTransaction,
     queryAddress,
     queryNativeRequest,

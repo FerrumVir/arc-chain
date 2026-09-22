@@ -89,4 +89,115 @@ check("native transactions link to their request; others do not", () => {
   assert.equal(transfer.requestId, null);
 });
 
+// The node source for expires_at/requester/output_hex/output_text was added
+// but is not yet compiled anywhere; every receipt above is the shape a
+// running node actually serves today. These fields must read as
+// "unavailable", never as fabricated zeros/empties, until a node upgrades.
+check("expiry, requester, and certified output are absent-safe on an un-upgraded receipt", () => {
+  const s = native.summarize(finalized);
+  assert.equal(s.expiresAt, null);
+  assert.equal(s.requester, null);
+  assert.equal(s.outputHex, "");
+  assert.equal(s.outputCertified, false);
+  assert.equal(s.outputText, null);
+});
+
+check("an upgraded receipt exposes expiry, requester, and certified output separately from display text", () => {
+  const upgraded = {
+    ...finalized,
+    expires_at: 40,
+    requester: "cc".repeat(32),
+    output_hex: "deadbeef",
+    output_text: "hello world",
+  };
+  const s = native.summarize(upgraded);
+  assert.equal(s.expiresAt, 40);
+  assert.equal(s.requester, "cc".repeat(32));
+  assert.equal(s.outputHex, "deadbeef");
+  assert.equal(s.outputCertified, true);
+  assert.equal(s.outputText, "hello world");
+});
+
+check("output_text absent from an otherwise-upgraded receipt reads as unavailable, not empty certified output", () => {
+  const noText = { ...finalized, expires_at: 40, requester: "cc".repeat(32), output_hex: "", output_text: null };
+  const s = native.summarize(noText);
+  assert.equal(s.outputCertified, false);
+  assert.equal(s.outputText, null);
+});
+
+check("a Pending request past its expiry height is expired without a certificate", () => {
+  const pending = { ...finalized, observed_status: "Pending", settlement_credits: [], terminal_transaction: null, expires_at: 40 };
+  const s = native.summarize(pending);
+  const atBoundary = native.classifyExpiry(s, 39); // 39 + 1 >= 40
+  assert.equal(atBoundary.applicable, true);
+  assert.equal(atBoundary.expired, true);
+  assert.match(atBoundary.message, /refundable by a refund transaction/);
+  assert.doesNotMatch(atBoundary.message, /has been refunded|refund(ed)? successfully/i);
+});
+
+check("a Pending request before its expiry height is not expired", () => {
+  const pending = { ...finalized, observed_status: "Pending", settlement_credits: [], terminal_transaction: null, expires_at: 40 };
+  const s = native.summarize(pending);
+  const early = native.classifyExpiry(s, 10); // 10 + 1 < 40
+  assert.equal(early.applicable, true);
+  assert.equal(early.expired, false);
+  assert.equal(early.message, null);
+});
+
+check("expiry does not apply once a request is settled or when a node reports no expiry field", () => {
+  const settledWithExpiry = { ...finalized, expires_at: 40 };
+  assert.equal(native.classifyExpiry(native.summarize(settledWithExpiry), 1000).applicable, false);
+  const pendingNoExpiry = { ...finalized, observed_status: "Pending", settlement_credits: [], terminal_transaction: null };
+  assert.equal(native.classifyExpiry(native.summarize(pendingNoExpiry), 1000).applicable, false);
+  assert.equal(native.classifyExpiry({ known: false }, 1000).applicable, false);
+});
+
+check("expiry is undecided, never assumed, when the chain height is unavailable", () => {
+  const pending = { ...finalized, observed_status: "Pending", settlement_credits: [], terminal_transaction: null, expires_at: 40 };
+  const result = native.classifyExpiry(native.summarize(pending), null);
+  assert.equal(result.applicable, true);
+  assert.equal(result.expired, null);
+});
+
+check("replicas that differ only in requester, expiry, or certified output are still a disagreement", () => {
+  const base = { ...finalized, expires_at: 40, requester: "cc".repeat(32), output_hex: "deadbeef" };
+  const differentRequester = { ...base, requester: "ee".repeat(32) };
+  const r = native.compareReplicas([
+    { source: "a", receipt: base },
+    { source: "b", receipt: differentRequester },
+  ]);
+  assert.equal(r.agree, false);
+});
+
+check("a replica that does not report the newer fields yet is not a disagreement", () => {
+  // During a rolling upgrade one node reports expiry, requester and output
+  // bytes and another does not: missing detail, not a different settlement.
+  const upgraded = { ...finalized, expires_at: 40, requester: "cc".repeat(32), output_hex: "deadbeef" };
+  const mixed = native.compareReplicas([
+    { source: "new", receipt: upgraded },
+    { source: "old", receipt: finalized },
+  ]);
+  assert.equal(mixed.agree, true);
+  // Settlement itself is still compared strictly across both.
+  const differentCredits = {
+    ...finalized,
+    settlement_credits: [{ payee: "ff".repeat(32), amount: 1 }],
+  };
+  assert.equal(
+    native.compareReplicas([
+      { source: "new", receipt: upgraded },
+      { source: "old", receipt: differentCredits },
+    ]).agree,
+    false,
+  );
+  // Two upgraded replicas with different certified output bytes disagree.
+  assert.equal(
+    native.compareReplicas([
+      { source: "a", receipt: upgraded },
+      { source: "b", receipt: { ...upgraded, output_hex: "00" } },
+    ]).agree,
+    false,
+  );
+});
+
 console.log(`\nARC local-dev native-inference view: ${passed}/${passed} checks passed`);
