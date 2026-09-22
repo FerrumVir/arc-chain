@@ -168,6 +168,24 @@ class RealModel(unittest.TestCase):
         self.assertIn("--native-inference-test-executor", orchestrate.Node(test_cfg, 0).args("g"))
         self.assertEqual(orchestrate.driver_executor_args_for(test_cfg), [])
 
+    def test_run_json_and_every_record_carry_the_executor_the_nodes_run(self):
+        # run.json used to say "deterministic-test-executor" for every native
+        # run, a real-model run included, while its records said otherwise.
+        real = types.SimpleNamespace(workload="native", real_model="/m.gguf",
+                                     qualification="/q.json", input_hex="01000000",
+                                     max_tokens=4)
+        label = orchestrate.executor_label_for(real)
+        self.assertEqual(label, "canonical-i8-real-model qualification=/q.json")
+        self.assertEqual(orchestrate.driver_executor_args_for(real)[-2:], ["--executor-label", label])
+        deterministic = types.SimpleNamespace(**{**vars(real), "real_model": None})
+        self.assertEqual(orchestrate.executor_label_for(deterministic), "deterministic-test-executor")
+        self.assertIsNone(orchestrate.executor_label_for(
+            types.SimpleNamespace(**{**vars(real), "workload": "faucet"})))
+        with open(orchestrate.__file__) as fh:
+            source = fh.read()
+        self.assertIn('"executor": executor_label_for(cfg)', source,
+                      "run.json takes its label from the same helper as the driver")
+
 
 class BinarySelfReport(unittest.TestCase):
     def test_a_node_reporting_another_build_aborts_the_run(self):

@@ -558,8 +558,8 @@ class Soak:
                                                if cfg.workload == "native" else None),
                          # Deterministic-executor evidence exercises protocol and
                          # settlement and qualifies nothing about model quality.
-                         "executor": ("deterministic-test-executor"
-                                      if cfg.workload == "native" else None)},
+                         # The same label the driver writes into every record.
+                         "executor": executor_label_for(cfg)},
             "thresholds": {"recovery_budget_s": cfg.recovery_budget_s},
             "nodes": [],
         }
@@ -1114,12 +1114,24 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def executor_label_for(cfg: Any) -> Optional[str]:
+    """The executor a native run's nodes execute requests with, as recorded in
+    run.json and in every workload record. A real-model run must never carry
+    the deterministic executor's label, or the reverse."""
+    if getattr(cfg, "workload", None) != "native":
+        return None
+    if getattr(cfg, "real_model", None):
+        return f"canonical-i8-real-model qualification={cfg.qualification}"
+    # The load driver's own default label.
+    return "deterministic-test-executor"
+
+
 def driver_executor_args_for(cfg: Any) -> List[str]:
     """The load driver's input for the executor the nodes run."""
     if not getattr(cfg, "real_model", None):
         return []
     return ["--input-hex", cfg.input_hex, "--max-tokens", str(cfg.max_tokens),
-            "--executor-label", f"canonical-i8-real-model qualification={cfg.qualification}"]
+            "--executor-label", executor_label_for(cfg)]
 
 
 def main(argv: Optional[List[str]] = None) -> int:

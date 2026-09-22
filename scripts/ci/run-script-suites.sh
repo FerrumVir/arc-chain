@@ -16,8 +16,8 @@
 # built arc-node binary, and nothing touches the network or another process.
 # A suite that needed one of those would be listed here as EXCLUDED with the
 # reason, not run. (As of this writing, nothing under scripts/arc_conformance/
-# tests, scripts/arc_soak/tests, scripts/arc_ops/tests or
-# scripts/release/tests needs such an exclusion.)
+# tests, scripts/arc_soak/tests, scripts/arc_ops/tests, scripts/release/tests
+# or scripts/benchmarks/tests needs such an exclusion.)
 #
 # Deliberately `set -uo pipefail` and not `-e`: every suite must get a chance
 # to run even if an earlier one fails, so a full report of failures comes
@@ -69,5 +69,11 @@ run_unittest "release: SBOM builder (R2)"                    scripts/release/tes
 run_unittest "release: signing-path FIXTURE tests (R3/U7)"   scripts/release/tests/test_signing_fixtures.py
 run_unittest "release: local artifact verifier (R2)"         scripts/release/tests/test_verify_local_artifacts.py
 run_unittest "release: local build script FIXTURE (R2)"      scripts/release/tests/test_build_local_artifacts.py
+
+# scripts/benchmarks/tests loads its modules by file path in the same way.
+# Synthetic workload records and the cost calculator's own self-test only:
+# no model, node or network.
+run_unittest "benchmarks: native request latency (M8)"      scripts/benchmarks/tests/test_native_request_latency.py
+run_unittest "benchmarks: inference cost projection (M9)"   scripts/benchmarks/tests/test_project_inference_cost.py
 
 exit "$failed"
