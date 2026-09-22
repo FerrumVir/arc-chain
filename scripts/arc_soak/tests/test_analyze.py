@@ -432,6 +432,29 @@ class AnalyzerTests(unittest.TestCase):
         code, v = self.run_case(d)
         self.assertEqual(v["status"], "FAIL")
 
+    def test_a_host_pause_leaves_the_run_incomplete_although_heights_rose_across_it(self):
+        # The 2026-09-22 soak: the host hibernated for 71 minutes, and the
+        # first sample after it showed higher heights than the last one before
+        # it, so no stall was seen. 150 s without a sample here.
+        d = passing()
+        d.samples = [s for s in d.samples if not 1750 < s["t"] < 1900]
+        code, v = self.run_case(d)
+        self.assertEqual(v["status"], "INCOMPLETE", v)
+        self.assertNotEqual(code, 0)
+        self.assertTrue(any(r.startswith("coverage:") for r in v["incomplete"]), v)
+        self.assertEqual([g["seconds"] for g in v["facts"]["sample_gaps"]], [150.0])
+        self.assertEqual(v["facts"]["unobserved_s"], 150.0)
+
+    def test_the_coverage_limit_follows_the_configured_sample_interval(self):
+        # At a 20 s interval, ten intervals (200 s) is the limit: 150 s is not
+        # a gap, and the run passes.
+        d = passing()
+        d.run["sample_interval_s"] = 20.0
+        d.samples = [s for s in d.samples if not 1750 < s["t"] < 1900]
+        code, v = self.run_case(d)
+        self.assertEqual(v["status"], "PASS", v)
+        self.assertEqual(v["facts"]["sample_gaps"], [])
+
     def test_a_network_wide_stall_fails(self):
         d = passing()
         for s in d.samples:

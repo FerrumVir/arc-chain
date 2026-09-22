@@ -47,6 +47,7 @@ import math
 import os
 import re
 import sys
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 PASS, FAIL, INCOMPLETE = "PASS", "FAIL", "INCOMPLETE"
@@ -60,6 +61,10 @@ DEFAULT_THRESHOLDS = {
     "min_duration_fraction": 0.98,
     # liveness
     "max_stall_s": 60.0,
+    # coverage: the longest gap between sample ticks that still counts as
+    # observed time - this many sample intervals, and never less than the floor
+    "max_sample_gap_intervals": 10.0,
+    "min_sample_gap_s": 120.0,
     # agreement
     "min_full_agreement_checks": 1,
     "max_unscheduled_unavailable_fraction": 0.05,
@@ -375,6 +380,34 @@ def check_liveness(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
             f"liveness: {len(regressions)} height regression(s) on a running node; "
             f"first: node {node} went from {before} to {after}")
     v.facts["height_regressions"] = len(regressions)
+
+
+def check_coverage(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
+    """A run observes only while it samples. A long gap between sample ticks
+    - the host asleep or hibernating, the orchestrator stalled - is time with
+    no liveness, agreement or fault evidence, so the verdict cannot speak for
+    it. Wall-clock completion still counts that time, and heights still rise
+    across it (the chain advanced before and after), which is why neither the
+    completion nor the stall check can see it. On 2026-09-22 a host that went
+    to sleep on low battery froze a 24-hour soak for 71 minutes that way.
+    """
+    times = sorted(_samples_by_time(ev))
+    if len(times) < 2:
+        return
+    interval = _finite((ev.run or {}).get("sample_interval_s")) or 0.0
+    limit = max(th["min_sample_gap_s"], th["max_sample_gap_intervals"] * interval)
+    gaps = [(a, b) for a, b in zip(times, times[1:]) if b - a > limit]
+    unobserved = sum(b - a for a, b in gaps)
+    v.facts["sample_gaps"] = [{"from_t": a, "to_t": b, "seconds": round(b - a, 1)}
+                              for a, b in gaps]
+    v.facts["unobserved_s"] = round(unobserved, 1)
+    if gaps:
+        a, b = max(gaps, key=lambda gap: gap[1] - gap[0])
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(a))
+        v.incomplete.append(
+            f"coverage: no samples for {unobserved:.0f}s in {len(gaps)} gap(s) longer than "
+            f"{limit:.0f}s (longest {b - a:.0f}s from {started}); the host slept or the harness "
+            "stalled, and the run did not observe that time")
 
 
 def _coherent(replica: Dict[str, Any], target: int, identity: str) -> Optional[str]:
@@ -704,6 +737,7 @@ def judge(run_dir: str) -> Verdict:
     check_provenance(ev, v)
     check_safety(run_dir, v)
     check_liveness(ev, v, th)
+    check_coverage(ev, v, th)
     check_agreement(ev, v, th)
     recovered = check_recovery(ev, v, th)
     check_throughput(ev, v, th, recovered)

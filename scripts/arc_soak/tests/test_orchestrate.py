@@ -187,6 +187,36 @@ class RealModel(unittest.TestCase):
                       "run.json takes its label from the same helper as the driver")
 
 
+class HostPower(unittest.TestCase):
+    """A long run refuses to start on battery: a sleep on low battery froze
+    the 2026-09-22 soak for 71 minutes."""
+
+    BATTERY = ("Now drawing from 'Battery Power'\n -InternalBattery-0 (id=21954659)\t85%; "
+               "discharging; (no estimate) present: true\n")
+    AC = ("Now drawing from 'AC Power'\n -InternalBattery-0 (id=21954659)\t100%; charged; "
+          "0:00 remaining present: true\n")
+
+    def test_pmset_output_is_read(self):
+        self.assertEqual(orchestrate.parse_power(self.BATTERY),
+                         {"source": "Battery Power", "percent": 85})
+        self.assertEqual(orchestrate.parse_power(self.AC), {"source": "AC Power", "percent": 100})
+        self.assertIsNone(orchestrate.parse_power("no power information"))
+
+    def test_a_long_run_on_battery_is_refused_unless_allowed(self):
+        battery = orchestrate.parse_power(self.BATTERY)
+        self.assertIn("on battery (85%)", orchestrate.battery_refusal(6 * 3600, battery, False))
+        self.assertIsNone(orchestrate.battery_refusal(6 * 3600, battery, True))
+        self.assertIsNone(orchestrate.battery_refusal(900, battery, False),
+                          "a short run may use battery")
+        self.assertIsNone(orchestrate.battery_refusal(6 * 3600, orchestrate.parse_power(self.AC),
+                                                      False))
+        self.assertIsNone(orchestrate.battery_refusal(6 * 3600, None, False),
+                          "no power information refuses nothing")
+        with open(orchestrate.__file__) as fh:
+            source = fh.read()
+        self.assertIn('"host_power_at_start": power', source, "run.json records the power source")
+
+
 class BinarySelfReport(unittest.TestCase):
     def test_a_node_reporting_another_build_aborts_the_run(self):
         digest = "ab" * 32

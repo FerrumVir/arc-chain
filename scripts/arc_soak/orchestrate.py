@@ -430,6 +430,7 @@ class Config:
         self.faucet_rate = a.faucet_rate
         self.native_rate = a.native_rate
         self.native_requesters = a.native_requesters
+        self.allow_battery = bool(getattr(a, "allow_battery", False))
         self.fund = parse_funding(getattr(a, "fund", None))
         workers = getattr(a, "native_workers", None)
         self.native_workers = a.nodes if workers is None else workers
@@ -524,6 +525,10 @@ class Soak:
                 for p in (cfg.base_rpc + i, cfg.base_p2p + i) if port_busy(p)]
         if busy:
             raise SystemExit(f"REFUSING: ports in use: {busy}")
+        power = host_power()
+        refusal = battery_refusal(cfg.duration, power, getattr(cfg, "allow_battery", False))
+        if refusal:
+            raise SystemExit(refusal)
         self.run = {
             "schema": "arc-soak-run/1",
             "mode": cfg.mode,
@@ -531,6 +536,7 @@ class Soak:
             "abort_reason": "the orchestrator has not finished",
             "planned_duration_s": cfg.duration,
             "sample_interval_s": cfg.sample_s,
+            "host_power_at_start": power,
             "planned_faults": cfg.planned_faults,
             "binary": cfg.binary,
             "binary_sha256": used,
@@ -1084,6 +1090,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workload", choices=["none", "faucet", "native"], default="faucet")
     p.add_argument("--native-rate", type=float, default=0.2,
                    help="native-inference requests per second offered (workload=native)")
+    p.add_argument("--allow-battery", action="store_true",
+                   help="start a run longer than 30 minutes on battery power; a sleep on low "
+                        "battery freezes the whole run")
     p.add_argument("--native-requesters", type=int, default=4,
                    help="requester accounts, i.e. the most requests in flight at once")
     p.add_argument("--load-driver",
@@ -1112,6 +1121,45 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rust-log", default="info")
     p.add_argument("--work")
     return p
+
+
+# A laptop that sleeps on low battery freezes every process of a run: on
+# 2026-09-22 a 24-hour soak lost 71 minutes that way, and the chain's heights
+# still rose across the gap. A run longer than this refuses to start on
+# battery power unless the operator accepts that risk.
+BATTERY_REFUSAL_S = 1800.0
+
+
+def parse_power(text: str) -> Optional[Dict[str, Any]]:
+    """`pmset -g batt` output: the power source and the charge, when shown."""
+    source = re.search(r"Now drawing from '([^']+)'", text)
+    if not source:
+        return None
+    percent = re.search(r"(\d+)%", text)
+    return {"source": source.group(1), "percent": int(percent.group(1)) if percent else None}
+
+
+def host_power() -> Optional[Dict[str, Any]]:
+    """This host's power source where the platform reports it (macOS)."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_power(out.stdout)
+
+
+def battery_refusal(duration_s: float, power: Optional[Dict[str, Any]],
+                    allowed: bool) -> Optional[str]:
+    """Why a run must not start on this power, or None."""
+    if allowed or power is None or duration_s <= BATTERY_REFUSAL_S:
+        return None
+    if power.get("source") != "Battery Power":
+        return None
+    return (f"REFUSING: this host is on battery ({power.get('percent')}%) and the run lasts "
+            f"{duration_s / 3600:.1f} h. A sleep on low battery freezes the whole run; plug "
+            "in, or pass --allow-battery to accept that.")
 
 
 def executor_label_for(cfg: Any) -> Optional[str]:
