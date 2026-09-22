@@ -3,10 +3,12 @@ import { expect, test } from "@playwright/test";
 // LOCAL-DEVELOPMENT explorer view, against a disposable local network.
 //
 // The canonical explorer (/explorer/index.html) refuses to publish block data
-// until the production maintenance interlock is configured, and that refusal is
-// covered by explorer-localdev.spec.ts. It stays as it is: a disposable chain
-// has no interlock, and fabricating one would mean writing a safety attestation
-// that nothing backs.
+// on its home panels until the production maintenance interlock is configured,
+// and that refusal is covered by explorer-localdev.spec.ts. It stays as it is:
+// a disposable chain has no interlock, and fabricating one would mean writing a
+// safety attestation that nothing backs. Its deep-link routes still answer
+// explicit lookups, labelled non-canonical; explorer-canonical-routes.spec.ts
+// covers those.
 //
 // /explorer/localdev.html is a SEPARATE, loudly labelled route that reads one
 // local node directly and never touches the canonical configuration path. This
