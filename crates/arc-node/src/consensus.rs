@@ -479,6 +479,79 @@ fn verify_peer_dag_transactions(
     verify_peer_dag_transactions_in_domain(committed_hashes, transactions, None)
 }
 
+/// This node's own block hash at `height` when a verified quorum finality
+/// certificate names a different block there. `None` when the hashes agree
+/// or this node has not executed that height (or no longer holds it).
+///
+/// A difference means one of two things. Either this node's chain diverged
+/// from the committee's (nondeterminism, a corrupt store, a bad adoption),
+/// or the certificate comes from another run of a chain with the same
+/// genesis and committee: a certificate's domain binds the genesis identity
+/// and validator epoch, not one run of the chain, so a certificate from an
+/// aborted or repeated run verifies here too. See [`report_divergence`].
+fn divergence(state: &StateDB, height: u64, certified: Hash256) -> Option<Hash256> {
+    state
+        .get_block(height)
+        .map(|block| block.hash)
+        .filter(|local| *local != certified)
+}
+
+/// The diverged height to record, as height + 1 (0: none yet): the lowest
+/// height reported so far, or `None` to keep the recorded one.
+fn lower_divergence(recorded_plus_one: u64, height: u64) -> Option<u64> {
+    let candidate = height.saturating_add(1);
+    (recorded_plus_one == 0 || candidate < recorded_plus_one).then_some(candidate)
+}
+
+/// Heights whose divergence was already logged, so a conflicting certificate
+/// delivered again and again is logged once. The lowest are forgotten first.
+static REPORTED_DIVERGENCES: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+const MAX_REPORTED_DIVERGENCES: usize = 256;
+
+/// Record and announce a divergence found by [`divergence`]: the lowest such
+/// height goes to `/consensus/diagnostics` (`diverged_at_height_plus_one`)
+/// and each height is logged once, naming both hashes.
+///
+/// It is an alarm, not a stop. Stopping on a certificate that is not bound
+/// to this chain run would let any peer holding one certificate from another
+/// run of the same genesis and committee halt every node that executed that
+/// height, and a stopped node under a restart policy only restarts into the
+/// same state. The node therefore keeps running, as it did before this
+/// check existed, and an operator compares its block with its peers'. A stop
+/// becomes safe once certificates are bound to the chain run.
+fn report_divergence(height: u64, local: Hash256, certified: Hash256) {
+    let _ = crate::consensus_diagnostics::DIAG
+        .diverged_at_height_plus_one
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |recorded| lower_divergence(recorded, height),
+        );
+    {
+        let mut reported = REPORTED_DIVERGENCES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !reported.insert(height) {
+            return;
+        }
+        if reported.len() > MAX_REPORTED_DIVERGENCES {
+            reported.pop_first();
+        }
+    }
+    error!(
+        height,
+        local = %local,
+        certified = %certified,
+        "SAFETY: a verified quorum finality certificate names a different block at a height \
+         this node executed. Either this node's chain diverged from the committee's, or the \
+         certificate comes from another run of a chain with the same genesis and committee \
+         (certificates are not yet bound to one chain run). This node keeps running: compare \
+         its block at this height with its peers' and, if it diverged, restore it from a \
+         verified backup."
+    );
+}
+
 /// Keep only transactions that have NOT yet produced a canonical receipt.
 ///
 /// Only the round leader's DAG block becomes canonical here, so a transaction
@@ -2386,6 +2459,11 @@ impl ConsensusManager {
                                     signing_stake = signing,
                                     "Committed-block finality certificate assembled"
                                 );
+                                if let Some(local) =
+                                    divergence(&state, height, certificate.block_hash)
+                                {
+                                    report_divergence(height, local, certificate.block_hash);
+                                }
                                 if let Some(ref tx_chan) = outbound_tx {
                                     let _ = tx_chan.try_send(
                                         OutboundMessage::BroadcastFinalityCertificate(certificate),
@@ -2415,8 +2493,15 @@ impl ConsensusManager {
                 // spot: the conflicting evidence arrived and was discarded
                 // unread. Registration is idempotent for a matching block and
                 // returns `ConflictingFinality` for a differing one.
+                let (height, certified) = (certificate.height, certificate.block_hash);
                 match self.engine.register_finality_certificate(certificate) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // Verified: it should also name the block this node
+                        // executed at that height, if it has.
+                        if let Some(local) = divergence(&state, height, certified) {
+                            report_divergence(height, local, certified);
+                        }
+                    }
                     Err(
                         conflict @ arc_consensus::view_change::CertificateError::ConflictingFinality { .. },
                     ) => {
@@ -2905,6 +2990,15 @@ impl ConsensusManager {
                     );
                     continue;
                 };
+                // The certified root authenticates only what it commits to.
+                // On an account-only-root chain the rest of the payload would
+                // be the serving peer's word, so it is not installed at all.
+                if let Err(reason) =
+                    decoded.root_covers_everything_under(state.recovery_context().as_ref())
+                {
+                    warn!(%source, reason, "REFUSED a certified checkpoint; nothing was installed");
+                    continue;
+                }
 
                 // Verify in a SCRATCH state first. An envelope can be
                 // internally consistent - right committee, right chain, right
@@ -4152,6 +4246,16 @@ impl ConsensusManager {
                         }
                     }
 
+                    // A certificate that arrived before this node executed the
+                    // height (a lagging or replaying node) is checked now. A
+                    // difference is reported, and this node still signs its
+                    // own block: see `report_divergence`.
+                    if let Some(certificate) = self.engine.finality_certificate(block.header.height)
+                        && certificate.block_hash != block.hash
+                    {
+                        report_divergence(block.header.height, block.hash, certificate.block_hash);
+                    }
+
                     // ── finality attestation ─────────────────────────────
                     // Signed only now: after the two-round commit rule
                     // certified the DAG block AND its transactions executed
@@ -4387,6 +4491,47 @@ impl ConsensusManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_certified_block_other_than_this_nodes_own_is_a_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let sender = arc_crypto::hash_bytes(b"divergence-sender");
+        let state = StateDB::with_genesis_persistent(&[(sender, 1_000)], dir.path(), Hash256::ZERO)
+            .unwrap();
+        let mut tx = arc_types::Transaction::new_transfer(
+            sender,
+            arc_crypto::hash_bytes(b"divergence-recipient"),
+            1,
+            0,
+        );
+        tx.sig_verified = true;
+        state
+            .execute_block_adaptive_at_with_proof(
+                &[tx],
+                sender,
+                1_700_000_000_000,
+                arc_crypto::hash_bytes(b"divergence-proof"),
+            )
+            .unwrap();
+        let local = state.get_block(1).unwrap().hash;
+        // The committee certified this node's own block: no divergence.
+        assert_eq!(divergence(&state, 1, local), None);
+        // It certified another block at a height this node executed.
+        let other = arc_crypto::hash_bytes(b"another block");
+        assert_eq!(divergence(&state, 1, other), Some(local));
+        // A height this node has not executed yet says nothing.
+        assert_eq!(divergence(&state, 2, other), None);
+    }
+
+    #[test]
+    fn the_lowest_diverged_height_is_the_one_recorded() {
+        // Recorded as height + 1, 0 meaning none: the first report is kept
+        // until a lower height is reported.
+        assert_eq!(lower_divergence(0, 7), Some(8));
+        assert_eq!(lower_divergence(8, 9), None);
+        assert_eq!(lower_divergence(8, 7), None);
+        assert_eq!(lower_divergence(8, 3), Some(4));
+        assert_eq!(lower_divergence(0, u64::MAX), Some(u64::MAX));
+    }
 
     #[test]
     fn a_committed_block_s_executed_body_is_found_in_state_when_the_cache_dropped_it() {

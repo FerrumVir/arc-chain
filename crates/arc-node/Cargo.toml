@@ -58,6 +58,7 @@ name = "v079_signed_inference"
 required-features = ["retired-live-examples"]
 
 [dependencies]
+arc-assign = { path = "../arc-assign" }
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
 arc-state = { path = "../arc-state" }

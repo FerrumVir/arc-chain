@@ -121,6 +121,8 @@ pub enum NativeInferenceError {
     Cancelled,
     #[error("request expired")]
     Expired,
+    #[error("request is no longer pending: it was settled, or never admitted")]
+    NotPending,
     #[error("input exceeds bounded worker limit")]
     InputTooLarge,
     #[error("output exceeds bounded worker limit")]
@@ -143,6 +145,26 @@ pub enum NativeInferenceError {
     Sink(String),
     #[error("io: {0}")]
     Io(#[from] io::Error),
+}
+
+impl NativeInferenceError {
+    /// A refusal of one request that running it again would repeat: it is
+    /// expired, no longer pending (the rest of the committee settled it
+    /// first), outside the worker's bounds, or refused by the executor (for
+    /// example over this node's KV budget, or for a model this node does not
+    /// run). Not a failure of the worker, so it never counts toward the
+    /// runtime's consecutive-error limit. `ContextMismatch` is not one: it
+    /// means the node's own context or store disagrees with the chain.
+    pub fn is_request_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Expired
+                | Self::NotPending
+                | Self::InputTooLarge
+                | Self::OutputTooLarge
+                | Self::Executor(_)
+        )
+    }
 }
 
 pub trait PendingSource: Send + Sync {
@@ -197,9 +219,9 @@ impl PendingSource for StatePendingSource {
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?
             .into_iter()
             .find(|snapshot| snapshot.request_id == request_id)
-            .ok_or_else(|| {
-                NativeInferenceError::Source("canonical pending request missing".into())
-            })?;
+            // Settled meanwhile (finalized or refunded without this member),
+            // or never admitted: over for this member too, not a failure.
+            .ok_or(NativeInferenceError::NotPending)?;
         let job = pending.request.job;
         Ok(PendingJob {
             request_id,
@@ -246,6 +268,17 @@ impl PendingSource for StatePendingSource {
 
 pub trait NativeExecutor: Send + Sync {
     fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError>;
+
+    /// [`Self::execute`] at chain height `now`, which is what the worker
+    /// calls. An executor that places work on other machines uses the height
+    /// to age link measurements and sweep reservations; the rest ignore it.
+    fn execute_at(
+        &self,
+        job: &PendingJob,
+        _now: u64,
+    ) -> Result<ExecutionOutput, NativeInferenceError> {
+        self.execute(job)
+    }
 }
 
 /// A reviewed binding for the private canonical-I8 worker.  The three hashes
@@ -262,6 +295,71 @@ pub struct CanonicalI8Qualification {
     pub reference_generation_qualified: bool,
 }
 
+/// Default KV-cache budget for one native job: 4 GiB, which is 2,048
+/// positions of the canonical 7B package (2 MiB each) beside its 7.8 GB of
+/// prepared weights. The protocol admits requests up to the 4,096-position
+/// context (8 GiB of KV, 16.4 GB resident: more than a 16 GB host), so a node
+/// refuses what it cannot hold instead of swapping or being killed mid-job.
+/// Refusing means not voting: the request expires and refunds. Operators
+/// with more memory raise it with `--native-kv-budget-bytes`.
+pub const DEFAULT_NATIVE_KV_BUDGET_BYTES: u64 = 4 << 30;
+
+/// KV-cache bytes for `positions` positions: every position holds one K and
+/// one V row of `d_kv` i64 values per layer. `None` on overflow.
+pub fn native_kv_bytes(positions: u64, n_layers: u64, d_kv: u64) -> Option<u64> {
+    positions
+        .checked_mul(n_layers)?
+        .checked_mul(d_kv)?
+        .checked_mul(2 * std::mem::size_of::<i64>() as u64)
+}
+
+/// The fewest positions a node's KV budget must hold: the smallest native
+/// job (1 BOS + 1 prompt token + 1 generated token) allocated as the next
+/// power of two. A smaller budget refuses every job, so startup refuses it.
+pub const MIN_NATIVE_KV_POSITIONS: u64 = 4;
+
+/// The most positions one job may use under `budget`. The KV cache grows by
+/// doubling (`KVCache` extends each layer's buffer), so a job of `p`
+/// positions holds `p.next_power_of_two()` of them: the most that fit is the
+/// largest power of two at or below what the budget holds, capped at the
+/// model's context.
+pub fn allocatable_kv_positions(budget: u64, per_position: u64, max_seq: u64) -> u64 {
+    (budget / per_position.max(1))
+        .checked_ilog2()
+        .map_or(0, |bits| 1u64 << bits)
+        .min(max_seq)
+}
+
+/// Refuse a job whose KV cache would exceed `budget` bytes: 1 BOS + prompt +
+/// `max_tokens` positions, allocated as the next power of two.
+pub fn check_native_kv_budget(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    n_layers: usize,
+    d_kv: usize,
+    budget: u64,
+) -> Result<(), NativeInferenceError> {
+    let positions = (prompt_tokens as u64)
+        .checked_add(max_tokens as u64)
+        .and_then(|p| p.checked_add(1));
+    let allocated = positions.and_then(u64::checked_next_power_of_two);
+    let needed = allocated.and_then(|p| native_kv_bytes(p, n_layers as u64, d_kv as u64));
+    match (positions, allocated, needed) {
+        (_, _, Some(bytes)) if bytes <= budget => Ok(()),
+        (Some(positions), Some(allocated), Some(bytes)) => {
+            Err(NativeInferenceError::Executor(format!(
+                "native job needs {bytes} bytes of KV cache ({positions} positions, allocated \
+                 as {allocated}); this node's budget is {budget}. Raise \
+                 --native-kv-budget-bytes if the host can hold it and the model's context \
+                 allows it"
+            )))
+        }
+        _ => Err(NativeInferenceError::Executor(
+            "native job KV-cache size overflows".into(),
+        )),
+    }
+}
+
 /// Concrete adapter for the corrected GGUF Llama per-row-I8 execution path.
 /// It intentionally accepts pre-qualified LE-u32 prompt IDs only.  The legacy
 /// greedy `CachedIntegerModel::encode` tokenizer is never called here, so raw
@@ -269,6 +367,10 @@ pub struct CanonicalI8Qualification {
 pub struct CanonicalI8NativeExecutor {
     model: Arc<arc_inference::cached_integer_model::CachedIntegerModel>,
     qualification: CanonicalI8Qualification,
+    kv_budget_bytes: u64,
+    /// This operator's own row machines, when configured (option (a) of the
+    /// assignment trust model; `crate::row_cohort`).
+    row_cohort: Option<Arc<crate::row_cohort::RowCohort>>,
 }
 
 impl CanonicalI8NativeExecutor {
@@ -328,12 +430,79 @@ impl CanonicalI8NativeExecutor {
         Ok(Self {
             model,
             qualification,
+            kv_budget_bytes: DEFAULT_NATIVE_KV_BUDGET_BYTES,
+            row_cohort: None,
         })
+    }
+
+    /// Replace the default KV-cache budget ([`DEFAULT_NATIVE_KV_BUDGET_BYTES`]).
+    pub fn with_kv_budget(mut self, bytes: u64) -> Self {
+        self.kv_budget_bytes = bytes;
+        self
+    }
+
+    /// Connect this operator's own row machines (`crate::row_cohort`). Paid
+    /// requests are then placed on them whenever placement predicts that is
+    /// faster; the tokens are local execution's either way.
+    pub fn connect_row_cohort(
+        mut self,
+        config: crate::row_cohort::RowCohortConfig,
+        validator: Hash256,
+        height: u64,
+    ) -> Result<Self, NativeInferenceError> {
+        let cohort = crate::row_cohort::RowCohort::connect(
+            config,
+            validator,
+            self.model.clone(),
+            self.qualification.artifact_hash,
+            height,
+        )
+        .map_err(NativeInferenceError::Executor)?;
+        self.row_cohort = Some(cohort);
+        Ok(self)
+    }
+
+    /// The connected row cohort, for the read-only view.
+    pub fn row_cohort(&self) -> Option<Arc<crate::row_cohort::RowCohort>> {
+        self.row_cohort.clone()
+    }
+
+    /// The most positions (1 BOS + prompt + generated tokens) one job may
+    /// use on this node: its KV budget, capped at the model's context. A
+    /// client checks a request against it before signing; the node refuses
+    /// (never votes on) a job that needs more.
+    pub fn max_positions(&self) -> u64 {
+        let config = &self.model.config;
+        let per_position =
+            native_kv_bytes(1, config.n_layers as u64, config.d_kv as u64).unwrap_or(u64::MAX);
+        allocatable_kv_positions(self.kv_budget_bytes, per_position, config.max_seq as u64)
+    }
+
+    /// Check that the package manifest pinned by `package_manifest_hash`
+    /// describes exactly what this executor loaded from `artifact`: the
+    /// artifact bytes, profile and generation commitments, graph, tokenizer
+    /// vocabulary, tensor inventory and KV cost. Startup refuses on any
+    /// difference, naming the field (model package contract v1).
+    pub fn verify_package(
+        &self,
+        artifact: &Path,
+        tokenizer: &arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer,
+        manifest: &Path,
+        package_manifest_hash: Hash256,
+    ) -> Result<(), NativeInferenceError> {
+        let loaded = package_facts(
+            &self.model,
+            self.qualification.artifact_hash,
+            artifact,
+            tokenizer,
+        )?;
+        verify_package_manifest(manifest, package_manifest_hash, &loaded)
     }
 
     fn prequalified_prompt(
         job: &PendingJob,
         bos_token: u32,
+        vocab_size: usize,
     ) -> Result<Vec<u32>, NativeInferenceError> {
         // The signed input hash was checked by StatePendingSource and again by
         // NativeWorker. This wire form prevents a hidden text tokenizer from
@@ -354,8 +523,90 @@ impl CanonicalI8NativeExecutor {
                     .into(),
             ));
         }
+        // The engine returns empty logits for an id outside the vocabulary and
+        // silently skips that position, so such a prompt would be paid for a
+        // corrupted sequence. Refuse it; the request then expires and refunds
+        // (integer profile contract v1, deviation D2).
+        if tokens.iter().any(|&token| token as usize >= vocab_size) {
+            return Err(NativeInferenceError::Executor(
+                "native canonical I8 prompt contains a token id outside the model vocabulary"
+                    .into(),
+            ));
+        }
         Ok(tokens)
     }
+}
+
+/// What a node measured of the package it loaded: the facts a package
+/// manifest must match (model package contract v1, section 7).
+/// `artifact_hash` is the BLAKE3 the loader verified for `artifact`.
+pub fn package_facts(
+    model: &arc_inference::cached_integer_model::CachedIntegerModel,
+    artifact_hash: Hash256,
+    artifact: &Path,
+    tokenizer: &arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer,
+) -> Result<arc_inference::model_package::LoadedPackage, NativeInferenceError> {
+    let refuse = |message: String| NativeInferenceError::Executor(message);
+    let (_, tensors) = arc_inference::gguf_meta::read_header_from_path(artifact)
+        .map_err(|error| refuse(format!("reading the artifact's tensor inventory: {error}")))?;
+    let config = &model.config;
+    // The tokenizer serving /native-inference/tokenize must agree with the
+    // loaded model before either is compared with the manifest.
+    if tokenizer.bos_token() != config.bos_token
+        || tokenizer.eos_tokens() != config.eos_tokens.as_slice()
+    {
+        return Err(refuse(
+            "the artifact's tokenizer and model disagree on BOS/EOS ids".into(),
+        ));
+    }
+    let widen = |value: usize| value as u64;
+    Ok(arc_inference::model_package::LoadedPackage {
+        artifact_blake3: artifact_hash.to_hex(),
+        artifact_bytes: std::fs::metadata(artifact)?.len(),
+        profile_commitment: canonical_i8_profile_commitment().to_hex(),
+        generation_commitment: canonical_i8_generation_commitment().to_hex(),
+        n_layers: widen(config.n_layers),
+        d_model: widen(config.d_model),
+        n_heads: widen(config.n_heads),
+        n_kv_heads: widen(config.n_kv_heads),
+        d_head: widen(config.d_head),
+        d_kv: widen(config.d_kv),
+        d_ff: widen(config.d_ff),
+        vocab_size: widen(config.vocab_size),
+        max_seq: widen(config.max_seq),
+        tokenizer_tokens: widen(tokenizer.vocab_len()),
+        vocab_blake3: hex::encode(tokenizer.vocabulary_digest()),
+        bos: u64::from(config.bos_token),
+        eos: config.eos_tokens.iter().map(|id| u64::from(*id)).collect(),
+        tensor_count: widen(tensors.len()),
+        inventory_blake3: hex::encode(arc_inference::gguf_meta::inventory_digest(&tensors)),
+        kv_bytes_per_position: native_kv_bytes(1, widen(config.n_layers), widen(config.d_kv))
+            .ok_or_else(|| refuse("KV bytes per position overflow".into()))?,
+    })
+}
+
+/// Read the manifest at `manifest` (bounded) and require it to be the one
+/// `package_manifest_hash` pins and to describe `loaded` exactly.
+pub fn verify_package_manifest(
+    manifest: &Path,
+    package_manifest_hash: Hash256,
+    loaded: &arc_inference::model_package::LoadedPackage,
+) -> Result<(), NativeInferenceError> {
+    use arc_inference::model_package::MAX_MANIFEST_BYTES;
+    let refuse = |message: String| NativeInferenceError::Executor(message);
+    if std::fs::metadata(manifest)?.len() > MAX_MANIFEST_BYTES as u64 {
+        return Err(refuse(format!(
+            "package manifest {} is larger than {MAX_MANIFEST_BYTES} bytes",
+            manifest.display()
+        )));
+    }
+    let bytes = std::fs::read(manifest)?;
+    arc_inference::model_package::verify_loaded_package(
+        &bytes,
+        &package_manifest_hash.to_hex(),
+        loaded,
+    )
+    .map_err(|error| refuse(format!("package manifest {}: {error}", manifest.display())))
 }
 
 fn artifact_hash(path: &Path) -> Result<Hash256, NativeInferenceError> {
@@ -378,22 +629,53 @@ fn artifact_hash(path: &Path) -> Result<Hash256, NativeInferenceError> {
     Ok(Hash256(*hasher.finalize().as_bytes()))
 }
 
-impl NativeExecutor for CanonicalI8NativeExecutor {
-    fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+impl CanonicalI8NativeExecutor {
+    /// One job. With a row cohort and the chain height, the generation may
+    /// be placed on this operator's machines; without either, it runs here.
+    fn run(
+        &self,
+        job: &PendingJob,
+        now: Option<u64>,
+    ) -> Result<ExecutionOutput, NativeInferenceError> {
         if job.model_hash != self.qualification.artifact_hash
             || job.artifact != self.qualification.artifact_hash
             || job.profile_hash != self.qualification.profile_hash
             || job.generation_hash != self.qualification.generation_hash
         {
-            return Err(NativeInferenceError::ContextMismatch);
+            // A property of this request (another allowlisted tuple), so a
+            // refusal of it, not a failure of this node.
+            return Err(NativeInferenceError::Executor(
+                "this node's executor does not run this request's model/profile/generation".into(),
+            ));
         }
-        let prompt = Self::prequalified_prompt(job, self.model.config.bos_token)?;
+        let prompt = Self::prequalified_prompt(
+            job,
+            self.model.config.bos_token,
+            self.model.config.vocab_size,
+        )?;
         let max_tokens =
             u32::try_from(job.max_tokens).map_err(|_| NativeInferenceError::OutputTooLarge)?;
-        let (tokens, output_hash) = self
-            .model
-            .try_generate_v2(&prompt, max_tokens, &self.model.config.eos_tokens)
-            .map_err(|error| NativeInferenceError::Executor(error.to_string()))?;
+        check_native_kv_budget(
+            prompt.len(),
+            job.max_tokens,
+            self.model.config.n_layers,
+            self.model.config.d_kv,
+            self.kv_budget_bytes,
+        )?;
+        let (tokens, output_hash) = match (&self.row_cohort, now) {
+            (Some(cohort), Some(now)) => cohort.generate(
+                job.request_id,
+                job.expires_at,
+                now,
+                &prompt,
+                max_tokens,
+                &self.model.config.eos_tokens,
+            )?,
+            _ => self
+                .model
+                .try_generate_v2(&prompt, max_tokens, &self.model.config.eos_tokens)
+                .map_err(|error| NativeInferenceError::Executor(error.to_string()))?,
+        };
         if tokens.is_empty()
             || tokens.len() > job.max_tokens
             || tokens.len() * std::mem::size_of::<u32>() > job.max_output_bytes
@@ -409,6 +691,153 @@ impl NativeExecutor for CanonicalI8NativeExecutor {
             tokens,
             output_hash,
         })
+    }
+}
+
+impl NativeExecutor for CanonicalI8NativeExecutor {
+    fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+        self.run(job, None)
+    }
+
+    fn execute_at(
+        &self,
+        job: &PendingJob,
+        now: u64,
+    ) -> Result<ExecutionOutput, NativeInferenceError> {
+        self.run(job, Some(now))
+    }
+}
+
+/// Which executor this node's native worker runs. Published on
+/// `/native-inference/context` so a client can build input the executor
+/// accepts. Client convenience only: admission never consults it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeExecutorKind {
+    /// The qualified canonical-I8 artifact. It reads little-endian u32 token
+    /// ids from the generation contract's tokenizer, without BOS.
+    CanonicalI8,
+    /// The integration-only deterministic executor. It loads no model and
+    /// ignores its input; its output is protocol coverage, not an answer.
+    DeterministicTest,
+}
+
+impl NativeExecutorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CanonicalI8 => "canonical_i8",
+            Self::DeterministicTest => "deterministic_test",
+        }
+    }
+
+    /// The input encoding this executor reads.
+    pub fn input_format(self) -> &'static str {
+        match self {
+            Self::CanonicalI8 => "le_u32_token_ids_without_bos",
+            Self::DeterministicTest => "opaque_bytes",
+        }
+    }
+}
+
+/// What this node serves for native requests: its executor, and for the
+/// canonical executor the tokenizer read from the same artifact.
+pub struct NativeServing {
+    pub executor: NativeExecutorKind,
+    pub tokenizer: Option<arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer>,
+    /// The most positions one job may use here (the executor's KV budget,
+    /// capped at the model's context); `None` when the executor has no such
+    /// limit.
+    pub max_positions: Option<u64>,
+    /// The executor's row cohort, for the read-only `/assignment/cohort`.
+    pub row_cohort: Option<Arc<crate::row_cohort::RowCohort>>,
+}
+
+impl NativeServing {
+    pub fn deterministic_test() -> Self {
+        Self {
+            executor: NativeExecutorKind::DeterministicTest,
+            tokenizer: None,
+            max_positions: None,
+            row_cohort: None,
+        }
+    }
+
+    pub fn canonical(
+        tokenizer: Option<arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer>,
+        max_positions: Option<u64>,
+    ) -> Self {
+        Self {
+            executor: NativeExecutorKind::CanonicalI8,
+            tokenizer,
+            max_positions,
+            row_cohort: None,
+        }
+    }
+
+    /// Attach the executor's row cohort for the read-only view.
+    pub fn with_row_cohort(mut self, cohort: Option<Arc<crate::row_cohort::RowCohort>>) -> Self {
+        self.row_cohort = cohort;
+        self
+    }
+
+    /// Tokenize a prompt into exactly the input the canonical executor
+    /// accepts: the tokenizer's ids without the BOS that generation v2 adds
+    /// itself. The same refusals as the executor apply, so a client learns
+    /// before signing, not after paying for an expiry.
+    pub fn tokenize_prompt(&self, text: &str) -> Result<Vec<u32>, NativeInferenceError> {
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            NativeInferenceError::Executor("this node holds no canonical tokenizer".into())
+        })?;
+        let encoded = tokenizer
+            .encode_prompt(text)
+            .map_err(|error| NativeInferenceError::Executor(error.to_string()))?;
+        let bos = tokenizer.bos_token();
+        let tokens = match encoded.split_first() {
+            Some((first, rest)) if *first == bos => rest.to_vec(),
+            _ => {
+                return Err(NativeInferenceError::Executor(
+                    "tokenizer did not lead with its BOS".into(),
+                ));
+            }
+        };
+        if tokens.is_empty() {
+            return Err(NativeInferenceError::Executor("the prompt is empty".into()));
+        }
+        if tokens.first() == Some(&bos) {
+            return Err(NativeInferenceError::Executor(
+                "the prompt begins with a literal BOS marker, which generation v2 owns".into(),
+            ));
+        }
+        if tokens.len() > MAX_INPUT_BYTES / 4 {
+            return Err(NativeInferenceError::Executor(format!(
+                "the prompt is {} tokens; the input limit is {}",
+                tokens.len(),
+                MAX_INPUT_BYTES / 4
+            )));
+        }
+        if tokens
+            .iter()
+            .any(|&token| token as usize >= tokenizer.vocab_len())
+        {
+            return Err(NativeInferenceError::Executor(
+                "tokenizer produced an id outside its vocabulary".into(),
+            ));
+        }
+        Ok(tokens)
+    }
+
+    /// Display text for a certified output, when this node holds the
+    /// tokenizer and the output is whole little-endian u32 ids. Display
+    /// only: the certificate commits to the bytes, not to this text.
+    pub fn decode_output(&self, output: &[u8]) -> Option<String> {
+        let tokenizer = self.tokenizer.as_ref()?;
+        if output.is_empty() || output.len() % 4 != 0 {
+            return None;
+        }
+        let tokens: Vec<u32> = output
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        Some(tokenizer.decode_generated_content(&tokens))
     }
 }
 
@@ -1115,8 +1544,10 @@ pub struct NativeWorker<S, E, G, V> {
     signer: Arc<G>,
     sink: Arc<V>,
     store: DecisionStore,
-    queue: crossbeam::channel::Sender<Hash256>,
-    receiver: crossbeam::channel::Receiver<Hash256>,
+    /// Round-robin across requesters, each request's expiry as its deadline
+    /// (S6): one requester with many admitted requests cannot hold every
+    /// execution slot, and an expired request is dropped before it runs.
+    queue: Mutex<arc_assign::queue::FairQueue>,
     queued: DashSet<[u8; 32]>,
     cancelled: Arc<AtomicBool>,
     compute_permit: Mutex<()>,
@@ -1130,22 +1561,34 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         sink: Arc<V>,
         store: DecisionStore,
     ) -> Self {
-        let (queue, receiver) = crossbeam::channel::bounded(MAX_QUEUE);
         Self {
             source,
             executor,
             signer,
             sink,
             store,
-            queue,
-            receiver,
+            queue: Mutex::new(arc_assign::queue::FairQueue::new(MAX_QUEUE)),
             queued: DashSet::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
             compute_permit: Mutex::new(()),
         }
     }
 
+    /// Queue a request with no requester or deadline known: it takes its
+    /// turn in one shared group and never expires in the queue (the source
+    /// still refuses an expired job when it runs).
     pub fn submit(&self, request_id: Hash256) -> Result<(), NativeInferenceError> {
+        self.submit_for(request_id, Hash256::ZERO, u64::MAX)
+    }
+
+    /// Queue a request in its requester's turn, dropped unrun once the next
+    /// block height reaches `expires_at`.
+    pub fn submit_for(
+        &self,
+        request_id: Hash256,
+        requester: Hash256,
+        expires_at: u64,
+    ) -> Result<(), NativeInferenceError> {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(NativeInferenceError::Cancelled);
         }
@@ -1155,30 +1598,71 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         if !self.queued.insert(request_id.0) {
             return Ok(());
         }
-        self.queue.try_send(request_id).map_err(|error| {
+        let call = arc_assign::queue::Call {
+            request: requester,
+            call_id: request_id,
+            deadline: expires_at,
+        };
+        self.queue.lock().push(call).map_err(|_| {
             self.queued.remove(&request_id.0);
-            if error.is_full() {
-                NativeInferenceError::QueueFull
-            } else {
-                NativeInferenceError::Cancelled
-            }
+            NativeInferenceError::QueueFull
         })
+    }
+
+    /// Nothing is queued.
+    pub fn is_idle(&self) -> bool {
+        self.queue.lock().is_empty()
     }
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    /// Run the next queued request. See [`Self::next_request`] and
+    /// [`Self::run_request`], which the runtime uses separately so it knows
+    /// which request a refusal belongs to.
     pub fn run_one(&self, now: u64) -> Result<StoredVote, NativeInferenceError> {
-        let _permit = self.compute_permit.lock();
         if self.cancelled.load(Ordering::Acquire) {
             return Err(NativeInferenceError::Cancelled);
         }
         let request_id = self
-            .receiver
-            .try_recv()
-            .map_err(|_| NativeInferenceError::QueueFull)?;
-        self.queued.remove(&request_id.0);
+            .next_request(now)
+            .ok_or(NativeInferenceError::QueueFull)?;
+        self.run_request(request_id, now)
+    }
+
+    /// The next queued request whose expiry is above `now` (the next block
+    /// height), taking one requester's turn. Expired calls are dropped on the
+    /// way, and `None` means nothing live is queued - idle, not an error.
+    pub fn next_request(&self, now: u64) -> Option<Hash256> {
+        loop {
+            let next = self.queue.lock().next(now);
+            match next {
+                arc_assign::queue::Next::Run(call) => {
+                    self.queued.remove(&call.call_id.0);
+                    return Some(call.call_id);
+                }
+                arc_assign::queue::Next::Expired(calls) => {
+                    for call in calls {
+                        self.queued.remove(&call.call_id.0);
+                    }
+                }
+                arc_assign::queue::Next::Idle => return None,
+            }
+        }
+    }
+
+    /// Execute (or re-emit the durable vote for) one request taken from the
+    /// queue by [`Self::next_request`].
+    pub fn run_request(
+        &self,
+        request_id: Hash256,
+        now: u64,
+    ) -> Result<StoredVote, NativeInferenceError> {
+        let _permit = self.compute_permit.lock();
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(NativeInferenceError::Cancelled);
+        }
         let job = self.source.load_pending(request_id)?;
         if now >= job.expires_at {
             return Err(NativeInferenceError::Expired);
@@ -1203,7 +1687,7 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         if self.cancelled.load(Ordering::Acquire) {
             return Err(NativeInferenceError::Cancelled);
         }
-        let output = self.executor.execute(&job)?;
+        let output = self.executor.execute_at(&job, now)?;
         if output.tokens.is_empty()
             || output.tokens.len() > job.max_tokens
             || output.tokens.len() > MAX_TOKENS
@@ -1268,6 +1752,11 @@ pub struct NativeWorkerRuntime<E, G, V> {
     worker: NativeWorker<StatePendingSource, E, G, V>,
     /// When this validator last emitted its vote for each still-pending request.
     last_emitted: Mutex<BTreeMap<[u8; 32], std::time::Instant>>,
+    /// Still-pending requests this node refused for good (expired, out of
+    /// bounds, refused by the executor), with the reason. Never offered to
+    /// the worker again while pending: re-running them would only repeat the
+    /// refusal, and counting it as a worker failure used to stop the worker.
+    refused: Mutex<BTreeMap<[u8; 32], String>>,
     /// When settled requests' decision files were last pruned.
     pruned_at: Mutex<Option<std::time::Instant>>,
 }
@@ -1301,6 +1790,7 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
             source,
             worker,
             last_emitted: Mutex::new(BTreeMap::new()),
+            refused: Mutex::new(BTreeMap::new()),
             pruned_at: Mutex::new(None),
         })
     }
@@ -1325,28 +1815,94 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
         {
             let mut last = self.last_emitted.lock();
-            // Terminal requests leave the map, so it stays bounded by the
+            let mut refused = self.refused.lock();
+            // Terminal requests leave both maps, so they stay bounded by the
             // state's own bounded pending index.
             let live: BTreeSet<[u8; 32]> = pending.iter().map(|p| p.request_id.0).collect();
             last.retain(|id, _| live.contains(id));
-            for item in &pending {
-                let due = last
-                    .get(&item.request_id.0)
-                    .is_none_or(|at| at.elapsed() >= NATIVE_VOTE_REEMIT_INTERVAL);
-                if due {
-                    self.worker.submit(item.request_id)?;
+            refused.retain(|id, _| live.contains(id));
+            // Offer due requests round-robin by requester, oldest admission
+            // first within each, so the bounded queue is fair across
+            // requesters as well as inside it.
+            let mut by_requester: BTreeMap<[u8; 32], std::collections::VecDeque<_>> =
+                BTreeMap::new();
+            let mut due: Vec<_> = pending
+                .iter()
+                .filter(|item| !refused.contains_key(&item.request_id.0))
+                .filter(|item| {
+                    last.get(&item.request_id.0)
+                        .is_none_or(|at| at.elapsed() >= NATIVE_VOTE_REEMIT_INTERVAL)
+                })
+                .collect();
+            due.sort_by_key(|item| (item.admission_height, item.request_id.0));
+            for item in due {
+                by_requester
+                    .entry(item.request.job.requester.0)
+                    .or_default()
+                    .push_back(item);
+            }
+            'offer: loop {
+                let mut offered = false;
+                for queue in by_requester.values_mut() {
+                    let Some(item) = queue.pop_front() else {
+                        continue;
+                    };
+                    offered = true;
+                    let job = &item.request.job;
+                    match self
+                        .worker
+                        .submit_for(item.request_id, job.requester, job.expires_at)
+                    {
+                        Ok(()) => {}
+                        // A full queue is backpressure, not a failure: the
+                        // rest are offered again next poll.
+                        Err(NativeInferenceError::QueueFull) => break 'offer,
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !offered {
+                    break;
                 }
             }
         }
         self.prune_settled_decisions(commitment);
-        if self.worker.receiver.is_empty() {
-            return Ok(None);
+        let now = self.state.height().saturating_add(1);
+        // A refusal runs nothing, so the next queued request is tried at once
+        // rather than after the idle interval; the queue bounds the loop.
+        for _ in 0..MAX_QUEUE {
+            // Nothing live queued (or only expired calls, now dropped): idle.
+            let Some(request_id) = self.worker.next_request(now) else {
+                return Ok(None);
+            };
+            match self.worker.run_request(request_id, now) {
+                Ok(vote) => {
+                    self.last_emitted
+                        .lock()
+                        .insert(vote.request_id.0, std::time::Instant::now());
+                    return Ok(Some(vote));
+                }
+                Err(NativeInferenceError::NotPending) => {
+                    tracing::debug!(
+                        request = %request_id.to_hex(),
+                        "native request settled before this member ran it"
+                    );
+                    self.refused
+                        .lock()
+                        .insert(request_id.0, NativeInferenceError::NotPending.to_string());
+                }
+                Err(error) if error.is_request_refusal() => {
+                    tracing::warn!(
+                        request = %request_id.to_hex(),
+                        %error,
+                        "native worker refused this request; it will not vote on it (it expires \
+                         and refunds unless the rest of the committee certifies it)"
+                    );
+                    self.refused.lock().insert(request_id.0, error.to_string());
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let vote = self.worker.run_one(self.state.height().saturating_add(1))?;
-        self.last_emitted
-            .lock()
-            .insert(vote.request_id.0, std::time::Instant::now());
-        Ok(Some(vote))
+        Ok(None)
     }
 
     /// At most once per `NATIVE_DECISION_PRUNE_INTERVAL`, delete decision
@@ -1691,17 +2247,40 @@ pub struct NativeQualificationRecord {
     pub decided_at: String,
     #[serde(default)]
     pub evidence: String,
+    /// BLAKE3 of the approved package manifest (`arc.model-package.v1`). A
+    /// reviewer approves a package by this hash; startup refuses to execute
+    /// a loaded artifact the manifest does not describe exactly.
+    #[serde(default)]
+    pub package_manifest_hash: Option<Hash256>,
+}
+
+/// A complete decision for real-model execution: the qualified identity and
+/// the package manifest it approved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealExecutionDecision {
+    pub qualification: CanonicalI8Qualification,
+    pub package_manifest_hash: Hash256,
 }
 
 /// Resolve the qualification for REAL-model execution, bound to `allowed`.
-///
-/// Returns `Err` for every path that is not an explicit, complete, matching,
-/// affirmative decision. Callers must run this **before** hashing or loading an
-/// artifact, so a missing decision costs nothing.
+/// See [`resolve_real_execution_decision`], which also returns the pinned
+/// package manifest hash.
 pub fn resolve_real_execution_qualification(
     path: Option<&std::path::Path>,
     allowed: &AllowedExecution,
 ) -> Result<CanonicalI8Qualification, QualificationError> {
+    resolve_real_execution_decision(path, allowed).map(|decision| decision.qualification)
+}
+
+/// Resolve the decision for REAL-model execution, bound to `allowed`.
+///
+/// Returns `Err` for every path that is not an explicit, complete, matching,
+/// affirmative decision. Callers must run this **before** hashing or loading an
+/// artifact, so a missing decision costs nothing.
+pub fn resolve_real_execution_decision(
+    path: Option<&std::path::Path>,
+    allowed: &AllowedExecution,
+) -> Result<RealExecutionDecision, QualificationError> {
     let path = path.ok_or(QualificationError::Missing)?;
     let raw = fs::read_to_string(path)
         .map_err(|e| QualificationError::Unreadable(format!("{}: {e}", path.display())))?;
@@ -1734,15 +2313,22 @@ pub fn resolve_real_execution_qualification(
     if record.evidence.trim().is_empty() {
         missing.push("evidence");
     }
-    if !missing.is_empty() {
-        return Err(QualificationError::Incomplete(missing.join(", ")));
+    if record.package_manifest_hash.is_none() {
+        missing.push("package_manifest_hash");
     }
+    let Some(package_manifest_hash) = record.package_manifest_hash.filter(|_| missing.is_empty())
+    else {
+        return Err(QualificationError::Incomplete(missing.join(", ")));
+    };
 
-    Ok(CanonicalI8Qualification {
-        artifact_hash: record.model_hash,
-        profile_hash: record.profile_hash,
-        generation_hash: record.generation_hash,
-        reference_generation_qualified: true,
+    Ok(RealExecutionDecision {
+        qualification: CanonicalI8Qualification {
+            artifact_hash: record.model_hash,
+            profile_hash: record.profile_hash,
+            generation_hash: record.generation_hash,
+            reference_generation_qualified: true,
+        },
+        package_manifest_hash,
     })
 }
 
@@ -2089,13 +2675,21 @@ mod tests {
             })
         }
     }
+    /// The one validator identity the test signer votes as. A worker refuses
+    /// a vote signed by anyone but the identity its decision store was opened
+    /// with, so every store paired with `Sign` is opened with this address.
+    fn test_signer() -> &'static Arc<KeyPair> {
+        static SIGNER: std::sync::OnceLock<Arc<KeyPair>> = std::sync::OnceLock::new();
+        SIGNER.get_or_init(|| Arc::new(KeyPair::generate_ed25519()))
+    }
+
     struct Sign;
     impl VoteSigner for Sign {
         fn sign(&self, decision: &DecisionMaterial) -> Result<InferenceVote, NativeInferenceError> {
             sign_vote(
                 decision.request_id,
                 &token_bytes(&decision.tokens),
-                &KeyPair::generate_ed25519(),
+                test_signer(),
             )
             .map_err(|error| NativeInferenceError::Signer(error.to_string()))
         }
@@ -2124,6 +2718,114 @@ mod tests {
             input: b"input".to_vec(),
         }
     }
+    #[test]
+    fn a_job_whose_kv_cache_exceeds_the_budget_is_refused_before_execution() {
+        // Canonical 7B: 32 layers x 4096 KV width -> 2 MiB per position.
+        assert_eq!(native_kv_bytes(1, 32, 4096), Some(2 << 20));
+        let budget = DEFAULT_NATIVE_KV_BUDGET_BYTES;
+        // 1 BOS + 1023 prompt + 1024 generated = 2048 positions = 4 GiB: fits.
+        assert!(check_native_kv_budget(1023, 1024, 32, 4096, budget).is_ok());
+        // One more position does not.
+        assert!(matches!(
+            check_native_kv_budget(1024, 1024, 32, 4096, budget),
+            Err(NativeInferenceError::Executor(message)) if message.contains("KV cache")
+        ));
+        // The largest request the protocol admits (4096 positions) needs 8 GiB.
+        assert!(check_native_kv_budget(2047, 2048, 32, 4096, budget).is_err());
+        assert!(check_native_kv_budget(2047, 2048, 32, 4096, 8 << 30).is_ok());
+        assert!(check_native_kv_budget(usize::MAX, 1, 32, 4096, u64::MAX).is_err());
+        // The cache grows by doubling: 3,000 positions hold 4,096 (8 GiB), so
+        // a 6 GiB budget refuses them although 3,000 x 2 MiB would fit.
+        assert!(check_native_kv_budget(1499, 1500, 32, 4096, 6 << 30).is_err());
+        assert!(check_native_kv_budget(1023, 1024, 32, 4096, 6 << 30).is_ok());
+        // What a node publishes as its limit follows the same rule.
+        let per_position = 2 << 20;
+        assert_eq!(allocatable_kv_positions(budget, per_position, 4096), 2048);
+        assert_eq!(allocatable_kv_positions(6 << 30, per_position, 4096), 2048);
+        assert_eq!(allocatable_kv_positions(8 << 30, per_position, 4096), 4096);
+        assert_eq!(allocatable_kv_positions(64 << 30, per_position, 4096), 4096);
+        assert_eq!(allocatable_kv_positions(7 << 20, per_position, 4096), 2);
+        assert_eq!(allocatable_kv_positions(1 << 20, per_position, 4096), 0);
+        assert!(allocatable_kv_positions(7 << 20, per_position, 4096) < MIN_NATIVE_KV_POSITIONS);
+    }
+
+    #[test]
+    fn a_real_execution_decision_pins_the_approved_package_manifest() {
+        let dir = tempdir().unwrap();
+        let tuple = hash_bytes(b"decision-tuple");
+        let allowed = AllowedExecution {
+            model_hash: tuple,
+            profile_hash: tuple,
+            generation_hash: tuple,
+            assignment_hash: tuple,
+        };
+        let manifest = hash_bytes(b"approved package manifest");
+        let record = |pin: Option<Hash256>| {
+            let mut value = serde_json::json!({
+                "model_hash": tuple.to_hex(),
+                "profile_hash": tuple.to_hex(),
+                "generation_hash": tuple.to_hex(),
+                "reference_generation_qualified": true,
+                "decided_by": "release engineering",
+                "decided_at": "2026-09-22",
+                "evidence": "reference comparison run 7",
+            });
+            if let Some(pin) = pin {
+                value["package_manifest_hash"] = serde_json::json!(pin.to_hex());
+            }
+            let path = dir.path().join(format!("record-{}.json", pin.is_some()));
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let pinned = record(Some(manifest));
+        let decision = resolve_real_execution_decision(Some(&pinned), &allowed).unwrap();
+        assert_eq!(decision.package_manifest_hash, manifest);
+        assert_eq!(decision.qualification.artifact_hash, tuple);
+        assert!(decision.qualification.reference_generation_qualified);
+        // A decision that approves no package is incomplete.
+        let unpinned = record(None);
+        match resolve_real_execution_decision(Some(&unpinned), &allowed) {
+            Err(QualificationError::Incomplete(missing)) => {
+                assert!(missing.contains("package_manifest_hash"), "{missing}")
+            }
+            other => panic!("expected an incomplete decision, got {other:?}"),
+        }
+        assert!(resolve_real_execution_qualification(Some(&unpinned), &allowed).is_err());
+    }
+
+    #[test]
+    fn a_node_without_the_canonical_tokenizer_never_tokenizes_or_decodes() {
+        let serving = NativeServing::deterministic_test();
+        assert_eq!(serving.executor.as_str(), "deterministic_test");
+        assert_eq!(serving.executor.input_format(), "opaque_bytes");
+        assert!(serving.tokenize_prompt("hello").is_err());
+        assert_eq!(serving.decode_output(&[1, 0, 0, 0]), None);
+        // A canonical executor whose tokenizer could not be read serves
+        // execution but not tokenization.
+        let canonical = NativeServing::canonical(None, Some(2_048));
+        assert_eq!(canonical.max_positions, Some(2_048));
+        assert_eq!(canonical.executor.input_format(), "le_u32_token_ids_without_bos");
+        assert!(canonical.tokenize_prompt("hello").is_err());
+    }
+
+    #[test]
+    fn a_prompt_token_outside_the_vocabulary_is_refused_before_execution() {
+        let prompt_bytes =
+            |ids: &[u32]| -> Vec<u8> { ids.iter().flat_map(|id| id.to_le_bytes()).collect() };
+        let mut j = job();
+        j.input = prompt_bytes(&[5, 31_999]);
+        assert_eq!(
+            CanonicalI8NativeExecutor::prequalified_prompt(&j, 1, 32_000).unwrap(),
+            vec![5, 31_999]
+        );
+        j.input = prompt_bytes(&[5, 32_000]);
+        assert!(matches!(
+            CanonicalI8NativeExecutor::prequalified_prompt(&j, 1, 32_000),
+            Err(NativeInferenceError::Executor(message))
+                if message.contains("outside the model vocabulary")
+        ));
+    }
+
     #[test]
     fn restart_and_conflict_are_idempotent() {
         let dir = tempdir().unwrap();
@@ -2237,13 +2939,134 @@ mod tests {
             Arc::new(Exec),
             Arc::new(Sign),
             Arc::new(Sink),
-            DecisionStore::open(dir.path(), Hash256([8; 32]), j.genesis, j.context).unwrap(),
+            DecisionStore::open(dir.path(), test_signer().address(), j.genesis, j.context)
+                .unwrap(),
         );
         w.cancel();
         assert!(matches!(
             w.submit(j.request_id),
             Err(NativeInferenceError::Cancelled)
         ));
+
+        // Expiry: a job at or past its signed expiry height is refused before
+        // the executor runs, whatever the queue says.
+        let dir = tempdir().unwrap();
+        let executor = Arc::new(CountingExec(std::sync::atomic::AtomicUsize::new(0)));
+        let w = NativeWorker::new(
+            Arc::new(Source(j.clone())),
+            executor.clone(),
+            Arc::new(Sign),
+            Arc::new(Sink),
+            DecisionStore::open(dir.path(), test_signer().address(), j.genesis, j.context)
+                .unwrap(),
+        );
+        for now in [j.expires_at, j.expires_at + 5] {
+            w.submit(j.request_id).unwrap();
+            assert!(matches!(w.run_one(now), Err(NativeInferenceError::Expired)));
+        }
+        assert_eq!(executor.0.load(Ordering::SeqCst), 0, "an expired job never executes");
+    }
+
+    struct Jobs(std::collections::HashMap<[u8; 32], PendingJob>);
+    impl PendingSource for Jobs {
+        fn load_pending(&self, id: Hash256) -> Result<PendingJob, NativeInferenceError> {
+            self.0
+                .get(&id.0)
+                .cloned()
+                .ok_or_else(|| NativeInferenceError::Source("missing".into()))
+        }
+    }
+    struct RecordingExec(Mutex<Vec<Hash256>>);
+    impl NativeExecutor for RecordingExec {
+        fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+            self.0.lock().push(job.request_id);
+            Ok(ExecutionOutput {
+                tokens: vec![1, 2],
+                output_hash: token_hash(&[1, 2]),
+            })
+        }
+    }
+    fn numbered_worker(
+        dir: &std::path::Path,
+        count: u8,
+    ) -> (
+        NativeWorker<Jobs, RecordingExec, Sign, Sink>,
+        Arc<RecordingExec>,
+    ) {
+        let base = job();
+        let jobs = (1..=count)
+            .map(|n| {
+                let numbered = PendingJob {
+                    request_id: Hash256([n; 32]),
+                    ..base.clone()
+                };
+                (numbered.request_id.0, numbered)
+            })
+            .collect();
+        let executor = Arc::new(RecordingExec(Mutex::new(Vec::new())));
+        let worker = NativeWorker::new(
+            Arc::new(Jobs(jobs)),
+            executor.clone(),
+            Arc::new(Sign),
+            Arc::new(Sink),
+            DecisionStore::open(dir, test_signer().address(), base.genesis, base.context).unwrap(),
+        );
+        (worker, executor)
+    }
+
+    #[test]
+    fn requesters_take_turns_and_an_expired_request_never_runs() {
+        let dir = tempdir().unwrap();
+        let (w, executor) = numbered_worker(dir.path(), 5);
+        let alice = Hash256([0xa1; 32]);
+        let bob = Hash256([0xb0; 32]);
+        // Alice queues three requests before Bob queues one: Bob does not
+        // wait behind all of Alice's.
+        for n in 1..=3 {
+            w.submit_for(Hash256([n; 32]), alice, 100).unwrap();
+        }
+        w.submit_for(Hash256([4; 32]), bob, 100).unwrap();
+        for _ in 0..4 {
+            w.run_one(10).unwrap();
+        }
+        assert_eq!(
+            *executor.0.lock(),
+            vec![Hash256([1; 32]), Hash256([4; 32]), Hash256([2; 32]), Hash256([3; 32])]
+        );
+        // At its expiry height a queued request is dropped unrun and frees
+        // its slot; nothing else was queued, so the worker is idle.
+        w.submit_for(Hash256([5; 32]), bob, 20).unwrap();
+        assert!(matches!(w.run_one(20), Err(NativeInferenceError::QueueFull)));
+        assert!(w.is_idle());
+        assert_eq!(executor.0.lock().len(), 4, "the expired request never executed");
+        w.submit_for(Hash256([5; 32]), bob, 30).unwrap();
+        w.run_one(21).unwrap();
+        assert_eq!(executor.0.lock().last(), Some(&Hash256([5; 32])));
+    }
+
+    #[test]
+    fn a_full_queue_is_backpressure_not_a_failure() {
+        // More due requests than queue slots used to fail the whole poll
+        // before anything ran, so the runtime stopped after repeated
+        // failures. The queue refuses the extra request; running one frees
+        // a slot for it.
+        let dir = tempdir().unwrap();
+        let count = (MAX_QUEUE + 1) as u8;
+        let (w, executor) = numbered_worker(dir.path(), count);
+        let requester = Hash256([0xc0; 32]);
+        for n in 1..count {
+            w.submit_for(Hash256([n; 32]), requester, 100).unwrap();
+        }
+        assert!(matches!(
+            w.submit_for(Hash256([count; 32]), requester, 100),
+            Err(NativeInferenceError::QueueFull)
+        ));
+        w.run_one(10).unwrap();
+        w.submit_for(Hash256([count; 32]), requester, 100).unwrap();
+        while !w.is_idle() {
+            w.run_one(10).unwrap();
+        }
+        assert_eq!(executor.0.lock().len(), MAX_QUEUE + 1);
     }
 
     struct CountingExec(std::sync::atomic::AtomicUsize);
@@ -3019,6 +3842,255 @@ mod tests {
             .unwrap();
         assert_eq!(format!("{:?}", receipt.metadata.status), "Finalized");
         assert_eq!(receipt.metadata.output, token_bytes(&[71, 72]));
+    }
+
+    #[test]
+    fn a_peer_vote_without_its_signed_output_or_from_a_non_member_is_refused() {
+        // Before any certificate exists, a vote must carry the output it
+        // signs: present, within the request's byte bound, hashing to the
+        // declared output hash, and signed over exactly those tokens, by a
+        // frozen member. A refused vote leaves no trace.
+        let fixture = native_fixture();
+        let [request_id] = admit_requests(&fixture, &[0])[..] else { unreachable!() };
+        let mempool = Arc::new(Mempool::new(16));
+        let sink = NativeFinalizeSink::new(
+            fixture.state.clone(),
+            mempool.clone(),
+            fixture.finalizer.clone(),
+        );
+        let member = &fixture.validators[0];
+        let mut mismatched = vote(request_id, &[71, 72], member);
+        mismatched.output_hash = token_hash(&[71, 73]);
+        let mut unsigned_tokens = vote(request_id, &[71, 72], member);
+        unsigned_tokens.tokens = vec![71, 73];
+        unsigned_tokens.output_hash = token_hash(&[71, 73]);
+        let outsider = KeyPair::generate_ed25519();
+        for (label, bad) in [
+            ("empty output", vote(request_id, &[], member)),
+            ("output over max_output_bytes", vote(request_id, &[7; 33], member)),
+            ("output hash mismatch", mismatched),
+            ("tokens the vote did not sign", unsigned_tokens),
+            ("non-member", vote(request_id, &[71, 72], &outsider)),
+        ] {
+            assert!(
+                matches!(sink.accept_peer_vote(&bad), Err(NativeInferenceError::Signer(_))),
+                "{label} must be refused"
+            );
+        }
+        assert_eq!(mempool.len(), 0);
+        sink.accept_peer_vote(&vote(request_id, &[71, 72], member))
+            .expect("the member's well-formed vote still counts after refused ones");
+    }
+
+    /// Refuses one request (as the KV budget would), runs the rest.
+    struct RefuseOne {
+        refused: Hash256,
+        calls: Mutex<Vec<Hash256>>,
+    }
+    impl NativeExecutor for RefuseOne {
+        fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+            self.calls.lock().push(job.request_id);
+            if job.request_id == self.refused {
+                return Err(NativeInferenceError::Executor(
+                    "native job needs more KV cache than this node's budget".into(),
+                ));
+            }
+            Ok(ExecutionOutput {
+                tokens: vec![1, 2],
+                output_hash: token_hash(&[1, 2]),
+            })
+        }
+    }
+
+    #[test]
+    fn a_refused_request_is_tried_once_and_never_stops_the_worker() {
+        // Before: the refused request was queued again on every poll, every
+        // poll returned an error, nothing reset the runtime's error count,
+        // and after 60 polls the worker stopped for every other request too.
+        let fixture = native_fixture();
+        let mut ids = Vec::new();
+        for nonce in 0..2 {
+            let request = request_for(&fixture, nonce, 1_000);
+            ids.push(request.job.request_id());
+            let tx = signed_native(
+                &fixture.state,
+                &fixture.requester,
+                nonce,
+                TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                    request,
+                    input_blob: token_bytes(&[11, 12]),
+                }),
+                gas_costs::NATIVE_INFERENCE_REQUEST,
+            );
+            fixture
+                .state
+                .execute_block_verified(&[tx], fixture.finalizer.address())
+                .unwrap();
+        }
+        let executor = Arc::new(RefuseOne {
+            refused: ids[0],
+            calls: Mutex::new(Vec::new()),
+        });
+        let dir = tempdir().unwrap();
+        let store = DecisionStore::open(
+            dir.path(),
+            test_signer().address(),
+            fixture.genesis,
+            fixture.context.commitment().unwrap(),
+        )
+        .unwrap();
+        let runtime = NativeWorkerRuntime::from_active(
+            fixture.state.clone(),
+            executor.clone(),
+            Arc::new(Sign),
+            Arc::new(Sink),
+            store,
+        )
+        .unwrap();
+        let mut votes = 0;
+        for poll in 0..80 {
+            match runtime.poll_once() {
+                Ok(Some(_)) => votes += 1,
+                Ok(None) => {}
+                Err(error) => panic!("poll {poll} failed: {error}"),
+            }
+        }
+        let calls = executor.calls.lock().clone();
+        assert_eq!(
+            calls.iter().filter(|id| **id == ids[0]).count(),
+            1,
+            "the refused request ran once"
+        );
+        assert!(calls.contains(&ids[1]), "the other request still ran");
+        assert!(votes >= 1);
+    }
+
+    #[test]
+    fn a_request_settled_before_this_member_runs_it_is_a_refusal_not_a_failure() {
+        // Before: a queued request the chain settled first (finalized by the
+        // rest of the committee, or refunded) came back from the pending
+        // source as `Source(..)`, which counted toward the runtime's
+        // consecutive-error limit, so a member slower than the rest could
+        // stop its worker for good.
+        let fixture = native_fixture();
+        let request = request_for(&fixture, 0, 3);
+        let request_id = request.job.request_id();
+        let request_tx = signed_native(
+            &fixture.state,
+            &fixture.requester,
+            0,
+            TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: token_bytes(&[11, 12]),
+            }),
+            gas_costs::NATIVE_INFERENCE_REQUEST,
+        );
+        fixture
+            .state
+            .execute_block_verified(&[request_tx], fixture.finalizer.address())
+            .unwrap();
+        let source =
+            StatePendingSource::new(fixture.state.clone(), fixture.context.commitment().unwrap());
+        assert!(
+            source.load_pending(request_id).is_ok(),
+            "admitted and pending"
+        );
+        fixture
+            .state
+            .execute_block_verified(&[], fixture.finalizer.address())
+            .unwrap();
+        let refund = signed_native(
+            &fixture.state,
+            &fixture.requester,
+            1,
+            TxBody::NativeInferenceRefund(arc_types::transaction::NativeInferenceRefundBody {
+                request_id: request_id.0,
+            }),
+            gas_costs::NATIVE_INFERENCE_REFUND,
+        );
+        fixture
+            .state
+            .execute_block_verified(std::slice::from_ref(&refund), fixture.finalizer.address())
+            .unwrap();
+        let error = source.load_pending(request_id).unwrap_err();
+        assert!(matches!(error, NativeInferenceError::NotPending), "{error}");
+        assert!(
+            error.is_request_refusal(),
+            "not counted as a worker failure"
+        );
+    }
+
+    #[test]
+    fn a_committee_short_of_quorum_never_finalizes_and_the_request_refunds() {
+        // A live committee that cannot reach a strict two-thirds: four of six
+        // equal members vote, the request expires, the requester's refund
+        // lands, and the fifth vote that would have completed a certificate
+        // arrives too late to create one.
+        let fixture = native_fixture();
+        let request = request_for(&fixture, 0, 3);
+        let request_id = request.job.request_id();
+        let request_tx = signed_native(
+            &fixture.state,
+            &fixture.requester,
+            0,
+            TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: token_bytes(&[11, 12]),
+            }),
+            gas_costs::NATIVE_INFERENCE_REQUEST,
+        );
+        fixture
+            .state
+            .execute_block_verified(&[request_tx], fixture.finalizer.address())
+            .unwrap();
+        let mempool = Arc::new(Mempool::new(16));
+        let sink = NativeFinalizeSink::new(
+            fixture.state.clone(),
+            mempool.clone(),
+            fixture.finalizer.clone(),
+        );
+        for member in &fixture.validators[..4] {
+            sink.accept_peer_vote(&vote(request_id, &[71, 72], member))
+                .expect("a member's well-formed vote is counted");
+        }
+        assert_eq!(mempool.len(), 0, "four of six is not a strict two-thirds");
+        fixture
+            .state
+            .execute_block_verified(&[], fixture.finalizer.address())
+            .unwrap();
+        let refund = signed_native(
+            &fixture.state,
+            &fixture.requester,
+            1,
+            TxBody::NativeInferenceRefund(arc_types::transaction::NativeInferenceRefundBody {
+                request_id: request_id.0,
+            }),
+            gas_costs::NATIVE_INFERENCE_REFUND,
+        );
+        fixture
+            .state
+            .execute_block_verified(std::slice::from_ref(&refund), fixture.finalizer.address())
+            .unwrap();
+        assert!(
+            sink.accept_peer_vote(&vote(request_id, &[71, 72], &fixture.validators[4]))
+                .is_err(),
+            "a vote for a refunded request is not counted"
+        );
+        assert_eq!(mempool.len(), 0, "no finalize is ever produced for it");
+        let commitment = fixture.context.commitment().unwrap();
+        assert_eq!(
+            format!(
+                "{:?}",
+                fixture
+                    .state
+                    .native_inference_receipt(request_id, commitment)
+                    .unwrap()
+                    .unwrap()
+                    .metadata
+                    .status
+            ),
+            "Refunded"
+        );
     }
 
     #[test]

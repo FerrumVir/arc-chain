@@ -98,6 +98,10 @@ counters!(
     // commits waiting for transaction bodies instead of exiting the process
     commit_stalls,
     commit_stalled_blocks,
+    // Lowest height + 1 at which this node's executed block differed from a
+    // verified quorum finality certificate (0: never). An alarm: the node
+    // keeps running (see `report_divergence` in consensus.rs).
+    diverged_at_height_plus_one,
     // GAUGES (current sizes, not totals) of the consensus loop's own
     // collections, published about once a second. Every one should plateau.
     gauge_pending_txs,

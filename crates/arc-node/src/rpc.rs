@@ -73,6 +73,15 @@ const TX_SENDER_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// exposed directly cannot allocate the router-wide 256 MiB maximum before
 /// the logical batch cap runs.
 const PUBLIC_TX_SUBMISSION_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+/// A tokenize request carries one prompt: the text limit plus JSON framing.
+const NATIVE_TOKENIZE_BODY_LIMIT_BYTES: usize = 64 * 1024;
+/// Longest prompt text tokenized. The score-merge encoder is quadratic in the
+/// text, and a 4,096-position context cannot use a longer prompt anyway.
+const NATIVE_TOKENIZE_MAX_TEXT_BYTES: usize = 16 * 1024;
+/// One tokenization at a time per node: it runs on a blocking thread, never
+/// on the async runtime that carries RPC and consensus transport, and a
+/// second caller is told to retry rather than queued.
+static NATIVE_TOKENIZE_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// Bound signature verification and admission work before iterating over any
 /// batch item. The public gateway also proves this exact contract during a
 /// production rollout.
@@ -637,6 +646,10 @@ pub struct NodeState {
     /// reports the name and chain_id as null with a reason, since the only
     /// thing such a node actually knows about its chain is its genesis hash.
     pub chain_identity: Option<ChainIdentity>,
+    /// What this node's protocol-4 native worker executes, when it runs one.
+    /// Published by `/native-inference/context` and used by
+    /// `/native-inference/tokenize`; admission never consults it.
+    pub native_serving: Option<Arc<crate::native_inference::NativeServing>>,
     /// Process lifecycle receiver installed by `serve`. Node-owned tasks that
     /// can mutate the settlement journal or mempool stop on this signal and are
     /// joined before `serve` returns to main's final WAL barrier.
@@ -1517,6 +1530,7 @@ pub fn build_node_state(
         // No genesis file is visible from here; `serve` overwrites this when
         // main.rs was given --genesis.
         chain_identity: None,
+        native_serving: None,
         runtime_shutdown: None,
         runtime_tasks: Arc::new(parking_lot::Mutex::new(tokio::task::JoinSet::new())),
         own_compute_ms: Arc::new(parking_lot::Mutex::new(
@@ -1909,6 +1923,9 @@ pub async fn serve(
     // Local issuance half of the two-part rollout gate. Consensus activation
     // comes from canonical genesis and is enforced independently by StateDB.
     community_rewards_v1_enabled: bool,
+    // native_serving: what this node's protocol-4 native worker executes,
+    //   when it runs one (context/tokenize endpoints only).
+    native_serving: Option<Arc<crate::native_inference::NativeServing>>,
     // When present, stop accepting new RPC work after the lifecycle owner
     // sends `true` and let Axum drain every active handler before returning.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
@@ -1934,6 +1951,7 @@ pub async fn serve(
     node.runtime_shutdown = shutdown.clone();
     node.chain_identity = chain_identity;
     node.community_rewards_v1_enabled = community_rewards_v1_enabled;
+    node.native_serving = native_serving;
     node.consensus_engine = consensus_engine;
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
@@ -2170,6 +2188,14 @@ pub async fn serve(
         // transaction ingress; this receipt view is read-only evidence of
         // canonical settlement, never a finality claim.
         .route("/native-inference/context", get(native_inference_context))
+        // Read-only: this operator's row cohort, its bounded books and the
+        // recent placements (the node's own audit record, not consensus).
+        .route("/assignment/cohort", get(assignment_cohort))
+        .route(
+            "/native-inference/tokenize",
+            post(native_inference_tokenize)
+                .layer(DefaultBodyLimit::max(NATIVE_TOKENIZE_BODY_LIMIT_BYTES)),
+        )
         .route(
             "/native-inference/receipt/{request_id}",
             get(native_inference_receipt),
@@ -2557,6 +2583,12 @@ struct HealthResponse {
     /// degraded response is told what specifically is degraded.
     #[serde(skip_serializing_if = "Option::is_none")]
     degraded_reason: Option<String>,
+    /// SHA-256 of this process's executable: the digest a build-provenance
+    /// record names, so evidence can be tied to one exact build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_sha256: Option<&'static str>,
+    /// Behaviour-changing cargo features this binary was built with.
+    features: Vec<&'static str>,
 }
 
 /// How stale the newest block must be before `/health` calls the node
@@ -2650,6 +2682,8 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
             .as_ref()
             .is_some_and(|engine| engine.dag_bootstrapping()),
         degraded_reason,
+        binary_sha256: crate::build_identity::executable_sha256(),
+        features: crate::build_identity::features(),
     })
 }
 
@@ -3082,6 +3116,45 @@ fn is_native_inference_transaction(tx: &Transaction) -> bool {
     )
 }
 
+/// This node's row cohort (`crate::row_cohort`): its machines, the bounded
+/// books and the recent placement records, for the operator. Machine names,
+/// measured rates and request timing describe the operator's own
+/// infrastructure, so only a direct loopback caller is answered: 404
+/// otherwise, as when the node runs no cohort, including anything a proxy
+/// forwarded. On the sealed production origin every request arrives through
+/// the nginx filter as loopback; that filter's route allowlist, which ends in
+/// `return 404`, does not include `/assignment/`.
+async fn assignment_cohort(
+    AxumState(node): AxumState<NodeState>,
+    ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<crate::row_cohort::CohortView>, StatusCode> {
+    // Not the operator's own when: a same-host reverse proxy forwarded it
+    // (deploy/nginx.conf forwards /rpc/ from 127.0.0.1 and marks what it
+    // forwards); a browser page sent it (browsers add Origin or Sec-Fetch-*);
+    // or it reached this port under another name (DNS rebinding).
+    let proxied = ["x-forwarded-for", "x-real-ip", "forwarded"]
+        .iter()
+        .any(|name| headers.contains_key(*name));
+    let from_a_page = headers.contains_key(axum::http::header::ORIGIN)
+        || headers
+            .keys()
+            .any(|name| name.as_str().starts_with("sec-fetch-"));
+    let named_here = headers
+        .get(axum::http::header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .is_some_and(crate::row_cohort::host_header_is_loopback);
+    if !peer_addr.ip().is_loopback() || proxied || from_a_page || !named_here {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let cohort = node
+        .native_serving
+        .as_ref()
+        .and_then(|serving| serving.row_cohort.clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(cohort.view()))
+}
+
 /// Publicly describable, read-only protocol-4 activation binding.  Activation
 /// itself deliberately has no HTTP route: it can only occur at fresh private
 /// genesis through StateDB's durable activation path.
@@ -3106,6 +3179,108 @@ async fn native_inference_context(
             "address": member.address.to_hex(), "stake": member.stake,
         })).collect::<Vec<_>>(),
         "allowed_execution_count": context.allowed_executions.len(),
+        // Everything a client needs to build a job the chain can admit. The
+        // chain still judges every request by its own rules.
+        "allowed_executions": context.allowed_executions.iter().map(|execution| json!({
+            "model_hash": execution.model_hash.to_hex(),
+            "profile_hash": execution.profile_hash.to_hex(),
+            "generation_hash": execution.generation_hash.to_hex(),
+            "assignment_hash": execution.assignment_hash.to_hex(),
+        })).collect::<Vec<_>>(),
+        "contract_version": arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+        "height": node.state.height(),
+        "limits": {
+            "max_tokens": arc_types::transaction::TIER1_MAX_TOKENS,
+            "max_output_bytes": arc_types::transaction::TIER1_OUTPUT_BLOB_MAX,
+            "max_input_bytes": arc_types::transaction::TIER1_INPUT_BLOB_MAX,
+            "request_gas_limit": arc_types::transaction::gas_costs::NATIVE_INFERENCE_REQUEST,
+            "refund_gas_limit": arc_types::transaction::gas_costs::NATIVE_INFERENCE_REFUND,
+        },
+        // This node only: another member may run a different executor build.
+        "serving": node.native_serving.as_deref().map(|serving| json!({
+            "executor": serving.executor.as_str(),
+            "input_format": serving.executor.input_format(),
+            "tokenizer_profile": serving.tokenizer.as_ref().map(|tokenizer| tokenizer.profile()),
+            "tokenize_endpoint": serving.tokenizer.is_some(),
+            // 1 BOS + prompt + max_tokens must fit, or this node never votes.
+            "max_positions": serving.max_positions,
+        })),
+        "node_version": env!("CARGO_PKG_VERSION"),
+    })))
+}
+
+#[derive(Deserialize)]
+struct NativeTokenizeRequest {
+    text: String,
+}
+
+/// Tokenize a prompt with the tokenizer read from the artifact this node's
+/// canonical executor runs, returning exactly the input bytes that executor
+/// accepts. A convenience for clients that hold no tokenizer: the requester
+/// signs the returned bytes, so a client that does not trust this node must
+/// tokenize for itself. Served only by a node running the canonical executor.
+async fn native_inference_tokenize(
+    AxumState(node): AxumState<NodeState>,
+    Json(request): Json<NativeTokenizeRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let serving = node.native_serving.clone().ok_or((
+        StatusCode::NOT_FOUND,
+        "this node runs no native executor".to_string(),
+    ))?;
+    let Some(tokenizer) = serving.tokenizer.as_ref() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "this node's native executor ({}) reads {} and serves no tokenizer",
+                serving.executor.as_str(),
+                serving.executor.input_format()
+            ),
+        ));
+    };
+    let profile = tokenizer.profile();
+    if request.text.len() > NATIVE_TOKENIZE_MAX_TEXT_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the prompt is longer than {NATIVE_TOKENIZE_MAX_TEXT_BYTES} bytes, more than \
+                 the model's context can use"
+            ),
+        ));
+    }
+    let Ok(permit) = NATIVE_TOKENIZE_PERMIT.try_acquire() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node is tokenizing another prompt; retry shortly".to_string(),
+        ));
+    };
+    let text = request.text;
+    let worker = serving.clone();
+    // The permit moves into the blocking task. A client that disconnects
+    // drops this handler but not the tokenization, so the permit must be
+    // released when the work ends, not when the connection does.
+    let tokens = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        worker.tokenize_prompt(&text)
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tokenization did not complete".to_string(),
+        )
+    })?
+    .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
+    let input: Vec<u8> = tokens
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
+    Ok(Json(json!({
+        "token_count": tokens.len(),
+        "tokens": tokens,
+        "input_hex": hex::encode(&input),
+        "input_hash": arc_crypto::hash_bytes(&input).to_hex(),
+        "input_format": serving.executor.input_format(),
+        "tokenizer_profile": profile,
     })))
 }
 
@@ -3160,6 +3335,16 @@ async fn native_inference_receipt(
         "settlement_credits": metadata.credits.iter().map(|credit| json!({
             "payee": credit.payee.to_hex(), "amount": credit.amount,
         })).collect::<Vec<_>>(),
+        "expires_at": metadata.request.job.expires_at,
+        "requester": metadata.request.job.requester.to_hex(),
+        // The certified output bytes (empty until finalized). The text is
+        // display only, from this node's tokenizer when it holds one: the
+        // certificate commits to the bytes, not to the text.
+        "output_hex": hex::encode(&metadata.output),
+        "output_text": node
+            .native_serving
+            .as_deref()
+            .and_then(|serving| serving.decode_output(&metadata.output)),
         "consensus_finality": "not asserted by milestone-2 receipt",
     })))
 }
@@ -5669,6 +5854,19 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
 ///   7. Build an ARC `Transaction` (Transfer or WasmCall) and insert into mempool
 ///   8. Return the Keccak-256 hash of the full signed RLP (Ethereum tx hash)
 fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    // Refuse what can never be included, as `/tx/submit_signed` does. A
+    // protocol-4 chain admits native inference only, and protocol v3 requires a
+    // signed minimum fee this Ethereum-shaped transfer never carries (its fee
+    // is 0). Accepting either would hand the caller a hash for a transaction
+    // that the next proposal drops.
+    if node.state.active_protocol_version().major >= 3 {
+        return eth_rpc_error(
+            id,
+            -32003,
+            "eth_sendRawTransaction transfers cannot be included on this protocol; \
+             submit a signed ARC transaction to /tx/submit_signed",
+        );
+    }
     // --- 1. Extract and hex-decode the raw transaction ---
     let raw_hex = match params.get(0).and_then(|v| v.as_str()) {
         Some(h) => h,
@@ -10678,13 +10876,18 @@ fn submit_inference_attestation(
                 // sign() assigns tx.hash as part of signing.
                 tx.sig_verified = true;
                 let h = tx.hash;
-                if node.state.active_protocol_version().major == 3 {
+                match node.state.active_protocol_version().major {
                     // Protocol v3 rejects standalone 0x16 transactions. The
                     // same signed certificate shape is used only as embedded
                     // evidence inside the consensus-authorized 0x25 reward;
                     // inserting it separately would create unpaid state-bloat
                     // and can never produce the earnings receipt users expect.
-                    return (h, "certificate_only_v3_not_submitted");
+                    3 => return (h, "certificate_only_v3_not_submitted"),
+                    // A protocol-4 block carries one native inference
+                    // transaction and nothing else; this one could only sit
+                    // in the mempool until dropped.
+                    major if major >= 4 => return (h, "not_submitted_native_inference_chain"),
+                    _ => {}
                 }
                 let _ = node.mempool.insert(tx);
                 (h, "submitted_to_mempool")
@@ -10697,10 +10900,16 @@ fn submit_inference_attestation(
         None => {
             // Test-fixture path: no keypair wired. Keep the legacy shape so
             // unit tests still execute, but at least assign the hash so the
-            // mempool doesn't dedupe every one of them to 0x00..0.
+            // mempool doesn't dedupe every one of them to 0x00..0. Protocol 3
+            // and later never pool a standalone attestation, as above.
             tx.sig_verified = true;
             let h = tx.compute_hash();
             tx.hash = h;
+            match node.state.active_protocol_version().major {
+                3 => return (h, "certificate_only_v3_not_submitted"),
+                major if major >= 4 => return (h, "not_submitted_native_inference_chain"),
+                _ => {}
+            }
             let _ = node.mempool.insert(tx);
             (h, "submitted_unsigned_no_keypair")
         }
@@ -10726,7 +10935,9 @@ async fn submit_or_relay_attestation(
     bond: u64,
     challenge_period: u64,
 ) -> (Hash256, String) {
-    if node.state.active_protocol_version().major == 3 {
+    // Protocol 3 and later neither pool nor relay a standalone attestation:
+    // `submit_inference_attestation` answers why without submitting it.
+    if node.state.active_protocol_version().major >= 3 {
         let (hash, status) = submit_inference_attestation(
             node,
             model_id,
@@ -20061,6 +20272,7 @@ mod tests {
             seed_rpc_addrs: Arc::new(Vec::new()),
             community_rpc_bases: Arc::new(Vec::new()),
             chain_identity: None,
+            native_serving: None,
             runtime_shutdown: None,
             runtime_tasks: Arc::new(parking_lot::Mutex::new(tokio::task::JoinSet::new())),
             own_compute_ms: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
@@ -23096,6 +23308,46 @@ mod tests {
             None,
             None,
         );
+        // Every ingress refuses what a protocol-4 block can never carry, not
+        // only /tx/submit_signed: the Ethereum-shaped raw transfer and the
+        // internal attestation used to reach this mempool (P3 audit).
+        let Json(eth) = eth_send_raw_transaction(&node, &json!(["0x00"]), &json!(1));
+        assert_eq!(eth["error"]["code"], -32003, "{eth}");
+        let (_, attestation) = submit_inference_attestation(
+            &node,
+            Hash256([1; 32]),
+            Hash256([2; 32]),
+            Hash256([3; 32]),
+            0,
+            10,
+        );
+        assert_eq!(attestation, "not_submitted_native_inference_chain");
+        assert_eq!(mempool.len(), 0, "nothing reached the mempool");
+        // The test-fixture path without a validator keypair refuses as well.
+        let keyless = build_node_state(
+            state.clone(),
+            mempool.clone(),
+            node.validator_address,
+            None,
+            StateDB::MIN_VALIDATOR_STAKE,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let (_, keyless_attestation) = submit_inference_attestation(
+            &keyless,
+            Hash256([1; 32]),
+            Hash256([2; 32]),
+            Hash256([3; 32]),
+            0,
+            10,
+        );
+        assert_eq!(keyless_attestation, "not_submitted_native_inference_chain");
+        assert_eq!(mempool.len(), 0, "nothing reached the mempool");
+
         let input = [11u32, 12]
             .iter()
             .flat_map(|token| token.to_le_bytes())
@@ -23152,11 +23404,64 @@ mod tests {
             .unwrap();
         assert_eq!(context_json["candidate_protocol"], 4);
         assert_eq!(context_json["allowed_execution_count"], 1);
+        // A client builds its job from these: the pinned tuple and the bounds.
+        assert_eq!(
+            context_json["allowed_executions"][0]["model_hash"],
+            tuple.to_hex()
+        );
+        assert_eq!(
+            context_json["allowed_executions"][0]["assignment_hash"],
+            tuple.to_hex()
+        );
+        assert_eq!(
+            context_json["limits"]["max_tokens"],
+            arc_types::transaction::TIER1_MAX_TOKENS
+        );
+        assert_eq!(
+            context_json["limits"]["request_gas_limit"],
+            gas_costs::NATIVE_INFERENCE_REQUEST
+        );
+        assert!(context_json["height"].is_u64());
+        // This node runs no native worker, so it claims no executor and
+        // tokenizes nothing.
+        assert!(context_json["serving"].is_null());
+        let refused = native_inference_tokenize(
+            AxumState(node.clone()),
+            Json(NativeTokenizeRequest {
+                text: "hello".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.0, StatusCode::NOT_FOUND);
+        let mut test_serving = node.clone();
+        test_serving.native_serving = Some(Arc::new(
+            crate::native_inference::NativeServing::deterministic_test(),
+        ));
+        let Json(served) = native_inference_context(AxumState(test_serving.clone()))
+            .await
+            .unwrap();
+        assert_eq!(served["serving"]["executor"], "deterministic_test");
+        assert_eq!(served["serving"]["input_format"], "opaque_bytes");
+        assert_eq!(served["serving"]["tokenize_endpoint"], false);
+        let refused = native_inference_tokenize(
+            AxumState(test_serving),
+            Json(NativeTokenizeRequest {
+                text: "hello".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.0, StatusCode::NOT_FOUND);
+        assert!(refused.1.contains("opaque_bytes"), "{}", refused.1);
         let Json(receipt) =
             native_inference_receipt(AxumState(node), AxumPath(request_id.to_hex()))
                 .await
                 .unwrap();
         assert_eq!(receipt["observed_status"], "Pending");
+        assert_eq!(receipt["output_hex"], "");
+        assert!(receipt["output_text"].is_null());
+        assert!(receipt["expires_at"].is_u64());
         assert!(receipt["admission_transaction"]["tx_hash"].is_string());
         assert!(receipt["admission_transaction"]["block"].is_string());
         assert!(receipt["terminal_transaction"].is_null());
@@ -24743,6 +25048,7 @@ mod tests {
                     0,
                     None,
                     false,
+                    None,
                     Some(coordinator_shutdown_rx),
                 )
                 .await
@@ -24826,6 +25132,7 @@ mod tests {
                 0,
                 None,
                 false,
+                None,
                 Some(shutdown_rx),
             )
             .await

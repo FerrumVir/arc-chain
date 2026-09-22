@@ -2,6 +2,7 @@
 
 pub mod benchmark;
 pub mod block_stm;
+pub mod build_identity;
 pub mod chunk_cache;
 pub mod coalesce;
 pub mod consensus;
@@ -13,6 +14,7 @@ pub mod pipeline;
 pub mod planner;
 pub mod producer;
 pub mod recovery_dag_wal;
+pub mod row_cohort;
 pub mod rpc;
 pub mod state_sync;
 #[cfg(unix)]

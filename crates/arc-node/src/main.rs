@@ -204,6 +204,12 @@ struct Cli {
     #[arg(long, default_value_t = false, requires = "native_inference_activation")]
     native_inference_runtime: bool,
 
+    /// Largest KV cache (bytes) one native job may use on this node. A job
+    /// needing more is refused and never voted on, so it expires and refunds.
+    /// The default fits the canonical 7B package on a 16 GB host.
+    #[arg(long, value_name = "BYTES", default_value_t = arc_node::native_inference::DEFAULT_NATIVE_KV_BUDGET_BYTES)]
+    native_kv_budget_bytes: u64,
+
     /// Canonical-I8 GGUF artifact for the native worker. Its bytes are hashed
     /// and must match a model hash in the activated allowlist.
     #[arg(long, value_name = "PATH")]
@@ -217,6 +223,23 @@ struct Cli {
     /// identity, not that the execution passed reference qualification.
     #[arg(long, value_name = "PATH")]
     native_inference_qualification: Option<PathBuf>,
+
+    /// The approved model package manifest (`arc.model-package.v1`) for the
+    /// real executor. Its hash must equal the qualification record's
+    /// `package_manifest_hash`, and it must describe exactly the artifact
+    /// this node loads (model package contract v1). Required with
+    /// `--native-inference-qualification`.
+    #[arg(long, value_name = "PATH")]
+    native_package_manifest: Option<PathBuf>,
+
+    /// This operator's own row machines (JSON; `arc_node::row_cohort`). Each
+    /// runs `tensor_row_model_worker` on the same artifact and is reached over
+    /// SSH with a pinned host key. Paid requests are then placed on them
+    /// whenever placement predicts that is faster; the tokens are those of
+    /// local execution either way. Only this operator's machines may feed its
+    /// vote (docs/design/assignment-node-integration.md, trust model).
+    #[arg(long, value_name = "PATH", requires = "native_package_manifest")]
+    native_row_workers: Option<PathBuf>,
 
     /// INTEGRATION TESTING ONLY: run the native worker with a deterministic
     /// executor that loads no model. Compiled in only with the
@@ -5752,6 +5775,8 @@ async fn auto_shard_join(
     rpc_base: &str,
     advertised_socket: &str,
     model_artifact_id: Hash256,
+    shape: &arc_inference::gguf_meta::ModelShape,
+    execution_profile: &str,
 ) -> Option<(usize, usize)> {
     if rpc_base.is_empty() {
         tracing::warn!(
@@ -5768,9 +5793,10 @@ async fn auto_shard_join(
         "socket_addr": advertised_socket,
         "node_name": public_node_name(cli),
         "model_id": model_id_hex,
-        "model_name": "Llama-2-7B",
-        "execution_profile": arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
-        "total_layers": 32u32,
+        // The model's own header, not an assumption about which model it is.
+        "model_name": shape.name.clone().unwrap_or_else(|| shape.architecture.clone()),
+        "execution_profile": execution_profile,
+        "total_layers": shape.block_count,
         "available_memory_mb": detect_ram_mb(),
         "gpu_tier": 0u8,
     });
@@ -6799,6 +6825,30 @@ async fn run_arc_node() -> Result<()> {
         .transpose()
         .context("cannot establish the exact --model artifact commitment")?;
     let model_artifact_id = model_artifact.as_ref().map(|artifact| artifact.model_id());
+    // What model it is comes from the file's own GGUF header, and this build
+    // must have a conformant integer adapter for that architecture - anything
+    // else is refused here rather than forced through the Llama path. ARC's
+    // own `.arc-int8` cache is produced from a supported GGUF and carries its
+    // own config, so it has no GGUF header to read.
+    let model_shape = match cli.model.as_deref() {
+        Some(path) if !path.ends_with(".arc-int8") => {
+            let shape = arc_inference::gguf_meta::read_shape_from_path(Path::new(path))
+                .context("cannot read the --model GGUF header")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the --model GGUF header names no architecture and block count")
+                })?;
+            if arc_inference::gguf_meta::supported_adapter(&shape.architecture).is_none() {
+                anyhow::bail!(
+                    "--model is a '{}' model ({} blocks); this build has a conformant integer \
+                     adapter only for: llama",
+                    shape.architecture,
+                    shape.block_count
+                );
+            }
+            Some(shape)
+        }
+        _ => None,
+    };
 
     // Ask for a shard only after the signing identity and genesis membership
     // have passed validation, so a misconfigured validator performs no remote
@@ -6811,17 +6861,30 @@ async fn run_arc_node() -> Result<()> {
         && cli.shard_end.is_none()
     {
         let advertised_socket = advertised_shard_rpc_origin(&cli, &rpc_addr)?;
-        match auto_shard_join(
-            &cli,
-            coordinator_rpc_bases
-                .first()
-                .map(String::as_str)
-                .unwrap_or(""),
-            &advertised_socket,
-            model_artifact_id.expect("--model commitment established above"),
-        )
-        .await
-        {
+        let joined = match model_shape.as_ref() {
+            Some(shape) => {
+                auto_shard_join(
+                    &cli,
+                    coordinator_rpc_bases
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    &advertised_socket,
+                    model_artifact_id.expect("--model commitment established above"),
+                    shape,
+                    arc_inference::gguf_meta::supported_adapter(&shape.architecture)
+                        .expect("unsupported architectures were refused above"),
+                )
+                .await
+            }
+            None => {
+                tracing::warn!(
+                    "auto-shard needs a GGUF --model whose header states its shape; not joining"
+                );
+                None
+            }
+        };
+        match joined {
             Some((start, end)) => {
                 tracing::info!(
                     "auto-shard: seed assigned this validator layers [{}, {}) — loading shard",
@@ -6881,6 +6944,11 @@ async fn run_arc_node() -> Result<()> {
     tracing::info!("╔═══════════════════════════════════════╗");
     tracing::info!("║   ARC Chain - Agent Runtime Chain     ║");
     tracing::info!("║   ARC Node v{:<26}║", env!("CARGO_PKG_VERSION"));
+    // Open our own executable now, before anything could replace the file,
+    // and hash it on another thread: /health reports the build this process
+    // actually runs, without delaying the node's start (the digest is logged
+    // when it is ready).
+    arc_node::build_identity::begin();
     tracing::info!("╚═══════════════════════════════════════╝");
     tracing::info!("Validator  : {}", validator_address);
     tracing::info!(
@@ -7134,6 +7202,14 @@ async fn run_arc_node() -> Result<()> {
     // The finalize sink is shared: the runtime emits this validator's votes into
     // it, and the consensus loop gossips them and feeds peers' votes back in.
     let mut native_vote_relay: Option<Arc<arc_node::native_inference::NativeFinalizeSink>> = None;
+    // What the native worker executes, for the context and tokenize endpoints.
+    let mut native_serving: Option<Arc<arc_node::native_inference::NativeServing>> = None;
+    if cli.native_row_workers.is_some() && !cli.native_inference_runtime {
+        anyhow::bail!(
+            "--native-row-workers places the canonical executor's work on this operator's \
+             machines; it needs --native-inference-runtime with a qualified artifact"
+        );
+    }
     if cli.native_inference_runtime {
         use arc_node::native_inference as ni;
         let context = state.native_inference_context().ok_or_else(|| {
@@ -7188,12 +7264,19 @@ async fn run_arc_node() -> Result<()> {
 
         #[cfg(feature = "native-test-executor")]
         let started = if cli.native_inference_test_executor {
+            if cli.native_row_workers.is_some() {
+                anyhow::bail!(
+                    "--native-row-workers needs the canonical executor, not the deterministic \
+                     test executor"
+                );
+            }
             tracing::warn!(
                 "native worker running with the DETERMINISTIC TEST EXECUTOR. No model is \
                  loaded. This is integration coverage and qualifies nothing."
             );
             let (signer, sink, store) = native_parts()?;
             let executor = Arc::new(ni::DeterministicTestExecutor::new(test_identity));
+            native_serving = Some(Arc::new(ni::NativeServing::deterministic_test()));
             let runtime =
                 ni::NativeWorkerRuntime::from_active(state.clone(), executor, signer, sink, store)
                     .map_err(|e| anyhow::anyhow!("native worker runtime: {e}"))?;
@@ -7214,23 +7297,31 @@ async fn run_arc_node() -> Result<()> {
                 // Resolve qualification FIRST. A missing or mismatched decision
                 // must cost nothing - it is rejected before the artifact is
                 // hashed or a multi-gigabyte model is loaded.
-                let qualification = ni::resolve_real_execution_qualification(
+                let decision = ni::resolve_real_execution_decision(
                     cli.native_inference_qualification.as_deref(),
                     &allowed,
                 )
                 .map_err(|e| anyhow::anyhow!("real-model execution refused: {e}"))?;
+                let qualification = decision.qualification;
                 let artifact = cli.native_inference_artifact.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "--native-inference-runtime needs --native-inference-artifact \
                          (the qualified canonical-I8 GGUF)"
                     )
                 })?;
+                let package_manifest = cli.native_package_manifest.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "real-model execution needs --native-package-manifest: the approved \
+                         package manifest whose hash the qualification record pins"
+                    )
+                })?;
                 tracing::warn!(
                     "real-model execution starting under an explicit reference-qualification \
                      record. That record is an operator decision, not proof of model quality."
                 );
-                let executor = Arc::new(
+                let executor =
                     ni::CanonicalI8NativeExecutor::load_qualified(artifact, qualification)
+                        .map(|executor| executor.with_kv_budget(cli.native_kv_budget_bytes))
                         .map_err(|e| {
                             anyhow::anyhow!(
                                 "native executor refused the artifact at {}: {e}. \
@@ -7239,8 +7330,70 @@ async fn run_arc_node() -> Result<()> {
                                  qualification.",
                                 artifact.display()
                             )
-                        })?,
+                        })?;
+                // A budget below the smallest job would refuse every request
+                // and never say why.
+                if executor.max_positions() < ni::MIN_NATIVE_KV_POSITIONS {
+                    anyhow::bail!(
+                        "--native-kv-budget-bytes {} holds {} KV positions of this model; the \
+                         smallest native job needs {} (1 BOS + 1 prompt token + 1 generated \
+                         token, allocated as the next power of two)",
+                        cli.native_kv_budget_bytes,
+                        executor.max_positions(),
+                        ni::MIN_NATIVE_KV_POSITIONS
+                    );
+                }
+                // The tokenizer is read from the artifact the executor just
+                // verified and loaded. The package check needs its vocabulary,
+                // and /native-inference/tokenize then serves exactly the
+                // executor's input contract.
+                let tokenizer = artifact
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("native artifact path is not UTF-8"))
+                    .and_then(|path| {
+                        arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer::from_gguf(path)
+                            .map_err(|e| anyhow::anyhow!("native artifact tokenizer: {e}"))
+                    })?;
+                executor
+                    .verify_package(
+                        artifact,
+                        &tokenizer,
+                        package_manifest,
+                        decision.package_manifest_hash,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "native executor refused the package: {e}. A node executes only the \
+                             package its qualification record approved."
+                        )
+                    })?;
+                tracing::info!(
+                    manifest = %decision.package_manifest_hash,
+                    "native package manifest verified against the loaded artifact"
                 );
+                // After the package check: only the approved package is ever
+                // placed on this operator's machines.
+                let executor = match cli.native_row_workers.as_ref() {
+                    Some(path) => {
+                        let config = arc_node::row_cohort::RowCohortConfig::load(path)
+                            .map_err(|e| anyhow::anyhow!("--native-row-workers: {e}"))?;
+                        let executor = executor
+                            .connect_row_cohort(config, validator_keypair.address(), state.height())
+                            .map_err(|e| anyhow::anyhow!("--native-row-workers: {e}"))?;
+                        tracing::warn!(
+                            "native requests may be placed on this operator's own row machines \
+                             (S10, the multi-machine comparison, is not yet passed)"
+                        );
+                        executor
+                    }
+                    None => executor,
+                };
+                let row_cohort = executor.row_cohort();
+                let executor = Arc::new(executor);
+                native_serving = Some(Arc::new(
+                    ni::NativeServing::canonical(Some(tokenizer), Some(executor.max_positions()))
+                        .with_row_cohort(row_cohort),
+                ));
                 let (signer, sink, store) = native_parts()?;
                 let runtime = ni::NativeWorkerRuntime::from_active(
                     state.clone(),
@@ -9014,6 +9167,7 @@ async fn run_arc_node() -> Result<()> {
         compute_threads,
         genesis_chain_identity,
         cli.enable_community_rewards_v1,
+        native_serving,
         Some(shutdown_rx),
     )
     .await;
@@ -9844,6 +9998,7 @@ mod tests {
                     0,
                     None,
                     false,
+                    None,
                     Some(coordinator_shutdown_rx),
                 )
                 .await

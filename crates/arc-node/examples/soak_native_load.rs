@@ -1,7 +1,8 @@
 //! Offered native-inference load for the recorded soak (checklist R8).
 //!
 //!     soak_native_load --rpc 9960,9961,9962,9963 --rate 0.2 --duration 600 \
-//!                      --out workload.jsonl --requester-seed soak --tuple m,p,g,a
+//!                      --out workload.jsonl --requester-seed soak --tuple m,p,g,a \
+//!                      [--input-hex LE_U32_TOKEN_IDS --max-tokens 8 --executor-label …]
 //!
 //! Offers signed native-inference requests at a fixed rate, round-robin across
 //! the given nodes, and follows each one to a terminal receipt on ANY replica.
@@ -114,6 +115,11 @@ struct Driver {
     domain: InferenceDomain,
     tuple: Vec<Hash256>,
     executor: String,
+    /// Fixed input for every request (`--input-hex`): little-endian u32
+    /// token ids for the real executor. Absent: a unique text per request,
+    /// which only the deterministic test executor accepts.
+    input: Option<Vec<u8>>,
+    max_tokens: u32,
     out: std::fs::File,
     lost_after: f64,
     requesters: Vec<Requester>,
@@ -158,7 +164,9 @@ impl Driver {
     }
 
     fn build(&self, requester: &KeyPair, nonce: u64, height: u64) -> (Transaction, Hash256) {
-        let input = format!("soak native input {}/{nonce}", requester.address().to_hex()).into_bytes();
+        let input = self.input.clone().unwrap_or_else(|| {
+            format!("soak native input {}/{nonce}", requester.address().to_hex()).into_bytes()
+        });
         let job = InferenceJob {
             version: INFERENCE_CONTRACT_VERSION,
             domain: self.domain,
@@ -169,8 +177,10 @@ impl Driver {
             input_hash: hash_bytes(&input),
             generation_hash: self.tuple[2],
             assignment_hash: self.tuple[3],
-            max_tokens: 8,
-            max_output_bytes: 128,
+            max_tokens: self.max_tokens,
+            // Four bytes per generated token id, and never below what the
+            // test executor returns.
+            max_output_bytes: (self.max_tokens * 4).max(128),
             execution_price: 10,
             reserved_max_payment: 100,
             expires_at: height + 2_000,
@@ -428,6 +438,18 @@ fn main() {
         .collect();
     assert_eq!(tuple.len(), 4, "--tuple needs four hashes");
     let executor = arg("--executor-label").unwrap_or_else(|| "deterministic-test-executor".into());
+    let input = arg("--input-hex").map(|h| {
+        let bytes = hex::decode(h.trim()).expect("--input-hex is hexadecimal");
+        assert!(
+            !bytes.is_empty() && bytes.len() % 4 == 0,
+            "--input-hex must be whole little-endian u32 token ids"
+        );
+        bytes
+    });
+    let max_tokens: u32 = arg("--max-tokens")
+        .map(|v| v.parse().expect("--max-tokens"))
+        .unwrap_or(8);
+    assert!((1..=2048).contains(&max_tokens), "--max-tokens must be 1..=2048");
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -454,6 +476,8 @@ fn main() {
         domain,
         tuple,
         executor,
+        input,
+        max_tokens,
         out,
         lost_after,
         requesters: Vec::new(),
