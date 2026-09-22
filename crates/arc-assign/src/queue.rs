@@ -95,7 +95,10 @@ impl FairQueue {
         let Some(key) = self.order.pop_front() else {
             return Next::Idle;
         };
-        let queue = self.calls.get_mut(&key).expect("ordered requests have calls");
+        let queue = self
+            .calls
+            .get_mut(&key)
+            .expect("ordered requests have calls");
         let call = queue.pop_front().expect("non-empty");
         self.len -= 1;
         if queue.is_empty() {

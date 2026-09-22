@@ -39,7 +39,9 @@ pub fn summarize(probes: &[Probe], measured_at: u64, simulated: bool) -> Option<
     let mut rtts: Vec<u64> = ok.iter().map(|p| p.rtt_us).collect();
     rtts.sort_unstable();
     let median = rtts[rtts.len() / 2];
-    let p95 = rtts[((rtts.len() * 95).div_ceil(100)).saturating_sub(1).min(rtts.len() - 1)];
+    let p95 = rtts[((rtts.len() * 95).div_ceil(100))
+        .saturating_sub(1)
+        .min(rtts.len() - 1)];
     let jitter = rtts[rtts.len() - 1] - rtts[0];
     let bandwidth = ok
         .iter()

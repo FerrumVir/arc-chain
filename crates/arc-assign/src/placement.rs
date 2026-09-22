@@ -150,13 +150,15 @@ fn predict(
             if *rows == 0 {
                 continue;
             }
-            let compute_us = (*rows as u128 * stage.cols as u128 * 1_000_000) / rates[pi].max(1) as u128;
+            let compute_us =
+                (*rows as u128 * stage.cols as u128 * 1_000_000) / rates[pi].max(1) as u128;
             let comm_us = match links[pi] {
                 None => 0,
                 Some(link) => {
                     let bytes = stage.cols as u128 * p.input_element_bytes as u128
                         + *rows as u128 * p.output_element_bytes as u128;
-                    link.rtt_p95_us as u128 + (bytes * 1_000_000) / link.bandwidth_bps.max(1) as u128
+                    link.rtt_p95_us as u128
+                        + (bytes * 1_000_000) / link.bandwidth_bps.max(1) as u128
                 }
             };
             slowest = slowest.max(compute_us + comm_us);
@@ -182,7 +184,11 @@ pub fn place(
     // Deterministic candidate order: fastest measured first, address breaks
     // ties. Input order never matters.
     let mut pool: Vec<&Candidate> = candidates.iter().filter(|c| usable(c, policy)).collect();
-    pool.sort_by(|a, b| b.macs_per_s.cmp(&a.macs_per_s).then(a.worker.0.cmp(&b.worker.0)));
+    pool.sort_by(|a, b| {
+        b.macs_per_s
+            .cmp(&a.macs_per_s)
+            .then(a.worker.0.cmp(&b.worker.0))
+    });
     // One entry per validator identity - its fastest offer - however many
     // leases or transports it presented.
     let mut seen = std::collections::BTreeSet::new();
@@ -258,8 +264,10 @@ pub fn place(
             continue;
         }
         let weights_u64: Vec<u64> = weights.iter().map(|w| *w as u64).collect();
-        let rows_per_stage: Vec<Vec<u64>> =
-            stages.iter().map(|s| split_rows(s.rows, &weights_u64)).collect();
+        let rows_per_stage: Vec<Vec<u64>> = stages
+            .iter()
+            .map(|s| split_rows(s.rows, &weights_u64))
+            .collect();
         let t = predict(stages, &rates, &links, &rows_per_stage, policy);
         let better = match &best {
             None => true,
