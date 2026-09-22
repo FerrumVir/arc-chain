@@ -160,6 +160,67 @@ Answers to the review, per point (the rest of this document follows them):
    request-boundary only. Recorded as an owner option, not v1. The WAN limit
    of row partitioning is therefore a chosen tradeoff.
 
+## Written under option (a), 2026-09-22 (not compiled; parse-checked)
+
+The node side of option (a) exists as source, pending compilation after the soak.
+- `arc-inference`:
+  - `try_generate_v2_with_backend`: generation v2 token by token on a projection backend.
+  - `VerifiedPartitionBackend`: per-call fallback to local rows, duplicate and spot checks, and every fallback and fault reported to a sink.
+  - Symmetric row-frame codecs and `serve_row_frames`.
+  - The `tensor_row_model_worker` example: a machine holding the whole artifact serves any assignment, which dynamic placement needs; the row-file sidecar holds one fixed slice.
+- `arc-assign`:
+  - `book::Offer` and `candidates_from`, so the operator's configured machines and other validators' leases feed one placement path.
+  - Reservations and the bounded books.
+- `arc-node`:
+  - `row_cohort`: the `--native-row-workers` JSON config of the operator's machines (SSH with pinned host keys).
+  - Per-epoch challenges this node recomputes.
+  - Probes from each real call's timing.
+  - Per request: placement, a reservation, a certificate, and a run on the verified backend. The request runs locally when placement says this node alone is faster, or when anything prevents a placed run.
+  - Exclusion after a fault or three consecutive failures.
+  - A 256-record ring behind the read-only `GET /assignment/cohort`.
+- The canonical executor runs through the cohort via `NativeExecutor::execute_at`, which the worker now calls with the chain height.
+
+After an independent review the same day (all uncompiled):
+- Responses now carry their own frame magic (`ARCTR001`), so a request frame, or a worker that echoes one, is never read as a response. The row-file sidecar example changed with it.
+- The SSH remote command is quoted with POSIX `'\''`; the old quoting let an apostrophe end an argument's quoting.
+- ssh runs with no configuration file (`-F none`), no global known-hosts file and no host-key updates, so the pin is exclusive.
+- An excluded machine's slices are reported as `Skipped`, so none moves silently.
+- A machine's connection closes itself on any failure; it is now reconnected at its next measurement.
+- Measurement:
+  - A warm-up call under `startup_timeout_ms` absorbs the remote model load.
+  - Eight one-row pings give the round trip, and a wide call gives the bandwidth. A real call's time mixes compute and queueing into the round trip, so it no longer counts as a probe.
+  - The challenge's compute time excludes the round trip.
+  - Stale links are refreshed between epochs.
+- Reservations are released by a drop guard on every exit path.
+- `/assignment/cohort` answers loopback callers only. The production nginx allowlist ends in `return 404` and does not list it.
+
+A second review of those fixes followed (still uncompiled):
+- Machines are connected and measured on a background thread, so neither startup nor a paid request waits on a connect or a model load. A request uses whatever has been measured so far.
+- A closed connection's slices are reported as `Skipped` and are not counted as failures. Before this, one timeout became three failures within a single token.
+- An unreachable machine has no refused challenge on record, so it takes the epoch's challenge once it answers.
+- A successful reconnect lifts an exclusion for failures, never one for a fault.
+- The challenge is 4,096 rows, and neither it nor the bandwidth probe subtracts a round trip it does not clearly exceed, so jitter cannot inflate a rate. The bandwidth probe takes the median of three wide calls.
+- known_hosts must be a plain absolute path, checked when the config loads.
+- ssh adds `CheckHostIP=no`, a 10 s connect timeout and keepalives.
+- `is_open()` is a flag, so the operator view never waits on a call.
+- The view also refuses proxied requests: the repo's `deploy/nginx.conf` forwards `/rpc/` from 127.0.0.1, and now denies `/rpc/assignment/` as well.
+
+A third review, of the threading, followed (still uncompiled):
+- Each machine is measured on its own thread and recorded as soon as it finishes, so one slow machine delays no other. The recording uses the latest height.
+- A drop guard clears a machine's in-flight mark however its measurement ends, even when no thread could be created.
+- A challenge that was never sent is never recorded as refused.
+- A challenge answered for an epoch that has since ended is dropped.
+- An open machine that missed the epoch's challenge takes it at the next request.
+- A reconnect lifts an exclusion for failures only if the machine is actually excluded, only in the epoch the measurement started in, and at most once per machine per epoch. A reconnect of a machine that is not excluded leaves its failure count alone, so a machine that answers pings but fails its real calls still reaches an exclusion.
+- A final review added: probing stops once the session closes, so calls that send nothing are not failed probes; a round whose challenge could not be prepared delays the next challenge attempt by a refresh interval; the `Host` check is exact (brackets for IPv6, digits only after the colon); a refusal is logged only when the book recorded one; and a poisoned lock reports `Closed`.
+- The challenge's input and expected answer are computed once per round, not once per machine.
+- A poisoned call lock now reads as closed, and the child is still killed when the worker is dropped.
+- Call deadlines are clamped to one hour.
+- The operator view also refuses browser requests (`Origin`, `Sec-Fetch-*`) and any `Host` that is not loopback, which covers DNS rebinding.
+- Known limit: a refresh of an open, placed machine shares its SSH session with that machine's paid calls, so a paid call can wait behind one short measurement call.
+
+Not written: the validator-mesh lease gossip and QUIC probes (options b and c), D19, and payment for other operators' work. S10 stays FAIL until a LAN run on real machines (E3) shows distinct slices, exact output and a measured comparison with local execution. The coordinator's own share still copies its rows per call (`rows_of`), which S11 should replace with a row-range kernel entry before any timing is quoted.
+
 ## What the running node still lacks, in dependency order
 
 1. **Real link measurements (S2).** The validator transport is QUIC

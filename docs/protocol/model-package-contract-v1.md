@@ -1,9 +1,9 @@
 # ARC model package contract v1 (`arc.model-package.v1`)
 
-Status: **defined and generated; not yet enforced by the node.**
-`scripts/arc_conformance/package_manifest.py` derives the manifest and
-refuses artifacts the adapter cannot execute exactly. §7 lists what the node
-still has to do.
+Status: **defined and generated; node enforcement written (2026-09-22, not
+yet compiled).** `scripts/arc_conformance/package_manifest.py` derives the
+manifest and refuses artifacts the adapter cannot execute exactly. The node
+checks a pinned manifest against what it loaded (§7).
 
 ## 1. Identity layers
 
@@ -12,7 +12,7 @@ still has to do.
 | Artifact | BLAKE3 of the GGUF file's bytes | native activation `model_hash`/`artifact`; `CanonicalI8NativeExecutor::load_qualified` re-hashes the file before loading |
 | Execution profile | BLAKE3 of `arc.gguf-llama.i8-per-row.rope-interleaved.v1` | activation `profile_hash` ([integer contract](integer-profile-contract-v1.md) §1) |
 | Generation semantics | BLAKE3 of `ARC-native-inference/gguf-llama-i8-interleaved-rope/generation-v2/bos-once/le-u32/v1` | activation `generation_hash` |
-| **Package** | BLAKE3 of the manifest (§3) | **not yet bound** (§7) |
+| **Package** | BLAKE3 of the manifest (§3) | the real-execution qualification record's `package_manifest_hash`, checked at startup against the loaded artifact (§7) |
 
 The manifest adds nothing a node could not recompute. Its value is that every
 derived fact becomes one reviewable, hashable object: shapes, tokenizer,
@@ -110,13 +110,43 @@ and refund. That guard is not yet written (R5).
 * The manifest never carries hand-entered values. If a fact cannot be derived,
   it belongs in the profile or generation contract, not here.
 
-## 7. Not yet implemented
+## 7. Node enforcement
 
-1. The node derives the manifest at load and refuses a mismatch with a pinned
-   manifest hash (Rust, beside `load_qualified`).
-2. The native activation binds the manifest hash alongside the three it binds
-   today.
-3. Tokenizer qualification against a pinned reference (M3). The vocabulary
-   digest identifies the vocabulary; it does not show that ARC encodes text
-   the way the reference does.
-4. The memory guard in §5.
+Written 2026-09-22; **not yet compiled** (a soak was measuring the host).
+
+1. **Pinned by the decision that approves execution.** The real-execution
+   qualification record gains `package_manifest_hash`; a record without it
+   is incomplete and real execution is refused
+   (`resolve_real_execution_decision`). The activation is not changed: the
+   manifest is a pure function of the artifact bytes, profile and
+   generation contract, all three of which the activation already binds, so
+   adding its hash to the consensus commitment would add no information and
+   would change every chain's commitment. What a reviewer approves is the
+   package, and that approval is the qualification record.
+2. **Checked against what was loaded.** At startup the node reads the
+   manifest named by `--native-package-manifest` (at most 1 MiB), recomputes
+   its hash with Python's canonical encoding (`arc_inference::model_package`,
+   including Python's float `repr`; the committed canonical manifest
+   reproduces `fecaf641…`), requires it to equal the record's pin, and then
+   compares it field by field with what the executor loaded: artifact BLAKE3
+   and length, profile and generation commitments, every graph dimension and
+   `max_seq`, the tokenizer's size, vocabulary digest, BOS and EOS ids, the
+   tensor count and inventory digest (read from the artifact's own header),
+   KV bytes per position, and `supported_outputs = ["token_ids"]`. Any
+   difference refuses startup and names the field. The tokenizer used for
+   `/native-inference/tokenize` is the one this check approved. A package
+   whose tokenizer declares end-of-turn or end-of-message ids is refused
+   even when correctly pinned: the engine stops only on the EOS ids, so it
+   would keep generating past the model's own stop (M3). Padding ids are
+   allowed.
+3. Tokenizer qualification against a pinned reference (M3) is still open.
+   The vocabulary digest identifies the vocabulary; it does not show that
+   ARC encodes text the way the reference does.
+4. The memory guard in §5 is written (`--native-kv-budget-bytes`, default
+   4 GiB): a job whose KV cache would exceed it is refused and never voted
+   on, so it expires and refunds. Not yet compiled.
+
+Tests (not yet run): `arc_inference::model_package` (Python float and string
+encoding, the committed manifest's hash, acceptance of the loaded package,
+refusal of each differing field by name, refusal of an edited or unpinned
+manifest) and `a_real_execution_decision_pins_the_approved_package_manifest`.
