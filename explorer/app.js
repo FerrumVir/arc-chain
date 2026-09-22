@@ -136,6 +136,24 @@
     }
   }
 
+  // Why a permitted source added nothing to a lookup. A 404 on every request
+  // it was sent means it answered and holds no record. Any other status, no
+  // response or a timeout leaves its record unknown. The inspector names each
+  // such source: an outage is never read as agreement, and a missing record
+  // never as an outage.
+  function describeSilentSource(label, errors, noun) {
+    const item = noun || "record";
+    const seen = (Array.isArray(errors) ? errors : [errors]).filter(Boolean);
+    const failure = seen.find((error) => error.status !== 404);
+    if (seen.length && !failure) {
+      return { label, state: "no-record", text: `${label}: answered, and holds no ${item} for this lookup.` };
+    }
+    if (failure?.status) {
+      return { label, state: "unknown", text: `${label}: returned HTTP ${failure.status}, so its ${item} is unknown.` };
+    }
+    return { label, state: "unknown", text: `${label}: could not be asked (${failure?.message || "no usable answer"}), so its ${item} is unknown.` };
+  }
+
   // Some deployed v0.8 gateways return 404 for the /block/latest alias even
   // though the source RPC implements it. Resolve the current height through
   // read-only status endpoints, then fetch the same canonical block shape.
@@ -379,6 +397,7 @@
         history: historyValue,
         historyState,
         historyError: history.ok ? null : (history.error?.message || null),
+        errors: account.ok ? [] : [account.error, ...(history.ok ? [] : [history.error])],
         txHashes,
         provenance,
         archiveVerification,
@@ -790,6 +809,18 @@
       elements.inspectorContent.append(wrap);
     }
 
+    // One note per permitted source that contributed nothing. A source with
+    // no record is listed only where every source should hold one (the
+    // replicas of a native request); across the recovery boundary a record
+    // on one segment only is expected. A source whose record is unknown is
+    // always listed.
+    function appendSilentSources(silent, includeNoRecord) {
+      for (const entry of silent) {
+        if (entry.state === "no-record" && !includeNoRecord) continue;
+        elements.inspectorContent.append(create("p", `inspector-note${entry.state === "unknown" ? " error" : ""}`, entry.text));
+      }
+    }
+
     function detailGrid(items) {
       const grid = create("dl", "detail-grid");
       for (const [label, value, wide] of items) {
@@ -951,9 +982,15 @@
       inspectorLoading("Transaction / receipt", network.formatHash(hash, 14, 12));
       try {
         const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId, signal: controller.signal, checkpointAudit: state.checkpointAudit });
-        if (!result.occurrences.length) return inspectorError("Transaction / receipt", "Transaction not found", `No record was returned by ${result.plannedSources.length} permitted source(s). Alternate forks were not searched unless explicitly selected.`);
+        const silent = result.failures.map((failure) => describeSilentSource(sourceDisplay(failure.source), failure.errors));
+        if (!result.occurrences.length) {
+          if (!result.plannedSources.length) return inspectorError("Transaction / receipt", "No source configured", "No permitted source is configured for this lookup, so nothing was asked.");
+          if (silent.every((entry) => entry.state === "no-record")) return inspectorError("Transaction / receipt", "Transaction not found", `No record was returned by ${result.plannedSources.length} permitted source(s). Alternate forks were not searched unless explicitly selected.`);
+          return inspectorError("Transaction / receipt", "Transaction status unknown", `Not every permitted source could be asked, so this transaction may still exist. ${silent.map((entry) => entry.text).join(" ")}`);
+        }
         setInspector("Transaction / receipt", network.formatHash(hash, 14, 12));
         elements.inspectorContent.append(create("p", "inspector-note", "Each occurrence is classified independently. A transaction on an alternate source is never promoted to the canonical timeline."));
+        appendSilentSources(silent, false);
         for (const occurrence of result.occurrences) elements.inspectorContent.append(occurrenceCard(occurrence));
       } catch (error) {
         if (!controller.signal.aborted) inspectorError("Transaction / receipt", "Lookup failed", error.message);
@@ -1013,9 +1050,15 @@
       inspectorLoading("Address", network.formatHash(address, 14, 12));
       try {
         const result = await queryAddress({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), address, sourceId: state.sourceId, signal: controller.signal, checkpointAudit: state.checkpointAudit });
-        if (!result.records.length) return inspectorError("Address", "Address unavailable", "No account or indexed history was returned by the permitted sources.");
+        const silent = result.failures.map((failure) => describeSilentSource(sourceDisplay(failure.source), failure.errors));
+        if (!result.records.length) {
+          if (!silent.length) return inspectorError("Address", "No source configured", "No permitted source is configured for this lookup, so nothing was asked.");
+          if (silent.every((entry) => entry.state === "no-record")) return inspectorError("Address", "No account or history", `None of ${silent.length} permitted source(s) holds an account or indexed history for this address.`);
+          return inspectorError("Address", "Address unavailable", `No account or indexed history was returned, and not every permitted source could be asked. ${silent.map((entry) => entry.text).join(" ")}`);
+        }
         setInspector("Address · source-separated", network.formatHash(address, 14, 12));
         elements.inspectorContent.append(create("p", "inspector-note", "Balances and histories below remain source-scoped. They are not added together across the recovery boundary."));
+        appendSilentSources(silent, false);
         for (const record of result.records) {
           const card = create("article", "occurrence-card");
           card.append(create("h3", "", sourceDisplay(record.source)), detailGrid([
@@ -1048,15 +1091,23 @@
       try {
         const result = await queryNativeRequest({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), requestId, sourceId: state.sourceId, signal: controller.signal });
         const { comparison } = result;
-        if (!comparison.answered) return inspectorError("Native request", "Request not found", `None of ${result.plannedSources.length} permitted source(s) holds a receipt for this request id.`);
+        const silent = result.answers
+          .filter((answer) => !answer.receipt)
+          .map((answer) => describeSilentSource(answer.source.id, answer.error, "receipt"));
+        if (!comparison.answered) {
+          if (!result.plannedSources.length) return inspectorError("Native request", "No source configured", "No replica is configured for native requests, so nothing was asked.");
+          if (silent.every((entry) => entry.state === "no-record")) return inspectorError("Native request", "Request not found", `None of ${result.plannedSources.length} permitted source(s) holds a receipt for this request id.`);
+          return inspectorError("Native request", "Request status unknown", `No permitted source returned a receipt, and not every one could be asked. ${silent.map((entry) => entry.text).join(" ")}`);
+        }
         setInspector("Native request · per-source receipts", network.formatHash(requestId, 14, 12));
         elements.inspectorContent.append(create(
           "p",
           `inspector-note ${comparison.agree ? "good" : "error"}`,
           comparison.agree
-            ? `All ${comparison.answered} answering source(s) record the same settlement.`
-            : `Sources DISAGREE about this request (${comparison.answered} answered). Nothing is averaged; each record is shown as served.`,
+            ? `${comparison.answered} of ${result.plannedSources.length} permitted source(s) returned a receipt, and all of them record the same settlement.`
+            : `Sources DISAGREE about this request (${comparison.answered} of ${result.plannedSources.length} returned a receipt). Nothing is averaged; each record is shown as served.`,
         ));
+        appendSilentSources(silent, true);
         for (const row of comparison.rows) {
           const summary = row.summary;
           const answer = result.answers.find((item) => item.source.id === row.source);
@@ -1184,6 +1235,7 @@
     extractRows,
     integerOrNull,
     formatExactInteger,
+    describeSilentSource,
     reportedHeight,
     requestJson,
     requestLatestBlock,

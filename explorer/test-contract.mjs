@@ -949,4 +949,94 @@ await test("native request answers carry each source's own reported height, neve
   assert.equal(r2.height, null);
 });
 
+await test("a silent source is named: a 404 means no record, anything else leaves the record unknown", () => {
+  const notFound = new app.RpcError("RPC returned HTTP 404", 404, "r1");
+  const down = new app.RpcError("RPC request failed", 0, "r1");
+  const busy = new app.RpcError("RPC returned HTTP 503", 503, "r1");
+  assert.equal(app.describeSilentSource("r1", [notFound, notFound]).state, "no-record");
+  assert.equal(
+    app.describeSilentSource("r1", notFound, "receipt").text,
+    "r1: answered, and holds no receipt for this lookup.",
+  );
+  const mixed = app.describeSilentSource("r1", [notFound, down]);
+  assert.equal(mixed.state, "unknown", "one request that got no answer leaves the record unknown");
+  assert.equal(mixed.text, "r1: could not be asked (RPC request failed), so its record is unknown.");
+  assert.equal(
+    app.describeSilentSource("r1", [notFound, busy]).text,
+    "r1: returned HTTP 503, so its record is unknown.",
+  );
+  for (const nothing of [[], null, undefined, [null]]) {
+    assert.equal(app.describeSilentSource("r1", nothing).state, "unknown", "no evidence is never read as absence");
+  }
+});
+
+await test("an address lookup keeps why each source found nothing", async () => {
+  const address = hex("5");
+  const result = await app.queryAddress({
+    resolver, address, sourceId: "canonical", checkpointAudit: verifiedAudit,
+    fetchImpl: async (url) => {
+      const parsed = new URL(url);
+      if (parsed.origin === "https://legacy.example.test") throw new Error("connection refused");
+      if (parsed.pathname.endsWith("/txs")) return response(200, { address, tx_count: 0, tx_hashes: [] });
+      return response(404, { error: "Account not found" });
+    },
+  });
+  assert.equal(result.records.length, 0);
+  const why = Object.fromEntries(result.failures.map(
+    (failure) => [failure.source.id, app.describeSilentSource(failure.source.id, failure.errors).state],
+  ));
+  assert.deepEqual(why, { v3: "no-record", legacy: "unknown" });
+});
+
+await test("the request inspector names replicas that returned nothing, and says when none could be asked", async () => {
+  const id = hex("9");
+  const settledReceipt = {
+    request_id: id, observed_status: "Finalized", execution_price: 10, reserved_max_payment: 100,
+    output_hash: hex("1"), certificate_votes: 5,
+    settlement_credits: [{ payee: hex("2"), amount: 10 }, { payee: hex("3"), amount: 90 }],
+    admission_transaction: { block_height: H + 3 }, terminal_transaction: { block_height: H + 5 },
+  };
+  // Boot the page on the request's deep link and wait for the inspector to
+  // leave its loading state. Everything but the receipt and /health answers
+  // 503, so the home panels stay paused and only the route is exercised.
+  async function inspect(receiptFor) {
+    const dom = installFakeDom(domConfig, async (url) => {
+      const parsed = new URL(url);
+      const replica = parsed.hostname.split(".")[0];
+      if (parsed.pathname === `/native-inference/receipt/${id}`) return receiptFor(replica);
+      if (parsed.pathname === "/health") return response(200, { height: H + 20 });
+      return response(503, { error: "unavailable" });
+    });
+    dom.win.location.hash = `#/request/${id}`;
+    app.boot();
+    await dom.settled;
+    const content = () => dom.byId.get("inspector-content").children;
+    for (let i = 0; i < 200 && (!content().length || content()[0].className === "inspector-empty"); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return { dom, content: content() };
+  }
+
+  const partial = await inspect((replica) => {
+    if (["v3-1", "v3-2", "v3-3", "v3-4"].includes(replica)) return response(200, settledReceipt);
+    if (replica === "v3-5") return response(404, { error: "not found" });
+    throw new Error("connection refused");
+  });
+  const notes = partial.content.filter((node) => node.tagName === "p");
+  assert.deepEqual(notes.map((node) => [node.className, node.textContent]), [
+    ["inspector-note good", "4 of 6 permitted source(s) returned a receipt, and all of them record the same settlement."],
+    ["inspector-note", "v3-5: answered, and holds no receipt for this lookup."],
+    ["inspector-note error", "v3-6: could not be asked (connection refused), so its receipt is unknown."],
+  ]);
+  assert.equal(partial.content.filter((node) => node.tagName === "article").length, 4, "one card per receipt, none invented");
+
+  const unreachable = await inspect(() => { throw new Error("connection refused"); });
+  assert.equal(unreachable.dom.said("inspector-title"), "Request status unknown", "an outage is not reported as not found");
+  assert.match(unreachable.content[0].children[1].textContent, /v3-1: could not be asked \(connection refused\)/);
+
+  const absent = await inspect(() => response(404, { error: "not found" }));
+  assert.equal(absent.dom.said("inspector-title"), "Request not found");
+  assert.equal(absent.content[0].children[1].textContent, "None of 6 permitted source(s) holds a receipt for this request id.");
+});
+
 process.stdout.write(`\nARC composite explorer contract: ${count}/${count} checks passed\n`);
