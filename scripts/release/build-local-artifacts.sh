@@ -15,11 +15,13 @@
 #
 # THIS SCRIPT NEVER SIGNS, UPLOADS, OR PUBLISHES ANYTHING. The desktop bundle
 # step explicitly disables Tauri's updater-artifact/signing step
-# (bundle.createUpdaterArtifacts) via a one-off --config override and refuses
-# to run at all if a real signing key is present in its own environment. Every
-# output file this script writes is confined to OUTPUT_DIR, which must be
-# given as an argument - nothing is written anywhere else, nothing is pushed,
-# and no GitHub API or release-publication call is made.
+# (bundle.createUpdaterArtifacts) via a one-off --config override, and the
+# script refuses to run at all if an updater signing key, an Apple signing
+# identity or certificate, or a notarization credential is present in its own
+# environment. Every artifact this script produces lands in OUTPUT_DIR, which
+# must be given as an argument and must be new or empty (cargo, npm ci and the
+# Tauri bundler still use their usual build directories inside the checkout).
+# Nothing is pushed, and no GitHub API or release-publication call is made.
 #
 # Refuses to run at all if a soak may be in progress: this repeats the exact
 # process-name checks specified for this script (pgrep -f arc-soak, pgrep -f
@@ -90,15 +92,36 @@ case "$OUTPUT_DIR" in
 esac
 [ ! -e "$OUTPUT_DIR" ] || [ -d "$OUTPUT_DIR" ] || die "OUTPUT_DIR exists and is not a directory: $OUTPUT_DIR"
 [ ! -L "$OUTPUT_DIR" ] || die "refusing a symlinked OUTPUT_DIR: $OUTPUT_DIR"
+# A leftover file from an earlier or failed run would be summed into
+# SHA256SUMS and verified as if this build had produced it, so only a new or
+# empty directory is accepted.
+if [ -d "$OUTPUT_DIR" ]; then
+    OUTPUT_ENTRIES="$(ls -A -- "$OUTPUT_DIR")" || die "cannot list OUTPUT_DIR: $OUTPUT_DIR"
+    [ -z "$OUTPUT_ENTRIES" ] || die "refusing a non-empty OUTPUT_DIR (use a new directory): $OUTPUT_DIR"
+fi
 mkdir -p -- "$OUTPUT_DIR"
 
-# Never let a real updater signing key reach this script's environment, even
-# by inheritance from the caller's shell - the desktop step must be
-# structurally incapable of producing a signed updater artifact.
-if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || [ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
-    die "refusing to run with a Tauri updater signing key present in the environment"
-fi
-unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+# Never let a signing key or notarization credential reach this script's
+# environment, even by inheritance from the caller's shell - the desktop step
+# must be structurally incapable of producing a signed updater artifact, a
+# Developer ID signature or a notarization upload. These are the names the
+# pinned Tauri CLI (2.11.x) reads: the updater key (TAURI_SIGNING_*, and the
+# v1 TAURI_PRIVATE_KEY* names it still recognises), a macOS signing identity
+# (APPLE_SIGNING_IDENTITY, or a certificate it imports from
+# APPLE_CERTIFICATE), and notarization (APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID,
+# or APPLE_API_KEY/APPLE_API_ISSUER/APPLE_API_KEY_PATH). A set-but-empty
+# variable is not refused, only unset.
+SIGNING_ENV_NAMES=(
+    TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD TAURI_SIGNING_PRIVATE_KEY_PATH
+    TAURI_PRIVATE_KEY TAURI_PRIVATE_KEY_PASSWORD TAURI_PRIVATE_KEY_PATH
+    APPLE_SIGNING_IDENTITY APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+    APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID APPLE_PROVIDER_SHORT_NAME
+    APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH
+)
+for name in "${SIGNING_ENV_NAMES[@]}"; do
+    [ -z "${!name:-}" ] || die "refusing to run with $name set in the environment (no signing or notarization input may reach this build)"
+done
+unset "${SIGNING_ENV_NAMES[@]}"
 
 sha256_file() {
     shasum -a 256 "$1" | awk '{print $1}'
@@ -197,11 +220,18 @@ UNSIGNED desktop bundle built locally by scripts/release/build-local-artifacts.s
 on $(date -u +%Y-%m-%dT%H:%M:%SZ) from revision $REVISION.
 
 This is NOT a signed production release. bundle.createUpdaterArtifacts was
-force-disabled for this build, no TAURI_SIGNING_PRIVATE_KEY was present or
-used, and nothing in this directory was uploaded or published. Do not
+force-disabled for this build, no updater signing key, Apple signing
+identity or certificate, or notarization credential was present or used, and
+nothing in this directory was uploaded or published. Do not
 distribute these files as, or describe them as, an ARC Chain release.
 EOF
-cp -- "$DESKTOP_OUT"/UNSIGNED-* "$COLLECTED_DIR"/ 2>/dev/null || true
+# Loud on purpose: a desktop artifact missing from collected/ would also be
+# missing from SHA256SUMS.
+shopt -s nullglob
+UNSIGNED_ITEMS=("$DESKTOP_OUT"/UNSIGNED-*)
+shopt -u nullglob
+[ "${#UNSIGNED_ITEMS[@]}" -gt 0 ] || die "no UNSIGNED-* desktop artifact to collect under $DESKTOP_OUT"
+cp -- "${UNSIGNED_ITEMS[@]}" "$COLLECTED_DIR"/ || die "could not copy the desktop artifacts into $COLLECTED_DIR"
 echo "desktop bundle (unsigned): $BUNDLE_ROOT -> $DESKTOP_OUT"
 
 # ---------------------------------------------------------------------------

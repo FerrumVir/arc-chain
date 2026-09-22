@@ -61,9 +61,13 @@ run_unittest "arc_ops: receipt reconciliation (P9)"     arc_ops.tests.test_recei
 # test_verify_local_artifacts.py load their module by file path via importlib,
 # and test_signing_fixtures.py only shells out to ssh-keygen - all run fine
 # addressed by file path from the repo root instead of a dotted module name.
+# test_build_local_artifacts.py runs a copy of build-local-artifacts.sh in a
+# throwaway tree with stub cargo/npm/pgrep, so it builds nothing and never
+# looks at the processes actually running on the host.
 cd "$REPO_ROOT" || exit 1
 run_unittest "release: SBOM builder (R2)"                    scripts/release/tests/test_sbom.py
 run_unittest "release: signing-path FIXTURE tests (R3/U7)"   scripts/release/tests/test_signing_fixtures.py
 run_unittest "release: local artifact verifier (R2)"         scripts/release/tests/test_verify_local_artifacts.py
+run_unittest "release: local build script FIXTURE (R2)"      scripts/release/tests/test_build_local_artifacts.py
 
 exit "$failed"
