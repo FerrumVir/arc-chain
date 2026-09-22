@@ -1,6 +1,7 @@
 mod commands;
 mod hardware;
 mod identity;
+mod native_paid;
 mod node_manager;
 mod paths;
 mod production_acceptance;
@@ -603,6 +604,13 @@ pub fn run() {
             commands::tier1_submit,
             commands::tier1_result,
             commands::run_paid_inference,
+            native_paid::native_context,
+            native_paid::native_prepare,
+            native_paid::native_submit,
+            native_paid::native_receipt,
+            native_paid::native_refund,
+            native_paid::native_resubmit,
+            native_paid::native_journal,
             commands::clear_crash,
             commands::ensure_binary,
             commands::get_autostart,

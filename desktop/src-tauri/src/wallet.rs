@@ -178,23 +178,42 @@ pub fn signed_transfer(
         return Err("recipient must be different from this wallet".to_string());
     }
 
-    let secret = blake3::derive_key(KEY_DERIVATION_DOMAIN, identity.seed_phrase.as_bytes());
-    let keypair = KeyPair::Ed25519(SigningKey::from_bytes(&secret));
-    if keypair.address() != expected_from {
-        return Err("stored wallet identity does not match its recovery phrase".to_string());
-    }
+    let (_, keypair) = wallet_keypair(identity)?;
 
     let mut tx = Transaction::new_transfer(expected_from, to, amount_base, nonce);
     tx.fee = transfer_fee_base(transaction_domain);
+    sign_for_domain(&mut tx, &keypair, transaction_domain, "transfer")?;
+    Ok(tx)
+}
+
+/// The wallet's signing key, derived from the Rust-only recovery phrase and
+/// checked against the stored address. It never crosses the IPC boundary.
+pub(crate) fn wallet_keypair(identity: &Identity) -> Result<(Hash256, KeyPair), String> {
+    let address = parse_address(&identity.address, "stored wallet address")?;
+    let secret = blake3::derive_key(KEY_DERIVATION_DOMAIN, identity.seed_phrase.as_bytes());
+    let keypair = KeyPair::Ed25519(SigningKey::from_bytes(&secret));
+    if keypair.address() != address {
+        return Err("stored wallet identity does not match its recovery phrase".to_string());
+    }
+    Ok((address, keypair))
+}
+
+/// Sign `tx` for the chain's transaction domain: the recovery domain when
+/// one is active, the legacy hash otherwise.
+pub(crate) fn sign_for_domain(
+    tx: &mut Transaction,
+    keypair: &KeyPair,
+    transaction_domain: Option<Hash256>,
+    what: &str,
+) -> Result<(), String> {
     match transaction_domain {
         Some(domain) => tx
-            .sign_in_domain(&keypair, &domain)
-            .map_err(|e| format!("could not sign transfer in the active recovery domain: {e}"))?,
+            .sign_in_domain(keypair, &domain)
+            .map_err(|e| format!("could not sign {what} in the active recovery domain: {e}")),
         None => tx
-            .sign(&keypair)
-            .map_err(|e| format!("could not sign transfer: {e}"))?,
+            .sign(keypair)
+            .map_err(|e| format!("could not sign {what}: {e}")),
     }
-    Ok(tx)
 }
 
 #[cfg(test)]

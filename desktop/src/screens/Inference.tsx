@@ -14,6 +14,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
+import { NativePaidRequests } from "../components/NativePaidRequests";
 import { api } from "../lib/tauri";
 import { formatHash } from "../lib/format";
 import { hostLabel } from "../lib/hosts";
@@ -341,6 +342,9 @@ export function Inference() {
         </div>
       </div>
 
+      {/* Renders only when the pinned host's chain is a protocol-4 chain. */}
+      <NativePaidRequests />
+
       <Card featured style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader
           title={
@@ -487,7 +491,7 @@ export function Inference() {
             <Coins size={15} style={{ flexShrink: 0, marginTop: 1 }} />
             <span>
               <strong>Prompts are free; worker rewards are separate.</strong>{" "}
-              This app does not sign or submit a paid requester escrow. A
+              This free prompt path does not sign or submit a paid requester escrow. A
               coordinator may still assign the prompt to an eligible community
               worker and return a validator-authorized <code>0x25</code> reward
               transaction for that worker. It is pending until the selected

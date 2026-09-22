@@ -535,4 +535,105 @@ mod tests {
         .is_err());
         assert!(validate_manifest_binding("0.8.1", "windows-aarch64", &exact, &selected).is_err());
     }
+
+    // ---- R3/U7: signing-path FIXTURE tests --------------------------------
+    // Every release, asset, actor, and JSON blob below is synthetic FIXTURE
+    // data manufactured only to drive one refusal path in this module. None
+    // of it is signed, none of it was published by the real ARC release
+    // pipeline, and none of it may be described as a real or production ARC
+    // Chain release - it exists solely to prove this file's own validation
+    // rules hold, independent of GitHub or Tauri's updater plugin.
+    //
+    // R3/U7 also asks for a "downgrade refused" fixture test. This module
+    // has no such rule to test: `select_release` carries no notion of the
+    // currently-installed version at all - it deterministically returns the
+    // single highest trusted, immutable release from whatever
+    // `fetch_releases` handed it. Whether that release is actually newer
+    // than the version already running is decided inside
+    // `tauri_plugin_updater`'s own `Updater::check()`, which this file calls
+    // but does not reimplement or wrap with an additional monotonicity gate.
+    // Testing that comparison would mean testing the tauri-plugin-updater
+    // crate, not this module's code, so no test is added here for it.
+
+    #[test]
+    fn rejects_a_fixture_cross_platform_payload_swap() {
+        // FIXTURE: an otherwise fully trusted release whose manifest
+        // advertises the right version but binds a supported platform
+        // target to ANOTHER platform's payload - e.g. a darwin-aarch64
+        // client handed the Windows installer's URL. Distinct from the
+        // existing "unsupported target string" case above: both platforms
+        // here are individually valid, only the pairing is wrong.
+        let selected = validate_channel_release(&release("0.8.2"), Version::new(0, 8, 2)).unwrap();
+        let windows_payload = release_asset_url("v0.8.2", "arc-desktop-windows-x86_64-setup.exe");
+        assert!(
+            validate_manifest_binding("0.8.2", "darwin-aarch64", &windows_payload, &selected)
+                .is_err()
+        );
+
+        // The matching platform/payload pairing for the same FIXTURE release
+        // still succeeds, proving the refusal above is specifically about
+        // the cross-platform mismatch and not some other field.
+        let darwin_payload = release_asset_url("v0.8.2", "arc-desktop-macos-arm64.app.tar.gz");
+        assert!(
+            validate_manifest_binding("0.8.2", "darwin-aarch64", &darwin_payload, &selected)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_fixture_releases_with_malformed_identity_metadata() {
+        // FIXTURE: a release id of 0. GitHub never issues id 0, so this
+        // stands in for a release record that was never really created.
+        let mut zero_id = release("0.8.3");
+        zero_id.id = 0;
+        assert!(select_release(&[zero_id]).is_err());
+
+        // FIXTURE: the release's own `name` does not match the
+        // "ARC Chain <tag>" contract this module enforces - a tampered or
+        // spoofed release title.
+        let mut wrong_name = release("0.8.3");
+        wrong_name.name = "Definitely Not ARC Chain v0.8.3".into();
+        assert!(select_release(&[wrong_name]).is_err());
+
+        // FIXTURE: a commit binding that is not a full lowercase 40-hex-char
+        // SHA - here, truncated.
+        let mut short_commit = release("0.8.3");
+        short_commit.target_commitish = "abc123".into();
+        assert!(select_release(&[short_commit]).is_err());
+
+        // FIXTURE: the right length, wrong case - GitHub's own API never
+        // returns an uppercase commit SHA, so this is refused too.
+        let mut uppercase_commit = release("0.8.3");
+        uppercase_commit.target_commitish = COMMIT.to_uppercase();
+        assert!(select_release(&[uppercase_commit]).is_err());
+    }
+
+    #[test]
+    fn rejects_syntactically_malformed_release_json() {
+        // FIXTURE: hand-written JSON standing in for a GitHub API response -
+        // never sent over the network in this test - missing the required
+        // `immutable` field. Proves the wire schema itself refuses partial
+        // metadata instead of silently defaulting a safety-relevant field.
+        let missing_immutable = r#"{
+            "id": 1,
+            "tag_name": "v0.8.4",
+            "target_commitish": "0123456789abcdef0123456789abcdef01234567",
+            "name": "ARC Chain v0.8.4",
+            "draft": false,
+            "prerelease": false,
+            "assets": []
+        }"#;
+        assert!(serde_json::from_str::<GithubRelease>(missing_immutable).is_err());
+
+        // FIXTURE: a required numeric field sent as the wrong JSON type.
+        let wrong_typed_size = r#"{
+            "id": 10,
+            "name": "latest.json",
+            "size": "123",
+            "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "state": "uploaded",
+            "browser_download_url": "https://example.invalid/FIXTURE-latest.json"
+        }"#;
+        assert!(serde_json::from_str::<GithubAsset>(wrong_typed_size).is_err());
+    }
 }

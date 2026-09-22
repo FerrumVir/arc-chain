@@ -35,6 +35,19 @@ import type {
   UpdateInstallPolicy,
   WalletTxResult,
 } from "./types";
+import type {
+  NativeContextView,
+  NativeJournalEntry,
+  NativeReceiptView,
+  NativeSubmitResult,
+  PreparedInput,
+} from "./native-request";
+import {
+  mockNativeInvoke,
+  mockNativeTransfer,
+  nativeMockBalance,
+  nativeMockEnabled,
+} from "./native-mock";
 
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -2033,6 +2046,62 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return "/browser-live-mode/.arc/models/standard.gguf" as T;
     case "remove_model":
       return undefined as T;
+    // Native paid requests: browser-live mode can read the chain but holds no
+    // signing material, so it describes the context and follows receipts and
+    // never signs, submits, or refunds.
+    case "native_context": {
+      const detailed = await getDetailed("/native-inference/context");
+      if (detailed.kind === "notFound") return null as T;
+      if (detailed.kind !== "ok") throw new Error("/native-inference/context is unavailable");
+      const body = detailed.body;
+      const serving = (body.serving ?? null) as Record<string, unknown> | null;
+      const current =
+        body.candidate_protocol === 4 &&
+        Array.isArray(body.allowed_executions) &&
+        body.contract_version === 1;
+      return {
+        host: base,
+        compatible: false,
+        reason: current
+          ? "Signing native requests requires the native desktop app so the wallet key stays in Rust."
+          : "the host's node is not a current protocol-4 node; update the node",
+        height: typeof body.height === "number" ? body.height : null,
+        members: Array.isArray(body.members) ? body.members.length : null,
+        executions: Array.isArray(body.allowed_executions) ? body.allowed_executions.length : null,
+        maxTokens: null,
+        serving: serving
+          ? {
+              executor: String(serving.executor ?? ""),
+              inputFormat: String(serving.input_format ?? ""),
+              tokenizeEndpoint: serving.tokenize_endpoint === true,
+              tokenizerProfile: (serving.tokenizer_profile as string | null) ?? null,
+              maxPositions: typeof serving.max_positions === "number" ? serving.max_positions : null,
+            }
+          : null,
+        inputKind: null,
+        nodeVersion: typeof body.node_version === "string" ? body.node_version : null,
+        appContractVersion: 1,
+      } as T;
+    }
+    case "native_receipt": {
+      const { requestId } = args as { requestId: string };
+      const health = await fetchJson("/health");
+      const detailed = await getDetailed(`/native-inference/receipt/${strip0x(requestId)}`);
+      if (detailed.kind === "notFound") {
+        return { found: false, height: Number(health.height), receipt: null } as T;
+      }
+      if (detailed.kind !== "ok") throw new Error("the receipt is unavailable");
+      return { found: true, height: Number(health.height), receipt: detailed.body } as T;
+    }
+    case "native_journal":
+      return [] as T;
+    case "native_prepare":
+    case "native_submit":
+    case "native_refund":
+    case "native_resubmit":
+      throw new Error(
+        "Native paid requests require the native desktop app so signing stays in Rust.",
+      );
     default:
       throw new Error(`Unhandled live command: ${cmd}`);
   }
@@ -2313,6 +2382,9 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     return override;
   }
   await new Promise((r) => setTimeout(r, 120));
+  // The protocol-4 chain model answers native commands (see native-mock.ts).
+  const native = mockNativeInvoke(cmd, args);
+  if (native !== undefined) return native as T;
   switch (cmd) {
     case "detect_hardware":
       return DEFAULT_HARDWARE as T;
@@ -2340,9 +2412,14 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const uptime = running
         ? Math.floor((Date.now() - mockStartedAt!) / 1000)
         : 0;
+      // Browser-preview only: a test can make the running node look like one
+      // this desktop process did not spawn (no child pid), the state in which
+      // Restart must be refused.
+      const external =
+        (globalThis as { __ARC_MOCK_EXTERNAL_NODE__?: boolean }).__ARC_MOCK_EXTERNAL_NODE__ === true;
       return {
         running,
-        pid: running ? 42_731 : null,
+        pid: running && !external ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
         version: "0.8.0",
         peers: running ? 8 : 0,
@@ -2561,6 +2638,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "open_external":
       return undefined as T;
     case "fetch_balance":
+      if (nativeMockEnabled()) return nativeMockBalance() as T;
       return {
         address: "fakehex0000000000000000000000000000000000000000000000000000000000",
         balanceBase: "28500000000000",
@@ -2570,6 +2648,13 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         stakedBalanceArc: "0",
       } as T;
     case "faucet_claim":
+      // A faucet claim is an ordinary transfer, which the protocol-4 browser
+      // chain cannot include, as a real protocol-4 node refuses it.
+      if (nativeMockEnabled()) {
+        throw new Error(
+          "a faucet claim is an ordinary transfer, which this chain cannot include",
+        );
+      }
       return {
         txHash:
           "8f31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
@@ -2585,6 +2670,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         message: "Faucet claim was accepted and is waiting for a mined receipt.",
       } as T;
     case "send_arc":
+      // The protocol-4 browser chain carries only native transactions.
+      if (nativeMockEnabled()) mockNativeTransfer();
       return {
         txHash:
           "8e31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
@@ -2880,6 +2967,26 @@ export const api = {
   faucetClaim: () => invoke<FaucetResult>("faucet_claim"),
   sendArc: (to: string, amountArc: string) =>
     invoke<WalletTxResult>("send_arc", { to, amountArc }),
+  // Protocol-4 native paid requests. Signing happens in Rust; these carry
+  // only the prompt, the user's price choices and public identifiers.
+  nativeContext: () => invoke<NativeContextView | null>("native_context"),
+  nativePrepare: (prompt: string) => invoke<PreparedInput>("native_prepare", { prompt }),
+  nativeSubmit: (request: {
+    inputHex: string;
+    inputKind: string;
+    promptPreview: string;
+    maxTokens: number;
+    priceArc: string;
+    reserveArc: string;
+    expiryBlocks: number;
+  }) => invoke<NativeSubmitResult>("native_submit", request),
+  nativeReceipt: (requestId: string) =>
+    invoke<NativeReceiptView>("native_receipt", { requestId }),
+  nativeRefund: (requestId: string) =>
+    invoke<NativeSubmitResult>("native_refund", { requestId }),
+  nativeResubmit: (txHash: string) =>
+    invoke<NativeSubmitResult>("native_resubmit", { txHash }),
+  nativeJournal: () => invoke<NativeJournalEntry[]>("native_journal"),
   // `chatTemplate` asks the serving node to apply the loaded model's own
   // chat template. The client no longer wraps prompts in Llama-2's
   // `[INST] ... [/INST]` tags, which were wrong for other architectures and

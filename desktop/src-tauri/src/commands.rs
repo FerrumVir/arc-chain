@@ -831,6 +831,16 @@ pub async fn send_arc(
     to: String,
     amount_arc: String,
 ) -> CmdResult<WalletTxResult> {
+    send_arc_inner(&state, to, amount_arc).await
+}
+
+/// The transfer core, callable without a Tauri runtime (the live journey in
+/// `native_paid` drives it against a real chain).
+pub(crate) async fn send_arc_inner(
+    state: &AppState,
+    to: String,
+    amount_arc: String,
+) -> CmdResult<WalletTxResult> {
     let amount_base = crate::wallet::parse_arc_amount(&amount_arc)?;
     if amount_base == 0 {
         return Err("amount must be greater than zero".to_string());
@@ -847,7 +857,18 @@ pub async fn send_arc(
     }
     .ok_or_else(|| "no identity".to_string())?;
 
-    let host = crate::wallet::validate_rpc_origin(&chain_host(&state).await)?;
+    let host = crate::wallet::validate_rpc_origin(&chain_host(state).await)?;
+    // A protocol-4 block carries only a native paid-inference transaction:
+    // its nodes refuse any other at submission and its blocks cannot include
+    // one. Say so before signing instead of after a refused submission. A
+    // host that cannot say is left to refuse the transfer itself.
+    if crate::native_paid::host_carries_only_native_transactions(state, &host).await {
+        return Err(
+            "this chain carries only native paid-inference transactions, so a transfer can \
+             never be included; nothing was signed"
+                .to_string(),
+        );
+    }
     let account = rpc_client::fetch_balance(&state.http, &host, &address).await?;
     let available = account
         .balance_base
@@ -983,7 +1004,7 @@ impl ChainHostChoice {
 /// is deliberately no longer the *first* thing checked and no longer silently
 /// redirects tier 1 alone: it redirects chain reads, which is what it always
 /// actually did.
-async fn chain_host(state: &AppState) -> String {
+pub(crate) async fn chain_host(state: &AppState) -> String {
     for key in ["ARC_WALLET_HOST", "ARC_TIER1_RPC"] {
         if let Ok(env) = std::env::var(key) {
             let trimmed = env.trim();
@@ -1988,6 +2009,78 @@ mod inference_retry_tests {
                 .is_err(),
             "redirect target received a replayed inference POST"
         );
+    }
+
+    /// A loopback host that answers `/native-inference/context` with
+    /// `context_status` and every other path with 404, recording each path.
+    async fn recording_host(context_status: u16) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 8192];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let (status, body) = if path == "/native-inference/context" {
+                        (context_status, "{}")
+                    } else {
+                        (404, "")
+                    };
+                    log.lock().unwrap().push(path);
+                    let reason = if status == 200 { "OK" } else { "Not Found" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (origin, seen)
+    }
+
+    #[tokio::test]
+    async fn a_transfer_is_refused_before_signing_on_a_protocol_4_host_and_proceeds_elsewhere() {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        for (context_status, protocol_4) in [(200u16, true), (404, false)] {
+            let (origin, seen) = recording_host(context_status).await;
+            let state = test_state();
+            state.store.lock().await.identity = Some(crate::identity::derive(PHRASE).unwrap());
+            *state.chain_host.lock().await = Some((
+                ChainHostChoice {
+                    host: origin,
+                    block_timestamp_ms: 1,
+                    height: 1,
+                },
+                std::time::Instant::now(),
+            ));
+            let outcome = super::send_arc_inner(&state, "11".repeat(32), "1".into()).await;
+            let paths = seen.lock().unwrap().clone();
+            if protocol_4 {
+                let error = outcome.unwrap_err();
+                assert!(error.contains("nothing was signed"), "{error}");
+                // Nothing past the check: no balance read, no submission.
+                assert_eq!(paths, ["/native-inference/context"]);
+            } else {
+                // Not protocol-4: the transfer goes on to read the account. The
+                // stub has none, so it stops there, before any submission.
+                assert!(outcome.is_err());
+                assert!(
+                    paths.iter().any(|path| path.starts_with("/account/")),
+                    "{paths:?}"
+                );
+                assert!(
+                    !paths.iter().any(|path| path == "/tx/submit_signed"),
+                    "{paths:?}"
+                );
+            }
+        }
     }
 }
 
@@ -3719,9 +3812,14 @@ pub async fn list_model_tiers() -> CmdResult<Vec<ModelTierInfo>> {
 /// usefully — frontend should offer "verifier-only" mode instead.
 #[tauri::command]
 pub async fn recommended_tier() -> CmdResult<String> {
-    let hw = hardware::detect();
-    let tier = if hw.ram_gb >= 16 { "standard" } else { "none" };
-    Ok(tier.into())
+    Ok(tier_for_ram_gb(hardware::detect().ram_gb).into())
+}
+
+/// The model tier a machine with `ram_gb` of memory can run. The canonical
+/// 7B package needs about 7.8 GB resident plus its KV cache (M1 manifest),
+/// so anything under 16 GB is offered no model rather than a failing one.
+fn tier_for_ram_gb(ram_gb: u64) -> &'static str {
+    if ram_gb >= 16 { "standard" } else { "none" }
 }
 
 /// Returns `Some(path)` only when the matching tier's GGUF is byte-for-byte
@@ -3936,6 +4034,46 @@ pub async fn remove_model(tier: String) -> CmdResult<()> {
 
 #[allow(dead_code)]
 fn _path_helper(_: &Path) {} // keep `Path` import used if `model_path_for` returns inline
+
+#[cfg(test)]
+mod model_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn a_model_file_is_ready_only_if_every_byte_matches_the_pinned_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        let bytes = b"FIXTURE gguf bytes, not a model".to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+        let digest: &'static str = Box::leak(hex::encode(Sha256::digest(&bytes)).into_boxed_str());
+        let spec = ModelTierSpec {
+            id: "fixture",
+            display_name: "Fixture",
+            url: "https://example.invalid/model.gguf",
+            size_bytes: bytes.len() as u64,
+            sha256: digest,
+        };
+        assert_eq!(verify_model_file(&path, &spec), Ok(true));
+        // Same size, one byte flipped: never ready.
+        let mut flipped = bytes.clone();
+        flipped[3] ^= 1;
+        std::fs::write(&path, &flipped).unwrap();
+        assert_eq!(verify_model_file(&path, &spec), Ok(false));
+        // Truncated, then missing: not ready either.
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(verify_model_file(&path, &spec), Ok(false));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(verify_model_file(&path, &spec), Ok(false));
+    }
+
+    #[test]
+    fn only_a_machine_with_room_for_the_canonical_model_is_offered_it() {
+        assert_eq!(tier_for_ram_gb(8), "none");
+        assert_eq!(tier_for_ram_gb(15), "none");
+        assert_eq!(tier_for_ram_gb(16), "standard");
+        assert_eq!(tier_for_ram_gb(64), "standard");
+    }
+}
 
 #[cfg(test)]
 mod release_binary_tests {

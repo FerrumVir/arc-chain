@@ -477,6 +477,32 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("btn-start")).toBeVisible({ timeout: 4000 });
   });
 
+  test("restart really restarts: the node goes back through syncing", async ({ page }) => {
+    await page.goto("/");
+    await page.getByTestId("btn-start").click();
+    await expect(page.getByTestId("syncing-banner")).toBeVisible({ timeout: 4000 });
+    // The mock reports "live" once the node has been up for 8 s.
+    await expect(page.getByTestId("syncing-banner")).toBeHidden({ timeout: 20_000 });
+    const restart = page.getByTestId("btn-restart");
+    await expect(restart).toBeEnabled();
+    await restart.click();
+    // Uptime was reset by restart_node, so health is "syncing" again.
+    await expect(page.getByTestId("syncing-banner")).toBeVisible({ timeout: 8000 });
+    await expect(page.getByTestId("btn-stop")).toBeVisible();
+  });
+
+  test("a node this desktop did not spawn cannot be restarted from it", async ({ page }) => {
+    await page.addInitScript(() => {
+      (globalThis as { __ARC_MOCK_EXTERNAL_NODE__?: boolean }).__ARC_MOCK_EXTERNAL_NODE__ = true;
+    });
+    await page.goto("/");
+    await page.getByTestId("btn-start").click();
+    const restart = page.getByTestId("btn-restart");
+    await expect(restart).toBeVisible({ timeout: 4000 });
+    await expect(restart).toBeDisabled();
+    await expect(restart).toHaveAttribute("title", /managed externally/);
+  });
+
   test("stats grid has four cards", async ({ page }) => {
     await page.goto("/");
     const grid = page.getByTestId("stat-grid");
