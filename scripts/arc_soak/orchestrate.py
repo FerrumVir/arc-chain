@@ -161,9 +161,11 @@ class Node:
     def args(self, genesis: str) -> List[str]:
         peers = ",".join(f"127.0.0.1:{self.cfg.base_p2p + j}"
                          for j in range(self.cfg.nodes) if j != self.index)
+        # A single-node chain (a real-model P8 run on one host) has no peers.
+        peer_args = ["--peers", peers] if peers else []
         return [self.binary, "--rpc", f"127.0.0.1:{self.rpc}",
                 "--p2p-port", str(self.p2p), "--data-dir", self.data_dir,
-                "--genesis", genesis, "--peers", peers,
+                "--genesis", genesis] + peer_args + [
                 "--insecure-dev-validator-seed", "--validator-seed", f"soak-node-{self.index}",
                 "--stake", str(self.cfg.stake),
                 "--snapshot-every-blocks", str(self.cfg.snapshot_every)] + (
@@ -172,10 +174,20 @@ class Node:
                     if self.cfg.workload == "native" else []) + (
                     # Every node holds the protocol-4 state; only the first
                     # `native_workers` execute and vote (see --native-workers).
-                    ["--native-inference-runtime", "--native-inference-test-executor"]
+                    self.executor_args()
                     if self.cfg.workload == "native"
                     and self.index < getattr(self.cfg, "native_workers", self.cfg.nodes)
                     else [])
+
+    def executor_args(self) -> List[str]:
+        real = getattr(self.cfg, "real_model", None)
+        if not real:
+            return ["--native-inference-runtime", "--native-inference-test-executor"]
+        # The real canonical executor: it verifies the artifact's bytes, the
+        # qualification record and the package manifest before it loads.
+        return ["--native-inference-runtime", "--native-inference-artifact", real,
+                "--native-inference-qualification", self.cfg.qualification,
+                "--native-package-manifest", self.cfg.package_manifest]
 
     def start(self, genesis: str) -> None:
         os.makedirs(self.data_dir, exist_ok=True)
@@ -293,6 +305,26 @@ def parse_fault_kinds(text: Optional[str]) -> List[str]:
     return kinds
 
 
+def real_model_tuple(manifest_path: str) -> List[str]:
+    """The activation tuple for the real canonical executor, read from the
+    approved package manifest: artifact BLAKE3, profile commitment,
+    generation commitment, and the harness's fixed assignment hash. The node
+    checks this manifest against the artifact it loads, so a manifest that
+    names another artifact stops the run at startup, not later."""
+    with open(manifest_path) as fh:
+        manifest = json.load(fh)
+    try:
+        tuple_ = [manifest["artifact"]["blake3"], manifest["execution"]["profile_commitment"],
+                  manifest["generation"]["commitment"],
+                  hashlib.sha256(b"arc-soak-assignment").hexdigest()]
+    except (KeyError, TypeError):
+        raise SystemExit(f"{manifest_path} is not an arc.model-package.v1 manifest")
+    if manifest.get("schema") != "arc.model-package.v1" or not all(
+            isinstance(h, str) and HEX64.match(h) for h in tuple_):
+        raise SystemExit(f"{manifest_path} is not an arc.model-package.v1 manifest")
+    return tuple_
+
+
 # 100 ARC in base units: enough for many paid requests at the desktop's defaults.
 DEFAULT_FUND_BASE_UNITS = 100_000_000_000
 
@@ -407,6 +439,27 @@ class Config:
         # A fixed execution tuple the activation allows and every request uses.
         self.native_tuple = [hashlib.sha256(f"arc-soak-{k}".encode()).hexdigest()
                              for k in ("model", "profile", "generation", "assignment")]
+        # Real canonical executor (P8): paths the owner supplies; the harness
+        # never writes a qualification record.
+        self.real_model = os.path.abspath(a.real_model) if getattr(a, "real_model", None) else None
+        self.qualification = getattr(a, "qualification", None)
+        self.package_manifest = getattr(a, "package_manifest", None)
+        self.input_hex = getattr(a, "input_hex", None)
+        self.max_tokens = getattr(a, "max_tokens", None) or 8
+        if self.real_model:
+            missing = [flag for flag, value in (("--qualification", self.qualification),
+                                                ("--package-manifest", self.package_manifest),
+                                                ("--input-hex", self.input_hex)) if not value]
+            if missing:
+                raise SystemExit(f"--real-model needs {', '.join(missing)}")
+            if a.workload != "native":
+                raise SystemExit("--real-model needs --workload native")
+            if a.nodes > 1 and not getattr(a, "allow_multiple_real_models", False):
+                raise SystemExit("--real-model loads ~8 GB per node; this host holds one. "
+                                 "Use --nodes 1, or --allow-multiple-real-models on a larger host")
+            self.qualification = os.path.abspath(self.qualification)
+            self.package_manifest = os.path.abspath(self.package_manifest)
+            self.native_tuple = real_model_tuple(self.package_manifest)
         self.work = os.path.abspath(a.work or f"/tmp/arc-soak-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
 
 
@@ -553,6 +606,9 @@ class Soak:
                 json.dump({"recovery_epoch": 0, "allowed_executions": [{
                     "model_hash": t[0], "profile_hash": t[1],
                     "generation_hash": t[2], "assignment_hash": t[3]}]}, fh)
+
+    def driver_executor_args(self) -> List[str]:
+        return driver_executor_args_for(self.cfg)
 
     def native_requesters(self) -> List[str]:
         """The driver's requester accounts, one per concurrent request, which
@@ -937,7 +993,7 @@ class Soak:
                  "--duration", str(int(cfg.duration)),
                  "--out", os.path.join(cfg.work, "workload.jsonl"),
                  "--requester-seed", "soak", "--requesters", str(cfg.native_requesters),
-                 "--tuple", ",".join(cfg.native_tuple)],
+                 "--tuple", ",".join(cfg.native_tuple)] + self.driver_executor_args(),
                 stdout=open(os.path.join(cfg.work, "load-driver.log"), "ab"),
                 stderr=subprocess.STDOUT, start_new_session=True)
         if cfg.workload == "faucet":
@@ -1034,6 +1090,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="soak_native_load binary (workload=native); must be built with the "
                         "native-test-executor feature alongside --binary")
     p.add_argument("--faucet-rate", type=float, default=0.5, help="claims per second offered")
+    p.add_argument("--real-model", metavar="GGUF",
+                   help="run the REAL canonical executor on this artifact (P8) instead of the "
+                        "deterministic test executor; needs --qualification, --package-manifest "
+                        "and --input-hex. The harness never writes a qualification record")
+    p.add_argument("--qualification", help="the owner's real-execution qualification record")
+    p.add_argument("--package-manifest", help="the approved arc.model-package.v1 manifest")
+    p.add_argument("--input-hex", help="every request's input: little-endian u32 token ids "
+                                       "(e.g. from the node's /native-inference/tokenize)")
+    p.add_argument("--max-tokens", type=int, help="tokens each request asks for (default 8)")
+    p.add_argument("--allow-multiple-real-models", action="store_true",
+                   help="allow --real-model with more than one node (each loads the model)")
     p.add_argument("--native-workers", type=int,
                    help="run the native worker on only the first N nodes (default: all). With "
                         "less than 2/3 of the stake voting no request can be certified, so every "
@@ -1045,6 +1112,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rust-log", default="info")
     p.add_argument("--work")
     return p
+
+
+def driver_executor_args_for(cfg: Any) -> List[str]:
+    """The load driver's input for the executor the nodes run."""
+    if not getattr(cfg, "real_model", None):
+        return []
+    return ["--input-hex", cfg.input_hex, "--max-tokens", str(cfg.max_tokens),
+            "--executor-label", f"canonical-i8-real-model qualification={cfg.qualification}"]
 
 
 def main(argv: Optional[List[str]] = None) -> int:

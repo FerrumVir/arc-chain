@@ -1,5 +1,6 @@
 """Fast tests for the orchestrator's pure helpers. No nodes."""
 
+import json
 import os
 import sys
 import tempfile
@@ -132,6 +133,40 @@ class NativeWorkers(unittest.TestCase):
         cfg = self._cfg()
         self.assertTrue(all("--native-inference-runtime" in orchestrate.Node(cfg, i).args("g")
                             for i in range(4)))
+
+
+class RealModel(unittest.TestCase):
+    """--real-model: the real executor's flags and a tuple from the manifest."""
+
+    MANIFEST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
+        __file__)))), "..", "docs", "protocol", "packages", "llama-2-7b-q4km.manifest.json")
+
+    def test_the_tuple_comes_from_the_approved_manifest(self):
+        tuple_ = orchestrate.real_model_tuple(self.MANIFEST)
+        self.assertEqual(tuple_[0], "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67")
+        self.assertEqual(len(tuple_), 4)
+        bad = os.path.join(tempfile.mkdtemp(), "m.json")
+        with open(bad, "w") as fh:
+            json.dump({"schema": "something-else"}, fh)
+        with self.assertRaises(SystemExit):
+            orchestrate.real_model_tuple(bad)
+
+    def test_nodes_run_the_real_executor_and_the_driver_sends_token_ids(self):
+        cfg = types.SimpleNamespace(base_rpc=9960, base_p2p=9160, nodes=1, work="/tmp/x",
+                                    binary="/b", stake=1, snapshot_every=500, workload="native",
+                                    real_model="/m.gguf", qualification="/q.json",
+                                    package_manifest="/p.json", input_hex="01000000",
+                                    max_tokens=4)
+        args = orchestrate.Node(cfg, 0).args("g")
+        self.assertNotIn("--peers", args, "a single-node chain has no peers")
+        self.assertIn("--native-inference-artifact", args)
+        self.assertIn("--native-package-manifest", args)
+        self.assertNotIn("--native-inference-test-executor", args)
+        driver = orchestrate.driver_executor_args_for(cfg)
+        self.assertEqual(driver[:4], ["--input-hex", "01000000", "--max-tokens", "4"])
+        test_cfg = types.SimpleNamespace(**{**vars(cfg), "real_model": None})
+        self.assertIn("--native-inference-test-executor", orchestrate.Node(test_cfg, 0).args("g"))
+        self.assertEqual(orchestrate.driver_executor_args_for(test_cfg), [])
 
 
 class BinarySelfReport(unittest.TestCase):
