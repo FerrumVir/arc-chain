@@ -168,9 +168,14 @@ class Node:
                 "--stake", str(self.cfg.stake),
                 "--snapshot-every-blocks", str(self.cfg.snapshot_every)] + (
                     ["--native-inference-activation",
-                     os.path.join(self.cfg.work, "activation.json"),
-                     "--native-inference-runtime", "--native-inference-test-executor"]
-                    if self.cfg.workload == "native" else [])
+                     os.path.join(self.cfg.work, "activation.json")]
+                    if self.cfg.workload == "native" else []) + (
+                    # Every node holds the protocol-4 state; only the first
+                    # `native_workers` execute and vote (see --native-workers).
+                    ["--native-inference-runtime", "--native-inference-test-executor"]
+                    if self.cfg.workload == "native"
+                    and self.index < getattr(self.cfg, "native_workers", self.cfg.nodes)
+                    else [])
 
     def start(self, genesis: str) -> None:
         os.makedirs(self.data_dir, exist_ok=True)
@@ -394,6 +399,10 @@ class Config:
         self.native_rate = a.native_rate
         self.native_requesters = a.native_requesters
         self.fund = parse_funding(getattr(a, "fund", None))
+        workers = getattr(a, "native_workers", None)
+        self.native_workers = a.nodes if workers is None else workers
+        if not 0 <= self.native_workers <= a.nodes:
+            raise SystemExit("--native-workers must be between 0 and --nodes")
         self.load_driver = os.path.abspath(a.load_driver) if a.load_driver else None
         # A fixed execution tuple the activation allows and every request uses.
         self.native_tuple = [hashlib.sha256(f"arc-soak-{k}".encode()).hexdigest()
@@ -532,6 +541,7 @@ class Soak:
                 if address in funded:
                     raise Abort(f"--fund {address} is already an account the harness funds")
                 fh.write(f'[[accounts]]\naddress = "{address}"\nbalance = {units}\n\n')
+            self.run["workload"]["native_workers"] = getattr(cfg, "native_workers", cfg.nodes)
             self.run["workload"]["extra_funded"] = [
                 {"address": address, "base_units": units}
                 for address, units in getattr(cfg, "fund", [])]
@@ -1024,6 +1034,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="soak_native_load binary (workload=native); must be built with the "
                         "native-test-executor feature alongside --binary")
     p.add_argument("--faucet-rate", type=float, default=0.5, help="claims per second offered")
+    p.add_argument("--native-workers", type=int,
+                   help="run the native worker on only the first N nodes (default: all). With "
+                        "less than 2/3 of the stake voting no request can be certified, so every "
+                        "admitted request expires: how a product journey exercises refunds. "
+                        "Such a run is labelled in run.json and is not a stability run")
     p.add_argument("--fund", action="append", default=[], metavar="ADDRESS[:BASE_UNITS]",
                    help="also fund this account in genesis (repeatable; default 100 ARC), e.g. a "
                         "desktop wallet for a product journey")

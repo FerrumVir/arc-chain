@@ -110,6 +110,30 @@ class ExtraFunding(unittest.TestCase):
                 orchestrate.parse_funding(values)
 
 
+class NativeWorkers(unittest.TestCase):
+    """--native-workers: every node holds protocol-4 state, some execute."""
+
+    def _cfg(self, **extra):
+        values = dict(base_rpc=9960, base_p2p=9160, nodes=4, work="/tmp/x", binary="/b",
+                      stake=1, snapshot_every=500, workload="native")
+        values.update(extra)
+        return types.SimpleNamespace(**values)
+
+    def test_only_the_first_n_nodes_run_the_native_worker(self):
+        cfg = self._cfg(native_workers=2)
+        runtime = [("--native-inference-runtime" in orchestrate.Node(cfg, i).args("g"))
+                   for i in range(4)]
+        activation = [("--native-inference-activation" in orchestrate.Node(cfg, i).args("g"))
+                      for i in range(4)]
+        self.assertEqual(runtime, [True, True, False, False])
+        self.assertEqual(activation, [True] * 4)
+
+    def test_by_default_every_node_runs_it(self):
+        cfg = self._cfg()
+        self.assertTrue(all("--native-inference-runtime" in orchestrate.Node(cfg, i).args("g")
+                            for i in range(4)))
+
+
 class BinarySelfReport(unittest.TestCase):
     def test_a_node_reporting_another_build_aborts_the_run(self):
         digest = "ab" * 32
