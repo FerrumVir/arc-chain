@@ -139,6 +139,21 @@ def attention_cases(rng: Lcg):
             [-3, 2, 5, 1, -(1 << 32) - 1, 1, 0, 1]]
     values = [[ONE, -ONE, 2 * ONE, 0, 5, -5, 9, -9], [3 * ONE, 1, -1, 7, -7, ONE, 0, 2]]
     case(q, keys, values, note="elements outside signed 32 bits; exact 64-bit products required")
+    # Deviation D1's boundary: the aarch64 fast path narrows Q and K to 32 bits
+    # only when every element lies in [-2^31, 2^31 - 1]. These sit exactly on
+    # the bounds (the fast path, which must stay exact) and one past them (the
+    # exact path). Each large element meets a small partner, so every product
+    # stays far inside signed 64 bits.
+    lo, hi = -(1 << 31), (1 << 31) - 1
+    q = [hi, 3, -2, 1, 0, 4, -1, lo]
+    keys = [[7, 1, lo, -1, 2, 0, 3, 1], [-3, 2, 5, 1, hi, 1, 0, -1]]
+    case(q, keys, values, note="elements exactly at the signed 32-bit bounds (aarch64 fast path)")
+    q = [hi + 1, 3, -2, 1, 0, 4, -1, lo - 1]
+    keys = [[7, 1, lo - 1, -1, 2, 0, 3, 1], [-3, 2, 5, 1, hi + 1, 1, 0, -1]]
+    case(q, keys, values, note="elements one past the signed 32-bit bounds (exact path)")
+    case([0] * d_head, [[0] * d_head] * 2,
+         [[-5, 5, -1, 1, 0, 3, -3, 2], [-4, 4, -2, 2, 1, 2, -2, 1]],
+         note="equal scores, averages not whole: negative ones truncate toward zero")
     return cases
 
 
