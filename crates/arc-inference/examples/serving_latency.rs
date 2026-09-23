@@ -99,6 +99,100 @@ fn load_average() -> Option<[f64; 3]> {
     (written == 3).then_some(loads)
 }
 
+/// Memory the OS can hand out now, without evicting anything that is in use:
+/// free + inactive + speculative pages on macOS, `MemAvailable` on Linux.
+fn available_memory_bytes() -> Option<u64> {
+    if cfg!(target_os = "macos") {
+        let out = std::process::Command::new("vm_stat").output().ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        let page: u64 = text
+            .lines()
+            .next()?
+            .split("page size of ")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        let pages = |name: &str| -> u64 {
+            text.lines()
+                .find(|line| line.starts_with(name))
+                .and_then(|line| line.split(':').nth(1))
+                .map(|value| value.trim().trim_end_matches('.'))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        Some((pages("Pages free") + pages("Pages inactive") + pages("Pages speculative")) * page)
+    } else {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("MemAvailable:"))?;
+        Some(line.split_whitespace().nth(1)?.parse::<u64>().ok()? * 1024)
+    }
+}
+
+/// A resident canonical model measured 6.7 GB for a 3.8 GB artifact (1.76x),
+/// so twice the artifact leaves room for that plus the KV cache and the
+/// process itself. Below this the run pages, and paging is what the previous
+/// attempt measured instead of the model.
+const REQUIRED_MEMORY_PER_ARTIFACT_BYTE: u64 = 2;
+
+/// The contaminated run started at a 1-minute load average of 7.08 on ten
+/// threads. Half the core count is the line between "this host is mine" and
+/// "something else is already using it".
+const MAX_START_LOAD_PER_CORE: f64 = 0.5;
+
+/// Swap that grows during the run means the model is being paged, which is
+/// exactly what invalidated the previous attempt (+5.24 GB). A clean run grows
+/// none; this allows a little for unrelated system activity.
+const MAX_SWAP_GROWTH_BYTES: u64 = 512 << 20;
+
+/// Why the host is not fit to measure on, or `None` if it is.
+fn contended(
+    artifact_bytes: u64,
+    cores: usize,
+    swap_before: Option<u64>,
+    started: bool,
+) -> Option<String> {
+    if let (Some(load), true) = (load_average(), !started) {
+        let limit = cores as f64 * MAX_START_LOAD_PER_CORE;
+        if load[0] > limit {
+            return Some(format!(
+                "start load average {:.2} exceeds {limit:.2} ({cores} cores): the host is \
+                 already busy, so these timings would measure contention",
+                load[0]
+            ));
+        }
+    }
+    if !started {
+        let required = artifact_bytes.saturating_mul(REQUIRED_MEMORY_PER_ARTIFACT_BYTE);
+        match available_memory_bytes() {
+            Some(available) if available < required => {
+                return Some(format!(
+                    "{:.1} GB available, {:.1} GB required (2x the {:.1} GB artifact): the model \
+                     would page instead of resident",
+                    available as f64 / (1 << 30) as f64,
+                    required as f64 / (1 << 30) as f64,
+                    artifact_bytes as f64 / (1 << 30) as f64,
+                ));
+            }
+            _ => {}
+        }
+    }
+    if let (Some(before), Some(now)) = (swap_before, swap_used_bytes())
+        && now.saturating_sub(before) > MAX_SWAP_GROWTH_BYTES
+    {
+        return Some(format!(
+            "swap grew {:.2} GB during the run (limit {:.2} GB): the model is being paged, so \
+             every timing after this point is paging, not compute",
+            now.saturating_sub(before) as f64 / (1 << 30) as f64,
+            MAX_SWAP_GROWTH_BYTES as f64 / (1 << 30) as f64,
+        ));
+    }
+    None
+}
+
 fn summary(mut samples: Vec<f64>) -> serde_json::Value {
     samples.sort_by(|a, b| a.total_cmp(b));
     let n = samples.len();
@@ -118,6 +212,29 @@ fn main() {
     let tokens: u32 = arg(&args, "--tokens").map_or(32, |v| v.parse().expect("--tokens"));
     assert!(repeats >= 3, "distributions need at least 3 samples");
     assert!(tokens >= 2, "decode needs at least two generated tokens");
+
+    // A contended host produces numbers that look like measurements and are
+    // not. The previous attempt ran ninety minutes and had to be thrown away:
+    // swap grew 5.24 GB and it started at a load average of 7.08 on ten
+    // threads. Check before spending that time, and again as it is spent.
+    let allow_contended = args.iter().any(|a| a == "--allow-contended");
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let artifact_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+    if let Some(reason) = contended(artifact_bytes, cores, None, false) {
+        if allow_contended {
+            eprintln!(
+                "serving_latency: PROCEEDING ON A CONTENDED HOST ({reason}). Its timings \
+                       are not a measurement."
+            );
+        } else {
+            eprintln!("serving_latency: refusing to start - {reason}.");
+            eprintln!(
+                "Free the host and try again, or pass --allow-contended to record a run that is \
+                 explicitly not a measurement."
+            );
+            std::process::exit(2);
+        }
+    }
 
     let load_average_start = load_average();
     let swap_before_load = swap_used_bytes();
@@ -200,6 +317,17 @@ fn main() {
                 throughput.push(f64::from(tokens) / tn);
             }
             eprintln!("batched={batched} prompt={len}: done");
+            // Re-check before paying for the next configuration rather than
+            // discovering at the end that everything since was paging.
+            if let Some(reason) = contended(artifact_bytes, cores, swap_before_load, true)
+                && !allow_contended
+            {
+                eprintln!(
+                    "serving_latency: ABORTING after batched={batched} prompt={len} - {reason}."
+                );
+                eprintln!("Partial results are discarded: a contended sample is not a sample.");
+                std::process::exit(3);
+            }
             results.push(json!({
                 "batched_prefill": batched,
                 "prompt_tokens": len,
@@ -219,6 +347,14 @@ fn main() {
         "threads": rayon::current_num_threads(),
         "repeats": repeats,
         "prompt_lens": prompt_lens,
+        "isolation": {
+            "checked": true,
+            "allow_contended": allow_contended,
+            "cores": cores,
+            "required_memory_bytes": artifact_bytes * REQUIRED_MEMORY_PER_ARTIFACT_BYTE,
+            "max_start_load": cores as f64 * MAX_START_LOAD_PER_CORE,
+            "max_swap_growth_bytes": MAX_SWAP_GROWTH_BYTES,
+        },
         "cold_load_s": cold_load_s,
         "first_request_after_load_s": first_request_after_load_s,
         "max_rss_bytes_after_load": rss_after_load,
