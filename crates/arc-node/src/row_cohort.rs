@@ -1431,6 +1431,40 @@ mod tests {
         }
     }
 
+    /// The operator-facing template must be a config the real loader accepts.
+    /// It is the artifact handed to whoever sets up the second machine, so a
+    /// typo in it would be discovered on their host instead of in CI.
+    #[test]
+    fn the_documented_cohort_template_is_accepted_by_the_real_loader() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/operations/row-cohort.example.json");
+        let config = RowCohortConfig::load(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        assert_eq!(config.workers.len(), 1);
+        let worker = &config.workers[0];
+        assert_eq!(worker.id, "machine-b");
+        assert_eq!(worker.max_concurrency, 1);
+        // The remote command must name the worker binary and pin the artifact
+        // the chain activated, or the machine would serve rows of some other
+        // model.
+        assert!(
+            worker
+                .remote_command
+                .iter()
+                .any(|part| part.ends_with("tensor_row_model_worker")),
+            "{:?}",
+            worker.remote_command
+        );
+        let artifact = worker
+            .remote_command
+            .iter()
+            .position(|part| part == "--artifact")
+            .and_then(|at| worker.remote_command.get(at + 1))
+            .expect("the template pins --artifact");
+        assert_eq!(artifact.len(), 64, "the artifact pin is a 32-byte hex hash");
+        assert!(artifact.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
     #[test]
     fn a_cohort_config_is_parsed_strictly_and_validated() {
         let json = serde_json::json!({
