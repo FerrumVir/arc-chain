@@ -87,7 +87,8 @@ for i in $(seq 0 $((NODES-1))); do
 done
 {
   echo '[chain]'; echo 'name = "arc-latejoin"'; echo 'chain_id = "0x415243"'
-  echo 'validator_set_complete = false'; echo ''
+  echo 'validator_set_complete = false'
+  echo "instance_id = \"late-join-$$-$(date -u +%s)\""; echo ''
   for a in "${ADDRS[@]}"; do echo '[[accounts]]'; echo "address = \"$a\""; echo 'balance = 1_000_000_000_000'; echo ''; done
   for a in "${ADDRS[@]}"; do echo '[[validators]]'; echo "address = \"$a\""; echo "stake = $STAKE"; echo ''; done
 } > "$WORK/genesis.toml"

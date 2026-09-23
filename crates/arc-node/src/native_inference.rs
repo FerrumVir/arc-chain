@@ -2458,7 +2458,13 @@ pub struct ActivationExpectations {
 ///   "expect": { "chain_genesis": "<64 hex>" }
 /// }
 /// ```
+/// Unknown fields are refused rather than ignored: an activation config is
+/// how a chain's inference contract is pinned at height 0, and a binary that
+/// silently dropped a field it did not understand would commit a different
+/// contract commitment than its peers and fork the chain at its first block.
+/// Failing to parse stops that node instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NativeActivationRequest {
     pub allowed_executions: Vec<AllowedExecution>,
     #[serde(default)]

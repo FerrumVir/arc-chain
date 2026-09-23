@@ -205,9 +205,38 @@ impl StateDB {
         if payload.height <= self.height() {
             return Err(refuse("the checkpoint does not move this node forward"));
         }
-        adoption_preconditions(self, payload)?;
-
         verify_history_window(&payload.blocks, tip)?;
+
+        // A window that is internally consistent still has to be THIS chain's.
+        // A payload from another run of a chain with the same genesis and
+        // committee verifies every certificate check and chains to its own
+        // tip perfectly well, so the only local evidence is what this node
+        // already committed: every height it holds inside the window must
+        // match block for block, and the window's lowest block must name this
+        // node's own block as its parent.
+        if let Some((lowest_height, lowest)) = payload.blocks.first() {
+            for (height, block) in &payload.blocks {
+                if let Some(ours) = self.get_block(*height)
+                    && ours.hash != block.hash
+                {
+                    return Err(refuse(format!(
+                        "window block at height {height} is not the block this node committed \
+                         there"
+                    )));
+                }
+            }
+            if let Some(parent_height) = lowest_height.checked_sub(1)
+                && let Some(ours) = self.get_block(parent_height)
+                && ours.hash != lowest.header.parent_hash
+            {
+                return Err(refuse(format!(
+                    "the window starting at {lowest_height} does not extend this node's block at \
+                     {parent_height}"
+                )));
+            }
+        }
+
+        adoption_preconditions(self, payload)?;
 
         // Domains nothing certified: they must already be this node's own.
         let local = self.export_durable_snapshot();

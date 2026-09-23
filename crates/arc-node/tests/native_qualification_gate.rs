@@ -45,9 +45,10 @@ impl Fixture {
             &genesis,
             format!(
                 "[chain]\nname = \"arc-qual-gate\"\nchain_id = \"0x415243\"\n\
-                 validator_set_complete = false\n\n\
+                 validator_set_complete = false\ninstance_id = \"{instance}\"\n\n\
                  [[accounts]]\naddress = \"{v}\"\nbalance = 1_000_000_000_000\n\n\
                  [[validators]]\naddress = \"{v}\"\nstake = 6666667\n",
+                instance = chain_instance_id(),
                 v = validator.address().to_hex()
             ),
         )
@@ -207,4 +208,18 @@ fn real_execution_is_refused_when_the_decision_has_no_author_or_basis() {
         out.contains("decided_by") && out.contains("evidence"),
         "an unattributed decision must be refused; got:\n{out}"
     );
+}
+
+/// A fresh chain-run identity for every execution of this test. The genesis
+/// is otherwise byte-identical run to run, so without it the certificates of
+/// one run would verify against the next one's committee.
+fn chain_instance_id() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }

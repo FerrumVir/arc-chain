@@ -74,7 +74,10 @@ done
 GEN="$STATE_DIR/genesis.toml"
 {
   echo '[chain]'; echo 'name = "arc-localdev"'; echo 'chain_id = "0x415243"'
-  echo 'validator_set_complete = false'; echo ''
+  echo 'validator_set_complete = false'
+  # A fresh chain-run identity: the certificate domain commits to it, so a
+  # certificate or checkpoint from a previous localdev chain cannot verify here.
+  echo "instance_id = \"localdev-$$-$(date -u +%s)\""; echo ''
   echo '[[accounts]]'; echo "address = \"$FAUCET_POOL\""; echo 'balance = 1_000_000_000_000'; echo ''
   for a in "${ADDRS[@]}"; do
     echo '[[accounts]]'; echo "address = \"$a\""; echo 'balance = 1_000_000_000_000'; echo ''

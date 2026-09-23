@@ -212,10 +212,13 @@ pub struct CheckpointRequestMessage {
 
 /// A checkpoint envelope and the exact payload bytes it authorises.
 ///
-/// The envelope is a quorum finality certificate plus the snapshot identity it
-/// covers. The payload is unstructured here on purpose: the receiver must
-/// verify the envelope against its OWN frozen committee and chain domain, and
-/// that these bytes hash to the authorised digest, before decoding anything.
+/// The envelope is a quorum finality certificate plus the snapshot identity
+/// the sending peer offers for it. The payload is unstructured here on
+/// purpose: the receiver must verify the envelope against its OWN frozen
+/// committee and chain domain, and that these bytes hash to the digest the
+/// peer stated, before decoding anything. The digest is the sender's claim,
+/// not a quorum's - what a quorum certified is the height and the state root,
+/// so the decoded payload must still be re-derived against the certified tip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointResponseMessage {
     pub envelope: arc_consensus::view_change::CheckpointEnvelope,

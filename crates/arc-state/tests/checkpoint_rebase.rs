@@ -24,16 +24,24 @@ fn open(dir: &std::path::Path) -> StateDB {
 }
 
 fn advance(state: &StateDB, first_nonce: u64, count: u64) {
+    advance_tagged(state, first_nonce, count, b"");
+}
+
+/// The same chain, except that `tag` changes each block's anchor proof - a
+/// different run producing different block hashes from the same genesis.
+fn advance_tagged(state: &StateDB, first_nonce: u64, count: u64, tag: &[u8]) {
     for i in 0..count {
         let nonce = first_nonce + i;
         let mut tx = Transaction::new_transfer(addr(1), addr(3), 10, nonce);
         tx.sig_verified = true;
+        let mut seed = tag.to_vec();
+        seed.extend_from_slice(&nonce.to_le_bytes());
         state
             .execute_block_adaptive_at_with_proof(
                 &[tx],
                 addr(1),
                 1_700_000_000_000 + nonce,
-                hash_bytes(&nonce.to_le_bytes()),
+                hash_bytes(&seed),
             )
             .expect("canonical execution");
     }
@@ -129,4 +137,71 @@ fn a_checkpoint_never_moves_a_node_backwards() {
     advance(&node, 0, 40);
     assert!(node.plan_checkpoint_adoption(&payload, &tip).is_err());
     assert_eq!(node.height(), 40);
+}
+
+#[test]
+fn an_adopted_window_must_extend_this_node_s_own_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let (payload, tip) = peer_checkpoint(&dir.path().join("peer"));
+    assert!(
+        verify_history_window(&payload.blocks, &tip).is_ok(),
+        "the window is internally perfect - that is the point"
+    );
+
+    // A node whose own blocks at the same heights are different: another run
+    // of the same genesis, or a fork. The window proves nothing about which
+    // chain it belongs to, so the overlap is what has to catch it.
+    let forked = open(&dir.path().join("forked"));
+    advance_tagged(&forked, 0, 10, b"another run");
+    assert_ne!(
+        forked.get_block(10).unwrap().hash,
+        payload
+            .blocks
+            .iter()
+            .find(|(height, _)| *height == 10)
+            .unwrap()
+            .1
+            .hash
+    );
+    let error = forked
+        .plan_checkpoint_adoption(&payload, &tip)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("is not the block this node committed"),
+        "{error}"
+    );
+
+    // No overlap at all: a window that begins above this node's height still
+    // has to name this node's own block as its parent.
+    let trimmed: Vec<_> = payload
+        .blocks
+        .iter()
+        .filter(|(height, _)| *height > 10)
+        .cloned()
+        .collect();
+    assert!(verify_history_window(&trimmed, &tip).is_ok());
+    let mut gapped = payload.clone();
+    gapped.blocks = trimmed;
+    let error = forked
+        .plan_checkpoint_adoption(&gapped, &tip)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("does not extend this node's block"),
+        "{error}"
+    );
+
+    // The honest case - this node's own prefix, same chain - is not caught by
+    // either rule. (It still stops later: this fixture is not protocol 4.)
+    let same = open(&dir.path().join("same"));
+    advance(&same, 0, 10);
+    let error = same
+        .plan_checkpoint_adoption(&payload, &tip)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !error.contains("this node committed") && !error.contains("does not extend"),
+        "a node's own prefix must not be refused as a foreign chain: {error}"
+    );
 }

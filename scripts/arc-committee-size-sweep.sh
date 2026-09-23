@@ -86,7 +86,8 @@ derive() { # seed rpc p2p -> address
 write_genesis() { # file addr...
   local f=$1; shift
   { echo '[chain]'; echo 'name = "arc-committee-sweep"'; echo 'chain_id = "0x415243"'
-    echo 'validator_set_complete = false'; echo ''
+    echo 'validator_set_complete = false'
+    echo "instance_id = \"sweep-$$-$(date -u +%s)-$#\""; echo ''
     for a in "$@"; do echo '[[accounts]]'; echo "address = \"$a\""; echo 'balance = 1_000_000_000_000'; echo ''; done
     for a in "$@"; do echo '[[validators]]'; echo "address = \"$a\""; echo "stake = $STAKE"; echo ''; done
   } > "$f"

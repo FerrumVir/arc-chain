@@ -1998,12 +1998,20 @@ pub enum CheckpointError {
 pub struct SnapshotIdentity {
     pub height: u64,
     pub state_root: Hash256,
-    /// BLAKE3 over the exact bytes of the snapshot payload.
+    /// BLAKE3 over the exact bytes of the snapshot payload. This is a
+    /// transport integrity check between a node and the peer that answered
+    /// it, NOT a quorum statement: the certificate covers the height and the
+    /// state root, and nothing a quorum signed mentions this digest. A peer
+    /// is free to send any payload it likes with a matching digest, so the
+    /// adopting node must re-derive everything it keeps - the state root in
+    /// scratch and every block in the window - from the certified tip.
     pub digest: Hash256,
 }
 
 /// A quorum-authenticated statement that one state root is canonical at one
-/// height, and that a specific snapshot payload is the one being authorised.
+/// height, carried with the identity of the snapshot payload a peer offers
+/// for it. The certificate authenticates the height and the state root; the
+/// payload digest only binds the bytes to the peer that sent them.
 ///
 /// This is the trust boundary for importing state a node did not compute
 /// itself, and it is deliberately separate from loading a node's own validated
@@ -2024,8 +2032,10 @@ pub struct CheckpointEnvelope {
 
 impl CheckpointEnvelope {
     /// Verify everything that can be checked without the payload: the
-    /// certificate against the frozen committee, and that the snapshot identity
-    /// is the one the certificate authorises.
+    /// certificate against the frozen committee, and that the snapshot's
+    /// height and state root are the ones the certificate authorises. The
+    /// payload digest is not checked here and is not covered by the
+    /// certificate - see `SnapshotIdentity::digest`.
     pub fn verify(
         &self,
         expected_domain: &ConsensusDomain,

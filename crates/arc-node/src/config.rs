@@ -33,6 +33,20 @@ pub struct ChainInfo {
     /// as though they were on the same chain.
     #[serde(default)]
     pub community_rewards_v1_activation_height: Option<u64>,
+    /// Distinguishes one *run* of a chain from any other run that shares this
+    /// genesis. `network_hash` commits to it, so it reaches every certificate
+    /// domain: a certificate, a recovery decision or a checkpoint produced by
+    /// an earlier chain with the same name, accounts and committee cannot be
+    /// presented to a later one as its own history. A chain sets it once, at
+    /// genesis, and never changes it; a disposable local or test network
+    /// generates a fresh one per run, which is exactly where the same genesis
+    /// is otherwise reused verbatim.
+    ///
+    /// Absent, the network hash is byte-identical to the hash of the same
+    /// file without the field, so an existing chain keeps its identity and
+    /// does not have to restart to upgrade.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 /// A prefunded account in the genesis state.
@@ -220,9 +234,31 @@ impl GenesisConfig {
             canonical.extend_from_slice(&address.0);
             append_u64(&mut canonical, stake);
         }
+        // The chain-run identity is a tagged suffix rather than a field in
+        // the v3 body: a genesis without it hashes to exactly the bytes it
+        // hashed to before this field existed, so adopting the field is not a
+        // network split for chains that do not set one.
+        if let Some(instance) = &self.chain.instance_id {
+            ensure!(
+                !instance.is_empty() && instance.len() <= MAX_INSTANCE_ID_LEN,
+                "chain.instance_id must be 1..={MAX_INSTANCE_ID_LEN} bytes"
+            );
+            ensure!(
+                instance
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() || byte == b' '),
+                "chain.instance_id must be printable ASCII"
+            );
+            canonical.extend_from_slice(b"instance\0");
+            append_bytes(&mut canonical, instance.as_bytes());
+        }
         Ok(hash_bytes(&canonical))
     }
 }
+
+/// Long enough for a UUID, a run label or a timestamped name; short enough
+/// that a genesis cannot carry a payload in this field.
+const MAX_INSTANCE_ID_LEN: usize = 128;
 
 fn append_bytes(canonical: &mut Vec<u8>, value: &[u8]) {
     append_u64(canonical, value.len() as u64);
@@ -820,6 +856,78 @@ mod tests {
             scheduled.network_hash(false).unwrap(),
             "consensus reward activation must be part of network identity"
         );
+    }
+
+    #[test]
+    fn network_hash_separates_runs_of_the_same_genesis() {
+        let address =
+            crate::validator_identity::derive_insecure_seed_keypair("instance-test").address();
+        let parse = |instance: Option<&str>| {
+            let line = match instance {
+                Some(value) => format!("instance_id = \"{value}\"\n"),
+                None => String::new(),
+            };
+            toml::from_str::<GenesisConfig>(&format!(
+                r#"
+                    [chain]
+                    name = "instance-network"
+                    chain_id = "0x415243"
+                    validator_set_complete = true
+                    {line}
+
+                    [[accounts]]
+                    address = "{address}"
+                    balance = 0
+
+                    [[validators]]
+                    address = "{address}"
+                    stake = 5000000
+                "#,
+                address = address.to_hex(),
+            ))
+            .unwrap()
+        };
+
+        // A genesis that names no run keeps the identity it had before the
+        // field existed: the hash must not move for a chain already running.
+        let unset = parse(None);
+        let mut explicitly_none = unset.clone();
+        explicitly_none.chain.instance_id = None;
+        assert_eq!(
+            unset.network_hash(false).unwrap(),
+            explicitly_none.network_hash(false).unwrap()
+        );
+
+        // Two runs of the identical genesis are different chains, so their
+        // certificate domains differ and neither can adopt the other.
+        let run_a = parse(Some("run-a"));
+        let run_b = parse(Some("run-b"));
+        assert_ne!(
+            run_a.network_hash(false).unwrap(),
+            run_b.network_hash(false).unwrap(),
+            "a chain run must not share a network identity with another run"
+        );
+        assert_ne!(
+            unset.network_hash(false).unwrap(),
+            run_a.network_hash(false).unwrap()
+        );
+
+        let mut empty = unset.clone();
+        empty.chain.instance_id = Some(String::new());
+        assert!(
+            empty
+                .network_hash(false)
+                .unwrap_err()
+                .to_string()
+                .contains("instance_id"),
+            "an empty instance id must be refused, not treated as unset"
+        );
+        let mut oversized = unset.clone();
+        oversized.chain.instance_id = Some("x".repeat(MAX_INSTANCE_ID_LEN + 1));
+        assert!(oversized.network_hash(false).is_err());
+        let mut unprintable = unset;
+        unprintable.chain.instance_id = Some("run\na".into());
+        assert!(unprintable.network_hash(false).is_err());
     }
 
     #[test]

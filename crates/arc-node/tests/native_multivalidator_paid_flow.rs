@@ -126,9 +126,10 @@ impl Fixture {
             hash_bytes(b"p5-generation"),
             hash_bytes(b"p5-assignment"),
         ];
-        let mut genesis = String::from(
+        let mut genesis = format!(
             "[chain]\nname = \"arc-p5-paid-flow\"\nchain_id = \"0x415243\"\n\
-             validator_set_complete = false\n\n",
+             validator_set_complete = false\ninstance_id = \"{}\"\n\n",
+            chain_instance_id()
         );
         for requester in &requesters {
             genesis.push_str(&format!(
@@ -860,4 +861,18 @@ fn a_validator_down_longer_than_retention_rejoins_by_checkpoint() {
             matches!((mine, theirs), (Some(m), Some(t)) if m + 10 >= t && m > common)
         },
     );
+}
+
+/// A fresh chain-run identity for every execution of this test. The genesis
+/// is otherwise byte-identical run to run, so without it the certificates of
+/// one run would verify against the next one's committee.
+fn chain_instance_id() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }

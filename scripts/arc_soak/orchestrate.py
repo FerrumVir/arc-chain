@@ -585,9 +585,17 @@ class Soak:
                               "p2p": n.p2p, "role": "seed" if n.index == 0 else "member"}
                              for n in self.nodes]
         self.write_run()
+        # One chain-run identity per soak. It reaches the certificate domain
+        # (genesis network hash), so certificates and checkpoints from an
+        # earlier soak of this same genesis cannot verify against this one.
+        instance = "soak-{}-{}".format(
+            time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid())
+        self.run["chain_instance_id"] = instance
+        self.write_run()
         with open(self.genesis, "w") as fh:
             fh.write('[chain]\nname = "arc-soak"\nchain_id = "0x415243"\n'
-                     "validator_set_complete = false\n\n")
+                     "validator_set_complete = false\n"
+                     f'instance_id = "{instance}"\n\n')
             fh.write(f'[[accounts]]\naddress = "{FAUCET_POOL}"\nbalance = 1_000_000_000_000\n\n')
             for n in self.nodes:
                 fh.write(f'[[accounts]]\naddress = "{n.identity}"\nbalance = 1_000_000_000_000\n\n')

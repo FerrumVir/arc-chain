@@ -634,10 +634,22 @@ impl StateDB {
         commitment: Hash256,
     ) -> Result<(), StateError> {
         self.native_inference_pending.clear();
-        for entry in self.storage.iter() {
-            let Some(bytes) = entry.value().get(&metadata_key()).map(|v| v.clone()) else {
-                continue;
-            };
+        // Two passes on purpose: the body below cross-reads storage through
+        // `get_storage` for the same escrow, which is the same DashMap shard
+        // this iterator holds a guard on. Recursive shard reads are what the
+        // two rebase deadlocks were, so the rows are collected first and the
+        // iterator dropped before anything reads storage again.
+        let rows: Vec<([u8; 32], Vec<u8>)> = self
+            .storage
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .get(&metadata_key())
+                    .map(|bytes| (*entry.key(), bytes.clone()))
+            })
+            .collect();
+        for (address, bytes) in rows {
             let metadata =
                 bincode::deserialize_limited_exact::<InferenceMetadata, MAX_METADATA_BYTES>(&bytes)
                     .map_err(|e| {
@@ -652,7 +664,7 @@ impl StateDB {
             let receipt = read_native_metadata(self, request_id, commitment)?.ok_or_else(|| {
                 StateError::ExecutionError("native metadata escrow mismatch".into())
             })?;
-            if escrow_address(request_id).0 != *entry.key() {
+            if escrow_address(request_id).0 != address {
                 return Err(StateError::ExecutionError(
                     "native metadata at wrong address".into(),
                 ));

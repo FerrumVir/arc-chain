@@ -449,6 +449,7 @@ GEN="$WORK/genesis.toml"
   # genesis that CLAIMS completeness, and that guard is right - the fix is to
   # not make a false claim, rather than to bypass the check.
   echo 'validator_set_complete = false'
+  echo "instance_id = \"fixture-$$-$(date -u +%s)\""
   echo ''
   # The faucet pool is a well-known address (the first account in the repo's own
   # genesis.toml). Without it funded, /faucet/claim returns HTTP 500 "Faucet pool

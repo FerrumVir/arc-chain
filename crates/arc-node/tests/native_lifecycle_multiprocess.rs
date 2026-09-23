@@ -119,10 +119,12 @@ impl Fixture {
                 "[chain]\n\
                  name = \"arc-native-lifecycle\"\n\
                  chain_id = \"0x415243\"\n\
-                 validator_set_complete = false\n\n\
+                 validator_set_complete = false\n\
+                 instance_id = \"{instance}\"\n\n\
                  [[accounts]]\naddress = \"{v}\"\nbalance = 1_000_000_000_000\n\n\
                  [[accounts]]\naddress = \"{r}\"\nbalance = 1_000_000_000_000\n\n\
                  [[validators]]\naddress = \"{v}\"\nstake = 6666667\n",
+                instance = chain_instance_id(),
                 v = validator.address().to_hex(),
                 r = requester.address().to_hex(),
             ),
@@ -788,4 +790,18 @@ fn paid_flow_across_concurrent_independent_stores() {
     eprintln!("store B settlement: {settled_b:?}");
     node_a.kill();
     node_b.kill();
+}
+
+/// A fresh chain-run identity for every execution of this test. The genesis
+/// is otherwise byte-identical run to run, so without it the certificates of
+/// one run would verify against the next one's committee.
+fn chain_instance_id() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
 }

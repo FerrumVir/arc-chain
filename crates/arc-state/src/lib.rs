@@ -1273,6 +1273,10 @@ impl StateDB {
                             record.height
                         )));
                     }
+                    // The window the record carries has to chain to that tip:
+                    // these blocks become this node's history at replay, so
+                    // they get the same check the adoption did.
+                    checkpoint_adoption::verify_history_window(&record.state.blocks, &record.tip)?;
                     validation.apply_wal_op(&entry.op);
                     let actual_root = validation.get_state_root();
                     if actual_root != record.tip.header.state_root {
@@ -1510,8 +1514,11 @@ impl StateDB {
             }
             WalOp::Rebase(record) => {
                 // The state is replaced wholesale. History this node already
-                // holds below the checkpoint stays: it is the canonical
-                // chain's own prefix.
+                // holds below the checkpoint stays, and so do the indexes
+                // over it (`tx_index`, `receipts`, `account_txs`): adoption
+                // proves the window is byte-identical wherever it overlaps
+                // this node's own blocks, so nothing kept here can describe a
+                // block the window replaced with a different one.
                 self.clear_state_for_rebase();
                 self.install_durable_snapshot(&record.state);
                 self.apply_wal_op(&WalOp::SetBlock(record.height, record.tip.clone()));
@@ -9899,7 +9906,12 @@ impl StateDB {
     /// the open path rebuilds the native pending index from storage, and
     /// startup rebuilds the Tier 1 and bond-release indexes.
     pub fn rebuild_after_rebase(&self) -> Result<(), StateError> {
-        if let Some(context) = self.native_inference_context.read().clone() {
+        // Bound before the `if let`: an `if let` scrutinee temporary lives
+        // for the whole body, and the body reaches `get_storage`, which takes
+        // the publication lock. Holding the context guard across that is the
+        // context -> publication order, the reverse of activation's.
+        let context = self.native_inference_context.read().clone();
+        if let Some(context) = context {
             self.rebuild_native_inference_pending(context.commitment()?)?;
         }
         // Unlike the bond-release rebuild, this one only inserts.
@@ -9961,6 +9973,11 @@ impl StateDB {
         // protocol 4 with selection rule v2, strict ordering, and every
         // account filed under its own address.
         checkpoint_adoption::adoption_preconditions(self, payload)?;
+        // The history window itself, re-derived here rather than trusted from
+        // the planner: this is the last point before the blocks become
+        // durable, and a caller that assembled a payload by hand must not be
+        // able to write a window that does not chain to its certified tip.
+        checkpoint_adoption::verify_history_window(&payload.blocks, tip)?;
         let scratch = Self::new();
         scratch.install_durable_snapshot(payload);
         if scratch.get_state_root() != tip.header.state_root {
