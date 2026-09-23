@@ -143,10 +143,32 @@ fn main() {
     model.try_generate_v2(&prompt(16), 1, &eos).expect("fits");
     let first_request_after_load_s = first_request.elapsed().as_secs_f64();
 
+    // Prompt lengths. The default is the full set; `--prompt-lens 16,128`
+    // exists because the 512-token configuration adds about 1 GB of KV cache
+    // on top of a ~6.7 GB resident model, which is what the OS killed this
+    // benchmark for on a 16 GB host. A run that measures fewer lengths says so
+    // in its own JSON (`prompt_lens`), so a shorter run can never be mistaken
+    // for a full one.
+    let prompt_lens: Vec<usize> = match arg(&args, "--prompt-lens") {
+        Some(list) => {
+            let lens: Vec<usize> = list
+                .split(',')
+                .map(|item| item.trim().parse().expect("--prompt-lens takes integers"))
+                .collect();
+            assert!(!lens.is_empty(), "--prompt-lens needs at least one length");
+            assert!(
+                lens.iter().all(|len| *len >= 2),
+                "a prompt shorter than 2 tokens cannot measure prefill"
+            );
+            lens
+        }
+        None => vec![16, 128, 512],
+    };
+
     let mut results = Vec::new();
     for batched in [false, true] {
         canonical_prefill::set_batched_prefill_enabled(batched);
-        for len in [16usize, 128, 512] {
+        for len in prompt_lens.iter().copied() {
             let p = prompt(len);
             let (mut ttft, mut full, mut per_token, mut throughput) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -196,6 +218,7 @@ fn main() {
         "profile": GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
         "threads": rayon::current_num_threads(),
         "repeats": repeats,
+        "prompt_lens": prompt_lens,
         "cold_load_s": cold_load_s,
         "first_request_after_load_s": first_request_after_load_s,
         "max_rss_bytes_after_load": rss_after_load,
