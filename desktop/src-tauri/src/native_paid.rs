@@ -2154,6 +2154,13 @@ mod live_journey {
         }
 
         let id = submitted.request_id.clone();
+        // Printed so the documented cross-surface check (runbook section 6.6)
+        // can be pointed at this request: the journal this test writes lives in
+        // a temporary directory that is deleted when the test ends, and the
+        // node exposes no endpoint that enumerates request ids, so without this
+        // line a refunded request cannot be handed to `arc_ops.receipts` or
+        // `explorer/test-live-native.mjs`. Visible with `-- --nocapture`.
+        println!("live_journey request_id={id}");
         let price = 10_000_000u64;
         let reserve = 20_000_000u64;
         let settled = if refund {
