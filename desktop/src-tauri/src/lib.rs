@@ -303,6 +303,8 @@ pub fn run() {
             let store_shared = store.clone();
             let data_dir_shared = data_dir.clone();
             let migration_error_shared = data_migration_error.clone();
+            let node_shared = app.state::<AppState>().node.clone();
+            let configured_rpc_port = start_config.rpc_port;
             let startup_boundary_reason = migration_failure_reason.clone().or_else(|| {
                 Some(
                     "managed-node startup reconciliation is still in progress; binary replacement and node start are temporarily blocked"
@@ -313,6 +315,10 @@ pub fn run() {
                 *store_shared.lock().await = loaded_store;
                 *data_dir_shared.lock().await = resolved;
                 *migration_error_shared.lock().await = startup_boundary_reason;
+                node_shared
+                    .lock()
+                    .await
+                    .configure_rpc_port_if_stopped(configured_rpc_port);
             });
 
             // Sync the autostart plugin with what the user chose during

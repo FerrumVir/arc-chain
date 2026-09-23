@@ -1442,8 +1442,9 @@ impl NodeManager {
         Self {
             child: None,
             started_at: None,
-            // Defaults to 9090 (community installer convention). Real value
-            // is set from NodeConfig.rpc_port on start().
+            // Defaults to 9090 (community installer convention). Startup
+            // replaces this with the saved config while stopped; a launch
+            // may then select a fallback port if the configured pair is busy.
             rpc_port: 9090,
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_RING_SIZE))),
             crash_info: Arc::new(Mutex::new(None)),
@@ -1460,6 +1461,16 @@ impl NodeManager {
             legacy_windows_stop_error: None,
             active_worker_threads: None,
         }
+    }
+
+    /// Initialize status polling from the saved configuration while this
+    /// manager is stopped. A live child's RPC port remains authoritative.
+    pub fn configure_rpc_port_if_stopped(&mut self, rpc_port: u16) -> bool {
+        if self.is_running() {
+            return false;
+        }
+        self.rpc_port = rpc_port;
+        true
     }
 
     pub async fn clear_crash(&self) {
@@ -4187,6 +4198,16 @@ fn _path_sanity(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_rpc_port_is_used_before_first_start() {
+        let mut manager = NodeManager::new();
+
+        assert_eq!(manager.rpc_port, 9090);
+        assert!(manager.configure_rpc_port_if_stopped(19_960));
+        assert_eq!(manager.rpc_port, 19_960);
+        assert!(!manager.is_running());
+    }
 
     #[cfg(windows)]
     fn private_directory_rebarrier_staging(path: &Path) -> PathBuf {
