@@ -47,8 +47,17 @@ lint:
 	cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # The blocking CI gate: library unit tests only. Fast.
+#
+# The second line exists because `--lib` with default features silently SKIPS
+# two conformance tests: the canonical GGUF loader's preparation vectors and
+# the loader's refusal of a model missing a norm weight both sit behind the
+# `candle` feature. Without this, the only check that the Rust loader prepares
+# a GGUF exactly as the independent Python reference does never runs in CI, and
+# a drift in either implementation would go unnoticed until someone ran it by
+# hand. It costs a few seconds; the crate is already compiled by then.
 test:
 	cargo test --workspace --lib --locked
+	cargo test -p arc-inference --lib --features candle --locked
 
 # Alias, for when it's ambiguous which one you meant.
 test-fast: test
