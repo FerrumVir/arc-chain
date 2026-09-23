@@ -113,6 +113,27 @@ impl I8Weights {
     }
 }
 
+/// Borrowed view of a contiguous I8 row range. Keeping scales paired with
+/// their rows preserves the canonical per-row quantization contract.
+#[derive(Clone, Copy)]
+pub(crate) struct I8WeightsView<'a> {
+    pub(crate) data: &'a [i8],
+    pub(crate) scales: &'a [i64],
+    pub(crate) n_rows: usize,
+    pub(crate) n_cols: usize,
+}
+
+impl<'a> From<&'a I8Weights> for I8WeightsView<'a> {
+    fn from(weights: &'a I8Weights) -> Self {
+        Self {
+            data: &weights.data,
+            scales: &weights.scales,
+            n_rows: weights.n_rows,
+            n_cols: weights.n_cols,
+        }
+    }
+}
+
 // ─── INT16 Weight Storage (Per-Row Quantization, Feature-Gated) ──────────────
 
 /// Per-row symmetric INT16 quantized weight matrix.
@@ -988,6 +1009,15 @@ unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
 /// Write matmul result into pre-allocated output buffer (zero-alloc).
 /// Parallel with 512-row chunks to minimize rayon scheduling overhead.
 fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
+    matmul_i8_view_into(I8WeightsView::from(weights), input, in_size, output);
+}
+
+fn matmul_i8_view_into(
+    weights: I8WeightsView<'_>,
+    input: &[i64],
+    in_size: usize,
+    output: &mut [i64],
+) {
     // Empty-weight guard. Shard-mode models pre-allocate every layer as an
     // empty placeholder and only populate the range this node holds. Any
     // code path that iterates over a non-held layer hits an empty weight
@@ -1009,12 +1039,14 @@ fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &m
     // refuses any input it cannot prove exact and returns false, leaving the
     // scalar kernel to run. See `crate::canonical_simd`.
     if crate::canonical_simd::fast_canonical_kernel_enabled()
-        && crate::canonical_simd::matmul_i8_canonical_rows_fast(weights, input, in_size, output)
+        && crate::canonical_simd::matmul_i8_canonical_rows_fast_view(
+            weights, input, in_size, output,
+        )
     {
         return;
     }
-    let data = &weights.data;
-    let scales = &weights.scales;
+    let data = weights.data;
+    let scales = weights.scales;
     // Chunk width 256, matching matmul_i16_into. At 512 a 4096-row output
     // yields only 8 rayon tasks, so the I8 path saturated at 8 cores no
     // matter how wide the pool was — which made "add two cores" a no-op on
@@ -1203,16 +1235,35 @@ pub fn matmul_i8_canonical_rows(
     input: &[i64],
     output: &mut [i64],
 ) -> Result<(), String> {
+    matmul_i8_canonical_row_range(weights, 0, weights.n_rows, input, output)
+}
+
+/// Canonical I8 projection over borrowed rows `[start, end)` of a resident
+/// matrix. This has the same checked dispatch as the copied-shard entry point.
+pub fn matmul_i8_canonical_row_range(
+    weights: &I8Weights,
+    start: usize,
+    end: usize,
+    input: &[i64],
+    output: &mut [i64],
+) -> Result<(), String> {
+    let expected_data_len = weights
+        .n_rows
+        .checked_mul(weights.n_cols)
+        .ok_or_else(|| "canonical I8 matrix geometry overflows".to_string())?;
     if weights.n_rows == 0
         || weights.n_cols == 0
-        || weights.data.len() != weights.n_rows.saturating_mul(weights.n_cols)
+        || weights.data.len() != expected_data_len
         || weights.scales.len() != weights.n_rows
+        || start >= end
+        || end > weights.n_rows
     {
-        return Err("invalid canonical I8 row shard".into());
+        return Err("invalid canonical I8 row range".into());
     }
-    if input.len() != weights.n_cols || output.len() != weights.n_rows {
+    let rows = end - start;
+    if input.len() != weights.n_cols || output.len() != rows {
         return Err(format!(
-            "canonical I8 row projection shape mismatch: input {}, output {}, weights {}x{}",
+            "canonical I8 row projection shape mismatch: input {}, output {}, weights {}x{} range [{start}, {end})",
             input.len(),
             output.len(),
             weights.n_rows,
@@ -1233,7 +1284,19 @@ pub fn matmul_i8_canonical_rows(
     let dot_bound = input_abs_sum
         .checked_mul(128)
         .ok_or_else(|| "canonical I8 dot bound overflows".to_string())?;
-    if weights.scales.iter().any(|scale| {
+    let row_start = start
+        .checked_mul(weights.n_cols)
+        .ok_or_else(|| "canonical I8 row offset overflows".to_string())?;
+    let row_end = end
+        .checked_mul(weights.n_cols)
+        .ok_or_else(|| "canonical I8 row offset overflows".to_string())?;
+    let view = I8WeightsView {
+        data: &weights.data[row_start..row_end],
+        scales: &weights.scales[start..end],
+        n_rows: rows,
+        n_cols: weights.n_cols,
+    };
+    if view.scales.iter().any(|scale| {
         scale
             .checked_abs()
             .and_then(|s| dot_bound.checked_mul(s))
@@ -1241,8 +1304,7 @@ pub fn matmul_i8_canonical_rows(
     }) {
         return Err("canonical I8 scale multiply would overflow".into());
     }
-    let input_q = QuantizedInput::from_i64(input);
-    matmul_fast_preq(weights, &input_q, input, weights.n_cols, output);
+    matmul_i8_view_into(view, input, view.n_cols, output);
     Ok(())
 }
 
@@ -7472,6 +7534,73 @@ mod tests {
         assert!(serve_row_frames(&model, artifact, &mut stream.as_slice(), &mut sink).is_err());
         let mut empty: &[u8] = &[];
         assert!(serve_row_frames(&model, artifact, &mut empty, &mut sink).is_ok());
+    }
+
+    #[test]
+    fn borrowed_canonical_row_ranges_match_copied_shards_with_both_dispatch_settings() {
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        struct RestoreFastKernel(bool);
+        impl Drop for RestoreFastKernel {
+            fn drop(&mut self) {
+                crate::canonical_simd::set_fast_canonical_kernel(self.0);
+            }
+        }
+        let restore = RestoreFastKernel(crate::canonical_simd::fast_canonical_kernel_enabled());
+        let weights = I8Weights::quantize_f32(
+            &[
+                1.0, -2.0, 0.5, 4.0, -3.0, 2.0, 8.0, 1.0, 0.25, -0.5, 2.0, -4.0,
+            ],
+            4,
+            3,
+        );
+        let input = [65_536, -32_768, 16_384];
+
+        for enabled in [false, true] {
+            crate::canonical_simd::set_fast_canonical_kernel(enabled);
+            for (start, end) in [(0, 1), (1, 3), (3, 4), (0, 4)] {
+                let copied = weights.copy_rows(start, end).unwrap();
+                let mut expected = vec![0; end - start];
+                matmul_i8_canonical_rows(&copied, &input, &mut expected).unwrap();
+                let mut borrowed = vec![i64::MIN; end - start];
+                matmul_i8_canonical_row_range(&weights, start, end, &input, &mut borrowed).unwrap();
+                assert_eq!(borrowed, expected, "range [{start}, {end}), fast={enabled}");
+            }
+        }
+
+        // Invalid geometry and selected-scale overflow are refused before
+        // the caller's output buffer is touched.
+        let mut untouched = vec![123; 5];
+        assert!(
+            matmul_i8_canonical_row_range(&weights, 1, 1, &input, &mut untouched[..0]).is_err()
+        );
+        assert_eq!(untouched, vec![123; 5]);
+        assert!(
+            matmul_i8_canonical_row_range(&weights, 3, 2, &input, &mut untouched[..0]).is_err()
+        );
+        assert_eq!(untouched, vec![123; 5]);
+        assert!(matmul_i8_canonical_row_range(&weights, 0, 5, &input, &mut untouched).is_err());
+        assert_eq!(untouched, vec![123; 5]);
+        assert!(
+            matmul_i8_canonical_row_range(&weights, 1, 3, &input[..2], &mut untouched[..2])
+                .is_err()
+        );
+        assert_eq!(untouched, vec![123; 5]);
+        let mut bad_geometry = I8Weights::quantize_f32(&[1.0], 1, 1);
+        bad_geometry.n_rows = usize::MAX;
+        assert!(
+            matmul_i8_canonical_row_range(&bad_geometry, 0, 1, &[1], &mut untouched[..1]).is_err()
+        );
+        assert_eq!(untouched, vec![123; 5]);
+
+        let mut overflow = I8Weights::quantize_f32(&[1.0, 2.0], 2, 1);
+        overflow.scales[1] = i64::MAX; // outside the selected range
+        let mut one_row = [0];
+        matmul_i8_canonical_row_range(&overflow, 0, 1, &[1], &mut one_row).unwrap();
+        overflow.scales[0] = i64::MAX;
+        one_row[0] = 456;
+        assert!(matmul_i8_canonical_row_range(&overflow, 0, 1, &[1], &mut one_row).is_err());
+        assert_eq!(one_row, [456]);
+        drop(restore);
     }
 
     #[test]

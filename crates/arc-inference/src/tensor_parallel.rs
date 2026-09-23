@@ -6,7 +6,9 @@
 //! row order.  It is useful on trusted, pinned-host-key stdio transports; it
 //! does not advertise a public listener or a validator capability.
 
-use crate::cached_integer_model::{I8Weights, matmul_i8_canonical_rows};
+use crate::cached_integer_model::{
+    I8Weights, matmul_i8_canonical_row_range, matmul_i8_canonical_rows,
+};
 use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -839,10 +841,31 @@ pub fn model_projection_weights(
     }
 }
 
-/// Rows `[start, end)` of `weights` applied to `input`, exactly as the
-/// canonical kernel computes them. Copies the rows first: correct, not yet
-/// fast (a row-range kernel entry is S11 work).
+/// Rows `[start, end)` of `weights` applied by the coordinator. Validate the
+/// geometry before allocating so a malformed plan cannot request a huge vec.
 fn rows_of(
+    weights: &I8Weights,
+    start: usize,
+    end: usize,
+    input: &[i64],
+) -> Result<Vec<i64>, TensorParallelError> {
+    if start >= end
+        || end > weights.n_rows
+        || weights.n_cols == 0
+        || input.len() != weights.n_cols
+        || weights.n_rows.checked_mul(weights.n_cols) != Some(weights.data.len())
+        || weights.scales.len() != weights.n_rows
+    {
+        return Err(TensorParallelError::WrongShape);
+    }
+    let mut values = vec![0; end - start];
+    matmul_i8_canonical_row_range(weights, start, end, input, &mut values)
+        .map_err(|_| TensorParallelError::WrongShape)?;
+    Ok(values)
+}
+
+/// The remote frame path retains its assignment-scoped row copy.
+fn rows_of_copy(
     weights: &I8Weights,
     start: usize,
     end: usize,
@@ -911,7 +934,7 @@ pub fn serve_row_frames(
         }
         let weights = model_projection_weights(model, a.layer, a.tensor)
             .ok_or(TensorParallelError::WrongIdentity)?;
-        let values = rows_of(weights, a.row_start, a.row_end, &request.input)?;
+        let values = rows_of_copy(weights, a.row_start, a.row_end, &request.input)?;
         let response = RowProjectionResponse {
             call_id: request.call_id,
             input_hash: request.input_hash,

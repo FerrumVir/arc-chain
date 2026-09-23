@@ -72,7 +72,7 @@
 //! Conformance evidence, including sanitiser runs and the boundary suite, is in
 //! `Desktop/Arc Chain V2/claude-reviews/stage-b-kernel-conformance.c`.
 
-use crate::cached_integer_model::I8Weights;
+use crate::cached_integer_model::{I8Weights, I8WeightsView};
 #[cfg(target_arch = "aarch64")]
 use crate::integer_lut::FRAC_BITS;
 #[cfg(target_arch = "aarch64")]
@@ -498,6 +498,15 @@ unsafe fn dot_limbs_x4(
 /// partially updated buffer behind.
 pub fn matmul_i8_canonical_rows_fast(
     weights: &I8Weights,
+    input: &[i64],
+    in_size: usize,
+    output: &mut [i64],
+) -> bool {
+    matmul_i8_canonical_rows_fast_view(I8WeightsView::from(weights), input, in_size, output)
+}
+
+pub(crate) fn matmul_i8_canonical_rows_fast_view(
+    weights: I8WeightsView<'_>,
     input: &[i64],
     in_size: usize,
     output: &mut [i64],
