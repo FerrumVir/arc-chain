@@ -31,6 +31,7 @@ import hashlib
 import io
 import json
 import os
+import stat
 import sys
 import tarfile
 import time
@@ -86,7 +87,12 @@ def backup(data_dir: str, out: str, binary: Optional[str] = None) -> Dict[str, A
         members = []
         for rel in _files(data_dir):
             full = os.path.join(data_dir, rel)
-            members.append({"path": rel, "bytes": os.path.getsize(full), "sha256": _sha256(full)})
+            members.append({"path": rel, "bytes": os.path.getsize(full),
+                            "sha256": _sha256(full),
+                            # The node refuses its own store if a private file
+                            # is not exactly 0600, so the mode is part of what
+                            # a backup has to carry.
+                            "mode": stat.S_IMODE(os.stat(full).st_mode)})
         manifest: Dict[str, Any] = {
             "format": FORMAT,
             "taken_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -159,18 +165,36 @@ def restore(archive: str, data_dir: str) -> Dict[str, Any]:
     os.makedirs(data_dir, mode=0o700, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tar:
         for m in manifest["members"]:
-            src = tar.extractfile(f"data/{m['path']}")
+            member = tar.getmember(f"data/{m['path']}")
+            src = tar.extractfile(member)
             dest = os.path.join(data_dir, m["path"])
             if os.path.commonpath([data_dir, os.path.abspath(dest)]) != data_dir:
                 raise ValueError(f"member escapes the target: {m['path']}")
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
             with open(dest, "wb") as out:
                 out.write(src.read())
                 out.flush()
                 os.fsync(out.fileno())
+            # Content is not enough: a store restored with default permissions
+            # is one the node refuses to open ("private file ... must have mode
+            # 0600"), so a backup that only round-tripped bytes was useless in
+            # exactly the situation it exists for. The archive's own mode is
+            # authoritative; the manifest's copy is cross-checked when present
+            # so an edited archive cannot widen a private file.
+            mode = stat.S_IMODE(member.mode)
+            recorded = m.get("mode")
+            if recorded is not None and recorded != mode:
+                raise ValueError(
+                    f"restored {m['path']} mode {mode:04o} does not match the recorded "
+                    f"{recorded:04o}")
+            os.chmod(dest, mode)
     for m in manifest["members"]:
-        if _sha256(os.path.join(data_dir, m["path"])) != m["sha256"]:
+        full = os.path.join(data_dir, m["path"])
+        if _sha256(full) != m["sha256"]:
             raise ValueError(f"restored {m['path']} does not match its recorded digest")
+        recorded = m.get("mode")
+        if recorded is not None and stat.S_IMODE(os.stat(full).st_mode) != recorded:
+            raise ValueError(f"restored {m['path']} does not have its recorded permissions")
     return manifest
 
 
