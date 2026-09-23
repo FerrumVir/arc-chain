@@ -1,6 +1,6 @@
 use crate::node_manager::{managed_binary_path, TestnetResources};
 use crate::types::*;
-use crate::{hardware, identity, paths, rpc_client, AppState, CommunityReceiptRoute};
+use crate::{hardware, identity, paths, rpc_client, store::Store, AppState, CommunityReceiptRoute};
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 use ssh_key::{PublicKey, SshSig};
@@ -50,15 +50,124 @@ pub async fn detect_hardware() -> CmdResult<HardwareInfo> {
 
 #[tauri::command]
 pub async fn generate_identity(state: State<'_, AppState>) -> CmdResult<IdentityPublic> {
-    let id = identity::generate();
-    let public = IdentityPublic::from(&id);
-    {
-        let mut store = state.store.lock().await;
-        store.identity = Some(id);
-        let dir = state.data_dir.lock().await.clone();
-        store.save_to(&dir).map_err(map_err)?;
+    let mut store = state.store.lock().await;
+    let dir = state.data_dir.lock().await.clone();
+    generate_identity_if_missing(&mut store, &dir)
+}
+
+/// Return the existing wallet during onboarding even before a node config
+/// exists. The caller holds the store mutex across this check and creation so
+/// concurrent IPC requests cannot replace one generated seed with another.
+fn generate_identity_if_missing(store: &mut Store, dir: &Path) -> CmdResult<IdentityPublic> {
+    if store.identity.is_none() {
+        store.identity = Some(identity::generate());
     }
+
+    // Retain the generated identity if saving fails. Store::save_to can
+    // publish store.json before a later durability check fails, so a retry
+    // must persist this same key rather than generate a replacement.
+    let public = IdentityPublic::from(store.identity.as_ref().unwrap());
+    store.save_to(dir).map_err(map_err)?;
     Ok(public)
+}
+
+#[cfg(test)]
+mod identity_generation_tests {
+    use super::*;
+    use crate::types::Identity;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn saved_identity() -> Identity {
+        Identity {
+            address: format!("0x{}", "11".repeat(32)),
+            public_key: format!("0x{}", "22".repeat(32)),
+            seed_phrase: "saved recovery phrase remains native".into(),
+            created_at: 1_758_000_000,
+        }
+    }
+
+    #[test]
+    fn onboarding_reuses_saved_identity_even_without_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = saved_identity();
+        let expected = IdentityPublic::from(&identity);
+        let mut store = Store {
+            identity: Some(identity),
+            config: None,
+            data_migration_notice: None,
+        };
+        store.save_to(dir.path()).unwrap();
+        let original_bytes = std::fs::read(dir.path().join("store.json")).unwrap();
+
+        let actual = generate_identity_if_missing(&mut store, dir.path()).unwrap();
+        let repeated = generate_identity_if_missing(&mut store, dir.path()).unwrap();
+        let saved_bytes = std::fs::read(dir.path().join("store.json")).unwrap();
+
+        assert_eq!(actual.address, expected.address);
+        assert_eq!(actual.public_key, expected.public_key);
+        assert_eq!(actual.created_at, expected.created_at);
+        assert_eq!(repeated.address, expected.address);
+        assert_eq!(repeated.public_key, expected.public_key);
+        assert!(store.config.is_none());
+        assert_eq!(saved_bytes, original_bytes);
+        let reopened = Store::load_from(dir.path());
+        let reopened = IdentityPublic::from(reopened.identity.as_ref().unwrap());
+        assert_eq!(reopened.address, expected.address);
+        assert_eq!(reopened.public_key, expected.public_key);
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_requests_persist_and_return_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(Store::default()));
+        let mut requests = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let dir = dir.path().to_path_buf();
+            requests.push(tokio::spawn(async move {
+                let mut store = store.lock().await;
+                generate_identity_if_missing(&mut store, &dir)
+            }));
+        }
+
+        let mut results = Vec::new();
+        for request in requests {
+            results.push(request.await.unwrap().unwrap());
+        }
+        assert!(results
+            .iter()
+            .all(|identity| identity.address == results[0].address));
+        assert!(results
+            .iter()
+            .all(|identity| identity.public_key == results[0].public_key));
+
+        let persisted = Store::load_from(dir.path());
+        let persisted = IdentityPublic::from(persisted.identity.as_ref().unwrap());
+        assert_eq!(persisted.address, results[0].address);
+        assert_eq!(persisted.public_key, results[0].public_key);
+    }
+
+    #[test]
+    fn failed_first_save_retains_the_same_identity_for_a_durable_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"file blocks the app-data directory").unwrap();
+        let mut store = Store::default();
+
+        assert!(generate_identity_if_missing(&mut store, &blocker.join("child")).is_err());
+        let pending = IdentityPublic::from(store.identity.as_ref().unwrap());
+
+        let retry_dir = tempfile::tempdir().unwrap();
+        let retry = generate_identity_if_missing(&mut store, retry_dir.path()).unwrap();
+        let reopened = Store::load_from(retry_dir.path());
+        let reopened = IdentityPublic::from(reopened.identity.as_ref().unwrap());
+
+        assert_eq!(retry.address, pending.address);
+        assert_eq!(retry.public_key, pending.public_key);
+        assert_eq!(reopened.address, pending.address);
+        assert_eq!(reopened.public_key, pending.public_key);
+    }
 }
 
 #[tauri::command]
