@@ -726,3 +726,138 @@ fn a_validator_restarted_past_the_retention_window_rejoins_and_settles_new_work(
         "the restarted node never finished its bootstrap, so ingress stayed closed"
     );
 }
+
+/// A validator down LONGER than its peers' DAG retention rejoins by adopting
+/// an authenticated checkpoint.
+///
+/// History cannot help it: its commit cursor round is pruned everywhere. It
+/// used to verify a checkpoint and then refuse to adopt it because it had
+/// history of its own ("rebasing a durable store onto a checkpoint is not
+/// implemented"), and stay down. Now it adopts one durably (`WalOp::Rebase`,
+/// with the resume round proven from the certified tip header), rebuilds the
+/// DAG from the round after the checkpoint's anchor, and carries on.
+#[test]
+fn a_validator_down_longer_than_retention_rejoins_by_checkpoint() {
+    let fx = Fixture::new(
+        9930,
+        9130,
+        &[
+            "--dag-retained-rounds",
+            "100",
+            "--snapshot-every-blocks",
+            "50",
+        ],
+    );
+    let mut nodes: Vec<NodeProcess> = (0..NODES).map(|i| fx.spawn(i)).collect();
+    wait_for(
+        Duration::from_secs(40),
+        "every node healthy and fully peered",
+        || {
+            nodes.iter().all(|n| {
+                get_json(n.port, "/health")
+                    .and_then(|h| h["peers"].as_u64())
+                    .is_some_and(|p| p >= (NODES - 1) as u64)
+            })
+        },
+    );
+    let ctx = get_json(nodes[0].port, "/native-inference/context").expect("activated");
+    let domain = InferenceDomain {
+        chain_genesis: Hash256::from_hex(ctx["chain_genesis"].as_str().unwrap()).unwrap(),
+        recovery_epoch: ctx["recovery_epoch"].as_u64().unwrap(),
+        validator_set_hash: Hash256::from_hex(ctx["validator_set_hash"].as_str().unwrap()).unwrap(),
+    };
+    let round = |port: u16| {
+        get_json(port, "/health")
+            .and_then(|h| h["dag_round"].as_u64())
+            .unwrap_or(0)
+    };
+    wait_for(
+        Duration::from_secs(300),
+        "the chain to pass 2x the retention window",
+        || round(nodes[0].port) >= 200,
+    );
+
+    let victim = 3;
+    let killed_round = round(nodes[victim].port);
+    {
+        let process = &mut nodes[victim];
+        process.child.kill().unwrap();
+        process.child.wait().unwrap();
+    }
+    // Work while it is down, then let the others run far past its cursor:
+    // more than their retention, so no history can reach it.
+    let (tx, while_down) = fx.request(1, domain, 0, 1_000_000);
+    assert_eq!(submit(nodes[0].port, &tx).0, 200);
+    wait_for(
+        Duration::from_secs(300),
+        "the others to run past the victim's retention",
+        || round(nodes[0].port) >= killed_round + 250,
+    );
+
+    let old = std::mem::replace(&mut nodes[victim], fx.spawn(victim));
+    std::mem::forget(old);
+    let victim_port = nodes[victim].port;
+    wait_for(
+        Duration::from_secs(240),
+        "the restarted validator to catch up",
+        || {
+            let mine = get_json(victim_port, "/health").and_then(|h| h["height"].as_u64());
+            let theirs = get_json(nodes[0].port, "/health").and_then(|h| h["height"].as_u64());
+            matches!((mine, theirs), (Some(m), Some(t)) if m + 10 >= t && m > 0)
+        },
+    );
+    let log = std::fs::read_to_string(nodes[victim].data_dir.join("node.log")).unwrap();
+    assert!(
+        log.contains("Adopted an authenticated checkpoint"),
+        "the restarted validator did not rejoin through a checkpoint"
+    );
+    let common = get_json(victim_port, "/health").unwrap()["height"]
+        .as_u64()
+        .unwrap()
+        - 5;
+    let reference = block_hash(nodes[0].port, common).expect("peer block");
+    for n in &nodes {
+        assert_eq!(
+            block_hash(n.port, common).as_deref(),
+            Some(reference.as_str())
+        );
+    }
+    let all: Vec<&NodeProcess> = nodes.iter().collect();
+    wait_finalized(
+        &all,
+        while_down,
+        Duration::from_secs(120),
+        "work from the downtime settles everywhere",
+    );
+    let (tx, after) = fx.request(1, domain, 1, 1_000_000);
+    wait_for(
+        Duration::from_secs(60),
+        "the rejoined node to accept new work",
+        || submit(victim_port, &tx).0 == 200,
+    );
+    wait_finalized(
+        &all,
+        after,
+        Duration::from_secs(120),
+        "new work through the rejoined node",
+    );
+
+    // And a plain restart afterwards recovers from its own rebased store.
+    {
+        let process = &mut nodes[victim];
+        process.child.kill().unwrap();
+        process.child.wait().unwrap();
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    let old = std::mem::replace(&mut nodes[victim], fx.spawn(victim));
+    std::mem::forget(old);
+    wait_for(
+        Duration::from_secs(120),
+        "the rebased node to restart and catch up",
+        || {
+            let mine = get_json(victim_port, "/health").and_then(|h| h["height"].as_u64());
+            let theirs = get_json(nodes[0].port, "/health").and_then(|h| h["height"].as_u64());
+            matches!((mine, theirs), (Some(m), Some(t)) if m + 10 >= t && m > common)
+        },
+    );
+}

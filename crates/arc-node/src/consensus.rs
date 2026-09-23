@@ -678,6 +678,8 @@ const HISTORY_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// block is direct evidence of exactly what is missing and who has it, so the
 /// request is small and targeted rather than a blind re-sync.
 const TARGETED_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// A peer is served at most one checkpoint per this interval.
+const CHECKPOINT_SERVE_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a node sits at one round, with peers connected, before it concludes
 /// it is behind and asks for history rather than waiting for gossip it can
 /// never accept.
@@ -1388,7 +1390,19 @@ impl ConsensusManager {
         // step in the commit path.
         let mut dag_wal_checkpoints: std::collections::VecDeque<(u64, u64)> =
             std::collections::VecDeque::new();
-        let mut checkpoint_requested = false;
+        // When this node last asked peers for a checkpoint. Asked again at most
+        // once a minute while history stays unproductive: a first request can
+        // find no peer able to serve (its snapshot's anchor already pruned).
+        let mut checkpoint_requested_at: Option<Instant> = None;
+        // The peers the outstanding checkpoint request went to. A response is
+        // considered only while a request is outstanding and only from one of
+        // them: an unsolicited checkpoint must not reset anything.
+        let mut checkpoint_requested_from: std::collections::HashSet<Hash256> =
+            std::collections::HashSet::new();
+        // When each peer was last served a checkpoint. Serving reads and
+        // decodes a whole snapshot, so a peer gets one per interval.
+        let mut checkpoint_served_at: std::collections::HashMap<Hash256, Instant> =
+            std::collections::HashMap::new();
         // When this node last gossiped each absence attestation it has made.
         let mut absence_gossiped_at: std::collections::HashMap<(u64, Hash256), std::time::Instant> =
             std::collections::HashMap::new();
@@ -2616,8 +2630,14 @@ impl ConsensusManager {
                     self.engine.close_restart_base_round();
                     self.engine.set_dag_bootstrapping(false);
                     info!(round = next, "DAG bootstrap complete");
+                    // History recovered this node: any checkpoint request is
+                    // over, and a late answer to it must not be adopted.
+                    checkpoint_requested_at = None;
+                    checkpoint_requested_from.clear();
                 } else if next > mark {
                     bootstrap_watermark = Some(next);
+                    checkpoint_requested_at = None;
+                    checkpoint_requested_from.clear();
                 }
             }
 
@@ -2683,6 +2703,13 @@ impl ConsensusManager {
                             // here escalated to a checkpoint about two seconds
                             // after any restart.
                             bootstrap_watermark = Some(next);
+                            if next > mark {
+                                // History made progress: any checkpoint
+                                // request is over, and a late answer to it
+                                // must not be adopted mid-recovery.
+                                checkpoint_requested_at = None;
+                                checkpoint_requested_from.clear();
+                            }
                             if next >= now_round {
                                 // Caught up with the round cursor; from here on
                                 // this node is an ordinary lagging peer, and
@@ -2691,6 +2718,8 @@ impl ConsensusManager {
                                 self.engine.close_restart_base_round();
                                 self.engine.set_dag_bootstrapping(false);
                                 info!(round = next, "DAG bootstrap complete");
+                                checkpoint_requested_at = None;
+                                checkpoint_requested_from.clear();
                             }
                             next
                         }
@@ -2786,9 +2815,11 @@ impl ConsensusManager {
                 // state while self-authenticating history was still available,
                 // and adopting state is the strictly stronger trust decision.
                 if unproductive_bootstrap_requests >= UNPRODUCTIVE_REQUESTS_BEFORE_CHECKPOINT
-                    && !checkpoint_requested
+                    && checkpoint_requested_at
+                        .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
                 {
-                    checkpoint_requested = true;
+                    checkpoint_requested_at = Some(Instant::now());
+                    checkpoint_requested_from.clear();
                     let needed_below_height = state.height();
                     warn!(
                         attempts = unproductive_bootstrap_requests,
@@ -2800,11 +2831,15 @@ impl ConsensusManager {
                         if !generation.connected {
                             continue;
                         }
-                        if let Some(ref tx_chan) = outbound_tx {
-                            let _ = tx_chan.try_send(OutboundMessage::SendCheckpointRequest {
-                                target: *peer,
-                                needed_below_height,
-                            });
+                        if let Some(ref tx_chan) = outbound_tx
+                            && tx_chan
+                                .try_send(OutboundMessage::SendCheckpointRequest {
+                                    target: *peer,
+                                    needed_below_height,
+                                })
+                                .is_ok()
+                        {
+                            checkpoint_requested_from.insert(*peer);
                         }
                     }
                 }
@@ -3006,6 +3041,15 @@ impl ConsensusManager {
             // committee and chain domain, and only for bytes that hash to the
             // digest that certificate authorises.
             for (source, needed_below_height) in inbound_checkpoint_requests {
+                if checkpoint_served_at
+                    .get(&source)
+                    .is_some_and(|at| at.elapsed() < CHECKPOINT_SERVE_INTERVAL)
+                {
+                    debug!(%source, "Not serving a checkpoint again so soon");
+                    continue;
+                }
+                checkpoint_served_at.retain(|_, at| at.elapsed() < CHECKPOINT_SERVE_INTERVAL);
+                checkpoint_served_at.insert(source, Instant::now());
                 let Some(dir) = state.persistence_dir() else {
                     warn!(%source, "Cannot serve a checkpoint: this node has no durable state");
                     continue;
@@ -3044,6 +3088,28 @@ impl ConsensusManager {
                         continue;
                     }
                 };
+                // Where a node adopting this resumes: the anchor that produced
+                // the block at this height, found from that block's header in
+                // the retained DAG. The receiver checks it against the certified
+                // header, so an old snapshot whose anchor was pruned is simply
+                // not served.
+                let anchor = self
+                    .engine
+                    .consensus_domain()
+                    .or_else(|| self.engine.certificate_domain())
+                    .zip(state.get_block(height))
+                    .and_then(|(domain, tip)| {
+                        self.engine
+                            .find_committed_anchor(&tip.header.proof_hash, &domain)
+                    });
+                let Some((anchor_hash, anchor_round)) = anchor else {
+                    warn!(
+                        %source, height,
+                        "Cannot serve a checkpoint: the anchor behind its height is no longer in \
+                         the retained DAG"
+                    );
+                    continue;
+                };
                 let envelope = arc_consensus::view_change::CheckpointEnvelope {
                     certificate,
                     snapshot: arc_consensus::view_change::SnapshotIdentity {
@@ -3051,6 +3117,8 @@ impl ConsensusManager {
                         state_root: snapshot.manifest.identity.state_root,
                         digest: snapshot.manifest.identity.digest,
                     },
+                    anchor_hash,
+                    anchor_round,
                 };
                 info!(
                     %source, height, needed_below_height, bytes = payload.len(),
@@ -3066,6 +3134,14 @@ impl ConsensusManager {
             }
 
             for (source, envelope, payload) in inbound_checkpoints {
+                // Only an answer to this node's own outstanding request, from
+                // a peer it asked. The request itself is sent only after
+                // history bootstrap proved unproductive.
+                // One answer per asked peer per request, whatever its outcome.
+                if checkpoint_requested_at.is_none() || !checkpoint_requested_from.remove(&source) {
+                    warn!(%source, "Ignoring an unsolicited checkpoint; nothing was installed");
+                    continue;
+                }
                 // Nothing below touches the payload until the envelope has
                 // been verified against THIS node's committee and domain.
                 let Some(domain) = self.engine.certificate_domain() else {
@@ -3092,78 +3168,131 @@ impl ConsensusManager {
                     );
                     continue;
                 }
-                let Ok(decoded) = arc_state::snapshot::SnapshotPayload::decode(&payload) else {
+                let Ok(decoded) = arc_state::snapshot::SnapshotPayload::decode_from_peer(&payload)
+                else {
                     warn!(
                         %source,
-                        "A certified checkpoint payload would not decode; nothing was installed"
+                        "A certified checkpoint payload would not decode within bounds; nothing \
+                         was installed"
                     );
                     continue;
                 };
-                // The certified root authenticates only what it commits to.
-                // On an account-only-root chain the rest of the payload would
-                // be the serving peer's word, so it is not installed at all.
-                if let Err(reason) =
-                    decoded.root_covers_everything_under(state.recovery_context().as_ref())
-                {
-                    warn!(%source, reason, "REFUSED a certified checkpoint; nothing was installed");
+                // Where does consensus resume? The certified block at the
+                // checkpoint height is the payload's tip; its header carries the
+                // decision commitment of the anchor that produced it, which the
+                // envelope's declared anchor must reproduce. A wrong resume
+                // round is a fork, so it is never taken on the server's word.
+                let Some((tip_height, tip)) = decoded.blocks.last().cloned() else {
+                    warn!(%source, "REFUSED a checkpoint that carries no tip block");
+                    continue;
+                };
+                let Some(resume_domain) = self
+                    .engine
+                    .consensus_domain()
+                    .or_else(|| self.engine.certificate_domain())
+                else {
+                    warn!(%source, "Cannot adopt a checkpoint without a decision domain");
+                    continue;
+                };
+                let cursor = match envelope.verify_resume_point(&tip, &resume_domain) {
+                    Ok(cursor) if tip_height == envelope.snapshot.height => cursor,
+                    Ok(_) => {
+                        warn!(%source, "REFUSED a checkpoint whose tip is not at its height");
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(%source, %error, "REFUSED a checkpoint's resume point; nothing was installed");
+                        continue;
+                    }
+                };
+                // Only what the certificate covers is adopted: the window is
+                // re-hashed block by block from the tip, unbound receipts and
+                // logs are dropped, and every domain the root does not cover
+                // must already be this node's own.
+                let adopted = match state.plan_checkpoint_adoption(&decoded, &tip) {
+                    Ok(adopted) => adopted,
+                    Err(error) => {
+                        warn!(%source, %error, "REFUSED a checkpoint; nothing was installed");
+                        continue;
+                    }
+                };
+                // Ask the engine BEFORE writing anything: a checkpoint it would
+                // refuse must never reach the WAL.
+                if let Err(error) = self.engine.check_rebase(envelope.anchor_round) {
+                    warn!(%source, %error, "REFUSED a checkpoint the engine cannot resume from");
                     continue;
                 }
 
-                // Verify in a SCRATCH state first. An envelope can be
-                // internally consistent - right committee, right chain, right
-                // digest - and still name a root its payload does not produce.
-                // Installing into the live state to find that out would leave
-                // this node inconsistent at the moment it discovered the
-                // problem, so the check happens somewhere disposable.
-                let scratch = arc_state::StateDB::with_genesis(&[]);
-                scratch.install_durable_snapshot(&decoded);
-                let produced = scratch.get_state_root();
-                if produced != envelope.snapshot.state_root {
-                    error!(
-                        %source,
-                        expected = %envelope.snapshot.state_root,
-                        produced = %produced,
-                        "REFUSED a certified checkpoint: its payload does not produce the state \
-                         root the committee signed. Nothing was installed."
-                    );
-                    continue;
-                }
-
-                // Adopting is safe only where there is no canonical history to
-                // destroy. A node that already has one would need its durable
-                // WAL rebased onto the checkpoint, which is the production
-                // recovery path's job and is NOT done here - merging a peer's
-                // state into an existing one produces neither state.
-                if state.height() > 0 {
-                    warn!(
-                        %source,
-                        height = envelope.snapshot.height,
-                        local_height = state.height(),
-                        "Verified an authenticated checkpoint but did NOT install it: this node \
-                         already has canonical history, and rebasing a durable store onto a \
-                         checkpoint is not implemented. Recover it through the production \
-                         checkpoint path instead."
-                    );
-                    continue;
-                }
-
-                state.install_durable_snapshot(&decoded);
-                let installed = state.get_state_root();
-                if installed == envelope.snapshot.state_root {
-                    info!(
-                        %source,
-                        height = envelope.snapshot.height,
-                        "Installed an authenticated state checkpoint into an empty node"
-                    );
-                } else {
-                    error!(
-                        %source,
-                        expected = %envelope.snapshot.state_root,
-                        found = %installed,
-                        "A checkpoint that verified in isolation did not reproduce its root in \
-                         this node; restart from the durable store"
+                // Adopt: durably first (the state record carries the resume
+                // round, so a crash anywhere after it restarts at the right
+                // cursor), then the commit record, then the engine. Once the
+                // record is written, any failure is fatal: a restart recovers
+                // from the record, whereas carrying on would leave the state
+                // and the consensus cursor apart.
+                if let Err(error) = state.rebase_onto_checkpoint(
+                    &adopted,
+                    &tip,
+                    envelope.anchor_hash,
+                    envelope.anchor_round,
+                ) {
+                    if state.height() < envelope.snapshot.height {
+                        error!(%source, %error, "Could not adopt a verified checkpoint; nothing moved");
+                        continue;
+                    }
+                    panic!(
+                        "a checkpoint was written to the WAL but could not be completed ({error}); \
+                         restart to recover from the durable record"
                     );
                 }
+                let persisted = match skip_tracker.as_mut() {
+                    Some(tracker) => {
+                        tracker.note_durable_commit_round(envelope.anchor_round);
+                        self.persist_signing_record(tracker.record())
+                    }
+                    None => {
+                        let mut record = self.load_signing_record();
+                        if record
+                            .last_applied_round
+                            .is_none_or(|applied| envelope.anchor_round > applied)
+                        {
+                            record.last_applied_round = Some(envelope.anchor_round);
+                        }
+                        self.persist_signing_record(&record)
+                    }
+                };
+                if !persisted && self.signing_record_path.is_some() {
+                    panic!(
+                        "an adopted checkpoint's commit record could not be persisted; restart \
+                         to recover from the durable state record"
+                    );
+                }
+                if let Err(error) = self.engine.rebase_to(envelope.anchor_round) {
+                    panic!(
+                        "the engine refused a rebase it had accepted ({error}); restart to recover \
+                         from the durable state record"
+                    );
+                }
+                commit_backlog.clear();
+                pending_blocks = arc_consensus::pending::PendingBlocks::new();
+                bootstrap_watermark = Some(cursor);
+                self.engine.set_dag_bootstrapping(true);
+                checkpoint_requested_at = None;
+                checkpoint_requested_from.clear();
+                unproductive_bootstrap_requests = 0;
+                last_bootstrap_request = None;
+                last_round_change = std::time::Instant::now()
+                    .checked_sub(HISTORY_STUCK_AFTER)
+                    .unwrap_or_else(std::time::Instant::now);
+                if let Err(error) = state.publish_durable_snapshot() {
+                    warn!(%error, "Adopted a checkpoint; publishing a fresh snapshot failed");
+                }
+                info!(
+                    %source,
+                    height = envelope.snapshot.height,
+                    anchor_round = envelope.anchor_round,
+                    resume_round = cursor,
+                    "Adopted an authenticated checkpoint; rebuilding the DAG from its resume round"
+                );
             }
 
             phase_mark = crate::consensus_diagnostics::phase(

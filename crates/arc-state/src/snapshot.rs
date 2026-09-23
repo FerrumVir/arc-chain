@@ -87,6 +87,9 @@ pub struct SnapshotManifestV1 {
     pub block_hash: Hash256,
 }
 
+/// The largest checkpoint payload a peer may send: the transport's frame cap.
+pub const MAX_PEER_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 /// Every piece of state that `apply_wal_op` reconstructs. Anything replay does
 /// not write is deliberately absent: including it would make the snapshot and
 /// a full replay disagree, which is the one thing that must not happen.
@@ -117,30 +120,6 @@ pub struct SnapshotPayload {
 }
 
 impl SnapshotPayload {
-    /// Whether a certified state root over this payload authenticates
-    /// everything in it, on a chain whose own recovery context is `local`.
-    ///
-    /// Only the recovery state root commits to every consensus domain
-    /// (accounts, storage, contracts, identities, validators, staking). On a
-    /// chain without a recovery context the root is the legacy account-only
-    /// Merkle root, so the rest of a checkpoint would be taken on the
-    /// serving peer's word. A payload from a different recovery context is
-    /// another chain's state. Both are refused; see
-    /// docs/design/checkpoint-rejoin.md.
-    pub fn root_covers_everything_under(
-        &self,
-        local: Option<&RecoveryContext>,
-    ) -> Result<(), &'static str> {
-        match (local, self.recovery_context.as_ref()) {
-            (None, _) => Err(
-                "this chain's state root commits to accounts only; a checkpoint cannot \
-                 authenticate its other domains",
-            ),
-            (Some(local), Some(payload)) if local == payload => Ok(()),
-            (Some(_), _) => Err("the checkpoint belongs to a different recovery context"),
-        }
-    }
-
     /// Put every collection in key order. Called before encoding so two nodes
     /// holding the same state produce the same bytes and the same digest.
     pub fn canonicalize(&mut self) {
@@ -167,6 +146,21 @@ impl SnapshotPayload {
         bytes.extend_from_slice(&bincode::serialize(self).expect("payload is serialisable"));
         let digest = hash_bytes(&bytes);
         (bytes, digest)
+    }
+
+    /// Decode a payload received from a peer: bounded by the transport's
+    /// frame cap and refusing trailing bytes. `decode` reads this node's own
+    /// snapshot file and is not bounded this way.
+    pub fn decode_from_peer(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let rest = bytes
+            .strip_prefix(SNAPSHOT_MAGIC)
+            .ok_or(SnapshotError::NotASnapshot)?;
+        let (version, body) = rest.split_first().ok_or(SnapshotError::Truncated)?;
+        if *version != SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnknownVersion(*version));
+        }
+        bincode::deserialize_limited_exact::<Self, MAX_PEER_PAYLOAD_BYTES>(body)
+            .map_err(|error| SnapshotError::Malformed(error.to_string()))
     }
 
     /// Decode a payload file body. The digest is checked by the caller against
@@ -363,27 +357,6 @@ mod tests {
             staking_pool: 7,
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn only_a_full_domain_root_under_the_same_context_authenticates_a_checkpoint() {
-        let context = RecoveryContext::new("test", hash_bytes(b"genesis"), 1, 1);
-        let other = RecoveryContext::new("test", hash_bytes(b"genesis"), 2, 1);
-        let mut payload = payload_at(10);
-        // Account-only root: refused whatever the payload claims.
-        assert!(payload.root_covers_everything_under(None).is_err());
-        payload.recovery_context = Some(context.clone());
-        assert!(payload.root_covers_everything_under(None).is_err());
-        // Full-domain root, same context: authenticated.
-        assert!(payload.root_covers_everything_under(Some(&context)).is_ok());
-        // Another context, or none in the payload: refused.
-        assert!(payload.root_covers_everything_under(Some(&other)).is_err());
-        payload.recovery_context = None;
-        assert!(
-            payload
-                .root_covers_everything_under(Some(&context))
-                .is_err()
-        );
     }
 
     #[test]

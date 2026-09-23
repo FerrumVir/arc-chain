@@ -2465,6 +2465,12 @@ pub struct NativeActivationRequest {
     pub recovery_epoch: u64,
     #[serde(default)]
     pub expect: Option<ActivationExpectations>,
+    /// Commit-time selection rule (decision D20), fixed for the chain's life.
+    /// Absent: a new activation uses `skip-used-nonces-v2`, and a restart
+    /// resumes whatever the chain was activated with (chains from before D20
+    /// resume `count-every-candidate-v1`). Stated: it must match on restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_rule: Option<arc_state::NativeSelectionRule>,
 }
 
 /// Parse an operator activation request from JSON.
@@ -2548,6 +2554,9 @@ pub fn assemble_activation_context(
         },
         members,
         allowed_executions: request.allowed_executions.clone(),
+        selection_rule: request
+            .selection_rule
+            .unwrap_or(arc_state::NativeSelectionRule::SkipUsedNoncesV2),
     };
     context
         .commitment()
@@ -2627,6 +2636,15 @@ fn resume_persisted_activation(
             "recovery_epoch",
             persisted.domain.recovery_epoch.to_string(),
             request.recovery_epoch.to_string(),
+        ));
+    }
+    if let Some(rule) = request.selection_rule
+        && rule != persisted.selection_rule
+    {
+        return Err(mismatch(
+            "selection_rule",
+            persisted.selection_rule.as_str().to_string(),
+            rule.as_str().to_string(),
         ));
     }
     if request.allowed_executions != persisted.allowed_executions {
@@ -3204,6 +3222,7 @@ mod tests {
                 generation_hash: marker,
                 assignment_hash: marker,
             }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
         };
         let mut prefunded = vec![(requester.address(), 1_000), (finalizer.address(), 0)];
         prefunded.extend(members.iter().map(|member| (member.address, 0)));
@@ -3329,6 +3348,7 @@ mod tests {
                 chain_genesis: Some(hash_bytes(b"pin")),
                 ..Default::default()
             }),
+            selection_rule: None,
         };
         write_request(&path, &req);
         let raw = fs::read_to_string(&path).unwrap();
@@ -3365,6 +3385,7 @@ mod tests {
                 allowed_executions: vec![marker()],
                 recovery_epoch: 0,
                 expect: None,
+                selection_rule: None,
             },
         );
 
@@ -3409,6 +3430,7 @@ mod tests {
                     chain_genesis: Some(hash_bytes(b"a genesis this node does not have")),
                     ..Default::default()
                 }),
+                selection_rule: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3434,6 +3456,7 @@ mod tests {
                 allowed_executions: vec![],
                 recovery_epoch: 0,
                 expect: None,
+                selection_rule: None,
             },
         );
         assert!(
@@ -3459,6 +3482,7 @@ mod tests {
                 allowed_executions: vec![marker()],
                 recovery_epoch: 0,
                 expect: None,
+                selection_rule: None,
             },
         );
         assert!(matches!(
@@ -3482,6 +3506,7 @@ mod tests {
                 allowed_executions: vec![marker()],
                 recovery_epoch: 0,
                 expect: None,
+                selection_rule: None,
             },
         );
 
@@ -3513,6 +3538,7 @@ mod tests {
             allowed_executions: vec![marker()],
             recovery_epoch: 0,
             expect: None,
+            selection_rule: None,
         };
         write_request(&path, &original);
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3533,6 +3559,7 @@ mod tests {
                 }],
                 recovery_epoch: 0,
                 expect: None,
+                selection_rule: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3552,6 +3579,7 @@ mod tests {
                     chain_genesis: Some(hash_bytes(b"not this chain")),
                     ..Default::default()
                 }),
+                selection_rule: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3560,6 +3588,68 @@ mod tests {
             }
             other => panic!("expected ReconfigurationRejected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_selection_rule_is_fixed_at_activation_and_resumed_unchanged() {
+        // A chain activated with rule v1 (as every chain before D20 was).
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        let v1 = NativeActivationRequest {
+            allowed_executions: vec![marker()],
+            recovery_epoch: 0,
+            expect: None,
+            selection_rule: Some(arc_state::NativeSelectionRule::CountEveryCandidateV1),
+        };
+        write_request(&path, &v1);
+        activate_native_inference_from_config(&state, &path).expect("fresh activation");
+        assert_eq!(
+            state.native_inference_context().unwrap().selection_rule,
+            arc_state::NativeSelectionRule::CountEveryCandidateV1
+        );
+        // An unchanged config that does not mention the rule resumes it.
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                selection_rule: None,
+                ..v1.clone()
+            },
+        );
+        activate_native_inference_from_config(&state, &path).expect("resume keeps rule v1");
+        // Asking for another rule is a reconfiguration, refused.
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                selection_rule: Some(arc_state::NativeSelectionRule::SkipUsedNoncesV2),
+                ..v1
+            },
+        );
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::ReconfigurationRejected { field, .. }) => {
+                assert_eq!(field, "selection_rule");
+            }
+            other => panic!("expected ReconfigurationRejected, got {other:?}"),
+        }
+
+        // A new activation that does not mention the rule gets v2.
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let (fresh, _) = activatable_state(&fresh_dir.path().join("state"));
+        let fresh_path = fresh_dir.path().join("activation.json");
+        write_request(
+            &fresh_path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 0,
+                expect: None,
+                selection_rule: None,
+            },
+        );
+        activate_native_inference_from_config(&fresh, &fresh_path).expect("fresh activation");
+        assert_eq!(
+            fresh.native_inference_context().unwrap().selection_rule,
+            arc_state::NativeSelectionRule::SkipUsedNoncesV2
+        );
     }
 
     #[test]
@@ -3589,6 +3679,7 @@ mod tests {
                 allowed_executions: vec![marker()],
                 recovery_epoch: 0,
                 expect: None,
+                selection_rule: None,
             },
         );
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3650,6 +3741,7 @@ mod tests {
                 allowed_executions: vec![marker()],
                 recovery_epoch: 0,
                 expect: None,
+                selection_rule: None,
             },
         );
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3710,6 +3802,7 @@ mod tests {
                 allowed_executions: vec![marker()],
                 recovery_epoch: 0,
                 expect: None,
+                selection_rule: None,
             },
         );
         assert!(state.refuse_registry_change_under_native_binding().is_ok());
@@ -3736,6 +3829,7 @@ mod tests {
                 allowed_executions: vec![marker()],
                 recovery_epoch: 0,
                 expect: None,
+                selection_rule: None,
             },
         );
         // Advance the chain with an empty block; there is deliberately no

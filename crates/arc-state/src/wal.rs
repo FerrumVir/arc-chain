@@ -551,6 +551,32 @@ pub enum WalOp {
     /// bincode enum discriminants remain unchanged. The state adapter writes
     /// this record before publishing replacements to in-memory state.
     InferenceTransition(InferenceTransitionRecord),
+    /// Adopt a certified checkpoint: replace the state with the record's and
+    /// continue the chain from its tip. Last, so every older discriminant is
+    /// unchanged; a binary that predates it cannot decode a rebased WAL and
+    /// refuses to replay it - the intended fail-closed result.
+    Rebase(Box<RebaseRecord>),
+}
+
+/// A certified checkpoint this node adopted (see `StateDB::rebase_onto_checkpoint`).
+///
+/// `state` is the checkpoint's snapshot payload - the state plus its recent
+/// history window - and `tip` the block at `height`, whose header binds the
+/// state root the committee certified. Replay installs it; WAL validation
+/// restarts block contiguity and parent linkage from `tip`.
+///
+/// It also carries the DAG anchor that produced `tip`. The commit cursor a
+/// node resumes from after adopting is `anchor_round + 1`, and it must be
+/// durable in the SAME record as the state: written separately, a crash
+/// between the two would restart the node on the new state with its old
+/// cursor, and it would re-apply old anchors as new heights.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RebaseRecord {
+    pub height: u64,
+    pub tip: Block,
+    pub state: crate::snapshot::SnapshotPayload,
+    pub anchor_hash: Hash256,
+    pub anchor_round: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

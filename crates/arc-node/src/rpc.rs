@@ -3188,6 +3188,8 @@ async fn native_inference_context(
             "assignment_hash": execution.assignment_hash.to_hex(),
         })).collect::<Vec<_>>(),
         "contract_version": arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+        // Commit-time selection rule fixed at activation (decision D20).
+        "selection_rule": context.selection_rule.as_str(),
         "height": node.state.height(),
         "limits": {
             "max_tokens": arc_types::transaction::TIER1_MAX_TOKENS,
@@ -23290,6 +23292,7 @@ mod tests {
                 generation_hash: tuple,
                 assignment_hash: tuple,
             }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
         };
         let mut prefunded = vec![(requester.address(), 1_000)];
         prefunded.extend(members.iter().map(|member| (member.address, 0)));

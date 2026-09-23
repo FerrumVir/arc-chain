@@ -7889,7 +7889,17 @@ async fn run_arc_node() -> Result<()> {
             // Preserve the segmented WAL compatibility path only for legacy
             // pre-recovery networks. Protocol-v3 startup above cannot reach it.
             let dag_wal_path = Path::new(&data_dir).join("dag-wal");
-            let recovered_round = restore_legacy_dag_wal_and_read_round(&dag_wal_path)?;
+            let dag_wal_round = restore_legacy_dag_wal_and_read_round(&dag_wal_path)?;
+            // An adopted checkpoint is durable in the STATE, with its anchor
+            // round, before anything else moves; the commit record and the DAG
+            // WAL may predate it (a crash right after adopting). Resuming
+            // below the round after that anchor would re-apply old anchors as
+            // new heights, so it bounds both cursors from below.
+            let rebase_cursor = state
+                .rebase_anchor_round()
+                .map(|round| round.saturating_add(1))
+                .unwrap_or(0);
+            let recovered_round = dag_wal_round.max(rebase_cursor);
             if recovered_round > 0 {
                 // The highest WAL round does not prove that any earlier leader
                 // was committed, so the cursor is NOT taken from it. It comes
@@ -7916,7 +7926,7 @@ async fn run_arc_node() -> Result<()> {
                         next_round_to_scan = next,
                         "Local commit record read"
                     );
-                    next.min(recovered_round)
+                    next.max(rebase_cursor).min(recovered_round)
                 };
                 consensus
                     .engine

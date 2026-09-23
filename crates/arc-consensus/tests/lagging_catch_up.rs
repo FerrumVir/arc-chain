@@ -553,3 +553,78 @@ fn a_base_round_block_nothing_in_the_next_round_supports_is_not_imported() {
     assert!(fresh.import_history(&[fabricated], u64::MAX).is_err());
     assert!(fresh.dag_is_empty());
 }
+
+#[test]
+fn rebasing_to_a_checkpoint_clears_the_dag_and_resumes_after_its_anchor() {
+    let (set, keys) = committee();
+    let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
+    let mut ts = 1_700_000_000_000u64;
+    let mut committed = vec![Vec::new(); 4];
+    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 20, &mut ts, &mut committed);
+    let reached = e[3].current_round();
+    assert!(!e[3].dag_is_empty());
+
+    // Adopt a checkpoint whose anchor is far ahead of this node.
+    let cursor = e[3].rebase_to(500).expect("rebase");
+    assert_eq!(cursor, 501);
+    assert!(e[3].dag_is_empty(), "nothing below the checkpoint is kept");
+    assert_eq!(e[3].last_committed_round(), 501);
+    assert!(e[3].current_round() >= 501);
+    assert_eq!(
+        e[3].restart_base_round(),
+        Some(501),
+        "the DAG is rebuilt from the resume round"
+    );
+    assert!(reached < 501);
+
+    // A backward (or no-op) move is refused before anything changes, and the
+    // node asks first (`check_rebase`) so it never writes a checkpoint the
+    // engine would then refuse.
+    let behind = engine(&set, &keys[3]);
+    behind.restore_round_from_local_wal(reached, reached - 2);
+    assert!(behind.check_rebase(3).is_err());
+    assert!(behind.rebase_to(3).is_err());
+    assert_eq!(behind.last_committed_round(), reached - 2, "nothing moved");
+    assert!(behind.check_rebase(reached).is_ok());
+
+    // A forward rebase whose cursor is still below the round this node had
+    // reached keeps the proposal floor: it may have signed blocks there.
+    let fresh = engine(&set, &keys[3]);
+    fresh.restore_round_from_local_wal(reached, 2);
+    fresh
+        .rebase_to(reached - 3)
+        .expect("forward in the commit cursor, below the reached round");
+    assert!(matches!(
+        fresh.propose_block(vec![], ts + 1),
+        Err(arc_consensus::ConsensusError::DuplicateBlock)
+    ));
+}
+
+#[test]
+fn a_live_engine_never_re_signs_its_round_after_a_rebase() {
+    // Unlike the restart case above, nothing here was restored from a WAL:
+    // only `rebase_to` itself can stop this engine from signing a second
+    // block at a round it signed before the rebase cleared its DAG.
+    let (set, keys) = committee();
+    let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
+    let mut ts = 1_700_000_000_000u64;
+    let mut committed = vec![Vec::new(); 4];
+    run_committing(&[&e[0], &e[1], &e[2], &e[3]], 12, &mut ts, &mut committed);
+    ts += 1;
+    e[3].propose_block(vec![], ts)
+        .expect("signs its block at the reached round");
+    let reached = e[3].current_round();
+    let committed_round = e[3].last_committed_round();
+    assert!(
+        committed_round + 1 < reached,
+        "a resume round between the commit cursor and the reached round exists"
+    );
+    let cursor = e[3].rebase_to(committed_round).expect("a forward rebase");
+    assert!(cursor < reached);
+    assert_eq!(e[3].current_round(), reached);
+    ts += 1;
+    assert!(matches!(
+        e[3].propose_block(vec![], ts),
+        Err(arc_consensus::ConsensusError::DuplicateBlock)
+    ));
+}

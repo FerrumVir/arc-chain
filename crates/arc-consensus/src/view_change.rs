@@ -1983,6 +1983,10 @@ pub enum CheckpointError {
     StateRootMismatch { expected: Hash256, found: Hash256 },
     #[error("snapshot declares height {found}, certificate authorises {expected}")]
     HeightMismatch { expected: u64, found: u64 },
+    #[error("the checkpoint's tip block is not the certified block at its height")]
+    TipMismatch,
+    #[error("the declared anchor does not match the decision commitment in the certified header")]
+    AnchorMismatch,
 }
 
 /// What a snapshot must say about itself for a checkpoint to authorise it.
@@ -2010,6 +2014,12 @@ pub struct SnapshotIdentity {
 pub struct CheckpointEnvelope {
     pub certificate: FinalityCertificate,
     pub snapshot: SnapshotIdentity,
+    /// The DAG anchor whose commit produced the certified block, and its
+    /// round: where a node adopting this checkpoint resumes consensus. Not
+    /// trusted as sent - `verify_resume_point` checks it against the
+    /// decision commitment in the certified header.
+    pub anchor_hash: Hash256,
+    pub anchor_round: u64,
 }
 
 impl CheckpointEnvelope {
@@ -2037,6 +2047,34 @@ impl CheckpointEnvelope {
         Ok(signing)
     }
 
+    /// The commit cursor a node adopting this checkpoint resumes from, once
+    /// proven: `tip` must be the certified block (its hash is the
+    /// certificate's, and it hashes to itself), and the declared anchor must
+    /// reproduce the decision commitment its header carries. A wrong resume
+    /// round would be a fork - the next anchor committed would become the
+    /// next height whether or not peers made it that height - so it is never
+    /// taken on the server's word.
+    pub fn verify_resume_point(
+        &self,
+        tip: &arc_types::Block,
+        domain: &ConsensusDomain,
+    ) -> Result<u64, CheckpointError> {
+        if tip.hash != self.certificate.block_hash
+            || tip.header.height != self.certificate.height
+            || arc_types::Block::compute_hash(&tip.header) != tip.hash
+        {
+            return Err(CheckpointError::TipMismatch);
+        }
+        let commitment =
+            crate::DagBlock::decision_commitment(domain, &self.anchor_hash, self.anchor_round);
+        if commitment != tip.header.proof_hash {
+            return Err(CheckpointError::AnchorMismatch);
+        }
+        self.anchor_round
+            .checked_add(1)
+            .ok_or(CheckpointError::AnchorMismatch)
+    }
+
     /// Verify the envelope AND that these bytes are the payload it authorises.
     ///
     /// The caller must not touch the payload before this returns `Ok`.
@@ -2062,6 +2100,67 @@ impl CheckpointEnvelope {
 mod checkpoint_tests {
     use super::*;
     use crate::{STAKE_ARC, Validator};
+
+    /// A tip block at `height` whose header commits to (anchor, round).
+    fn committed_tip(height: u64, anchor: Hash256, round: u64) -> arc_types::Block {
+        let mut tip = arc_types::Block::genesis();
+        tip.header.height = height;
+        tip.header.proof_hash = crate::DagBlock::decision_commitment(&domain(), &anchor, round);
+        tip.hash = arc_types::Block::compute_hash(&tip.header);
+        tip
+    }
+
+    #[test]
+    fn a_checkpoint_resume_point_is_proven_from_the_certified_header() {
+        let anchor = hash_bytes(b"anchor");
+        let tip = committed_tip(900, anchor, 4_000);
+        let mut envelope = CheckpointEnvelope {
+            certificate: FinalityCertificate {
+                domain: domain(),
+                validator_set_hash: Hash256::ZERO,
+                height: 900,
+                block_hash: tip.hash,
+                state_root: Hash256::ZERO,
+                tx_root: Hash256::ZERO,
+                votes: vec![],
+            },
+            snapshot: SnapshotIdentity {
+                height: 900,
+                state_root: Hash256::ZERO,
+                digest: Hash256::ZERO,
+            },
+            anchor_hash: anchor,
+            anchor_round: 4_000,
+        };
+        assert_eq!(envelope.verify_resume_point(&tip, &domain()), Ok(4_001));
+
+        // A server lying about the round, or the anchor, is caught.
+        envelope.anchor_round = 3_999;
+        assert_eq!(
+            envelope.verify_resume_point(&tip, &domain()),
+            Err(CheckpointError::AnchorMismatch)
+        );
+        envelope.anchor_round = 4_000;
+        envelope.anchor_hash = hash_bytes(b"another anchor");
+        assert_eq!(
+            envelope.verify_resume_point(&tip, &domain()),
+            Err(CheckpointError::AnchorMismatch)
+        );
+        envelope.anchor_hash = anchor;
+
+        // A tip that is not the certified block proves nothing.
+        let other = committed_tip(900, anchor, 4_001);
+        assert_eq!(
+            envelope.verify_resume_point(&other, &domain()),
+            Err(CheckpointError::TipMismatch)
+        );
+        let mut tampered = tip.clone();
+        tampered.header.timestamp += 1; // hash no longer matches its header
+        assert_eq!(
+            envelope.verify_resume_point(&tampered, &domain()),
+            Err(CheckpointError::TipMismatch)
+        );
+    }
 
     fn domain() -> ConsensusDomain {
         ConsensusDomain::new(hash_bytes(b"arc.checkpoint.test"), 1, 1)
@@ -2114,6 +2213,8 @@ mod checkpoint_tests {
                 state_root,
                 digest: hash_bytes(payload),
             },
+            anchor_hash: Hash256::ZERO,
+            anchor_round: 0,
         }
     }
 
