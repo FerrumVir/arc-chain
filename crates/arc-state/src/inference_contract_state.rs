@@ -882,6 +882,93 @@ impl StateDB {
         })
     }
 
+    /// Authorise a binding update for a coordinated height. Every validator
+    /// is given the identical instruction, and each applies it in the block
+    /// that reaches that height - the same rule activation follows, and for
+    /// the same reason: publishing a binding writes state.
+    pub fn authorize_binding_update(
+        &self,
+        at_height: u64,
+        replacing: Hash256,
+        context: InferenceAdmissionContext,
+    ) -> Result<(), StateError> {
+        let Some(current) = self.native_inference_context() else {
+            return Err(StateError::ExecutionError(
+                "there is no active inference binding to update; activate one first".into(),
+            ));
+        };
+        let current_commitment = current.commitment()?;
+        if replacing != current_commitment {
+            return Err(StateError::ExecutionError(format!(
+                "this update replaces binding {}, but the binding in force is {}",
+                replacing.to_hex(),
+                current_commitment.to_hex()
+            )));
+        }
+        if context.domain.chain_genesis != current.domain.chain_genesis {
+            return Err(StateError::ExecutionError(
+                "a binding update cannot move the chain the binding is bound to".into(),
+            ));
+        }
+        if context.selection_rule != current.selection_rule {
+            return Err(StateError::ExecutionError(
+                "the commit-time selection rule is fixed for the chain's life; a binding update \
+                 cannot change it"
+                    .into(),
+            ));
+        }
+        if at_height <= self.height() {
+            return Err(StateError::ExecutionError(format!(
+                "a binding update is coordinated at height {at_height}, which this chain has \
+                 already passed (now at {}); publishing it here would diverge from every other \
+                 validator",
+                self.height()
+            )));
+        }
+        *self.pending_binding_update.write() = Some((at_height, replacing, context));
+        Ok(())
+    }
+
+    /// Apply an authorised binding update whose coordinated height the chain
+    /// has just reached. Fatal on failure, for the same reason the migration
+    /// is: a node that cannot publish the binding every other validator just
+    /// published must stop rather than carry on out of step.
+    pub fn apply_due_binding_update(&self) -> Result<(), StateError> {
+        let due = {
+            let pending = self.pending_binding_update.read();
+            match pending.as_ref() {
+                Some((at, _, _)) if *at == self.height() => pending.clone(),
+                _ => None,
+            }
+        };
+        let Some((_, replacing, context)) = due else {
+            return Ok(());
+        };
+        let current = self
+            .native_inference_context()
+            .ok_or_else(|| {
+                StateError::ExecutionError(
+                    "a binding update is due but no binding is active".into(),
+                )
+            })?
+            .commitment()?;
+        if current == context.commitment()? {
+            // Already published, by a replay of this same block.
+            *self.pending_binding_update.write() = None;
+            return Ok(());
+        }
+        if current != replacing {
+            return Err(StateError::ExecutionError(format!(
+                "a binding update due at this height replaces {}, but the binding in force is {}",
+                replacing.to_hex(),
+                current.to_hex()
+            )));
+        }
+        self.update_native_inference_binding(context)?;
+        *self.pending_binding_update.write() = None;
+        Ok(())
+    }
+
     /// Publish a NEW binding over a running one: a changed committee, an added
     /// allowed execution, a model upgrade. The new binding governs requests
     /// admitted from here on.

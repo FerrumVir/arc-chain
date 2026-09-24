@@ -2377,6 +2377,10 @@ pub enum ActivationConfigError {
     /// a failure: the node keeps running and activates when the chain gets
     /// there.
     MigrationPending { at: u64, height: u64 },
+    /// A binding update is authorised and waiting for its coordinated
+    /// height. Also not a failure: the binding in force is unchanged and the
+    /// node keeps serving under it until the chain gets there.
+    BindingUpdatePending { at: u64, height: u64 },
 }
 
 impl std::fmt::Display for ActivationConfigError {
@@ -2419,6 +2423,11 @@ impl std::fmt::Display for ActivationConfigError {
                 f,
                 "migration authorised for height {at}; this chain is at {height} and will \
                  activate when it gets there"
+            ),
+            Self::BindingUpdatePending { at, height } => write!(
+                f,
+                "binding update authorised for height {at}; this chain is at {height} and the \
+                 binding in force is unchanged until it gets there"
             ),
         }
     }
@@ -2502,6 +2511,12 @@ pub struct NativeActivationRequest {
     /// under the binding that accepted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_from: Option<String>,
+    /// The coordinated height for that update: the single block at which
+    /// every validator publishes the new binding. Publishing writes state,
+    /// so doing it whenever each node happens to restart would leave them
+    /// deriving different roots. Required whenever `update_from` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_at_height: Option<u64>,
 }
 
 /// The operator's half of an existing-chain migration, as it appears in the
@@ -2753,10 +2768,31 @@ fn resume_persisted_activation(
                 replacing.to_hex(),
             ));
         }
+        let Some(at) = request.update_at_height else {
+            return Err(ActivationConfigError::Malformed(
+                "update_from requires update_at_height: the coordinated block at which every \
+                 validator publishes the new binding"
+                    .into(),
+            ));
+        };
         let next = assemble_activation_context(state, request)?;
-        return state
-            .update_native_inference_binding(next)
-            .map_err(|e| ActivationConfigError::Refused(e.to_string()));
+        let published = next
+            .commitment()
+            .map_err(|e| ActivationConfigError::InvalidContext(e.to_string()))?;
+        state
+            .authorize_binding_update(at, replacing, next)
+            .map_err(|e| ActivationConfigError::Refused(e.to_string()))?;
+        // Due already, if this node is starting exactly at that height.
+        state
+            .apply_due_binding_update()
+            .map_err(|e| ActivationConfigError::Refused(e.to_string()))?;
+        return match state.native_inference_context() {
+            Some(active) if active.commitment().ok() == Some(published) => Ok(published),
+            _ => Err(ActivationConfigError::BindingUpdatePending {
+                at,
+                height: state.height(),
+            }),
+        };
     }
     if request.allowed_executions != persisted.allowed_executions {
         return Err(mismatch(
@@ -3479,6 +3515,7 @@ mod tests {
                 context_commitment: commitment.to_hex(),
             }),
             update_from: None,
+            update_at_height: None,
         }
     }
 
@@ -3555,6 +3592,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         assert!(matches!(
@@ -3606,6 +3644,7 @@ mod tests {
             selection_rule: None,
             migration: None,
             update_from: None,
+            update_at_height: None,
         };
         write_request(&path, &base);
         let v1 = activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3642,21 +3681,52 @@ mod tests {
             vec![marker()]
         );
 
-        // Pinned to the binding actually in force: published.
+        // Pinned, but with no coordinated height: refused, because every
+        // validator has to publish in the same block.
+        let mut unscheduled = changed.clone();
+        unscheduled.update_from = Some(v1.to_hex());
+        write_request(&path, &unscheduled);
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::Malformed(reason)) => {
+                assert!(reason.contains("update_at_height"), "{reason}");
+            }
+            other => panic!("expected a missing-height refusal, got {other:?}"),
+        }
+
+        // Pinned and scheduled: authorised, and waiting for its height.
         let mut pinned = changed;
         pinned.update_from = Some(v1.to_hex());
+        pinned.update_at_height = Some(2);
         write_request(&path, &pinned);
-        let v2 = activate_native_inference_from_config(&state, &path)
-            .expect("a pinned update publishes a new binding");
-        assert_ne!(v1, v2);
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::BindingUpdatePending { at, height }) => {
+                assert_eq!((at, height), (2, 0));
+            }
+            other => panic!("expected a pending update, got {other:?}"),
+        }
         assert_eq!(
             state.native_inference_context().unwrap().allowed_executions,
-            vec![marker(), upgraded()],
-            "the new configuration governs new work"
+            vec![marker()],
+            "the binding in force is unchanged until the coordinated height"
         );
 
-        // Replaying the same pinned file is now a wrong-pin refusal, because
-        // the binding it names is no longer the one in force.
+        // The chain reaches that height and publishes it, in that block.
+        let producer = state.native_inference_context().unwrap().members[0].address;
+        while state.height() < 2 {
+            state
+                .execute_block_adaptive_at(&[], producer, 1_700_000 + state.height())
+                .unwrap();
+        }
+        let active = state.native_inference_context().unwrap();
+        assert_eq!(
+            active.allowed_executions,
+            vec![marker(), upgraded()],
+            "the new configuration governs new work from its coordinated height"
+        );
+        assert_ne!(active.commitment().unwrap(), v1);
+
+        // Replaying the same file is now a wrong-pin refusal, because the
+        // binding it names is no longer the one in force.
         match activate_native_inference_from_config(&state, &path) {
             Err(ActivationConfigError::ReconfigurationRejected { field, .. }) => {
                 assert_eq!(field, "update_from");
@@ -3679,6 +3749,7 @@ mod tests {
             selection_rule: None,
             migration: None,
             update_from: None,
+            update_at_height: None,
         };
         write_request(&path, &req);
         let raw = fs::read_to_string(&path).unwrap();
@@ -3718,6 +3789,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
 
@@ -3765,6 +3837,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3793,6 +3866,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         assert!(
@@ -3821,6 +3895,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         assert!(matches!(
@@ -3847,6 +3922,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
 
@@ -3881,6 +3957,7 @@ mod tests {
             selection_rule: None,
             migration: None,
             update_from: None,
+            update_at_height: None,
         };
         write_request(&path, &original);
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3904,6 +3981,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3926,6 +4004,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3949,6 +4028,7 @@ mod tests {
             selection_rule: Some(arc_state::NativeSelectionRule::CountEveryCandidateV1),
             migration: None,
             update_from: None,
+            update_at_height: None,
         };
         write_request(&path, &v1);
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3993,6 +4073,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         activate_native_inference_from_config(&fresh, &fresh_path).expect("fresh activation");
@@ -4032,6 +4113,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -4096,6 +4178,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -4169,6 +4252,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         assert!(state.refuse_registry_change_under_native_binding().is_ok());
@@ -4198,6 +4282,7 @@ mod tests {
                 selection_rule: None,
                 migration: None,
                 update_from: None,
+                update_at_height: None,
             },
         );
         // Advance the chain with an empty block; there is deliberately no

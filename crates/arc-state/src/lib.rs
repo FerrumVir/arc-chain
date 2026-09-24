@@ -692,6 +692,12 @@ pub struct StateDB {
     /// with, so that binding stays available until nothing references it.
     pub(crate) superseded_bindings:
         RwLock<std::collections::BTreeMap<[u8; 32], InferenceAdmissionContext>>,
+    /// A binding update the operator has authorised but the chain has not
+    /// reached yet: the coordinated height, the binding being replaced, and
+    /// the one replacing it. Publishing a binding writes state, so every
+    /// validator has to do it in the same block or they derive different
+    /// roots from there on - the same reason activation names one height.
+    pub(crate) pending_binding_update: RwLock<Option<(u64, Hash256, InferenceAdmissionContext)>>,
     native_inference_pending: DashMap<[u8; 32], u64>,
     native_inference_execution: parking_lot::Mutex<()>,
     native_inference_publication: RwLock<()>,
@@ -782,6 +788,7 @@ impl StateDB {
             native_migration: RwLock::new(None),
             pending_migration_context: RwLock::new(None),
             superseded_bindings: RwLock::new(std::collections::BTreeMap::new()),
+            pending_binding_update: RwLock::new(None),
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
@@ -839,6 +846,7 @@ impl StateDB {
             native_migration: RwLock::new(None),
             pending_migration_context: RwLock::new(None),
             superseded_bindings: RwLock::new(std::collections::BTreeMap::new()),
+            pending_binding_update: RwLock::new(None),
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
@@ -3263,6 +3271,7 @@ impl StateDB {
         // passes through the coordinated height whether it produces or
         // applies, and this is the one place both paths share.
         self.apply_due_native_migration()?;
+        self.apply_due_binding_update()?;
         Ok(produced)
     }
 
