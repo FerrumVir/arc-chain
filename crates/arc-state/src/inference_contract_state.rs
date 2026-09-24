@@ -694,10 +694,26 @@ impl StateDB {
         let Some(record) = self.native_migration() else {
             return Ok(());
         };
-        if self.height() != record.activation_height {
+        if self.native_inference_context().is_some() {
             return Ok(());
         }
-        if self.native_inference_context().is_some() {
+        // Past the coordinated height with nothing activated. A node can
+        // reach here by advancing without executing the block at that height
+        // - importing history, adopting a window - and if it simply carried
+        // on it would be quietly deriving different state from every
+        // validator that did activate. Silence is the dangerous outcome, so
+        // this stops instead: the node has to be resynchronised from a peer
+        // that holds the activated state.
+        if self.height() > record.activation_height {
+            return Err(StateError::ExecutionError(format!(
+                "this chain passed the coordinated native activation height {} without \
+                 activating (now at {}); it cannot agree with the validators that did, and must \
+                 be resynchronised rather than restarted",
+                record.activation_height,
+                self.height()
+            )));
+        }
+        if self.height() != record.activation_height {
             return Ok(());
         }
         let Some(context) = self.pending_migration_context.read().clone() else {
@@ -934,16 +950,40 @@ impl StateDB {
     /// is: a node that cannot publish the binding every other validator just
     /// published must stop rather than carry on out of step.
     pub fn apply_due_binding_update(&self) -> Result<(), StateError> {
-        let due = {
+        let (due, passed) = {
             let pending = self.pending_binding_update.read();
             match pending.as_ref() {
-                Some((at, _, _)) if *at == self.height() => pending.clone(),
-                _ => None,
+                Some((at, _, _)) if *at == self.height() => (pending.clone(), false),
+                Some((at, _, _)) if *at < self.height() => (pending.clone(), true),
+                _ => (None, false),
             }
         };
-        let Some((_, replacing, context)) = due else {
+        let Some((at, replacing, context)) = due else {
             return Ok(());
         };
+        if passed {
+            // Already published, if the binding in force is the new one -
+            // this node applied it and simply has the instruction still in
+            // hand. Otherwise it advanced past the coordinated height without
+            // publishing, which is the same silent divergence the migration
+            // guards against, and it stops here for the same reason.
+            let current = self
+                .native_inference_context()
+                .ok_or_else(|| {
+                    StateError::ExecutionError("a binding update is due but none is active".into())
+                })?
+                .commitment()?;
+            if current == context.commitment()? {
+                *self.pending_binding_update.write() = None;
+                return Ok(());
+            }
+            return Err(StateError::ExecutionError(format!(
+                "this chain passed the coordinated binding-update height {at} without publishing \
+                 it (now at {}); it cannot agree with the validators that did, and must be \
+                 resynchronised rather than restarted",
+                self.height()
+            )));
+        }
         let current = self
             .native_inference_context()
             .ok_or_else(|| {
@@ -5298,6 +5338,32 @@ mod tests {
             state.select_native_block_transactions(&natives).len(),
             1,
             "two native requests in one block are cut to one"
+        );
+    }
+
+    /// A node can reach a height without executing the block at it - it
+    /// imported history, or adopted a window. If the coordinated height went
+    /// by that way, the node holds different state from every validator that
+    /// applied the change, and carrying on quietly is the worst thing it can
+    /// do. It stops instead.
+    #[test]
+    fn passing_a_coordinated_height_without_applying_it_stops_the_node() {
+        let f = fixture("coordination-missed");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 8), f.context.clone())
+            .unwrap();
+
+        // Advance the way a catching-up node does: the height moves without
+        // that block being executed here, so no hook ran at 8.
+        *state.height.write() = 12;
+        let error = state
+            .apply_due_native_migration()
+            .expect_err("a chain past the coordinated height must not carry on");
+        assert!(format!("{error}").contains("resynchronised"), "{error}");
+        assert!(
+            state.native_inference_context().is_none(),
+            "and nothing was activated late"
         );
     }
 
