@@ -681,6 +681,11 @@ pub struct StateDB {
     /// original rule applies: fresh genesis only, never recovery-bound state.
     pub(crate) native_migration:
         RwLock<Option<crate::inference_contract_state::NativeMigrationRecord>>,
+    /// The binding a still-pending migration will freeze when its coordinated
+    /// height arrives. Held with the record so the activation is performed by
+    /// the chain itself at that height, rather than only by whichever node
+    /// happened to be starting up at that moment.
+    pub(crate) pending_migration_context: RwLock<Option<InferenceAdmissionContext>>,
     native_inference_pending: DashMap<[u8; 32], u64>,
     native_inference_execution: parking_lot::Mutex<()>,
     native_inference_publication: RwLock<()>,
@@ -769,6 +774,7 @@ impl StateDB {
             recovery_manifest_hash: RwLock::new(None),
             native_inference_context: RwLock::new(None),
             native_migration: RwLock::new(None),
+            pending_migration_context: RwLock::new(None),
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
@@ -824,6 +830,7 @@ impl StateDB {
             recovery_manifest_hash: RwLock::new(None),
             native_inference_context: RwLock::new(None),
             native_migration: RwLock::new(None),
+            pending_migration_context: RwLock::new(None),
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
@@ -3227,7 +3234,7 @@ impl StateDB {
         proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         let mode = crate::block_stm::choose_execution_mode(transactions);
-        match mode {
+        let produced = match mode {
             crate::block_stm::AdaptiveMode::Sequential => self
                 .execute_block_verified_at_with_proof(
                     transactions,
@@ -3239,7 +3246,16 @@ impl StateDB {
                 // Use BlockSTM partitioned execution
                 self.execute_block_blockstm_at(transactions, producer, timestamp, proof_hash)
             }
-        }
+        }?;
+        // An authorised migration whose coordinated height this block just
+        // reached is applied HERE, before any later block can be built on
+        // top of it. Doing it only at startup would activate whichever node
+        // happened to be starting at that moment and strand every node that
+        // was already running, or was down and caught up later: a validator
+        // passes through the coordinated height whether it produces or
+        // applies, and this is the one place both paths share.
+        self.apply_due_native_migration()?;
+        Ok(produced)
     }
 
     /// Execute a block using BlockSTM partitioned parallel execution.

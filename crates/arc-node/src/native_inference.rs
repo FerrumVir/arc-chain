@@ -2666,7 +2666,7 @@ pub fn activate_native_inference_from_config(
             context_commitment: hash_from_hex("context_commitment", &migration.context_commitment)?,
         };
         state
-            .authorize_native_migration(record)
+            .authorize_native_migration(record, context.clone())
             .map_err(|e| ActivationConfigError::Refused(e.to_string()))?;
         if height != migration.activation_height {
             // Authorised, not yet due. The node keeps running; this is the

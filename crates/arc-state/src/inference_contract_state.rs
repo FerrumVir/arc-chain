@@ -640,9 +640,38 @@ impl StateDB {
     /// then on). What it may never do is authorise a point this chain has
     /// already passed without having activated - that would be a retroactive
     /// state change, and every other validator would have a different root.
+    /// Apply a migration whose coordinated height the chain has just reached.
+    /// Called once per block from the single block funnel, so every validator
+    /// makes the same write at the same point whether it produced that block
+    /// or applied someone else's. A failure here is fatal on purpose: a node
+    /// that cannot perform the coordinated activation must stop rather than
+    /// continue on a chain it no longer agrees with. The block is already
+    /// durable, so a restart replays and retries at the same height.
+    pub(crate) fn apply_due_native_migration(&self) -> Result<(), StateError> {
+        let Some(record) = self.native_migration() else {
+            return Ok(());
+        };
+        if self.height() != record.activation_height {
+            return Ok(());
+        }
+        if self.native_inference_context().is_some() {
+            return Ok(());
+        }
+        let Some(context) = self.pending_migration_context.read().clone() else {
+            return Err(StateError::ExecutionError(format!(
+                "a migration is authorised for height {}, which this chain has now reached, but \
+                 the binding it freezes was never supplied to this node",
+                record.activation_height
+            )));
+        };
+        self.activate_native_inference(context)?;
+        Ok(())
+    }
+
     pub fn authorize_native_migration(
         &self,
         record: NativeMigrationRecord,
+        context: InferenceAdmissionContext,
     ) -> Result<(), StateError> {
         if let Some(reason) = record.refusal_against(self) {
             return Err(StateError::ExecutionError(reason));
@@ -660,6 +689,7 @@ impl StateDB {
             )));
         }
         *self.native_migration.write() = Some(record);
+        *self.pending_migration_context.write() = Some(context);
         Ok(())
     }
 
@@ -3815,7 +3845,7 @@ mod tests {
         let balance_before = state.get_account(&f.requester.address()).unwrap().balance;
 
         state
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .expect("a record for this chain, ahead of its height, is accepted");
         // Not yet: the coordinated height has not arrived.
         assert!(state.activate_native_inference(f.context.clone()).is_err());
@@ -3846,20 +3876,24 @@ mod tests {
         let mut other_chain = migration_for(&f, 5);
         other_chain.chain_genesis = hash_bytes(b"a different chain");
         let error = state
-            .authorize_native_migration(other_chain)
+            .authorize_native_migration(other_chain, f.context.clone())
             .expect_err("a record naming another genesis must not authorise this chain");
         assert!(format!("{error}").contains("genesis"), "{error}");
 
         let mut other_epoch = migration_for(&f, 5);
         other_epoch.recovery_epoch = 2;
         let error = state
-            .authorize_native_migration(other_epoch)
+            .authorize_native_migration(other_epoch, f.context.clone())
             .expect_err("a record from another recovery epoch must be refused");
         assert!(format!("{error}").contains("recovery epoch"), "{error}");
 
         let mut other_set = migration_for(&f, 5);
         other_set.validator_set_id = 7;
-        assert!(state.authorize_native_migration(other_set).is_err());
+        assert!(
+            state
+                .authorize_native_migration(other_set, f.context.clone())
+                .is_err()
+        );
 
         // None of the refused records left anything behind.
         assert!(state.native_migration().is_none());
@@ -3874,7 +3908,7 @@ mod tests {
         let f = fixture("migration-retroactive");
         let state = recovered_chain_at(&f, 10);
         let error = state
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .expect_err("a passed height must not be authorised");
         assert!(format!("{error}").contains("retroactive"), "{error}");
         assert!(state.native_migration().is_none());
@@ -3886,12 +3920,14 @@ mod tests {
         let state = recovered_chain_at(&f, 4);
         let mut wrong = migration_for(&f, 5);
         wrong.context_commitment = hash_bytes(b"some other binding");
-        state.authorize_native_migration(wrong).unwrap();
         state
-            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .authorize_native_migration(wrong, f.context.clone())
             .unwrap();
+        // Reaching the coordinated height with a record that names another
+        // binding stops this node rather than activating the wrong one or
+        // carrying on out of step with the validators that did activate.
         let error = state
-            .activate_native_inference(f.context.clone())
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
             .expect_err("the record must authorise this exact binding");
         assert!(
             format!("{error}").contains("different inference binding"),
@@ -3900,20 +3936,24 @@ mod tests {
         assert!(state.native_inference_context().is_none());
     }
 
-    /// Activation happens at one height, not "at or after" one: every
-    /// validator must write the same state in the same block.
+    /// Activation happens at ONE height, not "at or after" one, and the chain
+    /// performs it itself when it gets there. Leaving it to whoever happens
+    /// to be starting up would activate one node and strand the rest.
     #[test]
-    fn activation_at_any_height_but_the_coordinated_one_is_refused() {
+    fn the_chain_activates_itself_at_the_coordinated_height_and_nowhere_else() {
         let f = fixture("migration-height");
         let state = recovered_chain_at(&f, 4);
         state
-            .authorize_native_migration(migration_for(&f, 6))
+            .authorize_native_migration(migration_for(&f, 6), f.context.clone())
             .unwrap();
-        // One block early.
+
+        // One block early: nothing has happened, and asking directly is
+        // refused with the height it is waiting for.
         state
             .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_098)
             .unwrap();
         assert_eq!(state.height(), 5);
+        assert!(state.native_inference_context().is_none());
         let error = state
             .activate_native_inference(f.context.clone())
             .expect_err("early activation is refused");
@@ -3921,15 +3961,29 @@ mod tests {
             format!("{error}").contains("activates at height 6"),
             "{error}"
         );
-        // One block late.
-        for _ in 0..2 {
-            state
-                .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_100)
-                .unwrap();
-        }
-        assert_eq!(state.height(), 7);
-        assert!(state.activate_native_inference(f.context.clone()).is_err());
-        assert!(state.native_inference_context().is_none());
+
+        // The block that reaches height 6 activates the binding, without
+        // anyone calling activation at all.
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        assert_eq!(state.height(), 6);
+        assert_eq!(
+            state.native_inference_context(),
+            Some(f.context.clone()),
+            "the chain activates itself at the coordinated height"
+        );
+
+        // And later blocks neither repeat it nor change it. An empty block
+        // moves the height without touching the root, which is exactly how
+        // the recovered chain has been advancing.
+        let root = state.compute_state_root();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_100)
+            .unwrap();
+        assert_eq!(state.height(), 7, "the chain kept moving");
+        assert_eq!(state.native_inference_context(), Some(f.context.clone()));
+        assert_eq!(state.compute_state_root(), root, "and activated once");
     }
 
     /// The original rule is untouched where no operator authorised anything.
@@ -3954,7 +4008,7 @@ mod tests {
         let f = fixture("migration-restart");
         let state = recovered_chain_at(&f, 4);
         state
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .unwrap();
         state
             .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
@@ -3991,7 +4045,7 @@ mod tests {
             .collect();
         let first = recovered_chain_at(&f, 4);
         first
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .unwrap();
         first
             .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
@@ -4015,7 +4069,7 @@ mod tests {
                 .unwrap();
         }
         second
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .unwrap();
         second
             .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
@@ -4039,7 +4093,7 @@ mod tests {
         let f = fixture("migration-repeat");
         let state = recovered_chain_at(&f, 4);
         state
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .unwrap();
         state
             .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
@@ -4056,7 +4110,7 @@ mod tests {
         // And again after re-authorising the same record, as a restarted
         // operator process would.
         state
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .expect("re-authorising an already applied migration is accepted");
         assert_eq!(
             state.activate_native_inference(f.context.clone()).unwrap(),
@@ -4073,7 +4127,7 @@ mod tests {
         let state = recovered_chain_at(&f, 4);
         let before = state.compute_state_root();
         state
-            .authorize_native_migration(migration_for(&f, 9))
+            .authorize_native_migration(migration_for(&f, 9), f.context.clone())
             .unwrap();
         // Height 4, coordinated height 9: refused.
         assert!(state.activate_native_inference(f.context.clone()).is_err());
@@ -4104,7 +4158,7 @@ mod tests {
         let f = fixture("migration-tampered");
         let state = recovered_chain_at(&f, 4);
         state
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .unwrap();
         state
             .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
@@ -4151,7 +4205,7 @@ mod tests {
         let f = fixture("migration-families");
         let state = recovered_chain_at(&f, 4);
         state
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .unwrap();
         state
             .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
@@ -4239,7 +4293,7 @@ mod tests {
         let f = fixture("migration-settles");
         let state = recovered_chain_at(&f, 4);
         state
-            .authorize_native_migration(migration_for(&f, 5))
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
             .unwrap();
         state
             .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
