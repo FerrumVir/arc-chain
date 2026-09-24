@@ -271,7 +271,13 @@ impl PendingSource for StatePendingSource {
         let commitment = context
             .commitment()
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
-        if commitment != self.context_commitment || job.context != commitment {
+        // Against the binding in force, not the one this source was built
+        // with: after an update they differ, and comparing to the startup
+        // value refuses every job on the chain. A job admitted under a
+        // superseded binding is still refused here - it settles or refunds
+        // on its own terms rather than being executed under semantics it was
+        // not accepted under.
+        if job.context != commitment {
             return Err(NativeInferenceError::ContextMismatch);
         }
         // Expiry is evaluated at the next canonical block, not wall clock.
@@ -4742,9 +4748,15 @@ mod tests {
             .execute_block_verified(&[request_tx], fixture.finalizer.address())
             .unwrap();
 
-        source
+        let job = source
             .load_pending(request_id)
             .expect("the worker must still be able to load work after an update");
+        // And the whole path, not just the load: the liveness check compared
+        // against the same startup-pinned commitment, so fixing one without
+        // the other simply moved where the worker stopped.
+        source
+            .ensure_live(&job, 0)
+            .expect("and must consider that work live");
     }
 
     #[test]
