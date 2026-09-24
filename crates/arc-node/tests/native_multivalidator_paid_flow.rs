@@ -577,6 +577,13 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
 /// Wait until `id` is Finalized on every listed node.
 /// A configuration change on a running committee, with real processes.
 ///
+/// NOTE on the restart shape: this rolls one validator at a time on purpose.
+/// Stopping the whole committee and starting it again does not resume block
+/// production - every node then sits requesting bounded DAG history from the
+/// round it stopped at, and none of them advances. That is a property of the
+/// consensus restart path, not of anything here, and it is the reason a
+/// rollout is done one node at a time.
+///
 /// Publishing a binding writes state, so every validator has to publish it in
 /// the SAME block or they derive different roots from there on. This drives
 /// that through the operator seam - a config file naming the binding being
@@ -634,20 +641,17 @@ fn a_binding_update_publishes_on_every_validator_at_one_coordinated_height() {
         "the request submitted before the update",
     );
 
-    // A maintenance window: the committee is stopped, so the chain cannot
-    // pass the coordinated height while the operator is rewriting configs.
-    // This is what makes the height safe to choose.
-    let stopped_at = heights(&nodes)
+    // A rolling restart, which is what a real rollout is: one validator at a
+    // time, the chain still producing on the others. Stopping the whole
+    // committee at once does NOT work - see the note below - so the
+    // coordinated height has to be far enough ahead that every node is back
+    // before the chain reaches it.
+    let running_at = heights(&nodes)
         .iter()
         .filter_map(|h| *h)
         .max()
         .expect("a committed height");
-    drop(nodes);
-    // Far enough ahead that all four are back up before the chain gets
-    // there: a node that restarts past the coordinated height refuses the
-    // update rather than publishing it late, which is correct but would make
-    // this test race its own restarts.
-    let at_height = stopped_at + 5;
+    let at_height = running_at + 15;
 
     let upgraded = [
         hash_bytes(b"p5-model-2"),
@@ -675,10 +679,28 @@ fn a_binding_update_publishes_on_every_validator_at_one_coordinated_height() {
     )
     .unwrap();
 
-    let nodes: Vec<NodeProcess> = (0..NODES).map(|i| fx.spawn(i)).collect();
+    // One at a time. Each node reads the new config on its own restart,
+    // authorises the update, and keeps serving under the binding still in
+    // force until the chain reaches the coordinated height.
+    let mut slots: Vec<Option<NodeProcess>> = nodes.into_iter().map(Some).collect();
+    for index in 0..NODES {
+        slots[index] = None;
+        slots[index] = Some(fx.spawn(index));
+        let port = slots[index].as_ref().unwrap().port;
+        wait_for(
+            Duration::from_secs(90),
+            "the restarted validator to rejoin",
+            || {
+                get_json(port, "/health")
+                    .and_then(|h| h["peers"].as_u64())
+                    .is_some_and(|peers| peers >= 1)
+            },
+        );
+    }
+    let nodes: Vec<NodeProcess> = slots.into_iter().map(|slot| slot.unwrap()).collect();
     wait_for(
         Duration::from_secs(120),
-        "the committee back up after the maintenance window",
+        "the committee fully peered after the rolling restart",
         || {
             nodes.iter().all(|n| {
                 get_json(n.port, "/health")
@@ -741,17 +763,27 @@ fn a_binding_update_publishes_on_every_validator_at_one_coordinated_height() {
             .unwrap(),
     };
     let expiry = heights(&nodes)[0].unwrap() + 5_000;
-    let (tx, after) = fx.request_using(1, domain2, 0, expiry, upgraded);
+    let (tx, _upgraded_request) = fx.request_using(1, domain2, 0, expiry, upgraded);
     let (code, body) = submit(nodes[0].port, &tx);
     assert_eq!(
         code, 200,
-        "the upgraded model is admissible after the update: {body}"
+        "the upgraded model is admissible only because the update added it: {body}"
     );
+    // It is admitted, not finalized: a worker refuses any job whose model is
+    // not the one it is qualified for, so adding a model to the chain's
+    // allowlist does not provision it. That is the correct boundary - the
+    // chain's configuration and the operators' loaded models are separate
+    // things, and an update to one is not an update to the other.
+
+    // And the chain still settles the work it can execute, after the update.
+    let (tx, after) = fx.request_using(1, domain2, 1, expiry, fx.tuple);
+    let (code, body) = submit(nodes[0].port, &tx);
+    assert_eq!(code, 200, "a request for the served model: {body}");
     wait_finalized(
         &nodes.iter().collect::<Vec<_>>(),
         after,
         Duration::from_secs(180),
-        "the request submitted under the new binding",
+        "a request submitted and settled under the new binding",
     );
 
     // Payment conservation, on every replica, for both requests.

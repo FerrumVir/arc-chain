@@ -2853,7 +2853,12 @@ async fn submit_tx(
                 "native inference state is unhealthy".to_string(),
             ));
         }
-    } {
+    } && node.state.native_migration().is_none()
+    {
+        // A PRIVATE protocol-4 chain carries only native work, so an
+        // unsigned submission here can never execute. A MIGRATED chain keeps
+        // every family it had, and refusing them at this endpoint would turn
+        // the migration into exactly the outage it exists to avoid.
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "private protocol-4 accepts only signed native inference transactions".to_string(),
@@ -2971,7 +2976,9 @@ async fn submit_batch(
                 "native inference state is unhealthy",
             ));
         }
-    } {
+    } && node.state.native_migration().is_none()
+    {
+        // As in `submit_tx`: only a private protocol-4 chain refuses these.
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "private protocol-4 accepts only signed native inference transactions",
@@ -3423,11 +3430,12 @@ async fn submit_signed_tx(
     if node.state.verify_transaction_signature(&tx).is_err() {
         return Err(StatusCode::BAD_REQUEST.into());
     }
-    // A native-inference chain's committee is frozen by its binding. The
+    // A PRIVATE protocol-4 chain's committee is frozen by its binding. The
     // executor refuses a registry change too (so a transaction that slips in
     // another way fails with a receipt instead of wedging every later block);
     // refusing it here tells the submitter now, rather than via a failed
-    // receipt later.
+    // receipt later. A migrated chain has versioned bindings and is not
+    // frozen, which the state's own guard decides.
     if arc_state::StateDB::is_registry_change(&tx)
         && node
             .state
@@ -3436,11 +3444,16 @@ async fn submit_signed_tx(
     {
         return Err(StatusCode::CONFLICT.into());
     }
-    // A protocol-4 block carries only a native-inference transaction, so
-    // anything else can never be included. Accepting it would hand the client
-    // a hash for a transaction that will never exist - refuse it here, as
-    // `submit_tx` already does.
+    // A PRIVATE protocol-4 block carries only a native-inference transaction,
+    // so anything else can never be included there. Accepting it would hand
+    // the client a hash for a transaction that will never exist - refuse it
+    // here, as `submit_tx` already does.
+    //
+    // A MIGRATED chain is not that chain: it keeps every transaction family
+    // it had, so refusing them here would reject the traffic the migration
+    // exists to preserve, at the very first step the user reaches.
     if node.state.native_inference_context().is_some()
+        && node.state.native_migration().is_none()
         && !arc_state::StateDB::is_native_inference_transaction(&tx)
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into());
@@ -3467,8 +3480,12 @@ async fn submit_signed_tx(
         Ok(Some(_)) => true,
         Ok(None) => false,
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into()),
-    } {
-        // Private protocol-4 blocks permit one native transition only.
+    } && node.state.native_migration().is_none()
+    {
+        // Private protocol-4 blocks permit one native transition only. A
+        // migrated chain admits its ordinary families, and they fall through
+        // to the v3 admission check below - which now runs, because a
+        // migrated chain reports protocol 3.
         return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     // The issuance switch gates every public mempool ingress, not just the
@@ -3731,9 +3748,11 @@ async fn faucet_claim(
             }),
         ));
     }
-    // A faucet claim is an ordinary transfer, which a protocol-4 block can
-    // never carry. Refuse it rather than return a hash that will never land.
-    if node.state.native_inference_context().is_some() {
+    // A faucet claim is an ordinary transfer, which a PRIVATE protocol-4
+    // block can never carry. Refuse it rather than return a hash that will
+    // never land. A migrated chain still carries faucet claims, so this does
+    // not apply there.
+    if node.state.native_inference_context().is_some() && node.state.native_migration().is_none() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(FaucetErrorResponse {

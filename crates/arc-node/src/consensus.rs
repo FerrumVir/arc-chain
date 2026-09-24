@@ -2163,14 +2163,28 @@ impl ConsensusManager {
                                     // re-broadcast, and Mempool deduplicates its
                                     // resident set, so accepting this retry does
                                     // not create a wire echo loop.
-                                    if state.native_inference_context().is_some()
-                                        && (!arc_state::StateDB::is_native_inference_transaction(
-                                            &tx,
-                                        ) || !state.native_transaction_still_admissible(&tx))
+                                    // On a PRIVATE protocol-4 chain nothing but
+                                    // native work can ever execute, so anything
+                                    // else is dropped here rather than
+                                    // circulated. A MIGRATED chain keeps every
+                                    // family it had, so only its native
+                                    // transactions are judged this way and the
+                                    // rest take the ordinary path - dropping
+                                    // them here would mean a transfer submitted
+                                    // to one validator never reached the others.
+                                    let native_only = state.native_inference_context().is_some()
+                                        && state.native_migration().is_none();
+                                    let is_native =
+                                        arc_state::StateDB::is_native_inference_transaction(&tx);
+                                    if (native_only && !is_native)
+                                        || (is_native
+                                            && state.native_inference_context().is_some()
+                                            && !state.native_transaction_still_admissible(&tx))
                                     {
-                                        // Not native, or native but neither
-                                        // admissible now nor a bounded future
-                                        // transaction of a funded sender.
+                                        // Not native on a chain that carries
+                                        // only native work, or native but
+                                        // neither admissible now nor a bounded
+                                        // future transaction of a funded sender.
                                         continue;
                                     }
                                     // Already executed: re-admitting it is how
@@ -3679,7 +3693,12 @@ impl ConsensusManager {
                     let mempool_len_pre = mempool.len();
                     let mut transactions = mempool.drain(drain_limit);
                     let stale = retain_unreceipted(&state, &mut transactions);
-                    if state.active_protocol_version().major == 4 && !transactions.is_empty() {
+                    // Keyed on the binding rather than the reported protocol
+                    // version, for the same reason as the commit path: a
+                    // migrated chain reports 3 and still carries native work,
+                    // and a proposal holding two native transactions is
+                    // refused at execution on every node at once.
+                    if state.native_inference_context().is_some() && !transactions.is_empty() {
                         let selected = state.select_native_block_transactions(&transactions);
                         for transaction in transactions.drain(..) {
                             if !selected.iter().any(|kept| kept.hash == transaction.hash)
@@ -4142,12 +4161,18 @@ impl ConsensusManager {
                         );
                     }
 
-                    // Protocol 4: at most one native-inference transaction per
-                    // canonical block, chosen deterministically. Without this,
-                    // execution refused the block and the refusal is fatal
-                    // below - so two requests in one committed DAG block would
-                    // have stopped every node at the same place.
-                    if state.active_protocol_version().major == 4 {
+                    // At most one native-inference transaction per canonical
+                    // block, chosen deterministically. Without this, execution
+                    // refused the block and the refusal is fatal below - so two
+                    // requests in one committed DAG block would have stopped
+                    // every node at the same place.
+                    //
+                    // Keyed on the BINDING, not on the reported protocol
+                    // version: a migrated chain reports 3 and still carries
+                    // native work, so keying on the version would have left it
+                    // with exactly the fatal case this exists to prevent. The
+                    // selection returns an ordinary block unchanged.
+                    if state.native_inference_context().is_some() {
                         let selected = state.select_native_block_transactions(&committed_txs);
                         let omitted = committed_txs.len().saturating_sub(selected.len());
                         if omitted > 0 {

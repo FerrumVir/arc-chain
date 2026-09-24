@@ -1303,6 +1303,17 @@ impl StateDB {
         if self.native_inference_context().is_none() {
             return candidates.to_vec();
         }
+        // A MIGRATED chain carries ordinary blocks too. When the committed
+        // set holds no native work there is nothing to choose between, and
+        // the block is an ordinary one: returning the empty native selection
+        // here would drop every transfer the block actually carries. When it
+        // does hold native work, the one-per-block rule applies exactly as
+        // on a private chain, because a block is either ordinary or native
+        // and admission refuses a mixture.
+        let holds_native = candidates.iter().any(|tx| is_native_body(&tx.body));
+        if self.native_migration().is_some() && !holds_native {
+            return candidates.to_vec();
+        }
         let mut ordered: Vec<&arc_types::Transaction> = candidates
             .iter()
             .filter(|tx| is_native_body(&tx.body))
@@ -5239,6 +5250,54 @@ mod tests {
             state.execution_mode(&bulk),
             crate::block_stm::AdaptiveMode::Sequential,
             "with a binding active it must take the path that accepts it"
+        );
+    }
+
+    /// Block selection on a migrated chain. An ordinary block must come back
+    /// whole - selecting the native subset of a block that has none would
+    /// drop every transfer it carries - and a block holding native work must
+    /// still be cut to one, because execution refuses a mixture and that
+    /// refusal stops every node at the same block.
+    #[test]
+    fn selection_keeps_an_ordinary_block_whole_and_cuts_native_work_to_one() {
+        let f = fixture("migrated-selection");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        assert!(state.native_inference_context().is_some());
+
+        let transfers: Vec<arc_types::Transaction> = (0..3u64)
+            .map(|nonce| {
+                outer_with_fee(
+                    state,
+                    &f.requester,
+                    nonce,
+                    1,
+                    arc_types::TxBody::Transfer(arc_types::transaction::TransferBody {
+                        to: f.validators[0].address(),
+                        amount: 1,
+                        amount_commitment: None,
+                    }),
+                )
+            })
+            .collect();
+        assert_eq!(
+            state.select_native_block_transactions(&transfers).len(),
+            3,
+            "an ordinary block on a migrated chain comes back whole"
+        );
+
+        let natives: Vec<arc_types::Transaction> = (0..2u64)
+            .map(|nonce| native_request(state, &f.requester, request(&f, nonce, 400)))
+            .collect();
+        assert_eq!(
+            state.select_native_block_transactions(&natives).len(),
+            1,
+            "two native requests in one block are cut to one"
         );
     }
 
