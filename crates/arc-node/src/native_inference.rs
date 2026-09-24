@@ -2492,6 +2492,16 @@ pub struct NativeActivationRequest {
     /// same write at the height it names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<MigrationAuthorization>,
+    /// Publish this configuration as a NEW binding over the one already
+    /// active, naming the binding being replaced (hex of its commitment).
+    ///
+    /// Absent, any difference from the active binding is a reconfiguration
+    /// attempt and is refused, exactly as before - a typo must never change
+    /// a live binding. Present and matching, the new configuration governs
+    /// requests admitted from here on, while work already admitted settles
+    /// under the binding that accepted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_from: Option<String>,
 }
 
 /// The operator's half of an existing-chain migration, as it appears in the
@@ -2727,6 +2737,26 @@ fn resume_persisted_activation(
             persisted.selection_rule.as_str().to_string(),
             rule.as_str().to_string(),
         ));
+    }
+    // An explicit, pinned update: the operator names the binding being
+    // replaced, so this can never fire on a mistyped config and never on a
+    // binding other than the one they reviewed.
+    if let Some(replacing) = &request.update_from {
+        let replacing = hash_from_hex("update_from", replacing)?;
+        let current = persisted
+            .commitment()
+            .map_err(|e| ActivationConfigError::InvalidContext(e.to_string()))?;
+        if replacing != current {
+            return Err(mismatch(
+                "update_from",
+                current.to_hex(),
+                replacing.to_hex(),
+            ));
+        }
+        let next = assemble_activation_context(state, request)?;
+        return state
+            .update_native_inference_binding(next)
+            .map_err(|e| ActivationConfigError::Refused(e.to_string()));
     }
     if request.allowed_executions != persisted.allowed_executions {
         return Err(mismatch(
@@ -3448,6 +3478,7 @@ mod tests {
                 activation_height,
                 context_commitment: commitment.to_hex(),
             }),
+            update_from: None,
         }
     }
 
@@ -3523,6 +3554,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         assert!(matches!(
@@ -3550,6 +3582,89 @@ mod tests {
         );
     }
 
+    fn upgraded() -> AllowedExecution {
+        let m = hash_bytes(b"activation-config-test-upgraded-model");
+        AllowedExecution {
+            model_hash: m,
+            profile_hash: m,
+            generation_hash: m,
+            assignment_hash: m,
+        }
+    }
+
+    /// The operator seam for a model upgrade: name the binding being
+    /// replaced, and the new configuration governs new work.
+    #[test]
+    fn a_pinned_update_publishes_a_new_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = activatable_state(&dir.path().join("state"));
+        let path = dir.path().join("activation.json");
+        let base = NativeActivationRequest {
+            allowed_executions: vec![marker()],
+            recovery_epoch: 0,
+            expect: None,
+            selection_rule: None,
+            migration: None,
+            update_from: None,
+        };
+        write_request(&path, &base);
+        let v1 = activate_native_inference_from_config(&state, &path).expect("fresh activation");
+
+        // The same file with another allowed execution, unpinned: still a
+        // reconfiguration attempt, still refused.
+        let mut changed = base.clone();
+        changed.allowed_executions.push(upgraded());
+        write_request(&path, &changed);
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::ReconfigurationRejected { field, .. }) => {
+                assert_eq!(field, "allowed_executions");
+            }
+            other => panic!("expected a reconfiguration refusal, got {other:?}"),
+        }
+        assert_eq!(
+            state.native_inference_context().unwrap().allowed_executions,
+            vec![marker()],
+            "a refusal changes nothing"
+        );
+
+        // Pinned to the wrong binding: refused, and still changes nothing.
+        let mut wrong = changed.clone();
+        wrong.update_from = Some(Hash256::ZERO.to_hex());
+        write_request(&path, &wrong);
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::ReconfigurationRejected { field, .. }) => {
+                assert_eq!(field, "update_from");
+            }
+            other => panic!("expected a pin refusal, got {other:?}"),
+        }
+        assert_eq!(
+            state.native_inference_context().unwrap().allowed_executions,
+            vec![marker()]
+        );
+
+        // Pinned to the binding actually in force: published.
+        let mut pinned = changed;
+        pinned.update_from = Some(v1.to_hex());
+        write_request(&path, &pinned);
+        let v2 = activate_native_inference_from_config(&state, &path)
+            .expect("a pinned update publishes a new binding");
+        assert_ne!(v1, v2);
+        assert_eq!(
+            state.native_inference_context().unwrap().allowed_executions,
+            vec![marker(), upgraded()],
+            "the new configuration governs new work"
+        );
+
+        // Replaying the same pinned file is now a wrong-pin refusal, because
+        // the binding it names is no longer the one in force.
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::ReconfigurationRejected { field, .. }) => {
+                assert_eq!(field, "update_from");
+            }
+            other => panic!("expected a pin refusal on replay, got {other:?}"),
+        }
+    }
+
     #[test]
     fn activation_request_round_trips_and_is_hex_readable() {
         let dir = tempfile::tempdir().unwrap();
@@ -3563,6 +3678,7 @@ mod tests {
             }),
             selection_rule: None,
             migration: None,
+            update_from: None,
         };
         write_request(&path, &req);
         let raw = fs::read_to_string(&path).unwrap();
@@ -3601,6 +3717,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
 
@@ -3647,6 +3764,7 @@ mod tests {
                 }),
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3674,6 +3792,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         assert!(
@@ -3701,6 +3820,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         assert!(matches!(
@@ -3726,6 +3846,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
 
@@ -3759,6 +3880,7 @@ mod tests {
             expect: None,
             selection_rule: None,
             migration: None,
+            update_from: None,
         };
         write_request(&path, &original);
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3781,6 +3903,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3802,6 +3925,7 @@ mod tests {
                 }),
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3824,6 +3948,7 @@ mod tests {
             expect: None,
             selection_rule: Some(arc_state::NativeSelectionRule::CountEveryCandidateV1),
             migration: None,
+            update_from: None,
         };
         write_request(&path, &v1);
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3867,6 +3992,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         activate_native_inference_from_config(&fresh, &fresh_path).expect("fresh activation");
@@ -3905,6 +4031,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3968,6 +4095,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -4040,6 +4168,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         assert!(state.refuse_registry_change_under_native_binding().is_ok());
@@ -4068,6 +4197,7 @@ mod tests {
                 expect: None,
                 selection_rule: None,
                 migration: None,
+                update_from: None,
             },
         );
         // Advance the chain with an empty block; there is deliberately no
