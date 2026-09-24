@@ -12254,15 +12254,29 @@ async fn announce_shard(
     req.shard.model_id = format!("0x{}", model_id.to_hex());
     let declared_origin = shard_rpc_origin(&req.shard.socket_addr)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    req.shard.socket_addr = if peer_addr.ip().is_loopback()
-        && is_stub_socket_addr(&req.shard.socket_addr)
-    {
+    // A loopback peer is NOT evidence that this node announced to itself.
+    // Behind an HTTPS gateway every remote announcement arrives from
+    // 127.0.0.1, so the peer address cannot distinguish "my own refresh" from
+    // "somebody else's announcement my proxy forwarded". The authenticated
+    // signer can, and it is the only trustworthy signal here.
+    //
+    // This is what took shard discovery down on the recovered fleet: each
+    // node advertises the stub `http://0.0.0.0:9944` (its bind address, since
+    // ARC_PUBLIC_SOCKET is unset), the gateway made the peer look local, the
+    // stub was rewritten to the RECEIVER's own `127.0.0.1:9944`, the audience
+    // probe then fetched the receiver's own /network/info, and the
+    // announcement was refused for "not matching the destination's validator
+    // identity" - a peer rejected for being the wrong node, because it had
+    // been rewritten into this one.
+    let own_announcement = announcing_validator == node.validator_address;
+    let from_own_process = peer_addr.ip().is_loopback() && own_announcement;
+    req.shard.socket_addr = if from_own_process && is_stub_socket_addr(&req.shard.socket_addr) {
         let port = shard_rpc_url(&req.shard.socket_addr, "/")
             .ok()
             .and_then(|url| url.port_or_known_default())
             .unwrap_or(peer_addr.port());
         SocketAddr::new(peer_addr.ip(), port).to_string()
-    } else if peer_addr.ip().is_loopback() || shard_origin_is_configured(&node, &declared_origin) {
+    } else if from_own_process || shard_origin_is_configured(&node, &declared_origin) {
         declared_origin
     } else {
         bind_announced_shard_addr(&req.shard.socket_addr, peer_addr)
@@ -25257,6 +25271,194 @@ mod tests {
         assert_eq!(
             models_view["models"][0]["execution_profile"],
             canonical_profile()
+        );
+    }
+
+    /// The fleet's exact failure, reproduced. Every node advertises the stub
+    /// `http://0.0.0.0:9944` (its bind address, because ARC_PUBLIC_SOCKET is
+    /// unset) and every announcement reaches its peers through an HTTPS
+    /// gateway, so the peer address is loopback. Before the signer check, the
+    /// stub was rewritten to the RECEIVER's own `127.0.0.1:9944`, the audience
+    /// probe fetched the receiver's own identity, and the peer was refused for
+    /// "not matching the destination's validator identity" - rejected for
+    /// being the wrong node after being rewritten into this one.
+    ///
+    /// It is still refused, because a stub is genuinely unroutable, but now
+    /// for the true reason, which tells an operator what to configure.
+    #[tokio::test]
+    async fn a_stub_announced_through_a_gateway_is_refused_as_unconfigured_not_as_a_wrong_validator()
+     {
+        let holder_key = arc_crypto::KeyPair::generate_ed25519();
+        let state = Arc::new(arc_state::StateDB::new());
+        state.seed_genesis_validators(&[(
+            holder_key.address(),
+            arc_state::StateDB::MIN_VALIDATOR_STAKE,
+        )]);
+        let model_id = arc_crypto::hash_bytes(b"gateway-stub-artifact");
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = state;
+        coordinator.model_artifact_id = Some(model_id);
+
+        let announced = ShardInfo {
+            start_layer: 0,
+            end_layer: 1,
+            total_layers: 1,
+            model_id: format!("0x{}", model_id.to_hex()),
+            model_name: "stub-through-gateway".to_string(),
+            execution_profile: canonical_profile(),
+            memory_mb: 1,
+            full_model_mb: 1,
+            // Exactly what every recovered validator advertises today.
+            socket_addr: "http://0.0.0.0:9944".to_string(),
+            node_name: "peer-behind-gateway".to_string(),
+        };
+        let signed = sign_validator_shard_announcement(
+            announced,
+            &holder_key,
+            coordinator.validator_address,
+            None,
+        )
+        .unwrap();
+        let error = announce_shard(
+            AxumState(coordinator.clone()),
+            // Caddy forwards from localhost: this is what the node observes.
+            ConnectInfo(RpcPeerAddr("127.0.0.1:49152".parse().unwrap())),
+            Json(signed),
+        )
+        .await
+        .expect_err("a stub origin is not routable and must not be registered");
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(
+            error.1.contains("not an explicitly configured"),
+            "the refusal must name the unconfigured origin, not a validator \
+             identity mismatch: {}",
+            error.1
+        );
+        assert!(
+            !error.1.contains("destination's validator identity"),
+            "a peer must never be refused for being this node: {}",
+            error.1
+        );
+        assert_eq!(coordinator.shard_registry.len(), 0);
+    }
+
+    /// The same gateway path, but the peer advertises the real origin the
+    /// operator configured. This is the case that restores discovery: a
+    /// loopback peer address no longer suppresses a legitimate remote
+    /// announcement.
+    #[tokio::test]
+    async fn a_peer_announcing_its_real_origin_through_a_gateway_is_registered() {
+        let holder_key = arc_crypto::KeyPair::generate_ed25519();
+        let state = Arc::new(arc_state::StateDB::new());
+        state.seed_genesis_validators(&[(
+            holder_key.address(),
+            arc_state::StateDB::MIN_VALIDATOR_STAKE,
+        )]);
+        let model_id = arc_crypto::hash_bytes(b"gateway-real-origin-artifact");
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = state;
+        coordinator.model_artifact_id = Some(model_id);
+        let origin = "https://198.51.100.7".to_string();
+        coordinator.community_rpc_bases = Arc::new(vec![origin.clone()]);
+        coordinator.shard_rpc_audiences.insert(
+            shard_rpc_origin(&origin).unwrap(),
+            ValidatorRpcAudience {
+                validator: holder_key.address(),
+                transaction_domain: None,
+                observed_at: Instant::now(),
+            },
+        );
+        let announced = ShardInfo {
+            start_layer: 3,
+            end_layer: 7,
+            total_layers: 32,
+            model_id: format!("0x{}", model_id.to_hex()),
+            model_name: "real-origin-through-gateway".to_string(),
+            execution_profile: canonical_profile(),
+            memory_mb: 1,
+            full_model_mb: 1,
+            socket_addr: origin.clone(),
+            node_name: "peer-behind-gateway".to_string(),
+        };
+        let signed = sign_validator_shard_announcement(
+            announced,
+            &holder_key,
+            coordinator.validator_address,
+            None,
+        )
+        .unwrap();
+        let Json(response) = announce_shard(
+            AxumState(coordinator.clone()),
+            ConnectInfo(RpcPeerAddr("127.0.0.1:49152".parse().unwrap())),
+            Json(signed),
+        )
+        .await
+        .expect("a configured remote origin announced through the gateway is legitimate");
+        assert_eq!(response["ok"], true);
+        assert_eq!(coordinator.shard_registry.len(), 1);
+        let registered = coordinator.shard_registry.iter().next().unwrap();
+        let (shard, _) = registered.value();
+        // The peer's own origin survived: it was not rewritten to this node.
+        assert_eq!(shard.socket_addr, origin);
+        assert!(!shard.socket_addr.contains("127.0.0.1"));
+    }
+
+    /// This node's own stub refresh from its own process still binds to
+    /// loopback, which is the behaviour the shortcut existed for.
+    #[tokio::test]
+    async fn this_nodes_own_stub_refresh_from_localhost_still_binds_to_loopback() {
+        let own_key = arc_crypto::KeyPair::generate_ed25519();
+        let state = Arc::new(arc_state::StateDB::new());
+        state.seed_genesis_validators(&[(
+            own_key.address(),
+            arc_state::StateDB::MIN_VALIDATOR_STAKE,
+        )]);
+        let model_id = arc_crypto::hash_bytes(b"self-refresh-artifact");
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = state;
+        coordinator.model_artifact_id = Some(model_id);
+        // The announcement is signed by this node's own validator identity.
+        coordinator.validator_address = own_key.address();
+        coordinator.shard_rpc_audiences.insert(
+            shard_rpc_origin("http://127.0.0.1:9944").unwrap(),
+            ValidatorRpcAudience {
+                validator: own_key.address(),
+                transaction_domain: None,
+                observed_at: Instant::now(),
+            },
+        );
+        let announced = ShardInfo {
+            start_layer: 0,
+            end_layer: 1,
+            total_layers: 1,
+            model_id: format!("0x{}", model_id.to_hex()),
+            model_name: "self-refresh".to_string(),
+            execution_profile: canonical_profile(),
+            memory_mb: 1,
+            full_model_mb: 1,
+            socket_addr: "http://0.0.0.0:9944".to_string(),
+            node_name: "self".to_string(),
+        };
+        let signed = sign_validator_shard_announcement(
+            announced,
+            &own_key,
+            coordinator.validator_address,
+            None,
+        )
+        .unwrap();
+        let Json(response) = announce_shard(
+            AxumState(coordinator.clone()),
+            ConnectInfo(RpcPeerAddr("127.0.0.1:49152".parse().unwrap())),
+            Json(signed),
+        )
+        .await
+        .expect("a node's own stub refresh from its own process is accepted");
+        assert_eq!(response["ok"], true);
+        let registered = coordinator.shard_registry.iter().next().unwrap();
+        assert!(
+            registered.value().0.socket_addr.contains("127.0.0.1"),
+            "own stub refresh binds to loopback: {}",
+            registered.value().0.socket_addr
         );
     }
 
