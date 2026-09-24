@@ -776,7 +776,10 @@ fn a_binding_update_publishes_on_every_validator_at_one_coordinated_height() {
     // things, and an update to one is not an update to the other.
 
     // And the chain still settles the work it can execute, after the update.
-    let (tx, after) = fx.request_using(1, domain2, 1, expiry, fx.tuple);
+    // Requester 0, whose earlier request finalized, so its next nonce is 1.
+    // Requester 1's nonce is still 0: its upgraded-model request was admitted
+    // and is waiting for a worker that will never take it.
+    let (tx, after) = fx.request_using(0, domain2, 1, expiry, fx.tuple);
     let (code, body) = submit(nodes[0].port, &tx);
     assert_eq!(code, 200, "a request for the served model: {body}");
     wait_finalized(

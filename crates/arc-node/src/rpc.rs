@@ -3109,6 +3109,17 @@ fn uses_unready_paid_inference_protocol(tx: &Transaction) -> bool {
     restricted(tx.tx_type) || restricted(tx.body.tx_type())
 }
 
+/// True when this chain admits ONLY native-inference transactions - a private
+/// protocol-4 chain, whose blocks carry one native transition and nothing
+/// else, so anything else submitted here can never execute.
+///
+/// A MIGRATED chain has a binding too, and keeps every transaction family it
+/// had. It is never "native only", and refusing its ordinary traffic at
+/// ingress would reject exactly what the migration exists to preserve.
+pub(crate) fn admits_only_native_transactions(state: &arc_state::StateDB) -> bool {
+    state.native_inference_context().is_some() && state.native_migration().is_none()
+}
+
 fn is_native_inference_transaction(tx: &Transaction) -> bool {
     matches!(
         tx.tx_type,
@@ -3452,8 +3463,7 @@ async fn submit_signed_tx(
     // A MIGRATED chain is not that chain: it keeps every transaction family
     // it had, so refusing them here would reject the traffic the migration
     // exists to preserve, at the very first step the user reaches.
-    if node.state.native_inference_context().is_some()
-        && node.state.native_migration().is_none()
+    if admits_only_native_transactions(&node.state)
         && !arc_state::StateDB::is_native_inference_transaction(&tx)
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into());
@@ -3752,7 +3762,7 @@ async fn faucet_claim(
     // block can never carry. Refuse it rather than return a hash that will
     // never land. A migrated chain still carries faucet claims, so this does
     // not apply there.
-    if node.state.native_inference_context().is_some() && node.state.native_migration().is_none() {
+    if admits_only_native_transactions(&node.state) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(FaucetErrorResponse {
@@ -18829,6 +18839,67 @@ mod tests {
             ".tmp-{}-{uuid}",
             "AA".repeat(32)
         )));
+    }
+
+    /// The ingress predicate that decides whether this chain refuses
+    /// everything but native inference. Getting it wrong on a migrated chain
+    /// rejects the traffic the migration exists to preserve, at the first
+    /// step a user reaches.
+    #[test]
+    fn only_a_private_protocol_4_chain_admits_native_transactions_alone() {
+        let temporary =
+            std::env::temp_dir().join(format!("arc-rpc-ingress-gate-{}", uuid::Uuid::new_v4()));
+        let members: Vec<arc_types::inference_contract::ValidatorMember> = (0u8..6)
+            .map(|i| arc_types::inference_contract::ValidatorMember {
+                address: arc_crypto::hash_bytes(&[i; 4]),
+                stake: StateDB::MIN_VALIDATOR_STAKE,
+            })
+            .collect();
+        let mut members = members;
+        members.sort_by_key(|member| member.address.0);
+        let genesis = arc_crypto::hash_bytes(b"ingress-gate-genesis");
+        let prefunded: Vec<(Hash256, u64)> = members.iter().map(|m| (m.address, 0)).collect();
+        let state = StateDB::with_genesis_persistent(&prefunded, &temporary.join("state"), genesis)
+            .unwrap();
+        state.seed_genesis_validators(
+            &members
+                .iter()
+                .map(|m| (m.address, m.stake))
+                .collect::<Vec<_>>(),
+        );
+
+        // No binding at all: an ordinary chain, everything admitted.
+        assert!(!admits_only_native_transactions(&state));
+
+        let context = arc_state::InferenceAdmissionContext {
+            domain: arc_types::inference_contract::InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 0,
+                validator_set_hash: arc_types::inference_contract::validator_set_commitment(
+                    &members,
+                )
+                .unwrap(),
+            },
+            members: members.clone(),
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: Hash256([7; 32]),
+                profile_hash: Hash256([7; 32]),
+                generation_hash: Hash256([7; 32]),
+                assignment_hash: Hash256([7; 32]),
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        state.activate_native_inference(context).unwrap();
+
+        // Activated at a fresh private genesis, with no migration record:
+        // this chain really does carry native work and nothing else.
+        assert!(state.native_migration().is_none());
+        assert!(admits_only_native_transactions(&state));
+
+        // The migrated case is the negation of that record being present,
+        // and a migrated chain always has one - qualified in arc-state,
+        // where a recovery-bound chain can be built.
+        std::fs::remove_dir_all(&temporary).ok();
     }
 
     #[test]
