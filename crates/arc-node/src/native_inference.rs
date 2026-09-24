@@ -211,11 +211,29 @@ impl StatePendingSource {
     }
 }
 
+impl StatePendingSource {
+    /// The binding in force RIGHT NOW, not the one this source was built
+    /// with. A binding update replaces it, and a source pinned to the
+    /// commitment it started with stops being able to load any work the
+    /// moment that happens - which on a live chain means the worker fails
+    /// every poll and the chain serves nothing. Reading it from the state
+    /// keeps the original property: the commitment is the state's own, never
+    /// one a caller supplied.
+    fn live_commitment(&self) -> Hash256 {
+        self.state
+            .try_native_inference_context()
+            .ok()
+            .flatten()
+            .and_then(|context| context.commitment().ok())
+            .unwrap_or(self.context_commitment)
+    }
+}
+
 impl PendingSource for StatePendingSource {
     fn load_pending(&self, request_id: Hash256) -> Result<PendingJob, NativeInferenceError> {
         let pending = self
             .state
-            .native_inference_pending_requests(self.context_commitment)
+            .native_inference_pending_requests(self.live_commitment())
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?
             .into_iter()
             .find(|snapshot| snapshot.request_id == request_id)
@@ -4608,6 +4626,54 @@ mod tests {
         );
         assert!(calls.contains(&ids[1]), "the other request still ran");
         assert!(votes >= 1);
+    }
+
+    /// A pending source built before a binding update must still load work
+    /// admitted after it. Pinned to the commitment it started with, the
+    /// worker failed every poll the moment such a request appeared - across
+    /// four real node processes, that stopped the chain serving any paid work
+    /// at all, silently, from one configuration change onward.
+    #[test]
+    fn a_pending_source_follows_the_binding_in_force_not_the_one_it_started_with() {
+        let fixture = native_fixture();
+        let source =
+            StatePendingSource::new(fixture.state.clone(), fixture.context.commitment().unwrap());
+
+        // The operator publishes a new binding, adding a model.
+        let upgraded = hash_bytes(b"a newer model for the pending source");
+        let mut next = fixture.context.clone();
+        next.allowed_executions.push(AllowedExecution {
+            model_hash: upgraded,
+            profile_hash: upgraded,
+            generation_hash: upgraded,
+            assignment_hash: upgraded,
+        });
+        fixture
+            .state
+            .update_native_inference_binding(next)
+            .expect("a running binding can be updated");
+
+        // Work admitted under the NEW binding.
+        let request = request_for(&fixture, 0, 3);
+        let request_id = request.job.request_id();
+        let request_tx = signed_native(
+            &fixture.state,
+            &fixture.requester,
+            0,
+            TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: token_bytes(&[11, 12]),
+            }),
+            gas_costs::NATIVE_INFERENCE_REQUEST,
+        );
+        fixture
+            .state
+            .execute_block_verified(&[request_tx], fixture.finalizer.address())
+            .unwrap();
+
+        source
+            .load_pending(request_id)
+            .expect("the worker must still be able to load work after an update");
     }
 
     #[test]

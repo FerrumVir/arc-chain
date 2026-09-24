@@ -5367,6 +5367,68 @@ mod tests {
         );
     }
 
+    /// Work admitted AFTER a binding update must be readable by the worker
+    /// that has to execute it. Running this across four node processes showed
+    /// the worker's poll failing on every tick the moment such a request was
+    /// admitted, which stops the chain serving any paid work at all.
+    #[test]
+    fn work_admitted_after_an_update_is_readable_by_the_worker() {
+        let f = fixture("post-update-poll");
+        let state = &f.ledger.state;
+        state.activate_native_inference(f.context.clone()).unwrap();
+
+        // Update with nothing pending, so the previous binding is not
+        // retained - exactly the shape the processes were in.
+        let upgraded = hash_bytes(b"a newer model");
+        let mut next = f.context.clone();
+        next.allowed_executions.push(AllowedExecution {
+            model_hash: upgraded,
+            profile_hash: upgraded,
+            generation_hash: upgraded,
+            assignment_hash: upgraded,
+        });
+        let v2 = state.update_native_inference_binding(next.clone()).unwrap();
+        assert!(
+            state.retained_binding_index().unwrap().is_empty(),
+            "nothing was pending, so nothing is retained"
+        );
+
+        // Admit a request for the model the UPDATE added - the case the
+        // processes were in, and the one `request()` cannot build because it
+        // always uses the binding's first execution.
+        let input = b"input".to_vec();
+        let job = arc_types::inference_contract::InferenceJob {
+            version: arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+            domain: next.domain,
+            requester: f.requester.address(),
+            nonce: 0,
+            model_hash: upgraded,
+            profile_hash: upgraded,
+            input_hash: hash_bytes(&input),
+            generation_hash: upgraded,
+            assignment_hash: upgraded,
+            max_tokens: 32,
+            max_output_bytes: 128,
+            execution_price: 10,
+            reserved_max_payment: 100,
+            expires_at: 400,
+        };
+        let req = InferenceRequest::sign(job, &f.requester).unwrap();
+        let id = req.job.request_id();
+        let tx = native_request(state, &f.requester, req);
+        let (_, receipts) = state
+            .execute_block_adaptive_at(&[tx], f.validators[0].address(), 10)
+            .unwrap();
+        assert!(receipts[0].success);
+
+        // What the worker does every tick.
+        let pending = state
+            .native_inference_pending_requests(v2)
+            .expect("the worker must be able to read the work it has to execute");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, id);
+    }
+
     #[test]
     fn canonical_native_envelope_domain_bounds_and_mixed_block_rejections_are_atomic() {
         let f = fixture("canonical-reject");
