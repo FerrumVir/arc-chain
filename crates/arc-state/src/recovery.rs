@@ -2452,7 +2452,15 @@ impl StateDB {
     }
 
     pub fn active_protocol_version(&self) -> ProtocolVersion {
-        if self.native_inference_context.read().is_some() {
+        // A MIGRATED chain is still the chain it was. Paid inference is an
+        // added capability there, not a replacement protocol: it keeps its
+        // recovery protocol version, and with it the whole v3 admission path
+        // that validates transfers, faucet claims and community rewards.
+        // Reporting 4 would skip that validation for every ordinary family
+        // the migration exists to preserve. Only a chain activated at a
+        // fresh private genesis, with no migration record, is protocol 4.
+        if self.native_inference_context.read().is_some() && self.native_migration.read().is_none()
+        {
             return ProtocolVersion::new(4, 0, 0);
         }
         self.recovery_context()

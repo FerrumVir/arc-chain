@@ -245,6 +245,19 @@ impl Fixture {
         nonce: u64,
         expires_at: u64,
     ) -> (Transaction, Hash256) {
+        self.request_using(who, domain, nonce, expires_at, self.tuple)
+    }
+
+    /// The same, against a stated execution tuple - so a test can submit work
+    /// for a model the chain only allows after a binding update.
+    fn request_using(
+        &self,
+        who: usize,
+        domain: InferenceDomain,
+        nonce: u64,
+        expires_at: u64,
+        tuple: [Hash256; 4],
+    ) -> (Transaction, Hash256) {
         let requester = &self.requesters[who];
         let input = format!("p5 input {who}/{nonce}").into_bytes();
         let job = InferenceJob {
@@ -252,11 +265,11 @@ impl Fixture {
             domain,
             requester: requester.address(),
             nonce,
-            model_hash: self.tuple[0],
-            profile_hash: self.tuple[1],
+            model_hash: tuple[0],
+            profile_hash: tuple[1],
             input_hash: hash_bytes(&input),
-            generation_hash: self.tuple[2],
-            assignment_hash: self.tuple[3],
+            generation_hash: tuple[2],
+            assignment_hash: tuple[3],
             max_tokens: 8,
             max_output_bytes: 128,
             execution_price: 10,
@@ -562,6 +575,206 @@ fn a_paid_request_settles_identically_on_every_validator_of_one_chain() {
 }
 
 /// Wait until `id` is Finalized on every listed node.
+/// A configuration change on a running committee, with real processes.
+///
+/// Publishing a binding writes state, so every validator has to publish it in
+/// the SAME block or they derive different roots from there on. This drives
+/// that through the operator seam - a config file naming the binding being
+/// replaced and the coordinated height - across four `arc-node` processes,
+/// and checks what the chain does either side of it: same binding everywhere,
+/// still agreeing block for block, work before and after the change settling
+/// with the escrow drained exactly.
+#[test]
+fn a_binding_update_publishes_on_every_validator_at_one_coordinated_height() {
+    let fx = Fixture::new(9960, 9160, &[]);
+    let nodes: Vec<NodeProcess> = (0..NODES).map(|i| fx.spawn(i)).collect();
+    wait_for(
+        Duration::from_secs(40),
+        "every node healthy and fully peered",
+        || {
+            nodes.iter().all(|n| {
+                get_json(n.port, "/health")
+                    .and_then(|h| h["peers"].as_u64())
+                    .is_some_and(|p| p >= (NODES - 1) as u64)
+            })
+        },
+    );
+    wait_for(
+        Duration::from_secs(120),
+        "the committee to commit blocks",
+        || heights(&nodes).iter().all(|h| h.unwrap_or(0) >= 3),
+    );
+
+    let ctx = get_json(nodes[0].port, "/native-inference/context").expect("activated");
+    let v1 = ctx["context_commitment"].as_str().unwrap().to_string();
+    let domain = InferenceDomain {
+        chain_genesis: Hash256::from_hex(ctx["chain_genesis"].as_str().unwrap()).unwrap(),
+        recovery_epoch: ctx["recovery_epoch"].as_u64().unwrap(),
+        validator_set_hash: Hash256::from_hex(ctx["validator_set_hash"].as_str().unwrap()).unwrap(),
+    };
+    for n in &nodes[1..] {
+        let other = get_json(n.port, "/native-inference/context").expect("activated");
+        assert_eq!(
+            other["context_commitment"].as_str().unwrap(),
+            v1,
+            "every validator starts on the same binding"
+        );
+        assert_eq!(other["allowed_execution_count"], 1);
+    }
+
+    // Work admitted under the binding in force before the change.
+    let expiry = heights(&nodes)[0].unwrap() + 5_000;
+    let (tx, before) = fx.request(0, domain, 0, expiry);
+    let (code, body) = submit(nodes[0].port, &tx);
+    assert_eq!(code, 200, "a request under the first binding: {body}");
+    wait_finalized(
+        &nodes.iter().collect::<Vec<_>>(),
+        before,
+        Duration::from_secs(180),
+        "the request submitted before the update",
+    );
+
+    // A maintenance window: the committee is stopped, so the chain cannot
+    // pass the coordinated height while the operator is rewriting configs.
+    // This is what makes the height safe to choose.
+    let stopped_at = heights(&nodes)
+        .iter()
+        .filter_map(|h| *h)
+        .max()
+        .expect("a committed height");
+    drop(nodes);
+    // Far enough ahead that all four are back up before the chain gets
+    // there: a node that restarts past the coordinated height refuses the
+    // update rather than publishing it late, which is correct but would make
+    // this test race its own restarts.
+    let at_height = stopped_at + 5;
+
+    let upgraded = [
+        hash_bytes(b"p5-model-2"),
+        hash_bytes(b"p5-profile-2"),
+        hash_bytes(b"p5-generation-2"),
+        hash_bytes(b"p5-assignment-2"),
+    ];
+    let execution = |t: &[Hash256; 4]| {
+        serde_json::json!({
+            "model_hash": t[0].to_hex(),
+            "profile_hash": t[1].to_hex(),
+            "generation_hash": t[2].to_hex(),
+            "assignment_hash": t[3].to_hex(),
+        })
+    };
+    std::fs::write(
+        &fx.activation,
+        serde_json::json!({
+            "recovery_epoch": 0,
+            "allowed_executions": [execution(&fx.tuple), execution(&upgraded)],
+            "update_from": v1,
+            "update_at_height": at_height,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let nodes: Vec<NodeProcess> = (0..NODES).map(|i| fx.spawn(i)).collect();
+    wait_for(
+        Duration::from_secs(120),
+        "the committee back up after the maintenance window",
+        || {
+            nodes.iter().all(|n| {
+                get_json(n.port, "/health")
+                    .and_then(|h| h["peers"].as_u64())
+                    .is_some_and(|p| p >= (NODES - 1) as u64)
+            })
+        },
+    );
+    wait_for(
+        Duration::from_secs(300),
+        "every validator to publish the new binding",
+        || {
+            nodes.iter().all(|n| {
+                get_json(n.port, "/native-inference/context")
+                    .and_then(|c| c["allowed_execution_count"].as_u64())
+                    .is_some_and(|count| count == 2)
+            })
+        },
+    );
+
+    // The same new binding on every one of them, and not the old one.
+    let updated = get_json(nodes[0].port, "/native-inference/context").expect("activated");
+    let v2 = updated["context_commitment"].as_str().unwrap().to_string();
+    assert_ne!(v2, v1, "a new configuration is a new binding");
+    for n in &nodes[1..] {
+        let other = get_json(n.port, "/native-inference/context").expect("activated");
+        assert_eq!(
+            other["context_commitment"].as_str().unwrap(),
+            v2,
+            "every validator published the SAME binding"
+        );
+    }
+
+    // Still one chain: same block hash at a height past the change.
+    wait_for(
+        Duration::from_secs(180),
+        "blocks past the coordinated height",
+        || {
+            heights(&nodes)
+                .iter()
+                .all(|h| h.unwrap_or(0) >= at_height + 2)
+        },
+    );
+    let agreed = at_height + 1;
+    let reference = block_hash(nodes[0].port, agreed).expect("a block past the update");
+    for (i, n) in nodes.iter().enumerate().skip(1) {
+        assert_eq!(
+            block_hash(n.port, agreed).as_deref(),
+            Some(reference.as_str()),
+            "validator {i} disagrees about the block after the binding update"
+        );
+    }
+
+    // The new configuration governs new work: a request for the model the
+    // chain only allows after the update.
+    let domain2 = InferenceDomain {
+        chain_genesis: Hash256::from_hex(updated["chain_genesis"].as_str().unwrap()).unwrap(),
+        recovery_epoch: updated["recovery_epoch"].as_u64().unwrap(),
+        validator_set_hash: Hash256::from_hex(updated["validator_set_hash"].as_str().unwrap())
+            .unwrap(),
+    };
+    let expiry = heights(&nodes)[0].unwrap() + 5_000;
+    let (tx, after) = fx.request_using(1, domain2, 0, expiry, upgraded);
+    let (code, body) = submit(nodes[0].port, &tx);
+    assert_eq!(
+        code, 200,
+        "the upgraded model is admissible after the update: {body}"
+    );
+    wait_finalized(
+        &nodes.iter().collect::<Vec<_>>(),
+        after,
+        Duration::from_secs(180),
+        "the request submitted under the new binding",
+    );
+
+    // Payment conservation, on every replica, for both requests.
+    for id in [before, after] {
+        let settled: Vec<_> = nodes.iter().map(|n| settlement(n.port, id)).collect();
+        let first = settled[0].clone().expect("a settlement");
+        for (i, s) in settled.iter().enumerate() {
+            assert_eq!(
+                s.as_ref().expect("a settlement"),
+                &first,
+                "replica {i} disagrees about the settlement of {}",
+                id.to_hex()
+            );
+        }
+        let paid: u64 = first.3.iter().map(|(_, amount)| amount).sum();
+        assert_eq!(
+            paid, 100,
+            "settlement drains the reserved escrow exactly, either side of a binding update: {:?}",
+            first.3
+        );
+    }
+}
+
 fn wait_finalized(nodes: &[&NodeProcess], id: Hash256, timeout: Duration, label: &str) {
     wait_for(timeout, label, || {
         nodes

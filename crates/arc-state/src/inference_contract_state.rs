@@ -1785,7 +1785,7 @@ impl StateDB {
     }
 }
 
-fn is_native_body(body: &arc_types::TxBody) -> bool {
+pub(crate) fn is_native_body(body: &arc_types::TxBody) -> bool {
     matches!(
         body,
         arc_types::TxBody::NativeInferenceRequest(_)
@@ -3314,6 +3314,24 @@ mod tests {
         tx
     }
 
+    /// Like `outer`, but for an ordinary family that pays a fee. Native
+    /// transactions require fee=0; a v3 transfer requires at least 1.
+    fn outer_with_fee(
+        state: &StateDB,
+        key: &KeyPair,
+        nonce: u64,
+        fee: u64,
+        body: arc_types::TxBody,
+    ) -> arc_types::Transaction {
+        let mut tx = arc_types::Transaction::new_transfer(key.address(), key.address(), 0, nonce);
+        tx.tx_type = body.tx_type();
+        tx.body = body;
+        tx.fee = fee;
+        tx.gas_limit = StateDB::gas_cost_for_tx(&tx);
+        state.sign_transaction(&mut tx, key).unwrap();
+        tx
+    }
+
     fn native_request(
         state: &StateDB,
         key: &KeyPair,
@@ -4655,10 +4673,11 @@ mod tests {
             .unwrap();
         state.activate_native_inference(f.context.clone()).unwrap();
 
-        let transfer = outer(
+        let transfer = outer_with_fee(
             state,
             &f.requester,
             0,
+            1,
             arc_types::TxBody::Transfer(arc_types::transaction::TransferBody {
                 to: f.validators[0].address(),
                 amount: 1,
@@ -4703,6 +4722,34 @@ mod tests {
         state
             .refuse_registry_change_under_native_binding()
             .expect("and the executor does not refuse it either");
+
+        // And it EXECUTES, which admission alone does not show: an ordinary
+        // block on a migrated chain must take the ordinary execution path,
+        // not the native one that every block used to take.
+        let before = state.get_account(&f.requester.address()).unwrap().balance;
+        let (block, receipts) = state
+            .execute_block_adaptive_at(
+                std::slice::from_ref(&transfer),
+                f.validators[0].address(),
+                1_700_400,
+            )
+            .expect("an ordinary block executes on a migrated chain");
+        assert!(receipts[0].success, "the transfer succeeded");
+        assert_eq!(block.header.protocol_version.major, 3);
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            before - 2,
+            "the transfer moved value and paid its fee"
+        );
+
+        // And the chain still reports the protocol it actually is. Reporting
+        // 4 here would skip the v3 admission path that validates every one of
+        // those families - the transfer above would reach a block unchecked.
+        assert_eq!(
+            state.active_protocol_version().major,
+            3,
+            "a migrated chain keeps its recovery protocol and its whole admission path"
+        );
     }
 
     /// The private protocol-4 rule is unchanged by any of the above: without
@@ -4731,6 +4778,11 @@ mod tests {
             .validate_native_inference_block_admission(std::slice::from_ref(&transfer))
             .expect_err("a private protocol-4 chain admits only native transactions");
         assert!(format!("{error}").contains("at most one"), "{error}");
+        assert_eq!(
+            state.active_protocol_version().major,
+            4,
+            "a fresh private genesis IS protocol 4"
+        );
     }
 
     /// The product requirement end to end: a real paid request reserved,
@@ -5070,6 +5122,74 @@ mod tests {
                 .is_none(),
             "and its row is gone from state"
         );
+    }
+
+    /// The sequence the public chain will actually follow: migrate, take paid
+    /// work, then upgrade the binding while that work is still in flight.
+    #[test]
+    fn a_migrated_chain_can_upgrade_its_binding_without_stranding_work() {
+        let f = fixture("migrated-then-upgraded");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        let v1 = f.context.commitment().unwrap();
+        assert_eq!(state.native_inference_context(), Some(f.context.clone()));
+
+        // Paid work admitted under the migrated binding.
+        let req = request(&f, 0, 400);
+        let id = req.job.request_id();
+        let tx = native_request(state, &f.requester, req);
+        state
+            .execute_block_adaptive_at(&[tx], f.validators[0].address(), 1_700_200)
+            .unwrap();
+        assert_eq!(state.get_account(&escrow_address(id)).unwrap().balance, 100);
+
+        // A model upgrade, coordinated two blocks ahead.
+        let upgraded = hash_bytes(b"a newer model for the public chain");
+        let mut next = f.context.clone();
+        next.allowed_executions.push(AllowedExecution {
+            model_hash: upgraded,
+            profile_hash: upgraded,
+            generation_hash: upgraded,
+            assignment_hash: upgraded,
+        });
+        let at = state.height() + 2;
+        state
+            .authorize_binding_update(at, v1, next.clone())
+            .expect("a migrated chain can schedule a binding update");
+        while state.height() < at {
+            state
+                .execute_block_adaptive_at(
+                    &[],
+                    f.validators[0].address(),
+                    1_700_300 + state.height(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            state.native_inference_context(),
+            Some(next),
+            "the migrated chain published the upgrade itself, at its height"
+        );
+        assert_eq!(state.retained_binding_index().unwrap(), vec![v1]);
+
+        // The work admitted before the upgrade still settles on its terms.
+        let terminal = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
+        let (_, receipts) = state
+            .execute_block_adaptive_at(&[terminal], f.validators[0].address(), 1_700_400)
+            .unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(state.get_account(&escrow_address(id)).unwrap().balance, 0);
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            990
+        );
+        // And the chain is still the recovered public chain it was.
+        assert!(state.recovery_context().is_some());
     }
 
     #[test]

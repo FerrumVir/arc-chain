@@ -7289,6 +7289,19 @@ async fn run_arc_node() -> Result<()> {
                     activation_path.display()
                 );
             }
+            // Likewise a binding update between being configured and the
+            // chain reaching its coordinated height: the binding in force is
+            // unchanged and this node keeps serving under it.
+            Err(
+                error @ arc_node::native_inference::ActivationConfigError::BindingUpdatePending {
+                    ..
+                },
+            ) => {
+                tracing::warn!(
+                    "native inference binding update is authorised and waiting: {error} (from {})",
+                    activation_path.display()
+                );
+            }
             Err(error) => {
                 bail!(
                     "--native-inference-activation {}: {error}",

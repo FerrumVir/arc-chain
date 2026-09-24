@@ -3459,12 +3459,26 @@ impl StateDB {
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         let _native_guard = self.native_inference_execution.lock();
         if self.native_inference_context.read().is_some() {
-            return self.execute_native_inference_block_at(
-                transactions,
-                producer,
-                timestamp,
-                proof_hash,
-            );
+            // A private protocol-4 chain runs nothing else, so every block of
+            // it is a native block. A MIGRATED chain is still protocol 3 with
+            // paid inference added: only its native blocks take the native
+            // execution path, and everything else - a transfer, a faucet
+            // claim, a reward, an empty block - takes the ordinary one, with
+            // the v3 admission that validates those families. Routing them
+            // all through the native path would admit an ordinary transaction
+            // and then fail to execute it.
+            let migrated = self.native_migration.read().is_some();
+            let native_block = transactions
+                .iter()
+                .any(|tx| inference_contract_state::is_native_body(&tx.body));
+            if !migrated || native_block {
+                return self.execute_native_inference_block_at(
+                    transactions,
+                    producer,
+                    timestamp,
+                    proof_hash,
+                );
+            }
         }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
