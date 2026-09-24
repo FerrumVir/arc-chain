@@ -5493,6 +5493,59 @@ mod tests {
         );
     }
 
+    /// A projected root must never be a cached one.
+    ///
+    /// This pins an invariant against a merge rather than against a bug. The
+    /// Studio's recovery hotfix makes a node reuse the last verified state
+    /// root until something that feeds the root actually changes, and this
+    /// projection asks the opposite question: what root would this state have
+    /// with changes that have NOT been applied. "Nothing has changed since
+    /// last time" is true for those calls and completely irrelevant to them.
+    /// If a cache ever leaks into the replacement path, native settlement
+    /// commits the current root as if it were the projected one and every
+    /// validator on a migrated chain derives something different at the first
+    /// paid request.
+    #[test]
+    fn a_projected_recovery_root_is_never_the_unprojected_one() {
+        let f = fixture("projection-not-cached");
+        let state = recovered_chain_at(&f, 4);
+        let context = state.recovery_context().expect("recovery-bound");
+
+        let plain = state.compute_recovery_state_root_with(&context, &[], &[]);
+        assert_eq!(
+            state.compute_recovery_state_root_with(&context, &[], &[]),
+            plain,
+            "the same state twice is the same root - caching this is legitimate"
+        );
+
+        // An account the projection changes but the state does not.
+        let address = f.requester.address();
+        let mut moved = state.get_account(&address).expect("a funded account");
+        moved.balance = moved.balance.checked_add(1).unwrap();
+        let projected = state.compute_recovery_state_root_with(&context, &[(address, moved)], &[]);
+        assert_ne!(
+            projected, plain,
+            "a projection with an account replacement must not return the unprojected root"
+        );
+
+        // And the same for a storage row, which native settlement also writes.
+        let with_storage = state.compute_recovery_state_root_with(
+            &context,
+            &[],
+            &[(context_account(), metadata_key(), b"projected".to_vec())],
+        );
+        assert_ne!(
+            with_storage, plain,
+            "a projection with a storage replacement must not return the unprojected root"
+        );
+
+        // The real state was never touched by any of this.
+        assert_eq!(
+            state.compute_recovery_state_root_with(&context, &[], &[]),
+            plain
+        );
+    }
+
     #[test]
     fn canonical_native_envelope_domain_bounds_and_mixed_block_rejections_are_atomic() {
         let f = fixture("canonical-reject");
