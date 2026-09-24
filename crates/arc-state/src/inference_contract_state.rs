@@ -544,6 +544,15 @@ pub(crate) fn activation_key() -> Hash256 {
     hash_bytes(b"ARC-native-inference-activation-v1")
 }
 
+/// Where the authorising migration record is kept once it has been applied.
+/// The record is an operator input to the ONE activation, but the fact that
+/// activation happened under it has to outlive the process: a restarting node
+/// is not handed the record again, and every validator's root must contain
+/// the same evidence of why a running chain was allowed to activate.
+pub(crate) fn migration_key() -> Hash256 {
+    hash_bytes(b"ARC-native-inference-migration-v1")
+}
+
 /// Authorisation to activate native inference on a chain that is ALREADY
 /// RUNNING, instead of only at a fresh genesis.
 ///
@@ -721,7 +730,7 @@ impl StateDB {
         }
         let mut account = Account::new(address, 0);
         account.storage_root = commitment;
-        let ops = [
+        let mut ops = vec![
             WalOp::SetAccount(address, account),
             WalOp::SetStorage(address, context_key(), commitment.0.to_vec()),
             WalOp::SetStorage(address, activation_key(), encoded),
@@ -734,6 +743,20 @@ impl StateDB {
                 self.staking_pool.load(std::sync::atomic::Ordering::Acquire),
             ),
         ];
+        // A migrated chain records what authorised it, in the same rooted
+        // write and the same block. Without this the binding cannot be
+        // rebuilt after a restart, and nothing on-chain says why a running
+        // chain was allowed to activate at all.
+        if let Some(record) = &migration {
+            let encoded_record = bincode::serialize(record)
+                .map_err(|error| StateError::ExecutionError(error.to_string()))?;
+            if encoded_record.len() > MAX_CONTEXT_BYTES {
+                return Err(StateError::ExecutionError(
+                    "native migration record exceeds bound".into(),
+                ));
+            }
+            ops.push(WalOp::SetStorage(address, migration_key(), encoded_record));
+        }
         let root = self.projected_root_after(&ops);
         for op in &ops {
             self.wal.append(op.clone(), at_height);
@@ -821,6 +844,25 @@ impl StateDB {
     }
 
     pub(crate) fn restore_native_inference_context(&self) -> Result<(), StateError> {
+        // Before anything revalidates the binding: a chain that migrated says
+        // so in its own state. Restoring the record first is what lets a
+        // recovery-bound chain come back with paid inference still active,
+        // and it is read from rooted storage, never from an operator input.
+        if let Some(encoded) = self.get_storage(&context_account(), &migration_key()) {
+            let record = bincode::deserialize_limited_exact::<
+                NativeMigrationRecord,
+                MAX_CONTEXT_BYTES,
+            >(&encoded)
+            .map_err(|error| {
+                StateError::ExecutionError(format!("invalid native migration record: {error}"))
+            })?;
+            if let Some(reason) = record.refusal_against(self) {
+                return Err(StateError::ExecutionError(format!(
+                    "recorded native migration does not authorise this chain: {reason}"
+                )));
+            }
+            *self.native_migration.write() = Some(record);
+        }
         let Some(encoded) = self.get_storage(&context_account(), &activation_key()) else {
             if self
                 .blocks
@@ -3851,6 +3893,201 @@ mod tests {
             format!("{error}").contains("recovery-bound state"),
             "{error}"
         );
+    }
+
+    /// A migrated chain has to come back after a restart. The operator's
+    /// record is an input to the ONE activation; a restarting node is not
+    /// given it again and rebuilds the binding from rooted storage alone.
+    #[test]
+    fn a_migrated_chain_rebuilds_its_binding_the_way_a_restart_does() {
+        let f = fixture("migration-restart");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5))
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        state.activate_native_inference(f.context.clone()).unwrap();
+        let root = state.compute_state_root();
+        let balance = state.get_account(&f.requester.address()).unwrap().balance;
+
+        // Exactly what reopening the state directory does: the in-memory
+        // caches start empty and the binding is restored from storage.
+        forget_cached_binding(state);
+        state
+            .restore_native_inference_context()
+            .expect("a migrated chain must rebuild its binding from its own rooted state");
+        assert_eq!(state.native_inference_context(), Some(f.context.clone()));
+        assert_eq!(state.compute_state_root(), root, "restart changes no root");
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            balance
+        );
+    }
+
+    /// Every validator must derive the SAME migrated state root. Two nodes
+    /// of the same chain, advanced identically and migrated by the same
+    /// record, are the whole point of naming a coordinated height.
+    #[test]
+    fn two_validators_migrating_the_same_chain_derive_the_same_root() {
+        let f = fixture("migration-agreement");
+        let members: Vec<_> = f
+            .context
+            .members
+            .iter()
+            .map(|member| (member.address, member.stake))
+            .collect();
+        let first = recovered_chain_at(&f, 4);
+        first
+            .authorize_native_migration(migration_for(&f, 5))
+            .unwrap();
+        first
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        let commitment = first.activate_native_inference(f.context.clone()).unwrap();
+
+        // A second node of the same chain, from the same genesis.
+        let dir = f.dir.with_extension("second");
+        let second = StateDB::with_genesis_persistent(&f.prefunded, &dir, f.genesis).unwrap();
+        second.seed_genesis_validators(&members);
+        *second.recovery_context.write() = Some(crate::recovery::RecoveryContext::new(
+            "test", f.genesis, 1, 0,
+        ));
+        while second.height() < 4 {
+            second
+                .execute_block_adaptive_at(
+                    &[],
+                    f.validators[0].address(),
+                    1_700_000 + second.height(),
+                )
+                .unwrap();
+        }
+        second
+            .authorize_native_migration(migration_for(&f, 5))
+            .unwrap();
+        second
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        let other = second.activate_native_inference(f.context.clone()).unwrap();
+
+        assert_eq!(commitment, other, "the same binding");
+        assert_eq!(
+            first.compute_state_root(),
+            second.compute_state_root(),
+            "two validators migrating the same chain must agree"
+        );
+        assert_eq!(first.height(), second.height());
+    }
+
+    /// Repeating the migration must change nothing: the same record, the same
+    /// binding, the same root. An operator retrying after a timeout, or a
+    /// restarted node re-reading its config, must not write twice.
+    #[test]
+    fn repeating_a_migration_changes_nothing() {
+        let f = fixture("migration-repeat");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5))
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        let commitment = state.activate_native_inference(f.context.clone()).unwrap();
+        let root = state.compute_state_root();
+
+        // Again, with the record still authorised - the idempotent path.
+        assert_eq!(
+            state.activate_native_inference(f.context.clone()).unwrap(),
+            commitment
+        );
+        assert_eq!(state.compute_state_root(), root, "a repeat writes nothing");
+        // And again after re-authorising the same record, as a restarted
+        // operator process would.
+        state
+            .authorize_native_migration(migration_for(&f, 5))
+            .expect("re-authorising an already applied migration is accepted");
+        assert_eq!(
+            state.activate_native_inference(f.context.clone()).unwrap(),
+            commitment
+        );
+        assert_eq!(state.compute_state_root(), root);
+    }
+
+    /// A refused migration must leave NO trace. Fail-closed means the chain
+    /// is exactly what it was, not a half-written context account.
+    #[test]
+    fn a_refused_migration_publishes_no_partial_state() {
+        let f = fixture("migration-refused");
+        let state = recovered_chain_at(&f, 4);
+        let before = state.compute_state_root();
+        state
+            .authorize_native_migration(migration_for(&f, 9))
+            .unwrap();
+        // Height 4, coordinated height 9: refused.
+        assert!(state.activate_native_inference(f.context.clone()).is_err());
+        assert!(
+            state.get_account(&context_account()).is_none(),
+            "no context account"
+        );
+        assert!(
+            state
+                .get_storage(&context_account(), &activation_key())
+                .is_none(),
+            "no activation row"
+        );
+        assert!(
+            state
+                .get_storage(&context_account(), &migration_key())
+                .is_none(),
+            "no migration row"
+        );
+        assert_eq!(state.compute_state_root(), before, "the chain is unchanged");
+    }
+
+    /// The rooted record is evidence, so it is checked like evidence. A row
+    /// that decodes to another chain's authorisation, or does not decode at
+    /// all, must stop the node rather than silently restore a binding.
+    #[test]
+    fn a_tampered_migration_row_is_refused_on_restore() {
+        let f = fixture("migration-tampered");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5))
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        state.activate_native_inference(f.context.clone()).unwrap();
+
+        // A record for some other chain.
+        let mut forged = migration_for(&f, 5);
+        forged.chain_genesis = hash_bytes(b"a different chain");
+        state.apply_wal_op(&WalOp::SetStorage(
+            context_account(),
+            migration_key(),
+            bincode::serialize(&forged).unwrap(),
+        ));
+        forget_cached_binding(state);
+        let error = state
+            .restore_native_inference_context()
+            .expect_err("a record naming another chain must not restore this binding");
+        assert!(format!("{error}").contains("genesis"), "{error}");
+
+        // And a row that is not a record at all.
+        state.apply_wal_op(&WalOp::SetStorage(
+            context_account(),
+            migration_key(),
+            b"not a migration record".to_vec(),
+        ));
+        forget_cached_binding(state);
+        assert!(state.restore_native_inference_context().is_err());
+    }
+
+    /// What a restart leaves behind: nothing in memory, everything in state.
+    fn forget_cached_binding(state: &StateDB) {
+        *state.native_inference_context.write() = None;
+        *state.native_migration.write() = None;
     }
 
     #[test]
