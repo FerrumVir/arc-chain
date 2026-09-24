@@ -191,10 +191,36 @@ struct Cli {
     /// enable production model execution, which stays behind
     /// `CanonicalI8NativeExecutor::load_qualified` (artifact hash, versioned
     /// profile/generation commitments, explicit reference qualification).
-    /// Activation is refused on any chain past height 0, so it cannot be
-    /// applied to an existing chain.
+    /// On a chain past height 0, activation additionally requires a
+    /// `migration` section naming this chain, the coordinated activation
+    /// height and the exact binding. Without one, a running chain is still
+    /// refused. Use --print-migration-record to produce that section.
     #[arg(long, value_name = "PATH")]
     native_inference_activation: Option<PathBuf>,
+
+    /// Print the `migration` section for --native-inference-activation and
+    /// exit, without activating or touching state.
+    ///
+    /// The record must be IDENTICAL on every validator, so it is derived here
+    /// from this node's own chain identity and the same context assembly the
+    /// activation itself uses - never typed by hand. Run it on one node,
+    /// review the output, and give the same section to all of them.
+    ///
+    /// It opens the state directory, which a running node holds locked, so
+    /// run it on a stopped node or on a copy of its data directory. It
+    /// activates nothing and writes no contract state.
+    #[arg(
+        long,
+        requires = "native_inference_activation",
+        requires = "migration_activation_height"
+    )]
+    print_migration_record: bool,
+
+    /// The coordinated height for --print-migration-record: the single block
+    /// at which every validator activates. Choose it far enough ahead that
+    /// every validator is on the new binary and configured.
+    #[arg(long, value_name = "HEIGHT")]
+    migration_activation_height: Option<u64>,
 
     /// PRIVATE PROTOCOL 4: run the native inference worker loop.
     ///
@@ -7185,6 +7211,56 @@ async fn run_arc_node() -> Result<()> {
     // contract, and a present flag that cannot be satisfied aborts startup
     // rather than continuing half-configured. It does NOT enable production
     // model execution - the executor's own qualification gate is untouched.
+    if cli.print_migration_record {
+        let activation_path = cli
+            .native_inference_activation
+            .as_ref()
+            .expect("clap requires --native-inference-activation");
+        let at = cli
+            .migration_activation_height
+            .expect("clap requires --migration-activation-height");
+        let request = arc_node::native_inference::load_activation_request(activation_path)
+            .map_err(|e| anyhow::anyhow!("--print-migration-record: {e}"))?;
+        let context =
+            arc_node::native_inference::assemble_activation_context(state.as_ref(), &request)
+                .map_err(|e| anyhow::anyhow!("--print-migration-record: {e}"))?;
+        let commitment = context
+            .commitment()
+            .map_err(|e| anyhow::anyhow!("--print-migration-record: {e}"))?;
+        let recovery = state.recovery_context().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--print-migration-record: this chain carries no recovery context, so it is not \
+                 an existing recovered chain and needs no migration record; activate it at \
+                 genesis instead"
+            )
+        })?;
+        if at <= state.height() {
+            bail!(
+                "--print-migration-record: height {at} is not ahead of this chain, which is at \
+                 {}; a coordinated activation must be in the future for every validator",
+                state.height()
+            );
+        }
+        let section = serde_json::json!({
+            "migration": {
+                "chain_genesis": recovery.genesis_hash.to_hex(),
+                "recovery_epoch": recovery.recovery_epoch,
+                "validator_set_id": recovery.validator_set_id,
+                "activation_height": at,
+                "context_commitment": commitment.to_hex(),
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&section)?);
+        eprintln!(
+            "Derived from chain height {} with {} committee members. Give this SAME section to \
+             every validator; a validator with a different one cannot activate and will stop at \
+             height {at}.",
+            state.height(),
+            context.members.len()
+        );
+        return Ok(());
+    }
+
     if let Some(activation_path) = cli.native_inference_activation.as_ref() {
         match arc_node::native_inference::activate_native_inference_from_config(
             state.as_ref(),
@@ -9308,6 +9384,54 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    /// The migration-record tool must not be usable without the two inputs
+    /// that make its output meaningful: the activation config it derives the
+    /// binding from, and the coordinated height every validator will use.
+    #[test]
+    fn printing_a_migration_record_requires_its_config_and_its_height() {
+        Cli::command().debug_assert();
+
+        assert!(
+            Cli::try_parse_from(["arc-node", "--print-migration-record"]).is_err(),
+            "no activation config and no height"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "--print-migration-record",
+                "--native-inference-activation",
+                "/tmp/activation.json",
+            ])
+            .is_err(),
+            "a record without a coordinated height authorises nothing"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "--print-migration-record",
+                "--migration-activation-height",
+                "1570000",
+            ])
+            .is_err(),
+            "a height with no binding to commit to"
+        );
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "--print-migration-record",
+            "--native-inference-activation",
+            "/tmp/activation.json",
+            "--migration-activation-height",
+            "1570000",
+        ])
+        .expect("both inputs present");
+        assert!(cli.print_migration_record);
+        assert_eq!(cli.migration_activation_height, Some(1_570_000));
+        // And it stays off unless asked for.
+        let plain = Cli::try_parse_from(["arc-node"]).expect("no flags is still valid");
+        assert!(!plain.print_migration_record);
+        assert_eq!(plain.migration_activation_height, None);
+    }
 
     #[test]
     fn inspect_legacy_block_cli_requires_every_input_root_and_explicit_wal_policy() {
