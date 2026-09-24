@@ -4974,15 +4974,31 @@ async fn post_signed_shard_announcement(
     )
     .map_err(anyhow::Error::msg)
     .context("sign validator shard announcement")?;
-    client
+    let response = client
         .post(format!("{rpc_base}{}", rpc::SHARD_ANNOUNCE_PATH))
         .json(&signed)
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
-        .with_context(|| format!("POST authenticated shard announcement to {rpc_base}"))?
-        .error_for_status()
-        .with_context(|| format!("validator {rpc_base} rejected shard announcement"))?;
+        .with_context(|| format!("POST authenticated shard announcement to {rpc_base}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        // The peer says exactly why it refused, in the response body. Throwing
+        // that away is what turned a fleet-wide discovery outage into a
+        // mystery: 3,360 refusals were logged in three hours and not one
+        // carried a reason, so the cause had to be reconstructed from source.
+        // Bounded, because a peer's body is untrusted input.
+        let body = response.text().await.unwrap_or_default();
+        let reason: String = body.chars().take(300).collect();
+        bail!(
+            "validator {rpc_base} rejected shard announcement: HTTP {status}: {}",
+            if reason.trim().is_empty() {
+                "(no reason given)"
+            } else {
+                reason.trim()
+            }
+        );
+    }
     Ok(())
 }
 
