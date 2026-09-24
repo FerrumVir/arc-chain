@@ -5192,6 +5192,56 @@ mod tests {
         assert!(state.recovery_context().is_some());
     }
 
+    /// A block of ordinary traffic must not be routed somewhere that refuses
+    /// it. BlockSTM refuses outright while a binding is active, and the
+    /// adaptive chooser sends any block of a hundred or more diverse
+    /// transfers there - so on a migrated chain, real public traffic would
+    /// have failed as a block rather than executed.
+    #[test]
+    fn a_migrated_chain_never_routes_ordinary_traffic_to_a_path_that_refuses_it() {
+        let f = fixture("migrated-execution-mode");
+        let state = recovered_chain_at(&f, 4);
+
+        // A hundred transfers to distinct receivers: what the chooser sends
+        // to BlockSTM. These are only inspected for their shape here.
+        let bulk: Vec<arc_types::Transaction> = (0..120u32)
+            .map(|i| {
+                let mut tx = arc_types::Transaction::new_transfer(
+                    f.requester.address(),
+                    hash_bytes(&i.to_le_bytes()),
+                    1,
+                    i as u64,
+                );
+                tx.tx_type = arc_types::TxType::Transfer;
+                tx.body = arc_types::TxBody::Transfer(arc_types::transaction::TransferBody {
+                    to: hash_bytes(&i.to_le_bytes()),
+                    amount: 1,
+                    amount_commitment: None,
+                });
+                tx
+            })
+            .collect();
+        assert_eq!(
+            state.execution_mode(&bulk),
+            crate::block_stm::AdaptiveMode::BlockSTM,
+            "without a binding this traffic goes to BlockSTM"
+        );
+
+        state
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        assert!(state.native_inference_context().is_some(), "migrated");
+
+        assert_eq!(
+            state.execution_mode(&bulk),
+            crate::block_stm::AdaptiveMode::Sequential,
+            "with a binding active it must take the path that accepts it"
+        );
+    }
+
     #[test]
     fn canonical_native_envelope_domain_bounds_and_mixed_block_rejections_are_atomic() {
         let f = fixture("canonical-reject");

@@ -3242,6 +3242,24 @@ impl StateDB {
     /// identity directly into the resulting linear block header. Protocol-v3
     /// consensus uses a domain-separated commitment to the exact DAG hash and
     /// round; legacy and direct execution paths retain a zero proof hash.
+    /// Which execution path a block takes.
+    ///
+    /// A chain with an active inference binding executes sequentially. The
+    /// native path requires it outright, and on a MIGRATED chain an ordinary
+    /// block of a hundred or more transfers would otherwise be routed to
+    /// BlockSTM, which refuses while a binding is active - failing a block of
+    /// perfectly ordinary traffic. Sequential execution of those blocks is a
+    /// throughput choice; routing them somewhere that refuses them is a bug.
+    pub(crate) fn execution_mode(
+        &self,
+        transactions: &[Transaction],
+    ) -> crate::block_stm::AdaptiveMode {
+        if self.native_inference_context.read().is_some() {
+            return crate::block_stm::AdaptiveMode::Sequential;
+        }
+        crate::block_stm::choose_execution_mode(transactions)
+    }
+
     pub fn execute_block_adaptive_at_with_proof(
         &self,
         transactions: &[Transaction],
@@ -3249,8 +3267,7 @@ impl StateDB {
         timestamp: u64,
         proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
-        let mode = crate::block_stm::choose_execution_mode(transactions);
-        let produced = match mode {
+        let produced = match self.execution_mode(transactions) {
             crate::block_stm::AdaptiveMode::Sequential => self
                 .execute_block_verified_at_with_proof(
                     transactions,
