@@ -1039,6 +1039,28 @@ impl StateDB {
             }
             return Ok(());
         };
+        // A chain that MIGRATED keeps the transaction families it already
+        // had. The fresh-genesis rule - one native transaction per block and
+        // nothing else - exists because a private protocol-4 chain has no
+        // other families to run. An existing public chain does, and its
+        // balances, transfers, contracts and rewards were promised to the
+        // people already using it; activation must not silently end them.
+        //
+        // What activation genuinely does freeze is the committee, because the
+        // binding names its exact members. So a migrated chain refuses the
+        // registry changes that would break the binding, and nothing else. A
+        // block is then either an ordinary block or a native block, never a
+        // mixture, which leaves native execution exactly as it was qualified.
+        if self.native_migration().is_some() && !contains_native {
+            if transactions.iter().any(|tx| Self::is_registry_change(tx)) {
+                return Err(StateError::ExecutionError(
+                    "the validator registry is frozen by the active native inference binding; \
+                     changing the committee requires an explicit migration to a fresh activation"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        }
         if transactions.len() > 1 || transactions.iter().any(|tx| !is_native_body(&tx.body)) {
             return Err(StateError::ExecutionError(
                 "private protocol-4 blocks allow at most one native inference transaction".into(),
@@ -1172,7 +1194,23 @@ impl StateDB {
     /// Project the account-root backend without publishing any replacements.
     /// The private candidate trades an O(accounts) projection for a clear
     /// durability boundary; worker polling remains O(bounded pending jobs).
-    fn projected_native_root(&self, replacements: &[(arc_types::Address, Account)]) -> Hash256 {
+    fn projected_native_root(
+        &self,
+        replacements: &[(arc_types::Address, Account)],
+        storage_replacements: &[(arc_types::Address, Hash256, Vec<u8>)],
+    ) -> Hash256 {
+        // A MIGRATED chain computes its root the recovery way, over domains a
+        // bare account projection never copies - storage among them, which a
+        // native settlement writes. Projecting the genesis way here would
+        // commit a root no validator, including this one one line later,
+        // could reproduce.
+        if let Some(context) = self.recovery_context() {
+            return self.compute_recovery_state_root_with(
+                &context,
+                replacements,
+                storage_replacements,
+            );
+        }
         let mut projected = StateDB::new();
         projected.use_jmt = self.use_jmt;
         for entry in self.accounts.iter() {
@@ -1235,7 +1273,11 @@ impl StateDB {
             .as_ref()
             .map(|r| r.account_updates.as_slice())
             .unwrap_or(&[]);
-        let state_root = self.projected_native_root(replacements);
+        let storage_replacements = record
+            .as_ref()
+            .map(|r| r.storage_updates.as_slice())
+            .unwrap_or(&[]);
+        let state_root = self.projected_native_root(replacements, storage_replacements);
         let tx_hashes: Vec<_> = transactions.iter().map(|tx| tx.hash).collect();
         let tree = arc_crypto::merkle::MerkleTree::from_leaves(tx_hashes.clone());
         let parent_hash = self
@@ -1693,7 +1735,16 @@ impl InferencePlanner<'_> {
                 "active validator set changed after isolated context pin".into(),
             ));
         }
-        if self.state.recovery_context().is_some() {
+        // Recovery-bound state is legitimate only for a chain that MIGRATED,
+        // and only while the record still authorises it. A later recovery to
+        // a new epoch invalidates the record, and native work stops there
+        // rather than planning against a repositioned state.
+        if self.state.recovery_context().is_some()
+            && !self
+                .state
+                .native_migration()
+                .is_some_and(|record| record.refusal_against(self.state).is_none())
+        {
             return Err(StateError::ExecutionError(
                 "isolated inference adapter became recovery-bound".into(),
             ));
@@ -4090,6 +4141,156 @@ mod tests {
         *state.native_migration.write() = None;
     }
 
+    /// Activation must not silently end the chain's existing economy. The
+    /// fresh-genesis rule admits one native transaction and nothing else,
+    /// which on a private chain removes nothing. On the public chain it would
+    /// remove every transfer, contract call and reward the community already
+    /// has. A migrated chain keeps them; only the committee is frozen.
+    #[test]
+    fn a_migrated_chain_still_runs_its_existing_transaction_families() {
+        let f = fixture("migration-families");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5))
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        state.activate_native_inference(f.context.clone()).unwrap();
+
+        let transfer = outer(
+            state,
+            &f.requester,
+            0,
+            arc_types::TxBody::Transfer(arc_types::transaction::TransferBody {
+                to: f.validators[0].address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+        );
+        state
+            .validate_native_inference_block_admission(std::slice::from_ref(&transfer))
+            .expect("a transfer survives the migration");
+
+        // A native transaction still gets a block of its own.
+        let req = native_request(state, &f.requester, request(&f, 0, 100));
+        state
+            .validate_native_inference_block_admission(std::slice::from_ref(&req))
+            .expect("a native request is still admissible");
+        // But never mixed with anything else.
+        assert!(
+            state
+                .validate_native_inference_block_admission(&[req, transfer.clone()])
+                .is_err(),
+            "a block is either ordinary or native, never both"
+        );
+
+        // The committee the binding names cannot change under it.
+        let stake = outer(
+            state,
+            &f.requester,
+            0,
+            arc_types::TxBody::Stake(arc_types::transaction::StakeBody {
+                amount: 1,
+                is_stake: true,
+                validator: f.validators[0].address(),
+            }),
+        );
+        let error = state
+            .validate_native_inference_block_admission(std::slice::from_ref(&stake))
+            .expect_err("a registry change is refused under an active binding");
+        assert!(format!("{error}").contains("frozen"), "{error}");
+    }
+
+    /// The private protocol-4 rule is unchanged by any of the above: without
+    /// a migration record, a chain admits native transactions and nothing
+    /// else, exactly as it did before this work.
+    #[test]
+    fn a_fresh_protocol_4_genesis_still_admits_only_native_transactions() {
+        let f = fixture("protocol4-unchanged");
+        let state = &f.ledger.state;
+        state.activate_native_inference(f.context.clone()).unwrap();
+        assert!(
+            state.native_migration().is_none(),
+            "this chain activated at genesis, with no migration"
+        );
+        let transfer = outer(
+            state,
+            &f.requester,
+            0,
+            arc_types::TxBody::Transfer(arc_types::transaction::TransferBody {
+                to: f.validators[0].address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+        );
+        let error = state
+            .validate_native_inference_block_admission(std::slice::from_ref(&transfer))
+            .expect_err("a private protocol-4 chain admits only native transactions");
+        assert!(format!("{error}").contains("at most one"), "{error}");
+    }
+
+    /// The product requirement end to end: a real paid request reserved,
+    /// certified, settled and receipted on the EXISTING recovered chain, with
+    /// that chain's own history and balances still underneath it. This is
+    /// what "migrate the public chain" has to mean to be worth doing.
+    #[test]
+    fn a_paid_request_settles_on_a_migrated_chain() {
+        let f = fixture("migration-settles");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5))
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        let commitment = state.activate_native_inference(f.context.clone()).unwrap();
+        let history_before = state.height();
+
+        let req = request(&f, 0, 400);
+        let id = req.job.request_id();
+        let tx = native_request(state, &f.requester, req);
+        let (_, receipts) = state
+            .execute_block_adaptive_at(&[tx], f.validators[0].address(), 1_700_200)
+            .unwrap();
+        assert!(receipts[0].success, "the request is admitted and reserved");
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            900
+        );
+        assert_eq!(state.get_account(&escrow_address(id)).unwrap().balance, 100);
+        assert_eq!(
+            state
+                .native_inference_pending_requests(commitment)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let terminal = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
+        let (_, receipts) = state
+            .execute_block_adaptive_at(&[terminal], f.validators[0].address(), 1_700_300)
+            .unwrap();
+        assert!(receipts[0].success, "the certificate settles");
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            990,
+            "the unspent reservation comes back"
+        );
+        assert_eq!(state.get_account(&escrow_address(id)).unwrap().balance, 0);
+        let paid: u64 = f
+            .validators
+            .iter()
+            .map(|v| state.get_account(&v.address()).unwrap().balance)
+            .sum();
+        assert_eq!(paid, 10, "the workers are paid exactly the execution price");
+
+        // Still the chain it was: recovered, continuing, history intact.
+        assert!(state.recovery_context().is_some());
+        assert!(state.height() > history_before);
+        assert_eq!(state.native_inference_context(), Some(f.context.clone()));
+    }
+
     #[test]
     fn canonical_native_envelope_domain_bounds_and_mixed_block_rejections_are_atomic() {
         let f = fixture("canonical-reject");
@@ -4298,7 +4499,7 @@ mod tests {
         let tx = native_request(state, &f.requester, request(&f, 0, 100));
         let prior_root = state.get_state_root();
         let plan = state.plan_native_transaction(&tx, &f.context, 1).unwrap();
-        let after_root = state.projected_native_root(&plan.account_updates);
+        let after_root = state.projected_native_root(&plan.account_updates, &plan.storage_updates);
         state.wal.inject_failure(crate::wal::WalFaultPoint::Fsync);
         assert!(
             state

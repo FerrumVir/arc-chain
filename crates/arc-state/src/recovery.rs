@@ -2486,6 +2486,20 @@ impl StateDB {
     }
 
     pub(crate) fn compute_recovery_state_root(&self, context: &RecoveryContext) -> Hash256 {
+        self.compute_recovery_state_root_with(context, &[], &[])
+    }
+
+    /// The recovery consensus root this state WOULD have with `replacements`
+    /// applied to its accounts. Native settlement needs the root of the block
+    /// it is about to write before writing it, and on a recovery-bound chain
+    /// that root commits domains an account-only projection never sees. Same
+    /// cost as the block's own root, which any state-changing block pays.
+    pub(crate) fn compute_recovery_state_root_with(
+        &self,
+        context: &RecoveryContext,
+        replacements: &[(Address, Account)],
+        storage_replacements: &[(Address, Hash256, Vec<u8>)],
+    ) -> Hash256 {
         // Do not materialize retained blocks, receipts, transaction bodies, or
         // logs here. They are content-addressed in ARCCHKPT, but are historical
         // data rather than live consensus state. Re-hashing history on every
@@ -2495,6 +2509,12 @@ impl StateDB {
             .iter()
             .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
             .collect();
+        for (address, account) in replacements {
+            match accounts.iter_mut().find(|(key, _)| key.0 == address.0) {
+                Some(slot) => slot.1 = account.clone(),
+                None => accounts.push((Hash256(address.0), account.clone())),
+            }
+        }
         accounts.sort_by_key(|entry| entry.0.0);
         let mut storage: Vec<_> = self
             .storage
@@ -2509,6 +2529,18 @@ impl StateDB {
                 (Hash256(*entry.key()), values)
             })
             .collect();
+        for (address, key, value) in storage_replacements {
+            match storage.iter_mut().find(|(addr, _)| addr.0 == address.0) {
+                Some((_, values)) => match values.iter_mut().find(|(k, _)| k.0 == key.0) {
+                    Some(slot) => slot.1 = value.clone(),
+                    None => {
+                        values.push((*key, value.clone()));
+                        values.sort_by_key(|value| value.0.0);
+                    }
+                },
+                None => storage.push((Hash256(address.0), vec![(*key, value.clone())])),
+            }
+        }
         storage.sort_by_key(|entry| entry.0.0);
         let mut contracts: Vec<_> = self
             .contracts
