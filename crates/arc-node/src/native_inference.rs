@@ -1310,11 +1310,16 @@ impl DecisionStore {
         })
     }
 
-    fn path(&self, request_id: Hash256) -> PathBuf {
+    /// Decisions are namespaced by the binding they were made under, so one
+    /// made under a superseded binding can never be mistaken for one made
+    /// under the binding now in force. That binding is the JOB's, not the one
+    /// this store was opened with: after an update the two differ, and a
+    /// store pinned to the opening value refuses every job on the chain.
+    fn path(&self, context: Hash256, request_id: Hash256) -> PathBuf {
         let mut bytes = Vec::with_capacity(128);
         bytes.extend_from_slice(&self.validator.0);
         bytes.extend_from_slice(&self.genesis.0);
-        bytes.extend_from_slice(&self.context.0);
+        bytes.extend_from_slice(&context.0);
         bytes.extend_from_slice(&request_id.0);
         self.root.join(format!(
             "{}.decision",
@@ -1322,11 +1327,15 @@ impl DecisionStore {
         ))
     }
 
-    fn load(&self, request_id: Hash256) -> Result<Option<StoredDecision>, NativeInferenceError> {
+    fn load(
+        &self,
+        context: Hash256,
+        request_id: Hash256,
+    ) -> Result<Option<StoredDecision>, NativeInferenceError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(NativeInferenceError::StorePoisoned);
         }
-        let path = self.path(request_id);
+        let path = self.path(context, request_id);
         let file = match File::open(path) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1350,8 +1359,12 @@ impl DecisionStore {
             .map_err(|_| NativeInferenceError::CorruptStore)
     }
 
-    fn sync_published(&self, request_id: Hash256) -> Result<(), NativeInferenceError> {
-        let file = File::open(self.path(request_id))?;
+    fn sync_published(
+        &self,
+        context: Hash256,
+        request_id: Hash256,
+    ) -> Result<(), NativeInferenceError> {
+        let file = File::open(self.path(context, request_id))?;
         file.sync_all()?;
         File::open(&self.root)?.sync_all()?;
         Ok(())
@@ -1361,7 +1374,7 @@ impl DecisionStore {
         &self,
         job: &PendingJob,
     ) -> Result<Option<StoredVote>, NativeInferenceError> {
-        let Some(stored) = self.load(job.request_id)? else {
+        let Some(stored) = self.load(job.context, job.request_id)? else {
             return Ok(None);
         };
         if stored.request_id != job.request_id
@@ -1439,10 +1452,13 @@ impl DecisionStore {
             else {
                 continue;
             };
+            // Any binding's decisions are swept, not just the one in force:
+            // the path check below already proves the file is namespaced by
+            // the binding the decision itself names, so a superseded
+            // binding's settled work is collected too rather than left behind.
             if stored.validator != self.validator
                 || stored.genesis != self.genesis
-                || stored.context != self.context
-                || path != self.path(stored.request_id)
+                || path != self.path(stored.context, stored.request_id)
             {
                 continue;
             }
@@ -1465,7 +1481,11 @@ impl DecisionStore {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(NativeInferenceError::StorePoisoned);
         }
-        if job.genesis != self.genesis || job.context != self.context {
+        // The job's binding is whichever one the chain admitted it under -
+        // the current one, or a superseded one still settling. What this
+        // store insists on is its own chain and its own validator identity;
+        // the binding is a namespace, not a filter.
+        if job.genesis != self.genesis {
             return Err(NativeInferenceError::ContextMismatch);
         }
         if decision.request_id != job.request_id {
@@ -1518,8 +1538,8 @@ impl DecisionStore {
             validator: decision.vote.validator,
             signature: decision.vote.signature.clone(),
         };
-        if let Some(existing) = self.load(job.request_id)? {
-            self.sync_published(job.request_id)?;
+        if let Some(existing) = self.load(job.context, job.request_id)? {
+            self.sync_published(job.context, job.request_id)?;
             if existing == stored {
                 return Ok(decision);
             }
@@ -1532,14 +1552,14 @@ impl DecisionStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        match fs::hard_link(&tmp, self.path(job.request_id)) {
+        match fs::hard_link(&tmp, self.path(job.context, job.request_id)) {
             Ok(()) => {
                 fs::remove_file(&tmp)?;
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 let _ = fs::remove_file(&tmp);
-                self.sync_published(job.request_id)?;
-                return match self.load(job.request_id)? {
+                self.sync_published(job.context, job.request_id)?;
+                return match self.load(job.context, job.request_id)? {
                     Some(existing) if existing == stored => Ok(decision),
                     _ => Err(NativeInferenceError::Equivocation),
                 };
@@ -1550,7 +1570,7 @@ impl DecisionStore {
                 return Err(e.into());
             }
         }
-        if let Err(error) = self.sync_published(job.request_id) {
+        if let Err(error) = self.sync_published(job.context, job.request_id) {
             self.poisoned.store(true, Ordering::Release);
             return Err(error);
         }
@@ -3076,6 +3096,53 @@ mod tests {
         // this validator-scoped anti-equivocation store.
         assert!(s.persist_signed(bad, &j).is_err());
     }
+    /// The store is opened with the binding in force at startup. After a
+    /// binding update the jobs the chain hands this worker name a different
+    /// one, and a store that refused them left every validator unable to sign
+    /// anything - which across four node processes meant the chain admitted
+    /// paid work and executed none of it.
+    #[test]
+    fn a_decision_store_signs_for_the_binding_the_job_names() {
+        let dir = tempdir().unwrap();
+        let key = KeyPair::generate_ed25519();
+        let mut opened_under = job();
+        opened_under.context = Hash256([0xA1; 32]);
+        let store = DecisionStore::open(
+            dir.path(),
+            key.address(),
+            opened_under.genesis,
+            opened_under.context,
+        )
+        .unwrap();
+
+        // A job admitted under a LATER binding.
+        let mut later = job();
+        later.context = Hash256([0xB2; 32]);
+        later.request_id = Hash256([0x33; 32]);
+        let vote = StoredVote {
+            request_id: later.request_id,
+            output_hash: token_hash(&[7]),
+            tokens: vec![7],
+            vote: sign_vote(later.request_id, &token_bytes(&[7]), &key).unwrap(),
+        };
+        store
+            .persist_signed(vote.clone(), &later)
+            .expect("a worker must sign for the binding the job was admitted under");
+
+        // And it is namespaced by that binding, not by the opening one, so a
+        // decision under one binding can never be read as another's.
+        assert!(store.path(later.context, later.request_id).exists());
+        assert!(!store.path(opened_under.context, later.request_id).exists());
+
+        // A job from another chain is still refused.
+        let mut elsewhere = later.clone();
+        elsewhere.genesis = Hash256([0xCC; 32]);
+        assert!(matches!(
+            store.persist_signed(vote, &elsewhere),
+            Err(NativeInferenceError::ContextMismatch)
+        ));
+    }
+
     #[test]
     fn only_settled_requests_decisions_are_pruned() {
         let dir = tempdir().unwrap();
@@ -3103,11 +3170,12 @@ mod tests {
         let removed = s.prune_terminal(|id| id == settled.0.request_id).unwrap();
         assert_eq!(removed, 1);
         assert!(
-            !s.path(settled.0.request_id).exists(),
+            !s.path(settled.0.context, settled.0.request_id).exists(),
             "the settled request's file is gone"
         );
         assert!(
-            s.path(still_pending.0.request_id).exists(),
+            s.path(still_pending.0.context, still_pending.0.request_id)
+                .exists(),
             "a pending request keeps its record"
         );
         assert!(dir.path().join("unreadable.decision").exists());
@@ -3128,7 +3196,10 @@ mod tests {
         let other =
             DecisionStore::open(dir.path(), Hash256([0xEE; 32]), j0.genesis, j0.context).unwrap();
         assert_eq!(other.prune_terminal(|_| true).unwrap(), 0);
-        assert!(s.path(still_pending.0.request_id).exists());
+        assert!(
+            s.path(still_pending.0.context, still_pending.0.request_id)
+                .exists()
+        );
     }
     #[test]
     fn corrupt_store_is_rejected() {
@@ -3146,7 +3217,7 @@ mod tests {
             .unwrap(),
         };
         let s = DecisionStore::open(dir.path(), v.vote.validator, j.genesis, j.context).unwrap();
-        fs::write(s.path(j.request_id), b"bad").unwrap();
+        fs::write(s.path(j.context, j.request_id), b"bad").unwrap();
         assert!(matches!(
             s.persist_signed(v, &j),
             Err(NativeInferenceError::CorruptStore)
