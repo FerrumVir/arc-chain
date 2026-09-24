@@ -356,10 +356,13 @@ pub fn genesis_committee_matches_binding(
         }
     }
     Err(format!(
-        "the genesis validator set differs from the committee frozen by this chain's native \
-         inference binding: {}. The persistent state is unchanged. Restart with the genesis \
-         file that was used at activation; changing a native-inference committee is an \
-         explicit migration to a fresh activation, never a genesis edit.",
+        "the genesis validator set differs from the committee named by this chain's native \
+         inference binding: {}. The persistent state is unchanged. A committee change IS \
+         supported - publish the new binding with a versioned update, which keeps work already \
+         admitted settling under the binding that accepted it - but the genesis committee must \
+         be updated to match in the same operation, or a restart re-seeds the old committee. \
+         This refusal is what stops the two drifting apart. Restart with a genesis file that \
+         matches the current binding.",
         differences.join("; ")
     ))
 }
@@ -367,6 +370,33 @@ pub fn genesis_committee_matches_binding(
 /// Validate the private native-inference activation boundary without mutating
 /// state. Recovery-bound state and non-persistent state are never eligible.
 pub fn validate_native_inference_activation(
+    state: &StateDB,
+    context: &InferenceAdmissionContext,
+) -> Result<Hash256, StateError> {
+    let commitment = validate_native_inference_binding_shape(state, context)?;
+    if let Some(pin) = state.get_storage(&context_account(), &context_key()) {
+        if pin.as_slice() != commitment.as_ref() {
+            return Err(StateError::ExecutionError(
+                "native inference pinned context mismatch on reopen".into(),
+            ));
+        }
+        let account = state.get_account(&context_account()).ok_or_else(|| {
+            StateError::ExecutionError("native inference context pin account is missing".into())
+        })?;
+        if account.storage_root != commitment {
+            return Err(StateError::ExecutionError(
+                "native inference context account root is not pinned".into(),
+            ));
+        }
+    }
+    Ok(commitment)
+}
+
+/// Everything `validate_native_inference_activation` checks EXCEPT that the
+/// context is the one the account is already pinned to. A binding update
+/// replaces that pin, so it validates the incoming binding against the chain
+/// and the live registry without requiring it to match what is pinned now.
+pub fn validate_native_inference_binding_shape(
     state: &StateDB,
     context: &InferenceAdmissionContext,
 ) -> Result<Hash256, StateError> {
@@ -413,23 +443,7 @@ pub fn validate_native_inference_activation(
             "native inference validator-set hash is incorrect".into(),
         ));
     }
-    let commitment = context.commitment()?;
-    if let Some(pin) = state.get_storage(&context_account(), &context_key()) {
-        if pin.as_slice() != commitment.as_ref() {
-            return Err(StateError::ExecutionError(
-                "native inference pinned context mismatch on reopen".into(),
-            ));
-        }
-        let account = state.get_account(&context_account()).ok_or_else(|| {
-            StateError::ExecutionError("native inference context pin account is missing".into())
-        })?;
-        if account.storage_root != commitment {
-            return Err(StateError::ExecutionError(
-                "native inference context account root is not pinned".into(),
-            ));
-        }
-    }
-    Ok(commitment)
+    context.commitment()
 }
 
 fn read_native_metadata(
@@ -456,7 +470,16 @@ fn read_native_metadata(
             "native inference escrow account is missing".into(),
         ));
     };
-    if metadata.context_commitment != context_commitment
+    // A request admitted before a configuration update names the binding it
+    // was admitted under. That binding is retained while the request is in
+    // flight, so reading its receipt has to accept it as well as the current
+    // one; anything naming neither is still refused.
+    let names_a_known_binding = metadata.context_commitment == context_commitment
+        || state
+            .superseded_bindings
+            .read()
+            .contains_key(&metadata.context_commitment.0);
+    if !names_a_known_binding
         || metadata.request.job.request_id() != request_id
         || account.storage_root != hash_bytes(&bytes)
         || metadata.input_blob.len() > arc_types::transaction::TIER1_INPUT_BLOB_MAX
@@ -542,6 +565,26 @@ const MAX_CONTEXT_BYTES: usize = 32 * 1024;
 
 pub(crate) fn activation_key() -> Hash256 {
     hash_bytes(b"ARC-native-inference-activation-v1")
+}
+
+/// How many superseded bindings may be retained at once. A binding is
+/// retired as soon as no pending request still names it, so this bounds only
+/// how many updates can be in flight over unsettled work at the same time.
+pub(crate) const MAX_RETAINED_BINDINGS: usize = 8;
+
+/// The index of retained superseded bindings: a list of their commitments.
+pub(crate) fn versions_key() -> Hash256 {
+    hash_bytes(b"ARC-native-inference-versions-v1")
+}
+
+/// Where one superseded binding is kept, by its own commitment. A request
+/// admitted under a binding keeps naming it through settlement or refund, so
+/// the binding has to outlive being replaced.
+pub(crate) fn version_key(commitment: Hash256) -> Hash256 {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(b"ARC-native-inference-version-v1");
+    bytes.extend_from_slice(commitment.as_ref());
+    hash_bytes(&bytes)
 }
 
 /// Where the authorising migration record is kept once it has been applied.
@@ -804,6 +847,178 @@ impl StateDB {
         Ok(commitment)
     }
 
+    /// Commitments still named by work that has not settled or refunded.
+    fn bindings_named_by_pending_work(&self) -> std::collections::BTreeSet<[u8; 32]> {
+        let ids: Vec<[u8; 32]> = self
+            .native_inference_pending
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        let mut named = std::collections::BTreeSet::new();
+        for id in ids {
+            let Some(bytes) = self.get_storage(&escrow_address(Hash256(id)), &metadata_key())
+            else {
+                continue;
+            };
+            let Ok(metadata) =
+                bincode::deserialize_limited_exact::<InferenceMetadata, MAX_METADATA_BYTES>(&bytes)
+            else {
+                continue;
+            };
+            if metadata.status == InferenceTransitionStatus::Pending {
+                named.insert(metadata.context_commitment.0);
+            }
+        }
+        named
+    }
+
+    /// The commitments of the superseded bindings this chain still holds.
+    pub(crate) fn retained_binding_index(&self) -> Result<Vec<Hash256>, StateError> {
+        let Some(bytes) = self.get_storage(&context_account(), &versions_key()) else {
+            return Ok(Vec::new());
+        };
+        bincode::deserialize_limited_exact::<Vec<Hash256>, 1024>(&bytes).map_err(|error| {
+            StateError::ExecutionError(format!("decode retained binding index: {error}"))
+        })
+    }
+
+    /// Publish a NEW binding over a running one: a changed committee, an added
+    /// allowed execution, a model upgrade. The new binding governs requests
+    /// admitted from here on.
+    ///
+    /// Work already admitted is NOT re-bound. Each request keeps naming the
+    /// binding it was admitted under, and that binding is retained here until
+    /// nothing names it, so everything in flight settles or refunds on the
+    /// exact terms it was accepted on. That is what makes a committee or
+    /// model change safe to do on a live chain instead of a reason to freeze
+    /// one forever.
+    pub fn update_native_inference_binding(
+        &self,
+        context: InferenceAdmissionContext,
+    ) -> Result<Hash256, StateError> {
+        let _guard = self.native_inference_execution.lock();
+        self.require_healthy_wal()?;
+        let Some(previous) = self.native_inference_context() else {
+            return Err(StateError::ExecutionError(
+                "there is no active inference binding to update; activate one first".into(),
+            ));
+        };
+        let previous_commitment = previous.commitment()?;
+        if previous == context {
+            return Ok(previous_commitment);
+        }
+        if self.use_jmt {
+            return Err(StateError::ExecutionError(
+                "a native inference binding update requires the canonical default account-root \
+                 backend"
+                    .into(),
+            ));
+        }
+        let commitment = validate_native_inference_binding_shape(self, &context)?;
+        if context.domain.chain_genesis != previous.domain.chain_genesis {
+            return Err(StateError::ExecutionError(
+                "a binding update cannot move the chain the binding is bound to".into(),
+            ));
+        }
+        if context.selection_rule != previous.selection_rule {
+            return Err(StateError::ExecutionError(
+                "the commit-time selection rule is fixed for the chain's life; a binding update \
+                 cannot change it"
+                    .into(),
+            ));
+        }
+
+        // Keep only the superseded bindings that pending work still names,
+        // and add the one being replaced if anything names it.
+        let named = self.bindings_named_by_pending_work();
+        let mut keep: Vec<Hash256> = Vec::new();
+        let mut discard: Vec<Hash256> = Vec::new();
+        for held in self.retained_binding_index()? {
+            if named.contains(&held.0) {
+                keep.push(held);
+            } else {
+                discard.push(held);
+            }
+        }
+        let retire_previous = named.contains(&previous_commitment.0);
+        if retire_previous && !keep.contains(&previous_commitment) {
+            keep.push(previous_commitment);
+        }
+        keep.sort_by_key(|entry| entry.0);
+        if keep.len() > MAX_RETAINED_BINDINGS {
+            return Err(StateError::ExecutionError(format!(
+                "{} superseded bindings would still be named by pending work, over the limit of \
+                 {MAX_RETAINED_BINDINGS}; let that work settle or expire before updating again",
+                keep.len()
+            )));
+        }
+
+        let encoded = encode_activation(&context)?;
+        if encoded.len() > MAX_CONTEXT_BYTES {
+            return Err(StateError::ExecutionError(
+                "native context exceeds bound".into(),
+            ));
+        }
+        let address = context_account();
+        let mut account = self.get_account(&address).ok_or_else(|| {
+            StateError::ExecutionError("native inference context account is missing".into())
+        })?;
+        account.storage_root = commitment;
+        let mut ops = vec![
+            WalOp::SetAccount(address, account),
+            WalOp::SetStorage(address, context_key(), commitment.0.to_vec()),
+            WalOp::SetStorage(address, activation_key(), encoded),
+            WalOp::SetValidatorState(
+                context
+                    .members
+                    .iter()
+                    .map(|member| (member.address, member.stake))
+                    .collect(),
+                self.staking_pool.load(std::sync::atomic::Ordering::Acquire),
+            ),
+            WalOp::SetStorage(
+                address,
+                versions_key(),
+                bincode::serialize(&keep)
+                    .map_err(|error| StateError::ExecutionError(error.to_string()))?,
+            ),
+        ];
+        if retire_previous {
+            ops.push(WalOp::SetStorage(
+                address,
+                version_key(previous_commitment),
+                encode_activation(&previous)?,
+            ));
+        }
+        for gone in &discard {
+            ops.push(WalOp::DeleteStorage(address, version_key(*gone)));
+        }
+
+        let height = self.height();
+        let root = self.projected_root_after(&ops);
+        for op in &ops {
+            self.wal.append(op.clone(), height);
+        }
+        self.wal.append(WalOp::Checkpoint(root), height);
+        self.durable_wal_barrier()?;
+        {
+            let _publication = self.native_inference_publication.write();
+            for op in &ops {
+                self.apply_wal_op(op);
+            }
+            {
+                let mut retained = self.superseded_bindings.write();
+                retained.retain(|held, _| keep.iter().any(|entry| entry.0 == *held));
+                if retire_previous {
+                    retained.insert(previous_commitment.0, previous.clone());
+                }
+            }
+            *self.native_inference_context.write() = Some(context);
+            debug_assert_eq!(self.compute_state_root(), root);
+        }
+        Ok(commitment)
+    }
+
     /// The last committed context; poisoned WAL state exposes no active context.
     pub fn native_inference_context(&self) -> Option<InferenceAdmissionContext> {
         self.try_native_inference_context().ok().flatten()
@@ -846,7 +1061,16 @@ impl StateDB {
                     .map_err(|e| {
                         StateError::ExecutionError(format!("invalid native pending metadata: {e}"))
                     })?;
-            if metadata.context_commitment != commitment {
+            // A pending request names the binding it was admitted under,
+            // which after a configuration update is a retained one rather
+            // than the current one. Anything naming neither is not this
+            // chain's work and still stops the rebuild.
+            if metadata.context_commitment != commitment
+                && !self
+                    .superseded_bindings
+                    .read()
+                    .contains_key(&metadata.context_commitment.0)
+            {
                 return Err(StateError::ExecutionError(
                     "native metadata context mismatch".into(),
                 ));
@@ -907,6 +1131,45 @@ impl StateDB {
         };
         let context = decode_activation(&encoded)?;
         let commitment = validate_native_inference_activation(self, &context)?;
+        // Superseded bindings come back too, or a restart would strand every
+        // request admitted under one. They are NOT revalidated against the
+        // live registry - they are not the live committee any more, and that
+        // is the point - but each must still be exactly the binding its own
+        // commitment names, on this chain.
+        {
+            let mut retained = std::collections::BTreeMap::new();
+            for held in self.retained_binding_index()? {
+                let Some(bytes) = self.get_storage(&context_account(), &version_key(held)) else {
+                    return Err(StateError::ExecutionError(format!(
+                        "retained inference binding {} is indexed but missing",
+                        held.to_hex()
+                    )));
+                };
+                let superseded = decode_activation(&bytes)?;
+                if superseded.commitment()? != held {
+                    return Err(StateError::ExecutionError(format!(
+                        "retained inference binding {} does not match its own commitment",
+                        held.to_hex()
+                    )));
+                }
+                if validator_set_commitment(&superseded.members).map_err(contract_error)?
+                    != superseded.domain.validator_set_hash
+                {
+                    return Err(StateError::ExecutionError(format!(
+                        "retained inference binding {} has an incorrect validator-set hash",
+                        held.to_hex()
+                    )));
+                }
+                if superseded.domain.chain_genesis != context.domain.chain_genesis {
+                    return Err(StateError::ExecutionError(format!(
+                        "retained inference binding {} belongs to another chain",
+                        held.to_hex()
+                    )));
+                }
+                retained.insert(held.0, superseded);
+            }
+            *self.superseded_bindings.write() = retained;
+        }
         *self.native_inference_context.write() = Some(context);
         // Snapshot recovery can omit the derived index. Rebuild once, never per poll.
         self.rebuild_native_inference_pending(commitment)?;
@@ -1082,13 +1345,13 @@ impl StateDB {
         // block is then either an ordinary block or a native block, never a
         // mixture, which leaves native execution exactly as it was qualified.
         if self.native_migration().is_some() && !contains_native {
-            if transactions.iter().any(|tx| Self::is_registry_change(tx)) {
-                return Err(StateError::ExecutionError(
-                    "the validator registry is frozen by the active native inference binding; \
-                     changing the committee requires an explicit migration to a fresh activation"
-                        .into(),
-                ));
-            }
+            // Including a registry change. Activation used to freeze the
+            // committee for the chain's life; with versioned bindings it does
+            // not, so staking and validator admission survive activation.
+            // New requests are refused between the registry moving and the
+            // operator publishing the matching binding - fail-closed - and
+            // requests already admitted settle under the binding that
+            // accepted them.
             return Ok(());
         }
         if transactions.len() > 1 || transactions.iter().any(|tx| !is_native_body(&tx.body)) {
@@ -1107,6 +1370,46 @@ impl StateDB {
         Ok(())
     }
 
+    /// The binding a pending request was admitted under, when that is not
+    /// the current one. `None` means "use the current binding": either the
+    /// request names it, or there is no such request and the planner reports
+    /// that in its own words.
+    fn binding_for_request(
+        &self,
+        request_id: Hash256,
+    ) -> Result<Option<InferenceAdmissionContext>, StateError> {
+        let Some(bytes) = self.get_storage(&escrow_address(request_id), &metadata_key()) else {
+            return Ok(None);
+        };
+        if bytes.len() > MAX_METADATA_BYTES {
+            return Ok(None);
+        }
+        let Ok(metadata) =
+            bincode::deserialize_limited_exact::<InferenceMetadata, MAX_METADATA_BYTES>(&bytes)
+        else {
+            return Ok(None);
+        };
+        let current = self
+            .native_inference_context()
+            .and_then(|context| context.commitment().ok());
+        if current == Some(metadata.context_commitment) {
+            return Ok(None);
+        }
+        match self
+            .superseded_bindings
+            .read()
+            .get(&metadata.context_commitment.0)
+        {
+            Some(context) => Ok(Some(context.clone())),
+            None => Err(StateError::ExecutionError(format!(
+                "request {} was admitted under inference binding {}, which this node no longer \
+                 holds; it cannot be settled or refunded here",
+                request_id.to_hex(),
+                metadata.context_commitment.to_hex()
+            ))),
+        }
+    }
+
     fn plan_native_transaction(
         &self,
         tx: &arc_types::Transaction,
@@ -1119,7 +1422,26 @@ impl StateDB {
                 "native context is not activated".into(),
             ));
         }
-        self.validate_native_inference_envelope_at(tx, context, height)?;
+        // From here, `context` is the CURRENT binding. Which binding governs
+        // the transaction is decided just below.
+        // Which binding governs THIS transaction. A new request is admitted
+        // under the current one - a configuration update governs new work.
+        // A settlement or refund is governed by the binding its request was
+        // admitted under, which the update retained for exactly this reason,
+        // so work already in flight is never stranded by a committee or
+        // execution change.
+        let current_commitment = context.commitment()?;
+        let retained = match &tx.body {
+            arc_types::TxBody::NativeInferenceFinalize(body) => {
+                self.binding_for_request(Hash256(body.request_id))?
+            }
+            arc_types::TxBody::NativeInferenceRefund(body) => {
+                self.binding_for_request(Hash256(body.request_id))?
+            }
+            _ => None,
+        };
+        let governing: &InferenceAdmissionContext = retained.as_ref().unwrap_or(context);
+        self.validate_native_inference_envelope_at(tx, governing, height)?;
         if tx.gas_limit < Self::gas_cost_for_tx(tx) {
             return Err(StateError::ExecutionError(
                 "native transaction has insufficient gas".into(),
@@ -1140,8 +1462,9 @@ impl StateDB {
             .ok_or_else(|| StateError::ExecutionError("native caller nonce overflow".into()))?;
         let planner = InferencePlanner {
             state: self,
-            context,
-            context_commitment: context.commitment()?,
+            context: governing,
+            context_commitment: governing.commitment()?,
+            current_commitment,
         };
         let request = matches!(&tx.body, arc_types::TxBody::NativeInferenceRequest(_));
         let plan = match &tx.body {
@@ -1429,12 +1752,24 @@ impl StateDB {
         execution_height: u64,
     ) -> Result<(), StateError> {
         self.require_healthy_wal()?;
-        if self.native_inference_context().as_ref() != Some(context) {
-            return Err(StateError::ExecutionError(
-                "native inference context is not activated".into(),
-            ));
-        }
-        let expected_context = validate_native_inference_activation(self, context)?;
+        // The binding here is either the current one - for new work - or one
+        // this chain retained because work admitted under it has not settled.
+        // A retained binding is not revalidated against the live registry: it
+        // is no longer the live committee, and it is held precisely so the
+        // work it accepted can finish on its own terms. What proves it is the
+        // binding it claims to be is its own commitment, which is rooted in
+        // this chain's state.
+        let expected_context = if self.native_inference_context().as_ref() == Some(context) {
+            validate_native_inference_activation(self, context)?
+        } else {
+            let commitment = context.commitment()?;
+            if !self.superseded_bindings.read().contains_key(&commitment.0) {
+                return Err(StateError::ExecutionError(
+                    "native inference context is not activated".into(),
+                ));
+            }
+            commitment
+        };
         if tx.fee != 0 {
             return Err(StateError::ExecutionError(
                 "native inference transactions require fee=0; price is signed in the job".into(),
@@ -1675,10 +2010,13 @@ impl IsolatedInferenceLedger {
     }
 
     fn planner(&self) -> InferencePlanner<'_> {
+        // The isolated ledger holds exactly one binding and never updates it,
+        // so its governing binding and its pin are the same.
         InferencePlanner {
             state: &self.state,
             context: &self.context,
             context_commitment: self.context_commitment,
+            current_commitment: self.context_commitment,
         }
     }
 
@@ -1745,8 +2083,15 @@ impl IsolatedInferenceLedger {
 /// Pure borrowed planner shared by isolated and canonical state publication.
 struct InferencePlanner<'a> {
     state: &'a StateDB,
+    /// The binding that governs THIS transaction: the current one for a new
+    /// request, the one it was admitted under for a settlement or refund.
     context: &'a InferenceAdmissionContext,
     context_commitment: Hash256,
+    /// The binding the context account is pinned to right now. The pin and
+    /// the inference clock belong to the account, not to a binding version,
+    /// so a request settling under a superseded binding still reads and
+    /// writes the current pin.
+    current_commitment: Hash256,
 }
 
 enum InferencePlan {
@@ -1759,12 +2104,23 @@ enum InferencePlan {
 }
 
 impl InferencePlanner<'_> {
+    /// For NEW work only: the binding being admitted under must still be the
+    /// live committee. Between a registry change and the operator publishing
+    /// the matching binding, new requests are refused - fail-closed - while
+    /// work already admitted goes on settling under its own binding.
     fn ensure_context_current(&self) -> Result<(), StateError> {
         if state_members(&self.state) != self.context.members {
             return Err(StateError::ExecutionError(
                 "active validator set changed after isolated context pin".into(),
             ));
         }
+        self.ensure_binding_usable()
+    }
+
+    /// For work ALREADY admitted: its binding is pinned by its own
+    /// commitment, so the live committee is not consulted. What still has to
+    /// hold is that this chain is one the binding was authorised for.
+    fn ensure_binding_usable(&self) -> Result<(), StateError> {
         // Recovery-bound state is legitimate only for a chain that MIGRATED,
         // and only while the record still authorises it. A later recovery to
         // a new epoch invalidates the record, and native work stops there
@@ -1786,7 +2142,7 @@ impl InferencePlanner<'_> {
         let Some(account) = self.state.get_account(&context_account()) else {
             return Ok(0);
         };
-        if account.storage_root != self.context_commitment {
+        if account.storage_root != self.current_commitment {
             return Err(StateError::ExecutionError(
                 "persisted inference clock is not bound to the context account".into(),
             ));
@@ -2012,13 +2368,13 @@ impl InferencePlanner<'_> {
                     "context pin account has an unrecognized storage root".into(),
                 ));
             }
-            pin_account.storage_root = self.context_commitment;
+            pin_account.storage_root = self.current_commitment;
             storage_updates.push((
                 context_account_address,
                 context_key(),
-                self.context_commitment.0.to_vec(),
+                self.current_commitment.0.to_vec(),
             ));
-        } else if pin_account.storage_root != self.context_commitment {
+        } else if pin_account.storage_root != self.current_commitment {
             return Err(StateError::ExecutionError(
                 "context pin account root does not match pinned context".into(),
             ));
@@ -2051,7 +2407,7 @@ impl InferencePlanner<'_> {
 
     fn plan_refund(&self, request_id: Hash256, now: u64) -> Result<InferencePlan, StateError> {
         self.state.require_healthy_wal()?;
-        self.ensure_context_current()?;
+        self.ensure_binding_usable()?;
         let (metadata, admission_height, escrow) = self.load_metadata(request_id)?;
         match metadata.status {
             InferenceTransitionStatus::Refunded => {
@@ -2103,7 +2459,7 @@ impl InferencePlanner<'_> {
         now: u64,
     ) -> Result<InferencePlan, StateError> {
         self.state.require_healthy_wal()?;
-        self.ensure_context_current()?;
+        self.ensure_binding_usable()?;
         let (metadata, admission_height, escrow) = self.load_metadata(request_id)?;
         match metadata.status {
             InferenceTransitionStatus::Finalized => {
@@ -2312,7 +2668,7 @@ impl InferencePlanner<'_> {
             .ok_or_else(|| StateError::ExecutionError("context clock account is missing".into()))?;
         if context_state.balance != 0
             || context_state.code_hash != Hash256::ZERO
-            || context_state.storage_root != self.context_commitment
+            || context_state.storage_root != self.current_commitment
             || self
                 .state
                 .get_storage(&context_address, &context_key())
@@ -4239,7 +4595,11 @@ mod tests {
             "a block is either ordinary or native, never both"
         );
 
-        // The committee the binding names cannot change under it.
+        // Staking and validator admission survive activation too. The
+        // committee is not frozen for the chain's life: versioned bindings
+        // let it move, with new work refused until the operator publishes
+        // the binding naming the new committee and work already admitted
+        // settling under the one that accepted it.
         let stake = outer(
             state,
             &f.requester,
@@ -4250,10 +4610,12 @@ mod tests {
                 validator: f.validators[0].address(),
             }),
         );
-        let error = state
+        state
             .validate_native_inference_block_admission(std::slice::from_ref(&stake))
-            .expect_err("a registry change is refused under an active binding");
-        assert!(format!("{error}").contains("frozen"), "{error}");
+            .expect("a migrated chain still admits staking");
+        state
+            .refuse_registry_change_under_native_binding()
+            .expect("and the executor does not refuse it either");
     }
 
     /// The private protocol-4 rule is unchanged by any of the above: without
@@ -4398,6 +4760,228 @@ mod tests {
             reopened.get_account(&requester).unwrap().balance,
             balance,
             "balances are what they were"
+        );
+    }
+
+    /// A configuration update governs NEW requests. Work already admitted
+    /// keeps the binding it was accepted under, all the way through
+    /// settlement - so upgrading the allowed model does not strand or
+    /// silently re-price anything already in flight.
+    #[test]
+    fn a_binding_update_governs_new_work_while_pending_work_keeps_its_own() {
+        let f = fixture("binding-update-executions");
+        let state = &f.ledger.state;
+        let v1 = state.activate_native_inference(f.context.clone()).unwrap();
+
+        // Admitted under v1.
+        let req = request(&f, 0, 400);
+        let id = req.job.request_id();
+        let tx = native_request(state, &f.requester, req);
+        let (_, receipts) = state
+            .execute_block_adaptive_at(&[tx], f.validators[0].address(), 10)
+            .unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(state.get_account(&escrow_address(id)).unwrap().balance, 100);
+
+        // The operator publishes a new binding: one more allowed execution.
+        let upgraded = hash_bytes(b"a newer model");
+        let mut next = f.context.clone();
+        next.allowed_executions.push(AllowedExecution {
+            model_hash: upgraded,
+            profile_hash: upgraded,
+            generation_hash: upgraded,
+            assignment_hash: upgraded,
+        });
+        let v2 = state
+            .update_native_inference_binding(next.clone())
+            .expect("a running binding can be updated");
+        assert_ne!(v1, v2, "a new configuration is a new binding");
+        assert_eq!(state.native_inference_context(), Some(next));
+        assert_eq!(
+            state.retained_binding_index().unwrap(),
+            vec![v1],
+            "v1 is retained because pending work still names it"
+        );
+
+        // The v1 request settles on v1's terms, after the update.
+        let terminal = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
+        let (_, receipts) = state
+            .execute_block_adaptive_at(&[terminal], f.validators[0].address(), 20)
+            .unwrap();
+        assert!(
+            receipts[0].success,
+            "pending work settles under its own binding"
+        );
+        assert_eq!(state.get_account(&escrow_address(id)).unwrap().balance, 0);
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            990
+        );
+        let paid: u64 = f
+            .validators
+            .iter()
+            .map(|v| state.get_account(&v.address()).unwrap().balance)
+            .sum();
+        assert_eq!(
+            paid, 10,
+            "paid exactly once, at the price it was admitted at"
+        );
+    }
+
+    /// The committee can change under a live binding. Staking and validator
+    /// admission are not suspended by activating paid inference: the registry
+    /// moves, the operator publishes the matching binding, new requests bind
+    /// the new committee, and work already admitted is still settled by the
+    /// committee that accepted it.
+    #[test]
+    fn a_committee_change_does_not_strand_work_admitted_before_it() {
+        let f = fixture("binding-update-committee");
+        let state = &f.ledger.state;
+        state.activate_native_inference(f.context.clone()).unwrap();
+
+        let req = request(&f, 0, 400);
+        let id = req.job.request_id();
+        let tx = native_request(state, &f.requester, req);
+        state
+            .execute_block_adaptive_at(&[tx], f.validators[0].address(), 10)
+            .unwrap();
+        assert_eq!(state.get_account(&escrow_address(id)).unwrap().balance, 100);
+
+        // A seventh validator joins the registry.
+        let joiner = KeyPair::generate_ed25519();
+        let mut members = f.context.members.clone();
+        members.push(ValidatorMember::new(
+            joiner.address(),
+            StateDB::MIN_VALIDATOR_STAKE,
+        ));
+        members.sort_by_key(|member| member.address.0);
+        state.apply_wal_op(&WalOp::SetValidatorState(
+            members
+                .iter()
+                .map(|member| (member.address, member.stake))
+                .collect(),
+            0,
+        ));
+
+        // Until the operator publishes the matching binding, NEW work is
+        // refused - fail-closed - and nothing is silently accepted against a
+        // committee the binding does not name.
+        let early = native_request(state, &f.requester, request(&f, 1, 400));
+        assert!(
+            state
+                .validate_native_inference_block_admission(std::slice::from_ref(&early))
+                .is_err(),
+            "new work waits for the binding to catch up with the registry"
+        );
+
+        let mut next = f.context.clone();
+        next.domain.validator_set_hash = validator_set_commitment(&members).unwrap();
+        next.members = members;
+        state
+            .update_native_inference_binding(next.clone())
+            .expect("the operator publishes the binding for the new committee");
+        assert_eq!(state.native_inference_context(), Some(next));
+
+        // The request admitted before the change still settles, certified by
+        // the committee that admitted it.
+        let terminal = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
+        let (_, receipts) = state
+            .execute_block_adaptive_at(&[terminal], f.validators[0].address(), 20)
+            .unwrap();
+        assert!(
+            receipts[0].success,
+            "the old committee settles the work it accepted"
+        );
+        assert_eq!(state.get_account(&escrow_address(id)).unwrap().balance, 0);
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            990
+        );
+        // Nothing still names the old binding, so it is not retained forever.
+        assert!(
+            state
+                .native_inference_pending_requests(
+                    state
+                        .native_inference_context()
+                        .unwrap()
+                        .commitment()
+                        .unwrap()
+                )
+                .is_ok()
+        );
+    }
+
+    /// A restart in the middle of a configuration change must not strand the
+    /// work in flight. The superseded binding is rooted in state and comes
+    /// back with it.
+    #[test]
+    fn a_retained_binding_survives_a_restart_and_is_retired_when_nothing_names_it() {
+        let f = fixture("binding-retained-restart");
+        let state = &f.ledger.state;
+        let v1 = state.activate_native_inference(f.context.clone()).unwrap();
+        let req = request(&f, 0, 400);
+        let id = req.job.request_id();
+        let tx = native_request(state, &f.requester, req);
+        state
+            .execute_block_adaptive_at(&[tx], f.validators[0].address(), 10)
+            .unwrap();
+
+        let upgraded = hash_bytes(b"a newer model");
+        let mut next = f.context.clone();
+        next.allowed_executions.push(AllowedExecution {
+            model_hash: upgraded,
+            profile_hash: upgraded,
+            generation_hash: upgraded,
+            assignment_hash: upgraded,
+        });
+        state.update_native_inference_binding(next.clone()).unwrap();
+        assert_eq!(state.retained_binding_index().unwrap(), vec![v1]);
+
+        // Restart, holding nothing in memory. The settling transaction is
+        // signed before the restart, as a validator's would have been.
+        let terminal = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
+        let producer = f.validators[0].address();
+        let dir = f.dir.clone();
+        let prefunded = f.prefunded.clone();
+        let genesis = f.genesis;
+        let requester = f.requester.address();
+        drop(f);
+
+        let reopened = StateDB::with_genesis_persistent(&prefunded, &dir, genesis)
+            .expect("a chain mid-update must reopen");
+        assert_eq!(reopened.native_inference_context(), Some(next));
+        assert_eq!(
+            reopened.retained_binding_index().unwrap(),
+            vec![v1],
+            "the superseded binding came back"
+        );
+
+        // And the work admitted under v1 still settles after the restart.
+        let (_, receipts) = reopened
+            .execute_block_adaptive_at(&[terminal], producer, 20)
+            .unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(reopened.get_account(&requester).unwrap().balance, 990);
+
+        // Nothing names v1 now, so the next update retires it.
+        let later = hash_bytes(b"a later model still");
+        let mut third = reopened.native_inference_context().unwrap();
+        third.allowed_executions.push(AllowedExecution {
+            model_hash: later,
+            profile_hash: later,
+            generation_hash: later,
+            assignment_hash: later,
+        });
+        reopened.update_native_inference_binding(third).unwrap();
+        assert!(
+            reopened.retained_binding_index().unwrap().is_empty(),
+            "a binding nothing names is not kept forever"
+        );
+        assert!(
+            reopened
+                .get_storage(&context_account(), &version_key(v1))
+                .is_none(),
+            "and its row is gone from state"
         );
     }
 

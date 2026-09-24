@@ -686,6 +686,12 @@ pub struct StateDB {
     /// the chain itself at that height, rather than only by whichever node
     /// happened to be starting up at that moment.
     pub(crate) pending_migration_context: RwLock<Option<InferenceAdmissionContext>>,
+    /// Bindings that have been superseded but are still named by requests
+    /// admitted under them. A configuration update governs NEW requests; work
+    /// already in flight settles or refunds under the binding it was admitted
+    /// with, so that binding stays available until nothing references it.
+    pub(crate) superseded_bindings:
+        RwLock<std::collections::BTreeMap<[u8; 32], InferenceAdmissionContext>>,
     native_inference_pending: DashMap<[u8; 32], u64>,
     native_inference_execution: parking_lot::Mutex<()>,
     native_inference_publication: RwLock<()>,
@@ -775,6 +781,7 @@ impl StateDB {
             native_inference_context: RwLock::new(None),
             native_migration: RwLock::new(None),
             pending_migration_context: RwLock::new(None),
+            superseded_bindings: RwLock::new(std::collections::BTreeMap::new()),
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
@@ -831,6 +838,7 @@ impl StateDB {
             native_inference_context: RwLock::new(None),
             native_migration: RwLock::new(None),
             pending_migration_context: RwLock::new(None),
+            superseded_bindings: RwLock::new(std::collections::BTreeMap::new()),
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
@@ -4968,6 +4976,18 @@ impl StateDB {
     /// of its binding. Changing it is an explicit migration - a new activation
     /// on a fresh genesis - never a side effect of a staking transaction.
     pub fn refuse_registry_change_under_native_binding(&self) -> Result<(), StateError> {
+        // A MIGRATED chain supports versioned bindings, so the committee is
+        // not frozen: the registry moves, new requests are refused until the
+        // operator publishes the binding that names the new committee, and
+        // work already admitted settles under the binding that accepted it.
+        // Staking and validator admission therefore keep working, which on a
+        // public chain they have to.
+        if self.native_migration.read().is_some() {
+            return Ok(());
+        }
+        // A private protocol-4 chain runs nothing but native inference, so a
+        // registry change cannot execute there anyway; this stays as the
+        // defence in depth it was.
         if self.native_inference_context.read().is_some() {
             return Err(StateError::ExecutionError(
                 "the validator registry is frozen by the active native inference binding; \

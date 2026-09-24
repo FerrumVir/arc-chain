@@ -4002,7 +4002,17 @@ mod tests {
             "{message}"
         );
         assert!(message.contains(&changed.to_hex()), "{message}");
-        assert!(message.contains("Restart with the genesis file that was used at activation"));
+        // The refusal still names a remedy, and since versioned bindings
+        // made a committee change supported, that remedy is the supported
+        // path rather than "you cannot do this".
+        assert!(
+            message.contains("Restart with a genesis file that matches the current binding"),
+            "{message}"
+        );
+        assert!(
+            message.contains("A committee change IS supported"),
+            "{message}"
+        );
 
         // Refusing touched nothing: the binding still resumes.
         assert_eq!(
