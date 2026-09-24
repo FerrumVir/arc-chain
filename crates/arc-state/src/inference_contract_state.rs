@@ -4345,6 +4345,62 @@ mod tests {
         assert_eq!(state.native_inference_context(), Some(f.context.clone()));
     }
 
+    /// WAL continuity across a mid-chain activation. The activation appends
+    /// its own ops and checkpoint at the coordinated height, AFTER that
+    /// block's own ops and checkpoint. Reopening the directory replays the
+    /// whole log through the real validation - genesis prefix, block and
+    /// checkpoint pairing, chain linkage - so if a second checkpoint at one
+    /// height were not accepted, a migrated node could never start again.
+    #[test]
+    fn a_mid_chain_activation_replays_from_its_own_wal() {
+        let f = fixture("migration-wal");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        assert_eq!(state.native_inference_context(), Some(f.context.clone()));
+        let height = state.height();
+        let balance = state.get_account(&f.requester.address()).unwrap().balance;
+        let commitment = f.context.commitment().unwrap();
+
+        let dir = f.dir.clone();
+        let prefunded = f.prefunded.clone();
+        let genesis = f.genesis;
+        let requester = f.requester.address();
+        let context = f.context.clone();
+        drop(f);
+
+        let reopened = StateDB::with_genesis_persistent(&prefunded, &dir, genesis)
+            .expect("a migrated chain's own WAL must replay");
+        assert_eq!(reopened.height(), height, "same tip");
+        assert_eq!(
+            reopened.native_inference_context(),
+            Some(context),
+            "the binding is rebuilt from the replayed activation"
+        );
+        assert_eq!(
+            reopened
+                .get_storage(&context_account(), &context_key())
+                .as_deref(),
+            Some(commitment.0.as_slice()),
+            "the rooted context row survived replay"
+        );
+        assert!(
+            reopened
+                .get_storage(&context_account(), &migration_key())
+                .is_some(),
+            "and so did the record that authorised it"
+        );
+        assert_eq!(
+            reopened.get_account(&requester).unwrap().balance,
+            balance,
+            "balances are what they were"
+        );
+    }
+
     #[test]
     fn canonical_native_envelope_domain_bounds_and_mixed_block_rejections_are_atomic() {
         let f = fixture("canonical-reject");
