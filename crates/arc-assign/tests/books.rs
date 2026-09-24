@@ -44,6 +44,7 @@ fn body(k: &KeyPair, nonce: u64) -> LeaseBody {
         claimed_macs_per_s: 2_000_000_000,
         max_concurrency: 4,
         warm_rows: vec![],
+        resident_layers: vec![],
         issued_at_height: 10,
         expires_at_height: 1_000,
         nonce,
@@ -535,6 +536,7 @@ fn an_operator_offer_uses_its_measured_rate_and_needs_every_other_input() {
         transport_id: "rack-1".into(),
         ram_headroom_bytes: 16 << 30,
         claimed_macs_per_s: None,
+        resident_layers: vec![],
         digest: hash_bytes(b"rack-1 config entry"),
     };
     let mut challenges = ChallengeBook::new(3);

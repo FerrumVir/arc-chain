@@ -121,6 +121,13 @@ pub struct RowWorkerEntry {
     pub startup_timeout_ms: u64,
     pub ram_headroom_bytes: u64,
     pub max_concurrency: u32,
+    /// Layers whose weights this machine holds, as half-open `[start, end)`
+    /// ranges - the same grid as `--shard-range`. Empty (the default) means
+    /// it loads the whole model, which is what every existing config does.
+    /// Declaring ranges lets a machine serve only the layers it can hold, so
+    /// its memory bounds its assignment instead of the model's total size.
+    #[serde(default)]
+    pub resident_layers: Vec<(u32, u32)>,
 }
 
 impl RowCohortConfig {
@@ -186,6 +193,14 @@ impl RowCohortConfig {
                 return Err(format!(
                     "machine {id}: startup_timeout_ms must be 1 to {MAX_STARTUP_TIMEOUT_MS}"
                 ));
+            }
+            for (start, end) in &entry.resident_layers {
+                if start >= end {
+                    return Err(format!(
+                        "machine {id}: resident_layers range {start}:{end} is empty; \
+                         ranges are half-open [start, end)"
+                    ));
+                }
             }
             if entry.timeout_ms == 0 || entry.timeout_ms > MAX_CALL_TIMEOUT_MS {
                 return Err(format!(
@@ -1078,6 +1093,7 @@ impl RowCohort {
                 transport_id: machine.entry.id.clone(),
                 ram_headroom_bytes: machine.entry.ram_headroom_bytes,
                 claimed_macs_per_s: None,
+                resident_layers: machine.entry.resident_layers.clone(),
                 digest: machine.digest,
             })
             .collect()
@@ -1418,6 +1434,7 @@ mod tests {
             timeout_ms: 5_000,
             startup_timeout_ms: 600_000,
             ram_headroom_bytes: 16 << 30,
+            resident_layers: vec![],
             max_concurrency: 2,
         }
     }
@@ -1605,6 +1622,7 @@ mod tests {
             ram_headroom_bytes: 64 << 30,
             max_concurrency: 2,
             link: link(),
+            resident_layers: vec![],
         };
         let policy = Policy {
             max_workers: 4,
@@ -1663,5 +1681,109 @@ mod tests {
         assert!(plans_from(&certificate, &keys, &BTreeMap::new()).is_err());
         // So is one that names more stages than the model has.
         assert!(plans_from(&certificate, &keys[..1], &id_of).is_err());
+    }
+
+    #[test]
+    fn a_machine_holding_one_layer_is_only_planned_for_that_layer() {
+        let machine = arc_crypto::hash_bytes(b"machine-1");
+        let keys = vec![(Some(0usize), TensorKey::Wq), (Some(1usize), TensorKey::Wq)];
+        let stages: Vec<Stage> = (0..2u32)
+            .map(|layer| Stage {
+                layer: Some(layer),
+                tensor: "wq".into(),
+                rows: 4096,
+                cols: 4096,
+            })
+            .collect();
+        // The machine declares, in its signed offer, that it holds layer 0
+        // only - it never loaded layer 1 and cannot serve a row of it.
+        let candidate = Candidate {
+            worker: machine,
+            transport_id: "rack-1".into(),
+            macs_per_s: 8_000_000_000,
+            ram_headroom_bytes: 64 << 30,
+            max_concurrency: 2,
+            link: link(),
+            resident_layers: vec![(0, 1)],
+        };
+        let policy = Policy {
+            max_workers: 4,
+            max_link_age: 50,
+            now: 110,
+            max_failure_per_mille: 20,
+            allow_simulated_links: false,
+            input_element_bytes: 8,
+            output_element_bytes: 8,
+            weight_bytes_per_element: 1,
+            include_coordinator: true,
+        };
+        let rule = VerificationRule {
+            duplicate_per_mille: 1_000,
+            spot_rows_per_stage: 2,
+        };
+        let certificate = AssignmentCertificate::issue(
+            arc_crypto::hash_bytes(b"request"),
+            arc_crypto::hash_bytes(b"artifact"),
+            "profile",
+            0,
+            stages,
+            1_000_000_000,
+            vec![candidate],
+            vec![arc_crypto::hash_bytes(b"entry")],
+            policy,
+            rule,
+        )
+        .unwrap();
+        let id_of: BTreeMap<[u8; 32], String> = [(machine.0, "rack-1".to_string())].into();
+        let plans = plans_from(&certificate, &keys, &id_of).unwrap();
+        let remote = SliceOwner::Remote("rack-1".into());
+        let rows_for = |key: (Option<usize>, TensorKey)| -> usize {
+            plans
+                .iter()
+                .find(|entry| *entry.0 == key)
+                .expect("a plan per key")
+                .1
+                .slices
+                .iter()
+                .filter(|s| s.owner == remote)
+                .map(|s| s.row_end - s.row_start)
+                .sum()
+        };
+        assert!(
+            rows_for((Some(0usize), TensorKey::Wq)) > 0,
+            "the machine must serve the layer it holds"
+        );
+        assert_eq!(
+            rows_for((Some(1usize), TensorKey::Wq)),
+            0,
+            "and must never be planned a row of the layer it does not"
+        );
+        // This node still covers every row of both layers.
+        for (_, plan) in &plans {
+            assert_eq!(plan.slices.first().unwrap().row_start, 0);
+            assert_eq!(plan.slices.last().unwrap().row_end, 4096);
+        }
+    }
+
+    #[test]
+    fn declared_layer_residency_is_parsed_and_an_empty_range_is_refused() {
+        let base = serde_json::json!({
+            "workers": [{
+                "id": "rack-1", "ssh_program": "/usr/bin/ssh", "target": "arc@10.0.0.11",
+                "known_hosts": "/etc/arc/known_hosts",
+                "remote_command": ["/opt/arc/tensor_row_model_worker", "--model", "/data/m.gguf"],
+                "timeout_ms": 5000, "ram_headroom_bytes": 17179869184u64, "max_concurrency": 2,
+                "resident_layers": [[0, 6], [11, 16]]
+            }]
+        });
+        let parsed: RowCohortConfig = serde_json::from_value(base.clone()).unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.workers[0].resident_layers, vec![(0, 6), (11, 16)]);
+        // A half-open range that holds nothing is a configuration mistake,
+        // not a machine that silently serves no rows.
+        let mut empty = base;
+        empty["workers"][0]["resident_layers"] = serde_json::json!([[3, 3]]);
+        let parsed: RowCohortConfig = serde_json::from_value(empty).unwrap();
+        assert!(parsed.validate().is_err());
     }
 }

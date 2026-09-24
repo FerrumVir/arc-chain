@@ -31,6 +31,13 @@ pub struct Candidate {
     pub ram_headroom_bytes: u64,
     pub max_concurrency: u32,
     pub link: LinkMeasurement,
+    /// Layers whose weights this worker actually holds, as half-open
+    /// `[start, end)` ranges - exactly what `--shard-range` configures and a
+    /// shard announcement carries. Empty means the whole model. A worker is
+    /// never given rows of a layer it does not hold, and a layerless stage
+    /// (embedding, output) belongs to full-model participants only.
+    #[serde(default)]
+    pub resident_layers: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +175,65 @@ fn predict(
     total.min(u64::MAX as u128) as u64
 }
 
+/// Whether a participant holding `resident` layers can serve this stage.
+/// Empty residency is a full-model participant: it holds everything.
+fn holds_stage(resident: &[(u32, u32)], stage: &Stage) -> bool {
+    if resident.is_empty() {
+        return true;
+    }
+    match stage.layer {
+        None => false,
+        Some(layer) => resident.iter().any(|(s, e)| layer >= *s && layer < *e),
+    }
+}
+
+/// Weights for one stage, in ppm: proportional to rate among the
+/// participants that hold it, each capped by what its memory allows, the
+/// excess redistributed to those with room left (bounded passes).
+fn capped_weights(rates: &[u64], caps: &[u128], eligible: &[bool]) -> Vec<u128> {
+    let rate_total: u128 = rates
+        .iter()
+        .zip(eligible)
+        .filter(|(_, e)| **e)
+        .map(|(r, _)| *r as u128)
+        .sum();
+    let mut weights: Vec<u128> = rates
+        .iter()
+        .zip(eligible)
+        .map(|(r, e)| {
+            if *e {
+                (*r as u128 * 1_000_000) / rate_total.max(1)
+            } else {
+                0
+            }
+        })
+        .collect();
+    for _ in 0..rates.len() {
+        let mut excess: u128 = 0;
+        let mut free_rate: u128 = 0;
+        for i in 0..weights.len() {
+            if !eligible[i] {
+                continue;
+            }
+            if weights[i] > caps[i] {
+                excess += weights[i] - caps[i];
+                weights[i] = caps[i];
+            } else if weights[i] < caps[i] {
+                free_rate += rates[i] as u128;
+            }
+        }
+        if excess == 0 || free_rate == 0 {
+            break;
+        }
+        for i in 0..weights.len() {
+            if eligible[i] && weights[i] < caps[i] {
+                weights[i] += (excess * rates[i] as u128) / free_rate;
+            }
+        }
+    }
+    weights
+}
+
 /// Choose a placement. See the module documentation.
 pub fn place(
     stages: &[Stage],
@@ -194,10 +260,6 @@ pub fn place(
     let mut seen = std::collections::BTreeSet::new();
     pool.retain(|c| seen.insert(c.worker.0));
 
-    let total_weight_bytes: u128 = stages
-        .iter()
-        .map(|s| s.rows as u128 * s.cols as u128 * policy.weight_bytes_per_element as u128)
-        .sum();
     let coordinator_only = if policy.include_coordinator {
         let rows: Vec<Vec<u64>> = stages.iter().map(|s| vec![s.rows]).collect();
         predict(stages, &[coordinator_macs_per_s], &[None], &rows, policy)
@@ -215,59 +277,55 @@ pub fn place(
         let chosen = &pool[..k];
         let mut rates: Vec<u64> = Vec::new();
         let mut links: Vec<Option<&LinkMeasurement>> = Vec::new();
-        let mut caps: Vec<u128> = Vec::new(); // max share of all rows, in ppm
+        let mut caps: Vec<u128> = Vec::new(); // max share of ANY held stage, in ppm
+        let mut resident: Vec<&[(u32, u32)]> = Vec::new();
         if policy.include_coordinator {
             rates.push(coordinator_macs_per_s);
             links.push(None);
             caps.push(1_000_000);
+            resident.push(&[]);
         }
         for c in chosen {
             rates.push(c.macs_per_s);
             links.push(Some(&c.link));
-            // No weights to hold: memory caps nothing. Otherwise the share
-            // of all rows this machine's headroom can hold, in ppm.
+            // Bytes this machine would hold if it took every row of every
+            // stage it is resident for - the denominator its headroom is
+            // measured against.
+            let held_bytes: u128 = stages
+                .iter()
+                .filter(|s| holds_stage(&c.resident_layers, s))
+                .map(|s| s.rows as u128 * s.cols as u128 * policy.weight_bytes_per_element as u128)
+                .sum();
+            // The same fraction cap on every held stage bounds total
+            // residency: sum over held stages of cap * stage_bytes is
+            // cap * held_bytes, which is the headroom itself.
             let cap = (c.ram_headroom_bytes as u128 * 1_000_000)
-                .checked_div(total_weight_bytes)
+                .checked_div(held_bytes)
                 .map_or(1_000_000, |share| share.min(1_000_000));
             caps.push(cap);
+            resident.push(&c.resident_layers);
         }
-        // Weights proportional to rate, each capped by what fits in memory;
-        // excess redistributed to uncapped participants (bounded passes).
-        let rate_total: u128 = rates.iter().map(|r| *r as u128).sum();
-        let mut weights: Vec<u128> = rates
-            .iter()
-            .map(|r| (*r as u128 * 1_000_000) / rate_total.max(1))
-            .collect();
-        for _ in 0..rates.len() {
-            let mut excess: u128 = 0;
-            let mut free_rate: u128 = 0;
-            for i in 0..weights.len() {
-                if weights[i] > caps[i] {
-                    excess += weights[i] - caps[i];
-                    weights[i] = caps[i];
-                } else if weights[i] < caps[i] {
-                    free_rate += rates[i] as u128;
-                }
-            }
-            if excess == 0 || free_rate == 0 {
+        // Each stage is shared out among the participants resident for it,
+        // so nobody is ever handed rows it does not hold. A set that cannot
+        // cover some stage is not a placement at all.
+        let mut rows_per_stage: Vec<Vec<u64>> = Vec::with_capacity(stages.len());
+        let mut coverable = true;
+        for stage in stages {
+            let eligible: Vec<bool> = resident.iter().map(|r| holds_stage(r, stage)).collect();
+            let weights = capped_weights(&rates, &caps, &eligible);
+            let placed: u128 = weights.iter().sum();
+            if placed + (weights.len() as u128) < 1_000_000 {
+                // Nobody resident for this stage, or not enough memory
+                // among those who are, to hold every one of its rows.
+                coverable = false;
                 break;
             }
-            for i in 0..weights.len() {
-                if weights[i] < caps[i] {
-                    weights[i] += (excess * rates[i] as u128) / free_rate;
-                }
-            }
+            let weights_u64: Vec<u64> = weights.iter().map(|w| *w as u64).collect();
+            rows_per_stage.push(split_rows(stage.rows, &weights_u64));
         }
-        let placed: u128 = weights.iter().sum();
-        if placed + (weights.len() as u128) < 1_000_000 {
-            // Cannot hold every row with this set.
+        if !coverable {
             continue;
         }
-        let weights_u64: Vec<u64> = weights.iter().map(|w| *w as u64).collect();
-        let rows_per_stage: Vec<Vec<u64>> = stages
-            .iter()
-            .map(|s| split_rows(s.rows, &weights_u64))
-            .collect();
         let t = predict(stages, &rates, &links, &rows_per_stage, policy);
         let better = match &best {
             None => true,

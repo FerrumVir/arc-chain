@@ -31,6 +31,11 @@ pub struct LeaseBody {
     pub max_concurrency: u32,
     /// Rows already resident per tensor key (warm), by name.
     pub warm_rows: Vec<(String, u64)>,
+    /// Layers this worker holds weights for, as half-open `[start, end)`
+    /// ranges. Empty means the whole model. Signed with the rest of the
+    /// body, so a worker cannot overstate what it can serve.
+    #[serde(default)]
+    pub resident_layers: Vec<(u32, u32)>,
     pub issued_at_height: u64,
     pub expires_at_height: u64,
     pub nonce: u64,

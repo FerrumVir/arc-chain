@@ -447,6 +447,8 @@ pub struct Offer {
     pub ram_headroom_bytes: u64,
     /// A claimed rate caps the measured one. `None`: the measurement alone.
     pub claimed_macs_per_s: Option<u64>,
+    /// Layers the worker holds, from its signed lease. Empty: the whole model.
+    pub resident_layers: Vec<(u32, u32)>,
     /// The digest a certificate binds for this offer.
     pub digest: Hash256,
 }
@@ -458,6 +460,7 @@ impl Offer {
             transport_id: lease.body.transport_id.clone(),
             ram_headroom_bytes: lease.body.ram_headroom_bytes,
             claimed_macs_per_s: Some(lease.body.claimed_macs_per_s),
+            resident_layers: lease.body.resident_layers.clone(),
             digest: lease.digest(),
         }
     }
@@ -506,6 +509,7 @@ pub fn candidates_from(
             ram_headroom_bytes: offer.ram_headroom_bytes,
             max_concurrency: slots,
             link,
+            resident_layers: offer.resident_layers,
         });
         digests.push(offer.digest);
     }

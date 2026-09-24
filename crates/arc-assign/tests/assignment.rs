@@ -32,6 +32,7 @@ fn body(k: &KeyPair) -> LeaseBody {
         claimed_macs_per_s: 2_000_000_000,
         max_concurrency: 4,
         warm_rows: vec![],
+        resident_layers: vec![],
         issued_at_height: 10,
         expires_at_height: 1_000,
         nonce: 1,
@@ -175,6 +176,7 @@ fn candidate(i: u8, rate: u64, link: LinkMeasurement) -> Candidate {
         ram_headroom_bytes: 64 << 30,
         max_concurrency: 4,
         link,
+        resident_layers: vec![],
     }
 }
 
@@ -334,6 +336,156 @@ fn without_the_coordinator_the_workers_must_hold_every_row() {
     let roomy = candidate(2, 4_000_000_000, fast);
     let placed = place(&stages(), 0, &[roomy], &p).unwrap();
     assert!(covers_exactly(&placed, &stages()));
+}
+
+/// A worker that holds only some layers, as `--shard-range` configures.
+fn sharded(i: u8, rate: u64, link: LinkMeasurement, layers: &[(u32, u32)]) -> Candidate {
+    let mut c = candidate(i, rate, link);
+    c.resident_layers = layers.to_vec();
+    c
+}
+
+/// Rows a participant was given on one stage.
+fn rows_on(p: &Placement, si: usize, who: &Participant) -> u64 {
+    p.stages[si]
+        .slices
+        .iter()
+        .filter(|s| &s.participant == who)
+        .map(|s| s.row_end - s.row_start)
+        .sum()
+}
+
+#[test]
+fn a_worker_is_never_given_rows_of_a_layer_it_does_not_hold() {
+    let fast = link(50, 10_000_000_000);
+    let lower = sharded(1, 8_000_000_000, fast, &[(0, 2)]);
+    let upper = sharded(2, 8_000_000_000, fast, &[(2, 4)]);
+    let p = place(&stages(), 1_000_000_000, &[lower, upper], &policy()).unwrap();
+    let all = stages();
+    for (si, stage) in all.iter().enumerate() {
+        for slice in &p.stages[si].slices {
+            let Participant::Worker(w) = &slice.participant else {
+                continue;
+            };
+            let held: &[(u32, u32)] = if *w == key(1).address() {
+                &[(0, 2)]
+            } else {
+                &[(2, 4)]
+            };
+            let layer = stage.layer.expect("every stage here has a layer");
+            assert!(
+                held.iter().any(|(s, e)| layer >= *s && layer < *e),
+                "worker given layer {layer} it does not hold: {slice:?}"
+            );
+        }
+    }
+    assert!(covers_exactly(&p, &all));
+}
+
+#[test]
+fn each_half_of_the_model_is_served_by_the_worker_holding_it() {
+    let fast = link(50, 10_000_000_000);
+    let lower = sharded(1, 8_000_000_000, fast, &[(0, 2)]);
+    let upper = sharded(2, 8_000_000_000, fast, &[(2, 4)]);
+    let p = place(&stages(), 1_000_000_000, &[lower, upper], &policy()).unwrap();
+    let a = Participant::Worker(key(1).address());
+    let b = Participant::Worker(key(2).address());
+    // Stage 0 is layer 0; stage 21 is layer 3 (7 tensors per layer).
+    assert!(rows_on(&p, 0, &a) > 0, "the lower half must serve layer 0");
+    assert_eq!(rows_on(&p, 0, &b), 0, "the upper half holds no layer 0");
+    assert!(rows_on(&p, 21, &b) > 0, "the upper half must serve layer 3");
+    assert_eq!(rows_on(&p, 21, &a), 0, "the lower half holds no layer 3");
+}
+
+#[test]
+fn a_layer_nobody_holds_is_not_a_placement_without_the_coordinator() {
+    let fast = link(50, 10_000_000_000);
+    let mut p = policy();
+    p.include_coordinator = false;
+    let lower = sharded(1, 8_000_000_000, fast, &[(0, 2)]);
+    assert_eq!(
+        place(&stages(), 0, &[lower.clone()], &p),
+        Err(PlacementError::Infeasible),
+        "layers 2 and 3 have no holder"
+    );
+    let upper = sharded(2, 8_000_000_000, fast, &[(2, 4)]);
+    let placed = place(&stages(), 0, &[lower, upper], &p).unwrap();
+    assert!(covers_exactly(&placed, &stages()));
+}
+
+#[test]
+fn a_layerless_stage_belongs_to_full_model_participants_only() {
+    let fast = link(50, 10_000_000_000);
+    let mixed = vec![
+        Stage {
+            layer: None,
+            tensor: "output".into(),
+            rows: 32000,
+            cols: 4096,
+        },
+        Stage {
+            layer: Some(0),
+            tensor: "wq".into(),
+            rows: 4096,
+            cols: 4096,
+        },
+    ];
+    let shard = sharded(1, 8_000_000_000, fast, &[(0, 1)]);
+    let p = place(&mixed, 1_000_000_000, &[shard.clone()], &policy()).unwrap();
+    let w = Participant::Worker(key(1).address());
+    assert_eq!(
+        rows_on(&p, 0, &w),
+        0,
+        "a layer-sharded worker holds no output projection"
+    );
+    assert!(rows_on(&p, 1, &w) > 0, "but it does hold layer 0");
+    assert!(covers_exactly(&p, &mixed));
+    // With no coordinator to hold it, that stage cannot be placed at all.
+    let mut solo = policy();
+    solo.include_coordinator = false;
+    assert_eq!(
+        place(&mixed, 0, &[shard], &solo),
+        Err(PlacementError::Infeasible)
+    );
+}
+
+#[test]
+fn memory_is_measured_against_the_layers_a_worker_actually_holds() {
+    let fast = link(50, 10_000_000_000);
+    let total: u64 = stages().iter().map(|s| s.rows * s.cols).sum();
+    // Room for its own quarter of the model and no more. Measured against
+    // the whole model this would cap it near a quarter of every stage;
+    // measured against what it holds, it can serve its own layer fully.
+    let mut shard = sharded(1, 8_000_000_000, fast, &[(0, 1)]);
+    shard.ram_headroom_bytes = total / 4;
+    let p = place(&stages(), 1_000_000_000, &[shard], &policy()).unwrap();
+    let w = Participant::Worker(key(1).address());
+    let layer0_rows = stages()[0].rows;
+    assert!(
+        rows_on(&p, 0, &w) * 2 > layer0_rows,
+        "{} of {layer0_rows} on its own layer",
+        rows_on(&p, 0, &w)
+    );
+    assert_eq!(rows_on(&p, 7, &w), 0, "and nothing on layer 1");
+    assert!(covers_exactly(&p, &stages()));
+}
+
+#[test]
+fn a_worker_too_small_for_its_own_layers_is_still_capped() {
+    let fast = link(50, 10_000_000_000);
+    let total: u64 = stages().iter().map(|s| s.rows * s.cols).sum();
+    let mut shard = sharded(1, 8_000_000_000, fast, &[(0, 1)]);
+    // A tenth of the one layer it holds (a quarter of the model).
+    shard.ram_headroom_bytes = total / 40;
+    let p = place(&stages(), 1_000_000_000, &[shard], &policy()).unwrap();
+    let w = Participant::Worker(key(1).address());
+    let layer0_rows = stages()[0].rows;
+    assert!(
+        rows_on(&p, 0, &w) * 10 <= layer0_rows + 1,
+        "{} of {layer0_rows} exceeds its headroom",
+        rows_on(&p, 0, &w)
+    );
+    assert!(covers_exactly(&p, &stages()));
 }
 
 fn rule() -> VerificationRule {

@@ -357,6 +357,7 @@ fn main() -> Result<(), String> {
             claimed_macs_per_s: claimed,
             max_concurrency: 1,
             warm_rows: Vec::new(),
+            resident_layers: Vec::new(),
             issued_at_height: 0,
             expires_at_height: 1_000,
             nonce: index as u64,
@@ -403,6 +404,7 @@ fn main() -> Result<(), String> {
             ram_headroom_bytes: lease.body.ram_headroom_bytes,
             max_concurrency: lease.body.max_concurrency,
             link,
+            resident_layers: lease.body.resident_layers.clone(),
         });
     }
 
