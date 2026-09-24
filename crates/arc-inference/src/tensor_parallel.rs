@@ -883,6 +883,72 @@ fn rows_of_copy(
     Ok(values)
 }
 
+/// A contiguous row range of ONE canonical tensor, held by a worker that does
+/// not hold the model.
+///
+/// This is the whole resident state a row worker needs: the i8 rows, their
+/// per-row scales and the column count, plus the identity those rows belong
+/// to. No embeddings, norms, vocabulary, KV cache or `ModelConfig` - a
+/// full-model worker carries well over a gigabyte of those and never reads
+/// them while serving.
+pub struct RowShard {
+    pub artifact: Hash256,
+    pub profile: String,
+    pub layer: Option<usize>,
+    pub tensor: TensorKey,
+    /// The canonical row range these weights are, half-open.
+    pub row_start: usize,
+    pub row_end: usize,
+    /// Exactly the held rows, already in canonical (post-permutation) order.
+    pub weights: I8Weights,
+}
+
+/// Answer one projection from held shards, serving any SUB-RANGE of a shard.
+///
+/// Placement decides row ranges when a request arrives and cannot know, when
+/// the weights were placed, how it will later divide them. A worker that
+/// insisted on bounds equal to what it holds would force a re-export for every
+/// re-placement, which is what kept memory-bounded workers out of automatic
+/// placement.
+///
+/// `worker_id` is deliberately not matched. It is placement's label for a
+/// machine, not an identity: the machine is authenticated by its transport,
+/// and these weights are identified by artifact, profile, layer, tensor and
+/// row range, every one of which is still matched exactly.
+///
+/// The arithmetic is the canonical kernel, not a second implementation of it,
+/// so a shard's answer is bit-identical to the same rows computed by a
+/// coordinator holding the whole model.
+pub fn project_from_shards(
+    shards: &[RowShard],
+    request: &RowProjectionRequest,
+) -> Result<Vec<i64>, TensorParallelError> {
+    let assignment = &request.assignment;
+    if assignment.row_start >= assignment.row_end {
+        return Err(TensorParallelError::WrongShape);
+    }
+    let shard = shards
+        .iter()
+        .find(|shard| {
+            shard.artifact == assignment.artifact_id
+                && shard.profile == assignment.execution_profile
+                && shard.layer == assignment.layer
+                && shard.tensor == assignment.tensor
+                && shard.row_start <= assignment.row_start
+                && assignment.row_end <= shard.row_end
+        })
+        .ok_or(TensorParallelError::WrongIdentity)?;
+    let offset = assignment.row_start - shard.row_start;
+    let rows = assignment.row_end - assignment.row_start;
+    let end = offset
+        .checked_add(rows)
+        .ok_or(TensorParallelError::WrongShape)?;
+    if end > shard.weights.n_rows {
+        return Err(TensorParallelError::WrongShape);
+    }
+    rows_of(&shard.weights, offset, end, &request.input)
+}
+
 /// Serve row projections of a resident canonical model over length-prefixed
 /// frames: the private-cohort protocol [`SshStdioRowWorker`] speaks, for any
 /// assignment of this artifact and profile. For an operator's own machine
@@ -2060,5 +2126,152 @@ mod tests {
         };
         let mut output = vec![0];
         assert!(matmul_i8_canonical_rows(&weights, &[1], &mut output).is_err());
+    }
+
+    // ---- memory-bounded row shards -------------------------------------
+
+    fn tensor_weights(n_rows: usize, n_cols: usize) -> I8Weights {
+        let data = (0..n_rows * n_cols)
+            .map(|i| (((i * 31) % 251) as i64 - 125) as i8)
+            .collect();
+        let scales = (0..n_rows).map(|r| 1_000 + (r as i64) * 37).collect();
+        I8Weights {
+            data,
+            scales,
+            n_rows,
+            n_cols,
+        }
+    }
+
+    fn shard_of(whole: &I8Weights, start: usize, end: usize) -> RowShard {
+        RowShard {
+            artifact: id(7),
+            profile: "canonical".into(),
+            layer: Some(2),
+            tensor: TensorKey::Wq,
+            row_start: start,
+            row_end: end,
+            weights: whole.copy_rows(start, end).unwrap(),
+        }
+    }
+
+    fn request_for(a: RowAssignment, input: &[i64]) -> RowProjectionRequest {
+        RowProjectionRequest {
+            call_id: id(9),
+            input_hash: hash_i64(input),
+            assignment: a,
+            input: input.to_vec(),
+        }
+    }
+
+    /// The property the whole memory-bounded design rests on: a worker holding
+    /// only some rows returns, for any sub-range, exactly what a coordinator
+    /// holding the whole tensor computes for those same rows.
+    #[test]
+    fn a_shard_serves_any_sub_range_bit_identically_to_the_whole_tensor() {
+        let n_cols = 12;
+        let whole = tensor_weights(32, n_cols);
+        let input: Vec<i64> = (0..n_cols).map(|i| (i as i64) * 7 - 40).collect();
+        // One worker holds rows 8..24 and nothing else.
+        let shards = vec![shard_of(&whole, 8, 24)];
+
+        for (start, end) in [(8, 24), (8, 9), (23, 24), (10, 18), (12, 13)] {
+            let expected = rows_of(&whole, start, end, &input).unwrap();
+            let served = project_from_shards(
+                &shards,
+                &request_for(assignment(start, end, "placement-label"), &input),
+            )
+            .unwrap_or_else(|error| panic!("rows {start}..{end}: {error}"));
+            assert_eq!(served, expected, "rows {start}..{end} must match exactly");
+            assert_eq!(served.len(), end - start);
+        }
+    }
+
+    #[test]
+    fn a_shard_refuses_rows_it_does_not_hold() {
+        let whole = tensor_weights(32, 4);
+        let input = vec![1, 2, 3, 4];
+        let shards = vec![shard_of(&whole, 8, 16)];
+        for (start, end) in [(0, 4), (7, 9), (15, 17), (16, 20)] {
+            assert_eq!(
+                project_from_shards(&shards, &request_for(assignment(start, end, "w"), &input)),
+                Err(TensorParallelError::WrongIdentity),
+                "rows {start}..{end} are not held and must not be answered"
+            );
+        }
+        // An empty or inverted range is refused before anything is matched.
+        assert!(
+            project_from_shards(&shards, &request_for(assignment(10, 10, "w"), &input)).is_err()
+        );
+    }
+
+    /// Placement renames machines between runs; the weights do not change.
+    #[test]
+    fn a_shard_serves_whatever_placement_label_the_request_carries() {
+        let whole = tensor_weights(16, 4);
+        let input = vec![5, -6, 7, -8];
+        let shards = vec![shard_of(&whole, 0, 16)];
+        let first = project_from_shards(
+            &shards,
+            &request_for(assignment(2, 6, "exported-as"), &input),
+        )
+        .unwrap();
+        let second = project_from_shards(
+            &shards,
+            &request_for(assignment(2, 6, "placed-as-something-else"), &input),
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, rows_of(&whole, 2, 6, &input).unwrap());
+    }
+
+    #[test]
+    fn a_shard_refuses_another_artifact_profile_layer_or_tensor() {
+        let whole = tensor_weights(16, 4);
+        let input = vec![1, 1, 1, 1];
+        let shards = vec![shard_of(&whole, 0, 16)];
+        let mut other_artifact = assignment(0, 4, "w");
+        other_artifact.artifact_id = id(8);
+        let mut other_profile = assignment(0, 4, "w");
+        other_profile.execution_profile = "something-else".into();
+        let mut other_layer = assignment(0, 4, "w");
+        other_layer.layer = Some(3);
+        let mut other_tensor = assignment(0, 4, "w");
+        other_tensor.tensor = TensorKey::WDown;
+        for bad in [other_artifact, other_profile, other_layer, other_tensor] {
+            assert_eq!(
+                project_from_shards(&shards, &request_for(bad, &input)),
+                Err(TensorParallelError::WrongIdentity)
+            );
+        }
+    }
+
+    /// Several shards of different tensors on one worker, which is what a
+    /// memory budget actually looks like once placement spreads work.
+    #[test]
+    fn a_worker_holding_several_shards_picks_the_right_one() {
+        let n_cols = 6;
+        let wq = tensor_weights(16, n_cols);
+        let wdown = tensor_weights(24, n_cols);
+        let input: Vec<i64> = (0..n_cols).map(|i| i as i64 - 3).collect();
+        let mut wq_shard = shard_of(&wq, 0, 16);
+        wq_shard.tensor = TensorKey::Wq;
+        let mut down_shard = shard_of(&wdown, 4, 20);
+        down_shard.tensor = TensorKey::WDown;
+        let shards = vec![wq_shard, down_shard];
+
+        let mut ask_wq = assignment(2, 5, "w");
+        ask_wq.tensor = TensorKey::Wq;
+        assert_eq!(
+            project_from_shards(&shards, &request_for(ask_wq, &input)).unwrap(),
+            rows_of(&wq, 2, 5, &input).unwrap()
+        );
+
+        let mut ask_down = assignment(6, 11, "w");
+        ask_down.tensor = TensorKey::WDown;
+        assert_eq!(
+            project_from_shards(&shards, &request_for(ask_down, &input)).unwrap(),
+            rows_of(&wdown, 6, 11, &input).unwrap()
+        );
     }
 }

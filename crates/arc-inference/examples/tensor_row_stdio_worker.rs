@@ -223,6 +223,10 @@ fn main() -> io::Result<()> {
         let worker_len = u16v(&mut b)?;
         let worker = take(&mut b, worker_len)?;
         let count = u32v(&mut b)?;
+
+        // Matching, bounds and arithmetic all live in the library
+        // (`project_from_shards`), so this worker cannot drift from the
+        // canonical kernel a coordinator uses for the same rows.
         let shard = shards
             .iter()
             .find(|s| {
@@ -230,9 +234,8 @@ fn main() -> io::Result<()> {
                     && profile == s.profile.as_slice()
                     && layer == s.layer
                     && tensor == s.tensor
-                    && start == s.start
-                    && end == s.end
-                    && worker == s.worker.as_slice()
+                    && s.start <= start
+                    && end <= s.end
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "identity mismatch"))?;
         if count != shard.cols || count > 131072 {
@@ -251,6 +254,18 @@ fn main() -> io::Result<()> {
                 "input hash mismatch",
             ));
         }
+        let offset = (start - shard.start) as usize;
+        let rows = (end - start) as usize;
+        if offset + rows > shard.scales.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "row range outside the held shard",
+            ));
+        }
+        // The same overflow bounds `matmul_i8_canonical_row_range` proves
+        // before it multiplies, over exactly the rows being served. A worker
+        // that skipped these could return a silently wrapped value that the
+        // coordinator would have to catch by duplicate compute alone.
         let sum = activation
             .iter()
             .try_fold(0i64, |s, v| s.checked_add(v.checked_abs()?))
@@ -258,15 +273,14 @@ fn main() -> io::Result<()> {
         let bound = sum
             .checked_mul(128)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "dot overflow"))?;
-        if shard
-            .scales
+        if shard.scales[offset..offset + rows]
             .iter()
             .any(|s| s.checked_abs().and_then(|v| bound.checked_mul(v)).is_none())
         {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "scale overflow"));
         }
-        let mut values = Vec::with_capacity(shard.scales.len());
-        for row in 0..shard.scales.len() {
+        let mut values = Vec::with_capacity(rows);
+        for row in offset..offset + rows {
             let mut acc = 0i64;
             for col in 0..count {
                 acc += shard.data[row * count + col] as i64 * activation[col];
@@ -301,10 +315,10 @@ fn main() -> io::Result<()> {
         reply.extend_from_slice(&shard.profile);
         reply.extend_from_slice(&shard.layer.to_le_bytes());
         reply.push(shard.tensor);
-        reply.extend_from_slice(&shard.start.to_le_bytes());
-        reply.extend_from_slice(&shard.end.to_le_bytes());
-        reply.extend_from_slice(&(shard.worker.len() as u16).to_le_bytes());
-        reply.extend_from_slice(&shard.worker);
+        reply.extend_from_slice(&start.to_le_bytes());
+        reply.extend_from_slice(&end.to_le_bytes());
+        reply.extend_from_slice(&(worker.len() as u16).to_le_bytes());
+        reply.extend_from_slice(worker);
         reply.extend_from_slice(&(values.len() as u32).to_le_bytes());
         for v in values {
             reply.extend_from_slice(&v.to_le_bytes());
