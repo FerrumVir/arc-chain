@@ -470,17 +470,17 @@ fn read_native_metadata(
             "native inference escrow account is missing".into(),
         ));
     };
-    // A request admitted before a configuration update names the binding it
-    // was admitted under. That binding is retained while the request is in
-    // flight, so reading its receipt has to accept it as well as the current
-    // one; anything naming neither is still refused.
-    let names_a_known_binding = metadata.context_commitment == context_commitment
-        || state
-            .superseded_bindings
-            .read()
-            .contains_key(&metadata.context_commitment.0);
-    if !names_a_known_binding
-        || metadata.request.job.request_id() != request_id
+    // Reading a receipt does NOT require the binding it names to still be one
+    // this chain holds. Work settled under a binding that has since been
+    // replaced is history, and its receipt has to stay readable for as long
+    // as the chain keeps it - a configuration change must not make past
+    // settlements disappear from the app, the explorer or an RPC client.
+    //
+    // What proves the receipt is the chain's own is the escrow account's
+    // rooted `storage_root`, which commits these exact bytes. The binding a
+    // request must name to be WORK rather than history is checked where that
+    // matters, in `native_inference_pending_requests`.
+    if metadata.request.job.request_id() != request_id
         || account.storage_root != hash_bytes(&bytes)
         || metadata.input_blob.len() > arc_types::transaction::TIER1_INPUT_BLOB_MAX
         || hash_bytes(&metadata.input_blob) != metadata.request.job.input_hash
@@ -1996,6 +1996,19 @@ impl StateDB {
                         "native pending index references missing receipt".into(),
                     )
                 })?;
+            // Pending work must name a binding this chain still holds: the
+            // current one, or one retained because work admitted under it has
+            // not settled. Anything else is not work this node can execute.
+            if receipt.metadata.context_commitment != context_commitment
+                && !self
+                    .superseded_bindings
+                    .read()
+                    .contains_key(&receipt.metadata.context_commitment.0)
+            {
+                return Err(StateError::ExecutionError(
+                    "native pending index references an unknown inference binding".into(),
+                ));
+            }
             if receipt.metadata.status != InferenceTransitionStatus::Pending {
                 return Err(StateError::ExecutionError(
                     "native pending index references terminal receipt".into(),
@@ -5427,6 +5440,57 @@ mod tests {
             .expect("the worker must be able to read the work it has to execute");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].request_id, id);
+    }
+
+    /// A configuration change must not make past settlements disappear. The
+    /// receipt of work settled under a binding that has since been replaced
+    /// stays readable - the app, the explorer and any RPC client depend on
+    /// it, and the migration exists to preserve history, not to rewrite it.
+    #[test]
+    fn a_receipt_survives_the_binding_it_was_settled_under_being_replaced() {
+        let f = fixture("receipt-across-update");
+        let state = &f.ledger.state;
+        let v1 = state.activate_native_inference(f.context.clone()).unwrap();
+
+        // Settle a request fully under v1.
+        let req = request(&f, 0, 400);
+        let id = req.job.request_id();
+        let tx = native_request(state, &f.requester, req);
+        state
+            .execute_block_adaptive_at(&[tx], f.validators[0].address(), 10)
+            .unwrap();
+        let terminal = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
+        let (_, receipts) = state
+            .execute_block_adaptive_at(&[terminal], f.validators[0].address(), 20)
+            .unwrap();
+        assert!(receipts[0].success);
+        let before = state
+            .native_inference_receipt(id, v1)
+            .expect("readable under its own binding")
+            .expect("a receipt");
+
+        // Replace the binding. Nothing is pending, so v1 is not retained.
+        let upgraded = hash_bytes(b"a newer model");
+        let mut next = f.context.clone();
+        next.allowed_executions.push(AllowedExecution {
+            model_hash: upgraded,
+            profile_hash: upgraded,
+            generation_hash: upgraded,
+            assignment_hash: upgraded,
+        });
+        let v2 = state.update_native_inference_binding(next).unwrap();
+        assert!(state.retained_binding_index().unwrap().is_empty());
+
+        let after = state
+            .native_inference_receipt(id, v2)
+            .expect("a settled receipt outlives the binding it was settled under")
+            .expect("a receipt");
+        assert_eq!(after.metadata.status, before.metadata.status);
+        assert_eq!(after.metadata.output_hash, before.metadata.output_hash);
+        assert_eq!(
+            after.metadata.context_commitment, v1,
+            "and still says which binding settled it"
+        );
     }
 
     #[test]
