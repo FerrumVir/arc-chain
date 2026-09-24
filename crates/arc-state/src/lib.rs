@@ -5,7 +5,7 @@ pub mod inference_contract_state;
 pub use inference_contract_state::{
     AllowedExecution, InferenceAdmissionContext, IsolatedInferenceLedger, IsolatedTransitionResult,
     NativeInferencePendingSnapshot, NativeInferenceReceiptSnapshot, NativeInferenceTransactionLink,
-    NativeSelectionRule, validate_native_inference_activation,
+    NativeMigrationRecord, NativeSelectionRule, validate_native_inference_activation,
 };
 pub mod io_backend;
 pub mod jmt_store;

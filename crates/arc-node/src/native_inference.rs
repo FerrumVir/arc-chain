@@ -2373,6 +2373,10 @@ pub enum ActivationConfigError {
     },
     /// Activation itself refused.
     Refused(String),
+    /// A migration is authorised and waiting for its coordinated height. Not
+    /// a failure: the node keeps running and activates when the chain gets
+    /// there.
+    MigrationPending { at: u64, height: u64 },
 }
 
 impl std::fmt::Display for ActivationConfigError {
@@ -2411,6 +2415,11 @@ impl std::fmt::Display for ActivationConfigError {
                  with the original activation file, or start a new private genesis."
             ),
             Self::Refused(e) => write!(f, "activation refused: {e}"),
+            Self::MigrationPending { at, height } => write!(
+                f,
+                "migration authorised for height {at}; this chain is at {height} and will \
+                 activate when it gets there"
+            ),
         }
     }
 }
@@ -2477,6 +2486,42 @@ pub struct NativeActivationRequest {
     /// resume `count-every-candidate-v1`). Stated: it must match on restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_rule: Option<arc_state::NativeSelectionRule>,
+    /// Authorisation to activate on a chain that is ALREADY RUNNING. Absent
+    /// means fresh private genesis only, exactly as before. Every validator
+    /// must be given the identical record, because each of them performs the
+    /// same write at the height it names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<MigrationAuthorization>,
+}
+
+/// The operator's half of an existing-chain migration, as it appears in the
+/// activation config. It restates the chain it is for so a record cannot be
+/// copied to another chain, and the exact binding so it cannot authorise a
+/// different one than the operator reviewed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationAuthorization {
+    /// Hex of the chain's genesis network hash.
+    pub chain_genesis: String,
+    pub recovery_epoch: u64,
+    pub validator_set_id: u64,
+    /// The coordinated height. Every validator activates exactly here.
+    pub activation_height: u64,
+    /// Hex of the commitment of the binding being frozen.
+    pub context_commitment: String,
+}
+
+fn hash_from_hex(field: &str, value: &str) -> Result<Hash256, ActivationConfigError> {
+    let bytes = hex::decode(value).map_err(|error| {
+        ActivationConfigError::Malformed(format!("migration.{field} is not hex: {error}"))
+    })?;
+    let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        ActivationConfigError::Malformed(format!(
+            "migration.{field} must be 32 bytes, got {}",
+            bytes.len()
+        ))
+    })?;
+    Ok(Hash256(bytes))
 }
 
 /// Parse an operator activation request from JSON.
@@ -2605,12 +2650,42 @@ pub fn activate_native_inference_from_config(
         return resume_persisted_activation(state, &request, &persisted);
     }
 
-    // FRESH ACTIVATION. Unused private genesis only.
     let height = state.height();
+    let context = assemble_activation_context(state, &request)?;
+
+    // MIGRATION. An operator record authorises activation on a chain that is
+    // already running. The record is checked against this chain's genesis,
+    // recovery epoch and validator set before anything is written, and the
+    // activation itself still happens only at the one coordinated height.
+    if let Some(migration) = &request.migration {
+        let record = arc_state::NativeMigrationRecord {
+            chain_genesis: hash_from_hex("chain_genesis", &migration.chain_genesis)?,
+            recovery_epoch: migration.recovery_epoch,
+            validator_set_id: migration.validator_set_id,
+            activation_height: migration.activation_height,
+            context_commitment: hash_from_hex("context_commitment", &migration.context_commitment)?,
+        };
+        state
+            .authorize_native_migration(record)
+            .map_err(|e| ActivationConfigError::Refused(e.to_string()))?;
+        if height != migration.activation_height {
+            // Authorised, not yet due. The node keeps running; this is the
+            // normal state of every validator between being configured and
+            // the chain reaching the coordinated height.
+            return Err(ActivationConfigError::MigrationPending {
+                at: migration.activation_height,
+                height,
+            });
+        }
+        return state
+            .activate_native_inference(context)
+            .map_err(|e| ActivationConfigError::Refused(e.to_string()));
+    }
+
+    // FRESH ACTIVATION. Unused private genesis only.
     if height != 0 {
         return Err(ActivationConfigError::ChainNotEmpty(height));
     }
-    let context = assemble_activation_context(state, &request)?;
     state
         .activate_native_inference(context)
         .map_err(|e| ActivationConfigError::Refused(e.to_string()))
@@ -3343,6 +3418,138 @@ mod tests {
         fs::write(path, serde_json::to_string_pretty(req).unwrap()).unwrap();
     }
 
+    fn running_state(
+        dir: &std::path::Path,
+        to_height: u64,
+    ) -> (arc_state::StateDB, Vec<ValidatorMember>) {
+        let (state, members) = activatable_state(dir);
+        while state.height() < to_height {
+            state
+                .execute_block_adaptive_at(&[], members[0].address, 1_700_000 + state.height())
+                .unwrap();
+        }
+        (state, members)
+    }
+
+    fn migration_request(
+        genesis: Hash256,
+        activation_height: u64,
+        commitment: Hash256,
+    ) -> NativeActivationRequest {
+        NativeActivationRequest {
+            allowed_executions: vec![marker()],
+            recovery_epoch: 1,
+            expect: None,
+            selection_rule: None,
+            migration: Some(MigrationAuthorization {
+                chain_genesis: genesis.to_hex(),
+                recovery_epoch: 1,
+                validator_set_id: 0,
+                activation_height,
+                context_commitment: commitment.to_hex(),
+            }),
+        }
+    }
+
+    /// The operator seam for an existing-chain migration. The config is
+    /// parsed, the record is built and offered to the state, and the state's
+    /// own checks decide - here, that this chain is not recovery-bound, so
+    /// the record does not authorise it. Nothing is activated either way.
+    /// The coordinated-height behaviour itself is qualified in arc-state
+    /// against a recovery-bound chain.
+    #[test]
+    fn a_migration_config_is_parsed_and_decided_by_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = running_state(&dir.path().join("state"), 4);
+        let path = dir.path().join("activation.json");
+        let genesis = hash_bytes(b"activation-config-test-genesis");
+        write_request(&path, &migration_request(genesis, 5, Hash256::ZERO));
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::Refused(reason)) => {
+                assert!(reason.contains("recovery context"), "{reason}");
+            }
+            other => panic!("expected the state to refuse, got {other:?}"),
+        }
+        assert!(
+            state.native_inference_context().is_none(),
+            "a refused migration activates nothing"
+        );
+    }
+
+    /// A migration section that is not a chain identity at all is a config
+    /// error, named by field, not a silent zero hash.
+    #[test]
+    fn a_malformed_migration_identity_is_refused_by_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = running_state(&dir.path().join("state"), 4);
+        let path = dir.path().join("activation.json");
+        let genesis = hash_bytes(b"activation-config-test-genesis");
+
+        let mut bad_hex = migration_request(genesis, 5, Hash256::ZERO);
+        bad_hex.migration.as_mut().unwrap().chain_genesis = "not hex".into();
+        write_request(&path, &bad_hex);
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::Malformed(reason)) => {
+                assert!(reason.contains("chain_genesis"), "{reason}");
+            }
+            other => panic!("expected a malformed config, got {other:?}"),
+        }
+
+        let mut short = migration_request(genesis, 5, Hash256::ZERO);
+        short.migration.as_mut().unwrap().context_commitment = "abcd".into();
+        write_request(&path, &short);
+        match activate_native_inference_from_config(&state, &path) {
+            Err(ActivationConfigError::Malformed(reason)) => {
+                assert!(reason.contains("context_commitment"), "{reason}");
+                assert!(reason.contains("32 bytes"), "{reason}");
+            }
+            other => panic!("expected a malformed config, got {other:?}"),
+        }
+        assert!(state.native_inference_context().is_none());
+    }
+
+    /// Without a migration section the fresh-genesis rule is exactly as it
+    /// was: a running chain is refused, by height.
+    #[test]
+    fn without_a_migration_a_running_chain_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = running_state(&dir.path().join("state"), 4);
+        let path = dir.path().join("activation.json");
+        write_request(
+            &path,
+            &NativeActivationRequest {
+                allowed_executions: vec![marker()],
+                recovery_epoch: 1,
+                expect: None,
+                selection_rule: None,
+                migration: None,
+            },
+        );
+        assert!(matches!(
+            activate_native_inference_from_config(&state, &path),
+            Err(ActivationConfigError::ChainNotEmpty(4))
+        ));
+    }
+
+    /// The migration section survives a round trip and rejects a field the
+    /// operator misspelled, rather than ignoring it.
+    #[test]
+    fn a_migration_section_round_trips_and_refuses_unknown_fields() {
+        let genesis = hash_bytes(b"round-trip");
+        let request = migration_request(genesis, 1_570_000, Hash256::ZERO);
+        let json = serde_json::to_string_pretty(&request).unwrap();
+        let back: NativeActivationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.migration, request.migration);
+        assert!(json.contains("\"activation_height\": 1570000"), "{json}");
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["migration"]["activation_heigth"] = serde_json::json!(5);
+        assert!(
+            serde_json::from_value::<NativeActivationRequest>(value).is_err(),
+            "a misspelled field must not be ignored"
+        );
+    }
+
     #[test]
     fn activation_request_round_trips_and_is_hex_readable() {
         let dir = tempfile::tempdir().unwrap();
@@ -3355,6 +3562,7 @@ mod tests {
                 ..Default::default()
             }),
             selection_rule: None,
+            migration: None,
         };
         write_request(&path, &req);
         let raw = fs::read_to_string(&path).unwrap();
@@ -3392,6 +3600,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
 
@@ -3437,6 +3646,7 @@ mod tests {
                     ..Default::default()
                 }),
                 selection_rule: None,
+                migration: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3463,6 +3673,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
         assert!(
@@ -3489,6 +3700,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
         assert!(matches!(
@@ -3513,6 +3725,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
 
@@ -3545,6 +3758,7 @@ mod tests {
             recovery_epoch: 0,
             expect: None,
             selection_rule: None,
+            migration: None,
         };
         write_request(&path, &original);
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3566,6 +3780,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3586,6 +3801,7 @@ mod tests {
                     ..Default::default()
                 }),
                 selection_rule: None,
+                migration: None,
             },
         );
         match activate_native_inference_from_config(&state, &path) {
@@ -3607,6 +3823,7 @@ mod tests {
             recovery_epoch: 0,
             expect: None,
             selection_rule: Some(arc_state::NativeSelectionRule::CountEveryCandidateV1),
+            migration: None,
         };
         write_request(&path, &v1);
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3649,6 +3866,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
         activate_native_inference_from_config(&fresh, &fresh_path).expect("fresh activation");
@@ -3686,6 +3904,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3748,6 +3967,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
         activate_native_inference_from_config(&state, &path).expect("fresh activation");
@@ -3809,6 +4029,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
         assert!(state.refuse_registry_change_under_native_binding().is_ok());
@@ -3836,6 +4057,7 @@ mod tests {
                 recovery_epoch: 0,
                 expect: None,
                 selection_rule: None,
+                migration: None,
             },
         );
         // Advance the chain with an empty block; there is deliberately no

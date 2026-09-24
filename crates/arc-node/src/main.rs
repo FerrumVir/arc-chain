@@ -7199,6 +7199,20 @@ async fn run_arc_node() -> Result<()> {
                     commitment.to_hex()
                 );
             }
+            // A migration that has not reached its coordinated height is the
+            // normal state of every validator between being configured and
+            // the chain arriving there. The node runs on and activates at
+            // that height; it does not refuse to start.
+            Err(
+                error @ arc_node::native_inference::ActivationConfigError::MigrationPending {
+                    ..
+                },
+            ) => {
+                tracing::warn!(
+                    "native inference migration is authorised and waiting: {error} (from {})",
+                    activation_path.display()
+                );
+            }
             Err(error) => {
                 bail!(
                     "--native-inference-activation {}: {error}",
