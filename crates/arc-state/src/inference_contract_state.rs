@@ -375,9 +375,14 @@ pub fn validate_native_inference_activation(
             "native inference requires a persistent WAL".into(),
         ));
     }
-    if state.recovery_context().is_some() {
+    // Recovery-bound state is the recovered public chain. Activating there is
+    // exactly what a migration record authorises, and without one the original
+    // rule stands.
+    if state.recovery_context().is_some() && state.native_migration().is_none() {
         return Err(StateError::ExecutionError(
-            "native inference is unavailable on recovery-bound state".into(),
+            "native inference is unavailable on recovery-bound state without an operator \
+             migration record"
+                .into(),
         ));
     }
     let bound = state
@@ -539,7 +544,116 @@ pub(crate) fn activation_key() -> Hash256 {
     hash_bytes(b"ARC-native-inference-activation-v1")
 }
 
+/// Authorisation to activate native inference on a chain that is ALREADY
+/// RUNNING, instead of only at a fresh genesis.
+///
+/// The fresh-genesis rule exists because activation writes state: every
+/// validator must make the identical write at the identical point, or they
+/// derive different roots. At genesis that is trivial. On a live chain it has
+/// to be arranged, and this record is the arrangement - it names the chain,
+/// the recovery epoch it was produced for, the exact height at which every
+/// validator applies it, and the binding being frozen. A node that disagrees
+/// about any of those refuses rather than guessing.
+///
+/// What it deliberately does NOT do is relax a check. Every binding
+/// `validate_native_inference_activation` already enforces - persistent WAL,
+/// genesis, the live validator registry, the validator-set commitment, an
+/// existing pin - still applies. This only replaces "height must be zero"
+/// with "height must be the one every validator agreed on".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeMigrationRecord {
+    /// Must equal the persistent `genesis.network-hash`, so a record written
+    /// for one chain cannot activate another.
+    pub chain_genesis: Hash256,
+    /// The recovery epoch and validator-set id this record was produced for.
+    /// A chain that has since been recovered again has a different epoch and
+    /// must not accept a record aimed at the previous one.
+    pub recovery_epoch: u64,
+    pub validator_set_id: u64,
+    /// The coordinated point. Every validator applies the activation when its
+    /// height is exactly this, so all of them write the same state at the
+    /// same place.
+    pub activation_height: u64,
+    /// The binding being frozen, restated here so the record is self-
+    /// describing and a mismatched context is caught before anything is
+    /// written.
+    pub context_commitment: Hash256,
+}
+
+impl NativeMigrationRecord {
+    /// Check the record against this chain before it is allowed to authorise
+    /// anything. Returns the reason it does not apply, or `None`.
+    pub fn refusal_against(&self, state: &StateDB) -> Option<String> {
+        let Some(recovery) = state.recovery_context() else {
+            return Some(
+                "a migration record authorises activation on a recovery-bound chain, and this \
+                 state carries no recovery context"
+                    .into(),
+            );
+        };
+        if recovery.genesis_hash != self.chain_genesis {
+            return Some(format!(
+                "migration record names genesis {} but this chain's is {}",
+                self.chain_genesis, recovery.genesis_hash
+            ));
+        }
+        if recovery.recovery_epoch != self.recovery_epoch
+            || recovery.validator_set_id != self.validator_set_id
+        {
+            return Some(format!(
+                "migration record was produced for recovery epoch {} / validator set {}, and this \
+                 chain is at epoch {} / validator set {}",
+                self.recovery_epoch,
+                self.validator_set_id,
+                recovery.recovery_epoch,
+                recovery.validator_set_id
+            ));
+        }
+        None
+    }
+}
+
 impl StateDB {
+    /// The operator's authorisation to activate on a running chain, if one
+    /// was loaded and accepted for this chain.
+    pub fn native_migration(&self) -> Option<NativeMigrationRecord> {
+        self.native_migration.read().clone()
+    }
+
+    /// Accept a migration record for THIS chain. Rejected records leave no
+    /// trace, so a node that was handed the wrong one behaves exactly as a
+    /// node that was handed none: fresh genesis only.
+    ///
+    /// A record may be loaded either before its height (the normal case, the
+    /// operator stages it ahead of the coordinated point) or after the
+    /// activation it authorised has already been applied (every restart from
+    /// then on). What it may never do is authorise a point this chain has
+    /// already passed without having activated - that would be a retroactive
+    /// state change, and every other validator would have a different root.
+    pub fn authorize_native_migration(
+        &self,
+        record: NativeMigrationRecord,
+    ) -> Result<(), StateError> {
+        if let Some(reason) = record.refusal_against(self) {
+            return Err(StateError::ExecutionError(reason));
+        }
+        let already_applied = self
+            .get_storage(&context_account(), &context_key())
+            .is_some();
+        if !already_applied && record.activation_height <= self.height() {
+            return Err(StateError::ExecutionError(format!(
+                "migration record activates at height {}, which this chain passed without \
+                 activating (now at {}); a retroactive activation would diverge from every \
+                 other validator",
+                record.activation_height,
+                self.height()
+            )));
+        }
+        *self.native_migration.write() = Some(record);
+        Ok(())
+    }
+
     /// Explicitly enable the private protocol-4 candidate at fresh genesis.
     /// This durable, rooted context is never inferred from a submitted job.
     pub fn activate_native_inference(
@@ -560,14 +674,38 @@ impl StateDB {
             }
             return Ok(commitment);
         }
-        if self.height() != 0
+        // Where activation is allowed to happen. At a fresh genesis the answer
+        // is height 0 and nothing else. With an operator migration record it
+        // is the single coordinated height every validator agreed on -
+        // exactly, never "at or after", so all of them make the same write in
+        // the same block and derive the same root.
+        let migration = self.native_migration();
+        if let Some(record) = &migration {
+            if let Some(reason) = record.refusal_against(self) {
+                return Err(StateError::ExecutionError(reason));
+            }
+            if record.context_commitment != commitment {
+                return Err(StateError::ExecutionError(
+                    "migration record authorises a different inference binding than the one \
+                     being activated"
+                        .into(),
+                ));
+            }
+        }
+        let at_height = migration.as_ref().map_or(0, |r| r.activation_height);
+        if self.height() != at_height
             || self
                 .get_storage(&context_account(), &context_key())
                 .is_some()
         {
-            return Err(StateError::ExecutionError(
-                "native inference activation requires unused private genesis".into(),
-            ));
+            return Err(StateError::ExecutionError(match &migration {
+                None => "native inference activation requires unused private genesis".to_string(),
+                Some(record) => format!(
+                    "native inference migration activates at height {}, and this node is at {}",
+                    record.activation_height,
+                    self.height()
+                ),
+            }));
         }
         let encoded = encode_activation(&context)?;
         if encoded.len() > MAX_CONTEXT_BYTES {
@@ -583,7 +721,6 @@ impl StateDB {
         }
         let mut account = Account::new(address, 0);
         account.storage_root = commitment;
-        let root = self.projected_native_root(&[(address, account.clone())]);
         let ops = [
             WalOp::SetAccount(address, account),
             WalOp::SetStorage(address, context_key(), commitment.0.to_vec()),
@@ -597,10 +734,11 @@ impl StateDB {
                 self.staking_pool.load(std::sync::atomic::Ordering::Acquire),
             ),
         ];
+        let root = self.projected_root_after(&ops);
         for op in &ops {
-            self.wal.append(op.clone(), 0);
+            self.wal.append(op.clone(), at_height);
         }
-        self.wal.append(WalOp::Checkpoint(root), 0);
+        self.wal.append(WalOp::Checkpoint(root), at_height);
         self.durable_wal_barrier()?;
         {
             let _publication = self.native_inference_publication.write();
@@ -1004,6 +1142,29 @@ impl StateDB {
             projected.accounts.insert(address.0, account.clone());
         }
         projected.compute_state_root()
+    }
+
+    /// The state root this node will have once `ops` are applied, computed the
+    /// way THIS state computes roots.
+    ///
+    /// `projected_native_root` above builds a bare `StateDB` holding only
+    /// accounts, which is faithful at a fresh genesis and nowhere else: on a
+    /// recovery-bound chain `compute_state_root` takes a different branch
+    /// entirely (`compute_recovery_state_root`) and commits domains that
+    /// projection never copies. Activating mid-chain with that number would
+    /// have written a checkpoint root no validator could reproduce.
+    ///
+    /// This projects by the idiom the rebase path already uses: snapshot the
+    /// real state, apply the same ops to the copy, and ask the copy. It costs
+    /// one snapshot, once, at the activation height.
+    fn projected_root_after(&self, ops: &[WalOp]) -> Hash256 {
+        let scratch = StateDB::new();
+        scratch.install_durable_snapshot(&self.export_durable_snapshot());
+        *scratch.recovery_context.write() = self.recovery_context();
+        for op in ops {
+            scratch.apply_wal_op(op);
+        }
+        scratch.compute_state_root()
     }
 
     /// The caller holds the serial native execution lock. No financial state,
@@ -3521,6 +3682,175 @@ mod tests {
             &context_key(),
             pin.storage_root.as_ref()
         ));
+    }
+
+    /// Advance a recovery-bound fixture to `height` with empty blocks, the way
+    /// the recovered public chain advances today.
+    fn recovered_chain_at(f: &Fixture, height: u64) -> &StateDB {
+        let state = &f.ledger.state;
+        *state.recovery_context.write() = Some(crate::recovery::RecoveryContext::new(
+            "test", f.genesis, 1, 0,
+        ));
+        while state.height() < height {
+            state
+                .execute_block_adaptive_at(
+                    &[],
+                    f.validators[0].address(),
+                    1_700_000 + state.height(),
+                )
+                .expect("an empty block advances a recovered chain");
+        }
+        state
+    }
+
+    fn migration_for(f: &Fixture, activation_height: u64) -> NativeMigrationRecord {
+        NativeMigrationRecord {
+            chain_genesis: f.genesis,
+            recovery_epoch: 1,
+            validator_set_id: 0,
+            activation_height,
+            context_commitment: f.context.commitment().unwrap(),
+        }
+    }
+
+    /// The product requirement: paid inference activates on the EXISTING
+    /// chain, preserving its history, rather than only on a fresh genesis.
+    #[test]
+    fn a_migration_record_activates_native_inference_on_a_running_recovered_chain() {
+        let f = fixture("migration-activates");
+        let state = recovered_chain_at(&f, 4);
+        let balance_before = state.get_account(&f.requester.address()).unwrap().balance;
+
+        state
+            .authorize_native_migration(migration_for(&f, 5))
+            .expect("a record for this chain, ahead of its height, is accepted");
+        // Not yet: the coordinated height has not arrived.
+        assert!(state.activate_native_inference(f.context.clone()).is_err());
+
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        assert_eq!(state.height(), 5);
+        let commitment = state
+            .activate_native_inference(f.context.clone())
+            .expect("at the coordinated height the migration activates");
+        assert_eq!(commitment, f.context.commitment().unwrap());
+        assert_eq!(state.native_inference_context(), Some(f.context.clone()));
+        // The chain it migrated is still the chain it was.
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            balance_before,
+            "migration must not move balances"
+        );
+        assert_eq!(state.height(), 5, "migration is not a block of its own");
+    }
+
+    #[test]
+    fn a_migration_record_for_another_chain_or_epoch_is_refused() {
+        let f = fixture("migration-wrong-chain");
+        let state = recovered_chain_at(&f, 4);
+
+        let mut other_chain = migration_for(&f, 5);
+        other_chain.chain_genesis = hash_bytes(b"a different chain");
+        let error = state
+            .authorize_native_migration(other_chain)
+            .expect_err("a record naming another genesis must not authorise this chain");
+        assert!(format!("{error}").contains("genesis"), "{error}");
+
+        let mut other_epoch = migration_for(&f, 5);
+        other_epoch.recovery_epoch = 2;
+        let error = state
+            .authorize_native_migration(other_epoch)
+            .expect_err("a record from another recovery epoch must be refused");
+        assert!(format!("{error}").contains("recovery epoch"), "{error}");
+
+        let mut other_set = migration_for(&f, 5);
+        other_set.validator_set_id = 7;
+        assert!(state.authorize_native_migration(other_set).is_err());
+
+        // None of the refused records left anything behind.
+        assert!(state.native_migration().is_none());
+        assert!(state.activate_native_inference(f.context.clone()).is_err());
+    }
+
+    /// A record aimed at a height this chain already passed without
+    /// activating would be a retroactive state change: every other validator
+    /// would have a different root.
+    #[test]
+    fn a_migration_record_cannot_activate_retroactively() {
+        let f = fixture("migration-retroactive");
+        let state = recovered_chain_at(&f, 10);
+        let error = state
+            .authorize_native_migration(migration_for(&f, 5))
+            .expect_err("a passed height must not be authorised");
+        assert!(format!("{error}").contains("retroactive"), "{error}");
+        assert!(state.native_migration().is_none());
+    }
+
+    #[test]
+    fn a_migration_record_must_name_the_binding_being_activated() {
+        let f = fixture("migration-binding");
+        let state = recovered_chain_at(&f, 4);
+        let mut wrong = migration_for(&f, 5);
+        wrong.context_commitment = hash_bytes(b"some other binding");
+        state.authorize_native_migration(wrong).unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        let error = state
+            .activate_native_inference(f.context.clone())
+            .expect_err("the record must authorise this exact binding");
+        assert!(
+            format!("{error}").contains("different inference binding"),
+            "{error}"
+        );
+        assert!(state.native_inference_context().is_none());
+    }
+
+    /// Activation happens at one height, not "at or after" one: every
+    /// validator must write the same state in the same block.
+    #[test]
+    fn activation_at_any_height_but_the_coordinated_one_is_refused() {
+        let f = fixture("migration-height");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 6))
+            .unwrap();
+        // One block early.
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_098)
+            .unwrap();
+        assert_eq!(state.height(), 5);
+        let error = state
+            .activate_native_inference(f.context.clone())
+            .expect_err("early activation is refused");
+        assert!(
+            format!("{error}").contains("activates at height 6"),
+            "{error}"
+        );
+        // One block late.
+        for _ in 0..2 {
+            state
+                .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_100)
+                .unwrap();
+        }
+        assert_eq!(state.height(), 7);
+        assert!(state.activate_native_inference(f.context.clone()).is_err());
+        assert!(state.native_inference_context().is_none());
+    }
+
+    /// The original rule is untouched where no operator authorised anything.
+    #[test]
+    fn without_a_migration_record_a_recovered_chain_still_refuses_activation() {
+        let f = fixture("migration-absent");
+        let state = recovered_chain_at(&f, 3);
+        let error = state
+            .activate_native_inference(f.context.clone())
+            .expect_err("recovery-bound state refuses activation by default");
+        assert!(
+            format!("{error}").contains("recovery-bound state"),
+            "{error}"
+        );
     }
 
     #[test]

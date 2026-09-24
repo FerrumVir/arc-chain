@@ -676,6 +676,11 @@ pub struct StateDB {
     /// Exact operator-approved manifest that established `recovery_context`.
     recovery_manifest_hash: RwLock<Option<Hash256>>,
     native_inference_context: RwLock<Option<InferenceAdmissionContext>>,
+    /// Operator authorisation to activate native inference on a chain that is
+    /// already running (see `NativeMigrationRecord`). Absent means the
+    /// original rule applies: fresh genesis only, never recovery-bound state.
+    pub(crate) native_migration:
+        RwLock<Option<crate::inference_contract_state::NativeMigrationRecord>>,
     native_inference_pending: DashMap<[u8; 32], u64>,
     native_inference_execution: parking_lot::Mutex<()>,
     native_inference_publication: RwLock<()>,
@@ -763,6 +768,7 @@ impl StateDB {
             recovery_context: RwLock::new(None),
             recovery_manifest_hash: RwLock::new(None),
             native_inference_context: RwLock::new(None),
+            native_migration: RwLock::new(None),
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
@@ -817,6 +823,7 @@ impl StateDB {
             recovery_context: RwLock::new(None),
             recovery_manifest_hash: RwLock::new(None),
             native_inference_context: RwLock::new(None),
+            native_migration: RwLock::new(None),
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
