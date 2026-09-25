@@ -3141,6 +3141,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -3255,6 +3260,12 @@ impl StateDB {
         transactions: &[Transaction],
     ) -> crate::block_stm::AdaptiveMode {
         if self.native_inference_context.read().is_some() {
+            return crate::block_stm::AdaptiveMode::Sequential;
+        }
+        // A binding change waiting for its coordinated height is applied in
+        // the block that reaches it. Keep those blocks on the sequential
+        // path, which is the one this behaviour is qualified on.
+        if self.native_migration.read().is_some() || self.pending_binding_update.read().is_some() {
             return crate::block_stm::AdaptiveMode::Sequential;
         }
         crate::block_stm::choose_execution_mode(transactions)
@@ -3399,6 +3410,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -3641,6 +3657,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_locked()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -3902,6 +3923,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -4033,6 +4059,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -4179,6 +4210,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -8509,6 +8545,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();

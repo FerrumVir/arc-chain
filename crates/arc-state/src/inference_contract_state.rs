@@ -567,6 +567,19 @@ pub(crate) fn activation_key() -> Hash256 {
     hash_bytes(b"ARC-native-inference-activation-v1")
 }
 
+/// Whether a binding write seals its own WAL checkpoint.
+///
+/// `Standalone` is a write of its own - a fresh-genesis activation, or one
+/// driven straight from operator config - and it checkpoints and barriers
+/// itself. `InBlock` is part of a block's transition: the block appends the
+/// checkpoint and takes the barrier, and a second standalone checkpoint at
+/// the same height is exactly what WAL replay validation refuses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WalSeal {
+    Standalone,
+    InBlock,
+}
+
 /// How many superseded bindings may be retained at once. A binding is
 /// retired as soon as no pending request still names it, so this bounds only
 /// how many updates can be in flight over unsettled work at the same time.
@@ -683,6 +696,84 @@ impl StateDB {
     /// then on). What it may never do is authorise a point this chain has
     /// already passed without having activated - that would be a retroactive
     /// state change, and every other validator would have a different root.
+    /// Apply a binding change due at the height THIS BLOCK is sealing, as
+    /// part of the block's own transition.
+    ///
+    /// This is the difference between a change every validator makes and one
+    /// only the validators that happened to execute that block make. Called
+    /// before the block's state root is computed, the activation or update
+    /// lands *inside* the root this block commits - so a node that applies
+    /// this block and does not make the same write computes a different root
+    /// and rejects it, loudly, instead of carrying on with state nobody else
+    /// has. A node whose height moved past the coordinated block by some other
+    /// route inherits the change with the state it took.
+    ///
+    /// The bond sweep beside it works the same way and for the same reason:
+    /// what a block is supposed to contain has to happen before its root is
+    /// taken, not after.
+    ///
+    /// Takes the serial native execution lock. Block paths that already hold
+    /// it call `apply_due_binding_change_locked` instead - it is not
+    /// reentrant.
+    pub(crate) fn apply_due_binding_change_in_block(&self) -> Result<(), StateError> {
+        let _guard = self.native_inference_execution.lock();
+        self.apply_due_binding_change_locked()
+    }
+
+    /// The body of the above, for a caller already holding that lock.
+    pub(crate) fn apply_due_binding_change_locked(&self) -> Result<(), StateError> {
+        let height = self.height();
+
+        // A migration authorised for exactly this height.
+        if let Some(record) = self.native_migration()
+            && self.native_inference_context().is_none()
+            && record.activation_height == height
+        {
+            let Some(context) = self.pending_migration_context.read().clone() else {
+                return Err(StateError::ExecutionError(format!(
+                    "a migration is authorised for height {height}, which this block reaches, \
+                     but the binding it freezes was never supplied to this node"
+                )));
+            };
+            self.activate_native_inference_locked(context, WalSeal::InBlock)?;
+            return Ok(());
+        }
+
+        // Or a binding update coordinated for exactly this height.
+        let due = {
+            let pending = self.pending_binding_update.read();
+            match pending.as_ref() {
+                Some((at, _, _)) if *at == height => pending.clone(),
+                _ => None,
+            }
+        };
+        let Some((_, replacing, context)) = due else {
+            return Ok(());
+        };
+        let current = self
+            .native_inference_context()
+            .ok_or_else(|| {
+                StateError::ExecutionError(
+                    "a binding update is due in this block but no binding is active".into(),
+                )
+            })?
+            .commitment()?;
+        if current == context.commitment()? {
+            *self.pending_binding_update.write() = None;
+            return Ok(());
+        }
+        if current != replacing {
+            return Err(StateError::ExecutionError(format!(
+                "a binding update due in this block replaces {}, but the binding in force is {}",
+                replacing.to_hex(),
+                current.to_hex()
+            )));
+        }
+        self.update_native_inference_binding_locked(context, WalSeal::InBlock)?;
+        *self.pending_binding_update.write() = None;
+        Ok(())
+    }
+
     /// Apply a migration whose coordinated height the chain has just reached.
     /// Called once per block from the single block funnel, so every validator
     /// makes the same write at the same point whether it produced that block
@@ -759,6 +850,16 @@ impl StateDB {
         context: InferenceAdmissionContext,
     ) -> Result<Hash256, StateError> {
         let _guard = self.native_inference_execution.lock();
+        self.activate_native_inference_locked(context, WalSeal::Standalone)
+    }
+
+    /// The body of the above, for callers that already hold the serial native
+    /// execution lock - block execution does, and that lock is not reentrant.
+    fn activate_native_inference_locked(
+        &self,
+        context: InferenceAdmissionContext,
+        seal: WalSeal,
+    ) -> Result<Hash256, StateError> {
         self.require_healthy_wal()?;
         let commitment = validate_native_inference_activation(self, &context)?;
         if self.use_jmt {
@@ -850,8 +951,10 @@ impl StateDB {
         for op in &ops {
             self.wal.append(op.clone(), at_height);
         }
-        self.wal.append(WalOp::Checkpoint(root), at_height);
-        self.durable_wal_barrier()?;
+        if seal == WalSeal::Standalone {
+            self.wal.append(WalOp::Checkpoint(root), at_height);
+            self.durable_wal_barrier()?;
+        }
         {
             let _publication = self.native_inference_publication.write();
             for op in &ops {
@@ -1024,6 +1127,15 @@ impl StateDB {
         context: InferenceAdmissionContext,
     ) -> Result<Hash256, StateError> {
         let _guard = self.native_inference_execution.lock();
+        self.update_native_inference_binding_locked(context, WalSeal::Standalone)
+    }
+
+    /// As above, for callers already holding the serial native execution lock.
+    fn update_native_inference_binding_locked(
+        &self,
+        context: InferenceAdmissionContext,
+        seal: WalSeal,
+    ) -> Result<Hash256, StateError> {
         self.require_healthy_wal()?;
         let Some(previous) = self.native_inference_context() else {
             return Err(StateError::ExecutionError(
@@ -1126,8 +1238,10 @@ impl StateDB {
         for op in &ops {
             self.wal.append(op.clone(), height);
         }
-        self.wal.append(WalOp::Checkpoint(root), height);
-        self.durable_wal_barrier()?;
+        if seal == WalSeal::Standalone {
+            self.wal.append(WalOp::Checkpoint(root), height);
+            self.durable_wal_barrier()?;
+        }
         {
             let _publication = self.native_inference_publication.write();
             for op in &ops {
@@ -5543,6 +5657,49 @@ mod tests {
         assert_eq!(
             state.compute_recovery_state_root_with(&context, &[], &[]),
             plain
+        );
+    }
+
+    /// The activation is part of the block that reaches the coordinated
+    /// height, not something that happens just after it.
+    ///
+    /// This is what makes the change one every validator makes rather than
+    /// one only the validators running a particular code path make. Because
+    /// the block's own state root commits it, a node that applies that block
+    /// without making the same write computes a different root and rejects
+    /// it - loudly, at that block - instead of carrying on with state nobody
+    /// else has.
+    #[test]
+    fn the_activation_is_inside_the_block_that_reaches_its_height() {
+        let f = fixture("activation-in-block");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
+            .unwrap();
+
+        // Empty blocks on this chain carry nothing and move no root, which is
+        // how the recovered chain has been advancing all along.
+        let before = state.compute_state_root();
+        assert_eq!(
+            state.blocks.get(&4).expect("block 4").header.state_root,
+            before
+        );
+
+        let (block, _) = state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        assert_eq!(state.height(), 5);
+        assert_eq!(state.native_inference_context(), Some(f.context.clone()));
+
+        let after = state.compute_state_root();
+        assert_ne!(
+            after, before,
+            "the activation changed state, so the root must have moved"
+        );
+        assert_eq!(
+            block.header.state_root, after,
+            "and the block that reached the coordinated height COMMITS that root - \
+             a validator that did not activate here cannot produce this block"
         );
     }
 
