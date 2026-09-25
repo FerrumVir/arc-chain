@@ -651,13 +651,14 @@ fn a_binding_update_publishes_on_every_validator_at_one_coordinated_height() {
         .filter_map(|h| *h)
         .max()
         .expect("a committed height");
-    // Far enough ahead that every validator is not merely restarted but fully
-    // CAUGHT UP before the chain reaches it. A node still importing history
-    // advances without executing those blocks, so the coordinated block can
-    // go by without its hook running - which now stops that node rather than
-    // letting it diverge, but is still not a rollout anyone wants. Choosing
-    // the height comfortably after the rollout completes is the rule.
-    let at_height = running_at + 400;
+    // Deliberately close. The change is applied inside the block that reaches
+    // this height, on every block-application path, so a validator still
+    // catching up when the chain gets here applies it as it executes that
+    // block - or inherits it with whatever state it took. An earlier version
+    // applied it from a hook on one path only, and this margin was the
+    // difference between the committee agreeing and one node silently holding
+    // a different binding.
+    let at_height = running_at + 15;
 
     let upgraded = [
         hash_bytes(b"p5-model-2"),
