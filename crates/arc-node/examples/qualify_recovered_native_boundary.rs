@@ -534,7 +534,7 @@ fn run() -> Result<()> {
     println!("activation height/context commitment: {activation_height}/{commitment}");
     println!("activated block root after reopen: {activated_root}");
     println!("pre-existing account digest: {before_account_digest}");
-    println!("pre-existing account and history digests preserved; input directory unchanged");
+    println!("pre-existing account and history digests preserved; input paths, contents, sizes, and descendant modes unchanged");
     println!(
         "This does not qualify a model, consensus/fleet execution, production configuration, or release."
     );
