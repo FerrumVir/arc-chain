@@ -368,6 +368,42 @@ test.describe("Network screen - blocks and attestations", () => {
     await seedOnboarded(page);
   });
 
+  test("shows a loading state before the recent-block query resolves", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      type TestWindow = Window & {
+        __ARC_MOCK__?: Record<string, unknown>;
+        __resolveRecentBlocks?: () => void;
+      };
+      const testWindow = window as TestWindow;
+      testWindow.__ARC_MOCK__ = {
+        fetch_recent_blocks: new Promise((resolve) => {
+          testWindow.__resolveRecentBlocks = () =>
+            resolve({
+              sourceHost: "http://140.82.16.112:9090",
+              unavailable: null,
+              blocks: [],
+            });
+        }),
+      };
+    });
+    await gotoNetwork(page);
+
+    await expect(page.getByTestId("blocks-loading")).toHaveText(
+      "Reading recent blocks…",
+    );
+    await expect(page.getByText("No blocks returned")).toHaveCount(0);
+    await page.evaluate(() => {
+      const testWindow = window as Window & {
+        __resolveRecentBlocks?: () => void;
+      };
+      testWindow.__resolveRecentBlocks?.();
+    });
+    await expect(page.getByText("No blocks returned")).toBeVisible();
+    await expect(page.getByTestId("blocks-loading")).toHaveCount(0);
+  });
+
   test("lists recent blocks newest-first with heights and tx counts", async ({
     page,
   }) => {

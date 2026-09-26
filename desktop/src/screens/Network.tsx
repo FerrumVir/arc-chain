@@ -81,7 +81,7 @@ export function Network() {
     queryFn: api.nodeStatus,
     refetchInterval: 5_000,
   });
-  const { data: recentBlocks } = useQuery({
+  const { data: recentBlocks, isLoading: recentBlocksLoading } = useQuery({
     queryKey: ["recent-blocks"],
     queryFn: () => api.fetchRecentBlocks(10),
     refetchInterval: 15_000,
@@ -286,7 +286,7 @@ export function Network() {
 
       <ValidatorSplit overview={overview} />
 
-      <RecentBlocksCard blocks={recentBlocks} />
+      <RecentBlocksCard blocks={recentBlocks} loading={recentBlocksLoading} />
 
       <RecentInferenceCard attestations={attestations} host={host} />
     </div>
@@ -675,7 +675,13 @@ function ValidatorSplit({
 }
 
 /** Recent blocks, newest first, with on-demand transaction expansion. */
-function RecentBlocksCard({ blocks }: { blocks: RecentBlocks | undefined }) {
+function RecentBlocksCard({
+  blocks,
+  loading,
+}: {
+  blocks: RecentBlocks | undefined;
+  loading: boolean;
+}) {
   const [expanded, setExpanded] = useState<number | null>(null);
 
   return (
@@ -694,6 +700,17 @@ function RecentBlocksCard({ blocks }: { blocks: RecentBlocks | undefined }) {
       />
       {blocks?.unavailable ? (
         <NotAvailable reason={blocks.unavailable} testId="blocks-unavailable" />
+      ) : loading ? (
+        <div
+          data-testid="blocks-loading"
+          style={{
+            padding: "var(--space-3) var(--space-6)",
+            fontSize: "var(--text-sm)",
+            color: "var(--text-muted)",
+          }}
+        >
+          Reading recent blocks…
+        </div>
       ) : !blocks || blocks.blocks.length === 0 ? (
         <EmptyState
           icon={Blocks}
