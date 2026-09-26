@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 macro_rules! counters {
     ($($name:ident),* $(,)?) => {
         pub struct ConsensusDiagnostics { $(pub $name: AtomicU64,)* }
+        impl Default for ConsensusDiagnostics {
+            fn default() -> Self { Self::new() }
+        }
         impl ConsensusDiagnostics {
             pub const fn new() -> Self { Self { $($name: AtomicU64::new(0),)* } }
             pub fn snapshot(&self) -> serde_json::Map<String, serde_json::Value> {

@@ -102,7 +102,7 @@ pub fn validator_set_hash(set: &ValidatorSet) -> Hash256 {
         .iter()
         .map(|validator| (validator.address, validator.stake))
         .collect();
-    members.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    members.sort_by_key(|member| member.0.0);
     let mut bytes = Vec::with_capacity(VALIDATOR_SET_DOMAIN.len() + 16 + members.len() * 40);
     bytes.extend_from_slice(VALIDATOR_SET_DOMAIN);
     bytes.extend_from_slice(&set.epoch.to_le_bytes());
@@ -1665,7 +1665,7 @@ mod tests {
             "a vote above the floor must survive, so a second transcript for \
              that height can still be refused"
         );
-        assert!(tracker.record().finality_votes.get(&10).is_none());
+        assert!(!tracker.record().finality_votes.contains_key(&10));
     }
 
     #[test]
@@ -1714,8 +1714,10 @@ mod tests {
 
     #[test]
     fn a_v2_record_is_self_identifying() {
-        let mut record = ConsensusSigningRecord::default();
-        record.last_applied_round = Some(9);
+        let record = ConsensusSigningRecord {
+            last_applied_round: Some(9),
+            ..ConsensusSigningRecord::default()
+        };
         let bytes = record.encode();
         assert!(bytes.starts_with(SIGNING_RECORD_MAGIC));
         assert_eq!(bytes[SIGNING_RECORD_MAGIC.len()], SIGNING_RECORD_VERSION);

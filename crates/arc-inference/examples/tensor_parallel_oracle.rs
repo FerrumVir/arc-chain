@@ -30,18 +30,22 @@ fn file_hash(path: &str) -> Result<Hash256, String> {
     Ok(Hash256(*h.finalize().as_bytes()))
 }
 
-fn add_tensor(
-    model: &Arc<CachedIntegerModel>,
+struct ExportContext<'a> {
+    model: &'a Arc<CachedIntegerModel>,
     artifact: Hash256,
-    profile: &str,
+    profile: &'a str,
+    remote_dir: &'a str,
+}
+
+fn add_tensor(
+    context: &ExportContext<'_>,
     layer: Option<usize>,
     tensor: TensorKey,
     weights: &I8Weights,
-    remote_dir: &str,
     assignments: &mut Vec<RowAssignment>,
     workers: &mut BTreeMap<String, Arc<dyn RowWorker>>,
 ) -> Result<(), String> {
-    if weights.n_rows < 8 || weights.n_rows % 8 != 0 {
+    if weights.n_rows < 8 || !weights.n_rows.is_multiple_of(8) {
         return Err(format!(
             "{tensor:?} rows {} cannot be divided into eighths",
             weights.n_rows
@@ -57,8 +61,8 @@ fn add_tensor(
             format!("local-{layer:?}-{tensor:?}-{i}")
         };
         let a = RowAssignment {
-            artifact_id: artifact,
-            execution_profile: profile.into(),
+            artifact_id: context.artifact,
+            execution_profile: context.profile.into(),
             layer,
             tensor,
             row_start: start,
@@ -67,9 +71,9 @@ fn add_tensor(
         };
         if i == 0 {
             export_verified_model_rows(
-                format!("{remote_dir}/{layer:?}-{tensor:?}-{start}.arcrow"),
-                model,
-                artifact,
+                format!("{}/{layer:?}-{tensor:?}-{start}.arcrow", context.remote_dir),
+                context.model,
+                context.artifact,
                 &a,
             )
             .map_err(|e| e.to_string())?;
@@ -79,7 +83,7 @@ fn add_tensor(
                 Arc::new(ModelRowWorker {
                     worker_id,
                     assignment: a.clone(),
-                    model: model.clone(),
+                    model: context.model.clone(),
                 }),
             );
         }
@@ -107,6 +111,12 @@ fn main() -> Result<(), String> {
     std::fs::create_dir_all(export_dir).map_err(|e| e.to_string())?;
     let mut assignments = Vec::new();
     let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
+    let context = ExportContext {
+        model: &model,
+        artifact,
+        profile: &profile,
+        remote_dir: export_dir,
+    };
     for (i, l) in model.layers.iter().enumerate() {
         for (k, w) in [
             (TensorKey::Wq, &l.wq),
@@ -117,27 +127,14 @@ fn main() -> Result<(), String> {
             (TensorKey::WUp, &l.w_up),
             (TensorKey::WDown, &l.w_down),
         ] {
-            add_tensor(
-                &model,
-                artifact,
-                &profile,
-                Some(i),
-                k,
-                w,
-                export_dir,
-                &mut assignments,
-                &mut workers,
-            )?;
+            add_tensor(&context, Some(i), k, w, &mut assignments, &mut workers)?;
         }
     }
     add_tensor(
-        &model,
-        artifact,
-        &profile,
+        &context,
         None,
         TensorKey::LmHead,
         &model.output_weight,
-        export_dir,
         &mut assignments,
         &mut workers,
     )?;

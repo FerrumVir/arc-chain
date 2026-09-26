@@ -376,14 +376,19 @@ echo "[2/3] Starting $NODES nodes..."
 for i in $(seq 0 $((NODES - 1))); do
     PORT_RPC=$((9944 + i)); PORT_P2P=$((9100 + i))
     DATA="$LOG_DIR/data-$i"; mkdir -p "$DATA"
+    NODE_ARGS_FOR_PROCESS=("${NODE_ARGS[@]}")
+    if [[ "${NEEDS_SEED:-0}" = 1 ]]; then
+        NODE_ARGS_FOR_PROCESS+=(--validator-seed "soak-node-$i")
+    fi
+    if [[ -n "$PEER_LIST" ]]; then
+        NODE_ARGS_FOR_PROCESS+=(--peers "$PEER_LIST")
+    fi
     echo "  node $i: rpc=127.0.0.1:$PORT_RPC p2p=$PORT_P2P data=$DATA"
     "$BINARY" \
         --rpc "127.0.0.1:$PORT_RPC" \
         --p2p-port "$PORT_P2P" \
         --data-dir "$DATA" \
-        ${NODE_ARGS[@]+"${NODE_ARGS[@]}"} \
-        $([ "${NEEDS_SEED:-0}" = 1 ] && echo "--validator-seed soak-node-$i") \
-        $([ -n "$PEER_LIST" ] && echo "--peers $PEER_LIST") \
+        "${NODE_ARGS_FOR_PROCESS[@]}" \
         > "$LOG_DIR/node-${i}.log" 2>&1 &
     PIDS+=($!); RPC_PORTS+=("$PORT_RPC")
 done

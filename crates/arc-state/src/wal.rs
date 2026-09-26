@@ -508,6 +508,9 @@ pub(crate) struct RepairableWalRead {
 }
 
 /// State operations that the WAL records.
+// Keep this lint exception narrow: changing the public, persisted WAL enum's
+// variant representation requires a separate compatibility review.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WalOp {
     /// Set or update an account.

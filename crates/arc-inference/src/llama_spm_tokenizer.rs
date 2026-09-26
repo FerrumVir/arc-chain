@@ -302,6 +302,9 @@ impl LlamaGgufSpmTokenizer {
         fragments
     }
 
+    // Exact score equality selects the earliest adjacent pair, matching the
+    // SentencePiece merge contract and preserving deterministic token IDs.
+    #[allow(clippy::float_cmp)]
     fn encode_spm_escaped(&self, text: &str, output: &mut Vec<u32>) -> Result<(), InferenceError> {
         let mut symbols = Vec::new();
         for character in text.chars() {
@@ -340,7 +343,7 @@ impl LlamaGgufSpmTokenizer {
                     continue;
                 };
                 let score = self.scores[id as usize];
-                if best.map_or(true, |(best_left, _, best_score)| {
+                if best.is_none_or(|(best_left, _, best_score)| {
                     score > best_score || (score == best_score && left < best_left)
                 }) {
                     best = Some((left, right, score));
@@ -360,12 +363,12 @@ impl LlamaGgufSpmTokenizer {
         let mut current = (!symbols.is_empty()).then_some(0usize);
         while let Some(index) = current {
             let symbol = &symbols[index];
-            if let Ok(piece) = std::str::from_utf8(&symbol.bytes) {
-                if let Some(&id) = self.ids.get(piece) {
-                    output.push(id);
-                    current = symbol.next;
-                    continue;
-                }
+            if let Ok(piece) = std::str::from_utf8(&symbol.bytes)
+                && let Some(&id) = self.ids.get(piece)
+            {
+                output.push(id);
+                current = symbol.next;
+                continue;
             }
             for &byte in &symbol.bytes {
                 let Some(id) = self.byte_ids[byte as usize] else {

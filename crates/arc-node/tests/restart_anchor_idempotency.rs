@@ -197,8 +197,10 @@ fn round_zero_is_recognised_like_any_other_round() {
     let height = node.apply(&genesis_anchor);
     assert_eq!(node.height_for(&genesis_anchor), Some(height));
 
-    let mut record = ConsensusSigningRecord::default();
-    record.last_applied_round = Some(0);
+    let record = ConsensusSigningRecord {
+        last_applied_round: Some(0),
+        ..ConsensusSigningRecord::default()
+    };
     assert_eq!(
         record.next_round_to_scan(),
         1,

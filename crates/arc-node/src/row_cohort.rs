@@ -1894,7 +1894,7 @@ mod tests {
             "and must never be planned a row of the layer it does not"
         );
         // This node still covers every row of both layers.
-        for (_, plan) in &plans {
+        for plan in plans.values() {
             assert_eq!(plan.slices.first().unwrap().row_start, 0);
             assert_eq!(plan.slices.last().unwrap().row_end, 4096);
         }

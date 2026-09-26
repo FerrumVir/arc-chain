@@ -114,12 +114,11 @@ impl MemoryTierConfig {
                 .args(["-n", "hw.memsize"])
                 .output()
                 .ok();
-            if let Some(out) = output {
-                if let Ok(s) = String::from_utf8(out.stdout) {
-                    if let Ok(bytes) = s.trim().parse::<u64>() {
-                        return bytes;
-                    }
-                }
+            if let Some(out) = output
+                && let Ok(s) = String::from_utf8(out.stdout)
+                && let Ok(bytes) = s.trim().parse::<u64>()
+            {
+                return bytes;
             }
             16 * 1024 * 1024 * 1024 // default 16GB
         }

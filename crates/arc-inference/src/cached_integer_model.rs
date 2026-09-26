@@ -1197,12 +1197,12 @@ pub(crate) fn matmul_i8_into_batched(
                 unsafe { inputs.as_ptr().add(tok * in_size) }
             };
             let ins = [src(0), src(1), src(2), src(3)];
-            for i in r0..r1 {
+            for (offset, &sc) in scales[r0..r1].iter().enumerate() {
+                let i = r0 + offset;
                 // SAFETY: `i < n_rows`, `data` holds n_rows*in_size. Each task
                 // owns a disjoint row range and writes only
                 // `out[(t+q) * n_rows + i]`, so writes never alias.
                 let acc = unsafe { dot_i8_i64_x4(data.as_ptr().add(i * in_size), &ins, in_size) };
-                let sc = scales[i];
                 for (q, a) in acc.iter().enumerate().take(quad) {
                     unsafe { *out.get().add((t + q) * n_rows + i) = (*a * sc) >> FRAC_BITS };
                 }
@@ -3172,13 +3172,11 @@ impl CachedIntegerModel {
             if let Some(hex) = piece
                 .strip_prefix("<0x")
                 .and_then(|value| value.strip_suffix('>'))
+                && hex.len() == 2
+                && let Ok(byte) = u8::from_str_radix(hex, 16)
             {
-                if hex.len() == 2 {
-                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                        fallback.push(byte);
-                        continue;
-                    }
-                }
+                fallback.push(byte);
+                continue;
             }
             flush(&mut text, &mut fallback);
             text.push_str(&piece.replace('▁', " "));
@@ -3222,13 +3220,11 @@ impl CachedIntegerModel {
             if let Some(hex) = piece
                 .strip_prefix("<0x")
                 .and_then(|value| value.strip_suffix('>'))
+                && hex.len() == 2
+                && let Ok(byte) = u8::from_str_radix(hex, 16)
             {
-                if hex.len() == 2 {
-                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                        fallback.push(byte);
-                        continue;
-                    }
-                }
+                fallback.push(byte);
+                continue;
             }
             flush(&mut text, &mut fallback);
             text.push_str(&piece.replace('▁', " "));
@@ -3250,12 +3246,12 @@ impl CachedIntegerModel {
             let mut best_id = 0u32;
             let max_try = (bytes.len() - pos).min(32);
             for try_len in (1..=max_try).rev() {
-                if let Ok(candidate) = std::str::from_utf8(&bytes[pos..pos + try_len]) {
-                    if let Some(id) = self.vocab.iter().position(|v| v == candidate) {
-                        best_len = try_len;
-                        best_id = id as u32;
-                        break;
-                    }
+                if let Ok(candidate) = std::str::from_utf8(&bytes[pos..pos + try_len])
+                    && let Some(id) = self.vocab.iter().position(|v| v == candidate)
+                {
+                    best_len = try_len;
+                    best_id = id as u32;
+                    break;
                 }
             }
             if best_len > 0 {
@@ -3585,12 +3581,12 @@ impl CachedIntegerModel {
             matmul_i16_into(i16_out, &normed, d, &mut logits);
             return logits;
         }
-        if let Some(blk_out) = &self.block_i8_output {
-            if blk_out.n_rows > 0 {
-                let mut logits = vec![0i64; cfg.vocab_size];
-                crate::block_i8::matmul_block_i8_into(blk_out, &normed, &mut logits);
-                return logits;
-            }
+        if let Some(blk_out) = &self.block_i8_output
+            && blk_out.n_rows > 0
+        {
+            let mut logits = vec![0i64; cfg.vocab_size];
+            crate::block_i8::matmul_block_i8_into(blk_out, &normed, &mut logits);
+            return logits;
         }
         if let Some(q4_out) = &self.q4_output {
             let mut logits = vec![0i64; cfg.vocab_size];
@@ -4097,10 +4093,10 @@ impl CachedIntegerModel {
                     cfg.d_ff,
                 ),
             );
-            if let Some(mut out) = self.prefill_canonical_i8_batched(prompt, cache, chunk, false) {
-                if let Some(last) = out.pop() {
-                    return Some(last);
-                }
+            if let Some(mut out) = self.prefill_canonical_i8_batched(prompt, cache, chunk, false)
+                && let Some(last) = out.pop()
+            {
+                return Some(last);
             }
         }
         let mut logits = Vec::new();
@@ -6460,7 +6456,7 @@ mod tests {
 
     #[test]
     fn batched_shape_predicate_accepts_the_shapes_prefill_actually_uses() {
-        let w = I8Weights::quantize_f32(&vec![0.1f32; 8 * 4], 8, 4);
+        let w = I8Weights::quantize_f32(&[0.1f32; 8 * 4], 8, 4);
         let inputs = vec![0i64; 3 * 4];
         let output = vec![0i64; 3 * 8];
         assert!(batched_shape_is_valid(&w, &inputs, 3, 4, &output));
@@ -6468,7 +6464,7 @@ mod tests {
 
     #[test]
     fn batched_shape_predicate_rejects_every_undersized_buffer() {
-        let w = I8Weights::quantize_f32(&vec![0.1f32; 8 * 4], 8, 4);
+        let w = I8Weights::quantize_f32(&[0.1f32; 8 * 4], 8, 4);
         let good_in = vec![0i64; 3 * 4];
         let good_out = vec![0i64; 3 * 8];
 
@@ -6496,13 +6492,7 @@ mod tests {
         };
         assert!(!batched_shape_is_valid(&scales, &good_in, 3, 4, &good_out));
         // Declared inner dimension disagreeing with the matrix.
-        assert!(!batched_shape_is_valid(
-            &w,
-            &vec![0i64; 3 * 5],
-            3,
-            5,
-            &good_out
-        ));
+        assert!(!batched_shape_is_valid(&w, &[0i64; 3 * 5], 3, 5, &good_out));
         // Degenerate counts.
         assert!(!batched_shape_is_valid(&w, &good_in, 0, 4, &good_out));
         assert!(!batched_shape_is_valid(&w, &good_in, 3, 0, &good_out));
@@ -6548,7 +6538,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid geometry")]
     fn batched_matmul_panics_on_undersized_input() {
-        let w = I8Weights::quantize_f32(&vec![0.1f32; 4 * 4], 4, 4);
+        let w = I8Weights::quantize_f32(&[0.1f32; 4 * 4], 4, 4);
         let mut out = vec![0i64; 2 * 4];
         matmul_i8_into_batched(&w, &[1i64; 4], 2, 4, &mut out);
     }
@@ -6580,7 +6570,7 @@ mod tests {
         let _switch = crate::canonical_simd::kernel_switch_guard();
         let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
         crate::canonical_simd::set_fast_canonical_kernel(false);
-        let w = I8Weights::quantize_f32(&vec![0.05f32; 6 * 3], 6, 3);
+        let w = I8Weights::quantize_f32(&[0.05f32; 6 * 3], 6, 3);
         let inputs: Vec<i64> = (0..2 * 3).map(|i| (i as i64 + 1) * 1000).collect();
         let mut batched = vec![0i64; 2 * 6];
         matmul_i8_into_batched(&w, &inputs, 2, 3, &mut batched);

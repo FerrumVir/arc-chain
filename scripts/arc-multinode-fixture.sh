@@ -791,9 +791,7 @@ PIDS[$LAST]=$!
 # 9183, and the fixture went on to report "reopened at 439" about a process from
 # a previous run. The PID is the only thing that distinguishes them.
 RESTART_PID=${PIDS[$LAST]}
-RESTART_ALIVE=0
 if wait_healthy "$((BASE_RPC+LAST))" 90 && kill -0 "$RESTART_PID" 2>/dev/null; then
-  RESTART_ALIVE=1
   ok "node $LAST restarted from its persisted store (pid $RESTART_PID alive)"
 else
   if ! kill -0 "$RESTART_PID" 2>/dev/null; then

@@ -18636,8 +18636,10 @@ mod tests {
             forward_us: 40,
         }));
         first.fold(None); // old peer: no sample, not a fabricated zero sample
-        let mut stats = HopStats::default();
-        stats.timing = first;
+        let stats = HopStats {
+            timing: first,
+            ..HopStats::default()
+        };
         let mut second = HopStats::default();
         second.timing.fold(Some(ShardTimingBreakdown {
             spawn_blocking_queue_us: 1,
@@ -19123,8 +19125,8 @@ mod tests {
         members.sort_by_key(|member| member.address.0);
         let genesis = arc_crypto::hash_bytes(b"ingress-gate-genesis");
         let prefunded: Vec<(Hash256, u64)> = members.iter().map(|m| (m.address, 0)).collect();
-        let state = StateDB::with_genesis_persistent(&prefunded, &temporary.join("state"), genesis)
-            .unwrap();
+        let state =
+            StateDB::with_genesis_persistent(&prefunded, temporary.join("state"), genesis).unwrap();
         state.seed_genesis_validators(
             &members
                 .iter()

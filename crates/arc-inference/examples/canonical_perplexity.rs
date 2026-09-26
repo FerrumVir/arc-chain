@@ -51,7 +51,7 @@ fn main() {
     let n_ctx: usize = arg(&args, "--ctx").map_or(512, |v| v.parse().expect("--ctx"));
     let max_chunks: usize = arg(&args, "--chunks").map_or(20, |v| v.parse().expect("--chunks"));
     assert!(
-        n_ctx >= 4 && n_ctx % 2 == 0,
+        n_ctx >= 4 && n_ctx.is_multiple_of(2),
         "--ctx must be even and at least 4"
     );
 

@@ -531,7 +531,7 @@ impl CanonicalI8NativeExecutor {
         // The signed input hash was checked by StatePendingSource and again by
         // NativeWorker. This wire form prevents a hidden text tokenizer from
         // changing a request after its generation commitment was signed.
-        if job.input.is_empty() || job.input.len() % std::mem::size_of::<u32>() != 0 {
+        if job.input.is_empty() || !job.input.len().is_multiple_of(std::mem::size_of::<u32>()) {
             return Err(NativeInferenceError::Executor(
                 "native canonical I8 input must be non-empty little-endian u32 token IDs".into(),
             ));
@@ -854,7 +854,7 @@ impl NativeServing {
     /// only: the certificate commits to the bytes, not to this text.
     pub fn decode_output(&self, output: &[u8]) -> Option<String> {
         let tokenizer = self.tokenizer.as_ref()?;
-        if output.is_empty() || output.len() % 4 != 0 {
+        if output.is_empty() || !output.len().is_multiple_of(4) {
             return None;
         }
         let tokens: Vec<u32> = output
@@ -925,6 +925,9 @@ pub struct NativeFinalizeSink {
 /// Votes queued for gossip at once.
 const MAX_OUTBOUND_NATIVE_VOTES: usize = 1_024;
 
+type ValidatorVotes = BTreeMap<[u8; 32], InferenceVote>;
+type OutputVotes = BTreeMap<[u8; 32], (Vec<u8>, ValidatorVotes)>;
+
 /// Votes for one request, kept per output. A single "the output" per request
 /// let the first vote to arrive decide what every later vote was compared
 /// against: one byzantine member voting first for invented tokens made every
@@ -933,7 +936,7 @@ const MAX_OUTBOUND_NATIVE_VOTES: usize = 1_024;
 #[derive(Default)]
 struct CandidateVotes {
     /// output hash -> (output bytes, validator -> vote)
-    outputs: BTreeMap<[u8; 32], (Vec<u8>, BTreeMap<[u8; 32], InferenceVote>)>,
+    outputs: OutputVotes,
     /// validator -> the output hash it voted for (a second, different output
     /// from the same validator is its equivocation, never counted).
     voted: BTreeMap<[u8; 32], [u8; 32]>,
@@ -1295,7 +1298,6 @@ pub struct DecisionStore {
     root: PathBuf,
     validator: Hash256,
     genesis: Hash256,
-    context: Hash256,
     poisoned: Arc<AtomicBool>,
 }
 
@@ -1304,14 +1306,13 @@ impl DecisionStore {
         root: impl AsRef<Path>,
         validator: Hash256,
         genesis: Hash256,
-        context: Hash256,
+        _context: Hash256,
     ) -> Result<Self, NativeInferenceError> {
         fs::create_dir_all(root.as_ref())?;
         Ok(Self {
             root: root.as_ref().to_path_buf(),
             validator,
             genesis,
-            context,
             poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -1991,7 +1992,7 @@ fn token_hash(tokens: &[u32]) -> Hash256 {
 }
 
 fn token_bytes(tokens: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(tokens.len() * std::mem::size_of::<u32>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(tokens));
     for token in tokens {
         bytes.extend_from_slice(&token.to_le_bytes());
     }
@@ -2174,15 +2175,15 @@ where
                             consecutive_errors,
                             "native worker poll failed"
                         );
-                        if let Some(limit) = bounds.max_consecutive_errors {
-                            if consecutive_errors >= limit {
-                                tracing::error!(
-                                    limit,
-                                    "native worker stopping after repeated failures; \
-                                     the contract stays activated but no further work is done"
-                                );
-                                break;
-                            }
+                        if let Some(limit) = bounds.max_consecutive_errors
+                            && consecutive_errors >= limit
+                        {
+                            tracing::error!(
+                                limit,
+                                "native worker stopping after repeated failures; \
+                                 the contract stays activated but no further work is done"
+                            );
+                            break;
                         }
                         std::thread::sleep(bounds.error_backoff);
                     }
@@ -2637,32 +2638,32 @@ pub fn assemble_activation_context(
         .map_err(|e| ActivationConfigError::InvalidContext(format!("{e:?}")))?;
 
     if let Some(expect) = &request.expect {
-        if let Some(pin) = expect.chain_genesis {
-            if pin != chain_genesis {
-                return Err(ActivationConfigError::ExpectationMismatch {
-                    field: "chain_genesis".into(),
-                    expected: pin.to_hex(),
-                    actual: chain_genesis.to_hex(),
-                });
-            }
+        if let Some(pin) = expect.chain_genesis
+            && pin != chain_genesis
+        {
+            return Err(ActivationConfigError::ExpectationMismatch {
+                field: "chain_genesis".into(),
+                expected: pin.to_hex(),
+                actual: chain_genesis.to_hex(),
+            });
         }
-        if let Some(pin) = expect.validator_set_hash {
-            if pin != validator_set_hash {
-                return Err(ActivationConfigError::ExpectationMismatch {
-                    field: "validator_set_hash".into(),
-                    expected: pin.to_hex(),
-                    actual: validator_set_hash.to_hex(),
-                });
-            }
+        if let Some(pin) = expect.validator_set_hash
+            && pin != validator_set_hash
+        {
+            return Err(ActivationConfigError::ExpectationMismatch {
+                field: "validator_set_hash".into(),
+                expected: pin.to_hex(),
+                actual: validator_set_hash.to_hex(),
+            });
         }
-        if let Some(pin) = &expect.members {
-            if pin != &members {
-                return Err(ActivationConfigError::ExpectationMismatch {
-                    field: "members".into(),
-                    expected: format!("{} member(s)", pin.len()),
-                    actual: format!("{} member(s)", members.len()),
-                });
-            }
+        if let Some(pin) = &expect.members
+            && pin != &members
+        {
+            return Err(ActivationConfigError::ExpectationMismatch {
+                field: "members".into(),
+                expected: format!("{} member(s)", pin.len()),
+                actual: format!("{} member(s)", members.len()),
+            });
         }
     }
 
@@ -2849,32 +2850,32 @@ fn resume_persisted_activation(
     // Operator pins are compared against the PERSISTED binding, so a pin that
     // matches the live committee but not the frozen one still fails.
     if let Some(expect) = &request.expect {
-        if let Some(pin) = expect.chain_genesis {
-            if pin != persisted.domain.chain_genesis {
-                return Err(mismatch(
-                    "expect.chain_genesis",
-                    persisted.domain.chain_genesis.to_hex(),
-                    pin.to_hex(),
-                ));
-            }
+        if let Some(pin) = expect.chain_genesis
+            && pin != persisted.domain.chain_genesis
+        {
+            return Err(mismatch(
+                "expect.chain_genesis",
+                persisted.domain.chain_genesis.to_hex(),
+                pin.to_hex(),
+            ));
         }
-        if let Some(pin) = expect.validator_set_hash {
-            if pin != persisted.domain.validator_set_hash {
-                return Err(mismatch(
-                    "expect.validator_set_hash",
-                    persisted.domain.validator_set_hash.to_hex(),
-                    pin.to_hex(),
-                ));
-            }
+        if let Some(pin) = expect.validator_set_hash
+            && pin != persisted.domain.validator_set_hash
+        {
+            return Err(mismatch(
+                "expect.validator_set_hash",
+                persisted.domain.validator_set_hash.to_hex(),
+                pin.to_hex(),
+            ));
         }
-        if let Some(pin) = &expect.members {
-            if pin != &persisted.members {
-                return Err(mismatch(
-                    "expect.members",
-                    format!("{} member(s)", persisted.members.len()),
-                    format!("{} member(s)", pin.len()),
-                ));
-            }
+        if let Some(pin) = &expect.members
+            && pin != &persisted.members
+        {
+            return Err(mismatch(
+                "expect.members",
+                format!("{} member(s)", persisted.members.len()),
+                format!("{} member(s)", pin.len()),
+            ));
         }
     }
 

@@ -1014,7 +1014,7 @@ impl ConsensusEngine {
     }
 
     pub fn consensus_domain(&self) -> Option<ConsensusDomain> {
-        self.consensus_domain.read().clone()
+        *self.consensus_domain.read()
     }
 
     /// Install the cursor certified by an ARCCHKPT manifest.
@@ -2552,7 +2552,7 @@ impl ConsensusEngine {
         // often than this) and every height a conflict could plausibly be
         // re-offered for; a conflicting certificate for a height below it can
         // no longer be compared, which is the price of a bounded node.
-        if height % FINALITY_PRUNE_EVERY == 0 {
+        if height.is_multiple_of(FINALITY_PRUNE_EVERY) {
             let floor = highest.saturating_sub(self.retained_finality_heights());
             self.finality_certificates.retain(|h, _| *h >= floor);
         }
@@ -3719,9 +3719,7 @@ impl ConsensusEngine {
         let mut quorum_signatures = Vec::with_capacity(certificate.votes.len());
         let mut signing_stake = 0u64;
         for vote in &certificate.votes {
-            let Some(validator) = vs.get_validator(&vote.voter) else {
-                return None;
-            };
+            let validator = vs.get_validator(&vote.voter)?;
             // Re-verify at export: a stored certificate is not a licence to
             // publish signatures nobody checked on the way out.
             if vote
@@ -4398,7 +4396,7 @@ mod tests {
         let engine = ConsensusEngine::new(vs, test_addr(0));
         let domain_a = ConsensusDomain::new(hash_bytes(b"recovery-domain-a"), 1, 7);
         let domain_b = ConsensusDomain::new(hash_bytes(b"recovery-domain-b"), 2, 8);
-        engine.install_consensus_domain(domain_a.clone()).unwrap();
+        engine.install_consensus_domain(domain_a).unwrap();
 
         let block = engine
             .propose_block(vec![hash_bytes(b"tx")], 1_000)
@@ -4451,7 +4449,7 @@ mod tests {
         assert!(engine.install_recovery_cursor(100).is_err());
 
         let domain = ConsensusDomain::new(hash_bytes(b"cursor-domain"), 3, 9);
-        engine.install_consensus_domain(domain.clone()).unwrap();
+        engine.install_consensus_domain(domain).unwrap();
         assert_eq!(engine.install_recovery_cursor(100).unwrap(), 101);
         assert_eq!(engine.current_round(), 101);
         assert_eq!(engine.last_committed_round(), 101);
@@ -4487,7 +4485,7 @@ mod tests {
     fn recovery_round_pauses_at_five_of_six_and_resumes_with_sixth() {
         let engine = ConsensusEngine::new(test_validator_set(6), test_addr(0));
         let domain = ConsensusDomain::new(hash_bytes(b"unanimous-recovery-round"), 3, 9);
-        engine.install_consensus_domain(domain.clone()).unwrap();
+        engine.install_consensus_domain(domain).unwrap();
         engine.install_recovery_cursor(100).unwrap();
         engine.propose_block(vec![], 1_000).unwrap();
         for author in (1..5).map(test_addr) {
@@ -4527,7 +4525,7 @@ mod tests {
             keys[0].clone(),
         );
         let domain = ConsensusDomain::new(hash_bytes(b"signed-six-parent-domain"), 3, 9);
-        engine.install_consensus_domain(domain.clone()).unwrap();
+        engine.install_consensus_domain(domain).unwrap();
         engine.install_recovery_cursor(100).unwrap();
         engine.propose_block(vec![], 1_000).unwrap();
         for (index, key) in keys.iter().enumerate().skip(1) {
@@ -4585,7 +4583,7 @@ mod tests {
     fn pinned_generation_boundary_is_parent_relaxed_only_during_local_replay() {
         let engine = ConsensusEngine::new(test_validator_set(4), test_addr(0));
         let domain = ConsensusDomain::new(hash_bytes(b"generation-domain"), 4, 12);
-        engine.install_consensus_domain(domain.clone()).unwrap();
+        engine.install_consensus_domain(domain).unwrap();
         assert_eq!(engine.install_recovery_cursor(100).unwrap(), 101);
         engine
             .install_recovery_generation_cursor(109, 111, 110)
@@ -4929,12 +4927,8 @@ mod tests {
         let validator_set = test_validator_set(6);
         let engine_forward = ConsensusEngine::new(validator_set.clone(), test_addr(0));
         let engine_reverse = ConsensusEngine::new(validator_set, test_addr(0));
-        engine_forward
-            .install_consensus_domain(domain.clone())
-            .unwrap();
-        engine_reverse
-            .install_consensus_domain(domain.clone())
-            .unwrap();
+        engine_forward.install_consensus_domain(domain).unwrap();
+        engine_reverse.install_consensus_domain(domain).unwrap();
         let initial_forward = validator_stakes(&engine_forward);
         let initial_reverse = validator_stakes(&engine_reverse);
 

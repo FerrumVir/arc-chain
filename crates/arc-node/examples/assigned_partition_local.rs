@@ -123,7 +123,7 @@ fn parse_args() -> Result<Args, String> {
     if args.workers == 0 || args.workers > 8 {
         return Err("--workers must be 1..=8".into());
     }
-    if args.slowdown.iter().any(|f| *f == 0) {
+    if args.slowdown.contains(&0) {
         return Err("--slowdown factors must be at least 1".into());
     }
     Ok(args)

@@ -102,7 +102,7 @@ fn validate(cfg: &Config) -> Result<(), &'static str> {
     if cfg.rows > MAX_DIMENSION || cfg.cols > MAX_DIMENSION {
         return Err("rows and cols must be <= 16384");
     }
-    if cfg.rows.checked_mul(cfg.cols).unwrap_or(usize::MAX) > MAX_WORK_ELEMENTS {
+    if cfg.rows.saturating_mul(cfg.cols) > MAX_WORK_ELEMENTS {
         return Err("rows * cols must be <= 32000000");
     }
     if cfg.repeats > MAX_REPEATS {

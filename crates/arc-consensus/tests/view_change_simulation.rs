@@ -226,7 +226,7 @@ impl Sim {
                 .own_blocks
                 .len()
                 .saturating_sub(GOSSIP_REPEAT);
-            for block in self.nodes[index].own_blocks[recent..].to_vec() {
+            for block in self.nodes[index].own_blocks[recent..].iter().cloned() {
                 outbox.push((index, Msg::Block(block)));
             }
         }
@@ -1046,13 +1046,11 @@ fn history_import_refuses_a_gap_a_jump_and_a_thin_round() {
     // this asserts - the importer may stop AT a thin round but never beyond it.
     let mut thin: Vec<DagBlock> = Vec::new();
     for round in 0..=2u64 {
-        let mut taken = 0;
-        for block in all.iter().filter(|b| b.round == round) {
+        for (taken, block) in all.iter().filter(|b| b.round == round).enumerate() {
             if round == 1 && taken >= 1 {
                 break;
             }
             thin.push(block.clone());
-            taken += 1;
         }
     }
     let thin_importer_sim = Sim::new(4);

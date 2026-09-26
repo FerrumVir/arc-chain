@@ -4437,7 +4437,7 @@ impl ConsensusManager {
                     // allowed to fail.
                     if self.snapshot_every_blocks > 0 {
                         let height = state.height();
-                        if height > 0 && height % self.snapshot_every_blocks == 0 {
+                        if height > 0 && height.is_multiple_of(self.snapshot_every_blocks) {
                             let snapshot_started = Instant::now();
                             let published = state.publish_durable_snapshot();
                             crate::consensus_diagnostics::add_elapsed(
@@ -4469,7 +4469,7 @@ impl ConsensusManager {
                     // forgotten; `ConsensusSigningRecord::prune` states why.
                     {
                         let height = state.height();
-                        if height > 0 && height % RECORD_PRUNE_EVERY == 0 {
+                        if height > 0 && height.is_multiple_of(RECORD_PRUNE_EVERY) {
                             let finality_floor = height.saturating_sub(FINALITY_RECORD_MARGIN);
                             let absence_floor = self
                                 .engine
@@ -4830,7 +4830,7 @@ mod tests {
         );
         executed.sign(&sender).unwrap();
         state
-            .execute_block_verified_at(&[executed.clone()], sender.address(), 1)
+            .execute_block_verified_at(std::slice::from_ref(&executed), sender.address(), 1)
             .expect("executes");
         let pending: dashmap::DashMap<[u8; 32], arc_types::Transaction> = dashmap::DashMap::new();
 
@@ -4890,7 +4890,7 @@ mod tests {
         let executed = make(0);
         let pending = make(1);
         state
-            .execute_block_verified_at(&[executed.clone()], sender.address(), 1)
+            .execute_block_verified_at(std::slice::from_ref(&executed), sender.address(), 1)
             .expect("executes");
         assert!(
             state.receipts.contains_key(&executed.hash.0),
@@ -5135,7 +5135,7 @@ mod tests {
             .iter()
             .map(|address| {
                 let engine = ConsensusEngine::new(validator_set.clone(), *address);
-                engine.install_consensus_domain(domain.clone()).unwrap();
+                engine.install_consensus_domain(domain).unwrap();
                 engine.install_recovery_cursor(100).unwrap();
                 engine
             })

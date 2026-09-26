@@ -90,6 +90,9 @@ pub struct SnapshotManifestV1 {
 /// The largest checkpoint payload a peer may send: the transport's frame cap.
 pub const MAX_PEER_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
+/// Canonical per-account storage rows carried by a snapshot payload.
+pub type StorageRows = Vec<(Address, Vec<(Hash256, Vec<u8>)>)>;
+
 /// Every piece of state that `apply_wal_op` reconstructs. Anything replay does
 /// not write is deliberately absent: including it would make the snapshot and
 /// a full replay disagree, which is the one thing that must not happen.
@@ -105,7 +108,7 @@ pub const MAX_PEER_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub struct SnapshotPayload {
     pub height: u64,
     pub accounts: Vec<(Address, Account)>,
-    pub storage: Vec<(Address, Vec<(Hash256, Vec<u8>)>)>,
+    pub storage: StorageRows,
     pub contracts: Vec<(Address, Vec<u8>)>,
     pub identities: Vec<(Address, Identity)>,
     pub blocks: Vec<(u64, Block)>,
@@ -338,9 +341,7 @@ pub fn directory_for(wal_dir: &Path) -> PathBuf {
 }
 
 /// Convert a `BTreeMap` of per-address storage into the payload's shape.
-pub fn storage_rows(
-    rows: BTreeMap<Address, BTreeMap<Hash256, Vec<u8>>>,
-) -> Vec<(Address, Vec<(Hash256, Vec<u8>)>)> {
+pub fn storage_rows(rows: BTreeMap<Address, BTreeMap<Hash256, Vec<u8>>>) -> StorageRows {
     rows.into_iter()
         .map(|(address, entries)| (address, entries.into_iter().collect()))
         .collect()
@@ -384,16 +385,20 @@ mod tests {
     fn the_digest_is_reproducible_from_the_same_state() {
         // Two payloads built in different orders must encode identically, or
         // the digest identifies the encoding rather than the state.
-        let mut first = SnapshotPayload::default();
-        first.accounts = vec![
-            (hash_bytes(b"z"), Account::new(hash_bytes(b"z"), 1)),
-            (hash_bytes(b"a"), Account::new(hash_bytes(b"a"), 2)),
-        ];
-        let mut second = SnapshotPayload::default();
-        second.accounts = vec![
-            (hash_bytes(b"a"), Account::new(hash_bytes(b"a"), 2)),
-            (hash_bytes(b"z"), Account::new(hash_bytes(b"z"), 1)),
-        ];
+        let mut first = SnapshotPayload {
+            accounts: vec![
+                (hash_bytes(b"z"), Account::new(hash_bytes(b"z"), 1)),
+                (hash_bytes(b"a"), Account::new(hash_bytes(b"a"), 2)),
+            ],
+            ..SnapshotPayload::default()
+        };
+        let mut second = SnapshotPayload {
+            accounts: vec![
+                (hash_bytes(b"a"), Account::new(hash_bytes(b"a"), 2)),
+                (hash_bytes(b"z"), Account::new(hash_bytes(b"z"), 1)),
+            ],
+            ..SnapshotPayload::default()
+        };
         first.canonicalize();
         second.canonicalize();
         assert_eq!(first.encode().1, second.encode().1);

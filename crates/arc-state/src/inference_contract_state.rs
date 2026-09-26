@@ -446,10 +446,11 @@ pub fn validate_native_inference_binding_shape(
     context.commitment()
 }
 
+// Receipt reads validate the escrow's rooted bytes; binding eligibility is
+// checked separately only for pending work, since settled old bindings remain history.
 fn read_native_metadata(
     state: &StateDB,
     request_id: Hash256,
-    context_commitment: Hash256,
 ) -> Result<Option<NativeInferenceReceiptSnapshot>, StateError> {
     let escrow = escrow_address(request_id);
     let Some(bytes) = state.get_storage(&escrow, &metadata_key()) else {
@@ -1317,7 +1318,7 @@ impl StateDB {
                 ));
             }
             let request_id = metadata.request.job.request_id();
-            let receipt = read_native_metadata(self, request_id, commitment)?.ok_or_else(|| {
+            let receipt = read_native_metadata(self, request_id)?.ok_or_else(|| {
                 StateError::ExecutionError("native metadata escrow mismatch".into())
             })?;
             if escrow_address(request_id).0 != address {
@@ -1740,11 +1741,12 @@ impl StateDB {
                 ));
             }
         };
-        let InferencePlan::Transition(mut record) = plan else {
+        let InferencePlan::Transition(record) = plan else {
             return Err(StateError::ExecutionError(
                 "native inference request is already terminal".into(),
             ));
         };
+        let mut record = *record;
         if tx.from == record.escrow || tx.from == context_account() {
             return Err(StateError::ExecutionError(
                 "native caller aliases reserved state account".into(),
@@ -1778,10 +1780,10 @@ impl StateDB {
         let Some(context) = self.native_inference_context() else {
             return;
         };
-        let Ok(commitment) = context.commitment() else {
+        let Ok(_commitment) = context.commitment() else {
             return;
         };
-        let Ok(Some(receipt)) = read_native_metadata(self, request_id, commitment) else {
+        let Ok(Some(receipt)) = read_native_metadata(self, request_id) else {
             return;
         };
         for credit in receipt.metadata.credits {
@@ -2104,12 +2106,9 @@ impl StateDB {
         let mut requests = Vec::new();
         for entry in self.native_inference_pending.iter() {
             let request_id = Hash256(*entry.key());
-            let receipt =
-                read_native_metadata(self, request_id, context_commitment)?.ok_or_else(|| {
-                    StateError::ExecutionError(
-                        "native pending index references missing receipt".into(),
-                    )
-                })?;
+            let receipt = read_native_metadata(self, request_id)?.ok_or_else(|| {
+                StateError::ExecutionError("native pending index references missing receipt".into())
+            })?;
             // Pending work must name a binding this chain still holds: the
             // current one, or one retained because work admitted under it has
             // not settled. Anything else is not work this node can execute.
@@ -2157,10 +2156,9 @@ impl StateDB {
         if !self.native_inference_pending.contains_key(&request_id.0) {
             return Ok(None);
         }
-        let receipt =
-            read_native_metadata(self, request_id, context_commitment)?.ok_or_else(|| {
-                StateError::ExecutionError("native pending index references missing receipt".into())
-            })?;
+        let receipt = read_native_metadata(self, request_id)?.ok_or_else(|| {
+            StateError::ExecutionError("native pending index references missing receipt".into())
+        })?;
         if receipt.metadata.status != InferenceTransitionStatus::Pending {
             return Err(StateError::ExecutionError(
                 "native pending index references terminal receipt".into(),
@@ -2177,15 +2175,16 @@ impl StateDB {
 
     /// Read a request-keyed native receipt after checking its escrow
     /// commitment. Terminal status is returned unchanged; no payment action
-    /// occurs in this accessor.
+    /// occurs in this accessor. The context argument is retained for API
+    /// compatibility; historical receipts remain readable after a binding change.
     pub fn native_inference_receipt(
         &self,
         request_id: Hash256,
-        context_commitment: Hash256,
+        _context_commitment: Hash256,
     ) -> Result<Option<NativeInferenceReceiptSnapshot>, StateError> {
         let _guard = self.native_inference_execution.lock();
         self.require_healthy_wal()?;
-        read_native_metadata(self, request_id, context_commitment)
+        read_native_metadata(self, request_id)
     }
 }
 
@@ -2293,7 +2292,7 @@ impl IsolatedInferenceLedger {
             InferencePlan::Transition(record) => {
                 let request_id = record.request_id;
                 let status = record.metadata.status;
-                let state_root = self.transition(record)?;
+                let state_root = self.transition(*record)?;
                 Ok(IsolatedTransitionResult::Applied {
                     request_id,
                     state_root,
@@ -2360,7 +2359,7 @@ struct InferencePlanner<'a> {
 }
 
 enum InferencePlan {
-    Transition(InferenceTransitionRecord),
+    Transition(Box<InferenceTransitionRecord>),
     AlreadyTerminal {
         request_id: Hash256,
         status: InferenceTransitionStatus,
@@ -2374,7 +2373,7 @@ impl InferencePlanner<'_> {
     /// the matching binding, new requests are refused - fail-closed - while
     /// work already admitted goes on settling under its own binding.
     fn ensure_context_current(&self) -> Result<(), StateError> {
-        if state_members(&self.state) != self.context.members {
+        if state_members(self.state) != self.context.members {
             return Err(StateError::ExecutionError(
                 "active validator set changed after isolated context pin".into(),
             ));
@@ -2391,10 +2390,10 @@ impl InferencePlanner<'_> {
         // a new epoch invalidates the record, and native work stops there
         // rather than planning against a repositioned state.
         if self.state.recovery_context().is_some()
-            && !self
+            && self
                 .state
                 .native_migration()
-                .is_some_and(|record| record.refusal_against(self.state).is_none())
+                .is_none_or(|record| record.refusal_against(self.state).is_some())
         {
             return Err(StateError::ExecutionError(
                 "isolated inference adapter became recovery-bound".into(),
@@ -2658,7 +2657,7 @@ impl InferencePlanner<'_> {
             storage_updates,
         };
         self.validate_record(&record)?;
-        Ok(InferencePlan::Transition(record))
+        Ok(InferencePlan::Transition(Box::new(record)))
     }
 
     fn plan_finalize(
@@ -2714,7 +2713,7 @@ impl InferencePlanner<'_> {
             credits,
         };
         let record = self.plan_terminal(terminal, request_id, admission_height, escrow, now)?;
-        Ok(InferencePlan::Transition(record))
+        Ok(InferencePlan::Transition(Box::new(record)))
     }
 
     fn plan_finish(
@@ -2777,7 +2776,7 @@ impl InferencePlanner<'_> {
             credits,
         };
         let record = self.plan_terminal(terminal, request_id, admission_height, escrow, now)?;
-        Ok(InferencePlan::Transition(record))
+        Ok(InferencePlan::Transition(Box::new(record)))
     }
 
     fn load_metadata(
@@ -2909,13 +2908,11 @@ impl InferencePlanner<'_> {
             if credit.amount == 0 {
                 continue;
             }
-            if !accounts.contains_key(&credit.payee.0) {
-                let account = self
-                    .state
+            accounts.entry(credit.payee.0).or_insert_with(|| {
+                self.state
                     .get_account(&credit.payee)
-                    .unwrap_or_else(|| Account::new(credit.payee, 0));
-                accounts.insert(credit.payee.0, account);
-            }
+                    .unwrap_or_else(|| Account::new(credit.payee, 0))
+            });
             let account = accounts.get_mut(&credit.payee.0).expect("inserted above");
             account.balance = account
                 .balance
@@ -2923,8 +2920,8 @@ impl InferencePlanner<'_> {
                 .ok_or_else(|| StateError::ExecutionError("credit balance overflow".into()))?;
         }
         let mut account_updates = accounts
-            .into_iter()
-            .map(|(_, account)| (account.address, account))
+            .into_values()
+            .map(|account| (account.address, account))
             .collect::<Vec<_>>();
         let context_address = context_account();
         let mut context_state = self
@@ -3269,10 +3266,7 @@ mod tests {
         let cert = certificate(&fixture, request_id);
         assert!(fixture.ledger.finalize(request_id, &cert, 2).is_err());
         assert!(fixture.ledger.state_root().is_err());
-        assert_eq!(
-            fixture.ledger.account(&request.job.requester).is_err(),
-            true
-        );
+        assert!(fixture.ledger.account(&request.job.requester).is_err());
         drop(fixture.ledger);
         let state =
             StateDB::with_genesis_persistent(&fixture.prefunded, &fixture.dir, fixture.genesis)
@@ -3592,7 +3586,7 @@ mod tests {
         let id = req.job.request_id();
         let tx = native_request(state, &f.requester, req);
         let (block, receipts) = state
-            .execute_block_adaptive_at(&[tx.clone()], f.validators[0].address(), 10)
+            .execute_block_adaptive_at(std::slice::from_ref(&tx), f.validators[0].address(), 10)
             .unwrap();
         assert_eq!(block.header.protocol_version.major, 4);
         assert!(receipts[0].success);
@@ -3612,7 +3606,11 @@ mod tests {
         // Caller is also a validator payee; its nonce and credit must coexist.
         let terminal = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
         let (_, receipts) = state
-            .execute_block_adaptive_at(&[terminal.clone()], f.validators[0].address(), 20)
+            .execute_block_adaptive_at(
+                std::slice::from_ref(&terminal),
+                f.validators[0].address(),
+                20,
+            )
             .unwrap();
         assert!(receipts[0].success);
         assert_eq!(
@@ -3632,7 +3630,7 @@ mod tests {
             .sum();
         assert_eq!(paid, 10);
         let root = state.get_state_root();
-        assert_rejected_unchanged(state, &[terminal.clone()]);
+        assert_rejected_unchanged(state, std::slice::from_ref(&terminal));
         let next_duplicate = native_finalize(state, &f.validators[0], 1, id, certificate(&f, id));
         assert_rejected_unchanged(state, &[next_duplicate]);
         let dir = f.dir.clone();
@@ -3721,7 +3719,7 @@ mod tests {
         assert!(!state.native_transaction_still_admissible(&transfer));
 
         state
-            .execute_block_adaptive_at(&[r0.clone()], f.validators[0].address(), 10)
+            .execute_block_adaptive_at(std::slice::from_ref(&r0), f.validators[0].address(), 10)
             .unwrap();
         assert!(
             !state.native_transaction_still_admissible(&r0),
@@ -3747,7 +3745,7 @@ mod tests {
             );
         }
         state
-            .execute_block_adaptive_at(&[fin_a.clone()], f.validators[0].address(), 20)
+            .execute_block_adaptive_at(std::slice::from_ref(&fin_a), f.validators[0].address(), 20)
             .unwrap();
         assert!(
             !state.native_transaction_still_admissible(&fin_b),
@@ -3854,7 +3852,7 @@ mod tests {
             .to_string();
         assert!(!refused.is_empty(), "the refusal must carry a reason");
         state
-            .execute_block_adaptive_at(&[r0.clone()], f.validators[0].address(), 10)
+            .execute_block_adaptive_at(std::slice::from_ref(&r0), f.validators[0].address(), 10)
             .unwrap();
         state
             .validate_native_inference_transaction_admission_next(&r1, &context)
@@ -3884,12 +3882,12 @@ mod tests {
             )
             .unwrap();
         let refund = native_refund(state, &f.requester, 1, id);
-        assert_rejected_unchanged(state, &[refund.clone()]);
+        assert_rejected_unchanged(state, std::slice::from_ref(&refund));
         state
             .execute_block_verified_at(&[], Hash256::ZERO, 2)
             .unwrap();
         state
-            .execute_block_verified_at(&[refund.clone()], Hash256::ZERO, 3)
+            .execute_block_verified_at(std::slice::from_ref(&refund), Hash256::ZERO, 3)
             .unwrap();
         let caller = state.get_account(&f.requester.address()).unwrap();
         assert_eq!((caller.balance, caller.nonce), (1000, 2));
@@ -5709,12 +5707,12 @@ mod tests {
         let state = &f.ledger.state;
         let req = request(&f, 0, 100);
         let original = native_request(state, &f.requester, req.clone());
-        assert_rejected_unchanged(state, &[original.clone()]); // default genesis
+        assert_rejected_unchanged(state, std::slice::from_ref(&original)); // default genesis
         *state.recovery_context.write() = Some(crate::recovery::RecoveryContext::new(
             "test", f.genesis, 1, 0,
         ));
         assert!(state.activate_native_inference(f.context.clone()).is_err());
-        assert_rejected_unchanged(state, &[original.clone()]); // recovered v3
+        assert_rejected_unchanged(state, std::slice::from_ref(&original)); // recovered v3
         *state.recovery_context.write() = None;
         state.activate_native_inference(f.context.clone()).unwrap();
         let mut variants = Vec::new();
@@ -5915,7 +5913,7 @@ mod tests {
         state.wal.inject_failure(crate::wal::WalFaultPoint::Fsync);
         assert!(
             state
-                .execute_block_verified_at(&[tx.clone()], Hash256::ZERO, 1)
+                .execute_block_verified_at(std::slice::from_ref(&tx), Hash256::ZERO, 1)
                 .is_err()
         );
         assert!(

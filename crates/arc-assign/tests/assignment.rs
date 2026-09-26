@@ -404,7 +404,7 @@ fn a_layer_nobody_holds_is_not_a_placement_without_the_coordinator() {
     p.include_coordinator = false;
     let lower = sharded(1, 8_000_000_000, fast, &[(0, 2)]);
     assert_eq!(
-        place(&stages(), 0, &[lower.clone()], &p),
+        place(&stages(), 0, std::slice::from_ref(&lower), &p),
         Err(PlacementError::Infeasible),
         "layers 2 and 3 have no holder"
     );
@@ -431,7 +431,13 @@ fn a_layerless_stage_belongs_to_full_model_participants_only() {
         },
     ];
     let shard = sharded(1, 8_000_000_000, fast, &[(0, 1)]);
-    let p = place(&mixed, 1_000_000_000, &[shard.clone()], &policy()).unwrap();
+    let p = place(
+        &mixed,
+        1_000_000_000,
+        std::slice::from_ref(&shard),
+        &policy(),
+    )
+    .unwrap();
     let w = Participant::Worker(key(1).address());
     assert_eq!(
         rows_on(&p, 0, &w),

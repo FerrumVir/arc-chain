@@ -202,11 +202,11 @@ fn merged_layer_ranges(layers: &[usize]) -> Result<Vec<[u32; 2]>, String> {
         let end = start
             .checked_add(1)
             .ok_or_else(|| "layer range overflow".to_string())?;
-        if let Some(last) = ranges.last_mut() {
-            if last[1] == start {
-                last[1] = end;
-                continue;
-            }
+        if let Some(last) = ranges.last_mut()
+            && last[1] == start
+        {
+            last[1] = end;
+            continue;
         }
         ranges.push([start, end]);
     }

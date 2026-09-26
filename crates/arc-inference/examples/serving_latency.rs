@@ -15,6 +15,7 @@
 //!   * peak resident memory, swap in use (before load, after load, at the
 //!     end) and the load average at the start and end, so a run that swapped
 //!     or shared the host says so.
+//!
 //! Each configuration runs with batched prefill OFF (the serving default) and
 //! ON (labelled). Every repeat must produce the same tokens, or the run
 //! aborts: a faster wrong answer is not a measurement.

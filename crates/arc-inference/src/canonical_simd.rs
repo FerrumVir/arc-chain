@@ -617,7 +617,7 @@ pub(crate) fn matmul_i8_canonical_rows_fast_view(
         // path does not go through. The dot accumulation itself is bounded by
         // construction inside the accepted domain (see the module docs and the
         // compile-time assertion above), so only the scale multiply is checked.
-        if !post_scale_bound_holds(input, &weights.scales) {
+        if !post_scale_bound_holds(input, weights.scales) {
             return record_refusal(Refusal::ScaleMultiplyWouldOverflow);
         }
         LIMB_SCRATCH.with(|cell| {
@@ -756,7 +756,8 @@ pub fn matmul_i8_batched_fast(
                     unsafe { limbs.as_ptr().add(tok * LIMB_COUNT * in_size) }
                 };
                 let planes = [plane_of(0), plane_of(1), plane_of(2), plane_of(3)];
-                for i in r0..r1 {
+                for (offset, &sc) in scales[r0..r1].iter().enumerate() {
+                    let i = r0 + offset;
                     // SAFETY: `i < n_rows` and `data` holds `n_rows * in_size`
                     // bytes. Each rayon task owns a disjoint row range, and for
                     // a given row it writes only `out[(t+q) * n_rows + i]`, so
@@ -764,7 +765,6 @@ pub fn matmul_i8_batched_fast(
                     let acc = unsafe {
                         dot_limbs_x4(data.as_ptr().add(i * in_size), &planes, in_size, used_max)
                     };
-                    let sc = scales[i];
                     for (q, a) in acc.iter().enumerate().take(quad) {
                         unsafe {
                             *out_ptr.get().add((t + q) * n_rows + i) = (*a * sc) >> FRAC_BITS
@@ -932,10 +932,10 @@ mod tests {
                     matmul_i8_canonical_rows_fast(&w, &input, cols, &mut fast),
                     "must accept cols={cols} rows={rows}"
                 );
-                for i in 0..rows {
+                for (i, got) in fast.iter().enumerate() {
                     let acc = scalar_dot(&w.data[i * cols..(i + 1) * cols], &input);
                     let want = (acc * w.scales[i]) >> FRAC_BITS;
-                    assert_eq!(fast[i], want, "cols={cols} rows={rows} row={i}");
+                    assert_eq!(*got, want, "cols={cols} rows={rows} row={i}");
                 }
             }
         }

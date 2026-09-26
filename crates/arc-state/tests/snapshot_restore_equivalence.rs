@@ -38,8 +38,11 @@ fn advance(state: &StateDB, count: u64) {
     }
 }
 
+type ObservedChain = Vec<(u64, Hash256, Hash256)>;
+type ObservableState = (u64, Hash256, ObservedChain, Vec<u64>);
+
 /// Everything an observer can read back, used to compare two recovered states.
-fn observable(state: &StateDB) -> (u64, Hash256, Vec<(u64, Hash256, Hash256)>, Vec<u64>) {
+fn observable(state: &StateDB) -> ObservableState {
     let height = state.height();
     let chain = (0..=height)
         .filter_map(|h| {

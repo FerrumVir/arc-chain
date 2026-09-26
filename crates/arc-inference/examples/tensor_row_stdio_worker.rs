@@ -34,7 +34,6 @@ struct Shard {
     tensor: u8,
     start: u64,
     end: u64,
-    worker: Vec<u8>,
     weights: I8Weights,
 }
 fn take<'a>(b: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
@@ -103,8 +102,8 @@ fn load(path: &std::path::Path) -> io::Result<Shard> {
             "worker id bound",
         ));
     }
-    let mut worker = vec![0; worker_len];
-    f.read_exact(&mut worker)?;
+    let mut _worker = vec![0; worker_len];
+    f.read_exact(&mut _worker)?;
     let cols = read_u64(&mut f)? as usize;
     let rows = read_u64(&mut f)? as usize;
     if start >= end
@@ -142,7 +141,6 @@ fn load(path: &std::path::Path) -> io::Result<Shard> {
         tensor,
         start,
         end,
-        worker,
         weights: I8Weights {
             data,
             scales,
@@ -333,7 +331,6 @@ mod tests {
             tensor: 3,
             start: 10,
             end: 13,
-            worker: b"rack-1".to_vec(),
             weights: I8Weights {
                 data: vec![1, 2, -3, 4, 5, -6],
                 scales: vec![65_536; 3],

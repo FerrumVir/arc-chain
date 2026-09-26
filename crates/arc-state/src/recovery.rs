@@ -3274,6 +3274,8 @@ impl StateDB {
                 ))
             })?;
         }
+        // Release the decoded verification copy before reading the full WAL.
+        drop(stored_checkpoint);
         if existing_marker.is_none() {
             write_marker_atomically(&marker_path, approved_hash)?;
         }
@@ -3314,6 +3316,9 @@ impl StateDB {
         staged.apply_verified_recovery_wal(&wal_plan.entries)?;
         staged.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
         staged.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
+        // The staged full state has served its pre-mutation verification role;
+        // free it before constructing the persistent replay state.
+        drop(staged);
 
         if wal_plan.report.recovery_wal_quarantined_tail_bytes != 0 {
             let quarantine_path = quarantine_and_truncate_wal_tail(
@@ -5551,7 +5556,7 @@ mod tests {
             );
         }
         state.wal.sync().unwrap();
-        let mut entries = read_repairable_wal_prefix(&active_dir.join("state.wal"))
+        let mut entries = read_repairable_wal_prefix(active_dir.join("state.wal"))
             .unwrap()
             .entries;
         let replayed = StateDB::new();
@@ -5619,7 +5624,7 @@ mod tests {
         duplicates[1] = duplicates[0];
         let mut context = state.recovery_context().unwrap();
         context.validator_set_id += 1;
-        let changes = vec![
+        let changes = [
             WalOp::SetAccount(target, account),
             WalOp::SetStorage(target, storage_key, b"stored".to_vec()),
             WalOp::DeleteStorage(target, storage_key),
@@ -5652,7 +5657,7 @@ mod tests {
             );
         }
         state.wal.sync().unwrap();
-        let entries = read_repairable_wal_prefix(&active_dir.join("state.wal"))
+        let entries = read_repairable_wal_prefix(active_dir.join("state.wal"))
             .unwrap()
             .entries;
         let replayed = StateDB::new();

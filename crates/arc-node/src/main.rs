@@ -10662,7 +10662,7 @@ mod tests {
             1,
         );
         let engine = ConsensusEngine::new(set, validators[0]);
-        engine.install_consensus_domain(domain.clone()).unwrap();
+        engine.install_consensus_domain(*domain).unwrap();
         engine
     }
 
@@ -11896,7 +11896,7 @@ mod tests {
         ));
         std::fs::create_dir(&data_dir).unwrap();
         let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"domain"), 7, 11);
-        let mut binding = recovery_test_binding(domain.clone());
+        let mut binding = recovery_test_binding(domain);
         binding.source_height = 0;
         binding.transition_height = 0;
         let validators: Vec<Hash256> = (0..4).map(|index| hash_bytes(&[index as u8])).collect();

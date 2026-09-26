@@ -49,11 +49,15 @@ start unless the file's BLAKE3 equals the `--artifact` it is given.
     # its shape is checked in CI by
     # row_cohort::tests::the_documented_cohort_template_is_accepted_by_the_real_loader
 
-    # 5. the node, with the REAL executor - `--native-row-workers` is refused
-    #    with the deterministic test executor
+    # 5. use only the approved validator key whose public address and stake
+    #    are already present in the exact shared genesis. Obtain it through
+    #    the validator fleet's approved secret-delivery process; never create
+    #    a new identity or place secret material in this command.
+    #    The keyfile must be mode 0600 and match one genesis validator entry.
+    #    `--native-row-workers` is refused with the deterministic test executor.
     arc-node --rpc 127.0.0.1:9960 --p2p-port 9160 --data-dir <dir> \
       --genesis <genesis.toml> --peers <peers> \
-      --insecure-dev-validator-seed --validator-seed <seed> --stake <stake> \
+      --validator-key-file /run/secrets/arc-validator.key --stake <approved-stake> \
       --native-inference-activation <activation.json> \
       --native-inference-runtime \
       --native-inference-artifact /path/standard.gguf \
