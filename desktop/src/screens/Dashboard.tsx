@@ -887,19 +887,14 @@ export function Dashboard() {
                 ? formatInt(network.totalInferences)
                 : "—"}
             </dd>
-            <dt>Host-reported TPS</dt>
-            <dd>
-              {network?.avgTps != null ? formatInt(network.avgTps) : "—"}
-            </dd>
             <dt>Host block height</dt>
             <dd>
               {network?.latestBlock != null
                 ? formatInt(network.latestBlock)
                 : "—"}
             </dd>
-            {/* Block production has been stalled on most seeds for days.
-                `/health` still reports "ok" because DAG rounds keep
-                advancing, so without this the network looks healthy. */}
+            {/* DAG rounds and health can advance without sealed blocks.
+                Show block age separately to make that distinction visible. */}
             {status?.chainBlockAgeSeconds != null && (
               <>
                 <dt>Last block</dt>

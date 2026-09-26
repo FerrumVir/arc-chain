@@ -204,7 +204,7 @@ export interface NetworkStats {
   totalNodes: number;
   totalInferences: number;
   avgTps: number;
-  latestBlock: number;
+  latestBlock: number | null;
 }
 
 /**

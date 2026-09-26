@@ -1125,14 +1125,14 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           totalNodes: Math.max(1, h.validators ?? 0),
           totalInferences: r.count ?? 0,
           avgTps: Math.floor(((h.dag_round ?? 0) * 4) / uptime),
-          latestBlock: h.dag_committed ?? 0,
+          latestBlock: typeof h.height === "number" ? h.height : null,
         } as T;
       } catch {
         return {
           totalNodes: 0,
           totalInferences: 0,
           avgTps: 0,
-          latestBlock: 0,
+          latestBlock: null,
         } as T;
       }
     }

@@ -283,7 +283,7 @@ pub struct NetworkStats {
     pub total_nodes: u64,
     pub total_inferences: u64,
     pub avg_tps: u64,
-    pub latest_block: u64,
+    pub latest_block: Option<u64>,
 }
 
 // `UpdateCheck` was removed along with the `check_for_update` command it
