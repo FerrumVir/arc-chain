@@ -962,13 +962,7 @@ impl RecoveryPayload {
     /// source accounts. This is intentionally independent of StateDB caches,
     /// dirty-key tracking, and the replacement validator set.
     pub fn legacy_state_root(&self) -> Hash256 {
-        let mut tree = IncrementalMerkle::new();
-        for (address, account) in &self.accounts {
-            let bytes = bincode::serialize(account).expect("canonical account is serializable");
-            tree.update(address.0, hash_bytes(&bytes));
-        }
-        tree.rebuild();
-        tree.root()
+        legacy_account_state_root(&self.accounts)
     }
 
     fn transition_accounts(
@@ -1260,6 +1254,18 @@ impl RecoveryPayload {
         }
         Ok(())
     }
+}
+
+fn legacy_account_state_root(accounts: &[(Address, Account)]) -> Hash256 {
+    // Match `IncrementalMerkle::update`'s historical last-write-wins behavior
+    // for duplicate keys, while bulk-building the sorted index only once.
+    // Checkpoint verification separately rejects duplicates as non-canonical.
+    let mut leaves = BTreeMap::new();
+    for (address, account) in accounts {
+        let bytes = bincode::serialize(account).expect("canonical account is serializable");
+        leaves.insert(address.0, hash_bytes(&bytes));
+    }
+    IncrementalMerkle::from_keyed_leaves(leaves.into_iter().collect()).root()
 }
 
 fn verify_network_policy(
@@ -3435,7 +3441,10 @@ impl StateDB {
     /// Return the number of full root computations so tests can bound the
     /// work without relying on wall-clock timing. This cache never escapes
     /// replay and cannot affect projected roots used by native settlement.
-    fn apply_verified_recovery_wal(&self, entries: &[crate::WalEntry]) -> Result<usize, StateError> {
+    fn apply_verified_recovery_wal(
+        &self,
+        entries: &[crate::WalEntry],
+    ) -> Result<usize, StateError> {
         let mut verified_root = None;
         let mut root_computations = 0;
         for entry in entries {
@@ -3851,6 +3860,38 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn legacy_account_root_bulk_build_matches_incremental_order_and_duplicate_semantics() {
+        let first = Hash256([3; 32]);
+        let second = Hash256([1; 32]);
+        let third = Hash256([2; 32]);
+        let accounts = vec![
+            (first, Account::new(first, 10)),
+            (second, Account::new(second, 20)),
+            (first, Account::new(first, 30)),
+            (third, Account::new(third, 40)),
+        ];
+
+        let mut incremental = IncrementalMerkle::new();
+        for (address, account) in &accounts {
+            let bytes = bincode::serialize(account).unwrap();
+            incremental.update(address.0, hash_bytes(&bytes));
+        }
+        incremental.rebuild();
+        assert_eq!(legacy_account_state_root(&accounts), incremental.root());
+
+        // The checkpoint format still rejects duplicate account keys before
+        // accepting a payload, even though the public legacy-root helper keeps
+        // its historical last-write-wins behavior for direct callers.
+        let (mut checkpoint, _, _) = checkpoint();
+        let address = checkpoint.payload.accounts[0].0;
+        checkpoint
+            .payload
+            .accounts
+            .push((address, Account::new(address, 1)));
+        assert!(checkpoint.payload.validate_canonical().is_err());
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let serial = NEXT_DIR.fetch_add(1, AtomicOrdering::Relaxed);
