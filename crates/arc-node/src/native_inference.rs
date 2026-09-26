@@ -1444,7 +1444,9 @@ impl DecisionStore {
         let vote = InferenceVote {
             validator: stored.validator,
             output_hash: stored.output_hash,
-            signature: stored.signature,
+            // Keep the stored record available for the Windows durability
+            // barrier below before re-emitting its validated vote.
+            signature: stored.signature.clone(),
         };
         if !verify_vote(&vote, job.request_id, &stored.tokens) {
             return Err(NativeInferenceError::CorruptStore);
