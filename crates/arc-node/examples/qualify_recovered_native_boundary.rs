@@ -293,24 +293,54 @@ fn assert_preexisting_accounts_preserved(
     after: &[(Hash256, Account)],
     allowed_new: Hash256,
 ) -> Result<()> {
-    for (address, account) in before {
-        let candidate = after
-            .iter()
-            .find(|(candidate, _)| candidate == address)
-            .map(|(_, account)| account)
-            .with_context(|| format!("pre-existing account {address} was removed"))?;
-        ensure!(
-            bincode::serialize(candidate)? == bincode::serialize(account)?,
-            "pre-existing account {address} changed"
-        );
-    }
-    for (address, _) in after {
-        if !before.iter().any(|(prior, _)| prior == address) {
-            ensure!(
-                *address == allowed_new,
-                "unexpected account appeared during activation: {address}"
-            );
+    let mut old: Vec<_> = before.iter().collect();
+    old.sort_by_key(|(address, _)| address.0);
+    let mut new: Vec<_> = after.iter().collect();
+    new.sort_by_key(|(address, _)| address.0);
+    ensure!(
+        old.windows(2).all(|pair| pair[0].0 != pair[1].0),
+        "duplicate address in pre-activation account snapshot"
+    );
+    ensure!(
+        new.windows(2).all(|pair| pair[0].0 != pair[1].0),
+        "duplicate address in post-activation account snapshot"
+    );
+
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() && j < new.len() {
+        match old[i].0.0.cmp(&new[j].0.0) {
+            std::cmp::Ordering::Less => {
+                bail!("pre-existing account {} was removed", old[i].0)
+            }
+            std::cmp::Ordering::Greater => {
+                ensure!(
+                    new[j].0 == allowed_new,
+                    "unexpected account appeared during activation: {}",
+                    new[j].0
+                );
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                ensure!(
+                    bincode::serialize(&old[i].1)? == bincode::serialize(&new[j].1)?,
+                    "pre-existing account {} changed",
+                    old[i].0
+                );
+                i += 1;
+                j += 1;
+            }
         }
+    }
+    ensure!(
+        i == old.len(),
+        "pre-existing account {} was removed",
+        old[i].0
+    );
+    for (address, _) in new.iter().skip(j) {
+        ensure!(
+            *address == allowed_new,
+            "unexpected account appeared during activation: {address}"
+        );
     }
     Ok(())
 }
@@ -334,10 +364,15 @@ fn policy(
 }
 
 fn run() -> Result<()> {
+    let started = std::time::Instant::now();
     let args = args()?;
     reject_symlink(&args.source)?;
     let source = fs::canonicalize(&args.source).context("canonicalize input state directory")?;
     let source_before = fingerprint(&source).context("fingerprint immutable input")?;
+    eprintln!(
+        "qualification progress: input fingerprint complete at {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     let marker = source.join("recovery.active");
     expected_hash_file(&marker, args.manifest, "approved recovery marker")?;
 
@@ -351,6 +386,10 @@ fn run() -> Result<()> {
     ensure!(
         fingerprint(&scratch)? == source_before,
         "copied state differs from source fingerprint"
+    );
+    eprintln!(
+        "qualification progress: private copy verified at {:.1}s",
+        started.elapsed().as_secs_f64()
     );
 
     let genesis_path = args.genesis.to_string_lossy();
@@ -405,6 +444,12 @@ fn run() -> Result<()> {
         state.native_inference_context().is_none(),
         "state already has native inference active; this checker expects the pre-activation state"
     );
+    eprintln!(
+        "qualification progress: replay verified height={} accounts={} at {:.1}s",
+        state.height(),
+        state.account_count(),
+        started.elapsed().as_secs_f64()
+    );
     ensure!(args.height.checked_add(1).is_some(), "height overflow");
     let activation_height = args.height + 1;
 
@@ -438,6 +483,10 @@ fn run() -> Result<()> {
         .map(|(address, _)| *address)
         .collect();
     let before_history = history_digest(&state, args.height, &addresses)?;
+    eprintln!(
+        "qualification progress: pre-activation accounts/history captured at {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     let prev = state.get_block(args.height).unwrap();
     let producer = state
         .active_validators()
@@ -459,6 +508,11 @@ fn run() -> Result<()> {
         state.native_migration().as_ref() == Some(&record),
         "migration record changed during activation"
     );
+    eprintln!(
+        "qualification progress: activation block H={} applied at {:.1}s",
+        activation_height,
+        started.elapsed().as_secs_f64()
+    );
     ensure!(
         block.header.state_root != args.root,
         "activation block did not change the committed state root"
@@ -468,6 +522,11 @@ fn run() -> Result<()> {
         "computed post-activation root differs from activation block root"
     );
     let context_account = hash_bytes(b"ARC-isolated-inference-context-account-v1");
+    eprintln!(
+        "qualification progress: checking {} pre-existing accounts at {:.1}s",
+        before_accounts.len(),
+        started.elapsed().as_secs_f64()
+    );
     assert_preexisting_accounts_preserved(
         &before_accounts,
         &account_snapshot(&state)?,
@@ -490,6 +549,10 @@ fn run() -> Result<()> {
         None,
     )
     .context("reopen disposable activated state")?;
+    eprintln!(
+        "qualification progress: reopened activated scratch state at {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     ensure!(
         reopened.height() == activation_height,
         "activated height did not persist across reopen"
@@ -528,13 +591,19 @@ fn run() -> Result<()> {
         "input state changed during qualification"
     );
     println!("OFFLINE STATE-CODE QUALIFICATION ONLY");
+    eprintln!(
+        "qualification progress: final checks complete at {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
     println!("source tree sha256: {source_before}");
     println!("approved recovery manifest: {}", args.manifest);
     println!("replayed height/root: {}/{}", args.height, args.root);
     println!("activation height/context commitment: {activation_height}/{commitment}");
     println!("activated block root after reopen: {activated_root}");
     println!("pre-existing account digest: {before_account_digest}");
-    println!("pre-existing account and history digests preserved; input paths, contents, sizes, and descendant modes unchanged");
+    println!(
+        "pre-existing account and history digests preserved; input paths, contents, sizes, and descendant modes unchanged"
+    );
     println!(
         "This does not qualify a model, consensus/fleet execution, production configuration, or release."
     );
@@ -634,6 +703,28 @@ mod tests {
                 &[
                     (prior, Account::new(prior, 9)),
                     (unrelated, Account::new(unrelated, 0))
+                ],
+                native
+            )
+            .is_err()
+        );
+        assert!(
+            assert_preexisting_accounts_preserved(
+                &[
+                    (prior, Account::new(prior, 9)),
+                    (prior, Account::new(prior, 9))
+                ],
+                &before,
+                native
+            )
+            .is_err()
+        );
+        assert!(
+            assert_preexisting_accounts_preserved(
+                &before,
+                &[
+                    (prior, Account::new(prior, 9)),
+                    (prior, Account::new(prior, 9))
                 ],
                 native
             )
