@@ -215,6 +215,46 @@ impl RowCohortConfig {
         }
         Ok(())
     }
+
+    fn validate_for_model(&self, layer_count: usize) -> Result<(), String> {
+        self.validate()?;
+        for worker in &self.workers {
+            probe_layer_for_residency(&worker.resident_layers, layer_count)
+                .map_err(|error| format!("machine {}: {error}", worker.id))?;
+        }
+        Ok(())
+    }
+}
+
+/// Pick the lowest layer a worker declares resident. Empty residency retains
+/// the legacy full-model meaning and therefore probes layer zero.
+fn probe_layer_for_residency(
+    resident_layers: &[(u32, u32)],
+    layer_count: usize,
+) -> Result<usize, String> {
+    if layer_count == 0 {
+        return Err("the model has no layers to probe".into());
+    }
+    if resident_layers.is_empty() {
+        return Ok(0);
+    }
+    let mut selected = None;
+    for &(start, end) in resident_layers {
+        if start >= end {
+            return Err(format!(
+                "resident layer range [{start}, {end}) is empty or reversed"
+            ));
+        }
+        if u64::from(end) > layer_count as u64 {
+            return Err(format!(
+                "resident layer range [{start}, {end}) exceeds the model's {layer_count} layers"
+            ));
+        }
+        selected = Some(selected.map_or(start, |current: u32| current.min(start)));
+    }
+    selected
+        .map(|layer| layer as usize)
+        .ok_or_else(|| "resident layer set is empty".into())
 }
 
 /// Whether a request's `Host` header names this machine itself (`localhost`,
@@ -381,6 +421,7 @@ struct Machine {
     entry: RowWorkerEntry,
     address: Hash256,
     digest: Hash256,
+    probe_layer: usize,
 }
 
 struct Books {
@@ -471,10 +512,11 @@ pub struct RowCohort {
     last_height: AtomicU64,
 }
 
-/// One round's challenge: rows of layer 0's gate for a height-seeded input,
-/// and the answer this node computed for it. Every machine measured in the
-/// round shares it, so it is computed once.
+/// One round's challenge: rows of a resident layer's gate for a height-seeded
+/// input, and the answer this node computed for it. Machines resident on the
+/// same layer share the material, so it is computed once per layer.
 struct ChallengeMaterial {
+    layer: usize,
     tensor: TensorKey,
     rows: usize,
     input: Vec<i64>,
@@ -483,15 +525,23 @@ struct ChallengeMaterial {
 
 fn challenge_material(
     model: &CachedIntegerModel,
+    layer: usize,
     height: u64,
 ) -> Result<ChallengeMaterial, String> {
     let tensor = TensorKey::WGate;
-    let weights =
-        model_projection_weights(model, Some(0), tensor).ok_or("the model has no layer 0")?;
+    let weights = model_projection_weights(model, Some(layer), tensor)
+        .ok_or("the model has no challenge layer")?;
     let rows = CHALLENGE_ROWS.min(weights.n_rows);
     let input: Vec<i64> = (0..weights.n_cols as u64)
         .map(|i| {
-            let h = arc_crypto::hash_bytes(&[height.to_le_bytes(), i.to_le_bytes()].concat());
+            let h = arc_crypto::hash_bytes(
+                &[
+                    height.to_le_bytes().as_slice(),
+                    (layer as u64).to_le_bytes().as_slice(),
+                    i.to_le_bytes().as_slice(),
+                ]
+                .concat(),
+            );
             // Q16 activations in [-2, 2).
             i64::from(u32::from_le_bytes([h.0[0], h.0[1], h.0[2], h.0[3]]) % (4 << 16)) - (2 << 16)
         })
@@ -500,6 +550,7 @@ fn challenge_material(
     let mut expected = vec![0; rows];
     matmul_i8_canonical_rows(&shard, &input, &mut expected)?;
     Ok(ChallengeMaterial {
+        layer,
         tensor,
         rows,
         input,
@@ -511,7 +562,7 @@ impl ChallengeMaterial {
     /// The challenge call to one machine.
     fn request(
         &self,
-        model: &CachedIntegerModel,
+        execution_profile: &str,
         artifact: Hash256,
         worker_id: &str,
         height: u64,
@@ -528,11 +579,8 @@ impl ChallengeMaterial {
             input_hash: hash_i64(&self.input),
             assignment: RowAssignment {
                 artifact_id: artifact,
-                execution_profile: model
-                    .canonical_execution_profile()
-                    .ok_or("the model has no canonical profile")?
-                    .to_string(),
-                layer: Some(0),
+                execution_profile: execution_profile.to_string(),
+                layer: Some(self.layer),
                 tensor: self.tensor,
                 row_start: 0,
                 row_end: self.rows,
@@ -551,8 +599,8 @@ fn elapsed_us(elapsed: Duration) -> u64 {
 
 /// This node's own rate on the challenge projection: the kernel alone, timed.
 fn local_rate(model: &CachedIntegerModel, height: u64) -> Result<u64, String> {
-    let material = challenge_material(model, height)?;
-    let weights = model_projection_weights(model, Some(0), material.tensor)
+    let material = challenge_material(model, 0, height)?;
+    let weights = model_projection_weights(model, Some(material.layer), material.tensor)
         .ok_or("the model has no layer 0")?;
     let shard = weights.copy_rows(0, material.rows)?;
     let mut values = vec![0; shard.n_rows];
@@ -573,11 +621,12 @@ fn zero_call(
     artifact: Hash256,
     worker: &SshStdioRowWorker,
     worker_id: &str,
+    layer: usize,
     tensor: TensorKey,
     seed: &[u8],
 ) -> Result<u64, String> {
-    let weights =
-        model_projection_weights(model, Some(0), tensor).ok_or("the model has no layer 0")?;
+    let weights = model_projection_weights(model, Some(layer), tensor)
+        .ok_or("the model has no probe layer")?;
     let input = vec![0i64; weights.n_cols];
     let request = RowProjectionRequest {
         call_id: arc_crypto::hash_bytes(
@@ -590,7 +639,7 @@ fn zero_call(
                 .canonical_execution_profile()
                 .ok_or("the model has no canonical profile")?
                 .to_string(),
-            layer: Some(0),
+            layer: Some(layer),
             tensor,
             row_start: 0,
             row_end: 1,
@@ -681,16 +730,22 @@ impl RowCohort {
         artifact: Hash256,
         height: u64,
     ) -> Result<Arc<Self>, String> {
-        config.validate()?;
+        config.validate_for_model(model.layers.len())?;
         let machines: Vec<Machine> = config
             .workers
             .iter()
-            .map(|entry| Machine {
-                entry: entry.clone(),
-                address: machine_address(&validator, entry),
-                digest: entry_digest(entry),
+            .map(|entry| {
+                Ok(Machine {
+                    entry: entry.clone(),
+                    address: machine_address(&validator, entry),
+                    digest: entry_digest(entry),
+                    probe_layer: probe_layer_for_residency(
+                        &entry.resident_layers,
+                        model.layers.len(),
+                    )?,
+                })
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         let coordinator_macs_per_s = local_rate(&model, height)?;
         let epoch = height / EPOCH_HEIGHTS;
         let cohort = Arc::new_cyclic(|me| Self {
@@ -757,6 +812,7 @@ impl RowCohort {
             self.artifact,
             &worker,
             &entry.id,
+            self.machines[index].probe_layer,
             TensorKey::Wq,
             &seed,
         )?;
@@ -775,6 +831,7 @@ impl RowCohort {
     ) -> Measurement {
         let (model, artifact) = (self.model.as_ref(), self.artifact);
         let entry = &self.machines[index].entry;
+        let probe_layer = self.machines[index].probe_layer;
         let (worker, reconnected) = match self.open_worker(index, height) {
             Ok(opened) => opened,
             Err(error) => {
@@ -797,7 +854,15 @@ impl RowCohort {
                 break;
             }
             let seed = [height.to_le_bytes(), ping.to_le_bytes()].concat();
-            match zero_call(model, artifact, &worker, &entry.id, TensorKey::Wq, &seed) {
+            match zero_call(
+                model,
+                artifact,
+                &worker,
+                &entry.id,
+                probe_layer,
+                TensorKey::Wq,
+                &seed,
+            ) {
                 Ok(rtt_us) => {
                     rtts.push(rtt_us);
                     // No bytes: a ping says nothing about bandwidth.
@@ -818,8 +883,8 @@ impl RowCohort {
         // already costs.
         if let (Some(rtt), Some(narrow), Some(wide)) = (
             rtt,
-            model_projection_weights(model, Some(0), TensorKey::Wq),
-            model_projection_weights(model, Some(0), TensorKey::WDown),
+            model_projection_weights(model, Some(probe_layer), TensorKey::Wq),
+            model_projection_weights(model, Some(probe_layer), TensorKey::WDown),
         ) && wide.n_cols > narrow.n_cols
         {
             let mut wide_calls = Vec::new();
@@ -828,7 +893,15 @@ impl RowCohort {
                     break;
                 }
                 let seed = [height.to_le_bytes(), (u64::MAX - call).to_le_bytes()].concat();
-                match zero_call(model, artifact, &worker, &entry.id, TensorKey::WDown, &seed) {
+                match zero_call(
+                    model,
+                    artifact,
+                    &worker,
+                    &entry.id,
+                    probe_layer,
+                    TensorKey::WDown,
+                    &seed,
+                ) {
                     Ok(elapsed) => wide_calls.push(elapsed),
                     Err(_) => probes.push(failed_probe()),
                 }
@@ -872,7 +945,11 @@ impl RowCohort {
         height: u64,
         rtt: Option<u64>,
     ) -> Option<Result<u64, String>> {
-        let request = match material.request(&self.model, self.artifact, worker_id, height) {
+        let profile = match self.model.canonical_execution_profile() {
+            Some(profile) => profile,
+            None => return Some(Err("the model has no canonical profile".to_string())),
+        };
+        let request = match material.request(profile, self.artifact, worker_id, height) {
             Ok(request) => request,
             Err(error) => return Some(Err(error)),
         };
@@ -927,11 +1004,22 @@ impl RowCohort {
                     return;
                 };
                 let material = if marked.iter().any(|(_, challenge, _)| *challenge) {
-                    let prepared = challenge_material(&cohort.model, height);
+                    let layers: BTreeSet<usize> = marked
+                        .iter()
+                        .filter(|(_, challenge, _)| *challenge)
+                        .map(|(index, _, _)| cohort.machines[*index].probe_layer)
+                        .collect();
+                    let prepared = layers
+                        .into_iter()
+                        .map(|layer| {
+                            challenge_material(&cohort.model, layer, height)
+                                .map(|material| (layer, material))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, _>>();
                     cohort.books.lock().material_failed_at = prepared.is_err().then_some(height);
                     prepared
                         .map_err(|error| {
-                            tracing::warn!(%error, "could not prepare the row challenge; no machine is challenged this round");
+                            tracing::warn!(%error, "could not prepare resident-layer row challenges; no machine is challenged this round");
                         })
                         .ok()
                 } else {
@@ -940,7 +1028,12 @@ impl RowCohort {
                 std::thread::scope(|scope| {
                     for (index, challenge, guard) in marked {
                         let cohort = &cohort;
-                        let material = material.as_ref().filter(|_| challenge);
+                        let material = material
+                            .as_ref()
+                            .and_then(|materials| {
+                                materials.get(&cohort.machines[index].probe_layer)
+                            })
+                            .filter(|_| challenge);
                         let spawned = std::thread::Builder::new()
                             .name("arc-row-machine".into())
                             .spawn_scoped(scope, move || {
@@ -1532,6 +1625,48 @@ mod tests {
             bad.known_hosts = path.into();
             assert!(config(vec![bad]).validate().is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn probe_and_challenge_use_a_declared_nonzero_resident_layer() {
+        assert_eq!(probe_layer_for_residency(&[], 16).unwrap(), 0);
+        // Choose the lowest resident layer independent of declaration order.
+        assert_eq!(
+            probe_layer_for_residency(&[(8, 12), (4, 6)], 16).unwrap(),
+            4
+        );
+
+        let material = ChallengeMaterial {
+            layer: 7,
+            tensor: TensorKey::WGate,
+            rows: 2,
+            input: vec![0, 1],
+            expected: vec![0, 1],
+        };
+        let request = material
+            .request(
+                "canonical-profile",
+                arc_crypto::hash_bytes(b"artifact"),
+                "rack-7",
+                9,
+            )
+            .unwrap();
+        assert_eq!(request.assignment.layer, Some(7));
+        assert_eq!(request.assignment.execution_profile, "canonical-profile");
+        assert_eq!(request.assignment.worker_id, "rack-7");
+    }
+
+    #[test]
+    fn model_residency_validation_rejects_missing_or_invalid_ranges() {
+        assert!(probe_layer_for_residency(&[], 0).is_err());
+        assert!(probe_layer_for_residency(&[(3, 3)], 8).is_err());
+        assert!(probe_layer_for_residency(&[(6, 4)], 8).is_err());
+        assert!(probe_layer_for_residency(&[(4, 9)], 8).is_err());
+
+        let mut worker = entry("partial");
+        worker.resident_layers = vec![(4, 8)];
+        assert!(config(vec![worker.clone()]).validate_for_model(7).is_err());
+        assert!(config(vec![worker]).validate_for_model(8).is_ok());
     }
 
     #[test]
