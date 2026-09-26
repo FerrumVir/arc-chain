@@ -494,11 +494,30 @@ fn run() -> Result<()> {
         .context("no active validator in recovered state")?
         .0;
     state.authorize_native_migration(record.clone(), context.clone())?;
-    let (block, _) =
-        state.execute_block_adaptive_at(&[], producer, prev.header.timestamp.saturating_add(1))?;
+    let mut decision = blake3::Hasher::new_derive_key("ARC-offline-native-migration-decision-v1");
+    decision.update(recovery.domain_hash().as_ref());
+    decision.update(genesis_hash.as_ref());
+    decision.update(args.manifest.as_ref());
+    decision.update(&args.epoch.to_be_bytes());
+    decision.update(&args.validator_set_id.to_be_bytes());
+    decision.update(&activation_height.to_be_bytes());
+    decision.update(prev.hash.as_ref());
+    decision.update(prev.header.proof_hash.as_ref());
+    decision.update(commitment.as_ref());
+    let synthetic_decision = Hash256(*decision.finalize().as_bytes());
+    let (block, _) = state.execute_block_adaptive_at_with_proof(
+        &[],
+        producer,
+        prev.header.timestamp.saturating_add(1),
+        synthetic_decision,
+    )?;
     ensure!(
         block.header.height == activation_height && state.height() == activation_height,
         "activation did not execute at the exact target height"
+    );
+    ensure!(
+        block.header.proof_hash == synthetic_decision,
+        "activation block does not carry the derived synthetic decision proof"
     );
     ensure!(
         state.native_inference_context().as_ref() == Some(&context),
@@ -567,6 +586,15 @@ fn run() -> Result<()> {
         "activation root changed after reopen"
     );
     ensure!(
+        reopened
+            .get_block(activation_height)
+            .context("activation block missing after reopen")?
+            .header
+            .proof_hash
+            == synthetic_decision,
+        "synthetic decision proof changed after reopen"
+    );
+    ensure!(
         reopened.get_state_root() == activated_root,
         "computed root after reopen differs from activation root"
     );
@@ -600,6 +628,9 @@ fn run() -> Result<()> {
     println!("replayed height/root: {}/{}", args.height, args.root);
     println!("activation height/context commitment: {activation_height}/{commitment}");
     println!("activated block root after reopen: {activated_root}");
+    println!(
+        "synthetic offline decision proof: {synthetic_decision} (not DAG-certified; no quorum)"
+    );
     println!("pre-existing account digest: {before_account_digest}");
     println!(
         "pre-existing account and history digests preserved; input paths, contents, sizes, and descendant modes unchanged"
