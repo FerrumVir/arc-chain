@@ -78,7 +78,7 @@ impl GenesisConfig {
     /// Parse the exact account set that will be materialized into state.
     /// Network authentication and state initialization must share this input;
     /// neither may add an account derived from the local signing identity.
-    fn validated_accounts(&self) -> Result<Vec<(Hash256, u64)>> {
+    pub fn validated_accounts(&self) -> Result<Vec<(Hash256, u64)>> {
         let mut seen = HashSet::new();
         let mut accounts = Vec::with_capacity(self.accounts.len());
         for (index, account) in self.accounts.iter().enumerate() {

@@ -5,6 +5,9 @@ pub mod block_stm;
 pub mod build_identity;
 pub mod chunk_cache;
 pub mod coalesce;
+// Offline qualification tools reuse the node's validated genesis/identity
+// parsing instead of maintaining another interpretation of chain identity.
+pub mod config;
 pub mod consensus;
 pub mod consensus_diagnostics;
 pub mod inference_validator;
@@ -19,6 +22,7 @@ pub mod rpc;
 pub mod state_sync;
 #[cfg(unix)]
 mod unix_listener;
+pub mod validator_identity;
 pub mod vrf;
 
 /// The live validator set — `(address, stake)` — shared between the consensus
