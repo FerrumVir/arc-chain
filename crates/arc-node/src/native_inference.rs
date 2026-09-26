@@ -3176,6 +3176,85 @@ mod tests {
         // this validator-scoped anti-equivocation store.
         assert!(s.persist_signed(bad, &j).is_err());
     }
+
+    #[test]
+    fn concurrent_conflicting_decisions_leave_one_durable_winner() {
+        let dir = tempdir().unwrap();
+        let key = KeyPair::generate_ed25519();
+        let j = job();
+        let make_vote = |token: u32| StoredVote {
+            request_id: j.request_id,
+            output_hash: token_hash(&[token]),
+            tokens: vec![token],
+            vote: sign_vote(j.request_id, &token_bytes(&[token]), &key).unwrap(),
+        };
+        let votes = [make_vote(11), make_vote(22)];
+        let store = DecisionStore::open(dir.path(), key.address(), j.genesis, j.context).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(votes.len() + 1));
+        let workers = votes
+            .iter()
+            .cloned()
+            .map(|vote| {
+                let store = store.clone();
+                let j = j.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.persist_signed(vote, &j)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(NativeInferenceError::Equivocation)))
+                .count(),
+            1
+        );
+
+        let winner = store.load(j.context, j.request_id).unwrap().unwrap();
+        assert!(votes.iter().any(|vote| {
+            vote.output_hash == winner.output_hash && vote.tokens == winner.tokens
+        }));
+        assert_eq!(
+            fs::read(store.path(j.context, j.request_id)).unwrap(),
+            bincode::serialize(&winner).unwrap(),
+            "the durable record must be exactly one of the two conflicting winners"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rebarrier_refuses_mismatched_winner_without_mutating_it() {
+        let dir = tempdir().unwrap();
+        let key = KeyPair::generate_ed25519();
+        let j = job();
+        let vote = StoredVote {
+            request_id: j.request_id,
+            output_hash: token_hash(&[31]),
+            tokens: vec![31],
+            vote: sign_vote(j.request_id, &token_bytes(&[31]), &key).unwrap(),
+        };
+        let store = DecisionStore::open(dir.path(), key.address(), j.genesis, j.context).unwrap();
+        store.persist_signed(vote, &j).unwrap();
+
+        let path = store.path(j.context, j.request_id);
+        let before = fs::read(&path).unwrap();
+        let mut mismatched = store.load(j.context, j.request_id).unwrap().unwrap();
+        mismatched.output_hash = token_hash(&[99]);
+        assert!(matches!(
+            store.sync_published(j.context, j.request_id, &mismatched),
+            Err(NativeInferenceError::Equivocation)
+        ));
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
     /// The store is opened with the binding in force at startup. After a
     /// binding update the jobs the chain hands this worker name a different
     /// one, and a store that refused them left every validator unable to sign
