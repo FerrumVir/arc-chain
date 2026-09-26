@@ -1711,7 +1711,12 @@ pub fn attestations_per_day_observed(
 /// Scans back at most `SELF_PRODUCED_SCAN_BLOCKS` and returns the first block
 /// found, so the reported height/hash/timestamp always describe a real block.
 fn latest_available_block(node: &NodeState) -> Option<Block> {
-    let h = node.state.height();
+    latest_available_block_at(node, node.state.height())
+}
+
+/// Select the newest extant block at or below the observed height. Keeping
+/// the bound explicit makes the reserved-height window deterministic to test.
+fn latest_available_block_at(node: &NodeState, h: u64) -> Option<Block> {
     let floor = h.saturating_sub(SELF_PRODUCED_SCAN_BLOCKS);
     let mut i = h;
     loop {
@@ -2740,12 +2745,14 @@ async fn chain_info(AxumState(node): AxumState<NodeState>) -> Json<ChainInfoResp
 async fn get_latest_block(
     AxumState(node): AxumState<NodeState>,
 ) -> Result<Json<Block>, StatusCode> {
-    let height = node.state.height();
-    if height == 0 {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    node.state
-        .get_block(height)
+    latest_block_at(&node, node.state.height())
+}
+
+fn latest_block_at(node: &NodeState, observed_height: u64) -> Result<Json<Block>, StatusCode> {
+    latest_available_block_at(node, observed_height)
+        // Preserve the endpoint's existing contract: the genesis block is
+        // not exposed as a produced "latest" block.
+        .filter(|block| block.header.height != 0)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -26117,6 +26124,36 @@ mod tests {
             Some(true),
             "a node with no readable block must never report the chain as advancing"
         );
+    }
+
+    #[tokio::test]
+    async fn latest_block_returns_newest_available_block_below_reserved_height() {
+        let mut node = fake_node_with_workers(Vec::new());
+        node.state = Arc::new(arc_state::StateDB::with_genesis(&[]));
+
+        // Genesis is intentionally not exposed as a produced latest block.
+        assert!(matches!(
+            get_latest_block(AxumState(node.clone())).await,
+            Err(StatusCode::NOT_FOUND)
+        ));
+
+        let (block, _) = node.state.execute_block(&[], Hash256([33; 32])).unwrap();
+        let reserved_height = node.state.height() + 1;
+
+        // This reproduces the API's observable race without timing: the state
+        // counter has reserved the next height, while the preceding block is
+        // present and can be served by the explicit-height endpoint.
+        let Json(reserved_latest) = latest_block_at(&node, reserved_height).unwrap();
+        assert_eq!(reserved_latest.hash, block.hash);
+
+        let Json(latest) = get_latest_block(AxumState(node)).await.unwrap();
+        assert_eq!(latest.hash, block.hash);
+
+        let empty = fake_node_with_workers(Vec::new());
+        assert!(matches!(
+            get_latest_block(AxumState(empty)).await,
+            Err(StatusCode::NOT_FOUND)
+        ));
     }
 
     /// Both directions of the status mapping, including the one a stake-0
