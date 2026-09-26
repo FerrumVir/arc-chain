@@ -3431,8 +3431,54 @@ impl StateDB {
         Ok(())
     }
 
-    fn apply_verified_recovery_wal(&self, entries: &[crate::WalEntry]) -> Result<(), StateError> {
+    /// Replay privately during startup, checking every block/checkpoint root.
+    /// Return the number of full root computations so tests can bound the
+    /// work without relying on wall-clock timing. This cache never escapes
+    /// replay and cannot affect projected roots used by native settlement.
+    fn apply_verified_recovery_wal(&self, entries: &[crate::WalEntry]) -> Result<usize, StateError> {
+        let mut verified_root = None;
+        let mut root_computations = 0;
         for entry in entries {
+            // Keep this exhaustive alongside apply_wal_op and
+            // consensus_state_root_from_sections. Historical records do not
+            // change that root. The two metadata records emitted for every
+            // block can preserve it only when their entire effect is a no-op.
+            let changes_root = match &entry.op {
+                WalOp::SetValidatorState(validators, staking_pool) => {
+                    *staking_pool != self.staking_pool.load(Ordering::Acquire)
+                        || validators.len() != self.validators.len()
+                        // Require unique sorted keys before using the fast
+                        // comparison: duplicate rows can omit a current key
+                        // even when lengths and every supplied stake match.
+                        || !validators.windows(2).all(|pair| pair[0].0.0 < pair[1].0.0)
+                        || validators.iter().any(|(address, stake)| {
+                            self.validators.get(&address.0).as_deref() != Some(stake)
+                        })
+                }
+                WalOp::SetRecoveryContext(context, activation_height) => {
+                    self.recovery_context().as_ref() != Some(context)
+                        || self.community_rewards_v1_activation_height() != *activation_height
+                }
+                WalOp::SetAccount(..)
+                | WalOp::SetStorage(..)
+                | WalOp::DeleteStorage(..)
+                | WalOp::SetContract(..)
+                | WalOp::SetIdentity(..)
+                | WalOp::InferenceTransition(..)
+                | WalOp::Rebase(..) => true,
+                WalOp::SetBlock(..)
+                | WalOp::SetReceipt(..)
+                | WalOp::SetAgent(..)
+                | WalOp::SetDagBlock(..)
+                | WalOp::SetDagRound(..)
+                | WalOp::CommitDagBlock(..)
+                | WalOp::SetFullTransaction(..)
+                | WalOp::SetEventLogs(..)
+                | WalOp::Checkpoint(..) => false,
+            };
+            if changes_root {
+                verified_root = None;
+            }
             self.apply_wal_op(&entry.op);
             let WalOp::Checkpoint(expected_root) = &entry.op else {
                 continue;
@@ -3449,7 +3495,10 @@ impl StateDB {
                     entry.block_height, block.header.state_root, expected_root
                 )));
             }
-            let actual_root = self.compute_state_root();
+            let actual_root = *verified_root.get_or_insert_with(|| {
+                root_computations += 1;
+                self.compute_state_root()
+            });
             if actual_root != *expected_root {
                 return Err(StateError::PersistenceError(format!(
                     "post-recovery WAL state root mismatch at checkpoint height {}: checkpoint {}, replayed {}",
@@ -3457,7 +3506,7 @@ impl StateDB {
                 )));
             }
         }
-        Ok(())
+        Ok(root_computations)
     }
 
     fn verify_recovery_restart(
@@ -5355,6 +5404,136 @@ mod tests {
         assert_eq!(quarantines.len(), 1);
         assert_eq!(fs::read(&quarantines[0]).unwrap(), original);
 
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_replay_reuses_roots_but_checks_every_checkpoint() {
+        let (state, checkpoint, keys, _, source_dir, active_dir) =
+            persistent_recovery_fixture("cached-replay-checkpoints");
+        for step in 1..=16 {
+            commit_empty_recovery_block(
+                &state,
+                keys[0].address(),
+                1_787_777_000_000 + step,
+                &step.to_le_bytes(),
+            );
+        }
+        state.wal.sync().unwrap();
+        let mut entries = read_repairable_wal_prefix(&active_dir.join("state.wal"))
+            .unwrap()
+            .entries;
+        let replayed = StateDB::new();
+        replayed.install_verified_checkpoint(&checkpoint).unwrap();
+        assert_eq!(
+            replayed.apply_verified_recovery_wal(&entries).unwrap(),
+            1,
+            "unchanged metadata emitted by actual block persistence must not rehash the full state"
+        );
+        assert_eq!(replayed.height(), state.height());
+        assert_eq!(replayed.get_state_root(), state.get_state_root());
+
+        // Exercise the decoded-entry checker with a bad intermediate root
+        // after its cache is warm. Physical WAL checksum validation is a
+        // separate layer; the existing restart regression covers that path.
+        let bad_height = checkpoint.manifest.source_height + 9;
+        let bad_root = hash_bytes(b"cached-replay-bad-intermediate-root");
+        for entry in &mut entries {
+            if entry.block_height != bad_height {
+                continue;
+            }
+            match &mut entry.op {
+                WalOp::SetBlock(_, block) => {
+                    let mut header = block.header.clone();
+                    header.state_root = bad_root;
+                    *block = Block::new(header, block.tx_hashes.clone());
+                }
+                WalOp::Checkpoint(root) => *root = bad_root,
+                _ => {}
+            }
+        }
+        let rejected = StateDB::new();
+        rejected.install_verified_checkpoint(&checkpoint).unwrap();
+        let error = rejected.apply_verified_recovery_wal(&entries).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "state root mismatch at checkpoint height {bad_height}"
+            )),
+            "{error}"
+        );
+        drop(state);
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_replay_invalidates_changed_state_and_duplicate_validator_rows() {
+        let (state, checkpoint, keys, _, source_dir, active_dir) =
+            persistent_recovery_fixture("cached-replay-state-changes");
+        let target = checkpoint.payload.accounts[0].0;
+        let mut account = state.get_account(&target).unwrap();
+        account.balance += 1;
+        let storage_key = hash_bytes(b"cached-replay-storage");
+        let mut validators: Vec<_> = state
+            .validators
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), *entry.value()))
+            .collect();
+        validators.sort_by_key(|entry| entry.0.0);
+        let pool = state.staking_pool.load(Ordering::Acquire);
+        let mut duplicates = validators.clone();
+        // Same row count and individually matching stakes, but applying this
+        // removes one current validator. A length-and-values check alone
+        // would incorrectly retain the old root.
+        duplicates[1] = duplicates[0];
+        let mut context = state.recovery_context().unwrap();
+        context.validator_set_id += 1;
+        let changes = vec![
+            WalOp::SetAccount(target, account),
+            WalOp::SetStorage(target, storage_key, b"stored".to_vec()),
+            WalOp::DeleteStorage(target, storage_key),
+            WalOp::SetContract(target, b"contract".to_vec()),
+            WalOp::SetIdentity(
+                target,
+                Identity {
+                    address: target,
+                    level: arc_types::identity::IdentityLevel::Basic,
+                    attestor: keys[0].address(),
+                    proof_hash: hash_bytes(b"cached-replay-identity"),
+                    country_code: *b"US",
+                    attested_at: 1,
+                    expires_at: 0,
+                },
+            ),
+            WalOp::SetValidatorState(duplicates, pool),
+            WalOp::SetValidatorState(validators, pool + 1),
+            WalOp::SetRecoveryContext(context, Some(300)),
+        ];
+        commit_empty_recovery_block(&state, keys[0].address(), 1_787_777_001_000, b"initial");
+        for (index, op) in changes.iter().enumerate() {
+            state.apply_wal_op(op);
+            state.wal.append(op.clone(), state.height() + 1);
+            commit_empty_recovery_block(
+                &state,
+                keys[0].address(),
+                1_787_777_002_000 + index as u64,
+                &index.to_le_bytes(),
+            );
+        }
+        state.wal.sync().unwrap();
+        let entries = read_repairable_wal_prefix(&active_dir.join("state.wal"))
+            .unwrap()
+            .entries;
+        let replayed = StateDB::new();
+        replayed.install_verified_checkpoint(&checkpoint).unwrap();
+        assert_eq!(
+            replayed.apply_verified_recovery_wal(&entries).unwrap(),
+            changes.len() + 1
+        );
+        assert_eq!(replayed.height(), state.height());
+        assert_eq!(replayed.get_state_root(), state.get_state_root());
+        drop(state);
         fs::remove_dir_all(source_dir).unwrap();
         fs::remove_dir_all(active_dir).unwrap();
     }
