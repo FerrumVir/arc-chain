@@ -14,16 +14,25 @@ use arc_inference::cached_integer_model::{CachedIntegerModel, KVCache};
 use arc_inference::canonical_simd;
 use std::time::Instant;
 
-fn max_rss_bytes() -> u64 {
-    // SAFETY: getrusage with a zeroed, correctly sized out-parameter.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn max_rss_bytes() -> Option<u64> {
+    // SAFETY: getrusage receives a zeroed, correctly sized out-parameter.
     unsafe {
         let mut u: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut u) == 0 {
-            u.ru_maxrss as u64 // bytes on macOS
-        } else {
-            0
+        if libc::getrusage(libc::RUSAGE_SELF, &mut u) != 0 {
+            return None;
         }
+        #[cfg(target_os = "macos")]
+        let bytes = u.ru_maxrss as u64;
+        #[cfg(target_os = "linux")]
+        let bytes = (u.ru_maxrss as u64).saturating_mul(1024);
+        Some(bytes)
     }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn max_rss_bytes() -> Option<u64> {
+    None
 }
 
 fn run(model: &CachedIntegerModel, tokens: &[u32]) -> (Vec<Vec<i64>>, Vec<f64>) {
