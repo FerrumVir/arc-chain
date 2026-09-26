@@ -1,4 +1,4 @@
-//! Bit-exact vectorised canonical INT8 projection (ARM64 NEON `dotprod`).
+//! Bit-exact vectorised canonical INT8 projection (ARM64 NEON / x86-64 AVX2).
 //!
 //! This module does **not** define a new arithmetic profile. It computes the
 //! same integer value as the scalar kernel for every input it accepts, and
@@ -53,8 +53,9 @@
 //!   sum_j w_j * x_j = sum_{i<4} 256^i * (sum_j w_j * c_i[j])
 //! ```
 //!
-//! Each inner sum is an i8 x i8 dot product, which `sdot` computes four lanes
-//! at a time with exact i32 accumulation.
+//! Each inner sum is an i8 x i8 dot product. ARM `sdot` computes four-byte
+//! groups; AVX2 sign-extends to i16 and uses non-saturating i16 products with
+//! i32 accumulation. Neither backend requantizes or changes the operands.
 //!
 //! # Derived domain (not assumed)
 //!
@@ -73,11 +74,11 @@
 //! `Desktop/Arc Chain V2/claude-reviews/stage-b-kernel-conformance.c`.
 
 use crate::cached_integer_model::{I8Weights, I8WeightsView};
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::integer_lut::FRAC_BITS;
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use rayon::prelude::*;
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -118,7 +119,7 @@ static FAST_KERNEL: AtomicBool = AtomicBool::new(false);
 /// Why a projection declined the vectorised path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// No `dotprod` on this build/CPU.
+    /// No supported exact vector backend on this build/CPU.
     Unavailable,
     /// Shape, length or scale-vector mismatch.
     Shape,
@@ -200,7 +201,7 @@ fn record_attempt() {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn record_accept() {
     if CENSUS_ON.load(Ordering::Relaxed) {
@@ -223,7 +224,7 @@ fn record_refusal(reason: Refusal) -> bool {
     false
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 thread_local! {
     /// Reused digit scratch. The digits depend only on the activation, so they
     /// are computed once per projection and read by every row. Allocating this
@@ -256,12 +257,18 @@ pub fn fast_canonical_kernel_enabled() -> bool {
 }
 
 /// Whether this build and CPU can run the vectorised path at all.
+/// The historical name is retained for callers: x86-64 requires AVX2,
+/// whereas ARM64 requires NEON dotprod. The opt-in still defaults to off.
 pub fn dotprod_available() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         std::arch::is_aarch64_feature_detected!("dotprod")
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         false
     }
@@ -398,7 +405,7 @@ unsafe fn dot_limbs_dotprod(row: *const i8, limbs: &[i8], len: usize, used: usiz
 /// row, using `dot_bound = 128 * sum|x_j| >= |acc|` as the accumulator bound.
 /// This mirrors the guard in `matmul_i8_canonical_rows`, which the ordinary
 /// forward path does **not** pass through.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn post_scale_bound_holds(input: &[i64], scales: &[i64]) -> bool {
     let Some(input_abs_sum) = input
         .iter()
@@ -421,14 +428,14 @@ fn post_scale_bound_holds(input: &[i64], scales: &[i64]) -> bool {
 /// Needed because the batched output is token-major (`out[t * n_rows + i]`), so
 /// one task's elements are strided and cannot be expressed as a `&mut` slice
 /// chunk. Disjointness is guaranteed by the row-block decomposition.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct SendPtr(*mut i64);
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 unsafe impl Send for SendPtr {}
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 unsafe impl Sync for SendPtr {}
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 impl SendPtr {
     /// Accessor rather than a public field: edition-2021 closures capture
     /// individual fields, so `p.0` inside a rayon closure would capture the
@@ -490,6 +497,75 @@ unsafe fn dot_limbs_x4(
     }
 }
 
+/// Exact signed-byte products on AVX2. Sign extension avoids the saturating
+/// unsigned-byte multiply/add instruction, which is not exact for this domain.
+///
+/// # Safety
+/// AVX2 must be available. `row` holds `len` bytes, each plane pointer holds
+/// `LIMB_COUNT * len` bytes, `used <= LIMB_COUNT`, and
+/// `len <= MAX_COLS_FOR_I32`. Every full load is bounded by `j + 16 <= len`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_limbs_avx2<const N: usize>(
+    row: *const i8,
+    planes: &[*const i8; N],
+    len: usize,
+    used: usize,
+) -> [i64; N] {
+    // SAFETY: all memory accesses follow the caller's bounds above. Products
+    // are exact i16*i16->i32, and the same proven i32 sum bound as ARM applies.
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut total = [0i64; N];
+        for limb in 0..used {
+            let mut accumulators = [_mm256_setzero_si256(); N];
+            let mut j = 0usize;
+            while j + 16 <= len {
+                let weights = _mm256_cvtepi8_epi16(_mm_loadu_si128(row.add(j).cast()));
+                for q in 0..N {
+                    let digits =
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(planes[q].add(limb * len + j).cast()));
+                    accumulators[q] =
+                        _mm256_add_epi32(accumulators[q], _mm256_madd_epi16(weights, digits));
+                }
+                j += 16;
+            }
+            for q in 0..N {
+                let mut lanes = [0i32; 8];
+                _mm256_storeu_si256(lanes.as_mut_ptr().cast(), accumulators[q]);
+                let mut partial: i64 = lanes.iter().map(|&lane| i64::from(lane)).sum();
+                for tail in j..len {
+                    partial +=
+                        i64::from(*row.add(tail)) * i64::from(*planes[q].add(limb * len + tail));
+                }
+                total[q] += partial * (1i64 << (8 * limb));
+            }
+        }
+        total
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_limbs_dotprod(row: *const i8, limbs: &[i8], len: usize, used: usize) -> i64 {
+    // SAFETY: this wrapper has the same bounds as dot_limbs_avx2; the caller
+    // has validated the row and the complete digit scratch before dispatch.
+    unsafe { dot_limbs_avx2(row, &[limbs.as_ptr()], len, used)[0] }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_limbs_x4(
+    row: *const i8,
+    planes: &[*const i8; 4],
+    len: usize,
+    used: usize,
+) -> [i64; 4] {
+    // SAFETY: the batched caller validates every plane and owns distinct
+    // output rows. Repeated plane pointers for a short final batch are reads.
+    unsafe { dot_limbs_avx2(row, planes, len, used) }
+}
+
 /// Vectorised canonical row projection.
 ///
 /// Returns `true` if it computed `output` exactly, `false` if it refused; on
@@ -511,13 +587,13 @@ pub(crate) fn matmul_i8_canonical_rows_fast_view(
     in_size: usize,
     output: &mut [i64],
 ) -> bool {
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = (weights, input, in_size, output);
         record_attempt();
         record_refusal(Refusal::Unavailable)
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
         record_attempt();
         if !dotprod_available() {
@@ -602,13 +678,13 @@ pub fn matmul_i8_batched_fast(
     in_size: usize,
     output: &mut [i64],
 ) -> bool {
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = (weights, inputs, n_tokens, in_size, output);
         record_attempt();
         record_refusal(Refusal::Unavailable)
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
         record_attempt();
         if !dotprod_available() {
@@ -877,6 +953,64 @@ mod tests {
             "K one over the derived i32 bound must be refused"
         );
         assert_eq!(out[0], 0, "a refused call must not write output");
+    }
+
+    #[test]
+    fn exact_vector_backend_handles_the_maximum_inner_dimension() {
+        let _guard = kernel_switch_guard();
+        if !dotprod_available() {
+            return;
+        }
+        let cols = MAX_COLS_FOR_I32;
+        let w = weights_from(1, cols, |_, _| -128);
+        let input = vec![LIMB_MIN; cols];
+        let mut output = vec![0; 1];
+        assert!(matmul_i8_canonical_rows_fast(&w, &input, cols, &mut output));
+        assert_eq!(output[0], scalar_dot(&w.data, &input) >> FRAC_BITS);
+    }
+
+    #[test]
+    fn exact_batched_backend_matches_scalar_across_short_quads_and_tails() {
+        let _guard = kernel_switch_guard();
+        if !dotprod_available() {
+            return;
+        }
+        for cols in [1, 15, 16, 17, 33, 4096] {
+            let rows = 5;
+            let w = weights_from(rows, cols, |r, c| (r * 73 + c * 19) as u8 as i8);
+            for tokens in [1, 2, 3, 4, 5, 7] {
+                let inputs: Vec<i64> = (0..tokens * cols)
+                    .map(|i| match (i / cols + i % cols) % 5 {
+                        0 => LIMB_MIN,
+                        1 => LIMB_MAX,
+                        2 => -129,
+                        3 => 1,
+                        _ => 65536,
+                    })
+                    .collect();
+                let mut output = vec![0; tokens * rows];
+                assert!(matmul_i8_batched_fast(
+                    &w,
+                    &inputs,
+                    tokens,
+                    cols,
+                    &mut output
+                ));
+                for token in 0..tokens {
+                    for row in 0..rows {
+                        let dot = scalar_dot(
+                            &w.data[row * cols..(row + 1) * cols],
+                            &inputs[token * cols..(token + 1) * cols],
+                        );
+                        assert_eq!(
+                            output[token * rows + row],
+                            (dot * w.scales[row]) >> FRAC_BITS,
+                            "cols={cols}, tokens={tokens}, token={token}, row={row}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Weights whose scale vector is chosen relative to a known `dot_bound`.

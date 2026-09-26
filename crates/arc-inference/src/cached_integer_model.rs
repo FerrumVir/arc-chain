@@ -6530,12 +6530,19 @@ mod tests {
         // The exact trigger from the review: valid public 1x1 weights, a
         // one-element input, and an EMPTY output slice. Must panic, not write
         // through the empty slice's pointer.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
         let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
         crate::canonical_simd::set_fast_canonical_kernel(false);
         let w = w1x1();
         let mut out: [i64; 0] = [];
-        matmul_i8_into_batched(&w, &[1i64], 1, 1, &mut out);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matmul_i8_into_batched(&w, &[1i64], 1, 1, &mut out);
+        }));
         crate::canonical_simd::set_fast_canonical_kernel(prev);
+        match result {
+            Err(error) => std::panic::resume_unwind(error),
+            Ok(()) => panic!("expected a panic but the call returned"),
+        }
     }
 
     #[test]
@@ -6570,6 +6577,7 @@ mod tests {
     #[test]
     fn batched_matmul_still_computes_the_documented_result() {
         // Validation must not have changed any accepted result.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
         let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
         crate::canonical_simd::set_fast_canonical_kernel(false);
         let w = I8Weights::quantize_f32(&vec![0.05f32; 6 * 3], 6, 3);
