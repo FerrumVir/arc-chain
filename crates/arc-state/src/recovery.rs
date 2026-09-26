@@ -3364,6 +3364,7 @@ impl StateDB {
         state.apply_verified_recovery_wal(&wal_plan.entries)?;
         state.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
         state.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
+        state.restore_native_inference_context()?;
         Ok(state)
     }
 
@@ -3891,6 +3892,94 @@ mod tests {
             .accounts
             .push((address, Account::new(address, 1)));
         assert!(checkpoint.payload.validate_canonical().is_err());
+    }
+
+    #[test]
+    fn prepared_recovery_restart_restores_rooted_native_migration_and_context() {
+        let (checkpoint, _, policy) = checkpoint();
+        let directory = temp_dir("prepared-recovery-native-restore");
+        let checkpoint_path = directory.join("candidate.arcchkpt");
+        checkpoint.write_to(&checkpoint_path).unwrap();
+        let active_dir = directory.join("active");
+        let approved_manifest_hash = checkpoint.manifest_hash();
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy.clone(),
+            Some(RecoveryImport {
+                checkpoint_path,
+                approved_manifest_hash,
+            }),
+        )
+        .unwrap();
+
+        let members: Vec<_> = checkpoint
+            .manifest
+            .validators
+            .iter()
+            .map(|validator| arc_types::inference_contract::ValidatorMember {
+                address: validator.address,
+                stake: validator.stake,
+            })
+            .collect();
+        let context = crate::InferenceAdmissionContext {
+            domain: arc_types::inference_contract::InferenceDomain {
+                chain_genesis: policy.genesis_hash,
+                recovery_epoch: policy.recovery_epoch,
+                validator_set_hash: arc_types::inference_contract::validator_set_commitment(
+                    &members,
+                )
+                .unwrap(),
+            },
+            members,
+            allowed_executions: vec![crate::AllowedExecution {
+                model_hash: hash_bytes(b"prepared-recovery-native-model"),
+                profile_hash: hash_bytes(b"prepared-recovery-native-profile"),
+                generation_hash: hash_bytes(b"prepared-recovery-native-generation"),
+                assignment_hash: hash_bytes(b"prepared-recovery-native-assignment"),
+            }],
+            selection_rule: crate::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        let record = crate::NativeMigrationRecord {
+            chain_genesis: policy.genesis_hash,
+            recovery_epoch: policy.recovery_epoch,
+            validator_set_id: policy.validator_set_id,
+            activation_height: state.height() + 1,
+            context_commitment: context.commitment().unwrap(),
+        };
+        state
+            .authorize_native_migration(record.clone(), context.clone())
+            .unwrap();
+        let producer = state.active_validators().first().unwrap().0;
+        let timestamp = state.get_block(state.height()).unwrap().header.timestamp + 1;
+        commit_empty_recovery_block(
+            &state,
+            producer,
+            timestamp,
+            b"prepared recovery native migration DAG decision at H+2",
+        );
+        assert_eq!(state.native_migration(), Some(record.clone()));
+        assert_eq!(state.native_inference_context(), Some(context.clone()));
+        state.try_sync_wal().unwrap();
+        drop(state);
+
+        let namespace_lock =
+            arc_crypto::secret_file::acquire_private_directory_namespace_lock(&active_dir)
+                .unwrap()
+                .rebarrier_into_prepared()
+                .unwrap();
+        let reopened = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
+            &[],
+            &namespace_lock,
+            policy,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.height(), record.activation_height);
+        assert_eq!(reopened.native_migration(), Some(record));
+        assert_eq!(reopened.native_inference_context(), Some(context));
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn temp_dir(label: &str) -> PathBuf {
