@@ -9,7 +9,7 @@ use arc_types::*;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State as AxumState},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     routing::{get, post},
 };
 use dashmap::mapref::entry::Entry;
@@ -8669,6 +8669,68 @@ struct ForwardShardResponse {
     signature: arc_crypto::Signature,
 }
 
+/// Optional, unsigned diagnostics carried in HTTP headers so the JSON response
+/// and its v3 signed transcript remain byte-for-byte schema compatible.
+/// Older coordinators ignore these headers; newer coordinators treat absent or
+/// malformed values from older peers as unavailable telemetry.
+const SHARD_TIMING_SCHEMA_HEADER: &str = "x-arc-shard-timing-schema";
+const SHARD_TIMING_BLOCKING_QUEUE_HEADER: &str = "x-arc-shard-spawn-blocking-queue-us";
+const SHARD_TIMING_POOL_QUEUE_HEADER: &str = "x-arc-shard-compute-pool-queue-us";
+const SHARD_TIMING_KV_WAIT_HEADER: &str = "x-arc-shard-kv-mutex-wait-us";
+const SHARD_TIMING_FORWARD_HEADER: &str = "x-arc-shard-forward-us";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ShardTimingBreakdown {
+    spawn_blocking_queue_us: u64,
+    compute_pool_queue_us: u64,
+    kv_mutex_wait_us: u64,
+    forward_us: u64,
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u64::MAX as u128) as u64
+}
+
+fn shard_timing_headers(timing: ShardTimingBreakdown) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("1"));
+    for (name, value) in [
+        (SHARD_TIMING_BLOCKING_QUEUE_HEADER, timing.spawn_blocking_queue_us),
+        (SHARD_TIMING_POOL_QUEUE_HEADER, timing.compute_pool_queue_us),
+        (SHARD_TIMING_KV_WAIT_HEADER, timing.kv_mutex_wait_us),
+        (SHARD_TIMING_FORWARD_HEADER, timing.forward_us),
+    ] {
+        headers.insert(
+            name,
+            value
+                .to_string()
+                .parse()
+                .expect("decimal shard timing is a valid HTTP header value"),
+        );
+    }
+    headers
+}
+
+fn parse_shard_timing_headers(headers: &HeaderMap) -> Option<ShardTimingBreakdown> {
+    if headers.get(SHARD_TIMING_SCHEMA_HEADER)?.as_bytes() != b"1" {
+        return None;
+    }
+    let parse_us = |name: &str| {
+        headers
+            .get(name)?
+            .to_str()
+            .ok()?
+            .parse::<u64>()
+            .ok()
+    };
+    Some(ShardTimingBreakdown {
+        spawn_blocking_queue_us: parse_us(SHARD_TIMING_BLOCKING_QUEUE_HEADER)?,
+        compute_pool_queue_us: parse_us(SHARD_TIMING_POOL_QUEUE_HEADER)?,
+        kv_mutex_wait_us: parse_us(SHARD_TIMING_KV_WAIT_HEADER)?,
+        forward_us: parse_us(SHARD_TIMING_FORWARD_HEADER)?,
+    })
+}
+
 /// Domain-separated transcript signed by a shard holder for every response.
 /// Authentication covers the request as well as the result, preventing a
 /// valid response from a different prompt/position/range from being replayed.
@@ -8968,7 +9030,7 @@ async fn inference_cache_check(
 async fn inference_forward_shard(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<ValidatorForwardShardRequest>>,
-) -> Result<Json<ForwardShardResponse>, (StatusCode, String)> {
+) -> Result<(HeaderMap, Json<ForwardShardResponse>), (StatusCode, String)> {
     let payload = authenticate_community_request(&node, FORWARD_SHARD_PATH, signed)?;
     let signer = parse_hash256_hex(&payload.validator_id, "validator_id")
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
@@ -9190,7 +9252,7 @@ async fn inference_forward_shard_authenticated(
     node: NodeState,
     req: ForwardShardRequest,
     signer: Hash256,
-) -> Result<Json<ForwardShardResponse>, (StatusCode, String)> {
+) -> Result<(HeaderMap, Json<ForwardShardResponse>), (StatusCode, String)> {
     if req.request_id.is_empty() || req.request_id.len() > VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -9426,27 +9488,46 @@ async fn inference_forward_shard_authenticated(
     };
     // Move both ownership guards into the actual blocking job. Dropping an HTTP
     // waiter does not cancel an already-running `spawn_blocking` closure.
-    let (result, compute_lease) =
+    let spawn_blocking_queued_at = Instant::now();
+    let ((result, timing), compute_lease) =
         spawn_blocking_with_shard_compute_lease(compute_lease, move || {
-            install_on_compute_pool(&pool_node, move || {
+            let spawn_blocking_queue_us = elapsed_micros(spawn_blocking_queued_at);
+            let compute_pool_queued_at = Instant::now();
+            let (result, mut timing) = install_on_compute_pool(&pool_node, move || {
+                let compute_pool_queue_us = elapsed_micros(compute_pool_queued_at);
                 // The KV lock is taken INSIDE the pool job (a MutexGuard is
                 // not Send, so it cannot cross into the pool). Concurrent
                 // jobs for the same request_id serialize here; they cannot
                 // deadlock, because a queued job holds no lock and the
                 // holder is always a running job that will finish.
+                let kv_mutex_wait_started = Instant::now();
                 let mut cache = match cache_arc.lock() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                model_clone.forward_shard_token_with_history(
+                let kv_mutex_wait_us = elapsed_micros(kv_mutex_wait_started);
+                let forward_started = Instant::now();
+                let result = model_clone.forward_shard_token_with_history(
                     input,
                     &mut cache,
                     start_layer,
                     end_layer,
                     position,
                     &generated_tokens,
+                );
+                let forward_us = elapsed_micros(forward_started);
+                (
+                    result,
+                    ShardTimingBreakdown {
+                        spawn_blocking_queue_us: 0,
+                        compute_pool_queue_us,
+                        kv_mutex_wait_us,
+                        forward_us,
+                    },
                 )
-            })
+            });
+            timing.spawn_blocking_queue_us = spawn_blocking_queue_us;
+            (result, timing)
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?;
@@ -9539,7 +9620,10 @@ async fn inference_forward_shard_authenticated(
         )
     })?;
     cache_reservation.commit();
-    Ok(Json(response))
+    // Diagnostics stay outside the response body and signature transcript.
+    // Old coordinators ignore the extra headers; new coordinators accept their
+    // absence so rolling upgrades remain compatible.
+    Ok((shard_timing_headers(timing), Json(response)))
 }
 
 /// POST /inference/cleanup_shard
@@ -9771,7 +9855,7 @@ fn fanout_quorum_plan(
 type FanoutJoinSet = tokio::task::JoinSet<(
     ShardInfo,
     u64,
-    Result<(ForwardShardResponse, usize, usize), (String, bool)>,
+    Result<(ForwardShardResponse, usize, usize, Option<ShardTimingBreakdown>), (String, bool)>,
 )>;
 
 /// Cancel every unfinished fan-out task and synchronously observe its exit.
@@ -9792,6 +9876,7 @@ struct HopOutcome {
     served_by: String,
     compute_ms: u64,
     wall_ms: u64,
+    timing: Option<ShardTimingBreakdown>,
     layers_processed: u64,
     req_bytes: usize,
     resp_bytes: usize,
@@ -9809,6 +9894,78 @@ struct HopStats {
     layers: u64,
     is_terminal: bool,
     served_by: std::collections::BTreeMap<String, u64>,
+    timing: ShardTimingTotals,
+}
+
+#[derive(Default, Clone)]
+struct ShardTimingTotals {
+    samples: u64,
+    spawn_blocking_queue_us: u64,
+    compute_pool_queue_us: u64,
+    kv_mutex_wait_us: u64,
+    forward_us: u64,
+}
+
+impl ShardTimingTotals {
+    fn fold(&mut self, timing: Option<ShardTimingBreakdown>) {
+        let Some(timing) = timing else { return };
+        self.samples = self.samples.saturating_add(1);
+        self.spawn_blocking_queue_us = self
+            .spawn_blocking_queue_us
+            .saturating_add(timing.spawn_blocking_queue_us);
+        self.compute_pool_queue_us = self
+            .compute_pool_queue_us
+            .saturating_add(timing.compute_pool_queue_us);
+        self.kv_mutex_wait_us = self
+            .kv_mutex_wait_us
+            .saturating_add(timing.kv_mutex_wait_us);
+        self.forward_us = self.forward_us.saturating_add(timing.forward_us);
+    }
+}
+
+/// Aggregate instrumented shard samples across pipeline positions. These
+/// durations may overlap across hops, so this is explicitly a sum of samples,
+/// never an estimate of end-to-end request wall time.
+fn aggregate_shard_timing(stats: &[HopStats]) -> ShardTimingTotals {
+    let mut total = ShardTimingTotals::default();
+    for hop in stats {
+        total.samples = total.samples.saturating_add(hop.timing.samples);
+        total.spawn_blocking_queue_us = total
+            .spawn_blocking_queue_us
+            .saturating_add(hop.timing.spawn_blocking_queue_us);
+        total.compute_pool_queue_us = total
+            .compute_pool_queue_us
+            .saturating_add(hop.timing.compute_pool_queue_us);
+        total.kv_mutex_wait_us = total
+            .kv_mutex_wait_us
+            .saturating_add(hop.timing.kv_mutex_wait_us);
+        total.forward_us = total.forward_us.saturating_add(hop.timing.forward_us);
+    }
+    total
+}
+
+fn render_shard_timing_totals(totals: &ShardTimingTotals) -> Value {
+    if totals.samples == 0 {
+        return Value::Null;
+    }
+    let avg = |total: u64| total / totals.samples;
+    json!({
+        "sample_count": totals.samples,
+        "trust": "unsigned unauthenticated diagnostic",
+        "scope": "selected successful hop responses across hop positions; fanout attempts and older peers without headers are not all represented; component durations may overlap and are not request wall time",
+        "sum_us": {
+            "spawn_blocking_queue": totals.spawn_blocking_queue_us,
+            "compute_pool_queue": totals.compute_pool_queue_us,
+            "kv_mutex_wait": totals.kv_mutex_wait_us,
+            "forward": totals.forward_us,
+        },
+        "avg_per_sample_us": {
+            "spawn_blocking_queue": avg(totals.spawn_blocking_queue_us),
+            "compute_pool_queue": avg(totals.compute_pool_queue_us),
+            "kv_mutex_wait": avg(totals.kv_mutex_wait_us),
+            "forward": avg(totals.forward_us),
+        }
+    })
 }
 
 impl HopStats {
@@ -9821,6 +9978,7 @@ impl HopStats {
         self.layers = o.layers_processed;
         self.is_terminal |= o.is_terminal;
         *self.served_by.entry(o.served_by.clone()).or_insert(0) += 1;
+        self.timing.fold(o.timing);
     }
 }
 
@@ -10007,7 +10165,7 @@ async fn forward_shard_once(
     node: &NodeState,
     socket: &str,
     request: &ForwardShardRequest,
-) -> Result<(ForwardShardResponse, usize, usize), (String, bool)> {
+) -> Result<(ForwardShardResponse, usize, usize, Option<ShardTimingBreakdown>), (String, bool)> {
     let audience = resolve_shard_rpc_audience(node, socket)
         .await
         .map_err(|error| (error, false))?;
@@ -10042,6 +10200,7 @@ async fn forward_shard_once(
         .map_err(|e| (format!("send: {}", e), false))?;
 
     let status = resp.status();
+    let timing = parse_shard_timing_headers(resp.headers());
     let raw = read_forward_shard_body_limited(resp)
         .await
         .map_err(|error| (error, false))?;
@@ -10073,7 +10232,7 @@ async fn forward_shard_once(
             false,
         ));
     }
-    Ok((parsed, raw.len(), request_bytes))
+    Ok((parsed, raw.len(), request_bytes, timing))
 }
 
 /// Execute one pipeline hop under `strategy`.
@@ -10099,7 +10258,7 @@ async fn pipeline_hop(
                 let shard = replicas[0].clone();
                 let t_hop = std::time::Instant::now();
                 match forward_shard_once(node, &shard.socket_addr, req).await {
-                    Ok((resp, resp_bytes, req_bytes)) => {
+                    Ok((resp, resp_bytes, req_bytes, timing)) => {
                         let wall_ms = t_hop.elapsed().as_millis() as u64;
                         record_latency(&node.latency_stats, &shard.socket_addr, wall_ms);
                         return Ok(HopOutcome {
@@ -10110,6 +10269,7 @@ async fn pipeline_hop(
                             served_by: shard.node_name.clone(),
                             compute_ms: resp.compute_ms,
                             wall_ms,
+                            timing,
                             layers_processed: resp.layers_processed as u64,
                             req_bytes,
                             resp_bytes,
@@ -10188,8 +10348,14 @@ async fn pipeline_hop(
             // desktop sends) that made the latency-aware sort a complete no-op
             // and every hop paid the worst replica. Cost per hop goes from
             // max(k) to the k/2+1-th order statistic.
-            let mut returned: Vec<(ShardInfo, u64, ForwardShardResponse, usize, usize)> =
-                Vec::new();
+            let mut returned: Vec<(
+                ShardInfo,
+                u64,
+                ForwardShardResponse,
+                usize,
+                usize,
+                Option<ShardTimingBreakdown>,
+            )> = Vec::new();
             let mut tally: HashMap<FanoutVoteKey, Vec<usize>> = HashMap::new();
             let mut signer_votes: std::collections::HashSet<(FanoutVoteKey, Hash256)> =
                 std::collections::HashSet::new();
@@ -10206,12 +10372,12 @@ async fn pipeline_hop(
                     }
                 };
                 match out {
-                    Ok((resp, resp_bytes, request_bytes)) => {
+                    Ok((resp, resp_bytes, request_bytes, timing)) => {
                         record_latency(&node.latency_stats, &shard.socket_addr, wall_ms);
                         let vote_key = FanoutVoteKey::from_response(&resp);
                         let idx = returned.len();
                         let signer = resp.validator_address;
-                        returned.push((shard, wall_ms, resp, resp_bytes, request_bytes));
+                        returned.push((shard, wall_ms, resp, resp_bytes, request_bytes, timing));
                         if let Some(key) = vote_key
                             && let Some(reached) = record_fanout_vote(
                                 &mut tally,
@@ -10280,7 +10446,7 @@ async fn pipeline_hop(
             let vote = if want_vote {
                 let divergent: Vec<(String, String)> = returned
                     .iter()
-                    .filter_map(|(s, _, r, _, _)| {
+                    .filter_map(|(s, _, r, _, _, _)| {
                         let key = FanoutVoteKey::from_response(r);
                         fanout_divergence_evidence(majority_key.as_ref(), key.as_ref())
                             .map(|evidence| (s.node_name.clone(), evidence))
@@ -10292,7 +10458,7 @@ async fn pipeline_hop(
                     replicas_contacted: selected.iter().map(|s| s.node_name.clone()).collect(),
                     replicas_returned: returned
                         .iter()
-                        .map(|(s, _, _, _, _)| s.node_name.clone())
+                        .map(|(s, _, _, _, _, _)| s.node_name.clone())
                         .collect(),
                     majority_hash: majority_hash.clone(),
                     majority_token_id,
@@ -10334,7 +10500,7 @@ async fn pipeline_hop(
             }
 
             let request_bytes = returned.iter().map(|entry| entry.4).sum();
-            let (shard, wall_ms, resp, resp_bytes, _) = &returned[members[0]];
+            let (shard, wall_ms, resp, resp_bytes, _, timing) = &returned[members[0]];
             Ok(HopOutcome {
                 hidden: resp.hidden.clone(),
                 hidden_hash: resp.hidden_hash.clone(),
@@ -10343,6 +10509,7 @@ async fn pipeline_hop(
                 served_by: shard.node_name.clone(),
                 compute_ms: resp.compute_ms,
                 wall_ms: *wall_ms,
+                timing: *timing,
                 layers_processed: resp.layers_processed as u64,
                 req_bytes: request_bytes,
                 resp_bytes: *resp_bytes,
@@ -10766,6 +10933,7 @@ fn render_shard_trace(pipeline: &[PipelineHop], stats: &[HopStats]) -> Vec<Value
                 "request_bytes": st.req_bytes,
                 "response_bytes": st.resp_bytes,
                 "served_by": served,
+                "timing": render_shard_timing_totals(&st.timing),
                 "replica_count": replicas.len(),
                 "is_terminal": st.is_terminal,
             })
@@ -11404,6 +11572,7 @@ async fn inference_run_sharded(
             for key in [
                 "attestation",
                 "shard_trace",
+                "shard_timing",
                 "total_bytes_transferred",
                 "committee",
                 "fee_split",
@@ -11620,6 +11789,7 @@ async fn inference_run_sharded(
         "pipeline_length": pipeline.len(),
         "model": model_id_data,
         "shard_trace": shard_trace,
+        "shard_timing": render_shard_timing_totals(&aggregate_shard_timing(&run.hop_stats)),
         "total_bytes_transferred": run.total_bytes,
         "profile_bound": assurance.profile_bound,
         "quorum_verified": assurance.quorum_verified,
@@ -11662,6 +11832,7 @@ async fn inference_run_sharded(
             "request_id": response["request_id"],
             "attestation": response["attestation"],
             "shard_trace": response["shard_trace"],
+            "shard_timing": response["shard_timing"],
             "total_bytes_transferred": response["total_bytes_transferred"],
             "committee": response["committee"],
             "fee_split": response["fee_split"],
@@ -11963,6 +12134,7 @@ async fn inference_run_consensus(
         // Additive: same per-hop trace run_sharded emits, so the dashboard's
         // activation-flow view works against this endpoint too.
         "shard_trace": shard_trace,
+        "shard_timing": render_shard_timing_totals(&aggregate_shard_timing(&run.hop_stats)),
         "total_bytes_transferred": run.total_bytes,
         "profile_bound": assurance.profile_bound,
         "quorum_verified": assurance.quorum_verified,
@@ -18396,6 +18568,75 @@ mod tests {
             .unwrap_err()
             .contains("not an active staked validator")
         );
+    }
+
+    #[test]
+    fn shard_timing_headers_are_optional_and_do_not_change_legacy_body() {
+        let response = ForwardShardResponse {
+            is_terminal: true,
+            hidden: None,
+            hidden_hash: None,
+            token_id: Some(42),
+            logits_hash: Some("0x01".into()),
+            layers_processed: 6,
+            compute_ms: 17,
+            node_name: "validator-a".into(),
+            validator_address: Hash256([7; 32]),
+            signature: arc_crypto::Signature::null(),
+        };
+        let legacy_body = serde_json::to_vec(&response).unwrap();
+        let parsed: ForwardShardResponse = serde_json::from_slice(&legacy_body).unwrap();
+        assert_eq!(parsed.compute_ms, 17);
+        assert_eq!(parse_shard_timing_headers(&HeaderMap::new()), None);
+
+        let timing = ShardTimingBreakdown {
+            spawn_blocking_queue_us: 1,
+            compute_pool_queue_us: 2,
+            kv_mutex_wait_us: 3,
+            forward_us: 4,
+        };
+        let headers = shard_timing_headers(timing);
+        assert_eq!(parse_shard_timing_headers(&headers), Some(timing));
+        let mut future_schema = headers.clone();
+        future_schema.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("2"));
+        assert_eq!(parse_shard_timing_headers(&future_schema), None);
+        let mut malformed = headers.clone();
+        malformed.insert(SHARD_TIMING_FORWARD_HEADER, HeaderValue::from_static("not-a-number"));
+        assert_eq!(parse_shard_timing_headers(&malformed), None);
+        let mut incomplete = HeaderMap::new();
+        incomplete.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("1"));
+        assert_eq!(parse_shard_timing_headers(&incomplete), None);
+        // The diagnostics travel outside the body, preserving the old JSON
+        // shape consumed by strict (`deny_unknown_fields`) peers.
+        assert_eq!(serde_json::to_vec(&parsed).unwrap(), legacy_body);
+    }
+
+    #[test]
+    fn shard_timing_aggregation_keeps_component_sums_and_marks_overlap() {
+        let mut first = ShardTimingTotals::default();
+        first.fold(Some(ShardTimingBreakdown {
+            spawn_blocking_queue_us: 10,
+            compute_pool_queue_us: 20,
+            kv_mutex_wait_us: 30,
+            forward_us: 40,
+        }));
+        first.fold(None); // old peer: no sample, not a fabricated zero sample
+        let mut stats = HopStats::default();
+        stats.timing = first;
+        let mut second = HopStats::default();
+        second.timing.fold(Some(ShardTimingBreakdown {
+            spawn_blocking_queue_us: 1,
+            compute_pool_queue_us: 2,
+            kv_mutex_wait_us: 3,
+            forward_us: 4,
+        }));
+
+        let rendered = render_shard_timing_totals(&aggregate_shard_timing(&[stats, second]));
+        assert_eq!(rendered["sample_count"], 2);
+        assert_eq!(rendered["sum_us"]["forward"], 44);
+        assert_eq!(rendered["avg_per_sample_us"]["kv_mutex_wait"], 16);
+        assert!(rendered["scope"].as_str().unwrap().contains("not request wall time"));
+        assert_eq!(render_shard_timing_totals(&ShardTimingTotals::default()), Value::Null);
     }
 
     #[test]
