@@ -7,6 +7,7 @@
 //! The coordinator validates response call/input commitments and exact row
 //! coverage; this worker validates its immutable row-file identity and shape.
 
+use arc_inference::cached_integer_model::{I8Weights, matmul_i8_canonical_row_range};
 use blake3::Hasher;
 use std::convert::TryInto;
 use std::fs::File;
@@ -34,9 +35,7 @@ struct Shard {
     start: u64,
     end: u64,
     worker: Vec<u8>,
-    cols: usize,
-    scales: Vec<i64>,
-    data: Vec<i8>,
+    weights: I8Weights,
 }
 fn take<'a>(b: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
     if b.len() < n {
@@ -144,11 +143,35 @@ fn load(path: &std::path::Path) -> io::Result<Shard> {
         start,
         end,
         worker,
-        cols,
-        scales,
-        data,
+        weights: I8Weights {
+            data,
+            scales,
+            n_rows: rows,
+            n_cols: cols,
+        },
     })
 }
+
+fn project_shard_rows(shard: &Shard, start: u64, end: u64, input: &[i64]) -> io::Result<Vec<i64>> {
+    if start >= end || start < shard.start || end > shard.end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "row range is empty, reversed, or outside the held shard",
+        ));
+    }
+    let row_start = usize::try_from(start - shard.start)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "row start overflow"))?;
+    let row_end = usize::try_from(end - shard.start)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "row end overflow"))?;
+    let rows = row_end
+        .checked_sub(row_start)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "row range reversed"))?;
+    let mut values = vec![0; rows];
+    matmul_i8_canonical_row_range(&shard.weights, row_start, row_end, input, &mut values)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(values)
+}
+
 fn load_directory(path: &str) -> io::Result<Vec<Shard>> {
     let mut out = Vec::new();
     let mut total = 0usize;
@@ -224,9 +247,9 @@ fn main() -> io::Result<()> {
         let worker = take(&mut b, worker_len)?;
         let count = u32v(&mut b)?;
 
-        // Matching, bounds and arithmetic all live in the library
-        // (`project_from_shards`), so this worker cannot drift from the
-        // canonical kernel a coordinator uses for the same rows.
+        // Identity stays bound to this immutable row file; the shared
+        // canonical row-range kernel supplies bounds, overflow checks and the
+        // same opt-in SIMD dispatch used by coordinator projections.
         let shard = shards
             .iter()
             .find(|s| {
@@ -234,11 +257,12 @@ fn main() -> io::Result<()> {
                     && profile == s.profile.as_slice()
                     && layer == s.layer
                     && tensor == s.tensor
+                    && start < end
                     && s.start <= start
                     && end <= s.end
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "identity mismatch"))?;
-        if count != shard.cols || count > 131072 {
+        if count != shard.weights.n_cols || count > 131072 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "shape mismatch",
@@ -254,45 +278,13 @@ fn main() -> io::Result<()> {
                 "input hash mismatch",
             ));
         }
-        let offset = (start - shard.start) as usize;
-        let rows = (end - start) as usize;
-        if offset + rows > shard.scales.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "row range outside the held shard",
-            ));
-        }
-        // The same overflow bounds `matmul_i8_canonical_row_range` proves
-        // before it multiplies, over exactly the rows being served. A worker
-        // that skipped these could return a silently wrapped value that the
-        // coordinator would have to catch by duplicate compute alone.
-        let sum = activation
-            .iter()
-            .try_fold(0i64, |s, v| s.checked_add(v.checked_abs()?))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "activation overflow"))?;
-        let bound = sum
-            .checked_mul(128)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "dot overflow"))?;
-        if shard.scales[offset..offset + rows]
-            .iter()
-            .any(|s| s.checked_abs().and_then(|v| bound.checked_mul(v)).is_none())
-        {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "scale overflow"));
-        }
-        let mut values = Vec::with_capacity(rows);
-        for row in offset..offset + rows {
-            let mut acc = 0i64;
-            for col in 0..count {
-                acc += shard.data[row * count + col] as i64 * activation[col];
-            }
-            values.push((acc * shard.scales[row]) >> 16);
-        }
         if !b.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "trailing frame bytes",
             ));
         }
+        let values = project_shard_rows(shard, start, end, &activation)?;
         let mut reply = Vec::with_capacity(
             8 + 32
                 + 32
@@ -326,5 +318,58 @@ fn main() -> io::Result<()> {
         output.write_all(&(reply.len() as u32).to_le_bytes())?;
         output.write_all(&reply)?;
         output.flush()?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_shard() -> Shard {
+        Shard {
+            artifact: [1; 32],
+            profile: b"canonical".to_vec(),
+            layer: 2,
+            tensor: 3,
+            start: 10,
+            end: 13,
+            worker: b"rack-1".to_vec(),
+            weights: I8Weights {
+                data: vec![1, 2, -3, 4, 5, -6],
+                scales: vec![65_536; 3],
+                n_rows: 3,
+                n_cols: 2,
+            },
+        }
+    }
+
+    #[test]
+    fn canonical_kernel_projects_a_nonzero_absolute_subrange_exactly() {
+        let values = project_shard_rows(&sample_shard(), 11, 13, &[2, 3]).unwrap();
+        assert_eq!(values, [6, -8]);
+    }
+
+    #[test]
+    fn canonical_kernel_rejects_empty_reversed_and_out_of_range_requests() {
+        let shard = sample_shard();
+        assert!(project_shard_rows(&shard, 11, 11, &[2, 3]).is_err());
+        assert!(project_shard_rows(&shard, 12, 11, &[2, 3]).is_err());
+        assert!(project_shard_rows(&shard, 9, 11, &[2, 3]).is_err());
+        assert!(project_shard_rows(&shard, 11, 14, &[2, 3]).is_err());
+    }
+
+    #[test]
+    fn canonical_kernel_refuses_overflowing_activation_before_multiply() {
+        let mut shard = sample_shard();
+        shard.end = shard.start + 1;
+        shard.weights = I8Weights {
+            data: vec![1],
+            scales: vec![1],
+            n_rows: 1,
+            n_cols: 1,
+        };
+        let error = project_shard_rows(&shard, shard.start, shard.end, &[i64::MAX]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("overflows"));
     }
 }
