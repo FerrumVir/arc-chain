@@ -132,3 +132,6 @@ required-features = ["candle"]
 
 [lints]
 workspace = true
+[[example]]
+name = "tensor_row_layer_bundle_export"
+required-features = ["candle"]
