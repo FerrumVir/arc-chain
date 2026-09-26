@@ -1,0 +1,97 @@
+name: Linux candidate artifacts
+
+# This workflow is intentionally limited to the current implementation
+# candidate branch. It builds review artifacts only; it has no release,
+# deployment, environment, or signing steps.
+on:
+  push:
+    branches: [arc-chain-v2-implementation-20260919]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  linux-candidate:
+    name: Linux production candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact candidate commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: linux-candidate
+
+      # Build the shipped node, the offline recovered-state qualification
+      # helper, and the portable sidecar row worker from the same locked tree.
+      - name: Build Linux candidate binaries
+        run: |
+          cargo build --locked --release -p arc-node --features candle --bin arc-node \
+            --example qualify_recovered_native_boundary
+          cargo build --locked --release -p arc-inference \
+            --example tensor_row_stdio_worker --features candle
+
+      # Repeat the recovery-state and native-boundary suites on Linux, then
+      # exercise the Linux canonical SIMD dispatch and refusal cases.
+      - name: Test recovery and native boundary on Linux
+        run: |
+          cargo test --locked --release -p arc-state --lib
+          cargo test --locked --release -p arc-node --lib --features candle
+          cargo test --locked --release -p arc-inference --lib --features candle \
+            canonical_simd::tests
+
+      - name: Package binaries and provenance
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/linux-candidate"
+          cp target/release/arc-node "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/qualify_recovered_native_boundary \
+            "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/tensor_row_stdio_worker \
+            "$RUNNER_TEMP/linux-candidate/"
+          {
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'commit=%s\n' "$CANDIDATE_SHA"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'workflow_run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'workflow_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'runner=%s\n' "$ImageOS $ImageVersion"
+            printf 'build= cargo build --locked --release -p arc-node --features candle --bin arc-node --example qualify_recovered_native_boundary\n'
+            printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --features candle\n'
+            printf 'tests= cargo test --locked --release -p arc-state --lib\n'
+            printf 'tests= cargo test --locked --release -p arc-node --lib --features candle\n'
+            printf 'tests= cargo test --locked --release -p arc-inference --lib --features candle canonical_simd::tests\n'
+            rustc --version --verbose
+            cargo --version
+          } > "$RUNNER_TEMP/linux-candidate/PROVENANCE.txt"
+          (cd "$RUNNER_TEMP/linux-candidate" && sha256sum -- * > SHA256SUMS)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-linux-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-candidate/
+          if-no-files-found: error
+          retention-days: 7
