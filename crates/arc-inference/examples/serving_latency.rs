@@ -43,20 +43,26 @@ fn arg(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-fn max_rss_bytes() -> u64 {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn max_rss_bytes() -> Option<u64> {
     // SAFETY: getrusage with a zeroed, correctly sized out-parameter.
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
-            return 0;
+            return None;
         }
         // ru_maxrss is bytes on macOS and kilobytes on Linux.
-        if cfg!(target_os = "macos") {
-            usage.ru_maxrss as u64
-        } else {
-            usage.ru_maxrss as u64 * 1024
-        }
+        #[cfg(target_os = "macos")]
+        let bytes = usage.ru_maxrss as u64;
+        #[cfg(target_os = "linux")]
+        let bytes = (usage.ru_maxrss as u64).saturating_mul(1024);
+        Some(bytes)
     }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn max_rss_bytes() -> Option<u64> {
+    None
 }
 
 /// Swap in use, in bytes, or None when the platform does not say.
@@ -93,11 +99,17 @@ fn swap_used_bytes() -> Option<u64> {
 }
 
 /// The 1, 5 and 15 minute load averages.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn load_average() -> Option<[f64; 3]> {
     let mut loads = [0f64; 3];
     // SAFETY: getloadavg writes at most `nelem` (3) doubles into the buffer.
     let written = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
     (written == 3).then_some(loads)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn load_average() -> Option<[f64; 3]> {
+    None
 }
 
 /// Memory the OS can hand out now, without evicting anything that is in use:
