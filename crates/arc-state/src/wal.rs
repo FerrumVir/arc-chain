@@ -507,10 +507,16 @@ pub(crate) struct RepairableWalRead {
     pub(crate) torn_tail: Option<RepairableWalTail>,
 }
 
+/// Streaming result for a repairable WAL prefix inspection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RepairableWalSummary {
+    pub(crate) entry_count: u64,
+    pub(crate) original_bytes: u64,
+    pub(crate) original_hash: blake3::Hash,
+    pub(crate) torn_tail: Option<RepairableWalTail>,
+}
+
 /// State operations that the WAL records.
-// Keep this lint exception narrow: changing the public, persisted WAL enum's
-// variant representation requires a separate compatibility review.
-#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WalOp {
     /// Set or update an account.
@@ -553,7 +559,7 @@ pub enum WalOp {
     /// One bounded isolated-inference transition. Kept last so legacy
     /// bincode enum discriminants remain unchanged. The state adapter writes
     /// this record before publishing replacements to in-memory state.
-    InferenceTransition(InferenceTransitionRecord),
+    InferenceTransition(Box<InferenceTransitionRecord>),
     /// Adopt a certified checkpoint: replace the state with the record's and
     /// continue the chain from its tip. Last, so every older discriminant is
     /// unchanged; a binary that predates it cannot decode a rebased WAL and
@@ -2047,14 +2053,13 @@ fn allocate_wal_frame(len: usize) -> std::io::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn finish_repairable_read(
+fn finish_repairable_visit(
     reader: &BufReader<File>,
     path: &Path,
-    entries: Vec<WalEntry>,
-    frame_end_offsets: Vec<u64>,
+    entry_count: u64,
     original_bytes: u64,
     torn_tail: Option<RepairableWalTail>,
-) -> std::io::Result<RepairableWalRead> {
+) -> std::io::Result<RepairableWalSummary> {
     let final_bytes = reader.get_ref().metadata()?.len();
     if final_bytes != original_bytes {
         return Err(std::io::Error::new(
@@ -2072,9 +2077,8 @@ fn finish_repairable_read(
             format!("WAL changed while being hashed: {path:?}"),
         ));
     }
-    Ok(RepairableWalRead {
-        entries,
-        frame_end_offsets,
+    Ok(RepairableWalSummary {
+        entry_count,
         original_bytes,
         original_hash,
         torn_tail,
@@ -2091,6 +2095,28 @@ fn finish_repairable_read(
 pub(crate) fn read_repairable_wal_prefix(
     path: impl AsRef<Path>,
 ) -> std::io::Result<RepairableWalRead> {
+    let mut entries = Vec::new();
+    let mut frame_end_offsets = Vec::new();
+    let summary = visit_repairable_wal_prefix(path, |entry, frame_end| {
+        entries.push(entry);
+        frame_end_offsets.push(frame_end);
+        Ok(())
+    })?;
+    Ok(RepairableWalRead {
+        entries,
+        frame_end_offsets,
+        original_bytes: summary.original_bytes,
+        original_hash: summary.original_hash,
+        torn_tail: summary.torn_tail,
+    })
+}
+
+/// Validate a repairable WAL prefix and stream each complete entry to `visitor`.
+/// The visitor runs only after frame decoding, checksum, and sequence validation.
+pub(crate) fn visit_repairable_wal_prefix(
+    path: impl AsRef<Path>,
+    mut visitor: impl FnMut(WalEntry, u64) -> std::io::Result<()>,
+) -> std::io::Result<RepairableWalSummary> {
     let path = path.as_ref();
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -2101,9 +2127,8 @@ pub(crate) fn read_repairable_wal_prefix(
     }
     let original_bytes = metadata.len();
     let mut reader = BufReader::new(File::open(path)?);
-    let mut entries = Vec::new();
-    let mut frame_end_offsets = Vec::new();
     let mut expected_sequence = 0u64;
+    let mut entry_count = 0u64;
     let mut offset = 0u64;
 
     loop {
@@ -2118,24 +2143,16 @@ pub(crate) fn read_repairable_wal_prefix(
                     ),
                 ));
             }
-            return finish_repairable_read(
-                &reader,
-                path,
-                entries,
-                frame_end_offsets,
-                original_bytes,
-                None,
-            );
+            return finish_repairable_visit(&reader, path, entry_count, original_bytes, None);
         }
         if let Err(error) = reader.read_exact(&mut len_buf[1..]) {
             if error.kind() != std::io::ErrorKind::UnexpectedEof {
                 return Err(error);
             }
-            return finish_repairable_read(
+            return finish_repairable_visit(
                 &reader,
                 path,
-                entries,
-                frame_end_offsets,
+                entry_count,
                 original_bytes,
                 Some(RepairableWalTail::TruncatedFrameLength),
             );
@@ -2155,11 +2172,10 @@ pub(crate) fn read_repairable_wal_prefix(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL byte offset overflow")
             })?;
         if declared_frame_end > original_bytes {
-            return finish_repairable_read(
+            return finish_repairable_visit(
                 &reader,
                 path,
-                entries,
-                frame_end_offsets,
+                entry_count,
                 original_bytes,
                 Some(RepairableWalTail::TruncatedFramePayload),
             );
@@ -2169,11 +2185,10 @@ pub(crate) fn read_repairable_wal_prefix(
             if error.kind() != std::io::ErrorKind::UnexpectedEof {
                 return Err(error);
             }
-            return finish_repairable_read(
+            return finish_repairable_visit(
                 &reader,
                 path,
-                entries,
-                frame_end_offsets,
+                entry_count,
                 original_bytes,
                 Some(RepairableWalTail::TruncatedFramePayload),
             );
@@ -2210,8 +2225,10 @@ pub(crate) fn read_repairable_wal_prefix(
         expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL sequence overflow")
         })?;
-        entries.push(entry);
-        frame_end_offsets.push(offset);
+        entry_count = entry_count.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL entry count overflow")
+        })?;
+        visitor(entry, offset)?;
     }
 }
 
@@ -2310,6 +2327,85 @@ pub(crate) fn verify_wal_file_identity(
         ));
     }
     Ok(())
+}
+
+/// Hash a stable WAL's complete expected contents and one prefix in a single
+/// read. The prefix digest is returned only after the full-file hash matches.
+pub(crate) fn hash_wal_identity_and_prefix(
+    path: impl AsRef<Path>,
+    expected_bytes: u64,
+    expected_hash: blake3::Hash,
+    prefix_bytes: u64,
+) -> std::io::Result<blake3::Hash> {
+    let path = path.as_ref();
+    if prefix_bytes > expected_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("WAL prefix length {prefix_bytes} exceeds expected size {expected_bytes}"),
+        ));
+    }
+    let before_path = fs::symlink_metadata(path)?;
+    if before_path.file_type().is_symlink() || !before_path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("state WAL must be a regular non-symlink file: {path:?}"),
+        ));
+    }
+    let before = WalFileIdentity::from_metadata(&before_path);
+    if before.len != expected_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state WAL size changed before hashing: {path:?}"),
+        ));
+    }
+    let mut file = File::open(path)?;
+    if WalFileIdentity::from_metadata(&file.metadata()?) != before {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state WAL identity changed while opening: {path:?}"),
+        ));
+    }
+
+    let mut full_hasher = blake3::Hasher::new();
+    let mut prefix_hasher = blake3::Hasher::new();
+    let mut full_remaining = expected_bytes;
+    let mut prefix_remaining = prefix_bytes;
+    let mut buffer = [0u8; 64 * 1024];
+    while full_remaining != 0 {
+        let limit =
+            usize::try_from(full_remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = file.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "state WAL was truncated while hashing identity and prefix",
+            ));
+        }
+        full_hasher.update(&buffer[..read]);
+        let prefix_read = usize::try_from(prefix_remaining.min(read as u64)).unwrap_or(read);
+        prefix_hasher.update(&buffer[..prefix_read]);
+        prefix_remaining -= prefix_read as u64;
+        full_remaining -= read as u64;
+    }
+    let after_handle = WalFileIdentity::from_metadata(&file.metadata()?);
+    let after_path = fs::symlink_metadata(path)?;
+    if after_path.file_type().is_symlink()
+        || !after_path.is_file()
+        || after_handle != before
+        || WalFileIdentity::from_metadata(&after_path) != before
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state WAL identity changed while hashing: {path:?}"),
+        ));
+    }
+    if full_hasher.finalize() != expected_hash {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state WAL content changed while hashing: {path:?}"),
+        ));
+    }
+    Ok(prefix_hasher.finalize())
 }
 
 /// Durably preserve an exact rejected WAL suffix, then truncate the active WAL.
@@ -2991,6 +3087,88 @@ mod tests {
             .unwrap();
         file.write_all(&length.to_le_bytes()).unwrap();
         file.write_all(&data).unwrap();
+    }
+
+    #[test]
+    fn wal_identity_helper_hashes_requested_prefix_only_after_full_match() {
+        let path = tmp_path("identity-prefix-hash");
+        let bytes = (0..200_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&path, &bytes).unwrap();
+        let full_hash = blake3::hash(&bytes);
+        let prefix =
+            hash_wal_identity_and_prefix(&path, bytes.len() as u64, full_hash, 65_537).unwrap();
+        assert_eq!(prefix, blake3::hash(&bytes[..65_537]));
+        assert_eq!(
+            hash_wal_identity_and_prefix(&path, bytes.len() as u64, blake3::hash(b"wrong"), 0)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            hash_wal_identity_and_prefix(
+                &path,
+                bytes.len() as u64,
+                full_hash,
+                bytes.len() as u64 + 1
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn streaming_repairable_reader_matches_collecting_reader() {
+        let path = tmp_path("streaming-repairable-reader");
+        let _ = fs::remove_file(&path);
+        append_encoded_entry(&path, &checkpoint_entry(0));
+        append_encoded_entry(&path, &checkpoint_entry(1));
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[1])
+            .unwrap();
+
+        let collected = read_repairable_wal_prefix(&path).unwrap();
+        let mut visited = Vec::new();
+        let summary = visit_repairable_wal_prefix(&path, |entry, end| {
+            visited.push((bincode::serialize(&entry).unwrap(), end));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(summary.entry_count, collected.entries.len() as u64);
+        assert_eq!(summary.original_bytes, collected.original_bytes);
+        assert_eq!(summary.original_hash, collected.original_hash);
+        assert_eq!(summary.torn_tail, collected.torn_tail);
+        assert_eq!(
+            visited,
+            collected
+                .entries
+                .iter()
+                .zip(&collected.frame_end_offsets)
+                .map(|(entry, end)| (bincode::serialize(entry).unwrap(), *end))
+                .collect::<Vec<_>>()
+        );
+
+        let malformed = tmp_path("streaming-repairable-malformed");
+        let _ = fs::remove_file(&malformed);
+        append_encoded_entry(&malformed, &checkpoint_entry(0));
+        let mut bytes = fs::read(&malformed).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&malformed, bytes).unwrap();
+        let mut callbacks = 0;
+        assert!(read_repairable_wal_prefix(&malformed).is_err());
+        assert!(
+            visit_repairable_wal_prefix(&malformed, |_, _| {
+                callbacks += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(callbacks, 0, "malformed frame must not reach the visitor");
     }
 
     fn assert_new_rejects_without_changing_bytes(path: &Path, expected: &str) {

@@ -1926,7 +1926,7 @@ impl StateDB {
             .collect();
         if let Some(record) = &record {
             self.wal
-                .append(WalOp::InferenceTransition(record.clone()), height);
+                .append(WalOp::InferenceTransition(Box::new(record.clone())), height);
         }
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
@@ -1936,7 +1936,7 @@ impl StateDB {
         {
             let _publication = self.native_inference_publication.write();
             if let Some(record) = record {
-                self.apply_wal_op(&WalOp::InferenceTransition(record));
+                self.apply_wal_op(&WalOp::InferenceTransition(Box::new(record)));
             }
             self.apply_wal_op(&WalOp::SetBlock(height, block.clone()));
             for (tx, receipt) in transactions.iter().zip(&receipts) {
@@ -2243,7 +2243,7 @@ impl IsolatedInferenceLedger {
         let height = self.state.height();
         self.state
             .wal
-            .append(WalOp::InferenceTransition(record.clone()), height);
+            .append(WalOp::InferenceTransition(Box::new(record.clone())), height);
         if let Err(error) = self.state.durable_wal_barrier() {
             self.poisoned = true;
             return Err(error);
@@ -2252,7 +2252,8 @@ impl IsolatedInferenceLedger {
         // The typed record is durable before this publication. A crash before
         // the checkpoint leaves it as an uncommitted WAL suffix for recovery
         // to quarantine; this adapter remains poisoned on the live process.
-        self.state.apply_wal_op(&WalOp::InferenceTransition(record));
+        self.state
+            .apply_wal_op(&WalOp::InferenceTransition(Box::new(record)));
         let root = self.state.get_state_root();
         #[cfg(test)]
         if self.fail_before_checkpoint {
@@ -5880,7 +5881,65 @@ mod tests {
         let tx = native_request(state, &f.requester, req);
         let root = state.get_state_root();
         let record = state.plan_native_transaction(&tx, &f.context, 1).unwrap();
-        state.wal.append(WalOp::InferenceTransition(record), 1);
+        // Legacy bincode stores enum variant 16 followed by the bare record.
+        // A Box is transparent to Serde, so old WAL bytes must remain exact.
+        let mut legacy_op_bytes = 16_u32.to_le_bytes().to_vec();
+        legacy_op_bytes.extend(bincode::serialize(&record).unwrap());
+        let boxed_op = WalOp::InferenceTransition(Box::new(record.clone()));
+        assert_eq!(bincode::serialize(&boxed_op).unwrap(), legacy_op_bytes);
+        let decoded: WalOp = bincode::deserialize(&legacy_op_bytes).unwrap();
+        let WalOp::InferenceTransition(decoded_record) = decoded else {
+            panic!("legacy inference transition decoded as another WAL operation");
+        };
+        assert_eq!(
+            bincode::serialize(decoded_record.as_ref()).unwrap(),
+            bincode::serialize(&record).unwrap()
+        );
+
+        let mut legacy_payload = 1_u64.to_le_bytes().to_vec();
+        legacy_payload.extend(1_u64.to_le_bytes());
+        legacy_payload.extend(&legacy_op_bytes);
+        let current_payload = bincode::serialize(&(1_u64, 1_u64, &boxed_op)).unwrap();
+        assert_eq!(current_payload, legacy_payload);
+        let legacy_checksum = crc32fast::hash(&legacy_payload);
+        assert_eq!(crc32fast::hash(&current_payload), legacy_checksum);
+        let legacy_entry = crate::wal::WalEntry {
+            block_height: 1,
+            sequence: 1,
+            op: boxed_op.clone(),
+            checksum: legacy_checksum,
+        };
+        let mut legacy_entry_bytes = 1_u64.to_le_bytes().to_vec();
+        legacy_entry_bytes.extend(1_u64.to_le_bytes());
+        legacy_entry_bytes.extend(&legacy_op_bytes);
+        legacy_entry_bytes.extend(legacy_checksum.to_le_bytes());
+        let mut legacy_frame = (legacy_entry_bytes.len() as u32).to_le_bytes().to_vec();
+        legacy_frame.extend(&legacy_entry_bytes);
+        let current_entry_bytes = bincode::serialize(&legacy_entry).unwrap();
+        let mut current_frame = (current_entry_bytes.len() as u32).to_le_bytes().to_vec();
+        current_frame.extend(current_entry_bytes);
+        assert_eq!(current_frame, legacy_frame);
+        let decoded_entry: crate::wal::WalEntry =
+            bincode::deserialize(&legacy_entry_bytes).unwrap();
+        assert_eq!(decoded_entry.block_height, 1);
+        assert_eq!(decoded_entry.sequence, 1);
+        assert_eq!(decoded_entry.checksum, legacy_checksum);
+        let WalOp::InferenceTransition(decoded_record) = decoded_entry.op else {
+            panic!("legacy framed entry decoded as another WAL operation");
+        };
+        assert_eq!(
+            bincode::serialize(decoded_record.as_ref()).unwrap(),
+            bincode::serialize(&record).unwrap()
+        );
+        // Pre-box measurements were 736-byte WalOp / 760-byte WalEntry.
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(std::mem::size_of::<WalOp>() <= 320);
+            assert!(std::mem::size_of::<crate::wal::WalEntry>() <= 344);
+        }
+        state
+            .wal
+            .append(WalOp::InferenceTransition(Box::new(record)), 1);
         state.durable_wal_barrier().unwrap(); // crash after typed record, before block checkpoint
         let dir = f.dir.clone();
         let prefunded = f.prefunded.clone();
