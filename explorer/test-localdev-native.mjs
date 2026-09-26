@@ -40,6 +40,41 @@ check("a settled receipt reconciles when credits equal the reservation", () => {
   assert.equal(s.terminalHeight, 21);
 });
 
+// A migrated chain settles paid work too, and its receipts are the same shape
+// whatever binding settled them. On the node side, reading a receipt used to
+// require the binding its metadata named to still be one the chain held, so a
+// configuration change made every past settlement unreadable. The view must
+// not reintroduce that from the other end: what a receipt says is decided by
+// the receipt, not by which binding is in force now.
+check("a settlement made under a superseded binding still reads and reconciles", () => {
+  const underOldBinding = {
+    ...finalized,
+    request_id: "21".repeat(32),
+    // The binding that settled it, which the chain has since replaced.
+    context_commitment: "11".repeat(32),
+  };
+  const s = native.summarize(underOldBinding);
+  assert.equal(s.known, true);
+  assert.equal(s.status, "Finalized");
+  assert.equal(s.credited, 100);
+  assert.equal(s.reconciled, true, "history does not stop reconciling because the binding moved");
+  assert.equal(s.terminal, true);
+});
+
+// A migrated chain reports protocol 3 and carries native receipts at the same
+// time - a combination neither a recovered chain nor a private protocol-4
+// chain has ever produced. These rules read receipts, not protocol versions,
+// and that is what makes them work across the migration.
+check("a receipt is read the same way whatever protocol version the chain reports", () => {
+  const three = { ...finalized, request_id: "22".repeat(32), protocol_version: "3.0.0" };
+  const four = { ...finalized, request_id: "22".repeat(32), protocol_version: "4.0.0" };
+  const a = native.summarize(three);
+  const b = native.summarize(four);
+  assert.deepEqual(a, b, "the protocol version must not change what a receipt says");
+  assert.equal(a.status, "Finalized");
+  assert.equal(a.reconciled, true);
+});
+
 check("credits that do not add up are reported, not hidden", () => {
   const broken = { ...finalized, settlement_credits: [{ payee: "aa".repeat(32), amount: 50 }] };
   assert.equal(native.summarize(broken).reconciled, false);
