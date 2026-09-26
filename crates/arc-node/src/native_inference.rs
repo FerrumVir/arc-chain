@@ -20,7 +20,9 @@ use dashmap::DashSet;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1370,10 +1372,43 @@ impl DecisionStore {
         &self,
         context: Hash256,
         request_id: Hash256,
+        expected: &StoredDecision,
     ) -> Result<(), NativeInferenceError> {
-        let file = File::open(self.path(context, request_id))?;
-        file.sync_all()?;
-        File::open(&self.root)?.sync_all()?;
+        let path = self.path(context, request_id);
+        #[cfg(windows)]
+        {
+            // A read-only File::sync_all and opening a directory do not work
+            // on Windows. Confirm the exact winner bytes before a durable
+            // write-through replacement; never publish this caller's proposed
+            // decision over a conflicting concurrent winner.
+            const MAX_DECISION_BYTES: u64 = 256 * 1024;
+            let file = File::open(&path)?;
+            if file.metadata()?.len() > MAX_DECISION_BYTES {
+                return Err(NativeInferenceError::CorruptStore);
+            }
+            let mut bytes = Vec::with_capacity(8192);
+            file.take(MAX_DECISION_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_DECISION_BYTES {
+                return Err(NativeInferenceError::CorruptStore);
+            }
+            let actual =
+                bincode::deserialize_limited_exact::<StoredDecision, { 256 * 1024 }>(&bytes)
+                    .map_err(|_| NativeInferenceError::CorruptStore)?;
+            if &actual != expected {
+                return Err(NativeInferenceError::Equivocation);
+            }
+            arc_crypto::secret_file::durably_replace_private(&path, &bytes)?;
+        }
+        #[cfg(not(windows))]
+        {
+            // The record's writable staging handle was flushed before
+            // publication. Preserve the historical file barrier and sync the
+            // parent namespace through the platform abstraction.
+            let file = File::open(&path)?;
+            file.sync_all()?;
+            arc_crypto::secret_file::sync_parent_directory(&path)?;
+            let _ = expected;
+        }
         Ok(())
     }
 
@@ -1414,6 +1449,11 @@ impl DecisionStore {
         if !verify_vote(&vote, job.request_id, &stored.tokens) {
             return Err(NativeInferenceError::CorruptStore);
         }
+        // A record may have become visible immediately before a publisher
+        // lost power or received a late write-through error. Reprove its
+        // namespace durability before the worker reemits the persisted vote.
+        #[cfg(windows)]
+        self.sync_published(job.context, job.request_id, &stored)?;
         Ok(Some(StoredVote {
             request_id: job.request_id,
             output_hash: stored.output_hash,
@@ -1475,7 +1515,14 @@ impl DecisionStore {
             }
         }
         if removed > 0 {
+            #[cfg(unix)]
             File::open(&self.root)?.sync_all()?;
+            #[cfg(windows)]
+            {
+                // Windows has no directory-fsync primitive in the shared
+                // platform abstraction. These entries are already canonical-
+                // terminal, so a resurrected record cannot enable a vote.
+            }
         }
         Ok(removed)
     }
@@ -1546,7 +1593,7 @@ impl DecisionStore {
             signature: decision.vote.signature.clone(),
         };
         if let Some(existing) = self.load(job.context, job.request_id)? {
-            self.sync_published(job.context, job.request_id)?;
+            self.sync_published(job.context, job.request_id, &existing)?;
             if existing == stored {
                 return Ok(decision);
             }
@@ -1554,18 +1601,43 @@ impl DecisionStore {
         }
         let bytes = bincode::serialize(&stored).map_err(|_| NativeInferenceError::CorruptStore)?;
         let tmp = self.root.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let target = self.path(job.context, job.request_id);
+        #[cfg(windows)]
+        {
+            let mut file = arc_crypto::secret_file::create_new_private(&tmp)?;
+            if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+                drop(file);
+                let _ = fs::remove_file(&tmp);
+                return Err(error.into());
+            }
+        }
+        #[cfg(not(windows))]
         {
             let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        match fs::hard_link(&tmp, self.path(job.context, job.request_id)) {
-            Ok(()) => {
-                fs::remove_file(&tmp)?;
+        let publication = {
+            #[cfg(windows)]
+            {
+                arc_crypto::secret_file::durably_publish_existing_private_no_replace(&tmp, &target)
             }
+            #[cfg(not(windows))]
+            {
+                match fs::hard_link(&tmp, &target) {
+                    Ok(()) => fs::remove_file(&tmp),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match publication {
+            Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 let _ = fs::remove_file(&tmp);
-                self.sync_published(job.context, job.request_id)?;
+                let existing = self
+                    .load(job.context, job.request_id)?
+                    .ok_or(NativeInferenceError::Equivocation)?;
+                self.sync_published(job.context, job.request_id, &existing)?;
                 return match self.load(job.context, job.request_id)? {
                     Some(existing) if existing == stored => Ok(decision),
                     _ => Err(NativeInferenceError::Equivocation),
@@ -1577,7 +1649,8 @@ impl DecisionStore {
                 return Err(e.into());
             }
         }
-        if let Err(error) = self.sync_published(job.context, job.request_id) {
+        #[cfg(not(windows))]
+        if let Err(error) = self.sync_published(job.context, job.request_id, &stored) {
             self.poisoned.store(true, Ordering::Release);
             return Err(error);
         }
