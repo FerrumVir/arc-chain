@@ -8695,7 +8695,10 @@ fn shard_timing_headers(timing: ShardTimingBreakdown) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("1"));
     for (name, value) in [
-        (SHARD_TIMING_BLOCKING_QUEUE_HEADER, timing.spawn_blocking_queue_us),
+        (
+            SHARD_TIMING_BLOCKING_QUEUE_HEADER,
+            timing.spawn_blocking_queue_us,
+        ),
         (SHARD_TIMING_POOL_QUEUE_HEADER, timing.compute_pool_queue_us),
         (SHARD_TIMING_KV_WAIT_HEADER, timing.kv_mutex_wait_us),
         (SHARD_TIMING_FORWARD_HEADER, timing.forward_us),
@@ -8715,14 +8718,7 @@ fn parse_shard_timing_headers(headers: &HeaderMap) -> Option<ShardTimingBreakdow
     if headers.get(SHARD_TIMING_SCHEMA_HEADER)?.as_bytes() != b"1" {
         return None;
     }
-    let parse_us = |name: &str| {
-        headers
-            .get(name)?
-            .to_str()
-            .ok()?
-            .parse::<u64>()
-            .ok()
-    };
+    let parse_us = |name: &str| headers.get(name)?.to_str().ok()?.parse::<u64>().ok();
     Some(ShardTimingBreakdown {
         spawn_blocking_queue_us: parse_us(SHARD_TIMING_BLOCKING_QUEUE_HEADER)?,
         compute_pool_queue_us: parse_us(SHARD_TIMING_POOL_QUEUE_HEADER)?,
@@ -9855,7 +9851,15 @@ fn fanout_quorum_plan(
 type FanoutJoinSet = tokio::task::JoinSet<(
     ShardInfo,
     u64,
-    Result<(ForwardShardResponse, usize, usize, Option<ShardTimingBreakdown>), (String, bool)>,
+    Result<
+        (
+            ForwardShardResponse,
+            usize,
+            usize,
+            Option<ShardTimingBreakdown>,
+        ),
+        (String, bool),
+    >,
 )>;
 
 /// Cancel every unfinished fan-out task and synchronously observe its exit.
@@ -10165,7 +10169,15 @@ async fn forward_shard_once(
     node: &NodeState,
     socket: &str,
     request: &ForwardShardRequest,
-) -> Result<(ForwardShardResponse, usize, usize, Option<ShardTimingBreakdown>), (String, bool)> {
+) -> Result<
+    (
+        ForwardShardResponse,
+        usize,
+        usize,
+        Option<ShardTimingBreakdown>,
+    ),
+    (String, bool),
+> {
     let audience = resolve_shard_rpc_audience(node, socket)
         .await
         .map_err(|error| (error, false))?;
@@ -18601,7 +18613,10 @@ mod tests {
         future_schema.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("2"));
         assert_eq!(parse_shard_timing_headers(&future_schema), None);
         let mut malformed = headers.clone();
-        malformed.insert(SHARD_TIMING_FORWARD_HEADER, HeaderValue::from_static("not-a-number"));
+        malformed.insert(
+            SHARD_TIMING_FORWARD_HEADER,
+            HeaderValue::from_static("not-a-number"),
+        );
         assert_eq!(parse_shard_timing_headers(&malformed), None);
         let mut incomplete = HeaderMap::new();
         incomplete.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("1"));
@@ -18635,8 +18650,16 @@ mod tests {
         assert_eq!(rendered["sample_count"], 2);
         assert_eq!(rendered["sum_us"]["forward"], 44);
         assert_eq!(rendered["avg_per_sample_us"]["kv_mutex_wait"], 16);
-        assert!(rendered["scope"].as_str().unwrap().contains("not request wall time"));
-        assert_eq!(render_shard_timing_totals(&ShardTimingTotals::default()), Value::Null);
+        assert!(
+            rendered["scope"]
+                .as_str()
+                .unwrap()
+                .contains("not request wall time")
+        );
+        assert_eq!(
+            render_shard_timing_totals(&ShardTimingTotals::default()),
+            Value::Null
+        );
     }
 
     #[test]
