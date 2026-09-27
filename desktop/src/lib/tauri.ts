@@ -2093,6 +2093,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         chainProtocol,
         nativeOnlyChain,
         requestAdmissionOpen,
+        trackingAvailable: current,
       } as T;
     }
     case "native_receipt": {

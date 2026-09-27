@@ -363,6 +363,8 @@ pub struct NativeContextView {
     pub chain_protocol: Option<u64>,
     pub native_only_chain: Option<bool>,
     pub request_admission_open: bool,
+    /// The signed chain context is parseable, so journal and receipt operations remain available.
+    pub tracking_available: bool,
 }
 
 fn context_view(host: String, parsed: Result<ChainContext, String>) -> NativeContextView {
@@ -381,10 +383,12 @@ fn context_view(host: String, parsed: Result<ChainContext, String>) -> NativeCon
         chain_protocol: None,
         native_only_chain: None,
         request_admission_open: false,
+        tracking_available: false,
     };
     match parsed {
         Err(reason) => view.reason = Some(reason),
         Ok(context) => {
+            view.tracking_available = true;
             view.chain_protocol = context.chain_protocol;
             view.native_only_chain = context.native_only_chain;
             view.request_admission_open = context.request_admission_open == Some(true);
@@ -1687,6 +1691,7 @@ mod tests {
         let view = context_view("h".into(), Ok(parsed));
         assert!(!view.compatible);
         assert!(!view.request_admission_open);
+        assert!(view.tracking_available);
         assert!(view.reason.unwrap().contains("not admitting"));
 
         let mut old = context_json();
@@ -1750,6 +1755,7 @@ mod tests {
         none["serving"] = Value::Null;
         let view = context_view("h".into(), parse_context(&none));
         assert!(!view.compatible);
+        assert!(view.tracking_available);
         assert!(view.reason.unwrap().contains("runs no native executor"));
 
         let mut untokenized = context_json();

@@ -432,6 +432,8 @@ export interface NativeContextView {
   nativeOnlyChain: boolean | null;
   /** False when admission is closed or the node is too old to advertise it. */
   requestAdmissionOpen: boolean;
+  /** Existing journal/receipt actions are usable even if new requests are unavailable. */
+  trackingAvailable: boolean;
 }
 
 /** Migrated protocol-3 chains can run native inference without banning transfers. */

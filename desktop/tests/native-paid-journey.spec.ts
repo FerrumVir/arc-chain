@@ -17,6 +17,12 @@ async function openNative(page: Page, flag: true | "incompatible" = true) {
   await expect(page.getByTestId("native-paid-card")).toBeVisible();
 }
 
+async function closeNativeAdmission(page: Page) {
+  await page.evaluate(() => {
+    (window as Window & { __ARC_MOCK_NATIVE__?: unknown }).__ARC_MOCK_NATIVE__ = "closed-admission";
+  });
+}
+
 async function submitPrompt(page: Page, prompt: string, options: { price?: string; reserve?: string } = {}) {
   await page.getByTestId("native-prompt").fill(prompt);
   if (options.price) await page.getByTestId("native-price").fill(options.price);
@@ -75,6 +81,24 @@ test.describe("native paid requests", () => {
     await expect(row).toHaveAttribute("data-phase", "refunded", { timeout: 15_000 });
     await expect(row).toContainText("Returned 2 ARC");
     await expect(page.getByTestId("native-available")).toHaveText("5 ARC", { timeout: 10_000 });
+  });
+
+  test("closing new-request admission keeps an in-flight request tracked and refundable", async ({ page }) => {
+    test.setTimeout(60_000);
+    await openNative(page);
+    await submitPrompt(page, "[expire] close admission while this request is pending");
+    const row = page.getByTestId("native-request-row").first();
+    await expect(row).toHaveAttribute("data-phase", /submitted|awaiting_certificate/);
+
+    await closeNativeAdmission(page);
+    await expect(page.getByTestId("native-context-status")).toContainText("not admitting new native paid requests", { timeout: 25_000 });
+    await expect(page.getByTestId("btn-native-review")).toBeDisabled();
+    await expect(page.getByTestId("btn-native-sign")).toHaveCount(0);
+    await expect(row).toHaveAttribute("data-phase", "refund_due", { timeout: 20_000 });
+    await expect(row.getByTestId("btn-native-refund")).toBeEnabled();
+    await row.getByTestId("btn-native-refund").click();
+    await expect(row).toHaveAttribute("data-phase", /refund_submitted|refunded/);
+    await expect(row).toHaveAttribute("data-phase", "refunded", { timeout: 15_000 });
   });
 
   test("a request no block admits before its expiry is dropped and costs nothing", async ({ page }) => {

@@ -1,4 +1,4 @@
-// Native paid requests (protocol 4): prepare a prompt, sign and submit a
+// Native paid requests: prepare a prompt, sign and submit a
 // paid request from this wallet, follow it on chain, and see what it cost.
 //
 // Everything past "submitted" comes from the request's receipt on the pinned
@@ -79,7 +79,7 @@ export function NativePaidRequests() {
     queryKey: ["native-balance"],
     queryFn: api.fetchBalance,
     refetchInterval: 3_000,
-    enabled: context.data?.compatible === true,
+    enabled: context.data?.trackingAvailable === true,
   });
 
   const [requests, setRequests] = useState<NativeRequestState[]>([]);
@@ -112,9 +112,9 @@ export function NativePaidRequests() {
   }, []);
 
   // A restart resumes following every journaled request from its receipt.
-  const compatible = context.data?.compatible === true;
+  const trackingAvailable = context.data?.trackingAvailable === true;
   useEffect(() => {
-    if (!compatible || !account) return;
+    if (!account) return;
     let cancelled = false;
     api
       .nativeJournal()
@@ -136,7 +136,7 @@ export function NativePaidRequests() {
     return () => {
       cancelled = true;
     };
-  }, [compatible, account]);
+  }, [account]);
 
   const signAndSubmit = useCallback(
     async (localId: string) => {
@@ -235,13 +235,15 @@ export function NativePaidRequests() {
   );
 
   useEffect(() => {
-    if (!compatible) return;
+    if (!trackingAvailable) return;
     const tick = async () => {
       if (busy.current) return;
       busy.current = true;
       try {
         const current = accountRef.current;
-        const next = current ? nextToSign(requestsRef.current, current) : undefined;
+        const next = context.data?.compatible && current
+          ? nextToSign(requestsRef.current, current)
+          : undefined;
         if (next) await signAndSubmit(next);
         for (const state of requestsRef.current) {
           if (!TERMINAL_PHASES.has(state.phase) && state.phase !== "waiting") {
@@ -255,9 +257,13 @@ export function NativePaidRequests() {
     const timer = window.setInterval(() => void tick(), POLL_MS);
     void tick();
     return () => window.clearInterval(timer);
-  }, [compatible, follow, signAndSubmit]);
+  }, [trackingAvailable, context.data?.compatible, follow, signAndSubmit]);
 
   const prepare = async () => {
+    if (!context.data?.compatible) {
+      setFormError(context.data?.reason ?? "New native requests are not currently available.");
+      return;
+    }
     setFormError(null);
     setReview(null);
     setPreparing(true);
@@ -271,7 +277,7 @@ export function NativePaidRequests() {
   };
 
   const queue = () => {
-    if (!review || !account) return;
+    if (!context.data?.compatible || !review || !account) return;
     const localId = `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     drafts.current.set(localId, {
       prompt,
@@ -293,7 +299,7 @@ export function NativePaidRequests() {
   /** Queue a request again that was refused before anything was signed. */
   const requeue = (state: NativeRequestState) => {
     const draft = drafts.current.get(state.localId);
-    if (!draft || !account) return;
+    if (!context.data?.compatible || !draft || !account) return;
     const localId = `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     drafts.current.set(localId, draft);
     drafts.current.delete(state.localId);
@@ -353,7 +359,7 @@ export function NativePaidRequests() {
   };
 
   if (context.isLoading || context.data === null || context.data === undefined) {
-    // Not a protocol-4 chain (or still asking): nothing to offer here.
+    // No native-inference context yet, or still asking the host.
     return null;
   }
   const view = context.data;
@@ -362,27 +368,11 @@ export function NativePaidRequests() {
     <CardHeader
       title={
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-          <Coins size={16} /> Native paid requests (protocol 4)
+          <Coins size={16} /> Native paid requests
         </span>
       }
     />
   );
-
-  if (!view.compatible) {
-    return (
-      <Card data-testid="native-paid-card" style={{ marginBottom: "var(--space-6)" }}>
-        {header}
-        <div role="status" data-testid="native-context-status" style={{ fontSize: "var(--text-sm)" }}>
-          <strong>Paid requests are not available from this host.</strong> {view.reason}
-          <div style={{ color: "var(--text-muted)", marginTop: 4 }}>
-            Host {view.host}
-            {view.nodeVersion ? ` · node ${view.nodeVersion}` : ""} · app contract v
-            {view.appContractVersion}
-          </div>
-        </div>
-      </Card>
-    );
-  }
 
   const escrow = account ? reservedInEscrow(requests, account) : 0;
   const positionLimit = view.serving?.maxPositions ?? null;
@@ -390,7 +380,9 @@ export function NativePaidRequests() {
     review && review.tokenCount !== null && positionLimit !== null && 1 + review.tokenCount + maxTokens > positionLimit
       ? { needed: 1 + review.tokenCount + maxTokens, limit: positionLimit }
       : null;
-  const executor = view.serving?.executor === "deterministic_test" ? "deterministic TEST executor" : "canonical model";
+  const executor = view.serving?.executor === "deterministic_test"
+    ? "deterministic TEST executor"
+    : view.serving?.executor ?? "unavailable";
   const visible = [...requests].reverse();
 
   return (
@@ -398,12 +390,20 @@ export function NativePaidRequests() {
       {header}
       <div
         role="status"
-        data-testid="native-context-status"
+        data-testid="native-chain-status"
         style={{ fontSize: "var(--text-sm)", color: "var(--text-secondary)", marginBottom: "var(--space-3)" }}
       >
         Chain at block {view.height} · {view.members} validators · executor: {executor}
         {view.nodeVersion ? ` · node ${view.nodeVersion}` : ""}
       </div>
+      {!view.compatible ? (
+        <div role="status" data-testid="native-context-status" style={{ fontSize: "var(--text-sm)", marginBottom: "var(--space-3)" }}>
+          <strong>New paid requests are unavailable.</strong> {view.reason}
+          <div style={{ color: "var(--text-muted)", marginTop: 4 }}>
+            Existing signed requests continue to be tracked and can be refunded or resubmitted.
+          </div>
+        </div>
+      ) : null}
       <div data-testid="native-balance" style={{ fontSize: "var(--text-sm)", marginBottom: "var(--space-3)" }}>
         Available:{" "}
         <strong data-testid="native-available">
@@ -477,7 +477,7 @@ export function NativePaidRequests() {
         <button
           className="btn btn-secondary"
           onClick={prepare}
-          disabled={preparing || !prompt.trim()}
+          disabled={!view.compatible || preparing || !prompt.trim()}
           data-testid="btn-native-review"
           style={{ alignSelf: "flex-end" }}
         >
@@ -522,7 +522,7 @@ export function NativePaidRequests() {
             className="btn btn-primary"
             onClick={queue}
             style={{ marginTop: 8 }}
-            disabled={overPositions !== null}
+            disabled={!view.compatible || overPositions !== null}
             data-testid="btn-native-sign"
           >
             <Send size={14} /> Sign and submit
@@ -596,7 +596,7 @@ export function NativePaidRequests() {
                 {state.phase === "rejected" &&
                 state.reason?.startsWith("not signed:") &&
                 drafts.current.has(state.localId) ? (
-                  <button className="btn btn-ghost btn-sm" onClick={() => requeue(state)} data-testid="btn-native-requeue">
+                  <button className="btn btn-ghost btn-sm" onClick={() => requeue(state)} disabled={!view.compatible} data-testid="btn-native-requeue">
                     <RotateCcw size={13} /> Queue again
                   </button>
                 ) : null}

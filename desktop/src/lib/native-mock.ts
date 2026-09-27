@@ -1,4 +1,4 @@
-// Browser-preview model of a protocol-4 chain for the native paid-request
+// Browser-preview model of a native-inference chain for the native paid-request
 // panel. A test seam only: `mockInvoke` consults it, never the Tauri app or a
 // production bundle (both refuse to mock), and only after a test sets
 // `window.__ARC_MOCK_NATIVE__`. Without that flag the mock host is not a
@@ -54,12 +54,12 @@ interface MockChain {
   journal: NativeJournalEntry[];
 }
 
-type Flag = true | "incompatible";
+type Flag = true | "incompatible" | "closed-admission";
 
 function flag(): Flag | null {
   if (typeof window === "undefined") return null;
   const value = (window as Window & { __ARC_MOCK_NATIVE__?: Flag }).__ARC_MOCK_NATIVE__;
-  return value === true || value === "incompatible" ? value : null;
+  return value === true || value === "incompatible" || value === "closed-admission" ? value : null;
 }
 
 export function nativeMockEnabled(): boolean {
@@ -140,12 +140,15 @@ function openEntry(chain: MockChain): NativeJournalEntry | undefined {
 function context(): NativeContextView {
   const chain = load();
   const incompatible = flag() === "incompatible";
+  const admissionOpen = flag() !== "closed-admission" && !incompatible;
   return {
     host: MOCK_HOST,
-    compatible: !incompatible,
+    compatible: admissionOpen,
     reason: incompatible
       ? "the node speaks native contract v2 and this app speaks v1; update the app"
-      : null,
+      : !admissionOpen
+        ? "this chain is not admitting new native paid requests right now"
+        : null,
     height: incompatible ? null : chain.height,
     members: incompatible ? null : VALIDATORS.length,
     executions: incompatible ? null : 1,
@@ -164,7 +167,8 @@ function context(): NativeContextView {
     appContractVersion: 1,
     chainProtocol: 4,
     nativeOnlyChain: true,
-    requestAdmissionOpen: !incompatible,
+    requestAdmissionOpen: admissionOpen,
+    trackingAvailable: !incompatible,
   };
 }
 
@@ -446,8 +450,10 @@ export function mockNativeInvoke(cmd: string, args: unknown): unknown {
     case "native_context":
       return context();
     case "native_prepare":
+      if (flag() === "closed-admission") throw new Error("this chain is not admitting new native paid requests right now");
       return prepare(String(input.prompt ?? ""));
     case "native_submit":
+      if (flag() === "closed-admission") throw new Error("this chain is not admitting new native paid requests right now");
       return submit(input as unknown as SubmitArgs);
     case "native_receipt":
       return receipt(String(input.requestId ?? ""));
