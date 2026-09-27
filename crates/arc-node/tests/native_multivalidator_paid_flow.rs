@@ -11,7 +11,10 @@
 //!   transaction needs a strict supermajority of stake - so on any committee
 //!   larger than one, no request could ever finalize.
 //!
-//! Four real `arc-node` processes, driven over HTTP, with the DETERMINISTIC
+//! The recovered-v3 regression additionally imports a signed checkpoint into
+//! six processes and crosses activation/restart with default-closed admission.
+//!
+//! Real `arc-node` processes, driven over HTTP, with the DETERMINISTIC
 //! TEST EXECUTOR: protocol integration coverage that loads no model and
 //! qualifies nothing about inference quality.
 #![cfg(feature = "native-test-executor")]
@@ -86,6 +89,7 @@ fn wait_for<F: FnMut() -> bool>(timeout: Duration, label: &str, mut f: F) {
 
 struct NodeProcess {
     child: Child,
+    log_already_preserved: bool,
     port: u16,
     data_dir: PathBuf,
 }
@@ -96,11 +100,22 @@ impl Drop for NodeProcess {
         let _ = self.child.wait();
         // Keep each node's log for diagnosis; the temp dir is deleted.
         let keep = std::env::temp_dir().join(format!("arc-p5-node-{}.log", self.port));
-        let _ = std::fs::copy(self.data_dir.join("node.log"), keep);
+        if !self.log_already_preserved {
+            let _ = std::fs::copy(self.data_dir.join("node.log"), keep);
+        }
     }
 }
 
+struct RecoveryFixture {
+    checkpoint: PathBuf,
+    manifest: Hash256,
+    transaction_domain: Hash256,
+    activation_height: u64,
+}
+
 struct Fixture {
+    stakes: Vec<u64>,
+    recovery: Option<RecoveryFixture>,
     base_rpc: u16,
     base_p2p: u16,
     /// Extra arguments every node is started with.
@@ -118,6 +133,10 @@ struct Fixture {
 impl Fixture {
     /// Tests in this file run concurrently, so each uses its own ports.
     fn new(base_rpc: u16, base_p2p: u16, node_args: &[&str]) -> Self {
+        Self::with_stakes(base_rpc, base_p2p, node_args, vec![STAKE; NODES])
+    }
+
+    fn with_stakes(base_rpc: u16, base_p2p: u16, node_args: &[&str], stakes: Vec<u64>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let requesters = [requester_keypair("p5"), requester_keypair("p5-second")];
         let tuple = [
@@ -137,7 +156,7 @@ impl Fixture {
                 requester.address().to_hex()
             ));
         }
-        for i in 0..NODES {
+        for i in 0..stakes.len() {
             let v = validator_keypair(&format!("p5-validator-{i}"))
                 .address()
                 .to_hex();
@@ -147,12 +166,13 @@ impl Fixture {
                 "[[accounts]]\naddress = \"{v}\"\nbalance = 1_000_000_000_000\n\n"
             ));
         }
-        for i in 0..NODES {
+        for i in 0..stakes.len() {
             let v = validator_keypair(&format!("p5-validator-{i}"))
                 .address()
                 .to_hex();
             genesis.push_str(&format!(
-                "[[validators]]\naddress = \"{v}\"\nstake = {STAKE}\n\n"
+                "[[validators]]\naddress = \"{v}\"\nstake = {}\n\n",
+                stakes[i]
             ));
         }
         let genesis_path = dir.path().join("genesis.toml");
@@ -173,6 +193,8 @@ impl Fixture {
         )
         .unwrap();
         Self {
+            stakes,
+            recovery: None,
             base_rpc,
             base_p2p,
             node_args: node_args.iter().map(|a| a.to_string()).collect(),
@@ -184,12 +206,148 @@ impl Fixture {
         }
     }
 
+    /// Same process harness, with a complete six-member production-shaped
+    /// recovery identity. All secrets and checkpoint signatures are generated
+    /// for this disposable local test; no external model/files are consulted.
+    fn recovered() -> Self {
+        use arc_state::recovery::{ArcCheckpoint, RecoveryExportSpec, RecoveryValidator};
+        use arc_types::inference_contract::{ValidatorMember, validator_set_commitment};
+        use std::io::Write;
+        let mut fx = Self::with_stakes(
+            9980,
+            9180,
+            &["--snapshot-every-blocks", "50"],
+            vec![
+                6_666_667, 6_666_667, 6_666_667, 6_666_667, 6_666_666, 6_666_666,
+            ],
+        );
+        let genesis_text = std::fs::read_to_string(&fx.genesis).unwrap().replace(
+            "validator_set_complete = false",
+            "validator_set_complete = true",
+        );
+        std::fs::write(&fx.genesis, genesis_text).unwrap();
+        let genesis = arc_node::config::load_genesis(fx.genesis.to_str().unwrap()).unwrap();
+        let genesis_hash = genesis.network_hash(false).unwrap();
+        let keys: Vec<_> = (0..fx.stakes.len())
+            .map(|i| validator_keypair(&format!("p5-validator-{i}")))
+            .collect();
+        for (i, key) in keys.iter().enumerate() {
+            let KeyPair::Ed25519(secret) = key else {
+                panic!("test needs Ed25519");
+            };
+            let mut file = arc_crypto::secret_file::create_new_private(
+                &fx.dir.path().join(format!("validator-{i}.key.json")),
+            )
+            .unwrap();
+            file.write_all(serde_json::json!({ "scheme": "ed25519", "secret_key": hex::encode(secret.to_bytes()),
+                "public_key": hex::encode(key.public_key_bytes()), "address": key.address().to_hex() })
+                .to_string().as_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        let mut funds = genesis.validated_accounts().unwrap();
+        funds.push((
+            arc_state::recovery::recovery_stake_reserve_address(),
+            40_000_000,
+        ));
+        let source = arc_state::StateDB::with_genesis(&funds);
+        let joins: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, 0);
+                tx.body = TxBody::JoinValidator(arc_types::transaction::JoinValidatorBody {
+                    pubkey: key.public_key_bytes().try_into().unwrap(),
+                    initial_stake: fx.stakes[i],
+                });
+                tx.tx_type = tx.body.tx_type();
+                tx.sign(key).unwrap();
+                tx
+            })
+            .collect();
+        let (_, receipts) = source.execute_block(&joins, keys[0].address()).unwrap();
+        assert!(receipts.iter().all(|r| r.success));
+        for key in &keys {
+            let mut account = source.get_account(&key.address()).unwrap();
+            account.staked_balance = 0;
+            source.update_account(&key.address(), account);
+        }
+        source.execute_block(&[], keys[0].address()).unwrap();
+        let validators = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: fx.stakes[i],
+            })
+            .collect();
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: genesis.chain.chain_id.clone(),
+                genesis_hash,
+                source_consensus_round: 64,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let checkpoint_path = fx.dir.path().join("approved.arcchkpt");
+        checkpoint.write_to(&checkpoint_path).unwrap();
+        let mut members: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| ValidatorMember::new(key.address(), fx.stakes[i]))
+            .collect();
+        members.sort_by_key(|m| m.address.0);
+        let context = arc_state::InferenceAdmissionContext {
+            domain: InferenceDomain {
+                chain_genesis: genesis_hash,
+                recovery_epoch: 1,
+                validator_set_hash: validator_set_commitment(&members).unwrap(),
+            },
+            members,
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: fx.tuple[0],
+                profile_hash: fx.tuple[1],
+                generation_hash: fx.tuple[2],
+                assignment_hash: fx.tuple[3],
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        // Plenty of actual DAG rounds for the ordinary transfer before H.
+        let activation_height = checkpoint.manifest.source_height + 1 + 256;
+        std::fs::write(&fx.activation, serde_json::json!({
+            "recovery_epoch": 1, "allowed_executions": context.allowed_executions,
+            "selection_rule": context.selection_rule,
+            "migration": arc_state::NativeMigrationRecord { chain_genesis: genesis_hash, recovery_epoch: 1,
+                validator_set_id: 1, activation_height, context_commitment: context.commitment().unwrap() },
+        }).to_string()).unwrap();
+        fx.recovery = Some(RecoveryFixture {
+            checkpoint: checkpoint_path,
+            manifest: checkpoint.manifest_hash(),
+            transaction_domain: checkpoint.manifest.recovery_context().domain_hash(),
+            activation_height,
+        });
+        fx
+    }
+
     /// Start node `index`, or restart it on the data directory it had.
     fn spawn(&self, index: usize) -> NodeProcess {
+        self.spawn_mode(index, true, true)
+    }
+
+    fn spawn_mode(&self, index: usize, runtime: bool, admit_requests: bool) -> NodeProcess {
         let port = self.base_rpc + index as u16;
         let data_dir = self.dir.path().join(format!("node-{index}"));
         std::fs::create_dir_all(&data_dir).unwrap();
-        let peers: Vec<String> = (0..NODES)
+        let peers: Vec<String> = (0..self.stakes.len())
             .filter(|j| *j != index)
             .map(|j| format!("127.0.0.1:{}", self.base_p2p + j as u16))
             .collect();
@@ -199,29 +357,62 @@ impl Fixture {
             .append(true)
             .open(data_dir.join("node.log"))
             .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_arc-node"))
-            .args([
-                "--rpc",
-                &format!("127.0.0.1:{port}"),
-                "--p2p-port",
-                &(self.base_p2p + index as u16).to_string(),
-                "--data-dir",
-                data_dir.to_str().unwrap(),
-                "--genesis",
-                self.genesis.to_str().unwrap(),
-                "--peers",
-                &peers.join(","),
+        // Preserve recovery diagnostics even if CI's hard timeout kills the
+        // test runner before Drop runs. The link survives TempDir cleanup.
+        if self.recovery.is_some() && !data_dir.join("recovery.active").exists() {
+            let keep = std::env::temp_dir().join(format!("arc-p5-node-{port}.log"));
+            match std::fs::remove_file(&keep) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot replace prior test log: {error}"),
+            }
+            std::fs::hard_link(data_dir.join("node.log"), keep).unwrap();
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_arc-node"));
+        command.args([
+            "--rpc",
+            &format!("127.0.0.1:{port}"),
+            "--p2p-port",
+            &(self.base_p2p + index as u16).to_string(),
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--genesis",
+            self.genesis.to_str().unwrap(),
+            "--peers",
+            &peers.join(","),
+            "--stake",
+            &self.stakes[index].to_string(),
+            "--native-inference-activation",
+            self.activation.to_str().unwrap(),
+        ]);
+        if let Some(recovery) = &self.recovery {
+            command
+                .arg("--validator-key-file")
+                .arg(self.dir.path().join(format!("validator-{index}.key.json")));
+            if !data_dir.join("recovery.active").exists() {
+                command
+                    .arg("--recovery-checkpoint")
+                    .arg(&recovery.checkpoint)
+                    .arg("--approved-recovery-manifest-hash")
+                    .arg(recovery.manifest.to_hex());
+            }
+        } else {
+            command.args([
                 "--insecure-dev-validator-seed",
                 "--validator-seed",
                 &format!("p5-validator-{index}"),
-                "--stake",
-                &STAKE.to_string(),
-                "--native-inference-activation",
-                self.activation.to_str().unwrap(),
+            ]);
+        }
+        if runtime {
+            command.args([
                 "--native-inference-runtime",
-                "--enable-native-inference-requests",
                 "--native-inference-test-executor",
-            ])
+            ]);
+        }
+        if admit_requests {
+            command.arg("--enable-native-inference-requests");
+        }
+        let child = command
             .args(&self.node_args)
             // ARC_TEST_NODE_LOG raises the nodes' log level when diagnosing.
             .env(
@@ -234,6 +425,7 @@ impl Fixture {
             .expect("arc-node must start");
         NodeProcess {
             child,
+            log_already_preserved: self.recovery.is_some(),
             port,
             data_dir,
         }
@@ -294,8 +486,12 @@ impl Fixture {
             signature: arc_crypto::signature::Signature::null(),
             sig_verified: false,
         };
-        tx.hash = tx.compute_hash();
-        tx.signature = requester.sign(&tx.hash).unwrap();
+        if let Some(recovery) = &self.recovery {
+            tx.sign_in_domain(requester, &recovery.transaction_domain)
+                .unwrap();
+        } else {
+            tx.sign(requester).unwrap();
+        }
         (tx, request_id)
     }
 }
@@ -333,6 +529,418 @@ fn heights(nodes: &[NodeProcess]) -> Vec<Option<u64>> {
         .iter()
         .map(|n| get_json(n.port, "/health").and_then(|h| h["height"].as_u64()))
         .collect()
+}
+
+/// Reap every process through its normal durability barrier before restarting.
+/// Send all TERM signals before waiting: a stopped validator may be the next
+/// required leader, so serial stop-and-wait must not masquerade as progress.
+#[cfg(unix)]
+fn stop_recovered_nodes(nodes: &mut [NodeProcess]) {
+    for node in nodes.iter() {
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &node.child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for node in nodes.iter_mut() {
+        loop {
+            if let Some(status) = node.child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "validator {} failed normal shutdown: {status}",
+                    node.port
+                );
+                let retained_log =
+                    std::env::temp_dir().join(format!("arc-p5-node-{}.log", node.port));
+                assert!(
+                    std::fs::metadata(retained_log).unwrap().len() > 0,
+                    "every recovered process must leave nonempty CI diagnostics"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "validator {} did not stop durably",
+                node.port
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn recovered_account(port: u16, who: Hash256) -> arc_types::Account {
+    serde_json::from_value(
+        get_json(port, &format!("/account/{}", who.to_hex())).expect("account RPC"),
+    )
+    .unwrap()
+}
+
+/// No StateDB execution in this helper: the only writer is the real node's
+/// DAG loop. Every replica must publish the same successful canonical receipt
+/// and v3 header, with an actual nonzero DAG decision commitment.
+fn recovered_commit(nodes: &[NodeProcess], tx: Hash256, native: bool) -> u64 {
+    wait_for(
+        Duration::from_secs(90),
+        "transaction committed on all recovered validators",
+        || {
+            nodes.iter().all(|n| {
+                get_json(n.port, &format!("/tx/{}", tx.to_hex()))
+                    .is_some_and(|r| r["success"] == true)
+            })
+        },
+    );
+    let reference = get_json(nodes[0].port, &format!("/tx/{}", tx.to_hex())).unwrap();
+    let height = reference["block_height"].as_u64().unwrap();
+    let reference_block = get_json(nodes[0].port, &format!("/block/{height}")).unwrap();
+    let block: arc_types::Block = serde_json::from_value(reference_block.clone()).unwrap();
+    assert_eq!(block.header.protocol_version.major, 3);
+    assert_ne!(
+        block.header.proof_hash,
+        Hash256::ZERO,
+        "must commit through actual recovered DAG"
+    );
+    assert!(block.tx_hashes.contains(&tx));
+    if native {
+        assert_eq!(
+            block.header.tx_count, 1,
+            "native transition gets an isolated state block"
+        );
+    }
+    for node in nodes {
+        assert_eq!(
+            get_json(node.port, &format!("/tx/{}", tx.to_hex())).unwrap(),
+            reference
+        );
+        assert_eq!(
+            get_json(node.port, &format!("/block/{height}")).unwrap(),
+            reference_block,
+            "recovered replicas disagree on header/root/body"
+        );
+    }
+    height
+}
+
+fn wait_recovered_peers(nodes: &[NodeProcess]) {
+    wait_for(
+        Duration::from_secs(60),
+        "six recovered validators fully connected",
+        || {
+            nodes
+                .iter()
+                .all(|n| get_json(n.port, "/health").and_then(|h| h["peers"].as_u64()) == Some(5))
+        },
+    );
+}
+
+/// Covers the actual six-process recovered-v3 proposal/commit path, not a
+/// private v4 shortcut or direct state publisher. The synthetic executor is
+/// protocol evidence only; independent real-model qualification is separate.
+#[cfg(unix)]
+#[test]
+fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
+    let fx = Fixture::recovered();
+    let recovery = fx.recovery.as_ref().unwrap();
+    let mut nodes: Vec<_> = (0..6).map(|i| fx.spawn_mode(i, false, false)).collect();
+    wait_recovered_peers(&nodes);
+    let initial = recovered_account(nodes[0].port, fx.requesters[0].address());
+    assert_eq!(initial.nonce, 0);
+    let mut before =
+        Transaction::new_transfer(fx.requesters[0].address(), fx.requesters[1].address(), 1, 0);
+    before.fee = 1;
+    before
+        .sign_in_domain(&fx.requesters[0], &recovery.transaction_domain)
+        .unwrap();
+    let (code, reason) = submit(nodes[0].port, &before);
+    assert_eq!(code, 200, "ordinary recovered transfer refused: {reason}");
+    assert!(
+        recovered_commit(&nodes, before.hash, false) < recovery.activation_height,
+        "fixture must actually exercise ordinary traffic before native activation"
+    );
+    wait_for(
+        Duration::from_secs(180),
+        "DAG reaches coordinated native activation with admission closed",
+        || {
+            nodes.iter().all(|n| {
+                get_json(n.port, "/native-inference/context").is_some_and(|ctx| {
+                    ctx["chain_protocol"] == 3
+                        && ctx["native_only_chain"] == false
+                        && ctx["request_admission_open"] == false
+                        && ctx["request_admission"]["operator_enabled"] == false
+                        && ctx["request_admission"]["runtime_ready"] == false
+                })
+            })
+        },
+    );
+    let ctx = get_json(nodes[0].port, "/native-inference/context").unwrap();
+    let domain = InferenceDomain {
+        chain_genesis: Hash256::from_hex(ctx["chain_genesis"].as_str().unwrap()).unwrap(),
+        recovery_epoch: ctx["recovery_epoch"].as_u64().unwrap(),
+        validator_set_hash: Hash256::from_hex(ctx["validator_set_hash"].as_str().unwrap()).unwrap(),
+    };
+    let (unadmitted, _) = fx.request(0, domain, 1, 1_000_000);
+    for node in &nodes {
+        assert_eq!(
+            submit(node.port, &unadmitted).0,
+            503,
+            "activation alone must never open paid ingress"
+        );
+        assert_eq!(
+            recovered_account(node.port, fx.requesters[0].address()).balance,
+            initial.balance - 2
+        );
+    }
+    let activation_block = get_json(
+        nodes[0].port,
+        &format!("/block/{}", recovery.activation_height),
+    )
+    .unwrap();
+    assert_eq!(activation_block["header"]["protocol_version"]["major"], 3);
+    for node in &nodes {
+        assert_eq!(
+            get_json(node.port, &format!("/block/{}", recovery.activation_height)).unwrap(),
+            activation_block
+        );
+    }
+    stop_recovered_nodes(&mut nodes);
+    drop(nodes);
+
+    // Only one node accepts NEW requests. The other five must still retain
+    // committed preimages, execute jobs, gossip votes and admit finalizations.
+    let mut nodes: Vec<_> = (0..6).map(|i| fx.spawn_mode(i, true, i == 0)).collect();
+    wait_recovered_peers(&nodes);
+    wait_for(
+        Duration::from_secs(60),
+        "every native runtime live, exactly one ingress enabled",
+        || {
+            nodes.iter().enumerate().all(|(i, n)| {
+                get_json(n.port, "/native-inference/context").is_some_and(|ctx| {
+                    ctx["request_admission"]["runtime_ready"] == true
+                        && ctx["request_admission_open"] == (i == 0)
+                        && ctx["chain_protocol"] == 3
+                        && ctx["native_only_chain"] == false
+                })
+            })
+        },
+    );
+    let (paid, paid_id) = fx.request(0, domain, 1, 1_000_000);
+    assert_eq!(submit(nodes[1].port, &paid).0, 503);
+    let (code, reason) = submit(nodes[0].port, &paid);
+    assert_eq!(
+        code, 200,
+        "ready opted-in recovered node refused request: {reason}"
+    );
+    recovered_commit(&nodes, paid.hash, true);
+    wait_finalized(
+        &nodes.iter().collect::<Vec<_>>(),
+        paid_id,
+        Duration::from_secs(120),
+        "native quorum finalizes on recovered DAG",
+    );
+    let paid_path = format!("/native-inference/receipt/{}", paid_id.to_hex());
+    let paid_receipt = get_json(nodes[0].port, &paid_path).unwrap();
+    assert!(
+        paid_receipt["certificate_votes"].as_u64().unwrap() >= 4,
+        "the uneven six-member committee cannot certify with one runtime"
+    );
+    let finalized_tx = Hash256::from_hex(
+        paid_receipt["terminal_transaction"]["tx_hash"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    recovered_commit(&nodes, finalized_tx, true);
+    let expected_settlement = settlement(nodes[0].port, paid_id).unwrap();
+    assert_eq!(
+        expected_settlement
+            .3
+            .iter()
+            .map(|(_, amount)| amount)
+            .sum::<u64>(),
+        100
+    );
+    assert_eq!(
+        expected_settlement
+            .3
+            .iter()
+            .find(|(payee, _)| *payee == fx.requesters[0].address().to_hex())
+            .unwrap()
+            .1,
+        90
+    );
+    for node in &nodes {
+        assert_eq!(settlement(node.port, paid_id).unwrap(), expected_settlement);
+        assert_eq!(
+            recovered_account(node.port, fx.requesters[0].address()).balance,
+            initial.balance - 12
+        );
+    }
+    let mut after =
+        Transaction::new_transfer(fx.requesters[0].address(), fx.requesters[1].address(), 1, 2);
+    after.fee = 1;
+    after
+        .sign_in_domain(&fx.requesters[0], &recovery.transaction_domain)
+        .unwrap();
+    assert_eq!(
+        submit(nodes[1].port, &after).0,
+        200,
+        "ordinary v3 traffic must pass a closed native gate"
+    );
+    recovered_commit(&nodes, after.hash, false);
+
+    // A valid one-token job is deliberately smaller than the synthetic
+    // executor's fixed two-token answer. Each real worker must refuse output
+    // bounds, never invent a shorter answer/certificate. It stays refundable.
+    let expires = heights(&nodes).into_iter().flatten().max().unwrap() + 40;
+    let (mut bounded, _) = fx.request(1, domain, 0, expires);
+    let TxBody::NativeInferenceRequest(body) = &mut bounded.body else {
+        unreachable!()
+    };
+    let mut job = body.request.job.clone();
+    job.max_tokens = 1;
+    job.max_output_bytes = 4;
+    body.request = InferenceRequest::sign(job, &fx.requesters[1]).unwrap();
+    let refund_id = body.request.job.request_id();
+    bounded
+        .sign_in_domain(&fx.requesters[1], &recovery.transaction_domain)
+        .unwrap();
+    let (code, reason) = submit(nodes[0].port, &bounded);
+    assert_eq!(
+        code, 200,
+        "bounded valid request refused before execution: {reason}"
+    );
+    recovered_commit(&nodes, bounded.hash, true);
+    for node in &nodes {
+        assert_eq!(settlement(node.port, refund_id).unwrap().0, "Pending");
+    }
+    stop_recovered_nodes(&mut nodes);
+    drop(nodes);
+
+    // Restart every process on exactly its durable data/signing state with
+    // NEW ingress closed. No checkpoint reimport, state edits or fake tips.
+    let mut nodes: Vec<_> = (0..6).map(|i| fx.spawn_mode(i, true, false)).collect();
+    wait_recovered_peers(&nodes);
+    wait_for(
+        Duration::from_secs(120),
+        "reopened DAG advances to refund height with ingress closed",
+        || {
+            heights(&nodes)
+                .iter()
+                .all(|h| h.is_some_and(|h| h + 1 >= expires))
+        },
+    );
+    for node in &nodes {
+        assert_eq!(
+            get_json(node.port, "/native-inference/context").unwrap()["request_admission_open"],
+            false
+        );
+        assert_eq!(settlement(node.port, paid_id).unwrap(), expected_settlement);
+        assert_eq!(settlement(node.port, refund_id).unwrap().0, "Pending");
+    }
+    let body = TxBody::NativeInferenceRefund(arc_types::transaction::NativeInferenceRefundBody {
+        request_id: refund_id.0,
+    });
+    let mut refund =
+        Transaction::new_transfer(fx.requesters[1].address(), fx.requesters[1].address(), 0, 1);
+    refund.tx_type = body.tx_type();
+    refund.body = body;
+    refund.gas_limit = arc_types::transaction::gas_costs::NATIVE_INFERENCE_REFUND;
+    refund
+        .sign_in_domain(&fx.requesters[1], &recovery.transaction_domain)
+        .unwrap();
+    let (code, reason) = submit(nodes[2].port, &refund);
+    assert_eq!(
+        code, 200,
+        "closed local ingress stranded an eligible refund: {reason}"
+    );
+    recovered_commit(&nodes, refund.hash, true);
+    for node in &nodes {
+        let receipt = settlement(node.port, refund_id).unwrap();
+        assert_eq!(receipt.0, "Refunded");
+        assert_eq!(receipt.3, vec![(fx.requesters[1].address().to_hex(), 100)]);
+        assert_eq!(
+            recovered_account(node.port, fx.requesters[0].address()).balance,
+            initial.balance - 14
+        );
+        assert_eq!(
+            recovered_account(node.port, fx.requesters[1].address()).balance,
+            initial.balance + 2
+        );
+        assert_eq!(
+            get_json(node.port, "/native-inference/context").unwrap()["chain_protocol"],
+            3
+        );
+    }
+    stop_recovered_nodes(&mut nodes);
+    // Reopen the real process-written recovery stores and independently
+    // verify the stored native certificate against the frozen binding. Four
+    // high-stake validators can meet this fleet's strict stake quorum; a
+    // fixed five-vote assertion would incorrectly change the actual rule.
+    let genesis = arc_node::config::load_genesis(fx.genesis.to_str().unwrap()).unwrap();
+    let policy = arc_state::recovery::RecoveryNetworkPolicy {
+        chain_id: genesis.chain.chain_id.clone(),
+        genesis_hash: genesis.network_hash(false).unwrap(),
+        recovery_epoch: 1,
+        validator_set_id: 1,
+        validators: genesis.validated_validator_set(false).unwrap(),
+        community_rewards_v1_activation_height: None,
+    };
+    for node in &nodes {
+        let state = arc_state::StateDB::with_genesis_persistent_recovery(
+            &[],
+            &node.data_dir,
+            policy.clone(),
+            None,
+        )
+        .unwrap();
+        let context = state.native_inference_context().unwrap();
+        let stored = state
+            .native_inference_receipt(paid_id, context.commitment().unwrap())
+            .unwrap()
+            .unwrap();
+        let pending = stored
+            .metadata
+            .request
+            .validate(&context.domain, &context.members, stored.admission_height)
+            .unwrap();
+        let terminal_height = stored.terminal_transaction.unwrap().block_height;
+        let plan = arc_types::inference_contract::plan_finalize(
+            &pending,
+            stored.metadata.certificate.as_ref().unwrap(),
+            &context.members,
+            &context.domain,
+            terminal_height,
+        )
+        .unwrap();
+        let arc_types::inference_contract::SettlementPlan::Finalize {
+            credits,
+            output_hash,
+            ..
+        } = plan
+        else {
+            unreachable!()
+        };
+        assert_eq!(credits, stored.metadata.credits);
+        assert_eq!(Some(output_hash), stored.metadata.output_hash);
+        assert!(
+            state
+                .native_inference_pending_requests(context.commitment().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .get_block(state.height())
+                .unwrap()
+                .header
+                .protocol_version
+                .major,
+            3
+        );
+    }
 }
 
 #[test]
