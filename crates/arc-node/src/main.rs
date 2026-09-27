@@ -6508,6 +6508,11 @@ async fn run_arc_node() -> Result<()> {
         return Ok(());
     }
 
+    let native_request_admission =
+        Arc::new(arc_node::native_inference::NativeRequestAdmission::new(
+            cli.enable_native_inference_requests,
+        ));
+
     // Arm lifecycle capture before community auto-download, config work,
     // persistent recovery/replay, or model loading. The signal edge records
     // intent synchronously in an atomic and closes both admission channels;
@@ -6529,12 +6534,14 @@ async fn run_arc_node() -> Result<()> {
         let shutdown_requested = shutdown_requested.clone();
         let shutdown_tx = shutdown_tx.clone();
         let background_admission_shutdown_tx = background_admission_shutdown_tx.clone();
+        let shutdown_worker_execution_gate = native_request_admission.worker_execution_gate();
         tokio::spawn(async move {
             match tokio::signal::ctrl_c().await {
                 Ok(()) => {
                     tracing::info!(
                         "SIGINT received - stopping HTTP/background admission and draining active work"
                     );
+                    shutdown_worker_execution_gate.commit_shutdown();
                     broadcast_node_shutdown(
                         &shutdown_requested,
                         &shutdown_tx,
@@ -6550,11 +6557,13 @@ async fn run_arc_node() -> Result<()> {
         let shutdown_requested = shutdown_requested.clone();
         let shutdown_tx = shutdown_tx.clone();
         let background_admission_shutdown_tx = background_admission_shutdown_tx.clone();
+        let shutdown_worker_execution_gate = native_request_admission.worker_execution_gate();
         tokio::spawn(async move {
             sigterm.recv().await;
             tracing::info!(
                 "SIGTERM received - stopping HTTP/background admission and draining active work"
             );
+            shutdown_worker_execution_gate.commit_shutdown();
             broadcast_node_shutdown(
                 &shutdown_requested,
                 &shutdown_tx,
@@ -6686,10 +6695,6 @@ async fn run_arc_node() -> Result<()> {
     let desktop_lifecycle_nonce = cli.desktop_lifecycle_nonce;
     let mut data_dir_lock =
         acquire_node_data_dir_lock(Path::new(&data_dir), desktop_lifecycle_nonce.as_ref())?;
-    let native_request_admission =
-        Arc::new(arc_node::native_inference::NativeRequestAdmission::new(
-            cli.enable_native_inference_requests,
-        ));
     let desktop_shutdown_control = prepare_desktop_shutdown_control(
         Path::new(&data_dir),
         cli.desktop_shutdown_token_file.as_deref(),
