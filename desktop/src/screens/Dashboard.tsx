@@ -65,6 +65,14 @@ export function Dashboard() {
     queryFn: api.fetchNetworkStats,
     refetchInterval: 10_000,
   });
+  // Share Network's host overview so chain height and block age come from the
+  // same current source. `nodeStatus` only has the age from the first host
+  // election; using it here lets that timestamp grow stale while height moves.
+  const { data: networkOverview } = useQuery({
+    queryKey: ["network-overview"],
+    queryFn: api.fetchNetworkOverview,
+    refetchInterval: 10_000,
+  });
   // Whether the OS will bring the node back by itself. Polled rather than
   // assumed from the config flag: the login item is registered separately, so
   // the two can disagree and that disagreement is worth seeing.
@@ -866,7 +874,7 @@ export function Dashboard() {
           <div className="section-heading">
             <h2 style={{ fontSize: "var(--text-base)" }}>
               Network
-              {status?.chainHost && (
+              {networkOverview?.sourceHost && (
                 <span
                   style={{
                     marginLeft: 8,
@@ -875,7 +883,7 @@ export function Dashboard() {
                     fontWeight: 400,
                   }}
                 >
-                  via {hostLabel(status.chainHost)}
+                  via {hostLabel(networkOverview.sourceHost)}
                 </span>
               )}
             </h2>
@@ -888,29 +896,30 @@ export function Dashboard() {
                 : "—"}
             </dd>
             <dt>Host block height</dt>
-            <dd>
-              {network?.latestBlock != null
-                ? formatInt(network.latestBlock)
+            <dd data-testid="dashboard-chain-height">
+              {networkOverview?.height != null
+                ? formatInt(networkOverview.height)
                 : "—"}
             </dd>
             {/* DAG rounds and health can advance without sealed blocks.
-                Show block age separately to make that distinction visible. */}
-            {status?.chainBlockAgeSeconds != null && (
-              <>
-                <dt>Last block</dt>
-                <dd
-                  data-testid="chain-block-age"
-                  style={{
-                    color:
-                      status.chainBlockAgeSeconds > 3600
-                        ? "var(--warning)"
-                        : undefined,
-                  }}
-                >
-                  {formatUptime(status.chainBlockAgeSeconds)} ago
-                </dd>
-              </>
-            )}
+                Height and age both come from the fresh host overview. */}
+            <dt>Last block</dt>
+            <dd
+              data-testid="chain-block-age"
+              style={{
+                color:
+                  networkOverview?.lastBlockAgeSecs != null &&
+                  networkOverview.lastBlockAgeSecs > 3600
+                    ? "var(--warning)"
+                    : undefined,
+              }}
+            >
+              {networkOverview
+                ? networkOverview.lastBlockAgeSecs != null
+                  ? `${formatUptime(networkOverview.lastBlockAgeSecs)} ago`
+                  : "Unavailable"
+                : "—"}
+            </dd>
           </div>
 
           {/* Was `openExternal("http://140.82.16.112:3200")` labelled "Open
@@ -930,7 +939,9 @@ export function Dashboard() {
             data-testid="btn-open-network"
           >
             <ArrowUpRight size={14} /> Check the chain
-            {status?.chainHost && <> ({hostLabel(status.chainHost)})</>}
+            {networkOverview?.sourceHost && (
+              <> ({hostLabel(networkOverview.sourceHost)})</>
+            )}
           </button>
         </Card>
       </div>

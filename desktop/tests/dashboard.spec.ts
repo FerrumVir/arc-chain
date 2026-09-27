@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { seedOnboarded } from "./helpers";
+import { seedMockOverrides, seedOnboarded } from "./helpers";
 
 const TEST_WORKER = "99".repeat(32);
 
@@ -167,6 +167,42 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("sidebar")).toBeVisible();
     await expect(page.getByTestId("main")).toBeVisible();
     await expect(page.getByTestId("dashboard")).toBeVisible();
+  });
+
+  test("uses one fresh host overview for Dashboard height and last-block age", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      fetch_network_overview: {
+        sourceHost: "http://136.244.109.1:9944",
+        height: 2_989_219,
+        lastBlockAgeSecs: 0,
+      },
+    });
+    await page.goto("/");
+
+    await expect(page.getByTestId("dashboard-chain-height")).toHaveText(
+      "2,989,219",
+    );
+    await expect(page.getByTestId("chain-block-age")).toHaveText("0s ago");
+    await expect(page.getByTestId("btn-open-network")).toContainText("(AMS)");
+  });
+
+  test("shows an unavailable block age instead of stale status age", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      fetch_network_overview: {
+        sourceHost: "http://136.244.109.1:9944",
+        height: 2_989_219,
+        lastBlockAgeSecs: null,
+      },
+    });
+    await page.goto("/");
+
+    await expect(page.getByTestId("chain-block-age")).toHaveText(
+      "Unavailable",
+    );
   });
 
   test("shows only host-confirmed mined rewards as an ARC amount", async ({ page }) => {
