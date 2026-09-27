@@ -706,6 +706,28 @@ fn verify_peer_dag_transactions_in_domain(
     Ok(verified)
 }
 
+/// The live DAG boundary authenticates exact bodies and immutable envelope
+/// rules. Current-state eligibility is checked separately at proposal/commit;
+/// it must not make an already-signed consensus parent disappear in flight.
+fn verify_peer_dag_availability(
+    state: &StateDB,
+    committed_hashes: &[Hash256],
+    transactions: &[arc_types::Transaction],
+) -> Result<Vec<arc_types::Transaction>, String> {
+    let verified = verify_peer_dag_transactions_in_domain(
+        committed_hashes,
+        transactions,
+        state.transaction_domain_hash(),
+    )
+    .map_err(|error| format!("invalid DAG transaction attachment: {error:?}"))?;
+    if state.active_protocol_version().major == 3 {
+        state
+            .validate_v3_dag_availability(&verified)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(verified)
+}
+
 /// The direct benchmark executor mutates canonical `StateDB` without a DAG
 /// commit. That is valid only for a one-validator development chain. A
 /// multi-validator benchmark must feed its signed transactions through the
@@ -2022,50 +2044,22 @@ impl ConsensusManager {
                             // vector can finalize a block whose transactions
                             // are unavailable (or populate pending state with
                             // transactions the author never committed to).
-                            let verified = match verify_peer_dag_transactions_in_domain(
+                            let verified = match verify_peer_dag_availability(
+                                &state,
                                 &block.transactions,
                                 &transactions,
-                                state.transaction_domain_hash(),
                             ) {
                                 Ok(verified) => verified,
-                                Err(PeerDagTransactionError::AttachmentMismatch) => {
-                                    warn!(
-                                        author = %block.author,
-                                        round = block.round,
-                                        committed = block.transactions.len(),
-                                        attached = transactions.len(),
-                                        "Rejected DAG block with mismatched transaction attachment"
-                                    );
-                                    continue;
-                                }
-                                Err(PeerDagTransactionError::InvalidTransaction(tx_hash)) => {
-                                    warn!(
-                                        %tx_hash,
-                                        author = %block.author,
-                                        round = block.round,
-                                        "Rejected entire DAG block containing an invalid transaction"
-                                    );
-                                    continue;
-                                }
-                            };
-                            if state.active_protocol_version().major == 3 {
-                                let fresh: Vec<_> = verified
-                                    .iter()
-                                    .filter(|transaction| {
-                                        !state.receipts.contains_key(&transaction.hash.0)
-                                    })
-                                    .cloned()
-                                    .collect();
-                                if let Err(error) = state.validate_v3_block_admission(&fresh) {
+                                Err(error) => {
                                     warn!(
                                         author = %block.author,
                                         round = block.round,
                                         error = %error,
-                                        "Rejected DAG block that fails protocol-v3 state admission"
+                                        "Rejected DAG block with invalid transaction availability"
                                     );
                                     continue;
                                 }
-                            }
+                            };
                             if !pending_preimage_capacity_allows(&pending_txs, &block.transactions)
                             {
                                 warn!(
@@ -5335,18 +5329,52 @@ mod tests {
             }],
             selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
         };
+        let mut future_native =
+            Transaction::new_transfer(requester.address(), requester.address(), 0, 0);
+        future_native.body =
+            TxBody::NativeInferenceRefund(arc_types::transaction::NativeInferenceRefundBody {
+                request_id: [71; 32],
+            });
+        future_native.tx_type = future_native.body.tx_type();
         state
-            .authorize_native_migration(
-                arc_state::NativeMigrationRecord {
-                    chain_genesis: genesis,
-                    recovery_epoch: 1,
-                    validator_set_id: 1,
-                    activation_height: state.height() + 1,
-                    context_commitment: context.commitment().unwrap(),
-                },
-                context.clone(),
-            )
+            .sign_transaction(&mut future_native, &requester)
             .unwrap();
+        let availability = |tx: &Transaction| {
+            verify_peer_dag_availability(&state, &[tx.hash], std::slice::from_ref(tx))
+        };
+        assert!(
+            availability(&future_native).is_err(),
+            "unconfigured recovery never admits the native family"
+        );
+        let migration = arc_state::NativeMigrationRecord {
+            chain_genesis: genesis,
+            recovery_epoch: 1,
+            validator_set_id: 1,
+            activation_height: state.height() + 1,
+            context_commitment: context.commitment().unwrap(),
+        };
+        let mut wrong_context = context.clone();
+        wrong_context.allowed_executions[0].assignment_hash =
+            hash_bytes(b"unapproved pending binding");
+        state
+            .authorize_native_migration(migration.clone(), wrong_context)
+            .unwrap();
+        assert!(
+            availability(&future_native).is_err(),
+            "a pending context must match the operator's commitment"
+        );
+        state
+            .authorize_native_migration(migration, context.clone())
+            .unwrap();
+        assert!(state.native_inference_context().is_none());
+        assert!(
+            availability(&future_native).is_ok(),
+            "authorized lagging nodes can retain future DAG envelopes"
+        );
+        assert!(
+            state.validate_v3_block_admission(&[future_native]).is_err(),
+            "retention must not activate execution"
+        );
         let commit = |transactions: &[Transaction]| {
             state.validate_v3_block_admission(transactions).unwrap();
             let (block, receipts) = state
@@ -5443,6 +5471,167 @@ mod tests {
                 .is_err(),
             "the native transition must still execute alone"
         );
+        // Reproduce the observed timing: one validator has a signed finalizer
+        // DAG block before canonical finalization; another receives those
+        // IDENTICAL bytes afterward. Both must retain the same consensus
+        // parents even though only the first terminal transaction may execute.
+        let domain =
+            arc_consensus::ConsensusDomain::new(state.transaction_domain_hash().unwrap(), 1, 1);
+        let make_engine = || {
+            let set = ValidatorSet::new(
+                keys.iter()
+                    .map(|key| Validator::new(key.address(), 5_000_000, 0).unwrap())
+                    .collect(),
+                0,
+            );
+            let engine = ConsensusEngine::new_with_keypair(set, keys[0].address(), keys[0].clone());
+            engine.install_consensus_domain(domain).unwrap();
+            engine.install_recovery_cursor(0).unwrap();
+            engine
+        };
+        let early = make_engine();
+        let late = make_engine();
+        let dag_block = |index: usize, round, parents: Vec<Hash256>, txs: Vec<Hash256>| {
+            let mut block = arc_consensus::DagBlock {
+                author: keys[index].address(),
+                round,
+                parents,
+                ordering_commitment: arc_consensus::DagBlock::compute_ordering_commitment(&txs),
+                transactions: txs,
+                timestamp: round,
+                hash: Hash256::ZERO,
+                signature: vec![],
+            };
+            block.hash = block.compute_hash_in_domain(&domain);
+            block.signature = bincode::serialize(&keys[index].sign(&block.hash).unwrap()).unwrap();
+            block
+        };
+        let parents: Vec<_> = (0..6)
+            .map(|i| dag_block(i, 1, vec![], vec![alternative.hash]))
+            .collect();
+        let mut unsigned_dag = parents[0].clone();
+        unsigned_dag.signature.clear();
+        assert!(early.receive_block(&unsigned_dag).is_err());
+        for block in &parents {
+            verify_peer_dag_availability(
+                &state,
+                &block.transactions,
+                std::slice::from_ref(&alternative),
+            )
+            .unwrap();
+            early.receive_block(block).unwrap();
+        }
+        for block in parents.iter().take(3) {
+            late.receive_block(block).unwrap();
+        }
+        assert!(early.advance_round());
+        assert!(
+            !late.advance_round(),
+            "three of six cannot advance recovery consensus"
+        );
+        assert!(
+            late.import_history(&parents[..3], HISTORY_MAX_ROUNDS)
+                .is_err(),
+            "history cannot repair a tip below quorum by relaxing its cursor"
+        );
+
+        // Admission still authenticates the outer recovery domain, all exact
+        // bodies (including ones already receipted), and immutable wire rules.
+        assert!(verify_peer_dag_availability(&state, &[alternative.hash], &[]).is_err());
+        assert!(
+            verify_peer_dag_availability(&state, &[alternative.hash], &[winner.clone()]).is_err()
+        );
+        let mut wrong_domain = alternative.clone();
+        wrong_domain
+            .sign_in_domain(&keys[1], &hash_bytes(b"foreign-recovery"))
+            .unwrap();
+        assert!(availability(&wrong_domain).is_err());
+        let mut wrong_type = alternative.clone();
+        wrong_type.tx_type = TxType::Transfer;
+        state.sign_transaction(&mut wrong_type, &keys[1]).unwrap();
+        assert!(availability(&wrong_type).is_err());
+        let unsupported = signed(&keys[1], TxBody::LeaveValidator, 0);
+        assert!(availability(&unsupported).is_err());
+        let mut under_quorum_body = alternative.body.clone();
+        let TxBody::NativeInferenceFinalize(body) = &mut under_quorum_body else {
+            unreachable!()
+        };
+        body.certificate.votes.truncate(4);
+        let under_quorum = signed(
+            &keys[1],
+            under_quorum_body,
+            gas_costs::NATIVE_INFERENCE_FINALIZE,
+        );
+        assert!(
+            availability(&under_quorum).is_ok(),
+            "a signed body is available, not execution-authorized"
+        );
+        assert!(
+            state
+                .validate_v3_block_admission(&[under_quorum])
+                .unwrap_err()
+                .to_string()
+                .contains("two-thirds-plus stake"),
+            "execution still requires the full native certificate quorum"
+        );
+        let bad_gas = signed(
+            &keys[1],
+            alternative.body.clone(),
+            gas_costs::NATIVE_INFERENCE_FINALIZE - 1,
+        );
+        assert!(availability(&bad_gas).is_err());
+        let mut oversized_body = alternative.body.clone();
+        let TxBody::NativeInferenceFinalize(body) = &mut oversized_body else {
+            unreachable!()
+        };
+        body.certificate.output = vec![0; arc_state::V3_MAX_TRANSACTION_BYTES as usize + 1];
+        let oversized = signed(
+            &keys[1],
+            oversized_body,
+            gas_costs::NATIVE_INFERENCE_FINALIZE,
+        );
+        assert!(availability(&oversized).is_err());
+        assert!(
+            state
+                .validate_v3_dag_availability(&[winner.clone(), ordinary.clone()])
+                .is_err()
+        );
+        assert!(
+            state
+                .validate_v3_dag_availability(&[winner.clone(), alternative.clone()])
+                .is_err()
+        );
+        assert!(
+            state
+                .validate_v3_dag_availability(&vec![
+                    ordinary.clone();
+                    arc_state::V3_MAX_TRANSACTIONS_PER_BLOCK + 1
+                ])
+                .is_err()
+        );
+        assert!(
+            state
+                .validate_v3_dag_availability(&[ordinary.clone(), ordinary.clone()])
+                .is_err()
+        );
+        let mut same_sender = ordinary.clone();
+        same_sender.nonce += 1;
+        state
+            .sign_transaction(&mut same_sender, &requester)
+            .unwrap();
+        assert!(
+            state
+                .validate_v3_dag_availability(&[ordinary.clone(), same_sender])
+                .is_err()
+        );
+        let mut overlap = Transaction::new_transfer(keys[1].address(), keys[0].address(), 1, 0);
+        overlap.fee = 1;
+        state.sign_transaction(&mut overlap, &keys[1]).unwrap();
+        assert!(
+            state
+                .validate_v3_dag_availability(&[ordinary.clone(), overlap])
+                .is_err()
+        );
         let mempool = Mempool::new(16);
         let admission = NativeRequestAdmission::default();
         let mut since = std::collections::HashMap::new();
@@ -5480,6 +5669,95 @@ mod tests {
                 .contains("finalize certificate does not match stored terminal output")
         );
         assert!(!state.native_transaction_still_admissible(&alternative));
+        assert!(
+            state
+                .validate_v3_block_admission(std::slice::from_ref(&alternative))
+                .is_err()
+        );
+        let root_after_finalization = state.get_state_root();
+        let history_peers: Vec<_> = keys
+            .iter()
+            .skip(1)
+            .map(|key| (key.address(), 5_000_000))
+            .collect();
+        let history = ConsensusManager::new_with_keypair(
+            keys[0].address(),
+            5_000_000,
+            1,
+            false,
+            &history_peers,
+            keys[0].clone(),
+        );
+        history.engine.install_consensus_domain(domain).unwrap();
+        history.engine.install_recovery_cursor(0).unwrap();
+        let pending = dashmap::DashMap::new();
+        // Preserve history compatibility: the old live boundary removed
+        // receipted bodies before structural checks. It could have accepted
+        // this block while the alternate finalizer was still fresh. History
+        // must still retain its exact signed bodies, never reinterpret that
+        // past acceptance using the new live boundary or current state.
+        assert!(state.receipts.contains_key(&request_tx.hash.0));
+        assert!(
+            state
+                .validate_v3_dag_availability(&[request_tx.clone(), alternative.clone()])
+                .is_err()
+        );
+        let mut old_hashes = vec![request_tx.hash, alternative.hash];
+        old_hashes.sort_by_key(|hash| hash.0);
+        let old_parents: Vec<_> = (0..6)
+            .map(|i| dag_block(i, 1, vec![], old_hashes.clone()))
+            .collect();
+        history
+            .import_history_durably(
+                &state,
+                &old_parents,
+                &[request_tx.clone(), alternative.clone()],
+                &pending,
+                &dashmap::DashMap::new(),
+            )
+            .unwrap();
+        assert!(pending.contains_key(&alternative.hash.0));
+        assert_eq!(history.engine.current_round(), 2);
+        for block in parents.iter().skip(3) {
+            verify_peer_dag_availability(
+                &state,
+                &block.transactions,
+                std::slice::from_ref(&alternative),
+            )
+            .unwrap();
+            late.receive_block(block).unwrap();
+        }
+        assert!(
+            late.advance_round(),
+            "late valid parent delivery must recover the round"
+        );
+        assert_eq!(late.current_round(), early.current_round());
+        let children: Vec<_> = (0..6)
+            .map(|i| {
+                dag_block(
+                    i,
+                    2,
+                    parents.iter().map(|block| block.hash).collect(),
+                    vec![],
+                )
+            })
+            .collect();
+        for block in &children {
+            early.receive_block(block).unwrap();
+            late.receive_block(block).unwrap();
+        }
+        assert!(early.advance_round());
+        assert!(late.advance_round());
+        assert_eq!(late.current_round(), 3);
+        // Exact already-receipted bodies remain valid availability; corrupting
+        // such an attachment cannot hide behind the canonical receipt filter.
+        assert!(availability(&winner).is_ok());
+        let mut forged_receipted = winner.clone();
+        forged_receipted.gas_limit = u64::MAX;
+        forged_receipted.sig_verified = true;
+        assert!(availability(&forged_receipted).is_err());
+        assert_eq!(state.get_state_root(), root_after_finalization);
+        assert!(!state.receipts.contains_key(&alternative.hash.0));
         mempool.insert(alternative.clone()).unwrap();
         let mut invalid_ordinary = ordinary.clone();
         invalid_ordinary.fee = 0;
@@ -5519,6 +5797,8 @@ mod tests {
         let block = commit(&selected);
         assert_eq!(block.tx_hashes, vec![ordinary.hash]);
         assert!(state.receipts.get(&ordinary.hash.0).unwrap().success);
+        assert!(availability(&ordinary).is_ok());
+        assert!(state.validate_v3_transaction_admission(&ordinary).is_err());
         assert_eq!(
             state.get_account(&requester.address()).unwrap().balance,
             988

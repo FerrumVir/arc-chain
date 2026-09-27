@@ -2126,6 +2126,16 @@ impl StateDB {
     }
 
     fn validate_v3_transaction_envelope(&self, tx: &Transaction) -> Result<(), StateError> {
+        let native_active =
+            self.native_migration().is_some() && self.native_inference_context().is_some();
+        self.validate_v3_transaction_envelope_with_native(tx, native_active)
+    }
+
+    fn validate_v3_transaction_envelope_with_native(
+        &self,
+        tx: &Transaction,
+        native_authorized: bool,
+    ) -> Result<(), StateError> {
         if tx.tx_type != tx.body.tx_type() {
             return Err(StateError::ExecutionError(format!(
                 "transaction type/body mismatch: envelope {:?}, body {:?}",
@@ -2135,9 +2145,8 @@ impl StateDB {
         }
         // A rooted migration adds the native lane to recovery v3. It does not
         // relax the ordinary v3 family policy or promote the chain to v4.
-        let migrated_native = self.native_migration().is_some()
-            && self.native_inference_context().is_some()
-            && inference_contract_state::is_native_body(&tx.body);
+        let migrated_native =
+            native_authorized && inference_contract_state::is_native_body(&tx.body);
         if !Self::v3_allows_transaction(&tx.body) && !migrated_native {
             return Err(StateError::ExecutionError(format!(
                 "transaction type {:?} is unavailable in recovery protocol v3",
@@ -2850,6 +2859,88 @@ impl StateDB {
                 "transaction family has no protocol-v3 admission handler".to_string(),
             )),
         }
+    }
+
+    /// Check signed DAG transaction availability, independently of execution.
+    /// A body's nonce, balance, expiry or terminal status can change while its
+    /// authenticated DAG block is in flight. Those checks belong to proposal
+    /// selection and canonical execution, not reception of consensus parents.
+    /// This does not authorize executing any transaction or opening ingress.
+    pub fn validate_v3_dag_availability(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<(), StateError> {
+        if self.active_protocol_version().major != 3 {
+            return Err(StateError::ExecutionError(
+                "protocol-v3 DAG availability requires recovery protocol v3".into(),
+            ));
+        }
+        let contains_native = transactions
+            .iter()
+            .any(|tx| inference_contract_state::is_native_body(&tx.body));
+        if contains_native && transactions.len() != 1 {
+            return Err(StateError::ExecutionError(
+                "native v3 blocks contain one native transition and cannot mix transaction families".into(),
+            ));
+        }
+        // A lagging node may need the DAG carrying activation's descendants
+        // before it has executed activation itself. Only its locally approved,
+        // matching migration binding permits retaining that native family.
+        // No peer-supplied context, height hint or transaction opens the lane.
+        let native_authorized = contains_native
+            && self.native_migration().is_some_and(|record| {
+                if self.native_inference_context().is_some() {
+                    return true;
+                }
+                record.activation_height > self.height()
+                    && record.refusal_against(self).is_none()
+                    && self
+                        .pending_migration_context
+                        .read()
+                        .as_ref()
+                        .is_some_and(|context| {
+                            inference_contract_state::validate_native_inference_binding_shape(
+                                self, context,
+                            )
+                            .is_ok_and(|commitment| commitment == record.context_commitment)
+                        })
+            });
+        if transactions.len() > V3_MAX_TRANSACTIONS_PER_BLOCK {
+            return Err(StateError::ExecutionError(format!(
+                "v3 block contains {} transactions; maximum is {V3_MAX_TRANSACTIONS_PER_BLOCK}",
+                transactions.len()
+            )));
+        }
+        let mut senders = HashMap::<[u8; 32], usize>::new();
+        let mut hashes = HashSet::new();
+        let mut accessed = HashSet::new();
+        for tx in transactions {
+            if !hashes.insert(tx.hash.0) {
+                return Err(StateError::ExecutionError(
+                    "v3 block contains a duplicate transaction hash".into(),
+                ));
+            }
+            let sender_count = senders.entry(tx.from.0).or_default();
+            *sender_count += 1;
+            if *sender_count > V3_MAX_TRANSACTIONS_PER_SENDER_PER_BLOCK {
+                return Err(StateError::ExecutionError(
+                    "v3 block exceeds per-sender transaction limit".into(),
+                ));
+            }
+            self.validate_v3_transaction_envelope_with_native(tx, native_authorized)?;
+            // Native access is checked by its single-transition planner at
+            // execution; ordinary blocks retain the existing static isolation.
+            if !contains_native {
+                for account in crate::block_stm::tx_access_set(tx).accounts {
+                    if !accessed.insert(account) {
+                        return Err(StateError::ExecutionError(
+                            "v3 block contains overlapping transaction state access".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate a complete candidate v3 state block without mutation. The
