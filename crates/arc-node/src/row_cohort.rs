@@ -2953,7 +2953,9 @@ mod tests {
             manifests: (1..=2)
                 .map(|i| crate::row_residency::ManifestPin {
                     worker_id: format!("owner-{i}"),
-                    path: PathBuf::from(format!("/manifests/owner-{i}.json")),
+                    path: std::env::temp_dir()
+                        .join("arc-row-cohort-test-manifests")
+                        .join(format!("owner-{i}.json")),
                     blake3: Hash256([i; 32]),
                 })
                 .collect(),
