@@ -353,7 +353,7 @@ impl VerifiedArtifact {
 #[cfg(any(feature = "candle", test))]
 impl std::io::Read for VerifiedArtifact {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{Seek, SeekFrom};
         if out.is_empty() || self.position >= self.len {
             return Ok(0);
         }
