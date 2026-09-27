@@ -5249,7 +5249,7 @@ pub(crate) fn config_from_gguf(
     let vs = content
         .tensor_infos
         .get("token_embd.weight")
-        .map(|t| t.shape.dims()[0])
+        .and_then(|t| t.shape.dims().first().copied())
         .unwrap_or(32000);
 
     let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {

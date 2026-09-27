@@ -50,7 +50,8 @@ jobs:
           cargo build --locked --release -p arc-node --features candle --bin arc-node \
             --example qualify_recovered_native_boundary
           cargo build --locked --release -p arc-inference \
-            --example tensor_row_stdio_worker --example tensor_row_low_residency_export --features candle
+            --example tensor_row_stdio_worker --example tensor_row_low_residency_export \
+            --example tensor_row_shared_worker --features candle
 
       - name: Check changed crates and examples in both feature modes
         run: |
@@ -82,6 +83,8 @@ jobs:
             "$RUNNER_TEMP/linux-candidate/"
           cp target/release/examples/tensor_row_low_residency_export \
             "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/tensor_row_shared_worker \
+            "$RUNNER_TEMP/linux-candidate/"
           {
             printf 'repository=%s\n' "$GITHUB_REPOSITORY"
             printf 'commit=%s\n' "$CANDIDATE_SHA"
@@ -90,7 +93,7 @@ jobs:
             printf 'workflow_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
             printf 'runner=%s\n' "$ImageOS $ImageVersion"
             printf 'build= cargo build --locked --release -p arc-node --features candle --bin arc-node --example qualify_recovered_native_boundary\n'
-            printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --example tensor_row_low_residency_export --features candle\n'
+            printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --example tensor_row_low_residency_export --example tensor_row_shared_worker --features candle\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node --features candle\n'
             printf 'tests= cargo test --locked --release -p arc-assign\n'

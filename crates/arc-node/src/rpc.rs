@@ -3240,6 +3240,8 @@ async fn native_inference_context(
         // This node only: another member may run a different executor build.
         "serving": node.native_serving.as_deref().map(|serving| json!({
             "executor": serving.executor.as_str(),
+            "requires_complete_row_coverage": serving.row_cohort.as_ref().is_some_and(|cohort| cohort.is_low_residency()),
+            "local_fallback_enabled": !serving.row_cohort.as_ref().is_some_and(|cohort| cohort.is_low_residency()),
             "input_format": serving.executor.input_format(),
             "tokenizer_profile": serving.tokenizer.as_ref().map(|tokenizer| tokenizer.profile()),
             "tokenize_endpoint": serving.tokenizer.is_some(),

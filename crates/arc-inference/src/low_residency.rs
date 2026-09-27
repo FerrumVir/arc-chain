@@ -79,6 +79,7 @@ impl CanonicalForwardSource for CachedIntegerModel {
 /// Construction validates every required projection's shape and block layout.
 /// It never loads a whole layer, embedding matrix, or output head.
 pub struct LowResidencyModel {
+    #[cfg(feature = "candle")]
     artifact: Hash256,
     config: ModelConfig,
     norms: Vec<(Vec<i64>, Vec<i64>)>,
@@ -517,6 +518,39 @@ pub fn load_low_residency_model(
         return Err(refuse(
             "low-residency canonical profile requires general.architecture=llama".into(),
         ));
+    }
+    // Enforce the coordinator's resident-state bound *before* the shared
+    // parser allocates RoPE tables. A qualified but unsuitable graph must
+    // refuse without first allocating a large prepared state.
+    let metadata_u64 = |name: &str| -> Option<u64> {
+        match content.metadata.get(name) {
+            Some(Value::U32(n)) => Some(u64::from(*n)),
+            Some(Value::U64(n)) => Some(*n),
+            Some(Value::I32(n)) => u64::try_from(*n).ok(),
+            _ => None,
+        }
+    };
+    let layers = metadata_u64("llama.block_count").unwrap_or(0);
+    let width = metadata_u64("llama.embedding_length").unwrap_or(0);
+    let heads = metadata_u64("llama.attention.head_count").unwrap_or(0);
+    let state_bytes = layers
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_mul(width))
+        .and_then(|n| n.checked_mul(8))
+        .zip(
+            width
+                .checked_div(heads)
+                .and_then(|n| n.checked_mul(4096 * 8)),
+        )
+        .and_then(|(norms, rope)| norms.checked_add(rope));
+    if layers == 0
+        || layers > 256
+        || width == 0
+        || heads == 0
+        || state_bytes.is_none_or(|n| n > 64 * 1024 * 1024)
+    {
+        return Err(refuse("low-residency norms/RoPE exceed the 64 MiB prepared-state bound or have invalid dimensions".into()));
     }
     let (mut config, _) = crate::cached_integer_model::config_from_gguf(&content)?;
     if !config.d_head.is_multiple_of(2)

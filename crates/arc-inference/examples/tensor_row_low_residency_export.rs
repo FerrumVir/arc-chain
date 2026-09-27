@@ -179,6 +179,9 @@ fn main() -> Result<(), String> {
             serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+        if destination.exists() {
+            return Err("output directory appeared before publication".into());
+        }
         std::fs::rename(&staging, &destination).map_err(|e| e.to_string())?;
         Ok(())
     })();

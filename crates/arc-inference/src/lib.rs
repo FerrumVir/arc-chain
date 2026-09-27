@@ -22,6 +22,8 @@ pub mod low_residency;
 pub mod model_artifact;
 pub mod model_package;
 pub mod q4_engine;
+#[cfg(unix)]
+pub mod row_service;
 pub mod streaming;
 /// Private-cohort, within-query tensor row partitioning.  This deliberately
 /// has no dependency on validator RPC or the public layer-pipeline endpoint.

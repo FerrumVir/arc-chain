@@ -1524,6 +1524,10 @@ impl RowCohort {
         }
     }
 
+    pub fn is_low_residency(&self) -> bool {
+        self.model.is_low_residency()
+    }
+
     /// The operator's view: machines, bounded books and recent records.
     pub fn view(&self) -> CohortView {
         let books = self.books.lock();
