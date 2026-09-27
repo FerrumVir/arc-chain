@@ -2580,6 +2580,9 @@ struct HealthResponse {
     version: String,
     height: u64,
     peers: u32,
+    /// True only when this process actually owns a running consensus engine.
+    /// Community clients intentionally serve HTTP without joining chain transport.
+    chain_participation_enabled: bool,
     /// Explicit compatibility restriction, independent of block liveness.
     legacy_v3_wire: bool,
     /// Whether this transport can send history/checkpoint/certificate/native
@@ -2693,6 +2696,7 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         height: node.state.height(),
         peers: node.peer_count.load(Ordering::Relaxed),
+        chain_participation_enabled: node.consensus_engine.is_some(),
         legacy_v3_wire: node.transport_wire_policy.legacy_v3(),
         extended_consensus_wire_enabled: !node.transport_wire_policy.legacy_v3(),
         wire_messages_suppressed: node.transport_wire_policy.suppressed_messages(),
@@ -26799,6 +26803,16 @@ mod tests {
             Some(true),
             "a node with no readable block must never report the chain as advancing"
         );
+    }
+
+    #[tokio::test]
+    async fn community_health_reports_disabled_chain_participation_without_claiming_liveness() {
+        let node = fake_node_with_workers(Vec::new());
+        assert!(node.consensus_engine.is_none());
+        let Json(response) = health(AxumState(node)).await;
+        assert!(!response.chain_participation_enabled);
+        assert_eq!(response.chain_advancing, None);
+        assert_eq!(response.status, "degraded");
     }
 
     #[tokio::test]

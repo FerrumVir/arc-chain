@@ -9,6 +9,32 @@ import { expect, test } from "@playwright/test";
 import { seedOnboarded } from "./helpers";
 
 test.describe("Dashboard zero-peer recovery", () => {
+  test("does not offer peer reset when the local node explicitly disables chain participation", async ({ page }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    await page.route("**/health", (route) => {
+      const local = new URL(route.request().url()).hostname === "127.0.0.1";
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(local ? {
+          status: "degraded", version: "0.8.0", height: 0, peers: 0,
+          uptime_secs: 60, dag_round: 0, dag_committed: 0, validators: 0,
+          chain_participation_enabled: false,
+        } : { status: "ok" }),
+      });
+    });
+    await page.goto("/");
+    const banner = page.getByTestId("chain-participation-disabled");
+    await expect(banner).toContainText("HTTP client mode");
+    await expect(banner).toContainText("Zero peers are expected");
+    await expect(banner).toContainText("Chain reads use");
+    await expect(page.getByTestId("reset-peer-state-btn")).toHaveCount(0);
+    await expect(page.getByTestId("syncing-banner")).toHaveCount(0);
+  });
+
   test("renders honest host-scoped client mode for a reachable coordinator", async ({
     page,
   }) => {

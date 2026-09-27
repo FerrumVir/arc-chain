@@ -28,6 +28,8 @@ export interface NodeStatus {
   health: HealthLevel;
   version: string;
   peers: number;
+  /** Reported by the local runtime; missing on older node versions. */
+  chainParticipationEnabled?: boolean | null;
   round: number;
   committed: number;
   height: number;

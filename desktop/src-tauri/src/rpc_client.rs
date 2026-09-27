@@ -156,6 +156,10 @@ pub async fn fetch_status(
         health: health_level.into(),
         version,
         peers,
+        chain_participation_enabled: local
+            .as_ref()
+            .and_then(|h| h.get("chain_participation_enabled"))
+            .and_then(|value| value.as_bool()),
         round,
         committed,
         height,
