@@ -321,8 +321,16 @@ jobs:
         include:
           - layout: layers
             row_partitions: 0
+            kernel: scalar
+            reference_kernel: scalar
           - layout: partial-rows
             row_partitions: 7
+            kernel: scalar
+            reference_kernel: scalar
+          - layout: partial-rows-fast
+            row_partitions: 7
+            kernel: fast
+            reference_kernel: scalar
     needs: [linux-candidate]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -346,6 +354,8 @@ jobs:
           RESULT_DIR: ${{ runner.temp }}/real-model-output-${{ matrix.layout }}
           CONFORMANCE_LAYOUT: ${{ matrix.layout }}
           ROW_PARTITIONS: ${{ matrix.row_partitions }}
+          KERNEL: ${{ matrix.kernel }}
+          REFERENCE_KERNEL: ${{ matrix.reference_kernel }}
         shell: bash
         run: |
           set -uo pipefail
@@ -395,15 +405,18 @@ jobs:
             timeout --signal=TERM --kill-after=30s 40m python3 scripts/qualification/run_low_residency_conformance.py \
               --binaries-dir "$CANDIDATE_DIR" --model "$MODEL_PATH" \
               --output-dir "$RESULT_DIR" --prompt-ids 6324 --max-tokens 2 \
-              --warmups 0 --kernel scalar --total-timeout-seconds 2100 \
+              --warmups 0 --kernel "$KERNEL" --reference-kernel "$REFERENCE_KERNEL" --total-timeout-seconds 2100 \
               "${row_layout_args[@]}" > "$EVIDENCE_DIR/runner.log" 2>&1 || status=$?
             cat "$EVIDENCE_DIR/runner.log"
-            python3 - "$RESULT_DIR/summary.json" "$CONFORMANCE_LAYOUT" "$ROW_PARTITIONS" <<'PY' || status=$?
+            python3 - "$RESULT_DIR/summary.json" "$CONFORMANCE_LAYOUT" "$ROW_PARTITIONS" "$KERNEL" "$REFERENCE_KERNEL" <<'PY' || status=$?
           import json, sys
           summary=json.load(open(sys.argv[1]))
           layout=sys.argv[2]
           partitions=int(sys.argv[3])
-          expected_layout={'layers':'layers','partial-rows':'partial-rows'}[layout]
+          kernel=sys.argv[4]
+          reference_kernel=sys.argv[5]
+          expected_layout={'layers':'layers','partial-rows':'partial-rows',
+                           'partial-rows-fast':'partial-rows'}[layout]
           expected_partitions=None if partitions == 0 else partitions
           if summary.get('pass') is not True:
               raise SystemExit('runner exited without a passing summary record')
@@ -411,6 +424,47 @@ jobs:
               raise SystemExit(f"summary layout mismatch: expected {expected_layout}, got {summary.get('layout')}")
           if summary.get('inputs', {}).get('row_partitions') != expected_partitions:
               raise SystemExit(f"summary row partition mismatch: expected {expected_partitions}, got {summary.get('inputs', {}).get('row_partitions')}")
+          inputs=summary.get('inputs', {})
+          if inputs.get('kernel') != kernel or inputs.get('reference_kernel') != reference_kernel:
+              raise SystemExit('summary kernel settings differ from matrix request')
+          observed=summary.get('kernel_observations', {})
+          if observed.get('reference', {}).get('requested_kernel') != reference_kernel or observed.get('coordinator', {}).get('requested_kernel') != kernel:
+              raise SystemExit('summary omitted exact reference/coordinator kernel observations')
+          if observed.get('reference', {}).get('effective_fast_kernel') != (reference_kernel == 'fast'):
+              raise SystemExit('reference effective kernel differs from matrix request')
+          if observed.get('coordinator', {}).get('effective_fast_kernel') != (kernel == 'fast'):
+              raise SystemExit('coordinator effective kernel differs from matrix request')
+          workers=observed.get('workers')
+          if not isinstance(workers, list) or not workers:
+              raise SystemExit('summary worker kernel observations do not match worker count')
+          if partitions and len(workers) != partitions:
+              raise SystemExit('summary worker count differs from requested row partitions')
+          if len({worker.get('worker_id') for worker in workers}) != len(workers):
+              raise SystemExit('summary repeats a worker identity')
+          if any(worker.get('requested_kernel') != kernel or worker.get('effective_fast_kernel') != (kernel == 'fast') for worker in workers):
+              raise SystemExit('worker effective kernel differs from matrix request')
+          if kernel == 'fast':
+              if reference_kernel != 'scalar' or observed.get('simd_path_qualified') is not True:
+                  raise SystemExit('fast distributed run lacks scalar-reference SIMD qualification')
+              coordinator_census=observed.get('coordinator', {}).get('projection_census')
+              if (observed.get('coordinator', {}).get('simd_available') is not True
+                      or not isinstance(coordinator_census, dict)
+                      or coordinator_census.get('attempted', 0) <= 0
+                      or coordinator_census.get('accepted') != coordinator_census.get('attempted')
+                      or any(coordinator_census.get(key, 0) != 0 for key in ('refused_unavailable','refused_shape',
+                          'refused_inner_dim_above_i32_bound','refused_activation_out_of_domain',
+                          'refused_scale_multiply_would_overflow'))):
+                  raise SystemExit('coordinator did not accept every SIMD projection')
+              for worker in workers:
+                  census=worker.get('projection_census')
+                  if (worker.get('simd_available') is not True or worker.get('completed_calls', 0) <= 0
+                          or worker.get('refused_calls') != 0 or not isinstance(census, dict)
+                          or census.get('attempted', 0) <= 0 or census.get('accepted') != census.get('attempted')
+                          or worker.get('projection_chunks') != census.get('attempted')
+                          or any(census.get(key, 0) != 0 for key in ('refused_unavailable','refused_shape',
+                              'refused_inner_dim_above_i32_bound','refused_activation_out_of_domain',
+                              'refused_scale_multiply_would_overflow'))):
+                      raise SystemExit(f"worker {worker.get('worker_id')} did not accept every SIMD projection")
           PY
           fi
           if [ -d "$RESULT_DIR" ]; then

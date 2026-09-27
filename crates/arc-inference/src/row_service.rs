@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 const MAX_FILES: usize = 1024;
 const MAX_CLIENTS: usize = 32;
+const ROW_COMPUTE_CHUNK_ROWS: usize = 32;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -255,7 +256,7 @@ impl SharedRowBundle {
         let mut values = vec![0; a.row_end - a.row_start];
         // A deadline is checked between bounded row chunks, so an expired
         // client cannot monopolize the single compute slot indefinitely.
-        for (chunk, out) in values.chunks_mut(32).enumerate() {
+        for (chunk, out) in values.chunks_mut(ROW_COMPUTE_CHUNK_ROWS).enumerate() {
             if shutdown.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return Err(timed_out());
             }
@@ -317,6 +318,7 @@ pub struct RowServiceStats {
     pub fast_kernel_enabled: bool,
     pub simd_available: bool,
     pub projection_census: Option<crate::canonical_simd::ProjectionCensus>,
+    pub projection_chunks: Option<u64>,
     pub resident_bundle_copies: usize,
     pub resident_row_files: usize,
     pub resident_row_bytes: usize,
@@ -339,6 +341,8 @@ pub struct SharedRowService {
     rejected: AtomicU64,
     completed: AtomicU64,
     refused: AtomicU64,
+    projection_chunks: AtomicU64,
+    diagnostic_simd_census: bool,
 }
 impl SharedRowService {
     pub fn new(bundle: SharedRowBundle, limits: RowServiceLimits) -> io::Result<Arc<Self>> {
@@ -352,6 +356,9 @@ impl SharedRowService {
             rejected: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            projection_chunks: AtomicU64::new(0),
+            diagnostic_simd_census: std::env::var("ARC_QUALIFICATION_SIMD_CENSUS").as_deref()
+                == Ok("1"),
         }))
     }
     pub fn stats(&self) -> RowServiceStats {
@@ -362,6 +369,8 @@ impl SharedRowService {
             fast_kernel_enabled: crate::canonical_simd::fast_canonical_kernel_enabled(),
             simd_available: crate::canonical_simd::dotprod_available(),
             projection_census: census_enabled.then(crate::canonical_simd::projection_census),
+            projection_chunks: census_enabled
+                .then(|| self.projection_chunks.load(Ordering::Relaxed)),
             resident_bundle_copies: 1,
             resident_row_files: self.bundle.shards.len(),
             resident_row_bytes: self
@@ -482,6 +491,10 @@ impl SharedRowService {
                 }
             };
             let values = self.bundle.project(&request, deadline, shutdown)?;
+            if self.diagnostic_simd_census {
+                self.projection_chunks
+                    .fetch_add(matmul_chunk_count(values.len()), Ordering::Relaxed);
+            }
             drop(slot);
             let response = RowProjectionResponse {
                 call_id: request.call_id,
@@ -500,6 +513,11 @@ impl SharedRowService {
             self.completed.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+#[inline]
+fn matmul_chunk_count(rows: usize) -> u64 {
+    rows.div_ceil(ROW_COMPUTE_CHUNK_ROWS) as u64
 }
 struct ClientGuard(Arc<SharedRowService>);
 impl Drop for ClientGuard {
@@ -750,6 +768,16 @@ mod tests {
         RowAssignment, decode_row_response, encode_row_request, export_canonical_row_file,
     };
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn projection_chunk_counter_maps_rows_per_rpc_without_off_by_one() {
+        assert_eq!(matmul_chunk_count(31), 1);
+        assert_eq!(matmul_chunk_count(32), 1);
+        assert_eq!(matmul_chunk_count(33), 2);
+        // Three separate successful RPCs; count each RPC's executed row chunks.
+        let multi_rpc_chunks: u64 = [31, 32, 33].into_iter().map(matmul_chunk_count).sum();
+        assert_eq!(multi_rpc_chunks, 4);
+    }
     struct Running {
         directory: PathBuf,
         socket: PathBuf,

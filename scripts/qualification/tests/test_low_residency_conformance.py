@@ -256,7 +256,8 @@ class KernelQualification(unittest.TestCase):
 
     def test_fast_worker_final_stats_require_real_accepted_projection_calls(self):
         stats = {"worker_id": "proof-0", "fast_kernel_requested": True, "fast_kernel_enabled": True,
-                 "simd_available": True, "projection_census": census(), "completed_calls": 3, "refused_calls": 0}
+                 "simd_available": True, "projection_census": census(attempted=4, accepted=4),
+                 "projection_chunks": 4, "completed_calls": 3, "refused_calls": 0}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "daemon.log"
             path.write_text(json.dumps({"event": "row_service_stopped", "stats": stats}) + "\n")
@@ -264,6 +265,11 @@ class KernelQualification(unittest.TestCase):
             stats["projection_census"] = census(attempted=2, accepted=1)
             path.write_text(json.dumps({"event": "row_service_stopped", "stats": stats}) + "\n")
             with self.assertRaisesRegex(RuntimeError, "refused"):
+                runner.read_daemon_simd_report(path, "proof-0", "fast", True)
+            stats["projection_census"] = census(attempted=4, accepted=4)
+            stats["projection_chunks"] = 3
+            path.write_text(json.dumps({"event": "row_service_stopped", "stats": stats}) + "\n")
+            with self.assertRaisesRegex(RuntimeError, "executed projection chunks"):
                 runner.read_daemon_simd_report(path, "proof-0", "fast", True)
 
 

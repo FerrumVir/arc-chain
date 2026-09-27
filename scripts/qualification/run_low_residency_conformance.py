@@ -71,7 +71,7 @@ def validate_kernel_report(report, expected, role, census):
     return observation
 
 
-def validate_projection_census(census, role):
+def validate_projection_census(census, role, expected_attempted=None):
     fields = ("attempted", "accepted", "refused_unavailable", "refused_shape",
               "refused_inner_dim_above_i32_bound", "refused_activation_out_of_domain",
               "refused_scale_multiply_would_overflow")
@@ -79,6 +79,8 @@ def validate_projection_census(census, role):
         raise RuntimeError(f"{role} omitted valid projection census")
     if census["attempted"] == 0 or census["accepted"] != census["attempted"] or any(census[field] for field in fields[2:]):
         raise RuntimeError(f"{role} fast path was unavailable or refused one or more projections")
+    if expected_attempted is not None and census["attempted"] != expected_attempted:
+        raise RuntimeError(f"{role} SIMD attempts do not match executed projection chunks")
     return census
 
 
@@ -103,17 +105,24 @@ def read_daemon_simd_report(path, worker_id, expected, census):
     expected_fast = expected == "fast"
     if requested != expected_fast or enabled != expected_fast or (expected_fast and not available):
         raise RuntimeError(f"worker {worker_id} did not run requested {expected} mode")
-    if stats.get("completed_calls", 0) <= 0 or stats.get("refused_calls", 0) != 0:
+    completed_calls = stats.get("completed_calls")
+    refused_calls = stats.get("refused_calls")
+    if (type(completed_calls) is not int or completed_calls <= 0
+            or type(refused_calls) is not int or refused_calls != 0):
         raise RuntimeError(f"worker {worker_id} did not serve clean projection calls")
     census_data = stats.get("projection_census")
     if census and expected_fast:
-        validate_projection_census(census_data, "worker " + worker_id)
+        projection_chunks = stats.get("projection_chunks")
+        if type(projection_chunks) is not int or projection_chunks <= 0:
+            raise RuntimeError(f"worker {worker_id} omitted executed projection chunk count")
+        validate_projection_census(census_data, "worker " + worker_id, projection_chunks)
     elif census_data is not None:
         raise RuntimeError(f"worker {worker_id} unexpectedly enabled SIMD census")
     return {"worker_id": worker_id, "requested_kernel": expected,
             "requested_fast_kernel": requested, "effective_fast_kernel": enabled,
-            "simd_available": available, "completed_calls": stats["completed_calls"],
-            "refused_calls": stats["refused_calls"], "projection_census": census_data}
+            "simd_available": available, "completed_calls": completed_calls,
+            "refused_calls": refused_calls, "projection_chunks": stats.get("projection_chunks"),
+            "projection_census": census_data}
 
 
 def read_numbers(path):
