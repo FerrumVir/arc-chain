@@ -503,9 +503,9 @@ impl FinalityCertificate {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusSigningRecord {
     /// Rounds this validator has attested about, which members it named, and
-    /// why. More than one member of a round can legitimately be attested, and
-    /// the reason decides whether the member is also excused from the
-    /// participation requirement, so both are recorded.
+    /// why. More than one member of a round can legitimately be attested.
+    /// These observations alone never excuse participation; the engine must
+    /// independently verify the quorum certificate for that exact member/round.
     pub skipped_rounds: HashMap<u64, HashMap<Address, AbsenceReason>>,
     /// Heights this validator has signed a finality transcript for.
     pub finality_votes: HashMap<u64, (Hash256, Hash256, Hash256)>,
@@ -716,9 +716,9 @@ pub struct SkipTracker {
     /// one that is absent, since `absentee_seen` is deliberately sticky.
     observations: HashMap<(u64, Address, AbsenceReason), RoundObservation>,
     record: ConsensusSigningRecord,
-    /// Leader blocks this validator has permanently refused, as
-    /// `(round, absentee)`. Once present, the block is never referenced as a
-    /// parent and never counted in commit support.
+    /// Observations already signed or learned from a certificate, keyed by
+    /// `(round, absentee)`. The historical name is retained internally; this
+    /// does not refuse late blocks or affect parent selection/commit support.
     refused: HashSet<(u64, Address)>,
 }
 
@@ -872,8 +872,9 @@ impl SkipTracker {
         Ok(vote)
     }
 
-    /// Adopt a peer's valid certificate. The local validator inherits the same
-    /// permanent refusal, so it cannot later help certify the skipped block.
+    /// Remember a peer's verified certificate as an absence observation.
+    /// Participation authority remains in the engine's verified certificate
+    /// map; this record alone never excuses a member or refuses a late block.
     pub fn adopt_certificate(&mut self, certificate: &SkipCertificate) {
         self.record
             .skipped_rounds

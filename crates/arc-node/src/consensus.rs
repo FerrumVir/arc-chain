@@ -87,6 +87,7 @@ fn retain_dag_preimages(
     Ok(())
 }
 
+#[cfg(test)]
 fn exact_dag_preimages(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     hashes: &[Hash256],
@@ -112,8 +113,8 @@ fn history_bodies(
         .collect()
 }
 
-/// As [`exact_dag_preimages`], also accepting a body this node's canonical
-/// state already holds.
+/// Resolve exact DAG transaction bodies, also accepting a body this node's
+/// canonical state already holds.
 ///
 /// The pending cache drops a body once its transaction executes. A committed
 /// DAG block can still name it - a transaction re-proposed before its receipt
@@ -155,6 +156,7 @@ fn local_proposal_with_preimages(
     local_address: Hash256,
     round: u64,
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    state: Option<&StateDB>,
 ) -> Result<Option<(arc_consensus::DagBlock, Vec<arc_types::Transaction>)>, DagPreimageError> {
     let mut local = engine
         .blocks_in_round(round)
@@ -167,7 +169,7 @@ fn local_proposal_with_preimages(
     if local.next().is_some() {
         return Err(DagPreimageError::DuplicateLocalProposal { round });
     }
-    let transactions = exact_dag_preimages(pending, &block.transactions)?;
+    let transactions = exact_dag_preimages_from(pending, state, &block.transactions)?;
     Ok(Some((block, transactions)))
 }
 
@@ -184,9 +186,10 @@ fn try_rebroadcast_local_proposal(
     round: u64,
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     outbound: Option<&mpsc::Sender<OutboundMessage>>,
+    state: Option<&StateDB>,
 ) -> Result<LocalProposalBroadcast, String> {
     let Some((block, transactions)) =
-        local_proposal_with_preimages(engine, local_address, round, pending)
+        local_proposal_with_preimages(engine, local_address, round, pending, state)
             .map_err(|error| format!("local proposal/preimage invariant failed: {error:?}"))?
     else {
         return Ok(LocalProposalBroadcast::NotPresent);
@@ -207,27 +210,63 @@ fn try_rebroadcast_local_proposal(
     }
 }
 
-/// Queue the smallest recovery-DAG window that can heal a clean rolling
-/// restart. A validator can stop after its current proposal was fsynced and
-/// delivered to its peers but before their proposals for that round reached
-/// its own WAL. The live peers then advance exactly one round and stall. Their
-/// current blocks are not admissible on the restarted node until it receives
-/// the missing parent-round blocks, so replay must be parent-first.
+/// Bound ordinary legacy DAG replay independently of arbitrary peer claims.
+const MAX_RECOVERY_REPLAY_ROUNDS: u64 = 16;
+
+/// Re-send exact held local proposals around the undecided commit boundary.
+/// A delayed validator can miss a parent while we move two rounds ahead, and
+/// re-sending only our current/current-1 proposal cannot repair that gap. The
+/// commit cursor is the NEXT undecided round: include its predecessor too,
+/// bounded to 16 rounds. Executed transaction bodies come from canonical state.
 ///
-/// Only the node's exact, already-signed local proposals are queued. This does
-/// not create a view-change certificate, relax parent quorum, or permit a
-/// second proposal for either round.
+/// Used periodically as well as on reconnect. Only already-signed, locally
+/// held blocks are queued, oldest first; no certificate, cursor, or signature
+/// is manufactured. More distant history still requires authenticated sync.
 fn queue_recovery_reconnect_replay(
     engine: &ConsensusEngine,
+    local_address: Hash256,
     pending_rounds: &mut std::collections::BTreeSet<u64>,
 ) {
-    let current_round = engine.current_round();
-    if !engine.is_recovery_bootstrap_round(current_round)
-        && let Some(parent_round) = current_round.checked_sub(1)
-    {
-        pending_rounds.insert(parent_round);
+    let current = engine.current_round();
+    let start = engine
+        .last_committed_round()
+        .saturating_sub(1)
+        .min(current.saturating_sub(1))
+        .max(current.saturating_sub(MAX_RECOVERY_REPLAY_ROUNDS - 1));
+    for round in start..=current {
+        if round == current
+            || engine.blocks_in_round(round).iter().any(|hash| {
+                engine
+                    .get_block(hash)
+                    .is_some_and(|block| block.author == local_address)
+            })
+        {
+            pending_rounds.insert(round);
+        }
     }
-    pending_rounds.insert(current_round);
+}
+
+/// Complete one entire replay window, including one drained across several
+/// ticks. Clearing the retry flag here prevents a capacity-limited transport
+/// from immediately refilling the same window and starving consensus input.
+fn complete_recovery_rebroadcast(pending: &mut bool, next: &mut Instant) {
+    *pending = false;
+    *next = Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
+}
+
+fn queue_due_recovery_replay(
+    engine: &ConsensusEngine,
+    local_address: Hash256,
+    rounds: &mut std::collections::BTreeSet<u64>,
+    pending: &mut bool,
+    next: Instant,
+) -> bool {
+    *pending |= Instant::now() >= next;
+    if !*pending {
+        return false;
+    }
+    queue_recovery_reconnect_replay(engine, local_address, rounds);
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,9 +285,17 @@ fn try_drain_recovery_reconnect_replay(
     pending_rounds: &mut std::collections::BTreeSet<u64>,
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     outbound: Option<&mpsc::Sender<OutboundMessage>>,
+    state: Option<&StateDB>,
 ) -> Result<RecoveryReplayDrain, String> {
     while let Some(round) = pending_rounds.first().copied() {
-        match try_rebroadcast_local_proposal(engine, local_address, round, pending, outbound)? {
+        match try_rebroadcast_local_proposal(
+            engine,
+            local_address,
+            round,
+            pending,
+            outbound,
+            state,
+        )? {
             LocalProposalBroadcast::Enqueued => {
                 pending_rounds.remove(&round);
             }
@@ -358,6 +405,25 @@ fn prune_irreversible_preimages(
         pending.remove(hash);
     }
     obsolete.len()
+}
+
+/// Retain every body in the replay predecessor, including receipt-bearing
+/// bodies whose canonical copy may have been evicted. Older unexecuted bodies
+/// remain available until the same retention floor as their DAG blocks.
+fn prune_dag_preimages(
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    latest_round: &dashmap::DashMap<[u8; 32], u64>,
+    committed_round_exclusive: u64,
+    unexecuted_floor: u64,
+    executed: impl Fn(&[u8; 32]) -> bool,
+) -> usize {
+    prune_irreversible_preimages(
+        pending,
+        latest_round,
+        committed_round_exclusive.saturating_sub(1),
+        unexecuted_floor,
+        executed,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1691,6 +1757,7 @@ impl ConsensusManager {
             self.validator_address,
             recovered_round,
             &pending_txs,
+            Some(&state),
         ) {
             Ok(Some((block, _))) => Some(block.round),
             Ok(None) => None,
@@ -1825,10 +1892,13 @@ impl ConsensusManager {
                     &mut recovery_reconnect_replay,
                     &pending_txs,
                     outbound_tx.as_ref(),
+                    Some(&state),
                 ) {
                     Ok(RecoveryReplayDrain::Complete) => {
-                        next_recovery_rebroadcast =
-                            Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
+                        complete_recovery_rebroadcast(
+                            &mut recovery_rebroadcast_pending,
+                            &mut next_recovery_rebroadcast,
+                        );
                     }
                     Ok(RecoveryReplayDrain::Backpressured { round }) => {
                         debug!(round, "Recovery DAG reconnect replay remains backpressured");
@@ -1937,6 +2007,7 @@ impl ConsensusManager {
                                 // that missing parent before the current block.
                                 queue_recovery_reconnect_replay(
                                     &self.engine,
+                                    self.validator_address,
                                     &mut recovery_reconnect_replay,
                                 );
                                 match try_drain_recovery_reconnect_replay(
@@ -1945,10 +2016,13 @@ impl ConsensusManager {
                                     &mut recovery_reconnect_replay,
                                     &pending_txs,
                                     outbound_tx.as_ref(),
+                                    Some(&state),
                                 ) {
                                     Ok(RecoveryReplayDrain::Complete) => {
-                                        next_recovery_rebroadcast =
-                                            Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
+                                        complete_recovery_rebroadcast(
+                                            &mut recovery_rebroadcast_pending,
+                                            &mut next_recovery_rebroadcast,
+                                        );
                                     }
                                     Ok(RecoveryReplayDrain::Backpressured { round }) => {
                                         // Do not drain a newly connected peer's
@@ -2195,6 +2269,7 @@ impl ConsensusManager {
                                             round,
                                             &pending_txs,
                                             outbound_tx.as_ref(),
+                                            Some(&state),
                                         ) {
                                             Ok(LocalProposalBroadcast::Enqueued) => {
                                                 recovery_rebroadcast_pending = false;
@@ -3464,13 +3539,9 @@ impl ConsensusManager {
             {
                 if skip_tracker.is_none() {
                     let record = self.load_signing_record();
-                    // Re-apply every refusal the record carries before this
-                    // node can reference or count anything.
-                    for (round, members) in &record.skipped_rounds {
-                        for member in members.keys() {
-                            self.engine.note_certified_absent(*round, *member);
-                        }
-                    }
+                    // Restore durable signing observations, not participation
+                    // exceptions. Only register_skip_certificate can excuse a
+                    // member after verifying the complete quorum certificate.
                     skip_tracker = Some(arc_consensus::view_change::SkipTracker::new(
                         domain,
                         self.engine.frozen_validator_set_hash(),
@@ -3565,7 +3636,6 @@ impl ConsensusManager {
                                 );
                                 continue;
                             }
-                            self.engine.note_certified_absent(round, member);
                             if already_durable {
                                 debug!(round, %member, "Re-gossiping an absence attestation");
                             } else {
@@ -3598,39 +3668,38 @@ impl ConsensusManager {
                 continue;
             }
 
-            // A recovery-domain validator that restarts after fsync has already
-            // signed its one legal block for this round. Re-broadcast that
-            // exact block and its exact durable preimages until the transport
-            // accepts it. A closed transport is fatal; a full channel is
-            // transient and retried on the next tick.
+            // Re-send the bounded parent-first window even while connected.
+            // Network delivery is not implied by enqueueing, and a newer
+            // current proposal cannot repair a peer's missing ancestor.
             if self.engine.requires_full_round_participation()
-                && Instant::now() >= next_recovery_rebroadcast
-            {
-                recovery_rebroadcast_pending = true;
-            }
-            if recovery_rebroadcast_pending && self.engine.requires_full_round_participation() {
-                let round = self.engine.current_round();
-                match try_rebroadcast_local_proposal(
+                && queue_due_recovery_replay(
                     &self.engine,
                     self.validator_address,
-                    round,
+                    &mut recovery_reconnect_replay,
+                    &mut recovery_rebroadcast_pending,
+                    next_recovery_rebroadcast,
+                )
+            {
+                match try_drain_recovery_reconnect_replay(
+                    &self.engine,
+                    self.validator_address,
+                    &mut recovery_reconnect_replay,
                     &pending_txs,
                     outbound_tx.as_ref(),
+                    Some(&state),
                 ) {
-                    Ok(LocalProposalBroadcast::Enqueued | LocalProposalBroadcast::NotPresent) => {
-                        recovery_rebroadcast_pending = false;
-                        next_recovery_rebroadcast =
-                            Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
+                    Ok(RecoveryReplayDrain::Complete) => {
+                        complete_recovery_rebroadcast(
+                            &mut recovery_rebroadcast_pending,
+                            &mut next_recovery_rebroadcast,
+                        );
                     }
-                    Ok(LocalProposalBroadcast::Backpressured) => {
-                        debug!(round, "Recovery DAG re-broadcast channel is full; retrying")
+                    Ok(RecoveryReplayDrain::Backpressured { round }) => {
+                        debug!(round, "Recovery DAG re-broadcast channel is full; retrying");
+                        continue;
                     }
                     Err(error) => {
-                        tracing::error!(
-                            round,
-                            %error,
-                            "Fatal local DAG re-broadcast/preimage invariant failure"
-                        );
+                        tracing::error!(%error, "Fatal local DAG re-broadcast/preimage invariant failure");
                         return;
                     }
                 }
@@ -4873,7 +4942,7 @@ impl ConsensusManager {
                 // known to reference them is irreversibly behind the contiguous
                 // commit cursor. Never use arbitrary DashMap iteration here.
                 let committed_round = self.engine.last_committed_round();
-                let pruned = prune_irreversible_preimages(
+                let pruned = prune_dag_preimages(
                     &pending_txs,
                     &pending_tx_latest_round,
                     committed_round,
@@ -4978,6 +5047,24 @@ mod tests {
         let found = exact_dag_preimages_from(&pending, Some(&state), &[executed.hash])
             .expect("the canonical state holds the executed body");
         assert_eq!(found[0].hash, executed.hash);
+        let set = ValidatorSet::new(
+            vec![Validator::new(sender.address(), arc_consensus::STAKE_ARC, 0).unwrap()],
+            1,
+        );
+        let engine = ConsensusEngine::new_with_keypair(set, sender.address(), sender.clone());
+        let original = engine.propose_block(vec![executed.hash], 1_000).unwrap();
+        let (replayed, bodies) =
+            local_proposal_with_preimages(&engine, sender.address(), 0, &pending, Some(&state))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            bincode::serialize(&replayed).unwrap(),
+            bincode::serialize(&original).unwrap()
+        );
+        assert_eq!(bodies[0].hash, executed.hash);
+        assert!(
+            local_proposal_with_preimages(&engine, sender.address(), 0, &pending, None).is_err()
+        );
 
         // And a responder now serves it.
         let wanted: std::collections::HashSet<[u8; 32]> = [executed.hash.0].into_iter().collect();
@@ -6387,6 +6474,221 @@ mod tests {
     }
 
     #[test]
+    fn periodic_replay_repairs_two_round_gap_with_one_slot_transport() {
+        use arc_consensus::view_change::{
+            AbsenceReason, SkipCertificate, SkipVote, validator_set_hash,
+        };
+        let keys: Vec<_> = (0..6)
+            .map(|index| {
+                KeyPair::from_ed25519_secret_bytes(
+                    &hash_bytes(format!("two-round-replay-{index}").as_bytes()).0,
+                )
+            })
+            .collect();
+        let set = ValidatorSet::new(
+            keys.iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    Validator::new(key.address(), arc_consensus::STAKE_ARC, index as u16).unwrap()
+                })
+                .collect(),
+            1,
+        );
+        let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"two-round-replay"), 1, 1);
+        let engines: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let engine =
+                    ConsensusEngine::new_with_keypair(set.clone(), key.address(), key.clone());
+                engine.install_consensus_domain(domain).unwrap();
+                engine.install_recovery_cursor(100).unwrap();
+                engine
+            })
+            .collect();
+        let parents: Vec<_> = engines
+            .iter()
+            .enumerate()
+            .map(|(index, engine)| engine.propose_block(vec![], 1_000 + index as u64).unwrap())
+            .collect();
+        for (target, engine) in engines.iter().enumerate() {
+            for (source, block) in parents.iter().enumerate() {
+                if target != source && !(target == 5 && source == 0) {
+                    engine.receive_block(block).unwrap();
+                }
+            }
+            assert_eq!(engine.advance_round(), target != 5);
+        }
+        let children: Vec<_> = engines
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(index, engine)| engine.propose_block(vec![], 2_000 + index as u64).unwrap())
+            .collect();
+        for (target, engine) in engines.iter().take(5).enumerate() {
+            for (source, child) in children.iter().enumerate() {
+                if source != target {
+                    engine.receive_block(child).unwrap();
+                }
+            }
+        }
+        // Model a node two rounds ahead with a genuine certificate. The live
+        // incident reached this shape via the separately-regressed local-vote
+        // defect; replay must also handle a legitimate certified advance.
+        let votes = keys
+            .iter()
+            .take(5)
+            .map(|key| {
+                SkipVote::sign(
+                    domain,
+                    validator_set_hash(&set),
+                    102,
+                    keys[5].address(),
+                    AbsenceReason::NoBlock,
+                    5 * arc_consensus::STAKE_ARC,
+                    key,
+                )
+                .unwrap()
+            })
+            .collect();
+        engines[0]
+            .register_skip_certificate(SkipCertificate::new(
+                domain,
+                validator_set_hash(&set),
+                102,
+                keys[5].address(),
+                AbsenceReason::NoBlock,
+                votes,
+            ))
+            .unwrap();
+        assert!(engines[0].advance_round());
+        assert_eq!(engines[0].current_round(), 103);
+        assert_eq!(engines[0].last_committed_round(), 101);
+        assert!(
+            engines[5].receive_block(&children[0]).is_err(),
+            "the old current/parent-only replay cannot supply round101"
+        );
+
+        let pending = dashmap::DashMap::new();
+        let mut rounds = std::collections::BTreeSet::new();
+        let mut retry = false;
+        let mut next = Instant::now();
+        assert!(queue_due_recovery_replay(
+            &engines[0],
+            keys[0].address(),
+            &mut rounds,
+            &mut retry,
+            next
+        ));
+        assert_eq!(
+            rounds.iter().copied().collect::<Vec<_>>(),
+            vec![101, 102, 103]
+        );
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut sent = Vec::new();
+        for _tick in 0..4 {
+            let drain = try_drain_recovery_reconnect_replay(
+                &engines[0],
+                keys[0].address(),
+                &mut rounds,
+                &pending,
+                Some(&sender),
+                None,
+            )
+            .unwrap();
+            if let Ok(OutboundMessage::BroadcastDagBlock {
+                block,
+                transactions,
+            }) = receiver.try_recv()
+            {
+                assert!(transactions.is_empty());
+                let expected = if block.round == 101 {
+                    &parents[0]
+                } else {
+                    &children[0]
+                };
+                assert_eq!(
+                    bincode::serialize(&block).unwrap(),
+                    bincode::serialize(expected).unwrap()
+                );
+                engines[5].receive_block(&block).unwrap();
+                sent.push(block.round);
+            }
+            if drain == RecoveryReplayDrain::Complete {
+                // This is also the top-of-loop continuation after backpressure.
+                complete_recovery_rebroadcast(&mut retry, &mut next);
+                break;
+            }
+        }
+        assert_eq!(sent, vec![101, 102]);
+        assert!(rounds.is_empty());
+        assert!(
+            !queue_due_recovery_replay(
+                &engines[0],
+                keys[0].address(),
+                &mut rounds,
+                &mut retry,
+                next
+            ),
+            "a drained window must not refill immediately"
+        );
+        assert!(rounds.is_empty());
+        assert!(
+            engines[5].advance_round(),
+            "event processing resumes after the bounded replay"
+        );
+        for child in children.iter().skip(1) {
+            engines[5].receive_block(child).unwrap();
+        }
+        let recovered = engines[5].propose_block(vec![], 3_000).unwrap();
+        for engine in engines.iter().take(5) {
+            engine.receive_block(&recovered).unwrap();
+        }
+        for engine in engines.iter().skip(1) {
+            assert!(engine.advance_round());
+        }
+        let next_blocks: Vec<_> = engines
+            .iter()
+            .enumerate()
+            .map(|(index, engine)| engine.propose_block(vec![], 4_000 + index as u64).unwrap())
+            .collect();
+        for (target, engine) in engines.iter().enumerate() {
+            for (source, block) in next_blocks.iter().enumerate() {
+                if source != target {
+                    engine.receive_block(block).unwrap();
+                }
+            }
+            assert!(
+                !engine.try_commit().is_empty(),
+                "all six regain certified commit progress"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_predecessor_retains_receipted_and_unexecuted_preimages() {
+        let key = KeyPair::generate_ed25519();
+        let executed = signed_transfer(&key, 41, 0);
+        let omitted = signed_transfer(&key, 42, 1);
+        let pending = dashmap::DashMap::new();
+        let latest = dashmap::DashMap::new();
+        retain_dag_preimages(&pending, &latest, 100, &[executed.clone(), omitted.clone()]).unwrap();
+        let ran = |hash: &[u8; 32]| *hash == executed.hash.0;
+        // cursor101 replays its predecessor100: even a receipt with no longer
+        // retained canonical body must remain fully replayable from this cache.
+        assert_eq!(prune_dag_preimages(&pending, &latest, 101, 0, ran), 0);
+        assert_eq!(
+            exact_dag_preimages(&pending, &[executed.hash, omitted.hash])
+                .unwrap()
+                .len(),
+            2
+        );
+        // Once100 is outside the replay boundary, executed bodies may leave;
+        // omitted bodies remain until the same retention floor as their DAG.
+        assert_eq!(prune_dag_preimages(&pending, &latest, 102, 0, ran), 1);
+        assert!(pending.contains_key(&omitted.hash.0));
+    }
+
+    #[test]
     fn rolling_restart_replays_missing_parent_before_current_and_all_six_advance() {
         let validators: Vec<_> = (0..6)
             .map(|index| hash_bytes(format!("restart-validator-{index}").as_bytes()))
@@ -6478,7 +6780,7 @@ mod tests {
         let pending = dashmap::DashMap::new();
         for source in 0..5 {
             let mut queued = std::collections::BTreeSet::new();
-            queue_recovery_reconnect_replay(&engines[source], &mut queued);
+            queue_recovery_reconnect_replay(&engines[source], validators[source], &mut queued);
             assert_eq!(queued.iter().copied().collect::<Vec<_>>(), vec![101, 102]);
 
             // A one-slot transport proves ordering and lossless retry for the
@@ -6493,6 +6795,7 @@ mod tests {
                         &mut queued,
                         &pending,
                         Some(&sender),
+                        None,
                     )
                     .unwrap(),
                     RecoveryReplayDrain::Backpressured { round: 102 }
@@ -6506,6 +6809,7 @@ mod tests {
                         &mut queued,
                         &pending,
                         Some(&sender),
+                        None,
                     )
                     .unwrap(),
                     RecoveryReplayDrain::Complete
@@ -6531,6 +6835,7 @@ mod tests {
                         &mut queued,
                         &pending,
                         Some(&sender),
+                        None,
                     )
                     .unwrap(),
                     RecoveryReplayDrain::Complete,

@@ -807,16 +807,11 @@ pub struct ConsensusEngine {
     /// on every chain, including a plain from-genesis one that has no recovery
     /// context, so they carry their own binding.
     certificate_domain: RwLock<Option<ConsensusDomain>>,
-    /// Verified round-skip certificates, by round. A round with a certificate
-    /// may be passed by the commit cursor without committing its leader; see
-    /// `view_change` for why that is safe.
+    /// Verified absence certificates, keyed by exact round and member. This
+    /// map is the sole authority for relaxing full participation; a local
+    /// persisted observation is not a quorum certificate. It does not affect
+    /// the commit rule or refuse late blocks.
     skip_certificates: DashMap<(u64, Address), view_change::SkipCertificate>,
-    /// `(round, member)` pairs excused from the recovery domain's
-    /// full-participation requirement by a verified absence certificate. This
-    /// is the certificate's ONLY effect: it relaxes one round's participation
-    /// requirement to the ordinary quorum rule. It never touches the commit
-    /// rule, refuses no block, and carries no safety weight.
-    excused_participation: DashMap<(u64, Address), ()>,
     /// Verified committed-block finality certificates, by height.
     finality_certificates: DashMap<u64, view_change::FinalityCertificate>,
     /// Highest height with a held finality certificate.
@@ -893,7 +888,6 @@ impl ConsensusEngine {
             consensus_domain: RwLock::new(None),
             certificate_domain: RwLock::new(None),
             skip_certificates: DashMap::new(),
-            excused_participation: DashMap::new(),
             retained_rounds: AtomicU64::new(DEFAULT_RETAINED_ROUNDS),
             finality_certificates: DashMap::new(),
             highest_finalized_height: AtomicU64::new(0),
@@ -946,7 +940,6 @@ impl ConsensusEngine {
             consensus_domain: RwLock::new(None),
             certificate_domain: RwLock::new(None),
             skip_certificates: DashMap::new(),
-            excused_participation: DashMap::new(),
             retained_rounds: AtomicU64::new(DEFAULT_RETAINED_ROUNDS),
             finality_certificates: DashMap::new(),
             highest_finalized_height: AtomicU64::new(0),
@@ -1726,7 +1719,7 @@ impl ConsensusEngine {
             // A local timeout or testnet flag is still not a quorum
             // certificate. The only thing that excuses a missing fixed
             // validator parent is an authenticated quorum skip certificate for
-            // that exact round, which proves its block can never be committed.
+            // that exact round. Late blocks may still be committed.
             if accumulated_stake < vs.quorum || !full_recovery_participation {
                 return Err(ConsensusError::InsufficientParents);
             }
@@ -2205,11 +2198,9 @@ impl ConsensusEngine {
 
     /// Verify and register an absence certificate.
     ///
-    /// Two effects, both load-bearing (see `view_change`): the named member is
-    /// excused from that round's participation requirement, and this node
-    /// permanently refuses that member's block for that round. When the
-    /// absentee is also the round's deterministic leader, the commit cursor may
-    /// pass the round.
+    /// Excuse the named member from this round's full-participation
+    /// requirement only after verifying the frozen committee's quorum. Late
+    /// blocks remain admissible, and the commit rule is unchanged.
     pub fn register_skip_certificate(
         &self,
         certificate: view_change::SkipCertificate,
@@ -2223,7 +2214,6 @@ impl ConsensusEngine {
         };
         let round = certificate.round;
         let absentee = certificate.absentee;
-        self.excused_participation.insert((round, absentee), ());
         self.skip_certificates
             .insert((round, absentee), certificate);
         info!(
@@ -2242,7 +2232,7 @@ impl ConsensusEngine {
     /// not certified as absent, and the certificate is what makes "absent"
     /// something a node proves rather than assumes.
     fn is_excused_for_round(&self, round: u64, address: &Address) -> bool {
-        self.excused_participation.contains_key(&(round, *address))
+        self.skip_certificates.contains_key(&(round, *address))
     }
 
     /// Bind the domain that absence and finality transcripts are signed under.
@@ -2296,16 +2286,10 @@ impl ConsensusEngine {
             .map(|c| c.value().clone())
     }
 
-    /// Record an excusal taken locally (this node signed the attestation and
-    /// is waiting for its peers' votes to form the certificate).
-    pub fn note_certified_absent(&self, round: u64, member: Address) {
-        self.excused_participation.insert((round, member), ());
-    }
-
     /// True when a member is excused from this round's participation
     /// requirement. Informational; nothing in the commit rule consults it.
     pub fn is_certified_absent(&self, round: u64, member: &Address) -> bool {
-        self.excused_participation.contains_key(&(round, *member))
+        self.has_skip_certificate(round, member)
     }
 
     /// Import a contiguous, ascending run of history from a peer.
@@ -2646,10 +2630,7 @@ impl ConsensusEngine {
             ),
             ("engine_finality_proofs", self.finality_proofs.len()),
             ("engine_skip_certificates", self.skip_certificates.len()),
-            (
-                "engine_excused_participation",
-                self.excused_participation.len(),
-            ),
+            ("engine_excused_participation", self.skip_certificates.len()),
             (
                 "engine_finality_certificates",
                 self.finality_certificates.len(),
@@ -3845,13 +3826,11 @@ impl ConsensusEngine {
         }
 
         // The other round-keyed maps age out on the same horizon. They were
-        // never pruned at all: skip certificates and excused participation
-        // accumulated one entry per attested (round, member) for the life of
+        // never pruned at all: skip certificates accumulated one entry per
+        // certified (round, member) for the life of
         // the process, which a day-long soak would have turned into a slow
         // leak with nothing else wrong.
         self.skip_certificates
-            .retain(|(round, _), _| *round >= cutoff);
-        self.excused_participation
             .retain(|(round, _), _| *round >= cutoff);
 
         // Prune committed hashes that are no longer in the DAG

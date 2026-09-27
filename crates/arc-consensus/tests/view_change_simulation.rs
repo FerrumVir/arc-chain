@@ -132,13 +132,8 @@ impl Node {
         engine
             .install_consensus_domain(domain())
             .expect("fresh engine binds its domain");
-        // Re-apply the refusals the reloaded record carries, so a restarted
-        // node cannot help certify a block it already voted to skip.
-        for (round, members) in &record.skipped_rounds {
-            for member in members.keys() {
-                engine.note_certified_absent(*round, *member);
-            }
-        }
+        // The durable record preserves observations, not quorum certificates.
+        // Certificates must be received and verified again after restart.
         self.engine = engine;
         self.tracker = SkipTracker::new(domain(), validator_set_hash(set), GRACE, record);
         self.skip_votes = SkipVoteCollector::new();
@@ -292,9 +287,6 @@ impl Sim {
                     ) {
                         // S5: the decision is already in the record; a real node
                         // fsyncs it here, before the vote leaves the process.
-                        self.nodes[index]
-                            .engine
-                            .note_certified_absent(round, member);
                         outbox.push((index, Msg::Skip(vote)));
                         continue;
                     }
@@ -728,6 +720,127 @@ fn a_stale_certificate_from_another_committee_is_rejected_by_every_node() {
 }
 
 #[test]
+fn local_absence_vote_and_reloaded_observation_do_not_excuse_participation() {
+    let mut sim = Sim::new(6);
+    let missing = sim.nodes[5].address;
+    let mut faults = Faults {
+        offline: HashSet::from([5]),
+        ..Default::default()
+    };
+    // Deliver five signed bootstrap blocks, then let every observer start its
+    // grace clock. Before votes form, isolate node 0 from all other voters.
+    sim.tick(&faults);
+    sim.tick(&faults);
+    faults.cut = (1..6).map(|from| (from, 0)).collect();
+    sim.tick(&faults);
+    let record = sim.nodes[0].tracker.record().clone();
+    assert_eq!(record.skipped_rounds[&0][&missing], AbsenceReason::NoBlock);
+    assert!(!sim.nodes[0].engine.has_skip_certificate(0, &missing));
+    assert_eq!(
+        sim.nodes[0].engine.current_round(),
+        0,
+        "one durable local observation must not advance the recovery round"
+    );
+    assert!(!sim.nodes[0].engine.is_certified_absent(0, &missing));
+    assert!(sim.nodes[0].engine.try_commit().is_empty());
+
+    // Peers with a real certificate can produce a five-parent child. The
+    // isolated node must not accept that same signed child or import it as
+    // complete history on the strength of its own observation.
+    let peer_child = sim.nodes[1].engine.propose_block(vec![], 40_000).unwrap();
+    assert!(sim.nodes[0].engine.receive_block(&peer_child).is_err());
+    assert!(sim.nodes[0].engine.get_block(&peer_child.hash).is_none());
+
+    let parents: Vec<_> = sim.nodes[0]
+        .engine
+        .blocks_in_round(0)
+        .into_iter()
+        .map(|hash| sim.nodes[0].engine.get_block(&hash).unwrap())
+        .collect();
+    let mut offered_history = parents.clone();
+    offered_history.push(peer_child.clone());
+    let _ = sim.nodes[0]
+        .engine
+        .import_history(&offered_history, HISTORY_SPAN);
+    assert_eq!(sim.nodes[0].engine.current_round(), 0);
+    assert!(sim.nodes[0].engine.get_block(&peer_child.hash).is_none());
+    let set = sim.set.clone();
+    sim.nodes[0].restart(&set);
+    assert_eq!(
+        sim.nodes[0].tracker.record().skipped_rounds,
+        record.skipped_rounds
+    );
+    for block in &parents {
+        sim.nodes[0].engine.receive_block(block).unwrap();
+    }
+    assert!(
+        !sim.nodes[0].engine.advance_round(),
+        "reopen must not upgrade a persisted observation into a certificate"
+    );
+    assert!(!sim.nodes[0].engine.is_certified_absent(0, &missing));
+
+    let votes: Vec<_> = sim
+        .nodes
+        .iter()
+        .take(5)
+        .map(|node| {
+            SkipVote::sign(
+                domain(),
+                validator_set_hash(&set),
+                0,
+                missing,
+                AbsenceReason::NoBlock,
+                5 * STAKE_ARC,
+                &node.keypair,
+            )
+            .unwrap()
+        })
+        .collect();
+    let insufficient = SkipCertificate::new(
+        domain(),
+        validator_set_hash(&set),
+        0,
+        missing,
+        AbsenceReason::NoBlock,
+        votes[..4].to_vec(),
+    );
+    assert!(
+        sim.nodes[0]
+            .engine
+            .register_skip_certificate(insufficient)
+            .is_err()
+    );
+    assert!(!sim.nodes[0].engine.advance_round());
+    let certified = SkipCertificate::new(
+        domain(),
+        validator_set_hash(&set),
+        0,
+        missing,
+        AbsenceReason::NoBlock,
+        votes,
+    );
+    sim.nodes[0]
+        .engine
+        .register_skip_certificate(certified)
+        .unwrap();
+    assert!(sim.nodes[0].engine.is_certified_absent(0, &missing));
+    assert!(sim.nodes[0].engine.advance_round());
+    sim.nodes[0].engine.receive_block(&peer_child).unwrap();
+    let child = sim.nodes[0].engine.propose_block(vec![], 50_000).unwrap();
+    assert_eq!(child.parents.len(), 5);
+    assert!(sim.nodes[0].engine.try_commit().is_empty());
+
+    // Absence is an observation, not a permanent block refusal. Keep the
+    // durable vote while accepting the absentee's delayed authentic block.
+    let late = sim.nodes[5].engine.propose_block(vec![], 50_001).unwrap();
+    sim.nodes[0].engine.receive_block(&late).unwrap();
+    assert_eq!(
+        sim.nodes[0].tracker.record().skipped_rounds,
+        record.skipped_rounds
+    );
+}
+
+#[test]
 fn a_restarted_node_keeps_its_refusals_and_rejoins_without_conflicting() {
     let mut sim = Sim::new(4);
     let silent_leader = leader_for_round(&sim.set, 1);
@@ -765,10 +878,10 @@ fn a_restarted_node_keeps_its_refusals_and_rejoins_without_conflicting() {
             "a restarted node forgot that it voted to skip round {round}"
         );
         assert!(
-            sim.nodes[restart_index]
+            !sim.nodes[restart_index]
                 .engine
                 .is_certified_absent(*round, leader),
-            "a restarted engine forgot its excusal for round {round}"
+            "a restarted engine must reacquire a verified certificate for round {round}"
         );
     }
 
@@ -1110,7 +1223,32 @@ fn many_absences_in_one_round_cannot_stop_block_production() {
     for round in 0..6u64 {
         for node in &sim.nodes {
             for member in &members {
-                node.engine.note_certified_absent(round, *member);
+                let votes = sim
+                    .nodes
+                    .iter()
+                    .map(|voter| {
+                        SkipVote::sign(
+                            domain(),
+                            validator_set_hash(&sim.set),
+                            round,
+                            *member,
+                            AbsenceReason::NoBlock,
+                            sim.set.total_stake,
+                            &voter.keypair,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                node.engine
+                    .register_skip_certificate(SkipCertificate::new(
+                        domain(),
+                        validator_set_hash(&sim.set),
+                        round,
+                        *member,
+                        AbsenceReason::NoBlock,
+                        votes,
+                    ))
+                    .unwrap();
             }
         }
     }
