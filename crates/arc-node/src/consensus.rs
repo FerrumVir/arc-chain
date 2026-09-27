@@ -302,6 +302,42 @@ fn requeue_native(
     first.elapsed() < NATIVE_REQUEUE_LIFETIME
 }
 
+/// Select the chain's single native transition without losing ordinary v3
+/// work displaced by it. Selection is canonical; this requeue policy affects
+/// only later local proposals and still honors the NEW-request readiness gate.
+fn select_native_transactions_and_requeue(
+    state: &StateDB,
+    candidates: &[arc_types::Transaction],
+    mempool: &Mempool,
+    admission: &crate::native_inference::NativeRequestAdmission,
+    requeued_since: &mut std::collections::HashMap<[u8; 32], Instant>,
+) -> Vec<arc_types::Transaction> {
+    let selected = state.select_native_block_transactions(candidates);
+    for transaction in candidates {
+        if selected.iter().any(|kept| kept.hash == transaction.hash)
+            || state.receipts.contains_key(&transaction.hash.0)
+        {
+            continue;
+        }
+        let eligible = if StateDB::is_native_inference_transaction(transaction) {
+            state.native_transaction_still_admissible(transaction)
+                && requeue_native(requeued_since, transaction)
+        } else {
+            // A migrated v3 chain retains its ordinary transaction families.
+            // Their exclusion from a native block says nothing about whether
+            // they can execute in the following ordinary block. Preserve the
+            // usual v3 admission rules, with no native retry lifetime applied.
+            state.active_protocol_version().major == 3
+                && state.native_migration().is_some()
+                && state.validate_v3_transaction_admission(transaction).is_ok()
+        };
+        if eligible {
+            admission.insert(mempool, transaction.clone());
+        }
+    }
+    selected
+}
+
 fn prune_irreversible_preimages(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     latest_round: &dashmap::DashMap<[u8; 32], u64>,
@@ -3811,16 +3847,13 @@ impl ConsensusManager {
                     // and a proposal holding two native transactions is
                     // refused at execution on every node at once.
                     if state.native_inference_context().is_some() && !transactions.is_empty() {
-                        let selected = state.select_native_block_transactions(&transactions);
-                        for transaction in transactions.drain(..) {
-                            if !selected.iter().any(|kept| kept.hash == transaction.hash)
-                                && state.native_transaction_still_admissible(&transaction)
-                                && requeue_native(&mut requeued_since, &transaction)
-                            {
-                                self.native_request_admission.insert(&mempool, transaction);
-                            }
-                        }
-                        transactions = selected;
+                        transactions = select_native_transactions_and_requeue(
+                            &state,
+                            &transactions,
+                            &mempool,
+                            &self.native_request_admission,
+                            &mut requeued_since,
+                        );
                     }
                     if stale > 0 {
                         crate::consensus_diagnostics::DIAG
@@ -4287,26 +4320,19 @@ impl ConsensusManager {
                     // with exactly the fatal case this exists to prevent. The
                     // selection returns an ordinary block unchanged.
                     if state.native_inference_context().is_some() {
-                        let selected = state.select_native_block_transactions(&committed_txs);
+                        let selected = select_native_transactions_and_requeue(
+                            &state,
+                            &committed_txs,
+                            &mempool,
+                            &self.native_request_admission,
+                            &mut requeued_since,
+                        );
                         let omitted = committed_txs.len().saturating_sub(selected.len());
                         if omitted > 0 {
-                            // Native envelopes that lost the one slot stay
-                            // eligible for a later leader; anything else can
-                            // never execute on this chain and is dropped.
-                            for transaction in committed_txs.iter() {
-                                if !selected.iter().any(|kept| kept.hash == transaction.hash)
-                                    && !state.receipts.contains_key(&transaction.hash.0)
-                                    && state.native_transaction_still_admissible(transaction)
-                                    && requeue_native(&mut requeued_since, transaction)
-                                {
-                                    self.native_request_admission
-                                        .insert(&mempool, transaction.clone());
-                                }
-                            }
                             debug!(
                                 block = %dag_block.hash,
                                 omitted,
-                                "Protocol-4 block carries one native transaction; the rest stay \
+                                "Native block carries at most one transaction; the rest stay \
                                  eligible or are dropped"
                             );
                             crate::consensus_diagnostics::DIAG
@@ -5184,6 +5210,333 @@ mod tests {
             !requeue_native(&mut since, &tx),
             "past its lifetime it is dropped"
         );
+    }
+
+    #[test]
+    fn migrated_v3_native_selection_retains_ordinary_work_and_drops_stale_finalizers() {
+        use crate::native_inference::NativeRequestAdmission;
+        use arc_state::recovery::{
+            ArcCheckpoint, RecoveryExportSpec, RecoveryImport, RecoveryNetworkPolicy,
+            RecoveryValidator,
+        };
+        use arc_types::TxBody;
+        use arc_types::inference_contract::{
+            INFERENCE_CONTRACT_VERSION, InferenceCertificate, InferenceDomain, InferenceJob,
+            InferenceRequest, ValidatorMember, sign_vote, validator_set_commitment,
+        };
+        use arc_types::transaction::{
+            JoinValidatorBody, NativeInferenceFinalizeBody, NativeInferenceRequestBody, gas_costs,
+        };
+
+        // Use an actual signed recovery checkpoint and authorized migration:
+        // an ordinary fresh-genesis fixture cannot exercise this mixed lane.
+        let directory = tempfile::tempdir().unwrap();
+        let requester = KeyPair::from_ed25519_secret_bytes(&hash_bytes(b"requeue-requester").0);
+        let keys: Vec<_> = (0..6)
+            .map(|i| {
+                KeyPair::from_ed25519_secret_bytes(&hash_bytes(format!("requeue-{i}").as_bytes()).0)
+            })
+            .collect();
+        let genesis = hash_bytes(b"requeue-recovered-v3");
+        let validators: Vec<_> = keys
+            .iter()
+            .map(|key| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: 5_000_000,
+            })
+            .collect();
+        let mut members: Vec<_> = validators
+            .iter()
+            .map(|v| ValidatorMember::new(v.address, v.stake))
+            .collect();
+        members.sort_by_key(|v| v.address.0);
+        let mut funds = vec![
+            (requester.address(), 1_000),
+            (
+                arc_state::recovery::recovery_stake_reserve_address(),
+                60_000_000,
+            ),
+        ];
+        funds.extend(keys.iter().map(|key| (key.address(), 5_000_000)));
+        let source = StateDB::with_genesis(&funds);
+        let joins: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, 0);
+                tx.tx_type = TxType::JoinValidator;
+                tx.body = TxBody::JoinValidator(JoinValidatorBody {
+                    pubkey: key.public_key_bytes().try_into().unwrap(),
+                    initial_stake: 5_000_000,
+                });
+                tx.sign(key).unwrap();
+                tx
+            })
+            .collect();
+        let (_, receipts) = source.execute_block(&joins, keys[0].address()).unwrap();
+        assert!(receipts.iter().all(|receipt| receipt.success));
+        for key in &keys {
+            let mut account = source.get_account(&key.address()).unwrap();
+            account.staked_balance = 0;
+            source.update_account(&key.address(), account);
+        }
+        source.execute_block(&[], keys[0].address()).unwrap();
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: "requeue-recovered-v3".into(),
+                genesis_hash: genesis,
+                source_consensus_round: 0,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let path = directory.path().join("approved.arcchkpt");
+        checkpoint.write_to(&path).unwrap();
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &directory.path().join("state"),
+            RecoveryNetworkPolicy {
+                chain_id: "requeue-recovered-v3".into(),
+                genesis_hash: genesis,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: members.iter().map(|v| (v.address, v.stake)).collect(),
+                community_rewards_v1_activation_height: None,
+            },
+            Some(RecoveryImport {
+                checkpoint_path: path,
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            }),
+        )
+        .unwrap();
+        // Synthetic execution identity tests transaction/certificate routing,
+        // not model qualification or numerical inference.
+        let tuple = hash_bytes(b"synthetic-requeue-execution");
+        let context = arc_state::InferenceAdmissionContext {
+            domain: InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 1,
+                validator_set_hash: validator_set_commitment(&members).unwrap(),
+            },
+            members,
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: tuple,
+                profile_hash: tuple,
+                generation_hash: tuple,
+                assignment_hash: tuple,
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        state
+            .authorize_native_migration(
+                arc_state::NativeMigrationRecord {
+                    chain_genesis: genesis,
+                    recovery_epoch: 1,
+                    validator_set_id: 1,
+                    activation_height: state.height() + 1,
+                    context_commitment: context.commitment().unwrap(),
+                },
+                context.clone(),
+            )
+            .unwrap();
+        let commit = |transactions: &[Transaction]| {
+            state.validate_v3_block_admission(transactions).unwrap();
+            let (block, receipts) = state
+                .execute_block_adaptive_at_with_proof(
+                    transactions,
+                    keys[0].address(),
+                    state.get_block(state.height()).unwrap().header.timestamp + 1,
+                    hash_bytes(&(state.height() + 1).to_le_bytes()),
+                )
+                .unwrap();
+            assert_eq!(block.header.protocol_version.major, 3);
+            assert!(receipts.iter().all(|receipt| receipt.success));
+            block
+        };
+        commit(&[]);
+        assert!(state.native_inference_context().is_some());
+        let signed = |key: &KeyPair, body: TxBody, gas| {
+            let nonce = state.get_account(&key.address()).unwrap().nonce;
+            let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, nonce);
+            tx.tx_type = body.tx_type();
+            tx.body = body;
+            tx.fee = 0;
+            tx.gas_limit = gas;
+            state.sign_transaction(&mut tx, key).unwrap();
+            tx
+        };
+        let input = vec![1, 2, 3];
+        let request = InferenceRequest::sign(
+            InferenceJob {
+                version: INFERENCE_CONTRACT_VERSION,
+                domain: context.domain,
+                requester: requester.address(),
+                nonce: state.get_account(&requester.address()).unwrap().nonce,
+                model_hash: tuple,
+                profile_hash: tuple,
+                input_hash: hash_bytes(&input),
+                generation_hash: tuple,
+                assignment_hash: tuple,
+                max_tokens: 2,
+                max_output_bytes: 8,
+                execution_price: 10,
+                reserved_max_payment: 100,
+                expires_at: 100,
+            },
+            &requester,
+        )
+        .unwrap();
+        let id = request.job.request_id();
+        let request_tx = signed(
+            &requester,
+            TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: input,
+            }),
+            gas_costs::NATIVE_INFERENCE_REQUEST,
+        );
+        commit(std::slice::from_ref(&request_tx));
+        let finalize = |submitter: usize, voters: &[KeyPair]| {
+            let output = 7u32.to_le_bytes().to_vec();
+            let mut votes: Vec<_> = voters
+                .iter()
+                .map(|key| sign_vote(id, &output, key).unwrap())
+                .collect();
+            votes.sort_by_key(|vote| vote.validator.0);
+            signed(
+                &keys[submitter],
+                TxBody::NativeInferenceFinalize(NativeInferenceFinalizeBody {
+                    request_id: id.0,
+                    certificate: InferenceCertificate { output, votes },
+                }),
+                gas_costs::NATIVE_INFERENCE_FINALIZE,
+            )
+        };
+        let winner = finalize(0, &keys[..5]);
+        let alternative = finalize(1, &keys[1..]);
+        // Same output, different valid >2/3 certificate signer sets. The
+        // latter becomes stale only after the first certificate is stored.
+        state.validate_v3_transaction_admission(&winner).unwrap();
+        state
+            .validate_v3_transaction_admission(&alternative)
+            .unwrap();
+        let mut ordinary = Transaction::new_transfer(
+            requester.address(),
+            keys[0].address(),
+            1,
+            state.get_account(&requester.address()).unwrap().nonce,
+        );
+        ordinary.fee = 1;
+        state.sign_transaction(&mut ordinary, &requester).unwrap();
+        state.validate_v3_transaction_admission(&ordinary).unwrap();
+        assert!(
+            state
+                .validate_v3_block_admission(&[winner.clone(), ordinary.clone()])
+                .is_err(),
+            "the native transition must still execute alone"
+        );
+        let mempool = Mempool::new(16);
+        let admission = NativeRequestAdmission::default();
+        let mut since = std::collections::HashMap::new();
+        // An ordinary envelope must not inherit the native retry expiry.
+        since.insert(
+            ordinary.hash.0,
+            Instant::now()
+                .checked_sub(NATIVE_REQUEUE_LIFETIME + Duration::from_secs(1))
+                .unwrap(),
+        );
+        mempool.insert(ordinary.clone()).unwrap();
+        mempool.insert(winner.clone()).unwrap();
+        let selected = select_native_transactions_and_requeue(
+            &state,
+            &mempool.drain(16),
+            &mempool,
+            &admission,
+            &mut since,
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hash, winner.hash);
+        assert!(mempool.contains(&ordinary.hash));
+        assert_eq!(commit(&selected).header.tx_count, 1);
+        assert_eq!(
+            state.get_account(&requester.address()).unwrap().balance,
+            990
+        );
+
+        let stale_error = state
+            .validate_v3_transaction_admission(&alternative)
+            .unwrap_err();
+        assert!(
+            stale_error
+                .to_string()
+                .contains("finalize certificate does not match stored terminal output")
+        );
+        assert!(!state.native_transaction_still_admissible(&alternative));
+        mempool.insert(alternative.clone()).unwrap();
+        let mut invalid_ordinary = ordinary.clone();
+        invalid_ordinary.fee = 0;
+        state
+            .sign_transaction(&mut invalid_ordinary, &requester)
+            .unwrap();
+        assert!(
+            state
+                .validate_v3_transaction_admission(&invalid_ordinary)
+                .is_err()
+        );
+        mempool.insert(invalid_ordinary.clone()).unwrap();
+        let selected = select_native_transactions_and_requeue(
+            &state,
+            &mempool.drain(16),
+            &mempool,
+            &admission,
+            &mut since,
+        );
+        assert!(selected.is_empty(), "the stale native body cannot execute");
+        assert_eq!(mempool.len(), 1);
+        assert!(mempool.contains(&ordinary.hash));
+        assert!(!mempool.contains(&alternative.hash));
+        assert!(!mempool.contains(&invalid_ordinary.hash));
+
+        // The next real selector invocation proposes the displaced transfer,
+        // and the unchanged v3 executor produces its successful receipt.
+        let selected = select_native_transactions_and_requeue(
+            &state,
+            &mempool.drain(16),
+            &mempool,
+            &admission,
+            &mut since,
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hash, ordinary.hash);
+        let block = commit(&selected);
+        assert_eq!(block.tx_hashes, vec![ordinary.hash]);
+        assert!(state.receipts.get(&ordinary.hash.0).unwrap().success);
+        assert_eq!(
+            state.get_account(&requester.address()).unwrap().balance,
+            988
+        );
+        assert!(mempool.is_empty());
+        // Even when a stale native body triggers selection again, the
+        // already-receipted transfer must not be put back.
+        assert!(
+            select_native_transactions_and_requeue(
+                &state,
+                &[ordinary, alternative],
+                &mempool,
+                &admission,
+                &mut since,
+            )
+            .is_empty()
+        );
+        assert!(mempool.is_empty());
     }
 
     #[test]

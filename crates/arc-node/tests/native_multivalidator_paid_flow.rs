@@ -582,17 +582,17 @@ fn recovered_account(port: u16, who: Hash256) -> arc_types::Account {
 /// No StateDB execution in this helper: the only writer is the real node's
 /// DAG loop. Every replica must publish the same successful canonical receipt
 /// and v3 header, with an actual nonzero DAG decision commitment.
-fn recovered_commit(nodes: &[NodeProcess], tx: Hash256, native: bool) -> u64 {
-    wait_for(
-        Duration::from_secs(90),
-        "transaction committed on all recovered validators",
-        || {
-            nodes.iter().all(|n| {
-                get_json(n.port, &format!("/tx/{}", tx.to_hex()))
-                    .is_some_and(|r| r["success"] == true)
-            })
-        },
+fn recovered_commit(nodes: &[NodeProcess], tx: Hash256, native: bool, phase: &str) -> u64 {
+    let label = format!(
+        "{phase}: transaction {} committed on all recovered validators",
+        tx.to_hex()
     );
+    eprintln!("Waiting for {label}");
+    wait_for(Duration::from_secs(90), &label, || {
+        nodes.iter().all(|n| {
+            get_json(n.port, &format!("/tx/{}", tx.to_hex())).is_some_and(|r| r["success"] == true)
+        })
+    });
     let reference = get_json(nodes[0].port, &format!("/tx/{}", tx.to_hex())).unwrap();
     let height = reference["block_height"].as_u64().unwrap();
     let reference_block = get_json(nodes[0].port, &format!("/block/{height}")).unwrap();
@@ -621,6 +621,10 @@ fn recovered_commit(nodes: &[NodeProcess], tx: Hash256, native: bool) -> u64 {
             "recovered replicas disagree on header/root/body"
         );
     }
+    eprintln!(
+        "Completed {phase}: transaction {} at height {height}",
+        tx.to_hex()
+    );
     height
 }
 
@@ -657,7 +661,12 @@ fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
     let (code, reason) = submit(nodes[0].port, &before);
     assert_eq!(code, 200, "ordinary recovered transfer refused: {reason}");
     assert!(
-        recovered_commit(&nodes, before.hash, false) < recovery.activation_height,
+        recovered_commit(
+            &nodes,
+            before.hash,
+            false,
+            "ordinary transfer before activation"
+        ) < recovery.activation_height,
         "fixture must actually exercise ordinary traffic before native activation"
     );
     wait_for(
@@ -736,7 +745,7 @@ fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
         code, 200,
         "ready opted-in recovered node refused request: {reason}"
     );
-    recovered_commit(&nodes, paid.hash, true);
+    recovered_commit(&nodes, paid.hash, true, "paid request after first restart");
     wait_finalized(
         &nodes.iter().collect::<Vec<_>>(),
         paid_id,
@@ -755,7 +764,7 @@ fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
             .unwrap(),
     )
     .unwrap();
-    recovered_commit(&nodes, finalized_tx, true);
+    recovered_commit(&nodes, finalized_tx, true, "paid request finalization");
     let expected_settlement = settlement(nodes[0].port, paid_id).unwrap();
     assert_eq!(
         expected_settlement
@@ -792,7 +801,12 @@ fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
         200,
         "ordinary v3 traffic must pass a closed native gate"
     );
-    recovered_commit(&nodes, after.hash, false);
+    recovered_commit(
+        &nodes,
+        after.hash,
+        false,
+        "ordinary transfer after native finalization",
+    );
 
     // A valid one-token job is deliberately smaller than the synthetic
     // executor's fixed two-token answer. Each real worker must refuse output
@@ -815,7 +829,12 @@ fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
         code, 200,
         "bounded valid request refused before execution: {reason}"
     );
-    recovered_commit(&nodes, bounded.hash, true);
+    recovered_commit(
+        &nodes,
+        bounded.hash,
+        true,
+        "bounded request before refund restart",
+    );
     for node in &nodes {
         assert_eq!(settlement(node.port, refund_id).unwrap().0, "Pending");
     }
@@ -862,7 +881,12 @@ fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
         code, 200,
         "closed local ingress stranded an eligible refund: {reason}"
     );
-    recovered_commit(&nodes, refund.hash, true);
+    recovered_commit(
+        &nodes,
+        refund.hash,
+        true,
+        "expired request refund after second restart",
+    );
     for node in &nodes {
         let receipt = settlement(node.port, refund_id).unwrap();
         assert_eq!(receipt.0, "Refunded");
