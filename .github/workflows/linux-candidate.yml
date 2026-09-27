@@ -19,6 +19,75 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
+  recovered-v3-paid-lifecycle:
+    name: Recovered-v3 paid lifecycle (isolated Linux process test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-03-16
+      CARGO_TARGET_DIR: target-recovered-native
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact candidate commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: recovered-v3-paid-lifecycle
+          workspaces: . -> target-recovered-native
+
+      - name: Compile isolated recovered-v3 process test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          log_file="/tmp/arc-p5-node-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
+          cargo test --locked --release -p arc-node --features native-test-executor \
+            --test native_multivalidator_paid_flow --no-run 2>&1 | tee "$log_file"
+
+      - name: Verify exact recovered-v3 test selector
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          log_file="/tmp/arc-p5-node-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
+          list_file="$(mktemp)"
+          trap 'rm -f "$list_file"' EXIT
+          cargo test --locked --release -p arc-node --features native-test-executor \
+            --test native_multivalidator_paid_flow \
+            recovered_v3_dag_migration_paid_lifecycle_survives_restart \
+            -- --list --exact 2>&1 | tee -a "$log_file" | tee "$list_file"
+          grep -Fx 'recovered_v3_dag_migration_paid_lifecycle_survives_restart: test' "$list_file"
+
+      - name: Run recovered-v3 paid lifecycle across restart
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          log_file="/tmp/arc-p5-node-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
+          timeout --signal=TERM --kill-after=30s 12m \
+            cargo test --locked --release -p arc-node --features native-test-executor \
+              --test native_multivalidator_paid_flow \
+              recovered_v3_dag_migration_paid_lifecycle_survives_restart \
+              -- --exact --nocapture --test-threads=1 2>&1 | tee -a "$log_file"
+          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log_file"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: arc-recovered-v3-paid-lifecycle-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/arc-p5-node-*.log
+          if-no-files-found: warn
+          retention-days: 14
+
   desktop-native-paid-test:
     name: Desktop native paid Rust tests (macOS)
     runs-on: macos-15
