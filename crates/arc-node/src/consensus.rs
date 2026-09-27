@@ -5539,7 +5539,12 @@ mod tests {
         // bodies (including ones already receipted), and immutable wire rules.
         assert!(verify_peer_dag_availability(&state, &[alternative.hash], &[]).is_err());
         assert!(
-            verify_peer_dag_availability(&state, &[alternative.hash], &[winner.clone()]).is_err()
+            verify_peer_dag_availability(
+                &state,
+                &[alternative.hash],
+                std::slice::from_ref(&winner),
+            )
+            .is_err()
         );
         let mut wrong_domain = alternative.clone();
         wrong_domain
