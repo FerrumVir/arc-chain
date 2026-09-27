@@ -62,6 +62,10 @@ pub struct NodeConfig {
     pub p2p_port: u16,
     pub auto_start: bool,
     pub auto_update: bool,
+    /// Separate consent for unattended installation. Older stores opted in
+    /// only to checking for updates, so migration must leave this disabled.
+    #[serde(default)]
+    pub auto_install_updates: bool,
     pub data_dir: String,
     /// How many CPU cores the node may use for parallel work (rayon's global
     /// pool). `None` = let rayon size itself, which means every logical core.
@@ -85,6 +89,7 @@ impl Default for NodeConfig {
             p2p_port: 9091,
             auto_start: true,
             auto_update: true,
+            auto_install_updates: false,
             // Keep protocol-v3 state separate from the managed binary, models,
             // and any v0.7 WAL that older desktop builds wrote in ~/.arc.
             data_dir: "~/.arc/data-v3".into(),

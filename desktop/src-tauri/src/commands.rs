@@ -487,11 +487,52 @@ pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()
         .map_err(|error| format!("could not establish the native update lifecycle fence: {error}"))
 }
 
+/// Unattended updates require separate saved consent, idle app-side writes,
+/// and an authenticated compute drain from the exact managed child.
+#[tauri::command]
+pub async fn try_prepare_auto_update_relaunch(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::auto_update::PrepareResult> {
+    use crate::auto_update::{PrepareResult, RequestFence};
+    require_data_migration_ready(&state).await?;
+    if !update_install_policy().await?.can_install {
+        return Ok(PrepareResult::busy("This installation is updated by its package manager", 0));
+    }
+    let mut held = state.auto_update_requests.lock().await;
+    if held.is_some() {
+        return Ok(PrepareResult::busy("An update preparation is already pending", 0));
+    }
+    {
+        let store = state.store.lock().await;
+        if !store.config.as_ref().is_some_and(|c| c.auto_update && c.auto_install_updates) {
+            return Ok(PrepareResult::busy("Automatic installation is disabled", 0));
+        }
+    }
+    let Some(fence) = RequestFence::try_acquire(&state.community_inference_write, &state.wallet_write) else {
+        return Ok(PrepareResult::busy("An inference or wallet operation is in progress", 1));
+    };
+    // Store before awaiting any child mutation. An interrupted IPC leaves the
+    // fence intact until Abort proves the node has resumed or safely stopped.
+    *held = Some(fence);
+    let result = state.node.lock().await.prepare_auto_update_relaunch().await;
+    if matches!(result, Ok(PrepareResult::Busy { .. })) {
+        *held = None;
+    }
+    result.map_err(|error| format!("automatic update preparation requires a safe abort: {error}"))
+}
+
 /// Seal the one-way native updater boundary immediately before invoking the
 /// signed installer. From this point the old node cannot be resumed by an
 /// abort command, even if installer IPC later rejects or disconnects.
 #[tauri::command]
 pub async fn begin_update_handoff(state: State<'_, AppState>) -> CmdResult<()> {
+    let requests = state.auto_update_requests.lock().await;
+    if requests.is_some() {
+        let store = state.store.lock().await;
+        if !store.config.as_ref().is_some_and(|c| c.auto_update && c.auto_install_updates) {
+            return Err("automatic installation was disabled before the installer handoff".into());
+        }
+    }
     let mut node = state.node.lock().await;
     node.begin_update_handoff()
         .map_err(|error| format!("could not commit the native updater handoff: {error}"))
@@ -505,10 +546,13 @@ pub async fn begin_update_handoff(state: State<'_, AppState>) -> CmdResult<()> {
 /// must end that process before another node can start.
 #[tauri::command]
 pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
+    let mut requests = state.auto_update_requests.lock().await;
     let mut node = state.node.lock().await;
     node.abort_update_relaunch().await.map_err(|error| {
         format!("could not safely abort the update and restore the prior node state: {error}")
-    })
+    })?;
+    *requests = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1692,6 +1736,7 @@ mod inference_retry_tests {
             community_inference_write: Arc::new(Mutex::new(())),
             chain_host: Arc::new(Mutex::new(None)),
             wallet_write: Arc::new(Mutex::new(())),
+            auto_update_requests: Arc::new(Mutex::new(None)),
             has_tray: Arc::new(AtomicBool::new(false)),
             data_migration_error: Arc::new(Mutex::new(None)),
         }

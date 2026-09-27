@@ -2172,6 +2172,7 @@ mod live_journey {
             community_inference_write: Arc::new(Mutex::new(())),
             chain_host: Arc::new(Mutex::new(None)),
             wallet_write: Arc::new(Mutex::new(())),
+            auto_update_requests: Arc::new(Mutex::new(None)),
             has_tray: Arc::new(AtomicBool::new(false)),
             data_migration_error: Arc::new(Mutex::new(None)),
         }

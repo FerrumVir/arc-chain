@@ -60,6 +60,10 @@ fn refresh_process_command_metadata(system: &mut sysinfo::System) {
     );
 }
 
+fn worker_control_now_ms() -> anyhow::Result<u64> {
+    Ok(u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis())?)
+}
+
 struct DesktopShutdownControl {
     data_dir: PathBuf,
     token_file: PathBuf,
@@ -1212,6 +1216,9 @@ pub struct NodeManager {
     /// One-way native boundary set immediately before the updater installer is
     /// invoked. Once set, abort is forbidden even if install() rejects.
     update_handoff_started: bool,
+    /// Exact compute-drain request retained across IPC cancellation. Abort
+    /// must resume it before releasing app-side request ownership.
+    auto_quiescence: Option<arc_crypto::secret_file::DesktopWorkerQuiescenceRequest>,
     managed_data_dir: Option<PathBuf>,
     durability_failure: Option<String>,
     legacy_windows_stop_context: Option<LegacyWindowsStopContext>,
@@ -1512,6 +1519,7 @@ impl NodeManager {
             active_launch_plan: None,
             update_restart_plan: None,
             update_handoff_started: false,
+            auto_quiescence: None,
             managed_data_dir: None,
             durability_failure: None,
             legacy_windows_stop_context: None,
@@ -2599,6 +2607,123 @@ impl NodeManager {
         Ok(())
     }
 
+    /// Pause actual worker execution before an unattended lifecycle stop.
+    /// Older nodes ignore the separate control file and are deferred, never
+    /// mistaken for idle by looking at a public health response.
+    pub async fn prepare_auto_update_relaunch(
+        &mut self,
+    ) -> anyhow::Result<crate::auto_update::PrepareResult> {
+        use arc_crypto::secret_file::{DesktopWorkerQuiescenceAction as Action, DesktopWorkerQuiescenceRequest, DesktopWorkerQuiescenceStatus as Status};
+        use crate::auto_update::PrepareResult;
+        anyhow::ensure!(self.auto_quiescence.is_none(), "a previous worker drain requires abort");
+        if self.update_lifecycle_lock.is_some() || self.update_handoff_started {
+            return Ok(PrepareResult::busy("An updater lifecycle transaction is already pending", 0));
+        }
+        let Some(pid) = self.pid() else {
+            // A detached/recovering child has no proven execution gate. The
+            // explicit manual update can reconcile it; unattended work waits.
+            return Ok(PrepareResult::busy("The managed node must be running before an unattended update can prove it is idle", 0));
+        };
+        let Some(nonce) = self.shutdown_control.as_ref().and_then(|c| c.receipt_nonce) else {
+            return Ok(PrepareResult::busy("This node does not expose authenticated worker drain", 0));
+        };
+        anyhow::ensure!(self.lifecycle_lock.is_some() && self.active_launch_plan.is_some(), "managed child lacks an exact lifecycle owner");
+        let request = DesktopWorkerQuiescenceRequest {
+            pid,
+            receipt_nonce: nonce,
+            request_id: rand::random(),
+            action: Action::Quiesce,
+            timeout_ms: 15_000,
+            lease_deadline_unix_ms: worker_control_now_ms()?.saturating_add(120_000),
+        };
+        // No await between recording ownership and publishing the capability.
+        self.auto_quiescence = Some(request);
+        if !self.publish_worker_control(request)? {
+            self.auto_quiescence = None;
+            return Ok(PrepareResult::busy("A worker control request is already pending", 0));
+        }
+        let response = self.wait_worker_control(request, Duration::from_secs(17), false).await?;
+        match response {
+            Some(response) if response.status == Status::Quiesced && response.active_jobs == 0 => {
+                // Leave enough of the bounded lease for the graceful stop.
+                // If scheduling consumed it, resume and retry another time.
+                if request.lease_deadline_unix_ms.saturating_sub(worker_control_now_ms()?) < 60_000 {
+                    self.resume_auto_update_worker().await?;
+                    return Ok(PrepareResult::busy("Worker drain lease expired before the update could start", 0));
+                }
+                self.prepare_update_relaunch().await?;
+                self.auto_quiescence = None;
+                Ok(PrepareResult::Prepared)
+            }
+            Some(response) if matches!(response.status, Status::Busy | Status::Unsupported) => {
+                self.auto_quiescence = None;
+                Ok(PrepareResult::busy("Worker is busy or does not support authenticated draining", response.active_jobs))
+            }
+            _ => {
+                self.resume_auto_update_worker().await?;
+                Ok(PrepareResult::busy("Worker did not confirm a complete execution drain", 0))
+            }
+        }
+    }
+
+    fn publish_worker_control(
+        &self,
+        request: arc_crypto::secret_file::DesktopWorkerQuiescenceRequest,
+    ) -> anyhow::Result<bool> {
+        let control = self.shutdown_control.as_ref().ok_or_else(|| anyhow::anyhow!("managed worker control is absent"))?;
+        let mut token = Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(control.token.as_str(), token.as_mut())?;
+        Ok(arc_crypto::secret_file::publish_desktop_worker_quiescence_request(&control.data_dir, &token, request)?)
+    }
+
+    async fn wait_worker_control(
+        &self,
+        request: arc_crypto::secret_file::DesktopWorkerQuiescenceRequest,
+        timeout: Duration,
+        resumed_only: bool,
+    ) -> anyhow::Result<Option<arc_crypto::secret_file::DesktopWorkerQuiescenceResponse>> {
+        let control = self.shutdown_control.as_ref().ok_or_else(|| anyhow::anyhow!("managed worker control is absent"))?;
+        let until = Instant::now() + timeout;
+        loop {
+            if let Some(response) = arc_crypto::secret_file::read_desktop_worker_quiescence_response(&control.data_dir, request.pid, &request.receipt_nonce, &request.request_id)? {
+                if !resumed_only || response.status == arc_crypto::secret_file::DesktopWorkerQuiescenceStatus::Resumed {
+                    return Ok(Some(response));
+                }
+            }
+            if Instant::now() >= until { return Ok(None); }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn resume_auto_update_worker(&mut self) -> anyhow::Result<()> {
+        use arc_crypto::secret_file::{DesktopWorkerQuiescenceAction as Action, take_desktop_worker_quiescence_request};
+        let Some(mut request) = self.auto_quiescence else { return Ok(()); };
+        if self.pid() != Some(request.pid) {
+            // The exact child is gone; its gate cannot affect a new process.
+            self.auto_quiescence = None;
+            return Ok(());
+        }
+        let control = self.shutdown_control.as_ref().ok_or_else(|| anyhow::anyhow!("managed worker control is absent"))?;
+        let mut token = Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(control.token.as_str(), token.as_mut())?;
+        if let Some(pending) = take_desktop_worker_quiescence_request(&control.data_dir, request.pid, &token, &request.receipt_nonce)? {
+            anyhow::ensure!(pending.request_id == request.request_id, "another worker control request occupies the owned channel");
+            if pending.action == Action::Quiesce {
+                // Atomically removed before the child consumed it. This also
+                // makes an older node's unsupported channel a safe deferral.
+                self.auto_quiescence = None;
+                return Ok(());
+            }
+        }
+        request.action = Action::Resume;
+        request.timeout_ms = 5_000;
+        request.lease_deadline_unix_ms = worker_control_now_ms()?.saturating_add(15_000);
+        anyhow::ensure!(self.publish_worker_control(request)?, "worker resume channel is occupied");
+        anyhow::ensure!(self.wait_worker_control(request, Duration::from_secs(5), true).await?.is_some(), "worker resume was not acknowledged; request fence retained");
+        self.auto_quiescence = None;
+        Ok(())
+    }
+
     /// Commit the irreversible updater handoff immediately before the signed
     /// installer is invoked. A frontend or IPC failure after this call must
     /// never route through the pre-install abort-and-resume path.
@@ -2624,6 +2749,8 @@ impl NodeManager {
     /// exists and the authenticated lifecycle receipt is clear. If Prepare
     /// stopped an owned node, restore its exact launch under the same guard.
     pub async fn abort_update_relaunch(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.update_handoff_started, "cannot abort after updater handoff has begun");
+        self.resume_auto_update_worker().await?;
         if self.update_lifecycle_lock.is_none() {
             return Ok(());
         }
@@ -5228,6 +5355,68 @@ mod tests {
         manager.update_restart_plan = Some(plan.clone());
         manager.update_restart_was_desired = true;
         (root, configured, manager, plan)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_update_busy_worker_keeps_same_child_running() {
+        use arc_crypto::secret_file::*;
+        let (root, _configured, mut manager, _plan) = updater_resume_fixture("auto-update-busy");
+        manager.abort_update_relaunch().await.unwrap();
+        let pid = manager.pid().unwrap();
+        let control = manager.shutdown_control.as_ref().unwrap();
+        let data = control.data_dir.clone();
+        let token = control.token_bytes().unwrap();
+        let nonce = control.receipt_nonce.unwrap();
+        let responder = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(request) = take_desktop_worker_quiescence_request(&data, pid, &token, &nonce).unwrap() {
+                        publish_desktop_worker_quiescence_response(&data, DesktopWorkerQuiescenceResponse {
+                            pid, receipt_nonce: nonce, request_id: request.request_id,
+                            status: DesktopWorkerQuiescenceStatus::Busy, active_jobs: 2,
+                        }).unwrap();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+        });
+        let result = manager.prepare_auto_update_relaunch().await.unwrap();
+        responder.await.unwrap();
+        assert!(matches!(result, crate::auto_update::PrepareResult::Busy { active_jobs: 2, .. }));
+        assert_eq!(manager.pid(), Some(pid));
+        assert!(manager.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(manager.desired_running);
+        assert!(manager.auto_quiescence.is_none());
+        assert!(manager.update_lifecycle_lock.is_none());
+        let mut child = manager.child.take().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_update_cancelled_unconsumed_drain_aborts_without_stopping_child() {
+        let (root, _configured, mut manager, _plan) = updater_resume_fixture("auto-update-cancel");
+        manager.abort_update_relaunch().await.unwrap();
+        let pid = manager.pid().unwrap();
+        // The fixture represents an older child which ignores the new file.
+        // Cancellation must retain ownership until Abort withdraws that file.
+        assert!(tokio::time::timeout(Duration::from_millis(100), manager.prepare_auto_update_relaunch()).await.is_err());
+        assert!(manager.auto_quiescence.is_some());
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(manager.auto_quiescence.is_none());
+        assert_eq!(manager.pid(), Some(pid));
+        assert!(manager.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(manager.desired_running);
+        let mut child = manager.child.take().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

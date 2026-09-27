@@ -1,3 +1,4 @@
+mod auto_update;
 mod commands;
 mod hardware;
 mod identity;
@@ -62,6 +63,7 @@ pub struct AppState {
     /// Serializes wallet writes so two UI clicks cannot sign the same account
     /// nonce concurrently. This lock never contains the recovery phrase.
     pub wallet_write: Arc<Mutex<()>>,
+    pub auto_update_requests: Arc<Mutex<Option<auto_update::RequestFence>>>,
     /// Whether a system tray icon was actually created. Gates hide-to-tray:
     /// on a desktop with no tray, hiding the window makes the app
     /// unreachable.
@@ -176,6 +178,7 @@ pub fn run() {
         community_inference_write: Arc::new(Mutex::new(())),
         chain_host: Arc::new(Mutex::new(None)),
         wallet_write: Arc::new(Mutex::new(())),
+            auto_update_requests: Arc::new(Mutex::new(None)),
         has_tray: has_tray.clone(),
         data_migration_error: data_migration_error.clone(),
     };
@@ -596,6 +599,7 @@ pub fn run() {
             commands::start_node,
             commands::stop_node,
             commands::prepare_update_relaunch,
+            commands::try_prepare_auto_update_relaunch,
             commands::begin_update_handoff,
             commands::abort_update_relaunch,
             commands::restart_node,
