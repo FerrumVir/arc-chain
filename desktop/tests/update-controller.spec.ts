@@ -123,6 +123,81 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
+  test("retries failed automatic checks with bounded backoff and cancels retry on disable", async () => {
+    const timers = new FakeTimers();
+    let checkCalls = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checkCalls += 1;
+          if (checkCalls < 4) throw new Error("offline");
+          return null;
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 1_000, retryDelaysMs: [20, 40, 80] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    await timers.advanceBy(10);
+    expect(checkCalls).toBe(1);
+    await timers.advanceBy(19);
+    expect(checkCalls).toBe(1);
+    await timers.advanceBy(1);
+    expect(checkCalls).toBe(2);
+    await timers.advanceBy(39);
+    expect(checkCalls).toBe(2);
+    await timers.advanceBy(1);
+    expect(checkCalls).toBe(3);
+    await timers.advanceBy(80);
+    expect(checkCalls).toBe(4);
+    expect(controller.getSnapshot().phase).toBe("up-to-date");
+
+    controller.setAutoChecksEnabled(false);
+    await timers.advanceBy(100);
+    expect(checkCalls).toBe(4);
+    controller.dispose();
+  });
+
+  test("cancels a pending automatic retry when checks are disabled", async () => {
+    const timers = new FakeTimers();
+    let checkCalls = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checkCalls += 1;
+          throw new Error("offline");
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 1_000, retryDelaysMs: [20] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    await timers.advanceBy(10);
+    expect(checkCalls).toBe(1);
+    controller.setAutoChecksEnabled(false);
+    await timers.advanceBy(100);
+    expect(checkCalls).toBe(1);
+
+    controller.setAutoChecksEnabled(true);
+    await timers.advanceBy(10);
+    expect(checkCalls).toBe(2);
+    controller.dispose();
+    await timers.advanceBy(100);
+    expect(checkCalls).toBe(2);
+  });
+
   test("coalesces startup, periodic, and manual checks into one flight", async () => {
     const timers = new FakeTimers();
     const pending = deferred<UpdateCandidate | null>();
@@ -213,8 +288,8 @@ test.describe("UpdateController", () => {
     installDone.resolve();
     while (!restartOrder.includes("relaunch")) await Promise.resolve();
     expect(restartOrder).toEqual([
-      "stop-node",
       "download",
+      "stop-node",
       "handoff",
       "install",
       "relaunch",
@@ -231,7 +306,7 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
-  test("runs native abort-and-resume when signature verification fails before handoff", async () => {
+  test("a failed verified download leaves the running node untouched", async () => {
     let relaunchCalls = 0;
     let installCalls = 0;
     const order: string[] = [];
@@ -273,12 +348,11 @@ test.describe("UpdateController", () => {
     expect(controller.getSnapshot().message).toContain("was not installed");
     expect(installCalls).toBe(0);
     expect(relaunchCalls).toBe(0);
-    expect(order).toEqual(["prepare", "download", "abort"]);
+    expect(order).toEqual(["download"]);
     controller.dispose();
   });
 
-  test("waits for native abort-and-resume before reporting a retryable download failure", async () => {
-    const resumed = deferred<void>();
+  test("a cancelled download does not enter the native update fence", async () => {
     const order: string[] = [];
     const controller = createUpdateController({
       supported: true,
@@ -299,9 +373,7 @@ test.describe("UpdateController", () => {
         order.push("handoff");
       },
       abortRelaunch: async () => {
-        order.push("abort-resume-start");
-        await resumed.promise;
-        order.push("abort-resume-complete");
+        order.push("abort-resume");
       },
       relaunch: async () => {
         order.push("app-relaunch");
@@ -309,28 +381,8 @@ test.describe("UpdateController", () => {
     });
 
     await controller.checkForUpdates("manual");
-    let resolved = false;
-    const installing = controller.installAvailableUpdate().then((snapshot) => {
-      resolved = true;
-      return snapshot;
-    });
-    while (!order.includes("abort-resume-start")) await Promise.resolve();
-    await Promise.resolve();
-    expect(resolved).toBe(false);
-    expect(order).toEqual([
-      "prepare-stop",
-      "download-cancelled",
-      "abort-resume-start",
-    ]);
-
-    resumed.resolve();
-    const snapshot = await installing;
-    expect(order).toEqual([
-      "prepare-stop",
-      "download-cancelled",
-      "abort-resume-start",
-      "abort-resume-complete",
-    ]);
+    const snapshot = await controller.installAvailableUpdate();
+    expect(order).toEqual(["download-cancelled"]);
     expect(snapshot).toMatchObject({
       phase: "error",
       restartRequired: false,
@@ -339,25 +391,34 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
-  test("reports a safe stopped state when native abort-and-resume fails", async () => {
+  test("does not install when the node cannot be safely prepared after download", async () => {
     let installCalls = 0;
+    let downloadCalls = 0;
+    let prepareCalls = 0;
+    const order: string[] = [];
     const controller = createUpdateController({
       supported: true,
       check: async () => ({
         version: "0.8.0",
         download: async () => {
-          throw new Error("signature rejected");
+          downloadCalls += 1;
+          order.push("download");
         },
         install: async () => {
           installCalls += 1;
+          order.push("install");
         },
       }),
-      prepareRelaunch: async () => {},
-      beginHandoff: async () => {},
+      prepareRelaunch: async () => {
+        prepareCalls += 1;
+        order.push("prepare");
+        if (prepareCalls === 1) throw new Error("node has pending work");
+      },
+      beginHandoff: async () => {
+        order.push("handoff");
+      },
       abortRelaunch: async () => {
-        throw new Error(
-          "could not safely restore the exact pre-update node; the node remains stopped, the update lifecycle fence remains active, and a manual restart is required",
-        );
+        order.push("abort");
       },
       relaunch: async () => {},
     });
@@ -365,15 +426,27 @@ test.describe("UpdateController", () => {
     await controller.checkForUpdates("manual");
     await controller.installAvailableUpdate();
 
+    expect(downloadCalls).toBe(1);
     expect(installCalls).toBe(0);
+    expect(order).toEqual(["download", "prepare"]);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "error",
       restartRequired: false,
-      canInstall: false,
+      canInstall: true,
     });
-    expect(controller.getSnapshot().message).toContain("node remains stopped");
-    expect(controller.getSnapshot().message).toContain("restart it manually");
-    expect(controller.getSnapshot().error).toContain("manual restart is required");
+    expect(controller.getSnapshot().error).toContain("pending work");
+
+    const retry = await controller.installAvailableUpdate();
+    expect(retry.phase).toBe("ready");
+    expect(downloadCalls).toBe(1);
+    expect(installCalls).toBe(1);
+    expect(order).toEqual([
+      "download",
+      "prepare",
+      "prepare",
+      "handoff",
+      "install",
+    ]);
     controller.dispose();
   });
 
@@ -409,7 +482,7 @@ test.describe("UpdateController", () => {
     await controller.checkForUpdates("manual");
     await controller.installAvailableUpdate();
 
-    expect(order).toEqual(["prepare", "download", "handoff", "install"]);
+    expect(order).toEqual(["download", "prepare", "handoff", "install"]);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "ready",
       restartRequired: true,
@@ -451,7 +524,7 @@ test.describe("UpdateController", () => {
     await controller.checkForUpdates("manual");
     await controller.installAvailableUpdate();
 
-    expect(order).toEqual(["prepare", "download", "handoff"]);
+    expect(order).toEqual(["download", "prepare", "handoff"]);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "ready",
       restartRequired: true,
@@ -461,7 +534,7 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
-  test("blocks relaunch when the old node cannot be stopped safely", async () => {
+  test("downloads the update but blocks install when the old node cannot be stopped safely", async () => {
     let downloadCalls = 0;
     let installCalls = 0;
     let relaunchCalls = 0;
@@ -493,7 +566,7 @@ test.describe("UpdateController", () => {
     await controller.checkForUpdates("manual");
     await controller.installAvailableUpdate();
 
-    expect(downloadCalls).toBe(0);
+    expect(downloadCalls).toBe(1);
     expect(installCalls).toBe(0);
     expect(relaunchCalls).toBe(0);
     expect(controller.getSnapshot()).toMatchObject({

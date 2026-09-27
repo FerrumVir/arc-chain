@@ -1,5 +1,6 @@
 export const UPDATE_STARTUP_DELAY_MS = 5_000;
 export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+export const UPDATE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const;
 
 export type UpdatePhase =
   | "idle"
@@ -64,7 +65,10 @@ export interface UpdateRuntime {
 export interface UpdateSchedule {
   startupDelayMs?: number;
   intervalMs?: number;
+  retryDelaysMs?: readonly number[];
 }
+
+type UpdateCheckSource = "automatic" | "manual" | "retry";
 
 /**
  * Injectable timer surface. Production uses the browser timers below; tests
@@ -120,13 +124,18 @@ export class UpdateController {
   private snapshot: UpdateSnapshot = IDLE_SNAPSHOT;
   private readonly listeners = new Set<() => void>();
   private candidate: UpdateCandidate | null = null;
+  private downloadedCandidate: UpdateCandidate | null = null;
   private checkInFlight: Promise<UpdateSnapshot> | null = null;
+  private automaticCheckRequestedInFlight = false;
   private installInFlight: Promise<UpdateSnapshot> | null = null;
   private startupTimer: unknown | null = null;
   private intervalTimer: unknown | null = null;
+  private retryTimer: unknown | null = null;
+  private automaticFailureCount = 0;
   private autoChecksEnabled = false;
   private readonly startupDelayMs: number;
   private readonly intervalMs: number;
+  private readonly retryDelaysMs: readonly number[];
 
   constructor(
     private readonly runtime: UpdateRuntime,
@@ -136,6 +145,7 @@ export class UpdateController {
     this.startupDelayMs =
       schedule.startupDelayMs ?? UPDATE_STARTUP_DELAY_MS;
     this.intervalMs = schedule.intervalMs ?? UPDATE_CHECK_INTERVAL_MS;
+    this.retryDelaysMs = schedule.retryDelaysMs ?? UPDATE_RETRY_DELAYS_MS;
   }
 
   getSnapshot = (): UpdateSnapshot => this.snapshot;
@@ -151,6 +161,7 @@ export class UpdateController {
 
     this.clearTimers();
     this.autoChecksEnabled = enabled;
+    this.automaticFailureCount = 0;
 
     // Browser previews and tests without the native shell keep the manual
     // unsupported state, but must never schedule calls to a missing plugin.
@@ -162,6 +173,11 @@ export class UpdateController {
     }, this.startupDelayMs);
 
     this.intervalTimer = this.timers.setInterval(() => {
+      // A bounded retry sequence owns the cadence after a recent failure.
+      // When retries are exhausted, a new ordinary interval starts a fresh
+      // sequence in case connectivity has returned.
+      if (this.retryTimer !== null) return;
+      this.automaticFailureCount = 0;
       void this.checkForUpdates("automatic");
     }, this.intervalMs);
   }
@@ -171,7 +187,7 @@ export class UpdateController {
    * promise; checks never run while an install is active.
    */
   checkForUpdates(
-    _source: "automatic" | "manual" = "manual",
+    source: UpdateCheckSource = "manual",
   ): Promise<UpdateSnapshot> {
     if (!this.runtime.supported) {
       this.setSnapshot({
@@ -192,7 +208,12 @@ export class UpdateController {
     if (this.snapshot.restartRequired) return Promise.resolve(this.snapshot);
 
     if (this.installInFlight) return this.installInFlight;
-    if (this.checkInFlight) return this.checkInFlight;
+    if (this.checkInFlight) {
+      if (source !== "manual") this.automaticCheckRequestedInFlight = true;
+      return this.checkInFlight;
+    }
+
+    this.automaticCheckRequestedInFlight = source !== "manual";
 
     this.setSnapshot({
       ...this.snapshot,
@@ -206,9 +227,16 @@ export class UpdateController {
     const check = (async () => {
       try {
         const next = await this.runtime.check();
+        this.automaticFailureCount = 0;
+        this.clearRetryTimer();
         const previous = this.candidate;
         this.candidate = next;
-        if (previous && previous !== next) void previous.close?.().catch(() => {});
+        if (previous && previous !== next) {
+          if (this.downloadedCandidate === previous) {
+            this.downloadedCandidate = null;
+          }
+          void previous.close?.().catch(() => {});
+        }
 
         const checkedAt = (this.runtime.now ?? Date.now)();
         if (next) {
@@ -252,8 +280,12 @@ export class UpdateController {
             this.candidate !== null && this.candidate.canInstall !== false,
           restartRequired: false,
         });
+        if (source !== "manual" || this.automaticCheckRequestedInFlight) {
+          this.scheduleAutomaticRetry();
+        }
       } finally {
         this.checkInFlight = null;
+        this.automaticCheckRequestedInFlight = false;
       }
       return this.snapshot;
     })();
@@ -303,11 +335,14 @@ export class UpdateController {
 
     const candidate = this.candidate;
     const version = candidate.version;
+    const alreadyDownloaded = this.downloadedCandidate === candidate;
     this.setSnapshot({
       ...this.snapshot,
       phase: "downloading",
       version,
-      message: `Downloading signed update ${version}…`,
+      message: alreadyDownloaded
+        ? `Preparing verified update ${version}…`
+        : `Downloading signed update ${version}…`,
       error: null,
       downloadedBytes: 0,
       contentLength: null,
@@ -316,16 +351,12 @@ export class UpdateController {
     });
 
     const install = (async () => {
-      let prepared = false;
       let handoffStarted = false;
       try {
-        // Establish the native durability boundary before the updater mutates
-        // the app bundle. The shutdown receipt binds the exact arc-node and
-        // genesis bytes; installing first could replace those resources and
-        // make a failed old-node shutdown impossible to recover safely.
-        await this.runtime.prepareRelaunch();
-        prepared = true;
-        await candidate.download((event) => {
+        // Download and verify while the node keeps running. Tauri retains the
+        // verified payload in its resource table; only the install step mutates
+        // the app bundle, so there is no reason to interrupt inference yet.
+        if (!alreadyDownloaded) await candidate.download((event) => {
           if (event.event === "Started") {
             this.setSnapshot({
               ...this.snapshot,
@@ -351,6 +382,12 @@ export class UpdateController {
             });
           }
         });
+        this.downloadedCandidate = candidate;
+
+        // Establish the native durability boundary only after the complete
+        // payload has passed signature verification, immediately before the
+        // updater may mutate the app bundle.
+        await this.runtime.prepareRelaunch();
 
         // Seal the one-way native boundary before calling the pinned Tauri
         // installer. IPC itself can disconnect after native code commits, so
@@ -362,6 +399,7 @@ export class UpdateController {
         await candidate.install();
 
         this.candidate = null;
+        this.downloadedCandidate = null;
         void candidate.close?.().catch(() => {});
         this.setSnapshot({
           ...this.snapshot,
@@ -391,21 +429,10 @@ export class UpdateController {
           });
         }
       } catch (error) {
-        let detail = errorMessage(error);
-        let abortFailed = false;
-        if (prepared && !handoffStarted) {
-          // Download/signature verification failed before the one-way native
-          // handoff. Only this pre-mutation failure may enter abort-and-resume,
-          // and native code still re-proves that no writer/receipt is live.
-          try {
-            await this.runtime.abortRelaunch();
-          } catch (abortError) {
-            abortFailed = true;
-            detail = `${detail}; failed-update lifecycle fence remains active: ${errorMessage(abortError)}`;
-          }
-        }
+        const detail = errorMessage(error);
         if (handoffStarted) {
           this.candidate = null;
+          this.downloadedCandidate = null;
           void candidate.close?.().catch(() => {});
           this.setSnapshot({
             ...this.snapshot,
@@ -422,11 +449,9 @@ export class UpdateController {
           ...this.snapshot,
           phase: "error",
           version,
-          message: abortFailed
-            ? `Update was not installed, and ARC could not safely restore the pre-update node. The node remains stopped; restart it manually after resolving the reported lifecycle error: ${detail}`
-            : `Update was not installed: ${detail}`,
+          message: `Update was not installed: ${detail}`,
           error: detail,
-          canInstall: !abortFailed && candidate.canInstall !== false,
+          canInstall: candidate.canInstall !== false,
           restartRequired: false,
         });
       } finally {
@@ -445,6 +470,7 @@ export class UpdateController {
     this.autoChecksEnabled = false;
     const candidate = this.candidate;
     this.candidate = null;
+    this.downloadedCandidate = null;
     if (candidate) void candidate.close?.().catch(() => {});
     this.listeners.clear();
   }
@@ -458,6 +484,25 @@ export class UpdateController {
       this.timers.clearInterval(this.intervalTimer);
       this.intervalTimer = null;
     }
+    this.clearRetryTimer();
+  }
+
+  private clearRetryTimer(): void {
+    if (this.retryTimer !== null) {
+      this.timers.clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
+  private scheduleAutomaticRetry(): void {
+    if (!this.autoChecksEnabled || this.retryTimer !== null) return;
+    const delayMs = this.retryDelaysMs[this.automaticFailureCount];
+    if (delayMs === undefined) return;
+    this.automaticFailureCount += 1;
+    this.retryTimer = this.timers.setTimeout(() => {
+      this.retryTimer = null;
+      void this.checkForUpdates("retry");
+    }, delayMs);
   }
 
   private setSnapshot(next: UpdateSnapshot): void {
