@@ -18,6 +18,7 @@ pub mod certificate;
 pub mod lease;
 pub mod link;
 pub mod placement;
+pub mod public_worker;
 pub mod queue;
 pub mod reservation;
 pub mod resident;
