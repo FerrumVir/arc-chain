@@ -68,7 +68,10 @@ export function Dashboard() {
   // Share Network's host overview so chain height and block age come from the
   // same current source. `nodeStatus` only has the age from the first host
   // election; using it here lets that timestamp grow stale while height moves.
-  const { data: networkOverview } = useQuery({
+  const {
+    data: networkOverview,
+    isError: networkOverviewError,
+  } = useQuery({
     queryKey: ["network-overview"],
     queryFn: api.fetchNetworkOverview,
     refetchInterval: 10_000,
@@ -81,6 +84,22 @@ export function Dashboard() {
     queryFn: api.getAutostart,
     refetchInterval: 30_000,
   });
+  const chainHeight = networkOverviewError
+    ? "Unavailable"
+    : networkOverview?.height != null
+      ? formatInt(networkOverview.height)
+      : "—";
+  const chainBlockAge = networkOverviewError
+    ? "Unavailable"
+    : networkOverview
+      ? networkOverview.lastBlockAgeSecs != null
+        ? `${formatUptime(networkOverview.lastBlockAgeSecs)} ago`
+        : "Unavailable"
+      : "—";
+  const chainBlockAgeIsStale =
+    !networkOverviewError &&
+    networkOverview?.lastBlockAgeSecs != null &&
+    networkOverview.lastBlockAgeSecs > 3600;
   const inferenceActivity = (attestations ?? []).filter((row) =>
     row.txType == null
     || row.txType === "Inference"
@@ -896,29 +915,17 @@ export function Dashboard() {
                 : "—"}
             </dd>
             <dt>Host block height</dt>
-            <dd data-testid="dashboard-chain-height">
-              {networkOverview?.height != null
-                ? formatInt(networkOverview.height)
-                : "—"}
-            </dd>
+            <dd data-testid="dashboard-chain-height">{chainHeight}</dd>
             {/* DAG rounds and health can advance without sealed blocks.
                 Height and age both come from the fresh host overview. */}
             <dt>Last block</dt>
             <dd
               data-testid="chain-block-age"
               style={{
-                color:
-                  networkOverview?.lastBlockAgeSecs != null &&
-                  networkOverview.lastBlockAgeSecs > 3600
-                    ? "var(--warning)"
-                    : undefined,
+                color: chainBlockAgeIsStale ? "var(--warning)" : undefined,
               }}
             >
-              {networkOverview
-                ? networkOverview.lastBlockAgeSecs != null
-                  ? `${formatUptime(networkOverview.lastBlockAgeSecs)} ago`
-                  : "Unavailable"
-                : "—"}
+              {chainBlockAge}
             </dd>
           </div>
 

@@ -205,6 +205,54 @@ test.describe("Dashboard", () => {
     );
   });
 
+  test("marks cached chain figures unavailable after an overview refetch fails", async ({
+    page,
+  }) => {
+    test.setTimeout(45_000);
+    await page.addInitScript((overview) => {
+      type TestWindow = Window & {
+        __ARC_MOCK__?: Record<string, unknown>;
+        __NETWORK_OVERVIEW_OFFLINE__?: boolean;
+      };
+      const testWindow = window as TestWindow;
+      testWindow.__NETWORK_OVERVIEW_OFFLINE__ = false;
+      const overrides: Record<string, unknown> = {};
+      Object.defineProperty(overrides, "fetch_network_overview", {
+        get: () => {
+          if (testWindow.__NETWORK_OVERVIEW_OFFLINE__) {
+            return {
+              then: (
+                _resolve: (value: unknown) => unknown,
+                reject: (reason: Error) => unknown,
+              ) => reject(new Error("network unavailable")),
+            };
+          }
+          return overview;
+        },
+      });
+      testWindow.__ARC_MOCK__ = overrides;
+    }, {
+      sourceHost: "http://136.244.109.1:9944",
+      height: 2_989_219,
+      lastBlockAgeSecs: 0,
+    });
+    await page.goto("/");
+
+    await expect(page.getByTestId("chain-block-age")).toHaveText("0s ago");
+    await page.evaluate(() => {
+      (window as Window & { __NETWORK_OVERVIEW_OFFLINE__?: boolean })
+        .__NETWORK_OVERVIEW_OFFLINE__ = true;
+    });
+
+    await expect(page.getByTestId("chain-block-age")).toHaveText(
+      "Unavailable",
+      { timeout: 40_000 },
+    );
+    await expect(page.getByTestId("dashboard-chain-height")).toHaveText(
+      "Unavailable",
+    );
+  });
+
   test("shows only host-confirmed mined rewards as an ARC amount", async ({ page }) => {
     await page.goto("/");
     const earnings = page.getByTestId("earnings-total");
