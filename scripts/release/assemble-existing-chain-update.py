@@ -272,6 +272,17 @@ def public_artifact(platform: str, value: dict) -> dict:
         if key not in {"binary_path", "genesis_path"}}}
 
 
+def verify_owner_verifier(args: argparse.Namespace, owner_verifier: dict) -> None:
+    """Re-materialize even a foreign-platform verifier; it need not be executed."""
+    owner_args = argparse.Namespace(**vars(args))
+    owner_args.verifier_platform = owner_verifier["platform"]
+    with tempfile.TemporaryDirectory(prefix="arc-owner-verifier-") as td:
+        _, artifacts, _ = select_and_materialize(owner_args, Path(td) / "materialized")
+        need(owner_verifier == public_artifact(owner_args.verifier_platform,
+                                               artifacts[owner_args.verifier_platform]),
+             "owner verifier bytes or metadata differ from independently materialized artifact")
+
+
 def validate_main_pin(repository_root: Path, commit: str, main_sha: str) -> None:
     need(COMMIT.fullmatch(commit) and main_sha == commit, "tag commit must equal the protected-main commit")
     head = subprocess.run(["git", "-C", str(repository_root), "rev-parse", "HEAD"],
@@ -366,6 +377,7 @@ def validate_owner_attestation(args: argparse.Namespace, owner_path: Path, now: 
     need(owner_verifier.get("artifact_id") == selected_owner_verifier.get("id") and
          owner_verifier.get("artifact_digest") == selected_owner_verifier.get("digest"),
          "owner checkpoint verifier artifact is not selected by the exact preflight tuple")
+    verify_owner_verifier(args, owner_verifier)
     owner_projection = json.loads(json.dumps(owner))
     producer_projection = json.loads(json.dumps(recomputed))
     owner_projection["release"].pop("checkpoint_verifier_artifact", None)

@@ -157,8 +157,10 @@ class ExistingChainUpdateTests(unittest.TestCase):
             producer["release"]["checkpoint_verifier_artifact"] = {
                 "platform": "linux-x86_64", "binary_sha256": "1" * 64}
             producer["release"]["api_artifact_response_sha256"] = "2" * 64
-            with mock.patch.object(mod, "assemble", side_effect=lambda supplied: dict(producer)):
+            with mock.patch.object(mod, "assemble", side_effect=lambda supplied: dict(producer)), \
+                 mock.patch.object(mod, "verify_owner_verifier") as reverify:
                 result = mod.validate_owner_attestation(args, path, now=1500)
+            reverify.assert_called_once_with(args, owner["release"]["checkpoint_verifier_artifact"])
             self.assertEqual(args.proof_validation_time, 1000.0)
             self.assertEqual(args.attestation_generated_at, 1000.0)
             self.assertEqual(result["producer_reverification"]["observed_at_unix"], 1000.0)
@@ -198,6 +200,7 @@ class ExistingChainUpdateTests(unittest.TestCase):
                     "repository": "FerrumVir/arc-chain", "commit": "c" * 40, "run_id": 123, "run_attempt": 1,
                     "artifacts": {"macos-arm64": {"headless": {"id": 1, "digest": "sha256:" + "a" * 64}}}}))
             with \
+                 mock.patch.object(mod, "verify_owner_verifier"), \
                  mock.patch.object(mod, "assemble", return_value={"schema": mod.SCHEMA,
                     "generated_at_unix": 1000,
                     "release": {"checkpoint_verifier_artifact": {"platform": "linux-x86_64"},
@@ -206,6 +209,21 @@ class ExistingChainUpdateTests(unittest.TestCase):
                     "checkpoint": {"checkpoint_sha256": "b" * 64}, "network": {}, "fresh_six_host_proof": {}}):
                 with self.assertRaisesRegex(mod.ProfileError, "differs from independently reverified"):
                     mod.validate_owner_attestation(args, path, now=1500)
+
+    def test_owner_verifier_rejects_payload_and_metadata_substitutions(self):
+        artifact = {"binary_path": Path("/tmp/node"), "genesis_path": Path("/tmp/genesis"),
+                    "binary_sha256": "a" * 64, "genesis_sha256": "b" * 64,
+                    "artifact_id": 123, "artifact_digest": "sha256:" + "c" * 64,
+                    "archive_sha256": "d" * 64, "build_metadata_sha256": "e" * 64,
+                    "materialization_receipt_sha256": "f" * 64}
+        owner = mod.public_artifact("macos-arm64", artifact)
+        args = Namespace(artifact_platform="linux-x86_64", verifier_platform="linux-x86_64")
+        with mock.patch.object(mod, "select_and_materialize", return_value=(None, {"macos-arm64": artifact}, None)):
+            mod.verify_owner_verifier(args, owner)
+            for field in ("binary_sha256", "genesis_sha256", "archive_sha256",
+                          "build_metadata_sha256", "materialization_receipt_sha256", "extra"):
+                with self.subTest(field=field), self.assertRaisesRegex(mod.ProfileError, "owner verifier bytes"):
+                    mod.verify_owner_verifier(args, {**owner, field: "0" * 64})
 
 
 if __name__ == "__main__":

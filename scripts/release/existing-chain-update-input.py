@@ -63,6 +63,7 @@ def validate_bytes(name: str, payload: bytes):
             raise InputError("invalid input JSON: " + name) from error
         require(isinstance(value, dict), "input JSON must be an object: " + name)
         reject_secret_fields(value)
+        validate_public_fields(name, value)
 
 
 def reject_secret_fields(value, depth=0):
@@ -70,8 +71,9 @@ def reject_secret_fields(value, depth=0):
     if isinstance(value, dict):
         for key, item in value.items():
             normalized = re.sub(r"[^a-z]", "", key.lower())
-            require(normalized not in {"privatekey", "seedphrase", "mnemonic", "apikey",
-                    "apitoken", "accesstoken", "password", "secretkey"},
+            require(not any(word in normalized for word in (
+                    "privatekey", "seedphrase", "mnemonic", "apikey", "apitoken",
+                    "accesstoken", "bearertoken", "refreshtoken", "password", "secret")),
                     "credential field is not an operational public input")
             reject_secret_fields(item, depth + 1)
     elif isinstance(value, list):
@@ -80,6 +82,45 @@ def reject_secret_fields(value, depth=0):
     elif isinstance(value, str):
         require(re.search(r"-----BEGIN [^-]*PRIVATE KEY-----", value) is None,
                 "private key material is not an operational public input")
+
+
+def validate_public_fields(name, value):
+    """Reject extra operational fields before creating any public Git objects.
+
+    Semantic completeness is independently checked by the protected producer.
+    This is a closed field contract, not a general detector for encoded secrets.
+    """
+    def fields(row, allowed):
+        require(isinstance(row, dict) and set(row) <= set(allowed.split()),
+                "unexpected public operational field in " + name)
+
+    if name == "host-config.json":
+        fields(value, "schema source_reference total_stake quorum_stake quorum_sites unobserved_stake "
+               "genesis_file_sha256 genesis_network_hash recovery_domain checkpoint_manifest_hash "
+               "validator_set_id lax_access hosts")
+        if "source_reference" in value:
+            fields(value["source_reference"], "source_sha workflow_run_id recovery_proof recovery_proof_sha256 "
+                   "full_state_copy_qualification full_state_copy_qualification_sha256 scope")
+        for host in value.get("hosts", []):
+            fields(host, "site ip hostname validator stake unit data_dir genesis_path genesis_sha256 "
+                   "baseline_binary_sha256 legacy_v3_wire")
+    elif name == "quorum-proof.json":
+        fields(value, "schema scope transport captured_at_unix checkpoint_manifest_hash common_block "
+               "genesis_file_sha256 genesis_network_hash quorum_stake recovery_domain samples total_stake validator_set_id")
+        block = value.get("common_block", {})
+        fields(block, "hash height hosts protocol_major state_root")
+        for host in block.get("hosts", []):
+            fields(host, "hash height protocol_major site state_root")
+        for sample in value.get("samples", []):
+            fields(sample, "captured_at_unix nodes")
+            for node in sample.get("nodes", []):
+                fields(node, "active active_stake argv_redacted binary_sha256 checkpoint_manifest_hash "
+                       "genesis_sha256 health height hostname invocation_id ip last_block_height network_genesis_hash "
+                       "network_total_stake pid recovery_domain restarts site stake validator validator_set_id")
+                fields(node.get("health", {}), "chain_advancing dag_committed dag_round height last_block_age_secs "
+                       "peers status uptime_secs validators version binary_sha256 dag_bootstrapping "
+                       "extended_consensus_wire_enabled features legacy_v3_wire wire_messages_suppressed "
+                       "chain_participation_enabled")
 
 
 def validate_bindings(payloads: dict[str, bytes], main: str):

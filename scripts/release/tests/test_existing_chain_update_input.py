@@ -60,7 +60,7 @@ class UpdateInputTests(unittest.TestCase):
             mod.create(self.repo, self.inputs, self.main)
 
     def test_unbound_proof_rejected(self):
-        (self.inputs / "quorum-proof.json").write_text('{"new": true}')
+        (self.inputs / "quorum-proof.json").write_text('{"scope": "changed"}')
         with self.assertRaisesRegex(mod.InputError, "proof differs"):
             mod.create(self.repo, self.inputs, self.main)
 
@@ -75,9 +75,24 @@ class UpdateInputTests(unittest.TestCase):
             mod.create(self.repo, self.inputs, self.main)
 
     def test_host_config_substitution_is_refused(self):
-        (self.inputs / "host-config.json").write_text('{"unexpected": "different host"}')
+        (self.inputs / "host-config.json").write_text('{"lax_access": "different host"}')
         with self.assertRaisesRegex(mod.InputError, "host configuration differs"):
             mod.create(self.repo, self.inputs, self.main)
+
+    def test_encoded_credentials_and_unrecognized_extra_fields_are_refused(self):
+        for field in ("ssh_private_key_b64", "bearer_token", "arbitrary_extra"):
+            with self.subTest(field=field):
+                with self.assertRaises(mod.InputError):
+                    mod.validate_bytes("host-config.json", json.dumps({field: "c2VjcmV0"}).encode())
+                with self.assertRaises(mod.InputError):
+                    mod.validate_bytes("quorum-proof.json", json.dumps({
+                        "samples": [{"nodes": [{field: "c2VjcmV0"}]}]}).encode())
+
+    def test_real_public_config_and_proof_fields_are_accepted(self):
+        fixtures = SCRIPT.parent / "tests" / "fixtures"
+        for name, fixture in (("host-config.json", "host-config-six-current-20260927.json"),
+                              ("quorum-proof.json", "six-host-before-cfd-20260927.json")):
+            mod.validate_bytes(name, (fixtures / fixture).read_bytes())
 
     def test_symlink_and_wrong_parent_rejected(self):
         commit = mod.create(self.repo, self.inputs, self.main)
