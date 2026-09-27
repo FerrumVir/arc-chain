@@ -3554,9 +3554,12 @@ async fn submit_signed_tx(
     }
     tx.sig_verified = true;
     if node.state.active_protocol_version().major == 3
-        && node.state.validate_v3_transaction_admission(&tx).is_err()
+        && let Err(error) = node.state.validate_v3_transaction_admission(&tx)
     {
-        return Err(StatusCode::BAD_REQUEST.into());
+        return Err(SubmitRefusal::new(
+            StatusCode::BAD_REQUEST,
+            error.to_string(),
+        ));
     }
     if node.mempool.contains(&tx.hash) {
         return Err(StatusCode::CONFLICT.into());
@@ -24125,10 +24128,20 @@ mod tests {
         state
             .sign_transaction(&mut before_migration, &requester)
             .unwrap();
-        let _ = submit_without_test_sender_throttle(&node, before_migration)
+        let _ = submit_without_test_sender_throttle(&node, before_migration.clone())
             .await
             .unwrap();
         commit(&state, &node.mempool.drain(1));
+        let expected_refusal = state
+            .validate_v3_transaction_admission(&before_migration)
+            .unwrap_err()
+            .to_string();
+        let refusal = submit_without_test_sender_throttle(&node, before_migration)
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.status, StatusCode::BAD_REQUEST);
+        assert_eq!(refusal.reason, expected_refusal);
+        assert!(!refusal.reason.is_empty(), "v3 refusal retains its cause");
         let balance_before_native = state.get_account(&requester.address()).unwrap().balance;
         assert_eq!(balance_before_native, 998);
         let (id, tx) = request_tx(

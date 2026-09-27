@@ -4981,6 +4981,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovered_v3_next_admission_serializes_with_canonical_height_changes() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let f = fixture("migration-admission-height-race");
+        let state = recovered_chain_at(&f, 4);
+        state
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
+            .unwrap();
+        let producer = f.validators[0].address();
+        state
+            .execute_block_adaptive_at(&[], producer, 1_700_099)
+            .unwrap();
+        let req = request(&f, 0, 8);
+        let id = req.job.request_id();
+        state
+            .execute_block_adaptive_at(
+                &[native_request(state, &f.requester, req)],
+                producer,
+                1_700_100,
+            )
+            .unwrap();
+        let refund = native_refund(state, &f.requester, 1, id);
+        assert!(
+            state.validate_v3_transaction_admission(&refund).is_err(),
+            "serialization must not admit a refund before expiry"
+        );
+        state
+            .execute_block_adaptive_at(&[], producer, 1_700_101)
+            .unwrap();
+        state.validate_v3_transaction_admission(&refund).unwrap();
+
+        // Reproduce the old read/validate interleaving without racing threads:
+        // an actual canonical empty block advances after the prospective height
+        // was captured. Exact-height validation must continue refusing it.
+        let captured_height = state.height() + 1;
+        let before_root = state.compute_state_root();
+        state
+            .execute_block_adaptive_at(&[], producer, 1_700_102)
+            .unwrap();
+        assert_eq!(state.compute_state_root(), before_root);
+        let error = state
+            .validate_v3_transaction_admission_at(&refund, captured_height)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("next canonical block height"),
+            "{error}"
+        );
+
+        // The public next-height wrapper must wait for the same boundary that
+        // the canonical executor holds. The old wrapper could complete immediately
+        // while this guard was held. Drop the guard before any assertion/join,
+        // so a failing test cannot strand its admission thread.
+        std::thread::scope(|scope| {
+            let guard = state.native_inference_execution.lock();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let refund = &refund;
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                result_tx
+                    .send(state.validate_v3_transaction_admission(refund))
+                    .unwrap();
+            });
+            let started = started_rx.recv_timeout(Duration::from_secs(5));
+            let while_locked = result_rx.recv_timeout(Duration::from_millis(200));
+            drop(guard);
+            worker.join().unwrap();
+            started.unwrap();
+            assert!(
+                matches!(while_locked, Err(RecvTimeoutError::Timeout)),
+                "next-height admission escaped the canonical execution boundary: {while_locked:?}"
+            );
+            result_rx.recv().unwrap().unwrap();
+        });
+
+        let (block, receipts) = state
+            .execute_block_adaptive_at(std::slice::from_ref(&refund), producer, 1_700_103)
+            .unwrap();
+        assert_eq!(block.header.protocol_version.major, 3);
+        assert!(receipts[0].success);
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            1_000
+        );
+        assert!(
+            state.validate_v3_transaction_admission(&refund).is_err(),
+            "serialization must not admit a refunded request twice"
+        );
+        let dir = f.dir.clone();
+        drop(f);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The product requirement end to end: a real paid request reserved,
     /// certified, settled and receipted on the EXISTING recovered chain, with
     /// that chain's own history and balances still underneath it. This is

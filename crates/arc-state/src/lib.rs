@@ -2784,10 +2784,12 @@ impl StateDB {
         Ok(())
     }
 
-    /// Side-effect-free protocol-v3 ingress validation. RPC, gossip, DAG, and
-    /// restore paths use this before retaining a transaction; the state
-    /// executor independently enforces the same conditions before writes.
+    /// Side-effect-free protocol-v3 ingress validation. Read the prospective
+    /// height and state under the canonical execution lock, so an intervening
+    /// empty block cannot make a valid native transaction fail the exact-height
+    /// check. Canonical execution already holds this lock and uses `_at`.
     pub fn validate_v3_transaction_admission(&self, tx: &Transaction) -> Result<(), StateError> {
+        let _guard = self.native_inference_execution.lock();
         let execution_height = self.height().checked_add(1).ok_or_else(|| {
             StateError::ExecutionError("prospective v3 block height overflow".to_string())
         })?;
