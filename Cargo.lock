@@ -218,6 +218,7 @@ dependencies = [
  "arc-crypto",
  "blake3",
  "serde",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 
