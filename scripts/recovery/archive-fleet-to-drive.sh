@@ -12973,10 +12973,17 @@ archive_write_current_process_id() {
     /bin/sh -c 'printf "%s\n" "$PPID"' > "$1"
 }
 
+# Supervisor and phase-bootstrap captures deliberately use backticks.
+# Bash 5.2 can run a pending INT trap while parsing a $() capture, interpret the
+# handler under the unfinished substitution parser, and exit 2 before recording
+# or forwarding the signal. Legacy capture parsing avoids that parser state.
+# Keep these simple, nonnested captures and their quoting intact. The contract
+# suite schedules this window explicitly and separately exercises full cleanup.
+# shellcheck disable=SC2006
 archive_process_field() {
     local field="$1" pid="$2" value
     case "$field" in ppid|pgid) ;; *) return 2 ;; esac
-    if value="$(/bin/ps -o "$field=" -p "$pid" 2>/dev/null)"; then
+    if value="`/bin/ps -o "$field=" -p "$pid" 2>/dev/null`"; then
         value="${value//[[:space:]]/}"
     else
         return 1
@@ -12985,19 +12992,21 @@ archive_process_field() {
     printf '%s\n' "$value"
 }
 
+# shellcheck disable=SC2006
 archive_process_exists() {
     local state
     builtin kill -0 -- "$1" 2>/dev/null || return 1
     # A transient ps failure is not proof that a killable process exited.
-    state="$(/bin/ps -o stat= -p "$1" 2>/dev/null)" || return 0
+    state="`/bin/ps -o stat= -p "$1" 2>/dev/null`" || return 0
     state="${state//[[:space:]]/}"
     case "$state" in Z*) return 1 ;; *) return 0 ;; esac
 }
 
+# shellcheck disable=SC2006
 archive_process_in_group() {
     local process_pid="$1" wanted_pgid="$2" observed_pgid
     archive_process_exists "$process_pid" || return 1
-    observed_pgid="$(archive_process_field pgid "$process_pid")" || return 1
+    observed_pgid="`archive_process_field pgid "$process_pid"`" || return 1
     [ "$observed_pgid" = "$wanted_pgid" ]
 }
 
@@ -13396,11 +13405,12 @@ archive_dispatch_sentinel() {
     done
 }
 
+# shellcheck disable=SC2006
 archive_stop_dispatch_sentinel() {
     local sentinel_pid="$1" phase_pgid="$2" fifo="$3" stop_token="$4"
     local observed_pgid
     while archive_process_exists "$sentinel_pid"; do
-        observed_pgid="$(archive_process_field pgid "$sentinel_pid")" || {
+        observed_pgid="`archive_process_field pgid "$sentinel_pid"`" || {
             /bin/sleep 0.02
             continue
         }
@@ -13515,6 +13525,7 @@ archive_restore_signal_trap() {
     fi
 }
 
+# shellcheck disable=SC2006
 archive_dispatch_phase() {
     local supervisor_pid="$1" gate="$2" command_name="$3"
     shift 3
@@ -13537,7 +13548,7 @@ archive_dispatch_phase() {
     trap 'bootstrap_signal_status=143' TERM
     archive_write_current_process_id "$gate/phase.pid.partial" || exit 125
     IFS= read -r phase_pid < "$gate/phase.pid.partial" || exit 125
-    phase_pgid="$(archive_process_field pgid "$phase_pid")" || exit 125
+    phase_pgid="`archive_process_field pgid "$phase_pid"`" || exit 125
     mkfifo "$gate/sentinel.fifo" || exit 125
     chmod 600 "$gate/sentinel.fifo" || exit 125
     stop_token="ARC-ARCHIVE-STOP:$supervisor_pid:$phase_pid:$RANDOM:$RANDOM"
@@ -13576,7 +13587,7 @@ archive_dispatch_phase() {
         *) exit 125 ;;
     esac
     while [ ! -f "$gate/go" ]; do
-        observed_parent="$(archive_process_field ppid "$phase_pid")" || observed_parent=""
+        observed_parent="`archive_process_field ppid "$phase_pid"`" || observed_parent=""
         if [ "$observed_parent" != "$supervisor_pid" ]; then
             archive_stop_dispatch_sentinel "$sentinel_pid" "$phase_pgid" \
                 "$gate/sentinel.fifo" "$stop_token"
@@ -13708,6 +13719,8 @@ archive_dispatch_parent_watchdog() {
     return 0
 }
 
+# See the signal-safe capture rationale above archive_process_field.
+# shellcheck disable=SC2006
 dispatch_archive_command() {
     local command_name="$1"
     shift
@@ -13736,9 +13749,9 @@ dispatch_archive_command() {
     local terminal_receipt=false terminal_guardian_failed=""
     local ready_fields_valid=true signal_acknowledged=false
     local monitor_enabled=false saved_hup saved_int saved_term
-    saved_hup="$(trap -p HUP)"
-    saved_int="$(trap -p INT)"
-    saved_term="$(trap -p TERM)"
+    saved_hup="`trap -p HUP`"
+    saved_int="`trap -p INT`"
+    saved_term="`trap -p TERM`"
     case $- in *m*) monitor_enabled=true ;; esac
     ARC_ARCHIVE_DISPATCH_GATE=""
     ARC_ARCHIVE_DISPATCH_STOP_TOKEN=""
@@ -13766,14 +13779,14 @@ dispatch_archive_command() {
             /*)
                 if [ -d "$requested_work_root" ] && [ ! -L "$requested_work_root" ] && \
                     [ -O "$requested_work_root" ] && \
-                    resolved_work_root="$(CDPATH='' cd -- "$requested_work_root" 2>/dev/null && pwd -P)" && \
+                    resolved_work_root="`CDPATH='' cd -- "$requested_work_root" 2>/dev/null && pwd -P`" && \
                     [ "$resolved_work_root" = "$requested_work_root" ]; then
                     gate_parent="$requested_work_root"
                 fi
                 ;;
         esac
     fi
-    if gate="$(mktemp -d "$gate_parent/arc-archive-dispatch.XXXXXX")"; then
+    if gate="`mktemp -d "$gate_parent/arc-archive-dispatch.XXXXXX"`"; then
         chmod 700 "$gate" || setup_status=125
         mkdir -m 700 "$gate/runtime" || setup_status=125
         archive_write_current_process_id "$gate/supervisor.pid" || setup_status=125
@@ -13902,7 +13915,7 @@ archive_dispatch_phase "${phase_arguments[@]}"
                 watchdog_pid="$ready_pid"
                 watchdog_pgid="$ready_pgid"
                 for ((attempt = 0; attempt < 250; attempt += 1)); do
-                    ready_pid="$(archive_process_field ppid "$watchdog_pid")" || ready_pid=""
+                    ready_pid="`archive_process_field ppid "$watchdog_pid"`" || ready_pid=""
                     if [ "$ready_pid" = "$sentinel_pid" ] && \
                         archive_process_in_group "$watchdog_pid" "$watchdog_pgid"; then
                         guardian_ready=true

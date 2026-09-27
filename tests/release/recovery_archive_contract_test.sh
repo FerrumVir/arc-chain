@@ -3154,6 +3154,88 @@ while :; do /bin/sleep 1; done
     }
 )
 
+archive_supervisor_capture_preserves_pending_signals() {
+    python3 - "$ORCHESTRATOR" <<'PY'
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+
+def definition(name):
+    match = re.search(r"^" + re.escape(name) + r"\(\) \{\n.*?^\}", source, re.M | re.S)
+    assert match is not None, name
+    return match.group()
+
+helper = definition("archive_process_exists")
+assert helper.count('state="') == 2, "review the capture fault-injection site"
+# Explicit scheduling fault injection, not an unmodified-helper reproduction:
+# prepend an empty-output legacy capture that signals only this fresh Bash.
+# The next capture is the exact production ps expression. On Bash 5.2.21 its
+# old $() form parses the pending INT handler in substitution context, exits 2,
+# and never records 130. The same injection with the fixed capture succeeds.
+# A ps shim that signals while ps runs does not force the earlier parser window.
+helper = helper.replace('state="', 'state="`builtin kill -s "$probe_signal" -- "$$"`', 1)
+handler = definition("archive_dispatch_forward_signal")
+env = dict(os.environ, BASH_ENV="/dev/null", ENV="/dev/null")
+for signal, status in (("INT", 130), ("HUP", 129), ("TERM", 143)):
+    script = handler + "\n" + helper + r'''
+probe_signal=$1
+expected_status=$2
+ARC_ARCHIVE_DISPATCH_SIGNAL=""
+ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS=0
+ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=false
+ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
+ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
+trap 'archive_dispatch_forward_signal HUP 129' HUP
+trap 'archive_dispatch_forward_signal INT 130' INT
+trap 'archive_dispatch_forward_signal TERM 143' TERM
+archive_process_exists "$$"
+[ "$ARC_ARCHIVE_DISPATCH_SIGNAL" = "$probe_signal" ]
+[ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq "$expected_status" ]
+[ "$ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED" = false ]
+printf '%s:%s\n' "$ARC_ARCHIVE_DISPATCH_SIGNAL" "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"
+'''
+    result = subprocess.run(
+        ["/bin/bash", "--noprofile", "--norc", "-Eeuo", "pipefail", "-c",
+         script, "archive-capture-signal-probe", signal, str(status)],
+        capture_output=True, text=True, env=env, start_new_session=True, timeout=5,
+    )
+    assert result.returncode == 0, (signal, result.returncode, result.stderr)
+    assert result.stdout == f"{signal}:{status}\n", (signal, result.stdout)
+    assert result.stderr == "", (signal, result.stderr)
+
+# Bash preserves trap definitions specially in a capture containing only trap.
+# Exercise the exact three production captures and restore function, including
+# handler text that would change or execute if capture/restore quoting broke.
+captures = re.findall(r"^    saved_(?:hup|int|term)=.*$",
+                      definition("dispatch_archive_command"), re.M)
+assert len(captures) == 3, captures
+trap_text = "printf '%s\\n' \"single ' double \\\" dollar \\$(literal) backtick \\`literal\\`\"\n:"
+script = definition("archive_restore_signal_trap") + r'''
+trap "$1" HUP INT TERM
+trap -p HUP INT TERM
+printf '%s\n' ARCHIVE_TRAP_CAPTURE_SEPARATOR
+''' + "\n".join(captures) + r'''
+trap - HUP INT TERM
+archive_restore_signal_trap "$saved_hup" HUP
+archive_restore_signal_trap "$saved_int" INT
+archive_restore_signal_trap "$saved_term" TERM
+trap -p HUP INT TERM
+'''
+result = subprocess.run(
+    ["/bin/bash", "--noprofile", "--norc", "-Eeuo", "pipefail", "-c",
+     script, "archive-caller-trap-probe", trap_text],
+    capture_output=True, text=True, env=env, start_new_session=True, timeout=5,
+)
+assert result.returncode == 0 and result.stderr == "", (result.returncode, result.stderr)
+before, after = result.stdout.split("ARCHIVE_TRAP_CAPTURE_SEPARATOR\n")
+assert before.count("trap -- ") == 3 and before == after, (before, after)
+PY
+}
+
 archive_dispatcher_signals_stop_the_full_phase_group_and_clean() (
     local fixture python_bin
     fixture="$(mktemp -d "$REPO_ROOT/.archive-dispatch-signal-test.XXXXXX")"
@@ -4247,6 +4329,7 @@ run_test 'remote COMPLETE rejects object attacks' remote_complete_rejects_missin
 run_test 'verify-complete plan cleanup is total and SSH-free' verify_complete_plan_cleans_transport_state_and_never_uses_ssh
 run_test 'archive command scopes clean plan, failure, and nested success state' archive_command_scopes_clean_plan_failure_and_nested_success
 run_test 'archive dispatcher preserves phase errexit and completed takeover' archive_dispatcher_preserves_errexit_and_accepts_completed_takeover
+run_test 'archive supervisor capture preserves pending signals' archive_supervisor_capture_preserves_pending_signals
 run_test 'archive dispatcher signals stop the full phase group and clean' archive_dispatcher_signals_stop_the_full_phase_group_and_clean
 run_test 'COMPLETE is last and fully verified' complete_is_last_and_fully_verified
 run_test 'immutable Gist revision recovers a lost local intent after latest edit' gist_revision_recovers_lost_local_intent_after_latest_edit
