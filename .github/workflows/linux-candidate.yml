@@ -52,41 +52,106 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          log_file="/tmp/arc-p5-node-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
+          evidence_dir="$RUNNER_TEMP/recovered-v3-evidence"
+          if [[ -e "$evidence_dir" ]]; then
+            echo "refusing to reuse stale lifecycle evidence directory: $evidence_dir" >&2
+            exit 1
+          fi
+          mkdir -p "$evidence_dir"
           cargo test --locked --release -p arc-node --features native-test-executor \
-            --test native_multivalidator_paid_flow --no-run 2>&1 | tee "$log_file"
+            --test native_multivalidator_paid_flow --no-run \
+            --message-format=json-render-diagnostics >"$evidence_dir/compile.log" 2>&1 || {
+              cat "$evidence_dir/compile.log"
+              exit 1
+            }
+          cat "$evidence_dir/compile.log"
+          python3 - "$evidence_dir/compile.log" "$evidence_dir/test-binary.path" <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          log_path, output_path = map(Path, sys.argv[1:])
+          executables = []
+          for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+              try:
+                  record = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              target = record.get("target", {})
+              if (
+                  record.get("reason") == "compiler-artifact"
+                  and target.get("name") == "native_multivalidator_paid_flow"
+                  and target.get("test") is True
+                  and record.get("executable")
+              ):
+                  executables.append(Path(record["executable"]))
+          if len(executables) != 1:
+              raise SystemExit(f"expected one compiled lifecycle test executable, found {len(executables)}")
+          executable = executables[0].resolve()
+          if not executable.is_file() or not os.access(executable, os.X_OK):
+              raise SystemExit(f"compiled lifecycle test executable is missing or not executable: {executable}")
+          output_path.write_text(f"{executable}\n", encoding="utf-8")
+          print(f"lifecycle test executable: {executable}")
+          PYTHON
 
       - name: Verify exact recovered-v3 test selector
         shell: bash
         run: |
           set -Eeuo pipefail
-          log_file="/tmp/arc-p5-node-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
-          list_file="$(mktemp)"
-          trap 'rm -f "$list_file"' EXIT
-          cargo test --locked --release -p arc-node --features native-test-executor \
-            --test native_multivalidator_paid_flow \
-            recovered_v3_dag_migration_paid_lifecycle_survives_restart \
-            -- --list --exact 2>&1 | tee -a "$log_file" | tee "$list_file"
-          grep -Fx 'recovered_v3_dag_migration_paid_lifecycle_survives_restart: test' "$list_file"
+          evidence_dir="$RUNNER_TEMP/recovered-v3-evidence"
+          selector_log="$evidence_dir/selector.log"
+          test_binary="$(cat "$evidence_dir/test-binary.path")"
+          "$test_binary" recovered_v3_dag_migration_paid_lifecycle_survives_restart \
+            --list --exact >"$selector_log" 2>&1 || {
+              cat "$selector_log"
+              exit 1
+            }
+          cat "$selector_log"
+          match_count="$(grep -Fxc \
+            'recovered_v3_dag_migration_paid_lifecycle_survives_restart: test' \
+            "$selector_log" || true)"
+          if [[ "$match_count" != 1 ]]; then
+            echo "expected exactly one matching lifecycle test, found $match_count" >&2
+            exit 1
+          fi
 
       - name: Run recovered-v3 paid lifecycle across restart
         shell: bash
         run: |
           set -Eeuo pipefail
-          log_file="/tmp/arc-p5-node-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log"
-          timeout --signal=TERM --kill-after=30s 12m \
-            cargo test --locked --release -p arc-node --features native-test-executor \
-              --test native_multivalidator_paid_flow \
-              recovered_v3_dag_migration_paid_lifecycle_survives_restart \
-              -- --exact --nocapture --test-threads=1 2>&1 | tee -a "$log_file"
-          grep -E 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log_file"
+          set -Eeuo pipefail
+          evidence_dir="$RUNNER_TEMP/recovered-v3-evidence"
+          test_binary="$(cat "$evidence_dir/test-binary.path")"
+          for attempt in 1 2 3; do
+            attempt_dir="$evidence_dir/attempt-$attempt"
+            mkdir "$attempt_dir"
+            controller_log="$attempt_dir/controller.log"
+            echo "attempt=$attempt binary=$test_binary" >"$attempt_dir/metadata.txt"
+            rc=0
+            TMPDIR="$attempt_dir" timeout --signal=TERM --kill-after=30s 12m \
+              "$test_binary" recovered_v3_dag_migration_paid_lifecycle_survives_restart \
+              --exact --nocapture --test-threads=1 >"$controller_log" 2>&1 || rc=$?
+            printf '%s\n' "$rc" >"$attempt_dir/exit-code.txt"
+            cat "$controller_log"
+            if [[ "$rc" -ne 0 ]]; then
+              echo "lifecycle attempt $attempt failed with exit code $rc; stopping without retry-to-green" >&2
+              exit "$rc"
+            fi
+            pass_count="$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored;' \
+              "$controller_log" || true)"
+            if [[ "$pass_count" != 1 ]]; then
+              echo "lifecycle attempt $attempt did not contain exactly one passing test result" >&2
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: arc-recovered-v3-paid-lifecycle-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: /tmp/arc-p5-node-*.log
-          if-no-files-found: warn
+          path: ${{ runner.temp }}/recovered-v3-evidence/
+          if-no-files-found: error
           retention-days: 14
 
   desktop-native-paid-test:
