@@ -25960,6 +25960,7 @@ mod tests {
                     None,
                     false,
                     None,
+                    Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
                 )
@@ -26045,6 +26046,7 @@ mod tests {
                 None,
                 false,
                 None,
+                Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                 Some(shutdown_rx),
                 Arc::new(arc_net::transport::TransportWirePolicy::default()),
             )
