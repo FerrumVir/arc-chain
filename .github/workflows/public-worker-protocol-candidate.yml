@@ -1,0 +1,37 @@
+name: Public worker offer candidate
+
+on:
+  push:
+    branches: [public-native-worker-protocol-20260927]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-worker-offer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offer-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly-2026-03-16
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          shared-key: test-ubuntu-latest
+      - name: Check offer module formatting
+        run: cargo fmt --package arc-assign -- --check
+      - name: Test assignment contracts including public offers
+        run: cargo test --locked -p arc-assign --lib -- --test-threads=1
+      - name: Check assignment warnings
+        run: cargo clippy --locked -p arc-assign --all-targets -- -D warnings
