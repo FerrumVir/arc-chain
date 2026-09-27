@@ -95,6 +95,7 @@ jobs:
           cargo test --locked --release -p arc-node --lib --features candle
           cargo test --locked --release -p arc-net --lib
           cargo test --locked --release -p arc-node --bin arc-node --features candle legacy_v3_wire
+          cargo test -p arc-node --bin arc-node native_request_opt_in_is_default_closed_and_requires_runtime_before_state_open
           cargo test --locked --release -p arc-inference --lib --features candle
           ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle
           cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance
@@ -133,6 +134,7 @@ jobs:
             printf 'tests= cargo test --locked --release -p arc-node --lib --features candle\n'
             printf 'tests= cargo test --locked --release -p arc-net --lib\n'
             printf 'tests= cargo test --locked --release -p arc-node --bin arc-node --features candle legacy_v3_wire\n'
+            printf 'tests= cargo test -p arc-node --bin arc-node native_request_opt_in_is_default_closed_and_requires_runtime_before_state_open\n'
             printf 'tests= cargo test --locked --release -p arc-inference --lib --features candle\n'
             printf 'tests= ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle\n'
             printf 'tests= cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance\n'
