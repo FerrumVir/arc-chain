@@ -16,6 +16,9 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
+import { StartStage } from "../components/StartStage";
+import { prefersReducedMotion } from "../components/Engraving";
+import type { ArchChainPhase } from "../lib/aqueduct/archchain";
 import { CrashBanner } from "../components/CrashBanner";
 import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
@@ -167,6 +170,25 @@ export function Dashboard() {
   const isStarting =
     (!running && status?.pid != null) || startMutation.isPending;
 
+  // The node's start, drawn as the first arch of an aqueduct: every step is one the node actually reports. No model-load
+  // percentage exists, so that step shows work under way without claiming progress; catching up is drawn from the real
+  // local and chain heights. Once caught up, the Network screen carries the live aqueduct.
+  const localHeight = status?.height ?? null;
+  const chainHeight = status?.chainHeight ?? null;
+  const catchingUp =
+    running && localHeight != null && chainHeight != null && chainHeight - localHeight > 50;
+  const startPhase: ArchChainPhase | null =
+    startMutation.isPending && status?.pid == null
+      ? "survey"
+      : isStarting
+        ? "model"
+        : running && (status?.peers ?? 0) === 0 && !catchingUp
+          ? "rpc"
+          : catchingUp
+            ? "sync"
+            : null;
+
+  const detailsRef = useRef<HTMLDivElement>(null);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [tick, setTick] = useState(0);
   useEffect(() => {
@@ -207,21 +229,7 @@ export function Dashboard() {
     [],
   );
 
-  return (
-    <div className="main-inner" data-testid="dashboard">
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Dashboard</h1>
-          <p className="page-subtitle">
-            {running
-              ? isExternal
-                ? "The node process is running under launchd or systemd. Peering, compatible work, and reward settlement are separate checks."
-                : "The node process is running. Peering, compatible work, and reward settlement are separate checks."
-              : isStarting
-                ? "Starting node — loading model and binding RPC. This can take a few minutes on first run."
-                : "Your node is stopped. Start it to sync and make configured compute available."}
-          </p>
-        </div>
+  const controls = (
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
           {running ? (
             <>
@@ -277,6 +285,33 @@ export function Dashboard() {
             </button>
           )}
         </div>
+  );
+
+  return (
+    <div className="main-inner" data-testid="dashboard">
+      {startPhase && (
+        <StartStage
+          phase={startPhase}
+          localHeight={localHeight}
+          chainHeight={chainHeight}
+          actions={controls}
+          onDetails={() => detailsRef.current?.scrollIntoView({ block: "start", behavior: prefersReducedMotion() ? "auto" : "smooth" })}
+        />
+      )}
+      <div className="page-header" ref={detailsRef}>
+        <div>
+          <h1 className="page-title">Dashboard</h1>
+          <p className="page-subtitle">
+            {running
+              ? isExternal
+                ? "The node process is running under launchd or systemd. Peering, compatible work, and reward settlement are separate checks."
+                : "The node process is running. Peering, compatible work, and reward settlement are separate checks."
+              : isStarting
+                ? "Starting node — loading model and binding RPC. This can take a few minutes on first run."
+                : "Your node is stopped. Start it to sync and make configured compute available."}
+          </p>
+        </div>
+        {!startPhase && controls}
       </div>
 
       {isStarting && (

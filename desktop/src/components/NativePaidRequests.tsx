@@ -367,8 +367,8 @@ export function NativePaidRequests() {
   const header = (
     <CardHeader
       title={
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-          <Coins size={16} /> Native paid requests
+        <span className="native-title">
+          <Coins size={15} aria-hidden="true" /> Native paid requests
         </span>
       }
     />
@@ -386,27 +386,23 @@ export function NativePaidRequests() {
   const visible = [...requests].reverse();
 
   return (
-    <Card data-testid="native-paid-card" style={{ marginBottom: "var(--space-6)" }}>
+    <Card data-testid="native-paid-card" className="native-card">
       {header}
-      <div
-        role="status"
-        data-testid="native-chain-status"
-        style={{ fontSize: "var(--text-sm)", color: "var(--text-secondary)", marginBottom: "var(--space-3)" }}
-      >
+      <div role="status" data-testid="native-chain-status" className="native-chain">
         Chain at block {view.height} · {view.members} validators · executor: {executor}
         {view.nodeVersion ? ` · node ${view.nodeVersion}` : ""}
       </div>
       {!view.compatible ? (
-        <div role="status" data-testid="native-context-status" style={{ fontSize: "var(--text-sm)", marginBottom: "var(--space-3)" }}>
+        <div role="status" data-testid="native-context-status" className="native-notice">
           <strong>New paid requests are unavailable.</strong> {view.reason}
-          <div style={{ color: "var(--text-muted)", marginTop: 4 }}>
+          <div className="native-muted">
             {view.trackingAvailable
               ? "Existing signed requests continue to be tracked and can be refunded or resubmitted."
               : "Existing signed requests remain journaled locally, but this host context prevents receipt tracking and refund operations."}
           </div>
         </div>
       ) : null}
-      <div data-testid="native-balance" style={{ fontSize: "var(--text-sm)", marginBottom: "var(--space-3)" }}>
+      <div data-testid="native-balance" className="native-balance">
         Available:{" "}
         <strong data-testid="native-available">
           {balance.data ? `${balance.data.balanceArc} ARC` : "-"}
@@ -416,11 +412,11 @@ export function NativePaidRequests() {
       </div>
 
       {journalError ? (
-        <div role="alert" data-testid="native-journal-error" style={{ color: "var(--danger)", marginBottom: "var(--space-3)" }}>
+        <div role="alert" data-testid="native-journal-error" className="native-error">
           {journalError}
         </div>
       ) : null}
-      <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <label className="field native-prompt">
         <span className="field-label">Prompt</span>
         <textarea
           className="input"
@@ -433,8 +429,8 @@ export function NativePaidRequests() {
           data-testid="native-prompt"
         />
       </label>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--space-3)", marginTop: "var(--space-3)" }}>
-        <label style={{ display: "flex", flexDirection: "column", gap: 4, flex: "0 0 110px" }}>
+      <div className="native-fields">
+        <label className="field">
           <span className="field-label">Max tokens</span>
           <input
             className="input input-mono"
@@ -446,7 +442,7 @@ export function NativePaidRequests() {
             data-testid="native-max-tokens"
           />
         </label>
-        <label style={{ display: "flex", flexDirection: "column", gap: 4, flex: "0 0 130px" }}>
+        <label className="field">
           <span className="field-label">Price (ARC)</span>
           <input
             className="input input-mono"
@@ -455,7 +451,7 @@ export function NativePaidRequests() {
             data-testid="native-price"
           />
         </label>
-        <label style={{ display: "flex", flexDirection: "column", gap: 4, flex: "0 0 130px" }}>
+        <label className="field">
           <span className="field-label">Reserve (ARC)</span>
           <input
             className="input input-mono"
@@ -464,7 +460,7 @@ export function NativePaidRequests() {
             data-testid="native-reserve"
           />
         </label>
-        <label style={{ display: "flex", flexDirection: "column", gap: 4, flex: "0 0 130px" }}>
+        <label className="field">
           <span className="field-label">Expires after (blocks)</span>
           <input
             className="input input-mono"
@@ -475,93 +471,78 @@ export function NativePaidRequests() {
             data-testid="native-expiry"
           />
         </label>
-        <div style={{ flex: 1 }} />
         <button
-          className="btn btn-secondary"
+          className="btn btn-secondary native-review-btn"
           onClick={prepare}
           disabled={!view.compatible || preparing || !prompt.trim()}
           data-testid="btn-native-review"
-          style={{ alignSelf: "flex-end" }}
         >
-          {preparing ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : null} Review
+          {preparing ? <Loader2 size={14} className="spin" /> : null} Review
         </button>
       </div>
       {formError ? (
-        <div role="alert" data-testid="native-form-error" style={{ color: "var(--danger)", marginTop: 8 }}>
+        <div role="alert" data-testid="native-form-error" className="native-error">
           {formError}
         </div>
       ) : null}
 
       {review ? (
-        <div
-          data-testid="native-review"
-          style={{
-            marginTop: "var(--space-3)",
-            padding: "10px 12px",
-            border: "1px solid var(--border)",
-            borderRadius: "var(--radius-sm)",
-            fontSize: "var(--text-sm)",
-          }}
-        >
+        <div data-testid="native-review" className="native-review">
           <div>
             You sign {review.tokenCount !== null ? `${review.tokenCount} token ids` : `${review.byteLen} bytes`}.{" "}
             {review.note}
           </div>
-          <div style={{ marginTop: 6 }}>
+          <div>
             {reserveArc} ARC leaves your balance when a block admits the request. If validators
             certify an output, {priceArc} ARC pays them and the rest comes back. If no block admits
             it within {expiryBlocks} blocks, nothing is charged. If it is admitted but not certified
             by then, you claim the reservation back. A signed request cannot be recalled.
           </div>
           {overPositions !== null ? (
-            <div role="alert" data-testid="native-positions-error" style={{ color: "var(--danger)", marginTop: 6 }}>
+            <div role="alert" data-testid="native-positions-error" className="native-error">
               This request needs {overPositions.needed} positions (1 + {review.tokenCount} prompt tokens +{" "}
               {maxTokens}); the host&apos;s executor holds at most {overPositions.limit}, so it would never
               vote on it. Lower max tokens or shorten the prompt.
             </div>
           ) : null}
-          <button
-            className="btn btn-primary"
-            onClick={queue}
-            style={{ marginTop: 8 }}
-            disabled={!view.compatible || overPositions !== null}
-            data-testid="btn-native-sign"
-          >
-            <Send size={14} /> Sign and submit
-          </button>
+          <div>
+            <button
+              className="btn btn-primary"
+              onClick={queue}
+              disabled={!view.compatible || overPositions !== null}
+              data-testid="btn-native-sign"
+            >
+              <Send size={14} /> Sign and submit
+            </button>
+          </div>
         </div>
       ) : null}
 
       {visible.length > 0 ? (
-        <ul style={{ listStyle: "none", padding: 0, margin: "var(--space-4) 0 0", display: "grid", gap: 8 }}>
+        <ul className="native-requests">
           {visible.map((state) => (
             <li
               key={state.localId}
+              className="native-request"
               data-testid="native-request-row"
               data-phase={state.phase}
-              style={{
-                padding: "8px 10px",
-                border: "1px solid var(--border)",
-                borderRadius: "var(--radius-sm)",
-                fontSize: "var(--text-sm)",
-              }}
             >
-              <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
+              <div className="native-request-head">
                 <strong data-testid="native-request-phase">{phaseLabel(state)}</strong>
-                <span style={{ color: "var(--text-muted)" }}>{state.promptPreview}</span>
+                <span className="native-muted">{state.promptPreview}</span>
               </div>
-              <div className="input-mono" style={{ color: "var(--text-muted)", fontSize: "var(--text-xs)" }}>
+              <div className="native-request-ids">
                 {state.requestId ? `request ${formatHash(state.requestId)}` : "not signed"}
                 {state.txHash ? ` · tx ${formatHash(state.txHash)}` : ""}
                 {state.expiresAt !== undefined ? ` · expires at block ${state.expiresAt}` : ""}
                 {state.admissionHeight !== undefined ? ` · admitted at ${state.admissionHeight}` : ""}
               </div>
               {state.phase === "finalized" ? (
-                <div data-testid="native-output" style={{ marginTop: 4 }}>
+                <div data-testid="native-output" className="native-request-output">
                   {state.outputText ? (
                     <span>
                       {state.outputText}{" "}
-                      <span style={{ color: "var(--text-muted)" }}>
+                      <span className="native-muted">
                         (display text from this host's tokenizer; the certificate covers the output
                         bytes {state.outputHex ? `0x${state.outputHex.slice(0, 16)}…` : ""})
                       </span>
@@ -570,26 +551,26 @@ export function NativePaidRequests() {
                     <span className="input-mono">output bytes {state.outputHex ?? "-"}</span>
                   )}
                   {view.serving?.executor === "deterministic_test" ? (
-                    <span style={{ color: "var(--text-muted)" }}> (test executor output, not an answer)</span>
+                    <span className="native-muted"> (test executor output, not an answer)</span>
                   ) : null}
-                  <div style={{ color: "var(--text-muted)" }}>
+                  <div className="native-muted">
                     Paid {arc(state.executionPrice)} ARC · {state.certificateVotes ?? "-"} validator votes ·
                     settlement {state.reconciled ? "reconciles with the reservation" : "does NOT reconcile"}
                   </div>
                 </div>
               ) : null}
               {state.phase === "refunded" ? (
-                <div style={{ marginTop: 4, color: "var(--text-muted)" }}>
+                <div className="native-request-note">
                   Returned {arc(state.reservedMaxPayment)} ARC
                 </div>
               ) : null}
               {state.reason && !TERMINAL_PHASES.has(state.phase) ? (
-                <div style={{ marginTop: 4, color: "var(--text-muted)" }}>{state.reason}</div>
+                <div className="native-request-note">{state.reason}</div>
               ) : null}
               {state.reason && (state.phase === "rejected" || state.phase === "dropped") ? (
-                <div style={{ marginTop: 4, color: "var(--text-muted)" }}>{state.reason}</div>
+                <div className="native-request-note">{state.reason}</div>
               ) : null}
-              <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+              <div className="native-request-actions">
                 {state.phase === "waiting" ? (
                   <button className="btn btn-ghost btn-sm" onClick={() => withdraw(state.localId)} data-testid="btn-native-withdraw">
                     <Undo2 size={13} /> Withdraw (not signed yet)
@@ -626,7 +607,7 @@ export function NativePaidRequests() {
           ))}
         </ul>
       ) : null}
-      <div style={{ marginTop: "var(--space-3)", fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+      <div className="native-foot">
         Queued requests are signed one at a time and are not kept if the app closes before
         signing. Signed requests are recorded on this device and followed again after a restart.
       </div>

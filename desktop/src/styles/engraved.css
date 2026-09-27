@@ -1,0 +1,239 @@
+/* ─────────────────────────────────────────────────────────────────────
+   Engraved theme: the website's language, white line on Arc blue.
+   Switched by one attribute, <html data-theme="engraved"> (lib/theme.ts).
+   Every screen follows through the design tokens; the rules after the token
+   block only replace the few hard-coded glows and fills in app.css that
+   would look wrong on blue. Remove the attribute and the classic theme is
+   untouched.
+   ───────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* The ground an engraving is printed on (its masks paint this colour). */
+  --engrave-ground: var(--surface);
+}
+
+:root[data-theme="engraved"] {
+  color-scheme: dark;
+
+  /* Ground and plates. Cards sit a shade deeper than the page, as inked areas do. */
+  --bg: #002dde;
+  --bg-soft: #0029cc;
+  --surface: #0026c4;
+  --surface-elevated: #0a33da;
+  --surface-hover: rgba(255, 255, 255, 0.08);
+  --surface-active: rgba(255, 255, 255, 0.13);
+  --border: rgba(255, 255, 255, 0.2);
+  --border-bright: rgba(255, 255, 255, 0.42);
+  --border-focus: #ffffff;
+
+  /* Ink. Muted text stays above 4.5:1 on the blue. */
+  --text: #ffffff;
+  --text-secondary: rgba(255, 255, 255, 0.86);
+  --text-muted: rgba(255, 255, 255, 0.72);
+  --text-faint: rgba(255, 255, 255, 0.48);
+
+  /* Accents. White does the work that the accent blue did on the dark theme. */
+  --arc: #1d4cff;
+  --arc-ink: #ffffff;
+  --arc-deep: #001a99;
+  --arc-soft: rgba(255, 255, 255, 0.1);
+  --arc-glow: rgba(255, 255, 255, 0.22);
+  --arc-paper: #c9d6ff;
+  --arc-gradient: linear-gradient(135deg, #2a58ff 0%, #0a35e4 55%, #001a99 100%);
+  --gradient-hero: var(--arc-gradient);
+  --gradient-earnings: linear-gradient(135deg, #ffffff 0%, #c7d5ff 100%);
+  --gradient-card: linear-gradient(180deg, rgba(255, 255, 255, 0.035) 0%, rgba(255, 255, 255, 0) 100%);
+  --gradient-border: linear-gradient(180deg, rgba(255, 255, 255, 0.6) 0%, rgba(255, 255, 255, 0.14) 100%);
+  --indigo-300: #e6ecff;
+  --indigo-400: #eef2ff;
+  --indigo-500: #ffffff;
+  --indigo-600: #dfe7ff;
+  --indigo-700: #001a99;
+  --purple: #c7d5ff;
+  --earn-from: #ffffff;
+  --earn-to: #c7d5ff;
+
+  /* States keep their hue so they read at a glance, pitched to sit on the blue. */
+  --success: #8af2cb;
+  --success-bg: rgba(138, 242, 203, 0.13);
+  --warning: #ffd98c;
+  --warning-bg: rgba(255, 217, 140, 0.13);
+  --danger: #ffb0b0;
+  --danger-bg: rgba(255, 150, 150, 0.15);
+  --info: #b3dcff;
+  --info-bg: rgba(179, 220, 255, 0.13);
+
+  /* The site's three faces. */
+  --font-sans: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-display: "Arc Figures", "Marcellus", Georgia, "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  --tracking-tighter: 0;
+  --tracking-tight: 0;
+  --tracking-wide: 0.06em;
+  --tracking-wider: 0.12em;
+
+  /* Crisp plates, as on the site: small radii, hairlines instead of glows. */
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-lg: 6px;
+  --radius-xl: 8px;
+  --radius-2xl: 10px;
+  --shadow-sm: 0 1px 0 rgba(0, 10, 90, 0.25);
+  --shadow-md: 0 8px 22px rgba(0, 12, 90, 0.35);
+  --shadow-lg: 0 18px 48px rgba(0, 10, 80, 0.45);
+  --shadow-glow: 0 0 0 1px rgba(255, 255, 255, 0.34);
+  --shadow-glow-strong: 0 0 0 1px rgba(255, 255, 255, 0.5), 0 0 26px rgba(255, 255, 255, 0.12);
+
+  --engrave-ground: var(--surface);
+}
+
+/* The page is a plate: faint engraved strokes run across it where the dark theme had glows. */
+[data-theme="engraved"] .app-shell::before,
+[data-theme="engraved"] .onboarding::before {
+  background: repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.028) 0 1px, transparent 1px 4px);
+  animation: none;
+}
+
+[data-theme="engraved"] body {
+  font-feature-settings: normal;
+}
+
+[data-theme="engraved"] .titlebar {
+  background: rgba(0, 36, 184, 0.72);
+}
+[data-theme="engraved"] .sidebar {
+  background: rgba(0, 24, 140, 0.28);
+}
+@media (max-width: 768px) {
+  [data-theme="engraved"] .sidebar {
+    background: rgba(0, 30, 170, 0.96);
+  }
+}
+[data-theme="engraved"] .nav-item.active::before {
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.55);
+}
+
+/* Titles in Marcellus, each underscored by a short engraved hatch. */
+[data-theme="engraved"] .page-title {
+  font-weight: 400;
+  letter-spacing: 0.005em;
+  font-size: 38px;
+}
+[data-theme="engraved"] .page-title::after {
+  content: "";
+  display: block;
+  width: 72px;
+  height: 6px;
+  margin-top: 14px;
+  background: repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.8) 0 1px, transparent 1px 3px);
+}
+@media (max-width: 768px) {
+  [data-theme="engraved"] .page-title {
+    font-size: 30px;
+  }
+}
+[data-theme="engraved"] .onboarding-title {
+  font-weight: 400;
+  letter-spacing: 0.005em;
+}
+
+/* Cards carry a plate mark: an outer hairline and a fainter inner one. */
+[data-theme="engraved"] .card {
+  box-shadow: inset 0 0 0 4px var(--surface), inset 0 0 0 5px rgba(255, 255, 255, 0.07);
+}
+[data-theme="engraved"] .card-title {
+  font-weight: 600;
+}
+
+/* Buttons as on the site: a white primary with blue ink; outlined secondaries. */
+[data-theme="engraved"] .btn-primary {
+  background: #ffffff;
+  color: #002dde;
+  box-shadow: none;
+}
+[data-theme="engraved"] .btn-primary:hover {
+  background: #e9eeff;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6), 0 8px 22px rgba(0, 12, 90, 0.3);
+}
+[data-theme="engraved"] .btn-primary:disabled {
+  opacity: 0.55;
+}
+[data-theme="engraved"] .btn-secondary {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.62);
+}
+[data-theme="engraved"] .btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: #ffffff;
+}
+[data-theme="engraved"] .btn-danger {
+  background: rgba(255, 150, 150, 0.12);
+  color: #ffd0d0;
+  border: 1px solid rgba(255, 170, 170, 0.45);
+}
+[data-theme="engraved"] .btn-danger:hover {
+  background: rgba(255, 150, 150, 0.2);
+  border-color: rgba(255, 190, 190, 0.7);
+}
+
+[data-theme="engraved"] .input {
+  background: #0022b0;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+[data-theme="engraved"] .input::placeholder {
+  color: rgba(255, 255, 255, 0.55);
+}
+[data-theme="engraved"] .input:focus {
+  border-color: #ffffff;
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.16);
+}
+
+[data-theme="engraved"] .role-card.selected {
+  border-color: #ffffff;
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: 0 0 0 1px #ffffff;
+}
+[data-theme="engraved"] .role-card.selected .role-icon {
+  background: rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+}
+[data-theme="engraved"] .hw-item.highlight {
+  background: rgba(255, 255, 255, 0.08);
+}
+/* Numbers are always set in the text face, lining and tabular, never in Marcellus: Marcellus is for words (titles). */
+[data-theme="engraved"] .big-number,
+[data-theme="engraved"] .stat-value {
+  font-family: var(--font-sans);
+  font-variant-numeric: lining-nums tabular-nums;
+  font-feature-settings: "lnum" 1, "tnum" 1;
+}
+[data-theme="engraved"] .shimmer::after {
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.1) 50%, transparent 100%);
+}
+
+/* The preview warning keeps its amber: it must never blend into the product. */
+[data-theme="engraved"] .synthetic-preview-banner {
+  background: rgba(38, 26, 0, 0.97);
+  box-shadow: 0 14px 45px rgba(0, 8, 60, 0.55);
+}
+
+[data-theme="engraved"] ::selection {
+  background: rgba(255, 255, 255, 0.85);
+  color: #002dde;
+}
+[data-theme="engraved"] :focus-visible {
+  outline: 2px solid #ffffff;
+  outline-offset: 2px;
+}
+
+/* An empty state's engraving sits where its icon was. */
+.empty .vignette {
+  --engrave-ground: var(--surface);
+  margin-bottom: var(--space-3);
+}
+
+[data-theme="engraved"] input[type="radio"],
+[data-theme="engraved"] input[type="checkbox"] {
+  accent-color: #ffffff;
+}

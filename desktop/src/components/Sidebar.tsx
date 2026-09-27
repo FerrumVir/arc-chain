@@ -12,7 +12,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useAppStore } from "../lib/store";
 import { api } from "../lib/tauri";
 import { PulseDot } from "./PulseDot";
-import { LogoMark, Tagline, Wordmark } from "./Logo";
+import { Tagline, Wordmark } from "./Logo";
 import { formatUptime } from "../lib/format";
 import type { Route } from "../lib/store";
 
@@ -41,18 +41,8 @@ export function Sidebar() {
   return (
     <aside className="sidebar" data-testid="sidebar">
       <div className="sidebar-brand">
-        <LogoMark size={28} />
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: 2,
-            lineHeight: 1,
-          }}
-        >
-          <Wordmark size={18} />
-          <Tagline size="xs" />
-        </div>
+        <Wordmark height={28} />
+        <Tagline size="sm" />
       </div>
 
       <nav className="sidebar-nav" aria-label="Primary">

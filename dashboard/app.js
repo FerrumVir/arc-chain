@@ -438,6 +438,61 @@
     const formatInteger = (value) => value === null || value === undefined ? "—" : new Intl.NumberFormat().format(value);
     const formatArc = (value) => value === null || value === undefined ? "—" : `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 4 }).format(value)} ARC`;
 
+    // The aqueduct in the page header (aqueduct/band.js) draws only blocks this console read: the checkpoint-selected
+    // v3 source's latest block at each audit, and a light poll of that same source's latest block. Its water runs with
+    // the confirmed inference receipts each audit reads. It is optional; without it every aqueduct call below does
+    // nothing.
+    const aqueduct = (() => {
+      const band = window.ArcAqueductBand;
+      if (!band || typeof band.mount !== "function") return null;
+      let mounted = null;
+      try { mounted = band.mount(document.getElementById("aqueduct"), { bot: 340 }); } catch (_error) { return null; }
+      if (!mounted) return null;
+      // The band only illustrates evidence the console already shows: a failure inside it must never change that evidence.
+      const safely = (method) => (options) => { try { mounted[method](options); } catch (_error) { /* the picture stays as it was */ } };
+      return { follow: safely("follow"), clear: safely("clear") };
+    })();
+    function blockTxCount(block) {
+      const header = network.blockHeader(block);
+      const explicit = numberOrNull(block?.tx_count, header.tx_count, block?.transactions_count);
+      if (explicit !== null) return explicit;
+      if (Array.isArray(block?.transactions)) return block.transactions.length;
+      if (Array.isArray(block?.tx_hashes)) return block.tx_hashes.length;
+      return null;
+    }
+    const aqueductBlock = (block) => ({ height: network.blockHeight(block), txCount: blockTxCount(block), timestamp: network.blockHeader(block).timestamp ?? null });
+    function followAqueduct(fleet, boundary, maintenanceAudit, publicationError, inference) {
+      if (!aqueduct) return;
+      // The band withdraws its picture whenever the console withdraws its claim.
+      if (maintenanceAudit.state !== "healthy") return aqueduct.clear({ tone: "bad", title: "Paused by the maintenance safety interlock", detail: "Public canonical claims are paused, so no blocks are drawn." });
+      if (boundary.state === "mismatch") return aqueduct.clear({ tone: "bad", title: "Recovery checkpoint mismatch", detail: "Canonical and earnings claims are paused, so no blocks are drawn." });
+      if (fleet.state === "fork") return aqueduct.clear({ tone: "bad", title: "Common-height fork confirmed", detail: "Configured v3 replicas disagree, so no blocks are drawn until recovery selection is resolved." });
+      const current = fleet.current;
+      if (!current) return aqueduct.clear({ tone: "warn", title: "Recovery not configured", detail: "No checkpoint-selected v3 source is configured, so no blocks are drawn." });
+      const tip = current.latest ? aqueductBlock(current.latest) : current.height !== null ? { height: current.height } : null;
+      if (!current.reachable || !tip || tip.height === null) return aqueduct.clear({ tone: "bad", title: "Canonical source unreachable", detail: `${current.source.name} did not report a block, so no blocks are drawn.` });
+      const verified = !publicationError && fleet.state === "healthy" && boundary.state === "verified";
+      const stalled = current.liveness.state === "stalled";
+      const told = verified
+        ? `Each stone is a block ${current.source.name} reported for the canonical timeline. Signed H, exact H+1, and all six maintenance interlocks are verified.`
+        : `Each stone is a block reported by ${current.source.name}. Evidence is incomplete${publicationError ? ` (${publicationError})` : ""}, so none of it is presented as verified.`;
+      return aqueduct.follow({
+        key: current.source.id,
+        tone: verified && !stalled ? "good" : "warn",
+        title: stalled ? "Chain appears stalled" : verified ? "Live · canonical v3 continuation" : "Canonical evidence incomplete",
+        detail: stalled ? `${told} Its newest block is stale, so building has stopped where the chain stopped.` : told,
+        source: current.source.name,
+        stalled,
+        blocks: [tip],
+        poll: (signal) => requestLatestBlock(window.fetch.bind(window), current.source, { signal }).then((block) => [aqueductBlock(block)]),
+        // Only verified evidence feeds the water: the receipts the inference table lists as confirmed, read from this
+        // same source. Anything less feeds nothing and withdraws the line under the headline.
+        inference: verified && inference && !inference.error && inference.source?.id === current.source.id
+          ? inference.confirmed.map(({ receipt }) => ({ id: receipt.txHash, height: receipt.height }))
+          : null,
+      });
+    }
+
     function setBadge(node, kind, label) { node.className = `badge ${kind}`; text(node, label); }
     function setTruth(kind, title, detail) {
       elements.truthBanner.className = `truth-banner ${kind}`;
@@ -525,7 +580,7 @@
         if (entry.receipt.txHash) link.href = `../explorer/#/tx/${entry.receipt.txHash}`;
         hashCell.append(link);
         const paid = entry.receipt.paymentConfirmed;
-        row.append(create("td", "", formatInteger(entry.receipt.height)), hashCell, create("td", "", network.formatHash(entry.row.inference?.model_hash ?? entry.row.model_id ?? entry.row.model)), create("td", "", network.formatHash(entry.row.worker_id ?? entry.row.worker)), create("td", "receipt-ok", paid ? "COMPUTED + PAID" : "COMPUTED · NOT PAYMENT"));
+        row.append(create("td", "", formatInteger(entry.receipt.height)), hashCell, create("td", "hash", network.formatHash(entry.row.inference?.model_hash ?? entry.row.model_id ?? entry.row.model)), create("td", "hash", network.formatHash(entry.row.worker_id ?? entry.row.worker)), create("td", "receipt-ok", paid ? "COMPUTED + PAID" : "COMPUTED · NOT PAYMENT"));
         elements.inferenceBody.append(row);
       }
       text(elements.inferenceSummary, `${result.confirmed.length} confirmed · ${result.excluded} unproven or non-canonical excluded · source ${result.source?.name ?? "unavailable"}`);
@@ -596,6 +651,7 @@
         const inference = await loadInferenceEvidence({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal, checkpointAudit: effectiveBoundary });
         if (signal.aborted) return;
         renderContinuity(effectiveBoundary); renderFleet(fleet); renderInference(inference);
+        followAqueduct(fleet, boundary, maintenanceAudit, publicationError, inference);
         if (maintenanceAudit.state !== "healthy") setTruth("bad", "Network maintenance safety interlock active", `Public canonical and earnings claims are paused: ${maintenanceAudit.reason || "fresh six-validator maintenance evidence is unavailable"}.`);
         else if (boundary.state === "mismatch") setTruth("bad", "Recovery checkpoint mismatch", "Exact H, H+1, chain identity, recovery epoch, validator set, domain, or manifest differs on a configured replica. Canonical and earnings claims are paused.");
         else if (fleet.state === "fork") setTruth("bad", "COMMON-HEIGHT FORK CONFIRMED", `Configured v3 replicas disagree at #${formatInteger(fleet.commonHeight)}. Stop canonical and reward claims until recovery selection is resolved.`);
@@ -604,7 +660,10 @@
         else setTruth("warn", "Canonical evidence is incomplete", `${publicationError || `Fleet ${fleet.state}; boundary ${boundary.state}`}. Missing evidence is not treated as success.`);
         text(elements.lastUpdated, `Updated ${new Date().toLocaleTimeString()}`);
       } catch (error) {
-        if (!signal.aborted) { renderContinuity({ state: "unknown", reason: error.message }); renderSources(null); setTruth("bad", "Dashboard audit failed", error.message); }
+        if (!signal.aborted) {
+          renderContinuity({ state: "unknown", reason: error.message }); renderSources(null); setTruth("bad", "Dashboard audit failed", error.message);
+          aqueduct?.clear({ tone: "bad", title: "Dashboard audit failed", detail: "The console could not complete its audit, so no blocks are drawn." });
+        }
       } finally {
         elements.refresh.classList.remove("spinning"); elements.refresh.disabled = false;
       }
@@ -639,6 +698,7 @@
         state.timer = window.setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_INTERVAL_MS);
       } catch (error) {
         setTruth("bad", "Dashboard configuration rejected", error.message);
+        aqueduct?.clear({ tone: "bad", title: "Configuration rejected", detail: "No canonical chain view is configured, so no blocks are drawn." });
         renderContinuity({ state: "unknown", reason: error.message });
       }
     })();

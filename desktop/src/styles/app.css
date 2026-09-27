@@ -191,33 +191,63 @@
   padding-left: 80px;
 }
 
-@media (max-width: 768px) {
-  .titlebar,
-  [data-platform="macos"] .titlebar {
-    padding: 0 var(--space-4);
-    padding-top: env(safe-area-inset-top);
-    height: calc(44px + env(safe-area-inset-top));
-  }
-  .titlebar-right .btn {
-    padding: 6px 10px;
-    font-size: 11px;
-  }
-}
-
 .titlebar-center {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  min-width: 0;
   font-size: var(--text-sm);
   color: var(--text-secondary);
   font-weight: var(--weight-medium);
+  white-space: nowrap;
+}
+
+.titlebar-sep {
+  opacity: 0.4;
 }
 
 .titlebar-right {
   display: flex;
   align-items: center;
   gap: var(--space-3);
+  flex-shrink: 0;
+  white-space: nowrap;
   -webkit-app-region: no-drag;
+}
+
+.titlebar-preview {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* Phone width: one line, always. The synthetic-preview label moves out (the
+   full preview banner stays on screen) and GitHub keeps only its icon. */
+@media (max-width: 768px) {
+  .titlebar,
+  [data-platform="macos"] .titlebar {
+    gap: var(--space-3);
+    padding: 0 var(--space-4);
+    padding-top: env(safe-area-inset-top);
+    height: calc(44px + env(safe-area-inset-top));
+  }
+  .titlebar-right {
+    gap: var(--space-2);
+  }
+  .titlebar-right .btn {
+    padding: 6px 10px;
+    font-size: 11px;
+  }
+  .titlebar-preview,
+  .titlebar-github-label {
+    display: none;
+  }
+  .titlebar-right .titlebar-github {
+    min-height: 32px;
+    padding: 6px 8px;
+  }
 }
 
 /* - Sidebar - */
@@ -232,83 +262,14 @@
   position: relative;
 }
 
-@media (max-width: 768px) {
-  .sidebar {
-    flex-direction: row;
-    align-items: center;
-    justify-content: space-around;
-    border-right: none;
-    border-top: 1px solid var(--border);
-    padding: 6px var(--space-2);
-    background: rgba(9, 9, 18, 0.92);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    padding-bottom: max(6px, env(safe-area-inset-bottom));
-  }
-  .sidebar-brand,
-  .sidebar-footer {
-    display: none;
-  }
-  .sidebar-nav {
-    flex-direction: row;
-    flex: 1;
-    justify-content: space-around;
-    gap: 0;
-  }
-  .nav-item {
-    flex: 1;
-    flex-direction: column;
-    gap: 2px;
-    padding: 8px 6px;
-    font-size: 10px;
-    font-weight: 500;
-    letter-spacing: 0;
-    text-align: center;
-  }
-  .nav-item svg {
-    width: 20px;
-    height: 20px;
-    margin: 0 auto;
-  }
-  .nav-item.active::before {
-    left: 50%;
-    top: -6px;
-    transform: translateX(-50%);
-    width: 24px;
-    height: 3px;
-  }
-}
-
+/* The real arc wordmark, the tagline under it. */
 .sidebar-brand {
   display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  margin-bottom: var(--space-6);
-}
-
-/* Retained for backwards-compat - LogoMark component replaces this. */
-.sidebar-logo {
-  width: 28px;
-  height: 28px;
-  border-radius: var(--radius-sm);
-  background: var(--arc);
-  display: grid;
-  place-items: center;
-  font-family: var(--font-display);
-  font-weight: var(--weight-medium);
-  font-size: 15px;
-  color: white;
-  letter-spacing: -0.045em;
-  box-shadow: var(--shadow-glow);
-}
-
-.sidebar-brand-name {
-  font-family: var(--font-display);
-  font-size: var(--text-lg);
-  font-weight: var(--weight-medium);
-  letter-spacing: -0.045em;
-  line-height: 1;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 7px;
+  padding: var(--space-2) var(--space-3) 0;
+  margin-bottom: var(--space-8);
 }
 
 .sidebar-nav {
@@ -380,11 +341,64 @@
   color: var(--text-secondary);
 }
 
+/* Phone width: the sidebar becomes a bottom tab bar. This block must come after the base sidebar rules above:
+   its selectors carry the same specificity, so placed earlier it lost the cascade and the bar showed the brand,
+   the footer, and a vertical nav spilling over the page. */
+@media (max-width: 768px) {
+  .sidebar {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-around;
+    border-right: none;
+    border-top: 1px solid var(--border);
+    padding: 6px var(--space-2);
+    background: rgba(9, 9, 18, 0.92);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    padding-bottom: max(6px, env(safe-area-inset-bottom));
+  }
+  .sidebar-brand,
+  .sidebar-footer {
+    display: none;
+  }
+  .sidebar-nav {
+    flex-direction: row;
+    flex: 1;
+    justify-content: space-around;
+    gap: 0;
+  }
+  .nav-item {
+    flex: 1;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 6px;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-align: center;
+  }
+  .nav-item svg {
+    width: 20px;
+    height: 20px;
+    margin: 0 auto;
+  }
+  .nav-item.active::before {
+    left: 50%;
+    top: -6px;
+    transform: translateX(-50%);
+    width: 24px;
+    height: 3px;
+  }
+}
+
 /* - Main area - */
+/* --main-pad is the scroll area's padding. Screens that reach edge to edge (the
+   dashboard's start-up stage, the chat's pinned composer) step back through it. */
 .main {
+  --main-pad: var(--space-8);
   grid-area: main;
   overflow-y: auto;
-  padding: var(--space-8);
+  padding: var(--main-pad);
   position: relative;
   z-index: var(--z-base);
 }
@@ -404,7 +418,7 @@
 
 @media (max-width: 768px) {
   .main {
-    padding: var(--space-5);
+    --main-pad: var(--space-5);
   }
   .page-header {
     flex-direction: column;
@@ -1053,23 +1067,6 @@
   min-height: 100vh;
 }
 
-/* Retained for backwards-compat - the LogoMark component is preferred. */
-.onboarding-logo {
-  width: 64px;
-  height: 64px;
-  border-radius: var(--radius-xl);
-  background: var(--arc);
-  box-shadow: var(--shadow-glow-strong);
-  display: grid;
-  place-items: center;
-  font-family: var(--font-display);
-  font-weight: var(--weight-medium);
-  font-size: 34px;
-  color: white;
-  letter-spacing: -0.045em;
-  margin: 0 auto var(--space-8);
-}
-
 .onboarding-title {
   font-family: var(--font-display);
   font-size: var(--text-4xl);
@@ -1407,3 +1404,86 @@
 
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin 1s linear infinite; }
+
+/* ── The start-up stage: while the node starts and catches up, the dashboard's visible area is the aqueduct ── */
+.start-stage {
+  position: relative;
+  display: block;
+  min-height: 320px;
+  margin: 0 0 var(--space-6);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: #002dde;
+  isolation: isolate;
+}
+.start-stage-art {
+  position: absolute !important;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+/* the words sit low, over the ground, so the channel along the top of the aqueduct stays clear for the water */
+.start-stage-top {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  padding: 72px clamp(18px, 3vw, 36px) clamp(18px, 3vw, 32px);
+  background: linear-gradient(0deg, rgba(0, 45, 222, 0.96) 0%, rgba(0, 45, 222, 0.84) 48%, rgba(0, 45, 222, 0) 100%);
+  pointer-events: none;
+}
+.start-stage-copy {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.start-stage-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: clamp(30px, 4.4vw, 56px);
+  line-height: 1.02;
+  color: #ffffff;
+}
+.start-stage-step {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.82);
+}
+.start-stage-actions {
+  display: flex;
+  gap: var(--space-2);
+  pointer-events: auto;
+}
+.start-stage-more {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 11px;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 35, 180, 0.6);
+  color: #ffffff;
+  font: 500 12.5px/1 var(--font-body, inherit);
+  cursor: pointer;
+}
+.start-stage-more:focus-visible {
+  outline: 2px solid #ffffff;
+  outline-offset: 2px;
+}
+@media (max-width: 768px) {
+  .start-stage-top {
+    padding-top: 56px;
+  }
+}

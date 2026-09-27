@@ -4,9 +4,13 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { api } from "./lib/tauri";
+import { initTheme } from "./lib/theme";
+import "./styles/fonts.css";
 import "./styles/tokens.css";
 import "./styles/reset.css";
 import "./styles/app.css";
+import "./styles/engraved.css";
+import "./styles/chat.css";
 
 // Stamp the platform on <html> so CSS can scope platform-specific chrome —
 // chiefly the 80px titlebar inset that clears macOS traffic lights and is
@@ -37,6 +41,8 @@ function stampPlatform() {
 }
 
 stampPlatform();
+// The theme is an attribute on <html>, set before the first paint (lib/theme.ts).
+initTheme();
 
 const queryClient = new QueryClient({
   defaultOptions: {

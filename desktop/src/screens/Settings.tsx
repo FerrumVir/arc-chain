@@ -9,6 +9,7 @@ import { formatInt } from "../lib/format";
 import { useAppStore } from "../lib/store";
 import { DEFAULT_NODE_CONFIG, type NodeConfig } from "../lib/types";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
+import { setTheme, useTheme, type Theme } from "../lib/theme";
 
 export function Settings() {
   const config = useAppStore((s) => s.config);
@@ -260,6 +261,11 @@ export function Settings() {
       <Card style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader title="Inference" />
         <InferenceModeToggle />
+      </Card>
+
+      <Card style={{ marginBottom: "var(--space-6)" }} data-testid="appearance-card">
+        <CardHeader title="Appearance" />
+        <AppearanceToggle />
       </Card>
 
       <Card style={{ marginBottom: "var(--space-6)" }}>
@@ -862,6 +868,28 @@ function InferenceModeToggle() {
           </div>
         </div>
       </label>
+    </div>
+  );
+}
+
+/** One switch for the whole look: the site's engraved language or the original dark theme (lib/theme.ts). */
+function AppearanceToggle() {
+  const theme = useTheme();
+  const options: { value: Theme; title: string; body: string }[] = [
+    { value: "engraved", title: "Engraved", body: "The website's language: white line on Arc blue, with engraved illustrations." },
+    { value: "classic", title: "Classic", body: "The original dark theme." },
+  ];
+  return (
+    <div style={{ display: "grid", gap: "var(--space-3)" }} role="radiogroup" aria-label="Appearance">
+      {options.map((o) => (
+        <label key={o.value} style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", cursor: "pointer" }}>
+          <input type="radio" name="appearance" checked={theme === o.value} onChange={() => setTheme(o.value)} data-testid={`theme-${o.value}`} />
+          <div>
+            <div style={{ fontWeight: 500 }}>{o.title}</div>
+            <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>{o.body} Saved on this device only.</div>
+          </div>
+        </label>
+      ))}
     </div>
   );
 }

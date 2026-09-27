@@ -237,10 +237,10 @@ export function Onboarding() {
                     marginBottom: "var(--space-8)",
                   }}
                 >
-                  <LogoMark size={64} radius={18} variant="gradient" />
-                  <Tagline size="sm" />
+                  <LogoMark size={84} radius={20} variant="gradient" />
+                  <Tagline size="md" />
                 </div>
-                <h1 className="onboarding-title">welcome to arc</h1>
+                <h1 className="onboarding-title">Welcome to Arc</h1>
                 <p className="onboarding-subtitle">
                   Run a node on your machine. Offer compatible compute. Verify
                   every result and reward from the selected chain host.
@@ -715,9 +715,9 @@ export function Onboarding() {
                   {launching ? (
                     <div
                       style={{
-                        width: 64,
-                        height: 64,
-                        borderRadius: 18,
+                        width: 84,
+                        height: 84,
+                        borderRadius: 20,
                         background: "var(--arc-gradient)",
                         display: "grid",
                         placeItems: "center",
@@ -725,10 +725,10 @@ export function Onboarding() {
                         boxShadow: "var(--shadow-glow-strong)",
                       }}
                     >
-                      <Loader2 size={26} className="spin" />
+                      <Loader2 size={28} className="spin" />
                     </div>
                   ) : (
-                    <LogoMark size={64} radius={18} variant="gradient" />
+                    <LogoMark size={84} radius={20} variant="gradient" />
                   )}
                 </div>
                 <h1 className="onboarding-title">
