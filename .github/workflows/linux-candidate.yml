@@ -183,6 +183,8 @@ jobs:
           ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle
           cargo test --locked --release -p arc-inference --features candle --example tensor_row_low_residency_export
           cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance
+          python3 scripts/qualification/test_row_relay_flush.py \
+            --binary target/release/examples/tensor_row_shared_worker
           python3 -m unittest discover -s scripts/qualification/tests -p 'test_*.py'
 
       - name: Package binaries and provenance
@@ -223,6 +225,7 @@ jobs:
             printf 'tests= ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle\n'
             printf 'tests= cargo test --locked --release -p arc-inference --features candle --example tensor_row_low_residency_export\n'
             printf 'tests= cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance\n'
+            printf 'tests= python3 scripts/qualification/test_row_relay_flush.py --binary target/release/examples/tensor_row_shared_worker\n'
             printf 'tests= python3 -m unittest discover -s scripts/qualification/tests -p test_*.py\n'
             rustc --version --verbose
             cargo --version

@@ -712,7 +712,25 @@ pub fn relay(socket: &Path) -> io::Result<()> {
             let _ = io::copy(&mut io::stdin().lock(), &mut input_stream);
             let _ = input_stream.shutdown(std::net::Shutdown::Write);
         })?;
-    io::copy(&mut stream, &mut io::stdout().lock())?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        output.write_all(&buffer[..read])?;
+        loop {
+            match output.flush() {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
     Ok(())
 }
 
