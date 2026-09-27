@@ -120,7 +120,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          set -Eeuo pipefail
           evidence_dir="$RUNNER_TEMP/recovered-v3-evidence"
           test_binary="$(cat "$evidence_dir/test-binary.path")"
           for attempt in 1 2 3; do
@@ -150,7 +149,14 @@ jobs:
         if: always()
         with:
           name: arc-recovered-v3-paid-lifecycle-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/recovered-v3-evidence/
+          path: |
+            ${{ runner.temp }}/recovered-v3-evidence/compile.log
+            ${{ runner.temp }}/recovered-v3-evidence/selector.log
+            ${{ runner.temp }}/recovered-v3-evidence/test-binary.path
+            ${{ runner.temp }}/recovered-v3-evidence/attempt-*/controller.log
+            ${{ runner.temp }}/recovered-v3-evidence/attempt-*/arc-p5-node-*.log
+            ${{ runner.temp }}/recovered-v3-evidence/attempt-*/metadata.txt
+            ${{ runner.temp }}/recovered-v3-evidence/attempt-*/exit-code.txt
           if-no-files-found: error
           retention-days: 14
 
