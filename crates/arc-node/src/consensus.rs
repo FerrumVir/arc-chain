@@ -5268,12 +5268,16 @@ mod tests {
             let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"history-test"), 1, 1);
             manager.engine.install_consensus_domain(domain).unwrap();
             manager.engine.install_recovery_cursor(64).unwrap();
-            // Recovery manifests require a nonzero baseline block hash and
-            // state root. A small funded genesis gives these regression
-            // fixtures a valid, deterministic state anchor without affecting
-            // their empty-transfer/retention assertions.
+            // with_genesis stores the height-0 sentinel, whose hash and root
+            // stay zero even when accounts are funded. Execute a canonical
+            // pre-recovery block so the generation pins a real state anchor.
             let state = StateDB::with_genesis(&[(keys[0].address(), 1)]);
-            let genesis = state.get_block(0).unwrap();
+            let (baseline, _) = state
+                .execute_block_verified_at(&[], keys[0].address(), 64)
+                .unwrap();
+            assert_ne!(baseline.hash, Hash256::ZERO);
+            assert_ne!(baseline.header.state_root, Hash256::ZERO);
+            assert_eq!(baseline.header.state_root, state.get_state_root());
             let store = GenerationStore::new(directory.path().join("dag"));
             let generation = store
                 .create_initial(
@@ -5284,9 +5288,9 @@ mod tests {
                             validator_set_commitment: manager.engine.frozen_validator_set_hash(),
                         },
                         baseline_state: BaselineState {
-                            height: 0,
-                            block_hash: genesis.hash,
-                            state_root: genesis.header.state_root,
+                            height: baseline.header.height,
+                            block_hash: baseline.hash,
+                            state_root: baseline.header.state_root,
                         },
                         dag_cursor: DagCursor {
                             committed_block_count: 0,
@@ -5462,7 +5466,8 @@ mod tests {
         let committed = f.manager.engine.try_commit();
         assert_eq!(committed.len(), 1);
         let leader = &committed[0];
-        f.state
+        let (baseline, _) = f
+            .state
             .execute_block_adaptive_at_with_proof(
                 &[],
                 leader.author,
@@ -5470,6 +5475,14 @@ mod tests {
                 leader.state_decision_commitment(&f.domain),
             )
             .unwrap();
+        assert_eq!(
+            baseline.header.height,
+            f.generation.manifest.baseline_state.height + 1
+        );
+        assert_eq!(
+            baseline.header.parent_hash,
+            f.generation.manifest.baseline_state.block_hash
+        );
         f.manager.persist_dag_commit(&f.state, leader).unwrap();
         let records = f.records();
         let summary = f
@@ -5480,7 +5493,6 @@ mod tests {
                 |_| Ok(()),
             )
             .unwrap();
-        let baseline = f.state.get_block(1).unwrap();
         let retained: Vec<_> = records
             .into_iter()
             .filter(|r| r.round >= 66 && r.kind != RetainedRecordKind::Commit)
@@ -5493,7 +5505,7 @@ mod tests {
                 GenerationInput {
                     binding: f.generation.manifest.binding.clone(),
                     baseline_state: BaselineState {
-                        height: 1,
+                        height: baseline.header.height,
                         block_hash: baseline.hash,
                         state_root: baseline.header.state_root,
                     },
@@ -5595,7 +5607,11 @@ mod tests {
         f.import(&blocks, std::slice::from_ref(&attached)).unwrap();
         for body in bodies {
             assert_eq!(*f.latest.get(&body.hash.0).unwrap(), 65);
-            assert!(f.pending.get(&body.hash.0).unwrap().sig_verified);
+            // Existing pending entries need not have their cache bit changed;
+            // signed payload identity and authentication are the invariant.
+            let retained = f.pending.get(&body.hash.0).unwrap();
+            assert_eq!(retained.hash, body.hash);
+            retained.verify_signature().unwrap();
         }
         let records = f.records();
         let mut available = std::collections::HashSet::new();
