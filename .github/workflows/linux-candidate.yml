@@ -51,7 +51,7 @@ jobs:
             --example qualify_recovered_native_boundary
           cargo build --locked --release -p arc-inference \
             --example tensor_row_stdio_worker --example tensor_row_low_residency_export \
-            --example tensor_row_shared_worker --features candle
+            --example tensor_row_shared_worker --example low_residency_conformance --features candle
 
       - name: Check changed crates and examples in both feature modes
         run: |
@@ -69,6 +69,8 @@ jobs:
           cargo test --locked --release -p arc-node --bin arc-node --features candle legacy_v3_wire
           cargo test --locked --release -p arc-inference --lib --features candle
           ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle
+          cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance
+          python3 -m unittest discover -s scripts/qualification/tests -p 'test_*.py'
 
       - name: Package binaries and provenance
         env:
@@ -85,6 +87,8 @@ jobs:
             "$RUNNER_TEMP/linux-candidate/"
           cp target/release/examples/tensor_row_shared_worker \
             "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/low_residency_conformance \
+            "$RUNNER_TEMP/linux-candidate/"
           {
             printf 'repository=%s\n' "$GITHUB_REPOSITORY"
             printf 'commit=%s\n' "$CANDIDATE_SHA"
@@ -93,7 +97,7 @@ jobs:
             printf 'workflow_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
             printf 'runner=%s\n' "$ImageOS $ImageVersion"
             printf 'build= cargo build --locked --release -p arc-node --features candle --bin arc-node --example qualify_recovered_native_boundary\n'
-            printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --example tensor_row_low_residency_export --example tensor_row_shared_worker --features candle\n'
+            printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --example tensor_row_low_residency_export --example tensor_row_shared_worker --example low_residency_conformance --features candle\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node --features candle\n'
             printf 'tests= cargo test --locked --release -p arc-assign\n'
@@ -103,6 +107,8 @@ jobs:
             printf 'tests= cargo test --locked --release -p arc-node --bin arc-node --features candle legacy_v3_wire\n'
             printf 'tests= cargo test --locked --release -p arc-inference --lib --features candle\n'
             printf 'tests= ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle\n'
+            printf 'tests= cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance\n'
+            printf 'tests= python3 -m unittest discover -s scripts/qualification/tests -p test_*.py\n'
             rustc --version --verbose
             cargo --version
           } > "$RUNNER_TEMP/linux-candidate/PROVENANCE.txt"
@@ -114,3 +120,115 @@ jobs:
           path: ${{ runner.temp }}/linux-candidate/
           if-no-files-found: error
           retention-days: 7
+
+  real-model-conformance:
+    name: Fresh-runner real-model conformance
+    if: github.ref == 'refs/heads/arc-native-low-residency-20260927'
+    needs: [linux-candidate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: arc-linux-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-candidate
+
+      - name: Download, verify, and qualify exact model on fresh runner
+        env:
+          MODEL_PATH: ${{ runner.temp }}/model/llama-2-7b-chat.Q4_K_M.gguf
+          CANDIDATE_DIR: ${{ runner.temp }}/linux-candidate
+          EVIDENCE_DIR: ${{ runner.temp }}/real-model-conformance
+          RESULT_DIR: ${{ runner.temp }}/real-model-output
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$(dirname "$MODEL_PATH")" "$EVIDENCE_DIR"
+          exec > >(tee "$EVIDENCE_DIR/job.log") 2>&1
+          status=0
+          (cd "$CANDIDATE_DIR" && sha256sum -c SHA256SUMS) || status=$?
+          grep -Fx "repository=$GITHUB_REPOSITORY" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
+          grep -Fx "commit=$GITHUB_SHA" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
+          grep -Fx "workflow_run_id=$GITHUB_RUN_ID" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
+          grep -Fx "workflow_run_attempt=$GITHUB_RUN_ATTEMPT" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
+          for binary in arc-node qualify_recovered_native_boundary tensor_row_stdio_worker tensor_row_low_residency_export tensor_row_shared_worker low_residency_conformance; do
+            test -f "$CANDIDATE_DIR/$binary" || { echo "missing candidate binary: $binary"; status=1; }
+            test ! -L "$CANDIDATE_DIR/$binary" || { echo "candidate binary is symlink: $binary"; status=1; }
+            chmod +x "$CANDIDATE_DIR/$binary" || status=1
+          done
+          python3 - <<'PY' || status=$?
+          import json, os, shutil
+          mem = {}
+          for line in open('/proc/meminfo'):
+              if line.startswith(('MemTotal:', 'MemAvailable:')):
+                  key, value, *_ = line.split(); mem[key[:-1]] = int(value) * 1024
+          disk = shutil.disk_usage(os.environ['RUNNER_TEMP'])
+          report = {'mem_bytes': mem, 'disk_total_bytes': disk.total, 'disk_free_bytes': disk.free}
+          with open(os.path.join(os.environ['EVIDENCE_DIR'], 'runner-resources.json'), 'w') as f:
+              json.dump(report, f, indent=2); f.write('\n')
+          if mem.get('MemAvailable', 0) < 12 * 1024**3 or disk.free < 12 * 1024**3:
+              raise SystemExit('fresh runner below real-model conformance resource floor')
+          PY
+          if [ "$status" -eq 0 ]; then
+            curl --fail --location --retry 2 --retry-all-errors --retry-max-time 600 --connect-timeout 15 --max-time 300 --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$MODEL_PATH" \
+              https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            actual_size="$(wc -c < "$MODEL_PATH" | tr -d ' ')"
+            [ "$actual_size" = 4081004224 ] || { echo "model size mismatch: $actual_size"; status=1; }
+          fi
+          if [ "$status" -eq 0 ]; then
+            printf '%s  %s\n' 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa "$MODEL_PATH" | sha256sum -c - || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            timeout --signal=TERM --kill-after=30s 40m python3 scripts/qualification/run_low_residency_conformance.py \
+              --binaries-dir "$CANDIDATE_DIR" --model "$MODEL_PATH" \
+              --output-dir "$RESULT_DIR" --prompt-ids 6324 --max-tokens 2 \
+              --warmups 0 --kernel scalar --total-timeout-seconds 2100 > "$EVIDENCE_DIR/runner.log" 2>&1 || status=$?
+            cat "$EVIDENCE_DIR/runner.log"
+            python3 - "$RESULT_DIR/summary.json" <<'PY' || status=$?
+          import json, sys
+          if json.load(open(sys.argv[1])).get('pass') is not True:
+              raise SystemExit('runner exited without a passing summary record')
+          PY
+          fi
+          if [ -d "$RESULT_DIR" ]; then
+            python3 - "$RESULT_DIR" "$EVIDENCE_DIR/results" <<'PY' || status=$?
+          import os, pathlib, shutil, sys
+          src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]); dst.mkdir(exist_ok=True)
+          # Retain only small textual/JSON evidence; never include GGUF or row bundle payloads.
+          allowed={'.json','.log','.txt'}
+          for p in src.rglob('*'):
+              manifest = p.name == 'manifest.json' and len(p.relative_to(src).parts) == 3 and p.relative_to(src).parts[0] == 'bundles'
+              if not p.is_file() or (p.suffix.lower() not in allowed and not manifest): continue
+              if 'bundles' in p.relative_to(src).parts and not manifest: continue
+              if p.stat().st_size > 2 * 1024 * 1024: continue
+              q=dst/p.relative_to(src);q.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(p,q)
+          PY
+          fi
+          printf '%s\n' "$status" > "$EVIDENCE_DIR/exit-code.txt"
+          python3 - "$EVIDENCE_DIR/result.json" "$status" <<'PY' || status=$?
+          import json, sys, time
+          with open(sys.argv[1], 'w') as f:
+              json.dump({'exit_code': int(sys.argv[2]), 'finished_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}, f, indent=2); f.write('\n')
+          PY
+          exit "$status"
+
+      - name: Retain conformance evidence (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-real-model-conformance-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/real-model-conformance/
+            ${{ runner.temp }}/real-model-output/**/*.json
+            ${{ runner.temp }}/real-model-output/**/*.log
+            ${{ runner.temp }}/real-model-output/**/*.txt
+          if-no-files-found: warn
+          retention-days: 14

@@ -139,3 +139,7 @@ required-features = ["candle"]
 [[example]]
 name = "tensor_row_low_residency_export"
 required-features = ["candle"]
+
+[[example]]
+name = "low_residency_conformance"
+required-features = ["candle"]

@@ -131,3 +131,59 @@ Run existing independent golden
 vectors as well, because a shared forward routine alone cannot establish an
 independent numerical oracle. None of these tests establishes real-model quality,
 8 GiB RSS, network performance or production readiness.
+
+## Offline real-model comparison
+
+Build the candle example `low_residency_conformance` alongside
+`tensor_row_low_residency_export` and `tensor_row_shared_worker`. On an isolated
+Linux runner with the already downloaded, pinned artifact, run:
+
+```sh
+python3 scripts/qualification/run_low_residency_conformance.py \
+  --binaries-dir /absolute/path/to/examples \
+  --model /absolute/path/to/llama2-7b.gguf \
+  --output-dir /absolute/path/to/new-result-directory
+```
+
+The runner downloads nothing. It verifies the package's SHA-256/size and the
+executor verifies its BLAKE3. Defaults are explicit prompt IDs `[6324]` (without
+BOS), two generated tokens, no warmup, and the scalar kernel. Optional
+`--prompt-ids`, `--max-tokens 1..4`, `--warmups 0..1`, and `--kernel scalar|fast`
+are recorded in every result. Each run uses fresh processes and a fresh output
+directory; scalar/fast timings must not be pooled. The caller must keep the GGUF
+immutable throughout the run; the resident reference rechecks its digest after
+execution as well as before loading.
+
+The runner first checks actual Linux `MemAvailable`, physical RAM, cgroup limits
+and free disk. An unreadable cgroup memory constraint refuses; the optional
+`memory.peak` observation may be unavailable. The resident-reference preflight requires at least
+12 GiB available (or the calculated model/KV payload plus 3 GiB, whichever is
+larger). This margin is an admission check, not a measured startup bound. Lower
+capacity refuses instead of running the reference amid memory pressure.
+The reference process completes and exits before any row preparation starts.
+The existing bounded exporter then creates complete layer/output bundles under
+the 1 GiB limit, and separate shared-daemon processes load each bundle exactly
+once. The low-residency coordinator uses the actual Unix row protocol, complete
+remote primary coverage, a local duplicate row and three local numerical spot
+rows per projection. It has no resident reference or full-model fallback.
+
+The reference uses the existing resident `forward_one_token` path, independently
+of the backend forward being tested. Both runs replay generation-v2 selection,
+including BOS once, repetition penalty, EOS inclusion and the final non-EOS
+forward. Each records every position's input token, logit count, BLAKE3 of the
+little-endian i64 logits, complete KV digest, generated IDs and output hash.
+The runner compares these exact commitments and identities, excluding timing.
+Warmup runs, when requested, have their own traces and are compared separately.
+
+`summary.json` reports success only after this comparison; phase JSON, worker
+manifests, process arguments and stderr logs remain available on failure.
+Termination reaps child process groups before removing the private socket
+directory. Every child must exit zero for success, including daemon shutdown;
+forced cleanup cannot pass. The default global deadline is 2700 seconds
+(`--total-timeout-seconds`, 60..5400); cleanup and evidence writing follow it.
+The CI job must reserve time afterward for evidence upload. Row exports remain under `bundles/`; do not upload those large files
+as CI logs. The reported 100 ms aggregate RSS sampling can miss peaks, per-process
+`getrusage` excludes other processes, and an existing cgroup peak can contain
+earlier or unrelated work. These limitations are included in the result.
+This exercise establishes neither the production SSH/cohort path nor quality,
+paid execution, real-host capacity or distributed latency qualification.
