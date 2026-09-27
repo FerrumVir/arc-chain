@@ -24245,7 +24245,7 @@ mod tests {
         assert_eq!(info["native_only_chain"], false);
         assert_eq!(info["request_admission_open"], false);
         node.native_request_admission = Arc::new(NativeRequestAdmission::ready_for_test());
-        submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
+        let _ = submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
             .await
             .unwrap();
         assert_eq!(node.mempool.drain(1)[0].hash, tx.hash);
@@ -24297,7 +24297,7 @@ mod tests {
                 .unwrap_err(),
             StatusCode::BAD_REQUEST
         );
-        submit_signed_tx(AxumState(node.clone()), Json(finalize.clone()))
+        let _ = submit_signed_tx(AxumState(node.clone()), Json(finalize.clone()))
             .await
             .unwrap();
         commit(&state, &node.mempool.drain(1));
@@ -24316,7 +24316,7 @@ mod tests {
         state
             .sign_transaction(&mut after_native, &requester)
             .unwrap();
-        submit_signed_tx(AxumState(node.clone()), Json(after_native))
+        let _ = submit_signed_tx(AxumState(node.clone()), Json(after_native))
             .await
             .unwrap();
         commit(&state, &node.mempool.drain(1));
@@ -24366,7 +24366,7 @@ mod tests {
             &bincode::serialize(&refund).unwrap()
         ));
         node.mempool.drain(1);
-        submit_signed_tx(AxumState(node.clone()), Json(refund))
+        let _ = submit_signed_tx(AxumState(node.clone()), Json(refund))
             .await
             .unwrap();
         commit(&reopened, &node.mempool.drain(1));
