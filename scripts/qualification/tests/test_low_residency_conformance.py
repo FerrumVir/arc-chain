@@ -1,6 +1,7 @@
 """Small offline runner tests. No model, network, compiler or resident weights."""
 import copy
 import importlib.util
+import io
 import os
 from pathlib import Path
 import sys
@@ -168,6 +169,98 @@ class ResourcesAndProcesses(unittest.TestCase):
                                            {"name": "daemon", "returncode": status}])
         runner.require_clean_exits([{"name": "reference", "returncode": 0},
                                    {"name": "daemon", "returncode": 0}])
+
+
+class PartialLayout(unittest.TestCase):
+    def fixture(self):
+        graph = dict(layers=2, width=7, kv_width=5, ff_width=11, vocab=13)
+        specs, manifests = [], []
+        for rank in range(3):
+            worker = f"proof-{rank:03}"
+            spec = dict(worker_id=worker, layers=[0, 1], include_output=True,
+                        row_partition=f"{rank}/3", serialized_row_bytes=1500)
+            files = []
+            shapes = {"wq": 7, "wk": 5, "wv": 5, "wo": 7, "w_gate": 11, "w_up": 11, "w_down": 7}
+            stages = [(layer, tensor, rows) for layer in range(2) for tensor, rows in shapes.items()]
+            stages.append((None, "lm_head", 13))
+            for layer, tensor, rows in stages:
+                files.append(dict(bytes=100, assignment=dict(artifact_id="a" * 64, execution_profile=runner.PROFILE,
+                    layer=layer, tensor=tensor, worker_id=worker, row_start=rows * rank // 3,
+                    row_end=rows * (rank + 1) // 3)))
+            manifests.append(dict(format="arc.tensor-row-offline-partition-bundle.v1",
+                row_partition=dict(rank=rank, count=3), artifact_blake3="a" * 64,
+                execution_profile=runner.PROFILE, worker_id=worker, serialized_row_bytes=1500, files=files))
+            specs.append(spec)
+        return dict(graph=graph, layout="partial-rows", row_partitions=3, bundles=specs,
+                    total_row_file_bytes=4500), manifests
+
+    def test_uneven_disjoint_layout_includes_output_head_on_every_worker(self):
+        plan, manifests = self.fixture()
+        runner.validate_layout_plan(plan, 3)
+        for spec, manifest in zip(plan["bundles"], manifests):
+            runner.validate_export_manifest(spec, manifest, plan, "a" * 64)
+        for stage in range(15):
+            assignments = [manifest["files"][stage]["assignment"] for manifest in manifests]
+            self.assertEqual(assignments[0]["row_start"], 0)
+            self.assertEqual(assignments[0]["row_end"], assignments[1]["row_start"])
+            self.assertEqual(assignments[1]["row_end"], assignments[2]["row_start"])
+            self.assertEqual(len({a["worker_id"] for a in assignments}), 3)
+        self.assertEqual(assignments[-1]["tensor"], "lm_head")
+        self.assertEqual(assignments[-1]["row_end"], 13)
+
+    def test_ignored_layout_flags_duplicate_worker_and_capacity_refuse(self):
+        for case in range(6):
+            plan, _ = self.fixture()
+            if case == 0:
+                plan["layout"] = "layers"
+            elif case == 1:
+                plan["bundles"][1]["worker_id"] = plan["bundles"][0]["worker_id"]
+            elif case == 2:
+                plan["bundles"][2]["row_partition"] = "0/3"
+            elif case == 3:
+                plan["bundles"][0]["serialized_row_bytes"] = runner.GIB + 1
+            elif case == 4:
+                plan["bundles"][0]["include_output"] = False
+            else:
+                plan["bundles"][0]["layers"] = [0]
+            with self.subTest(case=case), self.assertRaises(RuntimeError):
+                runner.validate_layout_plan(plan, 3)
+
+    def test_exported_gaps_overlap_alias_missing_head_or_changed_identity_refuse(self):
+        for case in range(10):
+            plan, manifests = self.fixture()
+            manifest = manifests[1]
+            assignment = manifest["files"][0]["assignment"]
+            if case == 0:
+                assignment["row_start"] += 1
+            elif case == 1:
+                assignment["row_end"] += 1
+            elif case == 2:
+                assignment["worker_id"] = "alias"
+            elif case == 3:
+                assignment["artifact_id"] = "b" * 64
+            elif case == 4:
+                assignment["execution_profile"] = "wrong"
+            elif case == 5:
+                manifest["files"].pop()  # LMHead
+            elif case == 6:
+                manifest["files"].append(copy.deepcopy(manifest["files"][0]))
+            elif case == 7:
+                manifest["resident_layers"] = [[0, 2]]
+            elif case == 8:
+                manifest["row_partition"]["rank"] = 0
+            else:
+                manifest["format"] = "arc.tensor-row-low-residency-bundle.v1"
+            with self.subTest(case=case), self.assertRaises(RuntimeError):
+                runner.validate_export_manifest(plan["bundles"][1], manifest, plan, "a" * 64)
+
+    def test_cli_defaults_to_layers_and_bounds_partial_proof(self):
+        args = ["--binaries-dir", "/bin", "--model", "/tiny.gguf", "--output-dir", "/proof"]
+        self.assertIsNone(runner.parser().parse_args(args).row_partitions)
+        self.assertEqual(runner.parser().parse_args(args + ["--row-partitions", "7"]).row_partitions, 7)
+        for count in (0, 1, 17, 32):
+            with self.subTest(count=count), patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+                runner.parser().parse_args(args + ["--row-partitions", str(count)])
 
 
 if __name__ == "__main__":

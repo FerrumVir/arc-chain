@@ -3,7 +3,12 @@
 //! before exporting or starting row daemons. This is not a readiness/quality gate.
 
 #[cfg(unix)]
+#[path = "support/row_partition.rs"]
+mod row_partition;
+
+#[cfg(unix)]
 mod unix {
+    use super::row_partition::RowPartition;
     use arc_crypto::Hash256;
     use arc_inference::cached_integer_model::{
         GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE as PROFILE, KVCache, ModelConfig,
@@ -11,14 +16,15 @@ mod unix {
     };
     use arc_inference::low_residency::{CanonicalRowSource, load_low_residency_model};
     use arc_inference::tensor_parallel::{
-        MAX_CANONICAL_ROW_FILE_BYTES, MAX_ROW_FRAME_BYTES, PlannedSlice, ProjectionPlan,
-        RowAssignment, RowEvent, RowEventSink, RowProjectionRequest, RowProjectionResponse,
-        RowWorker, SliceOwner, TensorKey, TensorParallelError, VerifiedPartitionBackend,
-        decode_row_response, encode_row_request, hash_i64,
+        MAX_CANONICAL_ROW_FILE_BYTES, MAX_ROW_FRAME_BYTES, MAX_ROW_WORKERS_PER_STAGE, PlannedSlice,
+        ProjectionPlan, RowAssignment, RowEvent, RowEventSink, RowProjectionRequest,
+        RowProjectionResponse, RowWorker, SliceOwner, TensorKey, TensorParallelError,
+        VerifiedPartitionBackend, decode_row_response, encode_row_request, hash_i64,
+        validate_exact_coverage,
     };
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
@@ -161,8 +167,32 @@ mod unix {
         layers: Vec<usize>,
         include_output: bool,
         serialized_row_bytes: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        row_partition: Option<String>,
     }
-    fn inspect(model: &impl CanonicalRowSource) -> Result<Value, String> {
+    // The first row of each owner is a separate, locally duplicated slice.
+    // The strict executor's slice cap therefore bounds proof partitions to 16.
+    fn proof_partition_count(value: Option<&str>) -> Result<Option<usize>, String> {
+        value
+            .map(|value| {
+                let count = value
+                    .parse::<usize>()
+                    .map_err(|_| "invalid row partition count")?;
+                if !(2..=MAX_ROW_WORKERS_PER_STAGE / 2).contains(&count) {
+                    return Err(format!(
+                        "offline proof row partitions must be 2..={}",
+                        MAX_ROW_WORKERS_PER_STAGE / 2
+                    ));
+                }
+                Ok(count)
+            })
+            .transpose()
+    }
+
+    fn inspect(
+        model: &impl CanonicalRowSource,
+        partitions: Option<usize>,
+    ) -> Result<Value, String> {
         let tensors = [
             TensorKey::Wq,
             TensorKey::Wk,
@@ -172,24 +202,62 @@ mod unix {
             TensorKey::WUp,
             TensorKey::WDown,
         ];
-        let bytes = |layer, tensor, id: &str| -> Result<usize, String> {
-            let (rows, cols) = model
-                .projection_shape(layer, tensor)
-                .ok_or("missing stage")?;
-            rows.checked_mul(cols + 8)
-                .and_then(|n| n.checked_add(85 + PROFILE.len() + id.len()))
-                .ok_or_else(|| "row size overflow".into())
-        };
+        let bytes =
+            |layer, tensor, id: &str, partition: Option<RowPartition>| -> Result<usize, String> {
+                let (rows, cols) = model
+                    .projection_shape(layer, tensor)
+                    .ok_or("missing stage")?;
+                let (start, end) = partition
+                    .unwrap_or(RowPartition { rank: 0, count: 1 })
+                    .range(rows)?;
+                (end - start)
+                    .checked_mul(cols + 8)
+                    .and_then(|n| n.checked_add(85 + PROFILE.len() + id.len()))
+                    .ok_or_else(|| "row size overflow".into())
+            };
+        if let Some(count) = partitions {
+            // Preflight EVERY bundle before the runner can start any export.
+            let mut bundles = Vec::new();
+            for rank in 0..count {
+                let id = format!("proof-{rank:03}");
+                let partition = Some(RowPartition::parse(&format!("{rank}/{count}"))?);
+                let mut total = bytes(None, TensorKey::LmHead, &id, partition)?;
+                for layer in 0..model.config().n_layers {
+                    for tensor in tensors {
+                        total = total
+                            .checked_add(bytes(Some(layer), tensor, &id, partition)?)
+                            .ok_or("bundle size overflow")?;
+                    }
+                }
+                if total > MAX_CANONICAL_ROW_FILE_BYTES {
+                    return Err(
+                        "partial-row bundle exceeds 1 GiB; increase --row-partitions".into(),
+                    );
+                }
+                bundles.push(ExportBundle {
+                    worker_id: id,
+                    layers: (0..model.config().n_layers).collect(),
+                    include_output: true,
+                    serialized_row_bytes: total,
+                    row_partition: Some(format!("{rank}/{count}")),
+                });
+            }
+            return Ok(json!({"graph": graph(model.config()), "bundles": bundles,
+                "layout": "partial-rows", "row_partitions": count,
+                "total_row_file_bytes": bundles.iter().map(|b| b.serialized_row_bytes).sum::<usize>(),
+                "kv_bytes_per_position": model.config().n_layers * model.config().d_kv * 16}));
+        }
         let mut bundles = Vec::new();
         let mut current = ExportBundle {
             worker_id: "proof-000".into(),
             layers: Vec::new(),
             include_output: false,
             serialized_row_bytes: 0,
+            row_partition: None,
         };
         for layer in 0..model.config().n_layers {
             let size = tensors.iter().try_fold(0usize, |sum, &t| {
-                sum.checked_add(bytes(Some(layer), t, &current.worker_id)?)
+                sum.checked_add(bytes(Some(layer), t, &current.worker_id, None)?)
                     .ok_or_else(|| "layer size overflow".to_string())
             })?;
             if size > MAX_CANONICAL_ROW_FILE_BYTES {
@@ -202,6 +270,7 @@ mod unix {
                     layers: Vec::new(),
                     include_output: false,
                     serialized_row_bytes: 0,
+                    row_partition: None,
                 };
             }
             current.layers.push(layer);
@@ -210,7 +279,7 @@ mod unix {
         bundles.push(current);
         let mut placed = false;
         for bundle in &mut bundles {
-            let output = bytes(None, TensorKey::LmHead, &bundle.worker_id)?;
+            let output = bytes(None, TensorKey::LmHead, &bundle.worker_id, None)?;
             if bundle.serialized_row_bytes + output <= MAX_CANONICAL_ROW_FILE_BYTES {
                 bundle.include_output = true;
                 bundle.serialized_row_bytes += output;
@@ -223,9 +292,11 @@ mod unix {
                 "no layer bundle has output-head capacity; choose smaller layer groups".into(),
             );
         }
-        Ok(json!({"graph": graph(model.config()), "bundles": bundles,
+        Ok(
+            json!({"graph": graph(model.config()), "bundles": bundles, "layout": "layers",
             "total_row_file_bytes": bundles.iter().map(|b| b.serialized_row_bytes).sum::<usize>(),
-            "kv_bytes_per_position": model.config().n_layers * model.config().d_kv * 16}))
+            "kv_bytes_per_position": model.config().n_layers * model.config().d_kv * 16}),
+        )
     }
 
     // Local offline adapter: actual daemon processes, identical bounded row
@@ -283,7 +354,7 @@ mod unix {
             false
         }
     }
-    #[derive(Deserialize)]
+    #[derive(Clone, Deserialize)]
     struct Worker {
         worker_id: String,
         socket: String,
@@ -291,25 +362,127 @@ mod unix {
     }
     type Plans = BTreeMap<(Option<usize>, TensorKey), ProjectionPlan>;
     type Workers = BTreeMap<String, Arc<dyn RowWorker>>;
+    // Validate the complete manifest union before opening any socket. The
+    // profile/identity/range gates are identical for whole and partial rows.
+    fn plans_from_entries(
+        entries: &[Worker],
+        model: &impl CanonicalRowSource,
+        artifact: Hash256,
+        partitions: Option<usize>,
+    ) -> Result<Plans, String> {
+        if entries.is_empty() || entries.len() > 64 {
+            return Err("worker count outside 1..64".into());
+        }
+        if partitions.is_some_and(|count| entries.len() != count) {
+            return Err("partial layout requires exactly the declared worker count".into());
+        }
+        let mut ids = BTreeSet::new();
+        let mut sockets = BTreeSet::new();
+        let mut grouped: BTreeMap<_, Vec<RowAssignment>> = BTreeMap::new();
+        for entry in entries {
+            if entry.worker_id.is_empty()
+                || entry.worker_id.len() > 64
+                || entry.worker_id.chars().any(char::is_whitespace)
+                || !ids.insert(&entry.worker_id)
+                || !sockets.insert(&entry.socket)
+                || entry.assignments.is_empty()
+            {
+                return Err(
+                    "empty, duplicate or invalid worker identity/socket/assignments".into(),
+                );
+            }
+            let mut stages = BTreeSet::new();
+            for assignment in &entry.assignments {
+                let key = (assignment.layer, assignment.tensor);
+                if assignment.worker_id != entry.worker_id || !stages.insert(key) {
+                    return Err("assignment has wrong worker or duplicate stage owner".into());
+                }
+                grouped.entry(key).or_default().push(assignment.clone());
+            }
+        }
+        let tensors = [
+            TensorKey::Wq,
+            TensorKey::Wk,
+            TensorKey::Wv,
+            TensorKey::Wo,
+            TensorKey::WGate,
+            TensorKey::WUp,
+            TensorKey::WDown,
+        ];
+        let keys = (0..model.config().n_layers)
+            .flat_map(|layer| tensors.into_iter().map(move |tensor| (Some(layer), tensor)))
+            .chain(std::iter::once((None, TensorKey::LmHead)));
+        let mut plans = BTreeMap::new();
+        for key in keys {
+            let (rows, _) = model
+                .projection_shape(key.0, key.1)
+                .ok_or("missing model projection")?;
+            let assignments = grouped.remove(&key).ok_or("missing manifest projection")?;
+            let ordered =
+                validate_exact_coverage(&assignments, artifact, PROFILE, key.0, key.1, rows)
+                    .map_err(|error| error.to_string())?;
+            if partitions.is_some_and(|count| ordered.len() != count) {
+                return Err("projection lacks distinct partial-row owners".into());
+            }
+            let mut slices = Vec::new();
+            for (rank, assignment) in ordered.iter().enumerate() {
+                if let Some(count) = partitions {
+                    let expected = RowPartition { rank, count }.range(rows)?;
+                    if (assignment.row_start, assignment.row_end) != expected {
+                        return Err(
+                            "manifest ranges differ from deterministic partial-row layout".into(),
+                        );
+                    }
+                }
+                let owner = SliceOwner::Remote(assignment.worker_id.clone());
+                // Bounded independent numerical verification of EVERY owner;
+                // every primary row, including the checked one, stays remote.
+                slices.push(PlannedSlice {
+                    owner: owner.clone(),
+                    row_start: assignment.row_start,
+                    row_end: assignment.row_start + 1,
+                    duplicate_on: Some(SliceOwner::Local),
+                });
+                if assignment.row_end > assignment.row_start + 1 {
+                    slices.push(PlannedSlice {
+                        owner,
+                        row_start: assignment.row_start + 1,
+                        row_end: assignment.row_end,
+                        duplicate_on: None,
+                    });
+                }
+            }
+            if slices.len() > MAX_ROW_WORKERS_PER_STAGE {
+                return Err("verified slice count exceeds executor bound".into());
+            }
+            plans.insert(
+                key,
+                ProjectionPlan {
+                    slices,
+                    spot_rows: vec![0, rows / 2, rows - 1],
+                },
+            );
+        }
+        if !grouped.is_empty() {
+            return Err("unknown manifest projection".into());
+        }
+        Ok(plans)
+    }
+
     fn connect(
         path: &Path,
         model: &impl CanonicalRowSource,
         artifact: Hash256,
+        partitions: Option<usize>,
     ) -> Result<(Plans, Workers), String> {
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
         if file.metadata().map_err(|e| e.to_string())?.len() > 1024 * 1024 {
             return Err("workers config exceeds 1 MiB".into());
         }
         let entries: Vec<Worker> = serde_json::from_reader(file).map_err(|e| e.to_string())?;
-        if entries.is_empty() || entries.len() > 64 {
-            return Err("worker count outside 1..64".into());
-        }
-        let mut plans = BTreeMap::new();
+        let plans = plans_from_entries(&entries, model, artifact, partitions)?;
         let mut workers: Workers = BTreeMap::new();
         for entry in entries {
-            if workers.contains_key(&entry.worker_id) {
-                return Err("duplicate worker ID".into());
-            }
             let stream = UnixStream::connect(&entry.socket).map_err(|e| e.to_string())?;
             stream
                 .set_read_timeout(Some(Duration::from_secs(180)))
@@ -318,48 +491,9 @@ mod unix {
                 .set_write_timeout(Some(Duration::from_secs(180)))
                 .map_err(|e| e.to_string())?;
             workers.insert(
-                entry.worker_id.clone(),
+                entry.worker_id,
                 Arc::new(SocketWorker(Mutex::new(Some(stream)))),
             );
-            for assignment in entry.assignments {
-                let key = (assignment.layer, assignment.tensor);
-                let (rows, _) = model
-                    .projection_shape(key.0, key.1)
-                    .ok_or("unknown projection")?;
-                if assignment.artifact_id != artifact
-                    || assignment.execution_profile != PROFILE
-                    || assignment.worker_id != entry.worker_id
-                    || assignment.row_start != 0
-                    || assignment.row_end != rows
-                    || rows < 2
-                    || plans.contains_key(&key)
-                {
-                    return Err("worker manifest identity/coverage differs from model".into());
-                }
-                // One duplicate row plus first/middle/last local spot checks;
-                // every primary row is still remote, including the output head.
-                let owner = SliceOwner::Remote(entry.worker_id.clone());
-                plans.insert(
-                    key,
-                    ProjectionPlan {
-                        slices: vec![
-                            PlannedSlice {
-                                owner: owner.clone(),
-                                row_start: 0,
-                                row_end: 1,
-                                duplicate_on: Some(SliceOwner::Local),
-                            },
-                            PlannedSlice {
-                                owner,
-                                row_start: 1,
-                                row_end: rows,
-                                duplicate_on: None,
-                            },
-                        ],
-                        spot_rows: vec![0, rows / 2, rows - 1],
-                    },
-                );
-            }
         }
         Ok((plans, workers))
     }
@@ -379,6 +513,7 @@ mod unix {
                     "--max-tokens",
                     "--warmups",
                     "--workers",
+                    "--row-partitions",
                     "--output",
                 ]
                 .contains(&pair[0].as_str())
@@ -416,10 +551,11 @@ mod unix {
         if prompt.is_empty() || prompt.len() > 16 || !(1..=4).contains(&max_tokens) || warmups > 1 {
             return Err("bounds: 1..16 prompt IDs, 1..4 generated tokens, 0..1 warmups".into());
         }
+        let partitions = proof_partition_count(values.get("--row-partitions").copied())?;
         let started = Instant::now();
         let mut result = if mode == "inspect" {
             let model = load_low_residency_model(path, artifact).map_err(|e| e.to_string())?;
-            let mut report = inspect(&model)?;
+            let mut report = inspect(&model, partitions)?;
             report["prepared_state_bytes"] = json!(model.resident_state_bytes());
             report
         } else if mode == "reference" {
@@ -457,7 +593,8 @@ mod unix {
                 "warmup_runs": discarded, "measured": measured})
         } else if mode == "coordinator" {
             let model = load_low_residency_model(path, artifact).map_err(|e| e.to_string())?;
-            let (plans, workers) = connect(Path::new(get("--workers")?), &model, artifact)?;
+            let (plans, workers) =
+                connect(Path::new(get("--workers")?), &model, artifact, partitions)?;
             let events = Events::default();
             let backend =
                 VerifiedPartitionBackend::new_strict(&model, artifact, plans, workers, &events)
@@ -487,8 +624,8 @@ mod unix {
                 return Err("strict backend reported non-answer event".into());
             }
             json!({"graph": graph(model.config()), "prepared_state_bytes": model.resident_state_bytes(),
-                "row_answers": counts.0, "non_answer_events": counts.1, "local_primary_rows": 0,
-                "checks": "one local duplicate row and first/middle/last spot rows per projection",
+                "row_partitions": partitions, "row_answers": counts.0, "non_answer_events": counts.1, "local_primary_rows": 0,
+                "checks": "one local duplicate row per primary owner and first/middle/last spot rows per projection",
                 "warmup_runs": discarded, "measured": measured})
         } else {
             return Err("unknown mode".into());
@@ -526,7 +663,282 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use arc_inference::cached_integer_model::ArithmeticProfile;
+        use arc_inference::cached_integer_model::{
+            ArithmeticProfile, I8Weights, matmul_i8_canonical_row_range,
+        };
+        use arc_inference::tensor_parallel::{ProjectionBackend, RowShard, project_from_shards};
+
+        struct TinySource {
+            config: ModelConfig,
+            weights: BTreeMap<(Option<usize>, TensorKey), I8Weights>,
+        }
+        impl TinySource {
+            fn new() -> Self {
+                let config = fixture_config();
+                let keys = [
+                    TensorKey::Wq,
+                    TensorKey::Wk,
+                    TensorKey::Wv,
+                    TensorKey::Wo,
+                    TensorKey::WGate,
+                    TensorKey::WUp,
+                    TensorKey::WDown,
+                ]
+                .into_iter()
+                .map(|tensor| (Some(0), tensor))
+                .chain(std::iter::once((None, TensorKey::LmHead)));
+                let weights = keys
+                    .map(|key| {
+                        // Uneven intervals, positive/negative inputs and canonical
+                        // integer arithmetic; these are tiny projection fixtures.
+                        let rows = if key.0.is_none() { 5 } else { 7 };
+                        let values = (0..rows * 2)
+                            .map(|i| (i as f32 - 5.0) / 7.0)
+                            .collect::<Vec<_>>();
+                        (key, I8Weights::quantize_f32(&values, rows, 2))
+                    })
+                    .collect();
+                Self { config, weights }
+            }
+        }
+        impl CanonicalRowSource for TinySource {
+            fn config(&self) -> &ModelConfig {
+                &self.config
+            }
+            fn canonical_execution_profile(&self) -> Option<&'static str> {
+                Some(PROFILE)
+            }
+            fn projection_shape(
+                &self,
+                layer: Option<usize>,
+                tensor: TensorKey,
+            ) -> Option<(usize, usize)> {
+                self.weights
+                    .get(&(layer, tensor))
+                    .map(|w| (w.n_rows, w.n_cols))
+            }
+            fn projection_rows(
+                &self,
+                layer: Option<usize>,
+                tensor: TensorKey,
+                start: usize,
+                end: usize,
+                input: &[i64],
+            ) -> Result<Vec<i64>, TensorParallelError> {
+                let weights = self
+                    .weights
+                    .get(&(layer, tensor))
+                    .ok_or(TensorParallelError::WrongIdentity)?;
+                if start >= end || end > weights.n_rows {
+                    return Err(TensorParallelError::WrongShape);
+                }
+                let mut values = vec![0; end - start];
+                matmul_i8_canonical_row_range(weights, start, end, input, &mut values)
+                    .map_err(|_| TensorParallelError::WrongShape)?;
+                Ok(values)
+            }
+        }
+        fn entries(source: &TinySource, count: usize) -> Vec<Worker> {
+            (0..count)
+                .map(|rank| {
+                    let id = format!("proof-{rank:03}");
+                    Worker {
+                        worker_id: id.clone(),
+                        socket: format!("/unused/{id}.sock"),
+                        assignments: source
+                            .weights
+                            .iter()
+                            .map(|(&(layer, tensor), weights)| {
+                                let (row_start, row_end) =
+                                    RowPartition { rank, count }.range(weights.n_rows).unwrap();
+                                RowAssignment {
+                                    artifact_id: Hash256([7; 32]),
+                                    execution_profile: PROFILE.into(),
+                                    layer,
+                                    tensor,
+                                    row_start,
+                                    row_end,
+                                    worker_id: id.clone(),
+                                }
+                            })
+                            .collect(),
+                    }
+                })
+                .collect()
+        }
+
+        #[test]
+        fn partial_manifests_refuse_gaps_overlap_missing_head_and_wrong_identity() {
+            let source = TinySource::new();
+            for case in 0..9 {
+                let mut workers = entries(&source, 2);
+                match case {
+                    0 => workers[1].assignments[0].row_start += 1,
+                    1 => workers[1].assignments[0].row_start -= 1,
+                    2 => workers[0]
+                        .assignments
+                        .retain(|a| a.tensor != TensorKey::LmHead),
+                    3 => workers[0].assignments[0].worker_id = "wrong".into(),
+                    4 => workers[0].assignments[0].artifact_id = Hash256::ZERO,
+                    5 => workers[0].assignments[0].execution_profile = "wrong".into(),
+                    6 => workers[1].socket = workers[0].socket.clone(),
+                    7 => workers[1].worker_id = workers[0].worker_id.clone(),
+                    8 => {
+                        let duplicate = workers[0].assignments[0].clone();
+                        workers[0].assignments.push(duplicate);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    plans_from_entries(&workers, &source, Hash256([7; 32]), Some(2)).is_err(),
+                    "case {case}"
+                );
+            }
+            // Whole-layer input cannot be reported as a two-owner proof.
+            assert!(
+                plans_from_entries(&entries(&source, 1), &source, Hash256([7; 32]), Some(2))
+                    .is_err()
+            );
+            assert!(
+                plans_from_entries(&entries(&source, 1), &source, Hash256([7; 32]), None).is_ok()
+            );
+        }
+
+        struct HeldWorker {
+            id: String,
+            shards: Vec<RowShard>,
+            corrupt: bool,
+        }
+        impl RowWorker for HeldWorker {
+            fn project(
+                &self,
+                request: RowProjectionRequest,
+            ) -> Result<RowProjectionResponse, TensorParallelError> {
+                if request.assignment.worker_id != self.id {
+                    return Err(TensorParallelError::WrongIdentity);
+                }
+                let mut values = project_from_shards(&self.shards, &request)?;
+                if self.corrupt {
+                    values[0] += 1;
+                }
+                Ok(RowProjectionResponse {
+                    call_id: request.call_id,
+                    input_hash: request.input_hash,
+                    assignment: request.assignment,
+                    values,
+                })
+            }
+        }
+
+        #[test]
+        fn distinct_disjoint_workers_match_canonical_rows_and_faults_refuse() {
+            let source = TinySource::new();
+            let entries = entries(&source, 2);
+            for corrupt in [false, true] {
+                let plans =
+                    plans_from_entries(&entries, &source, Hash256([7; 32]), Some(2)).unwrap();
+                for plan in plans.values() {
+                    assert_eq!(
+                        plan.slices
+                            .iter()
+                            .filter(|s| s.duplicate_on == Some(SliceOwner::Local))
+                            .count(),
+                        2
+                    );
+                }
+                let workers: Workers = entries
+                    .iter()
+                    .map(|entry| {
+                        let shards = entry
+                            .assignments
+                            .iter()
+                            .map(|a| RowShard {
+                                artifact: a.artifact_id,
+                                profile: a.execution_profile.clone(),
+                                layer: a.layer,
+                                tensor: a.tensor,
+                                row_start: a.row_start,
+                                row_end: a.row_end,
+                                weights: source.weights[&(a.layer, a.tensor)]
+                                    .copy_rows(a.row_start, a.row_end)
+                                    .unwrap(),
+                            })
+                            .collect();
+                        (
+                            entry.worker_id.clone(),
+                            Arc::new(HeldWorker {
+                                id: entry.worker_id.clone(),
+                                shards,
+                                corrupt,
+                            }) as Arc<dyn RowWorker>,
+                        )
+                    })
+                    .collect();
+                let events = Events::default();
+                let backend = VerifiedPartitionBackend::new_strict(
+                    &source,
+                    Hash256([7; 32]),
+                    plans,
+                    workers,
+                    &events,
+                )
+                .unwrap();
+                for (&(layer, tensor), weights) in &source.weights {
+                    let input = [65536, -32768];
+                    let actual = backend.project_rows(
+                        Hash256([9; 32]),
+                        layer,
+                        tensor,
+                        &input,
+                        weights.n_rows,
+                    );
+                    if corrupt {
+                        assert!(
+                            actual.is_err(),
+                            "faulty primary must not become local success"
+                        );
+                    } else {
+                        assert_eq!(
+                            actual.unwrap(),
+                            source
+                                .projection_rows(layer, tensor, 0, weights.n_rows, &input)
+                                .unwrap()
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn inspector_partial_layout_includes_every_head_and_respects_slice_bound() {
+            let source = TinySource::new();
+            let plan = inspect(&source, Some(3)).unwrap();
+            assert_eq!(plan["bundles"].as_array().unwrap().len(), 3);
+            for (rank, bundle) in plan["bundles"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(bundle["include_output"], true);
+                assert_eq!(bundle["row_partition"], format!("{rank}/3"));
+            }
+            assert!(
+                inspect(&source, Some(6)).is_err(),
+                "LMHead has only five rows"
+            );
+            for invalid in ["0", "1", "17", "33", "oops"] {
+                assert!(proof_partition_count(Some(invalid)).is_err());
+            }
+            assert_eq!(proof_partition_count(Some("16")).unwrap(), Some(16));
+            assert!(
+                inspect(&source, None).unwrap()["bundles"][0]
+                    .get("row_partition")
+                    .is_none()
+            );
+            // Metadata-only capacity preflight: no allocation of these
+            // advertised columns and no export can begin on this plan.
+            let mut oversized = TinySource::new();
+            for weights in oversized.weights.values_mut() {
+                weights.n_cols = MAX_CANONICAL_ROW_FILE_BYTES;
+            }
+            assert!(inspect(&oversized, Some(3)).unwrap_err().contains("1 GiB"));
+        }
 
         fn fixture_config() -> ModelConfig {
             ModelConfig {

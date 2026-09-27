@@ -3,6 +3,8 @@
 
 Runs reference, export, shared workers, coordinator in that order. Reference must
 exit before any row heap exists. This does not activate/qualify a validator route.
+--row-partitions N selects disjoint rows of every projection on N local daemons;
+omitting it retains the original whole-layer layout. Neither proves WAN speed.
 """
 import argparse
 import hashlib
@@ -33,9 +35,9 @@ def digest(path):
     return result.hexdigest()
 
 
-def write_json(path, value):
+def write_json(path, value, indent=2):
     with Path(path).open("x", encoding="utf-8") as out:
-        json.dump(value, out, indent=2, sort_keys=True)
+        json.dump(value, out, indent=indent, sort_keys=True)
         out.write("\n")
 
 
@@ -98,6 +100,63 @@ def require_capacity(snapshot, memory, disk=0):
                            f"observed {snapshot['effective_available_bytes']}")
     if snapshot["disk_free_bytes"] < disk:
         raise RuntimeError(f"insufficient free disk: need {disk} bytes, observed {snapshot['disk_free_bytes']}")
+
+
+def validate_layout_plan(plan, partitions):
+    """Do not let an older inspector silently run the layer-only proof."""
+    expected = "layers" if partitions is None else "partial-rows"
+    if plan.get("layout") != expected:
+        raise RuntimeError("inspected layout differs from requested proof")
+    if partitions is not None:
+        if plan.get("row_partitions") != partitions or len(plan["bundles"]) != partitions:
+            raise RuntimeError("inspected partial worker count mismatch")
+        for rank, spec in enumerate(plan["bundles"]):
+            if (spec.get("row_partition") != f"{rank}/{partitions}" or not spec["include_output"]
+                    or spec["layers"] != list(range(plan["graph"]["layers"]))):
+                raise RuntimeError("inspected partial plan omits a layer/output/rank")
+    if (len({spec["worker_id"] for spec in plan["bundles"]}) != len(plan["bundles"])
+            or any(not 0 < spec["serialized_row_bytes"] <= GIB for spec in plan["bundles"])
+            or sum(spec["serialized_row_bytes"] for spec in plan["bundles"]) != plan["total_row_file_bytes"]):
+        raise RuntimeError("inspected bundle identity/aggregate capacity mismatch")
+
+
+def validate_export_manifest(spec, manifest, plan, artifact):
+    if (manifest["serialized_row_bytes"] != spec["serialized_row_bytes"]
+            or manifest["worker_id"] != spec["worker_id"]
+            or manifest["artifact_blake3"] != artifact or manifest["execution_profile"] != PROFILE):
+        raise RuntimeError("exported manifest differs from bounded plan")
+    partition = spec.get("row_partition")
+    if partition is None:
+        if manifest.get("format") != "arc.tensor-row-low-residency-bundle.v1":
+            raise RuntimeError("whole-layer export format mismatch")
+        return
+    rank, count = map(int, partition.split("/"))
+    if (manifest.get("format") != "arc.tensor-row-offline-partition-bundle.v1"
+            or manifest.get("row_partition") != {"rank": rank, "count": count}
+            or "resident_layers" in manifest or "resident_output" in manifest):
+        raise RuntimeError("partial manifest format/rank or production residency mismatch")
+    graph = plan["graph"]
+    tensors = {"wq": graph["width"], "wk": graph["kv_width"], "wv": graph["kv_width"],
+               "wo": graph["width"], "w_gate": graph["ff_width"], "w_up": graph["ff_width"],
+               "w_down": graph["width"]}
+    expected = {(layer, tensor): rows for layer in spec["layers"] for tensor, rows in tensors.items()}
+    expected[(None, "lm_head")] = graph["vocab"]
+    seen = set()
+    for file in manifest["files"]:
+        a = file["assignment"]
+        key = (a["layer"], a["tensor"])
+        rows = expected.get(key)
+        if rows is None or key in seen:
+            raise RuntimeError("unknown or duplicate partial projection")
+        seen.add(key)
+        if (a["artifact_id"] != artifact or a["execution_profile"] != PROFILE
+                or a["worker_id"] != spec["worker_id"] or rows < count
+                or (a["row_start"], a["row_end"]) != (rows * rank // count, rows * (rank + 1) // count)):
+            raise RuntimeError("partial manifest identity/range mismatch")
+    if seen != expected.keys():
+        raise RuntimeError("partial manifest omits required projection, including output head")
+    if sum(file["bytes"] for file in manifest["files"]) != manifest["serialized_row_bytes"]:
+        raise RuntimeError("partial manifest byte total mismatch")
 
 
 def validate_trace(trace, report):
@@ -257,6 +316,8 @@ def parser():
     result.add_argument("--max-tokens", default=2, type=int, choices=range(1, 5))
     result.add_argument("--warmups", default=0, type=int, choices=(0, 1))
     result.add_argument("--kernel", default="scalar", choices=("scalar", "fast"))
+    result.add_argument("--row-partitions", type=int, choices=range(2, 17),
+                        help="offline-only disjoint rows per tensor on 2..16 daemons; default uses layer bundles")
     result.add_argument("--timeout-seconds", default=1800, type=int)
     result.add_argument("--total-timeout-seconds", default=2700, type=int,
                         help="global deadline including all phases; cleanup/evidence writing follow it")
@@ -284,7 +345,7 @@ def run(args):
     summary = {"schema": "arc.low-residency-conformance-run.v1", "pass": False,
                "scope": "offline numerical comparison only; not quality, paid path, SSH, distributed latency or fleet readiness",
                "inputs": {"prompt_token_ids": prompt, "max_tokens": args.max_tokens, "warmups": args.warmups,
-                          "kernel": args.kernel, "model": str(args.model)},
+                          "kernel": args.kernel, "model": str(args.model), "row_partitions": args.row_partitions},
                "package_manifest_sha256": digest(PACKAGE), "resource_checks": [],
                "package_manifest_blake3": package["manifest_blake3"],
                "profile_commitment": package["execution"]["profile_commitment"],
@@ -314,11 +375,14 @@ def run(args):
             require_capacity(snapshot, memory, disk)
 
         checkpoint("inspect", 2 * GIB)
-        child = children.start("inspect", [binaries[BINARIES[0]], "inspect", *common, "--output", output / "inspect.json"])
+        layout_args = [] if args.row_partitions is None else ["--row-partitions", str(args.row_partitions)]
+        child = children.start("inspect", [binaries[BINARIES[0]], "inspect", *common, *layout_args, "--output", output / "inspect.json"])
         children.wait(child, args.timeout_seconds)
         plan = json.loads((output / "inspect.json").read_text())
         if plan["artifact_blake3"] != package["artifact"]["blake3"] or plan["profile"] != PROFILE:
             raise RuntimeError("inspected artifact/profile pin mismatch")
+        validate_layout_plan(plan, args.row_partitions)
+        summary["layout"] = plan["layout"]
         positions = 1 + len(prompt) + args.max_tokens
         kv_bytes = plan["kv_bytes_per_position"] * positions
         disk = plan["total_row_file_bytes"] + GIB
@@ -338,13 +402,11 @@ def run(args):
                        "--worker-id", spec["worker_id"], "--layers", ",".join(map(str, spec["layers"])), "--output-dir", dest]
             if spec["include_output"]:
                 command.append("--include-output")
+            if spec.get("row_partition") is not None:
+                command.extend(["--row-partition", spec["row_partition"]])
             children.wait(children.start("export-" + spec["worker_id"], command), args.timeout_seconds)
             manifest = json.loads((dest / "manifest.json").read_text())
-            if (manifest["serialized_row_bytes"] != spec["serialized_row_bytes"]
-                    or manifest["worker_id"] != spec["worker_id"]
-                    or manifest["artifact_blake3"] != package["artifact"]["blake3"]
-                    or manifest["execution_profile"] != PROFILE):
-                raise RuntimeError("exported manifest differs from bounded plan")
+            validate_export_manifest(spec, manifest, plan, package["artifact"]["blake3"])
             manifests.append((dest, manifest))
         # Short private runtime paths avoid Unix sockaddr length limits on CI.
         runtime = Path(tempfile.mkdtemp(prefix="arc-proof-", dir="/tmp"))
@@ -374,15 +436,21 @@ def run(args):
             config.append({"worker_id": manifest["worker_id"], "socket": str(socket),
                            "assignments": [entry["assignment"] for entry in manifest["files"]]})
             remaining_rows -= manifest["serialized_row_bytes"]
-        write_json(output / "workers.json", config)
+        # Compact assignments keep even 16 x 225 projections within the
+        # coordinator's existing 1 MiB configuration bound.
+        if len(json.dumps(config, sort_keys=True).encode()) + 1 > 1024 * 1024:
+            raise RuntimeError("worker assignment configuration exceeds 1 MiB")
+        write_json(output / "workers.json", config, indent=None)
         checkpoint("coordinator", kv_bytes + 2 * GIB)
-        coordinator = children.start("coordinator", [binaries[BINARIES[0]], "coordinator", *common,
+        coordinator = children.start("coordinator", [binaries[BINARIES[0]], "coordinator", *common, *layout_args,
             "--workers", output / "workers.json", "--output", output / "coordinator.json"])
         children.wait(coordinator, args.timeout_seconds)
         if any(daemon.poll() is not None for daemon in daemons):
             raise RuntimeError("a row daemon exited before comparison completed")
         expected = json.loads((output / "reference.json").read_text())
         actual = json.loads((output / "coordinator.json").read_text())
+        if actual.get("row_partitions") != args.row_partitions:
+            raise RuntimeError("coordinator did not use the requested partial-row proof")
         summary.update(compare(expected, actual))
         summary["pass"] = True
     except Exception as error:
