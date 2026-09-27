@@ -5268,7 +5268,11 @@ mod tests {
             let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"history-test"), 1, 1);
             manager.engine.install_consensus_domain(domain).unwrap();
             manager.engine.install_recovery_cursor(64).unwrap();
-            let state = StateDB::with_genesis(&[]);
+            // Recovery manifests require a nonzero baseline block hash and
+            // state root. A small funded genesis gives these regression
+            // fixtures a valid, deterministic state anchor without affecting
+            // their empty-transfer/retention assertions.
+            let state = StateDB::with_genesis(&[(keys[0].address(), 1)]);
             let genesis = state.get_block(0).unwrap();
             let store = GenerationStore::new(directory.path().join("dag"));
             let generation = store

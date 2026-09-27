@@ -46,6 +46,7 @@ jobs:
         with:
           shared-key: recovered-v3-paid-lifecycle
           workspaces: . -> target-recovered-native
+          cache-on-failure: true
 
       - name: Compile isolated recovered-v3 process test
         shell: bash
@@ -151,6 +152,7 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: linux-candidate
+          cache-on-failure: true
 
       # Build the shipped node, the offline recovered-state qualification
       # helper, and the portable sidecar row worker from the same locked tree.
