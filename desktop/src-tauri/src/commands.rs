@@ -175,6 +175,7 @@ pub async fn import_identity(
     state: State<'_, AppState>,
     phrase: String,
 ) -> CmdResult<IdentityPublic> {
+    state.cancel_startup_retry();
     // Restoration path: user types their 12-word phrase on a new device
     // and gets back the exact same address + signing keys.
     identity::validate_bip39(&phrase)?;
@@ -232,6 +233,9 @@ pub async fn save_config(
         store.config = Some(config);
         let dir = state.data_dir.lock().await.clone();
         store.save_to(&dir).map_err(map_err)?;
+    }
+    if !auto_start {
+        state.cancel_startup_retry();
     }
     // Keep the OS-level login item in sync with the user's stored
     // preference. Errors here don't block the save - tray still works.
@@ -329,11 +333,50 @@ pub async fn dismiss_data_migration_notice(state: State<'_, AppState>) -> CmdRes
 ///
 /// Takes `&AppState` rather than `State<'_, AppState>` so it is callable both
 /// from a command and from a background task holding an `AppHandle`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StartupFailure {
+    Transient(String),
+    Terminal(String),
+}
+
+impl StartupFailure {
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient(_))
+    }
+
+    fn with_context(self, context: &str) -> Self {
+        match self {
+            Self::Transient(message) => Self::Transient(format!("{message}. {context}")),
+            Self::Terminal(message) => Self::Terminal(format!("{message}. {context}")),
+        }
+    }
+}
+
+impl std::fmt::Display for StartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Transient(message) | Self::Terminal(message) => message,
+        })
+    }
+}
+
+impl From<String> for StartupFailure {
+    fn from(message: String) -> Self {
+        Self::Terminal(message)
+    }
+}
+
+impl From<&str> for StartupFailure {
+    fn from(message: &str) -> Self {
+        Self::Terminal(message.to_owned())
+    }
+}
+
 async fn start_node_transaction(
     app: &AppHandle,
     state: &AppState,
     start_after_recovery: bool,
-) -> Result<(), String> {
+) -> Result<(), StartupFailure> {
     require_data_migration_ready(state).await?;
     let (config, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
@@ -376,7 +419,7 @@ async fn start_node_transaction(
         // Make sure we have a runnable binary only after proving there is no
         // stale receipt bound to the currently installed bytes. Replacing an
         // executable first would strand the only safe recovery identity.
-        ensure_binary_inner(app).await?;
+        ensure_binary_inner_classified(app).await?;
     }
     let app_data_dir = state.data_dir.lock().await.clone();
     let keyfile_result =
@@ -419,14 +462,38 @@ async fn start_node_transaction(
                 .into(),
         );
     }
-    ensure_binary_inner(app).await?;
+    ensure_binary_inner_classified(app).await?;
     let mut node = state.node.lock().await;
     node.start(&config, &validator_keyfile, &resources, lifecycle_lock)
         .await
-        .map_err(map_err)
+        .map_err(map_err)?;
+    Ok(())
 }
 
 pub async fn start_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    state.startup_retry_cancel.send_replace(());
+    start_node_transaction(app, state, true)
+        .await
+        .map_err(|failure| failure.to_string())
+}
+
+pub(crate) async fn autostart_node_inner(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<(), StartupFailure> {
+    {
+        let store = state.store.lock().await;
+        if !store
+            .config
+            .as_ref()
+            .is_some_and(|config| config.auto_start)
+            || store.identity.is_none()
+        {
+            return Err(StartupFailure::Terminal(
+                "automatic node start is no longer enabled or has no saved identity".into(),
+            ));
+        }
+    }
     start_node_transaction(app, state, true).await
 }
 
@@ -434,7 +501,9 @@ pub(crate) async fn recover_managed_shutdown_inner(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<(), String> {
-    start_node_transaction(app, state, false).await
+    start_node_transaction(app, state, false)
+        .await
+        .map_err(|failure| failure.to_string())
 }
 
 fn data_migration_start_gate(reason: Option<&str>) -> Result<(), String> {
@@ -466,6 +535,7 @@ pub async fn start_node(
 
 #[tauri::command]
 pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
+    state.cancel_startup_retry();
     let mut node = state.node.lock().await;
     node.stop().await.map_err(map_err)
 }
@@ -480,6 +550,7 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
 /// boundary is safe.
 #[tauri::command]
 pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
+    state.cancel_startup_retry();
     require_data_migration_ready(&state).await?;
     let mut node = state.node.lock().await;
     node.prepare_update_relaunch()
@@ -557,6 +628,7 @@ pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> 
 
 #[tauri::command]
 pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    state.cancel_startup_retry();
     require_data_migration_ready(&state).await?;
     let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
@@ -627,6 +699,7 @@ pub async fn reset_peer_state(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> CmdResult<ResetPeerStateResult> {
+    state.cancel_startup_retry();
     // This command mutates the configured data directory before restarting.
     // Apply the same native migration fence first: when legacy selection is
     // ambiguous, even deleting its peer cache would violate the promise that
@@ -1739,6 +1812,7 @@ mod inference_retry_tests {
             auto_update_requests: Arc::new(Mutex::new(None)),
             has_tray: Arc::new(AtomicBool::new(false)),
             data_migration_error: Arc::new(Mutex::new(None)),
+            startup_retry_cancel: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -2849,6 +2923,64 @@ async fn read_bounded_release_body(
     Ok(body)
 }
 
+fn classify_release_transport(stage: &str, error: reqwest::Error) -> StartupFailure {
+    let message = format!("{stage} transport failed: {error}");
+    if error.is_connect() || error.is_timeout() || error.is_body() {
+        StartupFailure::Transient(message)
+    } else {
+        StartupFailure::Terminal(message)
+    }
+}
+
+fn classify_release_status(
+    stage: &str,
+    status: reqwest::StatusCode,
+    version: &str,
+) -> StartupFailure {
+    let message = format!("{stage} returned HTTP {status} for v{version}");
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+    {
+        StartupFailure::Transient(message)
+    } else {
+        StartupFailure::Terminal(message)
+    }
+}
+
+async fn read_bounded_release_body_for_startup(
+    mut response: reqwest::Response,
+    maximum: usize,
+    label: &str,
+) -> Result<Vec<u8>, StartupFailure> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(StartupFailure::Terminal(format!(
+            "{label} exceeds its {maximum}-byte safety limit"
+        )));
+    }
+    let capacity = response
+        .content_length()
+        .unwrap_or_default()
+        .min(maximum as u64) as usize;
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| classify_release_transport(label, error))?
+    {
+        if chunk.len() > maximum.saturating_sub(body.len()) {
+            return Err(StartupFailure::Terminal(format!(
+                "{label} exceeds its {maximum}-byte safety limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn binary_download_sidecar(target: &Path, nonce: u64) -> PathBuf {
     let suffix = format!("download-{}-{nonce:016x}", std::process::id());
     match target.extension().and_then(|extension| extension.to_str()) {
@@ -3022,6 +3154,12 @@ fn installed(path: &Path) -> BinaryStatus {
 /// Resolution order mirrors `node_manager::resolve_binary` so the thing this
 /// function blesses is the thing that actually gets spawned.
 async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
+    ensure_binary_inner_classified(app)
+        .await
+        .map_err(|failure| failure.to_string())
+}
+
+async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus, StartupFailure> {
     // 1. An explicitly configured binary is the operator's decision. Never
     //    version-check it, never overwrite it.
     if let Some(p) = crate::node_manager::env_binary_override() {
@@ -3032,7 +3170,8 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
         return Err(format!(
             "ARC_NODE_BIN points at {}, which does not exist",
             p.display()
-        ));
+        )
+        .into());
     }
 
     let target = managed_binary_path();
@@ -3078,14 +3217,16 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
                     return Err(format!(
                         "managed arc-node v{} is newer than desktop v{}. Upgrade the desktop, or set ARC_NODE_BIN explicitly if this pairing is intentional",
                         v, EXPECTED_NODE_VERSION
-                    ));
+                    )
+                    .into());
                 } else {
                     return Err(format!(
                         "managed arc-node at {} reports unrecognized version '{}'; expected v{}",
                         target.display(),
                         v,
                         EXPECTED_NODE_VERSION
-                    ));
+                    )
+                    .into());
                 }
             }
             None => {
@@ -3126,11 +3267,8 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
                 );
                 return Ok(installed(&dev));
             }
-            Err(format!(
-                "{}. No arc-node is available to run. Build one with \
-                 `cargo build --release -p arc-node` in the arc-chain checkout, or set \
-                 ARC_NODE_BIN to an existing binary.",
-                e
+            Err(e.with_context(
+                "No arc-node is available to run. Build one with `cargo build --release -p arc-node` in the arc-chain checkout, or set ARC_NODE_BIN to an existing binary",
             ))
         }
     }
@@ -3138,7 +3276,7 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
 
 /// Fetch the platform's arc-node release asset and install it at `target`.
 /// Returns the byte count on success.
-async fn download_arc_node(target: &Path) -> Result<u64, String> {
+async fn download_arc_node(target: &Path) -> Result<u64, StartupFailure> {
     let asset = platform_release_asset().ok_or_else(|| {
         format!(
             "no prebuilt arc-node binary for platform {}-{}; build from source with \
@@ -3161,15 +3299,19 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
         .build()
         .map_err(map_err)?;
 
-    let checksum_resp = client.get(&checksum_url).send().await.map_err(map_err)?;
+    let checksum_resp = client
+        .get(&checksum_url)
+        .send()
+        .await
+        .map_err(|error| classify_release_transport("release checksum manifest", error))?;
     if !checksum_resp.status().is_success() {
-        return Err(format!(
-            "release checksum manifest returned HTTP {} for v{}",
+        return Err(classify_release_status(
+            "release checksum manifest",
             checksum_resp.status(),
-            EXPECTED_NODE_VERSION
+            EXPECTED_NODE_VERSION,
         ));
     }
-    let checksum_bytes = read_bounded_release_body(
+    let checksum_bytes = read_bounded_release_body_for_startup(
         checksum_resp,
         MAX_CHECKSUM_MANIFEST_BYTES,
         "release checksum manifest",
@@ -3179,15 +3321,15 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
         .get(&checksum_signature_url)
         .send()
         .await
-        .map_err(map_err)?;
+        .map_err(|error| classify_release_transport("release checksum signature", error))?;
     if !signature_resp.status().is_success() {
-        return Err(format!(
-            "release checksum signature returned HTTP {} for v{}",
+        return Err(classify_release_status(
+            "release checksum signature",
             signature_resp.status(),
-            EXPECTED_NODE_VERSION
+            EXPECTED_NODE_VERSION,
         ));
     }
-    let signature_bytes = read_bounded_release_body(
+    let signature_bytes = read_bounded_release_body_for_startup(
         signature_resp,
         MAX_MANIFEST_SIGNATURE_BYTES,
         "release checksum signature",
@@ -3201,22 +3343,26 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
         .map_err(|_| "release checksum manifest is not UTF-8".to_string())?;
     let expected_sha256 = expected_release_sha256(checksum_manifest, asset)?;
 
-    let mut resp = client.get(&url).send().await.map_err(map_err)?;
+    let mut resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| classify_release_transport("release asset", error))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "release asset {} returned HTTP {}",
-            asset,
-            resp.status()
+        return Err(classify_release_status(
+            "release asset",
+            resp.status(),
+            EXPECTED_NODE_VERSION,
         ));
     }
     if resp
         .content_length()
         .is_some_and(|length| length > MAX_NODE_BINARY_BYTES)
     {
-        return Err(format!(
+        return Err(StartupFailure::Terminal(format!(
             "release asset {} exceeds the 512 MiB safety limit",
             asset
-        ));
+        )));
     }
     let mut pending = create_binary_download_sidecar(target).await?;
     let mut hasher = Sha256::new();
@@ -3226,22 +3372,26 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(error) => {
-                return Err(format!(
-                    "release asset {} failed after {} bytes: {}",
-                    asset, total_bytes, error
+                return Err(classify_release_transport(
+                    &format!("release asset {asset} after {total_bytes} bytes"),
+                    error,
                 ));
             }
         };
         total_bytes = total_bytes.saturating_add(chunk.len() as u64);
         if total_bytes > MAX_NODE_BINARY_BYTES {
-            return Err(format!(
+            return Err(StartupFailure::Terminal(format!(
                 "release asset {} exceeds the 512 MiB safety limit",
                 asset
-            ));
+            )));
         }
         hasher.update(&chunk);
         if let Err(error) = pending.file_mut()?.write_all(&chunk).await {
-            return Err(format!("write {}: {}", pending.path.display(), error));
+            return Err(StartupFailure::Terminal(format!(
+                "write {}: {}",
+                pending.path.display(),
+                error
+            )));
         }
     }
     pending.file_mut()?.flush().await.map_err(map_err)?;
@@ -3250,12 +3400,12 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
 
     let actual_sha256: [u8; 32] = hasher.finalize().into();
     if actual_sha256 != expected_sha256 {
-        return Err(format!(
+        return Err(StartupFailure::Terminal(format!(
             "checksum verification failed for {} (expected {}, got {})",
             asset,
             hex::encode(expected_sha256),
             hex::encode(actual_sha256)
-        ));
+        )));
     }
 
     // Verify the durable file, not only the network byte stream. The unique
@@ -3266,10 +3416,10 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
             .await
             .map_err(map_err)??;
     if persisted_sha256 != Some(expected_sha256) {
-        return Err(format!(
+        return Err(StartupFailure::Terminal(format!(
             "durable checksum verification failed for {}",
             asset
-        ));
+        )));
     }
 
     #[cfg(unix)]
@@ -3281,10 +3431,10 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
     let downloaded_version = read_arc_node_version(&pending.path)
         .ok_or_else(|| format!("downloaded {} did not report a parseable version", asset))?;
     if downloaded_version != EXPECTED_NODE_VERSION {
-        return Err(format!(
+        return Err(StartupFailure::Terminal(format!(
             "downloaded {} reports v{}, expected v{}",
             asset, downloaded_version, EXPECTED_NODE_VERSION
-        ));
+        )));
     }
 
     install_over(&pending.path, target, expected_sha256)?;
@@ -4235,6 +4385,52 @@ mod model_readiness_tests {
 #[cfg(test)]
 mod release_binary_tests {
     use super::*;
+
+    #[test]
+    fn startup_retry_classifies_only_transient_release_statuses() {
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                classify_release_status("release asset", status, EXPECTED_NODE_VERSION)
+                    .is_transient()
+            );
+        }
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::BAD_REQUEST,
+        ] {
+            assert!(
+                !classify_release_status("release asset", status, EXPECTED_NODE_VERSION)
+                    .is_transient()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_retry_classifies_connectivity_errors_as_transient() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::new()
+            .get(format!("http://{address}/release"))
+            .send()
+            .await
+            .expect_err("the just-released local port must refuse the connection");
+        assert!(classify_release_transport("release asset", error).is_transient());
+    }
+
+    #[test]
+    fn integrity_and_identity_failures_are_terminal() {
+        let error = StartupFailure::from("checksum verification failed");
+        assert!(!error.is_transient());
+        let error = StartupFailure::from("managed identity bytes changed");
+        assert!(!error.is_transient());
+    }
 
     fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         let start_at = source.find(start).expect("command start marker");

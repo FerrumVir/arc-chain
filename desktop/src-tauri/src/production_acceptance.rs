@@ -330,6 +330,7 @@ pub(crate) async fn run_standalone(request: &Request) -> Result<(), String> {
             auto_update_requests: Arc::new(Mutex::new(None)),
         has_tray: Arc::new(AtomicBool::new(false)),
         data_migration_error: Arc::new(Mutex::new(None)),
+        startup_retry_cancel: tokio::sync::watch::channel(()).0,
     };
     run(&state, &app_data, request).await
 }

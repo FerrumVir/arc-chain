@@ -21,6 +21,41 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
+const AUTOSTART_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const AUTOSTART_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn next_autostart_retry_delay(current: std::time::Duration) -> std::time::Duration {
+    current.saturating_mul(2).min(AUTOSTART_RETRY_MAX_DELAY)
+}
+
+async fn cancellable_autostart_attempt<F>(
+    cancel: &mut tokio::sync::watch::Receiver<()>,
+    attempt: F,
+) -> Option<Result<(), commands::StartupFailure>>
+where
+    F: std::future::Future<Output = Result<(), commands::StartupFailure>>,
+{
+    tokio::select! {
+        biased;
+        changed = cancel.changed() => {
+            changed.ok()?;
+            None
+        }
+        result = attempt => Some(result),
+    }
+}
+
+async fn wait_autostart_retry(
+    cancel: &mut tokio::sync::watch::Receiver<()>,
+    delay: std::time::Duration,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
 fn durable_legacy_stop_material(
     migration_notice_is_durable: bool,
     notice: Option<types::DataMigrationNotice>,
@@ -73,6 +108,15 @@ pub struct AppState {
     /// this state; a WebView Start/Restart click cannot bypass a startup
     /// failure and replay an ambiguous legacy WAL.
     pub data_migration_error: Arc<Mutex<Option<String>>>,
+    /// Cancels the single per-launch auto-start transaction and its bounded-
+    /// rate network retry loop when Stop, Quit, update, or settings disable it.
+    pub startup_retry_cancel: tokio::sync::watch::Sender<()>,
+}
+
+impl AppState {
+    pub fn cancel_startup_retry(&self) {
+        self.startup_retry_cancel.send_replace(());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +211,9 @@ pub fn run() {
 
     let has_tray = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let data_migration_error = Arc::new(Mutex::new(None));
+    let (startup_retry_cancel, _) = tokio::sync::watch::channel(());
+    let mut startup_retry_cancel_receiver = startup_retry_cancel.subscribe();
+    startup_retry_cancel_receiver.borrow_and_update();
     let state = AppState {
         node,
         store: store.clone(),
@@ -181,6 +228,7 @@ pub fn run() {
             auto_update_requests: Arc::new(Mutex::new(None)),
         has_tray: has_tray.clone(),
         data_migration_error: data_migration_error.clone(),
+        startup_retry_cancel,
     };
 
     tauri::Builder::default()
@@ -411,6 +459,7 @@ pub fn run() {
                 let Some(state) = handle.try_state::<AppState>() else {
                     return;
                 };
+                let mut startup_cancel = startup_retry_cancel_receiver.clone();
 
                 // Adopt an already-running local node only when it is the
                 // exact matched version. A v0.7 child deliberately survives
@@ -545,12 +594,42 @@ pub fn run() {
                     return;
                 }
 
-                match commands::start_node_inner(&handle, &state).await {
-                    Ok(()) => tracing::info!("auto-started arc-node on launch"),
-                    // Surfaced in the log ring and the Dashboard's error
-                    // state rather than thrown away; a failed auto-start
-                    // is exactly what the user needs told.
-                    Err(e) => tracing::error!("auto-start failed: {}", e),
+                let mut retry_delay = AUTOSTART_RETRY_BASE_DELAY;
+                loop {
+                    if startup_cancel.has_changed().unwrap_or(true) {
+                        tracing::info!("auto-start cancelled by an explicit lifecycle or settings action");
+                        break;
+                    }
+                    let Some(outcome) = cancellable_autostart_attempt(
+                        &mut startup_cancel,
+                        commands::autostart_node_inner(&handle, &state),
+                    )
+                    .await else {
+                        tracing::info!("auto-start cancelled by an explicit lifecycle or settings action");
+                        break;
+                    };
+                    match outcome {
+                        Ok(()) => {
+                            tracing::info!("auto-started arc-node on launch");
+                            break;
+                        }
+                        Err(error) if error.is_transient() => {
+                            tracing::warn!(
+                                %error,
+                                delay_secs = retry_delay.as_secs(),
+                                "auto-start hit a transient release-network failure; retrying"
+                            );
+                            if !wait_autostart_retry(&mut startup_cancel, retry_delay).await {
+                                tracing::info!("auto-start retry cancelled by an explicit lifecycle or settings action");
+                                break;
+                            }
+                            retry_delay = next_autostart_retry_delay(retry_delay);
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "auto-start failed permanently");
+                            break;
+                        }
+                    }
                 }
             });
 
@@ -578,6 +657,7 @@ pub fn run() {
                         let handle = window.app_handle().clone();
                         tauri::async_runtime::spawn(async move {
                             if let Some(state) = handle.try_state::<AppState>() {
+                                state.cancel_startup_retry();
                                 let mut node = state.node.lock().await;
                                 let _ = node.stop().await;
                             }
@@ -650,4 +730,72 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running ARC desktop");
+}
+
+#[cfg(test)]
+mod startup_retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn autostart_backoff_doubles_and_caps_at_one_minute() {
+        let delays = [1, 2, 4, 8, 16, 32, 60, 60];
+        let mut delay = AUTOSTART_RETRY_BASE_DELAY;
+        for seconds in delays {
+            assert_eq!(delay, std::time::Duration::from_secs(seconds));
+            delay = next_autostart_retry_delay(delay);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_pending_autostart_attempt_and_drops_its_future() {
+        struct DropFlag(Arc<AtomicUsize>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (cancel, mut receiver) = tokio::sync::watch::channel(());
+        receiver.borrow_and_update();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let future_dropped = dropped.clone();
+        let attempt = async move {
+            let _drop_flag = DropFlag(future_dropped);
+            std::future::pending::<Result<(), commands::StartupFailure>>().await
+        };
+        let task =
+            tokio::spawn(async move { cancellable_autostart_attempt(&mut receiver, attempt).await });
+        tokio::task::yield_now().await;
+        cancel.send_replace(());
+        assert!(task.await.unwrap().is_none());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_autostart_attempt_is_delivered_once() {
+        let (_cancel, mut receiver) = tokio::sync::watch::channel(());
+        receiver.borrow_and_update();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let started = starts.clone();
+        let result = cancellable_autostart_attempt(&mut receiver, async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(matches!(result, Some(Ok(()))));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn disabling_autostart_cancels_the_retry_delay() {
+        let (cancel, mut receiver) = tokio::sync::watch::channel(());
+        receiver.borrow_and_update();
+        let task = tokio::spawn(async move {
+            wait_autostart_retry(&mut receiver, std::time::Duration::from_secs(60)).await
+        });
+        tokio::task::yield_now().await;
+        cancel.send_replace(());
+        assert!(!task.await.unwrap());
+    }
 }

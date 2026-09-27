@@ -61,6 +61,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                     // hide-to-tray pattern means the node is otherwise left
                     // running across window close.
                     if let Some(state) = handle.try_state::<AppState>() {
+                        state.cancel_startup_retry();
                         let mut node = state.node.lock().await;
                         let _ = node.stop().await;
                     }
