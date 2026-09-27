@@ -1894,6 +1894,15 @@ fn worker_quiescence_field<'a>(lines: &mut std::str::Lines<'a>, name: &str) -> i
         })
 }
 
+fn worker_quiescence_io_context(error: io::Error, operation: &str) -> io::Error {
+    let kind = error.kind();
+    let detail = match error.raw_os_error() {
+        Some(code) => format!("{error} (OS error {code})"),
+        None => error.to_string(),
+    };
+    io::Error::new(kind, format!("{operation}: {detail}"))
+}
+
 fn worker_quiescence_paths(data_dir: &Path) -> io::Result<(PathBuf, PathBuf)> {
     let canonical = data_dir.canonicalize()?;
     let control_dir = canonical.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
@@ -1948,7 +1957,9 @@ pub fn take_desktop_worker_quiescence_request(
 ) -> io::Result<Option<DesktopWorkerQuiescenceRequest>> {
     use rand::RngCore as _;
 
-    let (path, _) = worker_quiescence_paths(data_dir)?;
+    let (path, _) = worker_quiescence_paths(data_dir).map_err(|error| {
+        worker_quiescence_io_context(error, "prepare worker quiescence request path")
+    })?;
     // Atomic rename claims the one-shot request before either side parses it.
     // This prevents the desktop timeout path and node watcher from both
     // believing they own the same request. The random same-directory name
@@ -1963,13 +1974,28 @@ pub fn take_desktop_worker_quiescence_request(
     match std::fs::rename(&path, &claim) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(worker_quiescence_io_context(
+                error,
+                "claim worker quiescence request",
+            ));
+        }
     }
     let mut file = match open_private(&claim) {
         Ok(file) => file,
         Err(error) => {
-            let _ = std::fs::remove_file(&claim);
-            return Err(error);
+            let mut contextual =
+                worker_quiescence_io_context(error, "open claimed worker quiescence request");
+            if let Err(cleanup_error) = std::fs::remove_file(&claim) {
+                contextual = io::Error::new(
+                    contextual.kind(),
+                    format!(
+                        "{contextual}; remove unopenable claimed worker quiescence request failed ({:?}): {cleanup_error}",
+                        cleanup_error.kind()
+                    ),
+                );
+            }
+            return Err(contextual);
         }
     };
     let parsed = (|| {
@@ -2052,8 +2078,15 @@ pub fn take_desktop_worker_quiescence_request(
     })();
     let removal = durably_remove_private_while_open(&file, &claim);
     drop(file);
-    removal?;
-    parsed.map(Some)
+    removal.map_err(|error| {
+        worker_quiescence_io_context(error, "durably remove claimed worker quiescence request")
+    })?;
+    parsed.map(Some).map_err(|error| {
+        worker_quiescence_io_context(
+            error,
+            "read or authenticate claimed worker quiescence request",
+        )
+    })
 }
 
 /// Durably publish the response associated with one authenticated request.
@@ -2973,6 +3006,8 @@ mod tests {
 
     #[test]
     fn desktop_worker_quiescence_request_has_one_atomic_consumer() {
+        use std::sync::Barrier;
+
         let dir = TestDir::new("worker-quiescence-single-consumer");
         let data_dir = dir.0.join("data");
         secure_private_directory_tree(&data_dir).unwrap();
@@ -2980,46 +3015,86 @@ mod tests {
         secure_private_directory_tree(&control_dir).unwrap();
         let token = [0x21; 32];
         let nonce = [0x32; 32];
-        let request = DesktopWorkerQuiescenceRequest {
-            pid: std::process::id(),
-            receipt_nonce: nonce,
-            request_id: [0x43; 32],
-            action: DesktopWorkerQuiescenceAction::Quiesce,
-            timeout_ms: 5_000,
-            lease_deadline_unix_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64
-                + 10_000,
-        };
-        assert!(publish_desktop_worker_quiescence_request(&data_dir, &token, request).unwrap());
-        let (first, second) = std::thread::scope(|scope| {
-            let first = scope.spawn(|| {
-                take_desktop_worker_quiescence_request(
-                    &data_dir,
-                    std::process::id(),
-                    &token,
-                    &nonce,
-                )
-                .unwrap()
-                .is_some()
+        for round in 0..64 {
+            let request = DesktopWorkerQuiescenceRequest {
+                pid: std::process::id(),
+                receipt_nonce: nonce,
+                request_id: [round as u8; 32],
+                action: DesktopWorkerQuiescenceAction::Quiesce,
+                timeout_ms: 5_000,
+                lease_deadline_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 10_000,
+            };
+            assert!(
+                publish_desktop_worker_quiescence_request(&data_dir, &token, request).unwrap(),
+                "round {round}: request should publish"
+            );
+            let barrier = Barrier::new(3);
+            let (first, second) = std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    barrier.wait();
+                    take_desktop_worker_quiescence_request(
+                        &data_dir,
+                        std::process::id(),
+                        &token,
+                        &nonce,
+                    )
+                });
+                let second = scope.spawn(|| {
+                    barrier.wait();
+                    take_desktop_worker_quiescence_request(
+                        &data_dir,
+                        std::process::id(),
+                        &token,
+                        &nonce,
+                    )
+                });
+                barrier.wait();
+                // Join both workers before assessing either result so a failure
+                // reports both consumers instead of stopping at the first panic.
+                (first.join(), second.join())
             });
-            let second = scope.spawn(|| {
-                take_desktop_worker_quiescence_request(
-                    &data_dir,
-                    std::process::id(),
-                    &token,
-                    &nonce,
-                )
-                .unwrap()
-                .is_some()
-            });
-            (first.join().unwrap(), second.join().unwrap())
-        });
-        assert_ne!(
-            first, second,
-            "exactly one consumer atomically claims a request"
-        );
+
+            enum ConsumerOutcome {
+                Request,
+                Empty,
+                Error(io::Error),
+                Panicked,
+            }
+            let outcome = |joined: std::thread::Result<
+                io::Result<Option<DesktopWorkerQuiescenceRequest>>,
+            >| {
+                match joined {
+                    Ok(Ok(Some(_))) => ConsumerOutcome::Request,
+                    Ok(Ok(None)) => ConsumerOutcome::Empty,
+                    Ok(Err(error)) => ConsumerOutcome::Error(error),
+                    Err(_) => ConsumerOutcome::Panicked,
+                }
+            };
+            let first = outcome(first);
+            let second = outcome(second);
+            let describe = |outcome: &ConsumerOutcome| match outcome {
+                ConsumerOutcome::Request => "consumed request".to_owned(),
+                ConsumerOutcome::Empty => "saw no request".to_owned(),
+                ConsumerOutcome::Error(error) => {
+                    format!("error ({:?}): {error}", error.kind())
+                }
+                ConsumerOutcome::Panicked => "worker panicked".to_owned(),
+            };
+            assert!(
+                matches!(
+                    (&first, &second),
+                    (ConsumerOutcome::Request, ConsumerOutcome::Empty)
+                        | (ConsumerOutcome::Empty, ConsumerOutcome::Request)
+                ),
+                "round {round}: expected exactly one consumer; first={}, second={}",
+                describe(&first),
+                describe(&second),
+            );
+        }
     }
 
     #[test]
