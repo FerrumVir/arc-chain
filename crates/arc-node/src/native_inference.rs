@@ -2355,6 +2355,7 @@ pub enum WorkerQuiescenceResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerResumeError {
     NoMatchingDrain,
+    ShutdownCommitted,
 }
 
 impl WorkerExecutionGate {
@@ -2386,6 +2387,11 @@ impl WorkerExecutionGate {
         }
         let (already_drained, newly_closed, generation) = {
             let mut state = self.state.lock();
+            if state.shutdown_committed {
+                return WorkerQuiescenceResult::Busy {
+                    active_jobs: state.active_jobs,
+                };
+            }
             if state.closed {
                 if state.request_id != Some(request_id) {
                     return WorkerQuiescenceResult::Busy {
@@ -2430,6 +2436,11 @@ impl WorkerExecutionGate {
             notified.as_mut().enable();
             {
                 let state = self.state.lock();
+                if state.shutdown_committed {
+                    return WorkerQuiescenceResult::Busy {
+                        active_jobs: state.active_jobs,
+                    };
+                }
                 if state.request_id != Some(request_id) || !state.closed {
                     return WorkerQuiescenceResult::Busy {
                         active_jobs: state.active_jobs,
@@ -2441,25 +2452,34 @@ impl WorkerExecutionGate {
                 }
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                let mut state = self.state.lock();
-                if state.request_id == Some(request_id) {
-                    state.closed = false;
-                    state.request_id = None;
-                    let active_jobs = state.active_jobs;
-                    drop(state);
-                    self.changed.notify_waiters();
-                    return WorkerQuiescenceResult::Busy { active_jobs };
-                }
-                return WorkerQuiescenceResult::Busy {
-                    active_jobs: state.active_jobs,
-                };
+                return self.timeout_quiescence(request_id);
             }
+        }
+    }
+
+    fn timeout_quiescence(&self, request_id: [u8; 32]) -> WorkerQuiescenceResult {
+        let mut state = self.state.lock();
+        if state.request_id == Some(request_id) {
+            let active_jobs = state.active_jobs;
+            if !state.shutdown_committed {
+                state.closed = false;
+                state.request_id = None;
+                drop(state);
+                self.changed.notify_waiters();
+            }
+            return WorkerQuiescenceResult::Busy { active_jobs };
+        }
+        WorkerQuiescenceResult::Busy {
+            active_jobs: state.active_jobs,
         }
     }
 
     /// Reopen compute only for the request that closed the gate.
     pub fn resume(&self, request_id: [u8; 32]) -> Result<usize, WorkerResumeError> {
         let mut state = self.state.lock();
+        if state.shutdown_committed {
+            return Err(WorkerResumeError::ShutdownCommitted);
+        }
         if !state.closed {
             return Ok(state.active_jobs);
         }
@@ -2475,14 +2495,16 @@ impl WorkerExecutionGate {
         Ok(active_jobs)
     }
 
-    /// Disable the local safety timeout only after the separate authenticated
-    /// shutdown channel has begun. Without this commit, cancellation/GUI crash
-    /// reopens the worker when the quiescence lease expires.
+    /// Permanently close execution admission once process shutdown begins,
+    /// whether from SIGINT/SIGTERM or the separate authenticated shutdown
+    /// channel. Before this commit, cancellation/GUI crash reopens the worker
+    /// when the quiescence lease expires.
     pub fn commit_shutdown(&self) {
         let mut state = self.state.lock();
-        if state.closed {
-            state.shutdown_committed = true;
-        }
+        state.closed = true;
+        state.shutdown_committed = true;
+        drop(state);
+        self.changed.notify_waiters();
     }
 
     fn expire_lease(&self, request_id: [u8; 32], generation: u64) {
@@ -5537,6 +5559,86 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(35)).await;
         assert!(gate.is_closed());
         assert!(gate.try_enter().is_none());
+        assert_eq!(
+            gate.resume([0x76; 32]),
+            Err(WorkerResumeError::ShutdownCommitted)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_active_drain_prevents_timeout_or_resume_reopening() {
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let _active = gate.try_enter().unwrap();
+        let request_id = [0x77; 32];
+        let gate_for_drain = gate.clone();
+        let drain = tokio::spawn(async move {
+            gate_for_drain
+                .quiesce(
+                    request_id,
+                    std::time::Duration::from_millis(40),
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(gate.is_closed());
+
+        gate.commit_shutdown();
+        assert_eq!(
+            drain.await.unwrap(),
+            WorkerQuiescenceResult::Busy { active_jobs: 1 }
+        );
+        assert!(gate.is_closed());
+        assert_eq!(
+            gate.resume(request_id),
+            Err(WorkerResumeError::ShutdownCommitted)
+        );
+        assert!(gate.try_enter().is_none());
+    }
+
+    #[test]
+    fn committed_shutdown_at_active_drain_timeout_does_not_reopen_gate() {
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let _active = gate.try_enter().unwrap();
+        let request_id = [0x79; 32];
+        {
+            let mut state = gate.state.lock();
+            state.closed = true;
+            state.request_id = Some(request_id);
+        }
+        gate.commit_shutdown();
+        assert_eq!(
+            gate.timeout_quiescence(request_id),
+            WorkerQuiescenceResult::Busy { active_jobs: 1 }
+        );
+        assert!(gate.is_closed());
+        assert_eq!(
+            gate.resume(request_id),
+            Err(WorkerResumeError::ShutdownCommitted)
+        );
+        assert!(gate.try_enter().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_commit_on_open_gate_is_terminal_and_rejects_quiesce() {
+        let gate = Arc::new(WorkerExecutionGate::default());
+        gate.commit_shutdown();
+        assert!(gate.is_closed());
+        assert!(gate.try_enter().is_none());
+        assert_eq!(
+            gate.quiesce(
+                [0x78; 32],
+                std::time::Duration::from_secs(1),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await,
+            WorkerQuiescenceResult::Busy { active_jobs: 0 }
+        );
+        assert_eq!(
+            gate.resume([0x78; 32]),
+            Err(WorkerResumeError::ShutdownCommitted)
+        );
+        assert!(gate.is_closed());
     }
 
     #[test]
