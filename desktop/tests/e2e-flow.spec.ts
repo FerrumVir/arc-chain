@@ -544,7 +544,18 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(updater).toContain("update.download(");
     expect(updater).toContain("install: () => update.install()");
     expect(updater).not.toContain("downloadAndInstall");
-    expect(updateController).toContain("prepared && !handoffStarted");
+    const downloadStart = updateController.indexOf("await candidate.download(");
+    const prepareRelaunch = updateController.indexOf(
+      "await this.runtime.prepareRelaunch();",
+    );
+    const beginHandoff = updateController.indexOf(
+      "await this.runtime.beginHandoff();",
+    );
+    const installStart = updateController.indexOf("await candidate.install();");
+    expect(downloadStart).toBeGreaterThanOrEqual(0);
+    expect(downloadStart).toBeLessThan(prepareRelaunch);
+    expect(prepareRelaunch).toBeLessThan(beginHandoff);
+    expect(beginHandoff).toBeLessThan(installStart);
     expect(updateController).not.toContain("downloadAndInstall");
     expect(commands).toContain("LocalNodeCompatibility::Incompatible");
     expect(lib).toContain("probe_local_node_compatibility");
