@@ -25454,6 +25454,7 @@ mod tests {
                     false,
                     None,
                     Some(coordinator_shutdown_rx),
+                    Arc::new(arc_net::transport::TransportWirePolicy::default()),
                 )
                 .await
                 .unwrap();
@@ -25538,6 +25539,7 @@ mod tests {
                 false,
                 None,
                 Some(shutdown_rx),
+                Arc::new(arc_net::transport::TransportWirePolicy::default()),
             )
             .await
         });
