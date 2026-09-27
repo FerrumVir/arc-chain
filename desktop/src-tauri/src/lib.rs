@@ -365,6 +365,22 @@ pub fn run() {
                 }
             }
 
+            // Keep managed-node crash supervision alive while the window is
+            // hidden. It reuses NodeManager's exact launch plan and lifecycle
+            // lock, and has no effect on an intentional Stop/Quit.
+            let supervisor_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let Some(state) = supervisor_handle.try_state::<AppState>() else {
+                        break;
+                    };
+                    state.node.lock().await.supervise_managed_node().await;
+                }
+            });
+
             // If the app was launched with `--minimized` (set by the
             // autostart plugin on login), keep the window hidden and
             // let the tray be the only surface until the user clicks it.

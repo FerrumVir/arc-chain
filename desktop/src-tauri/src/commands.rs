@@ -662,9 +662,6 @@ pub async fn reset_peer_state(
 pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     let (port, pid, crash, worker_threads) = {
         let mut node = state.node.lock().await;
-        // Opportunistic crash detection - checks if our child process exited
-        // unexpectedly since the last poll.
-        node.try_reap_if_crashed().await;
         let pid = if node.is_running() { node.pid() } else { None };
         let port = node.rpc_port;
         let worker_threads = node.active_worker_threads;

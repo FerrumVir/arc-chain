@@ -24,6 +24,10 @@ const LOG_RING_SIZE: usize = 2000;
 const GRACEFUL_STOP_TIMEOUT_SECS: u64 = 4_420;
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(GRACEFUL_STOP_TIMEOUT_SECS);
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CRASH_RESTARTS: u8 = 5;
+const CRASH_RESTART_BASE_DELAY: Duration = Duration::from_secs(1);
+const CRASH_RESTART_MAX_DELAY: Duration = Duration::from_secs(16);
+const CRASH_RESTART_STABLE_RUNTIME: Duration = Duration::from_secs(10 * 60);
 const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str =
     arc_crypto::secret_file::DESKTOP_SHUTDOWN_CONTROL_DIR_NAME;
 const DESKTOP_SHUTDOWN_TOKEN_FILE_NAME: &str = "token";
@@ -1217,6 +1221,59 @@ pub struct NodeManager {
     /// width rather than whatever the config currently says — those diverge
     /// the moment the user moves the slider without applying it.
     pub active_worker_threads: Option<u32>,
+    /// Native run intent for crash supervision. It becomes true only after a
+    /// successful Start and is cleared before every intentional drain.
+    desired_running: bool,
+    crash_restart_policy: CrashRestartPolicy,
+    update_restart_was_desired: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CrashRestartPolicy {
+    restarts_attempted: u8,
+    retry_at: Option<Instant>,
+}
+
+impl CrashRestartPolicy {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn schedule_after_crash(&mut self, now: Instant) -> Option<(u8, Duration)> {
+        if self.restarts_attempted >= MAX_CRASH_RESTARTS {
+            self.retry_at = None;
+            return None;
+        }
+        let exponent = self.restarts_attempted as u32;
+        let delay = CRASH_RESTART_BASE_DELAY
+            .saturating_mul(1u32 << exponent)
+            .min(CRASH_RESTART_MAX_DELAY);
+        self.restarts_attempted += 1;
+        self.retry_at = Some(now + delay);
+        Some((self.restarts_attempted, delay))
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.retry_at.is_some_and(|retry_at| retry_at <= now)
+    }
+
+    fn consume_due(&mut self, now: Instant) -> bool {
+        if self.is_due(now) {
+            self.retry_at = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset_after_stable_run(&mut self, now: Instant, started_at: Instant) -> bool {
+        if now.saturating_duration_since(started_at) >= CRASH_RESTART_STABLE_RUNTIME {
+            self.reset();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1460,6 +1517,9 @@ impl NodeManager {
             legacy_windows_stop_context: None,
             legacy_windows_stop_error: None,
             active_worker_threads: None,
+            desired_running: false,
+            crash_restart_policy: CrashRestartPolicy::default(),
+            update_restart_was_desired: false,
         }
     }
 
@@ -1475,6 +1535,167 @@ impl NodeManager {
 
     pub async fn clear_crash(&self) {
         *self.crash_info.lock().await = None;
+    }
+
+    /// Clear runtime run intent before an intentional stop or update drain.
+    /// A later successful Start establishes fresh intent and retry budget.
+    pub fn clear_desired_running(&mut self) {
+        self.desired_running = false;
+        self.crash_restart_policy.retry_at = None;
+    }
+
+    /// Reap an exited child and run one due exact-plan retry. Called only by
+    /// the app-lifetime watcher, so recovery is independent of window polling.
+    pub async fn supervise_managed_node(&mut self) {
+        self.try_reap_if_crashed().await;
+        if self.child.is_some() {
+            if let Some(started_at) = self.started_at {
+                self.crash_restart_policy
+                    .reset_after_stable_run(Instant::now(), started_at);
+            }
+        }
+        self.try_restart_after_crash().await;
+    }
+
+    async fn try_restart_after_crash(&mut self) {
+        if !self.desired_running
+            || self.child.is_some()
+            || self.update_lifecycle_lock.is_some()
+            || self.update_handoff_started
+            || !self.crash_restart_policy.is_due(Instant::now())
+        {
+            return;
+        }
+        let Some(plan) = self.active_launch_plan.clone() else {
+            self.fail_crash_restart("the exact prior launch plan is unavailable")
+                .await;
+            return;
+        };
+        let Some(lifecycle_lock) = self.lifecycle_lock.take() else {
+            self.fail_crash_restart("the managed data-directory lifecycle lock is unavailable")
+                .await;
+            return;
+        };
+        let resources = TestnetResources {
+            seeds_file: Some(plan.seeds.path.clone()),
+            genesis_file: Some(plan.genesis.path.clone()),
+        };
+        push_log(
+            &self.logs,
+            "warn",
+            format!(
+                "retrying crashed arc-node with its exact saved launch (attempt {}/{})",
+                self.crash_restart_policy.restarts_attempted, MAX_CRASH_RESTARTS
+            ),
+        )
+        .await;
+        // The native watcher is the only caller. Preserve the retry deadline
+        // across awaits so cancellation cannot consume recovery authority.
+        let recovery_launch = self
+            .managed_data_dir
+            .as_deref()
+            .and_then(|dir| arc_crypto::secret_file::desktop_shutdown_lifecycle_state(dir).ok())
+            .is_some_and(|state| !state.is_clear());
+        let result = self
+            .start_while_lifecycle_locked(
+                &plan.config,
+                &plan.validator_keyfile.path,
+                &resources,
+                &lifecycle_lock,
+                Some(&plan),
+                recovery_launch,
+            )
+            .await;
+        match result {
+            Ok(()) => {
+                self.lifecycle_lock = Some(lifecycle_lock);
+                // Install the exact plan and guard before any post-spawn
+                // suspension. Recovery launches remain quarantined until the
+                // authenticated stop path consumes their ACK.
+                if recovery_launch {
+                    self.desired_running = true;
+                    let stop = self.stop_and_retain_lifecycle_lock().await;
+                    match stop {
+                        Ok(outcome) => {
+                            let Some(recovery_lock) = outcome.lifecycle_lock else {
+                                self.fail_crash_restart("the recovered lifecycle lock was lost")
+                                    .await;
+                                return;
+                            };
+                            let recovery_clear = self
+                                .managed_data_dir
+                                .as_deref()
+                                .and_then(|dir| {
+                                    arc_crypto::secret_file::desktop_shutdown_lifecycle_state(dir)
+                                        .ok()
+                                })
+                                .is_some_and(|state| state.is_clear());
+                            if !recovery_clear {
+                                self.lifecycle_lock = Some(recovery_lock);
+                                self.fail_crash_restart(
+                                    "the authenticated recovery boundary remains unresolved",
+                                )
+                                .await;
+                                return;
+                            }
+                            let resources = TestnetResources {
+                                seeds_file: Some(plan.seeds.path.clone()),
+                                genesis_file: Some(plan.genesis.path.clone()),
+                            };
+                            match self
+                                .start_while_lifecycle_locked(
+                                    &plan.config,
+                                    &plan.validator_keyfile.path,
+                                    &resources,
+                                    &recovery_lock,
+                                    Some(&plan),
+                                    false,
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    self.lifecycle_lock = Some(recovery_lock);
+                                    self.desired_running = true;
+                                }
+                                Err(error) => {
+                                    self.lifecycle_lock = Some(recovery_lock);
+                                    self.fail_crash_restart(&error.to_string()).await;
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.fail_crash_restart(&error.to_string()).await;
+                            return;
+                        }
+                    }
+                }
+                self.crash_restart_policy.consume_due(Instant::now());
+                self.note_successful_spawn().await;
+            }
+            Err(error) => {
+                drop(lifecycle_lock);
+                self.fail_crash_restart(&error.to_string()).await;
+            }
+        }
+    }
+
+    async fn fail_crash_restart(&mut self, reason: &str) {
+        self.desired_running = false;
+        self.crash_restart_policy.retry_at = None;
+        // A failed stop may have restored a still-live child. Never release
+        // its sole-writer fence merely because recovery itself failed.
+        if self.child.is_none() {
+            self.lifecycle_lock = None;
+            self.active_launch_plan = None;
+        }
+        let message = format!("automatic crash recovery stopped: {reason}");
+        *self.crash_info.lock().await = Some(CrashInfo {
+            exit_code: None,
+            message: message.clone(),
+            at_millis: chrono::Utc::now().timestamp_millis(),
+        });
+        push_log(&self.logs, "error", message).await;
     }
 
     pub fn configure_legacy_windows_stop_context(
@@ -1628,10 +1849,24 @@ impl NodeManager {
             resources,
             &lifecycle_lock,
             None,
+            false,
         )
         .await?;
         self.lifecycle_lock = Some(lifecycle_lock);
+        self.desired_running = true;
+        self.crash_restart_policy.reset();
+        self.note_successful_spawn().await;
         Ok(())
+    }
+
+    async fn note_successful_spawn(&self) {
+        *self.crash_info.lock().await = None;
+        push_log(
+            &self.logs,
+            "info",
+            format!("arc-node started on 127.0.0.1:{}", self.rpc_port),
+        )
+        .await;
     }
 
     /// Spawn while borrowing the caller's already-held lifecycle lock. The
@@ -1645,6 +1880,7 @@ impl NodeManager {
         resources: &TestnetResources,
         lifecycle_lock: &ManagedLifecycleLock,
         resume_plan: Option<&ManagedLaunchPlan>,
+        recovery_retry: bool,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.update_lifecycle_lock.is_none(),
@@ -1687,7 +1923,7 @@ impl NodeManager {
             .transpose()?;
         let binary = if let Some((_, binary, _)) = verified_resume.as_ref() {
             anyhow::ensure!(
-                !recovery_launch,
+                !recovery_launch || recovery_retry,
                 "cannot resume the pre-update node while its durable shutdown receipt is unresolved"
             );
             persist_managed_executable_identity(&data_dir, binary)?
@@ -1748,6 +1984,10 @@ impl NodeManager {
                         .into(),
                 );
             }
+            anyhow::ensure!(
+                !recovery_retry || control.receipt_nonce.is_some(),
+                "automatic recovery launch requires the exact unresolved shutdown receipt"
+            );
             Some(control)
         } else {
             None
@@ -1963,6 +2203,11 @@ impl NodeManager {
                     .into(),
             );
         }
+        // After spawn returns, this async method must run to completion
+        // without another suspension point. Each caller installs its owned
+        // lifecycle lock before awaiting post-start status/log bookkeeping.
+        self.stopping
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -2008,17 +2253,7 @@ impl NodeManager {
             });
         }
 
-        self.stopping
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        *self.crash_info.lock().await = None;
         self.child = Some(child);
-
-        push_log(
-            &self.logs,
-            "info",
-            format!("arc-node started on 127.0.0.1:{}", rpc_port),
-        )
-        .await;
         Ok(())
     }
 
@@ -2039,21 +2274,72 @@ impl NodeManager {
                 self.child = None;
                 self.started_at = None;
                 self.shutdown_control = None;
-                self.lifecycle_lock = None;
                 self.active_worker_threads = None;
-                self.active_launch_plan = None;
                 if !was_stopping {
                     let code = status.code();
                     let message = format!(
                         "arc-node exited unexpectedly{}",
                         code.map(|c| format!(" (code {})", c)).unwrap_or_default()
                     );
+                    // Publish the next lifecycle state before any IPC/log
+                    // mutex await. Cancellation of a status reader must not
+                    // leave a desired app with no retry deadline.
+                    let was_desired = self.desired_running;
+                    let retry_schedule = if was_desired && self.active_launch_plan.is_some() {
+                        self.crash_restart_policy
+                            .schedule_after_crash(Instant::now())
+                    } else {
+                        None
+                    };
+                    let retry_exhausted = was_desired
+                        && self.active_launch_plan.is_some()
+                        && retry_schedule.is_none();
+                    let missing_plan = was_desired && self.active_launch_plan.is_none();
+                    if retry_exhausted || missing_plan || !was_desired {
+                        self.desired_running = false;
+                        self.lifecycle_lock = None;
+                        self.active_launch_plan = None;
+                    }
                     push_log(&self.logs, "error", message.clone()).await;
                     *self.crash_info.lock().await = Some(CrashInfo {
                         exit_code: code,
                         message,
                         at_millis: chrono::Utc::now().timestamp_millis(),
                     });
+                    if let Some((attempt, delay)) = retry_schedule {
+                        push_log(
+                                &self.logs,
+                                "warn",
+                                format!(
+                                    "arc-node crash retry {attempt}/{MAX_CRASH_RESTARTS} scheduled in {}s",
+                                    delay.as_secs()
+                                ),
+                            )
+                            .await;
+                    } else if retry_exhausted {
+                        push_log(
+                                &self.logs,
+                                "error",
+                                format!(
+                                    "arc-node crash recovery stopped after {MAX_CRASH_RESTARTS} automatic restarts; start it manually to begin a new retry budget"
+                                ),
+                            )
+                            .await;
+                    } else if missing_plan {
+                        let reason = "automatic crash recovery stopped: the exact prior launch plan is unavailable";
+                        self.desired_running = false;
+                        self.lifecycle_lock = None;
+                        self.active_launch_plan = None;
+                        *self.crash_info.lock().await = Some(CrashInfo {
+                            exit_code: code,
+                            message: reason.into(),
+                            at_millis: chrono::Utc::now().timestamp_millis(),
+                        });
+                        push_log(&self.logs, "error", reason.to_string()).await;
+                    }
+                } else {
+                    self.lifecycle_lock = None;
+                    self.active_launch_plan = None;
                 }
             }
             Ok(None) => { /* still running */ }
@@ -2133,6 +2419,9 @@ impl NodeManager {
     }
 
     async fn stop_and_retain_lifecycle_lock(&mut self) -> anyhow::Result<StopLifecycleOutcome> {
+        // Suppress crash restarts before any intentional process drain starts,
+        // including Stop, Quit, local mutations, and updater preparation.
+        self.clear_desired_running();
         anyhow::ensure!(
             self.update_lifecycle_lock.is_none(),
             "a signed desktop update already owns the managed-node lifecycle fence"
@@ -2273,6 +2562,11 @@ impl NodeManager {
         // running owned node somehow lacks this post-spawn identity, do not
         // stop it: an updater failure could not restore what was running.
         let owned_was_running = self.child.is_some();
+        let restart_was_desired = self.desired_running;
+        anyhow::ensure!(
+            !restart_was_desired || owned_was_running,
+            "cannot prepare an update while exact-plan crash recovery is pending; let recovery run or explicitly stop the node first"
+        );
         let restart_plan = if owned_was_running {
             Some(self.active_launch_plan.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -2299,6 +2593,7 @@ impl NodeManager {
             );
         }
         self.update_restart_plan = restart_plan;
+        self.update_restart_was_desired = restart_was_desired;
         self.update_handoff_started = false;
         self.update_lifecycle_lock = Some(lifecycle_lock);
         Ok(())
@@ -2366,6 +2661,7 @@ impl NodeManager {
             // updater fence and preserve that stopped state.
             self.update_lifecycle_lock = None;
             self.update_handoff_started = false;
+            self.update_restart_was_desired = false;
             return Ok(());
         };
         let lifecycle_lock = self
@@ -2383,6 +2679,7 @@ impl NodeManager {
                 &resources,
                 &lifecycle_lock,
                 Some(&restart_plan),
+                false,
             )
             .await;
         match result {
@@ -2390,7 +2687,10 @@ impl NodeManager {
                 // Convert the same continuously-held OS lock from updater
                 // ownership back into ordinary child-lifecycle ownership.
                 self.lifecycle_lock = Some(lifecycle_lock);
+                self.desired_running = self.update_restart_was_desired;
+                self.update_restart_was_desired = false;
                 self.update_handoff_started = false;
+                self.note_successful_spawn().await;
                 Ok(())
             }
             Err(error) => {
@@ -4209,6 +4509,38 @@ mod tests {
         assert!(!manager.is_running());
     }
 
+    #[test]
+    fn crash_restart_policy_is_exponential_and_caps_at_five_restarts() {
+        let mut policy = CrashRestartPolicy::default();
+        let now = Instant::now();
+        let delays = [1, 2, 4, 8, 16];
+        for (index, seconds) in delays.into_iter().enumerate() {
+            let (attempt, delay) = policy.schedule_after_crash(now).unwrap();
+            assert_eq!(attempt, index as u8 + 1);
+            assert_eq!(delay, Duration::from_secs(seconds));
+            assert!(!policy.consume_due(now));
+            assert!(policy.consume_due(now + delay));
+        }
+        assert!(policy.schedule_after_crash(now).is_none());
+        assert_eq!(policy.restarts_attempted, MAX_CRASH_RESTARTS);
+        policy.reset();
+        assert_eq!(policy.restarts_attempted, 0);
+    }
+
+    #[test]
+    fn crash_restart_budget_resets_only_after_ten_stable_minutes() {
+        let mut policy = CrashRestartPolicy::default();
+        let now = Instant::now();
+        policy.schedule_after_crash(now);
+        assert!(!policy.reset_after_stable_run(
+            now,
+            now - CRASH_RESTART_STABLE_RUNTIME + Duration::from_secs(1)
+        ));
+        assert_eq!(policy.restarts_attempted, 1);
+        assert!(policy.reset_after_stable_run(now, now - CRASH_RESTART_STABLE_RUNTIME));
+        assert_eq!(policy.restarts_attempted, 0);
+    }
+
     #[cfg(windows)]
     fn private_directory_rebarrier_staging(path: &Path) -> PathBuf {
         path.parent().unwrap().join(format!(
@@ -4868,7 +5200,7 @@ mod tests {
         let genesis = root.join("genesis.toml");
         std::fs::write(
             &binary,
-            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file --desktop-lifecycle-nonce'\n  exit 0\nfi\nwhile :; do sleep 1; done\n",
+            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file --desktop-lifecycle-nonce'\n  exit 0\nfi\ndata_dir=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --data-dir ]; then data_dir=\"$2\"; shift 2; else shift; fi\ndone\nstarts=0\nif [ -f \"$data_dir/crash-retry-fixture-starts\" ]; then starts=$(cat \"$data_dir/crash-retry-fixture-starts\"); fi\nstarts=$((starts + 1))\nprintf '%s' \"$starts\" > \"$data_dir/crash-retry-fixture-starts\"\nif [ \"$starts\" -eq 3 ] && [ ! -f \"$data_dir/crash-retry-fixture-ack-observed\" ]; then printf bad > \"$data_dir/crash-retry-fixture-order-error\"; fi\nprintf started > \"$data_dir/crash-retry-fixture-started\"\nif [ \"$starts\" -eq 2 ]; then while [ ! -f \"$data_dir/.arc-desktop-control/request\" ]; do sleep 0.01; done; sleep 0.1; exit 0; fi\nexec sleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -4894,7 +5226,59 @@ mod tests {
         manager.configure_managed_data_dir(&configured).unwrap();
         manager.update_lifecycle_lock = Some(acquire_managed_lifecycle_lock(&configured).unwrap());
         manager.update_restart_plan = Some(plan.clone());
+        manager.update_restart_was_desired = true;
         (root, configured, manager, plan)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_after_spawn_keeps_owned_child_and_lifecycle_lock() {
+        let (root, configured, manager, _plan) =
+            updater_resume_fixture("post-spawn-cancellation-fence");
+        let manager = Arc::new(tokio::sync::Mutex::new(manager));
+        let crash_info = manager.lock().await.crash_info.clone();
+        let held_crash_info = crash_info.lock().await;
+
+        let aborting_manager = manager.clone();
+        let task =
+            tokio::spawn(
+                async move { aborting_manager.lock().await.abort_update_relaunch().await },
+            );
+        let marker = Path::new(&configured).join("crash-retry-fixture-started");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !marker.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture child must spawn while crash status is contended");
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "post-start status update must be blocked"
+        );
+
+        // Cancelling the caller while it waits for the contended crash-info
+        // lock must not orphan a child or drop the OS lifecycle fence.
+        task.abort();
+        let _ = task.await;
+        drop(held_crash_info);
+        let mut manager_state = manager.lock().await;
+        assert!(manager_state.child.is_some());
+        assert!(manager_state.lifecycle_lock.is_some());
+        assert!(manager_state.desired_running);
+        assert!(acquire_managed_lifecycle_lock(&configured).is_err());
+
+        let mut child = manager_state.child.take().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager_state.clear_desired_running();
+        manager_state.shutdown_control = None;
+        manager_state.lifecycle_lock = None;
+        manager_state.active_launch_plan = None;
+        drop(manager_state);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -4920,6 +5304,261 @@ mod tests {
         manager.lifecycle_lock = None;
         manager.active_launch_plan = None;
         drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crashed_owned_child_restarts_exact_plan_under_same_lifecycle_lock() {
+        let (root, configured, mut manager, _plan) =
+            updater_resume_fixture("crash-retry-exact-launch");
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(manager.desired_running);
+        let first_pid = manager.pid().unwrap();
+
+        let child = manager.child.as_mut().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
+        assert!(manager.lifecycle_lock.is_some());
+        assert_eq!(manager.crash_restart_policy.restarts_attempted, 1);
+
+        // The real schedule is exponential; make this integration test prompt
+        // while preserving the same due-retry transition.
+        manager.crash_restart_policy.retry_at = Some(Instant::now());
+
+        // The fixture recovery process exits only after the exact request is
+        // published. Simulate arc-node's final authenticated WAL ACK using
+        // the real receipt API, so retry cannot skip the quarantine boundary.
+        let mut control = prepare_desktop_shutdown_control(Path::new(&configured)).unwrap();
+        control
+            .bind_receipt_identity(&_plan.binary.path, &_plan.genesis.path)
+            .unwrap();
+        let request = control.request_file.clone();
+        let data_dir = control.data_dir.clone();
+        let token = control.token_bytes().unwrap();
+        let nonce = control.receipt_nonce.unwrap();
+        let executable = control.receipt_executable.clone().unwrap();
+        let genesis = control.receipt_genesis.clone().unwrap();
+        let ack_marker = Path::new(&configured).join("crash-retry-fixture-ack-observed");
+        let ack_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !request.is_file() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("recovery stop must publish its authenticated request");
+            arc_crypto::secret_file::acknowledge_desktop_shutdown_receipt(
+                &data_dir,
+                &token,
+                &nonce,
+                &executable,
+                &genesis,
+            )
+            .unwrap();
+            std::fs::write(ack_marker, b"acknowledged").unwrap();
+        });
+        manager.supervise_managed_node().await;
+        ack_task.await.unwrap();
+        assert!(
+            !Path::new(&configured)
+                .join("crash-retry-fixture-order-error")
+                .exists(),
+            "normal launch must wait for the authenticated recovery ACK"
+        );
+        let second_pid = manager.pid().expect("automatic retry must spawn child");
+        assert_ne!(first_pid, second_pid);
+        assert!(manager.desired_running);
+        assert_eq!(
+            manager.crash_restart_policy.restarts_attempted, 1,
+            "an internal retry must not reset the bounded restart budget"
+        );
+        assert!(
+            acquire_managed_lifecycle_lock(&configured).is_err(),
+            "the same lock must fence a second writer across crash and retry"
+        );
+
+        let mut child = manager.child.take().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.clear_desired_running();
+        manager.shutdown_control = None;
+        manager.lifecycle_lock = None;
+        manager.active_launch_plan = None;
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_prepare_defers_without_erasing_pending_crash_retry() {
+        let (root, _configured, mut manager, plan) =
+            updater_resume_fixture("update-defers-pending-crash-retry");
+        manager.abort_update_relaunch().await.unwrap();
+        let child = manager.child.as_mut().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.supervise_managed_node().await;
+        let retry_at = manager.crash_restart_policy.retry_at;
+        assert!(manager.child.is_none());
+        assert!(manager.desired_running);
+        assert!(retry_at.is_some());
+
+        let error = manager
+            .prepare_update_relaunch()
+            .await
+            .expect_err("update must defer while exact-plan automatic recovery is pending");
+        assert!(error.to_string().contains("crash recovery is pending"));
+        assert!(manager.desired_running);
+        assert!(manager.child.is_none());
+        assert!(manager.lifecycle_lock.is_some());
+        assert_eq!(
+            manager.active_launch_plan.as_ref().unwrap().binary.path,
+            plan.binary.path
+        );
+        assert_eq!(manager.crash_restart_policy.retry_at, retry_at);
+
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crash_retry_refuses_changed_genesis_and_keeps_durability_receipt() {
+        let (root, _configured, mut manager, plan) =
+            updater_resume_fixture("crash-retry-changed-genesis");
+        manager.abort_update_relaunch().await.unwrap();
+        let child = manager.child.as_mut().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.supervise_managed_node().await;
+        manager.crash_restart_policy.retry_at = Some(Instant::now());
+        std::fs::write(&plan.genesis.path, b"[chain]\nname='tampered'\n").unwrap();
+
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
+        assert!(!manager.desired_running);
+        assert!(manager
+            .crash_info
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|crash| crash.message.contains("genesis identity bytes changed")));
+        assert!(
+            arc_crypto::secret_file::desktop_shutdown_receipt_exists(Path::new(
+                &plan.config.data_dir
+            ))
+            .unwrap()
+        );
+
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crash_retry_refuses_changed_executable_and_keeps_durability_receipt() {
+        let (root, _configured, mut manager, plan) =
+            updater_resume_fixture("crash-retry-changed-binary");
+        manager.abort_update_relaunch().await.unwrap();
+        let child = manager.child.as_mut().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.supervise_managed_node().await;
+        manager.crash_restart_policy.retry_at = Some(Instant::now());
+        std::fs::write(&plan.binary.path, b"changed executable bytes").unwrap();
+
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
+        assert!(!manager.desired_running);
+        assert!(manager
+            .crash_info
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|crash| crash.message.contains("executable bytes changed")));
+        assert!(
+            arc_crypto::secret_file::desktop_shutdown_receipt_exists(Path::new(
+                &plan.config.data_dir
+            ))
+            .unwrap()
+        );
+
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crash_retry_stops_when_launch_plan_or_lifecycle_lock_is_missing() {
+        let mut no_plan = NodeManager::new();
+        no_plan.desired_running = true;
+        no_plan.crash_restart_policy.retry_at = Some(Instant::now());
+        no_plan.supervise_managed_node().await;
+        assert!(!no_plan.desired_running);
+        assert!(no_plan
+            .crash_info
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|crash| crash
+                .message
+                .contains("exact prior launch plan is unavailable")));
+
+        let (root, _configured, mut no_lock, plan) =
+            updater_resume_fixture("crash-retry-missing-lock");
+        no_lock.update_lifecycle_lock = None;
+        no_lock.active_launch_plan = Some(plan);
+        no_lock.desired_running = true;
+        no_lock.crash_restart_policy.retry_at = Some(Instant::now());
+        no_lock.supervise_managed_node().await;
+        assert!(!no_lock.desired_running);
+        assert!(no_lock
+            .crash_info
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|crash| crash.message.contains("lifecycle lock is unavailable")));
+        drop(no_lock);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn intentional_stop_and_update_drain_clear_crash_restart_intent() {
+        let root = resource_test_dir("intentional-stop-no-crash-retry");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
+        let configured = root.join("data-v3").to_string_lossy().into_owned();
+        let mut stopped = NodeManager::new();
+        stopped.configure_managed_data_dir(&configured).unwrap();
+        stopped.desired_running = true;
+        stopped
+            .crash_restart_policy
+            .schedule_after_crash(Instant::now());
+        stopped.stop().await.unwrap();
+        assert!(!stopped.desired_running);
+        assert!(stopped.crash_restart_policy.retry_at.is_none());
+        stopped.supervise_managed_node().await;
+        assert!(stopped.child.is_none());
+
+        let mut updating = NodeManager::new();
+        updating.configure_managed_data_dir(&configured).unwrap();
+        // No owned child means this is not an intentional updater drain of a
+        // previously running app; the pending-retry case is covered by the
+        // explicit defer test above.
+        updating.desired_running = false;
+        updating
+            .crash_restart_policy
+            .schedule_after_crash(Instant::now());
+        updating.prepare_update_relaunch().await.unwrap();
+        assert!(!updating.desired_running);
+        assert!(updating.crash_restart_policy.retry_at.is_none());
+        updating.supervise_managed_node().await;
+        assert!(updating.child.is_none());
+        updating.abort_update_relaunch().await.unwrap();
+        drop(stopped);
+        drop(updating);
         std::fs::remove_dir_all(root).unwrap();
     }
 
