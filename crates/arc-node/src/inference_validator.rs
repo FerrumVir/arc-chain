@@ -91,6 +91,7 @@ pub struct InferenceValidatorTask {
     /// non-terminal.
     finalize_submitted: Arc<DashMap<[u8; 32], std::time::Instant>>,
     compute_permits: Arc<tokio::sync::Semaphore>,
+    worker_execution: Arc<crate::native_inference::WorkerExecutionGate>,
 }
 
 /// How long to wait after a finalize submit before allowing a retry on the
@@ -122,7 +123,16 @@ impl InferenceValidatorTask {
             compute_permits: Arc::new(tokio::sync::Semaphore::new(
                 TIER1_INFERENCE_COMPUTE_CONCURRENCY,
             )),
+            worker_execution: Arc::new(crate::native_inference::WorkerExecutionGate::default()),
         }
+    }
+
+    pub fn with_worker_execution_gate(
+        mut self,
+        gate: Arc<crate::native_inference::WorkerExecutionGate>,
+    ) -> Self {
+        self.worker_execution = gate;
+        self
     }
 
     /// Run forever. Cancellation is via the parent runtime dropping the
@@ -236,7 +246,9 @@ impl InferenceValidatorTask {
                     // one waiter/task per pending request: the engine itself
                     // is serialized, so queued blocking jobs add no throughput
                     // and can exhaust runtime memory under adversarial demand.
-                    if let Ok(compute_permit) = self.compute_permits.clone().try_acquire_owned() {
+                    if let Some(worker_permit) = self.worker_execution.try_enter()
+                        && let Ok(compute_permit) = self.compute_permits.clone().try_acquire_owned()
+                    {
                         // Mark optimistically; clear on submission failure.
                         self.voted.insert(request_id, ());
                         let task = self.clone();
@@ -244,7 +256,11 @@ impl InferenceValidatorTask {
                         let snap_for_task = snap.clone();
                         jobs.spawn(async move {
                             if let Err(e) = task
-                                .run_inference_and_vote(snap_for_task, compute_permit)
+                                .run_inference_and_vote(
+                                    snap_for_task,
+                                    compute_permit,
+                                    worker_permit,
+                                )
                                 .await
                             {
                                 warn!(
@@ -294,6 +310,7 @@ impl InferenceValidatorTask {
         self: Arc<Self>,
         snap: Tier1RequestSnapshot,
         compute_permit: tokio::sync::OwnedSemaphorePermit,
+        worker_permit: crate::native_inference::WorkerExecutionPermit,
     ) -> anyhow::Result<()> {
         let request_id = snap.request_id;
         info!(
@@ -327,8 +344,10 @@ impl InferenceValidatorTask {
         }
         let generation_tokens =
             Self::prepare_generation_tokens(&tokenizer, &snap.input_blob, requested_max_tokens)?;
+        let worker_permit_for_compute = worker_permit.clone();
         let (output_hash, output_blob) =
             spawn_blocking_with_tier1_compute_permit(compute_permit, move || {
+                let _worker_permit = worker_permit_for_compute;
                 Self::compute_output_blocking(
                     &engine,
                     model_id,

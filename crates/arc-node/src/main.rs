@@ -5991,6 +5991,7 @@ const DESKTOP_SHUTDOWN_REQUEST_FILE_NAME: &str = "request";
 const DESKTOP_SHUTDOWN_REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
 const DESKTOP_SHUTDOWN_FILE_MAX_BYTES: u64 = 256;
 
+#[derive(Clone)]
 struct DesktopShutdownControl {
     request_file: PathBuf,
     expected_token: [u8; 32],
@@ -6288,6 +6289,83 @@ async fn wait_for_authenticated_desktop_shutdown(
                     Err(error) => {
                         tracing::warn!(%error, "ignored invalid desktop shutdown request");
                     }
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_desktop_worker_quiescence(
+    control: DesktopShutdownControl,
+    admission: Arc<arc_node::native_inference::NativeRequestAdmission>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use arc_crypto::secret_file::{
+        DesktopWorkerQuiescenceResponse, DesktopWorkerQuiescenceStatus,
+        publish_desktop_worker_quiescence_response, take_desktop_worker_quiescence_request,
+    };
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(100));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow_and_update() { return; }
+            }
+            _ = poll.tick() => {
+                let request = match take_desktop_worker_quiescence_request(
+                    &control.data_dir,
+                    std::process::id(),
+                    &control.expected_token,
+                    &control.armed_receipt_nonce,
+                ) {
+                    Ok(Some(request)) => request,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, "ignored invalid desktop worker-quiescence request");
+                        continue;
+                    }
+                };
+                let gate = admission.worker_execution_gate();
+                let (status, active_jobs) = match request.action {
+                    arc_crypto::secret_file::DesktopWorkerQuiescenceAction::Quiesce => {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_millis() as u64)
+                            .unwrap_or(u64::MAX);
+                        let remaining = request.lease_deadline_unix_ms.saturating_sub(now_ms);
+                        let lease_deadline = tokio::time::Instant::now()
+                            + std::time::Duration::from_millis(remaining);
+                        match gate.quiesce(
+                            request.request_id,
+                            std::time::Duration::from_millis(u64::from(request.timeout_ms)),
+                            lease_deadline,
+                        ).await {
+                            arc_node::native_inference::WorkerQuiescenceResult::Quiesced { active_jobs } =>
+                                (DesktopWorkerQuiescenceStatus::Quiesced, active_jobs),
+                            arc_node::native_inference::WorkerQuiescenceResult::Busy { active_jobs } =>
+                                (DesktopWorkerQuiescenceStatus::Busy, active_jobs),
+                        }
+                    }
+                    arc_crypto::secret_file::DesktopWorkerQuiescenceAction::Resume => {
+                        match gate.resume(request.request_id) {
+                            Ok(active_jobs) => (DesktopWorkerQuiescenceStatus::Resumed, active_jobs),
+                            Err(_) => (DesktopWorkerQuiescenceStatus::Error, gate.active_jobs()),
+                        }
+                    }
+                };
+                let response = DesktopWorkerQuiescenceResponse {
+                    pid: std::process::id(),
+                    receipt_nonce: control.armed_receipt_nonce,
+                    request_id: request.request_id,
+                    status,
+                    active_jobs: u64::try_from(active_jobs).unwrap_or(u64::MAX),
+                };
+                if let Err(error) = publish_desktop_worker_quiescence_response(&control.data_dir, response) {
+                    tracing::error!(%error, "failed to publish desktop worker-quiescence response");
                 }
             }
         }
@@ -6608,12 +6686,18 @@ async fn run_arc_node() -> Result<()> {
     let desktop_lifecycle_nonce = cli.desktop_lifecycle_nonce;
     let mut data_dir_lock =
         acquire_node_data_dir_lock(Path::new(&data_dir), desktop_lifecycle_nonce.as_ref())?;
+    let native_request_admission =
+        Arc::new(arc_node::native_inference::NativeRequestAdmission::new(
+            cli.enable_native_inference_requests,
+        ));
     let desktop_shutdown_control = prepare_desktop_shutdown_control(
         Path::new(&data_dir),
         cli.desktop_shutdown_token_file.as_deref(),
         cli.genesis.as_deref().map(Path::new),
     )?;
-    if let Some(control) = desktop_shutdown_control {
+    if let Some(control) = desktop_shutdown_control.clone() {
+        let quiescence_control = control.clone();
+        let shutdown_worker_execution_gate = native_request_admission.worker_execution_gate();
         let shutdown_requested = shutdown_requested.clone();
         let shutdown_tx = shutdown_tx.clone();
         let background_admission_shutdown_tx = background_admission_shutdown_tx.clone();
@@ -6633,12 +6717,23 @@ async fn run_arc_node() -> Result<()> {
                 tracing::info!(
                     "authenticated local desktop shutdown requested - stopping HTTP/background admission and draining active work"
                 );
+                shutdown_worker_execution_gate.commit_shutdown();
                 broadcast_node_shutdown(
                     &shutdown_requested,
                     &shutdown_tx,
                     &background_admission_shutdown_tx,
                 );
             }
+        }));
+        let quiescence_admission = native_request_admission.clone();
+        let quiescence_shutdown = shutdown_rx.clone();
+        runtime_tasks.push(tokio::spawn(async move {
+            wait_for_desktop_worker_quiescence(
+                quiescence_control,
+                quiescence_admission,
+                quiescence_shutdown,
+            )
+            .await;
         }));
         // The first interval tick is immediate. Poll the watcher once before
         // persistent recovery or model work can monopolize this future.
@@ -7418,10 +7513,6 @@ async fn run_arc_node() -> Result<()> {
     // empty polls, backs off on error, stops after repeated failures rather
     // than hot-looping, and is shut down explicitly below.
     let native_runtime_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let native_request_admission =
-        Arc::new(arc_node::native_inference::NativeRequestAdmission::new(
-            cli.enable_native_inference_requests,
-        ));
     let mut native_runtime_handle: Option<arc_node::native_inference::NativeRuntimeHandle> = None;
     // The finalize sink is shared: the runtime emits this validator's votes into
     // it, and the consensus loop gossips them and feeds peers' votes back in.
@@ -8423,7 +8514,8 @@ async fn run_arc_node() -> Result<()> {
             candle_engine.clone(),
             inference_model.clone(),
             model_artifact_id,
-        );
+        )
+        .with_worker_execution_gate(native_request_admission.worker_execution_gate());
         let validator_shutdown = background_admission_shutdown_rx.clone();
         runtime_tasks.push(tokio::spawn(async move {
             validator_task.run_with_shutdown(validator_shutdown).await;
@@ -8773,6 +8865,7 @@ async fn run_arc_node() -> Result<()> {
             let attestation_nonce = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let attestation_nonce_initialized =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_execution_gate = native_request_admission.worker_execution_gate();
             let mut worker_shutdown = Some(background_admission_shutdown_rx.clone());
 
             runtime_tasks.push(tokio::spawn(async move {
@@ -8924,6 +9017,18 @@ async fn run_arc_node() -> Result<()> {
                     {
                         let Some((winner, job)) = claimed else {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        };
+                        let Some(worker_execution_permit) = worker_execution_gate.try_enter() else {
+                            decline_community_assignment(
+                                client.clone(),
+                                winner,
+                                job,
+                                worker_id_w.clone(),
+                                worker_keypair.clone(),
+                                "worker is quiescing for desktop update",
+                            )
+                            .await;
                             continue;
                         };
 
@@ -9153,7 +9258,9 @@ async fn run_arc_node() -> Result<()> {
                             .await;
                             continue;
                         }
+                        let worker_execution_for_compute = worker_execution_permit.clone();
                         let inference = tokio::task::spawn_blocking(move || {
+                            let _worker_execution_permit = worker_execution_for_compute;
                             // The fallible model API is authoritative at this
                             // untrusted boundary. It performs checked context
                             // admission immediately before allocating KV state;

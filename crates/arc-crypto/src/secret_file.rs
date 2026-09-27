@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 pub const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str = ".arc-desktop-control";
 pub const DESKTOP_SHUTDOWN_RECEIPT_FILE_NAME: &str = "shutdown-unproven";
 pub const DESKTOP_SHUTDOWN_ACK_FILE_NAME: &str = "shutdown-clean-ack";
+pub const DESKTOP_WORKER_QUIESCENCE_REQUEST_FILE_NAME: &str = "worker-quiescence-request";
+pub const DESKTOP_WORKER_QUIESCENCE_RESPONSE_FILE_NAME: &str = "worker-quiescence-response";
 pub const DESKTOP_LIFECYCLE_LOCK_FILE_NAME: &str = "lifecycle.lock";
 pub const DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME: &str = "lifecycle.owner.lock";
 pub const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_PREFIX: &str = "lifecycle.namespace-proof.v3-";
@@ -21,6 +23,46 @@ const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_MAX_BYTES: u64 = 512;
 const DESKTOP_SHUTDOWN_RECEIPT_SCHEMA: &str = "arc.desktop.shutdown-unproven.v1";
 const DESKTOP_SHUTDOWN_ACK_SCHEMA: &str = "arc.desktop.shutdown-clean-ack.v1";
 const DESKTOP_SHUTDOWN_RECEIPT_MAX_BYTES: u64 = 768;
+const DESKTOP_WORKER_QUIESCENCE_REQUEST_SCHEMA: &str = "arc.desktop.worker-quiescence-request.v1";
+const DESKTOP_WORKER_QUIESCENCE_RESPONSE_SCHEMA: &str = "arc.desktop.worker-quiescence-response.v1";
+const DESKTOP_WORKER_QUIESCENCE_MAX_BYTES: u64 = 1024;
+pub const DESKTOP_WORKER_QUIESCENCE_MAX_TIMEOUT_MS: u32 = 120_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopWorkerQuiescenceAction {
+    Quiesce,
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DesktopWorkerQuiescenceRequest {
+    pub pid: u32,
+    pub receipt_nonce: [u8; 32],
+    pub request_id: [u8; 32],
+    pub action: DesktopWorkerQuiescenceAction,
+    pub timeout_ms: u32,
+    /// Absolute Unix-millisecond expiry for the quiesced state. If shutdown
+    /// does not begin by this time, the worker automatically resumes.
+    pub lease_deadline_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopWorkerQuiescenceStatus {
+    Quiesced,
+    Busy,
+    Resumed,
+    Unsupported,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DesktopWorkerQuiescenceResponse {
+    pub pid: u32,
+    pub receipt_nonce: [u8; 32],
+    pub request_id: [u8; 32],
+    pub status: DesktopWorkerQuiescenceStatus,
+    pub active_jobs: u64,
+}
 
 fn permission_error(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
@@ -1813,6 +1855,310 @@ pub fn durably_replace_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     validate_private(&final_file, path)
 }
 
+fn worker_quiescence_hex32(value: &str, field: &str) -> io::Result<[u8; 32]> {
+    let bytes = hex::decode(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("invalid {field} hex")))?;
+    bytes.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} must contain exactly 32 bytes"),
+        )
+    })
+}
+
+fn worker_quiescence_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+fn worker_quiescence_deadline_valid(deadline_ms: u64) -> bool {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(u64::MAX);
+    deadline_ms >= now_ms
+        && deadline_ms.saturating_sub(now_ms) <= u64::from(DESKTOP_WORKER_QUIESCENCE_MAX_TIMEOUT_MS)
+}
+
+fn worker_quiescence_field<'a>(lines: &mut std::str::Lines<'a>, name: &str) -> io::Result<&'a str> {
+    lines
+        .next()
+        .and_then(|line| line.strip_prefix(name))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("worker quiescence field missing {name}"),
+            )
+        })
+}
+
+fn worker_quiescence_paths(data_dir: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    let canonical = data_dir.canonicalize()?;
+    let control_dir = canonical.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    validate_private_directory(&control_dir)?;
+    Ok((
+        control_dir.join(DESKTOP_WORKER_QUIESCENCE_REQUEST_FILE_NAME),
+        control_dir.join(DESKTOP_WORKER_QUIESCENCE_RESPONSE_FILE_NAME),
+    ))
+}
+
+/// Publish one request on a separate filename from the legacy shutdown
+/// protocol. An old node therefore cannot misread drain as permission to stop.
+pub fn publish_desktop_worker_quiescence_request(
+    data_dir: &Path,
+    token: &[u8; 32],
+    request: DesktopWorkerQuiescenceRequest,
+) -> io::Result<bool> {
+    if request.pid == 0
+        || request.timeout_ms == 0
+        || request.timeout_ms > DESKTOP_WORKER_QUIESCENCE_MAX_TIMEOUT_MS
+        || !worker_quiescence_deadline_valid(request.lease_deadline_unix_ms)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker quiescence request has invalid pid or timeout",
+        ));
+    }
+    let (path, _) = worker_quiescence_paths(data_dir)?;
+    let action = match request.action {
+        DesktopWorkerQuiescenceAction::Quiesce => "quiesce",
+        DesktopWorkerQuiescenceAction::Resume => "resume",
+    };
+    let contents = format!(
+        "{DESKTOP_WORKER_QUIESCENCE_REQUEST_SCHEMA}\npid={}\ntoken={}\nnonce={}\nrequest_id={}\naction={action}\ntimeout_ms={}\nlease_deadline_unix_ms={}\n",
+        request.pid,
+        hex::encode(token),
+        hex::encode(request.receipt_nonce),
+        hex::encode(request.request_id),
+        request.timeout_ms,
+        request.lease_deadline_unix_ms,
+    );
+    durably_publish_new_private(&path, contents.as_bytes())
+}
+
+/// Consume and authenticate one request using the existing private desktop
+/// capability and armed-receipt nonce. The request is one-shot even if invalid.
+pub fn take_desktop_worker_quiescence_request(
+    data_dir: &Path,
+    expected_pid: u32,
+    expected_token: &[u8; 32],
+    expected_nonce: &[u8; 32],
+) -> io::Result<Option<DesktopWorkerQuiescenceRequest>> {
+    use rand::RngCore as _;
+
+    let (path, _) = worker_quiescence_paths(data_dir)?;
+    // Atomic rename claims the one-shot request before either side parses it.
+    // This prevents the desktop timeout path and node watcher from both
+    // believing they own the same request. The random same-directory name
+    // also works on Windows without replacing another claim.
+    let mut claim_nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut claim_nonce);
+    let claim = path.with_file_name(format!(
+        ".worker-quiescence-{}-{}.claim",
+        std::process::id(),
+        hex::encode(claim_nonce)
+    ));
+    match std::fs::rename(&path, &claim) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let mut file = match open_private(&claim) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&claim);
+            return Err(error);
+        }
+    };
+    let parsed = (|| {
+        if file.metadata()?.len() > DESKTOP_WORKER_QUIESCENCE_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker quiescence request exceeds size limit",
+            ));
+        }
+        let mut text = String::new();
+        std::io::Read::by_ref(&mut file)
+            .take(DESKTOP_WORKER_QUIESCENCE_MAX_BYTES + 1)
+            .read_to_string(&mut text)?;
+        if text.len() as u64 > DESKTOP_WORKER_QUIESCENCE_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker quiescence request exceeds size limit",
+            ));
+        }
+        let mut lines = text.lines();
+        if lines.next() != Some(DESKTOP_WORKER_QUIESCENCE_REQUEST_SCHEMA) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid worker quiescence request schema",
+            ));
+        }
+        let pid = worker_quiescence_field(&mut lines, "pid=")?
+            .parse::<u32>()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid worker quiescence pid")
+            })?;
+        let token =
+            worker_quiescence_hex32(worker_quiescence_field(&mut lines, "token=")?, "token")?;
+        let nonce =
+            worker_quiescence_hex32(worker_quiescence_field(&mut lines, "nonce=")?, "nonce")?;
+        let request_id = worker_quiescence_hex32(
+            worker_quiescence_field(&mut lines, "request_id=")?,
+            "request_id",
+        )?;
+        let action = match worker_quiescence_field(&mut lines, "action=")? {
+            "quiesce" => DesktopWorkerQuiescenceAction::Quiesce,
+            "resume" => DesktopWorkerQuiescenceAction::Resume,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid worker quiescence action",
+                ));
+            }
+        };
+        let timeout_ms = worker_quiescence_field(&mut lines, "timeout_ms=")?
+            .parse::<u32>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid timeout_ms"))?;
+        let lease_deadline_unix_ms =
+            worker_quiescence_field(&mut lines, "lease_deadline_unix_ms=")?
+                .parse::<u64>()
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid lease deadline")
+                })?;
+        if lines.next().is_some()
+            || pid != expected_pid
+            || !worker_quiescence_eq(&token, expected_token)
+            || !worker_quiescence_eq(&nonce, expected_nonce)
+            || timeout_ms == 0
+            || timeout_ms > DESKTOP_WORKER_QUIESCENCE_MAX_TIMEOUT_MS
+            || !worker_quiescence_deadline_valid(lease_deadline_unix_ms)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker quiescence request failed exact identity or bounds checks",
+            ));
+        }
+        Ok(DesktopWorkerQuiescenceRequest {
+            pid,
+            receipt_nonce: nonce,
+            request_id,
+            action,
+            timeout_ms,
+            lease_deadline_unix_ms,
+        })
+    })();
+    let removal = durably_remove_private_while_open(&file, &claim);
+    drop(file);
+    removal?;
+    parsed.map(Some)
+}
+
+/// Durably publish the response associated with one authenticated request.
+pub fn publish_desktop_worker_quiescence_response(
+    data_dir: &Path,
+    response: DesktopWorkerQuiescenceResponse,
+) -> io::Result<()> {
+    let (_, path) = worker_quiescence_paths(data_dir)?;
+    let status = match response.status {
+        DesktopWorkerQuiescenceStatus::Quiesced => "quiesced",
+        DesktopWorkerQuiescenceStatus::Busy => "busy",
+        DesktopWorkerQuiescenceStatus::Resumed => "resumed",
+        DesktopWorkerQuiescenceStatus::Unsupported => "unsupported",
+        DesktopWorkerQuiescenceStatus::Error => "error",
+    };
+    let contents = format!(
+        "{DESKTOP_WORKER_QUIESCENCE_RESPONSE_SCHEMA}\npid={}\nnonce={}\nrequest_id={}\nstatus={status}\nactive_jobs={}\n",
+        response.pid,
+        hex::encode(response.receipt_nonce),
+        hex::encode(response.request_id),
+        response.active_jobs,
+    );
+    durably_replace_private(&path, contents.as_bytes())
+}
+
+/// Read only a response bound to the caller's exact process, nonce and request.
+pub fn read_desktop_worker_quiescence_response(
+    data_dir: &Path,
+    expected_pid: u32,
+    expected_nonce: &[u8; 32],
+    expected_request_id: &[u8; 32],
+) -> io::Result<Option<DesktopWorkerQuiescenceResponse>> {
+    let (_, path) = worker_quiescence_paths(data_dir)?;
+    let mut file = match open_private(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() > DESKTOP_WORKER_QUIESCENCE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker quiescence response exceeds size limit",
+        ));
+    }
+    let mut text = String::new();
+    std::io::Read::by_ref(&mut file)
+        .take(DESKTOP_WORKER_QUIESCENCE_MAX_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > DESKTOP_WORKER_QUIESCENCE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker quiescence response exceeds size limit",
+        ));
+    }
+    let mut lines = text.lines();
+    if lines.next() != Some(DESKTOP_WORKER_QUIESCENCE_RESPONSE_SCHEMA) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid worker quiescence response schema",
+        ));
+    }
+    let pid = worker_quiescence_field(&mut lines, "pid=")?
+        .parse::<u32>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid worker quiescence pid"))?;
+    let receipt_nonce =
+        worker_quiescence_hex32(worker_quiescence_field(&mut lines, "nonce=")?, "nonce")?;
+    let request_id = worker_quiescence_hex32(
+        worker_quiescence_field(&mut lines, "request_id=")?,
+        "request_id",
+    )?;
+    let status = match worker_quiescence_field(&mut lines, "status=")? {
+        "quiesced" => DesktopWorkerQuiescenceStatus::Quiesced,
+        "busy" => DesktopWorkerQuiescenceStatus::Busy,
+        "resumed" => DesktopWorkerQuiescenceStatus::Resumed,
+        "unsupported" => DesktopWorkerQuiescenceStatus::Unsupported,
+        "error" => DesktopWorkerQuiescenceStatus::Error,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid worker quiescence response status",
+            ));
+        }
+    };
+    let active_jobs = worker_quiescence_field(&mut lines, "active_jobs=")?
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid active_jobs"))?;
+    if lines.next().is_some()
+        || pid != expected_pid
+        || !worker_quiescence_eq(&receipt_nonce, expected_nonce)
+        || !worker_quiescence_eq(&request_id, expected_request_id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "worker quiescence response failed exact identity checks",
+        ));
+    }
+    Ok(Some(DesktopWorkerQuiescenceResponse {
+        pid,
+        receipt_nonce,
+        request_id,
+        status,
+        active_jobs,
+    }))
+}
+
 pub fn arm_desktop_shutdown_receipt(
     data_dir: &Path,
     token: &[u8; 32],
@@ -2553,6 +2899,127 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn desktop_worker_quiescence_control_is_separate_authenticated_and_request_bound() {
+        let dir = TestDir::new("worker-quiescence-control");
+        let data_dir = dir.0.join("data");
+        secure_private_directory_tree(&data_dir).unwrap();
+        let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        secure_private_directory_tree(&control_dir).unwrap();
+        let token = [0x31; 32];
+        let nonce = [0x42; 32];
+        let request_id = [0x53; 32];
+        let request = DesktopWorkerQuiescenceRequest {
+            pid: std::process::id(),
+            receipt_nonce: nonce,
+            request_id,
+            action: DesktopWorkerQuiescenceAction::Quiesce,
+            timeout_ms: 5_000,
+            lease_deadline_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 5_000,
+        };
+
+        assert!(publish_desktop_worker_quiescence_request(&data_dir, &token, request).unwrap());
+        assert!(!publish_desktop_worker_quiescence_request(&data_dir, &token, request).unwrap());
+        assert!(
+            take_desktop_worker_quiescence_request(
+                &data_dir,
+                std::process::id(),
+                &[0x99; 32],
+                &nonce,
+            )
+            .is_err()
+        );
+
+        assert!(publish_desktop_worker_quiescence_request(&data_dir, &token, request).unwrap());
+        assert_eq!(
+            take_desktop_worker_quiescence_request(&data_dir, std::process::id(), &token, &nonce,)
+                .unwrap(),
+            Some(request)
+        );
+        let response = DesktopWorkerQuiescenceResponse {
+            pid: std::process::id(),
+            receipt_nonce: nonce,
+            request_id,
+            status: DesktopWorkerQuiescenceStatus::Quiesced,
+            active_jobs: 0,
+        };
+        publish_desktop_worker_quiescence_response(&data_dir, response).unwrap();
+        assert_eq!(
+            read_desktop_worker_quiescence_response(
+                &data_dir,
+                std::process::id(),
+                &nonce,
+                &request_id,
+            )
+            .unwrap(),
+            Some(response)
+        );
+        assert!(
+            read_desktop_worker_quiescence_response(
+                &data_dir,
+                std::process::id(),
+                &nonce,
+                &[0x99; 32],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_worker_quiescence_request_has_one_atomic_consumer() {
+        let dir = TestDir::new("worker-quiescence-single-consumer");
+        let data_dir = dir.0.join("data");
+        secure_private_directory_tree(&data_dir).unwrap();
+        let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        secure_private_directory_tree(&control_dir).unwrap();
+        let token = [0x21; 32];
+        let nonce = [0x32; 32];
+        let request = DesktopWorkerQuiescenceRequest {
+            pid: std::process::id(),
+            receipt_nonce: nonce,
+            request_id: [0x43; 32],
+            action: DesktopWorkerQuiescenceAction::Quiesce,
+            timeout_ms: 5_000,
+            lease_deadline_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 10_000,
+        };
+        assert!(publish_desktop_worker_quiescence_request(&data_dir, &token, request).unwrap());
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                take_desktop_worker_quiescence_request(
+                    &data_dir,
+                    std::process::id(),
+                    &token,
+                    &nonce,
+                )
+                .unwrap()
+                .is_some()
+            });
+            let second = scope.spawn(|| {
+                take_desktop_worker_quiescence_request(
+                    &data_dir,
+                    std::process::id(),
+                    &token,
+                    &nonce,
+                )
+                .unwrap()
+                .is_some()
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(
+            first, second,
+            "exactly one consumer atomically claims a request"
+        );
     }
 
     #[test]

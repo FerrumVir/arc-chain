@@ -3296,6 +3296,14 @@ async fn native_inference_tokenize(
         ));
     };
     let profile = tokenizer.profile();
+    let worker_execution_permit = node
+        .native_request_admission
+        .worker_execution_gate()
+        .try_enter()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker is quiescing for update".to_string(),
+        ))?;
     if request.text.len() > NATIVE_TOKENIZE_MAX_TEXT_BYTES {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -3313,11 +3321,13 @@ async fn native_inference_tokenize(
     };
     let text = request.text;
     let worker = serving.clone();
+    let worker_execution_for_compute = worker_execution_permit.clone();
     // The permit moves into the blocking task. A client that disconnects
     // drops this handler but not the tokenization, so the permit must be
     // released when the work ends, not when the connection does.
     let tokens = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _worker_execution_permit = worker_execution_for_compute;
         worker.tokenize_prompt(&text)
     })
     .await
@@ -6739,6 +6749,11 @@ async fn dispatch_to_community_worker_with_probe(
     recovery_probe_id: Option<Hash256>,
     expected_worker_id: Option<String>,
 ) -> Result<CommunityDispatchOutcome, CommunityDispatchError> {
+    let _worker_execution_permit = node
+        .native_request_admission
+        .worker_execution_gate()
+        .try_enter()
+        .ok_or_else(|| CommunityDispatchError::before_enqueue("worker is quiescing for update"))?;
     if recovery_probe_id.is_some_and(|probe_id| {
         !arc_types::transaction::CommunityInferenceRewardBody::is_recovery_probe_assignment(
             &probe_id,
@@ -7210,6 +7225,16 @@ async fn inference_run(
             ));
         }
     };
+    let worker_execution_permit = node
+        .native_request_admission
+        .worker_execution_gate()
+        .try_enter()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Worker is quiescing for update.",
+            )
+        })?;
 
     let input_text = req
         .get("input")
@@ -7652,7 +7677,9 @@ async fn inference_run(
             let mid_c = *mid;
             let toks = tokens_with_bos.clone();
             let pool_node = node.clone();
+            let worker_execution_for_compute = worker_execution_permit.clone();
             let result = spawn_blocking_with_public_compute_permit(inference_permit, move || {
+                let _worker_execution_permit = worker_execution_for_compute;
                 install_on_compute_pool(&pool_node, move || {
                     engine_c.generate(&mid_c, &toks, max_tokens)
                 })
@@ -7693,7 +7720,9 @@ async fn inference_run(
             let model_c = model.clone();
             let toks = prompt_tokens.clone();
             let pool_node = node.clone();
+            let worker_execution_for_compute = worker_execution_permit.clone();
             let result = spawn_blocking_with_public_compute_permit(inference_permit, move || {
+                let _worker_execution_permit = worker_execution_for_compute;
                 install_on_compute_pool(&pool_node, move || {
                     model_c.try_generate(&toks, max_tokens, &model_c.config.eos_tokens)
                 })
@@ -9302,6 +9331,14 @@ async fn inference_forward_shard_authenticated(
     req: ForwardShardRequest,
     signer: Hash256,
 ) -> Result<(HeaderMap, Json<ForwardShardResponse>), (StatusCode, String)> {
+    let worker_execution_permit = node
+        .native_request_admission
+        .worker_execution_gate()
+        .try_enter()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker is quiescing for update".to_string(),
+        ))?;
     if req.request_id.is_empty() || req.request_id.len() > VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -9527,6 +9564,7 @@ async fn inference_forward_shard_authenticated(
 
     let t0 = std::time::Instant::now();
     let pool_node = node.clone();
+    let worker_execution_for_compute = worker_execution_permit.clone();
     // `install_on_compute_pool` puts the whole forward pass — including the
     // par_iter over attention heads and every matmul's par_chunks_mut — on
     // this node's configured rayon pool, so POST /node/threads changes real
@@ -9540,6 +9578,7 @@ async fn inference_forward_shard_authenticated(
     let spawn_blocking_queued_at = Instant::now();
     let ((result, timing), compute_lease) =
         spawn_blocking_with_shard_compute_lease(compute_lease, move || {
+            let _worker_execution_permit = worker_execution_for_compute;
             let spawn_blocking_queue_us = elapsed_micros(spawn_blocking_queued_at);
             let compute_pool_queued_at = Instant::now();
             let (result, mut timing) = install_on_compute_pool(&pool_node, move || {
@@ -11454,6 +11493,16 @@ async fn inference_run_sharded(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let _worker_execution_permit = node
+        .native_request_admission
+        .worker_execution_gate()
+        .try_enter()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Worker is quiescing for update.",
+            )
+        })?;
     let _inference_permit = node
         .public_inference_permits
         .clone()
@@ -12010,6 +12059,16 @@ async fn inference_run_consensus(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let _worker_execution_permit = node
+        .native_request_admission
+        .worker_execution_gate()
+        .try_enter()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Worker is quiescing for update.",
+            )
+        })?;
     let _inference_permit = node
         .public_inference_permits
         .clone()
@@ -14285,6 +14344,14 @@ async fn community_reward_approve_signed(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<CommunityRewardApprovalPayload>>,
 ) -> Result<Json<arc_types::transaction::CommunityRewardValidatorApproval>, (StatusCode, String)> {
+    let _worker_execution_permit = node
+        .native_request_admission
+        .worker_execution_gate()
+        .try_enter()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker is quiescing for update".to_string(),
+        ))?;
     let payload = authenticate_community_request(&node, COMMUNITY_REWARD_APPROVE_PATH, signed)?;
     // Reject malformed/model-context-invalid candidates before they occupy a
     // bounded queue slot or start shard recomputation. The payload is

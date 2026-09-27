@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
+use tokio::sync::Notify;
 
 pub const MAX_QUEUE: usize = 32;
 pub const MAX_INPUT_BYTES: usize = TIER1_INPUT_BLOB_MAX;
@@ -2306,6 +2307,206 @@ pub struct NativeRequestAdmission {
     operator_enabled: bool,
     running: AtomicBool,
     healthy_at: Mutex<Option<std::time::Instant>>,
+    worker_execution: Arc<WorkerExecutionGate>,
+}
+
+/// Process-local compute barrier shared by every local inference execution
+/// path. It is intentionally separate from transaction admission: committed
+/// requests remain canonical and queued while a desktop updater drains work.
+#[derive(Default)]
+pub struct WorkerExecutionGate {
+    state: Mutex<WorkerExecutionState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct WorkerExecutionState {
+    closed: bool,
+    active_jobs: usize,
+    request_id: Option<[u8; 32]>,
+    lease_generation: u64,
+    shutdown_committed: bool,
+}
+
+/// One admitted worker execution. Clones share one count, so a cancelled HTTP
+/// handler cannot report idle while its `spawn_blocking` closure still runs.
+#[derive(Clone)]
+pub struct WorkerExecutionPermit {
+    _lease: Arc<WorkerExecutionLease>,
+}
+
+struct WorkerExecutionLease(Arc<WorkerExecutionGate>);
+
+impl Drop for WorkerExecutionLease {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock();
+        state.active_jobs = state.active_jobs.saturating_sub(1);
+        drop(state);
+        self.0.changed.notify_waiters();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerQuiescenceResult {
+    Quiesced { active_jobs: usize },
+    Busy { active_jobs: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerResumeError {
+    NoMatchingDrain,
+}
+
+impl WorkerExecutionGate {
+    /// Admit a complete unit of local compute, or refuse it once drain begins.
+    pub fn try_enter(self: &Arc<Self>) -> Option<WorkerExecutionPermit> {
+        let mut state = self.state.lock();
+        if state.closed {
+            return None;
+        }
+        state.active_jobs = state.active_jobs.checked_add(1)?;
+        Some(WorkerExecutionPermit {
+            _lease: Arc::new(WorkerExecutionLease(self.clone())),
+        })
+    }
+
+    /// Close admission and wait up to `timeout` for every already-admitted
+    /// execution to drop its lease. A timeout reopens admission atomically.
+    /// Success leaves the gate closed until a matching resume or process exit.
+    pub async fn quiesce(
+        self: &Arc<Self>,
+        request_id: [u8; 32],
+        timeout: std::time::Duration,
+        lease_deadline: tokio::time::Instant,
+    ) -> WorkerQuiescenceResult {
+        if lease_deadline <= tokio::time::Instant::now() {
+            return WorkerQuiescenceResult::Busy {
+                active_jobs: self.active_jobs(),
+            };
+        }
+        let (already_drained, newly_closed, generation) = {
+            let mut state = self.state.lock();
+            if state.closed {
+                if state.request_id != Some(request_id) {
+                    return WorkerQuiescenceResult::Busy {
+                        active_jobs: state.active_jobs,
+                    };
+                }
+                return if state.active_jobs == 0 {
+                    WorkerQuiescenceResult::Quiesced { active_jobs: 0 }
+                } else {
+                    WorkerQuiescenceResult::Busy {
+                        active_jobs: state.active_jobs,
+                    }
+                };
+            } else {
+                let Some(generation) = state.lease_generation.checked_add(1) else {
+                    return WorkerQuiescenceResult::Busy {
+                        active_jobs: state.active_jobs,
+                    };
+                };
+                state.closed = true;
+                state.request_id = Some(request_id);
+                state.lease_generation = generation;
+                state.shutdown_committed = false;
+                (state.active_jobs == 0, true, generation)
+            }
+        };
+        if newly_closed {
+            let gate = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(lease_deadline).await;
+                gate.expire_lease(request_id, generation);
+            });
+        }
+        if already_drained {
+            return WorkerQuiescenceResult::Quiesced { active_jobs: 0 };
+        }
+
+        let deadline = (tokio::time::Instant::now() + timeout).min(lease_deadline);
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.state.lock();
+                if state.request_id != Some(request_id) || !state.closed {
+                    return WorkerQuiescenceResult::Busy {
+                        active_jobs: state.active_jobs,
+                    };
+                }
+                if state.active_jobs == 0 {
+                    drop(state);
+                    return WorkerQuiescenceResult::Quiesced { active_jobs: 0 };
+                }
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                let mut state = self.state.lock();
+                if state.request_id == Some(request_id) {
+                    state.closed = false;
+                    state.request_id = None;
+                    let active_jobs = state.active_jobs;
+                    drop(state);
+                    self.changed.notify_waiters();
+                    return WorkerQuiescenceResult::Busy { active_jobs };
+                }
+                return WorkerQuiescenceResult::Busy {
+                    active_jobs: state.active_jobs,
+                };
+            }
+        }
+    }
+
+    /// Reopen compute only for the request that closed the gate.
+    pub fn resume(&self, request_id: [u8; 32]) -> Result<usize, WorkerResumeError> {
+        let mut state = self.state.lock();
+        if !state.closed {
+            return Ok(state.active_jobs);
+        }
+        if state.request_id != Some(request_id) {
+            return Err(WorkerResumeError::NoMatchingDrain);
+        }
+        state.closed = false;
+        state.request_id = None;
+        state.shutdown_committed = false;
+        let active_jobs = state.active_jobs;
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(active_jobs)
+    }
+
+    /// Disable the local safety timeout only after the separate authenticated
+    /// shutdown channel has begun. Without this commit, cancellation/GUI crash
+    /// reopens the worker when the quiescence lease expires.
+    pub fn commit_shutdown(&self) {
+        let mut state = self.state.lock();
+        if state.closed {
+            state.shutdown_committed = true;
+        }
+    }
+
+    fn expire_lease(&self, request_id: [u8; 32], generation: u64) {
+        let mut state = self.state.lock();
+        if !state.closed
+            || state.shutdown_committed
+            || state.request_id != Some(request_id)
+            || state.lease_generation != generation
+        {
+            return;
+        }
+        state.closed = false;
+        state.request_id = None;
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    pub fn active_jobs(&self) -> usize {
+        self.state.lock().active_jobs
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.state.lock().closed
+    }
 }
 
 /// A busy or unresponsive worker cannot continue admitting new paid work on
@@ -2339,6 +2540,13 @@ impl NativeRequestAdmission {
     pub fn allows(&self, tx: &arc_types::Transaction) -> bool {
         !matches!(tx.body, arc_types::TxBody::NativeInferenceRequest(_))
             || self.accepting_requests()
+    }
+
+    /// Shared local compute barrier used by RPC and background worker paths.
+    /// This does not close canonical transaction admission; queued chain work
+    /// remains available after a pre-handoff resume or process restart.
+    pub fn worker_execution_gate(&self) -> Arc<WorkerExecutionGate> {
+        self.worker_execution.clone()
     }
 
     pub(crate) fn retain_for_proposal(&self, transactions: &mut Vec<arc_types::Transaction>) {
@@ -2477,6 +2685,10 @@ where
             worker_admission.running.store(true, Ordering::Release);
             let mut consecutive_errors: u32 = 0;
             while !flag.load(Ordering::Acquire) {
+                let Some(_execution_permit) = worker_admission.worker_execution.try_enter() else {
+                    std::thread::sleep(bounds.idle_interval);
+                    continue;
+                };
                 match runtime.poll_once() {
                     Ok(Some(vote)) => {
                         worker_admission.record_health(runtime.ready_for_requests());
@@ -5203,6 +5415,128 @@ mod tests {
             !stale.accepting_requests(),
             "a hung/occupied worker's old poll expires"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_quiescence_closes_admission_drains_leases_and_resumes_only_matching_request() {
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let request_id = [0x71; 32];
+        let other_request = [0x72; 32];
+        let permit = gate.try_enter().expect("open gate admits work");
+        let gate_for_drain = gate.clone();
+        let drain = tokio::spawn(async move {
+            gate_for_drain
+                .quiesce(
+                    request_id,
+                    std::time::Duration::from_secs(1),
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(gate.is_closed());
+        assert_eq!(gate.active_jobs(), 1);
+        assert!(gate.try_enter().is_none(), "drain rejects new work");
+        drop(permit);
+        assert_eq!(
+            drain.await.unwrap(),
+            WorkerQuiescenceResult::Quiesced { active_jobs: 0 }
+        );
+        assert!(gate.try_enter().is_none(), "successful drain stays closed");
+        assert_eq!(
+            gate.resume(other_request),
+            Err(WorkerResumeError::NoMatchingDrain)
+        );
+        assert_eq!(gate.resume(request_id), Ok(0));
+        assert_eq!(
+            gate.resume(request_id),
+            Ok(0),
+            "resume after expiry is idempotent"
+        );
+        assert!(gate.try_enter().is_some(), "matching resume reopens gate");
+    }
+
+    #[test]
+    fn worker_execution_lease_survives_caller_cancellation_clone() {
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let caller_permit = gate.try_enter().unwrap();
+        let detached_compute_permit = caller_permit.clone();
+        drop(caller_permit);
+        assert_eq!(gate.active_jobs(), 1);
+        drop(detached_compute_permit);
+        assert_eq!(gate.active_jobs(), 0);
+    }
+
+    #[tokio::test]
+    async fn worker_quiescence_timeout_reopens_admission() {
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let _permit = gate.try_enter().unwrap();
+        let result = gate
+            .quiesce(
+                [0x73; 32],
+                std::time::Duration::from_millis(1),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(result, WorkerQuiescenceResult::Busy { active_jobs: 1 });
+        assert!(!gate.is_closed());
+        assert_eq!(gate.active_jobs(), 1);
+        assert!(gate.try_enter().is_some());
+    }
+
+    #[tokio::test]
+    async fn worker_quiescence_lease_reopens_when_shutdown_never_begins() {
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let result = gate
+            .quiesce(
+                [0x74; 32],
+                std::time::Duration::from_secs(1),
+                tokio::time::Instant::now() + std::time::Duration::from_millis(15),
+            )
+            .await;
+        assert_eq!(result, WorkerQuiescenceResult::Quiesced { active_jobs: 0 });
+        assert!(gate.is_closed());
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!gate.is_closed());
+        assert!(gate.try_enter().is_some());
+    }
+
+    #[tokio::test]
+    async fn canceled_pending_quiescence_reopens_at_lease_deadline() {
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let _active = gate.try_enter().unwrap();
+        let gate_for_drain = gate.clone();
+        let drain = tokio::spawn(async move {
+            gate_for_drain
+                .quiesce(
+                    [0x75; 32],
+                    std::time::Duration::from_secs(1),
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(gate.is_closed());
+        drain.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+        assert!(!gate.is_closed());
+    }
+
+    #[tokio::test]
+    async fn authenticated_shutdown_commit_keeps_quiescence_closed_past_lease() {
+        let gate = Arc::new(WorkerExecutionGate::default());
+        let result = gate
+            .quiesce(
+                [0x76; 32],
+                std::time::Duration::from_secs(1),
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+            )
+            .await;
+        assert_eq!(result, WorkerQuiescenceResult::Quiesced { active_jobs: 0 });
+        gate.commit_shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+        assert!(gate.is_closed());
+        assert!(gate.try_enter().is_none());
     }
 
     #[test]
