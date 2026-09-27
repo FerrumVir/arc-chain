@@ -567,25 +567,50 @@ pub async fn try_prepare_auto_update_relaunch(
     use crate::auto_update::{PrepareResult, RequestFence};
     require_data_migration_ready(&state).await?;
     if !update_install_policy().await?.can_install {
-        return Ok(PrepareResult::busy("This installation is updated by its package manager", 0));
+        return Ok(PrepareResult::busy(
+            "This installation is updated by its package manager",
+            0,
+        ));
     }
     let mut held = state.auto_update_requests.lock().await;
     if held.is_some() {
-        return Ok(PrepareResult::busy("An update preparation is already pending", 0));
+        return Ok(PrepareResult::busy(
+            "An update preparation is already pending",
+            0,
+        ));
     }
     {
         let store = state.store.lock().await;
-        if !store.config.as_ref().is_some_and(|c| c.auto_update && c.auto_install_updates) {
+        if !store
+            .config
+            .as_ref()
+            .is_some_and(|c| c.auto_update && c.auto_install_updates)
+        {
             return Ok(PrepareResult::busy("Automatic installation is disabled", 0));
         }
     }
-    let Some(fence) = RequestFence::try_acquire(&state.community_inference_write, &state.wallet_write) else {
-        return Ok(PrepareResult::busy("An inference or wallet operation is in progress", 1));
+    let Some(fence) =
+        RequestFence::try_acquire(&state.community_inference_write, &state.wallet_write)
+    else {
+        return Ok(PrepareResult::busy(
+            "An inference or wallet operation is in progress",
+            1,
+        ));
     };
     // Store before awaiting any child mutation. An interrupted IPC leaves the
     // fence intact until Abort proves the node has resumed or safely stopped.
     *held = Some(fence);
-    let result = state.node.lock().await.prepare_auto_update_relaunch().await;
+    let Ok(mut node) = state.node.try_lock() else {
+        *held = None;
+        return Ok(PrepareResult::busy(
+            "A node lifecycle operation is in progress",
+            0,
+        ));
+    };
+    if node.pid().is_some() {
+        state.cancel_startup_retry();
+    }
+    let result = node.prepare_auto_update_relaunch().await;
     if matches!(result, Ok(PrepareResult::Busy { .. })) {
         *held = None;
     }
@@ -597,13 +622,11 @@ pub async fn try_prepare_auto_update_relaunch(
 /// abort command, even if installer IPC later rejects or disconnects.
 #[tauri::command]
 pub async fn begin_update_handoff(state: State<'_, AppState>) -> CmdResult<()> {
-    let requests = state.auto_update_requests.lock().await;
-    if requests.is_some() {
-        let store = state.store.lock().await;
-        if !store.config.as_ref().is_some_and(|c| c.auto_update && c.auto_install_updates) {
-            return Err("automatic installation was disabled before the installer handoff".into());
-        }
-    }
+    // Serialize with Abort, but do not introduce a new consent refusal here:
+    // the frontend commits its irreversible IPC boundary before this await.
+    // Native Prepare checks saved consent and the frontend checks generation
+    // immediately before invoking Handoff, with no intervening await.
+    let _requests = state.auto_update_requests.lock().await;
     let mut node = state.node.lock().await;
     node.begin_update_handoff()
         .map_err(|error| format!("could not commit the native updater handoff: {error}"))

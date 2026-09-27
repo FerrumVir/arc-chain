@@ -225,7 +225,7 @@ pub fn run() {
         community_inference_write: Arc::new(Mutex::new(())),
         chain_host: Arc::new(Mutex::new(None)),
         wallet_write: Arc::new(Mutex::new(())),
-            auto_update_requests: Arc::new(Mutex::new(None)),
+        auto_update_requests: Arc::new(Mutex::new(None)),
         has_tray: has_tray.clone(),
         data_migration_error: data_migration_error.clone(),
         startup_retry_cancel,
@@ -765,7 +765,9 @@ mod startup_retry_tests {
             std::future::pending::<Result<(), commands::StartupFailure>>().await
         };
         let task =
-            tokio::spawn(async move { cancellable_autostart_attempt(&mut receiver, attempt).await });
+            tokio::spawn(
+                async move { cancellable_autostart_attempt(&mut receiver, attempt).await },
+            );
         tokio::task::yield_now().await;
         cancel.send_replace(());
         assert!(task.await.unwrap().is_none());
