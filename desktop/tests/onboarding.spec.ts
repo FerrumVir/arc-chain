@@ -63,6 +63,35 @@ test.describe("Onboarding wizard", () => {
     await expect(page.getByTestId("step-dot-1")).toHaveClass(/active/);
   });
 
+  test("keeps setup visible while the binary download is pending or fails", async ({ page }) => {
+    await page.addInitScript(() => {
+      const state = window as unknown as {
+        __ARC_MOCK__: Record<string, unknown>;
+        rejectSetupDownload: () => void;
+      };
+      state.__ARC_MOCK__ = {
+        ensure_binary: new Promise((_resolve, reject) => {
+          state.rejectSetupDownload = () => reject(new Error("release checksum manifest returned HTTP 404"));
+        }),
+      };
+    });
+    await page.goto("/");
+    await page.getByTestId("btn-continue-welcome").click();
+    await page.getByTestId("btn-reveal-seed").click();
+    await page.getByTestId("btn-continue-identity").click();
+    await page.getByTestId("tier-skip").click();
+    await page.getByTestId("btn-continue-model").click();
+    await page.getByTestId("btn-launch").click();
+    await expect(page.getByTestId("step-launch")).toBeVisible();
+    await expect(page.getByTestId("dashboard")).toHaveCount(0);
+    await page.evaluate(() => {
+      (window as unknown as { rejectSetupDownload: () => void }).rejectSetupDownload();
+    });
+    await expect(page.getByText("release checksum manifest returned HTTP 404", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: /retry/i })).toBeEnabled();
+    await expect(page.getByTestId("dashboard")).toHaveCount(0);
+  });
+
   test("back button returns to prior step", async ({ page }) => {
     await page.goto("/");
     await page.getByTestId("btn-continue-welcome").click();

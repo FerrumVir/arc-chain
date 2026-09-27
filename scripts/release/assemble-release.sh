@@ -15,6 +15,8 @@ REPOSITORY="${REPOSITORY:-FerrumVir/arc-chain}"
 RELEASE_DATE="${RELEASE_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 GENESIS_FILE="${GENESIS_FILE:-genesis.toml}"
 CUTOVER_HANDOFF_DIR="${CUTOVER_HANDOFF_DIR:-cutover-handoff}"
+EXISTING_UPDATE_HANDOFF_DIR="${EXISTING_UPDATE_HANDOFF_DIR:-existing-chain-update-handoff}"
+RELEASE_PROFILE="${RELEASE_PROFILE:-cutover-v1}"
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_VALIDATOR="$SCRIPT_DIR/validate-genesis.py"
 CUTOVER_ASSET_VALIDATOR="$SCRIPT_DIR/validate-cutover-derived-assets.py"
@@ -36,8 +38,17 @@ printf '%s\n' "$REPOSITORY" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
 [ -f testnet-seeds.txt ] || die "testnet-seeds.txt is missing"
 [ -f "$GENESIS_FILE" ] || die "genesis file is missing: $GENESIS_FILE"
 [ -f "$GENESIS_VALIDATOR" ] || die "genesis validator is missing: $GENESIS_VALIDATOR"
-[ -d "$CUTOVER_HANDOFF_DIR" ] || die "protected cutover handoff is missing: $CUTOVER_HANDOFF_DIR"
-[ -f "$CUTOVER_ASSET_VALIDATOR" ] || die "cutover asset validator is missing: $CUTOVER_ASSET_VALIDATOR"
+case "$RELEASE_PROFILE" in
+    cutover-v1)
+        [ -d "$CUTOVER_HANDOFF_DIR" ] || die "protected cutover handoff is missing: $CUTOVER_HANDOFF_DIR"
+        [ -f "$CUTOVER_ASSET_VALIDATOR" ] || die "cutover asset validator is missing: $CUTOVER_ASSET_VALIDATOR"
+        [ "$RELEASE_TAG" = "v0.8.0" ] || die "cutover-v1 remains pinned to v0.8.0"
+        ;;
+    existing-recovered-chain-update-v1)
+        [ -d "$EXISTING_UPDATE_HANDOFF_DIR" ] || die "protected existing-chain update handoff is missing"
+        ;;
+    *) die "unsupported RELEASE_PROFILE: $RELEASE_PROFILE" ;;
+esac
 command -v python3 >/dev/null 2>&1 || die "python3 is required to generate latest.json"
 
 # Validate before clearing or writing OUTPUT_DIR. A release may ship either a
@@ -196,20 +207,48 @@ copy_as install.sh install.sh
 copy_as testnet-seeds.txt testnet-seeds.txt
 copy_as "$GENESIS_FILE" genesis.toml
 
-# The full checkpoint stays on the protected recovery host. The separately
-# protected exact-main producer transports only three compact canonical assets;
-# the exact release binary independently reconstructs the signed manifest and
-# verifies every H/root/H+1/epoch/set and 5-of-6 certificate binding here.
-python3 "$CUTOVER_ASSET_VALIDATOR" \
-    --input-dir "$CUTOVER_HANDOFF_DIR" \
-    --output-dir "$OUTPUT_DIR" \
-    --verifier-binary "$OUTPUT_DIR/arc-node-linux-x86_64" \
-    --inspector-binary "$OUTPUT_DIR/arc-node-linux-x86_64" \
-    --genesis "$OUTPUT_DIR/genesis.toml" \
-    --repository "$REPOSITORY" \
-    --tag "$RELEASE_TAG" \
-    --commit "$RELEASE_COMMIT" \
-    || die "protected cutover assets failed recovery validation"
+if [ "$RELEASE_PROFILE" = "cutover-v1" ]; then
+    # The v1 first-cutover ceremony retains its existing strict validator.
+    python3 "$CUTOVER_ASSET_VALIDATOR" \
+        --input-dir "$CUTOVER_HANDOFF_DIR" \
+        --output-dir "$OUTPUT_DIR" \
+        --verifier-binary "$OUTPUT_DIR/arc-node-linux-x86_64" \
+        --inspector-binary "$OUTPUT_DIR/arc-node-linux-x86_64" \
+        --genesis "$OUTPUT_DIR/genesis.toml" \
+        --repository "$REPOSITORY" \
+        --tag "$RELEASE_TAG" \
+        --commit "$RELEASE_COMMIT" \
+        || die "protected cutover assets failed recovery validation"
+else
+    # Existing-chain updates carry only their truthful readiness attestation;
+    # they do not manufacture or imply first-cutover/retirement evidence.
+    UPDATE_ATTESTATION="$EXISTING_UPDATE_HANDOFF_DIR/arc-existing-chain-update-attestation.json"
+    [ -s "$UPDATE_ATTESTATION" ] && [ ! -L "$UPDATE_ATTESTATION" ] \
+        || die "existing-chain update attestation is missing or unsafe"
+    if ! python3 - "$UPDATE_ATTESTATION" "$REPOSITORY" "$RELEASE_TAG" "$RELEASE_COMMIT" \
+        "$OUTPUT_DIR/arc-node-linux-x86_64" <<'PY'
+import json, sys
+import hashlib
+from pathlib import Path
+p = Path(sys.argv[1])
+v = json.loads(p.read_text(encoding="utf-8"))
+assert isinstance(v, dict) and v.get("schema") == "arc.existing-recovered-chain-update/v1"
+assert v.get("release", {}).get("repository") == sys.argv[2]
+assert v.get("release", {}).get("tag") == sys.argv[3]
+assert v.get("release", {}).get("commit") == sys.argv[4]
+artifact = v.get("release", {}).get("production_artifact", {})
+assert artifact.get("platform") == "linux-x86_64"
+assert artifact.get("binary_sha256") == hashlib.sha256(Path(sys.argv[5]).read_bytes()).hexdigest()
+claim = v.get("claim", {})
+assert claim == {"existing_recovered_chain_update": True,
+    "original_cutover_ceremony_verified": False, "original_cutover_archive_present": False,
+    "validator_retirement_authorized": False}
+PY
+    then
+        die "existing-chain update attestation identity or production artifact is invalid"
+    fi
+    copy_as "$UPDATE_ATTESTATION" arc-existing-chain-update-attestation.json
+fi
 
 VERSION="${RELEASE_TAG#v}"
 BASE_URL="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}"

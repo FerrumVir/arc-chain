@@ -124,6 +124,9 @@ pub struct NodeStatus {
     pub health: String,
     pub version: String,
     pub peers: u32,
+    /// Actual local runtime mode; absent on older node versions.
+    #[serde(default)]
+    pub chain_participation_enabled: Option<bool>,
     pub round: u64,
     pub committed: u64,
     pub height: u64,

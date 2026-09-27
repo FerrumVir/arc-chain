@@ -955,6 +955,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           health,
           version: h.version ?? "unknown",
           peers,
+          chainParticipationEnabled:
+            typeof h.chain_participation_enabled === "boolean"
+              ? h.chain_participation_enabled
+              : null,
           round: h.dag_round ?? 0,
           committed: h.dag_committed ?? 0,
           height: h.height ?? 0,

@@ -153,7 +153,10 @@ export function Dashboard() {
   // The node is up but not peered — the state "Reset peer state" exists to
   // fix. Covers both "lite" (a seed is reachable over HTTP) and "syncing"
   // (nothing is).
-  const stuckWithoutPeers = running && (status?.peers ?? 0) === 0;
+  const chainParticipationDisabled =
+    running && status?.chainParticipationEnabled === false;
+  const stuckWithoutPeers =
+    running && !chainParticipationDisabled && (status?.peers ?? 0) === 0;
   const isCrashed =
     !!status?.lastError && status.lastError.includes("exited unexpectedly");
   // Spawned but RPC not yet bound. arc-node spends most of its startup time
@@ -335,7 +338,7 @@ export function Dashboard() {
         </div>
       )}
 
-      {status?.running && status?.health === "syncing" && (
+      {status?.running && !chainParticipationDisabled && status?.health === "syncing" && (
         <div
           className="syncing-banner"
           role="status"
@@ -368,6 +371,17 @@ export function Dashboard() {
               : syncElapsed < 45
                 ? "Still connecting — trying all 6 data centers…"
                 : "Taking longer than usual. If this persists, try resetting peer state below."}
+        </div>
+      )}
+
+      {chainParticipationDisabled && (
+        <div className="lite-banner" role="status" data-testid="chain-participation-disabled">
+          <strong>HTTP client mode</strong> — this process has chain participation disabled.
+          Zero peers are expected; resetting peer state will not enable chain transport.
+          {status?.coordinatorUrl
+            ? ` Chain reads use ${hostLabel(status.coordinatorUrl)}.`
+            : " No public coordinator is currently reachable."}
+          {" "}Compatible model execution and confirmed rewards are separate checks.
         </div>
       )}
 

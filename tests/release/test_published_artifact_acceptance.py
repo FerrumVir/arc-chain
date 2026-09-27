@@ -254,6 +254,47 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(set(binding["assets"]), acceptance.EXPECTED_RELEASE_ASSETS)
 
+    def test_public_asset_contract_accepts_only_exact_profile_sets(self) -> None:
+        update_names = acceptance.EXISTING_UPDATE_RELEASE_ASSETS
+        update_release = copy.deepcopy(self.release)
+        update_release["assets"] = []
+        for index, name in enumerate(sorted(update_names)):
+            raw = dict(self.release["assets"][0])
+            raw.update({"id": 20_000 + index, "name": name,
+                        "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.0/{name}"})
+            update_release["assets"].append(raw)
+        resolved = acceptance.validate_release_assets(update_release, self.repository, "v0.8.0")
+        self.assertEqual(acceptance.release_profile_for_assets(set(resolved)),
+                         acceptance.PROFILE_EXISTING_UPDATE_V1)
+
+        mixed = copy.deepcopy(update_release)
+        mixed["assets"] = [row for row in mixed["assets"]
+                           if row["name"] != "arc-existing-chain-update-attestation.json"]
+        extra = copy.deepcopy(self.release["assets"][0])
+        extra.update({"id": 30_000, "name": "arc-cutover-policy.json",
+                      "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.0/arc-cutover-policy.json"})
+        mixed["assets"].append(extra)
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "matches neither profile"):
+            acceptance.validate_release_assets(mixed, self.repository, "v0.8.0")
+
+    def test_update_binding_schema_cannot_be_downgraded_to_cutover_v1(self) -> None:
+        binding = json.loads(self.bind().read_text(encoding="utf-8"))
+        binding["schema"] = "arc.published-release-binding.v2"
+        binding["profile"] = acceptance.PROFILE_EXISTING_UPDATE_V1
+        binding["tag"] = "v0.8.0"
+        assets = dict(binding["assets"])
+        for name in ("arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json",
+                     "arc-cutover-policy.json"):
+            assets.pop(name)
+        assets["arc-existing-chain-update-attestation.json"] = assets["latest.json"]
+        binding["assets"] = assets
+        acceptance.validate_binding(binding)
+
+        downgraded = dict(binding)
+        downgraded["schema"] = "arc.published-release-binding.v1"
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "missing or unexpected fields"):
+            acceptance.validate_binding(downgraded)
+
     def test_selects_only_one_exact_attempt_publication_evidence_artifact(self) -> None:
         artifacts_json = self.write_json(
             "artifacts.json",

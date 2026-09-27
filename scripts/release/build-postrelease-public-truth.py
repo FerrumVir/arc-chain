@@ -1927,6 +1927,12 @@ def validate_release(
     ):
         fail("release API response does not prove the exact immutable v0.8.0 release")
     positive_int(release["id"], "release.id")
+    if isinstance(release["assets"], list) and any(
+        isinstance(asset, dict)
+        and asset.get("name") == "arc-existing-chain-update-attestation.json"
+        for asset in release["assets"]
+    ):
+        fail("cutover public truth does not consume the separate existing-chain update profile")
     published_at = timestamp(release["published_at"], "release.published_at")
     assets = release["assets"]
     if not isinstance(assets, list) or len(assets) != len(EXPECTED_RELEASE_ASSETS):

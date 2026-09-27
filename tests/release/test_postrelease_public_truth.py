@@ -1764,6 +1764,22 @@ class PublicTruthTests(unittest.TestCase):
         with self.assertRaisesRegex(TRUTH.TruthError, "cannot create"):
             TRUTH.build(self.fixture.args(existing))
 
+    def test_cutover_truth_refuses_existing_chain_update_profile(self) -> None:
+        release = copy.deepcopy(self.fixture.release)
+        asset_template = release["assets"][0]
+        update_assets = []
+        for index, name in enumerate(sorted(PUBLISHED.EXISTING_UPDATE_RELEASE_ASSETS)):
+            asset = copy.deepcopy(asset_template)
+            asset["id"] = 90_000 + index
+            asset["name"] = name
+            asset["browser_download_url"] = (
+                f"https://github.com/{TRUTH.REPOSITORY}/releases/download/{TRUTH.TAG}/{name}"
+            )
+            update_assets.append(asset)
+        release["assets"] = update_assets
+        with self.assertRaisesRegex(TRUTH.TruthError, "separate existing-chain update profile"):
+            TRUTH.validate_release(release, self.fixture.source_sha)
+
     def test_rejects_duplicate_packaged_appimage_asset_ids(self) -> None:
         external = json.loads(self.fixture.packaged_appimage_receipt.read_text())
         names = sorted(external["release"]["assets"])

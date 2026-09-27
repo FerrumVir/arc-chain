@@ -14,7 +14,10 @@ from pathlib import Path
 from typing import NoReturn
 
 
-SCHEMA = "arc.release-manifest-handoff.v1"
+SCHEMA_V1 = "arc.release-manifest-handoff.v1"
+SCHEMA_V2 = "arc.release-manifest-handoff.v2"
+PROFILE_CUTOVER_V1 = "cutover-v1"
+PROFILE_EXISTING_UPDATE_V1 = "existing-recovered-chain-update-v1"
 HANDOFF_NAME = "ARC-RELEASE-HANDOFF.json"
 HEADLESS = (
     "arc-node-linux-x86_64",
@@ -53,6 +56,14 @@ BASE_FILES = HEADLESS + DESKTOP + (
     "latest.json",
     "SHA256SUMS",
 )
+UPDATE_FILES = tuple(
+    name for name in BASE_FILES
+    if name not in {
+        "arc-legacy-maintenance-boundary.json",
+        "arc-recovery-checkpoint-descriptor.json",
+        "arc-cutover-policy.json",
+    }
+) + ("arc-existing-chain-update-attestation.json",)
 MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024
 MAX_TOTAL_BYTES = 12 * 1024 * 1024 * 1024
 MAX_METADATA_BYTES = 4 * 1024 * 1024
@@ -105,8 +116,16 @@ def normalized_mode(name: str) -> int:
     return 0o644
 
 
-def expected_files(sealed: bool) -> tuple[str, ...]:
-    return BASE_FILES + (("SHA256SUMS.sig",) if sealed else ())
+def profile_files(profile: str) -> tuple[str, ...]:
+    if profile == PROFILE_CUTOVER_V1:
+        return BASE_FILES
+    if profile == PROFILE_EXISTING_UPDATE_V1:
+        return UPDATE_FILES
+    fail("unknown release profile")
+
+
+def expected_files(sealed: bool, profile: str = PROFILE_CUTOVER_V1) -> tuple[str, ...]:
+    return profile_files(profile) + (("SHA256SUMS.sig",) if sealed else ())
 
 
 def validate_manifest(root: Path, args: argparse.Namespace) -> dict[str, str]:
@@ -130,7 +149,7 @@ def validate_manifest(root: Path, args: argparse.Namespace) -> dict[str, str]:
         if match is None or match.group(2) in records:
             fail("SHA256SUMS contains an invalid or duplicate record")
         records[match.group(2)] = match.group(1)
-    expected_records = set(BASE_FILES) - {"SHA256SUMS"}
+    expected_records = set(profile_files(args.profile)) - {"SHA256SUMS"}
     if set(records) != expected_records:
         fail("SHA256SUMS record set differs from the release allowlist")
     for name, expected_hash in records.items():
@@ -142,7 +161,7 @@ def validate_manifest(root: Path, args: argparse.Namespace) -> dict[str, str]:
 def validate_release(root: Path, args: argparse.Namespace, sealed: bool) -> tuple[dict, dict]:
     if not root.is_dir() or root.is_symlink():
         fail("release-files must be a non-symlink directory")
-    expected = set(expected_files(sealed))
+    expected = set(expected_files(sealed, args.profile))
     try:
         actual = {path.name for path in root.iterdir()}
     except OSError as error:
@@ -192,10 +211,11 @@ def stage(args: argparse.Namespace) -> None:
         fail("stage directory already exists")
     release_dir = args.stage_dir / "release-files"
     release_dir.mkdir(parents=True, mode=0o700)
-    for name in sorted(expected_files(args.sealed)):
+    for name in sorted(expected_files(args.sealed, args.profile)):
         copy_exclusive(args.source_dir / name, release_dir / name, modes[name])
+    is_update = args.profile == PROFILE_EXISTING_UPDATE_V1
     metadata = {
-        "schema": SCHEMA,
+        "schema": SCHEMA_V2 if is_update else SCHEMA_V1,
         "sealed": args.sealed,
         "repository": args.repository,
         "commit": args.commit,
@@ -206,6 +226,8 @@ def stage(args: argparse.Namespace) -> None:
         "modes": modes,
         "manifest_sha256": hashes["SHA256SUMS"],
     }
+    if is_update:
+        metadata["profile"] = PROFILE_EXISTING_UPDATE_V1
     metadata_bytes = canonical_json(metadata)
     metadata_sha = hashlib.sha256(metadata_bytes).hexdigest()
     copy_target = args.stage_dir / HANDOFF_NAME
@@ -222,8 +244,9 @@ def stage(args: argparse.Namespace) -> None:
     finally:
         os.close(descriptor)
     kind = "sealed" if args.sealed else "unsigned"
+    profile_name = "existing-update-" if is_update else ""
     artifact_name = (
-        f"arc-release-{kind}-handoff-{args.commit}-{args.run_id}-"
+        f"arc-release-{profile_name}{kind}-handoff-{args.commit}-{args.run_id}-"
         f"{args.run_attempt}-{metadata_sha}"
     )
     if args.github_output:
@@ -252,8 +275,9 @@ def verify(args: argparse.Namespace) -> None:
         fail(f"handoff metadata is invalid JSON: {error}")
     if canonical_json(metadata) != metadata_bytes:
         fail("handoff metadata is not canonical")
+    is_update = args.profile == PROFILE_EXISTING_UPDATE_V1
     expected_identity = {
-        "schema": SCHEMA,
+        "schema": SCHEMA_V2 if is_update else SCHEMA_V1,
         "sealed": args.sealed,
         "repository": args.repository,
         "commit": args.commit,
@@ -261,6 +285,10 @@ def verify(args: argparse.Namespace) -> None:
         "workflow_run_id": args.run_id,
         "workflow_run_attempt": args.run_attempt,
     }
+    if is_update:
+        expected_identity["profile"] = PROFILE_EXISTING_UPDATE_V1
+    if set(metadata) != set(expected_identity) | {"files", "modes", "manifest_sha256"}:
+        fail("handoff metadata fields differ from the selected profile schema")
     for field, expected in expected_identity.items():
         if metadata.get(field) != expected:
             fail(f"handoff metadata field {field} differs")
@@ -282,6 +310,8 @@ def common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--run-attempt", required=True, type=int)
     parser.add_argument("--sealed", action="store_true")
+    parser.add_argument("--profile", choices=(PROFILE_CUTOVER_V1, PROFILE_EXISTING_UPDATE_V1),
+                        default=PROFILE_CUTOVER_V1)
 
 
 def parse_args() -> argparse.Namespace:

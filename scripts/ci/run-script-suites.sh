@@ -69,6 +69,9 @@ run_unittest "release: SBOM builder (R2)"                    scripts/release/tes
 run_unittest "release: signing-path FIXTURE tests (R3/U7)"   scripts/release/tests/test_signing_fixtures.py
 run_unittest "release: local artifact verifier (R2)"         scripts/release/tests/test_verify_local_artifacts.py
 run_unittest "release: local build script FIXTURE (R2)"      scripts/release/tests/test_build_local_artifacts.py
+run_unittest "release: existing-chain update evidence"      scripts/release/tests/test_existing_chain_update.py
+run_unittest "release: exact-parent update inputs"           scripts/release/tests/test_existing_chain_update_input.py
+run_unittest "release: immutable update handoff ZIP"         scripts/release/tests/test_materialize_update_handoff.py
 
 # scripts/benchmarks/tests loads its modules by file path in the same way.
 # Synthetic workload records and the cost calculator's own self-test only:

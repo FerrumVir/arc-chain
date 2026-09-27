@@ -69,7 +69,6 @@ function ProductionBrowserBlocker() {
 
 export function App() {
   const onboardedFlag = useAppStore((s) => s.onboarded);
-  const identity = useAppStore((s) => s.identity);
   const config = useAppStore((s) => s.config);
   const route = useAppStore((s) => s.route);
   const setConfig = useAppStore((s) => s.setConfig);
@@ -79,10 +78,10 @@ export function App() {
   const [dataMigration, setDataMigration] =
     useState<DataMigrationNotice | null>(null);
 
-  // Compute onboarded from *either* the explicit flag (set by the wizard on
-  // launch) or the presence of a persisted identity+config pair. This way a
-  // reinstall or fresh launch with an existing Rust-side store skips onboarding.
-  const onboarded = onboardedFlag || (!!identity && !!config);
+  // The wizard stages identity/config before downloading and starting the
+  // node. Those drafts must not unmount it while setup can still fail.
+  // Native-store hydration below restores completion for existing installs.
+  const onboarded = onboardedFlag;
 
   useEffect(() => {
     let active = true;

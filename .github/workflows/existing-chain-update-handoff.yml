@@ -1,0 +1,159 @@
+name: Existing recovered-chain update handoff
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_commit_sha:
+        description: Exact public operational-input commit with current main as its sole parent
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: existing-chain-update-handoff-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-upload:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind the public operational input to current protected main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_COMMIT: ${{ inputs.input_commit_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$INPUT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
+          [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]
+          [ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA" ]
+          gh auth setup-git --hostname github.com
+          INPUT_REF="refs/arc-existing-chain-updates/$GITHUB_SHA"
+          git -c protocol.version=2 fetch --no-tags --no-write-fetch-head origin \
+            "+$INPUT_REF:refs/remotes/origin/arc-existing-chain-updates/$GITHUB_SHA"
+          [ "$(git rev-parse "refs/remotes/origin/arc-existing-chain-updates/$GITHUB_SHA^{commit}")" = "$INPUT_COMMIT" ]
+          python3 scripts/release/existing-chain-update-input.py materialize \
+            --repository-root . --main-commit "$GITHUB_SHA" \
+            --handoff-commit "$INPUT_COMMIT" --output-dir operational-input
+
+      - name: Resolve and verify the exact protected preflight artifacts
+        id: selection
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          OWNER=operational-input/update-attestation.json
+          TAG="$(jq -er '.release.tag' "$OWNER")"
+          RUN_ID="$(jq -er '.release.preflight_run_id' "$OWNER")"
+          ATTEMPT="$(jq -er '.release.preflight_run_attempt' "$OWNER")"
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$RUN_ID" =~ ^[1-9][0-9]*$ && "$ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[]' | jq -s '{artifacts: .}' > api-artifacts.json
+          python3 scripts/release/select-pretag-artifacts.py \
+            --api-json api-artifacts.json --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" --run-id "$RUN_ID" --run-attempt "$ATTEMPT" \
+            --output selection.json >/dev/null
+          SELECTED="$(jq -c '.artifacts' selection.json)"
+          scripts/release/verify-pretag-run-and-artifacts.sh \
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$RUN_ID" "$ATTEMPT" "$SELECTED"
+          OWNER_PLATFORM="$(jq -er '.release.checkpoint_verifier_artifact.platform' "$OWNER")"
+          case "$OWNER_PLATFORM" in linux-x86_64|macos-arm64|macos-x86_64|windows-x86_64) ;; *) exit 1 ;; esac
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+            echo "run_id=$RUN_ID"
+            echo "run_attempt=$ATTEMPT"
+            echo "artifact_ids=$(jq -er --arg owner "$OWNER_PLATFORM" '[.artifacts["linux-x86_64"].headless.id, .artifacts[$owner].headless.id] | unique | map(tostring) | join(",")' selection.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the selected verifier and production artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.selection.outputs.artifact_ids }}
+          path: pretag-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.selection.outputs.run_id }}
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Independently verify the checkpoint and bounded owner observation
+        env:
+          PLANNED_TAG: ${{ steps.selection.outputs.tag }}
+          VERSION: ${{ steps.selection.outputs.version }}
+          PREFLIGHT_RUN_ID: ${{ steps.selection.outputs.run_id }}
+          PREFLIGHT_ATTEMPT: ${{ steps.selection.outputs.run_attempt }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir update-handoff
+          python3 scripts/release/assemble-existing-chain-update.py \
+            --repository "$GITHUB_REPOSITORY" --repository-root . \
+            --tag "$PLANNED_TAG" --version "$VERSION" --commit "$GITHUB_SHA" --main-sha "$GITHUB_SHA" \
+            --run-id "$PREFLIGHT_RUN_ID" --run-attempt "$PREFLIGHT_ATTEMPT" \
+            --selection selection.json --api-artifacts api-artifacts.json --downloads-root pretag-download \
+            --selector scripts/release/select-pretag-artifacts.py \
+            --materializer scripts/release/materialize-pretag-artifacts.py \
+            --rollout-validator scripts/release/update-quorum-validator.py \
+            --artifact-platform linux-x86_64 --verifier-platform linux-x86_64 \
+            --host-config operational-input/host-config.json --quorum-proof operational-input/quorum-proof.json \
+            --checkpoint operational-input/recovery.arcchkpt --recovery-epoch 1 \
+            --approved-genesis-network-hash operational-input/approved-genesis.network-hash \
+            --owner-attestation operational-input/update-attestation.json \
+            --output update-handoff/arc-existing-chain-update-attestation.json
+
+      - name: Check source and current main before publishing the handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git diff --exit-code
+          git diff --cached --exit-code
+          [ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')" = "$GITHUB_SHA" ]
+          [ "$(find update-handoff -mindepth 1 -maxdepth 1 -printf '%f\n')" = arc-existing-chain-update-attestation.json ]
+
+      - name: Upload the exact independently verified update handoff
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: arc-existing-chain-update-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: update-handoff/arc-existing-chain-update-attestation.json
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: false
+          retention-days: 90
+
+      - name: Record the immutable handoff tuple
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ && "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          {
+            echo '### Existing recovered-chain update handoff'
+            echo "Main commit: $GITHUB_SHA"
+            echo "Run/attempt: $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+            echo "Artifact ID: $ARTIFACT_ID"
+            echo "Artifact digest: sha256:$ARTIFACT_DIGEST"
+            echo 'The observation time is recorded in the attestation. This handoff does not prove the original cutover ceremony or authorize retirement.'
+          } >> "$GITHUB_STEP_SUMMARY"
