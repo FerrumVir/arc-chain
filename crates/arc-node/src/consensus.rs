@@ -630,7 +630,6 @@ pub(crate) fn admit_gossiped_transaction(
 /// offered. Execution was never duplicated (the commit path filters receipted
 /// bodies), but disk, bandwidth and per-block signature verification all grew
 /// without bound.
-
 fn retain_unreceipted(state: &StateDB, transactions: &mut Vec<arc_types::Transaction>) -> usize {
     let before = transactions.len();
     transactions.retain(|transaction| !state.receipts.contains_key(&transaction.hash.0));
@@ -1031,7 +1030,9 @@ impl ConsensusManager {
                 }
                 let mut bodies = Vec::with_capacity(block.transactions.len());
                 for hash in &block.transactions {
-                    if !verified.contains_key(&hash.0) {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        verified.entry(hash.0)
+                    {
                         let body = match attachments.get(&hash.0) {
                             Some(body) => (**body).clone(),
                             None => exact_dag_preimages_from(pending, Some(state), &[*hash])
@@ -1049,7 +1050,7 @@ impl ConsensusManager {
                                 "history transaction failed signature/domain validation: {error:?}"
                             ))
                         })?;
-                        verified.insert(hash.0, checked.remove(0));
+                        entry.insert(checked.remove(0));
                     }
                     bodies.push(verified[&hash.0].clone());
                 }
