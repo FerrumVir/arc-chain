@@ -600,13 +600,12 @@ fn initialize_journal(
             // Publication helpers can report an error after the name was
             // committed. Re-open and sync that exact final state before
             // accepting it; never clean up or overwrite ambiguous files.
-            if let Ok(mut published) = open_private_append_owned_migration(&path) {
-                if validate_empty_journal(&mut published, capacity).is_ok()
-                    && published.sync_all().is_ok()
-                    && sync_parent_directory(&path).is_ok()
-                {
-                    return Ok(published);
-                }
+            if let Ok(mut published) = open_private_append_owned_migration(&path)
+                && validate_empty_journal(&mut published, capacity).is_ok()
+                && published.sync_all().is_ok()
+                && sync_parent_directory(&path).is_ok()
+            {
+                return Ok(published);
             }
             Err(publish_error.into())
         }
@@ -721,7 +720,7 @@ fn parse_journal(
         return Err(PublicWorkerOfferAdmissionError::Corrupt);
     }
     let tail = &bytes[ADMISSION_HEADER_LEN..];
-    if tail.len() % ADMISSION_RECORD_LEN != 0 {
+    if !tail.len().is_multiple_of(ADMISSION_RECORD_LEN) {
         return Err(PublicWorkerOfferAdmissionError::Corrupt);
     }
     let count = tail.len() / ADMISSION_RECORD_LEN;
