@@ -435,7 +435,7 @@ mod unix {
             {
                 return Err("reference is not complete canonical interleaved I8".into());
             }
-            model
+            let _admission = model
                 .preflight_generation(prompt.len(), max_tokens)
                 .map_err(|e| e.to_string())?;
             let mut discarded = Vec::new();

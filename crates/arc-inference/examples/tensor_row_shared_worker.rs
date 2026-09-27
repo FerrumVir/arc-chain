@@ -85,8 +85,8 @@ fn main() -> Result<(), String> {
     // SAFETY: handlers only store into a lock-free AtomicBool, perform no
     // allocation or I/O, and remain alive for the process lifetime.
     unsafe {
-        libc::signal(libc::SIGTERM, stop as libc::sighandler_t);
-        libc::signal(libc::SIGINT, stop as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
     }
     let cancel = Arc::new(AtomicBool::new(false));
     let watched = cancel.clone();
