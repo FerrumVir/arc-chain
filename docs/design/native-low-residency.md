@@ -187,3 +187,38 @@ as CI logs. The reported 100 ms aggregate RSS sampling can miss peaks, per-proce
 earlier or unrelated work. These limitations are included in the result.
 This exercise establishes neither the production SSH/cohort path nor quality,
 paid execution, real-host capacity or distributed latency qualification.
+
+
+## Recovered v3 routing and local request readiness
+
+An authorized migration adds native inference to the recovered v3 chain. Native
+blocks retain protocol 3 headers and the recovery root commits both native account
+and storage updates. Ordinary v3 admission rules remain in force. A native block
+contains at most one transition and cannot mix native and ordinary transactions.
+
+New local paid requests require `--enable-native-inference-requests`, which
+requires `--native-inference-runtime`. Leave the request flag absent through
+activation and while starting the qualified runtimes on the whole committee.
+Enable it only after the operator has verified the coordinated fleet's readiness.
+The flag is local rollout policy, not an attestation of fleet readiness, reference
+conformance or model quality.
+
+Even with the flag, admission stays closed until the runtime polls successfully.
+The low-residency executor must also have a current measured placement covering
+all primary projections, including the output head, passing the same strict
+coverage preflight as execution. Readiness expires after five seconds without a
+successful poll and closes on dependency failure, worker stop, error-limit exit
+or panic. Long execution can therefore temporarily close new admission. A new
+process starts without inherited health and must pass these checks again.
+
+`/native-inference/context` remains readable and preserves `candidate_protocol: 4`
+for the existing contract API. `chain_protocol` reports the actual chain major,
+`native_only_chain` distinguishes a fresh native chain from a migrated chain,
+and `request_admission_open` reports this node's local gate. The detailed
+`request_admission` object separates operator opt-in from runtime readiness.
+
+The gate covers signed RPC submissions, transaction gossip, local proposals and
+mempool requeues. It never changes consensus validity: a valid committed request
+is retained and executed even on a locally closed node. Workers still process
+canonical pending jobs while admission is closed, and finalization and refunds
+remain available. Closing admission cannot undo an already committed reservation.

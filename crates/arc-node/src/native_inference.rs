@@ -293,6 +293,12 @@ impl PendingSource for StatePendingSource {
 }
 
 pub trait NativeExecutor: Send + Sync {
+    /// Local readiness only, never consensus validity. Unknown executors are
+    /// closed by default; construction/identity checks alone are not liveness.
+    fn ready_for_requests(&self, _context: &InferenceAdmissionContext, _now: u64) -> bool {
+        false
+    }
+
     fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError>;
 
     /// [`Self::execute`] at chain height `now`, which is what the worker
@@ -760,6 +766,17 @@ impl CanonicalI8NativeExecutor {
 }
 
 impl NativeExecutor for CanonicalI8NativeExecutor {
+    fn ready_for_requests(&self, context: &InferenceAdmissionContext, now: u64) -> bool {
+        context.allowed_executions.iter().any(|allowed| {
+            allowed.model_hash == self.qualification.artifact_hash
+                && allowed.profile_hash == self.qualification.profile_hash
+                && allowed.generation_hash == self.qualification.generation_hash
+        }) && match &self.row_cohort {
+            Some(cohort) => cohort.ready_for_requests(now),
+            None => !self.model.is_low_residency(),
+        }
+    }
+
     fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
         self.run(job, None)
     }
@@ -1956,6 +1973,18 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
         })
     }
 
+    fn ready_for_requests(&self) -> bool {
+        self.state
+            .try_native_inference_context()
+            .ok()
+            .flatten()
+            .is_some_and(|context| {
+                self.worker
+                    .executor
+                    .ready_for_requests(&context, self.state.height())
+            })
+    }
+
     /// Enqueue every bounded canonical pending request and execute at most one.
     /// The caller supplies no height: StateDB determines the canonical next
     /// block height at each validation point.
@@ -2181,6 +2210,14 @@ impl DeterministicTestExecutor {
 
 #[cfg(feature = "native-test-executor")]
 impl NativeExecutor for DeterministicTestExecutor {
+    fn ready_for_requests(&self, context: &InferenceAdmissionContext, _now: u64) -> bool {
+        context.allowed_executions.iter().any(|allowed| {
+            allowed.model_hash == self.qualification.artifact_hash
+                && allowed.profile_hash == self.qualification.profile_hash
+                && allowed.generation_hash == self.qualification.generation_hash
+        })
+    }
+
     fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
         // Domain-separated so this output can never collide with a real one.
         let mut seed = Vec::new();
@@ -2200,10 +2237,94 @@ impl NativeExecutor for DeterministicTestExecutor {
     }
 }
 
+/// Local NEW-request policy, shared by RPC, gossip and proposal/requeue paths.
+/// It is deliberately absent from StateDB and committed-block validation.
+/// Operator opt-in certifies rollout intent, not fleet readiness or model quality.
+#[derive(Default)]
+pub struct NativeRequestAdmission {
+    operator_enabled: bool,
+    running: AtomicBool,
+    healthy_at: Mutex<Option<std::time::Instant>>,
+}
+
+/// A busy or unresponsive worker cannot continue admitting new paid work on
+/// the strength of an old poll. Existing canonical jobs still run and settle.
+const NATIVE_READINESS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl NativeRequestAdmission {
+    pub fn new(operator_enabled: bool) -> Self {
+        Self {
+            operator_enabled,
+            ..Self::default()
+        }
+    }
+
+    pub fn operator_enabled(&self) -> bool {
+        self.operator_enabled
+    }
+
+    pub fn runtime_ready(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+            && self
+                .healthy_at
+                .lock()
+                .is_some_and(|at| at.elapsed() < NATIVE_READINESS_MAX_AGE)
+    }
+
+    pub fn accepting_requests(&self) -> bool {
+        self.operator_enabled && self.runtime_ready()
+    }
+
+    pub fn allows(&self, tx: &arc_types::Transaction) -> bool {
+        !matches!(tx.body, arc_types::TxBody::NativeInferenceRequest(_))
+            || self.accepting_requests()
+    }
+
+    pub(crate) fn retain_for_proposal(&self, transactions: &mut Vec<arc_types::Transaction>) {
+        transactions.retain(|tx| self.allows(tx));
+    }
+
+    /// Every local insertion/requeue uses the same check. A committed DAG
+    /// preimage is retained separately and must never be discarded here.
+    pub(crate) fn insert(
+        &self,
+        mempool: &arc_mempool::Mempool,
+        tx: arc_types::Transaction,
+    ) -> bool {
+        self.allows(&tx) && mempool.insert(tx).is_ok()
+    }
+
+    fn record_health(&self, ready: bool) {
+        *self.healthy_at.lock() = ready.then(std::time::Instant::now);
+    }
+
+    fn stopped(&self) {
+        self.running.store(false, Ordering::Release);
+        self.record_health(false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_for_test() -> Self {
+        let gate = Self::new(true);
+        gate.running.store(true, Ordering::Release);
+        gate.record_health(true);
+        gate
+    }
+}
+
+/// Clears readiness on normal exit, error-limit exit and unwinding.
+struct NativeReadinessGuard(Arc<NativeRequestAdmission>);
+impl Drop for NativeReadinessGuard {
+    fn drop(&mut self) {
+        self.0.stopped();
+    }
+}
+
 /// Handle to a running native worker loop.
 pub struct NativeRuntimeHandle {
     cancel: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
+    admission: Arc<NativeRequestAdmission>,
 }
 
 impl NativeRuntimeHandle {
@@ -2211,6 +2332,7 @@ impl NativeRuntimeHandle {
     /// handle without calling this also cancels, so a panicking caller cannot
     /// leave the loop running.
     pub fn shutdown(mut self) {
+        self.admission.stopped();
         self.cancel.store(true, Ordering::Release);
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -2219,11 +2341,13 @@ impl NativeRuntimeHandle {
 
     pub fn is_running(&self) -> bool {
         !self.cancel.load(Ordering::Acquire)
+            && self.join.as_ref().is_some_and(|join| !join.is_finished())
     }
 }
 
 impl Drop for NativeRuntimeHandle {
     fn drop(&mut self) {
+        self.admission.stopped();
         self.cancel.store(true, Ordering::Release);
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -2264,14 +2388,37 @@ where
     G: VoteSigner + Send + Sync + 'static,
     V: VoteSink + Send + Sync + 'static,
 {
+    spawn_native_runtime_with_admission(
+        runtime,
+        bounds,
+        cancel,
+        Arc::new(NativeRequestAdmission::default()),
+    )
+}
+
+pub fn spawn_native_runtime_with_admission<E, G, V>(
+    runtime: NativeWorkerRuntime<E, G, V>,
+    bounds: NativeRuntimeBounds,
+    cancel: Arc<AtomicBool>,
+    admission: Arc<NativeRequestAdmission>,
+) -> NativeRuntimeHandle
+where
+    E: NativeExecutor + Send + Sync + 'static,
+    G: VoteSigner + Send + Sync + 'static,
+    V: VoteSink + Send + Sync + 'static,
+{
     let flag = cancel.clone();
+    let worker_admission = admission.clone();
     let join = std::thread::Builder::new()
         .name("arc-native-worker".into())
         .spawn(move || {
+            let _readiness = NativeReadinessGuard(worker_admission.clone());
+            worker_admission.running.store(true, Ordering::Release);
             let mut consecutive_errors: u32 = 0;
             while !flag.load(Ordering::Acquire) {
                 match runtime.poll_once() {
                     Ok(Some(vote)) => {
+                        worker_admission.record_health(runtime.ready_for_requests());
                         consecutive_errors = 0;
                         tracing::info!(
                             request = %vote.request_id.to_hex(),
@@ -2279,10 +2426,12 @@ where
                         );
                     }
                     Ok(None) => {
+                        worker_admission.record_health(runtime.ready_for_requests());
                         consecutive_errors = 0;
                         std::thread::sleep(bounds.idle_interval);
                     }
                     Err(error) => {
+                        worker_admission.record_health(false);
                         consecutive_errors = consecutive_errors.saturating_add(1);
                         tracing::warn!(
                             %error,
@@ -2309,6 +2458,7 @@ where
     NativeRuntimeHandle {
         cancel,
         join: Some(join),
+        admission,
     }
 }
 
@@ -3612,6 +3762,9 @@ mod tests {
     /// settlement path; it is explicitly not a model-quality or P2P proof.
     struct FixtureExecutor;
     impl NativeExecutor for FixtureExecutor {
+        fn ready_for_requests(&self, _: &InferenceAdmissionContext, _: u64) -> bool {
+            true
+        }
         fn execute(&self, _: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
             Ok(ExecutionOutput {
                 tokens: vec![71, 72],
@@ -4685,6 +4838,156 @@ mod tests {
             ),
             "Finalized"
         );
+    }
+
+    fn wait_until(check: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !check() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native runtime did not reach expected state"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn request_gate_requires_opt_in_live_polls_and_closes_on_failure_panic_stop_and_restart() {
+        struct Availability(std::sync::atomic::AtomicU8);
+        impl NativeExecutor for Availability {
+            fn ready_for_requests(&self, _: &InferenceAdmissionContext, _: u64) -> bool {
+                match self.0.load(Ordering::Acquire) {
+                    0 => true,
+                    1 => false,
+                    _ => panic!("synthetic dependency panic"),
+                }
+            }
+            fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+                FixtureExecutor.execute(job)
+            }
+        }
+        let fixture = native_fixture();
+        let availability = Arc::new(Availability(std::sync::atomic::AtomicU8::new(0)));
+        let bounds = NativeRuntimeBounds {
+            idle_interval: std::time::Duration::from_millis(5),
+            error_backoff: std::time::Duration::from_millis(5),
+            max_consecutive_errors: Some(1),
+        };
+        let start = |gate: Arc<NativeRequestAdmission>| {
+            let key = fixture.validators[0].clone();
+            let store = DecisionStore::open(
+                fixture.directory.path().join("readiness-decisions"),
+                key.address(),
+                fixture.genesis,
+                fixture.context.commitment().unwrap(),
+            )
+            .unwrap();
+            let runtime = NativeWorkerRuntime::from_active(
+                fixture.state.clone(),
+                availability.clone(),
+                Arc::new(KeyPairVoteSigner::new(key)),
+                Arc::new(Sink),
+                store,
+            )
+            .unwrap();
+            spawn_native_runtime_with_admission(
+                runtime,
+                bounds,
+                Arc::new(AtomicBool::new(false)),
+                gate,
+            )
+        };
+        let disabled = Arc::new(NativeRequestAdmission::default());
+        let handle = start(disabled.clone());
+        wait_until(|| disabled.runtime_ready());
+        assert!(
+            !disabled.accepting_requests(),
+            "runtime health cannot open operator policy"
+        );
+        handle.shutdown();
+        assert!(!disabled.runtime_ready());
+        let enabled = Arc::new(NativeRequestAdmission::new(true));
+        assert!(
+            !enabled.accepting_requests(),
+            "configured does not mean running"
+        );
+        let handle = start(enabled.clone());
+        wait_until(|| enabled.accepting_requests());
+        availability.0.store(1, Ordering::Release);
+        wait_until(|| !enabled.runtime_ready());
+        availability.0.store(0, Ordering::Release);
+        wait_until(|| enabled.accepting_requests());
+        availability.0.store(2, Ordering::Release);
+        wait_until(|| !handle.is_running());
+        assert!(!enabled.accepting_requests(), "unwinding clears readiness");
+        drop(handle);
+        let restarted = Arc::new(NativeRequestAdmission::new(true));
+        assert!(
+            !restarted.accepting_requests(),
+            "restart never inherits health"
+        );
+        availability.0.store(0, Ordering::Release);
+        let handle = start(restarted.clone());
+        wait_until(|| restarted.accepting_requests());
+        handle.shutdown();
+        assert!(!restarted.accepting_requests());
+        let stale = NativeRequestAdmission::ready_for_test();
+        *stale.healthy_at.lock() = Some(std::time::Instant::now() - NATIVE_READINESS_MAX_AGE);
+        assert!(
+            !stale.accepting_requests(),
+            "a hung/occupied worker's old poll expires"
+        );
+    }
+
+    #[test]
+    fn runtime_error_limit_closes_admission_without_discarding_canonical_pending_job() {
+        struct FailedSink;
+        impl VoteSink for FailedSink {
+            fn emit(&self, _: &StoredVote) -> Result<(), NativeInferenceError> {
+                Err(NativeInferenceError::Sink(
+                    "synthetic unavailable sink".into(),
+                ))
+            }
+        }
+        let fixture = native_fixture();
+        let ids = admit_requests(&fixture, &[0]);
+        let key = fixture.validators[0].clone();
+        let store = DecisionStore::open(
+            fixture.directory.path().join("failed-sink-decisions"),
+            key.address(),
+            fixture.genesis,
+            fixture.context.commitment().unwrap(),
+        )
+        .unwrap();
+        let runtime = NativeWorkerRuntime::from_active(
+            fixture.state.clone(),
+            Arc::new(FixtureExecutor),
+            Arc::new(KeyPairVoteSigner::new(key)),
+            Arc::new(FailedSink),
+            store,
+        )
+        .unwrap();
+        let gate = Arc::new(NativeRequestAdmission::new(true));
+        let handle = spawn_native_runtime_with_admission(
+            runtime,
+            NativeRuntimeBounds {
+                max_consecutive_errors: Some(1),
+                ..NativeRuntimeBounds::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+            gate.clone(),
+        );
+        wait_until(|| !handle.is_running());
+        assert!(!gate.accepting_requests());
+        assert_eq!(
+            fixture
+                .state
+                .native_inference_pending_requests(fixture.context.commitment().unwrap())
+                .unwrap()[0]
+                .request_id,
+            ids[0]
+        );
+        handle.shutdown();
     }
 
     /// Admit `requests` (one per block, as protocol 4 requires) and return

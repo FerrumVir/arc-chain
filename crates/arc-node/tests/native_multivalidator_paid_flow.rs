@@ -219,6 +219,7 @@ impl Fixture {
                 "--native-inference-activation",
                 self.activation.to_str().unwrap(),
                 "--native-inference-runtime",
+                "--enable-native-inference-requests",
                 "--native-inference-test-executor",
             ])
             .args(&self.node_args)

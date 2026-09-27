@@ -1309,6 +1309,105 @@ impl RowCohort {
         recent.push_back(record);
     }
 
+    fn issue_placement(
+        &self,
+        request: Hash256,
+        now: u64,
+        stages: Vec<Stage>,
+        open: &BTreeMap<String, Arc<dyn RowWorker>>,
+    ) -> Result<AssignmentCertificate, arc_assign::placement::PlacementError> {
+        let books = self.books.lock();
+        let (candidates, digests) = book::candidates_from(
+            self.offers(open),
+            &books.challenges,
+            &books.probes,
+            &books.ledger,
+            &books.exclusions,
+        );
+        let policy = Policy {
+            max_workers: self.config.max_workers,
+            max_link_age: LINK_MAX_AGE_HEIGHTS,
+            now,
+            max_failure_per_mille: LINK_MAX_FAILURE_PER_MILLE,
+            allow_simulated_links: false,
+            input_element_bytes: 8,
+            output_element_bytes: 8,
+            weight_bytes_per_element: 1,
+            include_coordinator: !self.model.is_low_residency(),
+        };
+        let rule = VerificationRule {
+            duplicate_per_mille: self.config.duplicate_per_mille,
+            spot_rows_per_stage: self.config.spot_rows_per_stage,
+        };
+        AssignmentCertificate::issue(
+            request,
+            self.artifact,
+            self.model
+                .source()
+                .canonical_execution_profile()
+                .unwrap_or_default(),
+            books.epoch,
+            stages,
+            self.coordinator_macs_per_s,
+            candidates,
+            digests,
+            policy,
+            rule,
+        )
+    }
+
+    /// Refresh measurements even on an idle node. Low residency is ready only
+    /// when the same measured placement and strict coverage preflight used by
+    /// execution succeed. This reserves no slots and loads no model matrices.
+    pub(crate) fn ready_for_requests(&self, now: u64) -> bool {
+        if !self.model.is_low_residency() {
+            return true;
+        }
+        self.begin(now);
+        let open: BTreeMap<String, Arc<dyn RowWorker>> = self
+            .workers
+            .lock()
+            .iter()
+            .filter(|(_, worker)| worker.is_open())
+            .map(|(id, worker)| (id.clone(), worker.clone() as Arc<dyn RowWorker>))
+            .collect();
+        let (keys, stages) = projection_stages(self.model.source());
+        let Ok(certificate) = self.issue_placement(Hash256::ZERO, now, stages, &open) else {
+            return false;
+        };
+        let id_of = self
+            .machines
+            .iter()
+            .map(|machine| (machine.address.0, machine.entry.id.clone()))
+            .collect();
+        let Ok(plans) = plans_from(&certificate, &keys, &id_of) else {
+            return false;
+        };
+        let stage_of = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (*key, index))
+            .collect();
+        let events = CohortEvents {
+            cohort: self,
+            certificate: certificate.hash(),
+            height: now,
+            stage_of: &stage_of,
+            answered: AtomicU64::new(0),
+            fallbacks: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+            faults: AtomicU64::new(0),
+        };
+        VerifiedPartitionBackend::new_strict(
+            self.model.source(),
+            self.artifact,
+            plans,
+            open,
+            &events,
+        )
+        .is_ok()
+    }
+
     /// Generate one request's tokens: placed on this cohort when placement
     /// predicts the machines make it faster, locally otherwise. Either way the
     /// tokens equal local execution's (see the module documentation). Never
@@ -1336,7 +1435,6 @@ impl RowCohort {
             )
         };
         let (keys, stages) = projection_stages(model);
-        let profile = model.canonical_execution_profile().unwrap_or_default();
         let open: BTreeMap<String, Arc<dyn RowWorker>> = self
             .workers
             .lock()
@@ -1344,43 +1442,7 @@ impl RowCohort {
             .filter(|(_, worker)| worker.is_open())
             .map(|(id, worker)| (id.clone(), worker.clone() as Arc<dyn RowWorker>))
             .collect();
-        let issued = {
-            let books = self.books.lock();
-            let (candidates, digests) = book::candidates_from(
-                self.offers(&open),
-                &books.challenges,
-                &books.probes,
-                &books.ledger,
-                &books.exclusions,
-            );
-            let policy = Policy {
-                max_workers: self.config.max_workers,
-                max_link_age: LINK_MAX_AGE_HEIGHTS,
-                now,
-                max_failure_per_mille: LINK_MAX_FAILURE_PER_MILLE,
-                allow_simulated_links: false,
-                input_element_bytes: 8,
-                output_element_bytes: 8,
-                weight_bytes_per_element: 1,
-                include_coordinator: !self.model.is_low_residency(),
-            };
-            let rule = VerificationRule {
-                duplicate_per_mille: self.config.duplicate_per_mille,
-                spot_rows_per_stage: self.config.spot_rows_per_stage,
-            };
-            AssignmentCertificate::issue(
-                request,
-                self.artifact,
-                profile,
-                books.epoch,
-                stages,
-                self.coordinator_macs_per_s,
-                candidates,
-                digests,
-                policy,
-                rule,
-            )
-        };
+        let issued = self.issue_placement(request, now, stages, &open);
         let mut record = CohortRecord {
             request_id: request.to_hex(),
             height: now,

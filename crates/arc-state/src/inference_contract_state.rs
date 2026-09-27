@@ -1575,6 +1575,20 @@ impl StateDB {
         &self,
         transactions: &[arc_types::Transaction],
     ) -> Result<(), StateError> {
+        let height = self
+            .height()
+            .checked_add(1)
+            .ok_or_else(|| StateError::ExecutionError("native block height overflow".into()))?;
+        self.validate_native_inference_block_admission_at(transactions, height)
+    }
+
+    /// Lock-free canonical preflight: execution callers already hold the
+    /// native execution lock. Local runtime availability is never validity.
+    pub(crate) fn validate_native_inference_block_admission_at(
+        &self,
+        transactions: &[arc_types::Transaction],
+        height: u64,
+    ) -> Result<(), StateError> {
         let context = self.native_inference_context();
         let contains_native = transactions.iter().any(|tx| is_native_body(&tx.body));
         let Some(context) = context else {
@@ -1612,10 +1626,11 @@ impl StateDB {
                 "private protocol-4 blocks allow at most one native inference transaction".into(),
             ));
         }
-        let height = self
-            .height()
-            .checked_add(1)
-            .ok_or_else(|| StateError::ExecutionError("native block height overflow".into()))?;
+        if self.height().checked_add(1) != Some(height) {
+            return Err(StateError::ExecutionError(
+                "native admission requires the next canonical block height".into(),
+            ));
+        }
         validate_native_inference_activation(self, &context)?;
         if let Some(tx) = transactions.first() {
             self.plan_native_transaction(tx, &context, height)?;
@@ -1864,7 +1879,11 @@ impl StateDB {
         proof_hash: Hash256,
     ) -> Result<(arc_types::Block, Vec<arc_types::TxReceipt>), StateError> {
         self.require_healthy_wal()?;
-        self.validate_native_inference_block_admission(transactions)?;
+        if self.active_protocol_version().major == 3 {
+            self.validate_v3_block_admission(transactions)?;
+        } else {
+            self.validate_native_inference_block_admission(transactions)?;
+        }
         let context = self
             .native_inference_context()
             .ok_or_else(|| StateError::ExecutionError("native context is unavailable".into()))?;
@@ -1902,7 +1921,7 @@ impl StateDB {
                 proof_hash,
                 tx_count: transactions.len() as u32,
                 producer,
-                protocol_version: arc_types::ProtocolVersion::new(4, 0, 0),
+                protocol_version: self.active_protocol_version(),
                 state_diff: None,
             },
             tx_hashes,
@@ -4982,10 +5001,36 @@ mod tests {
         let req = request(&f, 0, 400);
         let id = req.job.request_id();
         let tx = native_request(state, &f.requester, req);
-        let (_, receipts) = state
+        state.validate_v3_transaction_admission(&tx).unwrap();
+        state
+            .validate_v3_block_admission(std::slice::from_ref(&tx))
+            .unwrap();
+        let (block, receipts) = state
             .execute_block_adaptive_at(&[tx], f.validators[0].address(), 1_700_200)
             .unwrap();
         assert!(receipts[0].success, "the request is admitted and reserved");
+        assert_eq!(
+            block.header.protocol_version,
+            state.active_protocol_version()
+        );
+        assert_eq!(block.header.protocol_version.major, 3);
+        assert_eq!(block.header.state_root, state.compute_state_root());
+        // Recovery commitments cover native storage itself, not just balances.
+        let slot = state
+            .get_storage(&escrow_address(id), &metadata_key())
+            .unwrap();
+        state
+            .storage
+            .get(&escrow_address(id).0)
+            .unwrap()
+            .insert(metadata_key(), vec![0]);
+        assert_ne!(block.header.state_root, state.compute_state_root());
+        state
+            .storage
+            .get(&escrow_address(id).0)
+            .unwrap()
+            .insert(metadata_key(), slot);
+        assert_eq!(block.header.state_root, state.compute_state_root());
         assert_eq!(
             state.get_account(&f.requester.address()).unwrap().balance,
             900
@@ -5000,10 +5045,16 @@ mod tests {
         );
 
         let terminal = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
-        let (_, receipts) = state
+        state.validate_v3_transaction_admission(&terminal).unwrap();
+        state
+            .validate_v3_block_admission(std::slice::from_ref(&terminal))
+            .unwrap();
+        let (block, receipts) = state
             .execute_block_adaptive_at(&[terminal], f.validators[0].address(), 1_700_300)
             .unwrap();
         assert!(receipts[0].success, "the certificate settles");
+        assert_eq!(block.header.protocol_version.major, 3);
+        assert_eq!(block.header.state_root, state.compute_state_root());
         assert_eq!(
             state.get_account(&f.requester.address()).unwrap().balance,
             990,

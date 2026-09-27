@@ -182,10 +182,10 @@ class Node:
     def executor_args(self) -> List[str]:
         real = getattr(self.cfg, "real_model", None)
         if not real:
-            return ["--native-inference-runtime", "--native-inference-test-executor"]
+            return ["--native-inference-runtime", "--enable-native-inference-requests", "--native-inference-test-executor"]
         # The real canonical executor: it verifies the artifact's bytes, the
         # qualification record and the package manifest before it loads.
-        return ["--native-inference-runtime", "--native-inference-artifact", real,
+        return ["--native-inference-runtime", "--enable-native-inference-requests", "--native-inference-artifact", real,
                 "--native-inference-qualification", self.cfg.qualification,
                 "--native-package-manifest", self.cfg.package_manifest]
 

@@ -2133,7 +2133,12 @@ impl StateDB {
                 tx.body.tx_type()
             )));
         }
-        if !Self::v3_allows_transaction(&tx.body) {
+        // A rooted migration adds the native lane to recovery v3. It does not
+        // relax the ordinary v3 family policy or promote the chain to v4.
+        let migrated_native = self.native_migration().is_some()
+            && self.native_inference_context().is_some()
+            && inference_contract_state::is_native_body(&tx.body);
+        if !Self::v3_allows_transaction(&tx.body) && !migrated_native {
             return Err(StateError::ExecutionError(format!(
                 "transaction type {:?} is unavailable in recovery protocol v3",
                 tx.tx_type
@@ -2798,6 +2803,13 @@ impl StateDB {
             TxBody::CommunityInferenceReward(body) => {
                 self.validate_community_reward_admission(tx, body, execution_height)
             }
+            TxBody::NativeInferenceRequest(_)
+            | TxBody::NativeInferenceFinalize(_)
+            | TxBody::NativeInferenceRefund(_) => self
+                .validate_native_inference_block_admission_at(
+                    std::slice::from_ref(tx),
+                    execution_height,
+                ),
             // Keep this list exhaustive rather than using a wildcard: a new
             // transaction family must be consciously classified and wired
             // before the crate can compile.
@@ -2834,10 +2846,7 @@ impl StateDB {
             | TxBody::ShardAssignmentProposal(_)
             | TxBody::InferenceRequest(_)
             | TxBody::InferenceVote(_)
-            | TxBody::InferenceFinalize(_)
-            | TxBody::NativeInferenceRequest(_)
-            | TxBody::NativeInferenceFinalize(_)
-            | TxBody::NativeInferenceRefund(_) => Err(StateError::ExecutionError(
+            | TxBody::InferenceFinalize(_) => Err(StateError::ExecutionError(
                 "transaction family has no protocol-v3 admission handler".to_string(),
             )),
         }
@@ -2863,6 +2872,27 @@ impl StateDB {
         transactions: &[Transaction],
         execution_height: u64,
     ) -> Result<(), StateError> {
+        if transactions
+            .iter()
+            .any(|tx| inference_contract_state::is_native_body(&tx.body))
+        {
+            // Native blocks have a single transition and cannot mix lanes.
+            // This validator is also called under the native execution lock;
+            // use the lock-free planner, not the public ingress lock wrapper.
+            if self.active_protocol_version().major != 3 {
+                return Err(StateError::ExecutionError(
+                    "native v3 block requires recovery protocol v3".into(),
+                ));
+            }
+            if transactions.len() != 1 {
+                return Err(StateError::ExecutionError(
+                    "native v3 blocks contain one native transition and cannot mix transaction families".into(),
+                ));
+            }
+            self.validate_v3_transaction_envelope(&transactions[0])?;
+            return self
+                .validate_native_inference_block_admission_at(transactions, execution_height);
+        }
         if transactions.len() > V3_MAX_TRANSACTIONS_PER_BLOCK {
             return Err(StateError::ExecutionError(format!(
                 "v3 block contains {} transactions; maximum is {V3_MAX_TRANSACTIONS_PER_BLOCK}",

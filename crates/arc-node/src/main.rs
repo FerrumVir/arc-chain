@@ -237,14 +237,20 @@ struct Cli {
     /// PRIVATE PROTOCOL 4: run the native inference worker loop.
     ///
     /// Default off, and requires --native-inference-activation. Activating the
-    /// contract without this means requests can be admitted that no process
-    /// ever executes or finalizes, so settlement could never complete.
+    /// contract without this keeps this node's new-request admission closed.
+    /// Finalization, refunds and committed-block validity remain available.
     #[arg(
         long,
         default_value_t = false,
         requires = "native_inference_activation"
     )]
     native_inference_runtime: bool,
+
+    /// Admit NEW native paid requests locally after coordinated fleet readiness.
+    /// Default closed, including after restart. Also requires a healthy native
+    /// worker; does not affect committed requests, finalization or refunds.
+    #[arg(long, default_value_t = false, requires = "native_inference_runtime")]
+    enable_native_inference_requests: bool,
 
     /// Largest KV cache (bytes) one native job may use on this node. A job
     /// needing more is refused and never voted on, so it expires and refunds.
@@ -7365,6 +7371,10 @@ async fn run_arc_node() -> Result<()> {
     // empty polls, backs off on error, stops after repeated failures rather
     // than hot-looping, and is shut down explicitly below.
     let native_runtime_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let native_request_admission =
+        Arc::new(arc_node::native_inference::NativeRequestAdmission::new(
+            cli.enable_native_inference_requests,
+        ));
     let mut native_runtime_handle: Option<arc_node::native_inference::NativeRuntimeHandle> = None;
     // The finalize sink is shared: the runtime emits this validator's votes into
     // it, and the consensus loop gossips them and feeds peers' votes back in.
@@ -7448,10 +7458,11 @@ async fn run_arc_node() -> Result<()> {
             let runtime =
                 ni::NativeWorkerRuntime::from_active(state.clone(), executor, signer, sink, store)
                     .map_err(|e| anyhow::anyhow!("native worker runtime: {e}"))?;
-            Some(ni::spawn_native_runtime(
+            Some(ni::spawn_native_runtime_with_admission(
                 runtime,
                 ni::NativeRuntimeBounds::default(),
                 native_runtime_cancel.clone(),
+                native_request_admission.clone(),
             ))
         } else {
             None
@@ -7578,10 +7589,11 @@ async fn run_arc_node() -> Result<()> {
                     store,
                 )
                 .map_err(|e| anyhow::anyhow!("native worker runtime: {e}"))?;
-                Some(ni::spawn_native_runtime(
+                Some(ni::spawn_native_runtime_with_admission(
                     runtime,
                     ni::NativeRuntimeBounds::default(),
                     native_runtime_cancel.clone(),
+                    native_request_admission.clone(),
                 ))
             }
         };
@@ -7916,6 +7928,7 @@ async fn run_arc_node() -> Result<()> {
             consensus.snapshot_every_blocks = blocks;
         }
         consensus.native_vote_relay = native_vote_relay.clone();
+        consensus.native_request_admission = native_request_admission.clone();
         if consensus.snapshot_every_blocks == 0 {
             tracing::warn!(
                 "State snapshots are DISABLED; every restart replays the entire WAL, and that \
@@ -9353,6 +9366,7 @@ async fn run_arc_node() -> Result<()> {
         genesis_chain_identity,
         cli.enable_community_rewards_v1,
         native_serving,
+        native_request_admission,
         Some(shutdown_rx),
         transport_wire_policy,
     )
@@ -9450,6 +9464,25 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn native_request_opt_in_is_default_closed_and_requires_runtime_before_state_open() {
+        assert!(
+            !Cli::try_parse_from(["arc-node"])
+                .unwrap()
+                .enable_native_inference_requests
+        );
+        assert!(Cli::try_parse_from(["arc-node", "--enable-native-inference-requests"]).is_err());
+        let configured = Cli::try_parse_from([
+            "arc-node",
+            "--enable-native-inference-requests",
+            "--native-inference-runtime",
+            "--native-inference-activation",
+            "/not-opened/context.json",
+        ])
+        .unwrap();
+        assert!(configured.enable_native_inference_requests);
+    }
 
     #[test]
     fn legacy_v3_wire_is_explicit_and_conflicts_with_native_activation() {
@@ -10279,6 +10312,7 @@ mod tests {
                     None,
                     false,
                     None,
+                    Arc::new(arc_node::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
                 )

@@ -128,6 +128,9 @@ class NativeWorkers(unittest.TestCase):
                       for i in range(4)]
         self.assertEqual(runtime, [True, True, False, False])
         self.assertEqual(activation, [True] * 4)
+        admission = [("--enable-native-inference-requests" in orchestrate.Node(cfg, i).args("g"))
+                     for i in range(4)]
+        self.assertEqual(admission, runtime, "only fixture nodes with a worker opt in to paid ingress")
 
     def test_by_default_every_node_runs_it(self):
         cfg = self._cfg()

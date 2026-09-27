@@ -552,6 +552,72 @@ fn report_divergence(height: u64, local: Hash256, certified: Hash256) {
     );
 }
 
+/// The actual untrusted Transactions ingress, shared with route regression tests.
+/// DAG block/history preimages intentionally do not use this local policy.
+pub(crate) fn admit_gossiped_transaction(
+    state: &StateDB,
+    mempool: &Mempool,
+    admission: &crate::native_inference::NativeRequestAdmission,
+    bytes: &[u8],
+) -> bool {
+    let Ok(mut tx) = bincode::deserialize::<arc_types::Transaction>(bytes) else {
+        return false;
+    };
+    // Gossip is an untrusted ingress boundary.
+    // Verify before consuming bounded mempool
+    // capacity and cache the result only in
+    // this process.
+    tx.sig_verified = false;
+    if state.verify_transaction_signature(&tx).is_err() {
+        return false;
+    }
+    tx.sig_verified = true;
+    if state.active_protocol_version().major == 3
+        && state.validate_v3_transaction_admission(&tx).is_err()
+    {
+        return false;
+    }
+    // A body retained for one non-leader DAG
+    // block must remain proposal-eligible until
+    // it has a canonical receipt. Inbound
+    // transaction gossip is not immediately
+    // re-broadcast, and Mempool deduplicates its
+    // resident set, so accepting this retry does
+    // not create a wire echo loop.
+    // On a PRIVATE protocol-4 chain nothing but
+    // native work can ever execute, so anything
+    // else is dropped here rather than
+    // circulated. A MIGRATED chain keeps every
+    // family it had, so only its native
+    // transactions are judged this way and the
+    // rest take the ordinary path - dropping
+    // them here would mean a transfer submitted
+    // to one validator never reached the others.
+    let native_only =
+        state.native_inference_context().is_some() && state.native_migration().is_none();
+    let is_native = arc_state::StateDB::is_native_inference_transaction(&tx);
+    if (native_only && !is_native)
+        || (is_native
+            && state.native_inference_context().is_some()
+            && !state.native_transaction_still_admissible(&tx))
+    {
+        // Not native on a chain that carries
+        // only native work, or native but
+        // neither admissible now nor a bounded
+        // future transaction of a funded sender.
+        return false;
+    }
+    // Already executed: re-admitting it is how
+    // a transaction circulated forever.
+    if state.receipts.contains_key(&tx.hash.0) {
+        crate::consensus_diagnostics::bump(
+            &crate::consensus_diagnostics::DIAG.stale_transactions_dropped,
+        );
+        return false;
+    }
+    admission.insert(mempool, tx)
+}
+
 /// Keep only transactions that have NOT yet produced a canonical receipt.
 ///
 /// Only the round leader's DAG block becomes canonical here, so a transaction
@@ -564,6 +630,7 @@ fn report_divergence(height: u64, local: Hash256, certified: Hash256) {
 /// offered. Execution was never duplicated (the commit path filters receipted
 /// bodies), but disk, bandwidth and per-block signature verification all grew
 /// without bound.
+
 fn retain_unreceipted(state: &StateDB, transactions: &mut Vec<arc_types::Transaction>) -> usize {
     let before = transactions.len();
     transactions.retain(|transaction| !state.receipts.contains_key(&transaction.hash.0));
@@ -750,6 +817,8 @@ pub struct ConsensusManager {
     /// The native-inference vote relay, when this node runs the native worker:
     /// its own votes go out through the loop, and peers' votes come back in.
     pub native_vote_relay: Option<Arc<crate::native_inference::NativeFinalizeSink>>,
+    /// Local NEW-request gate only; canonical DAG preimages bypass this policy.
+    pub native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
     /// DAG decision commitment -> the canonical height it produced, over the
     /// window of anchors a peer could still serve. This is what makes applying
     /// an anchor idempotent across a lost commit record.
@@ -833,6 +902,9 @@ impl ConsensusManager {
             signing_record_path: None,
             snapshot_every_blocks: DEFAULT_SNAPSHOT_EVERY_BLOCKS,
             native_vote_relay: None,
+            native_request_admission: Arc::new(
+                crate::native_inference::NativeRequestAdmission::default(),
+            ),
             applied_decisions: dashmap::DashMap::new(),
             decisions_indexed_through: std::sync::atomic::AtomicU64::new(0),
             require_full_committee_at_genesis: false,
@@ -892,6 +964,9 @@ impl ConsensusManager {
             signing_record_path: None,
             snapshot_every_blocks: DEFAULT_SNAPSHOT_EVERY_BLOCKS,
             native_vote_relay: None,
+            native_request_admission: Arc::new(
+                crate::native_inference::NativeRequestAdmission::default(),
+            ),
             applied_decisions: dashmap::DashMap::new(),
             decisions_indexed_through: std::sync::atomic::AtomicU64::new(0),
             require_full_committee_at_genesis: false,
@@ -2141,64 +2216,13 @@ impl ConsensusManager {
                         InboundMessage::Transactions(txs) => {
                             let mut inserted = 0usize;
                             for tx_bytes in txs {
-                                if let Ok(mut tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
-                                    // Gossip is an untrusted ingress boundary.
-                                    // Verify before consuming bounded mempool
-                                    // capacity and cache the result only in
-                                    // this process.
-                                    tx.sig_verified = false;
-                                    if state.verify_transaction_signature(&tx).is_err() {
-                                        continue;
-                                    }
-                                    tx.sig_verified = true;
-                                    if state.active_protocol_version().major == 3
-                                        && state.validate_v3_transaction_admission(&tx).is_err()
-                                    {
-                                        continue;
-                                    }
-                                    // A body retained for one non-leader DAG
-                                    // block must remain proposal-eligible until
-                                    // it has a canonical receipt. Inbound
-                                    // transaction gossip is not immediately
-                                    // re-broadcast, and Mempool deduplicates its
-                                    // resident set, so accepting this retry does
-                                    // not create a wire echo loop.
-                                    // On a PRIVATE protocol-4 chain nothing but
-                                    // native work can ever execute, so anything
-                                    // else is dropped here rather than
-                                    // circulated. A MIGRATED chain keeps every
-                                    // family it had, so only its native
-                                    // transactions are judged this way and the
-                                    // rest take the ordinary path - dropping
-                                    // them here would mean a transfer submitted
-                                    // to one validator never reached the others.
-                                    let native_only = state.native_inference_context().is_some()
-                                        && state.native_migration().is_none();
-                                    let is_native =
-                                        arc_state::StateDB::is_native_inference_transaction(&tx);
-                                    if (native_only && !is_native)
-                                        || (is_native
-                                            && state.native_inference_context().is_some()
-                                            && !state.native_transaction_still_admissible(&tx))
-                                    {
-                                        // Not native on a chain that carries
-                                        // only native work, or native but
-                                        // neither admissible now nor a bounded
-                                        // future transaction of a funded sender.
-                                        continue;
-                                    }
-                                    // Already executed: re-admitting it is how
-                                    // a transaction circulated forever.
-                                    if state.receipts.contains_key(&tx.hash.0) {
-                                        crate::consensus_diagnostics::bump(
-                                            &crate::consensus_diagnostics::DIAG
-                                                .stale_transactions_dropped,
-                                        );
-                                        continue;
-                                    }
-                                    if mempool.insert(tx).is_ok() {
-                                        inserted += 1;
-                                    }
+                                if admit_gossiped_transaction(
+                                    &state,
+                                    &mempool,
+                                    &self.native_request_admission,
+                                    &tx_bytes,
+                                ) {
+                                    inserted += 1;
                                 }
                             }
                             if inserted > 0 {
@@ -3547,7 +3571,7 @@ impl ConsensusManager {
                 let signed_txs = pool.drain(200);
                 let fed = signed_txs.len();
                 for tx in signed_txs {
-                    let _ = mempool.insert(tx);
+                    self.native_request_admission.insert(&mempool, tx);
                 }
                 if fed > 0 && mempool.len() % 10_000 < 2_000 {
                     info!(
@@ -3692,6 +3716,8 @@ impl ConsensusManager {
                     };
                     let mempool_len_pre = mempool.len();
                     let mut transactions = mempool.drain(drain_limit);
+                    self.native_request_admission
+                        .retain_for_proposal(&mut transactions);
                     let stale = retain_unreceipted(&state, &mut transactions);
                     // Keyed on the binding rather than the reported protocol
                     // version, for the same reason as the commit path: a
@@ -3705,7 +3731,7 @@ impl ConsensusManager {
                                 && state.native_transaction_still_admissible(&transaction)
                                 && requeue_native(&mut requeued_since, &transaction)
                             {
-                                let _ = mempool.insert(transaction);
+                                self.native_request_admission.insert(&mempool, transaction);
                             }
                         }
                         transactions = selected;
@@ -3749,7 +3775,7 @@ impl ConsensusManager {
                             // winning canonical state transition decides which
                             // envelope became stale.
                             for transaction in deferred {
-                                let _ = mempool.insert(transaction);
+                                self.native_request_admission.insert(&mempool, transaction);
                             }
                         }
                     }
@@ -3765,7 +3791,7 @@ impl ConsensusManager {
                             "Backpressuring local transaction proposal at preimage capacity"
                         );
                         for transaction in transactions.drain(..) {
-                            let _ = mempool.insert(transaction);
+                            self.native_request_admission.insert(&mempool, transaction);
                         }
                     }
                     if !transactions.is_empty() {
@@ -3798,6 +3824,8 @@ impl ConsensusManager {
                     // committee secret. Keep it completely dark until ARC has
                     // a replicated ciphertext commitment and validator-specific
                     // threshold reveal protocol.
+                    self.native_request_admission
+                        .retain_for_proposal(&mut transactions);
                     let has_txs = !transactions.is_empty();
 
                     if has_txs || multi_validator {
@@ -3922,14 +3950,14 @@ impl ConsensusManager {
                                 // preimage cache.
                                 for transaction in transactions.iter().cloned() {
                                     if !state.receipts.contains_key(&transaction.hash.0) {
-                                        let _ = mempool.insert(transaction);
+                                        self.native_request_admission.insert(&mempool, transaction);
                                     }
                                 }
                             }
                             Err(e) => {
                                 warn!("Failed to propose block: {}", e);
                                 for transaction in transactions.iter().cloned() {
-                                    let _ = mempool.insert(transaction);
+                                    self.native_request_admission.insert(&mempool, transaction);
                                 }
                             }
                         }
@@ -4185,7 +4213,8 @@ impl ConsensusManager {
                                     && state.native_transaction_still_admissible(transaction)
                                     && requeue_native(&mut requeued_since, transaction)
                                 {
-                                    let _ = mempool.insert(transaction.clone());
+                                    self.native_request_admission
+                                        .insert(&mempool, transaction.clone());
                                 }
                             }
                             debug!(

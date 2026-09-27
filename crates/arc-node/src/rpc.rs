@@ -651,6 +651,7 @@ pub struct NodeState {
     /// Published by `/native-inference/context` and used by
     /// `/native-inference/tokenize`; admission never consults it.
     pub native_serving: Option<Arc<crate::native_inference::NativeServing>>,
+    pub native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
     /// Process lifecycle receiver installed by `serve`. Node-owned tasks that
     /// can mutate the settlement journal or mempool stop on this signal and are
     /// joined before `serve` returns to main's final WAL barrier.
@@ -1533,6 +1534,9 @@ pub fn build_node_state(
         // main.rs was given --genesis.
         chain_identity: None,
         native_serving: None,
+        native_request_admission: Arc::new(
+            crate::native_inference::NativeRequestAdmission::default(),
+        ),
         runtime_shutdown: None,
         runtime_tasks: Arc::new(parking_lot::Mutex::new(tokio::task::JoinSet::new())),
         own_compute_ms: Arc::new(parking_lot::Mutex::new(
@@ -1933,6 +1937,7 @@ pub async fn serve(
     // native_serving: what this node's protocol-4 native worker executes,
     //   when it runs one (context/tokenize endpoints only).
     native_serving: Option<Arc<crate::native_inference::NativeServing>>,
+    native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
     // When present, stop accepting new RPC work after the lifecycle owner
     // sends `true` and let Axum drain every active handler before returning.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
@@ -1961,6 +1966,7 @@ pub async fn serve(
     node.chain_identity = chain_identity;
     node.community_rewards_v1_enabled = community_rewards_v1_enabled;
     node.native_serving = native_serving;
+    node.native_request_admission = native_request_admission;
     node.consensus_engine = consensus_engine;
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
@@ -3208,8 +3214,17 @@ async fn native_inference_context(
     let commitment = context
         .commitment()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let operator_enabled = node.native_request_admission.operator_enabled();
+    let runtime_ready = node.native_request_admission.runtime_ready();
     Ok(Json(json!({
         "candidate_protocol": 4,
+        "chain_protocol": node.state.active_protocol_version().major,
+        "native_only_chain": node.state.native_migration().is_none(),
+        "request_admission_open": operator_enabled && runtime_ready,
+        "request_admission": {
+            "operator_enabled": operator_enabled,
+            "runtime_ready": runtime_ready,
+        },
         "context_commitment": commitment.to_hex(),
         "chain_genesis": context.domain.chain_genesis.to_hex(),
         "recovery_epoch": context.domain.recovery_epoch,
@@ -3464,6 +3479,12 @@ async fn submit_signed_tx(
     if node.state.verify_transaction_signature(&tx).is_err() {
         return Err(StatusCode::BAD_REQUEST.into());
     }
+    if !node.native_request_admission.allows(&tx) {
+        return Err(SubmitRefusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "new native requests are closed on this node: operator opt-in and a ready native runtime are required",
+        ));
+    }
     // A PRIVATE protocol-4 chain's committee is frozen by its binding. The
     // executor refuses a registry change too (so a transaction that slips in
     // another way fails with a receipt instead of wedging every later block);
@@ -3552,6 +3573,12 @@ async fn submit_signed_tx(
         "Verified signed transaction submission"
     );
 
+    if !node.native_request_admission.allows(&tx) {
+        return Err(SubmitRefusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native request runtime is no longer ready",
+        ));
+    }
     match node.mempool.insert(tx) {
         Ok(()) => {
             tracing::debug!(
@@ -20678,6 +20705,9 @@ mod tests {
             community_rpc_bases: Arc::new(Vec::new()),
             chain_identity: None,
             native_serving: None,
+            native_request_admission: Arc::new(
+                crate::native_inference::NativeRequestAdmission::default(),
+            ),
             runtime_shutdown: None,
             runtime_tasks: Arc::new(parking_lot::Mutex::new(tokio::task::JoinSet::new())),
             own_compute_ms: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
@@ -23795,6 +23825,15 @@ mod tests {
         };
         state.sign_transaction(&mut tx, &requester).unwrap();
         assert_eq!(
+            submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let mut node = node;
+        node.native_request_admission =
+            Arc::new(crate::native_inference::NativeRequestAdmission::ready_for_test());
+        assert_eq!(
             submit_signed_tx(AxumState(node.clone()), Json(tx))
                 .await
                 .unwrap()
@@ -23874,6 +23913,472 @@ mod tests {
         assert_eq!(
             receipt["consensus_finality"],
             "not asserted by milestone-2 receipt"
+        );
+    }
+
+    /// Synthetic signed end-to-end routing on an imported recovery checkpoint.
+    /// No model or invented qualification: this covers real admission, value,
+    /// native certificates, headers, and durable restart only.
+    #[tokio::test]
+    async fn recovered_v3_native_outer_routes_gate_commit_settlement_and_restart() {
+        use crate::native_inference::NativeRequestAdmission;
+        use arc_state::recovery::{
+            ArcCheckpoint, RecoveryExportSpec, RecoveryImport, RecoveryNetworkPolicy,
+            RecoveryValidator,
+        };
+        use arc_types::inference_contract::{
+            InferenceCertificate, InferenceDomain, InferenceJob, InferenceRequest, ValidatorMember,
+            sign_vote, validator_set_commitment,
+        };
+        use arc_types::transaction::{
+            NativeInferenceFinalizeBody, NativeInferenceRefundBody, NativeInferenceRequestBody,
+            gas_costs,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let requester = KeyPair::generate_ed25519();
+        let keys: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
+        let genesis = arc_crypto::hash_bytes(b"native-v3-outer-routes");
+        let validators: Vec<_> = keys
+            .iter()
+            .map(|key| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: 5_000_000,
+            })
+            .collect();
+        let members: Vec<_> = {
+            let mut v: Vec<_> = validators
+                .iter()
+                .map(|v| ValidatorMember::new(v.address, v.stake))
+                .collect();
+            v.sort_by_key(|v| v.address.0);
+            v
+        };
+        let mut funds = vec![
+            (requester.address(), 1_000),
+            (
+                arc_state::recovery::recovery_stake_reserve_address(),
+                60_000_000,
+            ),
+        ];
+        funds.extend(keys.iter().map(|key| (key.address(), 5_000_000)));
+        let source = StateDB::with_genesis(&funds);
+        let joins: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, 0);
+                tx.tx_type = TxType::JoinValidator;
+                tx.body = TxBody::JoinValidator(arc_types::transaction::JoinValidatorBody {
+                    pubkey: key.public_key_bytes().try_into().unwrap(),
+                    initial_stake: 5_000_000,
+                });
+                tx.sign(key).unwrap();
+                tx
+            })
+            .collect();
+        let (_, receipts) = source.execute_block(&joins, keys[0].address()).unwrap();
+        assert!(receipts.iter().all(|r| r.success));
+        // The export requires the explicit legacy staking reserve decomposition.
+        for key in &keys {
+            let mut account = source.get_account(&key.address()).unwrap();
+            account.staked_balance = 0;
+            source.update_account(&key.address(), account);
+        }
+        source.execute_block(&[], keys[0].address()).unwrap();
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: "native-v3-outer-routes".into(),
+                genesis_hash: genesis,
+                source_consensus_round: 0,
+                recovery_epoch: 1,
+                validator_set_id: 0,
+                validators: validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let path = dir.path().join("approved.arcchkpt");
+        checkpoint.write_to(&path).unwrap();
+        let data_dir = dir.path().join("state");
+        let policy = RecoveryNetworkPolicy {
+            chain_id: "native-v3-outer-routes".into(),
+            genesis_hash: genesis,
+            recovery_epoch: 1,
+            validator_set_id: 0,
+            validators: members.iter().map(|m| (m.address, m.stake)).collect(),
+            community_rewards_v1_activation_height: None,
+        };
+        let state = Arc::new(
+            StateDB::with_genesis_persistent_recovery(
+                &[],
+                &data_dir,
+                policy.clone(),
+                Some(RecoveryImport {
+                    checkpoint_path: path,
+                    approved_manifest_hash: checkpoint.manifest_hash(),
+                }),
+            )
+            .unwrap(),
+        );
+        let tuple = arc_crypto::hash_bytes(b"synthetic-native-tuple-not-model-qualification");
+        let context = arc_state::InferenceAdmissionContext {
+            domain: InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 1,
+                validator_set_hash: validator_set_commitment(&members).unwrap(),
+            },
+            members,
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: tuple,
+                profile_hash: tuple,
+                generation_hash: tuple,
+                assignment_hash: tuple,
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        let mut node = fake_node_with_workers(vec![]);
+        node.state = state.clone();
+        node.mempool = Arc::new(Mempool::new(32));
+        node.validator_address = keys[0].address();
+        node.validator_keypair = Some(Arc::new(keys[0].clone()));
+        let signed = |state: &StateDB, key: &KeyPair, nonce, body: TxBody, gas| {
+            let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, nonce);
+            tx.tx_type = body.tx_type();
+            tx.body = body;
+            tx.fee = 0;
+            tx.gas_limit = gas;
+            state.sign_transaction(&mut tx, key).unwrap();
+            tx
+        };
+        let request_tx = |state: &StateDB, nonce, expires_at| {
+            let input = vec![1, 2, 3];
+            let request = InferenceRequest::sign(
+                InferenceJob {
+                    version: arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+                    domain: context.domain,
+                    requester: requester.address(),
+                    nonce,
+                    model_hash: tuple,
+                    profile_hash: tuple,
+                    input_hash: arc_crypto::hash_bytes(&input),
+                    generation_hash: tuple,
+                    assignment_hash: tuple,
+                    max_tokens: 2,
+                    max_output_bytes: 8,
+                    execution_price: 10,
+                    reserved_max_payment: 100,
+                    expires_at,
+                },
+                &requester,
+            )
+            .unwrap();
+            let id = request.job.request_id();
+            (
+                id,
+                signed(
+                    state,
+                    &requester,
+                    nonce,
+                    TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                        request,
+                        input_blob: input,
+                    }),
+                    gas_costs::NATIVE_INFERENCE_REQUEST,
+                ),
+            )
+        };
+        let commit = |state: &StateDB, txs: &[Transaction]| {
+            state.validate_v3_block_admission(txs).unwrap();
+            let height = state.height() + 1;
+            let (block, receipts) = state
+                .execute_block_adaptive_at_with_proof(
+                    txs,
+                    keys[0].address(),
+                    state.get_block(state.height()).unwrap().header.timestamp + 1,
+                    arc_crypto::hash_bytes(&height.to_le_bytes()),
+                )
+                .unwrap();
+            assert_eq!(block.header.protocol_version.major, 3);
+            assert_eq!(block.header.state_root, state.get_state_root());
+            assert!(receipts.iter().all(|r| r.success));
+            block
+        };
+        let mut before_migration =
+            Transaction::new_transfer(requester.address(), keys[0].address(), 1, 0);
+        before_migration.fee = 1;
+        state
+            .sign_transaction(&mut before_migration, &requester)
+            .unwrap();
+        submit_signed_tx(AxumState(node.clone()), Json(before_migration))
+            .await
+            .unwrap();
+        commit(&state, &node.mempool.drain(1));
+        let balance_before_native = state.get_account(&requester.address()).unwrap().balance;
+        assert_eq!(balance_before_native, 998);
+        let (id, tx) = request_tx(
+            &state,
+            state.get_account(&requester.address()).unwrap().nonce,
+            100,
+        );
+        assert!(state.validate_v3_transaction_admission(&tx).is_err());
+        let open = Arc::new(NativeRequestAdmission::ready_for_test());
+        node.native_request_admission = open.clone();
+        assert!(
+            submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
+                .await
+                .is_err()
+        );
+        state
+            .authorize_native_migration(
+                arc_state::NativeMigrationRecord {
+                    chain_genesis: genesis,
+                    recovery_epoch: 1,
+                    validator_set_id: 0,
+                    activation_height: state.height() + 1,
+                    context_commitment: context.commitment().unwrap(),
+                },
+                context.clone(),
+            )
+            .unwrap();
+        commit(&state, &[]);
+        assert!(state.native_inference_context().is_some());
+        state.validate_v3_transaction_admission(&tx).unwrap();
+        let before = state.get_state_root();
+        assert!(
+            state
+                .validate_v3_block_admission(&[tx.clone(), tx.clone()])
+                .is_err()
+        );
+        assert!(
+            state
+                .validate_v3_transaction_admission_at(&tx, state.height() + 2)
+                .is_err()
+        );
+        let mut bad = tx.clone();
+        bad.signature = arc_crypto::Signature::null();
+        bad.sig_verified = true;
+        assert!(state.validate_v3_transaction_admission(&bad).is_err());
+        let mut unsupported = tx.clone();
+        if let TxBody::NativeInferenceRequest(body) = &mut unsupported.body {
+            let mut job = body.request.job.clone();
+            job.assignment_hash = Hash256::ZERO;
+            body.request = InferenceRequest::sign(job, &requester).unwrap();
+        }
+        state
+            .sign_transaction(&mut unsupported, &requester)
+            .unwrap();
+        assert!(
+            state
+                .validate_v3_transaction_admission(&unsupported)
+                .is_err()
+        );
+
+        let mut transfer = Transaction::new_transfer(
+            requester.address(),
+            keys[0].address(),
+            1,
+            state.get_account(&requester.address()).unwrap().nonce,
+        );
+        transfer.fee = 1;
+        state.sign_transaction(&mut transfer, &requester).unwrap();
+        state.validate_v3_transaction_admission(&transfer).unwrap();
+        assert!(
+            state
+                .validate_v3_block_admission(&[tx.clone(), transfer.clone()])
+                .is_err()
+        );
+        node.native_request_admission = Arc::new(NativeRequestAdmission::default());
+        submit_signed_tx(AxumState(node.clone()), Json(transfer.clone()))
+            .await
+            .unwrap();
+        node.mempool.drain(1);
+        assert!(crate::consensus::admit_gossiped_transaction(
+            &state,
+            &node.mempool,
+            &node.native_request_admission,
+            &bincode::serialize(&transfer).unwrap()
+        ));
+        node.mempool.drain(1);
+        transfer.fee = 0;
+        state.sign_transaction(&mut transfer, &requester).unwrap();
+        assert!(state.validate_v3_transaction_admission(&transfer).is_err());
+        assert_eq!(state.get_state_root(), before);
+
+        // Default and operator-enabled-but-not-running are both closed.
+        for gate in [
+            NativeRequestAdmission::default(),
+            NativeRequestAdmission::new(true),
+        ] {
+            node.native_request_admission = Arc::new(gate);
+            assert_eq!(
+                submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
+                    .await
+                    .unwrap_err(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(!crate::consensus::admit_gossiped_transaction(
+                &state,
+                &node.mempool,
+                &node.native_request_admission,
+                &bincode::serialize(&tx).unwrap()
+            ));
+            assert!(
+                !node
+                    .native_request_admission
+                    .insert(&node.mempool, tx.clone())
+            );
+            let mut proposal = vec![tx.clone()];
+            node.native_request_admission
+                .retain_for_proposal(&mut proposal);
+            assert!(proposal.is_empty());
+            assert!(node.mempool.is_empty());
+        }
+        let Json(info) = native_inference_context(AxumState(node.clone()))
+            .await
+            .unwrap();
+        assert_eq!(info["chain_protocol"], 3);
+        assert_eq!(info["native_only_chain"], false);
+        assert_eq!(info["request_admission_open"], false);
+        node.native_request_admission = Arc::new(NativeRequestAdmission::ready_for_test());
+        submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
+            .await
+            .unwrap();
+        assert_eq!(node.mempool.drain(1)[0].hash, tx.hash);
+        assert!(crate::consensus::admit_gossiped_transaction(
+            &state,
+            &node.mempool,
+            &node.native_request_admission,
+            &bincode::serialize(&tx).unwrap()
+        ));
+        let committed = node.mempool.drain(1);
+        // Losing local readiness after a peer commits MUST NOT lose the body
+        // or change canonical validity. The reservation still executes once.
+        node.native_request_admission = Arc::new(NativeRequestAdmission::default());
+        commit(&state, &committed);
+        assert_eq!(
+            state.get_account(&requester.address()).unwrap().balance,
+            balance_before_native - 100
+        );
+        let output = 7u32.to_le_bytes().to_vec();
+        let mut votes: Vec<_> = keys
+            .iter()
+            .take(5)
+            .map(|key| sign_vote(id, &output, key).unwrap())
+            .collect();
+        votes.sort_by_key(|v| v.validator.0);
+        let finalize = signed(
+            &state,
+            &keys[0],
+            state.get_account(&keys[0].address()).unwrap().nonce,
+            TxBody::NativeInferenceFinalize(NativeInferenceFinalizeBody {
+                request_id: id.0,
+                certificate: InferenceCertificate { output, votes },
+            }),
+            gas_costs::NATIVE_INFERENCE_FINALIZE,
+        );
+        let mut uncertified = finalize.clone();
+        if let TxBody::NativeInferenceFinalize(body) = &mut uncertified.body {
+            body.certificate.votes.pop();
+        }
+        state.sign_transaction(&mut uncertified, &keys[0]).unwrap();
+        assert!(
+            state
+                .validate_v3_transaction_admission(&uncertified)
+                .is_err()
+        );
+        assert_eq!(
+            submit_signed_tx(AxumState(node.clone()), Json(uncertified))
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        submit_signed_tx(AxumState(node.clone()), Json(finalize.clone()))
+            .await
+            .unwrap();
+        commit(&state, &node.mempool.drain(1));
+        assert_eq!(
+            state.get_account(&requester.address()).unwrap().balance,
+            balance_before_native - 10
+        );
+
+        let mut after_native = Transaction::new_transfer(
+            requester.address(),
+            keys[0].address(),
+            1,
+            state.get_account(&requester.address()).unwrap().nonce,
+        );
+        after_native.fee = 1;
+        state
+            .sign_transaction(&mut after_native, &requester)
+            .unwrap();
+        submit_signed_tx(AxumState(node.clone()), Json(after_native))
+            .await
+            .unwrap();
+        commit(&state, &node.mempool.drain(1));
+        assert_eq!(
+            state.get_account(&requester.address()).unwrap().balance,
+            balance_before_native - 12
+        );
+        let expires = state.height() + 3;
+        let (refund_id, second) = request_tx(
+            &state,
+            state.get_account(&requester.address()).unwrap().nonce,
+            expires,
+        );
+        // Canonical catch-up continues while all local admission is closed.
+        commit(&state, &[second]);
+        let refund = signed(
+            &state,
+            &requester,
+            state.get_account(&requester.address()).unwrap().nonce,
+            TxBody::NativeInferenceRefund(NativeInferenceRefundBody {
+                request_id: refund_id.0,
+            }),
+            gas_costs::NATIVE_INFERENCE_REFUND,
+        );
+        assert!(state.validate_v3_transaction_admission(&refund).is_err());
+        while state.height() + 1 < expires {
+            commit(&state, &[]);
+        }
+        state.try_sync_wal().unwrap();
+        let root = state.get_state_root();
+        let height = state.height();
+        drop(node);
+        drop(state);
+        let reopened = Arc::new(
+            StateDB::with_genesis_persistent_recovery(&[], &data_dir, policy, None).unwrap(),
+        );
+        assert_eq!(reopened.get_state_root(), root);
+        assert_eq!(reopened.height(), height);
+        assert_eq!(reopened.active_protocol_version().major, 3);
+        let mut node = fake_node_with_workers(vec![]);
+        node.state = reopened.clone();
+        assert!(!node.native_request_admission.accepting_requests());
+        assert!(crate::consensus::admit_gossiped_transaction(
+            &reopened,
+            &node.mempool,
+            &node.native_request_admission,
+            &bincode::serialize(&refund).unwrap()
+        ));
+        node.mempool.drain(1);
+        submit_signed_tx(AxumState(node.clone()), Json(refund))
+            .await
+            .unwrap();
+        commit(&reopened, &node.mempool.drain(1));
+        assert_eq!(
+            reopened.get_account(&requester.address()).unwrap().balance,
+            balance_before_native - 12
+        );
+        assert!(
+            reopened
+                .native_inference_pending_requests(context.commitment().unwrap())
+                .unwrap()
+                .is_empty()
         );
     }
 
