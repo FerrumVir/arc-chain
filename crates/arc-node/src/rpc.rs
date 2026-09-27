@@ -24114,7 +24114,7 @@ mod tests {
         state
             .sign_transaction(&mut before_migration, &requester)
             .unwrap();
-        submit_signed_tx(AxumState(node.clone()), Json(before_migration))
+        let _ = submit_signed_tx(AxumState(node.clone()), Json(before_migration))
             .await
             .unwrap();
         commit(&state, &node.mempool.drain(1));
@@ -24193,7 +24193,7 @@ mod tests {
                 .is_err()
         );
         node.native_request_admission = Arc::new(NativeRequestAdmission::default());
-        submit_signed_tx(AxumState(node.clone()), Json(transfer.clone()))
+        let _ = submit_signed_tx(AxumState(node.clone()), Json(transfer.clone()))
             .await
             .unwrap();
         node.mempool.drain(1);
