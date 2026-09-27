@@ -15,17 +15,37 @@ on:
         description: Existing strict tag to release (for example v0.8.0); repository rules must separately protect it from moves
         required: true
         type: string
+      release_profile:
+        description: First-cutover evidence or an update to the already recovered chain
+        required: true
+        default: cutover-v1
+        type: choice
+        options:
+          - cutover-v1
+          - existing-recovered-chain-update-v1
+      update_handoff_artifact_id:
+        description: Immutable existing-chain update handoff artifact ID (update profile only)
+        required: false
+        type: string
+      update_handoff_artifact_digest:
+        description: Exact sha256 server digest of the update handoff (update profile only)
+        required: false
+        type: string
+      update_handoff_run_attempt:
+        description: Exact successful existing-chain-update-handoff attempt (update profile only)
+        required: false
+        type: string
       cutover_handoff_artifact_id:
         description: Immutable producer artifact ID containing the three compact certificate-bound cutover assets
-        required: true
+        required: false
         type: string
       cutover_handoff_artifact_digest:
         description: "Exact server digest for that protected handoff (sha256: followed by 64 lowercase hex characters)"
-        required: true
+        required: false
         type: string
       cutover_handoff_run_attempt:
         description: Exact successful recovery-release-handoff attempt that created the selected artifact
-        required: true
+        required: false
         type: string
       pretag_run_id:
         description: Exact successful release-signing-preflight workflow run ID for the tagged protected-main SHA
@@ -45,6 +65,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_PROFILE: ${{ inputs.release_profile || 'cutover-v1' }}
 
 jobs:
   validate:
@@ -85,6 +106,9 @@ jobs:
           REQUESTED_CUTOVER_ARTIFACT_ID: ${{ inputs.cutover_handoff_artifact_id }}
           REQUESTED_CUTOVER_ARTIFACT_DIGEST: ${{ inputs.cutover_handoff_artifact_digest }}
           REQUESTED_CUTOVER_RUN_ATTEMPT: ${{ inputs.cutover_handoff_run_attempt }}
+          REQUESTED_UPDATE_ARTIFACT_ID: ${{ inputs.update_handoff_artifact_id }}
+          REQUESTED_UPDATE_ARTIFACT_DIGEST: ${{ inputs.update_handoff_artifact_digest }}
+          REQUESTED_UPDATE_RUN_ATTEMPT: ${{ inputs.update_handoff_run_attempt }}
           REQUESTED_PREFLIGHT_RUN_ID: ${{ inputs.pretag_run_id }}
           REQUESTED_PREFLIGHT_RUN_ATTEMPT: ${{ inputs.pretag_run_attempt }}
         run: |
@@ -106,12 +130,30 @@ jobs:
             echo "::error::Checkout $HEAD_COMMIT does not match tag $TAG ($TAG_COMMIT)."
             exit 1
           fi
+          gh auth setup-git --hostname github.com
           git fetch --no-tags --force origin main:refs/remotes/origin/main
           MAIN_COMMIT="$(git rev-parse refs/remotes/origin/main)"
           if [ "$TAG_COMMIT" != "$MAIN_COMMIT" ]; then
             echo "::error::Tag $TAG targets $TAG_COMMIT, but current main is $MAIN_COMMIT. Release only the exact protected-main head verified by preflight."
             exit 1
           fi
+
+          case "$RELEASE_PROFILE" in
+            cutover-v1)
+              [ -z "$REQUESTED_UPDATE_ARTIFACT_ID$REQUESTED_UPDATE_ARTIFACT_DIGEST$REQUESTED_UPDATE_RUN_ATTEMPT" ]
+              HANDOFF_PREFIX=arc-recovery-release-handoff
+              HANDOFF_WORKFLOW=.github/workflows/recovery-release-handoff.yml
+              ;;
+            existing-recovered-chain-update-v1)
+              [ -z "$REQUESTED_CUTOVER_ARTIFACT_ID$REQUESTED_CUTOVER_ARTIFACT_DIGEST$REQUESTED_CUTOVER_RUN_ATTEMPT" ]
+              REQUESTED_CUTOVER_ARTIFACT_ID="$REQUESTED_UPDATE_ARTIFACT_ID"
+              REQUESTED_CUTOVER_ARTIFACT_DIGEST="$REQUESTED_UPDATE_ARTIFACT_DIGEST"
+              REQUESTED_CUTOVER_RUN_ATTEMPT="$REQUESTED_UPDATE_RUN_ATTEMPT"
+              HANDOFF_PREFIX=arc-existing-chain-update-handoff
+              HANDOFF_WORKFLOW=.github/workflows/existing-chain-update-handoff.yml
+              ;;
+            *) echo '::error::Unknown release profile.'; exit 1 ;;
+          esac
 
           # The recovery boundary and compact quorum certificate do not exist
           # at source build time. Select one immutable, exact-commit Actions artifact by
@@ -146,7 +188,7 @@ jobs:
           CUTOVER_RUN_ID="$(jq -er '.workflow_run.id' "$CUTOVER_ARTIFACT_JSON")"
           CUTOVER_RUN_ATTEMPT="$REQUESTED_CUTOVER_RUN_ATTEMPT"
           CUTOVER_ARTIFACT_SIZE="$(jq -er '.size_in_bytes' "$CUTOVER_ARTIFACT_JSON")"
-          CUTOVER_ARTIFACT_NAME="arc-recovery-release-handoff-$TAG_COMMIT-$CUTOVER_RUN_ID-$CUTOVER_RUN_ATTEMPT"
+          CUTOVER_ARTIFACT_NAME="$HANDOFF_PREFIX-$TAG_COMMIT-$CUTOVER_RUN_ID-$CUTOVER_RUN_ATTEMPT"
           jq -e \
             --argjson artifact_id "$REQUESTED_CUTOVER_ARTIFACT_ID" \
             --arg name "$CUTOVER_ARTIFACT_NAME" \
@@ -161,13 +203,14 @@ jobs:
             > "$CUTOVER_RUN_JSON"
           jq -e \
             --arg repository "$GITHUB_REPOSITORY" \
+            --arg workflow_path "$HANDOFF_WORKFLOW" \
             --arg sha "$TAG_COMMIT" \
             --argjson run_id "$CUTOVER_RUN_ID" \
             --argjson run_attempt "$CUTOVER_RUN_ATTEMPT" \
             '.id == $run_id and .head_repository.full_name == $repository
              and .run_attempt == $run_attempt
              and .head_branch == "main" and .head_sha == $sha
-             and .path == ".github/workflows/recovery-release-handoff.yml"
+             and .path == $workflow_path
              and .event == "workflow_dispatch" and .status == "completed"
              and .conclusion == "success"' \
             "$CUTOVER_RUN_JSON" >/dev/null || {
@@ -904,10 +947,25 @@ jobs:
           digest-mismatch: error
 
       - name: Materialize the exact three-file recovery handoff
+        if: env.RELEASE_PROFILE == 'cutover-v1'
         shell: bash
         run: |
           set -Eeuo pipefail
           python3 scripts/release/materialize-cutover-handoff.py \
+            --downloads-root cutover-handoff-download \
+            --output-dir cutover-handoff \
+            --artifact-id "${{ needs.validate.outputs.cutover_artifact_id }}" \
+            --artifact-name "${{ needs.validate.outputs.cutover_artifact_name }}" \
+            --artifact-digest "${{ needs.validate.outputs.cutover_artifact_digest }}" \
+            --artifact-size "${{ needs.validate.outputs.cutover_artifact_size }}" \
+            --commit "${{ needs.validate.outputs.sha }}"
+
+      - name: Materialize the exact one-file existing-chain update handoff
+        if: env.RELEASE_PROFILE == 'existing-recovered-chain-update-v1'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/release/materialize-update-handoff.py \
             --downloads-root cutover-handoff-download \
             --output-dir cutover-handoff \
             --artifact-id "${{ needs.validate.outputs.cutover_artifact_id }}" \
@@ -925,6 +983,7 @@ jobs:
           RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}
           REPOSITORY: ${{ github.repository }}
           CUTOVER_HANDOFF_DIR: cutover-handoff
+          EXISTING_UPDATE_HANDOFF_DIR: cutover-handoff
         run: ./scripts/release/assemble-release.sh
 
       - name: Cryptographically verify every updater payload against the embedded key
@@ -965,6 +1024,7 @@ jobs:
             exit 1
           fi
           python3 scripts/release/release-manifest-handoff.py stage \
+            --profile "$RELEASE_PROFILE" \
             --repository "$GITHUB_REPOSITORY" \
             --commit "${{ needs.validate.outputs.sha }}" \
             --tag "${{ needs.validate.outputs.tag }}" \
@@ -1032,7 +1092,9 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          expected_name="arc-release-unsigned-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_METADATA_SHA"
+          profile_marker=""
+          if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ]; then profile_marker="existing-update-"; fi
+          expected_name="arc-release-${profile_marker}unsigned-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_METADATA_SHA"
           [ "$EXPECTED_ARTIFACT_NAME" = "$expected_name" ]
           /usr/bin/python3 -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" "$RELEASE_TAG" \
             "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$EXPECTED_METADATA_SHA" \
@@ -1058,7 +1120,14 @@ jobs:
               raise SystemExit("unsigned release metadata hash differs")
           metadata = json.loads(raw)
           canonical = (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode()
-          if raw != canonical or metadata.get("schema") != "arc.release-manifest-handoff.v1" or \
+          profile = os.environ["RELEASE_PROFILE"]
+          if profile not in {"cutover-v1", "existing-recovered-chain-update-v1"}:
+              raise SystemExit("unsupported release profile")
+          is_update = profile == "existing-recovered-chain-update-v1"
+          expected_schema = "arc.release-manifest-handoff.v2" if is_update else "arc.release-manifest-handoff.v1"
+          if metadata.get("profile") != (profile if is_update else None):
+              raise SystemExit("handoff profile metadata differs")
+          if raw != canonical or metadata.get("schema") != expected_schema or \
              metadata.get("sealed") is not False or metadata.get("repository") != repository or \
              metadata.get("commit") != commit or metadata.get("tag") != tag or \
              metadata.get("workflow_run_id") != int(run_id) or \
@@ -1077,6 +1146,9 @@ jobs:
               "arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json", "arc-cutover-policy.json",
               "SHA256SUMS",
           }
+          if is_update:
+              expected -= {"arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json", "arc-cutover-policy.json"}
+              expected.add("arc-existing-chain-update-attestation.json")
           files = metadata.get("files")
           if not isinstance(files, dict) or set(files) != expected or \
              {path.name for path in release.iterdir()} != expected:
@@ -1209,6 +1281,7 @@ jobs:
               raise SystemExit("signer output is not one bounded regular signature")
           PY
           python3 scripts/release/release-manifest-handoff.py stage \
+            --profile "$RELEASE_PROFILE" \
             --sealed \
             --repository "$GITHUB_REPOSITORY" \
             --commit "${{ needs.validate.outputs.sha }}" \
@@ -1272,7 +1345,9 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          expected_name="arc-release-sealed-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_METADATA_SHA"
+          profile_marker=""
+          if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ]; then profile_marker="existing-update-"; fi
+          expected_name="arc-release-${profile_marker}sealed-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_METADATA_SHA"
           [ "$EXPECTED_ARTIFACT_NAME" = "$expected_name" ]
           /usr/bin/python3 -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" "$RELEASE_TAG" \
             "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$EXPECTED_METADATA_SHA" \
@@ -1298,7 +1373,14 @@ jobs:
               raise SystemExit("sealed handoff metadata hash or size differs")
           metadata = json.loads(raw)
           canonical = (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode()
-          if raw != canonical or metadata.get("schema") != "arc.release-manifest-handoff.v1" or \
+          profile = os.environ["RELEASE_PROFILE"]
+          if profile not in {"cutover-v1", "existing-recovered-chain-update-v1"}:
+              raise SystemExit("unsupported release profile")
+          is_update = profile == "existing-recovered-chain-update-v1"
+          expected_schema = "arc.release-manifest-handoff.v2" if is_update else "arc.release-manifest-handoff.v1"
+          if metadata.get("profile") != (profile if is_update else None):
+              raise SystemExit("handoff profile metadata differs")
+          if raw != canonical or metadata.get("schema") != expected_schema or \
              metadata.get("sealed") is not True or metadata.get("repository") != repository or \
              metadata.get("commit") != commit or metadata.get("tag") != tag or \
              metadata.get("workflow_run_id") != int(run_id) or \
@@ -1316,6 +1398,9 @@ jobs:
               "arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json", "arc-cutover-policy.json",
               "SHA256SUMS", "SHA256SUMS.sig",
           }
+          if is_update:
+              expected -= {"arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json", "arc-cutover-policy.json"}
+              expected.add("arc-existing-chain-update-attestation.json")
           files, modes = metadata.get("files"), metadata.get("modes")
           if not isinstance(files, dict) or set(files) != expected or \
              not isinstance(modes, dict) or set(modes) != expected or \
@@ -1549,11 +1634,13 @@ jobs:
           /usr/bin/gh release upload "$RELEASE_TAG" release-files/* \
             --repo "$GITHUB_REPOSITORY"
           /usr/bin/gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$response"
+          expected_asset_count=32
+          if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ]; then expected_asset_count=30; fi
           /usr/bin/jq -e --argjson id "$release_id" --arg tag "$RELEASE_TAG" \
-            --arg sha "$EXPECTED_SHA" \
+            --arg sha "$EXPECTED_SHA" --argjson expected_asset_count "$expected_asset_count" \
             '.id == $id and .tag_name == $tag and .target_commitish == $sha
              and .draft == true and .immutable == false
-             and (.assets | length == 32)
+             and (.assets | length == $expected_asset_count)
              and all(.assets[]; .state == "uploaded" and (.digest | startswith("sha256:")))' \
             "$response" >/dev/null
 
@@ -1666,6 +1753,7 @@ jobs:
           [ -f draft-evidence/release-draft.json ] && [ ! -L draft-evidence/release-draft.json ]
           [ "$(sha256sum draft-evidence/release-draft.json | awk '{print $1}')" = "$EXPECTED_EVIDENCE_SHA" ]
           python3 scripts/release/release-manifest-handoff.py verify \
+            --profile "$RELEASE_PROFILE" \
             --sealed --repository "$GITHUB_REPOSITORY" --commit "$EXPECTED_SHA" \
             --tag "$RELEASE_TAG" --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
@@ -1929,11 +2017,13 @@ jobs:
             echo "::error::Release ID $RELEASE_ID was published or publication was attempted, but immutable state was not observed within 60 seconds. It is retained for manual verification and will not be deleted."
             exit 1
           }
+          expected_asset_count=32
+          if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ]; then expected_asset_count=30; fi
           /usr/bin/jq -e --argjson id "$RELEASE_ID" --arg tag "$RELEASE_TAG" \
-            --arg sha "$EXPECTED_SHA" \
+            --arg sha "$EXPECTED_SHA" --argjson expected_asset_count "$expected_asset_count" \
             '.id == $id and .tag_name == $tag and .target_commitish == $sha
              and .draft == false and .immutable == true
-             and (.assets | length == 32)
+             and (.assets | length == $expected_asset_count)
              and all(.assets[]; .state == "uploaded" and (.digest | startswith("sha256:")))' \
             "$published" >/dev/null
           /usr/bin/mkdir published-evidence
@@ -2038,6 +2128,7 @@ jobs:
           [ -f published-evidence/release-published.json ] && [ ! -L published-evidence/release-published.json ]
           [ "$(sha256sum published-evidence/release-published.json | awk '{print $1}')" = "$EXPECTED_EVIDENCE_SHA" ]
           python3 scripts/release/release-manifest-handoff.py verify \
+            --profile "$RELEASE_PROFILE" \
             --sealed --repository "$GITHUB_REPOSITORY" --commit "$EXPECTED_SHA" \
             --tag "$RELEASE_TAG" --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \

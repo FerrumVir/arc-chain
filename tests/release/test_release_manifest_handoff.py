@@ -61,10 +61,11 @@ class ReleaseManifestHandoffTests(unittest.TestCase):
             self.fail("helper accepted an invalid release handoff")
         return result
 
-    def release_files(self, name: str, *, sealed: bool = False) -> Path:
+    def release_files(self, name: str, *, sealed: bool = False, profile: str = HANDOFF.PROFILE_CUTOVER_V1) -> Path:
         root = self.root / name
         root.mkdir()
-        for index, filename in enumerate(HANDOFF.BASE_FILES, start=1):
+        files = HANDOFF.profile_files(profile)
+        for index, filename in enumerate(files, start=1):
             if filename != "SHA256SUMS":
                 (root / filename).write_bytes(f"{filename}:{index}\n".encode())
         records = [
@@ -73,15 +74,15 @@ class ReleaseManifestHandoffTests(unittest.TestCase):
             f"# tag={TAG}",
             f"# commit={COMMIT}",
         ]
-        for filename in sorted(set(HANDOFF.BASE_FILES) - {"SHA256SUMS"}):
+        for filename in sorted(set(files) - {"SHA256SUMS"}):
             records.append(f"{digest(root / filename)}  {filename}")
         (root / "SHA256SUMS").write_text("\n".join(records) + "\n", encoding="utf-8")
         if sealed:
             (root / "SHA256SUMS.sig").write_bytes(b"fixture signature\n")
         return root
 
-    def stage(self, name: str, *, sealed: bool = False) -> tuple[Path, dict[str, str]]:
-        source = self.release_files(f"{name}-source", sealed=sealed)
+    def stage(self, name: str, *, sealed: bool = False, profile: str = HANDOFF.PROFILE_CUTOVER_V1) -> tuple[Path, dict[str, str]]:
+        source = self.release_files(f"{name}-source", sealed=sealed, profile=profile)
         stage = self.root / f"{name}-stage"
         output = self.root / f"{name}.out"
         arguments = [
@@ -91,6 +92,8 @@ class ReleaseManifestHandoffTests(unittest.TestCase):
         ]
         if sealed:
             arguments.insert(0, "--sealed")
+        if profile != HANDOFF.PROFILE_CUTOVER_V1:
+            arguments.extend(("--profile", profile))
         self.invoke("stage", *arguments)
         outputs = dict(
             line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines()
@@ -113,6 +116,39 @@ class ReleaseManifestHandoffTests(unittest.TestCase):
                     outputs["artifact_name"],
                     f"arc-release-{kind}-handoff-{COMMIT}-{RUN_ID}-{ATTEMPT}-{outputs['metadata_sha']}",
                 )
+
+    def test_update_profile_v2_round_trip_is_disjoint_and_profile_bound(self) -> None:
+        stage, outputs = self.stage("update-profile", profile=HANDOFF.PROFILE_EXISTING_UPDATE_V1)
+        metadata = __import__("json").loads((stage / HANDOFF.HANDOFF_NAME).read_text())
+        self.assertEqual(metadata["schema"], HANDOFF.SCHEMA_V2)
+        self.assertEqual(metadata["profile"], HANDOFF.PROFILE_EXISTING_UPDATE_V1)
+        members = {p.name for p in (stage / "release-files").iterdir()}
+        self.assertIn("arc-existing-chain-update-attestation.json", members)
+        self.assertFalse(members & {"arc-cutover-policy.json", "arc-recovery-checkpoint-descriptor.json",
+                                    "arc-legacy-maintenance-boundary.json"})
+        self.invoke("verify", "--profile", HANDOFF.PROFILE_EXISTING_UPDATE_V1,
+                    "--handoff-dir", str(stage), "--expected-metadata-sha", outputs["metadata_sha"])
+        self.invoke("verify", "--handoff-dir", str(stage),
+                    "--expected-metadata-sha", outputs["metadata_sha"], succeeds=False)
+
+    def test_update_profile_rejects_mixed_assets_and_schema_downgrade(self) -> None:
+        source = self.release_files("update-mixed", profile=HANDOFF.PROFILE_EXISTING_UPDATE_V1)
+        (source / "arc-cutover-policy.json").write_bytes(b"cutover mixed in\n")
+        self.invoke("stage", "--profile", HANDOFF.PROFILE_EXISTING_UPDATE_V1,
+                    "--source-dir", str(source), "--stage-dir", str(self.root / "update-mixed-stage"),
+                    succeeds=False)
+
+        stage, outputs = self.stage("update-downgrade", profile=HANDOFF.PROFILE_EXISTING_UPDATE_V1)
+        metadata_path = stage / HANDOFF.HANDOFF_NAME
+        metadata_path.chmod(0o600)
+        metadata = __import__("json").loads(metadata_path.read_text())
+        metadata["schema"] = HANDOFF.SCHEMA_V1
+        metadata.pop("profile")
+        raw = HANDOFF.canonical_json(metadata)
+        metadata_path.write_bytes(raw)
+        self.invoke("verify", "--profile", HANDOFF.PROFILE_EXISTING_UPDATE_V1,
+                    "--handoff-dir", str(stage), "--expected-metadata-sha", hashlib.sha256(raw).hexdigest(),
+                    succeeds=False)
 
     def test_stage_rejects_missing_extra_symlink_and_cross_signature_members(self) -> None:
         for mutation in ("missing", "extra", "symlink", "signature"):

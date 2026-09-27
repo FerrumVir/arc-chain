@@ -104,6 +104,9 @@ REVIEWED_PRIVILEGED_PYTHON_SHA256 = {
     "7f2abec0d11ea6f177af1b7aa84a2982743f57bad66eda07d42d9c64357dc282",
     "dc5630726239b434b993c503a2463bab77c590ba24da1b906a77ea2f45dbdb9a",
     "e4a38bf1f2fdeb64ee5b6b90fa55718c1389e6f93715a80a6fc9697ee1ce66f5",
+    # Reviewed exact-profile v1/v2 branching and mutually exclusive asset sets.
+    "40f5d8dcef2519d0be58f879185f67e2043ec084c3d39db7dfb7e6dc4cf360de",
+    "603b386df5493f629d11f3e831a8a009a46915aa2e352ce73be5461204b9fb5c",
 }
 
 SECRET_COMMANDS = {

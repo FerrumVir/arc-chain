@@ -64,6 +64,29 @@ EXPECTED_RELEASE_ASSETS = frozenset(
         "SHA256SUMS.sig",
     }
 )
+EXISTING_UPDATE_RELEASE_ASSETS = frozenset(
+    (EXPECTED_RELEASE_ASSETS - {
+        "arc-legacy-maintenance-boundary.json",
+        "arc-recovery-checkpoint-descriptor.json",
+        "arc-cutover-policy.json",
+    }) | {"arc-existing-chain-update-attestation.json"}
+)
+PROFILE_CUTOVER_V1 = "cutover-v1"
+PROFILE_EXISTING_UPDATE_V1 = "existing-recovered-chain-update-v1"
+
+
+def release_profile_for_assets(names: set[str] | frozenset[str]) -> str:
+    """Resolve only exact, mutually exclusive public release asset contracts."""
+    if names == EXPECTED_RELEASE_ASSETS:
+        return PROFILE_CUTOVER_V1
+    if names == EXISTING_UPDATE_RELEASE_ASSETS:
+        return PROFILE_EXISTING_UPDATE_V1
+    missing_cutover = sorted(EXPECTED_RELEASE_ASSETS - names)
+    extra_cutover = sorted(names - EXPECTED_RELEASE_ASSETS)
+    raise AcceptanceError(
+        f"release asset set mismatch (matches neither profile); cutover missing={missing_cutover!r}, "
+        f"extra={extra_cutover!r}"
+    )
 
 EXPECTED_RELEASE_JOBS = frozenset(
     {
@@ -387,12 +410,7 @@ def validate_release_assets(
             "sha256": sha256,
             "size": size,
         }
-    if set(assets) != EXPECTED_RELEASE_ASSETS:
-        missing = sorted(EXPECTED_RELEASE_ASSETS - set(assets))
-        extra = sorted(set(assets) - EXPECTED_RELEASE_ASSETS)
-        raise AcceptanceError(
-            f"release asset set mismatch; missing={missing!r}, extra={extra!r}"
-        )
+    release_profile_for_assets(set(assets))
     if sum(item["size"] for item in assets.values()) > 12 * 1024 * 1024 * 1024:
         raise AcceptanceError("release asset total exceeds 12 GiB")
     return dict(sorted(assets.items()))
@@ -744,6 +762,7 @@ def command_bind(args: argparse.Namespace) -> None:
         raise AcceptanceError("release author must be an object")
     exact(author.get("login"), "github-actions[bot]", "release author")
     assets = validate_release_assets(release, repository, args.tag)
+    profile = release_profile_for_assets(set(assets))
     published_payload, published_zip, published_metadata = validate_published_evidence(
         args.published_evidence_artifact_json,
         args.published_evidence_download_root,
@@ -824,15 +843,28 @@ def command_bind(args: argparse.Namespace) -> None:
             "run_id": run_id,
         },
         "repository": repository,
-        "schema": "arc.published-release-binding.v1",
+        "schema": (
+            "arc.published-release-binding.v1"
+            if profile == PROFILE_CUTOVER_V1
+            else "arc.published-release-binding.v2"
+        ),
         "tag": args.tag,
     }
+    if profile == PROFILE_EXISTING_UPDATE_V1:
+        binding["profile"] = PROFILE_EXISTING_UPDATE_V1
     write_canonical(args.output, binding)
 
 
 def validate_binding(binding: dict[str, Any]) -> None:
-    exact(binding.get("schema"), "arc.published-release-binding.v1", "binding schema")
-    if set(binding) != {
+    schema = binding.get("schema")
+    is_update = schema == "arc.published-release-binding.v2"
+    expected_schema = (
+        "arc.published-release-binding.v2"
+        if is_update
+        else "arc.published-release-binding.v1"
+    )
+    exact(schema, expected_schema, "binding schema")
+    expected_fields = {
         "assets",
         "commit",
         "legacy_source",
@@ -842,12 +874,19 @@ def validate_binding(binding: dict[str, Any]) -> None:
         "repository",
         "schema",
         "tag",
-    }:
+    }
+    if is_update:
+        expected_fields.add("profile")
+    if set(binding) != expected_fields:
         raise AcceptanceError("binding contains missing or unexpected fields")
     if not SHA40.fullmatch(str(binding.get("commit", ""))):
         raise AcceptanceError("binding commit is malformed")
     exact(binding.get("repository"), EXPECTED_REPOSITORY, "binding repository")
-    exact(binding.get("tag"), "v0.8.0", "binding tag")
+    if is_update:
+        exact(binding.get("profile"), PROFILE_EXISTING_UPDATE_V1, "binding profile")
+        exact(binding.get("tag"), "v0.8.0", "binding tag")
+    else:
+        exact(binding.get("tag"), "v0.8.0", "binding tag")
     exact(binding.get("legacy_source"), LEGACY_SOURCE, "binding v0.7.7 source")
     release = binding.get("release")
     if not isinstance(release, dict):
@@ -913,7 +952,10 @@ def validate_binding(binding: dict[str, Any]) -> None:
         "binding published-evidence artifact name",
     )
     assets = binding.get("assets")
-    if not isinstance(assets, dict) or set(assets) != EXPECTED_RELEASE_ASSETS:
+    expected_assets = (
+        EXISTING_UPDATE_RELEASE_ASSETS if is_update else EXPECTED_RELEASE_ASSETS
+    )
+    if not isinstance(assets, dict) or set(assets) != expected_assets:
         raise AcceptanceError("binding has an invalid release asset set")
     for name, value in assets.items():
         if not isinstance(value, dict):
