@@ -43,11 +43,35 @@ on another worker merely to make it eligible.
 Copy only small manifests onto coordinators. The manifest loader hashes their
 bounded exact bytes, derives intervals from assignments, and validates declared
 ARCROW01 sizes and payload digest fields. It does **not** read or authenticate
-remote weight-file payloads. Independently verify the deployed row-file hashes
-against those manifests and preserve the existing package/artifact qualification.
-Worker startup enforces its artifact/profile/worker identity and resident bounds;
-runtime canonical numerical checks remain required. These private trust checks
-are not a proof of arbitrary public workers' honest computation.
+remote weight-file payloads. Start each partial daemon with the **same exact
+manifest bytes and pin** held by its coordinator:
+
+```
+tensor_row_shared_worker serve --rows-dir /srv/arc/owner-0/rows \
+  --artifact ARTIFACT_HASH --manifest /srv/arc/owner-0/manifest.json \
+  --manifest-blake3 MANIFEST_HASH --socket /run/arc-owner-0/rows.sock
+```
+
+Both manifest options are required together. Startup verifies bounded manifest
+bytes, the exact file set, identities and sizes; it hashes each file through the
+same read stream that decodes the retained weights. A replaced payload of the
+same size and header refuses startup. No separate prehash/reopen is trusted.
+The service reports `verified_manifest_blake3` in its startup/shutdown stats.
+
+Every partial SSH connection, including reconnects, requires an `ARCPIN01`
+manifest/worker handshake and distinct `ARCPACK1` response before any warmup,
+measurement or projection. Pinned daemons refuse unhandshaken clients; partial
+clients refuse old or unpinned daemons. The existing relay carries these bounded
+frames unchanged. Legacy full-layer clients and unpinned CLI remain compatible;
+they do not gain payload pinning implicitly. Existing row-v1 frames, policy
+hashes and consensus protocols are unchanged by this service handshake.
+
+Preserve package/artifact qualification and runtime canonical numerical checks.
+Pinned SSH authenticates the private host, not its software: a malicious trusted
+host can falsely acknowledge a pin. This is configuration binding to verified
+loaded bytes in the approved daemon, not remote attestation or a proof of
+arbitrary public workers' honest computation. Manifest checks do not replace
+the coordinator's full model-dimension/coverage validation.
 
 `--native-low-residency` is mandatory. Warmup and measurement calls use rows inside
 the worker's declared ranges. The challenge cache distinguishes layer/start/end.

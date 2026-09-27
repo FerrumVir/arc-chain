@@ -28,6 +28,8 @@ fn main() -> Result<(), String> {
             "--socket",
             "--rows-dir",
             "--artifact",
+            "--manifest",
+            "--manifest-blake3",
             "--max-clients",
             "--idle-timeout-ms",
             "--frame-timeout-ms",
@@ -86,7 +88,16 @@ fn main() -> Result<(), String> {
     // No connection can trigger a model load: the socket is reserved before
     // loading, and connections are accepted only after that single load.
     let (_socket, listener) = PrivateRowSocket::bind(socket).map_err(|e| e.to_string())?;
-    let bundle = SharedRowBundle::load(rows, artifact).map_err(|e| e.to_string())?;
+    let bundle = match (values.get("--manifest"), values.get("--manifest-blake3")) {
+        (None, None) => SharedRowBundle::load(rows, artifact),
+        (Some(path), Some(hash)) => {
+            let hash = arc_crypto::Hash256::from_hex(hash.trim_start_matches("0x"))
+                .map_err(|e| e.to_string())?;
+            SharedRowBundle::load_pinned(rows, artifact, std::path::Path::new(path), hash)
+        }
+        _ => return Err("--manifest and --manifest-blake3 must be supplied together".into()),
+    }
+    .map_err(|e| e.to_string())?;
     let service = SharedRowService::new(bundle, limits).map_err(|e| e.to_string())?;
     // SAFETY: handlers only store into a lock-free AtomicBool, perform no
     // allocation or I/O, and remain alive for the process lifetime.

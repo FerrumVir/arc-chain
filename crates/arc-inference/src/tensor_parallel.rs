@@ -34,6 +34,18 @@ const ROW_FILE_MAGIC: &[u8; 8] = b"ARCROW01";
 /// request frame (or a worker that echoes one) is never read as a response.
 const ROW_FRAME_MAGIC: &[u8; 8] = b"ARCTP001";
 const ROW_RESPONSE_MAGIC: &[u8; 8] = b"ARCTR001";
+// Additive private-service handshake, outside the unchanged row-v1 codec.
+// Distinct request/response domains reject reflected requests. SSH authenticates
+// the host; this proves service configuration, not honest remote computation.
+pub(crate) const MANIFEST_PIN_REQUEST_MAGIC: &[u8; 8] = b"ARCPIN01";
+pub(crate) const MANIFEST_PIN_RESPONSE_MAGIC: &[u8; 8] = b"ARCPACK1";
+pub(crate) fn manifest_pin_frame(magic: &[u8; 8], hash: Hash256, worker: &str) -> [u8; 72] {
+    let mut frame = [0; 72];
+    frame[..8].copy_from_slice(magic);
+    frame[8..40].copy_from_slice(&hash.0);
+    frame[40..].copy_from_slice(blake3::hash(worker.as_bytes()).as_bytes());
+    frame
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -449,6 +461,43 @@ impl SshStdioRowWorker {
                 .max(1),
             AtomicOrdering::Relaxed,
         );
+    }
+
+    /// Before any row traffic, require the private service to acknowledge the
+    /// manifest it verified while loading resident bytes. Legacy/unpinned
+    /// services fail closed. This is configuration binding over pinned SSH,
+    /// not remote attestation of an untrusted host's software or computation.
+    pub fn verify_manifest_pin(&self, manifest: Hash256) -> Result<(), TensorParallelError> {
+        let mut slot = self.child.lock().map_err(|_| {
+            self.closed.store(true, AtomicOrdering::Release);
+            TensorParallelError::Closed
+        })?;
+        if manifest == Hash256::ZERO {
+            return Err(self.fail_closed(&mut slot, "zero row manifest pin"));
+        }
+        let child = slot.as_mut().ok_or(TensorParallelError::Closed)?;
+        let timeout = self
+            .timeout_ms
+            .load(AtomicOrdering::Relaxed)
+            .min(MAX_SSH_CALL_TIMEOUT_MS);
+        let deadline = Instant::now() + Duration::from_millis(timeout);
+        let frame = manifest_pin_frame(MANIFEST_PIN_REQUEST_MAGIC, manifest, &self.worker_id);
+        let mut framed = Vec::with_capacity(frame.len() + 4);
+        framed.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&frame);
+        if let Err(e) = write_timeout(&mut child.stdin, &framed, deadline) {
+            return Err(self.fail_closed(&mut slot, format!("write row manifest pin: {e}")));
+        }
+        let raw = match read_framed_timeout(&mut child.stdout, deadline) {
+            Ok(value) => value,
+            Err(error) => return Err(self.fail_closed(&mut slot, error)),
+        };
+        if raw.as_slice()
+            != manifest_pin_frame(MANIFEST_PIN_RESPONSE_MAGIC, manifest, &self.worker_id)
+        {
+            return Err(self.fail_closed(&mut slot, "row service manifest or worker pin mismatch"));
+        }
+        Ok(())
     }
 
     fn fail_closed(
@@ -2037,6 +2086,62 @@ mod tests {
             out.extend_from_slice(&frame);
         }
         out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_pin_handshake_binds_hash_worker_and_response_domain() {
+        let pin = Hash256([17; 32]);
+        for (label, reply) in [
+            (
+                "pin-wrong-hash",
+                manifest_pin_frame(
+                    MANIFEST_PIN_RESPONSE_MAGIC,
+                    Hash256([18; 32]),
+                    "pin-wrong-hash",
+                ),
+            ),
+            (
+                "pin-wrong-worker",
+                manifest_pin_frame(MANIFEST_PIN_RESPONSE_MAGIC, pin, "another-worker"),
+            ),
+            (
+                "pin-reflected",
+                manifest_pin_frame(MANIFEST_PIN_REQUEST_MAGIC, pin, "pin-reflected"),
+            ),
+        ] {
+            let mut framed = Vec::from((reply.len() as u32).to_le_bytes());
+            framed.extend_from_slice(&reply);
+            let (worker, directory) = fake_ssh_worker(label, &framed, 0, Duration::from_secs(2));
+            assert!(worker.verify_manifest_pin(pin).is_err(), "accepted {label}");
+            assert!(!worker.is_open());
+            assert!(worker.verify_manifest_pin(pin).is_err());
+            drop(worker);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+        let name = "pin-good";
+        let reply = manifest_pin_frame(MANIFEST_PIN_RESPONSE_MAGIC, pin, name);
+        let mut bytes = Vec::from((reply.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&reply);
+        let input = vec![3, -4];
+        let request = RowProjectionRequest {
+            call_id: Hash256([19; 32]),
+            input_hash: hash_i64(&input),
+            assignment: assignment(0, 2, name),
+            input,
+        };
+        let answer = RowProjectionResponse {
+            call_id: request.call_id,
+            input_hash: request.input_hash,
+            assignment: request.assignment.clone(),
+            values: vec![11, 12],
+        };
+        bytes.extend_from_slice(&framed(&answer, 1));
+        let (worker, directory) = fake_ssh_worker(name, &bytes, 0, Duration::from_secs(2));
+        worker.verify_manifest_pin(pin).unwrap();
+        assert_eq!(worker.project(request).unwrap().values, answer.values);
+        drop(worker);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]

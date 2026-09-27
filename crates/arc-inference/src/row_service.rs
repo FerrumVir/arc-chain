@@ -1,5 +1,6 @@
 //! Shared, private Unix-socket service for immutable canonical row bundles.
-//! Each SSH relay carries the existing row protocol to one resident bundle;
+//! Each SSH relay carries the row protocol to one resident bundle, with an
+//! initial manifest-pin handshake when the bundle uses verified startup pins;
 //! connections never reload weights. This is deliberately not a public TCP
 //! endpoint and does not cache projections or generation results.
 
@@ -7,8 +8,9 @@ use crate::cached_integer_model::{
     GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, I8Weights, matmul_i8_canonical_row_range,
 };
 use crate::tensor_parallel::{
-    MAX_CANONICAL_ROW_FILE_BYTES, MAX_ROW_FRAME_BYTES, RowProjectionRequest, RowProjectionResponse,
-    RowShard, TensorKey, decode_row_request, encode_row_response, hash_i64,
+    MANIFEST_PIN_REQUEST_MAGIC, MANIFEST_PIN_RESPONSE_MAGIC, MAX_CANONICAL_ROW_FILE_BYTES,
+    MAX_ROW_FRAME_BYTES, RowProjectionRequest, RowProjectionResponse, RowShard, TensorKey,
+    decode_row_request, encode_row_response, hash_i64, manifest_pin_frame,
 };
 use arc_crypto::Hash256;
 use std::io::{self, Read, Write};
@@ -23,6 +25,8 @@ use std::time::{Duration, Instant};
 const MAX_FILES: usize = 1024;
 const MAX_CLIENTS: usize = 32;
 const ROW_COMPUTE_CHUNK_ROWS: usize = 32;
+mod manifest;
+use manifest::{DigestReader, FilePin, PinnedManifest, regular_file};
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -54,14 +58,36 @@ pub struct SharedRowBundle {
     shards: Vec<RowShard>,
     serialized_bytes: usize,
     largest_file: usize,
+    manifest_hash: Option<Hash256>,
     // An exclusive nonblocking directory lock prevents a second daemon
     // from preparing another heap for this same bundle, even at a different socket.
     _directory_lease: std::fs::File,
 }
 impl SharedRowBundle {
     /// Preflight the complete aggregate before allocating any row weights.
-    /// Files must be canonical ARCROW01 exports for the expected artifact.
+    /// Legacy mode checks ARCROW01 identities and bounds, without content
+    /// digests. Partial cohorts require `load_pinned` instead.
     pub fn load(directory: &Path, expected: Hash256) -> io::Result<Self> {
+        Self::load_inner(directory, expected, None)
+    }
+
+    /// Verify the pinned manifest and hash the exact stream decoded into each
+    /// retained matrix. Pinned bundles require a matching connection handshake.
+    pub fn load_pinned(
+        directory: &Path,
+        expected: Hash256,
+        manifest: &Path,
+        manifest_hash: Hash256,
+    ) -> io::Result<Self> {
+        let pin = PinnedManifest::read(manifest, manifest_hash, expected)?;
+        Self::load_inner(directory, expected, Some(pin))
+    }
+
+    fn load_inner(
+        directory: &Path,
+        expected: Hash256,
+        manifest: Option<PinnedManifest>,
+    ) -> io::Result<Self> {
         let lease = std::fs::File::open(directory)?;
         if !lease.metadata()?.is_dir() {
             return Err(invalid("row bundle path is not a directory"));
@@ -84,6 +110,16 @@ impl SharedRowBundle {
             }
             let len = usize::try_from(entry.metadata()?.len())
                 .map_err(|_| invalid("row file length overflow"))?;
+            if let Some(manifest) = &manifest {
+                let name = entry.file_name();
+                let pin = name
+                    .to_str()
+                    .and_then(|n| manifest.files.get(n))
+                    .ok_or_else(|| invalid("row directory contains an unpinned file"))?;
+                if pin.bytes != len {
+                    return Err(invalid("row file length differs from manifest"));
+                }
+            }
             total = total
                 .checked_add(len)
                 .ok_or_else(|| invalid("row bundle length overflow"))?;
@@ -96,11 +132,23 @@ impl SharedRowBundle {
         if files.is_empty() {
             return Err(invalid("empty row bundle"));
         }
+        if manifest
+            .as_ref()
+            .is_some_and(|m| m.files.len() != files.len())
+        {
+            return Err(invalid("row directory is missing pinned files"));
+        }
         files.sort_by(|a, b| a.0.cmp(&b.0));
         let mut shards = Vec::with_capacity(files.len());
         let mut worker_id = None;
         for (path, len) in files {
-            let (shard, id) = Self::load_file(&path, len, expected)?;
+            let pin = manifest.as_ref().map(|m| {
+                &m.files[path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .expect("preflight name")]
+            });
+            let (shard, id) = Self::load_file(&path, len, expected, pin)?;
             if worker_id.as_ref().is_some_and(|held| held != &id) {
                 return Err(invalid("row bundle worker ids are inconsistent"));
             }
@@ -123,6 +171,7 @@ impl SharedRowBundle {
             shards,
             serialized_bytes: total,
             largest_file: largest,
+            manifest_hash: manifest.map(|m| m.hash),
             _directory_lease: lease,
         })
     }
@@ -130,11 +179,17 @@ impl SharedRowBundle {
         path: &Path,
         expected_len: usize,
         expected: Hash256,
+        pin: Option<&FilePin>,
     ) -> io::Result<(RowShard, String)> {
-        let mut file = std::fs::File::open(path)?;
+        let file = regular_file(path)?;
         if file.metadata()?.len() != expected_len as u64 {
             return Err(invalid("row file changed after size preflight"));
         }
+        let mut file = DigestReader {
+            reader: file,
+            digest: blake3::Hasher::new(),
+            enabled: pin.is_some(),
+        };
         let mut magic = [0; 8];
         file.read_exact(&mut magic)?;
         if &magic != b"ARCROW01" {
@@ -196,6 +251,18 @@ impl SharedRowBundle {
         if length != expected_len {
             return Err(invalid("row shape differs from preflight file length"));
         }
+        if pin.is_some_and(|p| {
+            let a = &p.assignment;
+            a.artifact_id != expected
+                || a.execution_profile != profile
+                || a.worker_id != worker
+                || a.layer != layer
+                || a.tensor != tensor
+                || a.row_start != start
+                || a.row_end != end
+        }) {
+            return Err(invalid("row header differs from pinned assignment"));
+        }
         let mut scales = Vec::with_capacity(rows);
         for _ in 0..rows {
             scales.push(read_u64(&mut file)? as i64);
@@ -205,6 +272,9 @@ impl SharedRowBundle {
         let mut tail = [0];
         if file.read(&mut tail)? != 0 {
             return Err(invalid("trailing row bytes"));
+        }
+        if pin.is_some_and(|p| Hash256(*file.digest.finalize().as_bytes()) != p.blake3) {
+            return Err(invalid("loaded row bytes differ from pinned digest"));
         }
         let data = raw.into_iter().map(|v| v as i8).collect();
         Ok((
@@ -319,6 +389,7 @@ pub struct RowServiceStats {
     pub simd_available: bool,
     pub projection_census: Option<crate::canonical_simd::ProjectionCensus>,
     pub projection_chunks: Option<u64>,
+    pub verified_manifest_blake3: Option<String>,
     pub resident_bundle_copies: usize,
     pub resident_row_files: usize,
     pub resident_row_bytes: usize,
@@ -371,6 +442,7 @@ impl SharedRowService {
             projection_census: census_enabled.then(crate::canonical_simd::projection_census),
             projection_chunks: census_enabled
                 .then(|| self.projection_chunks.load(Ordering::Relaxed)),
+            verified_manifest_blake3: self.bundle.manifest_hash.map(|h| h.to_hex()),
             resident_bundle_copies: 1,
             resident_row_files: self.bundle.shards.len(),
             resident_row_bytes: self
@@ -452,6 +524,7 @@ impl SharedRowService {
         Ok(())
     }
     fn client(&self, mut stream: UnixStream, shutdown: &AtomicBool) -> io::Result<()> {
+        let mut needs_pin = self.bundle.manifest_hash.is_some();
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 return Ok(());
@@ -470,11 +543,34 @@ impl SharedRowService {
                 false,
             )?;
             let count = u32::from_le_bytes(length) as usize;
-            if count == 0 || count > MAX_ROW_FRAME_BYTES {
+            if count == 0 || count > MAX_ROW_FRAME_BYTES || (needs_pin && count != 72) {
                 return Err(invalid("row frame size"));
             }
             let mut frame = vec![0; count];
             read_exact_until(&mut stream, &mut frame, frame_deadline, shutdown, false)?;
+            if needs_pin {
+                let hash = self.bundle.manifest_hash.expect("pinned bundle");
+                let expected =
+                    manifest_pin_frame(MANIFEST_PIN_REQUEST_MAGIC, hash, &self.bundle.worker_id);
+                if frame.as_slice() != expected {
+                    return Err(invalid(
+                        "pinned bundle requires matching manifest/worker handshake",
+                    ));
+                }
+                let response =
+                    manifest_pin_frame(MANIFEST_PIN_RESPONSE_MAGIC, hash, &self.bundle.worker_id);
+                write_all_until(
+                    &mut stream,
+                    &(response.len() as u32).to_le_bytes(),
+                    frame_deadline,
+                    shutdown,
+                )?;
+                write_all_until(&mut stream, &response, frame_deadline, shutdown)?;
+                needs_pin = false;
+                continue;
+            }
+            // Legacy/unpinned services and repeat handshakes refuse through
+            // the existing row decoder; no connection can switch bundles.
             let request = decode_row_request(&frame).map_err(|e| invalid(e.to_string()))?;
             drop(frame);
             let deadline = Instant::now() + self.limits.call_timeout;
@@ -789,6 +885,9 @@ mod tests {
     }
     impl Running {
         fn start(limits: RowServiceLimits) -> Self {
+            Self::start_with_pin(limits, false)
+        }
+        fn start_with_pin(limits: RowServiceLimits, pinned: bool) -> Self {
             let directory = PathBuf::from(format!(
                 "/tmp/arc-row-shared-{}-{}",
                 std::process::id(),
@@ -807,7 +906,12 @@ mod tests {
                 n_cols: 4,
             };
             export_canonical_row_file(&file, &assignment, &weights).unwrap();
-            let bundle = SharedRowBundle::load(&rows, Hash256([7; 32])).unwrap();
+            let bundle = if pinned {
+                let (manifest, hash) = write_manifest(&directory, &file);
+                SharedRowBundle::load_pinned(&rows, Hash256([7; 32]), &manifest, hash).unwrap()
+            } else {
+                SharedRowBundle::load(&rows, Hash256([7; 32])).unwrap()
+            };
             // A second instance cannot prepare duplicate resident heaps for
             // this directory, even if it would choose a different socket.
             assert!(SharedRowBundle::load(&rows, Hash256([7; 32])).is_err());
@@ -855,6 +959,213 @@ mod tests {
             row_end: 8,
             worker_id: worker.into(),
         }
+    }
+    fn manifest_value(file: &Path) -> serde_json::Value {
+        let bytes = std::fs::read(file).unwrap();
+        serde_json::json!({
+            "format": "arc.tensor-row-offline-partition-bundle.v1",
+            "row_partition": {"rank": 0, "count": 1},
+            "artifact_blake3": Hash256([7; 32]).to_hex(),
+            "execution_profile": GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+            "worker_id": "fixture", "serialized_row_bytes": bytes.len(),
+            "files": [{"file": "q.arcrow", "assignment": assignment("fixture", Hash256::ZERO),
+                       "bytes": bytes.len(), "blake3": blake3::hash(&bytes).to_hex().to_string()}]
+        })
+    }
+    fn write_manifest(directory: &Path, file: &Path) -> (PathBuf, Hash256) {
+        write_manifest_value(directory, &manifest_value(file))
+    }
+    fn write_manifest_value(directory: &Path, value: &serde_json::Value) -> (PathBuf, Hash256) {
+        let path = directory.join("manifest.json");
+        let bytes = serde_json::to_vec(value).unwrap();
+        let hash = Hash256(*blake3::hash(&bytes).as_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        (path, hash)
+    }
+    struct PinnedFiles {
+        directory: PathBuf,
+        rows: PathBuf,
+        file: PathBuf,
+    }
+    impl PinnedFiles {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "arc-row-pins-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let rows = directory.join("rows");
+            std::fs::create_dir_all(&rows).unwrap();
+            let file = rows.join("q.arcrow");
+            export_canonical_row_file(
+                &file,
+                &assignment("fixture", Hash256::ZERO),
+                &I8Weights {
+                    data: vec![3; 32],
+                    scales: vec![65536; 8],
+                    n_rows: 8,
+                    n_cols: 4,
+                },
+            )
+            .unwrap();
+            Self {
+                directory,
+                rows,
+                file,
+            }
+        }
+        fn load(&self, value: &serde_json::Value) -> io::Result<SharedRowBundle> {
+            let (path, pin) = write_manifest_value(&self.directory, value);
+            SharedRowBundle::load_pinned(&self.rows, Hash256([7; 32]), &path, pin)
+        }
+    }
+    impl Drop for PinnedFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn pinned_loader_refuses_same_size_payload_corruption_and_keeps_verified_resident_bytes() {
+        let fixture = PinnedFiles::new();
+        let value = manifest_value(&fixture.file);
+        let original = std::fs::read(&fixture.file).unwrap();
+        let bundle = fixture.load(&value).unwrap();
+        let call = request("fixture", Hash256([3; 32]));
+        let cancel = AtomicBool::new(false);
+        let before = bundle
+            .project(&call, Instant::now() + Duration::from_secs(1), &cancel)
+            .unwrap();
+        let mut corrupted = original.clone();
+        *corrupted.last_mut().unwrap() ^= 1; // Identical header, size and scales.
+        std::fs::write(&fixture.file, &corrupted).unwrap();
+        assert_eq!(
+            bundle
+                .project(&call, Instant::now() + Duration::from_secs(1), &cancel)
+                .unwrap(),
+            before
+        );
+        drop(bundle);
+        let error = fixture.load(&value).err().expect("corrupt bytes accepted");
+        assert!(
+            error.to_string().contains("loaded row bytes differ"),
+            "{error}"
+        );
+        // Legacy mode intentionally has no content pin; identical corrupt
+        // header/length remains parseable, demonstrating the actual gap.
+        drop(SharedRowBundle::load(&fixture.rows, Hash256([7; 32])).unwrap());
+        std::fs::write(&fixture.file, original).unwrap();
+        assert!(fixture.load(&value).is_ok());
+    }
+
+    #[test]
+    fn pinned_loader_checks_manifest_hash_identities_bounds_and_exact_file_set() {
+        let fixture = PinnedFiles::new();
+        let original = manifest_value(&fixture.file);
+        let (path, pin) = write_manifest_value(&fixture.directory, &original);
+        assert!(
+            SharedRowBundle::load_pinned(&fixture.rows, Hash256([7; 32]), &path, Hash256([8; 32]))
+                .is_err()
+        );
+        assert!(SharedRowBundle::load_pinned(&fixture.rows, Hash256([8; 32]), &path, pin).is_err());
+        for (pointer, value) in [
+            ("/worker_id", serde_json::json!("other")),
+            ("/execution_profile", serde_json::json!("other")),
+            ("/row_partition/count", serde_json::json!(33)),
+            ("/files/0/file", serde_json::json!("../q.arcrow")),
+            ("/files/0/file", serde_json::json!("/q.arcrow")),
+            (
+                "/files/0/bytes",
+                serde_json::json!(MAX_CANONICAL_ROW_FILE_BYTES + 1),
+            ),
+            ("/files/0/assignment/worker_id", serde_json::json!("other")),
+            ("/files/0/assignment/row_end", serde_json::json!(7)),
+            ("/files/0/assignment/tensor", serde_json::json!("wk")),
+        ] {
+            let mut bad = original.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert!(fixture.load(&bad).is_err(), "accepted {pointer}");
+        }
+        let mut duplicate = original.clone();
+        duplicate["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(original["files"][0].clone());
+        assert!(fixture.load(&duplicate).is_err());
+        std::fs::write(fixture.rows.join("extra"), b"extra").unwrap();
+        assert!(fixture.load(&original).is_err());
+        std::fs::remove_file(fixture.rows.join("extra")).unwrap();
+        std::fs::rename(&fixture.file, fixture.directory.join("saved")).unwrap();
+        assert!(fixture.load(&original).is_err());
+        std::os::unix::fs::symlink(fixture.directory.join("saved"), &fixture.file).unwrap();
+        assert!(fixture.load(&original).is_err());
+        let alias = fixture.directory.join("manifest-alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(
+            SharedRowBundle::load_pinned(&fixture.rows, Hash256([7; 32]), &alias, pin).is_err()
+        );
+        std::fs::write(&path, vec![b' '; (1 << 20) + 1]).unwrap();
+        assert!(SharedRowBundle::load_pinned(&fixture.rows, Hash256([7; 32]), &path, pin).is_err());
+    }
+
+    fn send_pin(stream: &mut UnixStream, pin: Hash256, worker: &str) {
+        let frame = manifest_pin_frame(MANIFEST_PIN_REQUEST_MAGIC, pin, worker);
+        stream
+            .write_all(&(frame.len() as u32).to_le_bytes())
+            .unwrap();
+        stream.write_all(&frame).unwrap();
+    }
+    #[test]
+    fn pinned_service_requires_exact_manifest_and_worker_on_each_connection() {
+        let running = Running::start_with_pin(RowServiceLimits::default(), true);
+        let pin = running.service.bundle.manifest_hash.unwrap();
+        assert_eq!(
+            running.service.stats().verified_manifest_blake3,
+            Some(pin.to_hex())
+        );
+        let mut no_pin = running.connect();
+        let row = encode_row_request(&request("fixture", Hash256([2; 32]))).unwrap();
+        // Reject the ordinary row frame before accepting/allocating its body.
+        no_pin.write_all(&(row.len() as u32).to_le_bytes()).unwrap();
+        match no_pin.read(&mut [0]) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            result => panic!("unhandshaken request was not refused: {result:?}"),
+        }
+        for (hash, worker) in [(Hash256([9; 32]), "fixture"), (pin, "other")] {
+            let mut wrong = running.connect();
+            send_pin(&mut wrong, hash, worker);
+            assert_eq!(wrong.read(&mut [0]).unwrap(), 0);
+        }
+        for id in [3, 4] {
+            let mut client = running.connect();
+            send_pin(&mut client, pin, "fixture");
+            let mut reply = [0; 76];
+            client.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply[..4], &72u32.to_le_bytes());
+            assert_eq!(
+                &reply[4..],
+                &manifest_pin_frame(MANIFEST_PIN_RESPONSE_MAGIC, pin, "fixture")
+            );
+            let call = request("fixture", Hash256([id; 32]));
+            send(&mut client, &call);
+            assert_eq!(answer(&mut client).call_id, call.call_id);
+            send_pin(&mut client, pin, "fixture");
+            assert_eq!(
+                client.read(&mut [0]).unwrap(),
+                0,
+                "repeat handshake accepted"
+            );
+        }
+        assert_eq!(running.service.stats().resident_bundle_copies, 1);
+        let legacy = Running::start(RowServiceLimits::default());
+        let mut client = legacy.connect();
+        send_pin(&mut client, pin, "fixture");
+        assert_eq!(
+            client.read(&mut [0]).unwrap(),
+            0,
+            "unpinned service acknowledged a pin"
+        );
     }
     fn request(worker: &str, call: Hash256) -> RowProjectionRequest {
         let input = vec![1234, -5678, 9012, 3456];

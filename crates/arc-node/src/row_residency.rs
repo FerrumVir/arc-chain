@@ -1,8 +1,9 @@
 //! Operator-pinned manifests for private fixed-residency row workers.
 //!
 //! This validates bounded manifest metadata and file sizes only. It does not
-//! read model weights or authenticate row-file contents; the worker transport
-//! and package qualification remain responsible for those checks. Offline
+//! read model weights or authenticate row-file contents. Partial connections
+//! require the shared daemon's exact-stream manifest pin handshake over trusted
+//! private SSH; canonical numerical and package qualification remain required. Offline
 //! exporter/conformance manifests are inputs to configuration validation,
 //! not evidence of production qualification.
 

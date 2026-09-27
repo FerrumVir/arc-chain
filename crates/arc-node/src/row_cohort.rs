@@ -1233,6 +1233,15 @@ impl RowCohort {
         };
         let worker =
             SshStdioRowWorker::connect(entry.id.clone(), ssh).map_err(|error| error.to_string())?;
+        if let Some(residency) = &self.residency {
+            let pin = residency
+                .iter()
+                .find(|r| r.worker == self.machines[index].address)
+                .ok_or("partial worker has no verified manifest pin")?;
+            worker
+                .verify_manifest_pin(pin.manifest_hash)
+                .map_err(|e| e.to_string())?;
+        }
         let seed = [b"warm-up".as_slice(), &height.to_le_bytes()].concat();
         zero_call(
             self.model.source(),
