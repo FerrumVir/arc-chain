@@ -104,3 +104,32 @@ allowlists must explicitly authorize that new hash through the normal binding
 procedure; no old assignment hash is reinterpreted. No deployment or activation
 is performed by this change. The earlier offline numerical proof does not by
 itself qualify this production planner, its probes, SSH path or resource usage.
+
+The additional offline integration gate uses the actual `RowCohort` low-residency
+constructor, asynchronous probes/challenges, readiness, placement, reservations
+and generation through ephemeral pinned loopback OpenSSH connections:
+
+```
+python3 scripts/qualification/run_low_residency_conformance.py \
+  --binaries-dir /absolute/candidate/bin --model /absolute/pinned/model.gguf \
+  --output-dir /absolute/new/proof-directory --row-partitions 7 \
+  --production-cohort --kernel scalar --reference-kernel scalar
+```
+
+Build/package the `arc-node` example `production_partial_row_conformance` beside
+the three existing inference proof executables. Run on an unprivileged fresh
+Linux runner with OpenSSH client/server tools and `/run/sshd` available; missing
+prerequisites refuse. The harness creates private ephemeral keys outside evidence
+artifacts and pins the generated host public key directly. It starts only a
+loopback SSH listener and removes its keys/processes during bounded cleanup.
+
+The resident reference exits before row export/daemon loading. The production
+report compares exact tokens/output hash and requires every owner measured and
+certified, the expected remote call count, zero fallback/skips/faults and released
+reservations. Production generation does not expose a per-position trace; the
+earlier full logit/KV proof remains separate. Observation height `1` is explicitly
+an offline constant, not a claimed chain clock. No qualification flag or native
+admission context is created by this fixture. Seven logical owners on this one
+host are not seven physical hosts or failure domains; per-owner declared RAM
+does not enforce aggregate colocated residency. Paid-chain, actual fleet memory,
+failure and WAN performance qualification remain separate requirements.

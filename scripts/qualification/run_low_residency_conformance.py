@@ -25,6 +25,105 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = ROOT / "docs/protocol/packages/llama-2-7b-q4km.manifest.json"
 PROFILE = "arc.gguf-llama.i8-per-row.rope-interleaved.v1"
 BINARIES = ("low_residency_conformance", "tensor_row_low_residency_export", "tensor_row_shared_worker")
+PRODUCTION_BINARY = "production_partial_row_conformance"
+
+
+def production_cohort_config(manifests, runtime, ssh, shared_worker):
+    """Fixture configuration; pins are derived by the Rust pin-config mode next."""
+    return {"max_workers": len(manifests), "duplicate_per_mille": 50, "spot_rows_per_stage": 2,
+            "workers": [{"id": manifest["worker_id"], "ssh_program": str(ssh.ssh_program),
+                         "target": ssh.target, "known_hosts": str(ssh.known_hosts),
+                         "remote_command": [str(shared_worker), "relay", "--socket",
+                                            str(runtime / (manifest["worker_id"] + ".sock"))],
+                         "timeout_ms": 30000, "startup_timeout_ms": 60000,
+                         "ram_headroom_bytes": manifest["serialized_row_bytes"],
+                         "max_concurrency": 1, "resident_layers": [], "resident_output": False}
+                        for _, manifest in manifests],
+            "partial_rows": {"format": "arc.private-row-residency.v1", "manifests": [
+                {"worker_id": manifest["worker_id"], "path": str(dest / "manifest.json"),
+                 "blake3": "0" * 64} for dest, manifest in manifests]}}
+
+
+def compare_production_cohort(reference, actual, owners):
+    """Tokens/commitment plus production integration; no claim of production logit tracing."""
+    if (reference.get("schema") != "arc.low-residency-conformance.v1"
+            or reference.get("mode") != "reference"
+            or actual.get("schema") != "arc.production-partial-cohort-conformance.v1"
+            or actual.get("mode") != "production-cohort"
+            or actual.get("qualification_flags_set") is not False
+            or actual.get("chain_clock_used") is not False
+            or type(actual.get("offline_observation_height")) is not int
+            or actual["offline_observation_height"] != 1
+            or not owners or len(set(owners)) != len(owners)):
+        raise RuntimeError("invalid production cohort proof schema/scope")
+    for key in ("artifact_blake3", "artifact_bytes", "profile", "prompt_token_ids", "max_tokens",
+                "warmup_count", "generation_semantics"):
+        if key not in reference or actual.get(key) != reference[key]:
+            raise RuntimeError("production cohort input differs: " + key)
+    if (actual["profile"] != PROFILE
+            or actual["generation_semantics"] != "generation-v2/BOS-once/repetition-penalty/EOS-included"
+            or type(actual["max_tokens"]) is not int or not 1 <= actual["max_tokens"] <= 4
+            or type(actual["warmup_count"]) is not int or actual["warmup_count"] not in (0, 1)):
+        raise RuntimeError("production cohort generation contract mismatch")
+    graph = reference["graph"]
+    prompt = actual["prompt_token_ids"]
+    if (type(actual["artifact_bytes"]) is not int or actual["artifact_bytes"] <= 0
+            or type(graph.get("layers")) is not int or not 1 <= graph["layers"] <= 4096
+            or type(graph.get("vocab")) is not int or graph["vocab"] <= 0
+            or type(graph.get("bos")) is not int or not 0 <= graph["bos"] < graph["vocab"]
+            or type(graph.get("max_seq")) is not int or graph["max_seq"] <= 0
+            or not graph.get("eos") or any(type(n) is not int or not 0 <= n < graph["vocab"] for n in graph["eos"])
+            or not prompt or len(prompt) > 16 or prompt[0] == graph["bos"]
+            or any(type(n) is not int or not 0 <= n < graph["vocab"] for n in prompt)
+            or not isinstance(reference.get("binary_blake3"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", reference["binary_blake3"])):
+        raise RuntimeError("production reference/input bounds malformed")
+    for key in ("artifact_blake3", "binary_blake3", "assignment_hash"):
+        if not isinstance(actual.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", actual[key]):
+            raise RuntimeError("invalid production commitment: " + key)
+    for key in ("bos", "eos", "vocab", "max_seq"):
+        if (actual.get("graph", {}).get(key) != reference["graph"][key]
+                or type(actual["graph"][key]) is not type(reference["graph"][key])):
+            raise RuntimeError("production graph differs: " + key)
+    for view_key in ("ready_view", "final_view"):
+        view = actual.get(view_key, {})
+        machines = view.get("machines", [])
+        if (view.get("low_residency") is not True or view.get("partial_row_residency") is not True
+                or view.get("local_fallback_enabled") is not False
+                or view.get("placement_timing_prediction_available") is not False
+                or type(view.get("reservations")) is not int or view["reservations"] != 0
+                or type(view.get("coordinator_macs_per_s")) is not int or view["coordinator_macs_per_s"] != 0
+                or len(machines) != len(owners) or {m.get("id") for m in machines} != set(owners)
+                or any(m.get("connected") is not True or m.get("excluded") is not False
+                       or type(m.get("measured_macs_per_s")) is not int or m["measured_macs_per_s"] <= 0
+                       or type(m.get("free_slots")) is not int or m["free_slots"] <= 0 for m in machines)):
+            raise RuntimeError("production cohort lacks complete measured/released remote ownership")
+    if (len(reference.get("warmup_runs", [])) != actual["warmup_count"]
+            or len(actual.get("warmup_runs", [])) != actual["warmup_count"]):
+        raise RuntimeError("production warmup count mismatch")
+    for a, b in [(reference["measured"], actual["measured"])] + list(zip(
+            reference.get("warmup_runs", []), actual.get("warmup_runs", []))):
+        validate_trace(a, reference)
+        if not isinstance(b.get("output_token_ids"), list) or any(type(n) is not int for n in b["output_token_ids"]):
+            raise RuntimeError("malformed production token IDs")
+        for key in ("output_token_ids", "output_hash"):
+            if b.get(key) != a[key]:
+                raise RuntimeError("production output differs: " + key)
+        record = b.get("cohort_record", {})
+        stages = reference["graph"].get("layers", 0) * 7 + 1
+        if (any(not isinstance(record.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", record[key])
+                or record[key] == "0" * 64 for key in ("certificate", "request_id"))
+                or len(record.get("machines", [])) != len(owners) or set(record["machines"]) != set(owners)
+                or type(record.get("answered")) is not int
+                or record["answered"] != stages * len(a["positions"]) * len(owners)
+                or any(type(record.get(key)) is not int or record[key] != 0
+                       for key in ("fallbacks", "skipped", "faults"))
+                or not record.get("outcome", "").startswith("partitioned fixed resident rows;")):
+            raise RuntimeError("production certificate/remote execution evidence incomplete")
+    return {"exact_output_tokens_and_hash": True, "production_cohort_constructor_readiness_generate": True,
+            "exact_position_logit_and_kv_digests": False,
+            "position_trace_scope": "reference validated; production generate exposes tokens/hash only",
+            "all_owners_measured_and_certified": True, "no_local_primary_or_fallback": True}
 
 
 def digest(path):
@@ -430,6 +529,8 @@ def parser():
                         help="independent reference mode; fast distributed mode requires scalar reference")
     result.add_argument("--row-partitions", type=int, choices=range(2, 17),
                         help="offline-only disjoint rows per tensor on 2..16 daemons; default uses layer bundles")
+    result.add_argument("--production-cohort", action="store_true",
+                        help="exercise actual RowCohort over ephemeral pinned loopback SSH; requires --row-partitions")
     result.add_argument("--timeout-seconds", default=1800, type=int)
     result.add_argument("--total-timeout-seconds", default=2700, type=int,
                         help="global deadline including all phases; cleanup/evidence writing follow it")
@@ -445,6 +546,8 @@ def run(args):
             or not 60 <= args.total_timeout_seconds <= 5400):
         raise RuntimeError("prompt count or timeout outside bounded limits")
     validate_kernel_selection(args.kernel, args.reference_kernel)
+    if args.production_cohort and args.row_partitions is None:
+        raise RuntimeError("production cohort proof requires explicit --row-partitions")
     output.mkdir(mode=0o700, exist_ok=False)
     package = json.loads(PACKAGE.read_text())
     if package["execution"]["profile"] != PROFILE:
@@ -452,6 +555,8 @@ def run(args):
     if prompt[0] == package["tokenizer"]["bos"] or any(not 0 <= n < package["graph"]["vocab_size"] for n in prompt):
         raise RuntimeError("invalid prompt IDs or leading BOS")
     binaries = {name: args.binaries_dir / name for name in BINARIES}
+    if args.production_cohort:
+        binaries[PRODUCTION_BINARY] = args.binaries_dir / PRODUCTION_BINARY
     census_enabled = args.kernel == "fast" or args.reference_kernel == "fast"
     base_environment = dict(os.environ, ARC_BATCHED_PREFILL="0",
                             ARC_QUALIFICATION_SIMD_CENSUS="1" if census_enabled else "0")
@@ -478,6 +583,14 @@ def run(args):
                    "No validator, legacy shard, SSH relay, OS overhead or real-host capacity qualification is performed. "
                    "When SIMD census is enabled, counter atomics add measurement overhead and timings are not speed evidence."}
     runtime = None
+    ssh = None
+    if args.production_cohort:
+        summary["scope"] = "offline production private-cohort integration over pinned loopback SSH; no activation, payment, quality, WAN or fleet readiness"
+        summary["inputs"]["production_cohort"] = True
+        summary["measurement_caveat"] = summary["measurement_caveat"].replace(
+            "No validator, legacy shard, SSH relay, OS overhead or real-host capacity qualification is performed.",
+            "No validator, legacy shard, OS overhead or real-host capacity qualification is performed. "
+            "Loopback SSH is included; direct-child RSS excludes its descendants.")
     def expired(_signum, _frame):
         raise TimeoutError(f"global conformance deadline expired after {args.total_timeout_seconds}s")
     old_alarm = signal.signal(signal.SIGALRM, expired)
@@ -507,6 +620,9 @@ def run(args):
             raise RuntimeError("inspected artifact/profile pin mismatch")
         validate_layout_plan(plan, args.row_partitions)
         summary["layout"] = plan["layout"]
+        if args.production_cohort:
+            summary["topology"] = {"physical_hosts": 1, "logical_row_owners": len(plan["bundles"]),
+                                   "scope": "colocated processes; no independent failure-domain or fleet capacity proof"}
         positions = 1 + len(prompt) + args.max_tokens
         kv_bytes = plan["kv_bytes_per_position"] * positions
         disk = plan["total_row_file_bytes"] + GIB
@@ -534,15 +650,34 @@ def run(args):
             manifests.append((dest, manifest))
         # Short private runtime paths avoid Unix sockaddr length limits on CI.
         runtime = Path(tempfile.mkdtemp(prefix="arc-proof-", dir="/tmp"))
+        pins = {}
+        if args.production_cohort:
+            from loopback_cohort_ssh import LoopbackCohortSsh
+            ssh = LoopbackCohortSsh(children, output, environments["coordinator"])
+            ssh.start()
+            summary["loopback_ssh"] = ssh.evidence()
+            draft = production_cohort_config(manifests, runtime, ssh, binaries[BINARIES[2]])
+            write_json(output / "cohort-draft.json", draft)
+            children.wait(children.start("pin-config", [binaries[PRODUCTION_BINARY], "pin-config",
+                "--cohort", output / "cohort-draft.json", "--output", output / "cohort.json"],
+                environments["coordinator"]), 30)
+            prepared = json.loads((output / "cohort.json").read_text())
+            pins = {p["worker_id"]: p["blake3"] for p in prepared["partial_rows"]["manifests"]}
+            if set(pins) != {m["worker_id"] for _, m in manifests} or any(
+                    not isinstance(pin, str) or not re.fullmatch(r"[0-9a-f]{64}", pin)
+                    or pin == "0" * 64 for pin in pins.values()):
+                raise RuntimeError("pin-config omitted or malformed a worker manifest pin")
         config, daemons = [], []
         remaining_rows = plan["total_row_file_bytes"]
         for dest, manifest in manifests:
             checkpoint("daemon-" + manifest["worker_id"], remaining_rows + kv_bytes + 2 * GIB)
             socket = runtime / (manifest["worker_id"] + ".sock")
             name = "daemon-" + manifest["worker_id"]
-            daemon = children.start(name, [binaries[BINARIES[2]], "serve", "--rows-dir", dest / "rows",
-                "--artifact", package["artifact"]["blake3"], "--socket", socket, "--max-clients", "2"],
-                environments["worker"])
+            command = [binaries[BINARIES[2]], "serve", "--rows-dir", dest / "rows",
+                "--artifact", package["artifact"]["blake3"], "--socket", socket, "--max-clients", "2"]
+            if args.production_cohort:
+                command.extend(["--manifest", dest / "manifest.json", "--manifest-blake3", pins[manifest["worker_id"]]])
+            daemon = children.start(name, command, environments["worker"])
             daemons.append(daemon)
             end = time.monotonic() + 180
             while True:
@@ -556,6 +691,8 @@ def run(args):
                     stats = started[-1]["stats"]
                     if stats["resident_bundle_copies"] != 1 or stats["worker_id"] != manifest["worker_id"]:
                         raise RuntimeError("daemon resident-copy/worker identity mismatch")
+                    if args.production_cohort and stats.get("verified_manifest_blake3") != pins[manifest["worker_id"]]:
+                        raise RuntimeError("daemon did not verify the coordinator's exact manifest pin")
                     break
                 time.sleep(0.1)
             config.append({"worker_id": manifest["worker_id"], "socket": str(socket),
@@ -567,9 +704,25 @@ def run(args):
             raise RuntimeError("worker assignment configuration exceeds 1 MiB")
         write_json(output / "workers.json", config, indent=None)
         checkpoint("coordinator", kv_bytes + 2 * GIB)
-        coordinator = children.start("coordinator", [binaries[BINARIES[0]], "coordinator", *common, *layout_args,
-            "--workers", output / "workers.json", "--output", output / "coordinator.json"], environments["coordinator"])
-        children.wait(coordinator, args.timeout_seconds)
+        if args.production_cohort:
+            command = [binaries[PRODUCTION_BINARY], "run", *common, "--cohort", output / "cohort.json",
+                       "--output", output / "coordinator.json", "--readiness-timeout-seconds", "180"]
+            coordinator_environment = ssh.environment
+        else:
+            command = [binaries[BINARIES[0]], "coordinator", *common, *layout_args,
+                       "--workers", output / "workers.json", "--output", output / "coordinator.json"]
+            coordinator_environment = environments["coordinator"]
+        coordinator = children.start("coordinator", command, coordinator_environment)
+        try:
+            children.wait(coordinator, args.timeout_seconds)
+        finally:
+            if args.production_cohort:
+                # Close SSH descendants even when their parent already exited;
+                # on timeout this also terminates the still-running coordinator.
+                try:
+                    os.killpg(coordinator.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
         if any(daemon.poll() is not None for daemon in daemons):
             raise RuntimeError("a row daemon exited before comparison completed")
         children.stop(daemons)
@@ -578,7 +731,7 @@ def run(args):
                           for _, manifest in manifests]
         expected = json.loads((output / "reference.json").read_text())
         actual = json.loads((output / "coordinator.json").read_text())
-        if actual.get("row_partitions") != args.row_partitions:
+        if not args.production_cohort and actual.get("row_partitions") != args.row_partitions:
             raise RuntimeError("coordinator did not use the requested partial-row proof")
         reference_kernel = validate_kernel_report(expected, args.reference_kernel, "reference", census_enabled)
         coordinator_kernel = validate_kernel_report(actual, args.kernel, "coordinator", census_enabled)
@@ -594,13 +747,21 @@ def run(args):
         }
         if args.kernel == "fast" and not summary["kernel_observations"]["simd_path_qualified"]:
             raise RuntimeError("fast distributed run lacks accepted SIMD census from every compute process")
-        summary.update(compare(expected, actual))
+        summary.update(compare_production_cohort(expected, actual, [m["worker_id"] for _, m in manifests])
+                       if args.production_cohort else compare(expected, actual))
         summary["pass"] = True
     except Exception as error:
         summary["error"] = str(error)
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_alarm)
+        try:
+            if ssh is not None:
+                ssh.close()
+                summary["loopback_ssh"] = ssh.evidence()
+        except Exception as error:
+            summary["pass"] = False
+            summary["ssh_cleanup_error"] = str(error)
         try:
             children.close()
             require_clean_exits(children.records)

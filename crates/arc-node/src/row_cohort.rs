@@ -1089,6 +1089,25 @@ impl RowCohort {
         )
     }
 
+    /// Connect an explicitly low-residency private coordinator through the same
+    /// measured production path. This constructs no admission/qualification
+    /// context; callers must separately enforce their activation policy.
+    pub fn connect_low_residency(
+        config: RowCohortConfig,
+        validator: Hash256,
+        model: Arc<LowResidencyModel>,
+        artifact: Hash256,
+        height: u64,
+    ) -> Result<Arc<Self>, String> {
+        Self::connect_model(
+            config,
+            validator,
+            CoordinatorModel::LowResidency(model),
+            artifact,
+            height,
+        )
+    }
+
     pub(crate) fn connect_model(
         config: RowCohortConfig,
         validator: Hash256,
@@ -1713,7 +1732,7 @@ impl RowCohort {
     /// Refresh measurements even on an idle node. Low residency is ready only
     /// when the same measured placement and strict coverage preflight used by
     /// execution succeed. This reserves no slots and loads no model matrices.
-    pub(crate) fn ready_for_requests(&self, now: u64) -> bool {
+    pub fn ready_for_requests(&self, now: u64) -> bool {
         if !self.model.is_low_residency() {
             return true;
         }
@@ -2552,9 +2571,10 @@ mod tests {
     }
     // Synthetic row arithmetic, deliberately not a qualified model. These
     // tests prove residency, verification and refusal at the real backend seam.
+    type CheckedRows = (Option<usize>, TensorKey, usize, usize);
     struct TinyRowSource {
         config: ModelConfig,
-        checks: Mutex<Vec<(Option<usize>, TensorKey, usize, usize)>>,
+        checks: Mutex<Vec<CheckedRows>>,
     }
     impl TinyRowSource {
         fn new() -> Self {

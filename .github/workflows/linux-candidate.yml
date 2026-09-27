@@ -216,6 +216,32 @@ jobs:
           EXPECTED_SHA: ${{ github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
+      - name: Verify ephemeral pinned loopback SSH before compilation
+        timeout-minutes: 9
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Fresh CI runner only. Prevent package post-install from exposing
+          # a system SSH listener; the proof starts its own loopback sshd.
+          sudo -n systemctl mask --runtime ssh.service ssh.socket
+          if ! command -v sshd >/dev/null; then
+            timeout 180s sudo -n apt-get -o Acquire::Retries=1 -o DPkg::Lock::Timeout=30 update
+            timeout 180s sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+              -o DPkg::Lock::Timeout=30 install -y --no-install-recommends openssh-server
+          fi
+          sudo -n install -d -m 0755 /run/sshd
+          timeout --signal=TERM --kill-after=20s 90s python3 scripts/qualification/loopback_cohort_ssh.py \
+            --smoke-output-dir "$RUNNER_TEMP/loopback-ssh-smoke"
+
+      - name: Retain early SSH smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-loopback-ssh-smoke-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/loopback-ssh-smoke/
+          if-no-files-found: warn
+          retention-days: 7
+
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: nightly-2026-03-16
@@ -230,7 +256,7 @@ jobs:
       - name: Build Linux candidate binaries
         run: |
           cargo build --locked --release -p arc-node --features candle --bin arc-node \
-            --example qualify_recovered_native_boundary
+            --example qualify_recovered_native_boundary --example production_partial_row_conformance
           cargo build --locked --release -p arc-inference \
             --example tensor_row_stdio_worker --example tensor_row_low_residency_export \
             --example tensor_row_shared_worker --example low_residency_conformance --features candle
@@ -255,6 +281,7 @@ jobs:
           ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle
           cargo test --locked --release -p arc-inference --features candle --example tensor_row_low_residency_export
           cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance
+          cargo test --locked --release -p arc-node --features candle --example production_partial_row_conformance
           python3 scripts/qualification/test_row_relay_flush.py \
             --binary target/release/examples/tensor_row_shared_worker
           python3 -m unittest discover -s scripts/qualification/tests -p 'test_*.py'
@@ -276,6 +303,8 @@ jobs:
             "$RUNNER_TEMP/linux-candidate/"
           cp target/release/examples/low_residency_conformance \
             "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/production_partial_row_conformance \
+            "$RUNNER_TEMP/linux-candidate/"
           {
             printf 'repository=%s\n' "$GITHUB_REPOSITORY"
             printf 'commit=%s\n' "$CANDIDATE_SHA"
@@ -283,7 +312,7 @@ jobs:
             printf 'workflow_run_id=%s\n' "$GITHUB_RUN_ID"
             printf 'workflow_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
             printf 'runner=%s\n' "$ImageOS $ImageVersion"
-            printf 'build= cargo build --locked --release -p arc-node --features candle --bin arc-node --example qualify_recovered_native_boundary\n'
+            printf 'build= cargo build --locked --release -p arc-node --features candle --bin arc-node --example qualify_recovered_native_boundary --example production_partial_row_conformance\n'
             printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --example tensor_row_low_residency_export --example tensor_row_shared_worker --example low_residency_conformance --features candle\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node --features candle\n'
@@ -298,6 +327,8 @@ jobs:
             printf 'tests= ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle\n'
             printf 'tests= cargo test --locked --release -p arc-inference --features candle --example tensor_row_low_residency_export\n'
             printf 'tests= cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance\n'
+            printf 'tests= cargo test --locked --release -p arc-node --features candle --example production_partial_row_conformance\n'
+            printf 'tests= python3 scripts/qualification/loopback_cohort_ssh.py --smoke-output-dir RUNNER_TEMP/loopback-ssh-smoke\n'
             printf 'tests= python3 scripts/qualification/test_row_relay_flush.py --binary target/release/examples/tensor_row_shared_worker\n'
             printf 'tests= python3 -m unittest discover -s scripts/qualification/tests -p test_*.py\n'
             rustc --version --verbose
@@ -331,9 +362,13 @@ jobs:
             row_partitions: 7
             kernel: fast
             reference_kernel: scalar
+          - layout: production-partial-rows
+            row_partitions: 7
+            kernel: scalar
+            reference_kernel: scalar
     needs: [linux-candidate]
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -345,6 +380,22 @@ jobs:
         with:
           name: arc-linux-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/linux-candidate
+
+      - name: Verify production SSH prerequisites before model download
+        if: matrix.layout == 'production-partial-rows'
+        timeout-minutes: 9
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo -n systemctl mask --runtime ssh.service ssh.socket
+          if ! command -v sshd >/dev/null; then
+            timeout 180s sudo -n apt-get -o Acquire::Retries=1 -o DPkg::Lock::Timeout=30 update
+            timeout 180s sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+              -o DPkg::Lock::Timeout=30 install -y --no-install-recommends openssh-server
+          fi
+          sudo -n install -d -m 0755 /run/sshd
+          timeout --signal=TERM --kill-after=20s 90s python3 scripts/qualification/loopback_cohort_ssh.py \
+            --smoke-output-dir "$RUNNER_TEMP/real-model-conformance-production-partial-rows/ssh-smoke"
 
       - name: Download, verify, and qualify exact model on fresh runner
         env:
@@ -367,7 +418,7 @@ jobs:
           grep -Fx "commit=$GITHUB_SHA" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
           grep -Fx "workflow_run_id=$GITHUB_RUN_ID" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
           grep -Fx "workflow_run_attempt=$GITHUB_RUN_ATTEMPT" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
-          for binary in arc-node qualify_recovered_native_boundary tensor_row_stdio_worker tensor_row_low_residency_export tensor_row_shared_worker low_residency_conformance; do
+          for binary in arc-node qualify_recovered_native_boundary tensor_row_stdio_worker tensor_row_low_residency_export tensor_row_shared_worker low_residency_conformance production_partial_row_conformance; do
             test -f "$CANDIDATE_DIR/$binary" || { echo "missing candidate binary: $binary"; status=1; }
             test ! -L "$CANDIDATE_DIR/$binary" || { echo "candidate binary is symlink: $binary"; status=1; }
             chmod +x "$CANDIDATE_DIR/$binary" || status=1
@@ -402,6 +453,9 @@ jobs:
             if [ "$ROW_PARTITIONS" != "0" ]; then
               row_layout_args=(--row-partitions "$ROW_PARTITIONS")
             fi
+            if [ "$CONFORMANCE_LAYOUT" = "production-partial-rows" ]; then
+              row_layout_args+=(--production-cohort)
+            fi
             timeout --signal=TERM --kill-after=30s 40m python3 scripts/qualification/run_low_residency_conformance.py \
               --binaries-dir "$CANDIDATE_DIR" --model "$MODEL_PATH" \
               --output-dir "$RESULT_DIR" --prompt-ids 6324 --max-tokens 2 \
@@ -416,7 +470,7 @@ jobs:
           kernel=sys.argv[4]
           reference_kernel=sys.argv[5]
           expected_layout={'layers':'layers','partial-rows':'partial-rows',
-                           'partial-rows-fast':'partial-rows'}[layout]
+                           'partial-rows-fast':'partial-rows', 'production-partial-rows':'partial-rows'}[layout]
           expected_partitions=None if partitions == 0 else partitions
           if summary.get('pass') is not True:
               raise SystemExit('runner exited without a passing summary record')
@@ -425,6 +479,14 @@ jobs:
           if summary.get('inputs', {}).get('row_partitions') != expected_partitions:
               raise SystemExit(f"summary row partition mismatch: expected {expected_partitions}, got {summary.get('inputs', {}).get('row_partitions')}")
           inputs=summary.get('inputs', {})
+          if layout == 'production-partial-rows':
+              if (inputs.get('production_cohort') is not True
+                      or summary.get('production_cohort_constructor_readiness_generate') is not True
+                      or summary.get('exact_output_tokens_and_hash') is not True
+                      or summary.get('exact_position_logit_and_kv_digests') is not False
+                      or summary.get('all_owners_measured_and_certified') is not True
+                      or summary.get('no_local_primary_or_fallback') is not True):
+                  raise SystemExit('production cohort integration evidence missing or scope overstated')
           if inputs.get('kernel') != kernel or inputs.get('reference_kernel') != reference_kernel:
               raise SystemExit('summary kernel settings differ from matrix request')
           observed=summary.get('kernel_observations', {})
@@ -475,7 +537,7 @@ jobs:
           allowed={'.json','.log','.txt'}
           for p in src.rglob('*'):
               manifest = p.name == 'manifest.json' and len(p.relative_to(src).parts) == 3 and p.relative_to(src).parts[0] == 'bundles'
-              if not p.is_file() or (p.suffix.lower() not in allowed and not manifest): continue
+              if not p.is_file() or (p.suffix.lower() not in allowed and not manifest and p.name != 'loopback_known_hosts'): continue
               if 'bundles' in p.relative_to(src).parts and not manifest: continue
               if p.stat().st_size > 2 * 1024 * 1024: continue
               q=dst/p.relative_to(src);q.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(p,q)
