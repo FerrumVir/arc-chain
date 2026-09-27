@@ -1,11 +1,11 @@
 name: Linux candidate artifacts
 
 # This workflow is intentionally limited to the current implementation
-# candidate branch. It builds review artifacts only; it has no release,
-# deployment, environment, or signing steps.
+# candidate and its isolated native-memory review branch. It builds review
+# artifacts only; it has no release, deployment, environment, or signing steps.
 on:
   push:
-    branches: [arc-chain-v2-implementation-20260919]
+    branches: [arc-chain-v2-implementation-20260919, arc-native-low-residency-20260927]
 
 permissions:
   contents: read
@@ -50,18 +50,24 @@ jobs:
           cargo build --locked --release -p arc-node --features candle --bin arc-node \
             --example qualify_recovered_native_boundary
           cargo build --locked --release -p arc-inference \
-            --example tensor_row_stdio_worker --features candle
+            --example tensor_row_stdio_worker --example tensor_row_low_residency_export --features candle
+
+      - name: Check changed crates and examples in both feature modes
+        run: |
+          cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node
+          cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node --features candle
 
       # Repeat the recovery-state and native-boundary suites on Linux, then
-      # exercise the Linux canonical SIMD dispatch and refusal cases.
+      # exercise canonical SIMD, lazy-weight parity, and refusal cases.
       - name: Test recovery and native boundary on Linux
         run: |
+          cargo test --locked --release -p arc-assign
           cargo test --locked --release -p arc-state --lib
           cargo test --locked --release -p arc-node --lib --features candle
           cargo test --locked --release -p arc-net --lib
           cargo test --locked --release -p arc-node --bin arc-node --features candle legacy_v3_wire
-          cargo test --locked --release -p arc-inference --lib --features candle \
-            canonical_simd::tests
+          cargo test --locked --release -p arc-inference --lib --features candle
+          ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle
 
       - name: Package binaries and provenance
         env:
@@ -74,6 +80,8 @@ jobs:
             "$RUNNER_TEMP/linux-candidate/"
           cp target/release/examples/tensor_row_stdio_worker \
             "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/tensor_row_low_residency_export \
+            "$RUNNER_TEMP/linux-candidate/"
           {
             printf 'repository=%s\n' "$GITHUB_REPOSITORY"
             printf 'commit=%s\n' "$CANDIDATE_SHA"
@@ -82,12 +90,16 @@ jobs:
             printf 'workflow_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
             printf 'runner=%s\n' "$ImageOS $ImageVersion"
             printf 'build= cargo build --locked --release -p arc-node --features candle --bin arc-node --example qualify_recovered_native_boundary\n'
-            printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --features candle\n'
+            printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --example tensor_row_low_residency_export --features candle\n'
+            printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node\n'
+            printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node --features candle\n'
+            printf 'tests= cargo test --locked --release -p arc-assign\n'
             printf 'tests= cargo test --locked --release -p arc-state --lib\n'
             printf 'tests= cargo test --locked --release -p arc-node --lib --features candle\n'
             printf 'tests= cargo test --locked --release -p arc-net --lib\n'
             printf 'tests= cargo test --locked --release -p arc-node --bin arc-node --features candle legacy_v3_wire\n'
-            printf 'tests= cargo test --locked --release -p arc-inference --lib --features candle canonical_simd::tests\n'
+            printf 'tests= cargo test --locked --release -p arc-inference --lib --features candle\n'
+            printf 'tests= ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle\n'
             rustc --version --verbose
             cargo --version
           } > "$RUNNER_TEMP/linux-candidate/PROVENANCE.txt"

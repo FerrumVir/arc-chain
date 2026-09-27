@@ -391,7 +391,7 @@ pub fn check_native_kv_budget(
 /// greedy `CachedIntegerModel::encode` tokenizer is never called here, so raw
 /// UTF-8 cannot become a paid output before tokenizer/template qualification.
 pub struct CanonicalI8NativeExecutor {
-    model: Arc<arc_inference::cached_integer_model::CachedIntegerModel>,
+    model: crate::row_cohort::CoordinatorModel,
     qualification: CanonicalI8Qualification,
     kv_budget_bytes: u64,
     /// This operator's own row machines, when configured (option (a) of the
@@ -433,6 +433,26 @@ impl CanonicalI8NativeExecutor {
         qualification: CanonicalI8Qualification,
     ) -> Result<Self, NativeInferenceError> {
         use arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE;
+        Self::validate_qualification(&qualification)?;
+        if model.canonical_execution_profile() != Some(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
+            || !model.has_all_transformer_layers()
+        {
+            return Err(NativeInferenceError::Executor(
+                "model is not the complete corrected GGUF interleaved-RoPE canonical I8 profile"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            model: crate::row_cohort::CoordinatorModel::Resident(model),
+            qualification,
+            kv_budget_bytes: DEFAULT_NATIVE_KV_BUDGET_BYTES,
+            row_cohort: None,
+        })
+    }
+
+    fn validate_qualification(
+        qualification: &CanonicalI8Qualification,
+    ) -> Result<(), NativeInferenceError> {
         if !qualification.reference_generation_qualified {
             return Err(NativeInferenceError::Executor(
                 "canonical I8 generation has not passed reference qualification".into(),
@@ -445,16 +465,28 @@ impl CanonicalI8NativeExecutor {
                 "canonical I8 activation does not use the exact versioned profile/generation commitments".into(),
             ));
         }
-        if model.canonical_execution_profile() != Some(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
-            || !model.has_all_transformer_layers()
-        {
-            return Err(NativeInferenceError::Executor(
-                "model is not the complete corrected GGUF interleaved-RoPE canonical I8 profile"
-                    .into(),
-            ));
-        }
+        Ok(())
+    }
+
+    /// Explicit remote-only coordinator. Verifies the same artifact and
+    /// qualification without ever constructing a full CachedIntegerModel.
+    /// Until a complete measured cohort is attached, every job is refused.
+    pub fn load_qualified_low_residency(
+        path: impl AsRef<Path>,
+        qualification: CanonicalI8Qualification,
+    ) -> Result<Self, NativeInferenceError> {
+        Self::validate_qualification(&qualification)?;
+        let model = arc_inference::low_residency::load_low_residency_model(
+            path.as_ref(),
+            qualification.artifact_hash,
+        )
+        .map_err(|e| NativeInferenceError::Executor(e.to_string()))?;
+        tracing::info!(
+            resident_state_bytes = model.resident_state_bytes(),
+            "native low-residency coordinator loaded; projection and embedding matrices are not resident; complete verified remote coverage is required"
+        );
         Ok(Self {
-            model,
+            model: crate::row_cohort::CoordinatorModel::LowResidency(Arc::new(model)),
             qualification,
             kv_budget_bytes: DEFAULT_NATIVE_KV_BUDGET_BYTES,
             row_cohort: None,
@@ -476,7 +508,7 @@ impl CanonicalI8NativeExecutor {
         validator: Hash256,
         height: u64,
     ) -> Result<Self, NativeInferenceError> {
-        let cohort = crate::row_cohort::RowCohort::connect(
+        let cohort = crate::row_cohort::RowCohort::connect_model(
             config,
             validator,
             self.model.clone(),
@@ -498,7 +530,7 @@ impl CanonicalI8NativeExecutor {
     /// client checks a request against it before signing; the node refuses
     /// (never votes on) a job that needs more.
     pub fn max_positions(&self) -> u64 {
-        let config = &self.model.config;
+        let config = self.model.config();
         let per_position =
             native_kv_bytes(1, config.n_layers as u64, config.d_kv as u64).unwrap_or(u64::MAX);
         allocatable_kv_positions(self.kv_budget_bytes, per_position, config.max_seq as u64)
@@ -516,8 +548,8 @@ impl CanonicalI8NativeExecutor {
         manifest: &Path,
         package_manifest_hash: Hash256,
     ) -> Result<(), NativeInferenceError> {
-        let loaded = package_facts(
-            &self.model,
+        let loaded = package_facts_from_config(
+            self.model.config(),
             self.qualification.artifact_hash,
             artifact,
             tokenizer,
@@ -572,10 +604,18 @@ pub fn package_facts(
     artifact: &Path,
     tokenizer: &arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer,
 ) -> Result<arc_inference::model_package::LoadedPackage, NativeInferenceError> {
+    package_facts_from_config(&model.config, artifact_hash, artifact, tokenizer)
+}
+
+fn package_facts_from_config(
+    config: &arc_inference::cached_integer_model::ModelConfig,
+    artifact_hash: Hash256,
+    artifact: &Path,
+    tokenizer: &arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer,
+) -> Result<arc_inference::model_package::LoadedPackage, NativeInferenceError> {
     let refuse = |message: String| NativeInferenceError::Executor(message);
     let (_, tensors) = arc_inference::gguf_meta::read_header_from_path(artifact)
         .map_err(|error| refuse(format!("reading the artifact's tensor inventory: {error}")))?;
-    let config = &model.config;
     // The tokenizer serving /native-inference/tokenize must agree with the
     // loaded model before either is compared with the manifest.
     if tokenizer.bos_token() != config.bos_token
@@ -676,16 +716,16 @@ impl CanonicalI8NativeExecutor {
         }
         let prompt = Self::prequalified_prompt(
             job,
-            self.model.config.bos_token,
-            self.model.config.vocab_size,
+            self.model.config().bos_token,
+            self.model.config().vocab_size,
         )?;
         let max_tokens =
             u32::try_from(job.max_tokens).map_err(|_| NativeInferenceError::OutputTooLarge)?;
         check_native_kv_budget(
             prompt.len(),
             job.max_tokens,
-            self.model.config.n_layers,
-            self.model.config.d_kv,
+            self.model.config().n_layers,
+            self.model.config().d_kv,
             self.kv_budget_bytes,
         )?;
         let (tokens, output_hash) = match (&self.row_cohort, now) {
@@ -695,12 +735,11 @@ impl CanonicalI8NativeExecutor {
                 now,
                 &prompt,
                 max_tokens,
-                &self.model.config.eos_tokens,
+                &self.model.config().eos_tokens,
             )?,
             _ => self
                 .model
-                .try_generate_v2(&prompt, max_tokens, &self.model.config.eos_tokens)
-                .map_err(|error| NativeInferenceError::Executor(error.to_string()))?,
+                .local_generate(&prompt, max_tokens, &self.model.config().eos_tokens)?,
         };
         if tokens.is_empty()
             || tokens.len() > job.max_tokens

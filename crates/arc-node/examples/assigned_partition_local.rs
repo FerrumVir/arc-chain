@@ -405,6 +405,7 @@ fn main() -> Result<(), String> {
             max_concurrency: lease.body.max_concurrency,
             link,
             resident_layers: lease.body.resident_layers.clone(),
+            resident_output: false,
         });
     }
 

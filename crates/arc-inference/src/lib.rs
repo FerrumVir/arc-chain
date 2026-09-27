@@ -18,6 +18,7 @@ pub mod gguf_meta;
 pub mod integer_engine;
 pub mod integer_lut;
 pub mod llama_spm_tokenizer;
+pub mod low_residency;
 pub mod model_artifact;
 pub mod model_package;
 pub mod q4_engine;

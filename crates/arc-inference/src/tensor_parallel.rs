@@ -843,7 +843,7 @@ pub fn model_projection_weights(
 
 /// Rows `[start, end)` of `weights` applied by the coordinator. Validate the
 /// geometry before allocating so a malformed plan cannot request a huge vec.
-fn rows_of(
+pub(crate) fn rows_of(
     weights: &I8Weights,
     start: usize,
     end: usize,
@@ -1296,6 +1296,14 @@ pub enum RowEvent {
         tensor: TensorKey,
         error: String,
     },
+    /// Strict coordinator refused a transport/identity/shape failure. No
+    /// local fallback was performed.
+    Refused {
+        worker: String,
+        layer: Option<usize>,
+        tensor: TensorKey,
+        error: String,
+    },
     /// Exact arithmetic disagreed on a checked slice or row; the coordinator
     /// recomputed the slice and used its own rows.
     Fault {
@@ -1326,7 +1334,8 @@ pub trait RowEventSink: Send + Sync {
 /// machines may feed a vote (docs/design/assignment-node-integration.md,
 /// trust model).
 pub struct VerifiedPartitionBackend<'a> {
-    model: &'a crate::cached_integer_model::CachedIntegerModel,
+    source: &'a dyn crate::low_residency::CanonicalRowSource,
+    strict: bool,
     artifact_id: Hash256,
     profile: String,
     plans: BTreeMap<(Option<usize>, TensorKey), ProjectionPlan>,
@@ -1347,7 +1356,97 @@ impl<'a> VerifiedPartitionBackend<'a> {
             .ok_or(TensorParallelError::WrongIdentity)?
             .to_string();
         Ok(Self {
-            model,
+            source: model,
+            strict: false,
+            artifact_id,
+            profile,
+            plans,
+            workers,
+            events,
+        })
+    }
+
+    /// All primary slices must be remote. Local rows remain available only
+    /// for the certificate's numerical checks. A failed check or transport
+    /// refuses the request; no primary slice is recomputed as a fallback.
+    pub fn new_strict(
+        source: &'a dyn crate::low_residency::CanonicalRowSource,
+        artifact_id: Hash256,
+        plans: BTreeMap<(Option<usize>, TensorKey), ProjectionPlan>,
+        workers: BTreeMap<String, Arc<dyn RowWorker>>,
+        events: &'a dyn RowEventSink,
+    ) -> Result<Self, TensorParallelError> {
+        let profile = source
+            .canonical_execution_profile()
+            .ok_or(TensorParallelError::WrongIdentity)?
+            .to_string();
+        // Validate every required stage before the first token is forwarded.
+        let keys = (0..source.config().n_layers)
+            .flat_map(|layer| {
+                [
+                    TensorKey::Wq,
+                    TensorKey::Wk,
+                    TensorKey::Wv,
+                    TensorKey::Wo,
+                    TensorKey::WGate,
+                    TensorKey::WUp,
+                    TensorKey::WDown,
+                ]
+                .into_iter()
+                .map(move |tensor| (Some(layer), tensor))
+            })
+            .chain(std::iter::once((None, TensorKey::LmHead)));
+        for (layer, tensor) in keys {
+            let (rows, _) = source
+                .projection_shape(layer, tensor)
+                .ok_or(TensorParallelError::WrongShape)?;
+            let plan =
+                plans
+                    .get(&(layer, tensor))
+                    .ok_or(TensorParallelError::IncompleteCoverage {
+                        expected: rows,
+                        covered: 0,
+                    })?;
+            let assignments = plan
+                .slices
+                .iter()
+                .map(|slice| {
+                    let SliceOwner::Remote(worker) = &slice.owner else {
+                        return Err(TensorParallelError::WrongIdentity);
+                    };
+                    if events.is_excluded(worker)
+                        || !workers.get(worker).is_some_and(|w| w.is_open())
+                    {
+                        return Err(TensorParallelError::MissingWorker(worker.clone()));
+                    }
+                    Ok(RowAssignment {
+                        artifact_id,
+                        execution_profile: profile.clone(),
+                        layer,
+                        tensor,
+                        row_start: slice.row_start,
+                        row_end: slice.row_end,
+                        worker_id: worker.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            validate_exact_coverage(&assignments, artifact_id, &profile, layer, tensor, rows)?;
+            if plan.spot_rows.is_empty() || plan.spot_rows.iter().any(|&row| row >= rows) {
+                return Err(TensorParallelError::WrongShape);
+            }
+            for slice in &plan.slices {
+                if let Some(SliceOwner::Remote(checker)) = &slice.duplicate_on {
+                    if events.is_excluded(checker)
+                        || !workers.get(checker).is_some_and(|w| w.is_open())
+                    {
+                        return Err(TensorParallelError::MissingWorker(checker.clone()));
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            source,
+            strict: true,
             artifact_id,
             profile,
             plans,
@@ -1364,9 +1463,8 @@ impl<'a> VerifiedPartitionBackend<'a> {
         end: usize,
         input: &[i64],
     ) -> Result<Vec<i64>, TensorParallelError> {
-        let weights = model_projection_weights(self.model, layer, tensor)
-            .ok_or(TensorParallelError::WrongIdentity)?;
-        rows_of(weights, start, end, input)
+        self.source
+            .projection_rows(layer, tensor, start, end, input)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1444,7 +1542,11 @@ impl<'a> VerifiedPartitionBackend<'a> {
                     layer,
                     tensor,
                 });
-                Ok(None)
+                if self.strict {
+                    Err(TensorParallelError::Closed)
+                } else {
+                    Ok(None)
+                }
             }
             SliceOwner::Remote(worker) => {
                 match self.remote(
@@ -1459,9 +1561,22 @@ impl<'a> VerifiedPartitionBackend<'a> {
                             layer,
                             tensor,
                         });
-                        Ok(None)
+                        if self.strict {
+                            Err(TensorParallelError::Closed)
+                        } else {
+                            Ok(None)
+                        }
                     }
                     Err(error) => {
+                        if self.strict {
+                            self.events.record(RowEvent::Refused {
+                                worker: worker.clone(),
+                                layer,
+                                tensor,
+                                error: error.to_string(),
+                            });
+                            return Err(error);
+                        }
                         self.events.record(RowEvent::Fallback {
                             worker: worker.clone(),
                             layer,
@@ -1521,6 +1636,30 @@ impl<'a> VerifiedPartitionBackend<'a> {
                 checker, call_id, input_hash, layer, tensor, start, end, input,
             )?;
             if second.as_deref() != Some(values.as_slice()) {
+                if self.strict {
+                    // A bounded local check identifies faulty participants,
+                    // but its result can never replace the failed primary.
+                    let own = self.local(layer, tensor, start, end, input)?;
+                    if own != values {
+                        fault(&own);
+                    }
+                    if let (Some(second), SliceOwner::Remote(checker_id)) = (&second, checker)
+                        && *second != own
+                    {
+                        self.events.record(RowEvent::Fault {
+                            worker: checker_id.clone(),
+                            layer,
+                            tensor,
+                            row_start: start,
+                            row_end: end,
+                            expected: hash_i64(&own),
+                            found: hash_i64(second),
+                        });
+                    }
+                    return Err(TensorParallelError::Worker(
+                        "duplicate row verification disagreed; request refused".into(),
+                    ));
+                }
                 // Disagreement, or no second answer: the coordinator's own
                 // rows decide, and are what the forward uses.
                 let own = self.local(layer, tensor, start, end, input)?;
@@ -1546,6 +1685,20 @@ impl<'a> VerifiedPartitionBackend<'a> {
         for &row in spot_rows.iter().filter(|row| (start..end).contains(*row)) {
             let own_row = self.local(layer, tensor, row, row + 1, input)?;
             if own_row[0] != values[row - start] {
+                if self.strict {
+                    self.events.record(RowEvent::Fault {
+                        worker: worker.clone(),
+                        layer,
+                        tensor,
+                        row_start: row,
+                        row_end: row + 1,
+                        expected: hash_i64(&own_row),
+                        found: hash_i64(&values[row - start..row - start + 1]),
+                    });
+                    return Err(TensorParallelError::Worker(
+                        "spot row verification disagreed; request refused".into(),
+                    ));
+                }
                 let own = self.local(layer, tensor, start, end, input)?;
                 fault(&own);
                 return Ok(own);
@@ -1644,7 +1797,7 @@ pub fn hash_i64(values: &[i64]) -> Hash256 {
 /// row order and their scales are exported together after permutation.
 /// This file is data-only; it contains no model-wide embedding, norms, cache,
 /// tokenizer, or public endpoint configuration.
-fn export_canonical_row_file(
+pub(crate) fn export_canonical_row_file(
     path: impl AsRef<Path>,
     assignment: &RowAssignment,
     weights: &I8Weights,

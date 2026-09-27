@@ -135,3 +135,7 @@ workspace = true
 [[example]]
 name = "tensor_row_layer_bundle_export"
 required-features = ["candle"]
+
+[[example]]
+name = "tensor_row_low_residency_export"
+required-features = ["candle"]

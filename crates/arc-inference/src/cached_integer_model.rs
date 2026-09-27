@@ -731,34 +731,7 @@ impl CachedIntegerModel {
         prompt_tokens: usize,
         max_tokens: u32,
     ) -> Result<GenerationPreflight, GenerationError> {
-        let generated_positions =
-            usize::try_from(max_tokens).map_err(|_| GenerationError::PositionCountOverflow {
-                prompt_tokens,
-                max_tokens,
-            })?;
-        let required_positions = GENERATION_INTERNAL_BOS_POSITIONS
-            .checked_add(prompt_tokens)
-            .and_then(|positions| positions.checked_add(generated_positions))
-            .ok_or(GenerationError::PositionCountOverflow {
-                prompt_tokens,
-                max_tokens,
-            })?;
-
-        if required_positions > self.config.max_seq {
-            return Err(GenerationError::ContextWindowExceeded {
-                prompt_tokens,
-                max_tokens,
-                required_positions,
-                max_seq: self.config.max_seq,
-            });
-        }
-
-        Ok(GenerationPreflight {
-            prompt_tokens,
-            max_tokens,
-            required_positions,
-            max_seq: self.config.max_seq,
-        })
+        preflight_generation_config(&self.config, prompt_tokens, max_tokens)
     }
 
     /// True only when every configured transformer layer has real weights.
@@ -3839,117 +3812,10 @@ impl CachedIntegerModel {
         call_id: Hash256,
         backend: &impl crate::tensor_parallel::ProjectionBackend,
     ) -> Result<Vec<i64>, crate::tensor_parallel::TensorParallelError> {
-        use crate::tensor_parallel::{TensorKey, TensorParallelError};
-        if self.canonical_execution_profile().is_none() || !self.has_all_transformer_layers() {
-            return Err(TensorParallelError::WrongIdentity);
+        if !self.has_all_transformer_layers() {
+            return Err(crate::tensor_parallel::TensorParallelError::WrongIdentity);
         }
-        let cfg = &self.config;
-        let d = cfg.d_model;
-        let pos = cache.seq_len;
-        if pos >= cfg.max_seq || self.embedding_q16.len() < (token as usize + 1).saturating_mul(d) {
-            return Err(TensorParallelError::WrongShape);
-        }
-        let emb_start = (token as usize).min(cfg.vocab_size.saturating_sub(1)) * d;
-        let mut hidden = self.embedding_q16[emb_start..emb_start + d].to_vec();
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let normed = layernorm(&hidden, &layer.attn_norm);
-            let mut qkv = backend.project_group(
-                call_id,
-                Some(layer_idx),
-                &[
-                    (TensorKey::Wq, d),
-                    (TensorKey::Wk, cfg.d_kv),
-                    (TensorKey::Wv, cfg.d_kv),
-                ],
-                &normed,
-            )?;
-            let mut q = qkv.remove(0);
-            let mut k_buf = qkv.remove(0);
-            let v_buf = qkv.remove(0);
-            if q.len() != d || k_buf.len() != cfg.d_kv || v_buf.len() != cfg.d_kv {
-                return Err(TensorParallelError::WrongShape);
-            }
-            for h in 0..cfg.n_heads {
-                apply_rope(
-                    &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
-                    pos,
-                    cfg.d_head,
-                    &cfg.rope_cos,
-                    &cfg.rope_sin,
-                );
-            }
-            for h in 0..cfg.n_kv_heads {
-                apply_rope(
-                    &mut k_buf[h * cfg.d_head..(h + 1) * cfg.d_head],
-                    pos,
-                    cfg.d_head,
-                    &cfg.rope_cos,
-                    &cfg.rope_sin,
-                );
-            }
-            cache.push_k(layer_idx, &k_buf);
-            cache.push_v(layer_idx, &v_buf);
-            let full_seq = pos + 1;
-            let heads: Vec<Vec<i64>> = (0..cfg.n_heads)
-                .into_par_iter()
-                .map(|h| {
-                    let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
-                    flash_attention_i64(
-                        &q[h * cfg.d_head..(h + 1) * cfg.d_head],
-                        &cache.k_data[layer_idx],
-                        &cache.v_data[layer_idx],
-                        cfg.d_kv,
-                        kv_h,
-                        cfg.d_head,
-                        full_seq,
-                        cfg.attn_scale,
-                    )
-                })
-                .collect();
-            let mut attn_out = vec![0; d];
-            for (h, value) in heads.iter().enumerate() {
-                attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(value);
-            }
-            let projected =
-                backend.project_rows(call_id, Some(layer_idx), TensorKey::Wo, &attn_out, d)?;
-            if projected.len() != d {
-                return Err(TensorParallelError::WrongShape);
-            }
-            for (out, projection) in hidden.iter_mut().zip(projected) {
-                *out += projection;
-            }
-            let normed_ff = layernorm(&hidden, &layer.ffn_norm);
-            let mut gate_up = backend.project_group(
-                call_id,
-                Some(layer_idx),
-                &[(TensorKey::WGate, cfg.d_ff), (TensorKey::WUp, cfg.d_ff)],
-                &normed_ff,
-            )?;
-            let mut gate = gate_up.remove(0);
-            let up = gate_up.remove(0);
-            if gate.len() != cfg.d_ff || up.len() != cfg.d_ff {
-                return Err(TensorParallelError::WrongShape);
-            }
-            for (g, u) in gate.iter_mut().zip(up) {
-                *g = (silu_i64(*g) * u) >> FRAC_BITS;
-            }
-            let ff_out =
-                backend.project_rows(call_id, Some(layer_idx), TensorKey::WDown, &gate, d)?;
-            if ff_out.len() != d {
-                return Err(TensorParallelError::WrongShape);
-            }
-            for (out, projection) in hidden.iter_mut().zip(ff_out) {
-                *out += projection;
-            }
-        }
-        cache.seq_len = pos + 1;
-        let normed = layernorm(&hidden, &self.final_norm);
-        let logits =
-            backend.project_rows(call_id, None, TensorKey::LmHead, &normed, cfg.vocab_size)?;
-        if logits.len() != cfg.vocab_size {
-            return Err(TensorParallelError::WrongShape);
-        }
-        Ok(logits)
+        forward_canonical_with_backend(self, token, cache, call_id, backend)
     }
 
     /// Generate with fallible context-window admission for untrusted callers.
@@ -4036,27 +3902,10 @@ impl CachedIntegerModel {
         eos_tokens: &[u32],
         backend: &impl crate::tensor_parallel::ProjectionBackend,
     ) -> Result<(Vec<u32>, Hash256), BackendGenerationError> {
-        let _admission = self.preflight_generation(prompt.len(), max_tokens)?;
-        let forward = |token: u32, cache: &mut KVCache| {
-            let call_id = backend_call_id(&request, cache.seq_len);
-            self.forward_one_token_canonical_i8_with_backend(token, cache, call_id, backend)
-        };
-        let mut cache = KVCache::new(self.config.n_layers);
-        let mut logits = forward(self.config.bos_token, &mut cache)?;
-        for &token in prompt {
-            logits = forward(token, &mut cache)?;
+        if !self.has_all_transformer_layers() {
+            return Err(crate::tensor_parallel::TensorParallelError::WrongIdentity.into());
         }
-        let mut generated = Vec::new();
-        for _ in 0..max_tokens {
-            let next = select_next_token_with_repetition_penalty(&mut logits, &generated);
-            generated.push(next);
-            if eos_tokens.contains(&next) {
-                break;
-            }
-            logits = forward(next, &mut cache)?;
-        }
-        let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
-        Ok((generated, arc_crypto::hash_bytes(&output_bytes)))
+        generate_canonical_with_backend(self, request, prompt, max_tokens, eos_tokens, backend)
     }
 
     /// Prefill `prompt` into `cache` and return the final position's logits.
@@ -5371,6 +5220,122 @@ fn validate_llama_gguf_for_interleaved_rope(path: &str) -> Result<(), crate::Inf
 }
 
 #[cfg(feature = "candle")]
+pub(crate) fn config_from_gguf(
+    content: &candle_core::quantized::gguf_file::Content,
+) -> Result<(ModelConfig, Vec<String>), crate::InferenceError> {
+    use candle_core::quantized::gguf_file;
+    let arch = match content.metadata.get("general.architecture") {
+        Some(gguf_file::Value::String(s)) => s.clone(),
+        _ => "llama".to_string(),
+    };
+
+    let get_u32 = |key: &str| -> u32 {
+        match content.metadata.get(key) {
+            Some(gguf_file::Value::U32(v)) => *v,
+            Some(gguf_file::Value::U64(v)) => *v as u32,
+            Some(gguf_file::Value::I32(v)) => *v as u32,
+            _ => 0,
+        }
+    };
+
+    let nl = get_u32(&format!("{arch}.block_count")) as usize;
+    let dm = get_u32(&format!("{arch}.embedding_length")) as usize;
+    let nh = get_u32(&format!("{arch}.attention.head_count")) as usize;
+    let nkv = {
+        let v = get_u32(&format!("{arch}.attention.head_count_kv"));
+        if v > 0 { v as usize } else { nh }
+    };
+    let dff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
+    let vs = content
+        .tensor_infos
+        .get("token_embd.weight")
+        .map(|t| t.shape.dims()[0])
+        .unwrap_or(32000);
+
+    let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
+        Some(gguf_file::Value::F32(v)) => *v as f64,
+        Some(gguf_file::Value::F64(v)) => *v,
+        _ => 10000.0,
+    };
+
+    let eos_tokens = match content.metadata.get("tokenizer.ggml.eos_token_id") {
+        Some(gguf_file::Value::U32(v)) => vec![*v],
+        Some(gguf_file::Value::U64(v)) => vec![*v as u32],
+        Some(gguf_file::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| match v {
+                gguf_file::Value::U32(n) => Some(*n),
+                gguf_file::Value::U64(n) => Some(*n as u32),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![2, 128001, 128009],
+    };
+
+    let bos_token = match content.metadata.get("tokenizer.ggml.bos_token_id") {
+        Some(gguf_file::Value::U32(v)) => *v,
+        Some(gguf_file::Value::U64(v)) => *v as u32,
+        _ => 1,
+    };
+
+    let chat_template = match content.metadata.get("tokenizer.chat_template") {
+        Some(gguf_file::Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+
+    let vocab = match content.metadata.get("tokenizer.ggml.tokens") {
+        Some(gguf_file::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| match v {
+                gguf_file::Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if nl == 0
+        || dm == 0
+        || nh == 0
+        || nkv == 0
+        || dff == 0
+        || vs == 0
+        || !dm.is_multiple_of(nh)
+        || !nh.is_multiple_of(nkv)
+    {
+        return Err(crate::InferenceError::Runtime(
+            "invalid GGUF model dimensions".into(),
+        ));
+    }
+    let d_head = dm / nh;
+    let d_kv = d_head
+        .checked_mul(nkv)
+        .ok_or_else(|| crate::InferenceError::Runtime("GGUF KV dimension overflow".into()))?;
+    let max_seq = 4096;
+    let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
+    Ok((
+        ModelConfig {
+            n_layers: nl,
+            d_model: dm,
+            n_heads: nh,
+            n_kv_heads: nkv,
+            d_ff: dff,
+            d_head,
+            d_kv,
+            vocab_size: vs,
+            attn_scale: integer_isqrt((d_head as i64) * ONE),
+            rope_cos,
+            rope_sin,
+            max_seq,
+            eos_tokens,
+            bos_token,
+            chat_template,
+            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
+        },
+        vocab,
+    ))
+}
+
+#[cfg(feature = "candle")]
 fn load_cached_model_shard_profile(
     path: &str,
     start_layer: usize,
@@ -5384,112 +5349,20 @@ fn load_cached_model_shard_profile(
     let device = Device::Cpu;
     let gguf_path = path.to_string();
 
-    // ── Read metadata ────────────────────────────────────────────────────────
-    let (
-        n_layers,
-        d_model,
-        n_heads,
-        n_kv_heads,
-        d_ff,
-        vocab_size,
-        vocab,
-        rope_base,
-        eos_tokens,
-        bos_token,
-        chat_template,
-    ) = {
+    let (config, vocab) = {
         let mut reader = std::fs::File::open(&gguf_path)
             .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
-
-        let arch = match content.metadata.get("general.architecture") {
-            Some(gguf_file::Value::String(s)) => s.clone(),
-            _ => "llama".to_string(),
-        };
-
-        let get_u32 = |key: &str| -> u32 {
-            match content.metadata.get(key) {
-                Some(gguf_file::Value::U32(v)) => *v,
-                Some(gguf_file::Value::U64(v)) => *v as u32,
-                Some(gguf_file::Value::I32(v)) => *v as u32,
-                _ => 0,
-            }
-        };
-
-        let nl = get_u32(&format!("{arch}.block_count")) as usize;
-        let dm = get_u32(&format!("{arch}.embedding_length")) as usize;
-        let nh = get_u32(&format!("{arch}.attention.head_count")) as usize;
-        let nkv = {
-            let v = get_u32(&format!("{arch}.attention.head_count_kv"));
-            if v > 0 { v as usize } else { nh }
-        };
-        let dff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
-        let vs = content
-            .tensor_infos
-            .get("token_embd.weight")
-            .map(|t| t.shape.dims()[0])
-            .unwrap_or(32000);
-
-        let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
-            Some(gguf_file::Value::F32(v)) => *v as f64,
-            Some(gguf_file::Value::F64(v)) => *v,
-            _ => 10000.0,
-        };
-
-        let eos_tokens = match content.metadata.get("tokenizer.ggml.eos_token_id") {
-            Some(gguf_file::Value::U32(v)) => vec![*v],
-            Some(gguf_file::Value::U64(v)) => vec![*v as u32],
-            Some(gguf_file::Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| match v {
-                    gguf_file::Value::U32(n) => Some(*n),
-                    gguf_file::Value::U64(n) => Some(*n as u32),
-                    _ => None,
-                })
-                .collect(),
-            _ => vec![2, 128001, 128009],
-        };
-
-        let bos_token = match content.metadata.get("tokenizer.ggml.bos_token_id") {
-            Some(gguf_file::Value::U32(v)) => *v,
-            Some(gguf_file::Value::U64(v)) => *v as u32,
-            _ => 1,
-        };
-
-        let chat_template = match content.metadata.get("tokenizer.chat_template") {
-            Some(gguf_file::Value::String(s)) => s.clone(),
-            _ => String::new(),
-        };
-
-        let vocab = match content.metadata.get("tokenizer.ggml.tokens") {
-            Some(gguf_file::Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| match v {
-                    gguf_file::Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-
-        (
-            nl,
-            dm,
-            nh,
-            nkv,
-            dff,
-            vs,
-            vocab,
-            rope_base,
-            eos_tokens,
-            bos_token,
-            chat_template,
-        )
+        config_from_gguf(&content)?
     };
-
-    let d_head = d_model / n_heads;
-    let d_kv = d_head * n_kv_heads;
+    let (n_layers, d_model, d_ff, d_kv, vocab_size) = (
+        config.n_layers,
+        config.d_model,
+        config.d_ff,
+        config.d_kv,
+        config.vocab_size,
+    );
 
     let end_layer = end_layer.min(n_layers);
     if start_layer >= end_layer {
@@ -5785,18 +5658,6 @@ fn load_cached_model_shard_profile(
         }
     }
 
-    // Llama-2-7B / 7B-Chat were trained on 4096-position RoPE. Capping
-    // max_seq at 2048 here forced every shard-holder seed to truncate
-    // prompts past position 2048 (apply_rope at line 1562 does an
-    // unchecked cos[pos*half + i] read; positions past the table either
-    // panic in debug or return undefined positional signal in release —
-    // either way, tokens past 2048 are useless). Doubling to 4096
-    // matches the trained capacity and only grows the RoPE tables by
-    // ~32 KB total per model — negligible.
-    let max_seq = 4096;
-    let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
-    let attn_scale = integer_isqrt((d_head as i64) * ONE);
-
     let shard_mb: usize = layers
         .iter()
         .filter(|l| l.is_loaded())
@@ -5817,24 +5678,7 @@ fn load_cached_model_shard_profile(
     );
 
     Ok(CachedIntegerModel {
-        config: ModelConfig {
-            n_layers,
-            d_model,
-            n_heads,
-            n_kv_heads,
-            d_ff,
-            d_head,
-            d_kv,
-            vocab_size,
-            attn_scale,
-            rope_cos,
-            rope_sin,
-            max_seq,
-            eos_tokens: eos_tokens.clone(),
-            bos_token,
-            chat_template: chat_template.clone(),
-            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
-        },
+        config,
         embedding_q16,
         embedding_i8,
         layers,
@@ -7358,6 +7202,172 @@ mod tests {
         (output, events.seen.into_inner().unwrap(), calls)
     }
 
+    fn all_remote_plans(
+        model: &CachedIntegerModel,
+    ) -> BTreeMap<(Option<usize>, TensorKey), crate::tensor_parallel::ProjectionPlan> {
+        let mut plans =
+            half_remote_plans(model, Some(crate::tensor_parallel::SliceOwner::Local), true);
+        for plan in plans.values_mut() {
+            plan.slices.remove(0);
+            plan.slices[0].row_start = 0;
+            plan.spot_rows = vec![0];
+        }
+        plans
+    }
+
+    #[test]
+    fn strict_backend_checks_numerical_and_response_identity_failures_without_fallback() {
+        use crate::tensor_parallel::{
+            RowEvent, RowProjectionRequest, RowProjectionResponse, TensorParallelError,
+            VerifiedPartitionBackend,
+        };
+        struct Altered {
+            inner: WholeModelWorker,
+            mode: u8,
+        }
+        impl RowWorker for Altered {
+            fn project(
+                &self,
+                request: RowProjectionRequest,
+            ) -> Result<RowProjectionResponse, TensorParallelError> {
+                if self.mode == 1 {
+                    return Err(TensorParallelError::Worker("timeout".into()));
+                }
+                let mut response = self.inner.project(request)?;
+                match self.mode {
+                    2 => response.call_id = Hash256([0; 32]),
+                    3 => response.input_hash = Hash256([0; 32]),
+                    4 => response.assignment.artifact_id = Hash256([0; 32]),
+                    5 => response.assignment.execution_profile = "other".into(),
+                    6 => response.assignment.layer = Some(99),
+                    7 => response.assignment.tensor = TensorKey::LmHead,
+                    8 => response.assignment.worker_id = "other".into(),
+                    9 => {
+                        response.values.pop();
+                    }
+                    10 => response.values[0] += 1,
+                    _ => (),
+                }
+                Ok(response)
+            }
+        }
+        let model = Arc::new(build_test_model(16, 32, 2, 64, 2));
+        for mode in 0..=10 {
+            let events = Events::default();
+            let worker = Arc::new(Altered {
+                inner: WholeModelWorker::new(&model, false, false),
+                mode,
+            });
+            let workers: BTreeMap<String, Arc<dyn RowWorker>> =
+                [("w".into(), worker as Arc<dyn RowWorker>)]
+                    .into_iter()
+                    .collect();
+            let backend = VerifiedPartitionBackend::new_strict(
+                model.as_ref(),
+                Hash256([77; 32]),
+                all_remote_plans(&model),
+                workers,
+                &events,
+            )
+            .unwrap();
+            let result =
+                model.try_generate_v2_with_backend(Hash256([5; 32]), &[3, 4], 2, &[99], &backend);
+            if mode == 0 {
+                assert_eq!(
+                    result.unwrap(),
+                    model.try_generate_v2(&[3, 4], 2, &[99]).unwrap()
+                );
+            } else {
+                assert!(result.is_err(), "mode {mode} accepted");
+            }
+            let events = events.seen.lock().unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, RowEvent::Fallback { .. })),
+                "strict mode silently fell back"
+            );
+            if mode == 10 {
+                assert!(events.iter().any(|e| matches!(e, RowEvent::Fault { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn strict_backend_refuses_missing_coverage_before_any_worker_call() {
+        use crate::tensor_parallel::{SliceOwner, VerifiedPartitionBackend};
+        let model = Arc::new(build_test_model(16, 32, 2, 64, 2));
+        let worker = Arc::new(WholeModelWorker::new(&model, false, false));
+        let workers: BTreeMap<String, Arc<dyn RowWorker>> =
+            [("w".into(), worker.clone() as Arc<dyn RowWorker>)]
+                .into_iter()
+                .collect();
+        let events = Events::default();
+        for mode in 0..6 {
+            let mut plans = all_remote_plans(&model);
+            if mode == 0 {
+                plans.remove(&(None, TensorKey::LmHead));
+            } else {
+                let stage = plans.get_mut(&(Some(0), TensorKey::Wq)).unwrap();
+                match mode {
+                    1 => stage.slices[0].row_start = 1,
+                    2 => stage.slices[0].row_end += 1,
+                    3 => stage.slices[0].owner = SliceOwner::Local,
+                    4 => stage.spot_rows.clear(),
+                    5 => stage.slices[0].duplicate_on = Some(SliceOwner::Remote("missing".into())),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                VerifiedPartitionBackend::new_strict(
+                    model.as_ref(),
+                    Hash256([77; 32]),
+                    plans,
+                    workers.clone(),
+                    &events
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(worker.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn strict_backend_refuses_worker_loss_mid_generation_without_partial_output() {
+        use crate::tensor_parallel::{RowEvent, VerifiedPartitionBackend};
+        let model = Arc::new(build_test_model(16, 32, 2, 64, 2));
+        let mut worker = WholeModelWorker::new(&model, false, false);
+        worker.fail_after = Some(20);
+        let worker = Arc::new(worker);
+        let workers: BTreeMap<String, Arc<dyn RowWorker>> =
+            [("w".into(), worker.clone() as Arc<dyn RowWorker>)]
+                .into_iter()
+                .collect();
+        let events = Events::default();
+        let backend = VerifiedPartitionBackend::new_strict(
+            model.as_ref(),
+            Hash256([77; 32]),
+            all_remote_plans(&model),
+            workers,
+            &events,
+        )
+        .unwrap();
+        assert!(
+            model
+                .try_generate_v2_with_backend(Hash256([5; 32]), &[3, 4], 2, &[99], &backend)
+                .is_err()
+        );
+        assert!(worker.calls.load(std::sync::atomic::Ordering::SeqCst) > 20);
+        assert!(
+            !events
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, RowEvent::Fallback { .. }))
+        );
+    }
+
     #[test]
     fn a_verified_partition_backend_keeps_the_output_exact_and_reports_every_fallback_and_fault() {
         use crate::tensor_parallel::{RowEvent, SliceOwner};
@@ -8571,4 +8581,196 @@ mod int16_tests {
             nonzero
         );
     }
+}
+
+// Shared arithmetic: resident and low-residency coordinators use these exact routines.
+pub(crate) fn preflight_generation_config(
+    config: &ModelConfig,
+    prompt_tokens: usize,
+    max_tokens: u32,
+) -> Result<GenerationPreflight, GenerationError> {
+    let generated_positions =
+        usize::try_from(max_tokens).map_err(|_| GenerationError::PositionCountOverflow {
+            prompt_tokens,
+            max_tokens,
+        })?;
+    let required_positions = GENERATION_INTERNAL_BOS_POSITIONS
+        .checked_add(prompt_tokens)
+        .and_then(|positions| positions.checked_add(generated_positions))
+        .ok_or(GenerationError::PositionCountOverflow {
+            prompt_tokens,
+            max_tokens,
+        })?;
+
+    if required_positions > config.max_seq {
+        return Err(GenerationError::ContextWindowExceeded {
+            prompt_tokens,
+            max_tokens,
+            required_positions,
+            max_seq: config.max_seq,
+        });
+    }
+
+    Ok(GenerationPreflight {
+        prompt_tokens,
+        max_tokens,
+        required_positions,
+        max_seq: config.max_seq,
+    })
+}
+pub(crate) fn forward_canonical_with_backend(
+    source: &impl crate::low_residency::CanonicalForwardSource,
+    token: u32,
+    cache: &mut KVCache,
+    call_id: Hash256,
+    backend: &impl crate::tensor_parallel::ProjectionBackend,
+) -> Result<Vec<i64>, crate::tensor_parallel::TensorParallelError> {
+    use crate::tensor_parallel::{TensorKey, TensorParallelError};
+    if source.canonical_execution_profile().is_none() {
+        return Err(TensorParallelError::WrongIdentity);
+    }
+    let cfg = source.config();
+    let d = cfg.d_model;
+    let pos = cache.seq_len;
+    if pos >= cfg.max_seq || token as usize >= cfg.vocab_size {
+        return Err(TensorParallelError::WrongShape);
+    }
+    let mut hidden = source.embedding(token)?;
+    if hidden.len() != d {
+        return Err(TensorParallelError::WrongShape);
+    }
+    for layer_idx in 0..cfg.n_layers {
+        let (attn_norm, ffn_norm) = source.norms(layer_idx)?;
+        let normed = layernorm(&hidden, attn_norm);
+        let mut qkv = backend.project_group(
+            call_id,
+            Some(layer_idx),
+            &[
+                (TensorKey::Wq, d),
+                (TensorKey::Wk, cfg.d_kv),
+                (TensorKey::Wv, cfg.d_kv),
+            ],
+            &normed,
+        )?;
+        if qkv.len() != 3 {
+            return Err(TensorParallelError::WrongShape);
+        }
+        let mut q = qkv.remove(0);
+        let mut k_buf = qkv.remove(0);
+        let v_buf = qkv.remove(0);
+        if q.len() != d || k_buf.len() != cfg.d_kv || v_buf.len() != cfg.d_kv {
+            return Err(TensorParallelError::WrongShape);
+        }
+        for h in 0..cfg.n_heads {
+            apply_rope(
+                &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
+                pos,
+                cfg.d_head,
+                &cfg.rope_cos,
+                &cfg.rope_sin,
+            );
+        }
+        for h in 0..cfg.n_kv_heads {
+            apply_rope(
+                &mut k_buf[h * cfg.d_head..(h + 1) * cfg.d_head],
+                pos,
+                cfg.d_head,
+                &cfg.rope_cos,
+                &cfg.rope_sin,
+            );
+        }
+        cache.push_k(layer_idx, &k_buf);
+        cache.push_v(layer_idx, &v_buf);
+        let full_seq = pos + 1;
+        let heads: Vec<Vec<i64>> = (0..cfg.n_heads)
+            .into_par_iter()
+            .map(|h| {
+                let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
+                flash_attention_i64(
+                    &q[h * cfg.d_head..(h + 1) * cfg.d_head],
+                    &cache.k_data[layer_idx],
+                    &cache.v_data[layer_idx],
+                    cfg.d_kv,
+                    kv_h,
+                    cfg.d_head,
+                    full_seq,
+                    cfg.attn_scale,
+                )
+            })
+            .collect();
+        let mut attn_out = vec![0; d];
+        for (h, value) in heads.iter().enumerate() {
+            attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(value);
+        }
+        let projected =
+            backend.project_rows(call_id, Some(layer_idx), TensorKey::Wo, &attn_out, d)?;
+        if projected.len() != d {
+            return Err(TensorParallelError::WrongShape);
+        }
+        for (out, projection) in hidden.iter_mut().zip(projected) {
+            *out += projection;
+        }
+        let normed_ff = layernorm(&hidden, ffn_norm);
+        let mut gate_up = backend.project_group(
+            call_id,
+            Some(layer_idx),
+            &[(TensorKey::WGate, cfg.d_ff), (TensorKey::WUp, cfg.d_ff)],
+            &normed_ff,
+        )?;
+        if gate_up.len() != 2 {
+            return Err(TensorParallelError::WrongShape);
+        }
+        let mut gate = gate_up.remove(0);
+        let up = gate_up.remove(0);
+        if gate.len() != cfg.d_ff || up.len() != cfg.d_ff {
+            return Err(TensorParallelError::WrongShape);
+        }
+        for (g, u) in gate.iter_mut().zip(up) {
+            *g = (silu_i64(*g) * u) >> FRAC_BITS;
+        }
+        let ff_out = backend.project_rows(call_id, Some(layer_idx), TensorKey::WDown, &gate, d)?;
+        if ff_out.len() != d {
+            return Err(TensorParallelError::WrongShape);
+        }
+        for (out, projection) in hidden.iter_mut().zip(ff_out) {
+            *out += projection;
+        }
+    }
+    cache.seq_len = pos + 1;
+    let normed = layernorm(&hidden, source.final_norm());
+    let logits = backend.project_rows(call_id, None, TensorKey::LmHead, &normed, cfg.vocab_size)?;
+    if logits.len() != cfg.vocab_size {
+        return Err(TensorParallelError::WrongShape);
+    }
+    Ok(logits)
+}
+pub(crate) fn generate_canonical_with_backend(
+    source: &impl crate::low_residency::CanonicalForwardSource,
+    request: Hash256,
+    prompt: &[u32],
+    max_tokens: u32,
+    eos_tokens: &[u32],
+    backend: &impl crate::tensor_parallel::ProjectionBackend,
+) -> Result<(Vec<u32>, Hash256), BackendGenerationError> {
+    let _admission = preflight_generation_config(source.config(), prompt.len(), max_tokens)?;
+    let forward = |token: u32, cache: &mut KVCache| {
+        let call_id = backend_call_id(&request, cache.seq_len);
+        forward_canonical_with_backend(source, token, cache, call_id, backend)
+    };
+    let mut cache = KVCache::new(source.config().n_layers);
+    let mut logits = forward(source.config().bos_token, &mut cache)?;
+    for &token in prompt {
+        logits = forward(token, &mut cache)?;
+    }
+    let mut generated = Vec::new();
+    for _ in 0..max_tokens {
+        let next = select_next_token_with_repetition_penalty(&mut logits, &generated);
+        generated.push(next);
+        if eos_tokens.contains(&next) {
+            break;
+        }
+        logits = forward(next, &mut cache)?;
+    }
+    let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
+    Ok((generated, arc_crypto::hash_bytes(&output_bytes)))
 }

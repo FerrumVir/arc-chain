@@ -26,11 +26,14 @@ use arc_assign::placement::{Participant, Policy, Stage};
 use arc_assign::reservation::{MAX_SLOTS_PER_WORKER, ReservationLedger};
 use arc_assign::verify::{Finding, VerificationRule, plan as verification_plan};
 use arc_crypto::Hash256;
-use arc_inference::cached_integer_model::{CachedIntegerModel, matmul_i8_canonical_rows};
+use arc_inference::cached_integer_model::{
+    BackendGenerationError, CachedIntegerModel, ModelConfig,
+};
+use arc_inference::low_residency::{CanonicalRowSource, LowResidencyModel};
 use arc_inference::tensor_parallel::{
     PlannedSlice, ProjectionPlan, RowAssignment, RowEvent, RowEventSink, RowProjectionRequest,
     RowWorker, SliceOwner, SshStdioConfig, SshStdioRowWorker, TensorKey, TensorParallelError,
-    VerifiedPartitionBackend, hash_i64, is_plain_absolute_path, model_projection_weights,
+    VerifiedPartitionBackend, hash_i64, is_plain_absolute_path,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -39,6 +42,51 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+
+/// The coordinator's residency policy is explicit and shared by execution,
+/// placement and verification. A low-residency model has no local generator.
+#[derive(Clone)]
+pub(crate) enum CoordinatorModel {
+    Resident(Arc<CachedIntegerModel>),
+    LowResidency(Arc<LowResidencyModel>),
+}
+impl CoordinatorModel {
+    pub(crate) fn source(&self) -> &dyn CanonicalRowSource {
+        match self {
+            Self::Resident(m) => m.as_ref(),
+            Self::LowResidency(m) => m.as_ref(),
+        }
+    }
+    pub(crate) fn config(&self) -> &ModelConfig {
+        self.source().config()
+    }
+    pub(crate) fn is_low_residency(&self) -> bool {
+        matches!(self, Self::LowResidency(_))
+    }
+    pub(crate) fn local_generate(&self, prompt: &[u32], max_tokens: u32, eos: &[u32]) -> Generated {
+        match self {
+            Self::Resident(m) => m.try_generate_v2(prompt, max_tokens, eos).map_err(|e| NativeInferenceError::Executor(e.to_string())),
+            Self::LowResidency(_) => Err(NativeInferenceError::Executor("low-residency execution requires complete verified remote coverage; local generation is unavailable".into())),
+        }
+    }
+    fn generate_with_backend(
+        &self,
+        request: Hash256,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos: &[u32],
+        backend: &impl arc_inference::tensor_parallel::ProjectionBackend,
+    ) -> Result<(Vec<u32>, Hash256), BackendGenerationError> {
+        match self {
+            Self::Resident(m) => {
+                m.try_generate_v2_with_backend(request, prompt, max_tokens, eos, backend)
+            }
+            Self::LowResidency(m) => {
+                m.try_generate_v2_with_backend(request, prompt, max_tokens, eos, backend)
+            }
+        }
+    }
+}
 
 /// Most machines one cohort lists.
 pub const MAX_COHORT_WORKERS: usize = 32;
@@ -128,6 +176,9 @@ pub struct RowWorkerEntry {
     /// its memory bounds its assignment instead of the model's total size.
     #[serde(default)]
     pub resident_layers: Vec<(u32, u32)>,
+    /// This ranged worker also holds the complete output head.
+    #[serde(default)]
+    pub resident_output: bool,
 }
 
 impl RowCohortConfig {
@@ -319,10 +370,10 @@ fn tensor_name(tensor: TensorKey) -> &'static str {
 /// Every projection the canonical forward dispatches, in forward order: the
 /// backend's keys and the placement's stages, index for index.
 pub fn projection_stages(
-    model: &CachedIntegerModel,
+    model: &dyn CanonicalRowSource,
 ) -> (Vec<(Option<usize>, TensorKey)>, Vec<Stage>) {
     let mut keys = Vec::new();
-    for layer in 0..model.layers.len() {
+    for layer in 0..model.config().n_layers {
         for tensor in [
             TensorKey::Wq,
             TensorKey::Wk,
@@ -339,13 +390,13 @@ pub fn projection_stages(
     let mut kept = Vec::with_capacity(keys.len());
     let mut stages = Vec::with_capacity(keys.len());
     for (layer, tensor) in keys {
-        if let Some(weights) = model_projection_weights(model, layer, tensor) {
+        if let Some((rows, cols)) = model.projection_shape(layer, tensor) {
             kept.push((layer, tensor));
             stages.push(Stage {
                 layer: layer.map(|l| l as u32),
                 tensor: tensor_name(tensor).into(),
-                rows: weights.n_rows as u64,
-                cols: weights.n_cols as u64,
+                rows: rows as u64,
+                cols: cols as u64,
             });
         }
     }
@@ -482,6 +533,8 @@ pub struct MachineView {
 /// Every count is bounded and is a growth gauge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CohortView {
+    pub low_residency: bool,
+    pub local_fallback_enabled: bool,
     pub machines: Vec<MachineView>,
     pub coordinator_macs_per_s: u64,
     pub epoch: u64,
@@ -496,7 +549,7 @@ pub struct CohortView {
 pub struct RowCohort {
     /// This cohort, for its background measurements.
     me: Weak<RowCohort>,
-    model: Arc<CachedIntegerModel>,
+    model: CoordinatorModel,
     artifact: Hash256,
     config: RowCohortConfig,
     machines: Vec<Machine>,
@@ -524,15 +577,16 @@ struct ChallengeMaterial {
 }
 
 fn challenge_material(
-    model: &CachedIntegerModel,
+    model: &dyn CanonicalRowSource,
     layer: usize,
     height: u64,
 ) -> Result<ChallengeMaterial, String> {
     let tensor = TensorKey::WGate;
-    let weights = model_projection_weights(model, Some(layer), tensor)
+    let (total_rows, cols) = model
+        .projection_shape(Some(layer), tensor)
         .ok_or("the model has no challenge layer")?;
-    let rows = CHALLENGE_ROWS.min(weights.n_rows);
-    let input: Vec<i64> = (0..weights.n_cols as u64)
+    let rows = CHALLENGE_ROWS.min(total_rows);
+    let input: Vec<i64> = (0..cols as u64)
         .map(|i| {
             let h = arc_crypto::hash_bytes(
                 &[
@@ -546,9 +600,9 @@ fn challenge_material(
             i64::from(u32::from_le_bytes([h.0[0], h.0[1], h.0[2], h.0[3]]) % (4 << 16)) - (2 << 16)
         })
         .collect();
-    let shard = weights.copy_rows(0, rows)?;
-    let mut expected = vec![0; rows];
-    matmul_i8_canonical_rows(&shard, &input, &mut expected)?;
+    let expected = model
+        .projection_rows(Some(layer), tensor, 0, rows, &input)
+        .map_err(|e| e.to_string())?;
     Ok(ChallengeMaterial {
         layer,
         tensor,
@@ -598,16 +652,20 @@ fn elapsed_us(elapsed: Duration) -> u64 {
 }
 
 /// This node's own rate on the challenge projection: the kernel alone, timed.
-fn local_rate(model: &CachedIntegerModel, height: u64) -> Result<u64, String> {
+fn local_rate(model: &dyn CanonicalRowSource, height: u64) -> Result<u64, String> {
     let material = challenge_material(model, 0, height)?;
-    let weights = model_projection_weights(model, Some(material.layer), material.tensor)
-        .ok_or("the model has no layer 0")?;
-    let shard = weights.copy_rows(0, material.rows)?;
-    let mut values = vec![0; shard.n_rows];
     let started = Instant::now();
-    matmul_i8_canonical_rows(&shard, &material.input, &mut values)?;
+    model
+        .projection_rows(
+            Some(material.layer),
+            material.tensor,
+            0,
+            material.rows,
+            &material.input,
+        )
+        .map_err(|e| e.to_string())?;
     let measured = ChallengeResult {
-        macs: (shard.n_rows * material.input.len()) as u64,
+        macs: (material.rows * material.input.len()) as u64,
         elapsed_us: elapsed_us(started.elapsed()),
         correct: true,
     };
@@ -617,7 +675,7 @@ fn local_rate(model: &CachedIntegerModel, height: u64) -> Result<u64, String> {
 /// A one-row call on a zero input, which must answer a zero row. Its time is
 /// the link's round trip for an input of that projection's width.
 fn zero_call(
-    model: &CachedIntegerModel,
+    model: &dyn CanonicalRowSource,
     artifact: Hash256,
     worker: &SshStdioRowWorker,
     worker_id: &str,
@@ -625,9 +683,10 @@ fn zero_call(
     tensor: TensorKey,
     seed: &[u8],
 ) -> Result<u64, String> {
-    let weights = model_projection_weights(model, Some(layer), tensor)
+    let (_, cols) = model
+        .projection_shape(Some(layer), tensor)
         .ok_or("the model has no probe layer")?;
-    let input = vec![0i64; weights.n_cols];
+    let input = vec![0i64; cols];
     let request = RowProjectionRequest {
         call_id: arc_crypto::hash_bytes(
             &[b"ARC-row-ping".as_slice(), seed, worker_id.as_bytes()].concat(),
@@ -730,7 +789,52 @@ impl RowCohort {
         artifact: Hash256,
         height: u64,
     ) -> Result<Arc<Self>, String> {
-        config.validate_for_model(model.layers.len())?;
+        Self::connect_model(
+            config,
+            validator,
+            CoordinatorModel::Resident(model),
+            artifact,
+            height,
+        )
+    }
+
+    pub(crate) fn connect_model(
+        config: RowCohortConfig,
+        validator: Hash256,
+        model: CoordinatorModel,
+        artifact: Hash256,
+        height: u64,
+    ) -> Result<Arc<Self>, String> {
+        if model.is_low_residency() && config.spot_rows_per_stage == 0 {
+            return Err(
+                "low-residency execution requires numerical spot checks on every stage".into(),
+            );
+        }
+        config.validate_for_model(model.config().n_layers)?;
+        if model.is_low_residency() {
+            // Declaration is not readiness: measured workers must still pass
+            // exact placement and per-call verification before execution.
+            for layer in 0..model.config().n_layers as u32 {
+                if !config.workers.iter().any(|w| {
+                    w.resident_layers.is_empty()
+                        || w.resident_layers
+                            .iter()
+                            .any(|&(start, end)| (start..end).contains(&layer))
+                }) {
+                    return Err(format!(
+                        "low-residency cohort has no declared coverage for layer {layer}"
+                    ));
+                }
+            }
+            if !config
+                .workers
+                .iter()
+                .any(|w| w.resident_layers.is_empty() || w.resident_output)
+            {
+                return Err("low-residency cohort has no declared output-head coverage".into());
+            }
+        }
+
         let machines: Vec<Machine> = config
             .workers
             .iter()
@@ -741,12 +845,16 @@ impl RowCohort {
                     digest: entry_digest(entry),
                     probe_layer: probe_layer_for_residency(
                         &entry.resident_layers,
-                        model.layers.len(),
+                        model.config().n_layers,
                     )?,
                 })
             })
             .collect::<Result<_, String>>()?;
-        let coordinator_macs_per_s = local_rate(&model, height)?;
+        let coordinator_macs_per_s = if model.is_low_residency() {
+            0
+        } else {
+            local_rate(model.source(), height)?
+        };
         let epoch = height / EPOCH_HEIGHTS;
         let cohort = Arc::new_cyclic(|me| Self {
             me: me.clone(),
@@ -808,7 +916,7 @@ impl RowCohort {
             SshStdioRowWorker::connect(entry.id.clone(), ssh).map_err(|error| error.to_string())?;
         let seed = [b"warm-up".as_slice(), &height.to_le_bytes()].concat();
         zero_call(
-            &self.model,
+            self.model.source(),
             self.artifact,
             &worker,
             &entry.id,
@@ -829,7 +937,7 @@ impl RowCohort {
         index: usize,
         material: Option<&ChallengeMaterial>,
     ) -> Measurement {
-        let (model, artifact) = (self.model.as_ref(), self.artifact);
+        let (model, artifact) = (self.model.source(), self.artifact);
         let entry = &self.machines[index].entry;
         let probe_layer = self.machines[index].probe_layer;
         let (worker, reconnected) = match self.open_worker(index, height) {
@@ -883,9 +991,9 @@ impl RowCohort {
         // already costs.
         if let (Some(rtt), Some(narrow), Some(wide)) = (
             rtt,
-            model_projection_weights(model, Some(probe_layer), TensorKey::Wq),
-            model_projection_weights(model, Some(probe_layer), TensorKey::WDown),
-        ) && wide.n_cols > narrow.n_cols
+            model.projection_shape(Some(probe_layer), TensorKey::Wq),
+            model.projection_shape(Some(probe_layer), TensorKey::WDown),
+        ) && wide.1 > narrow.1
         {
             let mut wide_calls = Vec::new();
             for call in 0..BULK_CALLS as u64 {
@@ -910,7 +1018,7 @@ impl RowCohort {
             if let Some(elapsed) = wide_calls.get(wide_calls.len() / 2) {
                 probes.push(Probe {
                     rtt_us: rtt,
-                    bytes: ((wide.n_cols - narrow.n_cols) * 8) as u64,
+                    bytes: ((wide.1 - narrow.1) * 8) as u64,
                     transfer_us: beyond_round_trip(*elapsed, Some(rtt)),
                     failed: false,
                 });
@@ -945,7 +1053,7 @@ impl RowCohort {
         height: u64,
         rtt: Option<u64>,
     ) -> Option<Result<u64, String>> {
-        let profile = match self.model.canonical_execution_profile() {
+        let profile = match self.model.source().canonical_execution_profile() {
             Some(profile) => profile,
             None => return Some(Err("the model has no canonical profile".to_string())),
         };
@@ -1012,7 +1120,7 @@ impl RowCohort {
                     let prepared = layers
                         .into_iter()
                         .map(|layer| {
-                            challenge_material(&cohort.model, layer, height)
+                            challenge_material(cohort.model.source(), layer, height)
                                 .map(|material| (layer, material))
                         })
                         .collect::<Result<BTreeMap<_, _>, _>>();
@@ -1187,6 +1295,7 @@ impl RowCohort {
                 ram_headroom_bytes: machine.entry.ram_headroom_bytes,
                 claimed_macs_per_s: None,
                 resident_layers: machine.entry.resident_layers.clone(),
+                resident_output: machine.entry.resident_output,
                 digest: machine.digest,
             })
             .collect()
@@ -1215,12 +1324,16 @@ impl RowCohort {
     ) -> Generated {
         let started = Instant::now();
         self.begin(now);
-        let model = self.model.as_ref();
+        let model = self.model.source();
         let local = |why: String| {
-            let result = model
-                .try_generate_v2(prompt, max_tokens, eos_tokens)
-                .map_err(|error| NativeInferenceError::Executor(error.to_string()));
-            (result, why)
+            if self.model.is_low_residency() {
+                let reason = format!("refused without local fallback: {why}");
+                return (Err(NativeInferenceError::Executor(reason.clone())), reason);
+            }
+            (
+                self.model.local_generate(prompt, max_tokens, eos_tokens),
+                why,
+            )
         };
         let (keys, stages) = projection_stages(model);
         let profile = model.canonical_execution_profile().unwrap_or_default();
@@ -1249,7 +1362,7 @@ impl RowCohort {
                 input_element_bytes: 8,
                 output_element_bytes: 8,
                 weight_bytes_per_element: 1,
-                include_coordinator: true,
+                include_coordinator: !self.model.is_low_residency(),
             };
             let rule = VerificationRule {
                 duplicate_per_mille: self.config.duplicate_per_mille,
@@ -1366,21 +1479,31 @@ impl RowCohort {
             skipped: AtomicU64::new(0),
             faults: AtomicU64::new(0),
         };
-        let model = self.model.as_ref();
-        let generated =
-            VerifiedPartitionBackend::new(model, self.artifact, plans, open.clone(), &sink)
-                .map_err(|error| error.to_string())
-                .and_then(|backend| {
-                    model
-                        .try_generate_v2_with_backend(
-                            certificate.request_id,
-                            prompt,
-                            max_tokens,
-                            eos_tokens,
-                            &backend,
-                        )
-                        .map_err(|error| error.to_string())
-                });
+        let backend = match &self.model {
+            CoordinatorModel::Resident(model) => {
+                VerifiedPartitionBackend::new(model, self.artifact, plans, open.clone(), &sink)
+            }
+            CoordinatorModel::LowResidency(model) => VerifiedPartitionBackend::new_strict(
+                model.as_ref(),
+                self.artifact,
+                plans,
+                open.clone(),
+                &sink,
+            ),
+        };
+        let generated = backend
+            .map_err(|error| error.to_string())
+            .and_then(|backend| {
+                self.model
+                    .generate_with_backend(
+                        certificate.request_id,
+                        prompt,
+                        max_tokens,
+                        eos_tokens,
+                        &backend,
+                    )
+                    .map_err(|error| error.to_string())
+            });
         record.answered = sink.answered.load(Ordering::Relaxed);
         record.fallbacks = sink.fallbacks.load(Ordering::Relaxed);
         record.skipped = sink.skipped.load(Ordering::Relaxed);
@@ -1420,6 +1543,8 @@ impl RowCohort {
             .collect();
         drop(workers);
         CohortView {
+            low_residency: self.model.is_low_residency(),
+            local_fallback_enabled: !self.model.is_low_residency(),
             machines,
             coordinator_macs_per_s: self.coordinator_macs_per_s,
             epoch: books.epoch,
@@ -1450,6 +1575,7 @@ struct CohortEvents<'a> {
 
 impl RowEventSink for CohortEvents<'_> {
     fn record(&self, event: RowEvent) {
+        let was_fallback = matches!(&event, RowEvent::Fallback { .. });
         match event {
             RowEvent::Answered { worker, .. } => {
                 self.answered.fetch_add(1, Ordering::Relaxed);
@@ -1460,8 +1586,10 @@ impl RowEventSink for CohortEvents<'_> {
             RowEvent::Skipped { .. } => {
                 self.skipped.fetch_add(1, Ordering::Relaxed);
             }
-            RowEvent::Fallback { worker, error, .. } => {
-                self.fallbacks.fetch_add(1, Ordering::Relaxed);
+            RowEvent::Fallback { worker, error, .. } | RowEvent::Refused { worker, error, .. } => {
+                if was_fallback {
+                    self.fallbacks.fetch_add(1, Ordering::Relaxed);
+                }
                 let Some(address) = self.cohort.address_of(&worker) else {
                     return;
                 };
@@ -1499,7 +1627,7 @@ impl RowEventSink for CohortEvents<'_> {
                         found_digest: found,
                     },
                 );
-                tracing::error!(machine = %worker, ?layer, ?tensor, "row machine returned wrong rows; recomputed here and excluded for the epoch");
+                tracing::error!(machine = %worker, ?layer, ?tensor, "row machine returned wrong rows and was excluded for the epoch");
             }
         }
     }
@@ -1528,6 +1656,7 @@ mod tests {
             startup_timeout_ms: 600_000,
             ram_headroom_bytes: 16 << 30,
             resident_layers: vec![],
+            resident_output: false,
             max_concurrency: 2,
         }
     }
@@ -1758,6 +1887,7 @@ mod tests {
             max_concurrency: 2,
             link: link(),
             resident_layers: vec![],
+            resident_output: false,
         };
         let policy = Policy {
             max_workers: 4,
@@ -1840,6 +1970,7 @@ mod tests {
             max_concurrency: 2,
             link: link(),
             resident_layers: vec![(0, 1)],
+            resident_output: false,
         };
         let policy = Policy {
             max_workers: 4,

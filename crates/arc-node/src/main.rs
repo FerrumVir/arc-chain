@@ -283,6 +283,13 @@ struct Cli {
     #[arg(long, value_name = "PATH", requires = "native_package_manifest")]
     native_row_workers: Option<PathBuf>,
 
+    /// Keep only canonical norms/RoPE and bounded verified GGUF rows locally.
+    /// Every primary projection requires a measured private row worker;
+    /// missing coverage, transport failure or failed verification refuses the
+    /// request. There is no full-model load or local generation fallback.
+    #[arg(long, default_value_t = false, requires_all = ["native_row_workers", "native_inference_runtime", "native_inference_qualification"])]
+    native_low_residency: bool,
+
     /// INTEGRATION TESTING ONLY: run the native worker with a deterministic
     /// executor that loads no model. Compiled in only with the
     /// `native-test-executor` cargo feature, so a default build cannot enable
@@ -7480,18 +7487,25 @@ async fn run_arc_node() -> Result<()> {
                     "real-model execution starting under an explicit reference-qualification \
                      record. That record is an operator decision, not proof of model quality."
                 );
-                let executor =
+                let loaded = if cli.native_low_residency {
+                    ni::CanonicalI8NativeExecutor::load_qualified_low_residency(
+                        artifact,
+                        qualification,
+                    )
+                } else {
                     ni::CanonicalI8NativeExecutor::load_qualified(artifact, qualification)
-                        .map(|executor| executor.with_kv_budget(cli.native_kv_budget_bytes))
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "native executor refused the artifact at {}: {e}. \
+                };
+                let executor = loaded
+                    .map(|executor| executor.with_kv_budget(cli.native_kv_budget_bytes))
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "native executor refused the artifact at {}: {e}. \
                                  Production execution stays gated on artifact hash, the exact \
                                  versioned profile/generation commitments, and reference \
                                  qualification.",
-                                artifact.display()
-                            )
-                        })?;
+                            artifact.display()
+                        )
+                    })?;
                 // A budget below the smallest job would refuse every request
                 // and never say why.
                 if executor.max_positions() < ni::MIN_NATIVE_KV_POSITIONS {

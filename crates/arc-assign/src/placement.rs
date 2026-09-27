@@ -38,6 +38,10 @@ pub struct Candidate {
     /// (embedding, output) belongs to full-model participants only.
     #[serde(default)]
     pub resident_layers: Vec<(u32, u32)>,
+    /// Explicit output-head rows on a ranged private worker. Does not imply
+    /// any other layerless tensor or a complete local model.
+    #[serde(default)]
+    pub resident_output: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,12 +181,12 @@ fn predict(
 
 /// Whether a participant holding `resident` layers can serve this stage.
 /// Empty residency is a full-model participant: it holds everything.
-fn holds_stage(resident: &[(u32, u32)], stage: &Stage) -> bool {
+fn holds_stage(resident: &[(u32, u32)], resident_output: bool, stage: &Stage) -> bool {
     if resident.is_empty() {
         return true;
     }
     match stage.layer {
-        None => false,
+        None => resident_output && stage.tensor == "lm_head",
         Some(layer) => resident.iter().any(|(s, e)| layer >= *s && layer < *e),
     }
 }
@@ -278,12 +282,12 @@ pub fn place(
         let mut rates: Vec<u64> = Vec::new();
         let mut links: Vec<Option<&LinkMeasurement>> = Vec::new();
         let mut caps: Vec<u128> = Vec::new(); // max share of ANY held stage, in ppm
-        let mut resident: Vec<&[(u32, u32)]> = Vec::new();
+        let mut resident: Vec<(&[(u32, u32)], bool)> = Vec::new();
         if policy.include_coordinator {
             rates.push(coordinator_macs_per_s);
             links.push(None);
             caps.push(1_000_000);
-            resident.push(&[]);
+            resident.push((&[], true));
         }
         for c in chosen {
             rates.push(c.macs_per_s);
@@ -293,7 +297,7 @@ pub fn place(
             // measured against.
             let held_bytes: u128 = stages
                 .iter()
-                .filter(|s| holds_stage(&c.resident_layers, s))
+                .filter(|s| holds_stage(&c.resident_layers, c.resident_output, s))
                 .map(|s| s.rows as u128 * s.cols as u128 * policy.weight_bytes_per_element as u128)
                 .sum();
             // The same fraction cap on every held stage bounds total
@@ -303,7 +307,7 @@ pub fn place(
                 .checked_div(held_bytes)
                 .map_or(1_000_000, |share| share.min(1_000_000));
             caps.push(cap);
-            resident.push(&c.resident_layers);
+            resident.push((&c.resident_layers, c.resident_output));
         }
         // Each stage is shared out among the participants resident for it,
         // so nobody is ever handed rows it does not hold. A set that cannot
@@ -311,7 +315,10 @@ pub fn place(
         let mut rows_per_stage: Vec<Vec<u64>> = Vec::with_capacity(stages.len());
         let mut coverable = true;
         for stage in stages {
-            let eligible: Vec<bool> = resident.iter().map(|r| holds_stage(r, stage)).collect();
+            let eligible: Vec<bool> = resident
+                .iter()
+                .map(|(r, output)| holds_stage(r, *output, stage))
+                .collect();
             let weights = capped_weights(&rates, &caps, &eligible);
             let placed: u128 = weights.iter().sum();
             if placed + (weights.len() as u128) < 1_000_000 {

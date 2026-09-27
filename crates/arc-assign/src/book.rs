@@ -449,6 +449,7 @@ pub struct Offer {
     pub claimed_macs_per_s: Option<u64>,
     /// Layers the worker holds, from its signed lease. Empty: the whole model.
     pub resident_layers: Vec<(u32, u32)>,
+    pub resident_output: bool,
     /// The digest a certificate binds for this offer.
     pub digest: Hash256,
 }
@@ -461,6 +462,7 @@ impl Offer {
             ram_headroom_bytes: lease.body.ram_headroom_bytes,
             claimed_macs_per_s: Some(lease.body.claimed_macs_per_s),
             resident_layers: lease.body.resident_layers.clone(),
+            resident_output: false,
             digest: lease.digest(),
         }
     }
@@ -510,6 +512,7 @@ pub fn candidates_from(
             max_concurrency: slots,
             link,
             resident_layers: offer.resident_layers,
+            resident_output: offer.resident_output,
         });
         digests.push(offer.digest);
     }

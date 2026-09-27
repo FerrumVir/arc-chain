@@ -177,6 +177,7 @@ fn candidate(i: u8, rate: u64, link: LinkMeasurement) -> Candidate {
         max_concurrency: 4,
         link,
         resident_layers: vec![],
+        resident_output: false,
     }
 }
 
@@ -643,4 +644,40 @@ fn the_queue_is_fair_bounded_and_honours_deadlines_and_cancellation() {
     assert_eq!(q.cancel(&hash_bytes(&[b'r', 1])), 1);
     assert_eq!(q.next(10), Next::Idle);
     assert!(q.is_empty());
+}
+
+#[test]
+fn ranged_workers_need_explicit_output_head_coverage_without_a_coordinator() {
+    let mut stages = stages();
+    stages.push(Stage {
+        layer: None,
+        tensor: "lm_head".into(),
+        rows: 32000,
+        cols: 4096,
+    });
+    let fast = link(50, 10_000_000_000);
+    let lower = sharded(1, 8_000_000_000, fast, &[(0, 2)]);
+    let mut upper = sharded(2, 8_000_000_000, fast, &[(2, 4)]);
+    let mut p = policy();
+    p.include_coordinator = false;
+    assert_eq!(
+        place(&stages, 0, &[lower.clone(), upper.clone()], &p),
+        Err(PlacementError::Infeasible)
+    );
+    upper.resident_output = true;
+    let placed = place(&stages, 0, &[lower.clone(), upper.clone()], &p).unwrap();
+    assert!(covers_exactly(&placed, &stages));
+    let output = placed.stages.last().unwrap();
+    assert!(
+        output
+            .slices
+            .iter()
+            .all(|s| s.participant == Participant::Worker(upper.worker))
+    );
+    // The explicit output capability cannot invent embedding residency.
+    stages.last_mut().unwrap().tensor = "embedding".into();
+    assert_eq!(
+        place(&stages, 0, &[lower, upper], &p),
+        Err(PlacementError::Infeasible)
+    );
 }

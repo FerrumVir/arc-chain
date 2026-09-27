@@ -537,6 +537,7 @@ fn an_operator_offer_uses_its_measured_rate_and_needs_every_other_input() {
         ram_headroom_bytes: 16 << 30,
         claimed_macs_per_s: None,
         resident_layers: vec![],
+        resident_output: false,
         digest: hash_bytes(b"rack-1 config entry"),
     };
     let mut challenges = ChallengeBook::new(3);
