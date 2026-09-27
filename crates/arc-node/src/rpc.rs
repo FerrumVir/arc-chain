@@ -15764,6 +15764,21 @@ pub async fn community_submit_work(
     AxumState(node): AxumState<NodeState>,
     Json(result): Json<WorkResult>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // A worker may submit during the coordinator's late-result grace period,
+    // after its `/inference/run` dispatch permit has been released. Verification
+    // below performs a fresh quorum inference, so it must own its own admission
+    // lease through verification and settlement. Reject before reserving the
+    // submission while an updater has closed compute admission; the worker can
+    // retry once the node resumes.
+    let _worker_execution_permit = node
+        .native_request_admission
+        .worker_execution_gate()
+        .try_enter()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker is quiescing for update".to_string(),
+        ))?;
+
     // ── Validate required fields ────────────────────────────────────────
     if result.job_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "job_id is required".to_string()));
@@ -20801,6 +20816,47 @@ mod tests {
             sum_total_ms_success: 0,
             last_total_ms: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn community_submit_work_is_rejected_while_worker_compute_is_quiesced() {
+        let node = fake_node_with_workers(Vec::new());
+        let drained = node
+            .native_request_admission
+            .worker_execution_gate()
+            .quiesce(
+                [7; 32],
+                std::time::Duration::from_secs(1),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(
+            drained,
+            crate::native_inference::WorkerQuiescenceResult::Quiesced { active_jobs: 0 }
+        );
+
+        let error = community_submit_work(
+            AxumState(node),
+            Json(WorkResult {
+                job_id: String::new(),
+                worker_id: String::new(),
+                success: false,
+                declined: false,
+                output: String::new(),
+                output_hash: String::new(),
+                tokens_generated: 0,
+                total_ms: 0,
+                ms_per_token: 0,
+                engine: String::new(),
+                error: None,
+                signed_attestation_hex: None,
+            }),
+        )
+        .await
+        .expect_err("submit work must not enter verification during worker drain");
+
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.1, "worker is quiescing for update");
     }
 
     fn assert_exact_reward_receipt_fields(value: &Value, expected: &[&str]) {
