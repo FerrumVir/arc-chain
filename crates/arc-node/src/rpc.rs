@@ -419,6 +419,7 @@ pub struct NodeState {
     pub tier: StakeTier,
     pub boot_time: Instant,
     pub peer_count: Arc<AtomicU32>,
+    pub transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
     /// Faucet rate limiter: address → last claim time.
     /// DashMap so faucet handler never blocks the tokio runtime under load.
     pub faucet_claims: Arc<dashmap::DashMap<[u8; 32], Instant>>,
@@ -1438,6 +1439,7 @@ pub fn build_node_state(
         tier,
         boot_time,
         peer_count,
+        transport_wire_policy: Arc::new(arc_net::transport::TransportWirePolicy::default()),
         faucet_claims: Arc::new(dashmap::DashMap::new()),
         faucet_claims_total: Arc::new(AtomicU32::new(0)),
         faucet_pending: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1934,6 +1936,7 @@ pub async fn serve(
     // When present, stop accepting new RPC work after the lifecycle owner
     // sends `true` and let Axum drain every active handler before returning.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
 ) -> anyhow::Result<()> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
         anyhow::bail!(
@@ -1954,6 +1957,7 @@ pub async fn serve(
         model_artifact_id,
     );
     node.runtime_shutdown = shutdown.clone();
+    node.transport_wire_policy = transport_wire_policy;
     node.chain_identity = chain_identity;
     node.community_rewards_v1_enabled = community_rewards_v1_enabled;
     node.native_serving = native_serving;
@@ -2570,6 +2574,13 @@ struct HealthResponse {
     version: String,
     height: u64,
     peers: u32,
+    /// Explicit compatibility restriction, independent of block liveness.
+    legacy_v3_wire: bool,
+    /// Whether this transport can send history/checkpoint/certificate/native
+    /// extensions. This is a capability, never a quorum-finality claim.
+    extended_consensus_wire_enabled: bool,
+    /// Intentionally suppressed send requests; these were not delivered.
+    wire_messages_suppressed: u64,
     uptime_secs: u64,
     dag_round: u64,
     dag_committed: u64,
@@ -2676,6 +2687,9 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         height: node.state.height(),
         peers: node.peer_count.load(Ordering::Relaxed),
+        legacy_v3_wire: node.transport_wire_policy.legacy_v3(),
+        extended_consensus_wire_enabled: !node.transport_wire_policy.legacy_v3(),
+        wire_messages_suppressed: node.transport_wire_policy.suppressed_messages(),
         uptime_secs: node.boot_time.elapsed().as_secs(),
         dag_round: node.dag_round.load(Ordering::Relaxed),
         dag_committed: node.dag_committed.load(Ordering::Relaxed),
@@ -20606,6 +20620,7 @@ mod tests {
             tier: StakeTier::Spark,
             boot_time: Instant::now(),
             peer_count: Arc::new(AtomicU32::new(0)),
+            transport_wire_policy: Arc::new(arc_net::transport::TransportWirePolicy::default()),
             faucet_claims: Arc::new(dashmap::DashMap::new()),
             faucet_claims_total: Arc::new(AtomicU32::new(0)),
             faucet_pending: Arc::new(tokio::sync::Mutex::new(None)),
@@ -26154,6 +26169,21 @@ mod tests {
             get_latest_block(AxumState(empty)).await,
             Err(StatusCode::NOT_FOUND)
         ));
+    }
+
+    #[tokio::test]
+    async fn legacy_v3_wire_health_exposes_restricted_transport() {
+        let mut node = fake_node_with_workers(Vec::new());
+        node.transport_wire_policy = Arc::new(arc_net::transport::TransportWirePolicy::new(true));
+        let response = serde_json::to_value(health(AxumState(node)).await.0).unwrap();
+        assert_eq!(response["legacy_v3_wire"], true);
+        assert_eq!(response["extended_consensus_wire_enabled"], false);
+        assert_eq!(response["wire_messages_suppressed"], 0);
+
+        let normal = fake_node_with_workers(Vec::new());
+        let response = serde_json::to_value(health(AxumState(normal)).await.0).unwrap();
+        assert_eq!(response["legacy_v3_wire"], false);
+        assert_eq!(response["extended_consensus_wire_enabled"], true);
     }
 
     /// Both directions of the status mapping, including the one a stake-0

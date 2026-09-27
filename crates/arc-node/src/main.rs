@@ -113,6 +113,18 @@ struct Cli {
     #[arg(long)]
     seeds_file: Option<String>,
 
+    /// TEMPORARY: restrict outgoing validator frames to original protocol-3
+    /// types 0x01..0x12 during an existing v3 fleet upgrade. Disables network
+    /// history/checkpoint transfer and absence/finality/native vote gossip.
+    /// Remove on every validator after the fleet upgrade, before native
+    /// activation. Authentication, proposal gates, and durable state stay intact.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["native_inference_activation", "native_inference_runtime", "recovery_checkpoint"]
+    )]
+    legacy_v3_wire: bool,
+
     /// HTTPS origin for a seed/community RPC service. Repeat once per seed
     /// (or provide a comma-separated ARC_COMMUNITY_RPC_URLS value). These
     /// URLs drive worker registration/claims/results and 5-of-6 reward
@@ -5678,6 +5690,18 @@ fn validate_full_integer_worker_role(
     Ok(())
 }
 
+fn validate_legacy_v3_wire_state(
+    protocol_major: u16,
+    has_native_context: bool,
+    has_native_migration: bool,
+) -> Result<()> {
+    ensure!(
+        protocol_major == 3 && !has_native_context && !has_native_migration,
+        "--legacy-v3-wire requires existing protocol-3 state without native activation or migration; remove compatibility mode across the upgraded fleet before native activation"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "benchmark-tools")]
 fn benchmark_mode_enabled(cli: &Cli) -> bool {
     cli.benchmark
@@ -6322,6 +6346,9 @@ async fn run_arc_node() -> Result<()> {
         .init();
 
     let mut cli = Cli::parse();
+    let transport_wire_policy = Arc::new(arc_net::transport::TransportWirePolicy::new(
+        cli.legacy_v3_wire,
+    ));
 
     // The legacy peer snapshot protocol is not quorum-authenticated and is
     // intentionally retired. Reject it before community model discovery,
@@ -7133,6 +7160,16 @@ async fn run_arc_node() -> Result<()> {
             recovery_import,
         )
         .context("failed to initialize genesis/recovery-bound persistent state")?;
+        // Check recovered state before activation, archive changes, or any
+        // new canonical operation. A migrated native chain still reports v3,
+        // so the native binding and migration record must also be absent.
+        if cli.legacy_v3_wire {
+            validate_legacy_v3_wire_state(
+                db.active_protocol_version().major,
+                db.try_native_inference_context()?.is_some(),
+                db.native_migration().is_some(),
+            )?;
+        }
         // The process-lifetime inner lock now protects the open WAL. Release
         // the stable sibling startup guard only after replay/import and every
         // namespace-dependent state decision has completed successfully.
@@ -8116,6 +8153,7 @@ async fn run_arc_node() -> Result<()> {
             data_dir.clone(),
             startup_tx,
             transport_shutdown,
+            transport_wire_policy.clone(),
         ));
         let bound_addr =
             match tokio::time::timeout(std::time::Duration::from_secs(15), startup_rx).await {
@@ -9302,6 +9340,7 @@ async fn run_arc_node() -> Result<()> {
         cli.enable_community_rewards_v1,
         native_serving,
         Some(shutdown_rx),
+        transport_wire_policy,
     )
     .await;
 
@@ -9397,6 +9436,52 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn legacy_v3_wire_is_explicit_and_conflicts_with_native_activation() {
+        assert!(!Cli::try_parse_from(["arc-node"]).unwrap().legacy_v3_wire);
+        assert!(
+            Cli::try_parse_from(["arc-node", "--legacy-v3-wire"])
+                .unwrap()
+                .legacy_v3_wire
+        );
+        for option in ["--native-inference-activation", "--recovery-checkpoint"] {
+            let error = Cli::try_parse_from([
+                "arc-node",
+                "--legacy-v3-wire",
+                option,
+                "/not-opened/config.json",
+            ])
+            .err()
+            .expect("legacy wire mode must reject activation/import before opening a file");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "--legacy-v3-wire",
+                "--native-inference-runtime",
+                "--native-inference-activation",
+                "/not-opened/config.json",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_v3_wire_refuses_native_or_non_v3_recovered_state() {
+        validate_legacy_v3_wire_state(3, false, false).unwrap();
+        for (major, native, migration) in [
+            (0, false, false),
+            (2, false, false),
+            (4, false, false),
+            (3, true, false),
+            (3, true, true),
+            (3, false, true),
+        ] {
+            assert!(validate_legacy_v3_wire_state(major, native, migration).is_err());
+        }
+    }
 
     /// The migration-record tool must not be usable without the two inputs
     /// that make its output meaningful: the activation config it derives the
@@ -10181,6 +10266,7 @@ mod tests {
                     false,
                     None,
                     Some(coordinator_shutdown_rx),
+                    Arc::new(arc_net::transport::TransportWirePolicy::default()),
                 )
                 .await
                 .unwrap();

@@ -46,6 +46,48 @@ const PEER_BYTE_RATE_LIMIT: u64 = 64 * 1024 * 1024;
 /// Rate limit window in seconds.
 const RATE_LIMIT_WINDOW_SECS: u64 = 1;
 
+/// Explicit, temporary outbound compatibility for the original protocol-3
+/// fleet, whose authenticated handshake has no message-capability field.
+/// This changes no authentication, membership, or consensus decision.
+#[derive(Default)]
+pub struct TransportWirePolicy {
+    legacy_v3: bool,
+    suppressed_messages: AtomicU64,
+}
+
+impl TransportWirePolicy {
+    pub fn new(legacy_v3: bool) -> Self {
+        Self {
+            legacy_v3,
+            suppressed_messages: AtomicU64::new(0),
+        }
+    }
+
+    pub fn legacy_v3(&self) -> bool {
+        self.legacy_v3
+    }
+
+    /// Suppressed send requests, not delivered messages or peer failures.
+    pub fn suppressed_messages(&self) -> u64 {
+        self.suppressed_messages.load(Ordering::Relaxed)
+    }
+
+    fn permits(&self, message: MessageType) -> bool {
+        // The deployed legacy parser accepts exactly 0x01..=0x12. Keep
+        // future extensions closed too; do not infer support from v3 alone.
+        if self.legacy_v3 && message as u8 > 0x12 {
+            self.suppressed_messages.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                ?message,
+                "Suppressed outbound frame by explicit legacy-v3 wire policy"
+            );
+            false
+        } else {
+            true
+        }
+    }
+}
+
 // ─── Channel Types ──────────────────────────────────────────────────────────
 
 /// Messages the transport sends TO consensus.
@@ -839,16 +881,22 @@ struct PeerConnections<S = quinn::SendStream> {
     next_connection_id: AtomicU64,
     inbound_tx: mpsc::Sender<InboundMessage>,
     peer_count: Arc<AtomicU32>,
+    wire_policy: Arc<TransportWirePolicy>,
 }
 
 impl<S> PeerConnections<S> {
-    fn new(inbound_tx: mpsc::Sender<InboundMessage>, peer_count: Arc<AtomicU32>) -> Self {
+    fn new(
+        inbound_tx: mpsc::Sender<InboundMessage>,
+        peer_count: Arc<AtomicU32>,
+        wire_policy: Arc<TransportWirePolicy>,
+    ) -> Self {
         Self {
             peers: DashMap::new(),
             // Zero is reserved as "no generation" in diagnostics/tests.
             next_connection_id: AtomicU64::new(1),
             inbound_tx,
             peer_count,
+            wire_policy,
         }
     }
 
@@ -947,7 +995,7 @@ impl<S> PeerConnections<S> {
     }
 }
 
-impl PeerConnections<quinn::SendStream> {
+impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
     async fn remove_and_notify(&self, address: Hash256, connection_id: u64) -> bool {
         if !self.remove_if_current(&address.0, connection_id) {
             return false;
@@ -963,6 +1011,9 @@ impl PeerConnections<quinn::SendStream> {
     }
 
     async fn broadcast(&self, msg_type: MessageType, payload: &[u8]) {
+        if !self.wire_policy.permits(msg_type) {
+            return;
+        }
         if payload.len() > MAX_PAYLOAD_SIZE as usize {
             error!(
                 ?msg_type,
@@ -1026,6 +1077,9 @@ impl PeerConnections<quinn::SendStream> {
 
     /// Send a message to a specific peer by validator address.
     async fn send_to(&self, target: &Hash256, msg_type: MessageType, payload: &[u8]) {
+        if !self.wire_policy.permits(msg_type) {
+            return;
+        }
         if payload.len() > MAX_PAYLOAD_SIZE as usize {
             error!(
                 ?msg_type,
@@ -1096,6 +1150,7 @@ pub async fn run_transport(
         data_dir,
         None,
         None,
+        Arc::new(TransportWirePolicy::default()),
     )
     .await;
 }
@@ -1133,6 +1188,7 @@ pub async fn run_transport_with_readiness(
         data_dir,
         Some(startup),
         None,
+        Arc::new(TransportWirePolicy::default()),
     )
     .await;
 }
@@ -1157,6 +1213,7 @@ pub async fn run_transport_with_readiness_and_shutdown(
     data_dir: String,
     startup: tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    wire_policy: Arc<TransportWirePolicy>,
 ) {
     run_transport_inner(
         listen_addr,
@@ -1172,6 +1229,7 @@ pub async fn run_transport_with_readiness_and_shutdown(
         data_dir,
         Some(startup),
         Some(shutdown),
+        wire_policy,
     )
     .await;
 }
@@ -1217,6 +1275,7 @@ async fn run_transport_inner(
     data_dir: String,
     mut startup: Option<tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    wire_policy: Arc<TransportWirePolicy>,
 ) {
     if allowed_validators.is_empty() || !allowed_validators.contains(&local_address.0) {
         let message = format!(
@@ -1364,7 +1423,16 @@ async fn run_transport_inner(
         let _ = sender.send(Ok(listen_addr));
     }
 
-    let connections = Arc::new(PeerConnections::new(inbound_tx.clone(), peer_count.clone()));
+    if wire_policy.legacy_v3() {
+        warn!(
+            "Legacy-v3 wire mode: outbound history, checkpoint, absence, finality, and native-vote frames are suppressed; authenticated live DAG gossip remains enabled"
+        );
+    }
+    let connections = Arc::new(PeerConnections::new(
+        inbound_tx.clone(),
+        peer_count.clone(),
+        wire_policy,
+    ));
     let rate_limiter = Arc::new(PeerRateLimiter::new());
     let keypair = Arc::new(local_keypair);
     let local_identity = LocalPeerIdentity {
@@ -3137,6 +3205,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_v3_wire_filters_extensions_without_closing_streams() {
+        // Exercise the real broadcast and directed-send paths over a framed
+        // stream. A surviving legacy marker proves no extension leaked or
+        // broke the connection; default mode must still deliver extensions.
+        for legacy in [true, false] {
+            let policy = Arc::new(TransportWirePolicy::new(legacy));
+            let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+            let peer_count = Arc::new(AtomicU32::new(0));
+            let connections = PeerConnections::new(inbound_tx, peer_count.clone(), policy.clone());
+            let peer = Hash256([8; 32]);
+            let (send, mut receive) = tokio::io::duplex(4096);
+            let (generation, _) = connections
+                .install_directed(
+                    peer.0,
+                    [7; 32],
+                    send,
+                    "127.0.0.1:9945".parse().unwrap(),
+                    1,
+                    true,
+                )
+                .unwrap();
+            let mut expected = Vec::new();
+            let mut suppressed = 0;
+            for byte in 1..=u8::MAX {
+                let Some(kind) = MessageType::from_u8(byte) else {
+                    continue;
+                };
+                connections.broadcast(kind, &[byte, 1]).await;
+                connections.send_to(&peer, kind, &[byte, 2]).await;
+                if legacy && byte > 0x12 {
+                    suppressed += 2;
+                } else {
+                    expected.push((kind, vec![byte, 1]));
+                    expected.push((kind, vec![byte, 2]));
+                }
+            }
+            connections
+                .send_to(&peer, MessageType::Heartbeat, b"still-connected")
+                .await;
+            expected.push((MessageType::Heartbeat, b"still-connected".to_vec()));
+            assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+            assert_eq!(policy.suppressed_messages(), suppressed);
+            assert!(connections.remove_if_current(&peer.0, generation));
+            for (kind, payload) in expected {
+                let (received_kind, received_payload) = read_message(&mut receive).await.unwrap();
+                assert_eq!(received_kind, kind);
+                assert_eq!(received_payload, payload);
+                if legacy {
+                    assert!(
+                        (received_kind as u8) <= 0x12,
+                        "legacy parser would disconnect"
+                    );
+                }
+            }
+            assert_eq!(
+                read_message(&mut receive).await.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn both_quic_endpoints_derive_the_same_exporter_binding() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server_key = KeyPair::generate_ed25519();
@@ -3271,6 +3401,7 @@ mod tests {
             std::env::temp_dir().to_string_lossy().into_owned(),
             startup_tx,
             shutdown_rx,
+            Arc::new(TransportWirePolicy::default()),
         ));
 
         tokio::time::timeout(std::time::Duration::from_secs(2), startup_rx)
@@ -3358,7 +3489,11 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel(8);
         let peer_count = Arc::new(AtomicU32::new(0));
         (
-            PeerConnections::new(inbound_tx, peer_count.clone()),
+            PeerConnections::new(
+                inbound_tx,
+                peer_count.clone(),
+                Arc::new(TransportWirePolicy::default()),
+            ),
             peer_count,
         )
     }
