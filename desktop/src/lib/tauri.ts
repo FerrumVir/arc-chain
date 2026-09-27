@@ -4,6 +4,7 @@
 
 import type {
   AccountBalance,
+  AutoUpdatePrepareResult,
   Attestation,
   BinaryStatus,
   BlockTxs,
@@ -2942,6 +2943,8 @@ export const api = {
   startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
   stopNode: () => invoke<void>("stop_node"),
   prepareUpdateRelaunch: () => invoke<void>("prepare_update_relaunch"),
+  tryPrepareAutoUpdateRelaunch: () =>
+    invoke<AutoUpdatePrepareResult>("try_prepare_auto_update_relaunch"),
   beginUpdateHandoff: () => invoke<void>("begin_update_handoff"),
   abortUpdateRelaunch: () => invoke<void>("abort_update_relaunch"),
   restartNode: () => invoke<void>("restart_node"),

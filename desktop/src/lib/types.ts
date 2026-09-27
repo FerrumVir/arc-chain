@@ -149,7 +149,10 @@ export interface NodeConfig {
   rpcPort: number;
   p2pPort: number;
   autoStart: boolean;
+  /** Automatically check signed app releases. */
   autoUpdate: boolean;
+  /** Install signed app releases unattended, after native worker quiescence. */
+  autoInstallUpdates: boolean;
   dataDir: string;
   /** Cores the node may use. null = every logical core. */
   workerThreads: number | null;
@@ -168,6 +171,7 @@ export const DEFAULT_NODE_CONFIG: NodeConfig = {
   p2pPort: 9091,
   autoStart: true,
   autoUpdate: true,
+  autoInstallUpdates: false,
   dataDir: "~/.arc/data-v3",
   workerThreads: null,
 };
@@ -709,6 +713,11 @@ export interface UpdateInstallPolicy {
   channel: "appimage" | "native" | "package-manager";
   instructions: string;
 }
+
+/** Atomic native admission-drain result for an unattended app update. */
+export type AutoUpdatePrepareResult =
+  | { status: "prepared" }
+  | { status: "busy"; reason: string; activeJobs: number };
 
 /** The exact ARC-compatible model the desktop can auto-download. */
 export interface ModelTierInfo {

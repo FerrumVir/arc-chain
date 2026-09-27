@@ -104,16 +104,21 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // `autoUpdate` used to be persisted but never read. Wait for the native
-  // store to hydrate so a stale localStorage value cannot start a check that
-  // the persisted setting disabled, then let the singleton scheduler own one
-  // startup timer and one daily interval for the whole app.
+  // Wait for the native store to hydrate so stale localStorage preferences
+  // cannot start checks or unattended installs that persisted config disabled.
+  // The singleton scheduler owns one startup timer and one daily interval.
   useEffect(() => {
-    appUpdater.setAutoChecksEnabled(
-      configHydrated && config?.autoUpdate === true,
+    const autoChecksEnabled =
+      configHydrated && config?.autoUpdate === true;
+    appUpdater.setAutoChecksEnabled(autoChecksEnabled);
+    appUpdater.setAutoInstallEnabled(
+      autoChecksEnabled && config?.autoInstallUpdates === true,
     );
-    return () => appUpdater.setAutoChecksEnabled(false);
-  }, [configHydrated, config?.autoUpdate]);
+    return () => {
+      appUpdater.setAutoInstallEnabled(false);
+      appUpdater.setAutoChecksEnabled(false);
+    };
+  }, [configHydrated, config?.autoUpdate, config?.autoInstallUpdates]);
 
   if (isBlockedProductionBrowser) {
     return <ProductionBrowserBlocker />;

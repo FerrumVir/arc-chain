@@ -123,6 +123,307 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
+  test("automatic checks remain check-only unless installs are separately opted in", async () => {
+    const timers = new FakeTimers();
+    let checks = 0;
+    let downloads = 0;
+    let installs = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checks += 1;
+          return {
+            version: "0.8.1",
+            download: async () => {
+              downloads += 1;
+            },
+            install: async () => {
+              installs += 1;
+            },
+          };
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 1_000 },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    await timers.advanceBy(10);
+
+    expect(checks).toBe(1);
+    expect(downloads).toBe(0);
+    expect(installs).toBe(0);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      version: "0.8.1",
+      canInstall: true,
+    });
+    controller.dispose();
+  });
+
+  test("auto install waits for native worker quiescence and retries a busy candidate", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    let prepareAttempts = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.1",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          order.push("try-prepare");
+          prepareAttempts += 1;
+          return prepareAttempts === 1
+            ? { status: "busy", reason: "inference active", activeJobs: 1 }
+            : { status: "prepared" };
+        },
+        prepareRelaunch: async () => {
+          order.push("manual-prepare");
+        },
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {
+          order.push("abort");
+        },
+        relaunch: async () => {
+          order.push("relaunch");
+        },
+      },
+      {
+        startupDelayMs: 10,
+        intervalMs: 1_000,
+        retryDelaysMs: [20],
+      },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    expect(order).toEqual(["download", "try-prepare"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      canInstall: true,
+      restartRequired: false,
+    });
+    expect(controller.getSnapshot().message).toContain("inference active");
+
+    await timers.advanceBy(20);
+    expect(order).toEqual([
+      "download",
+      "try-prepare",
+      "try-prepare",
+      "handoff",
+      "install",
+      "relaunch",
+    ]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "ready",
+      restartRequired: true,
+    });
+    controller.dispose();
+  });
+
+  test("turning auto install off during download prevents native preparation", async () => {
+    const timers = new FakeTimers();
+    const download = deferred<void>();
+    let prepareAttempts = 0;
+    let installCalls = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.1",
+          download: () => download.promise,
+          install: async () => {
+            installCalls += 1;
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          prepareAttempts += 1;
+          return { status: "prepared" };
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 1_000 },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    controller.setAutoInstallEnabled(false);
+    download.resolve();
+    await timers.advanceBy(0);
+
+    expect(prepareAttempts).toBe(0);
+    expect(installCalls).toBe(0);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      canInstall: true,
+      restartRequired: false,
+    });
+    expect(controller.getSnapshot().message).toContain("turned off");
+    controller.dispose();
+  });
+
+  test("turning auto install off during native drain aborts before handoff", async () => {
+    const timers = new FakeTimers();
+    const prepare = deferred<{ status: "prepared" }>();
+    const order: string[] = [];
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.1",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: () => {
+          order.push("try-prepare");
+          return prepare.promise;
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {
+          order.push("abort");
+        },
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 1_000 },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    expect(order).toEqual(["download", "try-prepare"]);
+    controller.setAutoInstallEnabled(false);
+    prepare.resolve({ status: "prepared" });
+    await timers.advanceBy(0);
+
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      canInstall: true,
+      restartRequired: false,
+    });
+    expect(controller.getSnapshot().message).toContain("turned off");
+    controller.dispose();
+  });
+
+  test("missing native auto safety support never falls back to manual preparation", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.1",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        prepareRelaunch: async () => {
+          order.push("manual-prepare");
+        },
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 1_000 },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+
+    expect(order).toEqual([]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      canInstall: true,
+      restartRequired: false,
+    });
+    expect(controller.getSnapshot().message).toContain(
+      "requires the native worker safety check",
+    );
+    controller.dispose();
+  });
+
+  test("native auto safety command errors abort pre-handoff and fail closed", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.1",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          order.push("try-prepare");
+          throw new Error("unknown command");
+        },
+        prepareRelaunch: async () => {
+          order.push("manual-prepare");
+        },
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {
+          order.push("abort");
+        },
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 1_000 },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      canInstall: true,
+      restartRequired: false,
+    });
+    expect(controller.getSnapshot().error).toBe("unknown command");
+    controller.dispose();
+  });
+
   test("retries failed automatic checks with bounded backoff and cancels retry on disable", async () => {
     const timers = new FakeTimers();
     let checkCalls = 0;

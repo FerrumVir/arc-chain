@@ -1,3 +1,5 @@
+import type { AutoUpdatePrepareResult } from "./types";
+
 export const UPDATE_STARTUP_DELAY_MS = 5_000;
 export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 export const UPDATE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const;
@@ -58,6 +60,8 @@ export interface UpdateRuntime {
   beginHandoff: () => Promise<void>;
   /** Atomically release or resume after a strictly pre-handoff failure. */
   abortRelaunch: () => Promise<void>;
+  /** Atomically prepare only when native inference admission is quiescent. */
+  tryPrepareAutoUpdateRelaunch?: () => Promise<AutoUpdatePrepareResult>;
   relaunch: () => Promise<void>;
   now?: () => number;
 }
@@ -131,8 +135,12 @@ export class UpdateController {
   private startupTimer: unknown | null = null;
   private intervalTimer: unknown | null = null;
   private retryTimer: unknown | null = null;
+  private autoInstallRetryTimer: unknown | null = null;
   private automaticFailureCount = 0;
+  private autoInstallDeferralCount = 0;
   private autoChecksEnabled = false;
+  private autoInstallEnabled = false;
+  private autoInstallGeneration = 0;
   private readonly startupDelayMs: number;
   private readonly intervalMs: number;
   private readonly retryDelaysMs: readonly number[];
@@ -157,6 +165,7 @@ export class UpdateController {
 
   /** Enable or cancel background checks. Safe to call repeatedly. */
   setAutoChecksEnabled(enabled: boolean): void {
+    if (!enabled) this.setAutoInstallEnabled(false);
     if (enabled === this.autoChecksEnabled) return;
 
     this.clearTimers();
@@ -180,6 +189,28 @@ export class UpdateController {
       this.automaticFailureCount = 0;
       void this.checkForUpdates("automatic");
     }, this.intervalMs);
+  }
+
+  /** Enable unattended installs only when automatic discovery is also enabled. */
+  setAutoInstallEnabled(enabled: boolean): void {
+    const next = enabled && this.autoChecksEnabled && this.runtime.supported;
+    if (next === this.autoInstallEnabled) return;
+
+    this.autoInstallEnabled = next;
+    this.autoInstallGeneration += 1;
+    this.clearAutoInstallRetryTimer();
+    this.autoInstallDeferralCount = 0;
+
+    // Saving explicit opt-in can apply to a signed candidate already found by
+    // an earlier check. The currently installed bundle never changes here.
+    if (
+      next &&
+      this.candidate &&
+      this.candidate.canInstall !== false &&
+      this.snapshot.phase === "available"
+    ) {
+      void this.installAutomatically(this.candidate);
+    }
   }
 
   /**
@@ -225,6 +256,7 @@ export class UpdateController {
     });
 
     const check = (async () => {
+      let autoInstallCandidate: UpdateCandidate | null = null;
       try {
         const next = await this.runtime.check();
         this.automaticFailureCount = 0;
@@ -232,6 +264,8 @@ export class UpdateController {
         const previous = this.candidate;
         this.candidate = next;
         if (previous && previous !== next) {
+          this.clearAutoInstallRetryTimer();
+          this.autoInstallDeferralCount = 0;
           if (this.downloadedCandidate === previous) {
             this.downloadedCandidate = null;
           }
@@ -255,6 +289,13 @@ export class UpdateController {
             canInstall,
             restartRequired: false,
           });
+          if (
+            source !== "manual" &&
+            this.autoInstallEnabled &&
+            canInstall
+          ) {
+            autoInstallCandidate = next;
+          }
         } else {
           this.setSnapshot({
             phase: "up-to-date",
@@ -287,6 +328,13 @@ export class UpdateController {
         this.checkInFlight = null;
         this.automaticCheckRequestedInFlight = false;
       }
+      if (
+        autoInstallCandidate &&
+        this.autoInstallEnabled &&
+        this.candidate === autoInstallCandidate
+      ) {
+        void this.installAutomatically(autoInstallCandidate);
+      }
       return this.snapshot;
     })();
 
@@ -299,6 +347,37 @@ export class UpdateController {
    * install is marked ready before requesting an immediate app relaunch.
    */
   installAvailableUpdate(): Promise<UpdateSnapshot> {
+    return this.startInstall(null);
+  }
+
+  private installAutomatically(
+    candidate: UpdateCandidate,
+  ): Promise<UpdateSnapshot> {
+    if (
+      !this.autoInstallEnabled ||
+      !this.autoChecksEnabled ||
+      this.candidate !== candidate ||
+      candidate.canInstall === false ||
+      this.snapshot.restartRequired ||
+      this.checkInFlight ||
+      this.installInFlight
+    ) {
+      return Promise.resolve(this.snapshot);
+    }
+    return this.startInstall(this.autoInstallGeneration);
+  }
+
+  private startInstall(
+    autoInstallGeneration: number | null,
+  ): Promise<UpdateSnapshot> {
+    const automatic = autoInstallGeneration !== null;
+    if (
+      automatic &&
+      !this.isAutoInstallCurrent(autoInstallGeneration)
+    ) {
+      return Promise.resolve(this.snapshot);
+    }
+
     if (this.installInFlight) return this.installInFlight;
 
     // The UI disables Install during a check, but retain the invariant at the
@@ -336,6 +415,18 @@ export class UpdateController {
     const candidate = this.candidate;
     const version = candidate.version;
     const alreadyDownloaded = this.downloadedCandidate === candidate;
+    if (automatic && !this.runtime.tryPrepareAutoUpdateRelaunch) {
+      this.setSnapshot({
+        ...this.snapshot,
+        phase: "available",
+        version,
+        message: `Version ${version} is available. Automatic installation requires the native worker safety check; install it manually from Settings.`,
+        error: null,
+        canInstall: true,
+        restartRequired: false,
+      });
+      return Promise.resolve(this.snapshot);
+    }
     this.setSnapshot({
       ...this.snapshot,
       phase: "downloading",
@@ -352,6 +443,7 @@ export class UpdateController {
 
     const install = (async () => {
       let handoffStarted = false;
+      let verifiedDownloaded = alreadyDownloaded;
       try {
         // Download and verify while the node keeps running. Tauri retains the
         // verified payload in its resource table; only the install step mutates
@@ -383,11 +475,128 @@ export class UpdateController {
           }
         });
         this.downloadedCandidate = candidate;
+        verifiedDownloaded = true;
+
+        // An explicit opt-out during network transfer is honored before any
+        // native lifecycle fence is requested. The verified bundle remains
+        // available for a later manual install.
+        if (automatic && !this.isAutoInstallCurrent(autoInstallGeneration)) {
+          this.setSnapshot({
+            ...this.snapshot,
+            phase: "available",
+            message: `Version ${version} was downloaded and verified. Automatic installation was turned off; install it manually from Settings if you choose.`,
+            error: null,
+            canInstall: true,
+            restartRequired: false,
+          });
+          return this.snapshot;
+        }
 
         // Establish the native durability boundary only after the complete
         // payload has passed signature verification, immediately before the
         // updater may mutate the app bundle.
-        await this.runtime.prepareRelaunch();
+        if (automatic) {
+          let outcome: AutoUpdatePrepareResult;
+          try {
+            outcome = await this.runtime.tryPrepareAutoUpdateRelaunch!();
+          } catch (error) {
+            const detail = errorMessage(error);
+            try {
+              // The IPC may fail after native quiescence was established.
+              // Abort is safe before beginUpdateHandoff and avoids leaving the
+              // node fenced when the result itself is unavailable.
+              await this.runtime.abortRelaunch();
+            } catch (abortError) {
+              this.setSnapshot({
+                ...this.snapshot,
+                phase: "error",
+                message: "Automatic installation did not begin, but ARC could not confirm that its node resumed. Quit and reopen ARC before continuing.",
+                error: `${detail}; resume failed: ${errorMessage(abortError)}`,
+                canInstall: false,
+                restartRequired: true,
+              });
+              return this.snapshot;
+            }
+            this.setSnapshot({
+              ...this.snapshot,
+              phase: "available",
+              message: `Automatic installation of ${version} was deferred because native worker safety could not be confirmed. Install it manually from Settings if you choose.`,
+              error: detail,
+              canInstall: true,
+              restartRequired: false,
+            });
+            return this.snapshot;
+          }
+
+          if (outcome.status === "busy") {
+            const detail = outcome.reason || "inference work is still active";
+            this.setSnapshot({
+              ...this.snapshot,
+              phase: "available",
+              message: `Automatic installation of ${version} is waiting for inference to finish: ${detail} (${outcome.activeJobs} active).`,
+              error: null,
+              canInstall: true,
+              restartRequired: false,
+            });
+            this.scheduleAutoInstallRetry(candidate);
+            return this.snapshot;
+          }
+
+          if (outcome.status !== "prepared") {
+            try {
+              await this.runtime.abortRelaunch();
+            } catch (error) {
+              this.setSnapshot({
+                ...this.snapshot,
+                phase: "error",
+                message: "ARC received an invalid worker safety result and could not confirm that its node resumed. Quit and reopen ARC before continuing.",
+                error: errorMessage(error),
+                canInstall: false,
+                restartRequired: true,
+              });
+              return this.snapshot;
+            }
+            this.setSnapshot({
+              ...this.snapshot,
+              phase: "available",
+              message: `Automatic installation of ${version} was deferred because native worker safety returned an unrecognized result. Install it manually from Settings if you choose.`,
+              error: "Unrecognized automatic update preparation result.",
+              canInstall: true,
+              restartRequired: false,
+            });
+            return this.snapshot;
+          }
+
+          // The preference may have changed while native quiescence drained
+          // jobs. Release the exact pre-handoff fence before returning control.
+          if (!this.isAutoInstallCurrent(autoInstallGeneration)) {
+            try {
+              await this.runtime.abortRelaunch();
+            } catch (error) {
+              const detail = errorMessage(error);
+              this.setSnapshot({
+                ...this.snapshot,
+                phase: "error",
+                message: `No app update was started, but ARC could not confirm that its node resumed. Quit and reopen ARC before continuing.`,
+                error: detail,
+                canInstall: false,
+                restartRequired: true,
+              });
+              return this.snapshot;
+            }
+            this.setSnapshot({
+              ...this.snapshot,
+              phase: "available",
+              message: `Automatic installation of ${version} was turned off before handoff. The node resumed; install manually from Settings if you choose.`,
+              error: null,
+              canInstall: true,
+              restartRequired: false,
+            });
+            return this.snapshot;
+          }
+        } else {
+          await this.runtime.prepareRelaunch();
+        }
 
         // Seal the one-way native boundary before calling the pinned Tauri
         // installer. IPC itself can disconnect after native code commits, so
@@ -430,6 +639,18 @@ export class UpdateController {
         }
       } catch (error) {
         const detail = errorMessage(error);
+        if (automatic && !handoffStarted) {
+          this.setSnapshot({
+            ...this.snapshot,
+            phase: "available",
+            message: `Automatic installation of ${version} was deferred: ${detail}. Install it manually from Settings if you choose.`,
+            error: detail,
+            canInstall: true,
+            restartRequired: false,
+          });
+          if (!verifiedDownloaded) this.scheduleAutoInstallRetry(candidate);
+          return this.snapshot;
+        }
         if (handoffStarted) {
           this.candidate = null;
           this.downloadedCandidate = null;
@@ -466,6 +687,7 @@ export class UpdateController {
 
   /** Test/app teardown: stop timers and release any native update handle. */
   dispose(): void {
+    this.setAutoInstallEnabled(false);
     this.clearTimers();
     this.autoChecksEnabled = false;
     const candidate = this.candidate;
@@ -485,6 +707,7 @@ export class UpdateController {
       this.intervalTimer = null;
     }
     this.clearRetryTimer();
+    this.clearAutoInstallRetryTimer();
   }
 
   private clearRetryTimer(): void {
@@ -492,6 +715,39 @@ export class UpdateController {
       this.timers.clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
+  }
+
+  private clearAutoInstallRetryTimer(): void {
+    if (this.autoInstallRetryTimer !== null) {
+      this.timers.clearTimeout(this.autoInstallRetryTimer);
+      this.autoInstallRetryTimer = null;
+    }
+  }
+
+  private isAutoInstallCurrent(generation: number | null): boolean {
+    return (
+      generation !== null &&
+      this.autoInstallEnabled &&
+      this.autoChecksEnabled &&
+      generation === this.autoInstallGeneration
+    );
+  }
+
+  private scheduleAutoInstallRetry(candidate: UpdateCandidate): void {
+    if (
+      !this.autoInstallEnabled ||
+      this.autoInstallRetryTimer !== null ||
+      this.candidate !== candidate
+    ) {
+      return;
+    }
+    const delayMs = this.retryDelaysMs[this.autoInstallDeferralCount];
+    if (delayMs === undefined) return;
+    this.autoInstallDeferralCount += 1;
+    this.autoInstallRetryTimer = this.timers.setTimeout(() => {
+      this.autoInstallRetryTimer = null;
+      void this.installAutomatically(candidate);
+    }, delayMs);
   }
 
   private scheduleAutomaticRetry(): void {

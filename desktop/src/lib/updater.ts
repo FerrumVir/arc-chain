@@ -63,6 +63,7 @@ export const appUpdater = createUpdateController({
     return candidate;
   },
   prepareRelaunch: api.prepareUpdateRelaunch,
+  tryPrepareAutoUpdateRelaunch: api.tryPrepareAutoUpdateRelaunch,
   beginHandoff: api.beginUpdateHandoff,
   abortRelaunch: api.abortUpdateRelaunch,
   relaunch: tauriRelaunch,

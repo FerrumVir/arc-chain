@@ -26,6 +26,9 @@ export function Settings() {
     config?.p2pPort ?? DEFAULT_NODE_CONFIG.p2pPort,
   );
   const [autoUpdate, setAutoUpdate] = useState(config?.autoUpdate ?? true);
+  const [autoInstallUpdates, setAutoInstallUpdates] = useState(
+    config?.autoInstallUpdates ?? false,
+  );
   const [autoStart, setAutoStart] = useState(config?.autoStart ?? true);
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -41,7 +44,11 @@ export function Settings() {
   });
   const savedAutoUpdate =
     config?.autoUpdate ?? DEFAULT_NODE_CONFIG.autoUpdate;
-  const autoUpdateHasUnsavedChange = autoUpdate !== savedAutoUpdate;
+  const savedAutoInstallUpdates =
+    config?.autoInstallUpdates ?? DEFAULT_NODE_CONFIG.autoInstallUpdates;
+  const updatePreferencesHaveUnsavedChange =
+    autoUpdate !== savedAutoUpdate ||
+    autoInstallUpdates !== savedAutoInstallUpdates;
 
   // Native config hydration can complete after the first render. Keep the
   // form aligned with the persisted preference without overwriting a user's
@@ -49,6 +56,12 @@ export function Settings() {
   useEffect(() => {
     setAutoUpdate(config?.autoUpdate ?? DEFAULT_NODE_CONFIG.autoUpdate);
   }, [config?.autoUpdate]);
+
+  useEffect(() => {
+    setAutoInstallUpdates(
+      config?.autoInstallUpdates ?? DEFAULT_NODE_CONFIG.autoInstallUpdates,
+    );
+  }, [config?.autoInstallUpdates]);
 
   const save = async () => {
     // Previously `if (!config) return;` — so on a fresh install, where
@@ -60,6 +73,7 @@ export function Settings() {
       rpcPort,
       p2pPort,
       autoUpdate,
+      autoInstallUpdates,
       autoStart,
     };
     try {
@@ -172,8 +186,34 @@ export function Settings() {
                 Check for app updates automatically
               </div>
               <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
-                Check shortly after ARC starts and once every 24 hours. Updates
-                are never installed without your confirmation.
+                Check shortly after ARC starts and once every 24 hours. This
+                setting only checks for signed releases.
+              </div>
+            </div>
+          </label>
+
+          <label
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: "var(--space-3)",
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={autoInstallUpdates}
+              onChange={(e) => setAutoInstallUpdates(e.target.checked)}
+              data-testid="toggle-autoinstall-updates"
+            />
+            <div>
+              <div style={{ fontWeight: 500 }}>
+                Install signed app updates automatically when idle
+              </div>
+              <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
+                Off by default. ARC downloads while the node runs, then asks
+                its native worker safety check to confirm inference has drained
+                before stopping the node and restarting ARC.
               </div>
             </div>
           </label>
@@ -243,13 +283,15 @@ export function Settings() {
           }}
           data-testid="update-policy"
         >
-          {autoUpdateHasUnsavedChange
-            ? autoUpdate
-              ? "Save settings to enable automatic background checks."
-              : "Save settings to turn automatic background checks off."
-            : autoUpdate
-              ? "Automatic checks run after startup and every 24 hours. Background checks never download or install an update."
-              : "Automatic background checks are off. You can still check manually below."}
+          {updatePreferencesHaveUnsavedChange
+            ? "Save settings to apply automatic update preferences."
+            : !autoUpdate
+              ? autoInstallUpdates
+                ? "Automatic checks are off, so unattended installation is inactive. You can still check and install manually below."
+                : "Automatic background checks are off. You can still check and install manually below."
+              : autoInstallUpdates
+                ? "Automatic checks run after startup and every 24 hours. Signed app updates may install and restart ARC automatically only after native worker safety confirms inference has drained."
+                : "Automatic checks run after startup and every 24 hours. Background checks never install an update."}
         </p>
         <p
           style={{

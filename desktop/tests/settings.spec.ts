@@ -72,7 +72,7 @@ test.describe("Settings", () => {
 
     await page.getByTestId("toggle-autoupdate").uncheck();
     await expect(page.getByTestId("update-policy")).toContainText(
-      "Save settings to turn automatic background checks off",
+      "Save settings to apply automatic update preferences",
     );
     await page.getByTestId("btn-save-settings").click();
     await expect(page.getByTestId("btn-save-settings")).toContainText("Saved");
@@ -90,6 +90,45 @@ test.describe("Settings", () => {
     expect(persistedAutoUpdate).toBe(false);
     await expect(page.getByTestId("toggle-autoupdate")).not.toBeChecked();
     await expect(page.getByTestId("btn-check-update")).toBeEnabled();
+  });
+
+  test("unattended installs are a separate opt-in and default off", async ({
+    page,
+  }) => {
+    // Persisted desktop preferences from older releases have no separate
+    // auto-install bit. Missing values must hydrate as disabled.
+    await page.addInitScript(() => {
+      const raw = localStorage.getItem("arc-desktop-state-v1");
+      if (!raw) return;
+      const state = JSON.parse(raw);
+      delete state.config?.autoInstallUpdates;
+      localStorage.setItem("arc-desktop-state-v1", JSON.stringify(state));
+    });
+    await page.goto("/");
+    await page.getByTestId("nav-settings").click();
+    const autoInstall = page.getByTestId("toggle-autoinstall-updates");
+    await expect(autoInstall).not.toBeChecked();
+    await expect(page.getByTestId("update-policy")).toContainText(
+      "Background checks never install an update",
+    );
+
+    await autoInstall.check();
+    await expect(page.getByTestId("update-policy")).toContainText(
+      "Save settings to apply automatic update preferences",
+    );
+    await page.getByTestId("btn-save-settings").click();
+    await expect(page.getByTestId("btn-save-settings")).toContainText("Saved");
+    await expect(page.getByTestId("update-policy")).toContainText(
+      "may install and restart ARC automatically",
+    );
+
+    const persistedAutoInstall = await page.evaluate(() => {
+      const raw = localStorage.getItem("arc-desktop-state-v1");
+      return raw ? JSON.parse(raw).config?.autoInstallUpdates : null;
+    });
+    expect(persistedAutoInstall).toBe(true);
+    await expect(page.getByTestId("toggle-autoupdate")).toBeChecked();
+    await expect(autoInstall).toBeChecked();
   });
 
   test("p2p port is its own field, not RPC + 1", async ({ page }) => {
