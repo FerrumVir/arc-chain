@@ -400,7 +400,9 @@ export function NativePaidRequests() {
         <div role="status" data-testid="native-context-status" style={{ fontSize: "var(--text-sm)", marginBottom: "var(--space-3)" }}>
           <strong>New paid requests are unavailable.</strong> {view.reason}
           <div style={{ color: "var(--text-muted)", marginTop: 4 }}>
-            Existing signed requests continue to be tracked and can be refunded or resubmitted.
+            {view.trackingAvailable
+              ? "Existing signed requests continue to be tracked and can be refunded or resubmitted."
+              : "Existing signed requests remain journaled locally, but this host context prevents receipt tracking and refund operations."}
           </div>
         </div>
       ) : null}

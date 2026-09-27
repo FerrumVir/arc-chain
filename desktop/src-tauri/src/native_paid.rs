@@ -363,7 +363,7 @@ pub struct NativeContextView {
     pub chain_protocol: Option<u64>,
     pub native_only_chain: Option<bool>,
     pub request_admission_open: bool,
-    /// The signed chain context is parseable, so journal and receipt operations remain available.
+    /// A parseable native contract context lets the app track existing requests.
     pub tracking_available: bool,
 }
 

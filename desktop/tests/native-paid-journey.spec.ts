@@ -44,13 +44,13 @@ test.describe("native paid requests", () => {
   test("an incompatible node is named with what to update, and nothing can be signed", async ({ page }) => {
     await openNative(page, "incompatible");
     await expect(page.getByTestId("native-context-status")).toContainText("update the app");
-    await expect(page.getByTestId("native-prompt")).toHaveCount(0);
+    await expect(page.getByTestId("btn-native-review")).toBeDisabled();
     await expect(page.getByTestId("btn-native-sign")).toHaveCount(0);
   });
 
   test("a request is signed, admitted, certified and settled, and the balance follows the chain", async ({ page }) => {
     await openNative(page);
-    await expect(page.getByTestId("native-context-status")).toContainText("deterministic TEST executor");
+    await expect(page.getByTestId("native-chain-status")).toContainText("deterministic TEST executor");
     await expect(page.getByTestId("native-available")).toHaveText("5 ARC");
 
     await submitPrompt(page, "What is ARC?", { price: "0.25", reserve: "1" });
