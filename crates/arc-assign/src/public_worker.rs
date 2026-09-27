@@ -1297,7 +1297,7 @@ mod tests {
             .append(true)
             .open(&oversized_journal)
             .unwrap()
-            .write_all(&[0])
+            .write_all(&vec![0; ADMISSION_RECORD_LEN + 1])
             .unwrap();
         assert!(fs::metadata(&oversized_journal).unwrap().len() > max_len);
         assert!(matches!(
