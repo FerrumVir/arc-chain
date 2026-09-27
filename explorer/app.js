@@ -334,11 +334,22 @@
           tx: fullValue?.transaction ?? fullValue?.tx ?? fullValue,
           receipt: receiptValue?.receipt ?? receiptValue,
         });
+      const boundClassification = Object.freeze({
+        ...classification,
+        transactionHashMatches: classification.txHash === txHash
+          && (classification.nativeInferenceStage
+            ? classification.receiptTxHash === txHash
+            : classification.receiptTxHash === undefined
+              || classification.receiptTxHash === null
+              || classification.receiptTxHash === txHash),
+      });
       const occurrenceRows = Array.isArray(occurrenceValue?.occurrences) ? occurrenceValue.occurrences : [];
       const occurrenceHeight = occurrenceValue?.unique_occurrence === true && occurrenceRows.length === 1
         ? integerOrNull(occurrenceRows[0]?.block_height)
         : null;
-      const evidenceHeight = classification.height ?? occurrenceHeight;
+      const evidenceHeight = boundClassification.nativeInferenceStage
+        ? (boundClassification.transactionHashMatches ? boundClassification.height ?? occurrenceHeight : occurrenceHeight)
+        : boundClassification.height ?? occurrenceHeight;
       const configured = evidenceHeight === null
         ? { canonical: false, segment: "unverified", reason: "receipt-height-unavailable" }
         : resolver.classifyOccurrence(source.id, evidenceHeight);
@@ -351,7 +362,7 @@
         rewardEvidence: rewardValue,
         rewardEvidenceBound,
         occurrence: occurrenceValue,
-        classification,
+        classification: boundClassification,
         provenance,
         archiveVerification,
       };
@@ -406,7 +417,7 @@
     return { records: attempts.filter((attempt) => attempt.found), failures: attempts.filter((attempt) => !attempt.found) };
   }
 
-  // A native paid-inference request (protocol 4) is identified by its request
+  // A native paid-inference request is identified by its request
   // id; its canonical record is the receipt each validator serves. Every
   // permitted source is asked, and the page shows whether the ones that
   // answer record the same settlement - a disagreement is shown, never
@@ -429,10 +440,16 @@
         optionalRequest(fetchImpl, source, `/native-inference/receipt/${id}`, { signal }),
         optionalRequest(fetchImpl, source, "/health", { signal }),
       ]);
+      const returnedId = result.ok ? network.normalizeHex(result.value?.request_id, 32) : null;
+      const receiptMatchesRequest = result.ok && returnedId === id;
       return {
         source,
-        receipt: result.ok ? result.value : null,
-        error: result.ok ? null : result.error,
+        receipt: receiptMatchesRequest ? result.value : null,
+        error: receiptMatchesRequest
+          ? null
+          : result.ok
+            ? new RpcError("native receipt response does not match the requested request id", 0, source.id)
+            : result.error,
         height: health.ok ? integerOrNull(health.value?.height) : null,
       };
     }));
@@ -951,6 +968,7 @@
 
     function occurrenceCard(occurrence) {
       const { source, classification, provenance } = occurrence;
+      const nativeEvidence = nativeReceipts.nativeEvidenceLabels(classification, provenance.canonical);
       const archiveOccurrences = Array.isArray(occurrence.occurrence?.occurrences)
         ? occurrence.occurrence.occurrences
         : [];
@@ -963,15 +981,23 @@
       card.append(heading, detailGrid([
         ["Receipt", classification.receiptBacked ? classification.status : preservedHeight === null ? "Absent / unproven" : "Pruned · block inclusion preserved"],
         ["Category", classification.category],
+        ...(nativeEvidence ? [["Native stage", nativeEvidence.stage], ["Mined outcome", nativeEvidence.outcome]] : []),
         ["Block", formatInteger(classification.height ?? preservedHeight)],
         ["Segment", provenance.segment?.replaceAll("-", " ")],
-        ["Inference", classification.inferenceConfirmed ? "Confirmed mined receipt" : "Not confirmed"],
+        ["Inference", nativeEvidence?.inference ?? (classification.inferenceConfirmed ? "Confirmed mined receipt" : "Not confirmed")],
         ["Reward", classification.rewardEarned ? "Earned · successful mined receipt" : "Not counted as earned"],
       ]));
       if (occurrence.full) card.append(rawSection("Transaction", occurrence.full));
       if (occurrence.receipt) card.append(rawSection("Receipt", occurrence.receipt));
       if (occurrence.rewardEvidence) card.append(rawSection("Community reward receipt", occurrence.rewardEvidence));
       if (occurrence.occurrence) card.append(rawSection("Preserved block occurrence", occurrence.occurrence));
+      const nativeTransaction = nativeReceipts.describeTransaction(occurrence.full);
+      if (nativeTransaction.native && nativeTransaction.requestId) {
+        const requestLink = create("button", "table-link", "View native request receipts");
+        requestLink.type = "button";
+        requestLink.addEventListener("click", () => navigate("request", nativeTransaction.requestId));
+        card.append(requestLink);
+      }
       return card;
     }
 

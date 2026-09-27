@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 
 const require = createRequire(import.meta.url);
 const native = require("./native-receipts.js");
+const network = require("../shared/frontend/arc-network.js");
 
 let passed = 0;
 const check = (name, fn) => {
@@ -13,7 +14,7 @@ const check = (name, fn) => {
   console.log(`ok ${passed} - ${name}`);
 };
 
-// A real receipt shape from a four-validator protocol-4 chain.
+// A real-shaped native receipt on the recovered chain.
 const finalized = {
   request_id: "20".repeat(32),
   observed_status: "Finalized",
@@ -119,9 +120,65 @@ check("native transactions link to their request; others do not", () => {
   });
   assert.equal(tx.native, true);
   assert.equal(tx.requestId, "20".repeat(32));
+  const requestTx = native.describeTransaction({
+    tx_type_code: "0x26", body: { request: { request_id: "21".repeat(32) } },
+  });
+  assert.equal(requestTx.native, true);
+  assert.equal(requestTx.nativeStage, "request");
+  assert.equal(requestTx.requestId, "21".repeat(32));
+  for (const [code, stage] of [["0x27", "finalize"], ["0x28", "refund"]]) {
+    const stageTx = native.describeTransaction({ tx_type_code: code, body: { request_id: "22".repeat(32) } });
+    assert.equal(stageTx.nativeStage, stage);
+    assert.equal(stageTx.requestId, "22".repeat(32));
+  }
   const transfer = native.describeTransaction({ tx_hash: "ab".repeat(32), tx_type: "Transfer", success: true });
   assert.equal(transfer.native, false);
   assert.equal(transfer.requestId, null);
+});
+
+check("native transaction stage labels require a successful canonical mined receipt", () => {
+  const finalized = {
+    ...network.classifyReceipt({
+      tx: { tx_type_code: "0x27", tx_hash: "20".repeat(32) },
+      receipt: { receipt_status: "success", block_height: 21 },
+    }),
+    transactionHashMatches: true,
+  };
+  assert.deepEqual(native.nativeEvidenceLabels(finalized, true), {
+    stage: "Finalize",
+    outcome: "Successful canonical mined transaction",
+    inference: "Confirmed canonical finalization",
+  });
+  assert.equal(native.nativeEvidenceLabels(finalized, false).inference, "Finalization is not confirmed");
+  assert.equal(native.nativeEvidenceLabels({ ...finalized, transactionHashMatches: false }, true).outcome,
+    "Receipt identity does not match the requested transaction hash");
+  assert.equal(native.nativeEvidenceLabels({ ...finalized, transactionHashMatches: false }, true).inference,
+    "Finalization is not confirmed");
+
+  const request = {
+    ...network.classifyReceipt({
+      tx: { tx_type: "NativeInferenceRequest", tx_hash: "20".repeat(32) },
+      receipt: { receipt_status: "success", block_height: 21 },
+    }),
+    transactionHashMatches: true,
+  };
+  assert.equal(native.nativeEvidenceLabels(request, true).inference, "Request admission is not inference completion");
+  const refund = {
+    ...network.classifyReceipt({
+      tx: { tx_type_code: "0x28", tx_hash: "20".repeat(32) },
+      receipt: { receipt_status: "success", block_height: 21 },
+    }),
+    transactionHashMatches: true,
+  };
+  assert.equal(native.nativeEvidenceLabels(refund, true).inference, "Refund transaction; not an inference completion");
+  const unmined = {
+    ...network.classifyReceipt({
+      tx: { tx_type_code: "0x27", tx_hash: "20".repeat(32) },
+      receipt: { receipt_status: "success" },
+    }),
+    transactionHashMatches: true,
+  };
+  assert.equal(native.nativeEvidenceLabels(unmined, true).outcome, "Receipt does not prove mined inclusion");
 });
 
 // The node source for expires_at/requester/output_hex/output_text was added

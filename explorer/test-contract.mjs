@@ -491,6 +491,44 @@ await test("successful mined inference receipts expose canonical provenance", as
   assert.equal(result.occurrences[0].provenance.canonical, true);
 });
 
+await test("native v3 finalization lookup is hash-bound and receipt-backed", async () => {
+  const hash = hex("8");
+  const fetchImpl = mockFetch({
+    [`https://v3.example.test/tx/${hash}/full`]: {
+      body: { transaction: { tx_type_code: "0x27", tx_hash: hash, block_height: H + 9 } },
+    },
+    [`https://v3.example.test/tx/${hash}`]: {
+      body: { receipt: { receipt_status: "success", block_height: H + 9, tx_hash: hash } },
+    },
+  });
+  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical", checkpointAudit: verifiedAudit });
+  const occurrence = result.occurrences.find((row) => row.source.id === "v3");
+  assert.equal(occurrence.classification.category, "native-inference");
+  assert.equal(occurrence.classification.nativeInferenceStage, "finalize");
+  assert.equal(occurrence.classification.transactionHashMatches, true);
+  assert.equal(occurrence.classification.inferenceConfirmed, true);
+  assert.equal(occurrence.provenance.canonical, true);
+});
+
+await test("native finalization is not confirmed unless its receipt is bound to the requested transaction", async () => {
+  const hash = hex("9");
+  for (const receiptTxHash of [hex("a"), undefined, "malformed"]) {
+    const receipt = { receipt_status: "success", block_height: H + 9 };
+    if (receiptTxHash !== undefined) receipt.tx_hash = receiptTxHash;
+    const fetchImpl = mockFetch({
+      [`https://v3.example.test/tx/${hash}/full`]: {
+        body: { transaction: { tx_type_code: "0x27", tx_hash: hash, block_height: H + 9 } },
+      },
+      [`https://v3.example.test/tx/${hash}`]: { body: { receipt } },
+    });
+    const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical", checkpointAudit: verifiedAudit });
+    const occurrence = result.occurrences.find((row) => row.source.id === "v3");
+    assert.equal(occurrence.classification.transactionHashMatches, false);
+    assert.equal(occurrence.provenance.canonical, false);
+    assert.equal(occurrence.classification.inferenceConfirmed, true);
+  }
+});
+
 await test("address responses stay separated by source", async () => {
   const address = hex("6");
   const fetchImpl = mockFetch({
@@ -903,6 +941,17 @@ await test("native requests are compared across replicas and a disagreement is r
   });
   assert.equal(partial.comparison.asked, 1, "only answering replicas are compared");
   assert.equal(partial.answers.filter((answer) => answer.error).length, 1, "the silent replica is recorded");
+
+  const mismatched = await app.queryNativeRequest({
+    resolver: replicaResolver, requestId: id, sourceId: "canonical",
+    fetchImpl: mockFetch({
+      [receiptPath("https://r1.example.test")]: { body: { ...settled(paid), request_id: hex("a") } },
+      [receiptPath("https://r2.example.test")]: { body: settled(paid) },
+    }),
+  });
+  assert.equal(mismatched.comparison.answered, 1, "a response for another request is excluded");
+  assert.match(mismatched.answers.find((answer) => answer.source.id === "r1").error.message, /does not match/);
+  assert.equal(mismatched.comparison.agree, true, "only the correctly bound response is comparable");
 
   await assert.rejects(
     app.queryNativeRequest({ resolver: replicaResolver, requestId: "../../admin", fetchImpl: mockFetch({}) }),

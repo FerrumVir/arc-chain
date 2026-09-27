@@ -1,4 +1,4 @@
-// ARC explorer: native paid inference (protocol 4) receipt rules, shared by
+// ARC explorer: native paid-inference receipt rules, shared by
 // the production explorer (app.js) and the local-development view.
 //
 // Pure functions only - no DOM, no fetch - so the rules that decide what a
@@ -136,24 +136,62 @@
     "NativeInferenceFinalize",
     "NativeInferenceRefund",
   ]);
+  const NATIVE_TYPE_CODES = new Map([[0x26, "request"], [0x27, "finalize"], [0x28, "refund"]]);
+
+  function nativeEvidenceLabels(classification, canonical) {
+    const stage = classification?.nativeInferenceStage;
+    if (!stage) return null;
+    const stageLabel = ({ request: "Request", finalize: "Finalize", refund: "Refund" })[stage] || "Unknown";
+    let outcome;
+    if (classification.transactionHashMatches !== true) outcome = "Receipt identity does not match the requested transaction hash";
+    else if (!classification.receiptBacked) outcome = "No transaction receipt observed";
+    else if (!classification.mined) outcome = "Receipt does not prove mined inclusion";
+    else if (!classification.success) outcome = "Mined transaction failed";
+    else if (!canonical) outcome = "Mined, but canonical inclusion is not verified";
+    else outcome = "Successful canonical mined transaction";
+    const inference = stage === "finalize" && classification.transactionHashMatches === true
+      && classification.inferenceConfirmed && canonical
+      ? "Confirmed canonical finalization"
+      : stage === "request"
+        ? "Request admission is not inference completion"
+        : stage === "refund"
+          ? "Refund transaction; not an inference completion"
+          : "Finalization is not confirmed";
+    return { stage: stageLabel, outcome, inference };
+  }
 
   // A /tx/{hash}/full response: its type, outcome and - for a native
   // transaction - the request it belongs to.
   function describeTransaction(full) {
     if (!full || typeof full !== "object") return { known: false };
-    const type = String(full.tx_type ?? "Unknown");
+    const tx = full.transaction || full.tx || full;
+    const type = String(tx.tx_type ?? tx.type ?? full.tx_type ?? "Unknown");
+    const normalizedType = type.trim().toLowerCase();
+    const rawCode = tx.tx_type_code ?? full.tx_type_code;
+    const code = typeof rawCode === "number" ? rawCode
+      : /^0x[0-9a-f]+$/i.test(String(rawCode ?? "")) ? Number.parseInt(String(rawCode), 16)
+        : /^0x[0-9a-f]+$/i.test(type) ? Number.parseInt(type, 16) : null;
+    const stage = NATIVE_TYPE_CODES.get(code) ?? ({
+      nativeinferencerequest: "request",
+      nativeinferencefinalize: "finalize",
+      nativeinferencerefund: "refund",
+    })[normalizedType] ?? null;
+    const body = tx.body ?? full.body ?? {};
     return {
       known: true,
-      hash: String(full.tx_hash ?? ""),
+      hash: String(tx.tx_hash ?? tx.hash ?? full.tx_hash ?? ""),
       type,
-      success: full.success === true,
-      height: full.block_height ?? null,
-      native: NATIVE_TYPES.has(type),
-      requestId: NATIVE_TYPES.has(type) ? String(full.body?.request_id ?? "") || null : null,
+      success: (tx.success ?? full.success) === true,
+      height: tx.block_height ?? full.block_height ?? null,
+      native: stage !== null || NATIVE_TYPES.has(type),
+      nativeStage: stage,
+      requestId: stage !== null
+        ? String(body.request_id ?? body.request?.request_id ?? "") || null
+        : null,
     };
   }
 
-  const api = { summarize, compareReplicas, describeTransaction, fingerprint, classifyExpiry };
+  const api = { summarize, compareReplicas, describeTransaction, nativeEvidenceLabels, fingerprint, classifyExpiry };
   if (typeof module === "object" && module && module.exports) module.exports = api;
   root.ArcLocalDevNative = api;
   // The production explorer reads the same receipt rules under this name.
