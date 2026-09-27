@@ -5302,7 +5302,7 @@ mod tests {
         checkpoint.write_to(&path).unwrap();
         let state = StateDB::with_genesis_persistent_recovery(
             &[],
-            &directory.path().join("state"),
+            directory.path().join("state"),
             RecoveryNetworkPolicy {
                 chain_id: "requeue-recovered-v3".into(),
                 genesis_hash: genesis,
