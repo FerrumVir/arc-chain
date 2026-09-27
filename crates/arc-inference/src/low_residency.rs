@@ -289,7 +289,7 @@ fn projection_shape(
             .is_none()
             .then_some((config.vocab_size, config.d_model));
     }
-    if !layer.is_some_and(|l| l < config.n_layers) {
+    if layer.is_none_or(|l| l >= config.n_layers) {
         return None;
     }
     Some(match tensor {

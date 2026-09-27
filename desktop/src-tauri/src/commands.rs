@@ -2120,8 +2120,7 @@ mod inference_retry_tests {
         );
     }
 
-    /// A loopback host that answers `/native-inference/context` with
-    /// `context_status` and every other path with 404, recording each path.
+    /// A loopback protocol-4 or protocol-3 host, recording each requested path.
     async fn recording_host(context_status: u16) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -2135,10 +2134,17 @@ mod inference_retry_tests {
                     let read = socket.read(&mut buffer).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                     let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
-                    let (status, body) = if path == "/native-inference/context" {
-                        (context_status, "{}")
-                    } else {
-                        (404, "")
+                    let (status, body) = match path.as_str() {
+                        "/native-inference/context" if context_status == 200 => (
+                            200,
+                            r#"{"candidate_protocol":4,"chain_protocol":4,"native_only_chain":true,"request_admission_open":true,"request_admission":{"operator_enabled":true,"runtime_ready":true}}"#,
+                        ),
+                        "/native-inference/context" => (404, ""),
+                        "/network/info" => (
+                            200,
+                            r#"{"protocol_version":"3.0.0","recovery_active":true,"recovery_domain":"0x0101010101010101010101010101010101010101010101010101010101010101"}"#,
+                        ),
+                        _ => (404, ""),
                     };
                     log.lock().unwrap().push(path);
                     let reason = if status == 200 { "OK" } else { "Not Found" };

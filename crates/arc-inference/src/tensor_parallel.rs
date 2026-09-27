@@ -1435,12 +1435,11 @@ impl<'a> VerifiedPartitionBackend<'a> {
                 return Err(TensorParallelError::WrongShape);
             }
             for slice in &plan.slices {
-                if let Some(SliceOwner::Remote(checker)) = &slice.duplicate_on {
-                    if events.is_excluded(checker)
-                        || !workers.get(checker).is_some_and(|w| w.is_open())
-                    {
-                        return Err(TensorParallelError::MissingWorker(checker.clone()));
-                    }
+                if let Some(SliceOwner::Remote(checker)) = &slice.duplicate_on
+                    && (events.is_excluded(checker)
+                        || !workers.get(checker).is_some_and(|w| w.is_open()))
+                {
+                    return Err(TensorParallelError::MissingWorker(checker.clone()));
                 }
             }
         }
