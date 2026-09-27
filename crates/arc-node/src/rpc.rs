@@ -23992,7 +23992,7 @@ mod tests {
                 genesis_hash: genesis,
                 source_consensus_round: 0,
                 recovery_epoch: 1,
-                validator_set_id: 0,
+                validator_set_id: 1,
                 validators: validators.clone(),
                 community_rewards_v1_activation_height: None,
                 created_at_unix_ms: 1,
@@ -24009,7 +24009,7 @@ mod tests {
             chain_id: "native-v3-outer-routes".into(),
             genesis_hash: genesis,
             recovery_epoch: 1,
-            validator_set_id: 0,
+            validator_set_id: 1,
             validators: members.iter().map(|m| (m.address, m.stake)).collect(),
             community_rewards_v1_activation_height: None,
         };
@@ -24138,7 +24138,7 @@ mod tests {
                 arc_state::NativeMigrationRecord {
                     chain_genesis: genesis,
                     recovery_epoch: 1,
-                    validator_set_id: 0,
+                    validator_set_id: 1,
                     activation_height: state.height() + 1,
                     context_commitment: context.commitment().unwrap(),
                 },
