@@ -1960,6 +1960,16 @@ pub fn take_desktop_worker_quiescence_request(
     let (path, _) = worker_quiescence_paths(data_dir).map_err(|error| {
         worker_quiescence_io_context(error, "prepare worker quiescence request path")
     })?;
+    let control_dir = path
+        .parent()
+        .expect("worker quiescence request path always has its control directory");
+    // Keep competing consumers in this private request namespace serialized
+    // through the complete claim and removal lifecycle. The Windows concurrency
+    // regression test observed a second successful rename followed by a missing
+    // claim at open; serializing consumers prevents that race.
+    let _namespace = acquire_private_directory_namespace_lock(control_dir).map_err(|error| {
+        worker_quiescence_io_context(error, "lock worker quiescence request namespace")
+    })?;
     // Atomic rename claims the one-shot request before either side parses it.
     // This prevents the desktop timeout path and node watcher from both
     // believing they own the same request. The random same-directory name
