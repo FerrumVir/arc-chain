@@ -3,6 +3,11 @@
 //! An offer is an authenticated statement by a worker key. It does not prove
 //! the claimed capacity, hardware, independence, complete job coverage, or an
 //! entitlement to payment. Callers must separately measure and verify work.
+//!
+//! This is an in-memory offer contract only. It does not provide a bounded
+//! network decoder or durable nonce/replay protection. Any future network
+//! adapter must cap the encoded frame before deserializing it, then persist
+//! nonce/replay state before accepting an offer.
 
 use crate::{Address, Hash256};
 use arc_crypto::{KeyPair, Signature};
@@ -21,6 +26,7 @@ const MAX_SIGNATURE_MATERIAL_BYTES: usize = 6_000;
 /// tensor; a range always covers every column for each row in `[row_start,
 /// row_end)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TensorRowRange {
     pub tensor_id: Hash256,
     pub tensor_rows: u32,
@@ -31,6 +37,7 @@ pub struct TensorRowRange {
 
 /// Worker-authored claims for one public-native execution binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicWorkerOfferBody {
     pub version: u16,
     pub chain_genesis: Hash256,
@@ -55,6 +62,7 @@ pub struct PublicWorkerOfferBody {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicWorkerOffer {
     pub body: PublicWorkerOfferBody,
     pub signature: Signature,
@@ -535,6 +543,14 @@ mod tests {
         b = body(h(10));
         b.ranges[0].row_end = 17;
         assert_eq!(b.validate(), Err(PublicWorkerOfferError::InvalidRange));
+        b = body(h(10));
+        let mut unsorted = b.ranges[0];
+        unsorted.tensor_id = h(8);
+        b.ranges.push(unsorted);
+        assert_eq!(
+            b.validate(),
+            Err(PublicWorkerOfferError::RangeOrderOrOverlap)
+        );
         b = body(h(10));
         let mut overlap = b.ranges[0];
         overlap.row_start = 3;
