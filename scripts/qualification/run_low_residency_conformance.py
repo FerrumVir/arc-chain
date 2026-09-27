@@ -417,7 +417,23 @@ def compare(reference, coordinator):
 
 
 def require_clean_exits(records):
-    bad = [record["name"] for record in records if record.get("returncode") != 0]
+    def is_expected_loopback_agent_exit(record):
+        return (
+            record.get("name") == "loopback-ssh-agent"
+            and record.get("returncode") == 2
+            and record.get("expected_shutdown") == {
+                "signal": "SIGTERM",
+                "requested_by_helper_while_alive": True,
+                "authentication_succeeded_before_shutdown": True,
+                "forced_kill": False,
+                "agent_socket_removed": True,
+                "private_key_directory_removed": True,
+                "raw_exit_code": 2,
+            }
+        )
+
+    bad = [record["name"] for record in records
+           if record.get("returncode") != 0 and not is_expected_loopback_agent_exit(record)]
     if bad:
         raise RuntimeError("nonzero or unreaped child exit: " + ", ".join(bad))
 

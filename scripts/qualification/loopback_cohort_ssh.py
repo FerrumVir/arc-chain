@@ -39,6 +39,8 @@ class LoopbackCohortSsh:
         self._processes = []
         self._ssh_binary = None
         self._ssh_wrapper = None
+        self._agent_socket = None
+        self._authenticated = False
 
     def start(self):
         if self._private_dir is not None:
@@ -71,6 +73,7 @@ class LoopbackCohortSsh:
         sshd_config = self._private_dir / "sshd_config"
         authorized_keys = self._private_dir / "authorized_keys"
         agent_socket = self._private_dir / "agent.sock"
+        self._agent_socket = agent_socket
         if len(os.fsencode(agent_socket)) >= 100:
             raise RuntimeError("private SSH agent socket path is too long")
 
@@ -170,6 +173,7 @@ class LoopbackCohortSsh:
             "-oPasswordAuthentication=no", "-oConnectTimeout=5", "--", self.target, "true",
         ], self.environment)
         self.children.wait(probe, 10)
+        self._authenticated = True
         return self
 
     def _start_child(self, name, command, environment):
@@ -225,22 +229,83 @@ class LoopbackCohortSsh:
         if self._closed:
             return
         self._closed = True
-        processes = list(self._processes)
         failure = None
-        if processes:
+        agent_requested = False
+        agent_forced = False
+        agent_record = self._record_for(self._agent)
+        if self._agent is not None and self._agent.poll() is None and self._authenticated:
             try:
-                self.children.stop(processes, timeout=5)
+                os.killpg(self._agent.pid, signal.SIGTERM)
+                agent_requested = True
             except Exception as error:  # cleanup must still remove private material
                 failure = error
-        if any(process.poll() is None for process in processes):
+        if self._agent is not None and agent_requested:
+            try:
+                self._agent.wait(timeout=5)
+            except Exception:
+                agent_forced = True
+                try:
+                    os.killpg(self._agent.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    self._agent.wait(timeout=5)
+                except Exception as error:
+                    failure = failure or error
+            self.children.record_exit(self._agent)
+        elif self._agent is not None and self._agent.poll() is None:
+            # Startup/authentication failed before the narrow expected-exit
+            # contract applies. Still stop our own agent, but never mark code 2
+            # from this path as an expected SIGTERM result.
+            try:
+                self.children.stop([self._agent], timeout=5)
+            except Exception as error:
+                failure = failure or error
+
+        other_processes = [process for process in self._processes if process is not self._agent]
+        if other_processes:
+            try:
+                self.children.stop(other_processes, timeout=5)
+            except Exception as error:
+                failure = failure or error
+
+        if any(process.poll() is None for process in self._processes):
             failure = failure or RuntimeError("loopback SSH child remained alive after bounded cleanup")
-        if any(getattr(process, "returncode", None) != 0 for process in processes):
-            failure = failure or RuntimeError("loopback SSH daemon required forced or unsuccessful shutdown")
+        for process in other_processes:
+            if getattr(process, "returncode", None) != 0:
+                failure = failure or RuntimeError("loopback SSH helper child exited unsuccessfully")
+        agent_code = getattr(self._agent, "returncode", 0) if self._agent is not None else 0
+        agent_socket_removed = self._agent_socket is None or not self._agent_socket.exists()
+        may_mark_agent_exit2 = (
+            agent_requested and self._authenticated and not agent_forced
+            and agent_code == 2 and agent_socket_removed
+        )
         if self._private_dir is not None:
-            shutil.rmtree(self._private_dir, ignore_errors=False)
-            self._private_dir = None
+            try:
+                shutil.rmtree(self._private_dir, ignore_errors=False)
+                self._private_dir = None
+            except Exception as error:
+                failure = failure or error
+        if self._agent is not None and agent_code != 0:
+            if may_mark_agent_exit2 and self._private_dir is None and agent_record is not None:
+                agent_record["expected_shutdown"] = {
+                    "signal": "SIGTERM",
+                    "requested_by_helper_while_alive": True,
+                    "authentication_succeeded_before_shutdown": True,
+                    "forced_kill": False,
+                    "agent_socket_removed": True,
+                    "private_key_directory_removed": True,
+                    "raw_exit_code": 2,
+                }
+            else:
+                failure = failure or RuntimeError("loopback SSH agent exited unexpectedly")
         if failure:
             raise failure
+
+    def _record_for(self, process):
+        if process is None:
+            return None
+        return next((record for child, record in self.children.items if child is process), None)
 
     def __enter__(self):
         return self.start()
