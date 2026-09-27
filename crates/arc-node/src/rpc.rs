@@ -23934,6 +23934,17 @@ mod tests {
             NativeInferenceFinalizeBody, NativeInferenceRefundBody, NativeInferenceRequestBody,
             gas_costs,
         };
+
+        // This fixture isolates native routing/admission status from the
+        // production 100 ms sender throttle; dedicated RPC tests cover that
+        // limiter independently.
+        async fn submit_without_test_sender_throttle(
+            node: &NodeState,
+            tx: Transaction,
+        ) -> Result<Json<SubmitTxResponse>, SubmitRefusal> {
+            node.tx_rate_limit.remove(&tx.from.0);
+            submit_signed_tx(AxumState(node.clone()), Json(tx)).await
+        }
         let dir = tempfile::tempdir().unwrap();
         let requester = KeyPair::generate_ed25519();
         let keys: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
@@ -24114,7 +24125,7 @@ mod tests {
         state
             .sign_transaction(&mut before_migration, &requester)
             .unwrap();
-        let _ = submit_signed_tx(AxumState(node.clone()), Json(before_migration))
+        let _ = submit_without_test_sender_throttle(&node, before_migration)
             .await
             .unwrap();
         commit(&state, &node.mempool.drain(1));
@@ -24128,10 +24139,12 @@ mod tests {
         assert!(state.validate_v3_transaction_admission(&tx).is_err());
         let open = Arc::new(NativeRequestAdmission::ready_for_test());
         node.native_request_admission = open.clone();
-        assert!(
-            submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
+        assert_eq!(
+            submit_without_test_sender_throttle(&node, tx.clone())
                 .await
-                .is_err()
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a native request has no admission context before migration",
         );
         state
             .authorize_native_migration(
@@ -24193,7 +24206,7 @@ mod tests {
                 .is_err()
         );
         node.native_request_admission = Arc::new(NativeRequestAdmission::default());
-        let _ = submit_signed_tx(AxumState(node.clone()), Json(transfer.clone()))
+        let _ = submit_without_test_sender_throttle(&node, transfer.clone())
             .await
             .unwrap();
         node.mempool.drain(1);
@@ -24216,7 +24229,7 @@ mod tests {
         ] {
             node.native_request_admission = Arc::new(gate);
             assert_eq!(
-                submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
+                submit_without_test_sender_throttle(&node, tx.clone())
                     .await
                     .unwrap_err(),
                 StatusCode::SERVICE_UNAVAILABLE
@@ -24245,7 +24258,7 @@ mod tests {
         assert_eq!(info["native_only_chain"], false);
         assert_eq!(info["request_admission_open"], false);
         node.native_request_admission = Arc::new(NativeRequestAdmission::ready_for_test());
-        let _ = submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
+        let _ = submit_without_test_sender_throttle(&node, tx.clone())
             .await
             .unwrap();
         assert_eq!(node.mempool.drain(1)[0].hash, tx.hash);
@@ -24292,12 +24305,12 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            submit_signed_tx(AxumState(node.clone()), Json(uncertified))
+            submit_without_test_sender_throttle(&node, uncertified)
                 .await
                 .unwrap_err(),
             StatusCode::BAD_REQUEST
         );
-        let _ = submit_signed_tx(AxumState(node.clone()), Json(finalize.clone()))
+        let _ = submit_without_test_sender_throttle(&node, finalize.clone())
             .await
             .unwrap();
         commit(&state, &node.mempool.drain(1));
@@ -24316,7 +24329,7 @@ mod tests {
         state
             .sign_transaction(&mut after_native, &requester)
             .unwrap();
-        let _ = submit_signed_tx(AxumState(node.clone()), Json(after_native))
+        let _ = submit_without_test_sender_throttle(&node, after_native)
             .await
             .unwrap();
         commit(&state, &node.mempool.drain(1));
@@ -24366,7 +24379,7 @@ mod tests {
             &bincode::serialize(&refund).unwrap()
         ));
         node.mempool.drain(1);
-        let _ = submit_signed_tx(AxumState(node.clone()), Json(refund))
+        let _ = submit_without_test_sender_throttle(&node, refund)
             .await
             .unwrap();
         commit(&reopened, &node.mempool.drain(1));
