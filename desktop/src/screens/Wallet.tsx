@@ -12,6 +12,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
 import { api } from "../lib/tauri";
+import { isNativeOnlyChain } from "../lib/native-request";
 import { useAppStore } from "../lib/store";
 import { formatArcExact, formatInt } from "../lib/format";
 import type { TxLookup, WalletTxResult } from "../lib/types";
@@ -83,16 +84,15 @@ export function Wallet() {
     onSuccess: setTrackedTx,
   });
 
-  // A protocol-4 chain carries only native paid-inference transactions: its
-  // nodes refuse transfers and faucet claims, and its blocks cannot include
-  // them (decision D13). The same query as the paid-request panel's.
+  // Only a protocol-4 native-only chain refuses ordinary transfers and faucet
+  // claims. Migrated protocol-3 chains can serve native inference alongside them.
   const nativeContext = useQuery({
     queryKey: ["native-context"],
     queryFn: api.nativeContext,
     refetchInterval: 15_000,
     retry: false,
   });
-  const nativeOnly = Boolean(nativeContext.data);
+  const nativeOnly = isNativeOnlyChain(nativeContext.data);
 
   const send = useMutation({
     mutationFn: () => api.sendArc(recipient.trim(), amountArc.trim()),

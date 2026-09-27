@@ -1,4 +1,4 @@
-//! Protocol-4 native paid inference, signed by the desktop wallet.
+//! Native paid inference on recovered chains, signed by the desktop wallet.
 //!
 //! The WebView sends a prompt and the price it accepts. This module reads the
 //! chain's native context from the pinned chain host, builds the exact job the
@@ -92,6 +92,19 @@ struct ChainContext {
     max_input_bytes: usize,
     serving: Option<NativeServingView>,
     node_version: Option<String>,
+    chain_protocol: Option<u64>,
+    native_only_chain: Option<bool>,
+    request_admission_open: Option<bool>,
+}
+
+impl ChainContext {
+    fn request_admission_error(&self) -> Option<&'static str> {
+        match self.request_admission_open {
+            Some(true) => None,
+            Some(false) => Some("this chain is not admitting new native paid requests right now"),
+            None => Some("the node does not advertise native request admission; update the node"),
+        }
+    }
 }
 
 fn hash_field(value: &Value, field: &str) -> Result<Hash256, String> {
@@ -244,6 +257,9 @@ fn parse_context(value: &Value) -> Result<ChainContext, String> {
             .get("node_version")
             .and_then(Value::as_str)
             .map(str::to_string),
+        chain_protocol: value.get("chain_protocol").and_then(Value::as_u64),
+        native_only_chain: value.get("native_only_chain").and_then(Value::as_bool),
+        request_admission_open: value.get("request_admission_open").and_then(Value::as_bool),
     })
 }
 
@@ -314,13 +330,18 @@ async fn fetch_context_value(http: &reqwest::Client, host: &str) -> Result<Optio
 /// `false` when it says it does not, and when it cannot say: the node then
 /// still refuses what it could never include.
 pub(crate) async fn host_carries_only_native_transactions(state: &AppState, host: &str) -> bool {
-    matches!(fetch_context_value(&state.http, host).await, Ok(Some(_)))
+    matches!(fetch_context_value(&state.http, host).await, Ok(Some(value)) if context_is_native_only(&value))
+}
+
+fn context_is_native_only(value: &Value) -> bool {
+    value.get("chain_protocol").and_then(Value::as_u64) == Some(4)
+        && value.get("native_only_chain").and_then(Value::as_bool) == Some(true)
 }
 
 async fn load_context(http: &reqwest::Client, host: &str) -> Result<ChainContext, String> {
-    let value = fetch_context_value(http, host).await?.ok_or_else(|| {
-        format!("{host} is not a protocol-4 chain; native paid requests are not available there")
-    })?;
+    let value = fetch_context_value(http, host)
+        .await?
+        .ok_or_else(|| format!("{host} does not expose a compatible native inference context"))?;
     parse_context(&value)
 }
 
@@ -339,6 +360,9 @@ pub struct NativeContextView {
     pub input_kind: Option<String>,
     pub node_version: Option<String>,
     pub app_contract_version: u16,
+    pub chain_protocol: Option<u64>,
+    pub native_only_chain: Option<bool>,
+    pub request_admission_open: bool,
 }
 
 fn context_view(host: String, parsed: Result<ChainContext, String>) -> NativeContextView {
@@ -354,21 +378,31 @@ fn context_view(host: String, parsed: Result<ChainContext, String>) -> NativeCon
         input_kind: None,
         node_version: None,
         app_contract_version: INFERENCE_CONTRACT_VERSION,
+        chain_protocol: None,
+        native_only_chain: None,
+        request_admission_open: false,
     };
     match parsed {
         Err(reason) => view.reason = Some(reason),
         Ok(context) => {
+            view.chain_protocol = context.chain_protocol;
+            view.native_only_chain = context.native_only_chain;
+            view.request_admission_open = context.request_admission_open == Some(true);
             view.height = Some(context.height);
             view.members = Some(context.members);
             view.executions = Some(context.executions.len());
             view.max_tokens = Some(context.max_tokens);
             view.node_version = context.node_version.clone();
-            match input_kind(context.serving.as_ref()) {
-                Ok(kind) => {
-                    view.compatible = true;
-                    view.input_kind = Some(kind.to_string());
+            if let Some(reason) = context.request_admission_error() {
+                view.reason = Some(reason.to_string());
+            } else {
+                match input_kind(context.serving.as_ref()) {
+                    Ok(kind) => {
+                        view.compatible = true;
+                        view.input_kind = Some(kind.to_string());
+                    }
+                    Err(reason) => view.reason = Some(reason),
                 }
-                Err(reason) => view.reason = Some(reason),
             }
             view.serving = context.serving;
         }
@@ -376,8 +410,8 @@ fn context_view(host: String, parsed: Result<ChainContext, String>) -> NativeCon
     view
 }
 
-/// The native context of the pinned chain host. `None` when the host's chain
-/// is not a protocol-4 chain (the panel stays hidden).
+/// The native context of the pinned chain host. `None` when the host does not
+/// expose the native-inference context endpoint (the panel stays hidden).
 #[tauri::command]
 pub async fn native_context(state: State<'_, AppState>) -> CmdResult<Option<NativeContextView>> {
     native_context_inner(&state).await
@@ -527,6 +561,9 @@ pub(crate) async fn native_prepare_inner(
     let prompt = prompt.to_string();
     let host = wallet::validate_rpc_origin(&crate::commands::chain_host(state).await)?;
     let context = load_context(&state.http, &host).await?;
+    if let Some(reason) = context.request_admission_error() {
+        return Err(reason.into());
+    }
     prepare_input(&state.http, &host, &context, &prompt).await
 }
 
@@ -1163,6 +1200,9 @@ pub(crate) async fn native_submit_inner(
     let address = wallet_address(state).await?;
     let host = wallet::validate_rpc_origin(&crate::commands::chain_host(state).await)?;
     let context = load_context(&state.http, &host).await?;
+    if let Some(reason) = context.request_admission_error() {
+        return Err(reason.into());
+    }
     let kind = input_kind_checked(&context, &input_kind, &input)?;
     check_terms(&terms, &context, kind)?;
     if kind == INPUT_CANONICAL_TOKENS {
@@ -1579,6 +1619,9 @@ mod tests {
         let tuple = hash_bytes(b"tuple");
         json!({
             "candidate_protocol": 4,
+            "chain_protocol": 4,
+            "native_only_chain": true,
+            "request_admission_open": true,
             "context_commitment": hash_bytes(b"commitment").to_hex(),
             "chain_genesis": hash_bytes(b"genesis").to_hex(),
             "recovery_epoch": 0,
@@ -1616,6 +1659,60 @@ mod tests {
         assert_eq!(view.input_kind.as_deref(), Some(INPUT_TEST_EXECUTOR_BYTES));
         assert_eq!(view.members, Some(4));
         assert_eq!(view.height, Some(100));
+        assert_eq!(view.chain_protocol, Some(4));
+        assert!(view.native_only_chain.unwrap());
+        assert!(view.request_admission_open);
+    }
+
+    #[test]
+    fn migrated_v3_can_admit_requests_without_being_classified_native_only() {
+        let mut migrated = context_json();
+        migrated["chain_protocol"] = json!(3);
+        migrated["native_only_chain"] = json!(false);
+        let context = parse_context(&migrated).unwrap();
+        assert_eq!(context.chain_protocol, Some(3));
+        assert_eq!(context.request_admission_error(), None);
+        assert!(!context_is_native_only(&migrated));
+    }
+
+    #[test]
+    fn closed_or_unadvertised_admission_keeps_context_readable_but_blocks_requests() {
+        let mut closed = context_json();
+        closed["request_admission_open"] = json!(false);
+        let parsed = parse_context(&closed).unwrap();
+        assert!(parsed
+            .request_admission_error()
+            .unwrap()
+            .contains("not admitting"));
+        let view = context_view("h".into(), Ok(parsed));
+        assert!(!view.compatible);
+        assert!(!view.request_admission_open);
+        assert!(view.reason.unwrap().contains("not admitting"));
+
+        let mut old = context_json();
+        old.as_object_mut()
+            .unwrap()
+            .remove("request_admission_open");
+        let parsed = parse_context(&old).unwrap();
+        assert!(parsed
+            .request_admission_error()
+            .unwrap()
+            .contains("update the node"));
+        // Receipt/refund paths parse the context without requiring request admission.
+        assert_eq!(parsed.height, 100);
+    }
+
+    #[test]
+    fn native_only_classification_requires_explicit_protocol_four_fields() {
+        let mut context = context_json();
+        assert!(context_is_native_only(&context));
+        context["chain_protocol"] = json!(3);
+        assert!(!context_is_native_only(&context));
+        context["chain_protocol"] = json!(4);
+        context["native_only_chain"] = json!(false);
+        assert!(!context_is_native_only(&context));
+        context.as_object_mut().unwrap().remove("chain_protocol");
+        assert!(!context_is_native_only(&context));
     }
 
     #[test]

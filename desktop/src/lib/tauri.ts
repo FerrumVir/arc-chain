@@ -2059,11 +2059,20 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         body.candidate_protocol === 4 &&
         Array.isArray(body.allowed_executions) &&
         body.contract_version === 1;
+      const chainProtocol = typeof body.chain_protocol === "number" ? body.chain_protocol : null;
+      const nativeOnlyChain = typeof body.native_only_chain === "boolean" ? body.native_only_chain : null;
+      const requestAdmissionOpen = body.request_admission_open === true;
+      const requestGateReason =
+        body.request_admission_open === false
+          ? "This chain is not admitting new native paid requests right now."
+          : "The node does not advertise native request admission; update the node.";
       return {
         host: base,
         compatible: false,
         reason: current
-          ? "Signing native requests requires the native desktop app so the wallet key stays in Rust."
+          ? requestAdmissionOpen
+            ? "Signing native requests requires the native desktop app so the wallet key stays in Rust."
+            : requestGateReason
           : "the host's node is not a current protocol-4 node; update the node",
         height: typeof body.height === "number" ? body.height : null,
         members: Array.isArray(body.members) ? body.members.length : null,
@@ -2081,6 +2090,9 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         inputKind: null,
         nodeVersion: typeof body.node_version === "string" ? body.node_version : null,
         appContractVersion: 1,
+        chainProtocol,
+        nativeOnlyChain,
+        requestAdmissionOpen,
       } as T;
     }
     case "native_receipt": {

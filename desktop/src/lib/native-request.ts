@@ -411,7 +411,7 @@ export interface NativeServingView {
   maxPositions: number | null;
 }
 
-/** The pinned host's protocol-4 context, or why this app cannot use it. */
+/** The pinned host's native-inference context, or why new requests are unavailable. */
 export interface NativeContextView {
   host: string;
   /** False when this app cannot build requests the host's chain admits. */
@@ -426,6 +426,19 @@ export interface NativeContextView {
   inputKind: string | null;
   nodeVersion: string | null;
   appContractVersion: number;
+  /** Actual chain protocol major (can be 3 for migrated/recovered chains). */
+  chainProtocol: number | null;
+  /** True only when the chain accepts native transactions exclusively. */
+  nativeOnlyChain: boolean | null;
+  /** False when admission is closed or the node is too old to advertise it. */
+  requestAdmissionOpen: boolean;
+}
+
+/** Migrated protocol-3 chains can run native inference without banning transfers. */
+export function isNativeOnlyChain(
+  context: Pick<NativeContextView, "chainProtocol" | "nativeOnlyChain"> | null | undefined,
+): boolean {
+  return context?.chainProtocol === 4 && context.nativeOnlyChain === true;
 }
 
 export interface PreparedInput {

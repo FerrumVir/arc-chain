@@ -162,6 +162,9 @@ function context(): NativeContextView {
     inputKind: incompatible ? null : "test_executor_bytes",
     nodeVersion: "0.8.0",
     appContractVersion: 1,
+    chainProtocol: 4,
+    nativeOnlyChain: true,
+    requestAdmissionOpen: !incompatible,
   };
 }
 

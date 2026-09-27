@@ -3,6 +3,7 @@ import {
   canClaimRefund,
   classifyRefusal,
   createNativeRequest,
+  isNativeOnlyChain,
   nextToSign,
   phaseLabel,
   reduce,
@@ -16,6 +17,17 @@ import {
 } from "../src/lib/native-request";
 
 const REQUEST = "ab".repeat(32);
+
+test("only protocol-4 native-only context disables ordinary wallet transactions", () => {
+  const context = {
+    chainProtocol: 3,
+    nativeOnlyChain: false,
+  };
+  expect(isNativeOnlyChain(context)).toBe(false);
+  expect(isNativeOnlyChain({ ...context, chainProtocol: 4, nativeOnlyChain: true })).toBe(true);
+  expect(isNativeOnlyChain({ ...context, chainProtocol: 4, nativeOnlyChain: null })).toBe(false);
+  expect(isNativeOnlyChain(undefined)).toBe(false);
+});
 
 function run(state: NativeRequestState, ...events: NativeRequestEvent[]): NativeRequestState {
   return events.reduce(reduce, state);
