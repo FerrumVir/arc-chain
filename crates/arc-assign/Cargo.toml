@@ -12,5 +12,8 @@ bincode.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
