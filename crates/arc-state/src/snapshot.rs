@@ -213,11 +213,13 @@ pub struct VerifiedSnapshot {
 }
 
 /// Write `bytes` to `path` so that a crash leaves either the old file or the
-/// new one, never a mixture: temp file, fsync, rename, fsync the directory.
+/// new one, never a mixture: temp file, fsync, atomic replace, and a durable
+/// namespace update.
 ///
-/// The directory fsync is not optional. Without it the rename itself can be
-/// lost, which would publish a manifest that points at a payload the crash
-/// discarded - the exact failure the manifest exists to prevent.
+/// The namespace durability step is not optional. Unix fsyncs the parent
+/// directory; Windows uses a write-through move because directory fsync is
+/// unsupported there. Without that barrier, a crash could lose the payload
+/// rename while retaining the manifest that points at it.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SnapshotError> {
     use std::io::Write;
     let temporary = path.with_extension("tmp");
@@ -226,11 +228,12 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SnapshotError> {
     file.write_all(bytes).map_err(io)?;
     file.sync_all().map_err(io)?;
     drop(file);
-    std::fs::rename(&temporary, path).map_err(io)?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(io)?;
+    #[cfg(windows)]
+    arc_crypto::secret_file::windows_move_path_write_through(&temporary, path, true).map_err(io)?;
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(&temporary, path).map_err(io)?;
+        arc_crypto::secret_file::sync_parent_directory(path).map_err(io)?;
     }
     Ok(())
 }
@@ -329,9 +332,7 @@ pub fn remove(dir: &Path) -> Result<(), SnapshotError> {
             Err(error) => return Err(io(error)),
         }
     }
-    if let Ok(dir_handle) = std::fs::File::open(dir) {
-        let _ = dir_handle.sync_all();
-    }
+    let _ = arc_crypto::secret_file::sync_parent_directory(&dir.join(PAYLOAD_FILE));
     Ok(())
 }
 
