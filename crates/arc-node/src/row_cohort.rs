@@ -24,6 +24,7 @@ use arc_assign::lease::{ChallengeResult, LeaseError};
 use arc_assign::link::Probe;
 use arc_assign::placement::{Participant, Policy, Stage};
 use arc_assign::reservation::{MAX_SLOTS_PER_WORKER, ReservationLedger};
+use arc_assign::resident::{ResidentCertificate, WorkerResidency};
 use arc_assign::verify::{Finding, VerificationRule, plan as verification_plan};
 use arc_crypto::Hash256;
 use arc_inference::cached_integer_model::{
@@ -147,6 +148,10 @@ pub struct RowCohortConfig {
     /// Rows of each projection this node recomputes itself, per request.
     #[serde(default = "default_spot_rows")]
     pub spot_rows_per_stage: u32,
+    /// Explicit fixed per-projection ownership; absent preserves the legacy
+    /// full-layer config and stable policy bytes. Requires low residency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_rows: Option<crate::row_residency::PartialRowConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +211,11 @@ impl RowCohortConfig {
     /// Workers and live observations remain certificate inputs, not policy.
     pub fn assignment_hash(&self, low_residency: bool) -> Hash256 {
         let (policy, verification) = self.placement_policy(low_residency, 0);
-        arc_assign::certificate::policy_hash_v2(&policy, &verification)
+        if self.partial_rows.is_some() {
+            arc_assign::resident::policy_hash(&policy, &verification)
+        } else {
+            arc_assign::certificate::policy_hash_v2(&policy, &verification)
+        }
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -240,6 +249,15 @@ impl RowCohortConfig {
         }
         if self.spot_rows_per_stage > MAX_SPOT_ROWS {
             return Err(format!("spot_rows_per_stage is at most {MAX_SPOT_ROWS}"));
+        }
+        if let Some(partial) = &self.partial_rows {
+            partial.validate(&self.workers)?;
+            if self.max_workers < self.workers.len() || self.spot_rows_per_stage == 0 {
+                return Err(
+                    "partial rows require all configured owners and per-stage canonical checks"
+                        .into(),
+                );
+            }
         }
         let mut ids = std::collections::BTreeSet::new();
         for entry in &self.workers {
@@ -463,6 +481,24 @@ pub fn plans_from(
     keys: &[(Option<usize>, TensorKey)],
     id_of: &BTreeMap<[u8; 32], String>,
 ) -> Result<BTreeMap<(Option<usize>, TensorKey), ProjectionPlan>, String> {
+    plans_with_checks(
+        certificate,
+        keys,
+        id_of,
+        verification_plan(
+            certificate.hash(),
+            &certificate.placement,
+            &certificate.verification,
+        ),
+    )
+}
+
+fn plans_with_checks(
+    certificate: &AssignmentCertificate,
+    keys: &[(Option<usize>, TensorKey)],
+    id_of: &BTreeMap<[u8; 32], String>,
+    checks: arc_assign::verify::VerificationPlan,
+) -> Result<BTreeMap<(Option<usize>, TensorKey), ProjectionPlan>, String> {
     let owner = |participant: &Participant| match participant {
         Participant::Coordinator => Ok(SliceOwner::Local),
         Participant::Worker(address) => id_of
@@ -495,11 +531,6 @@ pub fn plans_from(
             },
         );
     }
-    let checks = verification_plan(
-        certificate.hash(),
-        &certificate.placement,
-        &certificate.verification,
-    );
     for duplicate in &checks.duplicates {
         let key = key_of(duplicate.stage)?;
         let slice = plans
@@ -519,11 +550,94 @@ pub fn plans_from(
     Ok(plans)
 }
 
+enum CohortAssignment {
+    Legacy(AssignmentCertificate),
+    Resident(ResidentCertificate),
+}
+impl std::ops::Deref for CohortAssignment {
+    type Target = AssignmentCertificate;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Legacy(c) => c,
+            Self::Resident(c) => &c.assignment,
+        }
+    }
+}
+impl CohortAssignment {
+    fn hash(&self) -> Hash256 {
+        match self {
+            Self::Legacy(c) => c.hash(),
+            Self::Resident(c) => c.hash(),
+        }
+    }
+    fn plans(
+        &self,
+        keys: &[(Option<usize>, TensorKey)],
+        id_of: &BTreeMap<[u8; 32], String>,
+    ) -> Result<BTreeMap<(Option<usize>, TensorKey), ProjectionPlan>, String> {
+        match self {
+            Self::Legacy(c) => plans_from(c, keys, id_of),
+            Self::Resident(c) => {
+                plans_with_checks(&c.assignment, keys, id_of, c.verification_plan())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ProbeLayout {
+    layer: usize,
+    narrow_row: usize,
+    wide_row: usize,
+    challenge_start: usize,
+    challenge_end: usize,
+}
+fn probe_layout(
+    model: &dyn CanonicalRowSource,
+    layer: usize,
+    residency: Option<&WorkerResidency>,
+    keys: &[(Option<usize>, TensorKey)],
+) -> Result<ProbeLayout, String> {
+    let range = |tensor| -> Result<(usize, usize), String> {
+        let (rows, _) = model
+            .projection_shape(Some(layer), tensor)
+            .ok_or("missing probe projection")?;
+        match residency {
+            None => Ok((0, rows)),
+            Some(owner) => {
+                let stage = keys
+                    .iter()
+                    .position(|key| *key == (Some(layer), tensor))
+                    .ok_or("missing probe stage")?;
+                let range = owner
+                    .ranges
+                    .iter()
+                    .find(|range| range.stage == stage)
+                    .ok_or("owner lacks probe rows")?;
+                let start = usize::try_from(range.row_start).map_err(|e| e.to_string())?;
+                let end = usize::try_from(range.row_end).map_err(|e| e.to_string())?;
+                if start >= end || end > rows {
+                    return Err("probe rows outside projection".into());
+                }
+                Ok((start, end))
+            }
+        }
+    };
+    let (gate_start, gate_end) = range(TensorKey::WGate)?;
+    Ok(ProbeLayout {
+        layer,
+        narrow_row: range(TensorKey::Wq)?.0,
+        wide_row: range(TensorKey::WDown)?.0,
+        challenge_start: gate_start,
+        challenge_end: gate_end.min(gate_start + CHALLENGE_ROWS),
+    })
+}
+
 struct Machine {
     entry: RowWorkerEntry,
     address: Hash256,
     digest: Hash256,
-    probe_layer: usize,
+    probe: ProbeLayout,
 }
 
 struct Books {
@@ -586,6 +700,10 @@ pub struct MachineView {
 pub struct CohortView {
     pub low_residency: bool,
     pub local_fallback_enabled: bool,
+    pub partial_row_residency: bool,
+    /// Partial fixed placement has no modeled total latency. Canonical checks
+    /// read the local artifact and consume CPU/I/O, including full selected duplicates.
+    pub placement_timing_prediction_available: bool,
     pub machines: Vec<MachineView>,
     pub coordinator_macs_per_s: u64,
     pub epoch: u64,
@@ -604,6 +722,7 @@ pub struct RowCohort {
     artifact: Hash256,
     config: RowCohortConfig,
     machines: Vec<Machine>,
+    residency: Option<Vec<WorkerResidency>>,
     /// Open connections, by machine id. A machine whose connection closed
     /// (the SSH worker closes itself on any failure) is reconnected at its
     /// next measurement.
@@ -623,6 +742,7 @@ struct ChallengeMaterial {
     layer: usize,
     tensor: TensorKey,
     rows: usize,
+    row_start: usize,
     input: Vec<i64>,
     expected: Vec<i64>,
 }
@@ -632,11 +752,27 @@ fn challenge_material(
     layer: usize,
     height: u64,
 ) -> Result<ChallengeMaterial, String> {
+    let (rows, _) = model
+        .projection_shape(Some(layer), TensorKey::WGate)
+        .ok_or("the model has no challenge layer")?;
+    challenge_material_range(model, layer, 0, CHALLENGE_ROWS.min(rows), height)
+}
+
+fn challenge_material_range(
+    model: &dyn CanonicalRowSource,
+    layer: usize,
+    row_start: usize,
+    row_end: usize,
+    height: u64,
+) -> Result<ChallengeMaterial, String> {
     let tensor = TensorKey::WGate;
     let (total_rows, cols) = model
         .projection_shape(Some(layer), tensor)
         .ok_or("the model has no challenge layer")?;
-    let rows = CHALLENGE_ROWS.min(total_rows);
+    if row_start >= row_end || row_end > total_rows || row_end - row_start > CHALLENGE_ROWS {
+        return Err("challenge rows outside residency or bounded work budget".into());
+    }
+    let rows = row_end - row_start;
     let input: Vec<i64> = (0..cols as u64)
         .map(|i| {
             let h = arc_crypto::hash_bytes(
@@ -652,12 +788,13 @@ fn challenge_material(
         })
         .collect();
     let expected = model
-        .projection_rows(Some(layer), tensor, 0, rows, &input)
+        .projection_rows(Some(layer), tensor, row_start, row_end, &input)
         .map_err(|e| e.to_string())?;
     Ok(ChallengeMaterial {
         layer,
         tensor,
         rows,
+        row_start,
         input,
         expected,
     })
@@ -687,8 +824,8 @@ impl ChallengeMaterial {
                 execution_profile: execution_profile.to_string(),
                 layer: Some(self.layer),
                 tensor: self.tensor,
-                row_start: 0,
-                row_end: self.rows,
+                row_start: self.row_start,
+                row_end: self.row_start + self.rows,
                 worker_id: worker_id.to_string(),
             },
             input: self.input.clone(),
@@ -725,6 +862,7 @@ fn local_rate(model: &dyn CanonicalRowSource, height: u64) -> Result<u64, String
 
 /// A one-row call on a zero input, which must answer a zero row. Its time is
 /// the link's round trip for an input of that projection's width.
+#[allow(clippy::too_many_arguments)]
 fn zero_call(
     model: &dyn CanonicalRowSource,
     artifact: Hash256,
@@ -732,13 +870,36 @@ fn zero_call(
     worker_id: &str,
     layer: usize,
     tensor: TensorKey,
+    row_start: usize,
     seed: &[u8],
 ) -> Result<u64, String> {
-    let (_, cols) = model
+    let request = zero_request(model, artifact, worker_id, layer, tensor, row_start, seed)?;
+    let started = Instant::now();
+    let response = worker.project(request).map_err(|error| error.to_string())?;
+    let elapsed = elapsed_us(started.elapsed());
+    if response.values != [0] {
+        return Err("a zero input did not give a zero row".into());
+    }
+    Ok(elapsed)
+}
+
+fn zero_request(
+    model: &dyn CanonicalRowSource,
+    artifact: Hash256,
+    worker_id: &str,
+    layer: usize,
+    tensor: TensorKey,
+    row_start: usize,
+    seed: &[u8],
+) -> Result<RowProjectionRequest, String> {
+    let (rows, cols) = model
         .projection_shape(Some(layer), tensor)
         .ok_or("the model has no probe layer")?;
+    if row_start >= rows {
+        return Err("probe row outside projection".into());
+    }
     let input = vec![0i64; cols];
-    let request = RowProjectionRequest {
+    Ok(RowProjectionRequest {
         call_id: arc_crypto::hash_bytes(
             &[b"ARC-row-ping".as_slice(), seed, worker_id.as_bytes()].concat(),
         ),
@@ -751,19 +912,12 @@ fn zero_call(
                 .to_string(),
             layer: Some(layer),
             tensor,
-            row_start: 0,
-            row_end: 1,
+            row_start,
+            row_end: row_start + 1,
             worker_id: worker_id.to_string(),
         },
         input,
-    };
-    let started = Instant::now();
-    let response = worker.project(request).map_err(|error| error.to_string())?;
-    let elapsed = elapsed_us(started.elapsed());
-    if response.values != [0] {
-        return Err("a zero input did not give a zero row".into());
-    }
-    Ok(elapsed)
+    })
 }
 
 fn failed_probe() -> Probe {
@@ -847,6 +1001,7 @@ impl RowCohort {
             artifact,
             config,
             machines: vec![],
+            residency: None,
             workers: Mutex::new(BTreeMap::new()),
             coordinator_macs_per_s: 1,
             books: Mutex::new(Books {
@@ -867,7 +1022,7 @@ impl RowCohort {
 
     fn verify_certificate(
         &self,
-        certificate: &AssignmentCertificate,
+        certificate: &CohortAssignment,
         request: Hash256,
         assignment: Hash256,
         now: u64,
@@ -877,17 +1032,41 @@ impl RowCohort {
                 "row assignment certificate does not match this job and runtime policy".into(),
             ));
         }
-        verify_row_certificate(
-            certificate,
-            request,
-            self.artifact,
-            self.model
-                .source()
-                .canonical_execution_profile()
-                .unwrap_or_default(),
-            assignment,
-            now,
-        )
+        match certificate {
+            CohortAssignment::Legacy(c) if self.residency.is_none() => verify_row_certificate(
+                c,
+                request,
+                self.artifact,
+                self.model
+                    .source()
+                    .canonical_execution_profile()
+                    .unwrap_or_default(),
+                assignment,
+                now,
+            ),
+            CohortAssignment::Resident(c) if self.residency.as_ref() == Some(&c.residency) => {
+                if c.assignment.request_id != request
+                    || c.assignment.artifact_id != self.artifact
+                    || c.assignment.execution_profile
+                        != self
+                            .model
+                            .source()
+                            .canonical_execution_profile()
+                            .unwrap_or_default()
+                    || c.assignment.policy.now != now
+                    || c.assignment.epoch != now / EPOCH_HEIGHTS
+                {
+                    return Err(NativeInferenceError::Executor(
+                        "resident certificate job or observation mismatch".into(),
+                    ));
+                }
+                c.verify(&assignment)
+                    .map_err(NativeInferenceError::Executor)
+            }
+            _ => Err(NativeInferenceError::Executor(
+                "certificate does not match the runtime resident layout".into(),
+            )),
+        }
     }
 
     /// Build the cohort and measure every listed machine on a background
@@ -923,7 +1102,28 @@ impl RowCohort {
             );
         }
         config.validate_for_model(model.config().n_layers)?;
-        if model.is_low_residency() {
+        if config.partial_rows.is_some() && !model.is_low_residency() {
+            return Err(
+                "partial rows require low residency; no full-model fallback mode is supported"
+                    .into(),
+            );
+        }
+        let (keys, stages) = projection_stages(model.source());
+        let residency = config
+            .partial_rows
+            .as_ref()
+            .map(|partial| {
+                let mut owners =
+                    partial.load(&config.workers, validator, model.source(), artifact)?;
+                owners.sort_by_key(|owner| owner.worker.0);
+                for owner in &mut owners {
+                    owner.ranges.sort_by_key(|range| range.stage);
+                }
+                arc_assign::resident::validate_layout(&stages, &owners, config.max_workers)?;
+                Ok::<_, String>(owners)
+            })
+            .transpose()?;
+        if model.is_low_residency() && residency.is_none() {
             // Declaration is not readiness: measured workers must still pass
             // exact placement and per-call verification before execution.
             for layer in 0..model.config().n_layers as u32 {
@@ -955,9 +1155,15 @@ impl RowCohort {
                     entry: entry.clone(),
                     address: machine_address(&validator, entry),
                     digest: entry_digest(entry),
-                    probe_layer: probe_layer_for_residency(
-                        &entry.resident_layers,
-                        model.config().n_layers,
+                    probe: probe_layout(
+                        model.source(),
+                        probe_layer_for_residency(&entry.resident_layers, model.config().n_layers)?,
+                        residency.as_ref().and_then(|owners| {
+                            owners
+                                .iter()
+                                .find(|owner| owner.worker == machine_address(&validator, entry))
+                        }),
+                        &keys,
                     )?,
                 })
             })
@@ -974,6 +1180,7 @@ impl RowCohort {
             artifact,
             config,
             machines,
+            residency,
             workers: Mutex::new(BTreeMap::new()),
             coordinator_macs_per_s,
             books: Mutex::new(Books {
@@ -1032,8 +1239,9 @@ impl RowCohort {
             self.artifact,
             &worker,
             &entry.id,
-            self.machines[index].probe_layer,
+            self.machines[index].probe.layer,
             TensorKey::Wq,
+            self.machines[index].probe.narrow_row,
             &seed,
         )?;
         worker.set_timeout(Duration::from_millis(entry.timeout_ms));
@@ -1051,7 +1259,8 @@ impl RowCohort {
     ) -> Measurement {
         let (model, artifact) = (self.model.source(), self.artifact);
         let entry = &self.machines[index].entry;
-        let probe_layer = self.machines[index].probe_layer;
+        let probe = self.machines[index].probe;
+        let probe_layer = probe.layer;
         let (worker, reconnected) = match self.open_worker(index, height) {
             Ok(opened) => opened,
             Err(error) => {
@@ -1081,6 +1290,7 @@ impl RowCohort {
                 &entry.id,
                 probe_layer,
                 TensorKey::Wq,
+                probe.narrow_row,
                 &seed,
             ) {
                 Ok(rtt_us) => {
@@ -1120,6 +1330,7 @@ impl RowCohort {
                     &entry.id,
                     probe_layer,
                     TensorKey::WDown,
+                    probe.wide_row,
                     &seed,
                 ) {
                     Ok(elapsed) => wide_calls.push(elapsed),
@@ -1224,16 +1435,19 @@ impl RowCohort {
                     return;
                 };
                 let material = if marked.iter().any(|(_, challenge, _)| *challenge) {
-                    let layers: BTreeSet<usize> = marked
+                    let ranges: BTreeSet<(usize, usize, usize)> = marked
                         .iter()
                         .filter(|(_, challenge, _)| *challenge)
-                        .map(|(index, _, _)| cohort.machines[*index].probe_layer)
+                        .map(|(index, _, _)| {
+                            let probe = cohort.machines[*index].probe;
+                            (probe.layer, probe.challenge_start, probe.challenge_end)
+                        })
                         .collect();
-                    let prepared = layers
+                    let prepared = ranges
                         .into_iter()
-                        .map(|layer| {
-                            challenge_material(cohort.model.source(), layer, height)
-                                .map(|material| (layer, material))
+                        .map(|range @ (layer, start, end)| {
+                            challenge_material_range(cohort.model.source(), layer, start, end, height)
+                                .map(|material| (range, material))
                         })
                         .collect::<Result<BTreeMap<_, _>, _>>();
                     cohort.books.lock().material_failed_at = prepared.is_err().then_some(height);
@@ -1251,7 +1465,8 @@ impl RowCohort {
                         let material = material
                             .as_ref()
                             .and_then(|materials| {
-                                materials.get(&cohort.machines[index].probe_layer)
+                                let probe = cohort.machines[index].probe;
+                                materials.get(&(probe.layer, probe.challenge_start, probe.challenge_end))
                             })
                             .filter(|_| challenge);
                         let spawned = std::thread::Builder::new()
@@ -1427,7 +1642,7 @@ impl RowCohort {
         now: u64,
         stages: Vec<Stage>,
         open: &BTreeMap<String, Arc<dyn RowWorker>>,
-    ) -> Result<AssignmentCertificate, arc_assign::placement::PlacementError> {
+    ) -> Result<CohortAssignment, String> {
         let books = self.books.lock();
         let (candidates, digests) = book::candidates_from(
             self.offers(open),
@@ -1439,6 +1654,34 @@ impl RowCohort {
         let (policy, rule) = self
             .config
             .placement_policy(self.model.is_low_residency(), now);
+        if let Some(residency) = &self.residency {
+            let assignment = AssignmentCertificate {
+                version: 3,
+                request_id: request,
+                artifact_id: self.artifact,
+                execution_profile: self
+                    .model
+                    .source()
+                    .canonical_execution_profile()
+                    .unwrap_or_default()
+                    .into(),
+                epoch: books.epoch,
+                stages,
+                coordinator_macs_per_s: 0,
+                candidates,
+                lease_digests: digests,
+                policy,
+                verification: rule,
+                placement: arc_assign::placement::Placement {
+                    workers: vec![],
+                    stages: vec![],
+                    predicted_token_us: 0,
+                    coordinator_only_token_us: 0,
+                },
+            };
+            return ResidentCertificate::issue(assignment, residency.clone())
+                .map(CohortAssignment::Resident);
+        }
         AssignmentCertificate::issue_v2(
             request,
             self.artifact,
@@ -1454,6 +1697,8 @@ impl RowCohort {
             policy,
             rule,
         )
+        .map(CohortAssignment::Legacy)
+        .map_err(|error| error.to_string())
     }
 
     /// Refresh measurements even on an idle node. Low residency is ready only
@@ -1486,7 +1731,7 @@ impl RowCohort {
             .iter()
             .map(|machine| (machine.address.0, machine.entry.id.clone()))
             .collect();
-        let Ok(plans) = plans_from(&certificate, &keys, &id_of) else {
+        let Ok(plans) = certificate.plans(&keys, &id_of) else {
             return false;
         };
         let stage_of = keys
@@ -1618,7 +1863,7 @@ impl RowCohort {
     #[allow(clippy::too_many_arguments)]
     fn run_placed(
         &self,
-        certificate: &AssignmentCertificate,
+        certificate: &CohortAssignment,
         keys: &[(Option<usize>, TensorKey)],
         id_of: &BTreeMap<[u8; 32], String>,
         open: &BTreeMap<String, Arc<dyn RowWorker>>,
@@ -1626,8 +1871,9 @@ impl RowCohort {
         (prompt, max_tokens, eos_tokens): (&[u32], u32, &[u32]),
         record: &mut CohortRecord,
     ) -> Result<(Generated, String), String> {
-        let plans =
-            plans_from(certificate, keys, id_of).map_err(|error| format!("local: {error}"))?;
+        let plans = certificate
+            .plans(keys, id_of)
+            .map_err(|error| format!("local: {error}"))?;
         self.books
             .lock()
             .ledger
@@ -1695,7 +1941,14 @@ impl RowCohort {
                     record.fallbacks, record.skipped
                 ),
             )),
-            Ok(output) => Ok((Ok(output), "partitioned".into())),
+            Ok(output) => Ok((
+                Ok(output),
+                if self.residency.is_some() {
+                    "partitioned fixed resident rows; timing prediction unavailable; canonical checks consume local artifact I/O and compute".into()
+                } else {
+                    "partitioned".into()
+                },
+            )),
             // The backend recomputes failed and faulty slices itself, so an
             // error here is this node's own; run the request locally.
             Err(error) => Err(format!("local: the partitioned run stopped: {error}")),
@@ -1725,6 +1978,8 @@ impl RowCohort {
             .collect();
         drop(workers);
         CohortView {
+            partial_row_residency: self.residency.is_some(),
+            placement_timing_prediction_available: self.residency.is_none(),
             low_residency: self.model.is_low_residency(),
             local_fallback_enabled: !self.model.is_low_residency(),
             machines,
@@ -1849,6 +2104,7 @@ mod tests {
             max_workers: default_max_workers(),
             duplicate_per_mille: default_duplicate_per_mille(),
             spot_rows_per_stage: default_spot_rows(),
+            partial_rows: None,
         }
     }
 
@@ -2001,6 +2257,7 @@ mod tests {
             layer: 7,
             tensor: TensorKey::WGate,
             rows: 2,
+            row_start: 0,
             input: vec![0, 1],
             expected: vec![0, 1],
         };
@@ -2283,5 +2540,409 @@ mod tests {
         empty["workers"][0]["resident_layers"] = serde_json::json!([[3, 3]]);
         let parsed: RowCohortConfig = serde_json::from_value(empty).unwrap();
         assert!(parsed.validate().is_err());
+    }
+    // Synthetic row arithmetic, deliberately not a qualified model. These
+    // tests prove residency, verification and refusal at the real backend seam.
+    struct TinyRowSource {
+        config: ModelConfig,
+        checks: Mutex<Vec<(Option<usize>, TensorKey, usize, usize)>>,
+    }
+    impl TinyRowSource {
+        fn new() -> Self {
+            Self {
+                config: ModelConfig {
+                    n_layers: 1, d_model: 2, n_heads: 1, n_kv_heads: 1,
+                    d_ff: 4, d_head: 2, d_kv: 2, vocab_size: 6, attn_scale: 1,
+                    rope_cos: vec![], rope_sin: vec![], max_seq: 8, eos_tokens: vec![],
+                    bos_token: 1, chat_template: String::new(),
+                    arithmetic_profile: arc_inference::cached_integer_model::ArithmeticProfile::GgufInterleavedRowsV1,
+                }, checks: Mutex::new(vec![]),
+            }
+        }
+        fn rows(start: usize, end: usize, input: &[i64]) -> Vec<i64> {
+            let sum: i64 = input.iter().sum();
+            (start..end).map(|row| (row as i64 + 1) * sum).collect()
+        }
+    }
+    impl CanonicalRowSource for TinyRowSource {
+        fn config(&self) -> &ModelConfig {
+            &self.config
+        }
+        fn canonical_execution_profile(&self) -> Option<&'static str> {
+            Some("synthetic-partial-row-fixture")
+        }
+        fn projection_shape(
+            &self,
+            layer: Option<usize>,
+            tensor: TensorKey,
+        ) -> Option<(usize, usize)> {
+            if (layer == Some(0) && tensor != TensorKey::LmHead)
+                || (layer.is_none() && tensor == TensorKey::LmHead)
+            {
+                Some((6, if tensor == TensorKey::WDown { 4 } else { 2 }))
+            } else {
+                None
+            }
+        }
+        fn projection_rows(
+            &self,
+            layer: Option<usize>,
+            tensor: TensorKey,
+            start: usize,
+            end: usize,
+            input: &[i64],
+        ) -> Result<Vec<i64>, TensorParallelError> {
+            let (rows, cols) = self
+                .projection_shape(layer, tensor)
+                .ok_or(TensorParallelError::WrongShape)?;
+            if start >= end || end > rows || input.len() != cols {
+                return Err(TensorParallelError::WrongShape);
+            }
+            self.checks.lock().push((layer, tensor, start, end));
+            Ok(Self::rows(start, end, input))
+        }
+    }
+    struct RangeWorker {
+        id: String,
+        start: usize,
+        end: usize,
+        open: std::sync::atomic::AtomicBool,
+        corrupt: std::sync::atomic::AtomicBool,
+        calls: Mutex<Vec<RowAssignment>>,
+    }
+    impl RowWorker for RangeWorker {
+        fn project(
+            &self,
+            request: RowProjectionRequest,
+        ) -> Result<arc_inference::tensor_parallel::RowProjectionResponse, TensorParallelError>
+        {
+            if !self.is_open() {
+                return Err(TensorParallelError::Closed);
+            }
+            let a = &request.assignment;
+            if a.worker_id != self.id
+                || a.artifact_id != Hash256([9; 32])
+                || a.execution_profile != "synthetic-partial-row-fixture"
+                || a.row_start < self.start
+                || a.row_end > self.end
+                || a.row_start >= a.row_end
+                || request.input_hash != hash_i64(&request.input)
+            {
+                return Err(TensorParallelError::WrongIdentity);
+            }
+            self.calls.lock().push(a.clone());
+            let mut values = TinyRowSource::rows(a.row_start, a.row_end, &request.input);
+            if self.corrupt.load(Ordering::Relaxed) {
+                values[0] += 1;
+            }
+            Ok(arc_inference::tensor_parallel::RowProjectionResponse {
+                call_id: request.call_id,
+                input_hash: request.input_hash,
+                assignment: request.assignment,
+                values,
+            })
+        }
+        fn is_open(&self) -> bool {
+            self.open.load(Ordering::Relaxed)
+        }
+    }
+    #[derive(Default)]
+    struct PartialEvents(Mutex<Vec<RowEvent>>);
+    impl RowEventSink for PartialEvents {
+        fn record(&self, event: RowEvent) {
+            self.0.lock().push(event);
+        }
+        fn is_excluded(&self, _: &str) -> bool {
+            false
+        }
+    }
+    fn partial_fixture(
+        source: &TinyRowSource,
+    ) -> (
+        CohortAssignment,
+        Vec<Arc<RangeWorker>>,
+        BTreeMap<[u8; 32], String>,
+    ) {
+        let (_, stages) = projection_stages(source);
+        let mut cfg = config(vec![entry("owner-1"), entry("owner-2")]);
+        cfg.duplicate_per_mille = 1000;
+        let (policy, verification) = cfg.placement_policy(true, 110);
+        let mut owners = Vec::new();
+        let mut candidates = Vec::new();
+        let mut workers = Vec::new();
+        let mut ids = BTreeMap::new();
+        for i in 0..2 {
+            let address = Hash256([i as u8 + 1; 32]);
+            let id = format!("owner-{}", i + 1);
+            let (start, end) = (i * 3, (i + 1) * 3);
+            ids.insert(address.0, id.clone());
+            owners.push(WorkerResidency {
+                worker: address,
+                manifest_hash: Hash256([i as u8 + 11; 32]),
+                ranges: (0..stages.len())
+                    .map(|stage| arc_assign::resident::ResidentRange {
+                        stage,
+                        row_start: start as u64,
+                        row_end: end as u64,
+                    })
+                    .collect(),
+            });
+            candidates.push(Candidate {
+                worker: address,
+                transport_id: id.clone(),
+                macs_per_s: 1000,
+                ram_headroom_bytes: 4096,
+                max_concurrency: 1,
+                link: link(),
+                resident_layers: vec![],
+                resident_output: false,
+            });
+            workers.push(Arc::new(RangeWorker {
+                id,
+                start,
+                end,
+                open: std::sync::atomic::AtomicBool::new(true),
+                corrupt: std::sync::atomic::AtomicBool::new(false),
+                calls: Mutex::new(vec![]),
+            }));
+        }
+        let assignment = AssignmentCertificate {
+            version: 3,
+            request_id: Hash256([8; 32]),
+            artifact_id: Hash256([9; 32]),
+            execution_profile: source.canonical_execution_profile().unwrap().into(),
+            epoch: 0,
+            stages,
+            coordinator_macs_per_s: 0,
+            candidates,
+            lease_digests: vec![],
+            policy,
+            verification,
+            placement: arc_assign::placement::Placement {
+                workers: vec![],
+                stages: vec![],
+                predicted_token_us: 0,
+                coordinator_only_token_us: 0,
+            },
+        };
+        (
+            CohortAssignment::Resident(ResidentCertificate::issue(assignment, owners).unwrap()),
+            workers,
+            ids,
+        )
+    }
+
+    #[test]
+    fn partial_resident_plans_execute_disjoint_rows_and_refuse_missing_or_faulty_owners() {
+        use arc_inference::tensor_parallel::ProjectionBackend;
+        let source = TinyRowSource::new();
+        let (certificate, workers, ids) = partial_fixture(&source);
+        let (keys, _) = projection_stages(&source);
+        let plans = certificate.plans(&keys, &ids).unwrap();
+        let open: BTreeMap<String, Arc<dyn RowWorker>> = workers
+            .iter()
+            .map(|worker| (worker.id.clone(), worker.clone() as Arc<dyn RowWorker>))
+            .collect();
+        let events = PartialEvents::default();
+        let backend = VerifiedPartitionBackend::new_strict(
+            &source,
+            Hash256([9; 32]),
+            plans.clone(),
+            open.clone(),
+            &events,
+        )
+        .unwrap();
+        for &(layer, tensor) in &keys {
+            let (rows, cols) = source.projection_shape(layer, tensor).unwrap();
+            let input = vec![1; cols];
+            assert_eq!(
+                backend
+                    .project_rows(Hash256([8; 32]), layer, tensor, &input, rows)
+                    .unwrap(),
+                TinyRowSource::rows(0, rows, &input)
+            );
+        }
+        for worker in &workers {
+            let calls = worker.calls.lock();
+            assert_eq!(
+                calls.len(),
+                keys.len(),
+                "one primary call per owner per projection"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|a| a.row_start == worker.start && a.row_end == worker.end)
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|a| a.layer.is_none() && a.tensor == TensorKey::LmHead)
+            );
+        }
+        assert!(
+            events
+                .0
+                .lock()
+                .iter()
+                .all(|event| matches!(event, RowEvent::Answered { .. }))
+        );
+        assert!(
+            !source.checks.lock().is_empty(),
+            "canonical verification is real work"
+        );
+        assert!(
+            source
+                .checks
+                .lock()
+                .iter()
+                .all(|(_, _, start, end)| end - start <= 3)
+        );
+        let mut missing = open.clone();
+        missing.remove("owner-2");
+        assert!(
+            VerifiedPartitionBackend::new_strict(
+                &source,
+                Hash256([9; 32]),
+                plans.clone(),
+                missing,
+                &events
+            )
+            .is_err()
+        );
+        workers[1].open.store(false, Ordering::Relaxed);
+        assert!(
+            backend
+                .project_rows(Hash256([8; 32]), Some(0), TensorKey::Wq, &[1, 1], 6)
+                .is_err(),
+            "loss after preflight cannot cause local fallback"
+        );
+        workers[1].open.store(true, Ordering::Relaxed);
+        workers[1].corrupt.store(true, Ordering::Relaxed);
+        assert!(
+            backend
+                .project_rows(Hash256([8; 32]), Some(0), TensorKey::Wq, &[1, 1], 6)
+                .is_err(),
+            "canonical duplicate mismatch refuses"
+        );
+    }
+
+    #[test]
+    fn partial_warmup_and_challenges_use_owned_nonzero_rows() {
+        let source = TinyRowSource::new();
+        let (certificate, workers, _) = partial_fixture(&source);
+        let CohortAssignment::Resident(certificate) = certificate else {
+            unreachable!()
+        };
+        let (keys, _) = projection_stages(&source);
+        let probe = probe_layout(&source, 0, Some(&certificate.residency[1]), &keys).unwrap();
+        assert_eq!(
+            (
+                probe.narrow_row,
+                probe.wide_row,
+                probe.challenge_start,
+                probe.challenge_end
+            ),
+            (3, 3, 3, 6)
+        );
+        for (tensor, row) in [
+            (TensorKey::Wq, probe.narrow_row),
+            (TensorKey::WDown, probe.wide_row),
+        ] {
+            let request = zero_request(
+                &source,
+                Hash256([9; 32]),
+                "owner-2",
+                0,
+                tensor,
+                row,
+                b"warmup",
+            )
+            .unwrap();
+            assert_eq!(workers[1].project(request).unwrap().values, vec![0]);
+        }
+        let material =
+            challenge_material_range(&source, 0, probe.challenge_start, probe.challenge_end, 110)
+                .unwrap();
+        let request = material
+            .request(
+                source.canonical_execution_profile().unwrap(),
+                Hash256([9; 32]),
+                "owner-2",
+                110,
+            )
+            .unwrap();
+        assert_eq!(
+            workers[1].project(request).unwrap().values,
+            material.expected
+        );
+        assert!(
+            workers[1]
+                .project(
+                    zero_request(
+                        &source,
+                        Hash256([9; 32]),
+                        "owner-2",
+                        0,
+                        TensorKey::Wq,
+                        0,
+                        b"wrong"
+                    )
+                    .unwrap()
+                )
+                .is_err()
+        );
+        let other = probe_layout(&source, 0, Some(&certificate.residency[0]), &keys).unwrap();
+        assert_ne!(
+            (probe.layer, probe.challenge_start, probe.challenge_end),
+            (other.layer, other.challenge_start, other.challenge_end),
+            "challenge cache must distinguish disjoint ranges on the same layer"
+        );
+    }
+
+    #[test]
+    fn legacy_config_identity_is_unchanged_and_partial_mode_requires_explicit_policy() {
+        assert_eq!(
+            arc_assign::resident::MAX_WORKERS,
+            arc_inference::tensor_parallel::MAX_ROW_WORKERS_PER_STAGE
+        );
+        assert_eq!(MAX_COHORT_WORKERS, arc_assign::resident::MAX_WORKERS);
+        let mut cfg = config(vec![entry("owner-1"), entry("owner-2")]);
+        let (policy, rule) = cfg.placement_policy(true, 10);
+        assert_eq!(
+            cfg.assignment_hash(true),
+            arc_assign::certificate::policy_hash_v2(&policy, &rule)
+        );
+        assert!(
+            serde_json::to_value(&cfg)
+                .unwrap()
+                .get("partial_rows")
+                .is_none()
+        );
+        cfg.partial_rows = Some(crate::row_residency::PartialRowConfig {
+            format: "arc.private-row-residency.v1".into(),
+            manifests: (1..=2)
+                .map(|i| crate::row_residency::ManifestPin {
+                    worker_id: format!("owner-{i}"),
+                    path: PathBuf::from(format!("/manifests/owner-{i}.json")),
+                    blake3: Hash256([i; 32]),
+                })
+                .collect(),
+        });
+        cfg.validate().unwrap();
+        assert_ne!(
+            cfg.assignment_hash(true),
+            arc_assign::certificate::policy_hash_v2(&policy, &rule)
+        );
+        assert!(crate::native_inference::runtime_assignment_hash(Some(&cfg), false).is_err());
+        assert_eq!(
+            crate::native_inference::runtime_assignment_hash(Some(&cfg), true).unwrap(),
+            cfg.assignment_hash(true)
+        );
+        cfg.max_workers = 1;
+        assert!(
+            cfg.validate().is_err(),
+            "fixed ownership requires every configured owner"
+        );
     }
 }

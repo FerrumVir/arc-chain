@@ -20,6 +20,7 @@ pub mod link;
 pub mod placement;
 pub mod queue;
 pub mod reservation;
+pub mod resident;
 pub mod verify;
 
 pub use arc_crypto::Hash256;

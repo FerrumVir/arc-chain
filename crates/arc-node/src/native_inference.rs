@@ -348,6 +348,11 @@ pub fn runtime_assignment_hash(
     low_residency: bool,
 ) -> Result<Hash256, NativeInferenceError> {
     match cohort {
+        Some(config) if config.partial_rows.is_some() && !low_residency => {
+            Err(NativeInferenceError::Executor(
+                "partial-row assignment requires low residency without full-model fallback".into(),
+            ))
+        }
         Some(config) => Ok(config.assignment_hash(low_residency)),
         None if !low_residency => Ok(local_canonical_assignment_hash()),
         None => Err(NativeInferenceError::Executor(
@@ -3371,6 +3376,7 @@ mod tests {
         assert!(executor.ready_for_requests(&context, 1));
         let config = crate::row_cohort::RowCohortConfig {
             workers: vec![],
+            partial_rows: None,
             max_workers: 4,
             duplicate_per_mille: 50,
             spot_rows_per_stage: 2,

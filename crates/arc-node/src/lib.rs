@@ -18,6 +18,7 @@ pub mod planner;
 pub mod producer;
 pub mod recovery_dag_wal;
 pub mod row_cohort;
+pub mod row_residency;
 pub mod rpc;
 pub mod state_sync;
 #[cfg(unix)]

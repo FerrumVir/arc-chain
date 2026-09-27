@@ -4644,10 +4644,11 @@ fn native_assignment_policy_report(
     Ok(serde_json::json!({
         "format": "arc.native-assignment-policy-report.v1",
         "assignment_hash": assignment.to_hex(),
-        "mode": if low_residency { "private-row-remote-only-strict-v1" }
+        "mode": if config.as_ref().is_some_and(|c| c.partial_rows.is_some()) { "private-fixed-resident-rows-canonical-checks-v1" }
+            else if low_residency { "private-row-remote-only-strict-v1" }
             else if config.is_some() { "private-row-resident-with-local-fallback-v1" }
             else { "local-canonical-i8-v1" },
-        "assignment_certificate_version": config.as_ref().map(|_| 2),
+        "assignment_certificate_version": config.as_ref().map(|c| if c.partial_rows.is_some() { 3 } else { 2 }),
         "max_workers": config.as_ref().map(|c| c.max_workers),
         "duplicate_per_mille": config.as_ref().map(|c| c.duplicate_per_mille),
         "spot_rows_per_stage": config.as_ref().map(|c| c.spot_rows_per_stage),
