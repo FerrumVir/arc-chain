@@ -624,10 +624,10 @@ fn recovered_commit(nodes: &[NodeProcess], tx: Hash256, native: bool) -> u64 {
     height
 }
 
-fn wait_recovered_peers(nodes: &[NodeProcess]) {
+fn wait_recovered_peers(nodes: &[NodeProcess], phase: &str) {
     wait_for(
         Duration::from_secs(60),
-        "six recovered validators fully connected",
+        &format!("six recovered validators fully connected: {phase}"),
         || {
             nodes
                 .iter()
@@ -645,7 +645,7 @@ fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
     let fx = Fixture::recovered();
     let recovery = fx.recovery.as_ref().unwrap();
     let mut nodes: Vec<_> = (0..6).map(|i| fx.spawn_mode(i, false, false)).collect();
-    wait_recovered_peers(&nodes);
+    wait_recovered_peers(&nodes, "initial signed-checkpoint import before activation");
     let initial = recovered_account(nodes[0].port, fx.requesters[0].address());
     assert_eq!(initial.nonce, 0);
     let mut before =
@@ -711,7 +711,10 @@ fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
     // Only one node accepts NEW requests. The other five must still retain
     // committed preimages, execute jobs, gossip votes and admit finalizations.
     let mut nodes: Vec<_> = (0..6).map(|i| fx.spawn_mode(i, true, i == 0)).collect();
-    wait_recovered_peers(&nodes);
+    wait_recovered_peers(
+        &nodes,
+        "first graceful restart with native runtimes enabled",
+    );
     wait_for(
         Duration::from_secs(60),
         "every native runtime live, exactly one ingress enabled",
@@ -822,7 +825,10 @@ fn recovered_v3_dag_migration_paid_lifecycle_survives_restart() {
     // Restart every process on exactly its durable data/signing state with
     // NEW ingress closed. No checkpoint reimport, state edits or fake tips.
     let mut nodes: Vec<_> = (0..6).map(|i| fx.spawn_mode(i, true, false)).collect();
-    wait_recovered_peers(&nodes);
+    wait_recovered_peers(
+        &nodes,
+        "second graceful restart after paid settlement with refund pending",
+    );
     wait_for(
         Duration::from_secs(120),
         "reopened DAG advances to refund height with ingress closed",

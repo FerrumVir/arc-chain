@@ -101,6 +101,12 @@ pub enum ConsensusError {
 
     #[error("cross-shard lock expired: {0}")]
     CrossShardLockExpired(String),
+
+    /// The block passed validation, but its caller could not make it durable.
+    /// It was not published into the DAG. The owning consensus loop must stop
+    /// because its durable writer may now be poisoned.
+    #[error("history block persistence failed: {0}")]
+    HistoryPersistence(String),
 }
 
 // ── Stake Tier ───────────────────────────────────────────────────────────────
@@ -1848,6 +1854,15 @@ impl ConsensusEngine {
         block: &DagBlock,
         base_exception: bool,
     ) -> Result<(), ConsensusError> {
+        self.receive_block_inner_with_persistence(block, base_exception, |_| Ok(()))
+    }
+
+    fn receive_block_inner_with_persistence(
+        &self,
+        block: &DagBlock,
+        base_exception: bool,
+        persist: impl FnOnce(&DagBlock) -> Result<(), ConsensusError>,
+    ) -> Result<(), ConsensusError> {
         let vs = self.validator_set.read();
 
         // 1. Author must be a registered validator that can produce blocks.
@@ -2020,6 +2035,11 @@ impl ConsensusEngine {
         }
 
         drop(vs);
+
+        // Authentication, ordering, round bounds and parent authority have
+        // passed. Make history and its exact preimages durable before any
+        // DAG/author index or side tracker can observe the new block.
+        persist(block)?;
 
         // 7. Equivocation detection: same author must not have two blocks in the same round
         let key = (block.author, block.round);
@@ -2308,6 +2328,22 @@ impl ConsensusEngine {
         blocks: &[DagBlock],
         max_rounds: u64,
     ) -> Result<u64, ConsensusError> {
+        self.import_history_with_persistence(blocks, max_rounds, |_| Ok(()))
+    }
+
+    /// Import through the ordinary history validation, making each newly
+    /// accepted block durable before DAG insertion, round advance or children.
+    /// A persistence failure is fatal to the caller, rather than the ordinary
+    /// peer-validation stop that retains a successfully imported prefix.
+    /// Duplicates and DAG-invalid blocks never reach `persist`. The hook may
+    /// refuse missing/invalid preimages with an ordinary validation error;
+    /// storage failures must use `HistoryPersistence` to stop immediately.
+    pub fn import_history_with_persistence(
+        &self,
+        blocks: &[DagBlock],
+        max_rounds: u64,
+        mut persist: impl FnMut(&DagBlock) -> Result<(), ConsensusError>,
+    ) -> Result<u64, ConsensusError> {
         if blocks.is_empty() {
             return Err(ConsensusError::InvalidBlock("empty history".into()));
         }
@@ -2461,9 +2497,14 @@ impl ConsensusEngine {
         let mut inserted = 0usize;
         'rounds: for (round, round_blocks) in by_round {
             for block in round_blocks {
-                match self.receive_block_inner(block, base == Some(round)) {
+                match self.receive_block_inner_with_persistence(
+                    block,
+                    base == Some(round),
+                    &mut persist,
+                ) {
                     Ok(()) => inserted += 1,
                     Err(ConsensusError::DuplicateBlock) => {}
+                    Err(error @ ConsensusError::HistoryPersistence(_)) => return Err(error),
                     Err(error) => {
                         debug!(
                             round,

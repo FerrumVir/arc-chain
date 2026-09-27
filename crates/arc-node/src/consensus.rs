@@ -987,6 +987,82 @@ impl ConsensusManager {
             || self.dag_wal.is_some()
     }
 
+    /// History changes the same DAG as live gossip. Validate exact transaction
+    /// bodies without applying local NEW-request policy, and persist every
+    /// accepted block before the importer can advance or accept its children.
+    /// Only accepted blocks publish preimages into the bounded pending cache.
+    fn import_history_durably(
+        &self,
+        state: &StateDB,
+        blocks: &[arc_consensus::DagBlock],
+        attached: &[arc_types::Transaction],
+        pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+        latest_round: &dashmap::DashMap<[u8; 32], u64>,
+    ) -> Result<u64, arc_consensus::ConsensusError> {
+        use arc_consensus::ConsensusError;
+        let mut attachments = std::collections::HashMap::new();
+        for transaction in attached {
+            if attachments
+                .insert(transaction.hash.0, transaction)
+                .is_some()
+            {
+                return Err(ConsensusError::InvalidBlock(
+                    "history contains duplicate transaction attachments".into(),
+                ));
+            }
+        }
+        let mut verified = std::collections::HashMap::new();
+        self.engine.import_history_with_persistence(
+            blocks,
+            HISTORY_MAX_ROUNDS,
+            |block| {
+                // Only blocks the importer actually accepts need bodies. A
+                // missing body in a thin/ignored suffix cannot poison the
+                // authenticated prefix. Duplicate blocks never get here.
+                if block.transactions.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err(ConsensusError::InvalidBlock(
+                        "history block repeats a transaction hash".into(),
+                    ));
+                }
+                if !pending_preimage_capacity_allows(pending, &block.transactions) {
+                    return Err(ConsensusError::InvalidBlock(
+                        "history exceeds pending transaction-preimage capacity".into(),
+                    ));
+                }
+                let mut bodies = Vec::with_capacity(block.transactions.len());
+                for hash in &block.transactions {
+                    if !verified.contains_key(&hash.0) {
+                        let body = match attachments.get(&hash.0) {
+                            Some(body) => (**body).clone(),
+                            None => exact_dag_preimages_from(pending, Some(state), &[*hash])
+                                .map_err(|error| {
+                                    ConsensusError::InvalidBlock(format!(
+                                        "history is missing an exact transaction preimage: {error:?}"
+                                    ))
+                                })?
+                                .remove(0),
+                        };
+                        let mut checked = verify_peer_dag_transactions_in_domain(
+                            &[*hash], &[body], state.transaction_domain_hash(),
+                        ).map_err(|error| {
+                            ConsensusError::InvalidBlock(format!(
+                                "history transaction failed signature/domain validation: {error:?}"
+                            ))
+                        })?;
+                        verified.insert(hash.0, checked.remove(0));
+                    }
+                    bodies.push(verified[&hash.0].clone());
+                }
+                self.persist_dag_block(state, block, &bodies)
+                    .map_err(ConsensusError::HistoryPersistence)?;
+                retain_dag_preimages(pending, latest_round, block.round, &bodies)
+                    .map_err(|error| ConsensusError::HistoryPersistence(format!(
+                        "history preimage retention failed: {error:?}"
+                    )))
+            },
+        )
+    }
+
     fn persist_dag_block(
         &self,
         state: &StateDB,
@@ -1016,6 +1092,15 @@ impl ConsensusManager {
                 block_bytes,
             ));
             let mut slot = writer_slot.lock();
+            if slot
+                .as_ref()
+                .is_some_and(|writer| block.round < writer.retention_floor_round())
+            {
+                // A late, ordinarily validated ancestor can precede the
+                // durable compaction floor. That exact baseline already
+                // covers it; never append it outside the retained window.
+                return Ok(());
+            }
             let mut writer = slot
                 .take()
                 .ok_or_else(|| "recovery DAG writer slot is empty".to_string())?;
@@ -2982,27 +3067,27 @@ impl ConsensusManager {
             let mut bootstrap_reject_logged = false;
             for (source, blocks, transactions) in inbound_history {
                 let block_count = blocks.len();
-                // Retain the bodies first: a block that commits without its
-                // exact preimage is a fatal consensus-loop exit, so the bodies
-                // must be in hand before the blocks can be stepped over.
-                for transaction in transactions {
-                    if transaction.hash.0 != transaction.compute_hash().0 {
-                        warn!(%source, "History supplied a transaction whose hash does not match");
-                        continue;
-                    }
-                    pending_txs.insert(transaction.hash.0, transaction);
-                }
                 crate::consensus_diagnostics::bump(
                     &crate::consensus_diagnostics::DIAG.history_responses_received,
                 );
                 let round_before_import = self.engine.current_round();
                 let blocks_before_import = self.engine.dag_block_count();
                 let import_started = std::time::Instant::now();
-                let imported = self.engine.import_history(&blocks, HISTORY_MAX_ROUNDS);
+                let imported = self.import_history_durably(
+                    &state,
+                    &blocks,
+                    &transactions,
+                    &pending_txs,
+                    &pending_tx_latest_round,
+                );
                 crate::consensus_diagnostics::add_elapsed(
                     &crate::consensus_diagnostics::DIAG.history_import_us,
                     import_started,
                 );
+                if let Err(arc_consensus::ConsensusError::HistoryPersistence(error)) = &imported {
+                    error!(%source, %error, "Fatal DAG history persistence failure before commit eligibility");
+                    return;
+                }
                 if let Err(error) = &imported {
                     crate::consensus_diagnostics::classify_import_rejection(&error.to_string());
                 }
@@ -5138,6 +5223,508 @@ mod tests {
             1
         );
         assert!(pending.is_empty());
+    }
+
+    struct HistoryDurabilityFixture {
+        _directory: tempfile::TempDir,
+        manager: ConsensusManager,
+        state: StateDB,
+        keys: Vec<KeyPair>,
+        domain: arc_consensus::ConsensusDomain,
+        store: crate::recovery_dag_wal::GenerationStore,
+        generation: crate::recovery_dag_wal::VerifiedGeneration,
+        pending: dashmap::DashMap<[u8; 32], Transaction>,
+        latest: dashmap::DashMap<[u8; 32], u64>,
+    }
+
+    impl HistoryDurabilityFixture {
+        fn new() -> Self {
+            use crate::recovery_dag_wal::{
+                BaselineState, DagCursor, GenerationInput, GenerationStore, RecoveryDagBinding,
+                RetentionLimits,
+            };
+            let directory = tempfile::tempdir().unwrap();
+            let keys: Vec<_> = (0..6)
+                .map(|index| {
+                    KeyPair::from_ed25519_secret_bytes(
+                        &hash_bytes(format!("durable-history-{index}").as_bytes()).0,
+                    )
+                })
+                .collect();
+            let peers: Vec<_> = keys
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(index, key)| (key.address(), if index < 4 { 6_666_667 } else { 6_666_666 }))
+                .collect();
+            let mut manager = ConsensusManager::new_with_keypair(
+                keys[0].address(),
+                6_666_667,
+                4,
+                false,
+                &peers,
+                keys[0].clone(),
+            );
+            let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"history-test"), 1, 1);
+            manager.engine.install_consensus_domain(domain).unwrap();
+            manager.engine.install_recovery_cursor(64).unwrap();
+            let state = StateDB::with_genesis(&[]);
+            let genesis = state.get_block(0).unwrap();
+            let store = GenerationStore::new(directory.path().join("dag"));
+            let generation = store
+                .create_initial(
+                    GenerationInput {
+                        binding: RecoveryDagBinding {
+                            recovery_manifest_hash: hash_bytes(b"history-manifest"),
+                            recovery_domain: domain.domain_hash,
+                            validator_set_commitment: manager.engine.frozen_validator_set_hash(),
+                        },
+                        baseline_state: BaselineState {
+                            height: 0,
+                            block_hash: genesis.hash,
+                            state_root: genesis.header.state_root,
+                        },
+                        dag_cursor: DagCursor {
+                            committed_block_count: 0,
+                            next_dag_round: 65,
+                            current_round: 65,
+                            retention_floor_round: 65,
+                            retention_ceiling_round: 100,
+                        },
+                        retention_limits: RetentionLimits {
+                            max_records: 100,
+                            max_payload_bytes: 1_048_576,
+                        },
+                    },
+                    Vec::new(),
+                )
+                .unwrap();
+            let writer = store
+                .open_current_active_writer(&generation.manifest.binding, generation.pin)
+                .unwrap();
+            manager.recovery_dag_writer = Some(Arc::new(parking_lot::Mutex::new(Some(writer))));
+            Self {
+                _directory: directory,
+                manager,
+                state,
+                keys,
+                domain,
+                store,
+                generation,
+                pending: dashmap::DashMap::new(),
+                latest: dashmap::DashMap::new(),
+            }
+        }
+
+        fn block(
+            &self,
+            author: usize,
+            round: u64,
+            parents: Vec<Hash256>,
+            mut transactions: Vec<Hash256>,
+        ) -> arc_consensus::DagBlock {
+            transactions.sort_by_key(|hash| hash.0);
+            let mut block = arc_consensus::DagBlock {
+                author: self.keys[author].address(),
+                round,
+                parents,
+                ordering_commitment: arc_consensus::DagBlock::compute_ordering_commitment(
+                    &transactions,
+                ),
+                transactions,
+                timestamp: round,
+                hash: Hash256::ZERO,
+                signature: Vec::new(),
+            };
+            block.hash = block.compute_hash_in_domain(&self.domain);
+            block.signature =
+                bincode::serialize(&self.keys[author].sign(&block.hash).unwrap()).unwrap();
+            block
+        }
+
+        fn import(
+            &self,
+            blocks: &[arc_consensus::DagBlock],
+            attached: &[Transaction],
+        ) -> Result<u64, arc_consensus::ConsensusError> {
+            self.manager.import_history_durably(
+                &self.state,
+                blocks,
+                attached,
+                &self.pending,
+                &self.latest,
+            )
+        }
+
+        fn records(&self) -> Vec<RetainedDagRecord> {
+            // Reopen from bytes after releasing the exclusive live writer.
+            drop(
+                self.manager
+                    .recovery_dag_writer
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .take(),
+            );
+            let mut records = Vec::new();
+            self.store
+                .stream_current_generation_and_active(
+                    &self.generation.manifest.binding,
+                    self.generation.pin,
+                    |record| {
+                        records.push(record);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            records
+        }
+    }
+
+    #[test]
+    fn history_parents_are_durable_before_subsequent_live_child_and_reopen() {
+        use crate::recovery_dag_wal::RetainedRecordKind;
+        let f = HistoryDurabilityFixture::new();
+        let parents: Vec<_> = (0..6).map(|i| f.block(i, 65, vec![], vec![])).collect();
+        // The observed restart held four parents and fetched the other two.
+        for block in parents.iter().take(4) {
+            f.manager.engine.receive_block(block).unwrap();
+            f.manager.persist_dag_block(&f.state, block, &[]).unwrap();
+        }
+        assert!(!f.manager.engine.advance_round());
+        assert_eq!(f.import(&parents, &[]).unwrap(), 66);
+        let child = f.block(0, 66, parents.iter().map(|b| b.hash).collect(), vec![]);
+        f.manager.engine.receive_block(&child).unwrap();
+        f.manager.persist_dag_block(&f.state, &child, &[]).unwrap();
+        // Already-held history must not append another record or change bytes.
+        assert!(f.import(&parents, &[]).is_err());
+        let records = f.records();
+        assert_eq!(records.len(), 7);
+        let restarted = ConsensusEngine::new_with_keypair(
+            f.manager.engine.validator_set(),
+            f.keys[0].address(),
+            f.keys[0].clone(),
+        );
+        restarted.install_consensus_domain(f.domain).unwrap();
+        restarted.install_recovery_cursor(64).unwrap();
+        for record in &records {
+            assert_eq!(record.kind, RetainedRecordKind::DagBlock);
+            let block = bincode::deserialize(&record.payload).unwrap();
+            restarted.receive_block(&block).unwrap();
+            restarted.advance_round();
+        }
+        assert!(restarted.get_block(&child.hash).is_some());
+        assert_eq!(restarted.current_round(), 66);
+        // The old path's durable prefix is exactly the reproducible failure:
+        // remove the two history-only parents, keep the later live child.
+        let old = ConsensusEngine::new_with_keypair(
+            f.manager.engine.validator_set(),
+            f.keys[0].address(),
+            f.keys[0].clone(),
+        );
+        old.install_consensus_domain(f.domain).unwrap();
+        old.install_recovery_cursor(64).unwrap();
+        for parent in parents.iter().take(4) {
+            old.receive_block(parent).unwrap();
+        }
+        assert!(matches!(
+            old.receive_block(&child),
+            Err(arc_consensus::ConsensusError::MissingParents { missing: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn history_below_pinned_floor_is_not_appended_and_floor_children_reopen() {
+        use crate::recovery_dag_wal::{
+            BaselineState, DagCursor, GenerationInput, RetainedRecordKind,
+        };
+        let mut f = HistoryDurabilityFixture::new();
+        let mut parents = Vec::new();
+        let mut old_parents = Vec::new();
+        for round in 65..=67 {
+            let blocks: Vec<_> = (0..6)
+                .map(|i| f.block(i, round, parents.clone(), vec![]))
+                .collect();
+            for block in &blocks {
+                f.manager.engine.receive_block(block).unwrap();
+                f.manager.persist_dag_block(&f.state, block, &[]).unwrap();
+            }
+            assert!(f.manager.engine.advance_round());
+            parents = blocks.iter().map(|b| b.hash).collect();
+            if round == 65 {
+                old_parents = blocks;
+            }
+        }
+        let committed = f.manager.engine.try_commit();
+        assert_eq!(committed.len(), 1);
+        let leader = &committed[0];
+        f.state
+            .execute_block_adaptive_at_with_proof(
+                &[],
+                leader.author,
+                leader.timestamp,
+                leader.state_decision_commitment(&f.domain),
+            )
+            .unwrap();
+        f.manager.persist_dag_commit(&f.state, leader).unwrap();
+        let records = f.records();
+        let summary = f
+            .store
+            .stream_current_generation_and_active(
+                &f.generation.manifest.binding,
+                f.generation.pin,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let baseline = f.state.get_block(1).unwrap();
+        let retained: Vec<_> = records
+            .into_iter()
+            .filter(|r| r.round >= 66 && r.kind != RetainedRecordKind::Commit)
+            .collect();
+        f.generation = f
+            .store
+            .append_compacted(
+                f.generation.pin,
+                summary.active_pin,
+                GenerationInput {
+                    binding: f.generation.manifest.binding.clone(),
+                    baseline_state: BaselineState {
+                        height: 1,
+                        block_hash: baseline.hash,
+                        state_root: baseline.header.state_root,
+                    },
+                    dag_cursor: DagCursor {
+                        committed_block_count: 1,
+                        next_dag_round: 66,
+                        current_round: 68,
+                        retention_floor_round: 66,
+                        retention_ceiling_round: 100,
+                    },
+                    retention_limits: f.generation.manifest.retained_records.limits,
+                },
+                retained.clone(),
+            )
+            .unwrap();
+        let reopened = {
+            let engine = ConsensusEngine::new_with_keypair(
+                f.manager.engine.validator_set(),
+                f.keys[0].address(),
+                f.keys[0].clone(),
+            );
+            engine.install_consensus_domain(f.domain).unwrap();
+            engine.install_recovery_cursor(64).unwrap();
+            engine
+                .install_recovery_generation_cursor(66, 68, 66)
+                .unwrap();
+            for record in &retained {
+                let block = bincode::deserialize(&record.payload).unwrap();
+                engine.receive_block(&block).unwrap();
+                engine.advance_round();
+            }
+            engine.finish_recovery_generation_replay().unwrap();
+            engine
+        };
+        f.manager.engine = Arc::new(reopened);
+        assert!(f.manager.engine.get_block(&old_parents[0].hash).is_none());
+        f.manager
+            .recovery_dag_writer
+            .as_ref()
+            .unwrap()
+            .lock()
+            .replace(
+                f.store
+                    .open_current_active_writer(&f.generation.manifest.binding, f.generation.pin)
+                    .unwrap(),
+            );
+        assert_eq!(f.import(&old_parents, &[]).unwrap(), 68);
+        assert!(f.manager.engine.get_block(&old_parents[0].hash).is_some());
+        let after = f.records();
+        assert_eq!(
+            after, retained,
+            "late ancestors stay behind the pinned boundary"
+        );
+        let reopened = ConsensusEngine::new_with_keypair(
+            f.manager.engine.validator_set(),
+            f.keys[0].address(),
+            f.keys[0].clone(),
+        );
+        reopened.install_consensus_domain(f.domain).unwrap();
+        reopened.install_recovery_cursor(64).unwrap();
+        reopened
+            .install_recovery_generation_cursor(66, 68, 66)
+            .unwrap();
+        for record in after {
+            let block = bincode::deserialize(&record.payload).unwrap();
+            reopened.receive_block(&block).unwrap();
+        }
+        reopened.finish_recovery_generation_replay().unwrap();
+        assert_eq!(reopened.blocks_in_round(66).len(), 6);
+        assert!(reopened.get_block(&old_parents[0].hash).is_none());
+    }
+
+    #[test]
+    fn history_persists_exact_bodies_from_attachment_pending_and_canonical_state() {
+        use crate::recovery_dag_wal::RetainedRecordKind;
+        let f = HistoryDurabilityFixture::new();
+        let key = KeyPair::generate_ed25519();
+        let attached = signed_transfer(&key, 1, 0);
+        let pending = signed_transfer(&key, 2, 1);
+        let canonical = signed_transfer(&key, 3, 2);
+        f.pending.insert(pending.hash.0, pending.clone());
+        f.state
+            .full_transactions
+            .insert(canonical.hash.0, canonical.clone());
+        let bodies = [&attached, &pending, &canonical];
+        let blocks: Vec<_> = (0..6)
+            .map(|i| {
+                f.block(
+                    i,
+                    65,
+                    vec![],
+                    bodies
+                        .get(i)
+                        .map(|body| vec![body.hash])
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        f.import(&blocks, std::slice::from_ref(&attached)).unwrap();
+        for body in bodies {
+            assert_eq!(*f.latest.get(&body.hash.0).unwrap(), 65);
+            assert!(f.pending.get(&body.hash.0).unwrap().sig_verified);
+        }
+        let records = f.records();
+        let mut available = std::collections::HashSet::new();
+        for record in records {
+            match record.kind {
+                RetainedRecordKind::TransactionBody => {
+                    let tx: Transaction = bincode::deserialize(&record.payload).unwrap();
+                    tx.verify_signature().unwrap();
+                    available.insert(tx.hash);
+                }
+                RetainedRecordKind::DagBlock => {
+                    let block: arc_consensus::DagBlock =
+                        bincode::deserialize(&record.payload).unwrap();
+                    assert!(
+                        block
+                            .transactions
+                            .iter()
+                            .all(|hash| available.contains(hash))
+                    );
+                }
+                _ => panic!("unexpected history record"),
+            }
+        }
+        assert_eq!(available.len(), 3);
+    }
+
+    #[test]
+    fn history_invalid_or_missing_preimages_do_not_mutate_dag_or_durable_log() {
+        for invalid_case in 0..3 {
+            let f = HistoryDurabilityFixture::new();
+            let key = KeyPair::generate_ed25519();
+            let mut body = signed_transfer(&key, 1, 0);
+            if invalid_case == 2 {
+                body.sign_in_domain(&key, &hash_bytes(b"wrong-history-transaction-domain"))
+                    .unwrap();
+            }
+            let blocks: Vec<_> = (0..6)
+                .map(|i| f.block(i, 65, vec![], vec![body.hash]))
+                .collect();
+            let attached = if invalid_case == 1 {
+                body.signature = Signature::Ed25519 {
+                    public_key: [0; 32],
+                    signature: vec![0; 64],
+                };
+                body.sig_verified = true; // A remote cache flag never establishes trust.
+                vec![body]
+            } else if invalid_case == 2 {
+                vec![body]
+            } else {
+                vec![]
+            };
+            assert!(matches!(
+                f.import(&blocks, &attached),
+                Err(arc_consensus::ConsensusError::InvalidBlock(_))
+            ));
+            assert!(f.manager.engine.dag_is_empty());
+            assert!(f.pending.is_empty());
+            assert!(f.records().is_empty());
+        }
+    }
+
+    #[test]
+    fn history_thin_suffix_with_missing_body_does_not_poison_complete_prefix() {
+        let f = HistoryDurabilityFixture::new();
+        let mut blocks: Vec<_> = (0..6).map(|i| f.block(i, 65, vec![], vec![])).collect();
+        let parents = blocks.iter().map(|b| b.hash).collect();
+        let missing = hash_bytes(b"thin suffix body is unavailable");
+        let thin = f.block(0, 66, parents, vec![missing]);
+        blocks.push(thin.clone());
+        assert_eq!(f.import(&blocks, &[]).unwrap(), 66);
+        assert!(f.manager.engine.get_block(&thin.hash).is_none());
+        assert_eq!(f.records().len(), 6);
+        assert!(f.pending.is_empty());
+    }
+
+    #[test]
+    fn history_valid_prefix_is_durable_when_later_dag_signature_is_invalid() {
+        let f = HistoryDurabilityFixture::new();
+        let mut blocks: Vec<_> = (0..6).map(|i| f.block(i, 65, vec![], vec![])).collect();
+        blocks[5].signature = vec![0];
+        assert_eq!(f.import(&blocks, &[]).unwrap(), 65);
+        assert_eq!(f.manager.engine.dag_block_count(), 5);
+        let persisted: Vec<_> = f.records().into_iter().map(|r| r.object_hash).collect();
+        assert_eq!(
+            persisted,
+            blocks[..5].iter().map(|b| b.hash).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn history_storage_failure_stops_before_round_advance_or_child_import() {
+        struct FailSecondAppend(std::sync::atomic::AtomicUsize);
+        impl RecoveryDagRollover for FailSecondAppend {
+            fn prepare_append(
+                &self,
+                _: &StateDB,
+                _: &ConsensusEngine,
+                writer: ActiveLogWriter,
+                _: &[RetainedDagRecord],
+            ) -> Result<ActiveLogWriter, String> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    Err("injected history write failure".into())
+                } else {
+                    Ok(writer)
+                }
+            }
+        }
+        let mut f = HistoryDurabilityFixture::new();
+        f.manager.recovery_dag_rollover = Some(Arc::new(FailSecondAppend(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+        let mut blocks: Vec<_> = (0..6).map(|i| f.block(i, 65, vec![], vec![])).collect();
+        let parents = blocks.iter().map(|b| b.hash).collect::<Vec<_>>();
+        blocks.extend((0..6).map(|i| f.block(i, 66, parents.clone(), vec![])));
+        assert!(matches!(
+            f.import(&blocks, &[]),
+            Err(arc_consensus::ConsensusError::HistoryPersistence(_))
+        ));
+        assert_eq!(f.manager.engine.current_round(), 65);
+        assert!(f.manager.engine.get_block(&blocks[1].hash).is_none());
+        assert!(f.manager.engine.get_block(&blocks[2].hash).is_none());
+        assert!(f.manager.engine.get_block(&blocks[6].hash).is_none());
+        assert!(
+            f.manager
+                .recovery_dag_writer
+                .as_ref()
+                .unwrap()
+                .lock()
+                .is_none()
+        );
+        let records = f.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].object_hash, blocks[0].hash);
     }
 
     #[test]

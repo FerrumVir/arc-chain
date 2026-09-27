@@ -524,6 +524,12 @@ impl ActiveLogWriter {
         self.generation.pin
     }
 
+    /// Older rounds belong to this independently pinned canonical baseline;
+    /// their ancestors are not part of the generation's replay window.
+    pub fn retention_floor_round(&self) -> u64 {
+        self.generation.manifest.dag_cursor.retention_floor_round
+    }
+
     pub fn inspection(&self) -> &ActiveLogInspection {
         &self.inspection
     }
