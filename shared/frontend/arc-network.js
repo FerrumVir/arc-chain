@@ -10,6 +10,14 @@
   const NETWORK_STATES = new Set(["maintenance", "recovered", "degraded"]);
   const SUCCESS_STATES = new Set(["success", "succeeded", "mined", "included", "confirmed", "ok"]);
   const FAILURE_STATES = new Set(["failed", "failure", "rejected", "reverted", "invalid", "dropped"]);
+  const NATIVE_INFERENCE_STAGES = new Map([
+    [0x26, "request"],
+    [0x27, "finalize"],
+    [0x28, "refund"],
+    ["nativeinferencerequest", "request"],
+    ["nativeinferencefinalize", "finalize"],
+    ["nativeinferencerefund", "refund"],
+  ]);
   const LEGACY_ARCHIVE_SOURCE_SCHEMA = "arc.legacy-archive.source.v1";
   const LEGACY_ARCHIVE_QUERY_SCHEMA = "arc.legacy-archive.query.v1";
   const MAINTENANCE_SERVICE_SCHEMA = "arc.frontend.maintenance-interlock.v1";
@@ -785,9 +793,14 @@
     const lookupRewardIdentity = !activityEnvelope && typeCode === 0x25;
     const lookupInferenceIdentity = !activityEnvelope
       && (typeCode === 0x16 || normalizedType === "inferenceattestation");
+    const nativeInferenceStage = activityEnvelope ? null
+      : NATIVE_INFERENCE_STAGES.get(typeCode) ?? NATIVE_INFERENCE_STAGES.get(normalizedType) ?? null;
+    const nativeInferenceIdentity = nativeInferenceStage !== null;
     const category = canonicalRewardIdentity || lookupRewardIdentity
       ? "reward"
-      : canonicalInferenceIdentity || lookupInferenceIdentity
+      : nativeInferenceIdentity
+        ? "native-inference"
+        : canonicalInferenceIdentity || lookupInferenceIdentity
         ? "inference"
         : "transaction";
     const rawStatus = receipt?.status ?? receipt?.receipt_status ?? payload?.receipt_status ?? payload?.status ?? null;
@@ -804,7 +817,10 @@
     const height = rawHeight !== null && rawHeight >= 0 ? rawHeight : null;
     const txHash = activityEnvelope
       ? normalizeHex(payload?.tx_hash, 32)
-      : normalizeHex(tx?.hash ?? tx?.tx_hash ?? payload?.hash ?? payload?.tx_hash, 32);
+      : normalizeHex(tx?.hash ?? tx?.tx_hash ?? receipt?.tx_hash ?? payload?.hash ?? payload?.tx_hash, 32);
+    const receiptTxHash = activityEnvelope
+      ? normalizeHex(payload?.tx_hash, 32)
+      : normalizeHex(receipt?.tx_hash, 32);
     const blockHash = activityEnvelope
       ? normalizeHex(payload?.block_hash, 32)
       : normalizeHex(receipt?.block_hash ?? tx?.block_hash ?? payload?.block_hash, 32);
@@ -842,6 +858,7 @@
     return Object.freeze({
       category,
       type: rawType,
+      nativeInferenceStage,
       status,
       receiptBacked,
       success,
@@ -849,12 +866,14 @@
       mined,
       height,
       txHash,
+      receiptTxHash,
       blockHash,
       index,
       rewardWorker,
       rewardJob,
       rewardEarned: canonicalPaidReward && success && mined,
-      inferenceConfirmed: (canonicalComputation || lookupComputation) && success && mined,
+      inferenceConfirmed: (canonicalComputation || lookupComputation
+        || nativeInferenceStage === "finalize") && success && mined,
       computationConfirmed: (canonicalComputation || lookupComputation) && success && mined,
       paymentConfirmed: canonicalPaidReward && success && mined,
     });

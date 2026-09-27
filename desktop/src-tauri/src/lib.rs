@@ -1,6 +1,7 @@
 mod commands;
 mod hardware;
 mod identity;
+mod native_paid;
 mod node_manager;
 mod paths;
 mod production_acceptance;
@@ -302,6 +303,8 @@ pub fn run() {
             let store_shared = store.clone();
             let data_dir_shared = data_dir.clone();
             let migration_error_shared = data_migration_error.clone();
+            let node_shared = app.state::<AppState>().node.clone();
+            let configured_rpc_port = start_config.rpc_port;
             let startup_boundary_reason = migration_failure_reason.clone().or_else(|| {
                 Some(
                     "managed-node startup reconciliation is still in progress; binary replacement and node start are temporarily blocked"
@@ -312,6 +315,10 @@ pub fn run() {
                 *store_shared.lock().await = loaded_store;
                 *data_dir_shared.lock().await = resolved;
                 *migration_error_shared.lock().await = startup_boundary_reason;
+                node_shared
+                    .lock()
+                    .await
+                    .configure_rpc_port_if_stopped(configured_rpc_port);
             });
 
             // Sync the autostart plugin with what the user chose during
@@ -357,6 +364,22 @@ pub fn run() {
                     );
                 }
             }
+
+            // Keep managed-node crash supervision alive while the window is
+            // hidden. It reuses NodeManager's exact launch plan and lifecycle
+            // lock, and has no effect on an intentional Stop/Quit.
+            let supervisor_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let Some(state) = supervisor_handle.try_state::<AppState>() else {
+                        break;
+                    };
+                    state.node.lock().await.supervise_managed_node().await;
+                }
+            });
 
             // If the app was launched with `--minimized` (set by the
             // autostart plugin on login), keep the window hidden and
@@ -603,6 +626,13 @@ pub fn run() {
             commands::tier1_submit,
             commands::tier1_result,
             commands::run_paid_inference,
+            native_paid::native_context,
+            native_paid::native_prepare,
+            native_paid::native_submit,
+            native_paid::native_receipt,
+            native_paid::native_refund,
+            native_paid::native_resubmit,
+            native_paid::native_journal,
             commands::clear_crash,
             commands::ensure_binary,
             commands::get_autostart,

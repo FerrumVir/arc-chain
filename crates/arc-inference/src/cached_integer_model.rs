@@ -88,6 +88,50 @@ impl I8Weights {
             n_cols: 0,
         }
     }
+
+    /// Copy an exact, half-open output-row range.  The per-row Q16 scales are
+    /// inseparable from the rows: exporting data without its matching scales
+    /// would silently change canonical-I8 arithmetic.
+    pub fn copy_rows(&self, start: usize, end: usize) -> Result<Self, String> {
+        if start >= end
+            || end > self.n_rows
+            || self.n_cols == 0
+            || self.data.len() != self.n_rows.saturating_mul(self.n_cols)
+            || self.scales.len() != self.n_rows
+        {
+            return Err(format!(
+                "invalid I8 row range [{start}, {end}) for {}x{} matrix",
+                self.n_rows, self.n_cols
+            ));
+        }
+        Ok(Self {
+            data: self.data[start * self.n_cols..end * self.n_cols].to_vec(),
+            scales: self.scales[start..end].to_vec(),
+            n_rows: end - start,
+            n_cols: self.n_cols,
+        })
+    }
+}
+
+/// Borrowed view of a contiguous I8 row range. Keeping scales paired with
+/// their rows preserves the canonical per-row quantization contract.
+#[derive(Clone, Copy)]
+pub(crate) struct I8WeightsView<'a> {
+    pub(crate) data: &'a [i8],
+    pub(crate) scales: &'a [i64],
+    pub(crate) n_rows: usize,
+    pub(crate) n_cols: usize,
+}
+
+impl<'a> From<&'a I8Weights> for I8WeightsView<'a> {
+    fn from(weights: &'a I8Weights) -> Self {
+        Self {
+            data: &weights.data,
+            scales: &weights.scales,
+            n_rows: weights.n_rows,
+            n_cols: weights.n_cols,
+        }
+    }
 }
 
 // ─── INT16 Weight Storage (Per-Row Quantization, Feature-Gated) ──────────────
@@ -322,6 +366,23 @@ pub struct ModelConfig {
     /// <|start_header_id|>user<|end_header_id|> for LLaMA-3, etc.).
     /// Empty string means no template - use raw input.
     pub chat_template: String,
+    /// Arithmetic identity of the Q/K layout consumed by the fixed-point
+    /// forward path. This is deliberately part of loaded model state: the
+    /// legacy split-half cache layout and the GGUF-interleaved compatibility
+    /// layout produce different outputs from identical source bytes.
+    pub arithmetic_profile: ArithmeticProfile,
+}
+
+/// Versioned Q/K/RoPE arithmetic layouts supported by this binary.
+///
+/// `LegacySplitHalfV0` is retained for existing ARC-INT8 cache files and
+/// protocol identities. `GgufInterleavedRowsV1` permutes the Q and K output
+/// rows at load time, so the existing split-half hot path is mathematically
+/// equivalent to GGUF/Candle's adjacent-pair RoPE convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArithmeticProfile {
+    LegacySplitHalfV0,
+    GgufInterleavedRowsV1,
 }
 
 /// Pre-converted Q4 layer weights (optional, converted at runtime).
@@ -428,6 +489,16 @@ pub struct CachedIntegerModel {
 /// quantization path, not merely start from the same GGUF bytes.
 pub const CANONICAL_REWARD_INFERENCE_PROFILE: &str =
     arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
+/// A new, incompatible execution identity for GGUF Q/K row canonicalization.
+/// It must never be substituted for the legacy canonical profile or stored in
+/// an unversioned `ARC-INT8` cache file.
+pub const GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE: &str =
+    arc_types::transaction::GGUF_LLAMA_I8_INTERLEAVED_ROPE_PROFILE_V1;
+/// Diagnostic-only sampling identity used for same-GGUF source comparisons.
+/// Unlike protocol v2, this selects raw greedy argmax at every step and never
+/// applies ARC's generated-token repetition penalty.
+pub const GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1: &str =
+    arc_types::transaction::GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1;
 pub const I16_INFERENCE_PROFILE: &str = "INT16 integer (per-row, cross-platform deterministic)";
 pub const BLOCK_I8_INFERENCE_PROFILE: &str =
     "block-INT8 integer (32-weight blocks, cross-platform deterministic)";
@@ -443,6 +514,7 @@ pub fn is_supported_inference_profile(profile: &str) -> bool {
     matches!(
         profile,
         CANONICAL_REWARD_INFERENCE_PROFILE
+            | GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
             | I16_INFERENCE_PROFILE
             | BLOCK_I8_INFERENCE_PROFILE
             | Q4_INFERENCE_PROFILE
@@ -529,7 +601,126 @@ impl std::fmt::Display for GenerationError {
 
 impl std::error::Error for GenerationError {}
 
+/// Why a generation whose projections come from a backend stopped.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackendGenerationError {
+    /// Refused before any compute, exactly as
+    /// [`CachedIntegerModel::try_generate_v2`] refuses.
+    Generation(GenerationError),
+    /// The backend could not supply exact rows for a projection.
+    Projection(crate::tensor_parallel::TensorParallelError),
+}
+
+impl std::fmt::Display for BackendGenerationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Generation(error) => write!(f, "{error}"),
+            Self::Projection(error) => write!(f, "row projection failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for BackendGenerationError {}
+
+impl From<GenerationError> for BackendGenerationError {
+    fn from(error: GenerationError) -> Self {
+        Self::Generation(error)
+    }
+}
+
+impl From<crate::tensor_parallel::TensorParallelError> for BackendGenerationError {
+    fn from(error: crate::tensor_parallel::TensorParallelError) -> Self {
+        Self::Projection(error)
+    }
+}
+
+/// The call id of the forward at `position` of one backend generation: it
+/// binds the request and the position, so a worker's answer for one position
+/// is never accepted for another.
+fn backend_call_id(request: &Hash256, position: usize) -> Hash256 {
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-backend-generation-call-v1");
+    hasher.update(&request.0);
+    hasher.update(&(position as u64).to_le_bytes());
+    Hash256(*hasher.finalize().as_bytes())
+}
+
 impl CachedIntegerModel {
+    /// Exact Q/K/RoPE arithmetic identity for this resident model. This does
+    /// not by itself identify the dispatched weight precision.
+    pub fn arithmetic_profile(&self) -> &'static str {
+        match self.config.arithmetic_profile {
+            ArithmeticProfile::LegacySplitHalfV0 => CANONICAL_REWARD_INFERENCE_PROFILE,
+            ArithmeticProfile::GgufInterleavedRowsV1 => GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+        }
+    }
+
+    /// The complete identity eligible for canonical I8 execution claims.
+    /// Optional I16, block-I8, Q4, or experimental copies deliberately yield
+    /// `None`: they must never be represented by either canonical I8 profile.
+    pub fn canonical_execution_profile(&self) -> Option<&'static str> {
+        self.has_canonical_i8_profile()
+            .then(|| self.arithmetic_profile())
+    }
+
+    /// Convert the resident I8 Q/K projections from GGUF's adjacent-pair
+    /// feature order to the legacy split-half feature order. Applying the
+    /// existing split-half RoPE afterwards is then exactly the permuted
+    /// representation of interleaved RoPE, and Q·K attention scores are
+    /// unchanged by the shared permutation.
+    ///
+    /// This only supports the canonical per-row I8 path. Optional precision
+    /// copies would need the same row permutation, so callers must load via
+    /// `load_cached_model_canonical_i8_interleaved_rope` rather than mutate a
+    /// general-purpose model after optional profiles are materialized.
+    pub(crate) fn canonicalize_gguf_interleaved_rope_rows(
+        &mut self,
+    ) -> Result<(), crate::InferenceError> {
+        if self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
+            return Err(crate::InferenceError::Runtime(
+                "GGUF interleaved-RoPE canonicalization was requested twice".into(),
+            ));
+        }
+        if !self.has_canonical_i8_profile() {
+            return Err(crate::InferenceError::Runtime(
+                "GGUF interleaved-RoPE canonicalization requires the canonical per-row INT8 profile".into(),
+            ));
+        }
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
+            if !layer.is_loaded() {
+                return Err(crate::InferenceError::Runtime(format!(
+                    "GGUF interleaved-RoPE canonicalization requires complete layers; layer {layer_index} is absent"
+                )));
+            }
+            permute_interleaved_rows_to_split_half(
+                &mut layer.wq,
+                self.config.n_heads,
+                self.config.d_head,
+                "wq",
+            )?;
+            permute_interleaved_rows_to_split_half(
+                &mut layer.wk,
+                self.config.n_kv_heads,
+                self.config.d_head,
+                "wk",
+            )?;
+        }
+        self.config.arithmetic_profile = ArithmeticProfile::GgufInterleavedRowsV1;
+        Ok(())
+    }
+
+    /// Historical Llama-2 system-message adapter retained for callers that
+    /// explicitly commit this text. It is not used by the reference-qualified
+    /// minimal diagnostic prompt path and must not be inferred from a GGUF.
+    pub const LLAMA2_CHAT_SYSTEM_PROMPT: &'static str = "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not contain harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure your responses are socially unbiased and positive in nature. If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.";
+
+    pub fn apply_llama2_chat_template(user_input: &str) -> String {
+        format!(
+            "[INST] <<SYS>>\n{}\n<</SYS>>\n{} [/INST]",
+            Self::LLAMA2_CHAT_SYSTEM_PROMPT,
+            user_input
+        )
+    }
+
     /// Validate a whole-model generation request before any model compute.
     ///
     /// This is the central admission check for untrusted prompts. The exact
@@ -540,34 +731,7 @@ impl CachedIntegerModel {
         prompt_tokens: usize,
         max_tokens: u32,
     ) -> Result<GenerationPreflight, GenerationError> {
-        let generated_positions =
-            usize::try_from(max_tokens).map_err(|_| GenerationError::PositionCountOverflow {
-                prompt_tokens,
-                max_tokens,
-            })?;
-        let required_positions = GENERATION_INTERNAL_BOS_POSITIONS
-            .checked_add(prompt_tokens)
-            .and_then(|positions| positions.checked_add(generated_positions))
-            .ok_or(GenerationError::PositionCountOverflow {
-                prompt_tokens,
-                max_tokens,
-            })?;
-
-        if required_positions > self.config.max_seq {
-            return Err(GenerationError::ContextWindowExceeded {
-                prompt_tokens,
-                max_tokens,
-                required_positions,
-                max_seq: self.config.max_seq,
-            });
-        }
-
-        Ok(GenerationPreflight {
-            prompt_tokens,
-            max_tokens,
-            required_positions,
-            max_seq: self.config.max_seq,
-        })
+        preflight_generation_config(&self.config, prompt_tokens, max_tokens)
     }
 
     /// True only when every configured transformer layer has real weights.
@@ -818,6 +982,15 @@ unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
 /// Write matmul result into pre-allocated output buffer (zero-alloc).
 /// Parallel with 512-row chunks to minimize rayon scheduling overhead.
 fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
+    matmul_i8_view_into(I8WeightsView::from(weights), input, in_size, output);
+}
+
+fn matmul_i8_view_into(
+    weights: I8WeightsView<'_>,
+    input: &[i64],
+    in_size: usize,
+    output: &mut [i64],
+) {
     // Empty-weight guard. Shard-mode models pre-allocate every layer as an
     // empty placeholder and only populate the range this node holds. Any
     // code path that iterates over a non-held layer hits an empty weight
@@ -834,8 +1007,19 @@ fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &m
         weights.scales.len(),
         "matmul output/scales mismatch"
     );
-    let data = &weights.data;
-    let scales = &weights.scales;
+    // Opt-in bit-exact vectorised path. Default OFF, so the scalar datapath
+    // below is unchanged unless a caller explicitly enables it. The fast path
+    // refuses any input it cannot prove exact and returns false, leaving the
+    // scalar kernel to run. See `crate::canonical_simd`.
+    if crate::canonical_simd::fast_canonical_kernel_enabled()
+        && crate::canonical_simd::matmul_i8_canonical_rows_fast_view(
+            weights, input, in_size, output,
+        )
+    {
+        return;
+    }
+    let data = weights.data;
+    let scales = weights.scales;
     // Chunk width 256, matching matmul_i16_into. At 512 a 4096-row output
     // yields only 8 rayon tasks, so the I8 path saturated at 8 cores no
     // matter how wide the pool was — which made "add two cores" a no-op on
@@ -852,6 +1036,249 @@ fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &m
                 *out = (acc * scales[i]) >> FRAC_BITS;
             }
         });
+}
+
+/// Four tokens against one weight row, sharing every weight load.
+///
+/// Scalar counterpart of the vectorised batched kernel. `row[j]` is loaded once
+/// and multiplied into four independent accumulators, so a batch of tokens
+/// reads the weights once instead of once per token. Each result is identical
+/// to `dot_i8_i64` for that token.
+///
+/// # Safety
+/// `row` valid for `len` reads; each `inputs[q]` valid for `len` reads.
+#[inline]
+unsafe fn dot_i8_i64_x4(row: *const i8, inputs: &[*const i64; 4], len: usize) -> [i64; 4] {
+    // SAFETY: wrapped for `unsafe_op_in_unsafe_fn`; caller guarantees the reads.
+    unsafe {
+        let mut acc = [0i64; 4];
+        for j in 0..len {
+            let w = *row.add(j) as i64;
+            for q in 0..4 {
+                acc[q] += w * *inputs[q].add(j);
+            }
+        }
+        acc
+    }
+}
+
+/// Batched per-row I8 projection: `n_tokens` activations against one matrix.
+///
+/// Token-major in (`n_tokens * in_size`) and out (`n_tokens * n_rows`). Every
+/// output is `(dot(row_i, x_t) * scale_i) >> FRAC_BITS`, exactly what
+/// [`matmul_i8_into`] computes one token at a time. Batching changes only how
+/// often the weights are read, never a value; there is no cross-token
+/// reduction and no batch-dependent quantisation in this profile.
+///
+/// When the opt-in vectorised kernel is enabled it is tried first and this
+/// falls back to the scalar path on refusal, exactly as the unbatched entry
+/// point does.
+/// Overflow-checked geometry validation for a batched projection.
+///
+/// Every bound the raw-pointer arithmetic below relies on is established HERE,
+/// before either implementation runs and before any output is written.
+///
+/// This exists because `debug_assert_eq!` was not enough and was actively
+/// misleading: it compiles out in release, which is exactly where the
+/// raw-pointer writes live. A public caller passing 1x1 weights, a one-element
+/// input and an EMPTY output slice would, in a release build, have written
+/// through the empty slice's pointer. Enabling the vectorised kernel did not
+/// help either — it refuses on shape and falls through to the same unsafe
+/// scalar path, so a SIMD refusal must never hand an unvalidated shape onward.
+///
+/// Multiplications are `checked_mul`, so a `n_tokens * in_size` that overflows
+/// `usize` is rejected rather than wrapping to a small, apparently valid length.
+fn batched_shape_is_valid(
+    weights: &I8Weights,
+    inputs: &[i64],
+    n_tokens: usize,
+    in_size: usize,
+    output: &[i64],
+) -> bool {
+    let (Some(in_len), Some(out_len), Some(weight_len)) = (
+        n_tokens.checked_mul(in_size),
+        n_tokens.checked_mul(weights.n_rows),
+        weights.n_rows.checked_mul(in_size),
+    ) else {
+        return false;
+    };
+    n_tokens != 0
+        && in_size != 0
+        && weights.n_rows != 0
+        && weights.n_cols == in_size
+        && weights.data.len() == weight_len
+        && weights.scales.len() == weights.n_rows
+        && inputs.len() == in_len
+        && output.len() == out_len
+}
+
+/// Batched per-row I8 projection.
+///
+/// `pub(crate)`: the only callers are the prefill in this module. It was
+/// briefly `pub`, which exposed the unsafe geometry contract below to arbitrary
+/// safe callers. Visibility alone would not be a fix — the invariant has to hold
+/// for internal callers too — so the validation above runs regardless.
+pub(crate) fn matmul_i8_into_batched(
+    weights: &I8Weights,
+    inputs: &[i64],
+    n_tokens: usize,
+    in_size: usize,
+    output: &mut [i64],
+) {
+    if weights.n_rows == 0 || weights.data.is_empty() {
+        for o in output.iter_mut() {
+            *o = 0;
+        }
+        return;
+    }
+    // Panics in release as well as debug. An invalid geometry here is a caller
+    // bug that would otherwise become memory unsafety, so failing loudly is the
+    // conservative outcome, not a regression.
+    assert!(
+        batched_shape_is_valid(weights, inputs, n_tokens, in_size, output),
+        "matmul_i8_into_batched: invalid geometry - n_tokens={n_tokens} in_size={in_size} \
+         n_rows={} n_cols={} data={} scales={} inputs={} output={}",
+        weights.n_rows,
+        weights.n_cols,
+        weights.data.len(),
+        weights.scales.len(),
+        inputs.len(),
+        output.len()
+    );
+    if crate::canonical_simd::fast_canonical_kernel_enabled()
+        && crate::canonical_simd::matmul_i8_batched_fast(weights, inputs, n_tokens, in_size, output)
+    {
+        return;
+    }
+    let data = &weights.data;
+    let scales = &weights.scales;
+    let n_rows = weights.n_rows;
+    // Same L1-resident row block and 4-token tile as the vectorised path, so
+    // the scalar batched baseline is a fair comparison rather than a straw man.
+    let row_block = (131_072 / in_size.max(1)).clamp(1, n_rows);
+    let n_blocks = n_rows.div_ceil(row_block);
+    let out = BatchOutPtr(output.as_mut_ptr());
+    (0..n_blocks).into_par_iter().for_each(|b| {
+        let r0 = b * row_block;
+        let r1 = (r0 + row_block).min(n_rows);
+        let mut t = 0usize;
+        while t < n_tokens {
+            let quad = (n_tokens - t).min(4);
+            let src = |q: usize| {
+                let tok = t + q.min(quad - 1);
+                // SAFETY: `tok < n_tokens` and `inputs` holds n_tokens*in_size.
+                unsafe { inputs.as_ptr().add(tok * in_size) }
+            };
+            let ins = [src(0), src(1), src(2), src(3)];
+            for (offset, &sc) in scales[r0..r1].iter().enumerate() {
+                let i = r0 + offset;
+                // SAFETY: `i < n_rows`, `data` holds n_rows*in_size. Each task
+                // owns a disjoint row range and writes only
+                // `out[(t+q) * n_rows + i]`, so writes never alias.
+                let acc = unsafe { dot_i8_i64_x4(data.as_ptr().add(i * in_size), &ins, in_size) };
+                for (q, a) in acc.iter().enumerate().take(quad) {
+                    unsafe { *out.get().add((t + q) * n_rows + i) = (*a * sc) >> FRAC_BITS };
+                }
+            }
+            t += quad;
+        }
+    });
+}
+
+/// Disjoint-range output pointer for the batched matmul. See the identical
+/// wrapper in `canonical_simd` for why a field accessor is used.
+#[derive(Clone, Copy)]
+struct BatchOutPtr(*mut i64);
+unsafe impl Send for BatchOutPtr {}
+unsafe impl Sync for BatchOutPtr {}
+impl BatchOutPtr {
+    #[inline]
+    fn get(self) -> *mut i64 {
+        self.0
+    }
+}
+
+/// Canonical per-row I8 projection for a worker-owned row shard.
+///
+/// This intentionally reaches the same raw I8×i64 dot product and Q16
+/// per-row scale operation as `matmul_fast_preq`; no synthetic matrix or
+/// altered accumulation order is introduced for tensor-parallel workers.
+pub fn matmul_i8_canonical_rows(
+    weights: &I8Weights,
+    input: &[i64],
+    output: &mut [i64],
+) -> Result<(), String> {
+    matmul_i8_canonical_row_range(weights, 0, weights.n_rows, input, output)
+}
+
+/// Canonical I8 projection over borrowed rows `[start, end)` of a resident
+/// matrix. This has the same checked dispatch as the copied-shard entry point.
+pub fn matmul_i8_canonical_row_range(
+    weights: &I8Weights,
+    start: usize,
+    end: usize,
+    input: &[i64],
+    output: &mut [i64],
+) -> Result<(), String> {
+    let expected_data_len = weights
+        .n_rows
+        .checked_mul(weights.n_cols)
+        .ok_or_else(|| "canonical I8 matrix geometry overflows".to_string())?;
+    if weights.n_rows == 0
+        || weights.n_cols == 0
+        || weights.data.len() != expected_data_len
+        || weights.scales.len() != weights.n_rows
+        || start >= end
+        || end > weights.n_rows
+    {
+        return Err("invalid canonical I8 row range".into());
+    }
+    let rows = end - start;
+    if input.len() != weights.n_cols || output.len() != rows {
+        return Err(format!(
+            "canonical I8 row projection shape mismatch: input {}, output {}, weights {}x{} range [{start}, {end})",
+            input.len(),
+            output.len(),
+            weights.n_rows,
+            weights.n_cols
+        ));
+    }
+    // `matmul_i8_into` is the established hot kernel and deliberately uses
+    // native integer arithmetic.  Before exposing it to a framed sidecar
+    // request, prove the untrusted activation cannot overflow either its dot
+    // accumulation or the exact post-dot Q16 scale multiply.  Valid model
+    // activations take the unchanged production kernel below.
+    let input_abs_sum = input
+        .iter()
+        .try_fold(0i64, |sum, value| {
+            sum.checked_add(value.checked_abs().ok_or(())?).ok_or(())
+        })
+        .map_err(|_| "canonical I8 input magnitude overflows accumulator".to_string())?;
+    let dot_bound = input_abs_sum
+        .checked_mul(128)
+        .ok_or_else(|| "canonical I8 dot bound overflows".to_string())?;
+    let row_start = start
+        .checked_mul(weights.n_cols)
+        .ok_or_else(|| "canonical I8 row offset overflows".to_string())?;
+    let row_end = end
+        .checked_mul(weights.n_cols)
+        .ok_or_else(|| "canonical I8 row offset overflows".to_string())?;
+    let view = I8WeightsView {
+        data: &weights.data[row_start..row_end],
+        scales: &weights.scales[start..end],
+        n_rows: rows,
+        n_cols: weights.n_cols,
+    };
+    if view.scales.iter().any(|scale| {
+        scale
+            .checked_abs()
+            .and_then(|s| dot_bound.checked_mul(s))
+            .is_none()
+    }) {
+        return Err("canonical I8 scale multiply would overflow".into());
+    }
+    matmul_i8_view_into(view, input, view.n_cols, output);
+    Ok(())
 }
 
 /// Allocating matmul (for compatibility and small outputs).
@@ -1020,10 +1447,12 @@ unsafe fn dot_i16_i64(row: *const i16, input: *const i64, len: usize) -> i64 {
 // ─── NEON attention Q·K / attention·V SIMD ────────────────────────────────────
 
 /// NEON dot product of two i64 arrays. Used by the attention inner loop
-/// for Q · K_cache scoring. The i64 inputs are truncated to i32 with the
-/// same assumption as dot_i16_i64_neon (hidden state magnitudes bounded
-/// by Q16 fixed-point ~ 2^28), then multiplied pairwise to i64
-/// accumulators via vmlal_s32. Processes 4 lanes per iteration.
+/// for Q · K_cache scoring. The lanes multiply the low 32 bits of each
+/// element pairwise into i64 accumulators via vmlal_s32, 4 lanes per
+/// iteration. That equals the exact product only while every element fits
+/// in i32, so a wider element takes [`dot_i64xi64_exact`], the loop every
+/// other target runs. Without that check ARM and x86 disagree once a Q or K
+/// value passes ±32768.0 (integer profile contract v1, deviation D1).
 ///
 /// Speedup vs scalar i64×i64 dot: ~2.5× on M2 Ultra for d_head=128.
 /// Called 32 heads × seq_len times per layer, so even marginal
@@ -1036,6 +1465,16 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
     // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         use std::arch::aarch64::*;
+        let a_values = std::slice::from_raw_parts(a, len);
+        let b_values = std::slice::from_raw_parts(b, len);
+        // Branch-free, so it vectorises: x fits in i32 exactly when
+        // (x + 2^31) as u64 is below 2^32, i.e. its top 32 bits are zero.
+        let outside_i32 = a_values.iter().chain(b_values).fold(0u64, |acc, &x| {
+            acc | ((x.wrapping_add(1 << 31) as u64) >> 32)
+        });
+        if outside_i32 != 0 {
+            return dot_i64xi64_exact(a_values, b_values);
+        }
         let mut acc = vdupq_n_s64(0);
         let simd_len = len / 4 * 4;
         let mut j = 0usize;
@@ -1045,7 +1484,7 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
             let a1 = vld1q_s64(a.add(j + 2)); // a[j+2..j+4]
             let b0 = vld1q_s64(b.add(j));
             let b1 = vld1q_s64(b.add(j + 2));
-            // Narrow to i32 (truncate - values are bounded by Q16)
+            // Narrow to i32: lossless, every element was checked above.
             let a32 = vcombine_s32(vmovn_s64(a0), vmovn_s64(a1));
             let b32 = vcombine_s32(vmovn_s64(b0), vmovn_s64(b1));
             // Multiply i32×i32 → i64 via vmull
@@ -1060,6 +1499,18 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
         }
         sum
     }
+}
+
+/// The attention dot product the integer profile defines: exact i64
+/// products, summed in order.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn dot_i64xi64_exact(a: &[i64], b: &[i64]) -> i64 {
+    let mut sum: i64 = 0;
+    for (x, y) in a.iter().zip(b) {
+        sum += x * y;
+    }
+    sum
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -2138,6 +2589,86 @@ pub fn apply_rope(vec: &mut [i64], pos: usize, d_head: usize, cos: &[i64], sin: 
     }
 }
 
+/// Apply the interleaved RoPE layout used by Candle's `rope_i` and the Llama
+/// GGUF reference path. The legacy [`apply_rope`] split-half layout remains
+/// unchanged for compatibility; callers must bind this helper to a new
+/// arithmetic profile before using it in production inference.
+pub fn apply_rope_interleaved(
+    vec: &mut [i64],
+    pos: usize,
+    d_head: usize,
+    cos: &[i64],
+    sin: &[i64],
+) {
+    let half = d_head / 2;
+    for i in 0..half {
+        let cos_val = cos[pos * half + i];
+        let sin_val = sin[pos * half + i];
+        let even = 2 * i;
+        let odd = even + 1;
+        let x0 = vec[even];
+        let x1 = vec[odd];
+        vec[even] = ((x0 * cos_val) >> FRAC_BITS) - ((x1 * sin_val) >> FRAC_BITS);
+        vec[odd] = ((x0 * sin_val) >> FRAC_BITS) + ((x1 * cos_val) >> FRAC_BITS);
+    }
+}
+
+/// Reorder an output-projection matrix from GGUF's adjacent RoPE pairs to the
+/// split-half representation consumed by [`apply_rope`]. Rows and their
+/// per-row scales are moved together, preserving the exact I8 dequantization.
+///
+/// For one four-wide head this maps source rows `[e0, o0, e1, o1]` to
+/// `[e0, e1, o0, o1]`. The same permutation is applied independently to every
+/// Q or K head. It is intentionally loader-only: changing these rows under an
+/// existing legacy cache would silently change that cache's arithmetic.
+fn permute_interleaved_rows_to_split_half(
+    weights: &mut I8Weights,
+    n_heads: usize,
+    d_head: usize,
+    matrix_name: &str,
+) -> Result<(), crate::InferenceError> {
+    if d_head == 0 || !d_head.is_multiple_of(2) || n_heads == 0 {
+        return Err(crate::InferenceError::Runtime(format!(
+            "{matrix_name}: RoPE row permutation requires a nonzero even head dimension and head count"
+        )));
+    }
+    let expected_rows = n_heads.checked_mul(d_head).ok_or_else(|| {
+        crate::InferenceError::Runtime(format!("{matrix_name}: RoPE row count overflow"))
+    })?;
+    if weights.n_rows != expected_rows
+        || weights.scales.len() != expected_rows
+        || weights.data.len() != expected_rows.saturating_mul(weights.n_cols)
+    {
+        return Err(crate::InferenceError::Runtime(format!(
+            "{matrix_name}: expected {expected_rows} complete output rows for {n_heads} heads of width {d_head}, got rows={}, cols={}, scales={}, data={}",
+            weights.n_rows,
+            weights.n_cols,
+            weights.scales.len(),
+            weights.data.len(),
+        )));
+    }
+
+    let source_data = weights.data.clone();
+    let source_scales = weights.scales.clone();
+    let half = d_head / 2;
+    for head in 0..n_heads {
+        let base = head * d_head;
+        for pair in 0..half {
+            for (destination, source) in [
+                (base + pair, base + 2 * pair),
+                (base + half + pair, base + 2 * pair + 1),
+            ] {
+                let dst = destination * weights.n_cols;
+                let src = source * weights.n_cols;
+                weights.data[dst..dst + weights.n_cols]
+                    .copy_from_slice(&source_data[src..src + weights.n_cols]);
+                weights.scales[destination] = source_scales[source];
+            }
+        }
+    }
+    Ok(())
+}
+
 /// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
 /// Uses the integer exp LUT for sigmoid computation.
 pub fn silu_i64(x: i64) -> i64 {
@@ -2336,7 +2867,7 @@ fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
 
 /// Flash attention for a single query head against i8-quantized KV cache.
 /// Uses online softmax: processes KV in streaming fashion, never allocates O(n²).
-/// Numerically equivalent to standard attention (within integer rounding).
+/// Not bit-equal to a two-pass softmax: rescaling truncates.
 ///
 /// NOTE: This i8-quantized variant is available for future use with i8 KV caches.
 /// The production path uses flash_attention_i64() which operates directly on the
@@ -2428,8 +2959,10 @@ fn flash_attention_i8(
 
 /// Flash attention for a single query head against the i64 KV cache.
 /// Uses online softmax: processes KV in streaming fashion, O(d_head) memory
-/// instead of O(full_seq) for the scores array. Numerically equivalent to the
-/// standard softmax(Q·K)·V path (same integer_exp + shift arithmetic).
+/// instead of O(full_seq) for the scores array. The rescaling on each new
+/// maximum truncates, so the result is NOT bit-equal to a two-pass softmax.
+/// This sequential form, in position order, is what the integer profile
+/// contract (docs/protocol/integer-profile-contract-v1.md §3.7) defines.
 ///
 /// This is the production attention path as of v0.5.3. It replaces the standard
 /// path that allocated a scores Vec<i64> of size full_seq per head.
@@ -2440,7 +2973,7 @@ fn flash_attention_i8(
 // indirection in the hottest integer kernel in the crate, so the count stays.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn flash_attention_i64(
+pub(crate) fn flash_attention_i64(
     q_head: &[i64],  // [d_head] i64 Q16
     k_cache: &[i64], // flat i64 [full_seq * d_kv]
     v_cache: &[i64], // flat i64 [full_seq * d_kv]
@@ -2590,6 +3123,87 @@ impl CachedIntegerModel {
                 }
             })
             .collect::<String>()
+    }
+
+    /// Decode v2 output, reconstructing GGUF byte-fallback tokens such as
+    /// `<0x0A>` into their UTF-8 text. The legacy decoder remains unchanged.
+    pub fn decode_v2(&self, tokens: &[u32]) -> String {
+        let mut text = String::new();
+        let mut fallback = Vec::new();
+        let flush = |text: &mut String, fallback: &mut Vec<u8>| {
+            if !fallback.is_empty() {
+                text.push_str(&String::from_utf8_lossy(fallback));
+                fallback.clear();
+            }
+        };
+        for &id in tokens {
+            let Some(piece) = self.vocab.get(id as usize) else {
+                flush(&mut text, &mut fallback);
+                text.push_str(&format!("[{id}]"));
+                continue;
+            };
+            if let Some(hex) = piece
+                .strip_prefix("<0x")
+                .and_then(|value| value.strip_suffix('>'))
+                && hex.len() == 2
+                && let Ok(byte) = u8::from_str_radix(hex, 16)
+            {
+                fallback.push(byte);
+                continue;
+            }
+            flush(&mut text, &mut fallback);
+            text.push_str(&piece.replace('▁', " "));
+        }
+        flush(&mut text, &mut fallback);
+        text
+    }
+
+    /// Decode generated content for v2-style APIs without rendering protocol
+    /// controls. The token trace still retains terminal EOS for deterministic
+    /// comparisons; this method stops before it and suppresses BOS/control
+    /// pieces from the user-visible completion. `decode_v2` remains the
+    /// legacy-compatible literal token decoder.
+    pub fn decode_v2_content(&self, tokens: &[u32]) -> String {
+        let mut text = String::new();
+        let mut fallback = Vec::new();
+        let flush = |text: &mut String, fallback: &mut Vec<u8>| {
+            if !fallback.is_empty() {
+                text.push_str(&String::from_utf8_lossy(fallback));
+                fallback.clear();
+            }
+        };
+        for &id in tokens {
+            if self.config.eos_tokens.contains(&id) {
+                break;
+            }
+            if id == self.config.bos_token {
+                continue;
+            }
+            let Some(piece) = self.vocab.get(id as usize) else {
+                flush(&mut text, &mut fallback);
+                text.push_str(&format!("[{id}]"));
+                continue;
+            };
+            // GGUF control pieces are not a part of a content completion.
+            // This covers common LLaMA controls even when an older artifact
+            // omitted token-type metadata from its in-memory cache.
+            if matches!(piece.as_str(), "<s>" | "</s>") {
+                continue;
+            }
+            if let Some(hex) = piece
+                .strip_prefix("<0x")
+                .and_then(|value| value.strip_suffix('>'))
+                && hex.len() == 2
+                && let Ok(byte) = u8::from_str_radix(hex, 16)
+            {
+                fallback.push(byte);
+                continue;
+            }
+            flush(&mut text, &mut fallback);
+            text.push_str(&piece.replace('▁', " "));
+        }
+        flush(&mut text, &mut fallback);
+        text
     }
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
@@ -2825,8 +3439,9 @@ impl CachedIntegerModel {
 
             // Flash attention with online softmax - NEON-vectorized Q·K dot product.
             // Processes KV cache in streaming fashion: O(d_head) memory instead of
-            // O(full_seq) for the scores array. Numerically equivalent to standard
-            // softmax(Q·K)·V (same integer_exp + shift arithmetic).
+            // O(full_seq) for the scores array. Its rescaling truncates, so it is
+            // NOT bit-equal to a two-pass softmax; this sequential form is the
+            // one the integer profile defines.
             let full_seq = pos + 1;
             let k_layer_data = &cache.k_data[layer_idx];
             let v_layer_data = &cache.v_data[layer_idx];
@@ -2954,6 +3569,255 @@ impl CachedIntegerModel {
         matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
     }
 
+    /// Batched multi-token prefill for the canonical per-row I8 profile.
+    ///
+    /// Semantics are identical to calling [`Self::forward_one_token`] for each
+    /// token in order: the same layer norms, the same RoPE positions, the same
+    /// causal attention over the same KV-cache ordering, the same activation,
+    /// the same residuals and the same output projection. Only the seven
+    /// per-layer projections and the output projection are batched, and
+    /// batching cannot change a value in this profile — see
+    /// [`crate::canonical_prefill`]. Attention is ~1% of prefill arithmetic and
+    /// stays strictly per position, so causality is structurally preserved.
+    ///
+    /// Returns `None` **without touching `cache`** if it refuses; the caller
+    /// must then use the token-at-a-time path. Refusal is a capability
+    /// decision: no admission bound is relaxed.
+    ///
+    /// With `all_positions` the logits of every token are returned, which is
+    /// the verification shape. Otherwise only the final token's logits are
+    /// computed, which is all prefill actually needs.
+    ///
+    /// # Resource note
+    ///
+    /// `all_positions` accumulates `tokens.len() * vocab_size` i64 values in the
+    /// returned vector — 1.05 GB at the canonical 4096-token context window, and
+    /// the one allocation here that scales with the caller's prompt rather than
+    /// with `chunk_size`. It exists to let a verifier compare every position and
+    /// **must not be used on a request-serving path**; serving passes `false`
+    /// and gets one logit vector. A verifier that needs every position on a long
+    /// prompt should drive this in slices, as `examples/batched_prefill_experiment.rs`
+    /// does, so the logits never accumulate.
+    pub fn prefill_canonical_i8_batched(
+        &self,
+        tokens: &[u32],
+        cache: &mut KVCache,
+        chunk_size: usize,
+        all_positions: bool,
+    ) -> Option<Vec<Vec<i64>>> {
+        use crate::canonical_prefill::{PrefillRefusal, record_chunk, record_prefill_refusal};
+        let cfg = &self.config;
+        let (d, dkv, dff, dh) = (cfg.d_model, cfg.d_kv, cfg.d_ff, cfg.d_head);
+        if !self.has_canonical_i8_profile() || !self.has_all_transformer_layers() {
+            record_prefill_refusal(PrefillRefusal::NotCanonicalProfile);
+            return None;
+        }
+        if tokens.is_empty()
+            || chunk_size == 0
+            || d == 0
+            || dh == 0
+            || cfg.n_heads == 0
+            || cfg.n_kv_heads == 0
+            || cfg.vocab_size == 0
+            || cache.k_data.len() != cfg.n_layers
+            || cache.v_data.len() != cfg.n_layers
+            || self.layers.len() != cfg.n_layers
+        {
+            record_prefill_refusal(PrefillRefusal::Shape);
+            return None;
+        }
+        // `forward_one_token` returns an empty vector when the embedding table
+        // is too small for the raw token id. Rather than reproduce that
+        // degenerate result here, refuse and let the token-at-a-time path
+        // produce exactly what it produces today.
+        if tokens
+            .iter()
+            .any(|t| self.embedding_q16.len() < (*t as usize + 1).saturating_mul(d))
+        {
+            record_prefill_refusal(PrefillRefusal::Shape);
+            return None;
+        }
+        let base = cache.seq_len;
+        if base
+            .checked_add(tokens.len())
+            .is_none_or(|end| end > cfg.max_seq)
+        {
+            record_prefill_refusal(PrefillRefusal::ContextWindowExceeded);
+            return None;
+        }
+        // Two ceilings, both capability decisions rather than admission ones.
+        // The first bounds the digit scratch the vectorised kernel splits into;
+        // the second bounds the ten per-chunk activation buffers below. Chunk
+        // size cannot change any output — the conformance tests run every
+        // prompt across nine chunk sizes and require bit-identical logits and
+        // an identical KV cache — so clamping is free of semantic effect and no
+        // request that the token-at-a-time path would serve is refused here.
+        let chunk_size = chunk_size
+            .min(crate::canonical_simd::MAX_BATCH_TOKENS)
+            .min(crate::canonical_prefill::max_chunk_within_scratch_budget(
+                d, dkv, dff,
+            ))
+            .max(1);
+
+        let total = tokens.len();
+        let mut out: Vec<Vec<i64>> = Vec::new();
+        let mut done = 0usize;
+        while done < total {
+            let t_n = chunk_size.min(total - done);
+            let chunk = &tokens[done..done + t_n];
+
+            let mut hidden = vec![0i64; t_n * d];
+            for (ti, &tok) in chunk.iter().enumerate() {
+                let idx = (tok as usize).min(cfg.vocab_size - 1);
+                hidden[ti * d..(ti + 1) * d]
+                    .copy_from_slice(&self.embedding_q16[idx * d..(idx + 1) * d]);
+            }
+            let mut normed = vec![0i64; t_n * d];
+            let mut q = vec![0i64; t_n * d];
+            let mut k = vec![0i64; t_n * dkv];
+            let mut v = vec![0i64; t_n * dkv];
+            let mut attn = vec![0i64; t_n * d];
+            let mut proj = vec![0i64; t_n * d];
+            let mut gate = vec![0i64; t_n * dff];
+            let mut up = vec![0i64; t_n * dff];
+            let mut ffo = vec![0i64; t_n * d];
+
+            for (li, layer) in self.layers.iter().enumerate() {
+                for ti in 0..t_n {
+                    normed[ti * d..(ti + 1) * d].copy_from_slice(&layernorm(
+                        &hidden[ti * d..(ti + 1) * d],
+                        &layer.attn_norm,
+                    ));
+                }
+                matmul_i8_into_batched(&layer.wq, &normed, t_n, d, &mut q);
+                matmul_i8_into_batched(&layer.wk, &normed, t_n, d, &mut k);
+                matmul_i8_into_batched(&layer.wv, &normed, t_n, d, &mut v);
+
+                // RoPE at each token's absolute position, then K/V appended in
+                // position order. Pushing the whole chunk before attention is
+                // safe because each token attends over `pos + 1` entries only.
+                for ti in 0..t_n {
+                    let pos = base + done + ti;
+                    for h in 0..cfg.n_heads {
+                        apply_rope(
+                            &mut q[ti * d + h * dh..ti * d + (h + 1) * dh],
+                            pos,
+                            dh,
+                            &cfg.rope_cos,
+                            &cfg.rope_sin,
+                        );
+                    }
+                    for h in 0..cfg.n_kv_heads {
+                        apply_rope(
+                            &mut k[ti * dkv + h * dh..ti * dkv + (h + 1) * dh],
+                            pos,
+                            dh,
+                            &cfg.rope_cos,
+                            &cfg.rope_sin,
+                        );
+                    }
+                    cache.push_k(li, &k[ti * dkv..(ti + 1) * dkv]);
+                    cache.push_v(li, &v[ti * dkv..(ti + 1) * dkv]);
+                }
+
+                {
+                    let kd = &cache.k_data[li];
+                    let vd = &cache.v_data[li];
+                    let heads = cfg.n_heads;
+                    let results: Vec<Vec<i64>> = (0..t_n * heads)
+                        .into_par_iter()
+                        .map(|x| {
+                            let ti = x / heads;
+                            let h = x % heads;
+                            let pos = base + done + ti;
+                            let kv_h = h * cfg.n_kv_heads / heads;
+                            flash_attention_i64(
+                                &q[ti * d + h * dh..ti * d + (h + 1) * dh],
+                                kd,
+                                vd,
+                                dkv,
+                                kv_h,
+                                dh,
+                                pos + 1,
+                                cfg.attn_scale,
+                            )
+                        })
+                        .collect();
+                    for (x, r) in results.iter().enumerate() {
+                        let ti = x / heads;
+                        let h = x % heads;
+                        attn[ti * d + h * dh..ti * d + (h + 1) * dh].copy_from_slice(r);
+                    }
+                }
+
+                matmul_i8_into_batched(&layer.wo, &attn, t_n, d, &mut proj);
+                for i in 0..t_n * d {
+                    hidden[i] += proj[i];
+                }
+                for ti in 0..t_n {
+                    normed[ti * d..(ti + 1) * d].copy_from_slice(&layernorm(
+                        &hidden[ti * d..(ti + 1) * d],
+                        &layer.ffn_norm,
+                    ));
+                }
+                matmul_i8_into_batched(&layer.w_gate, &normed, t_n, d, &mut gate);
+                matmul_i8_into_batched(&layer.w_up, &normed, t_n, d, &mut up);
+                for j in 0..t_n * dff {
+                    gate[j] = (silu_i64(gate[j]) * up[j]) >> FRAC_BITS;
+                }
+                matmul_i8_into_batched(&layer.w_down, &gate, t_n, dff, &mut ffo);
+                for i in 0..t_n * d {
+                    hidden[i] += ffo[i];
+                }
+            }
+            cache.seq_len = base + done + t_n;
+
+            let want: Vec<usize> = if all_positions {
+                (0..t_n).collect()
+            } else if done + t_n == total {
+                vec![t_n - 1]
+            } else {
+                Vec::new()
+            };
+            if !want.is_empty() {
+                let cnt = want.len();
+                let mut fin = vec![0i64; cnt * d];
+                for (o, &ti) in want.iter().enumerate() {
+                    fin[o * d..(o + 1) * d].copy_from_slice(&layernorm(
+                        &hidden[ti * d..(ti + 1) * d],
+                        &self.final_norm,
+                    ));
+                }
+                let mut logits = vec![0i64; cnt * cfg.vocab_size];
+                matmul_i8_into_batched(&self.output_weight, &fin, cnt, d, &mut logits);
+                for o in 0..cnt {
+                    out.push(logits[o * cfg.vocab_size..(o + 1) * cfg.vocab_size].to_vec());
+                }
+            }
+            record_chunk(t_n, 7 * cfg.n_layers + usize::from(!want.is_empty()));
+            done += t_n;
+        }
+        Some(out)
+    }
+
+    /// Canonical-I8 whole-token forward whose projections are supplied by a
+    /// fallible row-partition backend.  Norms, RoPE, KV cache, attention,
+    /// residuals, activation, and ordered output assembly remain local.  This
+    /// is deliberately separate from `forward_one_token`, preserving every
+    /// existing production dispatch profile and public validator route.
+    pub fn forward_one_token_canonical_i8_with_backend(
+        &self,
+        token: u32,
+        cache: &mut KVCache,
+        call_id: Hash256,
+        backend: &impl crate::tensor_parallel::ProjectionBackend,
+    ) -> Result<Vec<i64>, crate::tensor_parallel::TensorParallelError> {
+        if !self.has_all_transformer_layers() {
+            return Err(crate::tensor_parallel::TensorParallelError::WrongIdentity);
+        }
+        forward_canonical_with_backend(self, token, cache, call_id, backend)
+    }
+
     /// Generate with fallible context-window admission for untrusted callers.
     ///
     /// The complete request is preflighted before allocating a KV cache or
@@ -2983,6 +3847,112 @@ impl CachedIntegerModel {
     ) -> (Vec<u32>, Hash256) {
         self.try_generate(prompt, max_tokens, eos_tokens)
             .expect("trusted generation request must fit the model context window")
+    }
+
+    /// Corrected whole-model generation semantics. The legacy `generate` API
+    /// is intentionally preserved for existing protocol identities; v2 owns
+    /// the single BOS forward and reuses the final prompt logits instead of
+    /// forwarding the last prompt token twice.
+    pub fn try_generate_v2(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> Result<(Vec<u32>, Hash256), GenerationError> {
+        let _admission = self.preflight_generation(prompt.len(), max_tokens)?;
+        Ok(self.generate_preflighted_v2(prompt, max_tokens, eos_tokens))
+    }
+
+    pub fn generate_v2(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> (Vec<u32>, Hash256) {
+        self.try_generate_v2(prompt, max_tokens, eos_tokens)
+            .expect("trusted v2 generation request must fit the model context window")
+    }
+
+    /// Same context/BOS/final-prompt-logit semantics as [`Self::try_generate_v2`],
+    /// with raw greedy argmax instead of the protocol-v2 repetition penalty.
+    /// This exists only to compare an ARC arithmetic profile with a reference
+    /// implementation configured for greedy sampling. Production requests
+    /// must retain their separately committed generation semantics.
+    pub fn try_generate_v2_greedy(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> Result<(Vec<u32>, Hash256), GenerationError> {
+        let _admission = self.preflight_generation(prompt.len(), max_tokens)?;
+        Ok(self.generate_preflighted_v2_with_sampling(prompt, max_tokens, eos_tokens, false))
+    }
+
+    /// [`Self::try_generate_v2`] with every projection supplied by `backend`
+    /// (row-partitioned work, S5): the same BOS, prompt, repetition-penalty
+    /// and EOS semantics as `generate_preflighted_v2_with_sampling`, one token
+    /// at a time (the reference path batched prefill must equal), so the tokens
+    /// and hash equal the local path's whenever the backend returns exact rows.
+    /// Norms, RoPE, the KV cache, attention and token selection stay local.
+    pub fn try_generate_v2_with_backend(
+        &self,
+        request: Hash256,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+        backend: &impl crate::tensor_parallel::ProjectionBackend,
+    ) -> Result<(Vec<u32>, Hash256), BackendGenerationError> {
+        if !self.has_all_transformer_layers() {
+            return Err(crate::tensor_parallel::TensorParallelError::WrongIdentity.into());
+        }
+        generate_canonical_with_backend(self, request, prompt, max_tokens, eos_tokens, backend)
+    }
+
+    /// Prefill `prompt` into `cache` and return the final position's logits.
+    ///
+    /// **This is the serving integration point for batched prefill.** Three
+    /// conditions must all hold for the batched path to run:
+    ///
+    ///   1. the operator enabled it (`canonical_prefill::batched_prefill_enabled`,
+    ///      default OFF, settable by `ARC_BATCHED_PREFILL=1` or an explicit call);
+    ///   2. the prompt clears the measured profitability floor
+    ///      ([`crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS`]) — below a
+    ///      full quad, batching is slower, so serving must not take it;
+    ///   3. the batched path accepts this model and shape, having first clamped
+    ///      the chunk to the scratch budget.
+    ///
+    /// Anything else falls back to the token-at-a-time loop, which is the
+    /// reference path. The fallback is safe in the strong sense: batched prefill
+    /// is bit-identical to token-at-a-time (conformance covers ten prompt
+    /// lengths across nine chunk sizes, plus KV bytes and continuation decode),
+    /// and it returns `None` **without touching `cache`** when it refuses. So
+    /// which branch runs changes latency and scratch, never an output.
+    fn prefill_prompt_into_cache(&self, prompt: &[u32], cache: &mut KVCache) -> Option<Vec<i64>> {
+        if prompt.is_empty() {
+            return None;
+        }
+        if crate::canonical_prefill::batched_prefill_enabled()
+            && crate::canonical_prefill::batching_is_profitable(prompt.len())
+        {
+            let cfg = &self.config;
+            let chunk = crate::canonical_prefill::SERVING_PREFILL_CHUNK.min(
+                crate::canonical_prefill::max_chunk_within_scratch_budget(
+                    cfg.d_model,
+                    cfg.d_kv,
+                    cfg.d_ff,
+                ),
+            );
+            if let Some(mut out) = self.prefill_canonical_i8_batched(prompt, cache, chunk, false)
+                && let Some(last) = out.pop()
+            {
+                return Some(last);
+            }
+        }
+        let mut logits = Vec::new();
+        for &tok in prompt {
+            logits = self.forward_one_token(tok, cache);
+        }
+        Some(logits)
     }
 
     fn generate_preflighted(
@@ -3021,9 +3991,58 @@ impl CachedIntegerModel {
         (generated, hash)
     }
 
+    fn generate_preflighted_v2(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> (Vec<u32>, Hash256) {
+        self.generate_preflighted_v2_with_sampling(prompt, max_tokens, eos_tokens, true)
+    }
+
+    fn generate_preflighted_v2_with_sampling(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+        repetition_penalty: bool,
+    ) -> (Vec<u32>, Hash256) {
+        let mut cache = KVCache::new(self.config.n_layers);
+        // The BOS forward stays token-at-a-time: it is a single token, which is
+        // below the batching profitability floor by definition.
+        let mut logits = self.forward_one_token(self.config.bos_token, &mut cache);
+        if let Some(last) = self.prefill_prompt_into_cache(prompt, &mut cache) {
+            logits = last;
+        }
+
+        let mut generated = Vec::new();
+        for _ in 0..max_tokens {
+            let next = if repetition_penalty {
+                select_next_token_with_repetition_penalty(&mut logits, &generated)
+            } else {
+                argmax_i64(&logits) as u32
+            };
+            generated.push(next);
+            if eos_tokens.contains(&next) {
+                break;
+            }
+            logits = self.forward_one_token(next, &mut cache);
+        }
+
+        let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let hash = arc_crypto::hash_bytes(&output_bytes);
+        (generated, hash)
+    }
+
     /// Save weights to binary .arc-int8 file for cross-platform distribution.
     pub fn save_weights(&self, path: &str) -> std::io::Result<()> {
         use std::io::Write;
+        if self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ARC-INT8 v2 cache has no arithmetic-profile tag; refusing to serialize GGUF interleaved-RoPE rows as a legacy cache",
+            ));
+        }
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         f.write_all(b"ARC-INT8\x02\x00")?; // v2: per-row scales
 
@@ -3706,14 +4725,25 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         Ok((i8, i16, block))
     };
 
+    // As in the shard loader: a norm weight that is missing or the wrong
+    // length makes the artifact malformed, and substituting ONE would serve
+    // a different model under the same file (deviation D3).
     let extract_norm = |reader: &mut std::fs::File,
                         content: &gguf_file::Content,
                         name: &str,
                         size: usize|
-     -> Vec<i64> {
-        extract_f32(reader, content, name)
-            .map(|f| f.iter().map(|&x| (x * ONE as f32).round() as i64).collect())
-            .unwrap_or_else(|_| vec![ONE; size])
+     -> Result<Vec<i64>, InferenceError> {
+        let values = extract_f32(reader, content, name)?;
+        if values.len() != size {
+            return Err(InferenceError::Runtime(format!(
+                "{name}: expected {size} norm weights, found {}",
+                values.len()
+            )));
+        }
+        Ok(values
+            .iter()
+            .map(|&x| (x * ONE as f32).round() as i64)
+            .collect())
     };
 
     // Embedding: single f32 extraction → I8 + full-precision Q16 vector.
@@ -3761,7 +4791,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
                 )
             }
         };
-    let final_norm = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
+    let final_norm = extract_norm(&mut reader, &content, "output_norm.weight", d_model)?;
 
     let mut layers = Vec::with_capacity(n_layers);
     let mut i16_layers_vec: Vec<I16Layer> = Vec::with_capacity(n_layers);
@@ -3835,13 +4865,13 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
                 &content,
                 &format!("{p}.attn_norm.weight"),
                 d_model,
-            ),
+            )?,
             ffn_norm: extract_norm(
                 &mut reader,
                 &content,
                 &format!("{p}.ffn_norm.weight"),
                 d_model,
-            ),
+            )?,
         });
         i16_layers_vec.push(I16Layer {
             wq: wq16,
@@ -3903,6 +4933,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             eos_tokens: eos_tokens.clone(),
             bos_token,
             chat_template: chat_template.clone(),
+            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
         },
         embedding_q16,
         embedding_i8,
@@ -4062,6 +5093,7 @@ pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::Infe
         eos_tokens,
         bos_token,
         chat_template,
+        arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
         max_seq,
     };
 
@@ -4131,6 +5163,178 @@ pub fn load_cached_model_canonical_i8(
     Ok(model)
 }
 
+/// Load the pinned Llama-family GGUF with the versioned interleaved-RoPE
+/// compatibility profile. The source artifact stores Q/K features as adjacent
+/// pairs; this loader rewrites only the resident per-row-I8 Q/K rows into the
+/// legacy split-half representation before any request is served.
+///
+/// This is intentionally not a generic GGUF switch. It admits only
+/// `general.architecture = llama`, requires complete canonical I8 weights, and
+/// carries a distinct execution identity so it cannot join legacy caches or
+/// validator claims by accident.
+#[cfg(feature = "candle")]
+pub fn load_cached_model_canonical_i8_interleaved_rope(
+    path: &str,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    validate_llama_gguf_for_interleaved_rope(path)?;
+    let mut model = load_cached_model_canonical_i8(path)?;
+    if model.config.d_model != model.config.n_heads.saturating_mul(model.config.d_head)
+        || model.config.d_kv != model.config.n_kv_heads.saturating_mul(model.config.d_head)
+        || !model.config.d_head.is_multiple_of(2)
+    {
+        return Err(crate::InferenceError::Runtime(format!(
+            "interleaved-RoPE Llama profile requires d_model=n_heads*d_head, d_kv=n_kv_heads*d_head, and even d_head; got d_model={}, n_heads={}, n_kv_heads={}, d_head={}, d_kv={}",
+            model.config.d_model,
+            model.config.n_heads,
+            model.config.n_kv_heads,
+            model.config.d_head,
+            model.config.d_kv,
+        )));
+    }
+    model.canonicalize_gguf_interleaved_rope_rows()?;
+    debug_assert_eq!(
+        model.arithmetic_profile(),
+        GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+    );
+    Ok(model)
+}
+
+#[cfg(feature = "candle")]
+fn validate_llama_gguf_for_interleaved_rope(path: &str) -> Result<(), crate::InferenceError> {
+    use candle_core::quantized::gguf_file;
+    let mut reader = std::fs::File::open(path)
+        .map_err(|error| crate::InferenceError::Runtime(format!("open GGUF: {error}")))?;
+    let content = gguf_file::Content::read(&mut reader)
+        .map_err(|error| crate::InferenceError::Runtime(format!("read GGUF: {error}")))?;
+    match content.metadata.get("general.architecture") {
+        Some(gguf_file::Value::String(architecture)) if architecture == "llama" => Ok(()),
+        Some(gguf_file::Value::String(architecture)) => {
+            Err(crate::InferenceError::Runtime(format!(
+                "GGUF interleaved-RoPE profile is pinned to Llama architecture, not {architecture}"
+            )))
+        }
+        _ => Err(crate::InferenceError::Runtime(
+            "GGUF interleaved-RoPE profile requires general.architecture=llama".into(),
+        )),
+    }
+}
+
+#[cfg(feature = "candle")]
+pub(crate) fn config_from_gguf(
+    content: &candle_core::quantized::gguf_file::Content,
+) -> Result<(ModelConfig, Vec<String>), crate::InferenceError> {
+    use candle_core::quantized::gguf_file;
+    let arch = match content.metadata.get("general.architecture") {
+        Some(gguf_file::Value::String(s)) => s.clone(),
+        _ => "llama".to_string(),
+    };
+
+    let get_u32 = |key: &str| -> u32 {
+        match content.metadata.get(key) {
+            Some(gguf_file::Value::U32(v)) => *v,
+            Some(gguf_file::Value::U64(v)) => *v as u32,
+            Some(gguf_file::Value::I32(v)) => *v as u32,
+            _ => 0,
+        }
+    };
+
+    let nl = get_u32(&format!("{arch}.block_count")) as usize;
+    let dm = get_u32(&format!("{arch}.embedding_length")) as usize;
+    let nh = get_u32(&format!("{arch}.attention.head_count")) as usize;
+    let nkv = {
+        let v = get_u32(&format!("{arch}.attention.head_count_kv"));
+        if v > 0 { v as usize } else { nh }
+    };
+    let dff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
+    let vs = content
+        .tensor_infos
+        .get("token_embd.weight")
+        .and_then(|t| t.shape.dims().first().copied())
+        .unwrap_or(32000);
+
+    let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
+        Some(gguf_file::Value::F32(v)) => *v as f64,
+        Some(gguf_file::Value::F64(v)) => *v,
+        _ => 10000.0,
+    };
+
+    let eos_tokens = match content.metadata.get("tokenizer.ggml.eos_token_id") {
+        Some(gguf_file::Value::U32(v)) => vec![*v],
+        Some(gguf_file::Value::U64(v)) => vec![*v as u32],
+        Some(gguf_file::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| match v {
+                gguf_file::Value::U32(n) => Some(*n),
+                gguf_file::Value::U64(n) => Some(*n as u32),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![2, 128001, 128009],
+    };
+
+    let bos_token = match content.metadata.get("tokenizer.ggml.bos_token_id") {
+        Some(gguf_file::Value::U32(v)) => *v,
+        Some(gguf_file::Value::U64(v)) => *v as u32,
+        _ => 1,
+    };
+
+    let chat_template = match content.metadata.get("tokenizer.chat_template") {
+        Some(gguf_file::Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+
+    let vocab = match content.metadata.get("tokenizer.ggml.tokens") {
+        Some(gguf_file::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| match v {
+                gguf_file::Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if nl == 0
+        || dm == 0
+        || nh == 0
+        || nkv == 0
+        || dff == 0
+        || vs == 0
+        || !dm.is_multiple_of(nh)
+        || !nh.is_multiple_of(nkv)
+    {
+        return Err(crate::InferenceError::Runtime(
+            "invalid GGUF model dimensions".into(),
+        ));
+    }
+    let d_head = dm / nh;
+    let d_kv = d_head
+        .checked_mul(nkv)
+        .ok_or_else(|| crate::InferenceError::Runtime("GGUF KV dimension overflow".into()))?;
+    let max_seq = 4096;
+    let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
+    Ok((
+        ModelConfig {
+            n_layers: nl,
+            d_model: dm,
+            n_heads: nh,
+            n_kv_heads: nkv,
+            d_ff: dff,
+            d_head,
+            d_kv,
+            vocab_size: vs,
+            attn_scale: integer_isqrt((d_head as i64) * ONE),
+            rope_cos,
+            rope_sin,
+            max_seq,
+            eos_tokens,
+            bos_token,
+            chat_template,
+            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
+        },
+        vocab,
+    ))
+}
+
 #[cfg(feature = "candle")]
 fn load_cached_model_shard_profile(
     path: &str,
@@ -4145,112 +5349,20 @@ fn load_cached_model_shard_profile(
     let device = Device::Cpu;
     let gguf_path = path.to_string();
 
-    // ── Read metadata ────────────────────────────────────────────────────────
-    let (
-        n_layers,
-        d_model,
-        n_heads,
-        n_kv_heads,
-        d_ff,
-        vocab_size,
-        vocab,
-        rope_base,
-        eos_tokens,
-        bos_token,
-        chat_template,
-    ) = {
+    let (config, vocab) = {
         let mut reader = std::fs::File::open(&gguf_path)
             .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
-
-        let arch = match content.metadata.get("general.architecture") {
-            Some(gguf_file::Value::String(s)) => s.clone(),
-            _ => "llama".to_string(),
-        };
-
-        let get_u32 = |key: &str| -> u32 {
-            match content.metadata.get(key) {
-                Some(gguf_file::Value::U32(v)) => *v,
-                Some(gguf_file::Value::U64(v)) => *v as u32,
-                Some(gguf_file::Value::I32(v)) => *v as u32,
-                _ => 0,
-            }
-        };
-
-        let nl = get_u32(&format!("{arch}.block_count")) as usize;
-        let dm = get_u32(&format!("{arch}.embedding_length")) as usize;
-        let nh = get_u32(&format!("{arch}.attention.head_count")) as usize;
-        let nkv = {
-            let v = get_u32(&format!("{arch}.attention.head_count_kv"));
-            if v > 0 { v as usize } else { nh }
-        };
-        let dff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
-        let vs = content
-            .tensor_infos
-            .get("token_embd.weight")
-            .map(|t| t.shape.dims()[0])
-            .unwrap_or(32000);
-
-        let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
-            Some(gguf_file::Value::F32(v)) => *v as f64,
-            Some(gguf_file::Value::F64(v)) => *v,
-            _ => 10000.0,
-        };
-
-        let eos_tokens = match content.metadata.get("tokenizer.ggml.eos_token_id") {
-            Some(gguf_file::Value::U32(v)) => vec![*v],
-            Some(gguf_file::Value::U64(v)) => vec![*v as u32],
-            Some(gguf_file::Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| match v {
-                    gguf_file::Value::U32(n) => Some(*n),
-                    gguf_file::Value::U64(n) => Some(*n as u32),
-                    _ => None,
-                })
-                .collect(),
-            _ => vec![2, 128001, 128009],
-        };
-
-        let bos_token = match content.metadata.get("tokenizer.ggml.bos_token_id") {
-            Some(gguf_file::Value::U32(v)) => *v,
-            Some(gguf_file::Value::U64(v)) => *v as u32,
-            _ => 1,
-        };
-
-        let chat_template = match content.metadata.get("tokenizer.chat_template") {
-            Some(gguf_file::Value::String(s)) => s.clone(),
-            _ => String::new(),
-        };
-
-        let vocab = match content.metadata.get("tokenizer.ggml.tokens") {
-            Some(gguf_file::Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| match v {
-                    gguf_file::Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-
-        (
-            nl,
-            dm,
-            nh,
-            nkv,
-            dff,
-            vs,
-            vocab,
-            rope_base,
-            eos_tokens,
-            bos_token,
-            chat_template,
-        )
+        config_from_gguf(&content)?
     };
-
-    let d_head = d_model / n_heads;
-    let d_kv = d_head * n_kv_heads;
+    let (n_layers, d_model, d_ff, d_kv, vocab_size) = (
+        config.n_layers,
+        config.d_model,
+        config.d_ff,
+        config.d_kv,
+        config.vocab_size,
+    );
 
     let end_layer = end_layer.min(n_layers);
     if start_layer >= end_layer {
@@ -4313,14 +5425,26 @@ fn load_cached_model_shard_profile(
         Ok((i8w, i16w))
     };
 
+    // A norm weight that is missing or the wrong length makes the artifact
+    // malformed. Substituting ONE, as this loader once did, served a
+    // different model under the same identity (integer profile contract v1,
+    // deviation D3).
     let extract_norm = |reader: &mut std::fs::File,
                         content: &gguf_file::Content,
                         name: &str,
                         size: usize|
-     -> Vec<i64> {
-        extract_f32(reader, content, name)
-            .map(|f| f.iter().map(|&x| (x * ONE as f32).round() as i64).collect())
-            .unwrap_or_else(|_| vec![ONE; size])
+     -> Result<Vec<i64>, InferenceError> {
+        let values = extract_f32(reader, content, name)?;
+        if values.len() != size {
+            return Err(InferenceError::Runtime(format!(
+                "{name}: expected {size} norm weights, found {}",
+                values.len()
+            )));
+        }
+        Ok(values
+            .iter()
+            .map(|&x| (x * ONE as f32).round() as i64)
+            .collect())
     };
 
     // ── Embeddings: ONLY on first shard ──────────────────────────────────────
@@ -4349,7 +5473,7 @@ fn load_cached_model_shard_profile(
         let i8w = I8Weights::quantize_f32(&f, vocab_size, d_model);
         let i16w = include_optional_quantizations
             .then(|| I16Weights::quantize_f32(&f, vocab_size, d_model));
-        let fn_ = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
+        let fn_ = extract_norm(&mut reader, &content, "output_norm.weight", d_model)?;
         info!("Shard last: output head + final_norm loaded");
         (i8w, i16w, fn_)
     } else {
@@ -4489,13 +5613,13 @@ fn load_cached_model_shard_profile(
                 &content,
                 &format!("{p}.attn_norm.weight"),
                 d_model,
-            ),
+            )?,
             ffn_norm: extract_norm(
                 &mut reader,
                 &content,
                 &format!("{p}.ffn_norm.weight"),
                 d_model,
-            ),
+            )?,
         };
         i16_layers_vec[l] = I16Layer {
             wq: wq16,
@@ -4534,18 +5658,6 @@ fn load_cached_model_shard_profile(
         }
     }
 
-    // Llama-2-7B / 7B-Chat were trained on 4096-position RoPE. Capping
-    // max_seq at 2048 here forced every shard-holder seed to truncate
-    // prompts past position 2048 (apply_rope at line 1562 does an
-    // unchecked cos[pos*half + i] read; positions past the table either
-    // panic in debug or return undefined positional signal in release —
-    // either way, tokens past 2048 are useless). Doubling to 4096
-    // matches the trained capacity and only grows the RoPE tables by
-    // ~32 KB total per model — negligible.
-    let max_seq = 4096;
-    let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
-    let attn_scale = integer_isqrt((d_head as i64) * ONE);
-
     let shard_mb: usize = layers
         .iter()
         .filter(|l| l.is_loaded())
@@ -4566,23 +5678,7 @@ fn load_cached_model_shard_profile(
     );
 
     Ok(CachedIntegerModel {
-        config: ModelConfig {
-            n_layers,
-            d_model,
-            n_heads,
-            n_kv_heads,
-            d_ff,
-            d_head,
-            d_kv,
-            vocab_size,
-            attn_scale,
-            rope_cos,
-            rope_sin,
-            max_seq,
-            eos_tokens: eos_tokens.clone(),
-            bos_token,
-            chat_template: chat_template.clone(),
-        },
+        config,
         embedding_q16,
         embedding_i8,
         layers,
@@ -4617,6 +5713,15 @@ pub fn load_cached_model_shard(
 
 #[cfg(not(feature = "candle"))]
 pub fn load_cached_model_canonical_i8(
+    _path: &str,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    Err(crate::InferenceError::Runtime(
+        "candle feature not enabled".into(),
+    ))
+}
+
+#[cfg(not(feature = "candle"))]
+pub fn load_cached_model_canonical_i8_interleaved_rope(
     _path: &str,
 ) -> Result<CachedIntegerModel, crate::InferenceError> {
     Err(crate::InferenceError::Runtime(
@@ -4835,8 +5940,23 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
     };
     let output_weight =
         I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("Out: {e}")))?;
-    let final_norm =
-        read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("Norm: {e}")))?;
+    // Every norm vector must hold exactly d_model weights: `layernorm` pads a
+    // short one with ONE, which would serve a different model under the same
+    // file (deviation D3).
+    let checked_norm = |name: String, values: Vec<i64>| -> Result<Vec<i64>, InferenceError> {
+        if values.len() == d_model {
+            Ok(values)
+        } else {
+            Err(InferenceError::Runtime(format!(
+                "{name}: expected {d_model} norm weights, found {}",
+                values.len()
+            )))
+        }
+    };
+    let final_norm = checked_norm(
+        "final norm".into(),
+        read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("Norm: {e}")))?,
+    )?;
 
     let mut layers = Vec::with_capacity(n_layers);
     for l in 0..n_layers {
@@ -4855,10 +5975,14 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
                 .map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
             w_down: I8Weights::read_from(&mut f)
                 .map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
-            attn_norm: read_i64_vec(&mut f)
-                .map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
-            ffn_norm: read_i64_vec(&mut f)
-                .map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
+            attn_norm: checked_norm(
+                format!("L{l} attention norm"),
+                read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
+            )?,
+            ffn_norm: checked_norm(
+                format!("L{l} FFN norm"),
+                read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l}: {e}")))?,
+            )?,
         });
     }
 
@@ -4893,6 +6017,7 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
             eos_tokens,
             bos_token: 1,
             chat_template: String::new(),
+            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
         },
         embedding_q16,
         embedding_i8,
@@ -4918,6 +6043,24 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor_parallel::{
+        LocalRowWorker, PartitionedProjectionBackend, RowAssignment, RowWorker, TensorKey,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn interleaved_rope_matches_candle_rope_i_pairing() {
+        let half = ONE / 2;
+        let mut actual = vec![ONE, 2 * ONE, 3 * ONE, 4 * ONE];
+        // One position with the same cos/sin for both pairs. Candle's rope_i
+        // pairs (0,1) and (2,3), unlike the legacy split-half (0,2)/(1,3).
+        apply_rope_interleaved(&mut actual, 0, 4, &[half, half], &[half, half]);
+        assert_eq!(
+            actual,
+            vec![-(ONE / 2), 3 * ONE / 2, -(ONE / 2), 7 * ONE / 2]
+        );
+    }
 
     #[test]
     fn shared_repetition_penalty_changes_a_repeated_raw_argmax() {
@@ -4937,6 +6080,441 @@ mod tests {
         assert_eq!(worker, 2);
         assert_eq!(distributed_verifier, worker);
         assert_eq!(worker_logits, distributed_verifier_logits);
+    }
+
+    // ── Batched prefill conformance ─────────────────────────────────────────
+    //
+    // Batched prefill must be indistinguishable from calling forward_one_token
+    // once per token: same logits at every position, same KV cache bytes, same
+    // seq_len, and the same continuation decode afterwards.
+
+    fn token_at_a_time(
+        model: &CachedIntegerModel,
+        tokens: &[u32],
+        cache: &mut KVCache,
+    ) -> Vec<Vec<i64>> {
+        tokens
+            .iter()
+            .map(|t| model.forward_one_token(*t, cache))
+            .collect()
+    }
+
+    fn clone_cache(c: &KVCache) -> KVCache {
+        KVCache {
+            k_data: c.k_data.clone(),
+            v_data: c.v_data.clone(),
+            seq_len: c.seq_len,
+        }
+    }
+
+    fn assert_same_cache(a: &KVCache, b: &KVCache, case: &str) {
+        assert_eq!(a.seq_len, b.seq_len, "seq_len differs ({case})");
+        assert_eq!(
+            a.k_data.len(),
+            b.k_data.len(),
+            "layer count differs ({case})"
+        );
+        for l in 0..a.k_data.len() {
+            assert_eq!(
+                a.k_data[l], b.k_data[l],
+                "K cache differs at layer {l} ({case})"
+            );
+            assert_eq!(
+                a.v_data[l], b.v_data[l],
+                "V cache differs at layer {l} ({case})"
+            );
+        }
+    }
+
+    fn run_batched_conformance(simd: bool) {
+        // The kernel switch is process-global and the harness is parallel, so
+        // opting in here is visible to every other test until it is restored.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
+        crate::canonical_simd::set_fast_canonical_kernel(simd);
+        let model = build_test_model(64, 32, 4, 64, 3);
+        assert!(model.has_canonical_i8_profile());
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1],
+            vec![1, 2],
+            vec![1, 2, 3],
+            vec![5, 9, 13, 21, 34, 55, 2],
+            (0..8u32).collect(),
+            (0..9u32).collect(),
+            (0..15u32).collect(),
+            (0..16u32).collect(),
+            (0..17u32).collect(),
+            (0..33u32).collect(),
+        ];
+        for prompt in &prompts {
+            let mut ref_cache = KVCache::new(model.config.n_layers);
+            let reference = token_at_a_time(&model, prompt, &mut ref_cache);
+            for &chunk in &[1usize, 2, 3, 4, 5, 7, 8, 16, 64] {
+                let mut cache = KVCache::new(model.config.n_layers);
+                let got = model
+                    .prefill_canonical_i8_batched(prompt, &mut cache, chunk, true)
+                    .unwrap_or_else(|| panic!("refused len={} chunk={chunk}", prompt.len()));
+                let case = format!("simd={simd} len={} chunk={chunk}", prompt.len());
+                assert_eq!(got.len(), reference.len(), "position count ({case})");
+                for (p, (a, b)) in reference.iter().zip(got.iter()).enumerate() {
+                    assert_eq!(a, b, "logits differ at position {p} ({case})");
+                }
+                assert_same_cache(&ref_cache, &cache, &case);
+
+                // Continuation decode must also match, which is what proves the
+                // persisted KV state is byte-correct and not merely consistent
+                // within the prefill itself.
+                let mut ref_cont = clone_cache(&ref_cache);
+                let mut got_cont = clone_cache(&cache);
+                for step in 0..3u32 {
+                    let a = model.forward_one_token(7 + step, &mut ref_cont);
+                    let b = model.forward_one_token(7 + step, &mut got_cont);
+                    assert_eq!(a, b, "continuation logits differ at step {step} ({case})");
+                }
+                assert_same_cache(&ref_cont, &got_cont, &format!("{case} after decode"));
+            }
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(prev);
+    }
+
+    #[test]
+    fn batched_prefill_matches_token_at_a_time_scalar() {
+        run_batched_conformance(false);
+    }
+
+    #[test]
+    fn batched_prefill_matches_token_at_a_time_simd() {
+        if !crate::canonical_simd::dotprod_available() {
+            return;
+        }
+        run_batched_conformance(true);
+    }
+
+    #[test]
+    fn batched_prefill_resumes_from_a_nonempty_cache() {
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let head: Vec<u32> = vec![1, 4, 9];
+        let tail: Vec<u32> = vec![16, 25, 36, 49, 64 - 1];
+        let mut ref_cache = KVCache::new(model.config.n_layers);
+        let _ = token_at_a_time(&model, &head, &mut ref_cache);
+        let reference = token_at_a_time(&model, &tail, &mut ref_cache);
+
+        for &chunk in &[1usize, 2, 3, 8] {
+            let mut cache = KVCache::new(model.config.n_layers);
+            let _ = token_at_a_time(&model, &head, &mut cache);
+            assert_eq!(cache.seq_len, head.len());
+            let got = model
+                .prefill_canonical_i8_batched(&tail, &mut cache, chunk, true)
+                .expect("must accept a resumed prefill");
+            for (p, (a, b)) in reference.iter().zip(got.iter()).enumerate() {
+                assert_eq!(
+                    a, b,
+                    "resumed prefill differs at position {p}, chunk={chunk}"
+                );
+            }
+            assert_same_cache(&ref_cache, &cache, &format!("resumed chunk={chunk}"));
+        }
+    }
+
+    #[test]
+    fn batched_prefill_last_position_only_matches_final_logits() {
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let prompt: Vec<u32> = (0..11u32).collect();
+        let mut ref_cache = KVCache::new(model.config.n_layers);
+        let reference = token_at_a_time(&model, &prompt, &mut ref_cache);
+        for &chunk in &[1usize, 3, 4, 16] {
+            let mut cache = KVCache::new(model.config.n_layers);
+            let got = model
+                .prefill_canonical_i8_batched(&prompt, &mut cache, chunk, false)
+                .expect("must accept");
+            assert_eq!(got.len(), 1, "production shape returns one logit vector");
+            assert_eq!(got[0], *reference.last().unwrap(), "chunk={chunk}");
+            assert_same_cache(&ref_cache, &cache, &format!("last-only chunk={chunk}"));
+        }
+    }
+
+    #[test]
+    fn batched_prefill_refuses_without_touching_the_cache() {
+        use crate::canonical_prefill::{prefill_census, reset_prefill_census};
+        // The prefill counters are process-global too: without this, a
+        // concurrent `reset_prefill_census` zeroes the counts between the
+        // refusals below and the assertions on them.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let max_seq = model.config.max_seq;
+        reset_prefill_census();
+
+        // empty prompt
+        let mut cache = KVCache::new(model.config.n_layers);
+        assert!(
+            model
+                .prefill_canonical_i8_batched(&[], &mut cache, 8, true)
+                .is_none()
+        );
+        assert_eq!(cache.seq_len, 0);
+        assert!(cache.k_data.iter().all(|k| k.is_empty()));
+
+        // zero chunk size
+        assert!(
+            model
+                .prefill_canonical_i8_batched(&[1, 2], &mut cache, 0, true)
+                .is_none()
+        );
+        assert_eq!(cache.seq_len, 0);
+        assert!(cache.k_data.iter().all(|k| k.is_empty()));
+
+        // beyond the context window: admission is NOT relaxed
+        let too_long: Vec<u32> = vec![1; max_seq + 1];
+        assert!(
+            model
+                .prefill_canonical_i8_batched(&too_long, &mut cache, 8, true)
+                .is_none()
+        );
+        assert_eq!(cache.seq_len, 0);
+        assert!(cache.k_data.iter().all(|k| k.is_empty()));
+
+        // exactly at the window is still admitted
+        let exact: Vec<u32> = vec![1; 4];
+        assert!(
+            model
+                .prefill_canonical_i8_batched(&exact, &mut cache, 4, false)
+                .is_some()
+        );
+
+        let c = prefill_census();
+        assert!(c.refused_shape >= 2, "{c:?}");
+        assert!(c.refused_context_window >= 1, "{c:?}");
+        reset_prefill_census();
+    }
+
+    // ── Batched projection geometry: the unsafe contract ────────────────────
+    //
+    // `matmul_i8_into_batched` indexes weights, inputs and output with raw
+    // pointers. Before this, its only shape checks were `debug_assert_eq!`,
+    // which compile out in release - precisely where those writes happen.
+    // These tests pin the validation that replaced them.
+
+    fn w1x1() -> I8Weights {
+        I8Weights::quantize_f32(&[0.5f32], 1, 1)
+    }
+
+    #[test]
+    fn batched_shape_predicate_accepts_the_shapes_prefill_actually_uses() {
+        let w = I8Weights::quantize_f32(&[0.1f32; 8 * 4], 8, 4);
+        let inputs = vec![0i64; 3 * 4];
+        let output = vec![0i64; 3 * 8];
+        assert!(batched_shape_is_valid(&w, &inputs, 3, 4, &output));
+    }
+
+    #[test]
+    fn batched_shape_predicate_rejects_every_undersized_buffer() {
+        let w = I8Weights::quantize_f32(&[0.1f32; 8 * 4], 8, 4);
+        let good_in = vec![0i64; 3 * 4];
+        let good_out = vec![0i64; 3 * 8];
+
+        // Output one short, and the empty-output case Codex identified.
+        assert!(!batched_shape_is_valid(&w, &good_in, 3, 4, &good_out[..23]));
+        assert!(!batched_shape_is_valid(&w1x1(), &[1i64], 1, 1, &[]));
+        // Input one short.
+        assert!(!batched_shape_is_valid(&w, &good_in[..11], 3, 4, &good_out));
+        // Weight data inconsistent with n_rows * in_size. Rebuilt rather than
+        // cloned: I8Weights deliberately does not derive Clone, and adding a
+        // derive to accepted code just to write a test is the wrong trade.
+        let short = I8Weights {
+            data: w.data[..w.data.len() - 1].to_vec(),
+            scales: w.scales.clone(),
+            n_rows: w.n_rows,
+            n_cols: w.n_cols,
+        };
+        assert!(!batched_shape_is_valid(&short, &good_in, 3, 4, &good_out));
+        // Scales inconsistent with n_rows.
+        let scales = I8Weights {
+            data: w.data.clone(),
+            scales: w.scales[..w.scales.len() - 1].to_vec(),
+            n_rows: w.n_rows,
+            n_cols: w.n_cols,
+        };
+        assert!(!batched_shape_is_valid(&scales, &good_in, 3, 4, &good_out));
+        // Declared inner dimension disagreeing with the matrix.
+        assert!(!batched_shape_is_valid(&w, &[0i64; 3 * 5], 3, 5, &good_out));
+        // Degenerate counts.
+        assert!(!batched_shape_is_valid(&w, &good_in, 0, 4, &good_out));
+        assert!(!batched_shape_is_valid(&w, &good_in, 3, 0, &good_out));
+    }
+
+    #[test]
+    fn batched_shape_predicate_rejects_overflowing_dimensions() {
+        // n_tokens * in_size must not wrap to a small, apparently valid length.
+        let w = w1x1();
+        let huge = usize::MAX / 2 + 1;
+        assert!(!batched_shape_is_valid(&w, &[1i64], huge, 4, &[0i64]));
+        assert!(!batched_shape_is_valid(&w, &[1i64], 4, huge, &[0i64]));
+        let wide = I8Weights {
+            data: vec![0i8; 4],
+            scales: vec![1i64; 2],
+            n_rows: huge,
+            n_cols: 2,
+        };
+        assert!(!batched_shape_is_valid(&wide, &[1i64, 2], 1, 2, &[0i64]));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid geometry")]
+    fn batched_matmul_panics_on_the_empty_output_slice() {
+        // The exact trigger from the review: valid public 1x1 weights, a
+        // one-element input, and an EMPTY output slice. Must panic, not write
+        // through the empty slice's pointer.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+        let w = w1x1();
+        let mut out: [i64; 0] = [];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matmul_i8_into_batched(&w, &[1i64], 1, 1, &mut out);
+        }));
+        crate::canonical_simd::set_fast_canonical_kernel(prev);
+        match result {
+            Err(error) => std::panic::resume_unwind(error),
+            Ok(()) => panic!("expected a panic but the call returned"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid geometry")]
+    fn batched_matmul_panics_on_undersized_input() {
+        let w = I8Weights::quantize_f32(&[0.1f32; 4 * 4], 4, 4);
+        let mut out = vec![0i64; 2 * 4];
+        matmul_i8_into_batched(&w, &[1i64; 4], 2, 4, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid geometry")]
+    fn simd_refusal_does_not_hand_an_invalid_shape_to_unsafe_scalar_code() {
+        // With the vectorised kernel ENABLED, a bad shape makes it refuse - and
+        // the refusal used to fall straight through to the unsafe scalar path
+        // with the same bad shape. It must panic instead.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
+        crate::canonical_simd::set_fast_canonical_kernel(true);
+        let w = w1x1();
+        let mut out: [i64; 0] = [];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            matmul_i8_into_batched(&w, &[1i64], 1, 1, &mut out);
+        }));
+        crate::canonical_simd::set_fast_canonical_kernel(prev);
+        match r {
+            Err(e) => std::panic::resume_unwind(e),
+            Ok(()) => panic!("expected a panic but the call returned"),
+        }
+    }
+
+    #[test]
+    fn batched_matmul_still_computes_the_documented_result() {
+        // Validation must not have changed any accepted result.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+        let w = I8Weights::quantize_f32(&[0.05f32; 6 * 3], 6, 3);
+        let inputs: Vec<i64> = (0..2 * 3).map(|i| (i as i64 + 1) * 1000).collect();
+        let mut batched = vec![0i64; 2 * 6];
+        matmul_i8_into_batched(&w, &inputs, 2, 3, &mut batched);
+        for t in 0..2 {
+            let mut one = vec![0i64; 6];
+            matmul_i8_into(&w, &inputs[t * 3..(t + 1) * 3], 3, &mut one);
+            assert_eq!(&batched[t * 6..(t + 1) * 6], &one[..], "token {t}");
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(prev);
+    }
+
+    // ── Serving integration for batched prefill ─────────────────────────────
+    //
+    // The review's point was blunt and correct: an environment variable that no
+    // serving path reads is not production integration. These tests pin that
+    // `generate_v2` - the entry the native executor actually calls, via
+    // try_generate_v2 - routes through the batched path when enabled, and that
+    // doing so cannot change a served result.
+
+    #[test]
+    fn serving_output_is_identical_with_batched_prefill_on_and_off() {
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let prompt: Vec<u32> = vec![1, 5, 9, 13, 21, 34, 55, 2, 7, 11];
+        let eos = [63u32];
+        let prev_batched = crate::canonical_prefill::batched_prefill_enabled();
+        let prev_simd = crate::canonical_simd::fast_canonical_kernel_enabled();
+
+        for &simd in &[false, true] {
+            if simd && !crate::canonical_simd::dotprod_available() {
+                continue;
+            }
+            crate::canonical_simd::set_fast_canonical_kernel(simd);
+
+            crate::canonical_prefill::set_batched_prefill_enabled(false);
+            crate::canonical_prefill::reset_prefill_census();
+            let (off_tokens, off_hash) = model.generate_v2(&prompt, 6, &eos);
+            let off_census = crate::canonical_prefill::prefill_census();
+            assert_eq!(
+                off_census.chunks, 0,
+                "batched prefill ran while disabled (simd={simd}): {off_census:?}"
+            );
+
+            crate::canonical_prefill::set_batched_prefill_enabled(true);
+            crate::canonical_prefill::reset_prefill_census();
+            let (on_tokens, on_hash) = model.generate_v2(&prompt, 6, &eos);
+            let on_census = crate::canonical_prefill::prefill_census();
+
+            assert_eq!(off_tokens, on_tokens, "served tokens differ (simd={simd})");
+            assert_eq!(
+                off_hash, on_hash,
+                "served output hash differs (simd={simd})"
+            );
+            assert!(
+                on_census.chunks > 0 && on_census.tokens as usize >= prompt.len(),
+                "the serving path did not actually use batched prefill (simd={simd}): {on_census:?}"
+            );
+            assert_eq!(
+                on_census.refused_total(),
+                0,
+                "batched prefill refused on the serving path (simd={simd}): {on_census:?}"
+            );
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(prev_simd);
+        crate::canonical_prefill::set_batched_prefill_enabled(prev_batched);
+        crate::canonical_prefill::reset_prefill_census();
+    }
+
+    #[test]
+    fn serving_path_refuses_to_batch_below_the_profitability_floor() {
+        // Batching a sub-quad prompt is a measured LOSS, so admission must keep
+        // serving on the token-at-a-time path even with the switch on.
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let model = build_test_model(64, 32, 4, 64, 3);
+        let prev = crate::canonical_prefill::batched_prefill_enabled();
+        crate::canonical_prefill::set_batched_prefill_enabled(true);
+
+        for len in 1..crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS {
+            let prompt: Vec<u32> = (1..=len as u32).collect();
+            crate::canonical_prefill::reset_prefill_census();
+            let _ = model.generate_v2(&prompt, 3, &[63u32]);
+            let c = crate::canonical_prefill::prefill_census();
+            assert_eq!(
+                c.chunks, 0,
+                "a {len}-token prompt is below the floor and must not batch: {c:?}"
+            );
+        }
+
+        // At the floor it engages, which is what makes the bound a bound.
+        let prompt: Vec<u32> =
+            (1..=crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS as u32).collect();
+        crate::canonical_prefill::reset_prefill_census();
+        let _ = model.generate_v2(&prompt, 3, &[63u32]);
+        assert!(
+            crate::canonical_prefill::prefill_census().chunks > 0,
+            "batching must engage at exactly the profitability floor"
+        );
+
+        crate::canonical_prefill::set_batched_prefill_enabled(prev);
+        crate::canonical_prefill::reset_prefill_census();
     }
 
     fn build_test_model(
@@ -5016,6 +6594,7 @@ mod tests {
                 eos_tokens: vec![2, 128001, 128009],
                 bos_token: 1,
                 chat_template: String::new(),
+                arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
             },
             embedding_q16,
             embedding_i8,
@@ -5104,6 +6683,115 @@ mod tests {
     }
 
     #[test]
+    fn q_and_k_row_permutation_matches_interleaved_rope_oracle_for_multihead_gqa() {
+        // Two Q heads and one KV head exercise both dimensions independently.
+        // Each row contains its source row id so data and scale movement are
+        // observable together.
+        let mut q = I8Weights {
+            data: (0i8..8).flat_map(|row| [row, -row]).collect(),
+            scales: (0i64..8).collect(),
+            n_rows: 8,
+            n_cols: 2,
+        };
+        let mut k = I8Weights {
+            data: (20i8..24).flat_map(|row| [row, -row]).collect(),
+            scales: (20i64..24).collect(),
+            n_rows: 4,
+            n_cols: 2,
+        };
+        permute_interleaved_rows_to_split_half(&mut q, 2, 4, "q").unwrap();
+        permute_interleaved_rows_to_split_half(&mut k, 1, 4, "k").unwrap();
+        assert_eq!(q.scales, vec![0, 2, 1, 3, 4, 6, 5, 7]);
+        assert_eq!(k.scales, vec![20, 22, 21, 23]);
+        assert_eq!(
+            q.data,
+            vec![0, 0, 2, -2, 1, -1, 3, -3, 4, -4, 6, -6, 5, -5, 7, -7]
+        );
+
+        let (cos, sin) = compute_rope_tables(4, 2, 10_000.0);
+        let original = vec![11 * ONE, 13 * ONE, 17 * ONE, 19 * ONE];
+        let mut reference = original.clone();
+        apply_rope_interleaved(&mut reference, 1, 4, &cos, &sin);
+
+        // The loader has already applied P to Q/K rows. Existing split-half
+        // RoPE computes P·R_interleaved; undo P only for this direct oracle.
+        let mut split = vec![original[0], original[2], original[1], original[3]];
+        apply_rope(&mut split, 1, 4, &cos, &sin);
+        let restored = vec![split[0], split[2], split[1], split[3]];
+        assert_eq!(restored, reference);
+
+        // Orthogonal P preserves the attention score once both Q and K use
+        // the same per-head permutation.
+        let original_k = vec![23 * ONE, 29 * ONE, 31 * ONE, 37 * ONE];
+        let mut reference_k = original_k.clone();
+        apply_rope_interleaved(&mut reference_k, 1, 4, &cos, &sin);
+        let mut split_k = vec![original_k[0], original_k[2], original_k[1], original_k[3]];
+        apply_rope(&mut split_k, 1, 4, &cos, &sin);
+        let dot = |left: &[i64], right: &[i64]| -> i128 {
+            left.iter()
+                .zip(right)
+                .map(|(a, b)| *a as i128 * *b as i128)
+                .sum()
+        };
+        assert_eq!(dot(&reference, &reference_k), dot(&split, &split_k));
+    }
+
+    #[test]
+    fn interleaved_rope_profile_is_versioned_and_legacy_cache_export_is_refused() {
+        let mut legacy = build_test_model(16, 8, 2, 16, 1);
+        assert_eq!(
+            legacy.arithmetic_profile(),
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        legacy.canonicalize_gguf_interleaved_rope_rows().unwrap();
+        assert_eq!(
+            legacy.arithmetic_profile(),
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+        );
+        assert!(legacy.has_canonical_i8_profile());
+        let error = legacy
+            .save_weights("/definitely-not-written/arc-interleaved-v1.arc-int8")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("arithmetic-profile tag"));
+    }
+
+    #[test]
+    fn a_binary_cache_with_a_short_or_empty_norm_is_refused() {
+        // Deviation D3 in the ARC-INT8 loader: `layernorm` pads a short gamma
+        // with ONE, so a cache whose norm vector lost entries used to load and
+        // serve a different model under the same file.
+        let path = std::env::temp_dir().join(format!(
+            "arc-d3-binary-norm-{}.arc-int8",
+            std::process::id()
+        ));
+        let path = path.to_str().unwrap();
+        let model = build_test_model(16, 32, 2, 64, 2);
+        model.save_weights(path).unwrap();
+        assert!(
+            load_cached_model_binary(path).is_ok(),
+            "an intact cache loads"
+        );
+
+        let mut short = build_test_model(16, 32, 2, 64, 2);
+        short.layers[1].ffn_norm.truncate(1);
+        short.save_weights(path).unwrap();
+        let error = load_cached_model_binary(path)
+            .err()
+            .expect("a short norm is refused");
+        assert!(error.to_string().contains("L1 FFN norm"), "{error}");
+
+        let mut empty = build_test_model(16, 32, 2, 64, 2);
+        empty.final_norm.clear();
+        empty.save_weights(path).unwrap();
+        let error = load_cached_model_binary(path)
+            .err()
+            .expect("an empty final norm is refused");
+        assert!(error.to_string().contains("final norm"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn generation_preflight_rejects_position_count_overflow() {
         let model = build_test_model(32, 16, 2, 32, 1);
         let err = model
@@ -5118,6 +6806,84 @@ mod tests {
                 max_tokens: 0,
             }
         );
+    }
+
+    #[test]
+    fn generation_v2_matches_explicit_single_bos_prompt_logit_oracle() {
+        let model = build_test_model(32, 16, 2, 32, 1);
+        let prompt = [3u32, 4u32];
+        let eos = [u32::MAX];
+
+        let mut cache = KVCache::new(model.config.n_layers);
+        let mut logits = model.forward_one_token(model.config.bos_token, &mut cache);
+        for &token in &prompt {
+            logits = model.forward_one_token(token, &mut cache);
+        }
+        let mut expected = Vec::new();
+        for _ in 0..3 {
+            let next = select_next_token_with_repetition_penalty(&mut logits, &expected);
+            expected.push(next);
+            if eos.contains(&next) {
+                break;
+            }
+            logits = model.forward_one_token(next, &mut cache);
+        }
+
+        let (actual, _) = model.generate_v2(&prompt, 3, &eos);
+        assert_eq!(
+            actual, expected,
+            "v2 must reuse final prompt logits exactly"
+        );
+
+        let (empty, _) = model.generate_v2(&[], 1, &eos);
+        assert_eq!(
+            empty.len(),
+            1,
+            "empty prompt still uses the single BOS logits"
+        );
+        let (zero, _) = model.generate_v2(&prompt, 0, &eos);
+        assert!(zero.is_empty(), "zero token budget must produce no output");
+    }
+
+    #[test]
+    fn generation_v2_greedy_matches_raw_argmax_single_bos_oracle() {
+        let model = build_test_model(32, 16, 2, 32, 1);
+        let prompt = [3u32, 4u32];
+        let eos = [u32::MAX];
+        let mut cache = KVCache::new(model.config.n_layers);
+        let mut logits = model.forward_one_token(model.config.bos_token, &mut cache);
+        for &token in &prompt {
+            logits = model.forward_one_token(token, &mut cache);
+        }
+        let mut expected = Vec::new();
+        for _ in 0..3 {
+            let next = argmax_i64(&logits) as u32;
+            expected.push(next);
+            logits = model.forward_one_token(next, &mut cache);
+        }
+        let (actual, _) = model
+            .try_generate_v2_greedy(&prompt, 3, &eos)
+            .expect("small test prompt fits context");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn v2_decoder_reconstructs_byte_fallback_utf8() {
+        let mut model = build_test_model(32, 16, 2, 32, 1);
+        model.vocab[13] = "<0x0A>".into();
+        assert_eq!(model.decode_v2(&[13, 13]), "\n\n");
+    }
+
+    #[test]
+    fn v2_content_decoder_stops_before_eos_and_suppresses_bos() {
+        let mut model = build_test_model(32, 16, 2, 32, 1);
+        model.vocab[1] = "<s>".into();
+        model.vocab[2] = "</s>".into();
+        model.vocab[3] = "▁Hello".into();
+        model.vocab[4] = "<0x21>".into();
+        model.config.eos_tokens = vec![2];
+        assert_eq!(model.decode_v2(&[3, 4, 2]), " Hello!</s>");
+        assert_eq!(model.decode_v2_content(&[1, 3, 4, 2, 3]), " Hello!");
     }
 
     #[test]
@@ -5170,6 +6936,811 @@ mod tests {
         assert_eq!(q.data[8], 127, "Row 1 outlier should be 127");
         // Per-row means row 0 is NOT affected by row 1's outlier
         assert!(q.scales[0] < q.scales[1], "Row 0 should have smaller scale");
+    }
+
+    /// Every projection of `model`, in forward order.
+    fn projection_keys(model: &CachedIntegerModel) -> Vec<(Option<usize>, TensorKey)> {
+        let mut keys = Vec::new();
+        for layer in 0..model.layers.len() {
+            for tensor in [
+                TensorKey::Wq,
+                TensorKey::Wk,
+                TensorKey::Wv,
+                TensorKey::Wo,
+                TensorKey::WGate,
+                TensorKey::WUp,
+                TensorKey::WDown,
+            ] {
+                keys.push((Some(layer), tensor));
+            }
+        }
+        keys.push((None, TensorKey::LmHead));
+        keys
+    }
+
+    /// Every projection split in two halves, each a `LocalRowWorker`.
+    fn halved_row_backend(
+        model: &CachedIntegerModel,
+        artifact: Hash256,
+    ) -> PartitionedProjectionBackend {
+        let profile = model.effective_precision_label().to_string();
+        let mut assignments = Vec::new();
+        let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
+        for (layer, tensor) in projection_keys(model) {
+            let weights =
+                crate::tensor_parallel::model_projection_weights(model, layer, tensor).unwrap();
+            let split = weights.n_rows / 2;
+            for (start, end) in [(0, split), (split, weights.n_rows)] {
+                let worker_id = format!("{layer:?}-{tensor:?}-{start}");
+                let assignment = RowAssignment {
+                    artifact_id: artifact,
+                    execution_profile: profile.clone(),
+                    layer,
+                    tensor,
+                    row_start: start,
+                    row_end: end,
+                    worker_id: worker_id.clone(),
+                };
+                workers.insert(
+                    worker_id.clone(),
+                    Arc::new(LocalRowWorker {
+                        worker_id,
+                        assignment: assignment.clone(),
+                        weights: weights.copy_rows(start, end).unwrap(),
+                    }),
+                );
+                assignments.push(assignment);
+            }
+        }
+        PartitionedProjectionBackend::new(artifact, profile, assignments, workers)
+    }
+
+    #[test]
+    fn generation_on_a_row_backend_equals_local_generation_token_for_token() {
+        let model = build_test_model(16, 32, 2, 64, 3);
+        let backend = halved_row_backend(&model, Hash256([77; 32]));
+        let request = Hash256([5; 32]);
+        let prompt = [1u32, 2, 3];
+        let local = model.try_generate_v2(&prompt, 4, &[99]).unwrap();
+        let rows = model
+            .try_generate_v2_with_backend(request, &prompt, 4, &[99], &backend)
+            .unwrap();
+        assert_eq!(rows, local);
+        // EOS stops both paths at the same token (99 is outside this
+        // vocabulary, so the case above never stops early). The second token
+        // the model generates with no stop token serves as the EOS.
+        let (open_ended, _) = model.try_generate_v2(&prompt, 6, &[]).unwrap();
+        let eos = [open_ended[1]];
+        let local = model.try_generate_v2(&prompt, 6, &eos).unwrap();
+        assert!(local.0.len() <= 2, "EOS stopped the local generation");
+        let rows = model
+            .try_generate_v2_with_backend(request, &prompt, 6, &eos, &backend)
+            .unwrap();
+        assert_eq!(rows, local);
+        // An empty prompt (BOS alone) and a request for no tokens.
+        for (prompt, max_tokens) in [(&[][..], 3), (&prompt[..], 0)] {
+            let local = model.try_generate_v2(prompt, max_tokens, &[99]).unwrap();
+            let rows = model
+                .try_generate_v2_with_backend(request, prompt, max_tokens, &[99], &backend)
+                .unwrap();
+            assert_eq!(rows, local);
+        }
+        // The same context refusal as the local path, before any projection.
+        let too_long = vec![1u32; model.config.max_seq];
+        assert!(matches!(
+            model.try_generate_v2_with_backend(request, &too_long, 4, &[99], &backend),
+            Err(BackendGenerationError::Generation(_))
+        ));
+        // A backend that cannot supply exact rows stops the generation.
+        let empty = PartitionedProjectionBackend::new(
+            Hash256([77; 32]),
+            model.effective_precision_label().to_string(),
+            Vec::new(),
+            BTreeMap::new(),
+        );
+        assert!(matches!(
+            model.try_generate_v2_with_backend(request, &prompt, 4, &[99], &empty),
+            Err(BackendGenerationError::Projection(_))
+        ));
+    }
+
+    /// A worker holding the whole model that serves any assignment, like the
+    /// `tensor_row_model_worker` example; it can be told to fail or to lie.
+    struct WholeModelWorker {
+        model: Arc<CachedIntegerModel>,
+        fail: bool,
+        lie: bool,
+        /// A connection that has closed itself, as the SSH worker does.
+        closed: bool,
+        /// Answer this many calls, then fail every later one: a machine that
+        /// drops out part-way through a query.
+        fail_after: Option<usize>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WholeModelWorker {
+        fn new(model: &Arc<CachedIntegerModel>, fail: bool, lie: bool) -> Self {
+            Self {
+                model: model.clone(),
+                fail,
+                lie,
+                closed: false,
+                fail_after: None,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RowWorker for WholeModelWorker {
+        fn is_open(&self) -> bool {
+            !self.closed
+        }
+
+        fn project(
+            &self,
+            request: crate::tensor_parallel::RowProjectionRequest,
+        ) -> Result<
+            crate::tensor_parallel::RowProjectionResponse,
+            crate::tensor_parallel::TensorParallelError,
+        > {
+            use crate::tensor_parallel::TensorParallelError;
+            let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail || self.fail_after.is_some_and(|after| index >= after) {
+                return Err(TensorParallelError::Worker("unreachable".into()));
+            }
+            let a = &request.assignment;
+            let weights =
+                crate::tensor_parallel::model_projection_weights(&self.model, a.layer, a.tensor)
+                    .ok_or(TensorParallelError::WrongIdentity)?;
+            let shard = weights
+                .copy_rows(a.row_start, a.row_end)
+                .map_err(|_| TensorParallelError::WrongShape)?;
+            let mut values = vec![0; shard.n_rows];
+            matmul_i8_canonical_rows(&shard, &request.input, &mut values)
+                .map_err(|_| TensorParallelError::WrongShape)?;
+            if self.lie {
+                values[0] += 1;
+            }
+            Ok(crate::tensor_parallel::RowProjectionResponse {
+                call_id: request.call_id,
+                input_hash: request.input_hash,
+                assignment: request.assignment,
+                values,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct Events {
+        seen: std::sync::Mutex<Vec<crate::tensor_parallel::RowEvent>>,
+        excluded: std::collections::BTreeSet<String>,
+    }
+
+    impl crate::tensor_parallel::RowEventSink for Events {
+        fn record(&self, event: crate::tensor_parallel::RowEvent) {
+            self.seen.lock().unwrap().push(event);
+        }
+        fn is_excluded(&self, worker: &str) -> bool {
+            self.excluded.contains(worker)
+        }
+    }
+
+    /// Plans that give the first half of every projection to the coordinator
+    /// and the second half to worker "w", checked as asked.
+    fn half_remote_plans(
+        model: &CachedIntegerModel,
+        duplicate_on: Option<crate::tensor_parallel::SliceOwner>,
+        spot_first_remote_row: bool,
+    ) -> BTreeMap<(Option<usize>, TensorKey), crate::tensor_parallel::ProjectionPlan> {
+        use crate::tensor_parallel::{PlannedSlice, ProjectionPlan, SliceOwner};
+        let mut plans = BTreeMap::new();
+        for (layer, tensor) in projection_keys(model) {
+            let rows = crate::tensor_parallel::model_projection_weights(model, layer, tensor)
+                .unwrap()
+                .n_rows;
+            let split = rows / 2;
+            plans.insert(
+                (layer, tensor),
+                ProjectionPlan {
+                    slices: vec![
+                        PlannedSlice {
+                            owner: SliceOwner::Local,
+                            row_start: 0,
+                            row_end: split,
+                            duplicate_on: None,
+                        },
+                        PlannedSlice {
+                            owner: SliceOwner::Remote("w".into()),
+                            row_start: split,
+                            row_end: rows,
+                            duplicate_on: duplicate_on.clone(),
+                        },
+                    ],
+                    spot_rows: if spot_first_remote_row {
+                        vec![split]
+                    } else {
+                        Vec::new()
+                    },
+                },
+            );
+        }
+        plans
+    }
+
+    /// One generation on a verified backend with worker "w": the output,
+    /// every event and how many calls reached the worker.
+    fn run_verified(
+        model: &Arc<CachedIntegerModel>,
+        worker: WholeModelWorker,
+        plans: BTreeMap<(Option<usize>, TensorKey), crate::tensor_parallel::ProjectionPlan>,
+        excluded: &[&str],
+    ) -> (
+        (Vec<u32>, Hash256),
+        Vec<crate::tensor_parallel::RowEvent>,
+        usize,
+    ) {
+        let events = Events {
+            excluded: excluded.iter().map(|w| w.to_string()).collect(),
+            ..Default::default()
+        };
+        let worker = Arc::new(worker);
+        let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
+        workers.insert("w".into(), worker.clone());
+        let backend = crate::tensor_parallel::VerifiedPartitionBackend::new(
+            model,
+            Hash256([77; 32]),
+            plans,
+            workers,
+            &events,
+        )
+        .unwrap();
+        let output = model
+            .try_generate_v2_with_backend(Hash256([5; 32]), &[1, 2, 3], 4, &[99], &backend)
+            .unwrap();
+        drop(backend);
+        let calls = worker.calls.load(std::sync::atomic::Ordering::SeqCst);
+        (output, events.seen.into_inner().unwrap(), calls)
+    }
+
+    fn all_remote_plans(
+        model: &CachedIntegerModel,
+    ) -> BTreeMap<(Option<usize>, TensorKey), crate::tensor_parallel::ProjectionPlan> {
+        let mut plans =
+            half_remote_plans(model, Some(crate::tensor_parallel::SliceOwner::Local), true);
+        for plan in plans.values_mut() {
+            plan.slices.remove(0);
+            plan.slices[0].row_start = 0;
+            plan.spot_rows = vec![0];
+        }
+        plans
+    }
+
+    #[test]
+    fn strict_backend_checks_numerical_and_response_identity_failures_without_fallback() {
+        use crate::tensor_parallel::{
+            RowEvent, RowProjectionRequest, RowProjectionResponse, TensorParallelError,
+            VerifiedPartitionBackend,
+        };
+        struct Altered {
+            inner: WholeModelWorker,
+            mode: u8,
+        }
+        impl RowWorker for Altered {
+            fn project(
+                &self,
+                request: RowProjectionRequest,
+            ) -> Result<RowProjectionResponse, TensorParallelError> {
+                if self.mode == 1 {
+                    return Err(TensorParallelError::Worker("timeout".into()));
+                }
+                let mut response = self.inner.project(request)?;
+                match self.mode {
+                    2 => response.call_id = Hash256([0; 32]),
+                    3 => response.input_hash = Hash256([0; 32]),
+                    4 => response.assignment.artifact_id = Hash256([0; 32]),
+                    5 => response.assignment.execution_profile = "other".into(),
+                    6 => response.assignment.layer = Some(99),
+                    7 => response.assignment.tensor = TensorKey::LmHead,
+                    8 => response.assignment.worker_id = "other".into(),
+                    9 => {
+                        response.values.pop();
+                    }
+                    10 => response.values[0] += 1,
+                    _ => (),
+                }
+                Ok(response)
+            }
+        }
+        let model = Arc::new(build_test_model(16, 32, 2, 64, 2));
+        for mode in 0..=10 {
+            let events = Events::default();
+            let worker = Arc::new(Altered {
+                inner: WholeModelWorker::new(&model, false, false),
+                mode,
+            });
+            let workers: BTreeMap<String, Arc<dyn RowWorker>> =
+                [("w".into(), worker as Arc<dyn RowWorker>)]
+                    .into_iter()
+                    .collect();
+            let backend = VerifiedPartitionBackend::new_strict(
+                model.as_ref(),
+                Hash256([77; 32]),
+                all_remote_plans(&model),
+                workers,
+                &events,
+            )
+            .unwrap();
+            let result =
+                model.try_generate_v2_with_backend(Hash256([5; 32]), &[3, 4], 2, &[99], &backend);
+            if mode == 0 {
+                assert_eq!(
+                    result.unwrap(),
+                    model.try_generate_v2(&[3, 4], 2, &[99]).unwrap()
+                );
+            } else {
+                assert!(result.is_err(), "mode {mode} accepted");
+            }
+            let events = events.seen.lock().unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, RowEvent::Fallback { .. })),
+                "strict mode silently fell back"
+            );
+            if mode == 10 {
+                assert!(events.iter().any(|e| matches!(e, RowEvent::Fault { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn strict_backend_refuses_missing_coverage_before_any_worker_call() {
+        use crate::tensor_parallel::{SliceOwner, VerifiedPartitionBackend};
+        let model = Arc::new(build_test_model(16, 32, 2, 64, 2));
+        let worker = Arc::new(WholeModelWorker::new(&model, false, false));
+        let workers: BTreeMap<String, Arc<dyn RowWorker>> =
+            [("w".into(), worker.clone() as Arc<dyn RowWorker>)]
+                .into_iter()
+                .collect();
+        let events = Events::default();
+        for mode in 0..6 {
+            let mut plans = all_remote_plans(&model);
+            if mode == 0 {
+                plans.remove(&(None, TensorKey::LmHead));
+            } else {
+                let stage = plans.get_mut(&(Some(0), TensorKey::Wq)).unwrap();
+                match mode {
+                    1 => stage.slices[0].row_start = 1,
+                    2 => stage.slices[0].row_end += 1,
+                    3 => stage.slices[0].owner = SliceOwner::Local,
+                    4 => stage.spot_rows.clear(),
+                    5 => stage.slices[0].duplicate_on = Some(SliceOwner::Remote("missing".into())),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                VerifiedPartitionBackend::new_strict(
+                    model.as_ref(),
+                    Hash256([77; 32]),
+                    plans,
+                    workers.clone(),
+                    &events
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(worker.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn strict_backend_refuses_worker_loss_mid_generation_without_partial_output() {
+        use crate::tensor_parallel::{RowEvent, VerifiedPartitionBackend};
+        let model = Arc::new(build_test_model(16, 32, 2, 64, 2));
+        let mut worker = WholeModelWorker::new(&model, false, false);
+        worker.fail_after = Some(20);
+        let worker = Arc::new(worker);
+        let workers: BTreeMap<String, Arc<dyn RowWorker>> =
+            [("w".into(), worker.clone() as Arc<dyn RowWorker>)]
+                .into_iter()
+                .collect();
+        let events = Events::default();
+        let backend = VerifiedPartitionBackend::new_strict(
+            model.as_ref(),
+            Hash256([77; 32]),
+            all_remote_plans(&model),
+            workers,
+            &events,
+        )
+        .unwrap();
+        assert!(
+            model
+                .try_generate_v2_with_backend(Hash256([5; 32]), &[3, 4], 2, &[99], &backend)
+                .is_err()
+        );
+        assert!(worker.calls.load(std::sync::atomic::Ordering::SeqCst) > 20);
+        assert!(
+            !events
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, RowEvent::Fallback { .. }))
+        );
+    }
+
+    #[test]
+    fn a_verified_partition_backend_keeps_the_output_exact_and_reports_every_fallback_and_fault() {
+        use crate::tensor_parallel::{RowEvent, SliceOwner};
+        let model = Arc::new(build_test_model(16, 32, 2, 64, 3));
+        let local = model.try_generate_v2(&[1, 2, 3], 4, &[99]).unwrap();
+        let is_fault = |event: &RowEvent| matches!(event, RowEvent::Fault { .. });
+        let is_fallback = |event: &RowEvent| matches!(event, RowEvent::Fallback { .. });
+
+        // An honest worker: the same tokens, and only timing samples.
+        let (output, events, calls) = run_verified(
+            &model,
+            WholeModelWorker::new(&model, false, false),
+            half_remote_plans(&model, Some(SliceOwner::Local), true),
+            &[],
+        );
+        assert_eq!(output, local);
+        assert!(calls > 0);
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e, RowEvent::Answered { .. }))
+        );
+
+        // A worker that is gone: every call falls back to the coordinator's
+        // rows, each fallback is reported, and the tokens do not change.
+        let (output, events, calls) = run_verified(
+            &model,
+            WholeModelWorker::new(&model, true, false),
+            half_remote_plans(&model, None, false),
+            &[],
+        );
+        assert_eq!(output, local);
+        assert_eq!(events.iter().filter(|e| is_fallback(e)).count(), calls);
+        assert!(!events.iter().any(is_fault));
+
+        // A worker that drops out part-way through the query: the five calls
+        // it answered count, every later call falls back, and the tokens
+        // still do not change.
+        let dropout = WholeModelWorker {
+            fail_after: Some(5),
+            ..WholeModelWorker::new(&model, false, false)
+        };
+        let (output, events, calls) =
+            run_verified(&model, dropout, half_remote_plans(&model, None, false), &[]);
+        assert_eq!(output, local);
+        assert!(calls > 5, "the query outlived the worker");
+        let answered = events
+            .iter()
+            .filter(|e| matches!(e, RowEvent::Answered { .. }))
+            .count();
+        assert_eq!(answered, 5);
+        assert_eq!(events.iter().filter(|e| is_fallback(e)).count(), calls - 5);
+        assert!(!events.iter().any(is_fault));
+
+        // A lying worker caught by a duplicate, then by a spot row: faults
+        // are reported, and the coordinator's own rows keep the tokens exact.
+        for (duplicate, spot) in [(Some(SliceOwner::Local), false), (None, true)] {
+            let (output, events, _) = run_verified(
+                &model,
+                WholeModelWorker::new(&model, false, true),
+                half_remote_plans(&model, duplicate, spot),
+                &[],
+            );
+            assert_eq!(output, local);
+            assert!(events.iter().any(is_fault));
+        }
+
+        // Unchecked, the same lie reaches the logits: rows no check covers are
+        // trusted, which is why only an operator's own machines may feed a
+        // vote. (Logits, not tokens: a small lie need not change an argmax.)
+        let events = Events::default();
+        let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
+        workers.insert(
+            "w".into(),
+            Arc::new(WholeModelWorker::new(&model, false, true)),
+        );
+        let backend = crate::tensor_parallel::VerifiedPartitionBackend::new(
+            &model,
+            Hash256([77; 32]),
+            half_remote_plans(&model, None, false),
+            workers,
+            &events,
+        )
+        .unwrap();
+        let mut local_cache = KVCache::new(model.config.n_layers);
+        let mut lied_cache = KVCache::new(model.config.n_layers);
+        let local_logits = model.forward_one_token(model.config.bos_token, &mut local_cache);
+        let lied_logits = model
+            .forward_one_token_canonical_i8_with_backend(
+                model.config.bos_token,
+                &mut lied_cache,
+                Hash256([1; 32]),
+                &backend,
+            )
+            .unwrap();
+        assert_ne!(lied_logits, local_logits);
+        drop(backend);
+
+        // An excluded worker is never called.
+        let (output, events, calls) = run_verified(
+            &model,
+            WholeModelWorker::new(&model, false, true),
+            half_remote_plans(&model, None, false),
+            &["w"],
+        );
+        assert_eq!(output, local);
+        assert_eq!(calls, 0);
+        // Every one of its slices is reported as skipped: none moves silently.
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|e| matches!(e, RowEvent::Skipped { .. })));
+
+        // A closed connection is skipped the same way, without a call and
+        // without counting as a failure.
+        let mut closed = WholeModelWorker::new(&model, false, false);
+        closed.closed = true;
+        let (output, events, calls) =
+            run_verified(&model, closed, half_remote_plans(&model, None, false), &[]);
+        assert_eq!(output, local);
+        assert_eq!(calls, 0);
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|e| matches!(e, RowEvent::Skipped { .. })));
+    }
+
+    #[test]
+    fn the_row_frame_server_answers_any_assignment_with_the_models_own_rows() {
+        use crate::tensor_parallel::{
+            RowProjectionRequest, decode_row_response, encode_row_request, hash_i64,
+            model_projection_weights, serve_row_frames,
+        };
+        let model = build_test_model(16, 32, 2, 64, 3);
+        let artifact = Hash256([77; 32]);
+        let profile = model.canonical_execution_profile().unwrap().to_string();
+        let input: Vec<i64> = (0..model.config.d_model as i64)
+            .map(|i| (i - 7) << 12)
+            .collect();
+        let request = RowProjectionRequest {
+            call_id: Hash256([9; 32]),
+            input_hash: hash_i64(&input),
+            assignment: RowAssignment {
+                artifact_id: artifact,
+                execution_profile: profile.clone(),
+                layer: Some(1),
+                tensor: TensorKey::Wv,
+                row_start: 1,
+                row_end: 3,
+                worker_id: "machine-2".into(),
+            },
+            input: input.clone(),
+        };
+        let frame = encode_row_request(&request).unwrap();
+        let mut stream = (frame.len() as u32).to_le_bytes().to_vec();
+        stream.extend_from_slice(&frame);
+        let mut answer: Vec<u8> = Vec::new();
+        serve_row_frames(&model, artifact, &mut stream.as_slice(), &mut answer).unwrap();
+        let length = u32::from_le_bytes(answer[..4].try_into().unwrap()) as usize;
+        assert_eq!(answer.len(), 4 + length, "one response for one request");
+        let response = decode_row_response(&answer[4..]).unwrap();
+        assert_eq!(response.assignment, request.assignment);
+        let weights = model_projection_weights(&model, Some(1), TensorKey::Wv).unwrap();
+        let shard = weights.copy_rows(1, 3).unwrap();
+        let mut expected = vec![0; 2];
+        matmul_i8_canonical_rows(&shard, &input, &mut expected).unwrap();
+        assert_eq!(response.values, expected);
+
+        // Another artifact ends the session; an empty stream is a clean end.
+        let mut other = request.clone();
+        other.assignment.artifact_id = Hash256([1; 32]);
+        let frame = encode_row_request(&other).unwrap();
+        let mut stream = (frame.len() as u32).to_le_bytes().to_vec();
+        stream.extend_from_slice(&frame);
+        let mut sink: Vec<u8> = Vec::new();
+        assert!(serve_row_frames(&model, artifact, &mut stream.as_slice(), &mut sink).is_err());
+        let mut empty: &[u8] = &[];
+        assert!(serve_row_frames(&model, artifact, &mut empty, &mut sink).is_ok());
+    }
+
+    #[test]
+    fn borrowed_canonical_row_ranges_match_copied_shards_with_both_dispatch_settings() {
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        struct RestoreFastKernel(bool);
+        impl Drop for RestoreFastKernel {
+            fn drop(&mut self) {
+                crate::canonical_simd::set_fast_canonical_kernel(self.0);
+            }
+        }
+        let restore = RestoreFastKernel(crate::canonical_simd::fast_canonical_kernel_enabled());
+        let weights = I8Weights::quantize_f32(
+            &[
+                1.0, -2.0, 0.5, 4.0, -3.0, 2.0, 8.0, 1.0, 0.25, -0.5, 2.0, -4.0,
+            ],
+            4,
+            3,
+        );
+        let input = [65_536, -32_768, 16_384];
+
+        for enabled in [false, true] {
+            crate::canonical_simd::set_fast_canonical_kernel(enabled);
+            for (start, end) in [(0, 1), (1, 3), (3, 4), (0, 4)] {
+                let copied = weights.copy_rows(start, end).unwrap();
+                let mut expected = vec![0; end - start];
+                matmul_i8_canonical_rows(&copied, &input, &mut expected).unwrap();
+                let mut borrowed = vec![i64::MIN; end - start];
+                matmul_i8_canonical_row_range(&weights, start, end, &input, &mut borrowed).unwrap();
+                assert_eq!(borrowed, expected, "range [{start}, {end}), fast={enabled}");
+            }
+        }
+
+        // Invalid geometry and selected-scale overflow are refused before
+        // the caller's output buffer is touched.
+        let mut untouched = vec![123; 5];
+        assert!(
+            matmul_i8_canonical_row_range(&weights, 1, 1, &input, &mut untouched[..0]).is_err()
+        );
+        assert_eq!(untouched, vec![123; 5]);
+        assert!(
+            matmul_i8_canonical_row_range(&weights, 3, 2, &input, &mut untouched[..0]).is_err()
+        );
+        assert_eq!(untouched, vec![123; 5]);
+        assert!(matmul_i8_canonical_row_range(&weights, 0, 5, &input, &mut untouched).is_err());
+        assert_eq!(untouched, vec![123; 5]);
+        assert!(
+            matmul_i8_canonical_row_range(&weights, 1, 3, &input[..2], &mut untouched[..2])
+                .is_err()
+        );
+        assert_eq!(untouched, vec![123; 5]);
+        let mut bad_geometry = I8Weights::quantize_f32(&[1.0], 1, 1);
+        bad_geometry.n_rows = usize::MAX;
+        assert!(
+            matmul_i8_canonical_row_range(&bad_geometry, 0, 1, &[1], &mut untouched[..1]).is_err()
+        );
+        assert_eq!(untouched, vec![123; 5]);
+
+        let mut overflow = I8Weights::quantize_f32(&[1.0, 2.0], 2, 1);
+        overflow.scales[1] = i64::MAX; // outside the selected range
+        let mut one_row = [0];
+        matmul_i8_canonical_row_range(&overflow, 0, 1, &[1], &mut one_row).unwrap();
+        overflow.scales[0] = i64::MAX;
+        one_row[0] = 456;
+        assert!(matmul_i8_canonical_row_range(&overflow, 0, 1, &[1], &mut one_row).is_err());
+        assert_eq!(one_row, [456]);
+        drop(restore);
+    }
+
+    #[test]
+    fn tensor_row_backend_matches_canonical_whole_token_across_positions() {
+        fn add_rows(
+            assignments: &mut Vec<RowAssignment>,
+            workers: &mut BTreeMap<String, Arc<dyn RowWorker>>,
+            artifact: Hash256,
+            profile: &str,
+            layer: Option<usize>,
+            tensor: TensorKey,
+            weights: &I8Weights,
+        ) {
+            let split = weights.n_rows / 2;
+            for (start, end) in [(0, split), (split, weights.n_rows)] {
+                let worker_id = format!("{layer:?}-{tensor:?}-{start}");
+                let assignment = RowAssignment {
+                    artifact_id: artifact,
+                    execution_profile: profile.into(),
+                    layer,
+                    tensor,
+                    row_start: start,
+                    row_end: end,
+                    worker_id: worker_id.clone(),
+                };
+                let shard = weights.copy_rows(start, end).unwrap();
+                workers.insert(
+                    worker_id.clone(),
+                    Arc::new(LocalRowWorker {
+                        worker_id,
+                        assignment: assignment.clone(),
+                        weights: shard,
+                    }),
+                );
+                assignments.push(assignment);
+            }
+        }
+        let model = build_test_model(16, 32, 2, 64, 3);
+        assert!(model.has_canonical_i8_profile());
+        let artifact = Hash256([77; 32]);
+        let profile = model.effective_precision_label().to_string();
+        let mut assignments = Vec::new();
+        let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
+        for (i, layer) in model.layers.iter().enumerate() {
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::Wq,
+                &layer.wq,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::Wk,
+                &layer.wk,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::Wv,
+                &layer.wv,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::Wo,
+                &layer.wo,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::WGate,
+                &layer.w_gate,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::WUp,
+                &layer.w_up,
+            );
+            add_rows(
+                &mut assignments,
+                &mut workers,
+                artifact,
+                &profile,
+                Some(i),
+                TensorKey::WDown,
+                &layer.w_down,
+            );
+        }
+        add_rows(
+            &mut assignments,
+            &mut workers,
+            artifact,
+            &profile,
+            None,
+            TensorKey::LmHead,
+            &model.output_weight,
+        );
+        let backend = PartitionedProjectionBackend::new(artifact, profile, assignments, workers);
+        let mut local_cache = KVCache::new(model.config.n_layers);
+        let mut rows_cache = KVCache::new(model.config.n_layers);
+        for token in [1u32, 2u32] {
+            let local = model.forward_one_token(token, &mut local_cache);
+            let rows = model
+                .forward_one_token_canonical_i8_with_backend(
+                    token,
+                    &mut rows_cache,
+                    Hash256([token as u8; 32]),
+                    &backend,
+                )
+                .unwrap();
+            assert_eq!(rows, local, "row backend diverged at token {token}");
+        }
     }
 
     #[test]
@@ -5955,6 +8526,7 @@ mod int16_tests {
                     eos_tokens: vec![2, 128001, 128009],
                     bos_token: 1,
                     chat_template: String::new(),
+                    arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
                 },
                 embedding_q16,
                 embedding_i8,
@@ -6009,4 +8581,196 @@ mod int16_tests {
             nonzero
         );
     }
+}
+
+// Shared arithmetic: resident and low-residency coordinators use these exact routines.
+pub(crate) fn preflight_generation_config(
+    config: &ModelConfig,
+    prompt_tokens: usize,
+    max_tokens: u32,
+) -> Result<GenerationPreflight, GenerationError> {
+    let generated_positions =
+        usize::try_from(max_tokens).map_err(|_| GenerationError::PositionCountOverflow {
+            prompt_tokens,
+            max_tokens,
+        })?;
+    let required_positions = GENERATION_INTERNAL_BOS_POSITIONS
+        .checked_add(prompt_tokens)
+        .and_then(|positions| positions.checked_add(generated_positions))
+        .ok_or(GenerationError::PositionCountOverflow {
+            prompt_tokens,
+            max_tokens,
+        })?;
+
+    if required_positions > config.max_seq {
+        return Err(GenerationError::ContextWindowExceeded {
+            prompt_tokens,
+            max_tokens,
+            required_positions,
+            max_seq: config.max_seq,
+        });
+    }
+
+    Ok(GenerationPreflight {
+        prompt_tokens,
+        max_tokens,
+        required_positions,
+        max_seq: config.max_seq,
+    })
+}
+pub(crate) fn forward_canonical_with_backend(
+    source: &impl crate::low_residency::CanonicalForwardSource,
+    token: u32,
+    cache: &mut KVCache,
+    call_id: Hash256,
+    backend: &impl crate::tensor_parallel::ProjectionBackend,
+) -> Result<Vec<i64>, crate::tensor_parallel::TensorParallelError> {
+    use crate::tensor_parallel::{TensorKey, TensorParallelError};
+    if source.canonical_execution_profile().is_none() {
+        return Err(TensorParallelError::WrongIdentity);
+    }
+    let cfg = source.config();
+    let d = cfg.d_model;
+    let pos = cache.seq_len;
+    if pos >= cfg.max_seq || token as usize >= cfg.vocab_size {
+        return Err(TensorParallelError::WrongShape);
+    }
+    let mut hidden = source.embedding(token)?;
+    if hidden.len() != d {
+        return Err(TensorParallelError::WrongShape);
+    }
+    for layer_idx in 0..cfg.n_layers {
+        let (attn_norm, ffn_norm) = source.norms(layer_idx)?;
+        let normed = layernorm(&hidden, attn_norm);
+        let mut qkv = backend.project_group(
+            call_id,
+            Some(layer_idx),
+            &[
+                (TensorKey::Wq, d),
+                (TensorKey::Wk, cfg.d_kv),
+                (TensorKey::Wv, cfg.d_kv),
+            ],
+            &normed,
+        )?;
+        if qkv.len() != 3 {
+            return Err(TensorParallelError::WrongShape);
+        }
+        let mut q = qkv.remove(0);
+        let mut k_buf = qkv.remove(0);
+        let v_buf = qkv.remove(0);
+        if q.len() != d || k_buf.len() != cfg.d_kv || v_buf.len() != cfg.d_kv {
+            return Err(TensorParallelError::WrongShape);
+        }
+        for h in 0..cfg.n_heads {
+            apply_rope(
+                &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
+                pos,
+                cfg.d_head,
+                &cfg.rope_cos,
+                &cfg.rope_sin,
+            );
+        }
+        for h in 0..cfg.n_kv_heads {
+            apply_rope(
+                &mut k_buf[h * cfg.d_head..(h + 1) * cfg.d_head],
+                pos,
+                cfg.d_head,
+                &cfg.rope_cos,
+                &cfg.rope_sin,
+            );
+        }
+        cache.push_k(layer_idx, &k_buf);
+        cache.push_v(layer_idx, &v_buf);
+        let full_seq = pos + 1;
+        let heads: Vec<Vec<i64>> = (0..cfg.n_heads)
+            .into_par_iter()
+            .map(|h| {
+                let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
+                flash_attention_i64(
+                    &q[h * cfg.d_head..(h + 1) * cfg.d_head],
+                    &cache.k_data[layer_idx],
+                    &cache.v_data[layer_idx],
+                    cfg.d_kv,
+                    kv_h,
+                    cfg.d_head,
+                    full_seq,
+                    cfg.attn_scale,
+                )
+            })
+            .collect();
+        let mut attn_out = vec![0; d];
+        for (h, value) in heads.iter().enumerate() {
+            attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(value);
+        }
+        let projected =
+            backend.project_rows(call_id, Some(layer_idx), TensorKey::Wo, &attn_out, d)?;
+        if projected.len() != d {
+            return Err(TensorParallelError::WrongShape);
+        }
+        for (out, projection) in hidden.iter_mut().zip(projected) {
+            *out += projection;
+        }
+        let normed_ff = layernorm(&hidden, ffn_norm);
+        let mut gate_up = backend.project_group(
+            call_id,
+            Some(layer_idx),
+            &[(TensorKey::WGate, cfg.d_ff), (TensorKey::WUp, cfg.d_ff)],
+            &normed_ff,
+        )?;
+        if gate_up.len() != 2 {
+            return Err(TensorParallelError::WrongShape);
+        }
+        let mut gate = gate_up.remove(0);
+        let up = gate_up.remove(0);
+        if gate.len() != cfg.d_ff || up.len() != cfg.d_ff {
+            return Err(TensorParallelError::WrongShape);
+        }
+        for (g, u) in gate.iter_mut().zip(up) {
+            *g = (silu_i64(*g) * u) >> FRAC_BITS;
+        }
+        let ff_out = backend.project_rows(call_id, Some(layer_idx), TensorKey::WDown, &gate, d)?;
+        if ff_out.len() != d {
+            return Err(TensorParallelError::WrongShape);
+        }
+        for (out, projection) in hidden.iter_mut().zip(ff_out) {
+            *out += projection;
+        }
+    }
+    cache.seq_len = pos + 1;
+    let normed = layernorm(&hidden, source.final_norm());
+    let logits = backend.project_rows(call_id, None, TensorKey::LmHead, &normed, cfg.vocab_size)?;
+    if logits.len() != cfg.vocab_size {
+        return Err(TensorParallelError::WrongShape);
+    }
+    Ok(logits)
+}
+pub(crate) fn generate_canonical_with_backend(
+    source: &impl crate::low_residency::CanonicalForwardSource,
+    request: Hash256,
+    prompt: &[u32],
+    max_tokens: u32,
+    eos_tokens: &[u32],
+    backend: &impl crate::tensor_parallel::ProjectionBackend,
+) -> Result<(Vec<u32>, Hash256), BackendGenerationError> {
+    let _admission = preflight_generation_config(source.config(), prompt.len(), max_tokens)?;
+    let forward = |token: u32, cache: &mut KVCache| {
+        let call_id = backend_call_id(&request, cache.seq_len);
+        forward_canonical_with_backend(source, token, cache, call_id, backend)
+    };
+    let mut cache = KVCache::new(source.config().n_layers);
+    let mut logits = forward(source.config().bos_token, &mut cache)?;
+    for &token in prompt {
+        logits = forward(token, &mut cache)?;
+    }
+    let mut generated = Vec::new();
+    for _ in 0..max_tokens {
+        let next = select_next_token_with_repetition_penalty(&mut logits, &generated);
+        generated.push(next);
+        if eos_tokens.contains(&next) {
+            break;
+        }
+        logits = forward(next, &mut cache)?;
+    }
+    let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
+    Ok((generated, arc_crypto::hash_bytes(&output_bytes)))
 }

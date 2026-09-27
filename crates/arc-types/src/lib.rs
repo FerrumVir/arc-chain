@@ -8,6 +8,7 @@ pub mod devtools;
 pub mod economics;
 pub mod governance;
 pub mod identity;
+pub mod inference_contract;
 pub mod intent;
 pub mod multisig;
 pub mod proof_market;

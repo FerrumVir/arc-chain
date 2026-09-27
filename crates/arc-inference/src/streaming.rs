@@ -632,6 +632,7 @@ mod tests {
             eos_tokens: vec![2],
             bos_token: 1,
             chat_template: String::new(),
+            arithmetic_profile: crate::cached_integer_model::ArithmeticProfile::LegacySplitHalfV0,
         }
     }
 

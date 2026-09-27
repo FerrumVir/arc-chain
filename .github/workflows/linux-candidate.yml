@@ -1,0 +1,565 @@
+name: Linux candidate artifacts
+
+# This workflow is intentionally limited to the current implementation
+# candidate and its isolated native-memory review branch. It builds review
+# artifacts only; it has no release, deployment, environment, or signing steps.
+on:
+  push:
+    branches: [arc-chain-v2-implementation-20260919, arc-native-low-residency-20260927]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  recovered-v3-paid-lifecycle:
+    name: Recovered-v3 paid lifecycle (isolated Linux process test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-03-16
+      CARGO_TARGET_DIR: target-recovered-native
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact candidate commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: recovered-v3-paid-lifecycle
+          workspaces: . -> target-recovered-native
+          cache-on-failure: true
+
+      - name: Compile isolated recovered-v3 process test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          evidence_dir="$RUNNER_TEMP/recovered-v3-evidence"
+          if [[ -e "$evidence_dir" ]]; then
+            echo "refusing to reuse stale lifecycle evidence directory: $evidence_dir" >&2
+            exit 1
+          fi
+          mkdir -p "$evidence_dir"
+          cargo test --locked --release -p arc-node --features native-test-executor \
+            --test native_multivalidator_paid_flow --no-run \
+            --message-format=json-render-diagnostics >"$evidence_dir/compile.log" 2>&1 || {
+              cat "$evidence_dir/compile.log"
+              exit 1
+            }
+          cat "$evidence_dir/compile.log"
+          python3 - "$evidence_dir/compile.log" "$evidence_dir/test-binary.path" <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          log_path, output_path = map(Path, sys.argv[1:])
+          executables = []
+          for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+              try:
+                  record = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              target = record.get("target", {})
+              if (
+                  record.get("reason") == "compiler-artifact"
+                  and target.get("name") == "native_multivalidator_paid_flow"
+                  and target.get("test") is True
+                  and record.get("executable")
+              ):
+                  executables.append(Path(record["executable"]))
+          if len(executables) != 1:
+              raise SystemExit(f"expected one compiled lifecycle test executable, found {len(executables)}")
+          executable = executables[0].resolve()
+          if not executable.is_file() or not os.access(executable, os.X_OK):
+              raise SystemExit(f"compiled lifecycle test executable is missing or not executable: {executable}")
+          output_path.write_text(f"{executable}\n", encoding="utf-8")
+          print(f"lifecycle test executable: {executable}")
+          PYTHON
+
+      - name: Verify exact recovered-v3 test selector
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          evidence_dir="$RUNNER_TEMP/recovered-v3-evidence"
+          selector_log="$evidence_dir/selector.log"
+          test_binary="$(cat "$evidence_dir/test-binary.path")"
+          "$test_binary" recovered_v3_dag_migration_paid_lifecycle_survives_restart \
+            --list --exact >"$selector_log" 2>&1 || {
+              cat "$selector_log"
+              exit 1
+            }
+          cat "$selector_log"
+          match_count="$(grep -Fxc \
+            'recovered_v3_dag_migration_paid_lifecycle_survives_restart: test' \
+            "$selector_log" || true)"
+          if [[ "$match_count" != 1 ]]; then
+            echo "expected exactly one matching lifecycle test, found $match_count" >&2
+            exit 1
+          fi
+
+      - name: Run recovered-v3 paid lifecycle across restart
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          evidence_dir="$RUNNER_TEMP/recovered-v3-evidence"
+          test_binary="$(cat "$evidence_dir/test-binary.path")"
+          for attempt in 1 2 3; do
+            attempt_dir="$evidence_dir/attempt-$attempt"
+            mkdir "$attempt_dir"
+            controller_log="$attempt_dir/controller.log"
+            echo "attempt=$attempt binary=$test_binary" >"$attempt_dir/metadata.txt"
+            rc=0
+            TMPDIR="$attempt_dir" timeout --signal=TERM --kill-after=30s 12m \
+              "$test_binary" recovered_v3_dag_migration_paid_lifecycle_survives_restart \
+              --exact --nocapture --test-threads=1 >"$controller_log" 2>&1 || rc=$?
+            printf '%s\n' "$rc" >"$attempt_dir/exit-code.txt"
+            cat "$controller_log"
+            if [[ "$rc" -ne 0 ]]; then
+              echo "lifecycle attempt $attempt failed with exit code $rc; stopping without retry-to-green" >&2
+              exit "$rc"
+            fi
+            pass_count="$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored;' \
+              "$controller_log" || true)"
+            if [[ "$pass_count" != 1 ]]; then
+              echo "lifecycle attempt $attempt did not contain exactly one passing test result" >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: arc-recovered-v3-paid-lifecycle-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/recovered-v3-evidence/compile.log
+            ${{ runner.temp }}/recovered-v3-evidence/selector.log
+            ${{ runner.temp }}/recovered-v3-evidence/test-binary.path
+            ${{ runner.temp }}/recovered-v3-evidence/attempt-*/controller.log
+            ${{ runner.temp }}/recovered-v3-evidence/attempt-*/arc-p5-node-*.log
+            ${{ runner.temp }}/recovered-v3-evidence/attempt-*/metadata.txt
+            ${{ runner.temp }}/recovered-v3-evidence/attempt-*/exit-code.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  desktop-native-paid-test:
+    name: Desktop native paid Rust tests (macOS)
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact candidate commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Build frontend assets required by Tauri context
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: desktop/src-tauri
+          shared-key: desktop-native-paid-macos
+
+      - name: Test desktop native paid request Rust code
+        run: 'cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib native_paid::'
+
+  linux-candidate:
+    name: Linux production candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact candidate commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Verify ephemeral pinned loopback SSH before compilation
+        timeout-minutes: 9
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Fresh CI runner only. Prevent package post-install from exposing
+          # a system SSH listener; the proof starts its own loopback sshd.
+          sudo -n systemctl mask --runtime ssh.service ssh.socket
+          if ! command -v sshd >/dev/null; then
+            timeout 180s sudo -n apt-get -o Acquire::Retries=1 -o DPkg::Lock::Timeout=30 update
+            timeout 180s sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+              -o DPkg::Lock::Timeout=30 install -y --no-install-recommends openssh-server
+          fi
+          sudo -n install -d -m 0755 /run/sshd
+          timeout --signal=TERM --kill-after=20s 90s python3 scripts/qualification/loopback_cohort_ssh.py \
+            --smoke-output-dir "$RUNNER_TEMP/loopback-ssh-smoke"
+
+      - name: Retain early SSH smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-loopback-ssh-smoke-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/loopback-ssh-smoke/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: linux-candidate
+          cache-on-failure: true
+
+      # Build the shipped node, the offline recovered-state qualification
+      # helper, and the portable sidecar row worker from the same locked tree.
+      - name: Build Linux candidate binaries
+        run: |
+          cargo build --locked --release -p arc-node --features candle --bin arc-node \
+            --example qualify_recovered_native_boundary --example production_partial_row_conformance
+          cargo build --locked --release -p arc-inference \
+            --example tensor_row_stdio_worker --example tensor_row_low_residency_export \
+            --example tensor_row_shared_worker --example low_residency_conformance --features candle
+
+      - name: Check changed crates and examples in both feature modes
+        run: |
+          cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node
+          cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node --features candle
+
+      # Repeat the recovery-state and native-boundary suites on Linux, then
+      # exercise canonical SIMD, lazy-weight parity, and refusal cases.
+      - name: Test recovery and native boundary on Linux
+        run: |
+          cargo test --locked --release -p arc-assign
+          cargo test --locked --release -p arc-state --lib
+          cargo test --locked --release -p arc-node --lib --features candle
+          cargo test --locked --release -p arc-net --lib
+          cargo test --locked --release -p arc-node --bin arc-node --features candle legacy_v3_wire
+          cargo test --locked --release -p arc-node --bin arc-node --features candle native_request_opt_in_is_default_closed_and_requires_runtime_before_state_open
+          cargo test --locked --release -p arc-node --bin arc-node --features candle native_assignment_policy_command_is_offline_and_matches_runtime_configuration
+          cargo test --locked --release -p arc-inference --lib --features candle
+          ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle
+          cargo test --locked --release -p arc-inference --features candle --example tensor_row_low_residency_export
+          cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance
+          cargo test --locked --release -p arc-node --features candle --example production_partial_row_conformance
+          python3 scripts/qualification/test_row_relay_flush.py \
+            --binary target/release/examples/tensor_row_shared_worker
+          python3 -m unittest discover -s scripts/qualification/tests -p 'test_*.py'
+
+      - name: Package binaries and provenance
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/linux-candidate"
+          cp target/release/arc-node "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/qualify_recovered_native_boundary \
+            "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/tensor_row_stdio_worker \
+            "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/tensor_row_low_residency_export \
+            "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/tensor_row_shared_worker \
+            "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/low_residency_conformance \
+            "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/examples/production_partial_row_conformance \
+            "$RUNNER_TEMP/linux-candidate/"
+          {
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'commit=%s\n' "$CANDIDATE_SHA"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'workflow_run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'workflow_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'runner=%s\n' "$ImageOS $ImageVersion"
+            printf 'build= cargo build --locked --release -p arc-node --features candle --bin arc-node --example qualify_recovered_native_boundary --example production_partial_row_conformance\n'
+            printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --example tensor_row_low_residency_export --example tensor_row_shared_worker --example low_residency_conformance --features candle\n'
+            printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node\n'
+            printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node --features candle\n'
+            printf 'tests= cargo test --locked --release -p arc-assign\n'
+            printf 'tests= cargo test --locked --release -p arc-state --lib\n'
+            printf 'tests= cargo test --locked --release -p arc-node --lib --features candle\n'
+            printf 'tests= cargo test --locked --release -p arc-net --lib\n'
+            printf 'tests= cargo test --locked --release -p arc-node --bin arc-node --features candle legacy_v3_wire\n'
+            printf 'tests= cargo test --locked --release -p arc-node --bin arc-node --features candle native_request_opt_in_is_default_closed_and_requires_runtime_before_state_open\n'
+            printf 'tests= cargo test --locked --release -p arc-node --bin arc-node --features candle native_assignment_policy_command_is_offline_and_matches_runtime_configuration\n'
+            printf 'tests= cargo test --locked --release -p arc-inference --lib --features candle\n'
+            printf 'tests= ARC_FAST_CANONICAL_KERNEL=1 cargo test --locked --release -p arc-inference --lib --features candle\n'
+            printf 'tests= cargo test --locked --release -p arc-inference --features candle --example tensor_row_low_residency_export\n'
+            printf 'tests= cargo test --locked --release -p arc-inference --features candle --example low_residency_conformance\n'
+            printf 'tests= cargo test --locked --release -p arc-node --features candle --example production_partial_row_conformance\n'
+            printf 'tests= python3 scripts/qualification/loopback_cohort_ssh.py --smoke-output-dir RUNNER_TEMP/loopback-ssh-smoke\n'
+            printf 'tests= python3 scripts/qualification/test_row_relay_flush.py --binary target/release/examples/tensor_row_shared_worker\n'
+            printf 'tests= python3 -m unittest discover -s scripts/qualification/tests -p test_*.py\n'
+            rustc --version --verbose
+            cargo --version
+          } > "$RUNNER_TEMP/linux-candidate/PROVENANCE.txt"
+          (cd "$RUNNER_TEMP/linux-candidate" && sha256sum -- * > SHA256SUMS)
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-linux-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+  real-model-conformance:
+    name: Fresh-runner real-model conformance (${{ matrix.layout }})
+    if: github.ref == 'refs/heads/arc-native-low-residency-20260927'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - layout: layers
+            row_partitions: 0
+            kernel: scalar
+            reference_kernel: scalar
+          - layout: partial-rows
+            row_partitions: 7
+            kernel: scalar
+            reference_kernel: scalar
+          - layout: partial-rows-fast
+            row_partitions: 7
+            kernel: fast
+            reference_kernel: scalar
+          - layout: production-partial-rows
+            row_partitions: 7
+            kernel: scalar
+            reference_kernel: scalar
+    needs: [linux-candidate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: arc-linux-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-candidate
+
+      - name: Verify production SSH prerequisites before model download
+        if: matrix.layout == 'production-partial-rows'
+        timeout-minutes: 9
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo -n systemctl mask --runtime ssh.service ssh.socket
+          if ! command -v sshd >/dev/null; then
+            timeout 180s sudo -n apt-get -o Acquire::Retries=1 -o DPkg::Lock::Timeout=30 update
+            timeout 180s sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+              -o DPkg::Lock::Timeout=30 install -y --no-install-recommends openssh-server
+          fi
+          sudo -n install -d -m 0755 /run/sshd
+          timeout --signal=TERM --kill-after=20s 90s python3 scripts/qualification/loopback_cohort_ssh.py \
+            --smoke-output-dir "$RUNNER_TEMP/real-model-conformance-production-partial-rows/ssh-smoke"
+
+      - name: Download, verify, and qualify exact model on fresh runner
+        env:
+          MODEL_PATH: ${{ runner.temp }}/model/llama-2-7b-chat.Q4_K_M.gguf
+          CANDIDATE_DIR: ${{ runner.temp }}/linux-candidate
+          EVIDENCE_DIR: ${{ runner.temp }}/real-model-conformance-${{ matrix.layout }}
+          RESULT_DIR: ${{ runner.temp }}/real-model-output-${{ matrix.layout }}
+          CONFORMANCE_LAYOUT: ${{ matrix.layout }}
+          ROW_PARTITIONS: ${{ matrix.row_partitions }}
+          KERNEL: ${{ matrix.kernel }}
+          REFERENCE_KERNEL: ${{ matrix.reference_kernel }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$(dirname "$MODEL_PATH")" "$EVIDENCE_DIR"
+          exec > >(tee "$EVIDENCE_DIR/job.log") 2>&1
+          status=0
+          (cd "$CANDIDATE_DIR" && sha256sum -c SHA256SUMS) || status=$?
+          grep -Fx "repository=$GITHUB_REPOSITORY" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
+          grep -Fx "commit=$GITHUB_SHA" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
+          grep -Fx "workflow_run_id=$GITHUB_RUN_ID" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
+          grep -Fx "workflow_run_attempt=$GITHUB_RUN_ATTEMPT" "$CANDIDATE_DIR/PROVENANCE.txt" >/dev/null || status=1
+          for binary in arc-node qualify_recovered_native_boundary tensor_row_stdio_worker tensor_row_low_residency_export tensor_row_shared_worker low_residency_conformance production_partial_row_conformance; do
+            test -f "$CANDIDATE_DIR/$binary" || { echo "missing candidate binary: $binary"; status=1; }
+            test ! -L "$CANDIDATE_DIR/$binary" || { echo "candidate binary is symlink: $binary"; status=1; }
+            chmod +x "$CANDIDATE_DIR/$binary" || status=1
+          done
+          python3 - <<'PY' || status=$?
+          import json, os, shutil
+          mem = {}
+          for line in open('/proc/meminfo'):
+              if line.startswith(('MemTotal:', 'MemAvailable:')):
+                  key, value, *_ = line.split(); mem[key[:-1]] = int(value) * 1024
+          disk = shutil.disk_usage(os.environ['RUNNER_TEMP'])
+          report = {'mem_bytes': mem, 'disk_total_bytes': disk.total, 'disk_free_bytes': disk.free}
+          with open(os.path.join(os.environ['EVIDENCE_DIR'], 'runner-resources.json'), 'w') as f:
+              json.dump(report, f, indent=2); f.write('\n')
+          if mem.get('MemAvailable', 0) < 12 * 1024**3 or disk.free < 12 * 1024**3:
+              raise SystemExit('fresh runner below real-model conformance resource floor')
+          PY
+          if [ "$status" -eq 0 ]; then
+            curl --fail --location --retry 2 --retry-all-errors --retry-max-time 600 --connect-timeout 15 --max-time 300 --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$MODEL_PATH" \
+              https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            actual_size="$(wc -c < "$MODEL_PATH" | tr -d ' ')"
+            [ "$actual_size" = 4081004224 ] || { echo "model size mismatch: $actual_size"; status=1; }
+          fi
+          if [ "$status" -eq 0 ]; then
+            printf '%s  %s\n' 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa "$MODEL_PATH" | sha256sum -c - || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            row_layout_args=()
+            if [ "$ROW_PARTITIONS" != "0" ]; then
+              row_layout_args=(--row-partitions "$ROW_PARTITIONS")
+            fi
+            if [ "$CONFORMANCE_LAYOUT" = "production-partial-rows" ]; then
+              row_layout_args+=(--production-cohort)
+            fi
+            timeout --signal=TERM --kill-after=30s 40m python3 scripts/qualification/run_low_residency_conformance.py \
+              --binaries-dir "$CANDIDATE_DIR" --model "$MODEL_PATH" \
+              --output-dir "$RESULT_DIR" --prompt-ids 6324 --max-tokens 2 \
+              --warmups 0 --kernel "$KERNEL" --reference-kernel "$REFERENCE_KERNEL" --total-timeout-seconds 2100 \
+              "${row_layout_args[@]}" > "$EVIDENCE_DIR/runner.log" 2>&1 || status=$?
+            cat "$EVIDENCE_DIR/runner.log"
+            python3 - "$RESULT_DIR/summary.json" "$CONFORMANCE_LAYOUT" "$ROW_PARTITIONS" "$KERNEL" "$REFERENCE_KERNEL" <<'PY' || status=$?
+          import json, sys
+          summary=json.load(open(sys.argv[1]))
+          layout=sys.argv[2]
+          partitions=int(sys.argv[3])
+          kernel=sys.argv[4]
+          reference_kernel=sys.argv[5]
+          expected_layout={'layers':'layers','partial-rows':'partial-rows',
+                           'partial-rows-fast':'partial-rows', 'production-partial-rows':'partial-rows'}[layout]
+          expected_partitions=None if partitions == 0 else partitions
+          if summary.get('pass') is not True:
+              raise SystemExit('runner exited without a passing summary record')
+          if summary.get('layout') != expected_layout:
+              raise SystemExit(f"summary layout mismatch: expected {expected_layout}, got {summary.get('layout')}")
+          if summary.get('inputs', {}).get('row_partitions') != expected_partitions:
+              raise SystemExit(f"summary row partition mismatch: expected {expected_partitions}, got {summary.get('inputs', {}).get('row_partitions')}")
+          inputs=summary.get('inputs', {})
+          if layout == 'production-partial-rows':
+              if (inputs.get('production_cohort') is not True
+                      or summary.get('production_cohort_constructor_readiness_generate') is not True
+                      or summary.get('exact_output_tokens_and_hash') is not True
+                      or summary.get('exact_position_logit_and_kv_digests') is not False
+                      or summary.get('all_owners_measured_and_certified') is not True
+                      or summary.get('no_local_primary_or_fallback') is not True):
+                  raise SystemExit('production cohort integration evidence missing or scope overstated')
+          if inputs.get('kernel') != kernel or inputs.get('reference_kernel') != reference_kernel:
+              raise SystemExit('summary kernel settings differ from matrix request')
+          observed=summary.get('kernel_observations', {})
+          if observed.get('reference', {}).get('requested_kernel') != reference_kernel or observed.get('coordinator', {}).get('requested_kernel') != kernel:
+              raise SystemExit('summary omitted exact reference/coordinator kernel observations')
+          if observed.get('reference', {}).get('effective_fast_kernel') != (reference_kernel == 'fast'):
+              raise SystemExit('reference effective kernel differs from matrix request')
+          if observed.get('coordinator', {}).get('effective_fast_kernel') != (kernel == 'fast'):
+              raise SystemExit('coordinator effective kernel differs from matrix request')
+          workers=observed.get('workers')
+          if not isinstance(workers, list) or not workers:
+              raise SystemExit('summary worker kernel observations do not match worker count')
+          if partitions and len(workers) != partitions:
+              raise SystemExit('summary worker count differs from requested row partitions')
+          if len({worker.get('worker_id') for worker in workers}) != len(workers):
+              raise SystemExit('summary repeats a worker identity')
+          if any(worker.get('requested_kernel') != kernel or worker.get('effective_fast_kernel') != (kernel == 'fast') for worker in workers):
+              raise SystemExit('worker effective kernel differs from matrix request')
+          if kernel == 'fast':
+              if reference_kernel != 'scalar' or observed.get('simd_path_qualified') is not True:
+                  raise SystemExit('fast distributed run lacks scalar-reference SIMD qualification')
+              coordinator_census=observed.get('coordinator', {}).get('projection_census')
+              if (observed.get('coordinator', {}).get('simd_available') is not True
+                      or not isinstance(coordinator_census, dict)
+                      or coordinator_census.get('attempted', 0) <= 0
+                      or coordinator_census.get('accepted') != coordinator_census.get('attempted')
+                      or any(coordinator_census.get(key, 0) != 0 for key in ('refused_unavailable','refused_shape',
+                          'refused_inner_dim_above_i32_bound','refused_activation_out_of_domain',
+                          'refused_scale_multiply_would_overflow'))):
+                  raise SystemExit('coordinator did not accept every SIMD projection')
+              for worker in workers:
+                  census=worker.get('projection_census')
+                  if (worker.get('simd_available') is not True or worker.get('completed_calls', 0) <= 0
+                          or worker.get('refused_calls') != 0 or not isinstance(census, dict)
+                          or census.get('attempted', 0) <= 0 or census.get('accepted') != census.get('attempted')
+                          or worker.get('projection_chunks') != census.get('attempted')
+                          or any(census.get(key, 0) != 0 for key in ('refused_unavailable','refused_shape',
+                              'refused_inner_dim_above_i32_bound','refused_activation_out_of_domain',
+                              'refused_scale_multiply_would_overflow'))):
+                      raise SystemExit(f"worker {worker.get('worker_id')} did not accept every SIMD projection")
+          PY
+          fi
+          if [ -d "$RESULT_DIR" ]; then
+            python3 - "$RESULT_DIR" "$EVIDENCE_DIR/results" <<'PY' || status=$?
+          import os, pathlib, shutil, sys
+          src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]); dst.mkdir(exist_ok=True)
+          # Retain only small textual/JSON evidence; never include GGUF or row bundle payloads.
+          allowed={'.json','.log','.txt'}
+          for p in src.rglob('*'):
+              manifest = p.name == 'manifest.json' and len(p.relative_to(src).parts) == 3 and p.relative_to(src).parts[0] == 'bundles'
+              if not p.is_file() or (p.suffix.lower() not in allowed and not manifest and p.name != 'loopback_known_hosts'): continue
+              if 'bundles' in p.relative_to(src).parts and not manifest: continue
+              if p.stat().st_size > 2 * 1024 * 1024: continue
+              q=dst/p.relative_to(src);q.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(p,q)
+          PY
+          fi
+          printf '%s\n' "$status" > "$EVIDENCE_DIR/exit-code.txt"
+          python3 - "$EVIDENCE_DIR/result.json" "$status" <<'PY' || status=$?
+          import json, sys, time
+          with open(sys.argv[1], 'w') as f:
+              json.dump({'exit_code': int(sys.argv[2]), 'finished_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}, f, indent=2); f.write('\n')
+          PY
+          exit "$status"
+
+      - name: Retain conformance evidence (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-real-model-conformance-${{ matrix.layout }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/real-model-conformance-${{ matrix.layout }}/
+            ${{ runner.temp }}/real-model-output-${{ matrix.layout }}/**/*.json
+            ${{ runner.temp }}/real-model-output-${{ matrix.layout }}/**/*.log
+            ${{ runner.temp }}/real-model-output-${{ matrix.layout }}/**/*.txt
+          if-no-files-found: warn
+          retention-days: 14

@@ -6,6 +6,7 @@ const CONTROL_DIR: &str = ".arc-desktop-control";
 const TOKEN_FILE: &str = "token";
 const REQUEST_FILE: &str = "request";
 const REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
+const STARTUP_GGUF_SIZE: u64 = 256 * 1024 * 1024;
 // The lifecycle receipt deliberately re-hashes the exact arc-node executable
 // when it is loaded, authenticated, and acknowledged.  An unstripped debug
 // binary is hundreds of MiB on hosted runners, where those security checks can
@@ -14,6 +15,32 @@ const REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
 // the production graceful-drain budget while allowing the integrity checks to
 // complete under slow CI I/O instead of weakening or bypassing them.
 const STARTUP_SHUTDOWN_TEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn write_sparse_startup_gguf(path: &std::path::Path) {
+    fn write_string(header: &mut Vec<u8>, value: &str) {
+        header.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        header.extend_from_slice(value.as_bytes());
+    }
+
+    // Startup reads these GGUF shape fields before opening persistent state.
+    // Keep the large sparse body to exercise model hashing, but use a valid
+    // header so the lifecycle test reaches its durable shutdown barrier.
+    let mut header = Vec::new();
+    header.extend_from_slice(b"GGUF");
+    header.extend_from_slice(&3u32.to_le_bytes());
+    header.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+    header.extend_from_slice(&2u64.to_le_bytes()); // metadata count
+    write_string(&mut header, "general.architecture");
+    header.extend_from_slice(&8u32.to_le_bytes()); // string
+    write_string(&mut header, "llama");
+    write_string(&mut header, "llama.block_count");
+    header.extend_from_slice(&4u32.to_le_bytes()); // u32
+    header.extend_from_slice(&1u32.to_le_bytes());
+
+    let mut model = std::fs::File::create(path).unwrap();
+    model.write_all(&header).unwrap();
+    model.set_len(STARTUP_GGUF_SIZE).unwrap();
+}
 
 fn take_child_logs(child: &mut Child) -> String {
     let mut logs = String::new();
@@ -144,9 +171,7 @@ fn private_desktop_request_stops_node_during_initialization() {
     let desktop_lifecycle_owner =
         acquire_managed_lifecycle_fixture(&data_dir, &desktop_lifecycle_nonce);
     let model_path = temp.path().join("startup-hash-fixture.gguf");
-    let model = std::fs::File::create(&model_path).unwrap();
-    model.set_len(256 * 1024 * 1024).unwrap();
-    drop(model);
+    write_sparse_startup_gguf(&model_path);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_arc-node"));
     command
@@ -243,9 +268,7 @@ fn sigterm_is_armed_before_synchronous_initialization() {
     let data_dir = temp.path().join("signal-node-data");
     std::fs::create_dir(&data_dir).unwrap();
     let model_path = temp.path().join("signal-startup-hash-fixture.gguf");
-    let model = std::fs::File::create(&model_path).unwrap();
-    model.set_len(256 * 1024 * 1024).unwrap();
-    drop(model);
+    write_sparse_startup_gguf(&model_path);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_arc-node"))
         .args([

@@ -390,7 +390,7 @@ test.describe("Inference - community-first coordinator routing", () => {
     await expect(page.getByTestId("inference-coordinator")).toHaveText("NYC");
     const evidence = page.getByTestId("inference-consensus");
     await expect(evidence).toContainText(
-      "independently checked with authenticated 2-of-3 range quorums",
+      "independently checked with authenticated replica agreement",
     );
     await expect(evidence).toContainText("exact execution profile bound");
     await expect(evidence).toContainText("authenticated quorum verified");
@@ -939,6 +939,79 @@ test.describe("Inference - community-first coordinator routing", () => {
     // Only one coordinator was hit (NYC succeeded first - no retry).
     expect(coordHitCount).toBe(1);
     expect(remoteDirectFailures).toBe(0);
+  });
+
+  test("does not promote an unbound quorum flag to authenticated consensus", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    await installReadiness(page, () => false);
+    await page.route("**/inference/run", (route) =>
+      route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "not ready" }) }),
+    );
+    await page.route("**/inference/run_consensus", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ...COORD_PAYLOAD, profile_bound: false, quorum_verified: true }),
+      }),
+    );
+    await page.route("**/health", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ peers: 6, uptime_secs: 3600, version: "test", dag_round: 1, dag_committed: 1, height: 1, validators: 6 }),
+      }),
+    );
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("Biggest planet?");
+    await page.getByTestId("btn-run-inference").click();
+    await expect(page.getByTestId("inference-result")).toBeVisible({ timeout: 15_000 });
+    const banner = page.getByTestId("inference-consensus");
+    await expect(banner).toContainText("quorum not verified");
+    await expect(banner).not.toContainText("authenticated quorum verified");
+    await expect(page.getByTestId("inference-result")).not.toContainText(/reward|paid|ARC/);
+  });
+
+  test("does not promote an absent quorum flag to authenticated consensus", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    await installReadiness(page, () => false);
+    await page.route("**/inference/run", (route) =>
+      route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "not ready" }) }),
+    );
+    await page.route("**/inference/run_consensus", (route) => {
+      const { quorum_verified: _ignored, ...withoutQuorum } = COORD_PAYLOAD;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ...withoutQuorum, profile_bound: true }),
+      });
+    });
+    await page.route("**/health", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ peers: 6, uptime_secs: 3600, version: "test", dag_round: 1, dag_committed: 1, height: 1, validators: 6 }),
+      }),
+    );
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("Biggest planet?");
+    await page.getByTestId("btn-run-inference").click();
+    await expect(page.getByTestId("inference-result")).toBeVisible({ timeout: 15_000 });
+    const banner = page.getByTestId("inference-consensus");
+    await expect(banner).toContainText("quorum not verified");
+    await expect(banner).not.toContainText("authenticated quorum verified");
+    await expect(page.getByTestId("inference-result")).not.toContainText(/reward|paid|ARC/);
   });
 
   test("local node healthy (returns real output) - no coordinator fallback", async ({

@@ -524,6 +524,38 @@ test("successful inference receipts are confirmed activity", () => {
   assert.equal(result.inferenceConfirmed, true);
 });
 
+test("native protocol-3 transactions distinguish admission, finalization and refund", () => {
+  const tx = (code) => ({ tx: { tx_type_code: `0x${code}`, tx_hash: hex("f") } });
+  const mined = { receipt: { receipt_status: "success", block_height: H + 8 } };
+  const request = network.classifyReceipt({ ...tx("26"), ...mined });
+  assert.equal(request.category, "native-inference");
+  assert.equal(request.nativeInferenceStage, "request");
+  assert.equal(request.success, true);
+  assert.equal(request.mined, true);
+  assert.equal(request.inferenceConfirmed, false, "request admission is not completed inference");
+
+  const finalize = network.classifyReceipt({ ...tx("27"), ...mined });
+  assert.equal(finalize.category, "native-inference");
+  assert.equal(finalize.nativeInferenceStage, "finalize");
+  assert.equal(finalize.inferenceConfirmed, true);
+
+  const refund = network.classifyReceipt({ ...tx("28"), ...mined });
+  assert.equal(refund.nativeInferenceStage, "refund");
+  assert.equal(refund.inferenceConfirmed, false);
+
+  const unmined = network.classifyReceipt({ ...tx("27"), receipt: { receipt_status: "success" } });
+  assert.equal(unmined.nativeInferenceStage, "finalize");
+  assert.equal(unmined.success, true);
+  assert.equal(unmined.mined, false);
+  assert.equal(unmined.inferenceConfirmed, false);
+
+  const failed = network.classifyReceipt({
+    ...tx("27"), receipt: { receipt_status: "failed", block_height: H + 8 },
+  });
+  assert.equal(failed.success, false);
+  assert.equal(failed.inferenceConfirmed, false);
+});
+
 test("H+1 parent linkage is independently verified", () => {
   const result = network.boundaryVerification(
     { header: { height: H + 1, parent_hash: recovered.checkpoint.blockHash, hash: recovered.checkpoint.boundaryBlockHash, state_root: recovered.checkpoint.boundaryStateRoot } },

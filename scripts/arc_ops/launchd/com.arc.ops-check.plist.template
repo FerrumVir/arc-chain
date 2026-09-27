@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PREPARED, NOT INSTALLED. A recurring run of the read-only ARC operational
+  check (scripts/arc_ops/check.py). Enabling it is an operator decision that
+  needs explicit approval; nothing in the repository installs it.
+
+  To enable after approval: replace the three @PLACEHOLDERS@, copy to
+  ~/Library/LaunchAgents/, then `launchctl load -w <that path>`.
+  To disable: `launchctl unload -w <that path>` and delete the file.
+
+  Each run writes a JSON report (facts + verdict) and exits 0 PASS,
+  1 FAIL, 2 INCOMPLETE, 3 WARN. Reports rotate by timestamp; prune the
+  directory yourself - this template deliberately does not delete anything.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.arc.ops-check</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>cd @REPO@/scripts &amp;&amp; /usr/bin/python3 -m arc_ops.check --rpc @RPC_LIST@ --report @REPORT_DIR@/ops-$(date -u +%Y%m%dT%H%M%SZ).json</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>StandardOutPath</key>
+  <string>@REPORT_DIR@/ops-check.log</string>
+  <key>StandardErrorPath</key>
+  <string>@REPORT_DIR@/ops-check.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

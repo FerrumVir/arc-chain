@@ -694,7 +694,10 @@ impl Pipeline {
                                 | TxBody::ShardAssignmentProposal(_)
                                 | TxBody::InferenceRequest(_)
                                 | TxBody::InferenceVote(_)
-                                | TxBody::InferenceFinalize(_) => {}
+                                | TxBody::InferenceFinalize(_)
+                                | TxBody::NativeInferenceRequest(_)
+                                | TxBody::NativeInferenceFinalize(_)
+                                | TxBody::NativeInferenceRefund(_) => {}
                             }
                         }
 

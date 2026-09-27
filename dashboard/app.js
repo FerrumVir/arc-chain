@@ -85,12 +85,37 @@
     catch (error) { return { ok: false, error }; }
   }
 
+  // Some deployed v0.8 gateways return 404 for the /block/latest alias even
+  // though the source RPC implements it. Resolve the current height through
+  // read-only status endpoints, then fetch the canonical block shape.
+  async function requestLatestBlock(fetchImpl, source, options) {
+    const direct = await optionalRequest(fetchImpl, source, "/block/latest", options);
+    if (direct.ok) return direct.value;
+    if (direct.error?.status !== 404) throw direct.error;
+    const [info, stats, health] = await Promise.all([
+      optionalRequest(fetchImpl, source, "/info", options),
+      optionalRequest(fetchImpl, source, "/stats", options),
+      optionalRequest(fetchImpl, source, "/health", options),
+    ]);
+    const height = snapshotHeight({
+      info: info.ok ? info.value : null,
+      stats: stats.ok ? stats.value : null,
+      health: health.ok ? health.value : null,
+    });
+    if (height === null) throw direct.error;
+    const block = await requestJson(fetchImpl, source, `/block/${height}`, options);
+    if (network.blockHeight(block) !== height) throw new RpcError("latest block height did not match the advertised height", 0, source.id);
+    return block;
+  }
+
   function snapshotHeight(snapshot) {
     const values = [
       snapshot?.health?.height,
       snapshot?.health?.block_height,
       snapshot?.info?.height,
       snapshot?.info?.block_height,
+      snapshot?.stats?.height,
+      snapshot?.stats?.block_height,
       network.blockHeight(snapshot?.latest),
     ].map((value) => integerOrNull(value)).filter((value) => value !== null);
     return values.length ? Math.max(...values) : null;
@@ -100,7 +125,7 @@
     const [health, info, latest] = await Promise.all([
       optionalRequest(fetchImpl, source, "/health", options),
       optionalRequest(fetchImpl, source, "/info", options),
-      optionalRequest(fetchImpl, source, "/block/latest", options),
+      requestLatestBlock(fetchImpl, source, options).then((value) => ({ ok: true, value })).catch((error) => ({ ok: false, error })),
     ]);
     const reachable = health.ok || info.ok || latest.ok;
     const snapshot = {
@@ -624,6 +649,7 @@
     numberOrNull,
     extractRows,
     requestJson,
+    requestLatestBlock,
     collectSourceSnapshot,
     collectFleetHealth,
     activeFleetPublicationError,

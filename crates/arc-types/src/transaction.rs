@@ -157,6 +157,11 @@ pub mod gas_costs {
     /// emits payouts; the actual cost scales with committee size but
     /// at K≤7 the work is bounded.
     pub const TIER1_INFERENCE_FINALIZE: u64 = 60_000;
+    /// Candidate protocol-4 native inference costs. Native payment is the
+    /// signed job price; these are execution-meter bounds, never outer fees.
+    pub const NATIVE_INFERENCE_REQUEST: u64 = 90_000;
+    pub const NATIVE_INFERENCE_FINALIZE: u64 = 90_000;
+    pub const NATIVE_INFERENCE_REFUND: u64 = 45_000;
     /// Gas for storage read.
     pub const SLOAD: u64 = 200;
     /// Gas for storage write.
@@ -350,6 +355,14 @@ pub enum TxType {
     /// Validator-authorized payment for one coordinator-issued community
     /// inference job. Appended to preserve every existing wire discriminant.
     CommunityInferenceReward = 0x25,
+    /// Candidate protocol-4 native inference request. Kept after all legacy
+    /// discriminants; activation is private-context gated in arc-state.
+    NativeInferenceRequest = 0x26,
+    /// Candidate protocol-4 native inference settlement with a full signed
+    /// certificate. Votes are aggregated off-chain and carried here.
+    NativeInferenceFinalize = 0x27,
+    /// Candidate protocol-4 native inference expiry refund.
+    NativeInferenceRefund = 0x28,
 }
 
 /// A transaction on the ARC chain.
@@ -455,6 +468,12 @@ pub enum TxBody {
     InferenceFinalize(InferenceFinalizeBody),
     /// Validator-authorized, replay-protected community inference payment.
     CommunityInferenceReward(CommunityInferenceRewardBody),
+    /// Candidate protocol-4 native inference request.
+    NativeInferenceRequest(NativeInferenceRequestBody),
+    /// Candidate protocol-4 native inference finalization.
+    NativeInferenceFinalize(NativeInferenceFinalizeBody),
+    /// Candidate protocol-4 native inference refund.
+    NativeInferenceRefund(NativeInferenceRefundBody),
 }
 
 impl TxBody {
@@ -502,6 +521,9 @@ impl TxBody {
             Self::InferenceVote(_) => TxType::InferenceVote,
             Self::InferenceFinalize(_) => TxType::InferenceFinalize,
             Self::CommunityInferenceReward(_) => TxType::CommunityInferenceReward,
+            Self::NativeInferenceRequest(_) => TxType::NativeInferenceRequest,
+            Self::NativeInferenceFinalize(_) => TxType::NativeInferenceFinalize,
+            Self::NativeInferenceRefund(_) => TxType::NativeInferenceRefund,
         }
     }
 }
@@ -1333,6 +1355,44 @@ pub struct InferenceVoteBody {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InferenceFinalizeBody {
     /// The request being finalized.
+    pub request_id: [u8; 32],
+}
+
+/// Arithmetic identity for GGUF Llama row-INT8 execution with interleaved
+/// rotary coordinates. Distinct from the historical split-half profile.
+pub const GGUF_LLAMA_I8_INTERLEAVED_ROPE_PROFILE_V1: &str =
+    "arc.gguf-llama.i8-per-row.rope-interleaved.v1";
+
+/// Diagnostic sampling identity for same-artifact reference comparisons.
+/// This selects raw greedy argmax and intentionally excludes the protocol-v2
+/// generated-token repetition penalty.
+pub const GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1: &str = "arc.whole-model-generation.greedy.v1";
+/// Header-only tokenizer identity for the LLaMA GGUF score-ordered
+/// SentencePiece merge implementation. It is intentionally distinct from
+/// ARC's legacy longest-piece encoder.
+pub const GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1: &str = "arc.gguf-llama.spm-score-merge.v1";
+
+/// Candidate protocol-4 native request. The signed immutable job is the
+/// economic and execution commitment; the bounded blob is carried so every
+/// validator can reconstruct the same input without consulting a caller.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeInferenceRequestBody {
+    pub request: crate::inference_contract::InferenceRequest,
+    pub input_blob: Vec<u8>,
+}
+
+/// Candidate protocol-4 native settlement. The certificate contains the
+/// complete bounded output and authenticated validator signatures; no
+/// per-vote transaction family is introduced.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeInferenceFinalizeBody {
+    pub request_id: [u8; 32],
+    pub certificate: crate::inference_contract::InferenceCertificate,
+}
+
+/// Candidate protocol-4 expiry refund.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeInferenceRefundBody {
     pub request_id: [u8; 32],
 }
 
@@ -2351,6 +2411,58 @@ mod tests {
         assert_eq!(TxType::InferenceVote as u8, 0x23);
         assert_eq!(TxType::InferenceFinalize as u8, 0x24);
         assert_eq!(TxType::CommunityInferenceReward as u8, 0x25);
+    }
+
+    #[test]
+    fn native_inference_tail_variants_roundtrip_without_legacy_renumbering() {
+        use crate::inference_contract::{InferenceDomain, InferenceJob, InferenceRequest};
+        let request = InferenceRequest {
+            job: InferenceJob {
+                version: crate::inference_contract::INFERENCE_CONTRACT_VERSION,
+                domain: InferenceDomain {
+                    chain_genesis: Hash256::ZERO,
+                    recovery_epoch: 1,
+                    validator_set_hash: Hash256::ZERO,
+                },
+                requester: test_addr(9),
+                nonce: 4,
+                model_hash: hash_bytes(b"model"),
+                profile_hash: hash_bytes(b"profile"),
+                input_hash: hash_bytes(b"input"),
+                generation_hash: hash_bytes(b"generation"),
+                assignment_hash: hash_bytes(b"assignment"),
+                max_tokens: 32,
+                max_output_bytes: 128,
+                execution_price: 10,
+                reserved_max_payment: 20,
+                expires_at: 100,
+            },
+            requester_signature: arc_crypto::Signature::null(),
+        };
+        let bodies = [
+            TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request: request.clone(),
+                input_blob: b"input".to_vec(),
+            }),
+            TxBody::NativeInferenceFinalize(NativeInferenceFinalizeBody {
+                request_id: request.job.request_id().0,
+                certificate: crate::inference_contract::InferenceCertificate {
+                    output: b"output".to_vec(),
+                    votes: Vec::new(),
+                },
+            }),
+            TxBody::NativeInferenceRefund(NativeInferenceRefundBody {
+                request_id: request.job.request_id().0,
+            }),
+        ];
+        for body in bodies {
+            let bytes = bincode::serialize(&body).expect("serialize native body");
+            let decoded: TxBody = bincode::deserialize(&bytes).expect("decode native body");
+            assert_eq!(decoded.tx_type(), body.tx_type());
+        }
+        assert_eq!(TxType::NativeInferenceRequest as u8, 0x26);
+        assert_eq!(TxType::NativeInferenceFinalize as u8, 0x27);
+        assert_eq!(TxType::NativeInferenceRefund as u8, 0x28);
     }
 
     #[test]

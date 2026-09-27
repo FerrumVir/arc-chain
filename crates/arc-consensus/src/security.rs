@@ -55,6 +55,12 @@ pub struct WithholdingDetector {
 }
 
 impl WithholdingDetector {
+    /// Round entries held (expected + received), for resource diagnostics.
+    pub fn entry_count(&self) -> usize {
+        self.expected.values().map(HashSet::len).sum::<usize>()
+            + self.received.values().map(HashSet::len).sum::<usize>()
+    }
+
     /// Create a new detector.
     pub fn new() -> Self {
         Self::default()
@@ -614,6 +620,14 @@ pub struct StakeTracker {
 }
 
 impl StakeTracker {
+    /// (vote entries, penalty records) held, for resource diagnostics.
+    pub fn sizes(&self) -> (usize, usize) {
+        (
+            self.votes.values().map(HashSet::len).sum(),
+            self.penalties.len(),
+        )
+    }
+
     /// Create a new tracker.
     pub fn new() -> Self {
         Self::default()

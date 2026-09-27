@@ -13,6 +13,10 @@ path = "src/main.rs"
 # Dev builds on stable use mock BLAKE3 verifier - proofs are structurally identical.
 [features]
 default = []
+# Integration-only deterministic native executor. Behind a feature so it cannot
+# exist in a default build; evidence produced with it is protocol coverage and
+# qualifies no model.
+native-test-executor = []
 benchmark-tools = ["arc-crypto/benchmark-tools", "arc-state/benchmark-tools"]
 candle = ["arc-inference/candle"]
 stwo-prover = ["arc-crypto/stwo-prover", "arc-state/stwo-prover"]
@@ -54,6 +58,7 @@ name = "v079_signed_inference"
 required-features = ["retired-live-examples"]
 
 [dependencies]
+arc-assign = { path = "../arc-assign" }
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
 arc-state = { path = "../arc-state" }

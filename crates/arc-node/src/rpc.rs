@@ -8,8 +8,8 @@ use arc_types::economics::RoleRevenueConfig;
 use arc_types::*;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Query, State as AxumState},
-    http::StatusCode,
+    extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State as AxumState},
+    http::{HeaderMap, HeaderValue, StatusCode},
     routing::{get, post},
 };
 use dashmap::mapref::entry::Entry;
@@ -73,6 +73,15 @@ const TX_SENDER_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// exposed directly cannot allocate the router-wide 256 MiB maximum before
 /// the logical batch cap runs.
 const PUBLIC_TX_SUBMISSION_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+/// A tokenize request carries one prompt: the text limit plus JSON framing.
+const NATIVE_TOKENIZE_BODY_LIMIT_BYTES: usize = 64 * 1024;
+/// Longest prompt text tokenized. The score-merge encoder is quadratic in the
+/// text, and a 4,096-position context cannot use a longer prompt anyway.
+const NATIVE_TOKENIZE_MAX_TEXT_BYTES: usize = 16 * 1024;
+/// One tokenization at a time per node: it runs on a blocking thread, never
+/// on the async runtime that carries RPC and consensus transport, and a
+/// second caller is told to retry rather than queued.
+static NATIVE_TOKENIZE_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// Bound signature verification and admission work before iterating over any
 /// batch item. The public gateway also proves this exact contract during a
 /// production rollout.
@@ -410,6 +419,7 @@ pub struct NodeState {
     pub tier: StakeTier,
     pub boot_time: Instant,
     pub peer_count: Arc<AtomicU32>,
+    pub transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
     /// Faucet rate limiter: address → last claim time.
     /// DashMap so faucet handler never blocks the tokio runtime under load.
     pub faucet_claims: Arc<dashmap::DashMap<[u8; 32], Instant>>,
@@ -430,6 +440,14 @@ pub struct NodeState {
     /// shard execution, caches, verification, and attestations.
     pub model_artifact_id: Option<arc_crypto::Hash256>,
     /// Live DAG validator set (updated by consensus loop via PeerConnected).
+    /// The live consensus engine, when this process runs one.
+    ///
+    /// Needed so the RPC can serve a finality CERTIFICATE rather than a claim
+    /// about one. A node's own observation that it committed a block and a
+    /// quorum's signed statement that the block is final are different facts,
+    /// and only the second is checkable by someone who does not trust this
+    /// node.
+    pub consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>>,
     pub dag_validators: SharedValidators,
     /// Per-sender rate limiter for tx submission: sender_address → last submit time.
     /// Limits to 10 tx/sec per sender to prevent mempool flood DoS.
@@ -629,6 +647,11 @@ pub struct NodeState {
     /// reports the name and chain_id as null with a reason, since the only
     /// thing such a node actually knows about its chain is its genesis hash.
     pub chain_identity: Option<ChainIdentity>,
+    /// What this node's protocol-4 native worker executes, when it runs one.
+    /// Published by `/native-inference/context` and used by
+    /// `/native-inference/tokenize`; admission never consults it.
+    pub native_serving: Option<Arc<crate::native_inference::NativeServing>>,
+    pub native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
     /// Process lifecycle receiver installed by `serve`. Node-owned tasks that
     /// can mutate the settlement journal or mempool stop on this signal and are
     /// joined before `serve` returns to main's final WAL barrier.
@@ -1017,6 +1040,9 @@ pub enum PipelineError {
     NoCompleteExecutionProfile { profiles: Vec<String> },
     /// Registry is empty (or every entry was a stub).
     NoShards,
+    /// A shard reached an authenticated/readiness path without the validator
+    /// identity bound by its signed announcement.
+    MissingValidatorIdentity { node: String, addr: String },
     /// Coverage stops before the model does.
     Gap {
         expected: usize,
@@ -1053,6 +1079,11 @@ impl std::fmt::Display for PipelineError {
                 f,
                 "No shards announced. Need shard registry to be populated."
             ),
+            PipelineError::MissingValidatorIdentity { node, addr } => write!(
+                f,
+                "Shard identity unavailable or malformed for node {} at {}",
+                node, addr
+            ),
             PipelineError::Gap {
                 expected,
                 got,
@@ -1070,6 +1101,21 @@ impl std::fmt::Display for PipelineError {
             ),
         }
     }
+}
+
+/// Signed shard announcements retain the authenticated validator identity in
+/// the registry's `node_name` field. That field is also serialized by the
+/// legacy `/shards` view, so live callers must treat it as the canonical ID;
+/// human-readable names remain valid only for the legacy/free compatibility
+/// helper and cannot enter readiness or reward verification.
+fn parse_canonical_shard_validator_identity(value: &str) -> Option<Hash256> {
+    let identity = parse_hash256_hex(value, "shard validator identity").ok()?;
+    (value == format!("0x{}", identity.to_hex())).then_some(identity)
+}
+
+fn bind_shard_registry_identity(mut shard: ShardInfo, validator: Hash256) -> ShardInfo {
+    shard.node_name = format!("0x{}", validator.to_hex());
+    shard
 }
 
 /// Turn a flat list of announced shards into a runnable pipeline: one entry
@@ -1095,9 +1141,10 @@ impl std::fmt::Display for PipelineError {
 ///
 /// Steps, in order:
 ///   1. bucket announcements by (start_layer, end_layer);
-///   2. dedupe per node_name inside each bucket, preferring a routable addr
-///      over a stub (a rebooted coordinator's self-announce and the gossiped
-///      copy land under different registry keys);
+///   2. dedupe per authenticated validator identity inside each bucket,
+///      preferring a routable addr over a stub (a rebooted coordinator's
+///      self-announce and the gossiped copy land under different registry
+///      keys);
 ///   3. drop stub addrs UNCONDITIONALLY, then drop buckets left empty. The old
 ///      run_consensus kept a stub "as a fallback" when no routable replica
 ///      existed — that is how a community worker announcing 127.0.0.1:9090
@@ -1118,37 +1165,76 @@ pub fn assemble_pipeline(
     announced: Vec<ShardInfo>,
     stats: &dashmap::DashMap<String, LatencyEWMA>,
 ) -> Result<Vec<PipelineHop>, PipelineError> {
-    let mut by_range: std::collections::BTreeMap<(usize, usize), Vec<ShardInfo>> =
+    assemble_pipeline_with_identity_policy(announced, stats, false)
+}
+
+/// Assemble a pipeline while optionally requiring the validator identity that
+/// was bound by `/shards/announce`. The public helper retains its historical
+/// display-name compatibility for local/free tests and observers; all live
+/// readiness and reward verification paths use the strict variant.
+fn assemble_pipeline_with_identity_policy(
+    announced: Vec<ShardInfo>,
+    stats: &dashmap::DashMap<String, LatencyEWMA>,
+    require_authenticated_identity: bool,
+) -> Result<Vec<PipelineHop>, PipelineError> {
+    let mut by_range: std::collections::BTreeMap<(usize, usize), Vec<(String, ShardInfo)>> =
         std::collections::BTreeMap::new();
     for s in announced {
+        let identity = parse_canonical_shard_validator_identity(&s.node_name)
+            .map(|id| format!("0x{}", id.to_hex()))
+            .or_else(|| {
+                (!require_authenticated_identity).then(|| format!("legacy:{}", s.node_name))
+            })
+            .ok_or_else(|| PipelineError::MissingValidatorIdentity {
+                node: s.node_name.clone(),
+                addr: s.socket_addr.clone(),
+            })?;
         let key = (s.start_layer, s.end_layer);
         let bucket = by_range.entry(key).or_default();
         match bucket
             .iter()
-            .position(|existing| existing.node_name == s.node_name)
+            .position(|(existing, _)| existing == &identity)
         {
-            None => bucket.push(s),
+            None => bucket.push((identity, s)),
             Some(i) => {
-                if is_stub_socket_addr(&bucket[i].socket_addr)
+                if is_stub_socket_addr(&bucket[i].1.socket_addr)
                     && !is_stub_socket_addr(&s.socket_addr)
                 {
-                    bucket[i] = s;
+                    bucket[i] = (identity, s);
                 }
             }
         }
     }
 
     by_range.retain(|_, bucket| {
-        bucket.retain(|s| !is_stub_socket_addr(&s.socket_addr));
+        bucket.retain(|(_, s)| !is_stub_socket_addr(&s.socket_addr));
         !bucket.is_empty()
     });
     for bucket in by_range.values_mut() {
-        sort_replicas_by_latency(bucket, stats);
+        let mut replicas: Vec<ShardInfo> = bucket.drain(..).map(|(_, s)| s).collect();
+        sort_replicas_by_latency(&mut replicas, stats);
+        *bucket = replicas
+            .into_iter()
+            .map(|s| {
+                let identity = parse_canonical_shard_validator_identity(&s.node_name)
+                    .map(|id| format!("0x{}", id.to_hex()))
+                    .unwrap_or_else(|| format!("legacy:{}", s.node_name));
+                (identity, s)
+            })
+            .collect();
     }
 
     // BTreeMap already iterates in (start, end) order, so the SHORTEST range
     // beginning at each layer is seen first.
-    let candidates: Vec<PipelineHop> = by_range.into_iter().collect();
+    let candidates: Vec<PipelineHop> = by_range
+        .into_iter()
+        .map(|(range, replicas)| {
+            (
+                range,
+                replicas.into_iter().map(|(_, shard)| shard).collect(),
+            )
+        })
+        .collect();
     if candidates.is_empty() {
         return Err(PipelineError::NoShards);
     }
@@ -1215,6 +1301,22 @@ pub fn assemble_profile_bound_pipeline_for_model(
     required_profile: Option<&str>,
     stats: &dashmap::DashMap<String, LatencyEWMA>,
 ) -> Result<ProfileBoundPipeline, PipelineError> {
+    assemble_profile_bound_pipeline_for_model_with_identity_policy(
+        announced,
+        expected_model_id,
+        required_profile,
+        stats,
+        false,
+    )
+}
+
+fn assemble_profile_bound_pipeline_for_model_with_identity_policy(
+    announced: Vec<ShardInfo>,
+    expected_model_id: Hash256,
+    required_profile: Option<&str>,
+    stats: &dashmap::DashMap<String, LatencyEWMA>,
+    require_authenticated_identity: bool,
+) -> Result<ProfileBoundPipeline, PipelineError> {
     let had_announcements = !announced.is_empty();
     let matching: Vec<_> = announced
         .into_iter()
@@ -1264,11 +1366,20 @@ pub fn assemble_profile_bound_pipeline_for_model(
         let shards = by_profile
             .remove(profile)
             .expect("profile key came from the same map");
-        if let Ok(hops) = assemble_pipeline(shards, stats) {
-            return Ok(ProfileBoundPipeline {
-                hops,
-                execution_profile: profile.clone(),
-            });
+        match assemble_pipeline_with_identity_policy(shards, stats, require_authenticated_identity)
+        {
+            Ok(hops) => {
+                return Ok(ProfileBoundPipeline {
+                    hops,
+                    execution_profile: profile.clone(),
+                });
+            }
+            Err(error @ PipelineError::MissingValidatorIdentity { .. })
+                if require_authenticated_identity =>
+            {
+                return Err(error);
+            }
+            Err(_) => {}
         }
     }
     Err(PipelineError::NoCompleteExecutionProfile { profiles })
@@ -1287,11 +1398,12 @@ pub fn assemble_profile_bound_pipeline_for(
     let model_id = node
         .model_artifact_id
         .ok_or(PipelineError::ModelIdentityUnavailable)?;
-    assemble_profile_bound_pipeline_for_model(
+    assemble_profile_bound_pipeline_for_model_with_identity_policy(
         fresh_shards(&node.shard_registry),
         model_id,
         required_profile,
         &node.latency_stats,
+        true,
     )
 }
 
@@ -1328,6 +1440,7 @@ pub fn build_node_state(
         tier,
         boot_time,
         peer_count,
+        transport_wire_policy: Arc::new(arc_net::transport::TransportWirePolicy::default()),
         faucet_claims: Arc::new(dashmap::DashMap::new()),
         faucet_claims_total: Arc::new(AtomicU32::new(0)),
         faucet_pending: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1335,6 +1448,7 @@ pub fn build_node_state(
         candle_engine,
         candle_model_id,
         model_artifact_id,
+        consensus_engine: None,
         dag_validators: Arc::new(parking_lot::RwLock::new(vec![(validator_address, stake)])),
         tx_rate_limit: Arc::new(dashmap::DashMap::new()),
         dag_round: Arc::new(AtomicU64::new(0)),
@@ -1419,6 +1533,10 @@ pub fn build_node_state(
         // No genesis file is visible from here; `serve` overwrites this when
         // main.rs was given --genesis.
         chain_identity: None,
+        native_serving: None,
+        native_request_admission: Arc::new(
+            crate::native_inference::NativeRequestAdmission::default(),
+        ),
         runtime_shutdown: None,
         runtime_tasks: Arc::new(parking_lot::Mutex::new(tokio::task::JoinSet::new())),
         own_compute_ms: Arc::new(parking_lot::Mutex::new(
@@ -1599,7 +1717,12 @@ pub fn attestations_per_day_observed(
 /// Scans back at most `SELF_PRODUCED_SCAN_BLOCKS` and returns the first block
 /// found, so the reported height/hash/timestamp always describe a real block.
 fn latest_available_block(node: &NodeState) -> Option<Block> {
-    let h = node.state.height();
+    latest_available_block_at(node, node.state.height())
+}
+
+/// Select the newest extant block at or below the observed height. Keeping
+/// the bound explicit makes the reserved-height window deterministic to test.
+fn latest_available_block_at(node: &NodeState, h: u64) -> Option<Block> {
     let floor = h.saturating_sub(SELF_PRODUCED_SCAN_BLOCKS);
     let mut i = h;
     loop {
@@ -1793,6 +1916,7 @@ pub async fn serve(
     dag_validators: Option<SharedValidators>,
     dag_round: Option<Arc<AtomicU64>>,
     dag_committed: Option<Arc<AtomicU64>>,
+    consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>>,
     shard_infos: Vec<ShardInfo>,
     // seed_rpc_addrs: configured absolute RPC origins used only to authorize
     //   destinations subsequently bound by signed shard announcements. Seed
@@ -1810,9 +1934,14 @@ pub async fn serve(
     // Local issuance half of the two-part rollout gate. Consensus activation
     // comes from canonical genesis and is enforced independently by StateDB.
     community_rewards_v1_enabled: bool,
+    // native_serving: what this node's protocol-4 native worker executes,
+    //   when it runs one (context/tokenize endpoints only).
+    native_serving: Option<Arc<crate::native_inference::NativeServing>>,
+    native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
     // When present, stop accepting new RPC work after the lifecycle owner
     // sends `true` and let Axum drain every active handler before returning.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
 ) -> anyhow::Result<()> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
         anyhow::bail!(
@@ -1833,8 +1962,12 @@ pub async fn serve(
         model_artifact_id,
     );
     node.runtime_shutdown = shutdown.clone();
+    node.transport_wire_policy = transport_wire_policy;
     node.chain_identity = chain_identity;
     node.community_rewards_v1_enabled = community_rewards_v1_enabled;
+    node.native_serving = native_serving;
+    node.native_request_admission = native_request_admission;
+    node.consensus_engine = consensus_engine;
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
     }
@@ -1868,8 +2001,13 @@ pub async fn serve(
     // different ranges coexist.
     for si in &shard_infos {
         let key = format!("{}#{}-{}", si.socket_addr, si.start_layer, si.end_layer);
-        node.shard_registry
-            .insert(key, (si.clone(), std::time::Instant::now()));
+        node.shard_registry.insert(
+            key,
+            (
+                bind_shard_registry_identity(si.clone(), node.validator_address),
+                std::time::Instant::now(),
+            ),
+        );
     }
     if !shard_infos.is_empty() {
         // Local configured shards are process-owned state, so refresh their
@@ -1878,6 +2016,7 @@ pub async fn serve(
         // Remote registries still accept only signed direct-holder announces.
         let refresh_registry = node.shard_registry.clone();
         let refresh_infos = shard_infos.clone();
+        let refresh_validator = node.validator_address;
         let mut refresh_shutdown = node.runtime_shutdown.clone();
         spawn_node_runtime_task(&node, async move {
             loop {
@@ -1892,7 +2031,13 @@ pub async fn serve(
                         "{}#{}-{}",
                         shard.socket_addr, shard.start_layer, shard.end_layer
                     );
-                    refresh_registry.insert(key, (shard.clone(), now));
+                    refresh_registry.insert(
+                        key,
+                        (
+                            bind_shard_registry_identity(shard.clone(), refresh_validator),
+                            now,
+                        ),
+                    );
                 }
             }
         });
@@ -2053,6 +2198,23 @@ pub async fn serve(
             post(submit_signed_tx)
                 .layer(DefaultBodyLimit::max(PUBLIC_TX_SUBMISSION_BODY_LIMIT_BYTES)),
         )
+        // Protocol-4 is activated only by a fresh, private genesis. Its
+        // request/finalize/refund envelopes still use the shared signed
+        // transaction ingress; this receipt view is read-only evidence of
+        // canonical settlement, never a finality claim.
+        .route("/native-inference/context", get(native_inference_context))
+        // Read-only: this operator's row cohort, its bounded books and the
+        // recent placements (the node's own audit record, not consensus).
+        .route("/assignment/cohort", get(assignment_cohort))
+        .route(
+            "/native-inference/tokenize",
+            post(native_inference_tokenize)
+                .layer(DefaultBodyLimit::max(NATIVE_TOKENIZE_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/native-inference/receipt/{request_id}",
+            get(native_inference_receipt),
+        )
         .route(
             "/tx/submit_batch",
             post(submit_batch).layer(DefaultBodyLimit::max(PUBLIC_TX_SUBMISSION_BODY_LIMIT_BYTES)),
@@ -2075,6 +2237,9 @@ pub async fn serve(
         .route("/faucet/status", get(faucet_status))
         // Light Client Finality Proofs (A8)
         .route("/light/snapshot", get(light_snapshot))
+        .route("/finality/latest", get(get_finality_latest))
+        .route("/finality/{height}", get(get_finality_certificate))
+        .route("/consensus/diagnostics", get(consensus_diagnostics))
         // State Sync Protocol (A5) - snapshot bootstrap for new nodes
         .route("/sync/snapshot", get(sync_snapshot))
         .route("/sync/snapshot/info", get(sync_snapshot_info))
@@ -2415,6 +2580,13 @@ struct HealthResponse {
     version: String,
     height: u64,
     peers: u32,
+    /// Explicit compatibility restriction, independent of block liveness.
+    legacy_v3_wire: bool,
+    /// Whether this transport can send history/checkpoint/certificate/native
+    /// extensions. This is a capability, never a quorum-finality claim.
+    extended_consensus_wire_enabled: bool,
+    /// Intentionally suppressed send requests; these were not delivered.
+    wire_messages_suppressed: u64,
     uptime_secs: u64,
     dag_round: u64,
     dag_committed: u64,
@@ -2426,10 +2598,19 @@ struct HealthResponse {
     /// Whether the chain this node serves is still sealing blocks.
     /// `null` when `last_block_age_secs` is unknown.
     chain_advancing: Option<bool>,
+    /// True while this node rebuilds its DAG from peers after a restart or a
+    /// late join. It accepts no submissions then (they would sit unproposed).
+    dag_bootstrapping: bool,
     /// Populated only when `status != "ok"`, so an operator reading a
     /// degraded response is told what specifically is degraded.
     #[serde(skip_serializing_if = "Option::is_none")]
     degraded_reason: Option<String>,
+    /// SHA-256 of this process's executable: the digest a build-provenance
+    /// record names, so evidence can be tied to one exact build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_sha256: Option<&'static str>,
+    /// Behaviour-changing cargo features this binary was built with.
+    features: Vec<&'static str>,
 }
 
 /// How stale the newest block must be before `/health` calls the node
@@ -2512,13 +2693,22 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         height: node.state.height(),
         peers: node.peer_count.load(Ordering::Relaxed),
+        legacy_v3_wire: node.transport_wire_policy.legacy_v3(),
+        extended_consensus_wire_enabled: !node.transport_wire_policy.legacy_v3(),
+        wire_messages_suppressed: node.transport_wire_policy.suppressed_messages(),
         uptime_secs: node.boot_time.elapsed().as_secs(),
         dag_round: node.dag_round.load(Ordering::Relaxed),
         dag_committed: node.dag_committed.load(Ordering::Relaxed),
         validators,
         last_block_age_secs,
         chain_advancing,
+        dag_bootstrapping: node
+            .consensus_engine
+            .as_ref()
+            .is_some_and(|engine| engine.dag_bootstrapping()),
         degraded_reason,
+        binary_sha256: crate::build_identity::executable_sha256(),
+        features: crate::build_identity::features(),
     })
 }
 
@@ -2575,12 +2765,14 @@ async fn chain_info(AxumState(node): AxumState<NodeState>) -> Json<ChainInfoResp
 async fn get_latest_block(
     AxumState(node): AxumState<NodeState>,
 ) -> Result<Json<Block>, StatusCode> {
-    let height = node.state.height();
-    if height == 0 {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    node.state
-        .get_block(height)
+    latest_block_at(&node, node.state.height())
+}
+
+fn latest_block_at(node: &NodeState, observed_height: u64) -> Result<Json<Block>, StatusCode> {
+    latest_available_block_at(node, observed_height)
+        // Preserve the endpoint's existing contract: the genesis block is
+        // not exposed as a produced "latest" block.
+        .filter(|block| block.header.height != 0)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -2679,6 +2871,26 @@ async fn submit_tx(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<SubmitTxRequest>,
 ) -> Result<Json<SubmitTxResponse>, (StatusCode, String)> {
+    if match node.state.try_native_inference_context() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native inference state is unhealthy".to_string(),
+            ));
+        }
+    } && node.state.native_migration().is_none()
+    {
+        // A PRIVATE protocol-4 chain carries only native work, so an
+        // unsigned submission here can never execute. A MIGRATED chain keeps
+        // every family it had, and refusing them at this endpoint would turn
+        // the migration into exactly the outage it exists to avoid.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "private protocol-4 accepts only signed native inference transactions".to_string(),
+        ));
+    }
     let from = Hash256::from_hex(&req.from)
         .map_err(|_| (StatusCode::BAD_REQUEST, "invalid from address".to_string()))?;
     let to = Hash256::from_hex(&req.to)
@@ -2782,6 +2994,23 @@ async fn submit_batch(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<SubmitBatchRequest>,
 ) -> Result<Json<SubmitBatchResponse>, (StatusCode, Json<ApiError>)> {
+    if match node.state.try_native_inference_context() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native inference state is unhealthy",
+            ));
+        }
+    } && node.state.native_migration().is_none()
+    {
+        // As in `submit_tx`: only a private protocol-4 chain refuses these.
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "private protocol-4 accepts only signed native inference transactions",
+        ));
+    }
     // Reject before parsing addresses, verifying signatures, consulting state,
     // or mutating the sender limiter/mempool. This is both the resource bound
     // and the externally probed public contract.
@@ -2907,16 +3136,337 @@ fn uses_unready_paid_inference_protocol(tx: &Transaction) -> bool {
     restricted(tx.tx_type) || restricted(tx.body.tx_type())
 }
 
+/// True when this chain admits ONLY native-inference transactions - a private
+/// protocol-4 chain, whose blocks carry one native transition and nothing
+/// else, so anything else submitted here can never execute.
+///
+/// A MIGRATED chain has a binding too, and keeps every transaction family it
+/// had. It is never "native only", and refusing its ordinary traffic at
+/// ingress would reject exactly what the migration exists to preserve.
+pub(crate) fn admits_only_native_transactions(state: &arc_state::StateDB) -> bool {
+    state.native_inference_context().is_some() && state.native_migration().is_none()
+}
+
+fn is_native_inference_transaction(tx: &Transaction) -> bool {
+    matches!(
+        tx.tx_type,
+        TxType::NativeInferenceRequest
+            | TxType::NativeInferenceFinalize
+            | TxType::NativeInferenceRefund
+    ) || matches!(
+        tx.body,
+        TxBody::NativeInferenceRequest(_)
+            | TxBody::NativeInferenceFinalize(_)
+            | TxBody::NativeInferenceRefund(_)
+    )
+}
+
+/// This node's row cohort (`crate::row_cohort`): its machines, the bounded
+/// books and the recent placement records, for the operator. Machine names,
+/// measured rates and request timing describe the operator's own
+/// infrastructure, so only a direct loopback caller is answered: 404
+/// otherwise, as when the node runs no cohort, including anything a proxy
+/// forwarded. On the sealed production origin every request arrives through
+/// the nginx filter as loopback; that filter's route allowlist, which ends in
+/// `return 404`, does not include `/assignment/`.
+async fn assignment_cohort(
+    AxumState(node): AxumState<NodeState>,
+    ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<crate::row_cohort::CohortView>, StatusCode> {
+    // Not the operator's own when: a same-host reverse proxy forwarded it
+    // (deploy/nginx.conf forwards /rpc/ from 127.0.0.1 and marks what it
+    // forwards); a browser page sent it (browsers add Origin or Sec-Fetch-*);
+    // or it reached this port under another name (DNS rebinding).
+    let proxied = ["x-forwarded-for", "x-real-ip", "forwarded"]
+        .iter()
+        .any(|name| headers.contains_key(*name));
+    let from_a_page = headers.contains_key(axum::http::header::ORIGIN)
+        || headers
+            .keys()
+            .any(|name| name.as_str().starts_with("sec-fetch-"));
+    let named_here = headers
+        .get(axum::http::header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .is_some_and(crate::row_cohort::host_header_is_loopback);
+    if !peer_addr.ip().is_loopback() || proxied || from_a_page || !named_here {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let cohort = node
+        .native_serving
+        .as_ref()
+        .and_then(|serving| serving.row_cohort.clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(cohort.view()))
+}
+
+/// Publicly describable, read-only protocol-4 activation binding.  Activation
+/// itself deliberately has no HTTP route: it can only occur at fresh private
+/// genesis through StateDB's durable activation path.
+async fn native_inference_context(
+    AxumState(node): AxumState<NodeState>,
+) -> Result<Json<Value>, StatusCode> {
+    let context = node
+        .state
+        .try_native_inference_context()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let commitment = context
+        .commitment()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let operator_enabled = node.native_request_admission.operator_enabled();
+    let runtime_ready = node.native_request_admission.runtime_ready();
+    Ok(Json(json!({
+        "candidate_protocol": 4,
+        "chain_protocol": node.state.active_protocol_version().major,
+        "native_only_chain": node.state.native_migration().is_none(),
+        "request_admission_open": operator_enabled && runtime_ready,
+        "request_admission": {
+            "operator_enabled": operator_enabled,
+            "runtime_ready": runtime_ready,
+        },
+        "context_commitment": commitment.to_hex(),
+        "chain_genesis": context.domain.chain_genesis.to_hex(),
+        "recovery_epoch": context.domain.recovery_epoch,
+        "validator_set_hash": context.domain.validator_set_hash.to_hex(),
+        "members": context.members.iter().map(|member| json!({
+            "address": member.address.to_hex(), "stake": member.stake,
+        })).collect::<Vec<_>>(),
+        "allowed_execution_count": context.allowed_executions.len(),
+        // Everything a client needs to build a job the chain can admit. The
+        // chain still judges every request by its own rules.
+        "allowed_executions": context.allowed_executions.iter().map(|execution| json!({
+            "model_hash": execution.model_hash.to_hex(),
+            "profile_hash": execution.profile_hash.to_hex(),
+            "generation_hash": execution.generation_hash.to_hex(),
+            "assignment_hash": execution.assignment_hash.to_hex(),
+        })).collect::<Vec<_>>(),
+        "contract_version": arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+        // Commit-time selection rule fixed at activation (decision D20).
+        "selection_rule": context.selection_rule.as_str(),
+        "height": node.state.height(),
+        "limits": {
+            "max_tokens": arc_types::transaction::TIER1_MAX_TOKENS,
+            "max_output_bytes": arc_types::transaction::TIER1_OUTPUT_BLOB_MAX,
+            "max_input_bytes": arc_types::transaction::TIER1_INPUT_BLOB_MAX,
+            "request_gas_limit": arc_types::transaction::gas_costs::NATIVE_INFERENCE_REQUEST,
+            "refund_gas_limit": arc_types::transaction::gas_costs::NATIVE_INFERENCE_REFUND,
+        },
+        // This node only: another member may run a different executor build.
+        "serving": node.native_serving.as_deref().map(|serving| json!({
+            "executor": serving.executor.as_str(),
+            "requires_complete_row_coverage": serving.row_cohort.as_ref().is_some_and(|cohort| cohort.is_low_residency()),
+            "local_fallback_enabled": !serving.row_cohort.as_ref().is_some_and(|cohort| cohort.is_low_residency()),
+            "input_format": serving.executor.input_format(),
+            "tokenizer_profile": serving.tokenizer.as_ref().map(|tokenizer| tokenizer.profile()),
+            "tokenize_endpoint": serving.tokenizer.is_some(),
+            // 1 BOS + prompt + max_tokens must fit, or this node never votes.
+            "max_positions": serving.max_positions,
+        })),
+        "node_version": env!("CARGO_PKG_VERSION"),
+    })))
+}
+
+#[derive(Deserialize)]
+struct NativeTokenizeRequest {
+    text: String,
+}
+
+/// Tokenize a prompt with the tokenizer read from the artifact this node's
+/// canonical executor runs, returning exactly the input bytes that executor
+/// accepts. A convenience for clients that hold no tokenizer: the requester
+/// signs the returned bytes, so a client that does not trust this node must
+/// tokenize for itself. Served only by a node running the canonical executor.
+async fn native_inference_tokenize(
+    AxumState(node): AxumState<NodeState>,
+    Json(request): Json<NativeTokenizeRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let serving = node.native_serving.clone().ok_or((
+        StatusCode::NOT_FOUND,
+        "this node runs no native executor".to_string(),
+    ))?;
+    let Some(tokenizer) = serving.tokenizer.as_ref() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "this node's native executor ({}) reads {} and serves no tokenizer",
+                serving.executor.as_str(),
+                serving.executor.input_format()
+            ),
+        ));
+    };
+    let profile = tokenizer.profile();
+    if request.text.len() > NATIVE_TOKENIZE_MAX_TEXT_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the prompt is longer than {NATIVE_TOKENIZE_MAX_TEXT_BYTES} bytes, more than \
+                 the model's context can use"
+            ),
+        ));
+    }
+    let Ok(permit) = NATIVE_TOKENIZE_PERMIT.try_acquire() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node is tokenizing another prompt; retry shortly".to_string(),
+        ));
+    };
+    let text = request.text;
+    let worker = serving.clone();
+    // The permit moves into the blocking task. A client that disconnects
+    // drops this handler but not the tokenization, so the permit must be
+    // released when the work ends, not when the connection does.
+    let tokens = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        worker.tokenize_prompt(&text)
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tokenization did not complete".to_string(),
+        )
+    })?
+    .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
+    let input: Vec<u8> = tokens
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
+    Ok(Json(json!({
+        "token_count": tokens.len(),
+        "tokens": tokens,
+        "input_hex": hex::encode(&input),
+        "input_hash": arc_crypto::hash_bytes(&input).to_hex(),
+        "input_format": serving.executor.input_format(),
+        "tokenizer_profile": profile,
+    })))
+}
+
+/// Return the persisted request-keyed receipt.  `observed_status` describes
+/// local canonical StateDB observation only; consensus-finality proofs remain
+/// a later milestone and are not implied by this endpoint.
+async fn native_inference_receipt(
+    AxumState(node): AxumState<NodeState>,
+    AxumPath(request_id): AxumPath<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let request_id = Hash256::from_hex(request_id.trim_start_matches("0x"))
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let context = node
+        .state
+        .try_native_inference_context()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let commitment = context
+        .commitment()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let receipt = node
+        .state
+        .native_inference_receipt(request_id, commitment)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let metadata = receipt.metadata;
+    let transaction_link = |link: arc_state::NativeInferenceTransactionLink| {
+        json!({
+            "tx_hash": link.tx_hash.to_hex(),
+            "block_height": link.block_height,
+            "block_hash": link.block_hash.to_hex(),
+            "transaction": format!("/tx/{}", link.tx_hash.to_hex()),
+            "block": format!("/block/{}", link.block_height),
+        })
+    };
+    Ok(Json(json!({
+        "candidate_protocol": 4,
+        "request_id": request_id.to_hex(),
+        "context_commitment": metadata.context_commitment.to_hex(),
+        "admission_height": receipt.admission_height,
+        "admission_transaction": receipt.admission_transaction.map(&transaction_link),
+        "terminal_transaction": receipt.terminal_transaction.map(transaction_link),
+        "observed_status": format!("{:?}", metadata.status),
+        "model_hash": metadata.request.job.model_hash.to_hex(),
+        "profile_hash": metadata.request.job.profile_hash.to_hex(),
+        "generation_hash": metadata.request.job.generation_hash.to_hex(),
+        "assignment_hash": metadata.request.job.assignment_hash.to_hex(),
+        "execution_price": metadata.request.job.execution_price,
+        "reserved_max_payment": metadata.request.job.reserved_max_payment,
+        "output_hash": metadata.output_hash.map(|hash| hash.to_hex()),
+        "certificate_votes": metadata.certificate.as_ref().map(|certificate| certificate.votes.len()),
+        "settlement_credits": metadata.credits.iter().map(|credit| json!({
+            "payee": credit.payee.to_hex(), "amount": credit.amount,
+        })).collect::<Vec<_>>(),
+        "expires_at": metadata.request.job.expires_at,
+        "requester": metadata.request.job.requester.to_hex(),
+        // The certified output bytes (empty until finalized). The text is
+        // display only, from this node's tokenizer when it holds one: the
+        // certificate commits to the bytes, not to the text.
+        "output_hex": hex::encode(&metadata.output),
+        "output_text": node
+            .native_serving
+            .as_deref()
+            .and_then(|serving| serving.decode_output(&metadata.output)),
+        "consensus_finality": "not asserted by milestone-2 receipt",
+    })))
+}
+
+/// Why `/tx/submit_signed` refused a transaction. Most refusals carry only a
+/// status; the native-inference preflight also says which admission rule
+/// failed, so a client can tell "not yet" (a future nonce) from "never".
+#[derive(Debug)]
+pub(crate) struct SubmitRefusal {
+    status: StatusCode,
+    reason: String,
+}
+
+impl SubmitRefusal {
+    fn new(status: StatusCode, reason: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<StatusCode> for SubmitRefusal {
+    fn from(status: StatusCode) -> Self {
+        Self::new(status, String::new())
+    }
+}
+
+impl PartialEq<StatusCode> for SubmitRefusal {
+    fn eq(&self, status: &StatusCode) -> bool {
+        self.status == *status
+    }
+}
+
+impl axum::response::IntoResponse for SubmitRefusal {
+    fn into_response(self) -> axum::response::Response {
+        (self.status, self.reason).into_response()
+    }
+}
+
 async fn submit_signed_tx(
     AxumState(node): AxumState<NodeState>,
     Json(mut tx): Json<Transaction>,
-) -> Result<Json<SubmitTxResponse>, StatusCode> {
+) -> Result<Json<SubmitTxResponse>, SubmitRefusal> {
     // `sig_verified` is a process-local cache hint, never caller authority.
     // Its wire deserializer now forces false; verify both type/body integrity
     // and the cryptographic signature before anything enters the mempool.
     tx.sig_verified = false;
-    if uses_unready_paid_inference_protocol(&tx) {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    if node
+        .consensus_engine
+        .as_ref()
+        .is_some_and(|engine| engine.dag_bootstrapping())
+    {
+        // A restarted or late-joining validator cannot propose until its DAG
+        // is rebuilt; a transaction accepted now would sit in this mempool,
+        // unannounced, while the client waits. Say so, so it goes elsewhere.
+        return Err(SubmitRefusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node is rebuilding its DAG from its peers and cannot propose yet; \
+             submit to another validator",
+        ));
+    }
+    if uses_unready_paid_inference_protocol(&tx) && !is_native_inference_transaction(&tx) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     if let TxBody::WasmCall(body) = &tx.body
         && node.state.is_evm_contract(&body.contract)
@@ -2924,10 +3474,73 @@ async fn submit_signed_tx(
         // Read-only eth_call remains available. State-changing EVM calls are
         // rejected at ingress as well as by the canonical executor so clients
         // never receive a misleading pending transaction for a disabled path.
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     if node.state.verify_transaction_signature(&tx).is_err() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
+    }
+    if !node.native_request_admission.allows(&tx) {
+        return Err(SubmitRefusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "new native requests are closed on this node: operator opt-in and a ready native runtime are required",
+        ));
+    }
+    // A PRIVATE protocol-4 chain's committee is frozen by its binding. The
+    // executor refuses a registry change too (so a transaction that slips in
+    // another way fails with a receipt instead of wedging every later block);
+    // refusing it here tells the submitter now, rather than via a failed
+    // receipt later. A migrated chain has versioned bindings and is not
+    // frozen, which the state's own guard decides.
+    if arc_state::StateDB::is_registry_change(&tx)
+        && node
+            .state
+            .refuse_registry_change_under_native_binding()
+            .is_err()
+    {
+        return Err(StatusCode::CONFLICT.into());
+    }
+    // A PRIVATE protocol-4 block carries only a native-inference transaction,
+    // so anything else can never be included there. Accepting it would hand
+    // the client a hash for a transaction that will never exist - refuse it
+    // here, as `submit_tx` already does.
+    //
+    // A MIGRATED chain is not that chain: it keeps every transaction family
+    // it had, so refusing them here would reject the traffic the migration
+    // exists to preserve, at the very first step the user reaches.
+    if admits_only_native_transactions(&node.state)
+        && !arc_state::StateDB::is_native_inference_transaction(&tx)
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+    }
+    if is_native_inference_transaction(&tx) {
+        let context = match node.state.try_native_inference_context() {
+            Ok(Some(context)) => context,
+            Ok(None) | Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into()),
+        };
+        // This pure preflight is the same state admission used by the
+        // canonical executor. It rejects type/body disguises, stale nonce,
+        // unfrozen members, bad certificates, expired requests and every
+        // non-private activation before the mempool mutates.
+        if let Err(error) = node
+            .state
+            .validate_native_inference_transaction_admission_next(&tx, &context)
+        {
+            return Err(SubmitRefusal::new(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+            ));
+        }
+    } else if match node.state.try_native_inference_context() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into()),
+    } && node.state.native_migration().is_none()
+    {
+        // Private protocol-4 blocks permit one native transition only. A
+        // migrated chain admits its ordinary families, and they fall through
+        // to the v3 admission check below - which now runs, because a
+        // migrated chain reports protocol 3.
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     // The issuance switch gates every public mempool ingress, not just the
     // coordinator helper. Otherwise a caller holding any validator key could
@@ -2937,19 +3550,22 @@ async fn submit_signed_tx(
     if tx.tx_type == TxType::CommunityInferenceReward
         && !community_rewards_v1_protocol_active(&node)
     {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     tx.sig_verified = true;
     if node.state.active_protocol_version().major == 3
-        && node.state.validate_v3_transaction_admission(&tx).is_err()
+        && let Err(error) = node.state.validate_v3_transaction_admission(&tx)
     {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(SubmitRefusal::new(
+            StatusCode::BAD_REQUEST,
+            error.to_string(),
+        ));
     }
     if node.mempool.contains(&tx.hash) {
-        return Err(StatusCode::CONFLICT);
+        return Err(StatusCode::CONFLICT.into());
     }
     if !consume_tx_sender_allowance(&node, &tx.from) {
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return Err(StatusCode::TOO_MANY_REQUESTS.into());
     }
     let hash = tx.hash.to_hex();
     tracing::debug!(
@@ -2960,6 +3576,12 @@ async fn submit_signed_tx(
         "Verified signed transaction submission"
     );
 
+    if !node.native_request_admission.allows(&tx) {
+        return Err(SubmitRefusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native request runtime is no longer ready",
+        ));
+    }
     match node.mempool.insert(tx) {
         Ok(()) => {
             tracing::debug!(
@@ -2974,7 +3596,7 @@ async fn submit_signed_tx(
         }
         Err(e) => {
             tracing::debug!(tx_hash = %hash, error = ?e, "Rejected signed transaction");
-            Err(StatusCode::CONFLICT)
+            Err(StatusCode::CONFLICT.into())
         }
     }
 }
@@ -3176,6 +3798,33 @@ async fn faucet_claim(
         ));
     }
 
+    if node
+        .consensus_engine
+        .as_ref()
+        .is_some_and(|engine| engine.dag_bootstrapping())
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(FaucetErrorResponse {
+                error: "this node is rebuilding its DAG from its peers and cannot propose yet"
+                    .into(),
+            }),
+        ));
+    }
+    // A faucet claim is an ordinary transfer, which a PRIVATE protocol-4
+    // block can never carry. Refuse it rather than return a hash that will
+    // never land. A migrated chain still carries faucet claims, so this does
+    // not apply there.
+    if admits_only_native_transactions(&node.state) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(FaucetErrorResponse {
+                error: "this chain is a private native-inference (protocol-4) chain; its blocks \
+                        carry only native inference transactions, so the faucet is unavailable"
+                    .into(),
+            }),
+        ));
+    }
     let marker = if node.state.active_protocol_version().major == 3 {
         arc_types::transaction::FaucetClaimBody::v3_marker_address(&to)
     } else {
@@ -3840,6 +4489,132 @@ async fn sync_status(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }))
 }
 
+/// GET /finality/latest - the highest height this node holds a quorum finality
+/// certificate for, next to its committed height, so finality lag is one read.
+///
+/// This is a node's own view. Anyone who does not trust it should fetch
+/// `/finality/{height}` and verify the certificate.
+async fn get_finality_latest(
+    AxumState(node): AxumState<NodeState>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let Some(engine) = node.consensus_engine.as_ref() else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this process runs no consensus engine, so it holds no finality certificates"
+                .to_string(),
+        ));
+    };
+    let committed = node.state.height();
+    let finalized = engine.highest_finalized_height();
+    Ok(Json(json!({
+        "finalized_height": finalized,
+        "committed_height": committed,
+        "finality_lag": finalized.map(|f| committed.saturating_sub(f)),
+        "certificates_held": engine.finality_certificate_count(),
+        "retained_heights": engine.retained_finality_heights(),
+    })))
+}
+
+/// GET /consensus/diagnostics - bounded process-wide consensus counters.
+///
+/// Fixed-size atomics: they answer "where did the time go" for a throughput
+/// question without a log line per event, and cost the same after a day as
+/// after a minute.
+async fn consensus_diagnostics(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let mut map = crate::consensus_diagnostics::DIAG.snapshot();
+    map.extend(crate::consensus_diagnostics::inbound_snapshot());
+    if let Some(engine) = node.consensus_engine.as_ref() {
+        map.insert("current_round".into(), Value::from(engine.current_round()));
+        map.insert(
+            "last_committed_round".into(),
+            Value::from(engine.last_committed_round()),
+        );
+        map.insert(
+            "dag_blocks".into(),
+            Value::from(engine.dag_block_count() as u64),
+        );
+        map.insert(
+            "finality_certificates_held".into(),
+            Value::from(engine.finality_certificate_count() as u64),
+        );
+        for (name, len) in engine.memory_gauges() {
+            map.insert(name.into(), Value::from(len));
+        }
+    }
+    for (name, len) in node.state.memory_gauges() {
+        map.insert(name.into(), Value::from(len));
+    }
+    map.insert("mempool_len".into(), Value::from(node.mempool.len() as u64));
+    map.insert("height".into(), Value::from(node.state.height()));
+    Json(Value::Object(map))
+}
+
+/// GET /finality/{height} - the quorum finality certificate for a height.
+///
+/// This is deliberately a different endpoint from `/block/{height}`. That one
+/// reports what THIS node committed - a local observation, believable only to
+/// someone who already trusts this node. This one returns a committee's signed
+/// statement, which a client can check for itself against the validator set
+/// and the chain domain without trusting the server at all.
+///
+/// A 404 means "this node holds no certificate at that height", which is not
+/// the same as "the block is not final": certificates are gossiped and this
+/// node may simply not have assembled one.
+async fn get_finality_certificate(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(height): axum::extract::Path<u64>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let Some(engine) = node.consensus_engine.as_ref() else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this process runs no consensus engine, so it holds no finality certificates"
+                .to_string(),
+        ));
+    };
+    let Some(certificate) = engine.finality_certificate(height) else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no finality certificate at height {height} on this node; it may exist elsewhere"
+            ),
+        ));
+    };
+    let set = engine.frozen_validator_set();
+    // Re-verify on the way out. A stored certificate is not a licence to
+    // publish signatures nobody checked, and a client that cannot verify
+    // should be told by the server that the server could not either.
+    let domain = engine.certificate_domain();
+    let signing_stake = match domain.as_ref() {
+        Some(domain) => certificate.verify(domain, &set).ok(),
+        None => None,
+    };
+    // Hex rather than base64: the rest of this API is hex, and the point is
+    // that a client can decode and verify it, not that it is compact.
+    let encoded = bincode::serialize(&certificate)
+        .ok()
+        .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+
+    Ok(Json(json!({
+        "height": certificate.height,
+        "block_hash": certificate.block_hash.to_hex(),
+        "state_root": certificate.state_root.to_hex(),
+        "tx_root": certificate.tx_root.to_hex(),
+        "validator_set_hash": certificate.validator_set_hash.to_hex(),
+        "voters": certificate.votes.iter().map(|v| v.voter.to_hex()).collect::<Vec<_>>(),
+        "signing_stake": signing_stake,
+        "quorum": set.quorum,
+        "total_stake": set.total_stake,
+        // What the client should do with this: verify the encoded certificate
+        // against the committee and domain it independently trusts. The fields
+        // above are a convenience, not the proof.
+        "certificate_bincode_hex": encoded,
+        "verified_by_server": signing_stake.is_some(),
+        "note": "a node-observed commit and a verified quorum certificate are \
+                 different facts; only this certificate is checkable without \
+                 trusting this node",
+    })))
+}
+
 /// GET /sync/dag_state - Returns the current DAG consensus round state.
 /// Used by new nodes to start at the right round instead of round 0.
 /// This prevents permanent partition from genesis round mismatch.
@@ -4154,6 +4929,29 @@ async fn get_full_transaction(
             "max_tokens": b.max_tokens,
             "expires_at_height": b.expires_at_height,
             "worker_attestation_hash": b.worker_certificate.attestation_hash.to_hex(),
+        }),
+        TxBody::NativeInferenceRequest(b) => json!({
+            "type": "NativeInferenceRequest",
+            "request_id": b.request.job.request_id().to_hex(),
+            "model_hash": b.request.job.model_hash.to_hex(),
+            "profile_hash": b.request.job.profile_hash.to_hex(),
+            "input_hash": b.request.job.input_hash.to_hex(),
+            "execution_price": b.request.job.execution_price,
+            "reserved_max_payment": b.request.job.reserved_max_payment,
+            "input_bytes": b.input_blob.len(),
+            "candidate_protocol": 4,
+        }),
+        TxBody::NativeInferenceFinalize(b) => json!({
+            "type": "NativeInferenceFinalize",
+            "request_id": hex::encode(b.request_id),
+            "output_bytes": b.certificate.output.len(),
+            "votes": b.certificate.votes.len(),
+            "candidate_protocol": 4,
+        }),
+        TxBody::NativeInferenceRefund(b) => json!({
+            "type": "NativeInferenceRefund",
+            "request_id": hex::encode(b.request_id),
+            "candidate_protocol": 4,
         }),
     };
 
@@ -5149,6 +5947,19 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
 ///   7. Build an ARC `Transaction` (Transfer or WasmCall) and insert into mempool
 ///   8. Return the Keccak-256 hash of the full signed RLP (Ethereum tx hash)
 fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    // Refuse what can never be included, as `/tx/submit_signed` does. A
+    // protocol-4 chain admits native inference only, and protocol v3 requires a
+    // signed minimum fee this Ethereum-shaped transfer never carries (its fee
+    // is 0). Accepting either would hand the caller a hash for a transaction
+    // that the next proposal drops.
+    if node.state.active_protocol_version().major >= 3 {
+        return eth_rpc_error(
+            id,
+            -32003,
+            "eth_sendRawTransaction transfers cannot be included on this protocol; \
+             submit a signed ARC transaction to /tx/submit_signed",
+        );
+    }
     // --- 1. Extract and hex-decode the raw transaction ---
     let raw_hex = match params.get(0).and_then(|v| v.as_str()) {
         Some(h) => h,
@@ -6348,11 +7159,12 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
     let sharded_pipeline_ready = exact_model.is_some_and(|model_id| {
         node.inference_model.is_some()
             && !local_model_ready
-            && assemble_profile_bound_pipeline_for_model(
+            && assemble_profile_bound_pipeline_for_model_with_identity_policy(
                 fresh_shards_snapshot(&node.shard_registry),
                 model_id,
                 Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE),
                 &node.latency_stats,
+                true,
             )
             .is_ok()
     });
@@ -7910,6 +8722,64 @@ struct ForwardShardResponse {
     signature: arc_crypto::Signature,
 }
 
+/// Optional, unsigned diagnostics carried in HTTP headers so the JSON response
+/// and its v3 signed transcript remain byte-for-byte schema compatible.
+/// Older coordinators ignore these headers; newer coordinators treat absent or
+/// malformed values from older peers as unavailable telemetry.
+const SHARD_TIMING_SCHEMA_HEADER: &str = "x-arc-shard-timing-schema";
+const SHARD_TIMING_BLOCKING_QUEUE_HEADER: &str = "x-arc-shard-spawn-blocking-queue-us";
+const SHARD_TIMING_POOL_QUEUE_HEADER: &str = "x-arc-shard-compute-pool-queue-us";
+const SHARD_TIMING_KV_WAIT_HEADER: &str = "x-arc-shard-kv-mutex-wait-us";
+const SHARD_TIMING_FORWARD_HEADER: &str = "x-arc-shard-forward-us";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ShardTimingBreakdown {
+    spawn_blocking_queue_us: u64,
+    compute_pool_queue_us: u64,
+    kv_mutex_wait_us: u64,
+    forward_us: u64,
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u64::MAX as u128) as u64
+}
+
+fn shard_timing_headers(timing: ShardTimingBreakdown) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("1"));
+    for (name, value) in [
+        (
+            SHARD_TIMING_BLOCKING_QUEUE_HEADER,
+            timing.spawn_blocking_queue_us,
+        ),
+        (SHARD_TIMING_POOL_QUEUE_HEADER, timing.compute_pool_queue_us),
+        (SHARD_TIMING_KV_WAIT_HEADER, timing.kv_mutex_wait_us),
+        (SHARD_TIMING_FORWARD_HEADER, timing.forward_us),
+    ] {
+        headers.insert(
+            name,
+            value
+                .to_string()
+                .parse()
+                .expect("decimal shard timing is a valid HTTP header value"),
+        );
+    }
+    headers
+}
+
+fn parse_shard_timing_headers(headers: &HeaderMap) -> Option<ShardTimingBreakdown> {
+    if headers.get(SHARD_TIMING_SCHEMA_HEADER)?.as_bytes() != b"1" {
+        return None;
+    }
+    let parse_us = |name: &str| headers.get(name)?.to_str().ok()?.parse::<u64>().ok();
+    Some(ShardTimingBreakdown {
+        spawn_blocking_queue_us: parse_us(SHARD_TIMING_BLOCKING_QUEUE_HEADER)?,
+        compute_pool_queue_us: parse_us(SHARD_TIMING_POOL_QUEUE_HEADER)?,
+        kv_mutex_wait_us: parse_us(SHARD_TIMING_KV_WAIT_HEADER)?,
+        forward_us: parse_us(SHARD_TIMING_FORWARD_HEADER)?,
+    })
+}
+
 /// Domain-separated transcript signed by a shard holder for every response.
 /// Authentication covers the request as well as the result, preventing a
 /// valid response from a different prompt/position/range from being replayed.
@@ -8209,7 +9079,7 @@ async fn inference_cache_check(
 async fn inference_forward_shard(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<ValidatorForwardShardRequest>>,
-) -> Result<Json<ForwardShardResponse>, (StatusCode, String)> {
+) -> Result<(HeaderMap, Json<ForwardShardResponse>), (StatusCode, String)> {
     let payload = authenticate_community_request(&node, FORWARD_SHARD_PATH, signed)?;
     let signer = parse_hash256_hex(&payload.validator_id, "validator_id")
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
@@ -8431,7 +9301,7 @@ async fn inference_forward_shard_authenticated(
     node: NodeState,
     req: ForwardShardRequest,
     signer: Hash256,
-) -> Result<Json<ForwardShardResponse>, (StatusCode, String)> {
+) -> Result<(HeaderMap, Json<ForwardShardResponse>), (StatusCode, String)> {
     if req.request_id.is_empty() || req.request_id.len() > VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -8667,27 +9537,46 @@ async fn inference_forward_shard_authenticated(
     };
     // Move both ownership guards into the actual blocking job. Dropping an HTTP
     // waiter does not cancel an already-running `spawn_blocking` closure.
-    let (result, compute_lease) =
+    let spawn_blocking_queued_at = Instant::now();
+    let ((result, timing), compute_lease) =
         spawn_blocking_with_shard_compute_lease(compute_lease, move || {
-            install_on_compute_pool(&pool_node, move || {
+            let spawn_blocking_queue_us = elapsed_micros(spawn_blocking_queued_at);
+            let compute_pool_queued_at = Instant::now();
+            let (result, mut timing) = install_on_compute_pool(&pool_node, move || {
+                let compute_pool_queue_us = elapsed_micros(compute_pool_queued_at);
                 // The KV lock is taken INSIDE the pool job (a MutexGuard is
                 // not Send, so it cannot cross into the pool). Concurrent
                 // jobs for the same request_id serialize here; they cannot
                 // deadlock, because a queued job holds no lock and the
                 // holder is always a running job that will finish.
+                let kv_mutex_wait_started = Instant::now();
                 let mut cache = match cache_arc.lock() {
                     Ok(g) => g,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                model_clone.forward_shard_token_with_history(
+                let kv_mutex_wait_us = elapsed_micros(kv_mutex_wait_started);
+                let forward_started = Instant::now();
+                let result = model_clone.forward_shard_token_with_history(
                     input,
                     &mut cache,
                     start_layer,
                     end_layer,
                     position,
                     &generated_tokens,
+                );
+                let forward_us = elapsed_micros(forward_started);
+                (
+                    result,
+                    ShardTimingBreakdown {
+                        spawn_blocking_queue_us: 0,
+                        compute_pool_queue_us,
+                        kv_mutex_wait_us,
+                        forward_us,
+                    },
                 )
-            })
+            });
+            timing.spawn_blocking_queue_us = spawn_blocking_queue_us;
+            (result, timing)
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?;
@@ -8780,7 +9669,10 @@ async fn inference_forward_shard_authenticated(
         )
     })?;
     cache_reservation.commit();
-    Ok(Json(response))
+    // Diagnostics stay outside the response body and signature transcript.
+    // Old coordinators ignore the extra headers; new coordinators accept their
+    // absence so rolling upgrades remain compatible.
+    Ok((shard_timing_headers(timing), Json(response)))
 }
 
 /// POST /inference/cleanup_shard
@@ -9012,7 +9904,15 @@ fn fanout_quorum_plan(
 type FanoutJoinSet = tokio::task::JoinSet<(
     ShardInfo,
     u64,
-    Result<(ForwardShardResponse, usize, usize), (String, bool)>,
+    Result<
+        (
+            ForwardShardResponse,
+            usize,
+            usize,
+            Option<ShardTimingBreakdown>,
+        ),
+        (String, bool),
+    >,
 )>;
 
 /// Cancel every unfinished fan-out task and synchronously observe its exit.
@@ -9033,6 +9933,7 @@ struct HopOutcome {
     served_by: String,
     compute_ms: u64,
     wall_ms: u64,
+    timing: Option<ShardTimingBreakdown>,
     layers_processed: u64,
     req_bytes: usize,
     resp_bytes: usize,
@@ -9050,6 +9951,78 @@ struct HopStats {
     layers: u64,
     is_terminal: bool,
     served_by: std::collections::BTreeMap<String, u64>,
+    timing: ShardTimingTotals,
+}
+
+#[derive(Default, Clone)]
+struct ShardTimingTotals {
+    samples: u64,
+    spawn_blocking_queue_us: u64,
+    compute_pool_queue_us: u64,
+    kv_mutex_wait_us: u64,
+    forward_us: u64,
+}
+
+impl ShardTimingTotals {
+    fn fold(&mut self, timing: Option<ShardTimingBreakdown>) {
+        let Some(timing) = timing else { return };
+        self.samples = self.samples.saturating_add(1);
+        self.spawn_blocking_queue_us = self
+            .spawn_blocking_queue_us
+            .saturating_add(timing.spawn_blocking_queue_us);
+        self.compute_pool_queue_us = self
+            .compute_pool_queue_us
+            .saturating_add(timing.compute_pool_queue_us);
+        self.kv_mutex_wait_us = self
+            .kv_mutex_wait_us
+            .saturating_add(timing.kv_mutex_wait_us);
+        self.forward_us = self.forward_us.saturating_add(timing.forward_us);
+    }
+}
+
+/// Aggregate instrumented shard samples across pipeline positions. These
+/// durations may overlap across hops, so this is explicitly a sum of samples,
+/// never an estimate of end-to-end request wall time.
+fn aggregate_shard_timing(stats: &[HopStats]) -> ShardTimingTotals {
+    let mut total = ShardTimingTotals::default();
+    for hop in stats {
+        total.samples = total.samples.saturating_add(hop.timing.samples);
+        total.spawn_blocking_queue_us = total
+            .spawn_blocking_queue_us
+            .saturating_add(hop.timing.spawn_blocking_queue_us);
+        total.compute_pool_queue_us = total
+            .compute_pool_queue_us
+            .saturating_add(hop.timing.compute_pool_queue_us);
+        total.kv_mutex_wait_us = total
+            .kv_mutex_wait_us
+            .saturating_add(hop.timing.kv_mutex_wait_us);
+        total.forward_us = total.forward_us.saturating_add(hop.timing.forward_us);
+    }
+    total
+}
+
+fn render_shard_timing_totals(totals: &ShardTimingTotals) -> Value {
+    if totals.samples == 0 {
+        return Value::Null;
+    }
+    let avg = |total: u64| total / totals.samples;
+    json!({
+        "sample_count": totals.samples,
+        "trust": "unsigned unauthenticated diagnostic",
+        "scope": "selected successful hop responses across hop positions; fanout attempts and older peers without headers are not all represented; component durations may overlap and are not request wall time",
+        "sum_us": {
+            "spawn_blocking_queue": totals.spawn_blocking_queue_us,
+            "compute_pool_queue": totals.compute_pool_queue_us,
+            "kv_mutex_wait": totals.kv_mutex_wait_us,
+            "forward": totals.forward_us,
+        },
+        "avg_per_sample_us": {
+            "spawn_blocking_queue": avg(totals.spawn_blocking_queue_us),
+            "compute_pool_queue": avg(totals.compute_pool_queue_us),
+            "kv_mutex_wait": avg(totals.kv_mutex_wait_us),
+            "forward": avg(totals.forward_us),
+        }
+    })
 }
 
 impl HopStats {
@@ -9062,6 +10035,7 @@ impl HopStats {
         self.layers = o.layers_processed;
         self.is_terminal |= o.is_terminal;
         *self.served_by.entry(o.served_by.clone()).or_insert(0) += 1;
+        self.timing.fold(o.timing);
     }
 }
 
@@ -9248,7 +10222,15 @@ async fn forward_shard_once(
     node: &NodeState,
     socket: &str,
     request: &ForwardShardRequest,
-) -> Result<(ForwardShardResponse, usize, usize), (String, bool)> {
+) -> Result<
+    (
+        ForwardShardResponse,
+        usize,
+        usize,
+        Option<ShardTimingBreakdown>,
+    ),
+    (String, bool),
+> {
     let audience = resolve_shard_rpc_audience(node, socket)
         .await
         .map_err(|error| (error, false))?;
@@ -9283,6 +10265,7 @@ async fn forward_shard_once(
         .map_err(|e| (format!("send: {}", e), false))?;
 
     let status = resp.status();
+    let timing = parse_shard_timing_headers(resp.headers());
     let raw = read_forward_shard_body_limited(resp)
         .await
         .map_err(|error| (error, false))?;
@@ -9314,7 +10297,7 @@ async fn forward_shard_once(
             false,
         ));
     }
-    Ok((parsed, raw.len(), request_bytes))
+    Ok((parsed, raw.len(), request_bytes, timing))
 }
 
 /// Execute one pipeline hop under `strategy`.
@@ -9340,7 +10323,7 @@ async fn pipeline_hop(
                 let shard = replicas[0].clone();
                 let t_hop = std::time::Instant::now();
                 match forward_shard_once(node, &shard.socket_addr, req).await {
-                    Ok((resp, resp_bytes, req_bytes)) => {
+                    Ok((resp, resp_bytes, req_bytes, timing)) => {
                         let wall_ms = t_hop.elapsed().as_millis() as u64;
                         record_latency(&node.latency_stats, &shard.socket_addr, wall_ms);
                         return Ok(HopOutcome {
@@ -9351,6 +10334,7 @@ async fn pipeline_hop(
                             served_by: shard.node_name.clone(),
                             compute_ms: resp.compute_ms,
                             wall_ms,
+                            timing,
                             layers_processed: resp.layers_processed as u64,
                             req_bytes,
                             resp_bytes,
@@ -9429,8 +10413,14 @@ async fn pipeline_hop(
             // desktop sends) that made the latency-aware sort a complete no-op
             // and every hop paid the worst replica. Cost per hop goes from
             // max(k) to the k/2+1-th order statistic.
-            let mut returned: Vec<(ShardInfo, u64, ForwardShardResponse, usize, usize)> =
-                Vec::new();
+            let mut returned: Vec<(
+                ShardInfo,
+                u64,
+                ForwardShardResponse,
+                usize,
+                usize,
+                Option<ShardTimingBreakdown>,
+            )> = Vec::new();
             let mut tally: HashMap<FanoutVoteKey, Vec<usize>> = HashMap::new();
             let mut signer_votes: std::collections::HashSet<(FanoutVoteKey, Hash256)> =
                 std::collections::HashSet::new();
@@ -9447,12 +10437,12 @@ async fn pipeline_hop(
                     }
                 };
                 match out {
-                    Ok((resp, resp_bytes, request_bytes)) => {
+                    Ok((resp, resp_bytes, request_bytes, timing)) => {
                         record_latency(&node.latency_stats, &shard.socket_addr, wall_ms);
                         let vote_key = FanoutVoteKey::from_response(&resp);
                         let idx = returned.len();
                         let signer = resp.validator_address;
-                        returned.push((shard, wall_ms, resp, resp_bytes, request_bytes));
+                        returned.push((shard, wall_ms, resp, resp_bytes, request_bytes, timing));
                         if let Some(key) = vote_key
                             && let Some(reached) = record_fanout_vote(
                                 &mut tally,
@@ -9521,7 +10511,7 @@ async fn pipeline_hop(
             let vote = if want_vote {
                 let divergent: Vec<(String, String)> = returned
                     .iter()
-                    .filter_map(|(s, _, r, _, _)| {
+                    .filter_map(|(s, _, r, _, _, _)| {
                         let key = FanoutVoteKey::from_response(r);
                         fanout_divergence_evidence(majority_key.as_ref(), key.as_ref())
                             .map(|evidence| (s.node_name.clone(), evidence))
@@ -9533,7 +10523,7 @@ async fn pipeline_hop(
                     replicas_contacted: selected.iter().map(|s| s.node_name.clone()).collect(),
                     replicas_returned: returned
                         .iter()
-                        .map(|(s, _, _, _, _)| s.node_name.clone())
+                        .map(|(s, _, _, _, _, _)| s.node_name.clone())
                         .collect(),
                     majority_hash: majority_hash.clone(),
                     majority_token_id,
@@ -9575,7 +10565,7 @@ async fn pipeline_hop(
             }
 
             let request_bytes = returned.iter().map(|entry| entry.4).sum();
-            let (shard, wall_ms, resp, resp_bytes, _) = &returned[members[0]];
+            let (shard, wall_ms, resp, resp_bytes, _, timing) = &returned[members[0]];
             Ok(HopOutcome {
                 hidden: resp.hidden.clone(),
                 hidden_hash: resp.hidden_hash.clone(),
@@ -9584,6 +10574,7 @@ async fn pipeline_hop(
                 served_by: shard.node_name.clone(),
                 compute_ms: resp.compute_ms,
                 wall_ms: *wall_ms,
+                timing: *timing,
                 layers_processed: resp.layers_processed as u64,
                 req_bytes: request_bytes,
                 resp_bytes: *resp_bytes,
@@ -10007,6 +10998,7 @@ fn render_shard_trace(pipeline: &[PipelineHop], stats: &[HopStats]) -> Vec<Value
                 "request_bytes": st.req_bytes,
                 "response_bytes": st.resp_bytes,
                 "served_by": served,
+                "timing": render_shard_timing_totals(&st.timing),
                 "replica_count": replicas.len(),
                 "is_terminal": st.is_terminal,
             })
@@ -10157,13 +11149,18 @@ fn submit_inference_attestation(
                 // sign() assigns tx.hash as part of signing.
                 tx.sig_verified = true;
                 let h = tx.hash;
-                if node.state.active_protocol_version().major == 3 {
+                match node.state.active_protocol_version().major {
                     // Protocol v3 rejects standalone 0x16 transactions. The
                     // same signed certificate shape is used only as embedded
                     // evidence inside the consensus-authorized 0x25 reward;
                     // inserting it separately would create unpaid state-bloat
                     // and can never produce the earnings receipt users expect.
-                    return (h, "certificate_only_v3_not_submitted");
+                    3 => return (h, "certificate_only_v3_not_submitted"),
+                    // A protocol-4 block carries one native inference
+                    // transaction and nothing else; this one could only sit
+                    // in the mempool until dropped.
+                    major if major >= 4 => return (h, "not_submitted_native_inference_chain"),
+                    _ => {}
                 }
                 let _ = node.mempool.insert(tx);
                 (h, "submitted_to_mempool")
@@ -10176,10 +11173,16 @@ fn submit_inference_attestation(
         None => {
             // Test-fixture path: no keypair wired. Keep the legacy shape so
             // unit tests still execute, but at least assign the hash so the
-            // mempool doesn't dedupe every one of them to 0x00..0.
+            // mempool doesn't dedupe every one of them to 0x00..0. Protocol 3
+            // and later never pool a standalone attestation, as above.
             tx.sig_verified = true;
             let h = tx.compute_hash();
             tx.hash = h;
+            match node.state.active_protocol_version().major {
+                3 => return (h, "certificate_only_v3_not_submitted"),
+                major if major >= 4 => return (h, "not_submitted_native_inference_chain"),
+                _ => {}
+            }
             let _ = node.mempool.insert(tx);
             (h, "submitted_unsigned_no_keypair")
         }
@@ -10205,7 +11208,9 @@ async fn submit_or_relay_attestation(
     bond: u64,
     challenge_period: u64,
 ) -> (Hash256, String) {
-    if node.state.active_protocol_version().major == 3 {
+    // Protocol 3 and later neither pool nor relay a standalone attestation:
+    // `submit_inference_attestation` answers why without submitting it.
+    if node.state.active_protocol_version().major >= 3 {
         let (hash, status) = submit_inference_attestation(
             node,
             model_id,
@@ -10632,6 +11637,7 @@ async fn inference_run_sharded(
             for key in [
                 "attestation",
                 "shard_trace",
+                "shard_timing",
                 "total_bytes_transferred",
                 "committee",
                 "fee_split",
@@ -10848,6 +11854,7 @@ async fn inference_run_sharded(
         "pipeline_length": pipeline.len(),
         "model": model_id_data,
         "shard_trace": shard_trace,
+        "shard_timing": render_shard_timing_totals(&aggregate_shard_timing(&run.hop_stats)),
         "total_bytes_transferred": run.total_bytes,
         "profile_bound": assurance.profile_bound,
         "quorum_verified": assurance.quorum_verified,
@@ -10890,6 +11897,7 @@ async fn inference_run_sharded(
             "request_id": response["request_id"],
             "attestation": response["attestation"],
             "shard_trace": response["shard_trace"],
+            "shard_timing": response["shard_timing"],
             "total_bytes_transferred": response["total_bytes_transferred"],
             "committee": response["committee"],
             "fee_split": response["fee_split"],
@@ -11191,6 +12199,7 @@ async fn inference_run_consensus(
         // Additive: same per-hop trace run_sharded emits, so the dashboard's
         // activation-flow view works against this endpoint too.
         "shard_trace": shard_trace,
+        "shard_timing": render_shard_timing_totals(&aggregate_shard_timing(&run.hop_stats)),
         "total_bytes_transferred": run.total_bytes,
         "profile_bound": assurance.profile_bound,
         "quorum_verified": assurance.quorum_verified,
@@ -11383,11 +12392,12 @@ async fn get_shards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }
     let fully_covered = contiguous && covered_to == total_layers && total_layers > 0;
     let profile_selection = node.model_artifact_id.and_then(|expected_model_id| {
-        assemble_profile_bound_pipeline_for_model(
+        assemble_profile_bound_pipeline_for_model_with_identity_policy(
             shards.clone(),
             expected_model_id,
             None,
             &node.latency_stats,
+            true,
         )
         .ok()
     });
@@ -11510,15 +12520,29 @@ async fn announce_shard(
     req.shard.model_id = format!("0x{}", model_id.to_hex());
     let declared_origin = shard_rpc_origin(&req.shard.socket_addr)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    req.shard.socket_addr = if peer_addr.ip().is_loopback()
-        && is_stub_socket_addr(&req.shard.socket_addr)
-    {
+    // A loopback peer is NOT evidence that this node announced to itself.
+    // Behind an HTTPS gateway every remote announcement arrives from
+    // 127.0.0.1, so the peer address cannot distinguish "my own refresh" from
+    // "somebody else's announcement my proxy forwarded". The authenticated
+    // signer can, and it is the only trustworthy signal here.
+    //
+    // This is what took shard discovery down on the recovered fleet: each
+    // node advertises the stub `http://0.0.0.0:9944` (its bind address, since
+    // ARC_PUBLIC_SOCKET is unset), the gateway made the peer look local, the
+    // stub was rewritten to the RECEIVER's own `127.0.0.1:9944`, the audience
+    // probe then fetched the receiver's own /network/info, and the
+    // announcement was refused for "not matching the destination's validator
+    // identity" - a peer rejected for being the wrong node, because it had
+    // been rewritten into this one.
+    let own_announcement = announcing_validator == node.validator_address;
+    let from_own_process = peer_addr.ip().is_loopback() && own_announcement;
+    req.shard.socket_addr = if from_own_process && is_stub_socket_addr(&req.shard.socket_addr) {
         let port = shard_rpc_url(&req.shard.socket_addr, "/")
             .ok()
             .and_then(|url| url.port_or_known_default())
             .unwrap_or(peer_addr.port());
         SocketAddr::new(peer_addr.ip(), port).to_string()
-    } else if peer_addr.ip().is_loopback() || shard_origin_is_configured(&node, &declared_origin) {
+    } else if from_own_process || shard_origin_is_configured(&node, &declared_origin) {
         declared_origin
     } else {
         bind_announced_shard_addr(&req.shard.socket_addr, peer_addr)
@@ -11542,9 +12566,13 @@ async fn announce_shard(
                 .to_string(),
         ));
     }
+    // The signed payload's display name is untrusted metadata. Bind the
+    // authenticated validator identity after audience verification so aliases
+    // cannot inflate a replica set or conflate two validators sharing a name.
+    req.shard = bind_shard_registry_identity(req.shard, announcing_validator);
 
     // Dedupe: if an existing entry already covers the same (layer_range,
-    // node_name) with a routable socket_addr, drop this announcement when
+    // authenticated validator identity) with a routable socket_addr, drop this announcement when
     // the incoming addr is STILL a stub (self-announce from localhost). This
     // preserves existing behavior and prevents self-announces from clobbering
     // gossiped entries with real public IPs.
@@ -11576,7 +12604,7 @@ async fn announce_shard(
     );
     // Also register in multi-model ShardRegistry for multi-model routing
     let assignment = arc_inference::distributed::ShardAssignment {
-        node_address: model_id, // placeholder; real node addr comes from p2p
+        node_address: announcing_validator,
         start_layer: req.shard.start_layer as u32,
         end_layer: req.shard.end_layer as u32,
         expert_indices: Vec::new(),
@@ -15675,11 +16703,12 @@ async fn get_models(AxumState(node): AxumState<NodeState>) -> Json<Value> {
             let selection = parse_hash256_hex(&s.model_id, "model_id")
                 .ok()
                 .and_then(|model_id| {
-                    assemble_profile_bound_pipeline_for_model(
+                    assemble_profile_bound_pipeline_for_model_with_identity_policy(
                         shards_for_model.clone(),
                         model_id,
                         None,
                         &node.latency_stats,
+                        true,
                     )
                     .ok()
                 });
@@ -15746,11 +16775,12 @@ async fn get_model_shards(
         .first()
         .map(|shard| shard.total_layers)
         .unwrap_or(0);
-    match assemble_profile_bound_pipeline_for_model(
+    match assemble_profile_bound_pipeline_for_model_with_identity_policy(
         announced,
         model_hash,
         None,
         &node.latency_stats,
+        true,
     ) {
         Ok(selection) => {
             let pipeline: Vec<Value> = selection
@@ -17606,6 +18636,88 @@ mod tests {
     }
 
     #[test]
+    fn shard_timing_headers_are_optional_and_do_not_change_legacy_body() {
+        let response = ForwardShardResponse {
+            is_terminal: true,
+            hidden: None,
+            hidden_hash: None,
+            token_id: Some(42),
+            logits_hash: Some("0x01".into()),
+            layers_processed: 6,
+            compute_ms: 17,
+            node_name: "validator-a".into(),
+            validator_address: Hash256([7; 32]),
+            signature: arc_crypto::Signature::null(),
+        };
+        let legacy_body = serde_json::to_vec(&response).unwrap();
+        let parsed: ForwardShardResponse = serde_json::from_slice(&legacy_body).unwrap();
+        assert_eq!(parsed.compute_ms, 17);
+        assert_eq!(parse_shard_timing_headers(&HeaderMap::new()), None);
+
+        let timing = ShardTimingBreakdown {
+            spawn_blocking_queue_us: 1,
+            compute_pool_queue_us: 2,
+            kv_mutex_wait_us: 3,
+            forward_us: 4,
+        };
+        let headers = shard_timing_headers(timing);
+        assert_eq!(parse_shard_timing_headers(&headers), Some(timing));
+        let mut future_schema = headers.clone();
+        future_schema.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("2"));
+        assert_eq!(parse_shard_timing_headers(&future_schema), None);
+        let mut malformed = headers.clone();
+        malformed.insert(
+            SHARD_TIMING_FORWARD_HEADER,
+            HeaderValue::from_static("not-a-number"),
+        );
+        assert_eq!(parse_shard_timing_headers(&malformed), None);
+        let mut incomplete = HeaderMap::new();
+        incomplete.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("1"));
+        assert_eq!(parse_shard_timing_headers(&incomplete), None);
+        // The diagnostics travel outside the body, preserving the old JSON
+        // shape consumed by strict (`deny_unknown_fields`) peers.
+        assert_eq!(serde_json::to_vec(&parsed).unwrap(), legacy_body);
+    }
+
+    #[test]
+    fn shard_timing_aggregation_keeps_component_sums_and_marks_overlap() {
+        let mut first = ShardTimingTotals::default();
+        first.fold(Some(ShardTimingBreakdown {
+            spawn_blocking_queue_us: 10,
+            compute_pool_queue_us: 20,
+            kv_mutex_wait_us: 30,
+            forward_us: 40,
+        }));
+        first.fold(None); // old peer: no sample, not a fabricated zero sample
+        let stats = HopStats {
+            timing: first,
+            ..HopStats::default()
+        };
+        let mut second = HopStats::default();
+        second.timing.fold(Some(ShardTimingBreakdown {
+            spawn_blocking_queue_us: 1,
+            compute_pool_queue_us: 2,
+            kv_mutex_wait_us: 3,
+            forward_us: 4,
+        }));
+
+        let rendered = render_shard_timing_totals(&aggregate_shard_timing(&[stats, second]));
+        assert_eq!(rendered["sample_count"], 2);
+        assert_eq!(rendered["sum_us"]["forward"], 44);
+        assert_eq!(rendered["avg_per_sample_us"]["kv_mutex_wait"], 16);
+        assert!(
+            rendered["scope"]
+                .as_str()
+                .unwrap()
+                .contains("not request wall time")
+        );
+        assert_eq!(
+            render_shard_timing_totals(&ShardTimingTotals::default()),
+            Value::Null
+        );
+    }
+
+    #[test]
     fn shard_response_auth_recomputes_hidden_hash_and_enforces_semantic_shape() {
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let request = ForwardShardRequest {
@@ -18046,6 +19158,67 @@ mod tests {
             ".tmp-{}-{uuid}",
             "AA".repeat(32)
         )));
+    }
+
+    /// The ingress predicate that decides whether this chain refuses
+    /// everything but native inference. Getting it wrong on a migrated chain
+    /// rejects the traffic the migration exists to preserve, at the first
+    /// step a user reaches.
+    #[test]
+    fn only_a_private_protocol_4_chain_admits_native_transactions_alone() {
+        let temporary =
+            std::env::temp_dir().join(format!("arc-rpc-ingress-gate-{}", uuid::Uuid::new_v4()));
+        let members: Vec<arc_types::inference_contract::ValidatorMember> = (0u8..6)
+            .map(|i| arc_types::inference_contract::ValidatorMember {
+                address: arc_crypto::hash_bytes(&[i; 4]),
+                stake: StateDB::MIN_VALIDATOR_STAKE,
+            })
+            .collect();
+        let mut members = members;
+        members.sort_by_key(|member| member.address.0);
+        let genesis = arc_crypto::hash_bytes(b"ingress-gate-genesis");
+        let prefunded: Vec<(Hash256, u64)> = members.iter().map(|m| (m.address, 0)).collect();
+        let state =
+            StateDB::with_genesis_persistent(&prefunded, temporary.join("state"), genesis).unwrap();
+        state.seed_genesis_validators(
+            &members
+                .iter()
+                .map(|m| (m.address, m.stake))
+                .collect::<Vec<_>>(),
+        );
+
+        // No binding at all: an ordinary chain, everything admitted.
+        assert!(!admits_only_native_transactions(&state));
+
+        let context = arc_state::InferenceAdmissionContext {
+            domain: arc_types::inference_contract::InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 0,
+                validator_set_hash: arc_types::inference_contract::validator_set_commitment(
+                    &members,
+                )
+                .unwrap(),
+            },
+            members: members.clone(),
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: Hash256([7; 32]),
+                profile_hash: Hash256([7; 32]),
+                generation_hash: Hash256([7; 32]),
+                assignment_hash: Hash256([7; 32]),
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        state.activate_native_inference(context).unwrap();
+
+        // Activated at a fresh private genesis, with no migration record:
+        // this chain really does carry native work and nothing else.
+        assert!(state.native_migration().is_none());
+        assert!(admits_only_native_transactions(&state));
+
+        // The migrated case is the negation of that record being present,
+        // and a migrated chain always has one - qualified in arc-state,
+        // where a recovery-bound chain can be built.
+        std::fs::remove_dir_all(&temporary).ok();
     }
 
     #[test]
@@ -19300,7 +20473,9 @@ mod tests {
     }
 
     fn test_inference_model() -> Arc<arc_inference::cached_integer_model::CachedIntegerModel> {
-        use arc_inference::cached_integer_model::{CachedIntegerModel, I8Weights, ModelConfig};
+        use arc_inference::cached_integer_model::{
+            ArithmeticProfile, CachedIntegerModel, I8Weights, ModelConfig,
+        };
 
         let mut vocab = vec!["<unk>".to_string(), "▁x".to_string()];
         vocab.extend((0u16..=255).map(|byte| format!("<0x{byte:02X}>")));
@@ -19321,6 +20496,7 @@ mod tests {
                 eos_tokens: Vec::new(),
                 bos_token: 0,
                 chat_template: String::new(),
+                arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
             },
             embedding_q16: Vec::new(),
             embedding_i8: I8Weights::empty(),
@@ -19343,7 +20519,7 @@ mod tests {
 
     fn test_reward_inference_model() -> arc_inference::cached_integer_model::CachedIntegerModel {
         use arc_inference::cached_integer_model::{
-            CachedIntegerModel, CachedLayer, I8Weights, ModelConfig,
+            ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, ModelConfig,
         };
 
         const ONE: i64 = 1 << 16;
@@ -19381,6 +20557,7 @@ mod tests {
                 eos_tokens: Vec::new(),
                 bos_token: 1,
                 chat_template: String::new(),
+                arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
             },
             embedding_q16,
             embedding_i8,
@@ -19475,6 +20652,7 @@ mod tests {
             tier: StakeTier::Spark,
             boot_time: Instant::now(),
             peer_count: Arc::new(AtomicU32::new(0)),
+            transport_wire_policy: Arc::new(arc_net::transport::TransportWirePolicy::default()),
             faucet_claims: Arc::new(dashmap::DashMap::new()),
             faucet_claims_total: Arc::new(AtomicU32::new(0)),
             faucet_pending: Arc::new(tokio::sync::Mutex::new(None)),
@@ -19482,6 +20660,7 @@ mod tests {
             candle_engine: None,
             candle_model_id: None,
             model_artifact_id: parse_hash256_hex(&test_model_id(), "test model_id").ok(),
+            consensus_engine: None,
             dag_validators: Arc::new(parking_lot::RwLock::new(Vec::new())),
             tx_rate_limit: Arc::new(dashmap::DashMap::new()),
             dag_round: Arc::new(AtomicU64::new(0)),
@@ -19528,6 +20707,10 @@ mod tests {
             seed_rpc_addrs: Arc::new(Vec::new()),
             community_rpc_bases: Arc::new(Vec::new()),
             chain_identity: None,
+            native_serving: None,
+            native_request_admission: Arc::new(
+                crate::native_inference::NativeRequestAdmission::default(),
+            ),
             runtime_shutdown: None,
             runtime_tasks: Arc::new(parking_lot::Mutex::new(tokio::task::JoinSet::new())),
             own_compute_ms: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
@@ -22478,6 +23661,754 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_rpc_requires_private_activation_and_returns_observed_receipt_links() {
+        // A cryptographically signed native envelope remains unavailable until
+        // the rooted private activation exists.
+        let inactive = fake_node_with_workers(vec![]);
+        let inactive_key = KeyPair::generate_ed25519();
+        let mut inactive_tx = Transaction {
+            tx_type: TxType::NativeInferenceRefund,
+            from: inactive_key.address(),
+            nonce: 0,
+            body: TxBody::NativeInferenceRefund(NativeInferenceRefundBody {
+                request_id: [7; 32],
+            }),
+            fee: 0,
+            gas_limit: gas_costs::NATIVE_INFERENCE_REFUND,
+            hash: Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        inactive_tx.sign(&inactive_key).unwrap();
+        assert_eq!(
+            submit_signed_tx(AxumState(inactive), Json(inactive_tx))
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let genesis = arc_crypto::hash_bytes(b"native-rpc-private-fixture");
+        let requester = KeyPair::generate_ed25519();
+        let mut validators: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
+        let mut members: Vec<_> = validators
+            .iter()
+            .map(|key| {
+                arc_types::inference_contract::ValidatorMember::new(
+                    key.address(),
+                    StateDB::MIN_VALIDATOR_STAKE,
+                )
+            })
+            .collect();
+        members.sort_by_key(|member| member.address.0);
+        let tuple = arc_crypto::hash_bytes(b"native-rpc-private-fixture-tuple");
+        let context = arc_state::InferenceAdmissionContext {
+            domain: arc_types::inference_contract::InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 0,
+                validator_set_hash: arc_types::inference_contract::validator_set_commitment(
+                    &members,
+                )
+                .unwrap(),
+            },
+            members: members.clone(),
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: tuple,
+                profile_hash: tuple,
+                generation_hash: tuple,
+                assignment_hash: tuple,
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        let mut prefunded = vec![(requester.address(), 1_000)];
+        prefunded.extend(members.iter().map(|member| (member.address, 0)));
+        let state =
+            Arc::new(StateDB::with_genesis_persistent(&prefunded, &state_dir, genesis).unwrap());
+        state.seed_genesis_validators(
+            &members
+                .iter()
+                .map(|member| (member.address, member.stake))
+                .collect::<Vec<_>>(),
+        );
+        state.activate_native_inference(context.clone()).unwrap();
+        let producer = validators.remove(0);
+        let mempool = Arc::new(Mempool::new(16));
+        let node = build_node_state(
+            state.clone(),
+            mempool.clone(),
+            producer.address(),
+            Some(Arc::new(producer)),
+            StateDB::MIN_VALIDATOR_STAKE,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        );
+        // Every ingress refuses what a protocol-4 block can never carry, not
+        // only /tx/submit_signed: the Ethereum-shaped raw transfer and the
+        // internal attestation used to reach this mempool (P3 audit).
+        let Json(eth) = eth_send_raw_transaction(&node, &json!(["0x00"]), &json!(1));
+        assert_eq!(eth["error"]["code"], -32003, "{eth}");
+        let (_, attestation) = submit_inference_attestation(
+            &node,
+            Hash256([1; 32]),
+            Hash256([2; 32]),
+            Hash256([3; 32]),
+            0,
+            10,
+        );
+        assert_eq!(attestation, "not_submitted_native_inference_chain");
+        assert_eq!(mempool.len(), 0, "nothing reached the mempool");
+        // The test-fixture path without a validator keypair refuses as well.
+        let keyless = build_node_state(
+            state.clone(),
+            mempool.clone(),
+            node.validator_address,
+            None,
+            StateDB::MIN_VALIDATOR_STAKE,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let (_, keyless_attestation) = submit_inference_attestation(
+            &keyless,
+            Hash256([1; 32]),
+            Hash256([2; 32]),
+            Hash256([3; 32]),
+            0,
+            10,
+        );
+        assert_eq!(keyless_attestation, "not_submitted_native_inference_chain");
+        assert_eq!(mempool.len(), 0, "nothing reached the mempool");
+
+        let input = [11u32, 12]
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        let request = arc_types::inference_contract::InferenceRequest::sign(
+            arc_types::inference_contract::InferenceJob {
+                version: arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+                domain: context.domain,
+                requester: requester.address(),
+                nonce: 0,
+                model_hash: tuple,
+                profile_hash: tuple,
+                input_hash: arc_crypto::hash_bytes(&input),
+                generation_hash: tuple,
+                assignment_hash: tuple,
+                max_tokens: 8,
+                max_output_bytes: 128,
+                execution_price: 10,
+                reserved_max_payment: 100,
+                expires_at: 10,
+            },
+            &requester,
+        )
+        .unwrap();
+        let request_id = request.job.request_id();
+        let mut tx = Transaction {
+            tx_type: TxType::NativeInferenceRequest,
+            from: requester.address(),
+            nonce: 0,
+            body: TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: input,
+            }),
+            fee: 0,
+            gas_limit: gas_costs::NATIVE_INFERENCE_REQUEST,
+            hash: Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        state.sign_transaction(&mut tx, &requester).unwrap();
+        assert_eq!(
+            submit_signed_tx(AxumState(node.clone()), Json(tx.clone()))
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let mut node = node;
+        node.native_request_admission =
+            Arc::new(crate::native_inference::NativeRequestAdmission::ready_for_test());
+        assert_eq!(
+            submit_signed_tx(AxumState(node.clone()), Json(tx))
+                .await
+                .unwrap()
+                .status,
+            "pending"
+        );
+        state
+            .execute_block_verified(&mempool.drain(1), node.validator_address)
+            .unwrap();
+
+        let Json(context_json) = native_inference_context(AxumState(node.clone()))
+            .await
+            .unwrap();
+        assert_eq!(context_json["candidate_protocol"], 4);
+        assert_eq!(context_json["allowed_execution_count"], 1);
+        // A client builds its job from these: the pinned tuple and the bounds.
+        assert_eq!(
+            context_json["allowed_executions"][0]["model_hash"],
+            tuple.to_hex()
+        );
+        assert_eq!(
+            context_json["allowed_executions"][0]["assignment_hash"],
+            tuple.to_hex()
+        );
+        assert_eq!(
+            context_json["limits"]["max_tokens"],
+            arc_types::transaction::TIER1_MAX_TOKENS
+        );
+        assert_eq!(
+            context_json["limits"]["request_gas_limit"],
+            gas_costs::NATIVE_INFERENCE_REQUEST
+        );
+        assert!(context_json["height"].is_u64());
+        // This node runs no native worker, so it claims no executor and
+        // tokenizes nothing.
+        assert!(context_json["serving"].is_null());
+        let refused = native_inference_tokenize(
+            AxumState(node.clone()),
+            Json(NativeTokenizeRequest {
+                text: "hello".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.0, StatusCode::NOT_FOUND);
+        let mut test_serving = node.clone();
+        test_serving.native_serving = Some(Arc::new(
+            crate::native_inference::NativeServing::deterministic_test(),
+        ));
+        let Json(served) = native_inference_context(AxumState(test_serving.clone()))
+            .await
+            .unwrap();
+        assert_eq!(served["serving"]["executor"], "deterministic_test");
+        assert_eq!(served["serving"]["input_format"], "opaque_bytes");
+        assert_eq!(served["serving"]["tokenize_endpoint"], false);
+        let refused = native_inference_tokenize(
+            AxumState(test_serving),
+            Json(NativeTokenizeRequest {
+                text: "hello".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.0, StatusCode::NOT_FOUND);
+        assert!(refused.1.contains("opaque_bytes"), "{}", refused.1);
+        let Json(receipt) =
+            native_inference_receipt(AxumState(node), AxumPath(request_id.to_hex()))
+                .await
+                .unwrap();
+        assert_eq!(receipt["observed_status"], "Pending");
+        assert_eq!(receipt["output_hex"], "");
+        assert!(receipt["output_text"].is_null());
+        assert!(receipt["expires_at"].is_u64());
+        assert!(receipt["admission_transaction"]["tx_hash"].is_string());
+        assert!(receipt["admission_transaction"]["block"].is_string());
+        assert!(receipt["terminal_transaction"].is_null());
+        assert_eq!(
+            receipt["consensus_finality"],
+            "not asserted by milestone-2 receipt"
+        );
+    }
+
+    /// Synthetic signed end-to-end routing on an imported recovery checkpoint.
+    /// No model or invented qualification: this covers real admission, value,
+    /// native certificates, headers, and durable restart only.
+    #[tokio::test]
+    async fn recovered_v3_native_outer_routes_gate_commit_settlement_and_restart() {
+        use crate::native_inference::NativeRequestAdmission;
+        use arc_state::recovery::{
+            ArcCheckpoint, RecoveryExportSpec, RecoveryImport, RecoveryNetworkPolicy,
+            RecoveryValidator,
+        };
+        use arc_types::inference_contract::{
+            InferenceCertificate, InferenceDomain, InferenceJob, InferenceRequest, ValidatorMember,
+            sign_vote, validator_set_commitment,
+        };
+        use arc_types::transaction::{
+            NativeInferenceFinalizeBody, NativeInferenceRefundBody, NativeInferenceRequestBody,
+            gas_costs,
+        };
+
+        // This fixture isolates native routing/admission status from the
+        // production 100 ms sender throttle; dedicated RPC tests cover that
+        // limiter independently.
+        async fn submit_without_test_sender_throttle(
+            node: &NodeState,
+            tx: Transaction,
+        ) -> Result<Json<SubmitTxResponse>, SubmitRefusal> {
+            node.tx_rate_limit.remove(&tx.from.0);
+            submit_signed_tx(AxumState(node.clone()), Json(tx)).await
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let requester = KeyPair::generate_ed25519();
+        let keys: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
+        let genesis = arc_crypto::hash_bytes(b"native-v3-outer-routes");
+        let validators: Vec<_> = keys
+            .iter()
+            .map(|key| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: 5_000_000,
+            })
+            .collect();
+        let members: Vec<_> = {
+            let mut v: Vec<_> = validators
+                .iter()
+                .map(|v| ValidatorMember::new(v.address, v.stake))
+                .collect();
+            v.sort_by_key(|v| v.address.0);
+            v
+        };
+        let mut funds = vec![
+            (requester.address(), 1_000),
+            (
+                arc_state::recovery::recovery_stake_reserve_address(),
+                60_000_000,
+            ),
+        ];
+        funds.extend(keys.iter().map(|key| (key.address(), 5_000_000)));
+        let source = StateDB::with_genesis(&funds);
+        let joins: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, 0);
+                tx.tx_type = TxType::JoinValidator;
+                tx.body = TxBody::JoinValidator(arc_types::transaction::JoinValidatorBody {
+                    pubkey: key.public_key_bytes().try_into().unwrap(),
+                    initial_stake: 5_000_000,
+                });
+                tx.sign(key).unwrap();
+                tx
+            })
+            .collect();
+        let (_, receipts) = source.execute_block(&joins, keys[0].address()).unwrap();
+        assert!(receipts.iter().all(|r| r.success));
+        // The export requires the explicit legacy staking reserve decomposition.
+        for key in &keys {
+            let mut account = source.get_account(&key.address()).unwrap();
+            account.staked_balance = 0;
+            source.update_account(&key.address(), account);
+        }
+        source.execute_block(&[], keys[0].address()).unwrap();
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: "native-v3-outer-routes".into(),
+                genesis_hash: genesis,
+                source_consensus_round: 0,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let path = dir.path().join("approved.arcchkpt");
+        checkpoint.write_to(&path).unwrap();
+        let data_dir = dir.path().join("state");
+        let policy = RecoveryNetworkPolicy {
+            chain_id: "native-v3-outer-routes".into(),
+            genesis_hash: genesis,
+            recovery_epoch: 1,
+            validator_set_id: 1,
+            validators: members.iter().map(|m| (m.address, m.stake)).collect(),
+            community_rewards_v1_activation_height: None,
+        };
+        let state = Arc::new(
+            StateDB::with_genesis_persistent_recovery(
+                &[],
+                &data_dir,
+                policy.clone(),
+                Some(RecoveryImport {
+                    checkpoint_path: path,
+                    approved_manifest_hash: checkpoint.manifest_hash(),
+                }),
+            )
+            .unwrap(),
+        );
+        let tuple = arc_crypto::hash_bytes(b"synthetic-native-tuple-not-model-qualification");
+        let context = arc_state::InferenceAdmissionContext {
+            domain: InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 1,
+                validator_set_hash: validator_set_commitment(&members).unwrap(),
+            },
+            members,
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: tuple,
+                profile_hash: tuple,
+                generation_hash: tuple,
+                assignment_hash: tuple,
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        let mut node = fake_node_with_workers(vec![]);
+        node.state = state.clone();
+        node.mempool = Arc::new(Mempool::new(32));
+        node.validator_address = keys[0].address();
+        node.validator_keypair = Some(Arc::new(keys[0].clone()));
+        let signed = |state: &StateDB, key: &KeyPair, nonce, body: TxBody, gas| {
+            let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, nonce);
+            tx.tx_type = body.tx_type();
+            tx.body = body;
+            tx.fee = 0;
+            tx.gas_limit = gas;
+            state.sign_transaction(&mut tx, key).unwrap();
+            tx
+        };
+        let request_tx = |state: &StateDB, nonce, expires_at| {
+            let input = vec![1, 2, 3];
+            let request = InferenceRequest::sign(
+                InferenceJob {
+                    version: arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+                    domain: context.domain,
+                    requester: requester.address(),
+                    nonce,
+                    model_hash: tuple,
+                    profile_hash: tuple,
+                    input_hash: arc_crypto::hash_bytes(&input),
+                    generation_hash: tuple,
+                    assignment_hash: tuple,
+                    max_tokens: 2,
+                    max_output_bytes: 8,
+                    execution_price: 10,
+                    reserved_max_payment: 100,
+                    expires_at,
+                },
+                &requester,
+            )
+            .unwrap();
+            let id = request.job.request_id();
+            (
+                id,
+                signed(
+                    state,
+                    &requester,
+                    nonce,
+                    TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                        request,
+                        input_blob: input,
+                    }),
+                    gas_costs::NATIVE_INFERENCE_REQUEST,
+                ),
+            )
+        };
+        let commit = |state: &StateDB, txs: &[Transaction]| {
+            state.validate_v3_block_admission(txs).unwrap();
+            let height = state.height() + 1;
+            let (block, receipts) = state
+                .execute_block_adaptive_at_with_proof(
+                    txs,
+                    keys[0].address(),
+                    state.get_block(state.height()).unwrap().header.timestamp + 1,
+                    arc_crypto::hash_bytes(&height.to_le_bytes()),
+                )
+                .unwrap();
+            assert_eq!(block.header.protocol_version.major, 3);
+            assert_eq!(block.header.state_root, state.get_state_root());
+            assert!(receipts.iter().all(|r| r.success));
+            block
+        };
+        let mut before_migration =
+            Transaction::new_transfer(requester.address(), keys[0].address(), 1, 0);
+        before_migration.fee = 1;
+        state
+            .sign_transaction(&mut before_migration, &requester)
+            .unwrap();
+        let _ = submit_without_test_sender_throttle(&node, before_migration.clone())
+            .await
+            .unwrap();
+        commit(&state, &node.mempool.drain(1));
+        let expected_refusal = state
+            .validate_v3_transaction_admission(&before_migration)
+            .unwrap_err()
+            .to_string();
+        let refusal = submit_without_test_sender_throttle(&node, before_migration)
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.status, StatusCode::BAD_REQUEST);
+        assert_eq!(refusal.reason, expected_refusal);
+        assert!(!refusal.reason.is_empty(), "v3 refusal retains its cause");
+        let balance_before_native = state.get_account(&requester.address()).unwrap().balance;
+        assert_eq!(balance_before_native, 998);
+        let (id, tx) = request_tx(
+            &state,
+            state.get_account(&requester.address()).unwrap().nonce,
+            100,
+        );
+        assert!(state.validate_v3_transaction_admission(&tx).is_err());
+        let open = Arc::new(NativeRequestAdmission::ready_for_test());
+        node.native_request_admission = open.clone();
+        assert_eq!(
+            submit_without_test_sender_throttle(&node, tx.clone())
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a native request has no admission context before migration",
+        );
+        state
+            .authorize_native_migration(
+                arc_state::NativeMigrationRecord {
+                    chain_genesis: genesis,
+                    recovery_epoch: 1,
+                    validator_set_id: 1,
+                    activation_height: state.height() + 1,
+                    context_commitment: context.commitment().unwrap(),
+                },
+                context.clone(),
+            )
+            .unwrap();
+        commit(&state, &[]);
+        assert!(state.native_inference_context().is_some());
+        state.validate_v3_transaction_admission(&tx).unwrap();
+        let before = state.get_state_root();
+        assert!(
+            state
+                .validate_v3_block_admission(&[tx.clone(), tx.clone()])
+                .is_err()
+        );
+        assert!(
+            state
+                .validate_v3_transaction_admission_at(&tx, state.height() + 2)
+                .is_err()
+        );
+        let mut bad = tx.clone();
+        bad.signature = arc_crypto::Signature::null();
+        bad.sig_verified = true;
+        assert!(state.validate_v3_transaction_admission(&bad).is_err());
+        let mut unsupported = tx.clone();
+        if let TxBody::NativeInferenceRequest(body) = &mut unsupported.body {
+            let mut job = body.request.job.clone();
+            job.assignment_hash = Hash256::ZERO;
+            body.request = InferenceRequest::sign(job, &requester).unwrap();
+        }
+        state
+            .sign_transaction(&mut unsupported, &requester)
+            .unwrap();
+        assert!(
+            state
+                .validate_v3_transaction_admission(&unsupported)
+                .is_err()
+        );
+
+        let mut transfer = Transaction::new_transfer(
+            requester.address(),
+            keys[0].address(),
+            1,
+            state.get_account(&requester.address()).unwrap().nonce,
+        );
+        transfer.fee = 1;
+        state.sign_transaction(&mut transfer, &requester).unwrap();
+        state.validate_v3_transaction_admission(&transfer).unwrap();
+        assert!(
+            state
+                .validate_v3_block_admission(&[tx.clone(), transfer.clone()])
+                .is_err()
+        );
+        node.native_request_admission = Arc::new(NativeRequestAdmission::default());
+        let _ = submit_without_test_sender_throttle(&node, transfer.clone())
+            .await
+            .unwrap();
+        node.mempool.drain(1);
+        assert!(crate::consensus::admit_gossiped_transaction(
+            &state,
+            &node.mempool,
+            &node.native_request_admission,
+            &bincode::serialize(&transfer).unwrap()
+        ));
+        node.mempool.drain(1);
+        transfer.fee = 0;
+        state.sign_transaction(&mut transfer, &requester).unwrap();
+        assert!(state.validate_v3_transaction_admission(&transfer).is_err());
+        assert_eq!(state.get_state_root(), before);
+
+        // Default and operator-enabled-but-not-running are both closed.
+        for gate in [
+            NativeRequestAdmission::default(),
+            NativeRequestAdmission::new(true),
+        ] {
+            node.native_request_admission = Arc::new(gate);
+            assert_eq!(
+                submit_without_test_sender_throttle(&node, tx.clone())
+                    .await
+                    .unwrap_err(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(!crate::consensus::admit_gossiped_transaction(
+                &state,
+                &node.mempool,
+                &node.native_request_admission,
+                &bincode::serialize(&tx).unwrap()
+            ));
+            assert!(
+                !node
+                    .native_request_admission
+                    .insert(&node.mempool, tx.clone())
+            );
+            let mut proposal = vec![tx.clone()];
+            node.native_request_admission
+                .retain_for_proposal(&mut proposal);
+            assert!(proposal.is_empty());
+            assert!(node.mempool.is_empty());
+        }
+        let Json(info) = native_inference_context(AxumState(node.clone()))
+            .await
+            .unwrap();
+        assert_eq!(info["chain_protocol"], 3);
+        assert_eq!(info["native_only_chain"], false);
+        assert_eq!(info["request_admission_open"], false);
+        node.native_request_admission = Arc::new(NativeRequestAdmission::ready_for_test());
+        let _ = submit_without_test_sender_throttle(&node, tx.clone())
+            .await
+            .unwrap();
+        assert_eq!(node.mempool.drain(1)[0].hash, tx.hash);
+        assert!(crate::consensus::admit_gossiped_transaction(
+            &state,
+            &node.mempool,
+            &node.native_request_admission,
+            &bincode::serialize(&tx).unwrap()
+        ));
+        let committed = node.mempool.drain(1);
+        // Losing local readiness after a peer commits MUST NOT lose the body
+        // or change canonical validity. The reservation still executes once.
+        node.native_request_admission = Arc::new(NativeRequestAdmission::default());
+        commit(&state, &committed);
+        assert_eq!(
+            state.get_account(&requester.address()).unwrap().balance,
+            balance_before_native - 100
+        );
+        let output = 7u32.to_le_bytes().to_vec();
+        let mut votes: Vec<_> = keys
+            .iter()
+            .take(5)
+            .map(|key| sign_vote(id, &output, key).unwrap())
+            .collect();
+        votes.sort_by_key(|v| v.validator.0);
+        let finalize = signed(
+            &state,
+            &keys[0],
+            state.get_account(&keys[0].address()).unwrap().nonce,
+            TxBody::NativeInferenceFinalize(NativeInferenceFinalizeBody {
+                request_id: id.0,
+                certificate: InferenceCertificate { output, votes },
+            }),
+            gas_costs::NATIVE_INFERENCE_FINALIZE,
+        );
+        let mut uncertified = finalize.clone();
+        if let TxBody::NativeInferenceFinalize(body) = &mut uncertified.body {
+            body.certificate.votes.pop();
+        }
+        state.sign_transaction(&mut uncertified, &keys[0]).unwrap();
+        assert!(
+            state
+                .validate_v3_transaction_admission(&uncertified)
+                .is_err()
+        );
+        assert_eq!(
+            submit_without_test_sender_throttle(&node, uncertified)
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        let _ = submit_without_test_sender_throttle(&node, finalize.clone())
+            .await
+            .unwrap();
+        commit(&state, &node.mempool.drain(1));
+        assert_eq!(
+            state.get_account(&requester.address()).unwrap().balance,
+            balance_before_native - 10
+        );
+
+        let mut after_native = Transaction::new_transfer(
+            requester.address(),
+            keys[0].address(),
+            1,
+            state.get_account(&requester.address()).unwrap().nonce,
+        );
+        after_native.fee = 1;
+        state
+            .sign_transaction(&mut after_native, &requester)
+            .unwrap();
+        let _ = submit_without_test_sender_throttle(&node, after_native)
+            .await
+            .unwrap();
+        commit(&state, &node.mempool.drain(1));
+        assert_eq!(
+            state.get_account(&requester.address()).unwrap().balance,
+            balance_before_native - 12
+        );
+        let expires = state.height() + 3;
+        let (refund_id, second) = request_tx(
+            &state,
+            state.get_account(&requester.address()).unwrap().nonce,
+            expires,
+        );
+        // Canonical catch-up continues while all local admission is closed.
+        commit(&state, &[second]);
+        let refund = signed(
+            &state,
+            &requester,
+            state.get_account(&requester.address()).unwrap().nonce,
+            TxBody::NativeInferenceRefund(NativeInferenceRefundBody {
+                request_id: refund_id.0,
+            }),
+            gas_costs::NATIVE_INFERENCE_REFUND,
+        );
+        assert!(state.validate_v3_transaction_admission(&refund).is_err());
+        while state.height() + 1 < expires {
+            commit(&state, &[]);
+        }
+        state.try_sync_wal().unwrap();
+        let root = state.get_state_root();
+        let height = state.height();
+        drop(node);
+        drop(state);
+        let reopened = Arc::new(
+            StateDB::with_genesis_persistent_recovery(&[], &data_dir, policy, None).unwrap(),
+        );
+        assert_eq!(reopened.get_state_root(), root);
+        assert_eq!(reopened.height(), height);
+        assert_eq!(reopened.active_protocol_version().major, 3);
+        let mut node = fake_node_with_workers(vec![]);
+        node.state = reopened.clone();
+        assert!(!node.native_request_admission.accepting_requests());
+        assert!(crate::consensus::admit_gossiped_transaction(
+            &reopened,
+            &node.mempool,
+            &node.native_request_admission,
+            &bincode::serialize(&refund).unwrap()
+        ));
+        node.mempool.drain(1);
+        let _ = submit_without_test_sender_throttle(&node, refund)
+            .await
+            .unwrap();
+        commit(&reopened, &node.mempool.drain(1));
+        assert_eq!(
+            reopened.get_account(&requester.address()).unwrap().balance,
+            balance_before_native - 12
+        );
+        assert!(
+            reopened
+                .native_inference_pending_requests(context.commitment().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn pending_transaction_replay_does_not_consume_sender_allowance() {
         let node = fake_node_with_workers(vec![]);
         let key = KeyPair::generate_ed25519();
@@ -23423,6 +25354,71 @@ mod tests {
         dashmap::DashMap::new()
     }
 
+    fn authenticated_shard(identity: &[u8], addr: &str, model_id: Hash256) -> ShardInfo {
+        let mut shard = shard("same-display-name", addr, 0, 32);
+        shard.model_id = format!("0x{}", model_id.to_hex());
+        shard.node_name = format!("0x{}", arc_crypto::hash_bytes(identity).to_hex());
+        shard
+    }
+
+    #[test]
+    fn strict_pipeline_dedupes_aliases_by_authenticated_validator_identity() {
+        let model_id = arc_crypto::hash_bytes(b"strict-alias-model");
+        let profile = canonical_profile();
+        let first = authenticated_shard(b"validator-a", "203.0.113.10:9090", model_id);
+        let mut alias = first.clone();
+        alias.socket_addr = "203.0.113.11:9090".to_string();
+        let selection = assemble_profile_bound_pipeline_for_model_with_identity_policy(
+            vec![first, alias],
+            model_id,
+            Some(&profile),
+            &no_stats(),
+            true,
+        )
+        .expect("authenticated alias set should remain a valid one-replica range");
+        assert_eq!(selection.hops[0].1.len(), 1);
+        assert_eq!(selection.hops[0].1[0].socket_addr, "203.0.113.10:9090");
+    }
+
+    #[test]
+    fn strict_pipeline_keeps_same_display_name_distinct_validator_identities() {
+        let model_id = arc_crypto::hash_bytes(b"strict-collision-model");
+        let profile = canonical_profile();
+        let first = authenticated_shard(b"validator-a", "203.0.113.20:9090", model_id);
+        let second = authenticated_shard(b"validator-b", "203.0.113.21:9090", model_id);
+        assert_ne!(first.node_name, second.node_name);
+        let selection = assemble_profile_bound_pipeline_for_model_with_identity_policy(
+            vec![first, second],
+            model_id,
+            Some(&profile),
+            &no_stats(),
+            true,
+        )
+        .expect("distinct authenticated validators should both remain eligible");
+        assert_eq!(selection.hops[0].1.len(), 2);
+    }
+
+    #[test]
+    fn strict_pipeline_rejects_missing_or_malformed_validator_identity() {
+        let model_id = arc_crypto::hash_bytes(b"strict-invalid-identity-model");
+        let invalid = shard("display-only", "203.0.113.30:9090", 0, 32);
+        let error = assemble_pipeline_with_identity_policy(vec![invalid], &no_stats(), true)
+            .expect_err("display-only shard metadata must not enter strict readiness");
+        assert!(matches!(
+            error,
+            PipelineError::MissingValidatorIdentity { .. }
+        ));
+        let malformed = authenticated_shard(b"validator-c", "203.0.113.31:9090", model_id);
+        let mut malformed = malformed;
+        malformed.node_name = "0xnot-a-validator".to_string();
+        let error = assemble_pipeline_with_identity_policy(vec![malformed], &no_stats(), true)
+            .expect_err("malformed validator identity must fail closed");
+        assert!(matches!(
+            error,
+            PipelineError::MissingValidatorIdentity { .. }
+        ));
+    }
+
     #[test]
     fn free_sharded_one_of_n_never_claims_quorum_or_determinism() {
         assert_eq!(
@@ -23866,7 +25862,7 @@ mod tests {
         let canonical = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE;
         assert!(matches!(
             assemble_profile_bound_pipeline_for(&node, Some(canonical)),
-            Err(PipelineError::NoCompleteExecutionProfile { .. })
+            Err(PipelineError::MissingValidatorIdentity { .. })
         ));
 
         let plan_request = || AutoShardPlanRequest {
@@ -23905,7 +25901,7 @@ mod tests {
         );
         assert!(matches!(
             assemble_profile_bound_pipeline_for(&node, Some(canonical)),
-            Err(PipelineError::NoCompleteExecutionProfile { .. })
+            Err(PipelineError::MissingValidatorIdentity { .. })
         ));
         let Json(models_view) = get_models(AxumState(node.clone())).await;
         assert_eq!(models_view["models"][0]["fully_covered"], false);
@@ -23982,13 +25978,17 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Vec::new(),
                     vec![poison_origin],
                     Vec::new(),
                     0,
                     None,
                     false,
+                    None,
+                    Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
+                    Arc::new(arc_net::transport::TransportWirePolicy::default()),
                 )
                 .await
                 .unwrap();
@@ -24064,13 +26064,17 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 0,
                 None,
                 false,
+                None,
+                Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                 Some(shutdown_rx),
+                Arc::new(arc_net::transport::TransportWirePolicy::default()),
             )
             .await
         });
@@ -24155,6 +26159,20 @@ mod tests {
         assert_eq!(response["ok"], true);
         assert_eq!(coordinator.shard_registry.len(), 1);
         assert_eq!(coordinator.multi_model_registry.total_shard_nodes(), 1);
+        let registered = coordinator.shard_registry.iter().next().unwrap();
+        assert_eq!(
+            registered.value().0.node_name,
+            format!("0x{}", holder_key.address().to_hex()),
+            "registry identity must come from the authenticated signer"
+        );
+        assert_eq!(
+            coordinator
+                .multi_model_registry
+                .get_node_shards(&holder_key.address())
+                .len(),
+            1,
+            "multi-model registry must key the holder by validator identity"
+        );
         let selection = assemble_profile_bound_pipeline_for(
             &coordinator,
             Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE),
@@ -24169,6 +26187,284 @@ mod tests {
             models_view["models"][0]["execution_profile"],
             canonical_profile()
         );
+    }
+
+    /// The fleet's exact failure, reproduced. Every node advertises the stub
+    /// `http://0.0.0.0:9944` (its bind address, because ARC_PUBLIC_SOCKET is
+    /// unset) and every announcement reaches its peers through an HTTPS
+    /// gateway, so the peer address is loopback. Before the signer check, the
+    /// stub was rewritten to the RECEIVER's own `127.0.0.1:9944`, the audience
+    /// probe fetched the receiver's own identity, and the peer was refused for
+    /// "not matching the destination's validator identity" - rejected for
+    /// being the wrong node after being rewritten into this one.
+    ///
+    /// It is still refused, because a stub is genuinely unroutable, but now
+    /// for the true reason, which tells an operator what to configure.
+    #[tokio::test]
+    async fn a_stub_announced_through_a_gateway_is_refused_as_unconfigured_not_as_a_wrong_validator()
+     {
+        let holder_key = arc_crypto::KeyPair::generate_ed25519();
+        let state = Arc::new(arc_state::StateDB::new());
+        state.seed_genesis_validators(&[(
+            holder_key.address(),
+            arc_state::StateDB::MIN_VALIDATOR_STAKE,
+        )]);
+        let model_id = arc_crypto::hash_bytes(b"gateway-stub-artifact");
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = state;
+        coordinator.model_artifact_id = Some(model_id);
+
+        let announced = ShardInfo {
+            start_layer: 0,
+            end_layer: 1,
+            total_layers: 1,
+            model_id: format!("0x{}", model_id.to_hex()),
+            model_name: "stub-through-gateway".to_string(),
+            execution_profile: canonical_profile(),
+            memory_mb: 1,
+            full_model_mb: 1,
+            // Exactly what every recovered validator advertises today.
+            socket_addr: "http://0.0.0.0:9944".to_string(),
+            node_name: "peer-behind-gateway".to_string(),
+        };
+        let signed = sign_validator_shard_announcement(
+            announced,
+            &holder_key,
+            coordinator.validator_address,
+            None,
+        )
+        .unwrap();
+        let error = announce_shard(
+            AxumState(coordinator.clone()),
+            // Caddy forwards from localhost: this is what the node observes.
+            ConnectInfo(RpcPeerAddr("127.0.0.1:49152".parse().unwrap())),
+            Json(signed),
+        )
+        .await
+        .expect_err("a stub origin is not routable and must not be registered");
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(
+            error.1.contains("not an explicitly configured"),
+            "the refusal must name the unconfigured origin, not a validator \
+             identity mismatch: {}",
+            error.1
+        );
+        assert!(
+            !error.1.contains("destination's validator identity"),
+            "a peer must never be refused for being this node: {}",
+            error.1
+        );
+        assert_eq!(coordinator.shard_registry.len(), 0);
+    }
+
+    /// The same gateway path, but the peer advertises the real origin the
+    /// operator configured. This is the case that restores discovery: a
+    /// loopback peer address no longer suppresses a legitimate remote
+    /// announcement.
+    #[tokio::test]
+    async fn a_peer_announcing_its_real_origin_through_a_gateway_is_registered() {
+        let holder_key = arc_crypto::KeyPair::generate_ed25519();
+        let state = Arc::new(arc_state::StateDB::new());
+        state.seed_genesis_validators(&[(
+            holder_key.address(),
+            arc_state::StateDB::MIN_VALIDATOR_STAKE,
+        )]);
+        let model_id = arc_crypto::hash_bytes(b"gateway-real-origin-artifact");
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = state;
+        coordinator.model_artifact_id = Some(model_id);
+        let origin = "https://198.51.100.7".to_string();
+        coordinator.community_rpc_bases = Arc::new(vec![origin.clone()]);
+        coordinator.shard_rpc_audiences.insert(
+            shard_rpc_origin(&origin).unwrap(),
+            ValidatorRpcAudience {
+                validator: holder_key.address(),
+                transaction_domain: None,
+                observed_at: Instant::now(),
+            },
+        );
+        let announced = ShardInfo {
+            start_layer: 3,
+            end_layer: 7,
+            total_layers: 32,
+            model_id: format!("0x{}", model_id.to_hex()),
+            model_name: "real-origin-through-gateway".to_string(),
+            execution_profile: canonical_profile(),
+            memory_mb: 1,
+            full_model_mb: 1,
+            socket_addr: origin.clone(),
+            node_name: "peer-behind-gateway".to_string(),
+        };
+        let signed = sign_validator_shard_announcement(
+            announced,
+            &holder_key,
+            coordinator.validator_address,
+            None,
+        )
+        .unwrap();
+        let Json(response) = announce_shard(
+            AxumState(coordinator.clone()),
+            ConnectInfo(RpcPeerAddr("127.0.0.1:49152".parse().unwrap())),
+            Json(signed),
+        )
+        .await
+        .expect("a configured remote origin announced through the gateway is legitimate");
+        assert_eq!(response["ok"], true);
+        assert_eq!(coordinator.shard_registry.len(), 1);
+        let registered = coordinator.shard_registry.iter().next().unwrap();
+        let (shard, _) = registered.value();
+        // The peer's own origin survived: it was not rewritten to this node.
+        assert_eq!(shard.socket_addr, origin);
+        assert!(!shard.socket_addr.contains("127.0.0.1"));
+    }
+
+    /// This node's own stub refresh from its own process still binds to
+    /// loopback, which is the behaviour the shortcut existed for.
+    #[tokio::test]
+    async fn this_nodes_own_stub_refresh_from_localhost_still_binds_to_loopback() {
+        let own_key = arc_crypto::KeyPair::generate_ed25519();
+        let state = Arc::new(arc_state::StateDB::new());
+        state.seed_genesis_validators(&[(
+            own_key.address(),
+            arc_state::StateDB::MIN_VALIDATOR_STAKE,
+        )]);
+        let model_id = arc_crypto::hash_bytes(b"self-refresh-artifact");
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = state;
+        coordinator.model_artifact_id = Some(model_id);
+        // The announcement is signed by this node's own validator identity.
+        coordinator.validator_address = own_key.address();
+        coordinator.shard_rpc_audiences.insert(
+            shard_rpc_origin("http://127.0.0.1:9944").unwrap(),
+            ValidatorRpcAudience {
+                validator: own_key.address(),
+                transaction_domain: None,
+                observed_at: Instant::now(),
+            },
+        );
+        let announced = ShardInfo {
+            start_layer: 0,
+            end_layer: 1,
+            total_layers: 1,
+            model_id: format!("0x{}", model_id.to_hex()),
+            model_name: "self-refresh".to_string(),
+            execution_profile: canonical_profile(),
+            memory_mb: 1,
+            full_model_mb: 1,
+            socket_addr: "http://0.0.0.0:9944".to_string(),
+            node_name: "self".to_string(),
+        };
+        let signed = sign_validator_shard_announcement(
+            announced,
+            &own_key,
+            coordinator.validator_address,
+            None,
+        )
+        .unwrap();
+        let Json(response) = announce_shard(
+            AxumState(coordinator.clone()),
+            ConnectInfo(RpcPeerAddr("127.0.0.1:49152".parse().unwrap())),
+            Json(signed),
+        )
+        .await
+        .expect("a node's own stub refresh from its own process is accepted");
+        assert_eq!(response["ok"], true);
+        let registered = coordinator.shard_registry.iter().next().unwrap();
+        assert!(
+            registered.value().0.socket_addr.contains("127.0.0.1"),
+            "own stub refresh binds to loopback: {}",
+            registered.value().0.socket_addr
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_shard_aliases_dedupe_by_signer_and_same_labels_do_not_collide() {
+        let first_key = arc_crypto::KeyPair::generate_ed25519();
+        let second_key = arc_crypto::KeyPair::generate_ed25519();
+        let state = Arc::new(arc_state::StateDB::new());
+        state.seed_genesis_validators(&[
+            (first_key.address(), arc_state::StateDB::MIN_VALIDATOR_STAKE),
+            (
+                second_key.address(),
+                arc_state::StateDB::MIN_VALIDATOR_STAKE,
+            ),
+        ]);
+
+        let model_id = arc_crypto::hash_bytes(b"signed-alias-collision-artifact");
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = state;
+        coordinator.model_artifact_id = Some(model_id);
+        let origins = [
+            "https://203.0.113.15".to_string(),
+            "https://203.0.113.16".to_string(),
+            "https://203.0.113.17".to_string(),
+        ];
+        coordinator.community_rpc_bases = Arc::new(origins.to_vec());
+        for (origin, validator) in [
+            (&origins[0], first_key.address()),
+            (&origins[1], first_key.address()),
+            (&origins[2], second_key.address()),
+        ] {
+            coordinator.shard_rpc_audiences.insert(
+                shard_rpc_origin(origin).unwrap(),
+                ValidatorRpcAudience {
+                    validator,
+                    transaction_domain: None,
+                    observed_at: Instant::now(),
+                },
+            );
+        }
+
+        let announce = |origin: String, key: &arc_crypto::KeyPair| {
+            sign_validator_shard_announcement(
+                ShardInfo {
+                    start_layer: 0,
+                    end_layer: 1,
+                    total_layers: 1,
+                    model_id: format!("0x{}", model_id.to_hex()),
+                    model_name: "one-layer-test".to_string(),
+                    execution_profile: canonical_profile(),
+                    memory_mb: 1,
+                    full_model_mb: 1,
+                    socket_addr: origin,
+                    node_name: "shared-display-label".to_string(),
+                },
+                key,
+                coordinator.validator_address,
+                None,
+            )
+            .unwrap()
+        };
+
+        for (origin, key) in [
+            (origins[0].clone(), &first_key),
+            (origins[1].clone(), &first_key),
+            (origins[2].clone(), &second_key),
+        ] {
+            let Json(response) = announce_shard(
+                AxumState(coordinator.clone()),
+                ConnectInfo(RpcPeerAddr("127.0.0.1:49152".parse().unwrap())),
+                Json(announce(origin, key)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["ok"], true);
+        }
+
+        let selection = assemble_profile_bound_pipeline_for(
+            &coordinator,
+            Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE),
+        )
+        .expect("signed aliases should produce a complete two-replica range");
+        assert_eq!(selection.hops[0].1.len(), 2);
+        let identities = selection.hops[0]
+            .1
+            .iter()
+            .map(|shard| shard.node_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities.len(), 2);
+        assert!(identities.contains(&format!("0x{}", first_key.address().to_hex())));
+        assert!(identities.contains(&format!("0x{}", second_key.address().to_hex())));
     }
 
     #[test]
@@ -24380,6 +26676,51 @@ mod tests {
             Some(true),
             "a node with no readable block must never report the chain as advancing"
         );
+    }
+
+    #[tokio::test]
+    async fn latest_block_returns_newest_available_block_below_reserved_height() {
+        let mut node = fake_node_with_workers(Vec::new());
+        node.state = Arc::new(arc_state::StateDB::with_genesis(&[]));
+
+        // Genesis is intentionally not exposed as a produced latest block.
+        assert!(matches!(
+            get_latest_block(AxumState(node.clone())).await,
+            Err(StatusCode::NOT_FOUND)
+        ));
+
+        let (block, _) = node.state.execute_block(&[], Hash256([33; 32])).unwrap();
+        let reserved_height = node.state.height() + 1;
+
+        // This reproduces the API's observable race without timing: the state
+        // counter has reserved the next height, while the preceding block is
+        // present and can be served by the explicit-height endpoint.
+        let Json(reserved_latest) = latest_block_at(&node, reserved_height).unwrap();
+        assert_eq!(reserved_latest.hash, block.hash);
+
+        let Json(latest) = get_latest_block(AxumState(node)).await.unwrap();
+        assert_eq!(latest.hash, block.hash);
+
+        let empty = fake_node_with_workers(Vec::new());
+        assert!(matches!(
+            get_latest_block(AxumState(empty)).await,
+            Err(StatusCode::NOT_FOUND)
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_v3_wire_health_exposes_restricted_transport() {
+        let mut node = fake_node_with_workers(Vec::new());
+        node.transport_wire_policy = Arc::new(arc_net::transport::TransportWirePolicy::new(true));
+        let response = serde_json::to_value(health(AxumState(node)).await.0).unwrap();
+        assert_eq!(response["legacy_v3_wire"], true);
+        assert_eq!(response["extended_consensus_wire_enabled"], false);
+        assert_eq!(response["wire_messages_suppressed"], 0);
+
+        let normal = fake_node_with_workers(Vec::new());
+        let response = serde_json::to_value(health(AxumState(normal)).await.0).unwrap();
+        assert_eq!(response["legacy_v3_wire"], false);
+        assert_eq!(response["extended_consensus_wire_enabled"], true);
     }
 
     /// Both directions of the status mapping, including the one a stake-0

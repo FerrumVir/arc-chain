@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { seedOnboarded } from "./helpers";
+import { seedMockOverrides, seedOnboarded } from "./helpers";
 
 const TEST_WORKER = "99".repeat(32);
 
@@ -167,6 +167,90 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("sidebar")).toBeVisible();
     await expect(page.getByTestId("main")).toBeVisible();
     await expect(page.getByTestId("dashboard")).toBeVisible();
+  });
+
+  test("uses one fresh host overview for Dashboard height and last-block age", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      fetch_network_overview: {
+        sourceHost: "http://136.244.109.1:9944",
+        height: 2_989_219,
+        lastBlockAgeSecs: 0,
+      },
+    });
+    await page.goto("/");
+
+    await expect(page.getByTestId("dashboard-chain-height")).toHaveText(
+      "2,989,219",
+    );
+    await expect(page.getByTestId("chain-block-age")).toHaveText("0s ago");
+    await expect(page.getByTestId("btn-open-network")).toContainText("(AMS)");
+  });
+
+  test("shows an unavailable block age instead of stale status age", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      fetch_network_overview: {
+        sourceHost: "http://136.244.109.1:9944",
+        height: 2_989_219,
+        lastBlockAgeSecs: null,
+      },
+    });
+    await page.goto("/");
+
+    await expect(page.getByTestId("chain-block-age")).toHaveText(
+      "Unavailable",
+    );
+  });
+
+  test("marks cached chain figures unavailable after an overview refetch fails", async ({
+    page,
+  }) => {
+    test.setTimeout(45_000);
+    await page.addInitScript((overview) => {
+      type TestWindow = Window & {
+        __ARC_MOCK__?: Record<string, unknown>;
+        __NETWORK_OVERVIEW_OFFLINE__?: boolean;
+      };
+      const testWindow = window as TestWindow;
+      testWindow.__NETWORK_OVERVIEW_OFFLINE__ = false;
+      const overrides: Record<string, unknown> = {};
+      Object.defineProperty(overrides, "fetch_network_overview", {
+        get: () => {
+          if (testWindow.__NETWORK_OVERVIEW_OFFLINE__) {
+            return {
+              then: (
+                _resolve: (value: unknown) => unknown,
+                reject: (reason: Error) => unknown,
+              ) => reject(new Error("network unavailable")),
+            };
+          }
+          return overview;
+        },
+      });
+      testWindow.__ARC_MOCK__ = overrides;
+    }, {
+      sourceHost: "http://136.244.109.1:9944",
+      height: 2_989_219,
+      lastBlockAgeSecs: 0,
+    });
+    await page.goto("/");
+
+    await expect(page.getByTestId("chain-block-age")).toHaveText("0s ago");
+    await page.evaluate(() => {
+      (window as Window & { __NETWORK_OVERVIEW_OFFLINE__?: boolean })
+        .__NETWORK_OVERVIEW_OFFLINE__ = true;
+    });
+
+    await expect(page.getByTestId("chain-block-age")).toHaveText(
+      "Unavailable",
+      { timeout: 40_000 },
+    );
+    await expect(page.getByTestId("dashboard-chain-height")).toHaveText(
+      "Unavailable",
+    );
   });
 
   test("shows only host-confirmed mined rewards as an ARC amount", async ({ page }) => {
@@ -475,6 +559,32 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("sidebar-status")).toContainText("Running");
     await page.getByTestId("btn-stop").click();
     await expect(page.getByTestId("btn-start")).toBeVisible({ timeout: 4000 });
+  });
+
+  test("restart really restarts: the node goes back through syncing", async ({ page }) => {
+    await page.goto("/");
+    await page.getByTestId("btn-start").click();
+    await expect(page.getByTestId("syncing-banner")).toBeVisible({ timeout: 4000 });
+    // The mock reports "live" once the node has been up for 8 s.
+    await expect(page.getByTestId("syncing-banner")).toBeHidden({ timeout: 20_000 });
+    const restart = page.getByTestId("btn-restart");
+    await expect(restart).toBeEnabled();
+    await restart.click();
+    // Uptime was reset by restart_node, so health is "syncing" again.
+    await expect(page.getByTestId("syncing-banner")).toBeVisible({ timeout: 8000 });
+    await expect(page.getByTestId("btn-stop")).toBeVisible();
+  });
+
+  test("a node this desktop did not spawn cannot be restarted from it", async ({ page }) => {
+    await page.addInitScript(() => {
+      (globalThis as { __ARC_MOCK_EXTERNAL_NODE__?: boolean }).__ARC_MOCK_EXTERNAL_NODE__ = true;
+    });
+    await page.goto("/");
+    await page.getByTestId("btn-start").click();
+    const restart = page.getByTestId("btn-restart");
+    await expect(restart).toBeVisible({ timeout: 4000 });
+    await expect(restart).toBeDisabled();
+    await expect(restart).toHaveAttribute("title", /managed externally/);
   });
 
   test("stats grid has four cards", async ({ page }) => {

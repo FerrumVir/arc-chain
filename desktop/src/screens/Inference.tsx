@@ -14,6 +14,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
+import { NativePaidRequests } from "../components/NativePaidRequests";
 import { api } from "../lib/tauri";
 import { formatHash } from "../lib/format";
 import { hostLabel } from "../lib/hosts";
@@ -118,6 +119,13 @@ export function Inference() {
   const communityWorker = run.data?.routedVia?.startsWith("community:")
     ? run.data.routedVia.slice("community:".length)
     : null;
+  // A quorum flag without an exact execution-profile binding is incomplete
+  // evidence: it cannot establish that every vote covered the same model and
+  // protocol profile. Keep the result visible, but do not promote it to
+  // authenticated consensus in the product copy.
+  const authenticatedQuorum = Boolean(
+    run.data?.quorumVerified === true && run.data?.profileBound === true,
+  );
   const settlement = run.data?.settlement;
   const isCommunityRewardTx = Boolean(
     settlement?.submitted === true &&
@@ -334,6 +342,9 @@ export function Inference() {
         </div>
       </div>
 
+      {/* Renders only when the pinned host's chain is a protocol-4 chain. */}
+      <NativePaidRequests />
+
       <Card featured style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader
           title={
@@ -480,7 +491,7 @@ export function Inference() {
             <Coins size={15} style={{ flexShrink: 0, marginTop: 1 }} />
             <span>
               <strong>Prompts are free; worker rewards are separate.</strong>{" "}
-              This app does not sign or submit a paid requester escrow. A
+              This free prompt path does not sign or submit a paid requester escrow. A
               coordinator may still assign the prompt to an eligible community
               worker and return a validator-authorized <code>0x25</code> reward
               transaction for that worker. It is pending until the selected
@@ -626,15 +637,15 @@ export function Inference() {
                     </>
                   )}
                 </>
-              ) : run.data.quorumVerified && communityWorker ? (
-                <> · independently checked with authenticated 2-of-3 range quorums</>
+              ) : authenticatedQuorum && communityWorker ? (
+                <> · independently checked with authenticated replica agreement</>
               ) : (
                 <> · no independent replica-agreement evidence returned</>
               )}
               {run.data.profileBound
                 ? " · exact execution profile bound"
                 : " · execution profile not proven"}
-              {run.data.quorumVerified
+              {authenticatedQuorum
                 ? " · authenticated quorum verified"
                 : " · quorum not verified"}
             </span>

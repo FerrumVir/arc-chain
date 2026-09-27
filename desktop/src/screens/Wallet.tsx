@@ -12,6 +12,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
 import { api } from "../lib/tauri";
+import { isNativeOnlyChain } from "../lib/native-request";
 import { useAppStore } from "../lib/store";
 import { formatArcExact, formatInt } from "../lib/format";
 import type { TxLookup, WalletTxResult } from "../lib/types";
@@ -83,6 +84,16 @@ export function Wallet() {
     onSuccess: setTrackedTx,
   });
 
+  // Only a protocol-4 native-only chain refuses ordinary transfers and faucet
+  // claims. Migrated protocol-3 chains can serve native inference alongside them.
+  const nativeContext = useQuery({
+    queryKey: ["native-context"],
+    queryFn: api.nativeContext,
+    refetchInterval: 15_000,
+    retry: false,
+  });
+  const nativeOnly = isNativeOnlyChain(nativeContext.data);
+
   const send = useMutation({
     mutationFn: () => api.sendArc(recipient.trim(), amountArc.trim()),
     onSuccess: (result) => {
@@ -116,6 +127,7 @@ export function Wallet() {
 
   const submitTransfer = (event: FormEvent) => {
     event.preventDefault();
+    if (nativeOnly) return;
     send.mutate();
   };
 
@@ -128,8 +140,9 @@ export function Wallet() {
         <div>
           <h1 className="page-title">Wallet</h1>
           <p className="page-subtitle">
-            Manage your ARC balance, receive funds, or claim from the testnet
-            faucet.
+            {nativeOnly
+              ? "Your ARC balance on a chain that carries only native paid-inference transactions."
+              : "Manage your ARC balance, receive funds, or claim from the testnet faucet."}
           </p>
         </div>
       </div>
@@ -142,11 +155,20 @@ export function Wallet() {
               <InfoPopover title="On-chain balance">
                 <p>
                   Your balance is fetched from the chain via{" "}
-                  <code>GET /account/&lt;address&gt;</code>. It reflects every
-                  successful transaction retained by this selected host:
-                  faucet credits, transfers, and mined community-reward
-                  transactions (<code>0x25</code>). A raw inference attestation
-                  (<code>0x16</code>) is not payment.
+                  <code>GET /account/&lt;address&gt;</code>.{" "}
+                  {nativeOnly ? (
+                    <>
+                      On this chain it changes only through native paid
+                      requests: reservations, settlements and refunds.
+                    </>
+                  ) : (
+                    <>
+                      It reflects every successful transaction retained by this
+                      selected host: faucet credits, transfers, and mined
+                      community-reward transactions (<code>0x25</code>). A raw
+                      inference attestation (<code>0x16</code>) is not payment.
+                    </>
+                  )}
                 </p>
                 <p style={{ color: "var(--text-muted)", fontSize: 11 }}>
                   Updates every 4 seconds.
@@ -209,12 +231,27 @@ export function Wallet() {
             <button
               className="btn btn-primary btn-lg"
               onClick={() => faucet.mutate()}
-              disabled={faucet.isPending}
+              disabled={faucet.isPending || nativeOnly}
               data-testid="btn-faucet"
             >
               <Droplet size={16} />{" "}
               {faucet.isPending ? "Submitting…" : "Claim 1 ARC"}
             </button>
+            {nativeOnly && (
+              <div
+                style={{
+                  marginTop: "var(--space-2)",
+                  fontSize: "var(--text-xs)",
+                  color: "var(--text-muted)",
+                  textAlign: "right",
+                  maxWidth: 260,
+                }}
+                data-testid="faucet-unavailable"
+              >
+                A faucet claim is an ordinary transfer, and this chain carries
+                only native paid-inference transactions.
+              </div>
+            )}
             {faucet.isSuccess && (
               <div
                 style={{
@@ -273,7 +310,9 @@ export function Wallet() {
               marginBottom: "var(--space-3)",
             }}
           >
-            Share your address to receive ARC.
+            {nativeOnly
+              ? "Transfers cannot reach this address on this chain."
+              : "Share your address to receive ARC."}
           </p>
           <div
             style={{
@@ -365,13 +404,29 @@ export function Wallet() {
               className="btn btn-primary"
               type="submit"
               disabled={
-                send.isPending || recipient.trim() === "" || amountArc.trim() === ""
+                nativeOnly ||
+                send.isPending ||
+                recipient.trim() === "" ||
+                amountArc.trim() === ""
               }
               data-testid="btn-send-arc"
               style={{ width: "100%", justifyContent: "center" }}
             >
               <Send size={14} /> {send.isPending ? "Signing and submitting…" : "Send ARC"}
             </button>
+            {nativeOnly && (
+              <p
+                style={{
+                  marginTop: "var(--space-2)",
+                  fontSize: "var(--text-xs)",
+                  color: "var(--text-muted)",
+                }}
+                data-testid="send-unavailable"
+              >
+                This chain carries only native paid-inference transactions, so
+                ARC cannot be transferred here. Nothing is signed.
+              </p>
+            )}
           </form>
           {send.isSuccess && (
             <div

@@ -1,6 +1,6 @@
 use crate::node_manager::{managed_binary_path, TestnetResources};
 use crate::types::*;
-use crate::{hardware, identity, paths, rpc_client, AppState, CommunityReceiptRoute};
+use crate::{hardware, identity, paths, rpc_client, store::Store, AppState, CommunityReceiptRoute};
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 use ssh_key::{PublicKey, SshSig};
@@ -50,15 +50,124 @@ pub async fn detect_hardware() -> CmdResult<HardwareInfo> {
 
 #[tauri::command]
 pub async fn generate_identity(state: State<'_, AppState>) -> CmdResult<IdentityPublic> {
-    let id = identity::generate();
-    let public = IdentityPublic::from(&id);
-    {
-        let mut store = state.store.lock().await;
-        store.identity = Some(id);
-        let dir = state.data_dir.lock().await.clone();
-        store.save_to(&dir).map_err(map_err)?;
+    let mut store = state.store.lock().await;
+    let dir = state.data_dir.lock().await.clone();
+    generate_identity_if_missing(&mut store, &dir)
+}
+
+/// Return the existing wallet during onboarding even before a node config
+/// exists. The caller holds the store mutex across this check and creation so
+/// concurrent IPC requests cannot replace one generated seed with another.
+fn generate_identity_if_missing(store: &mut Store, dir: &Path) -> CmdResult<IdentityPublic> {
+    if store.identity.is_none() {
+        store.identity = Some(identity::generate());
     }
+
+    // Retain the generated identity if saving fails. Store::save_to can
+    // publish store.json before a later durability check fails, so a retry
+    // must persist this same key rather than generate a replacement.
+    let public = IdentityPublic::from(store.identity.as_ref().unwrap());
+    store.save_to(dir).map_err(map_err)?;
     Ok(public)
+}
+
+#[cfg(test)]
+mod identity_generation_tests {
+    use super::*;
+    use crate::types::Identity;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn saved_identity() -> Identity {
+        Identity {
+            address: format!("0x{}", "11".repeat(32)),
+            public_key: format!("0x{}", "22".repeat(32)),
+            seed_phrase: "saved recovery phrase remains native".into(),
+            created_at: 1_758_000_000,
+        }
+    }
+
+    #[test]
+    fn onboarding_reuses_saved_identity_even_without_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = saved_identity();
+        let expected = IdentityPublic::from(&identity);
+        let mut store = Store {
+            identity: Some(identity),
+            config: None,
+            data_migration_notice: None,
+        };
+        store.save_to(dir.path()).unwrap();
+        let original_bytes = std::fs::read(dir.path().join("store.json")).unwrap();
+
+        let actual = generate_identity_if_missing(&mut store, dir.path()).unwrap();
+        let repeated = generate_identity_if_missing(&mut store, dir.path()).unwrap();
+        let saved_bytes = std::fs::read(dir.path().join("store.json")).unwrap();
+
+        assert_eq!(actual.address, expected.address);
+        assert_eq!(actual.public_key, expected.public_key);
+        assert_eq!(actual.created_at, expected.created_at);
+        assert_eq!(repeated.address, expected.address);
+        assert_eq!(repeated.public_key, expected.public_key);
+        assert!(store.config.is_none());
+        assert_eq!(saved_bytes, original_bytes);
+        let reopened = Store::load_from(dir.path());
+        let reopened = IdentityPublic::from(reopened.identity.as_ref().unwrap());
+        assert_eq!(reopened.address, expected.address);
+        assert_eq!(reopened.public_key, expected.public_key);
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_requests_persist_and_return_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(Store::default()));
+        let mut requests = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let dir = dir.path().to_path_buf();
+            requests.push(tokio::spawn(async move {
+                let mut store = store.lock().await;
+                generate_identity_if_missing(&mut store, &dir)
+            }));
+        }
+
+        let mut results = Vec::new();
+        for request in requests {
+            results.push(request.await.unwrap().unwrap());
+        }
+        assert!(results
+            .iter()
+            .all(|identity| identity.address == results[0].address));
+        assert!(results
+            .iter()
+            .all(|identity| identity.public_key == results[0].public_key));
+
+        let persisted = Store::load_from(dir.path());
+        let persisted = IdentityPublic::from(persisted.identity.as_ref().unwrap());
+        assert_eq!(persisted.address, results[0].address);
+        assert_eq!(persisted.public_key, results[0].public_key);
+    }
+
+    #[test]
+    fn failed_first_save_retains_the_same_identity_for_a_durable_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"file blocks the app-data directory").unwrap();
+        let mut store = Store::default();
+
+        assert!(generate_identity_if_missing(&mut store, &blocker.join("child")).is_err());
+        let pending = IdentityPublic::from(store.identity.as_ref().unwrap());
+
+        let retry_dir = tempfile::tempdir().unwrap();
+        let retry = generate_identity_if_missing(&mut store, retry_dir.path()).unwrap();
+        let reopened = Store::load_from(retry_dir.path());
+        let reopened = IdentityPublic::from(reopened.identity.as_ref().unwrap());
+
+        assert_eq!(retry.address, pending.address);
+        assert_eq!(retry.public_key, pending.public_key);
+        assert_eq!(reopened.address, pending.address);
+        assert_eq!(reopened.public_key, pending.public_key);
+    }
 }
 
 #[tauri::command]
@@ -553,9 +662,6 @@ pub async fn reset_peer_state(
 pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     let (port, pid, crash, worker_threads) = {
         let mut node = state.node.lock().await;
-        // Opportunistic crash detection - checks if our child process exited
-        // unexpectedly since the last poll.
-        node.try_reap_if_crashed().await;
         let pid = if node.is_running() { node.pid() } else { None };
         let port = node.rpc_port;
         let worker_threads = node.active_worker_threads;
@@ -831,6 +937,16 @@ pub async fn send_arc(
     to: String,
     amount_arc: String,
 ) -> CmdResult<WalletTxResult> {
+    send_arc_inner(&state, to, amount_arc).await
+}
+
+/// The transfer core, callable without a Tauri runtime (the live journey in
+/// `native_paid` drives it against a real chain).
+pub(crate) async fn send_arc_inner(
+    state: &AppState,
+    to: String,
+    amount_arc: String,
+) -> CmdResult<WalletTxResult> {
     let amount_base = crate::wallet::parse_arc_amount(&amount_arc)?;
     if amount_base == 0 {
         return Err("amount must be greater than zero".to_string());
@@ -847,7 +963,18 @@ pub async fn send_arc(
     }
     .ok_or_else(|| "no identity".to_string())?;
 
-    let host = crate::wallet::validate_rpc_origin(&chain_host(&state).await)?;
+    let host = crate::wallet::validate_rpc_origin(&chain_host(state).await)?;
+    // A protocol-4 block carries only a native paid-inference transaction:
+    // its nodes refuse any other at submission and its blocks cannot include
+    // one. Say so before signing instead of after a refused submission. A
+    // host that cannot say is left to refuse the transfer itself.
+    if crate::native_paid::host_carries_only_native_transactions(state, &host).await {
+        return Err(
+            "this chain carries only native paid-inference transactions, so a transfer can \
+             never be included; nothing was signed"
+                .to_string(),
+        );
+    }
     let account = rpc_client::fetch_balance(&state.http, &host, &address).await?;
     let available = account
         .balance_base
@@ -983,7 +1110,7 @@ impl ChainHostChoice {
 /// is deliberately no longer the *first* thing checked and no longer silently
 /// redirects tier 1 alone: it redirects chain reads, which is what it always
 /// actually did.
-async fn chain_host(state: &AppState) -> String {
+pub(crate) async fn chain_host(state: &AppState) -> String {
     for key in ["ARC_WALLET_HOST", "ARC_TIER1_RPC"] {
         if let Ok(env) = std::env::var(key) {
             let trimmed = env.trim();
@@ -1988,6 +2115,84 @@ mod inference_retry_tests {
                 .is_err(),
             "redirect target received a replayed inference POST"
         );
+    }
+
+    /// A loopback protocol-4 or protocol-3 host, recording each requested path.
+    async fn recording_host(context_status: u16) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buffer = vec![0u8; 8192];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let (status, body) = match path.as_str() {
+                        "/native-inference/context" if context_status == 200 => (
+                            200,
+                            r#"{"candidate_protocol":4,"chain_protocol":4,"native_only_chain":true,"request_admission_open":true,"request_admission":{"operator_enabled":true,"runtime_ready":true}}"#,
+                        ),
+                        "/native-inference/context" => (404, ""),
+                        "/network/info" => (
+                            200,
+                            r#"{"protocol_version":"3.0.0","recovery_active":true,"recovery_domain":"0x0101010101010101010101010101010101010101010101010101010101010101"}"#,
+                        ),
+                        _ => (404, ""),
+                    };
+                    log.lock().unwrap().push(path);
+                    let reason = if status == 200 { "OK" } else { "Not Found" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (origin, seen)
+    }
+
+    #[tokio::test]
+    async fn a_transfer_is_refused_before_signing_on_a_protocol_4_host_and_proceeds_elsewhere() {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        for (context_status, protocol_4) in [(200u16, true), (404, false)] {
+            let (origin, seen) = recording_host(context_status).await;
+            let state = test_state();
+            state.store.lock().await.identity = Some(crate::identity::derive(PHRASE).unwrap());
+            *state.chain_host.lock().await = Some((
+                ChainHostChoice {
+                    host: origin,
+                    block_timestamp_ms: 1,
+                    height: 1,
+                },
+                std::time::Instant::now(),
+            ));
+            let outcome = super::send_arc_inner(&state, "11".repeat(32), "1".into()).await;
+            let paths = seen.lock().unwrap().clone();
+            if protocol_4 {
+                let error = outcome.unwrap_err();
+                assert!(error.contains("nothing was signed"), "{error}");
+                // Nothing past the check: no balance read, no submission.
+                assert_eq!(paths, ["/native-inference/context"]);
+            } else {
+                // Not protocol-4: the transfer goes on to read the account. The
+                // stub has none, so it stops there, before any submission.
+                assert!(outcome.is_err());
+                assert!(
+                    paths.iter().any(|path| path.starts_with("/account/")),
+                    "{paths:?}"
+                );
+                assert!(
+                    !paths.iter().any(|path| path == "/tx/submit_signed"),
+                    "{paths:?}"
+                );
+            }
+        }
     }
 }
 
@@ -3719,9 +3924,14 @@ pub async fn list_model_tiers() -> CmdResult<Vec<ModelTierInfo>> {
 /// usefully — frontend should offer "verifier-only" mode instead.
 #[tauri::command]
 pub async fn recommended_tier() -> CmdResult<String> {
-    let hw = hardware::detect();
-    let tier = if hw.ram_gb >= 16 { "standard" } else { "none" };
-    Ok(tier.into())
+    Ok(tier_for_ram_gb(hardware::detect().ram_gb).into())
+}
+
+/// The model tier a machine with `ram_gb` of memory can run. The canonical
+/// 7B package needs about 7.8 GB resident plus its KV cache (M1 manifest),
+/// so anything under 16 GB is offered no model rather than a failing one.
+fn tier_for_ram_gb(ram_gb: u64) -> &'static str {
+    if ram_gb >= 16 { "standard" } else { "none" }
 }
 
 /// Returns `Some(path)` only when the matching tier's GGUF is byte-for-byte
@@ -3936,6 +4146,46 @@ pub async fn remove_model(tier: String) -> CmdResult<()> {
 
 #[allow(dead_code)]
 fn _path_helper(_: &Path) {} // keep `Path` import used if `model_path_for` returns inline
+
+#[cfg(test)]
+mod model_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn a_model_file_is_ready_only_if_every_byte_matches_the_pinned_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        let bytes = b"FIXTURE gguf bytes, not a model".to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+        let digest: &'static str = Box::leak(hex::encode(Sha256::digest(&bytes)).into_boxed_str());
+        let spec = ModelTierSpec {
+            id: "fixture",
+            display_name: "Fixture",
+            url: "https://example.invalid/model.gguf",
+            size_bytes: bytes.len() as u64,
+            sha256: digest,
+        };
+        assert_eq!(verify_model_file(&path, &spec), Ok(true));
+        // Same size, one byte flipped: never ready.
+        let mut flipped = bytes.clone();
+        flipped[3] ^= 1;
+        std::fs::write(&path, &flipped).unwrap();
+        assert_eq!(verify_model_file(&path, &spec), Ok(false));
+        // Truncated, then missing: not ready either.
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(verify_model_file(&path, &spec), Ok(false));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(verify_model_file(&path, &spec), Ok(false));
+    }
+
+    #[test]
+    fn only_a_machine_with_room_for_the_canonical_model_is_offered_it() {
+        assert_eq!(tier_for_ram_gb(8), "none");
+        assert_eq!(tier_for_ram_gb(15), "none");
+        assert_eq!(tier_for_ram_gb(16), "standard");
+        assert_eq!(tier_for_ram_gb(64), "standard");
+    }
+}
 
 #[cfg(test)]
 mod release_binary_tests {

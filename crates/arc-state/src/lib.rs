@@ -1,11 +1,19 @@
 pub mod block_stm;
+pub mod checkpoint_adoption;
 pub mod gpu_state;
+pub mod inference_contract_state;
+pub use inference_contract_state::{
+    AllowedExecution, InferenceAdmissionContext, IsolatedInferenceLedger, IsolatedTransitionResult,
+    NativeInferencePendingSnapshot, NativeInferenceReceiptSnapshot, NativeInferenceTransactionLink,
+    NativeMigrationRecord, NativeSelectionRule, validate_native_inference_activation,
+};
 pub mod io_backend;
 pub mod jmt_store;
 pub mod light_client;
 pub mod mmap_state;
 pub mod recovery;
 pub mod simd_parse;
+pub mod snapshot;
 pub mod wal;
 
 use arc_crypto::{Hash256, IncrementalMerkle, MerkleTree, hash_bytes, hash_pair};
@@ -586,6 +594,12 @@ pub struct StateDB {
     pub full_transactions: DashMap<[u8; 32], Transaction>,
     /// Blocks since last snapshot.
     snapshot_counter: AtomicU64,
+    /// How many of the most recent heights a durable snapshot carries the
+    /// history of. See `export_durable_snapshot`.
+    snapshot_history_window: AtomicU64,
+    /// The anchor round of the latest checkpoint this node adopted (0: none).
+    /// Consensus resumes scanning at the round after it.
+    rebase_anchor_round: AtomicU64,
     /// Total benchmark transactions executed (atomic counter for /stats).
     pub benchmark_tx_count: AtomicU64,
     /// Async indexer channel - sends batches to background threads.
@@ -661,6 +675,32 @@ pub struct StateDB {
     recovery_context: RwLock<Option<recovery::RecoveryContext>>,
     /// Exact operator-approved manifest that established `recovery_context`.
     recovery_manifest_hash: RwLock<Option<Hash256>>,
+    native_inference_context: RwLock<Option<InferenceAdmissionContext>>,
+    /// Operator authorisation to activate native inference on a chain that is
+    /// already running (see `NativeMigrationRecord`). Absent means the
+    /// original rule applies: fresh genesis only, never recovery-bound state.
+    pub(crate) native_migration:
+        RwLock<Option<crate::inference_contract_state::NativeMigrationRecord>>,
+    /// The binding a still-pending migration will freeze when its coordinated
+    /// height arrives. Held with the record so the activation is performed by
+    /// the chain itself at that height, rather than only by whichever node
+    /// happened to be starting up at that moment.
+    pub(crate) pending_migration_context: RwLock<Option<InferenceAdmissionContext>>,
+    /// Bindings that have been superseded but are still named by requests
+    /// admitted under them. A configuration update governs NEW requests; work
+    /// already in flight settles or refunds under the binding it was admitted
+    /// with, so that binding stays available until nothing references it.
+    pub(crate) superseded_bindings:
+        RwLock<std::collections::BTreeMap<[u8; 32], InferenceAdmissionContext>>,
+    /// A binding update the operator has authorised but the chain has not
+    /// reached yet: the coordinated height, the binding being replaced, and
+    /// the one replacing it. Publishing a binding writes state, so every
+    /// validator has to do it in the same block or they derive different
+    /// roots from there on - the same reason activation names one height.
+    pub(crate) pending_binding_update: RwLock<Option<(u64, Hash256, InferenceAdmissionContext)>>,
+    native_inference_pending: DashMap<[u8; 32], u64>,
+    native_inference_execution: parking_lot::Mutex<()>,
+    native_inference_publication: RwLock<()>,
 }
 
 impl StateDB {
@@ -689,6 +729,7 @@ impl StateDB {
         &self,
         transactions: &[Transaction],
     ) -> Result<(), StateError> {
+        self.validate_native_inference_block_admission(transactions)?;
         if self.active_protocol_version().major == 3 {
             let height = self.height().checked_add(1).ok_or_else(|| {
                 StateError::ExecutionError("prospective v3 block height overflow".to_string())
@@ -713,6 +754,8 @@ impl StateDB {
             identities: DashMap::new(),
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
+            snapshot_history_window: AtomicU64::new(snapshot::DEFAULT_HISTORY_WINDOW),
+            rebase_anchor_round: AtomicU64::new(0),
             benchmark_tx_count: AtomicU64::new(0),
             #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
@@ -741,6 +784,14 @@ impl StateDB {
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
             recovery_context: RwLock::new(None),
             recovery_manifest_hash: RwLock::new(None),
+            native_inference_context: RwLock::new(None),
+            native_migration: RwLock::new(None),
+            pending_migration_context: RwLock::new(None),
+            superseded_bindings: RwLock::new(std::collections::BTreeMap::new()),
+            pending_binding_update: RwLock::new(None),
+            native_inference_pending: DashMap::new(),
+            native_inference_execution: parking_lot::Mutex::new(()),
+            native_inference_publication: RwLock::new(()),
         }
     }
 
@@ -761,6 +812,8 @@ impl StateDB {
             identities: DashMap::new(),
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
+            snapshot_history_window: AtomicU64::new(snapshot::DEFAULT_HISTORY_WINDOW),
+            rebase_anchor_round: AtomicU64::new(0),
             benchmark_tx_count: AtomicU64::new(0),
             #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
@@ -789,6 +842,14 @@ impl StateDB {
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
             recovery_context: RwLock::new(None),
             recovery_manifest_hash: RwLock::new(None),
+            native_inference_context: RwLock::new(None),
+            native_migration: RwLock::new(None),
+            pending_migration_context: RwLock::new(None),
+            superseded_bindings: RwLock::new(std::collections::BTreeMap::new()),
+            pending_binding_update: RwLock::new(None),
+            native_inference_pending: DashMap::new(),
+            native_inference_execution: parking_lot::Mutex::new(()),
+            native_inference_publication: RwLock::new(()),
         })
     }
 
@@ -881,12 +942,42 @@ impl StateDB {
         Self::verify_or_create_genesis_binding(wal_dir, wal_path.exists(), expected_genesis_hash)?;
 
         if wal_path.exists() {
-            // WAL exists - replay to recover state
+            // WAL exists - replay to recover state. Validation still walks the
+            // whole log: it checks the genesis prefix, block/checkpoint
+            // pairing and chain linkage, and a snapshot does not make earlier
+            // records trustworthy. What the snapshot bounds is the far more
+            // expensive part - APPLYING every record ever written.
             let entries = Self::prepare_normal_wal_replay(&wal_path, prefunded)?;
             let state = Self::with_persistence(&wal_path)?;
-            let entry_count = entries.len();
+            let adopted = state.adopt_snapshot_if_trustworthy(wal_dir);
+            let resume_from = adopted.map(|manifest| manifest.resume_from_sequence);
+            let mut entry_count = 0usize;
+            let mut history_rebuilt = 0usize;
             for entry in &entries {
+                if resume_from.is_some_and(|first| entry.sequence < first) {
+                    // Before the snapshot: its state is already installed, but
+                    // a snapshot carries only a recent window of history. The
+                    // rest is rebuilt here from the records that were just
+                    // decoded and validated anyway - insertion, never
+                    // execution, so the cost is the same order as reading.
+                    if Self::is_history_op(&entry.op) {
+                        state.apply_wal_op(&entry.op);
+                        history_rebuilt += 1;
+                    } else if let WalOp::Rebase(record) = &entry.op {
+                        // A rebase below the snapshot: its state is already
+                        // in the snapshot, its history window and its resume
+                        // round are not.
+                        state.install_history_window(&record.state);
+                        state.apply_wal_op(&WalOp::SetBlock(record.height, record.tip.clone()));
+                        state
+                            .rebase_anchor_round
+                            .fetch_max(record.anchor_round, Ordering::AcqRel);
+                        history_rebuilt += 1;
+                    }
+                    continue;
+                }
                 state.apply_wal_op(&entry.op);
+                entry_count += 1;
             }
 
             // Insert genesis block if not already present from WAL replay
@@ -895,12 +986,16 @@ impl StateDB {
             }
 
             tracing::info!(
-                "WAL recovery complete: replayed {} entries, {} accounts, height {}",
-                entry_count,
-                state.accounts.len(),
-                state.height()
+                replayed = entry_count,
+                history_rebuilt,
+                of_total = entries.len(),
+                from_snapshot_height = ?adopted.map(|m| m.identity.height),
+                accounts = state.accounts.len(),
+                height = state.height(),
+                "WAL recovery complete"
             );
 
+            state.restore_native_inference_context()?;
             Ok(state)
         } else {
             // Build the complete genesis WAL at an inert staging name. The
@@ -1184,6 +1279,46 @@ impl StateDB {
                     }
                     accepted_entries = index + 1;
                 }
+                WalOp::Rebase(record) => {
+                    // An adopted checkpoint: it must move the chain forward to
+                    // a self-consistent tip, and its state must reproduce the
+                    // root that tip's header carries - the root a quorum
+                    // certified when it was adopted. Contiguity and linkage
+                    // then continue from the tip.
+                    if pending_block.is_some()
+                        || record.height <= last_checkpoint_height
+                        || !record.state.receipts.is_empty()
+                        || !record.state.event_logs.is_empty()
+                        || !record.state.full_transactions.is_empty()
+                        || !record.state.native_inference_pending.is_empty()
+                        || record.state.recovery_context.is_some()
+                        || record.state.height != record.height
+                        || record.tip.header.height != record.height
+                        || Block::compute_hash(&record.tip.header) != record.tip.hash
+                        || checkpoint_adoption::accounts_bound_to_keys(&record.state).is_err()
+                    {
+                        return Err(StateError::PersistenceError(format!(
+                            "state WAL rebase to height {} is not a forward move to a \
+                             self-consistent tip",
+                            record.height
+                        )));
+                    }
+                    // The window the record carries has to chain to that tip:
+                    // these blocks become this node's history at replay, so
+                    // they get the same check the adoption did.
+                    checkpoint_adoption::verify_history_window(&record.state.blocks, &record.tip)?;
+                    validation.apply_wal_op(&entry.op);
+                    let actual_root = validation.get_state_root();
+                    if actual_root != record.tip.header.state_root {
+                        return Err(StateError::PersistenceError(format!(
+                            "state WAL rebase root mismatch: tip {} carries {}, state replays {actual_root}",
+                            record.height, record.tip.header.state_root
+                        )));
+                    }
+                    previous_block_hash = record.tip.hash;
+                    last_checkpoint_height = record.height;
+                    accepted_entries = index + 1;
+                }
                 _ => validation.apply_wal_op(&entry.op),
             }
         }
@@ -1235,6 +1370,15 @@ impl StateDB {
 
     /// Recover state from a snapshot and WAL replay.
     pub fn recover(snapshot: Snapshot, wal_path: impl AsRef<Path>) -> Result<Self, StateError> {
+        if snapshot.storage.iter().any(|(_, entries)| {
+            entries
+                .iter()
+                .any(|(key, _)| *key == inference_contract_state::activation_key())
+        }) {
+            return Err(StateError::PersistenceError(
+                "native inference state requires genesis-bound checkpointed WAL recovery".into(),
+            ));
+        }
         let state = Self::with_persistence(&wal_path)?;
 
         // Load snapshot state
@@ -1265,10 +1409,41 @@ impl StateDB {
             state.height()
         );
 
+        if state.storage.iter().any(|entries| {
+            entries
+                .value()
+                .contains_key(&inference_contract_state::activation_key())
+        }) {
+            return Err(StateError::PersistenceError(
+                "native inference state requires genesis-bound checkpointed WAL recovery".into(),
+            ));
+        }
+        state.restore_native_inference_context()?;
         Ok(state)
     }
 
     /// Apply a WAL operation to in-memory state (used during recovery replay).
+    /// Records that describe the chain's history - blocks, receipts, bodies,
+    /// event logs - as opposed to its state. Replaying one below a snapshot
+    /// rebuilds history the snapshot deliberately does not carry.
+    fn is_history_op(op: &WalOp) -> bool {
+        matches!(
+            op,
+            WalOp::SetBlock(..)
+                | WalOp::SetReceipt(..)
+                | WalOp::SetFullTransaction(..)
+                | WalOp::SetEventLogs(..)
+        )
+    }
+
+    /// How many of the most recent heights a durable snapshot carries the
+    /// history of (at least 1: the tip block anchors the chain linkage of
+    /// whatever is applied next).
+    pub fn set_snapshot_history_window(&self, heights: u64) {
+        self.snapshot_history_window
+            .store(heights.max(1), Ordering::Release);
+    }
+
     fn apply_wal_op(&self, op: &WalOp) {
         match op {
             WalOp::SetAccount(addr, account) => {
@@ -1343,8 +1518,42 @@ impl StateDB {
                 self.community_rewards_v1_activation_height
                     .store(activation_height.unwrap_or(u64::MAX), Ordering::Release);
             }
+            WalOp::InferenceTransition(record) => {
+                for (address, account) in &record.account_updates {
+                    self.accounts.insert(address.0, account.clone());
+                    self.dirty_accounts.insert(address.0);
+                    if let Some(cache) = &self.gpu_cache {
+                        cache.put_account(account);
+                    }
+                }
+                if record.metadata.status == wal::InferenceTransitionStatus::Pending {
+                    self.native_inference_pending
+                        .insert(record.request_id.0, record.admission_height);
+                } else {
+                    self.native_inference_pending.remove(&record.request_id.0);
+                }
+                for (address, key, value) in &record.storage_updates {
+                    self.storage
+                        .entry(address.0)
+                        .or_default()
+                        .insert(*key, value.clone());
+                }
+            }
             WalOp::Checkpoint(_) => {
                 // Checkpoints are informational - no state change
+            }
+            WalOp::Rebase(record) => {
+                // The state is replaced wholesale. History this node already
+                // holds below the checkpoint stays, and so do the indexes
+                // over it (`tx_index`, `receipts`, `account_txs`): adoption
+                // proves the window is byte-identical wherever it overlaps
+                // this node's own blocks, so nothing kept here can describe a
+                // block the window replaced with a different one.
+                self.clear_state_for_rebase();
+                self.install_durable_snapshot(&record.state);
+                self.apply_wal_op(&WalOp::SetBlock(record.height, record.tip.clone()));
+                self.rebase_anchor_round
+                    .fetch_max(record.anchor_round, Ordering::AcqRel);
             }
             WalOp::SetDagBlock(_, _) | WalOp::SetDagRound(_) | WalOp::CommitDagBlock(_) => {
                 // DAG operations are replayed by the consensus engine, not StateDB.
@@ -1586,6 +1795,7 @@ impl StateDB {
 
     /// Get a storage value for a contract.
     pub fn get_storage(&self, contract: &Address, key: &Hash256) -> Option<Vec<u8>> {
+        let _publication = self.native_inference_publication.read();
         self.storage
             .get(&contract.0)
             .and_then(|map| map.get(key).map(|v| v.clone()))
@@ -1613,6 +1823,7 @@ impl StateDB {
     /// When a GPU state cache is enabled, checks GPU memory first for ~40x
     /// bandwidth improvement on hot accounts.
     pub fn get_account(&self, addr: &Address) -> Option<Account> {
+        let _publication = self.native_inference_publication.read();
         // Fast path: check GPU cache first.
         if let Some(ref cache) = self.gpu_cache
             && let Some(acct) = cache.get_account_fast(&addr.0)
@@ -1655,7 +1866,10 @@ impl StateDB {
     /// Store event logs for a specific block height.
     pub fn store_event_logs(&self, height: u64, logs: Vec<arc_types::EventLog>) {
         if !logs.is_empty() {
-            if self.is_persistent() && self.recovery_context().is_some() {
+            if self.is_persistent()
+                && (self.recovery_context().is_some()
+                    || self.native_inference_context.read().is_some())
+            {
                 // Recovery replay currently accepts only signed transition
                 // state followed by canonical SetBlock+Checkpoint boundaries.
                 // Do not emit a standalone durable record that this stricter
@@ -1912,6 +2126,16 @@ impl StateDB {
     }
 
     fn validate_v3_transaction_envelope(&self, tx: &Transaction) -> Result<(), StateError> {
+        let native_active =
+            self.native_migration().is_some() && self.native_inference_context().is_some();
+        self.validate_v3_transaction_envelope_with_native(tx, native_active)
+    }
+
+    fn validate_v3_transaction_envelope_with_native(
+        &self,
+        tx: &Transaction,
+        native_authorized: bool,
+    ) -> Result<(), StateError> {
         if tx.tx_type != tx.body.tx_type() {
             return Err(StateError::ExecutionError(format!(
                 "transaction type/body mismatch: envelope {:?}, body {:?}",
@@ -1919,7 +2143,11 @@ impl StateDB {
                 tx.body.tx_type()
             )));
         }
-        if !Self::v3_allows_transaction(&tx.body) {
+        // A rooted migration adds the native lane to recovery v3. It does not
+        // relax the ordinary v3 family policy or promote the chain to v4.
+        let migrated_native =
+            native_authorized && inference_contract_state::is_native_body(&tx.body);
+        if !Self::v3_allows_transaction(&tx.body) && !migrated_native {
             return Err(StateError::ExecutionError(format!(
                 "transaction type {:?} is unavailable in recovery protocol v3",
                 tx.tx_type
@@ -2556,10 +2784,12 @@ impl StateDB {
         Ok(())
     }
 
-    /// Side-effect-free protocol-v3 ingress validation. RPC, gossip, DAG, and
-    /// restore paths use this before retaining a transaction; the state
-    /// executor independently enforces the same conditions before writes.
+    /// Side-effect-free protocol-v3 ingress validation. Read the prospective
+    /// height and state under the canonical execution lock, so an intervening
+    /// empty block cannot make a valid native transaction fail the exact-height
+    /// check. Canonical execution already holds this lock and uses `_at`.
     pub fn validate_v3_transaction_admission(&self, tx: &Transaction) -> Result<(), StateError> {
+        let _guard = self.native_inference_execution.lock();
         let execution_height = self.height().checked_add(1).ok_or_else(|| {
             StateError::ExecutionError("prospective v3 block height overflow".to_string())
         })?;
@@ -2584,6 +2814,13 @@ impl StateDB {
             TxBody::CommunityInferenceReward(body) => {
                 self.validate_community_reward_admission(tx, body, execution_height)
             }
+            TxBody::NativeInferenceRequest(_)
+            | TxBody::NativeInferenceFinalize(_)
+            | TxBody::NativeInferenceRefund(_) => self
+                .validate_native_inference_block_admission_at(
+                    std::slice::from_ref(tx),
+                    execution_height,
+                ),
             // Keep this list exhaustive rather than using a wildcard: a new
             // transaction family must be consciously classified and wired
             // before the crate can compile.
@@ -2626,6 +2863,88 @@ impl StateDB {
         }
     }
 
+    /// Check signed DAG transaction availability, independently of execution.
+    /// A body's nonce, balance, expiry or terminal status can change while its
+    /// authenticated DAG block is in flight. Those checks belong to proposal
+    /// selection and canonical execution, not reception of consensus parents.
+    /// This does not authorize executing any transaction or opening ingress.
+    pub fn validate_v3_dag_availability(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<(), StateError> {
+        if self.active_protocol_version().major != 3 {
+            return Err(StateError::ExecutionError(
+                "protocol-v3 DAG availability requires recovery protocol v3".into(),
+            ));
+        }
+        let contains_native = transactions
+            .iter()
+            .any(|tx| inference_contract_state::is_native_body(&tx.body));
+        if contains_native && transactions.len() != 1 {
+            return Err(StateError::ExecutionError(
+                "native v3 blocks contain one native transition and cannot mix transaction families".into(),
+            ));
+        }
+        // A lagging node may need the DAG carrying activation's descendants
+        // before it has executed activation itself. Only its locally approved,
+        // matching migration binding permits retaining that native family.
+        // No peer-supplied context, height hint or transaction opens the lane.
+        let native_authorized = contains_native
+            && self.native_migration().is_some_and(|record| {
+                if self.native_inference_context().is_some() {
+                    return true;
+                }
+                record.activation_height > self.height()
+                    && record.refusal_against(self).is_none()
+                    && self
+                        .pending_migration_context
+                        .read()
+                        .as_ref()
+                        .is_some_and(|context| {
+                            inference_contract_state::validate_native_inference_binding_shape(
+                                self, context,
+                            )
+                            .is_ok_and(|commitment| commitment == record.context_commitment)
+                        })
+            });
+        if transactions.len() > V3_MAX_TRANSACTIONS_PER_BLOCK {
+            return Err(StateError::ExecutionError(format!(
+                "v3 block contains {} transactions; maximum is {V3_MAX_TRANSACTIONS_PER_BLOCK}",
+                transactions.len()
+            )));
+        }
+        let mut senders = HashMap::<[u8; 32], usize>::new();
+        let mut hashes = HashSet::new();
+        let mut accessed = HashSet::new();
+        for tx in transactions {
+            if !hashes.insert(tx.hash.0) {
+                return Err(StateError::ExecutionError(
+                    "v3 block contains a duplicate transaction hash".into(),
+                ));
+            }
+            let sender_count = senders.entry(tx.from.0).or_default();
+            *sender_count += 1;
+            if *sender_count > V3_MAX_TRANSACTIONS_PER_SENDER_PER_BLOCK {
+                return Err(StateError::ExecutionError(
+                    "v3 block exceeds per-sender transaction limit".into(),
+                ));
+            }
+            self.validate_v3_transaction_envelope_with_native(tx, native_authorized)?;
+            // Native access is checked by its single-transition planner at
+            // execution; ordinary blocks retain the existing static isolation.
+            if !contains_native {
+                for account in crate::block_stm::tx_access_set(tx).accounts {
+                    if !accessed.insert(account) {
+                        return Err(StateError::ExecutionError(
+                            "v3 block contains overlapping transaction state access".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate a complete candidate v3 state block without mutation. The
     /// launch policy permits one transaction per sender and rejects any
     /// overlapping static account access sets, ensuring that individually
@@ -2646,6 +2965,27 @@ impl StateDB {
         transactions: &[Transaction],
         execution_height: u64,
     ) -> Result<(), StateError> {
+        if transactions
+            .iter()
+            .any(|tx| inference_contract_state::is_native_body(&tx.body))
+        {
+            // Native blocks have a single transition and cannot mix lanes.
+            // This validator is also called under the native execution lock;
+            // use the lock-free planner, not the public ingress lock wrapper.
+            if self.active_protocol_version().major != 3 {
+                return Err(StateError::ExecutionError(
+                    "native v3 block requires recovery protocol v3".into(),
+                ));
+            }
+            if transactions.len() != 1 {
+                return Err(StateError::ExecutionError(
+                    "native v3 blocks contain one native transition and cannot mix transaction families".into(),
+                ));
+            }
+            self.validate_v3_transaction_envelope(&transactions[0])?;
+            return self
+                .validate_native_inference_block_admission_at(transactions, execution_height);
+        }
         if transactions.len() > V3_MAX_TRANSACTIONS_PER_BLOCK {
             return Err(StateError::ExecutionError(format!(
                 "v3 block contains {} transactions; maximum is {V3_MAX_TRANSACTIONS_PER_BLOCK}",
@@ -2682,7 +3022,42 @@ impl StateDB {
     }
 
     /// Get current block height.
+    /// Entry counts of the in-memory collections, for resource diagnostics.
+    /// Blocks, receipts, transaction bodies and indexes are the chain's own
+    /// history and grow with it by design; everything else should plateau.
+    /// `/consensus/diagnostics` reports these so a soak can tell the two apart.
+    pub fn memory_gauges(&self) -> Vec<(&'static str, u64)> {
+        let account_tx_entries: usize = self.account_txs.iter().map(|e| e.value().len()).sum();
+        let event_log_entries: usize = self.event_logs.iter().map(|e| e.value().len()).sum();
+        [
+            ("state_accounts", self.accounts.len()),
+            ("state_storage_contracts", self.storage.len()),
+            ("state_blocks", self.blocks.len()),
+            ("state_receipts", self.receipts.len()),
+            ("state_tx_index", self.tx_index.len()),
+            ("state_full_transactions", self.full_transactions.len()),
+            ("state_account_txs_addresses", self.account_txs.len()),
+            ("state_account_txs_entries", account_tx_entries),
+            ("state_event_log_heights", self.event_logs.len()),
+            ("state_event_log_entries", event_log_entries),
+            ("state_contracts", self.contracts.len()),
+            ("state_identities", self.identities.len()),
+            ("state_signed_block_data", self.signed_block_data.len()),
+            ("state_dirty_accounts", self.dirty_accounts.len()),
+            ("state_validators", self.validators.len()),
+            ("state_native_pending", self.native_inference_pending.len()),
+            (
+                "state_pending_bond_release_heights",
+                self.pending_bond_releases.lock().len(),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, len)| (name, len as u64))
+        .collect()
+    }
+
     pub fn height(&self) -> u64 {
+        let _publication = self.native_inference_publication.read();
         *self.height.read()
     }
 
@@ -2732,6 +3107,7 @@ impl StateDB {
 
     /// Get a block by height.
     pub fn get_block(&self, height: u64) -> Option<Block> {
+        let _publication = self.native_inference_publication.read();
         self.blocks.get(&height).map(|b| b.clone())
     }
 
@@ -2755,6 +3131,9 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return self.execute_block_verified(transactions, producer);
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         let mut receipts = Vec::with_capacity(transactions.len());
@@ -2885,6 +3264,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -2986,6 +3370,30 @@ impl StateDB {
     /// identity directly into the resulting linear block header. Protocol-v3
     /// consensus uses a domain-separated commitment to the exact DAG hash and
     /// round; legacy and direct execution paths retain a zero proof hash.
+    /// Which execution path a block takes.
+    ///
+    /// A chain with an active inference binding executes sequentially. The
+    /// native path requires it outright, and on a MIGRATED chain an ordinary
+    /// block of a hundred or more transfers would otherwise be routed to
+    /// BlockSTM, which refuses while a binding is active - failing a block of
+    /// perfectly ordinary traffic. Sequential execution of those blocks is a
+    /// throughput choice; routing them somewhere that refuses them is a bug.
+    pub(crate) fn execution_mode(
+        &self,
+        transactions: &[Transaction],
+    ) -> crate::block_stm::AdaptiveMode {
+        if self.native_inference_context.read().is_some() {
+            return crate::block_stm::AdaptiveMode::Sequential;
+        }
+        // A binding change waiting for its coordinated height is applied in
+        // the block that reaches it. Keep those blocks on the sequential
+        // path, which is the one this behaviour is qualified on.
+        if self.native_migration.read().is_some() || self.pending_binding_update.read().is_some() {
+            return crate::block_stm::AdaptiveMode::Sequential;
+        }
+        crate::block_stm::choose_execution_mode(transactions)
+    }
+
     pub fn execute_block_adaptive_at_with_proof(
         &self,
         transactions: &[Transaction],
@@ -2993,8 +3401,7 @@ impl StateDB {
         timestamp: u64,
         proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
-        let mode = crate::block_stm::choose_execution_mode(transactions);
-        match mode {
+        let produced = match self.execution_mode(transactions) {
             crate::block_stm::AdaptiveMode::Sequential => self
                 .execute_block_verified_at_with_proof(
                     transactions,
@@ -3006,7 +3413,17 @@ impl StateDB {
                 // Use BlockSTM partitioned execution
                 self.execute_block_blockstm_at(transactions, producer, timestamp, proof_hash)
             }
-        }
+        }?;
+        // An authorised migration whose coordinated height this block just
+        // reached is applied HERE, before any later block can be built on
+        // top of it. Doing it only at startup would activate whichever node
+        // happened to be starting at that moment and strand every node that
+        // was already running, or was down and caught up later: a validator
+        // passes through the coordinated height whether it produces or
+        // applies, and this is the one place both paths share.
+        self.apply_due_native_migration()?;
+        self.apply_due_binding_update()?;
+        Ok(produced)
     }
 
     /// Execute a block using BlockSTM partitioned parallel execution.
@@ -3017,6 +3434,11 @@ impl StateDB {
         timestamp: u64,
         proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         use rayon::prelude::*;
@@ -3111,6 +3533,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -3186,6 +3613,29 @@ impl StateDB {
         timestamp: u64,
         proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        let _native_guard = self.native_inference_execution.lock();
+        if self.native_inference_context.read().is_some() {
+            // A private protocol-4 chain runs nothing else, so every block of
+            // it is a native block. A MIGRATED chain is still protocol 3 with
+            // paid inference added: only its native blocks take the native
+            // execution path, and everything else - a transfer, a faucet
+            // claim, a reward, an empty block - takes the ordinary one, with
+            // the v3 admission that validates those families. Routing them
+            // all through the native path would admit an ordinary transaction
+            // and then fail to execute it.
+            let migrated = self.native_migration.read().is_some();
+            let native_block = transactions
+                .iter()
+                .any(|tx| inference_contract_state::is_native_body(&tx.body));
+            if !migrated || native_block {
+                return self.execute_native_inference_block_at(
+                    transactions,
+                    producer,
+                    timestamp,
+                    proof_hash,
+                );
+            }
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         let mut receipts = Vec::with_capacity(transactions.len());
@@ -3330,6 +3780,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_locked()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -3398,6 +3853,11 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         use arc_gpu::metal_verify::{MetalVerifier, VerifyTask};
@@ -3586,6 +4046,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -3644,6 +4109,11 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         let height = {
@@ -3712,6 +4182,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -3772,6 +4247,11 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
         let height = {
@@ -3853,6 +4333,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -4001,6 +4486,11 @@ impl StateDB {
         producer: Address,
         nonce_base: &mut u64,
     ) -> Result<Block, StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         if self.active_protocol_version().major == 3 {
             return Err(StateError::ExecutionError(
                 "unsigned benchmark execution is unavailable in recovery protocol v3".to_string(),
@@ -4151,6 +4641,11 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<Block, StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         if self.active_protocol_version().major == 3 {
             return Err(StateError::ExecutionError(
@@ -4591,6 +5086,9 @@ impl StateDB {
             TxBody::InferenceRequest(_) => gas_costs::TIER1_INFERENCE_REQUEST,
             TxBody::InferenceVote(_) => gas_costs::TIER1_INFERENCE_VOTE,
             TxBody::InferenceFinalize(_) => gas_costs::TIER1_INFERENCE_FINALIZE,
+            TxBody::NativeInferenceRequest(_) => gas_costs::NATIVE_INFERENCE_REQUEST,
+            TxBody::NativeInferenceFinalize(_) => gas_costs::NATIVE_INFERENCE_FINALIZE,
+            TxBody::NativeInferenceRefund(_) => gas_costs::NATIVE_INFERENCE_REFUND,
         }
     }
 
@@ -4640,7 +5138,10 @@ impl StateDB {
             | TxType::ShardAssignmentProposal
             | TxType::InferenceRequest
             | TxType::InferenceVote
-            | TxType::InferenceFinalize => V3TransactionFamilyPolicy::Denied,
+            | TxType::InferenceFinalize
+            | TxType::NativeInferenceRequest
+            | TxType::NativeInferenceFinalize
+            | TxType::NativeInferenceRefund => V3TransactionFamilyPolicy::Denied,
         }
     }
 
@@ -4656,6 +5157,54 @@ impl StateDB {
     /// Returns the gas consumed on success. When `gas_limit == 0` (backward
     /// compat / benchmark mode), an effectively unlimited gas budget is used
     /// so that no existing transaction can fail due to gas exhaustion.
+    /// Refuse a validator-registry change while a native inference binding
+    /// is active.
+    ///
+    /// The binding freezes the committee it was activated for, and every block
+    /// re-checks that the live registry still matches it. Before this guard, a
+    /// Stake, JoinValidator or UpdateStake transaction was simply executed, the
+    /// registry moved, and from then on EVERY block failed that check - one
+    /// transaction wedged the chain, and a restart could not recover because
+    /// activation re-checks the same thing (D2).
+    ///
+    /// Refusing here keeps both guarantees and removes the wedge: the offending
+    /// transaction fails with a receipt, the registry does not move, the binding
+    /// is never silently rebound, and the next block executes normally.
+    ///
+    /// The committee of a native-inference chain is therefore fixed for the life
+    /// of its binding. Changing it is an explicit migration - a new activation
+    /// on a fresh genesis - never a side effect of a staking transaction.
+    pub fn refuse_registry_change_under_native_binding(&self) -> Result<(), StateError> {
+        // A MIGRATED chain supports versioned bindings, so the committee is
+        // not frozen: the registry moves, new requests are refused until the
+        // operator publishes the binding that names the new committee, and
+        // work already admitted settles under the binding that accepted it.
+        // Staking and validator admission therefore keep working, which on a
+        // public chain they have to.
+        if self.native_migration.read().is_some() {
+            return Ok(());
+        }
+        // A private protocol-4 chain runs nothing but native inference, so a
+        // registry change cannot execute there anyway; this stays as the
+        // defence in depth it was.
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "the validator registry is frozen by the active native inference binding; \
+                 changing the committee requires an explicit migration to a fresh activation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// True for transactions that would change the validator registry.
+    pub fn is_registry_change(tx: &Transaction) -> bool {
+        matches!(
+            tx.body,
+            TxBody::Stake(_) | TxBody::JoinValidator(_) | TxBody::UpdateStake(_)
+        )
+    }
+
     fn execute_tx(&self, tx: &Transaction) -> Result<u64, StateError> {
         if tx.tx_type != tx.body.tx_type() {
             return Err(StateError::ExecutionError(format!(
@@ -4910,6 +5459,9 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::Stake(body) => {
+                // The native inference binding froze this committee; see
+                // `refuse_registry_change_under_native_binding`.
+                self.refuse_registry_change_under_native_binding()?;
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -5727,6 +6279,9 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::JoinValidator(body) => {
+                // The native inference binding froze this committee; see
+                // `refuse_registry_change_under_native_binding`.
+                self.refuse_registry_change_under_native_binding()?;
                 // Deduct initial stake from sender's balance and register as validator
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
@@ -5861,6 +6416,9 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::UpdateStake(body) => {
+                // The native inference binding froze this committee; see
+                // `refuse_registry_change_under_native_binding`.
+                self.refuse_registry_change_under_native_binding()?;
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -8017,6 +8575,11 @@ impl StateDB {
 
                 Ok(gas.consumed)
             }
+            TxBody::NativeInferenceRequest(_)
+            | TxBody::NativeInferenceFinalize(_)
+            | TxBody::NativeInferenceRefund(_) => Err(StateError::ExecutionError(
+                "native inference requires the canonical block publisher".into(),
+            )),
         }
     }
 
@@ -8028,6 +8591,11 @@ impl StateDB {
     /// execute stage which runs on a dedicated thread.
     /// Returns gas consumed on success.
     pub fn execute_tx_pub(&self, tx: &Transaction) -> Result<u64, StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         if self.active_protocol_version().major == 3 {
             return Err(StateError::ExecutionError(
                 "pipeline/direct transaction execution is unavailable in recovery protocol v3"
@@ -8053,6 +8621,11 @@ impl StateDB {
         receipt_success: &[bool],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        if self.native_inference_context.read().is_some() {
+            return Err(StateError::ExecutionError(
+                "protocol-4 requires canonical sequential block execution".into(),
+            ));
+        }
         self.require_healthy_wal()?;
         if self.active_protocol_version().major == 3 {
             return Err(StateError::ExecutionError(
@@ -8095,6 +8668,11 @@ impl StateDB {
         // every real block-application path so the bond lifecycle advances the
         // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
+        // A coordinated binding change due at this height belongs INSIDE this
+        // block, exactly as the sweep above does: it has to be in the state
+        // before the root is taken, or it is a change only the nodes that ran
+        // this particular path ever make.
+        self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -8545,11 +9123,13 @@ impl StateDB {
 
     /// Look up a transaction receipt by tx hash.
     pub fn get_receipt(&self, tx_hash: &[u8; 32]) -> Option<TxReceipt> {
+        let _publication = self.native_inference_publication.read();
         self.receipts.get(tx_hash).map(|r| r.clone())
     }
 
     /// Look up transaction location (block_height, tx_index) by tx hash.
     pub fn get_tx_location(&self, tx_hash: &[u8; 32]) -> Option<(u64, u32)> {
+        let _publication = self.native_inference_publication.read();
         self.tx_index.get(tx_hash).map(|r| *r)
     }
 
@@ -8888,6 +9468,32 @@ impl StateDB {
                     .or_default()
                     .push(tx.hash);
             }
+            TxBody::NativeInferenceRequest(body) => {
+                let escrow_addr =
+                    inference_contract_state::escrow_address(body.request.job.request_id());
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
+            TxBody::NativeInferenceFinalize(body) => {
+                self.index_native_inference_payees(Hash256(body.request_id), tx);
+                let escrow_addr =
+                    inference_contract_state::escrow_address(Hash256(body.request_id));
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
+            TxBody::NativeInferenceRefund(body) => {
+                self.index_native_inference_payees(Hash256(body.request_id), tx);
+                let escrow_addr =
+                    inference_contract_state::escrow_address(Hash256(body.request_id));
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
         }
     }
 
@@ -9111,6 +9717,25 @@ impl StateDB {
                 let treasury_addr = arc_types::transaction::faucet_pool_address();
                 self.dirty_accounts.insert(treasury_addr.0);
             }
+            TxBody::NativeInferenceRequest(body) => {
+                let escrow_addr =
+                    inference_contract_state::escrow_address(body.request.job.request_id());
+                self.dirty_accounts.insert(escrow_addr.0);
+            }
+            TxBody::NativeInferenceFinalize(body) => {
+                let escrow_addr =
+                    inference_contract_state::escrow_address(Hash256(body.request_id));
+                self.dirty_accounts.insert(escrow_addr.0);
+                self.dirty_accounts
+                    .insert(arc_types::transaction::faucet_pool_address().0);
+            }
+            TxBody::NativeInferenceRefund(body) => {
+                let escrow_addr =
+                    inference_contract_state::escrow_address(Hash256(body.request_id));
+                self.dirty_accounts.insert(escrow_addr.0);
+                self.dirty_accounts
+                    .insert(arc_types::transaction::faucet_pool_address().0);
+            }
         }
     }
 
@@ -9257,6 +9882,12 @@ impl StateDB {
     /// `compute_state_root_jmt()` instead of using IncrementalMerkle.
     /// Initializes the JMT with all existing accounts on first call.
     pub fn enable_jmt(&mut self) {
+        // Native protocol-4 WAL recovery has one fixed account-root backend.
+        // Switching an active chain's hash algorithm is not a cache toggle.
+        if self.native_inference_context.read().is_some() {
+            tracing::warn!("JMT root switch ignored for the activated native protocol-4 candidate");
+            return;
+        }
         self.use_jmt = true;
         // Initialize JMT with all existing accounts.
         let mut jmt = self.jmt.lock();
@@ -9330,6 +9961,417 @@ impl StateDB {
 
     /// Export the current state as a snapshot for state sync.
     /// New nodes can download this to bootstrap without replaying from genesis.
+    /// Capture exactly the state that WAL replay reconstructs, so a snapshot
+    /// plus the WAL tail after it reaches the same state as replaying
+    /// everything. Anything `apply_wal_op` does not write is deliberately
+    /// excluded - including it would make the two paths disagree.
+    ///
+    /// History - blocks, receipts, bodies, event logs - is captured for the
+    /// most recent `snapshot_history_window` heights only. Capturing all of it
+    /// made every snapshot proportional to the length of the chain, and one
+    /// is rewritten every interval inside the consensus loop: quadratic I/O
+    /// over a node's life, and a stall that grew with every snapshot. The
+    /// older history is not lost - it is in the WAL, and opening a node
+    /// rebuilds it from there (see `is_history_op`).
+    pub fn export_durable_snapshot(&self) -> snapshot::SnapshotPayload {
+        let height = self.height();
+        let window = self.snapshot_history_window.load(Ordering::Acquire).max(1);
+        let first = height.saturating_sub(window - 1);
+        let blocks: Vec<(u64, Block)> = (first..=height)
+            .filter_map(|h| self.blocks.get(&h).map(|b| (h, b.value().clone())))
+            .collect();
+        let in_window: Vec<[u8; 32]> = blocks
+            .iter()
+            .flat_map(|(_, block)| block.tx_hashes.iter().map(|hash| hash.0))
+            .collect();
+        let mut payload = snapshot::SnapshotPayload {
+            height,
+            accounts: self
+                .accounts
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect(),
+            storage: self
+                .storage
+                .iter()
+                .map(|e| {
+                    (
+                        Hash256(*e.key()),
+                        e.value()
+                            .iter()
+                            .map(|i| (*i.key(), i.value().clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            contracts: self
+                .contracts
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect(),
+            identities: self
+                .identities
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect(),
+            receipts: in_window
+                .iter()
+                .filter_map(|hash| {
+                    self.receipts
+                        .get(hash)
+                        .map(|r| (Hash256(*hash), r.value().clone()))
+                })
+                .collect(),
+            full_transactions: in_window
+                .iter()
+                .filter_map(|hash| {
+                    self.full_transactions
+                        .get(hash)
+                        .map(|t| (Hash256(*hash), t.value().clone()))
+                })
+                .collect(),
+            event_logs: (first..=height)
+                .filter_map(|h| self.event_logs.get(&h).map(|l| (h, l.value().clone())))
+                .collect(),
+            blocks,
+            validators: self
+                .validators
+                .iter()
+                .map(|e| (Hash256(*e.key()), *e.value()))
+                .collect(),
+            staking_pool: self.staking_pool.load(Ordering::Acquire),
+            recovery_context: self.recovery_context.read().clone(),
+            community_rewards_activation_height: self
+                .community_rewards_v1_activation_height
+                .load(Ordering::Acquire),
+            native_inference_pending: self
+                .native_inference_pending
+                .iter()
+                .map(|e| (Hash256(*e.key()), *e.value()))
+                .collect(),
+        };
+        payload.canonicalize();
+        payload
+    }
+
+    /// Install a verified snapshot into this (empty) state.
+    ///
+    /// Every row is applied through the SAME `apply_wal_op` path that replay
+    /// uses, so there is one implementation of what each record means. A
+    /// second implementation here would be a second thing to keep in step,
+    /// and the whole point of the snapshot is that it agrees with replay.
+    pub fn install_durable_snapshot(&self, payload: &snapshot::SnapshotPayload) {
+        for (address, account) in &payload.accounts {
+            self.apply_wal_op(&WalOp::SetAccount(*address, account.clone()));
+        }
+        for (address, entries) in &payload.storage {
+            for (key, value) in entries {
+                self.apply_wal_op(&WalOp::SetStorage(*address, *key, value.clone()));
+            }
+        }
+        for (address, bytecode) in &payload.contracts {
+            self.apply_wal_op(&WalOp::SetContract(*address, bytecode.clone()));
+        }
+        for (address, identity) in &payload.identities {
+            self.apply_wal_op(&WalOp::SetIdentity(*address, identity.clone()));
+        }
+        self.install_history_window(payload);
+        if !payload.validators.is_empty() || payload.staking_pool != 0 {
+            self.apply_wal_op(&WalOp::SetValidatorState(
+                payload.validators.clone(),
+                payload.staking_pool,
+            ));
+        }
+        if let Some(context) = &payload.recovery_context {
+            let activation = (payload.community_rewards_activation_height != u64::MAX)
+                .then_some(payload.community_rewards_activation_height);
+            self.apply_wal_op(&WalOp::SetRecoveryContext(context.clone(), activation));
+        }
+        for (request_id, admission_height) in &payload.native_inference_pending {
+            self.native_inference_pending
+                .insert(request_id.0, *admission_height);
+        }
+        // `height` is raised by each SetBlock, but a snapshot taken with no
+        // block at the tip must still report its own height.
+        let mut height = self.height.write();
+        if payload.height > *height {
+            *height = payload.height;
+        }
+    }
+
+    /// The history part of a snapshot payload: its blocks, receipts, bodies
+    /// and event logs, through `apply_wal_op` like everything else.
+    fn install_history_window(&self, payload: &snapshot::SnapshotPayload) {
+        for (height, block) in &payload.blocks {
+            self.apply_wal_op(&WalOp::SetBlock(*height, block.clone()));
+        }
+        for (hash, receipt) in &payload.receipts {
+            self.apply_wal_op(&WalOp::SetReceipt(*hash, receipt.clone()));
+        }
+        for (hash, transaction) in &payload.full_transactions {
+            self.apply_wal_op(&WalOp::SetFullTransaction(
+                *hash,
+                Box::new(transaction.clone()),
+            ));
+        }
+        for (height, logs) in &payload.event_logs {
+            self.apply_wal_op(&WalOp::SetEventLogs(*height, logs.clone()));
+        }
+    }
+
+    /// The anchor round of the latest adopted checkpoint, if this node ever
+    /// adopted one: consensus must never resume scanning below the round
+    /// after it, whatever its other records say.
+    pub fn rebase_anchor_round(&self) -> Option<u64> {
+        let round = self.rebase_anchor_round.load(Ordering::Acquire);
+        (round > 0).then_some(round)
+    }
+
+    /// Empty the STATE a rebase replaces - accounts, storage, contracts,
+    /// identities, validators, native pending, staking pool - but not the
+    /// history this node already holds, its height, or configuration
+    /// (recovery context, reward activation), which adoption requires to be
+    /// unchanged.
+    fn clear_state_for_rebase(&self) {
+        self.accounts.clear();
+        self.storage.clear();
+        self.contracts.clear();
+        self.identities.clear();
+        self.validators.clear();
+        self.native_inference_pending.clear();
+        self.dirty_accounts.clear();
+        self.staking_pool.store(0, Ordering::Release);
+        // The community-reward activation height is configuration on an
+        // account-only-root chain (set from genesis at startup); adoption
+        // requires the checkpoint to carry this node's own value, so it is
+        // left as it is rather than reset to "disabled".
+        *self.incremental_merkle.lock() = IncrementalMerkle::new();
+    }
+
+    /// Rebuild every index a rebase cannot carry, from the adopted state, so
+    /// that a live rebase leaves memory as a restart of the same WAL would:
+    /// the open path rebuilds the native pending index from storage, and
+    /// startup rebuilds the Tier 1 and bond-release indexes.
+    pub fn rebuild_after_rebase(&self) -> Result<(), StateError> {
+        // Bound before the `if let`: an `if let` scrutinee temporary lives
+        // for the whole body, and the body reaches `get_storage`, which takes
+        // the publication lock. Holding the context guard across that is the
+        // context -> publication order, the reverse of activation's.
+        let context = self.native_inference_context.read().clone();
+        if let Some(context) = context {
+            self.rebuild_native_inference_pending(context.commitment()?)?;
+        }
+        // Unlike the bond-release rebuild, this one only inserts.
+        self.tier1_pending.clear();
+        self.rebuild_tier1_pending();
+        self.rebuild_pending_bond_releases();
+        Ok(())
+    }
+
+    /// Adopt a certified checkpoint, durably, before anything in memory moves.
+    ///
+    /// The caller has already verified the checkpoint envelope against this
+    /// node's own committee and domain, the payload digest, and that `tip`
+    /// is the certified block (see `CheckpointEnvelope::verify_resume_point`).
+    /// This proves again, in a scratch state, that the payload reproduces the
+    /// root `tip` carries - a record that would not replay must never be
+    /// written - then appends and fsyncs a `WalOp::Rebase` and applies it.
+    ///
+    /// It replaces the memory-only install a checkpoint used to get (lost at
+    /// the next restart, with no durable trace), and it is what lets a node
+    /// that already has history - one down longer than its peers' DAG
+    /// retention - rejoin at all. `payload` must be the output of
+    /// [`Self::plan_checkpoint_adoption`]: only what the certificate covers.
+    pub fn rebase_onto_checkpoint(
+        &self,
+        payload: &snapshot::SnapshotPayload,
+        tip: &Block,
+        anchor_hash: Hash256,
+        anchor_round: u64,
+    ) -> Result<(), StateError> {
+        let _guard = self.native_inference_execution.lock();
+        self.require_healthy_wal()?;
+        // Only a planned adoption (`plan_checkpoint_adoption`) is written: the
+        // same shape open-time validation requires of a Rebase record, so a
+        // payload that skipped planning cannot break the next open.
+        if !payload.receipts.is_empty()
+            || !payload.event_logs.is_empty()
+            || !payload.full_transactions.is_empty()
+            || !payload.native_inference_pending.is_empty()
+            || payload.recovery_context.is_some()
+        {
+            return Err(StateError::PersistenceError(
+                "a rebase carries only planned state and verified blocks".into(),
+            ));
+        }
+        let height = payload.height;
+        if tip.header.height != height || Block::compute_hash(&tip.header) != tip.hash {
+            return Err(StateError::PersistenceError(
+                "checkpoint tip does not describe the checkpoint height".into(),
+            ));
+        }
+        if height <= self.height() {
+            return Err(StateError::PersistenceError(format!(
+                "a checkpoint at height {height} does not move this node (at {}) forward",
+                self.height()
+            )));
+        }
+        // The planner's preconditions again, immediately before the write:
+        // protocol 4 with selection rule v2, strict ordering, and every
+        // account filed under its own address.
+        checkpoint_adoption::adoption_preconditions(self, payload)?;
+        // The history window itself, re-derived here rather than trusted from
+        // the planner: this is the last point before the blocks become
+        // durable, and a caller that assembled a payload by hand must not be
+        // able to write a window that does not chain to its certified tip.
+        checkpoint_adoption::verify_history_window(&payload.blocks, tip)?;
+        let scratch = Self::new();
+        scratch.install_durable_snapshot(payload);
+        if scratch.get_state_root() != tip.header.state_root {
+            return Err(StateError::PersistenceError(
+                "checkpoint payload does not reproduce its tip's state root".into(),
+            ));
+        }
+        // Everything the rebuild after the write will check, checked here
+        // first: every native metadata row decodes, belongs to its escrow and
+        // matches that escrow's certified storage root. A failure after the
+        // record is durable would stop this node on every restart.
+        if let Some(context) = self.native_inference_context.read().clone() {
+            let commitment = context.commitment()?;
+            *scratch.native_inference_context.write() = Some(context);
+            scratch.rebuild_native_inference_pending(commitment)?;
+        }
+        let record = wal::RebaseRecord {
+            height,
+            tip: tip.clone(),
+            state: payload.clone(),
+            anchor_hash,
+            anchor_round,
+        };
+        self.wal
+            .append(WalOp::Rebase(Box::new(record.clone())), height);
+        self.durable_wal_barrier()?;
+        // The swap itself is exclusive: readers of native state (RPC, the
+        // worker) see the state before the rebase or after it, never the
+        // cleared or half-installed state.
+        //
+        // Nothing inside this block may call a public accessor. `get_account`,
+        // `get_storage`, `height`, `get_block`, `get_receipt` and
+        // `get_state_root` all take this same lock for read, and it is not
+        // reentrant: `get_state_root` here, and `get_storage` under
+        // `rebuild_after_rebase`, each deadlocked the adopting node against
+        // itself until its test was first run.
+        {
+            let _publication = self.native_inference_publication.write();
+            self.apply_wal_op(&WalOp::Rebase(Box::new(record)));
+            let adopted = self.compute_state_root();
+            if adopted != tip.header.state_root {
+                // Durable and verified in scratch, so this cannot happen short
+                // of a bug; refuse loudly rather than run on a state nobody
+                // certified.
+                return Err(StateError::PersistenceError(format!(
+                    "adopted checkpoint produced root {adopted}, expected {}",
+                    tip.header.state_root
+                )));
+            }
+        }
+        // Derived indexes are rebuilt after the certified state is published,
+        // with the ordinary accessors. A reader between the two sees adopted,
+        // certified state whose native pending index is still filling; the
+        // worker picks those requests up on its next poll.
+        self.rebuild_after_rebase()
+    }
+
+    /// Empty everything a snapshot or replay would repopulate.
+    ///
+    /// Used to back out a snapshot whose state root did not verify, so a
+    /// refused snapshot leaves no residue for the full replay that follows.
+    fn clear_replayable_state(&self) {
+        self.accounts.clear();
+        self.storage.clear();
+        self.contracts.clear();
+        self.identities.clear();
+        self.blocks.clear();
+        self.receipts.clear();
+        self.tx_index.clear();
+        self.full_transactions.clear();
+        self.event_logs.clear();
+        self.validators.clear();
+        self.native_inference_pending.clear();
+        self.dirty_accounts.clear();
+        self.staking_pool.store(0, Ordering::Release);
+        self.community_rewards_v1_activation_height
+            .store(u64::MAX, Ordering::Release);
+        *self.recovery_context.write() = None;
+        *self.height.write() = 0;
+        *self.incremental_merkle.lock() = IncrementalMerkle::new();
+    }
+
+    /// Install the snapshot in `dir`, if there is one that verifies.
+    ///
+    /// Returns the WAL sequence already contained in it, so replay can resume
+    /// strictly after that point. `None` means "replay everything", which is
+    /// always correct - a snapshot is an optimisation over a durable log, so
+    /// refusing one can never cost correctness.
+    fn adopt_snapshot_if_trustworthy(&self, dir: &Path) -> Option<snapshot::SnapshotManifestV1> {
+        let verified = match snapshot::load(dir) {
+            Ok(verified) => verified,
+            Err(snapshot::SnapshotError::Absent) => return None,
+            Err(error) => {
+                tracing::warn!(%error, "Ignoring an unusable state snapshot; replaying the full WAL");
+                return None;
+            }
+        };
+        self.install_durable_snapshot(&verified.payload);
+        let found = self.get_state_root();
+        if found == verified.manifest.identity.state_root {
+            tracing::info!(
+                height = verified.manifest.identity.height,
+                resume_from = verified.manifest.resume_from_sequence,
+                "Installed a verified state snapshot; replaying only the WAL tail"
+            );
+            return Some(verified.manifest);
+        }
+        // A digest proves the bytes are the ones that were written. It does
+        // not prove they describe the state they claim to, which is why the
+        // root is recomputed here - and why a mismatch backs the install out
+        // entirely rather than continuing on top of it.
+        tracing::error!(
+            expected = %verified.manifest.identity.state_root,
+            %found,
+            "State snapshot does not reproduce its own state root; discarding it"
+        );
+        self.clear_replayable_state();
+        None
+    }
+
+    /// Publish a snapshot of this state next to its WAL.
+    ///
+    /// The resume point is read AFTER the state is captured, never before: a
+    /// sequence taken first could name a record the capture did not include,
+    /// and replay would then skip it. `sequence()` is the NEXT number to hand
+    /// out, so it is exactly "the first record this snapshot does not
+    /// contain". Reading it after the capture can only make it too LOW, which
+    /// re-applies a record the snapshot already had - and every WAL op is
+    /// idempotent, so that direction is safe. Too high would lose a block.
+    pub fn publish_durable_snapshot(
+        &self,
+    ) -> Result<snapshot::SnapshotManifestV1, snapshot::SnapshotError> {
+        let dir = self.persistence_dir().ok_or_else(|| {
+            snapshot::SnapshotError::Io("state has no persistence directory".into())
+        })?;
+        self.try_sync_wal()
+            .map_err(|error| snapshot::SnapshotError::Io(error.to_string()))?;
+        let payload = self.export_durable_snapshot();
+        let height = payload.height;
+        let block_hash = self
+            .get_block(height)
+            .map(|block| block.hash)
+            .unwrap_or(Hash256::ZERO);
+        let sequence = self.wal.sequence();
+        snapshot::publish(&dir, payload, self.get_state_root(), sequence, block_hash)
+    }
+
     pub fn export_snapshot(&self) -> Snapshot {
         let accounts: Vec<(Address, Account)> = self
             .accounts
@@ -9467,7 +10509,9 @@ impl StateDB {
     pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Result<Hash256, StateError> {
         use std::collections::HashSet;
 
-        if self.is_persistent() && self.recovery_context().is_some() {
+        if self.is_persistent()
+            && (self.recovery_context().is_some() || self.native_inference_context.read().is_some())
+        {
             return Err(StateError::PersistenceError(
                 "standalone state-diff persistence is unavailable on recovery-bound state; authenticate and commit the matching canonical block"
                     .into(),
@@ -9616,6 +10660,7 @@ impl StateDB {
     /// Accounts are serialised with bincode, hashed, then sorted to ensure a
     /// deterministic tree regardless of DashMap iteration order.
     pub fn get_state_root(&self) -> Hash256 {
+        let _publication = self.native_inference_publication.read();
         self.compute_state_root()
     }
 

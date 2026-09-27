@@ -11,6 +11,7 @@
     <title>ARC Composite Explorer</title>
     <link rel="stylesheet" href="./styles.css?v=3" />
     <script src="../shared/frontend/arc-network.js?v=3" defer></script>
+    <script src="./native-receipts.js?v=3" defer></script>
     <script src="./app.js?v=3" defer></script>
   </head>
   <body>
@@ -39,7 +40,7 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg>
           <input id="search-input" type="search" spellcheck="false" autocomplete="off" placeholder="Block height, transaction hash, or address" />
           <label class="sr-only" for="search-kind">Lookup type</label>
-          <select id="search-kind"><option value="auto">Auto</option><option value="block">Block</option><option value="tx">Transaction / receipt</option><option value="address">Address</option></select>
+          <select id="search-kind"><option value="auto">Auto</option><option value="block">Block</option><option value="tx">Transaction / receipt</option><option value="request">Native request</option><option value="address">Address</option></select>
           <button type="submit">Explore</button>
         </form>
         <p id="search-error" class="field-error" role="alert"></p>
@@ -74,7 +75,7 @@
 
       <section class="content-grid">
         <article class="panel blocks-panel">
-          <div class="panel-heading"><div><span class="micro-label">Resolved canonical segment</span><h2>Recent protocol-v3 blocks</h2></div><span id="blocks-status" class="quiet-pill">Waiting</span></div>
+          <div class="panel-heading"><div><span class="micro-label">Resolved canonical segment</span><h2>Recent protocol-v3 blocks</h2></div><span id="blocks-status" class="quiet-pill">Waiting</span><button id="blocks-page-link" class="text-button" type="button">Paged history →</button></div>
           <div class="table-scroll"><table><thead><tr><th>Height</th><th>Segment</th><th>Age</th><th>Transactions</th><th>Block hash</th></tr></thead><tbody id="blocks-body"><tr><td colspan="5" class="empty-cell">No canonical source configured.</td></tr></tbody></table></div>
         </article>
         <aside class="panel facts-panel">

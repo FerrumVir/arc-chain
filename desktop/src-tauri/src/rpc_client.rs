@@ -629,7 +629,7 @@ pub async fn fetch_network_stats(http: &reqwest::Client, base_url: &str) -> Netw
     //   total_nodes  ← /health.validators (rough: treat each validator as a node)
     //   total_inferences ← /inference/results.count
     //   avg_tps      ← /health.dag_round / uptime_secs * factor
-    //   latest_block ← /health.dag_committed
+    //   latest_block ← /health.height (canonical sealed block height)
     let base = base_url.to_string();
     let (health_val, results_val) = tokio::join!(
         async {
@@ -670,11 +670,10 @@ pub async fn fetch_network_stats(http: &reqwest::Client, base_url: &str) -> Netw
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
 
-    let dag_committed = health_val
+    let block_height = health_val
         .as_ref()
-        .and_then(|v| v.get("dag_committed"))
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
+        .and_then(|v| v.get("height"))
+        .and_then(|x| x.as_u64());
 
     let uptime_secs = health_val
         .as_ref()
@@ -692,7 +691,7 @@ pub async fn fetch_network_stats(http: &reqwest::Client, base_url: &str) -> Netw
         total_nodes: validators.max(1),
         total_inferences: total_inf,
         avg_tps,
-        latest_block: dag_committed,
+        latest_block: block_height,
     }
 }
 
@@ -3119,6 +3118,52 @@ pub async fn fetch_block_txs(
 mod chain_read_tests {
     use super::*;
     use serde_json::json;
+
+    async fn fetch_stats_from_health_body(health_body: &'static str) -> NetworkStats {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if request.starts_with("GET /health ") {
+                    health_body
+                } else {
+                    r#"{"count":17,"results":[]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let stats = fetch_network_stats(&reqwest::Client::new(), &format!("http://{address}")).await;
+        server.await.unwrap();
+        stats
+    }
+
+    #[tokio::test]
+    async fn dashboard_network_stats_uses_height_and_preserves_missing_height() {
+        let stats = fetch_stats_from_health_body(
+            r#"{"height":2657128,"dag_committed":13001938,"dag_round":13001940,"uptime_secs":100,"validators":6}"#,
+        )
+        .await;
+        assert_eq!(stats.latest_block, Some(2_657_128));
+        assert_eq!(stats.avg_tps, (13_001_940_u64 * 4) / 100);
+
+        let missing_height = fetch_stats_from_health_body(
+            r#"{"dag_committed":13001938,"dag_round":13001940,"uptime_secs":100,"validators":6}"#,
+        )
+        .await;
+        assert_eq!(missing_height.latest_block, None);
+    }
 
     fn production_models(model_id: &str) -> Value {
         let profile = arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;

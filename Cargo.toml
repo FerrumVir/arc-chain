@@ -13,6 +13,7 @@ members = [
     "crates/arc-gpu",
     "crates/arc-bench",
     "crates/arc-consensus",
+    "crates/arc-assign",
     "crates/arc-net",
     "crates/arc-cli",
     "crates/arc-channel",

@@ -1,0 +1,147 @@
+{
+ "artifact": {
+  "blake3": "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67",
+  "bytes": 4081004224,
+  "format": "gguf",
+  "gguf_version": 2,
+  "header_bytes": 741039,
+  "sha256": "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
+ },
+ "execution": {
+  "contract": "docs/protocol/integer-profile-contract-v1.md",
+  "profile": "arc.gguf-llama.i8-per-row.rope-interleaved.v1",
+  "profile_commitment": "8e1c69d4b325699481e0308bde3394efe1d81ea25057471c35647d14ebff689e"
+ },
+ "generation": {
+  "admission": "1 + prompt_tokens + max_tokens <= 4096",
+  "commitment": "89843f82d20f8541de5fdd250a4c3bf1f70d808faf35f5987b38f37dd5e123e9",
+  "input": "little-endian u32 token ids; non-empty; no leading BOS; each < vocab_size",
+  "output": "little-endian u32 token ids; output_hash = BLAKE3 of those bytes",
+  "selection": "repetition penalty over the 64 most recent generated tokens (x5/6 if positive, x6/5 otherwise, truncating, once per occurrence), then argmax with ties to the lowest index",
+  "semantics": "ARC-native-inference/gguf-llama-i8-interleaved-rope/generation-v2/bos-once/le-u32/v1",
+  "stopping": {
+   "eos": [
+    2
+   ],
+   "eos_included_in_output": true,
+   "max_tokens": true
+  }
+ },
+ "graph": {
+  "activation": "silu-gated",
+  "architecture": "llama",
+  "attention": "causal, grouped-query (query head h reads KV head h*n_kv/n_heads)",
+  "d_ff": 11008,
+  "d_head": 128,
+  "d_kv": 4096,
+  "d_model": 4096,
+  "declared_context_length": 4096,
+  "declared_rms_epsilon": 9.999999974752427e-07,
+  "executed_rms_epsilon_q16": 1,
+  "max_seq": 4096,
+  "n_heads": 32,
+  "n_kv_heads": 32,
+  "n_layers": 32,
+  "norm": "rms",
+  "positions_beyond_declared_context": 0,
+  "rope": {
+   "base": 10000.0,
+   "base_source": "default (key absent)",
+   "dimension_count": 128,
+   "pairing": "interleaved"
+  },
+  "tied_embeddings": false,
+  "vocab_size": 32000
+ },
+ "manifest_blake3": "fecaf64104b3be988ff5f3ddf3c38e6739787f9cd390b64835dc59aecb0309bf",
+ "memory": {
+  "embedding_i8_bytes": 131328000,
+  "embedding_q16_bytes": 1048576000,
+  "kv_bytes_at_max_native_request": 8589934592,
+  "kv_bytes_at_max_seq": 8589934592,
+  "kv_bytes_per_position": 2097152,
+  "max_native_request_positions": 4096,
+  "output_i8_bytes": 131328000,
+  "prepared_layer_bytes": 6488981504,
+  "prepared_total_bytes": 7804440576,
+  "resident_bytes_for_max_native_request": 16394375168,
+  "rope_table_bytes": 4194304
+ },
+ "partitioning": {
+  "column_partition": "not defined: it needs a cross-worker reduction whose rounding the profile does not specify",
+  "layer_pipeline": {
+   "handoff": "Q16 i64 hidden state after the last layer of the range",
+   "handoff_bytes_per_token": 32768,
+   "supported": true
+  },
+  "row_collective": "concatenate output rows in row order; no reduction",
+  "row_partitionable": [
+   {
+    "cols": 4096,
+    "rows": 4096,
+    "tensor": "attn_q"
+   },
+   {
+    "cols": 4096,
+    "rows": 4096,
+    "tensor": "attn_k"
+   },
+   {
+    "cols": 4096,
+    "rows": 4096,
+    "tensor": "attn_v"
+   },
+   {
+    "cols": 4096,
+    "rows": 4096,
+    "tensor": "attn_output"
+   },
+   {
+    "cols": 4096,
+    "rows": 11008,
+    "tensor": "ffn_gate"
+   },
+   {
+    "cols": 4096,
+    "rows": 11008,
+    "tensor": "ffn_up"
+   },
+   {
+    "cols": 11008,
+    "rows": 4096,
+    "tensor": "ffn_down"
+   },
+   {
+    "cols": 4096,
+    "rows": 32000,
+    "tensor": "output"
+   }
+  ]
+ },
+ "schema": "arc.model-package.v1",
+ "supported_outputs": [
+  "token_ids"
+ ],
+ "tensors": {
+  "count": 291,
+  "inventory_blake3": "632cffb0c981fe8e0c40b0dd1f57b4a3ff363970b7df95ced1fdb1b7a2410f8c",
+  "types": {
+   "F32": 65,
+   "Q4_K": 193,
+   "Q6_K": 33
+  }
+ },
+ "tokenizer": {
+  "bos": 1,
+  "chat_template_blake3": null,
+  "eos": [
+   2
+  ],
+  "identity": "arc.gguf-llama.spm-score-merge.v1",
+  "ignored_special_ids": {},
+  "model": "llama",
+  "tokens": 32000,
+  "unk": 0,
+  "vocab_blake3": "554ac0fc5b0a69519530c0343c34657f32b6fd212b909a68e718a2a22da9765c"
+ }
+}

@@ -820,6 +820,54 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python -m compileall -q arc_sdk tests
 
+  # ---------------------------------------------------- script suites -----
+  # The non-Rust suites that, before this job existed, only ran by hand:
+  # arc_conformance / arc_soak / arc_ops (independent Python reference
+  # implementations and operational checks) and the release tooling's Python
+  # tests, plus the explorer local-dev contract and the desktop pure-logic
+  # Playwright specs. `make test-scripts` runs the same commands locally.
+  #
+  # explorer/test-contract.mjs and dashboard/test-contract.mjs are NOT
+  # repeated here: they already run in the blocking `explorer-contract` job
+  # above and in `dashboard-contract`'s `npm test`, respectively.
+  #
+  # Every suite here is synthetic and self-contained - see
+  # scripts/ci/run-script-suites.sh for the "why nothing is excluded" note.
+  # desktop's `npm run test:unit` runs playwright.unit.config.ts, which is
+  # restricted to specs that use no `page` fixture: no browser, no build, no
+  # preview server (see that config's own comment).
+  script-suites:
+    name: script suites (python + node contract + desktop unit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      # arc_conformance.tests.test_integer_reference imports operator_vectors
+      # (needs numpy) and kat/rope_margin/package_manifest (need blake3).
+      # Nothing else under the four suites below needs a third-party package,
+      # and neither package is pinned anywhere else in the repo to match.
+      - name: Install the third-party packages arc_conformance needs
+        run: python -m pip install "blake3>=1.0" "numpy>=1.26"
+      - name: Python suites (arc_conformance, arc_soak, arc_ops, scripts/release/tests)
+        run: bash scripts/ci/run-script-suites.sh
+      - name: explorer local-dev native-inference contract (no browser, no build)
+        run: node explorer/test-localdev-native.mjs
+      - name: desktop pure-logic unit specs (Playwright unit config, no browser)
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run test:unit
+
 # REMOVED: the old `explorer-build` job. It probed for explorer/package.json,
 # emitted a ::notice:: and exited. Explorer is intentionally dependency-free
 # static HTML/CSS/JavaScript now, and its executable contract is enforced by

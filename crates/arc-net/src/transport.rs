@@ -46,6 +46,48 @@ const PEER_BYTE_RATE_LIMIT: u64 = 64 * 1024 * 1024;
 /// Rate limit window in seconds.
 const RATE_LIMIT_WINDOW_SECS: u64 = 1;
 
+/// Explicit, temporary outbound compatibility for the original protocol-3
+/// fleet, whose authenticated handshake has no message-capability field.
+/// This changes no authentication, membership, or consensus decision.
+#[derive(Default)]
+pub struct TransportWirePolicy {
+    legacy_v3: bool,
+    suppressed_messages: AtomicU64,
+}
+
+impl TransportWirePolicy {
+    pub fn new(legacy_v3: bool) -> Self {
+        Self {
+            legacy_v3,
+            suppressed_messages: AtomicU64::new(0),
+        }
+    }
+
+    pub fn legacy_v3(&self) -> bool {
+        self.legacy_v3
+    }
+
+    /// Suppressed send requests, not delivered messages or peer failures.
+    pub fn suppressed_messages(&self) -> u64 {
+        self.suppressed_messages.load(Ordering::Relaxed)
+    }
+
+    fn permits(&self, message: MessageType) -> bool {
+        // The deployed legacy parser accepts exactly 0x01..=0x12. Keep
+        // future extensions closed too; do not infer support from v3 alone.
+        if self.legacy_v3 && message as u8 > 0x12 {
+            self.suppressed_messages.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                ?message,
+                "Suppressed outbound frame by explicit legacy-v3 wire policy"
+            );
+            false
+        } else {
+            true
+        }
+    }
+}
+
 // ─── Channel Types ──────────────────────────────────────────────────────────
 
 /// Messages the transport sends TO consensus.
@@ -162,6 +204,61 @@ pub enum InboundMessage {
         current_round: u64,
         last_committed_round: u64,
     },
+    /// A peer's absence attestation. Self-authenticating; `source` is recorded
+    /// for diagnostics only and is never the authorisation boundary.
+    ConsensusAbsenceVote {
+        source: Hash256,
+        vote: arc_consensus::view_change::SkipVote,
+    },
+    /// A peer's complete absence certificate.
+    ConsensusAbsenceCertificate {
+        source: Hash256,
+        certificate: arc_consensus::view_change::SkipCertificate,
+    },
+    /// A peer's finality attestation over a committed block.
+    ConsensusFinalityVote {
+        source: Hash256,
+        vote: arc_consensus::view_change::FinalityVote,
+    },
+    /// A peer's complete finality certificate.
+    ConsensusFinalityCertificate {
+        source: Hash256,
+        certificate: arc_consensus::view_change::FinalityCertificate,
+    },
+    /// A peer is asking this node for a bounded run of DAG history.
+    DagHistoryRequest {
+        source: Hash256,
+        from_round: u64,
+        max_rounds: u64,
+    },
+    /// A peer supplied a bounded run of DAG history.
+    DagHistoryResponse {
+        source: Hash256,
+        blocks: Vec<DagBlock>,
+        transactions: Vec<Transaction>,
+    },
+    /// A peer has fallen below every peer's retention window and is asking
+    /// for an authenticated state checkpoint.
+    CheckpointRequest {
+        source: Hash256,
+        needed_below_height: u64,
+    },
+    /// A checkpoint envelope and the payload bytes it authorises. Nothing here
+    /// is trusted: the receiver verifies the envelope against its own frozen
+    /// committee and chain domain before decoding the payload.
+    CheckpointResponse {
+        source: Hash256,
+        envelope: Box<arc_consensus::view_change::CheckpointEnvelope>,
+        payload: Vec<u8>,
+    },
+    /// A validator's signed native-inference vote. Self-authenticating; the
+    /// receiver verifies it before it counts.
+    NativeInferenceVote {
+        source: Hash256,
+        request_id: Hash256,
+        tokens: Vec<u32>,
+        vote: arc_types::inference_contract::InferenceVote,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -172,6 +269,40 @@ pub enum OutboundMessage {
         transactions: Vec<Transaction>,
     },
     BroadcastTransactions(Vec<Vec<u8>>),
+    /// Gossip this node's absence attestation to every peer.
+    BroadcastAbsenceVote(arc_consensus::view_change::SkipVote),
+    /// Gossip a complete absence certificate to every peer.
+    BroadcastAbsenceCertificate(arc_consensus::view_change::SkipCertificate),
+    /// Gossip this node's finality attestation to every peer.
+    BroadcastFinalityVote(arc_consensus::view_change::FinalityVote),
+    /// Gossip a complete finality certificate to every peer.
+    BroadcastFinalityCertificate(arc_consensus::view_change::FinalityCertificate),
+    /// Ask one peer for a bounded run of DAG history.
+    SendDagHistoryRequest {
+        target: Hash256,
+        from_round: u64,
+        max_rounds: u64,
+    },
+    /// Answer one peer's history request.
+    SendDagHistoryResponse {
+        target: Hash256,
+        blocks: Vec<DagBlock>,
+        transactions: Vec<Transaction>,
+    },
+    SendCheckpointRequest {
+        target: Hash256,
+        needed_below_height: u64,
+    },
+    SendCheckpointResponse {
+        target: Hash256,
+        envelope: Box<arc_consensus::view_change::CheckpointEnvelope>,
+        payload: Vec<u8>,
+    },
+    BroadcastNativeInferenceVote {
+        request_id: Hash256,
+        tokens: Vec<u32>,
+        vote: arc_types::inference_contract::InferenceVote,
+    },
     /// Broadcast a state diff (Propose-Verify protocol).
     BroadcastStateDiff {
         block_hash: Hash256,
@@ -735,7 +866,14 @@ struct PeerConnection<S> {
     dial_addr: SocketAddr,
     /// The peer's self-reported stake.
     stake: u64,
+    /// Whether THIS node dialed the connection (false: the peer did).
+    initiated_locally: bool,
+    installed_at: std::time::Instant,
 }
+
+/// Two connections to one peer installed within this window are treated as a
+/// simultaneous dial, and resolved by the tie-break in `install_directed`.
+const SIMULTANEOUS_DIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Tracks active peer send streams and metadata for outbound broadcast.
 struct PeerConnections<S = quinn::SendStream> {
@@ -743,21 +881,29 @@ struct PeerConnections<S = quinn::SendStream> {
     next_connection_id: AtomicU64,
     inbound_tx: mpsc::Sender<InboundMessage>,
     peer_count: Arc<AtomicU32>,
+    wire_policy: Arc<TransportWirePolicy>,
 }
 
 impl<S> PeerConnections<S> {
-    fn new(inbound_tx: mpsc::Sender<InboundMessage>, peer_count: Arc<AtomicU32>) -> Self {
+    fn new(
+        inbound_tx: mpsc::Sender<InboundMessage>,
+        peer_count: Arc<AtomicU32>,
+        wire_policy: Arc<TransportWirePolicy>,
+    ) -> Self {
         Self {
             peers: DashMap::new(),
             // Zero is reserved as "no generation" in diagnostics/tests.
             next_connection_id: AtomicU64::new(1),
             inbound_tx,
             peer_count,
+            wire_policy,
         }
     }
 
     /// Atomically install the newest authenticated connection generation for
-    /// one fixed validator identity.
+    /// one fixed validator identity, resolving a simultaneous dial
+    /// deterministically. Returns `None` when the new connection loses the
+    /// tie-break and must be closed.
     ///
     /// A clean process restart can leave the remote QUIC generation writable
     /// in the kernel for substantially longer than the validator process is
@@ -767,36 +913,63 @@ impl<S> PeerConnections<S> {
     /// so replacing this one identity's slot cannot admit a new member or grow
     /// the fixed connection set. Generation-checked cleanup below prevents the
     /// superseded reader from removing its replacement.
-    fn install_generation(
+    ///
+    /// Last-writer-wins was the rule, and under a simultaneous dial it let
+    /// each side keep a DIFFERENT connection and then drop the one the other
+    /// side kept - so both died. Both sides now compute the same answer:
+    /// within `SIMULTANEOUS_DIAL_WINDOW`, the connection initiated by the
+    /// lower validator address is the one kept. Outside the window the newer
+    /// connection still wins, which is the reconnect case.
+    fn install_directed(
         &self,
         key: [u8; 32],
+        local_key: [u8; 32],
         send: S,
         dial_addr: SocketAddr,
         stake: u64,
-    ) -> (u64, Option<u64>) {
+        initiated_locally: bool,
+    ) -> Option<(u64, Option<u64>)> {
         use dashmap::mapref::entry::Entry;
-
-        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::Instant::now();
+        // The initiator of the preferred connection is the lower address.
+        let preferred_initiator_is_local = local_key < key;
         match self.peers.entry(key) {
             Entry::Occupied(mut entry) => {
-                let previous_id = entry.get().connection_id;
+                let existing = entry.get();
+                let simultaneous =
+                    now.saturating_duration_since(existing.installed_at) < SIMULTANEOUS_DIAL_WINDOW;
+                if simultaneous
+                    && existing.initiated_locally == preferred_initiator_is_local
+                    && initiated_locally != preferred_initiator_is_local
+                {
+                    // The existing connection is the preferred one; so is the
+                    // peer's view of it. Keep it and drop the newcomer.
+                    return None;
+                }
+                let previous_id = existing.connection_id;
+                let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
                 entry.insert(PeerConnection {
                     connection_id,
                     send,
                     dial_addr,
                     stake,
+                    initiated_locally,
+                    installed_at: now,
                 });
-                (connection_id, Some(previous_id))
+                Some((connection_id, Some(previous_id)))
             }
             Entry::Vacant(entry) => {
+                let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
                 entry.insert(PeerConnection {
                     connection_id,
                     send,
                     dial_addr,
                     stake,
+                    initiated_locally,
+                    installed_at: now,
                 });
                 self.peer_count.fetch_add(1, Ordering::Relaxed);
-                (connection_id, None)
+                Some((connection_id, None))
             }
         }
     }
@@ -822,7 +995,7 @@ impl<S> PeerConnections<S> {
     }
 }
 
-impl PeerConnections<quinn::SendStream> {
+impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
     async fn remove_and_notify(&self, address: Hash256, connection_id: u64) -> bool {
         if !self.remove_if_current(&address.0, connection_id) {
             return false;
@@ -838,6 +1011,9 @@ impl PeerConnections<quinn::SendStream> {
     }
 
     async fn broadcast(&self, msg_type: MessageType, payload: &[u8]) {
+        if !self.wire_policy.permits(msg_type) {
+            return;
+        }
         if payload.len() > MAX_PAYLOAD_SIZE as usize {
             error!(
                 ?msg_type,
@@ -901,6 +1077,9 @@ impl PeerConnections<quinn::SendStream> {
 
     /// Send a message to a specific peer by validator address.
     async fn send_to(&self, target: &Hash256, msg_type: MessageType, payload: &[u8]) {
+        if !self.wire_policy.permits(msg_type) {
+            return;
+        }
         if payload.len() > MAX_PAYLOAD_SIZE as usize {
             error!(
                 ?msg_type,
@@ -971,6 +1150,7 @@ pub async fn run_transport(
         data_dir,
         None,
         None,
+        Arc::new(TransportWirePolicy::default()),
     )
     .await;
 }
@@ -1008,6 +1188,7 @@ pub async fn run_transport_with_readiness(
         data_dir,
         Some(startup),
         None,
+        Arc::new(TransportWirePolicy::default()),
     )
     .await;
 }
@@ -1032,6 +1213,7 @@ pub async fn run_transport_with_readiness_and_shutdown(
     data_dir: String,
     startup: tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    wire_policy: Arc<TransportWirePolicy>,
 ) {
     run_transport_inner(
         listen_addr,
@@ -1047,6 +1229,7 @@ pub async fn run_transport_with_readiness_and_shutdown(
         data_dir,
         Some(startup),
         Some(shutdown),
+        wire_policy,
     )
     .await;
 }
@@ -1092,6 +1275,7 @@ async fn run_transport_inner(
     data_dir: String,
     mut startup: Option<tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    wire_policy: Arc<TransportWirePolicy>,
 ) {
     if allowed_validators.is_empty() || !allowed_validators.contains(&local_address.0) {
         let message = format!(
@@ -1239,7 +1423,16 @@ async fn run_transport_inner(
         let _ = sender.send(Ok(listen_addr));
     }
 
-    let connections = Arc::new(PeerConnections::new(inbound_tx.clone(), peer_count.clone()));
+    if wire_policy.legacy_v3() {
+        warn!(
+            "Legacy-v3 wire mode: outbound history, checkpoint, absence, finality, and native-vote frames are suppressed; authenticated live DAG gossip remains enabled"
+        );
+    }
+    let connections = Arc::new(PeerConnections::new(
+        inbound_tx.clone(),
+        peer_count.clone(),
+        wire_policy,
+    ));
     let rate_limiter = Arc::new(PeerRateLimiter::new());
     let keypair = Arc::new(local_keypair);
     let local_identity = LocalPeerIdentity {
@@ -1338,14 +1531,25 @@ async fn run_transport_inner(
                 }
             }));
         }
-        // Wait for all dials to complete (or timeout)
-        for h in dial_handles {
-            let _ = h.await;
-        }
-        info!(
-            "Bootstrap dial phase complete, {} peers connected",
-            peer_count.load(Ordering::Relaxed)
-        );
+        // Do NOT wait for the dials here. This used to await every dial
+        // before the function reached its accept loop, so a node could not
+        // answer anyone's handshake while its own dials were in flight. Four
+        // nodes started together each waited on acceptors that did not exist
+        // yet: every dial timed out (3 x 15 s), the queued inbound handshakes
+        // were then abandoned "during the handshake", and the 30 s reconnect
+        // timer finally connected them - D1's "simultaneous mutual dialling
+        // deadlocks until timeout", which staggered startup had only avoided.
+        // The dials now finish in the background while inbound is served.
+        let dial_phase_peer_count = peer_count.clone();
+        tokio::spawn(async move {
+            for h in dial_handles {
+                let _ = h.await;
+            }
+            info!(
+                "Bootstrap dial phase complete, {} peers connected",
+                dial_phase_peer_count.load(Ordering::Relaxed)
+            );
+        });
     }
 
     // ── Dial persisted peers (from previous sessions) ───────────────────
@@ -1369,10 +1573,18 @@ async fn run_transport_inner(
             &rate_limiter,
             &allowed_validators,
         );
-        match dial_peer(&endpoint, *peer_addr, &ctx).await {
-            Ok(()) => info!("Connected to persisted peer {}", peer_addr),
-            Err(e) => debug!("Failed to connect to persisted peer {}: {}", peer_addr, e),
-        }
+        // In the background, like the bootstrap dials. Awaited here, one
+        // dead persisted address held back the outbound fanout and the accept
+        // loop - neither exists until this section finishes - for a full dial
+        // timeout, so a restarted validator could neither gossip nor accept.
+        let ep = endpoint.clone();
+        let addr = *peer_addr;
+        tokio::spawn(async move {
+            match dial_peer(&ep, addr, &ctx).await {
+                Ok(()) => info!("Connected to persisted peer {}", addr),
+                Err(e) => debug!("Failed to connect to persisted peer {}: {}", addr, e),
+            }
+        });
     }
 
     // ── Spawn outbound fanout task ──────────────────────────────────────
@@ -1400,6 +1612,114 @@ async fn run_transport_inner(
                     if let Ok(bytes) = bincode::serialize(&payload) {
                         conn_out
                             .broadcast(MessageType::DagBlockWithTxs, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::BroadcastAbsenceVote(vote) => {
+                    let payload = crate::protocol::ConsensusAbsenceVoteMessage { vote };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::ConsensusAbsenceVote, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::BroadcastAbsenceCertificate(certificate) => {
+                    let payload =
+                        crate::protocol::ConsensusAbsenceCertificateMessage { certificate };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::ConsensusAbsenceCertificate, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::BroadcastFinalityVote(vote) => {
+                    let payload = crate::protocol::ConsensusFinalityVoteMessage { vote };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::ConsensusFinalityVote, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::BroadcastFinalityCertificate(certificate) => {
+                    let payload =
+                        crate::protocol::ConsensusFinalityCertificateMessage { certificate };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::ConsensusFinalityCertificate, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::SendDagHistoryRequest {
+                    target,
+                    from_round,
+                    max_rounds,
+                } => {
+                    let payload = crate::protocol::DagHistoryRequestMessage {
+                        from_round,
+                        max_rounds,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .send_to(&target, MessageType::DagHistoryRequest, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::SendDagHistoryResponse {
+                    target,
+                    blocks,
+                    transactions,
+                } => {
+                    let payload = crate::protocol::DagHistoryResponseMessage {
+                        blocks,
+                        transactions,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .send_to(&target, MessageType::DagHistoryResponse, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::BroadcastNativeInferenceVote {
+                    request_id,
+                    tokens,
+                    vote,
+                } => {
+                    let payload = crate::protocol::NativeInferenceVoteMessage {
+                        request_id,
+                        tokens,
+                        vote,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::NativeInferenceVote, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::SendCheckpointRequest {
+                    target,
+                    needed_below_height,
+                } => {
+                    let payload = crate::protocol::CheckpointRequestMessage {
+                        needed_below_height,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .send_to(&target, MessageType::CheckpointRequest, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::SendCheckpointResponse {
+                    target,
+                    envelope,
+                    payload,
+                } => {
+                    let message = crate::protocol::CheckpointResponseMessage {
+                        envelope: *envelope,
+                        payload,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&message) {
+                        conn_out
+                            .send_to(&target, MessageType::CheckpointResponse, &bytes)
                             .await;
                     }
                 }
@@ -1952,8 +2272,21 @@ async fn dial_peer(
     // Atomically install the newest authenticated generation. A delayed reader
     // cleanup from the old generation is generation-checked below and cannot
     // remove this replacement.
-    let (connection_id, replaced_generation) =
-        connections.install_generation(remote.validator_address.0, send, dial_addr, remote.stake);
+    let Some((connection_id, replaced_generation)) = connections.install_directed(
+        remote.validator_address.0,
+        local_address.0,
+        send,
+        dial_addr,
+        remote.stake,
+        true,
+    ) else {
+        info!(
+            peer = %remote.validator_address,
+            "Simultaneous dial: keeping the connection the lower address initiated; closing this one"
+        );
+        conn.close(0u32.into(), b"simultaneous dial duplicate");
+        return Ok(());
+    };
     if let Some(replaced_generation) = replaced_generation {
         info!(
             peer = %remote.validator_address,
@@ -2070,8 +2403,21 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
     // Replace only this already-authenticated validator identity's generation.
     // The fixed allowlist above bounds the address map; replacement keeps the
     // peer count constant and makes a clean rolling restart immediately usable.
-    let (connection_id, replaced_generation) =
-        connections.install_generation(remote.validator_address.0, send, dial_addr, remote.stake);
+    let Some((connection_id, replaced_generation)) = connections.install_directed(
+        remote.validator_address.0,
+        local_address.0,
+        send,
+        dial_addr,
+        remote.stake,
+        false,
+    ) else {
+        info!(
+            peer = %remote.validator_address,
+            "Simultaneous dial: keeping the connection the lower address initiated; closing this one"
+        );
+        conn.close(0u32.into(), b"simultaneous dial duplicate");
+        return Ok(());
+    };
     if let Some(replaced_generation) = replaced_generation {
         info!(
             peer = %remote.validator_address,
@@ -2547,6 +2893,143 @@ async fn handle_peer_recv(
                     Err(e) => warn!("Bad ShardAnnounce from {}: {}", peer_address, e),
                 }
             }
+            MessageType::ConsensusAbsenceVote => {
+                match deserialize_message::<crate::protocol::ConsensusAbsenceVoteMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::ConsensusAbsenceVote {
+                                source: peer_address,
+                                vote: msg.vote,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad ConsensusAbsenceVote from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::ConsensusAbsenceCertificate => {
+                match deserialize_message::<crate::protocol::ConsensusAbsenceCertificateMessage>(
+                    &data,
+                ) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::ConsensusAbsenceCertificate {
+                                source: peer_address,
+                                certificate: msg.certificate,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Bad ConsensusAbsenceCertificate from {}: {}",
+                            peer_address, e
+                        )
+                    }
+                }
+            }
+            MessageType::ConsensusFinalityVote => {
+                match deserialize_message::<crate::protocol::ConsensusFinalityVoteMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::ConsensusFinalityVote {
+                                source: peer_address,
+                                vote: msg.vote,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad ConsensusFinalityVote from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::ConsensusFinalityCertificate => {
+                match deserialize_message::<crate::protocol::ConsensusFinalityCertificateMessage>(
+                    &data,
+                ) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::ConsensusFinalityCertificate {
+                                source: peer_address,
+                                certificate: msg.certificate,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Bad ConsensusFinalityCertificate from {}: {}",
+                            peer_address, e
+                        )
+                    }
+                }
+            }
+            MessageType::DagHistoryRequest => {
+                match deserialize_message::<crate::protocol::DagHistoryRequestMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::DagHistoryRequest {
+                                source: peer_address,
+                                from_round: msg.from_round,
+                                max_rounds: msg.max_rounds,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad DagHistoryRequest from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::DagHistoryResponse => {
+                match deserialize_message::<crate::protocol::DagHistoryResponseMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::DagHistoryResponse {
+                                source: peer_address,
+                                blocks: msg.blocks,
+                                transactions: msg.transactions,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad DagHistoryResponse from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::NativeInferenceVote => {
+                match deserialize_message::<crate::protocol::NativeInferenceVoteMessage>(&data) {
+                    Ok(msg) if msg.tokens.len() <= crate::protocol::MAX_NATIVE_VOTE_TOKENS => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::NativeInferenceVote {
+                                source: peer_address,
+                                request_id: msg.request_id,
+                                tokens: msg.tokens,
+                                vote: msg.vote,
+                            })
+                            .await;
+                    }
+                    Ok(_) => warn!("Oversized NativeInferenceVote from {}", peer_address),
+                    Err(e) => warn!("Bad NativeInferenceVote from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::CheckpointRequest => {
+                match deserialize_message::<crate::protocol::CheckpointRequestMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::CheckpointRequest {
+                                source: peer_address,
+                                needed_below_height: msg.needed_below_height,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad CheckpointRequest from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::CheckpointResponse => {
+                match deserialize_message::<crate::protocol::CheckpointResponseMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx
+                            .send(InboundMessage::CheckpointResponse {
+                                source: peer_address,
+                                envelope: Box::new(msg.envelope),
+                                payload: msg.payload,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad CheckpointResponse from {}: {}", peer_address, e),
+                }
+            }
             MessageType::RoundSyncRequest => {
                 match deserialize_message::<crate::protocol::RoundSyncRequestMessage>(&data) {
                     Ok(msg) => {
@@ -2722,6 +3205,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_v3_wire_filters_extensions_without_closing_streams() {
+        // Exercise the real broadcast and directed-send paths over a framed
+        // stream. A surviving legacy marker proves no extension leaked or
+        // broke the connection; default mode must still deliver extensions.
+        for legacy in [true, false] {
+            let policy = Arc::new(TransportWirePolicy::new(legacy));
+            let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+            let peer_count = Arc::new(AtomicU32::new(0));
+            let connections = PeerConnections::new(inbound_tx, peer_count.clone(), policy.clone());
+            let peer = Hash256([8; 32]);
+            let (send, mut receive) = tokio::io::duplex(4096);
+            let (generation, _) = connections
+                .install_directed(
+                    peer.0,
+                    [7; 32],
+                    send,
+                    "127.0.0.1:9945".parse().unwrap(),
+                    1,
+                    true,
+                )
+                .unwrap();
+            let mut expected = Vec::new();
+            let mut suppressed = 0;
+            for byte in 1..=u8::MAX {
+                let Some(kind) = MessageType::from_u8(byte) else {
+                    continue;
+                };
+                connections.broadcast(kind, &[byte, 1]).await;
+                connections.send_to(&peer, kind, &[byte, 2]).await;
+                if legacy && byte > 0x12 {
+                    suppressed += 2;
+                } else {
+                    expected.push((kind, vec![byte, 1]));
+                    expected.push((kind, vec![byte, 2]));
+                }
+            }
+            connections
+                .send_to(&peer, MessageType::Heartbeat, b"still-connected")
+                .await;
+            expected.push((MessageType::Heartbeat, b"still-connected".to_vec()));
+            assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+            assert_eq!(policy.suppressed_messages(), suppressed);
+            assert!(connections.remove_if_current(&peer.0, generation));
+            for (kind, payload) in expected {
+                let (received_kind, received_payload) = read_message(&mut receive).await.unwrap();
+                assert_eq!(received_kind, kind);
+                assert_eq!(received_payload, payload);
+                if legacy {
+                    assert!(
+                        (received_kind as u8) <= 0x12,
+                        "legacy parser would disconnect"
+                    );
+                }
+            }
+            assert_eq!(
+                read_message(&mut receive).await.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn both_quic_endpoints_derive_the_same_exporter_binding() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let server_key = KeyPair::generate_ed25519();
@@ -2856,6 +3401,7 @@ mod tests {
             std::env::temp_dir().to_string_lossy().into_owned(),
             startup_tx,
             shutdown_rx,
+            Arc::new(TransportWirePolicy::default()),
         ));
 
         tokio::time::timeout(std::time::Duration::from_secs(2), startup_rx)
@@ -2939,11 +3485,15 @@ mod tests {
         assert!(limiter.allow_at(&peer, MAX_PAYLOAD_SIZE, now + RATE_LIMIT_WINDOW_SECS));
     }
 
-    fn test_connections() -> (PeerConnections<()>, Arc<AtomicU32>) {
+    fn test_connections<S>() -> (PeerConnections<S>, Arc<AtomicU32>) {
         let (inbound_tx, _inbound_rx) = mpsc::channel(8);
         let peer_count = Arc::new(AtomicU32::new(0));
         (
-            PeerConnections::new(inbound_tx, peer_count.clone()),
+            PeerConnections::new(
+                inbound_tx,
+                peer_count.clone(),
+                Arc::new(TransportWirePolicy::default()),
+            ),
             peer_count,
         )
     }
@@ -2954,10 +3504,13 @@ mod tests {
         let peer = [3_u8; 32];
         let dial_addr: SocketAddr = "127.0.0.1:7331".parse().unwrap();
 
-        let (first_id, replaced) = connections.install_generation(peer, (), dial_addr, 500_000);
+        let (first_id, replaced) = connections
+            .install_directed(peer, LOCAL, (), dial_addr, 500_000, true)
+            .unwrap();
         assert_eq!(replaced, None);
-        let (replacement_id, replaced) =
-            connections.install_generation(peer, (), dial_addr, 500_000);
+        let (replacement_id, replaced) = connections
+            .install_directed(peer, LOCAL, (), dial_addr, 500_000, true)
+            .unwrap();
         assert_eq!(replaced, Some(first_id));
         assert!(replacement_id > first_id);
         assert_eq!(connections.peers.len(), 1);
@@ -2977,11 +3530,14 @@ mod tests {
         let peer = [9_u8; 32];
         let dial_addr: SocketAddr = "127.0.0.1:7332".parse().unwrap();
 
-        let (old_id, replaced) = connections.install_generation(peer, (), dial_addr, 500_000);
+        let (old_id, replaced) = connections
+            .install_directed(peer, LOCAL, (), dial_addr, 500_000, true)
+            .unwrap();
         assert_eq!(replaced, None);
         assert!(connections.remove_if_current(&peer, old_id));
-        let (replacement_id, replaced) =
-            connections.install_generation(peer, (), dial_addr, 500_000);
+        let (replacement_id, replaced) = connections
+            .install_directed(peer, LOCAL, (), dial_addr, 500_000, true)
+            .unwrap();
         assert_eq!(replaced, None);
         assert!(replacement_id > old_id);
 
@@ -2996,5 +3552,112 @@ mod tests {
 
         assert!(connections.remove_if_current(&peer, replacement_id));
         assert_eq!(peer_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// A local identity for the single-map tests (the lower of the pair).
+    const LOCAL: [u8; 32] = [1_u8; 32];
+
+    /// Replays one simultaneous dial between a lower address A and a higher
+    /// address B, with each side's two handshakes finishing in the given
+    /// order, and returns which connection each side kept. "A->B" is the one
+    /// A initiated.
+    fn simultaneous_dial(
+        a_accepts_first: bool,
+        b_accepts_first: bool,
+    ) -> (&'static str, &'static str) {
+        let a = [1_u8; 32];
+        let b = [2_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7333".parse().unwrap();
+        let (a_view, _) = test_connections::<&'static str>();
+        let (b_view, _) = test_connections::<&'static str>();
+        // On A: "A->B" is a dial, "B->A" an accept. On B, the reverse.
+        let a_steps = [("A->B", true), ("B->A", false)];
+        let b_steps = [("B->A", true), ("A->B", false)];
+        for (view, local, remote, steps, accepts_first) in [
+            (&a_view, a, b, a_steps, a_accepts_first),
+            (&b_view, b, a, b_steps, b_accepts_first),
+        ] {
+            let mut order = steps.to_vec();
+            if accepts_first {
+                order.reverse();
+            }
+            for (label, dialed) in order {
+                let _ = view.install_directed(remote, local, label, addr, 500_000, dialed);
+            }
+        }
+        let kept = |view: &PeerConnections<&'static str>, remote: [u8; 32]| {
+            assert_eq!(view.peers.len(), 1, "exactly one connection per peer");
+            view.peers.get(&remote).unwrap().send
+        };
+        (kept(&a_view, b), kept(&b_view, a))
+    }
+
+    #[test]
+    fn a_simultaneous_dial_converges_on_one_connection_in_every_completion_order() {
+        // Under last-writer-wins, A could keep "B->A" while B kept "A->B",
+        // each then closing the connection the other side kept. Every order
+        // must now land both sides on the SAME connection.
+        for a_accepts_first in [false, true] {
+            for b_accepts_first in [false, true] {
+                let (a_kept, b_kept) = simultaneous_dial(a_accepts_first, b_accepts_first);
+                assert_eq!(
+                    (a_kept, b_kept),
+                    ("A->B", "A->B"),
+                    "order a_accepts_first={a_accepts_first} b_accepts_first={b_accepts_first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_losing_duplicate_neither_bumps_the_peer_count_nor_replaces_the_winner() {
+        let (connections, peer_count) = test_connections::<&'static str>();
+        let local = [1_u8; 32];
+        let remote = [2_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7334".parse().unwrap();
+        let (kept_id, _) = connections
+            .install_directed(remote, local, "A->B", addr, 500_000, true)
+            .unwrap();
+        assert!(
+            connections
+                .install_directed(remote, local, "B->A", addr, 500_000, false)
+                .is_none()
+        );
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            connections.peers.get(&remote).unwrap().connection_id,
+            kept_id
+        );
+        assert_eq!(connections.peers.get(&remote).unwrap().send, "A->B");
+    }
+
+    #[test]
+    fn outside_the_window_a_reconnect_replaces_the_old_connection_in_either_direction() {
+        // A restarted peer's new connection must win over a stale one even
+        // when the stale one had the preferred direction - otherwise a
+        // rolling restart would look like a partition until QUIC timed out.
+        let (connections, peer_count) = test_connections::<&'static str>();
+        let local = [1_u8; 32];
+        let remote = [2_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7335".parse().unwrap();
+        let (old_id, _) = connections
+            .install_directed(remote, local, "A->B (stale)", addr, 500_000, true)
+            .unwrap();
+        {
+            let mut entry = connections.peers.get_mut(&remote).unwrap();
+            entry.installed_at = entry
+                .installed_at
+                .checked_sub(SIMULTANEOUS_DIAL_WINDOW + std::time::Duration::from_secs(1))
+                .expect("monotonic clock far enough from boot");
+        }
+        let (new_id, replaced) = connections
+            .install_directed(remote, local, "B->A (restart)", addr, 500_000, false)
+            .expect("a reconnect outside the window replaces");
+        assert_eq!(replaced, Some(old_id));
+        assert_eq!(
+            connections.peers.get(&remote).unwrap().connection_id,
+            new_id
+        );
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
     }
 }

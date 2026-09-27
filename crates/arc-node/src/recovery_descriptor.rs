@@ -759,6 +759,7 @@ mod tests {
             chain_id: "0x415243".into(),
             validator_set_complete: true,
             community_rewards_v1_activation_height: Some(137_146),
+            instance_id: None,
         };
         let genesis = config::GenesisConfig {
             chain,

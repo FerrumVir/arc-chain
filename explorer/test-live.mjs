@@ -52,7 +52,7 @@ assert.equal(network.stateRoot(boundary.block), checkpoint.boundaryStateRoot, "H
 const current = resolver.currentSource();
 const [health, latest] = await Promise.all([
   explorer.requestJson(fetch, current, "/health"),
-  explorer.requestJson(fetch, current, "/block/latest"),
+  explorer.requestLatestBlock(fetch, current),
 ]);
 assert.ok(network.blockHeight(latest) >= checkpoint.recoveryHeight, "latest v3 block must not precede H+1");
 const liveness = network.evaluateLiveness(health, latest);

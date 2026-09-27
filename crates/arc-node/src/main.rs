@@ -113,6 +113,18 @@ struct Cli {
     #[arg(long)]
     seeds_file: Option<String>,
 
+    /// TEMPORARY: restrict outgoing validator frames to original protocol-3
+    /// types 0x01..0x12 during an existing v3 fleet upgrade. Disables network
+    /// history/checkpoint transfer and absence/finality/native vote gossip.
+    /// Remove on every validator after the fleet upgrade, before native
+    /// activation. Authentication, proposal gates, and durable state stay intact.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["native_inference_activation", "native_inference_runtime", "recovery_checkpoint"]
+    )]
+    legacy_v3_wire: bool,
+
     /// HTTPS origin for a seed/community RPC service. Repeat once per seed
     /// (or provide a comma-separated ARC_COMMUNITY_RPC_URLS value). These
     /// URLs drive worker registration/claims/results and 5-of-6 reward
@@ -183,6 +195,147 @@ struct Cli {
     /// restart. Requires more memory, disk space, and replay time.
     #[arg(long, default_value_t = false)]
     archive: bool,
+
+    /// PRIVATE PROTOCOL 4: activate the native inference contract from an
+    /// operator-supplied context file (JSON), on a FRESH private genesis only.
+    ///
+    /// Default off. This configures and activates the contract; it does NOT
+    /// enable production model execution, which stays behind
+    /// `CanonicalI8NativeExecutor::load_qualified` (artifact hash, versioned
+    /// profile/generation commitments, explicit reference qualification).
+    /// On a chain past height 0, activation additionally requires a
+    /// `migration` section naming this chain, the coordinated activation
+    /// height and the exact binding. Without one, a running chain is still
+    /// refused. Use --print-migration-record to produce that section.
+    #[arg(long, value_name = "PATH")]
+    native_inference_activation: Option<PathBuf>,
+
+    /// Print the `migration` section for --native-inference-activation and
+    /// exit, without activating or touching state.
+    ///
+    /// The record must be IDENTICAL on every validator, so it is derived here
+    /// from this node's own chain identity and the same context assembly the
+    /// activation itself uses - never typed by hand. Run it on one node,
+    /// review the output, and give the same section to all of them.
+    ///
+    /// It opens the state directory, which a running node holds locked, so
+    /// run it on a stopped node or on a copy of its data directory. It
+    /// activates nothing and writes no contract state.
+    #[arg(
+        long,
+        requires = "native_inference_activation",
+        requires = "migration_activation_height"
+    )]
+    print_migration_record: bool,
+
+    /// The coordinated height for --print-migration-record: the single block
+    /// at which every validator activates. Choose it far enough ahead that
+    /// every validator is on the new binary and configured.
+    #[arg(long, value_name = "HEIGHT")]
+    migration_activation_height: Option<u64>,
+
+    /// PRIVATE PROTOCOL 4: run the native inference worker loop.
+    ///
+    /// Default off, and requires --native-inference-activation. Activating the
+    /// contract without this keeps this node's new-request admission closed.
+    /// Finalization, refunds and committed-block validity remain available.
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "native_inference_activation"
+    )]
+    native_inference_runtime: bool,
+
+    /// Admit NEW native paid requests locally after coordinated fleet readiness.
+    /// Default closed, including after restart. Also requires a healthy native
+    /// worker; does not affect committed requests, finalization or refunds.
+    #[arg(long, default_value_t = false, requires = "native_inference_runtime")]
+    enable_native_inference_requests: bool,
+
+    /// Largest KV cache (bytes) one native job may use on this node. A job
+    /// needing more is refused and never voted on, so it expires and refunds.
+    /// The default fits the canonical 7B package on a 16 GB host.
+    #[arg(long, value_name = "BYTES", default_value_t = arc_node::native_inference::DEFAULT_NATIVE_KV_BUDGET_BYTES)]
+    native_kv_budget_bytes: u64,
+
+    /// Canonical-I8 GGUF artifact for the native worker. Its bytes are hashed
+    /// and must match a model hash in the activated allowlist.
+    #[arg(long, value_name = "PATH")]
+    native_inference_artifact: Option<PathBuf>,
+
+    /// Explicit reference-qualification record for REAL-model execution, bound
+    /// to one execution identity (see `NativeQualificationRecord`).
+    ///
+    /// Required for the real executor. Startup does not infer qualification:
+    /// matching artifact/profile/generation hashes establish execution
+    /// identity, not that the execution passed reference qualification.
+    #[arg(long, value_name = "PATH")]
+    native_inference_qualification: Option<PathBuf>,
+
+    /// The approved model package manifest (`arc.model-package.v1`) for the
+    /// real executor. Its hash must equal the qualification record's
+    /// `package_manifest_hash`, and it must describe exactly the artifact
+    /// this node loads (model package contract v1). Required with
+    /// `--native-inference-qualification`.
+    #[arg(long, value_name = "PATH")]
+    native_package_manifest: Option<PathBuf>,
+
+    /// This operator's own row machines (JSON; `arc_node::row_cohort`). Each
+    /// runs `tensor_row_model_worker` on the same artifact and is reached over
+    /// SSH with a pinned host key. Paid requests are then placed on them
+    /// whenever placement predicts that is faster; the tokens are those of
+    /// local execution either way. Only this operator's machines may feed its
+    /// vote (docs/design/assignment-node-integration.md, trust model).
+    #[arg(long, value_name = "PATH", requires = "native_package_manifest")]
+    native_row_workers: Option<PathBuf>,
+
+    /// Keep only canonical norms/RoPE and bounded verified GGUF rows locally.
+    /// Every primary projection requires a measured private row worker;
+    /// missing coverage, transport failure or failed verification refuses the
+    /// request. There is no full-model load or local generation fallback.
+    #[arg(long, default_value_t = false, requires_all = ["native_row_workers", "native_inference_runtime", "native_inference_qualification"])]
+    native_low_residency: bool,
+
+    /// INTEGRATION TESTING ONLY: run the native worker with a deterministic
+    /// executor that loads no model. Compiled in only with the
+    /// `native-test-executor` cargo feature, so a default build cannot enable
+    /// it. Evidence produced this way is protocol coverage and qualifies no
+    /// model.
+    #[cfg(feature = "native-test-executor")]
+    #[arg(long, default_value_t = false)]
+    native_inference_test_executor: bool,
+
+    /// How many rounds of DAG history this node keeps below its commit cursor.
+    ///
+    /// Operator meaning: how far behind a validator may fall and still rejoin
+    /// by authenticated history transfer. Beyond it, its peers no longer hold
+    /// the rounds it needs and it requires an authenticated checkpoint - a
+    /// different trust boundary. This is a memory choice, not a safety one:
+    /// every rejoining block is validated exactly as a live one.
+    #[arg(long, value_name = "ROUNDS")]
+    dag_retained_rounds: Option<u64>,
+
+    /// Publish a state snapshot every this many canonical blocks; 0 disables.
+    ///
+    /// Operator meaning: the upper bound on how much of the WAL a restart has
+    /// to apply. Disabling it is correct - the WAL alone recovers the node -
+    /// but recovery time then grows with the chain forever.
+    #[arg(long, value_name = "BLOCKS")]
+    snapshot_every_blocks: Option<u64>,
+
+    /// DEVELOPMENT START BARRIER, default off: while still at round 0, wait
+    /// for every genesis validator with stake to be connected before
+    /// proposing, instead of the usual quorum of connected stake.
+    ///
+    /// With equal stake and four or more validators, quorum is smaller than
+    /// the committee, so the nodes that start first advance without the last
+    /// one; the last node is then permanently behind (there is no
+    /// authenticated history transfer) and the commit rule halts at the first
+    /// round it was due to lead. This barrier is strictly stronger than the
+    /// quorum rule and only delays the first proposal. It is not a substitute
+    /// for history transfer and does nothing after round 0.
+    #[arg(long, default_value_t = false)]
+    require_full_committee_at_genesis: bool,
 
     /// Enable continuous transaction generation (testnet benchmark mode).
     /// Generates transfers between genesis accounts to keep the chain busy.
@@ -410,6 +563,14 @@ struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum OperatorCommand {
+    /// Print the actual native assignment policy commitment without starting
+    /// a node, connecting workers, reading chain state, or loading a model.
+    NativeAssignmentPolicy {
+        #[arg(long)]
+        row_workers: Option<PathBuf>,
+        #[arg(long, requires = "row_workers")]
+        low_residency: bool,
+    },
     /// Create or finalize offline, create-only v0.7 community retirement evidence.
     LegacyRetirement {
         #[command(subcommand)]
@@ -2146,6 +2307,18 @@ fn prepare_replayed_consensus_state(
             "Recovered validator/state replay rechecked against its canonical block"
         );
     } else if !genesis_validators.is_empty() {
+        // A native-inference chain's committee is frozen by its binding, which
+        // is restored from the WAL when the state opens - before this point.
+        // Refuse a genesis whose committee differs, naming the difference,
+        // BEFORE re-seeding: the persistent state is fine, and the remedy is to
+        // restore the activation-time genesis (D2).
+        if let Some(binding) = state.native_inference_context() {
+            arc_state::inference_contract_state::genesis_committee_matches_binding(
+                genesis_validators,
+                &binding.members,
+            )
+            .map_err(|message| anyhow::anyhow!(message))?;
+        }
         state.seed_genesis_validators(genesis_validators);
         tracing::info!(
             "Seeded {} genesis validators into StateDB.validators",
@@ -4398,6 +4571,19 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
 
 async fn run_operator_command(command: OperatorCommand) -> Result<()> {
     match command {
+        OperatorCommand::NativeAssignmentPolicy {
+            row_workers,
+            low_residency,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&native_assignment_policy_report(
+                    row_workers.as_deref(),
+                    low_residency,
+                )?)?
+            );
+            Ok(())
+        }
         OperatorCommand::LegacyRetirement { command } => legacy_retirement::run(command),
         OperatorCommand::Recovery { command } => run_recovery_operator_command(command),
         OperatorCommand::Archive {
@@ -4443,6 +4629,32 @@ async fn run_operator_command(command: OperatorCommand) -> Result<()> {
             .await
         }
     }
+}
+
+fn native_assignment_policy_report(
+    row_workers: Option<&std::path::Path>,
+    low_residency: bool,
+) -> Result<serde_json::Value> {
+    let config = row_workers
+        .map(arc_node::row_cohort::RowCohortConfig::load)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let assignment =
+        arc_node::native_inference::runtime_assignment_hash(config.as_ref(), low_residency)?;
+    Ok(serde_json::json!({
+        "format": "arc.native-assignment-policy-report.v1",
+        "assignment_hash": assignment.to_hex(),
+        "mode": if config.as_ref().is_some_and(|c| c.partial_rows.is_some()) { "private-fixed-resident-rows-canonical-checks-v1" }
+            else if low_residency { "private-row-remote-only-strict-v1" }
+            else if config.is_some() { "private-row-resident-with-local-fallback-v1" }
+            else { "local-canonical-i8-v1" },
+        "assignment_certificate_version": config.as_ref().map(|c| if c.partial_rows.is_some() { 3 } else { 2 }),
+        "max_workers": config.as_ref().map(|c| c.max_workers),
+        "duplicate_per_mille": config.as_ref().map(|c| c.duplicate_per_mille),
+        "spot_rows_per_stage": config.as_ref().map(|c| c.spot_rows_per_stage),
+        "qualified": false,
+        "note": "Computed configuration identity only. Does not activate, approve, qualify, or establish worker readiness."
+    }))
 }
 
 /// Return the first candidate whose complete SHA-256 matches the canonical
@@ -4860,15 +5072,31 @@ async fn post_signed_shard_announcement(
     )
     .map_err(anyhow::Error::msg)
     .context("sign validator shard announcement")?;
-    client
+    let response = client
         .post(format!("{rpc_base}{}", rpc::SHARD_ANNOUNCE_PATH))
         .json(&signed)
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
-        .with_context(|| format!("POST authenticated shard announcement to {rpc_base}"))?
-        .error_for_status()
-        .with_context(|| format!("validator {rpc_base} rejected shard announcement"))?;
+        .with_context(|| format!("POST authenticated shard announcement to {rpc_base}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        // The peer says exactly why it refused, in the response body. Throwing
+        // that away is what turned a fleet-wide discovery outage into a
+        // mystery: 3,360 refusals were logged in three hours and not one
+        // carried a reason, so the cause had to be reconstructed from source.
+        // Bounded, because a peer's body is untrusted input.
+        let body = response.text().await.unwrap_or_default();
+        let reason: String = body.chars().take(300).collect();
+        bail!(
+            "validator {rpc_base} rejected shard announcement: HTTP {status}: {}",
+            if reason.trim().is_empty() {
+                "(no reason given)"
+            } else {
+                reason.trim()
+            }
+        );
+    }
     Ok(())
 }
 
@@ -5522,6 +5750,18 @@ fn validate_full_integer_worker_role(
     Ok(())
 }
 
+fn validate_legacy_v3_wire_state(
+    protocol_major: u16,
+    has_native_context: bool,
+    has_native_migration: bool,
+) -> Result<()> {
+    ensure!(
+        protocol_major == 3 && !has_native_context && !has_native_migration,
+        "--legacy-v3-wire requires existing protocol-3 state without native activation or migration; remove compatibility mode across the upgraded fleet before native activation"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "benchmark-tools")]
 fn benchmark_mode_enabled(cli: &Cli) -> bool {
     cli.benchmark
@@ -5665,6 +5905,8 @@ async fn auto_shard_join(
     rpc_base: &str,
     advertised_socket: &str,
     model_artifact_id: Hash256,
+    shape: &arc_inference::gguf_meta::ModelShape,
+    execution_profile: &str,
 ) -> Option<(usize, usize)> {
     if rpc_base.is_empty() {
         tracing::warn!(
@@ -5681,9 +5923,10 @@ async fn auto_shard_join(
         "socket_addr": advertised_socket,
         "node_name": public_node_name(cli),
         "model_id": model_id_hex,
-        "model_name": "Llama-2-7B",
-        "execution_profile": arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
-        "total_layers": 32u32,
+        // The model's own header, not an assumption about which model it is.
+        "model_name": shape.name.clone().unwrap_or_else(|| shape.architecture.clone()),
+        "execution_profile": execution_profile,
+        "total_layers": shape.block_count,
         "available_memory_mb": detect_ram_mb(),
         "gpu_tier": 0u8,
     });
@@ -6155,11 +6398,17 @@ fn main() -> Result<()> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn run_arc_node() -> Result<()> {
+    // Colour codes only for a person at a terminal; in a log file they are
+    // bytes on every line that every reader has to strip.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("arc=info".parse()?))
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     let mut cli = Cli::parse();
+    let transport_wire_policy = Arc::new(arc_net::transport::TransportWirePolicy::new(
+        cli.legacy_v3_wire,
+    ));
 
     // The legacy peer snapshot protocol is not quorum-authenticated and is
     // intentionally retired. Reject it before community model discovery,
@@ -6709,6 +6958,30 @@ async fn run_arc_node() -> Result<()> {
         .transpose()
         .context("cannot establish the exact --model artifact commitment")?;
     let model_artifact_id = model_artifact.as_ref().map(|artifact| artifact.model_id());
+    // What model it is comes from the file's own GGUF header, and this build
+    // must have a conformant integer adapter for that architecture - anything
+    // else is refused here rather than forced through the Llama path. ARC's
+    // own `.arc-int8` cache is produced from a supported GGUF and carries its
+    // own config, so it has no GGUF header to read.
+    let model_shape = match cli.model.as_deref() {
+        Some(path) if !path.ends_with(".arc-int8") => {
+            let shape = arc_inference::gguf_meta::read_shape_from_path(Path::new(path))
+                .context("cannot read the --model GGUF header")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the --model GGUF header names no architecture and block count")
+                })?;
+            if arc_inference::gguf_meta::supported_adapter(&shape.architecture).is_none() {
+                anyhow::bail!(
+                    "--model is a '{}' model ({} blocks); this build has a conformant integer \
+                     adapter only for: llama",
+                    shape.architecture,
+                    shape.block_count
+                );
+            }
+            Some(shape)
+        }
+        _ => None,
+    };
 
     // Ask for a shard only after the signing identity and genesis membership
     // have passed validation, so a misconfigured validator performs no remote
@@ -6721,17 +6994,30 @@ async fn run_arc_node() -> Result<()> {
         && cli.shard_end.is_none()
     {
         let advertised_socket = advertised_shard_rpc_origin(&cli, &rpc_addr)?;
-        match auto_shard_join(
-            &cli,
-            coordinator_rpc_bases
-                .first()
-                .map(String::as_str)
-                .unwrap_or(""),
-            &advertised_socket,
-            model_artifact_id.expect("--model commitment established above"),
-        )
-        .await
-        {
+        let joined = match model_shape.as_ref() {
+            Some(shape) => {
+                auto_shard_join(
+                    &cli,
+                    coordinator_rpc_bases
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    &advertised_socket,
+                    model_artifact_id.expect("--model commitment established above"),
+                    shape,
+                    arc_inference::gguf_meta::supported_adapter(&shape.architecture)
+                        .expect("unsupported architectures were refused above"),
+                )
+                .await
+            }
+            None => {
+                tracing::warn!(
+                    "auto-shard needs a GGUF --model whose header states its shape; not joining"
+                );
+                None
+            }
+        };
+        match joined {
             Some((start, end)) => {
                 tracing::info!(
                     "auto-shard: seed assigned this validator layers [{}, {}) — loading shard",
@@ -6791,6 +7077,11 @@ async fn run_arc_node() -> Result<()> {
     tracing::info!("╔═══════════════════════════════════════╗");
     tracing::info!("║   ARC Chain - Agent Runtime Chain     ║");
     tracing::info!("║   ARC Node v{:<26}║", env!("CARGO_PKG_VERSION"));
+    // Open our own executable now, before anything could replace the file,
+    // and hash it on another thread: /health reports the build this process
+    // actually runs, without delaying the node's start (the digest is logged
+    // when it is ready).
+    arc_node::build_identity::begin();
     tracing::info!("╚═══════════════════════════════════════╝");
     tracing::info!("Validator  : {}", validator_address);
     tracing::info!(
@@ -6929,6 +7220,16 @@ async fn run_arc_node() -> Result<()> {
             recovery_import,
         )
         .context("failed to initialize genesis/recovery-bound persistent state")?;
+        // Check recovered state before activation, archive changes, or any
+        // new canonical operation. A migrated native chain still reports v3,
+        // so the native binding and migration record must also be absent.
+        if cli.legacy_v3_wire {
+            validate_legacy_v3_wire_state(
+                db.active_protocol_version().major,
+                db.try_native_inference_context()?.is_some(),
+                db.native_migration().is_some(),
+            )?;
+        }
         // The process-lifetime inner lock now protects the open WAL. Release
         // the stable sibling startup guard only after replay/import and every
         // namespace-dependent state decision has completed successfully.
@@ -6996,7 +7297,374 @@ async fn run_arc_node() -> Result<()> {
         return Ok(());
     }
 
+    // ── Private protocol-4 native inference activation (default OFF) ────────
+    //
+    // Previously nothing in this binary referenced the native contract at all:
+    // every caller of `activate_native_inference` was in `#[cfg(test)]`, so the
+    // contract could not be configured, activated or exercised outside unit
+    // tests. This is the operator seam.
+    //
+    // Fail-closed in both directions: an absent flag never touches the
+    // contract, and a present flag that cannot be satisfied aborts startup
+    // rather than continuing half-configured. It does NOT enable production
+    // model execution - the executor's own qualification gate is untouched.
+    if cli.print_migration_record {
+        let activation_path = cli
+            .native_inference_activation
+            .as_ref()
+            .expect("clap requires --native-inference-activation");
+        let at = cli
+            .migration_activation_height
+            .expect("clap requires --migration-activation-height");
+        let request = arc_node::native_inference::load_activation_request(activation_path)
+            .map_err(|e| anyhow::anyhow!("--print-migration-record: {e}"))?;
+        let context =
+            arc_node::native_inference::assemble_activation_context(state.as_ref(), &request)
+                .map_err(|e| anyhow::anyhow!("--print-migration-record: {e}"))?;
+        let commitment = context
+            .commitment()
+            .map_err(|e| anyhow::anyhow!("--print-migration-record: {e}"))?;
+        let recovery = state.recovery_context().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--print-migration-record: this chain carries no recovery context, so it is not \
+                 an existing recovered chain and needs no migration record; activate it at \
+                 genesis instead"
+            )
+        })?;
+        if at <= state.height() {
+            bail!(
+                "--print-migration-record: height {at} is not ahead of this chain, which is at \
+                 {}; a coordinated activation must be in the future for every validator",
+                state.height()
+            );
+        }
+        let section = serde_json::json!({
+            "migration": {
+                "chain_genesis": recovery.genesis_hash.to_hex(),
+                "recovery_epoch": recovery.recovery_epoch,
+                "validator_set_id": recovery.validator_set_id,
+                "activation_height": at,
+                "context_commitment": commitment.to_hex(),
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&section)?);
+        eprintln!(
+            "Derived from chain height {} with {} committee members. Give this SAME section to \
+             every validator; a validator with a different one cannot activate and will stop at \
+             height {at}.",
+            state.height(),
+            context.members.len()
+        );
+        return Ok(());
+    }
+
+    if let Some(activation_path) = cli.native_inference_activation.as_ref() {
+        match arc_node::native_inference::activate_native_inference_from_config(
+            state.as_ref(),
+            activation_path,
+        ) {
+            Ok(commitment) => {
+                tracing::warn!(
+                    "PRIVATE protocol-4 native inference ACTIVATED from {} (commitment {}). \
+                     Private genesis-only capability; production model execution remains \
+                     behind separate artifact qualification.",
+                    activation_path.display(),
+                    commitment.to_hex()
+                );
+            }
+            // A migration that has not reached its coordinated height is the
+            // normal state of every validator between being configured and
+            // the chain arriving there. The node runs on and activates at
+            // that height; it does not refuse to start.
+            Err(
+                error @ arc_node::native_inference::ActivationConfigError::MigrationPending {
+                    ..
+                },
+            ) => {
+                tracing::warn!(
+                    "native inference migration is authorised and waiting: {error} (from {})",
+                    activation_path.display()
+                );
+            }
+            // Likewise a binding update between being configured and the
+            // chain reaching its coordinated height: the binding in force is
+            // unchanged and this node keeps serving under it.
+            Err(
+                error @ arc_node::native_inference::ActivationConfigError::BindingUpdatePending {
+                    ..
+                },
+            ) => {
+                tracing::warn!(
+                    "native inference binding update is authorised and waiting: {error} (from {})",
+                    activation_path.display()
+                );
+            }
+            Err(error) => {
+                bail!(
+                    "--native-inference-activation {}: {error}",
+                    activation_path.display()
+                );
+            }
+        }
+    }
+
     let mempool = Arc::new(Mempool::new(10_000_000));
+
+    // ── Private protocol-4 native worker runtime (default OFF) ──────────────
+    //
+    // Activation writes contract state; it does not execute anything. Without
+    // this loop a request can be admitted with no process to run it and no
+    // finalization to settle it. Bounded and cancellable: it sleeps between
+    // empty polls, backs off on error, stops after repeated failures rather
+    // than hot-looping, and is shut down explicitly below.
+    let native_runtime_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let native_request_admission =
+        Arc::new(arc_node::native_inference::NativeRequestAdmission::new(
+            cli.enable_native_inference_requests,
+        ));
+    let mut native_runtime_handle: Option<arc_node::native_inference::NativeRuntimeHandle> = None;
+    // The finalize sink is shared: the runtime emits this validator's votes into
+    // it, and the consensus loop gossips them and feeds peers' votes back in.
+    let mut native_vote_relay: Option<Arc<arc_node::native_inference::NativeFinalizeSink>> = None;
+    // What the native worker executes, for the context and tokenize endpoints.
+    let mut native_serving: Option<Arc<arc_node::native_inference::NativeServing>> = None;
+    if cli.native_row_workers.is_some() && !cli.native_inference_runtime {
+        anyhow::bail!(
+            "--native-row-workers places the canonical executor's work on this operator's \
+             machines; it needs --native-inference-runtime with a qualified artifact"
+        );
+    }
+    if cli.native_inference_runtime {
+        use arc_node::native_inference as ni;
+        let context = state.native_inference_context().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--native-inference-runtime requires an activated contract; \
+                 --native-inference-activation did not produce one"
+            )
+        })?;
+        let commitment = context
+            .commitment()
+            .map_err(|e| anyhow::anyhow!("activated context has no valid commitment: {e}"))?;
+        let allowed =
+            context.allowed_executions.first().copied().ok_or_else(|| {
+                anyhow::anyhow!("activated context has an empty execution allowlist")
+            })?;
+        // Built per branch: the two executor types are different, so the
+        // runtime is generic over them and the parts cannot be shared by move.
+        // `DecisionStore::open` is a directory handle, so rebuilding it is
+        // cheap and lands on the same durable path either way.
+        let shared_sink = Arc::new(ni::NativeFinalizeSink::new(
+            state.clone(),
+            mempool.clone(),
+            Arc::new(validator_keypair.clone()),
+        ));
+        native_vote_relay = Some(shared_sink.clone());
+        let native_parts = || -> anyhow::Result<(
+            Arc<ni::KeyPairVoteSigner>,
+            Arc<ni::NativeFinalizeSink>,
+            ni::DecisionStore,
+        )> {
+            let store = ni::DecisionStore::open(
+                std::path::Path::new(&cli.data_dir).join("native-decisions"),
+                validator_keypair.address(),
+                context.domain.chain_genesis,
+                commitment,
+            )
+            .map_err(|e| anyhow::anyhow!("native decision store: {e}"))?;
+            let signer = Arc::new(ni::KeyPairVoteSigner::new(validator_keypair.clone()));
+            Ok((signer, shared_sink.clone(), store))
+        };
+        // The deterministic test executor loads no model and never consults
+        // this field; it is carried only so its output is domain-separated by
+        // execution identity. It is `false` because nothing here qualified
+        // anything, and writing `true` next to a comment saying startup cannot
+        // decide that is exactly the defect being removed.
+        #[cfg(feature = "native-test-executor")]
+        let test_identity = ni::CanonicalI8Qualification {
+            artifact_hash: allowed.model_hash,
+            profile_hash: allowed.profile_hash,
+            generation_hash: allowed.generation_hash,
+            reference_generation_qualified: false,
+        };
+
+        #[cfg(feature = "native-test-executor")]
+        let started = if cli.native_inference_test_executor {
+            if cli.native_row_workers.is_some() {
+                anyhow::bail!(
+                    "--native-row-workers needs the canonical executor, not the deterministic \
+                     test executor"
+                );
+            }
+            tracing::warn!(
+                "native worker running with the DETERMINISTIC TEST EXECUTOR. No model is \
+                 loaded. This is integration coverage and qualifies nothing."
+            );
+            let (signer, sink, store) = native_parts()?;
+            let executor = Arc::new(ni::DeterministicTestExecutor::new(test_identity));
+            native_serving = Some(Arc::new(ni::NativeServing::deterministic_test()));
+            let runtime =
+                ni::NativeWorkerRuntime::from_active(state.clone(), executor, signer, sink, store)
+                    .map_err(|e| anyhow::anyhow!("native worker runtime: {e}"))?;
+            Some(ni::spawn_native_runtime_with_admission(
+                runtime,
+                ni::NativeRuntimeBounds::default(),
+                native_runtime_cancel.clone(),
+                native_request_admission.clone(),
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "native-test-executor"))]
+        let started: Option<ni::NativeRuntimeHandle> = None;
+
+        native_runtime_handle = match started {
+            Some(handle) => Some(handle),
+            None => {
+                // Resolve qualification FIRST. A missing or mismatched decision
+                // must cost nothing - it is rejected before the artifact is
+                // hashed or a multi-gigabyte model is loaded.
+                let decision = ni::resolve_real_execution_decision(
+                    cli.native_inference_qualification.as_deref(),
+                    &allowed,
+                )
+                .map_err(|e| anyhow::anyhow!("real-model execution refused: {e}"))?;
+                let qualification = decision.qualification;
+                let row_config = cli
+                    .native_row_workers
+                    .as_ref()
+                    .map(|path| arc_node::row_cohort::RowCohortConfig::load(path))
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("--native-row-workers: {e}"))?;
+                let assignment =
+                    ni::runtime_assignment_hash(row_config.as_ref(), cli.native_low_residency)
+                        .map_err(|e| anyhow::anyhow!("native assignment policy refused: {e}"))?;
+                anyhow::ensure!(
+                    context.allowed_executions.iter().any(|entry| {
+                        entry.model_hash == qualification.artifact_hash
+                            && entry.profile_hash == qualification.profile_hash
+                            && entry.generation_hash == qualification.generation_hash
+                            && entry.assignment_hash == assignment
+                    }),
+                    "actual native runtime assignment policy {} is not in the activated execution \
+                     allowlist; refusing before model load. Existing assignment hashes are not \
+                     reinterpreted or automatically approved",
+                    assignment.to_hex()
+                );
+                let artifact = cli.native_inference_artifact.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--native-inference-runtime needs --native-inference-artifact \
+                         (the qualified canonical-I8 GGUF)"
+                    )
+                })?;
+                let package_manifest = cli.native_package_manifest.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "real-model execution needs --native-package-manifest: the approved \
+                         package manifest whose hash the qualification record pins"
+                    )
+                })?;
+                tracing::warn!(
+                    "real-model execution starting under an explicit reference-qualification \
+                     record. That record is an operator decision, not proof of model quality."
+                );
+                let loaded = if cli.native_low_residency {
+                    ni::CanonicalI8NativeExecutor::load_qualified_low_residency(
+                        artifact,
+                        qualification,
+                    )
+                } else {
+                    ni::CanonicalI8NativeExecutor::load_qualified(artifact, qualification)
+                };
+                let executor = loaded
+                    .map(|executor| executor.with_kv_budget(cli.native_kv_budget_bytes))
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "native executor refused the artifact at {}: {e}. \
+                                 Production execution stays gated on artifact hash, the exact \
+                                 versioned profile/generation commitments, and reference \
+                                 qualification.",
+                            artifact.display()
+                        )
+                    })?;
+                // A budget below the smallest job would refuse every request
+                // and never say why.
+                if executor.max_positions() < ni::MIN_NATIVE_KV_POSITIONS {
+                    anyhow::bail!(
+                        "--native-kv-budget-bytes {} holds {} KV positions of this model; the \
+                         smallest native job needs {} (1 BOS + 1 prompt token + 1 generated \
+                         token, allocated as the next power of two)",
+                        cli.native_kv_budget_bytes,
+                        executor.max_positions(),
+                        ni::MIN_NATIVE_KV_POSITIONS
+                    );
+                }
+                // The tokenizer is read from the artifact the executor just
+                // verified and loaded. The package check needs its vocabulary,
+                // and /native-inference/tokenize then serves exactly the
+                // executor's input contract.
+                let tokenizer = artifact
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("native artifact path is not UTF-8"))
+                    .and_then(|path| {
+                        arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer::from_gguf(path)
+                            .map_err(|e| anyhow::anyhow!("native artifact tokenizer: {e}"))
+                    })?;
+                executor
+                    .verify_package(
+                        artifact,
+                        &tokenizer,
+                        package_manifest,
+                        decision.package_manifest_hash,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "native executor refused the package: {e}. A node executes only the \
+                             package its qualification record approved."
+                        )
+                    })?;
+                tracing::info!(
+                    manifest = %decision.package_manifest_hash,
+                    "native package manifest verified against the loaded artifact"
+                );
+                // After the package check: only the approved package is ever
+                // placed on this operator's machines.
+                let executor = match row_config {
+                    Some(config) => {
+                        let executor = executor
+                            .connect_row_cohort(config, validator_keypair.address(), state.height())
+                            .map_err(|e| anyhow::anyhow!("--native-row-workers: {e}"))?;
+                        tracing::warn!(
+                            "native requests may be placed on this operator's own row machines \
+                             (S10, the multi-machine comparison, is not yet passed)"
+                        );
+                        executor
+                    }
+                    None => executor,
+                };
+                let row_cohort = executor.row_cohort();
+                let executor = Arc::new(executor);
+                native_serving = Some(Arc::new(
+                    ni::NativeServing::canonical(Some(tokenizer), Some(executor.max_positions()))
+                        .with_row_cohort(row_cohort),
+                ));
+                let (signer, sink, store) = native_parts()?;
+                let runtime = ni::NativeWorkerRuntime::from_active(
+                    state.clone(),
+                    executor,
+                    signer,
+                    sink,
+                    store,
+                )
+                .map_err(|e| anyhow::anyhow!("native worker runtime: {e}"))?;
+                Some(ni::spawn_native_runtime_with_admission(
+                    runtime,
+                    ni::NativeRuntimeBounds::default(),
+                    native_runtime_cancel.clone(),
+                    native_request_admission.clone(),
+                ))
+            }
+        };
+        tracing::warn!("PRIVATE protocol-4 native worker runtime STARTED (bounded, cancellable)");
+    }
 
     // ── Initialize candle float backend FIRST (for coherent inference) ──────
     // For GGUF files, load candle FIRST (lightweight Q4), then load tokenizer-only
@@ -7284,6 +7952,10 @@ async fn run_arc_node() -> Result<()> {
     let dag_validators = Arc::new(parking_lot::RwLock::new(all_vals));
     let dag_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Set when a consensus engine is actually started. A process without one
+    // must report that it holds no certificates rather than a 404 that reads
+    // as "not final".
+    let mut rpc_consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>> = None;
 
     if runtime_roles.chain_participation {
         let recovery_dag_startup = prepare_recovery_dag_startup(Path::new(&data_dir), &state)?;
@@ -7295,6 +7967,58 @@ async fn run_arc_node() -> Result<()> {
             &peer_vals,
             validator_keypair.clone(),
         );
+        // Anti-equivocation decisions live next to the node's other durable
+        // state. Without a home for them this validator refuses to sign
+        // absence or finality transcripts at all, which is the safe default.
+        consensus.signing_record_path =
+            Some(Path::new(&data_dir).join("consensus-signing-record.bin"));
+        // Absence and finality transcripts need domain separation on EVERY
+        // chain, not only one with a recovery context. A from-genesis chain
+        // binds them to its own genesis identity and frozen validator epoch;
+        // a recovery chain re-binds them to its recovery domain below, and
+        // rebinding to a different domain is refused.
+        {
+            let epoch = consensus.engine.frozen_validator_set().epoch;
+            let certificate_domain = arc_consensus::ConsensusDomain::new(genesis_hash, 0, epoch);
+            if let Err(error) = consensus
+                .engine
+                .install_certificate_domain(certificate_domain)
+            {
+                tracing::warn!(%error, "Could not bind the certificate domain");
+            }
+        }
+        if let Some(rounds) = cli.dag_retained_rounds {
+            consensus.engine.set_retained_rounds(rounds);
+        }
+        if let Some(blocks) = cli.snapshot_every_blocks {
+            consensus.snapshot_every_blocks = blocks;
+        }
+        consensus.native_vote_relay = native_vote_relay.clone();
+        consensus.native_request_admission = native_request_admission.clone();
+        if consensus.snapshot_every_blocks == 0 {
+            tracing::warn!(
+                "State snapshots are DISABLED; every restart replays the entire WAL, and that \
+                 cost grows with the chain"
+            );
+        } else {
+            tracing::info!(
+                every_blocks = consensus.snapshot_every_blocks,
+                "State snapshot interval: the upper bound on WAL records a restart must apply"
+            );
+        }
+        tracing::info!(
+            retained_rounds = consensus.engine.retained_rounds(),
+            "DAG retention: how far behind a validator may fall and still rejoin \
+             by history transfer"
+        );
+        consensus.require_full_committee_at_genesis = cli.require_full_committee_at_genesis;
+        if consensus.require_full_committee_at_genesis {
+            tracing::warn!(
+                "DEVELOPMENT START BARRIER: round-0 proposals wait for the FULL genesis \
+                 committee, not a quorum. This is stricter than the protocol requires and is \
+                 intended for local multi-node experiments."
+            );
+        }
         if let Some(context) = state.recovery_context() {
             let domain = arc_consensus::ConsensusDomain::new(
                 context.domain_hash(),
@@ -7317,6 +8041,10 @@ async fn run_arc_node() -> Result<()> {
         consensus.dag_validators = Some(dag_validators.clone());
         consensus.dag_round = Some(dag_round.clone());
         consensus.dag_committed = Some(dag_committed.clone());
+        // Share the engine with the RPC surface so `/finality/{height}` can
+        // serve the committee's signed statement rather than this node's own
+        // claim about it.
+        rpc_consensus_engine = Some(consensus.engine.clone());
         if let Some(startup) = recovery_dag_startup.as_ref() {
             // Protocol v3 never opens the legacy segmented WAL. Select an
             // independently pinned content-addressed generation, stage its
@@ -7410,19 +8138,68 @@ async fn run_arc_node() -> Result<()> {
             // Preserve the segmented WAL compatibility path only for legacy
             // pre-recovery networks. Protocol-v3 startup above cannot reach it.
             let dag_wal_path = Path::new(&data_dir).join("dag-wal");
-            let recovered_round = restore_legacy_dag_wal_and_read_round(&dag_wal_path)?;
+            let dag_wal_round = restore_legacy_dag_wal_and_read_round(&dag_wal_path)?;
+            // An adopted checkpoint is durable in the STATE, with its anchor
+            // round, before anything else moves; the commit record and the DAG
+            // WAL may predate it (a crash right after adopting). Resuming
+            // below the round after that anchor would re-apply old anchors as
+            // new heights, so it bounds both cursors from below.
+            let rebase_cursor = state
+                .rebase_anchor_round()
+                .map(|round| round.saturating_add(1))
+                .unwrap_or(0);
+            let recovered_round = dag_wal_round.max(rebase_cursor);
             if recovered_round > 0 {
-                // The highest WAL round does not prove that any earlier leader was
-                // committed. Preserve the commit cursor until an exact local commit
-                // record or quorum-certified checkpoint recovery path is available.
-                let recovered_committed = 0;
+                // The highest WAL round does not prove that any earlier leader
+                // was committed, so the cursor is NOT taken from it. It comes
+                // from this node's own durable commit record - written only
+                // after a committed block crossed the durability barrier - which
+                // is the "exact local commit record" this path was waiting for.
+                //
+                // Without it the cursor stayed fail-closed at 0 forever: the
+                // scan restarted at a round whose blocks are no longer in
+                // memory, broke there, and the node rejoined the mesh, accepted
+                // transactions, and never committed another block. The 4-node
+                // fixture measured exactly that - "before kill=511 after
+                // recovery=511" with peers at 649.
+                // The record holds the LAST APPLIED round; the engine's cursor
+                // is the NEXT round to scan. Converting between them is the
+                // whole point of `next_round_to_scan` - restoring the applied
+                // round verbatim re-scanned it and appended a second canonical
+                // block for the same anchor, with no crash required.
+                let recovered_committed = {
+                    let record = consensus.load_signing_record();
+                    let next = record.next_round_to_scan();
+                    tracing::info!(
+                        last_applied = ?record.last_applied_round,
+                        next_round_to_scan = next,
+                        "Local commit record read"
+                    );
+                    next.max(rebase_cursor).min(recovered_round)
+                };
                 consensus
                     .engine
                     .restore_round_from_local_wal(recovered_round, recovered_committed);
+
+                // Restoring the cursors is not enough on its own: the
+                // engine's DAG starts EMPTY, and block validation is recursive
+                // - inserting a block at round R needs its parents at R-1 - so
+                // nothing this node later receives can be validated until the
+                // DAG is bootstrapped.
+                //
+                // Replaying the local DAG WAL was tried and does not work: the
+                // WAL is not a contiguous DAG. A restarted node found 31 blocks
+                // in it with a gap at round 1, against a chain at round 577.
+                // The parents it needs were never all persisted locally.
+                //
+                // So the bootstrap comes from peers, over the authenticated
+                // history path, starting at round 0 where parents are empty by
+                // definition. `ConsensusManager` requests it that way whenever
+                // its DAG is empty.
                 tracing::info!(
                     recovered_round,
                     recovered_committed,
-                    "DAG WAL round restored from local disk; commit cursor remains fail-closed pending certified recovery"
+                    "DAG WAL round restored from local disk; commit cursor restored from this node's own durable commit record"
                 );
             } else {
                 tracing::info!("DAG WAL is empty - starting fresh from round 0");
@@ -7469,6 +8246,7 @@ async fn run_arc_node() -> Result<()> {
             data_dir.clone(),
             startup_tx,
             transport_shutdown,
+            transport_wire_policy.clone(),
         ));
         let bound_addr =
             match tokio::time::timeout(std::time::Duration::from_secs(15), startup_rx).await {
@@ -8646,15 +9424,28 @@ async fn run_arc_node() -> Result<()> {
         Some(dag_validators),
         Some(dag_round),
         Some(dag_committed),
+        rpc_consensus_engine,
         shard_infos,
         coordinator_seed_rpcs,
         community_rpc_bases,
         compute_threads,
         genesis_chain_identity,
         cli.enable_community_rewards_v1,
+        native_serving,
+        native_request_admission,
         Some(shutdown_rx),
+        transport_wire_policy,
     )
     .await;
+
+    // Stop the native worker before the rest of the shutdown sequence so it
+    // cannot observe a half-torn-down state. `shutdown` joins the thread; the
+    // handle's Drop also cancels, so an early return cannot leak the loop.
+    if let Some(handle) = native_runtime_handle.take() {
+        tracing::info!("stopping the native worker runtime");
+        native_runtime_cancel.store(true, std::sync::atomic::Ordering::Release);
+        handle.shutdown();
+    }
 
     let eth_result = if let Some(task) = eth_server_task {
         match task.await {
@@ -8739,6 +9530,177 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn native_assignment_policy_command_is_offline_and_matches_runtime_configuration() {
+        let parsed = Cli::try_parse_from(["arc-node", "native-assignment-policy"]).unwrap();
+        assert!(matches!(
+            parsed.operator_command,
+            Some(OperatorCommand::NativeAssignmentPolicy {
+                row_workers: None,
+                low_residency: false
+            })
+        ));
+        assert!(!parsed.native_inference_runtime);
+        assert!(
+            Cli::try_parse_from(["arc-node", "native-assignment-policy", "--low-residency"])
+                .is_err()
+        );
+        let local = native_assignment_policy_report(None, false).unwrap();
+        assert_eq!(
+            local["assignment_hash"],
+            arc_node::native_inference::local_canonical_assignment_hash().to_hex()
+        );
+        assert_eq!(local["qualified"], false);
+        assert!(native_assignment_policy_report(None, true).is_err());
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/operations/row-cohort.example.json");
+        let parsed = Cli::try_parse_from([
+            "arc-node",
+            "native-assignment-policy",
+            "--row-workers",
+            path.to_str().unwrap(),
+            "--low-residency",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.operator_command,
+            Some(OperatorCommand::NativeAssignmentPolicy {
+                row_workers: Some(_),
+                low_residency: true
+            })
+        ));
+        assert!(!parsed.native_inference_runtime);
+        let cfg = arc_node::row_cohort::RowCohortConfig::load(&path).unwrap();
+        let report = native_assignment_policy_report(Some(&path), true).unwrap();
+        assert_eq!(
+            report["assignment_hash"],
+            cfg.assignment_hash(true).to_hex()
+        );
+        assert_eq!(report["assignment_certificate_version"], 2);
+        assert_eq!(report["qualified"], false);
+        assert_ne!(report["assignment_hash"], local["assignment_hash"]);
+        assert!(
+            native_assignment_policy_report(
+                Some(std::path::Path::new("/nonexistent/row-policy.json")),
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_request_opt_in_is_default_closed_and_requires_runtime_before_state_open() {
+        assert!(
+            !Cli::try_parse_from(["arc-node"])
+                .unwrap()
+                .enable_native_inference_requests
+        );
+        assert!(Cli::try_parse_from(["arc-node", "--enable-native-inference-requests"]).is_err());
+        let configured = Cli::try_parse_from([
+            "arc-node",
+            "--enable-native-inference-requests",
+            "--native-inference-runtime",
+            "--native-inference-activation",
+            "/not-opened/context.json",
+        ])
+        .unwrap();
+        assert!(configured.enable_native_inference_requests);
+    }
+
+    #[test]
+    fn legacy_v3_wire_is_explicit_and_conflicts_with_native_activation() {
+        assert!(!Cli::try_parse_from(["arc-node"]).unwrap().legacy_v3_wire);
+        assert!(
+            Cli::try_parse_from(["arc-node", "--legacy-v3-wire"])
+                .unwrap()
+                .legacy_v3_wire
+        );
+        for option in ["--native-inference-activation", "--recovery-checkpoint"] {
+            let error = Cli::try_parse_from([
+                "arc-node",
+                "--legacy-v3-wire",
+                option,
+                "/not-opened/config.json",
+            ])
+            .err()
+            .expect("legacy wire mode must reject activation/import before opening a file");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "--legacy-v3-wire",
+                "--native-inference-runtime",
+                "--native-inference-activation",
+                "/not-opened/config.json",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_v3_wire_refuses_native_or_non_v3_recovered_state() {
+        validate_legacy_v3_wire_state(3, false, false).unwrap();
+        for (major, native, migration) in [
+            (0, false, false),
+            (2, false, false),
+            (4, false, false),
+            (3, true, false),
+            (3, true, true),
+            (3, false, true),
+        ] {
+            assert!(validate_legacy_v3_wire_state(major, native, migration).is_err());
+        }
+    }
+
+    /// The migration-record tool must not be usable without the two inputs
+    /// that make its output meaningful: the activation config it derives the
+    /// binding from, and the coordinated height every validator will use.
+    #[test]
+    fn printing_a_migration_record_requires_its_config_and_its_height() {
+        Cli::command().debug_assert();
+
+        assert!(
+            Cli::try_parse_from(["arc-node", "--print-migration-record"]).is_err(),
+            "no activation config and no height"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "--print-migration-record",
+                "--native-inference-activation",
+                "/tmp/activation.json",
+            ])
+            .is_err(),
+            "a record without a coordinated height authorises nothing"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "--print-migration-record",
+                "--migration-activation-height",
+                "1570000",
+            ])
+            .is_err(),
+            "a height with no binding to commit to"
+        );
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "--print-migration-record",
+            "--native-inference-activation",
+            "/tmp/activation.json",
+            "--migration-activation-height",
+            "1570000",
+        ])
+        .expect("both inputs present");
+        assert!(cli.print_migration_record);
+        assert_eq!(cli.migration_activation_height, Some(1_570_000));
+        // And it stays off unless asked for.
+        let plain = Cli::try_parse_from(["arc-node"]).expect("no flags is still valid");
+        assert!(!plain.print_migration_record);
+        assert_eq!(plain.migration_activation_height, None);
+    }
 
     #[test]
     fn inspect_legacy_block_cli_requires_every_input_root_and_explicit_wal_policy() {
@@ -9466,13 +10428,17 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     Vec::new(),
                     Vec::new(),
                     vec![holder_origin],
                     0,
                     None,
                     false,
+                    None,
+                    Arc::new(arc_node::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
+                    Arc::new(arc_net::transport::TransportWirePolicy::default()),
                 )
                 .await
                 .unwrap();
@@ -9954,7 +10920,7 @@ mod tests {
             1,
         );
         let engine = ConsensusEngine::new(set, validators[0]);
-        engine.install_consensus_domain(domain.clone()).unwrap();
+        engine.install_consensus_domain(*domain).unwrap();
         engine
     }
 
@@ -11188,7 +12154,7 @@ mod tests {
         ));
         std::fs::create_dir(&data_dir).unwrap();
         let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"domain"), 7, 11);
-        let mut binding = recovery_test_binding(domain.clone());
+        let mut binding = recovery_test_binding(domain);
         binding.source_height = 0;
         binding.transition_height = 0;
         let validators: Vec<Hash256> = (0..4).map(|index| hash_bytes(&[index as u8])).collect();

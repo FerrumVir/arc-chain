@@ -1,0 +1,820 @@
+//! S9: synthetic assignment scenarios - no network, no model.
+
+use arc_assign::certificate::{
+    AssignmentCertificate, CertificateError, policy_hash, policy_hash_v2,
+};
+use arc_assign::lease::{
+    self, CapabilityLease, ChallengeResult, LeaseBody, LeaseError, LeaseRequirements,
+    OP_ROW_PROJECTION_I8,
+};
+use arc_assign::link::{LinkMeasurement, Probe, summarize};
+use arc_assign::placement::{
+    Candidate, Participant, Placement, PlacementError, Policy, Stage, covers_exactly, place,
+};
+use arc_assign::queue::{Call, FairQueue, Next, QueueError};
+use arc_assign::verify::{VerificationRule, plan};
+use arc_crypto::{Hash256, KeyPair, hash_bytes};
+use std::collections::BTreeSet;
+
+fn key(i: u8) -> KeyPair {
+    KeyPair::from_ed25519_secret_bytes(&hash_bytes(&[b'w', i]).0)
+}
+
+fn body(k: &KeyPair) -> LeaseBody {
+    LeaseBody {
+        version: 1,
+        worker: k.address(),
+        transport_id: format!("ssh-ed25519:{}", k.address()),
+        artifact_id: hash_bytes(b"artifact"),
+        execution_profile: "arc.gguf-llama.i8-per-row.rope-interleaved.v1".into(),
+        backend: "cpu-neon".into(),
+        kernel_set: hash_bytes(b"kernels"),
+        operators: [OP_ROW_PROJECTION_I8.to_string()].into_iter().collect(),
+        ram_headroom_bytes: 8 << 30,
+        claimed_macs_per_s: 2_000_000_000,
+        max_concurrency: 4,
+        warm_rows: vec![],
+        resident_layers: vec![],
+        issued_at_height: 10,
+        expires_at_height: 1_000,
+        nonce: 1,
+    }
+}
+
+fn members(keys: &[&KeyPair]) -> BTreeSet<[u8; 32]> {
+    keys.iter().map(|k| k.address().0).collect()
+}
+
+#[test]
+fn a_lease_is_used_only_when_signed_current_and_for_this_model() {
+    let k = key(1);
+    let m = members(&[&k]);
+    let req = LeaseRequirements {
+        members: &m,
+        artifact_id: hash_bytes(b"artifact"),
+        execution_profile: "arc.gguf-llama.i8-per-row.rope-interleaved.v1",
+        operator: OP_ROW_PROJECTION_I8,
+        height: 100,
+    };
+    let good = CapabilityLease::sign(body(&k), &k).unwrap();
+    lease::validate(&good, &req).unwrap();
+
+    // Signed by someone else for this worker.
+    let forged = CapabilityLease::sign(body(&k), &key(2)).unwrap();
+    assert_eq!(lease::validate(&forged, &req), Err(LeaseError::Signature));
+    // Not a committee member.
+    let outsider = key(3);
+    let foreign = CapabilityLease::sign(body(&outsider), &outsider).unwrap();
+    assert_eq!(lease::validate(&foreign, &req), Err(LeaseError::NotMember));
+    // Another model; a missing operator; expired.
+    let mut b = body(&k);
+    b.artifact_id = hash_bytes(b"other");
+    assert_eq!(
+        lease::validate(&CapabilityLease::sign(b, &k).unwrap(), &req),
+        Err(LeaseError::WrongModel)
+    );
+    let mut b = body(&k);
+    b.operators.clear();
+    assert!(matches!(
+        lease::validate(&CapabilityLease::sign(b, &k).unwrap(), &req),
+        Err(LeaseError::MissingOperator(_))
+    ));
+    let mut b = body(&k);
+    b.expires_at_height = 100;
+    assert!(matches!(
+        lease::validate(&CapabilityLease::sign(b, &k).unwrap(), &req),
+        Err(LeaseError::Expired { .. })
+    ));
+}
+
+#[test]
+fn claimed_capacity_is_replaced_by_the_measured_one_or_refused() {
+    let k = key(1);
+    let lease = CapabilityLease::sign(body(&k), &k).unwrap();
+    // Answered correctly at 1.8e9 MAC/s against a 2e9 claim: accepted at the
+    // measured rate.
+    let honest = ChallengeResult {
+        macs: 1_800_000_000,
+        elapsed_us: 1_000_000,
+        correct: true,
+    };
+    assert_eq!(
+        lease::check_challenge(&lease, &honest, 80),
+        Ok(1_800_000_000)
+    );
+    // Half the claim: dishonest capacity.
+    let slow = ChallengeResult {
+        macs: 1_000_000_000,
+        elapsed_us: 1_000_000,
+        correct: true,
+    };
+    assert!(matches!(
+        lease::check_challenge(&lease, &slow, 80),
+        Err(LeaseError::DishonestCapacity { .. })
+    ));
+    // Fast but wrong is refused outright.
+    let wrong = ChallengeResult {
+        macs: 4_000_000_000,
+        elapsed_us: 1_000_000,
+        correct: false,
+    };
+    assert!(lease::check_challenge(&lease, &wrong, 80).is_err());
+}
+
+#[test]
+fn a_link_is_summarised_pessimistically() {
+    let probes: Vec<Probe> = (1..=20)
+        .map(|i| Probe {
+            rtt_us: i * 100,
+            bytes: 1_000_000,
+            transfer_us: 1_000 + i * 10,
+            failed: i == 20,
+        })
+        .collect();
+    let m = summarize(&probes, 7, false).unwrap();
+    assert_eq!(m.samples, 20);
+    assert_eq!(m.failure_per_mille, 50);
+    assert_eq!(m.rtt_median_us, 1_000);
+    assert!(m.rtt_p95_us >= 1_800);
+    assert_eq!(
+        m.bandwidth_bps,
+        1_000_000 * 1_000_000 / (1_000 + 190),
+        "slowest bulk probe"
+    );
+    assert!(
+        summarize(
+            &[Probe {
+                rtt_us: 1,
+                bytes: 0,
+                transfer_us: 0,
+                failed: true
+            }],
+            7,
+            false
+        )
+        .is_none()
+    );
+}
+
+fn link(rtt_us: u64, bandwidth_bps: u64) -> LinkMeasurement {
+    LinkMeasurement {
+        samples: 32,
+        rtt_median_us: rtt_us,
+        rtt_p95_us: rtt_us,
+        jitter_us: 0,
+        bandwidth_bps,
+        failure_per_mille: 0,
+        measured_at: 100,
+        simulated: false,
+    }
+}
+
+fn candidate(i: u8, rate: u64, link: LinkMeasurement) -> Candidate {
+    let k = key(i);
+    Candidate {
+        worker: k.address(),
+        transport_id: format!("t{i}"),
+        macs_per_s: rate,
+        ram_headroom_bytes: 64 << 30,
+        max_concurrency: 4,
+        link,
+        resident_layers: vec![],
+        resident_output: false,
+    }
+}
+
+fn policy() -> Policy {
+    Policy {
+        max_workers: 8,
+        max_link_age: 50,
+        now: 110,
+        max_failure_per_mille: 20,
+        allow_simulated_links: false,
+        input_element_bytes: 8,
+        output_element_bytes: 8,
+        weight_bytes_per_element: 1,
+        include_coordinator: true,
+    }
+}
+
+/// A 7B-like layer's projections: rows x cols per token.
+fn stages() -> Vec<Stage> {
+    let mut s = Vec::new();
+    for layer in 0..4u32 {
+        for (tensor, rows, cols) in [
+            ("wq", 4096, 4096),
+            ("wk", 4096, 4096),
+            ("wv", 4096, 4096),
+            ("wo", 4096, 4096),
+            ("w_gate", 11008, 4096),
+            ("w_up", 11008, 4096),
+            ("w_down", 4096, 11008),
+        ] {
+            s.push(Stage {
+                layer: Some(layer),
+                tensor: tensor.into(),
+                rows,
+                cols,
+            });
+        }
+    }
+    s
+}
+
+fn rows_of(p: &Placement, who: &Participant) -> u64 {
+    p.stages
+        .iter()
+        .flat_map(|s| &s.slices)
+        .filter(|s| &s.participant == who)
+        .map(|s| s.row_end - s.row_start)
+        .sum()
+}
+
+#[test]
+fn unequal_workers_get_unequal_slices_on_a_fast_network() {
+    let fast = link(50, 10_000_000_000);
+    let cands = vec![
+        candidate(1, 4_000_000_000, fast),
+        candidate(2, 1_000_000_000, fast),
+    ];
+    let p = place(&stages(), 1_000_000_000, &cands, &policy()).unwrap();
+    assert!(covers_exactly(&p, &stages()));
+    assert_eq!(p.workers.len(), 2, "both help on a fast network");
+    assert!(p.predicted_token_us < p.coordinator_only_token_us);
+    let fast_rows = rows_of(&p, &Participant::Worker(key(1).address()));
+    let slow_rows = rows_of(&p, &Participant::Worker(key(2).address()));
+    assert!(
+        fast_rows > 3 * slow_rows,
+        "shares follow measured rate: {fast_rows} vs {slow_rows}"
+    );
+}
+
+#[test]
+fn a_slow_network_means_the_coordinator_works_alone() {
+    // Stage A's measured WAN: 161 ms round trips. No worker can pay that 28
+    // times per token and win.
+    let wan = link(161_000, 12_500_000);
+    let cands = vec![
+        candidate(1, 8_000_000_000, wan),
+        candidate(2, 8_000_000_000, wan),
+    ];
+    let p = place(&stages(), 1_000_000_000, &cands, &policy()).unwrap();
+    assert!(p.workers.is_empty(), "adding workers would be slower");
+    assert_eq!(p.predicted_token_us, p.coordinator_only_token_us);
+    assert!(covers_exactly(&p, &stages()));
+}
+
+#[test]
+fn memory_caps_a_workers_share_and_the_rest_goes_elsewhere() {
+    let fast = link(50, 10_000_000_000);
+    let mut small = candidate(1, 8_000_000_000, fast);
+    let total: u64 = stages().iter().map(|s| s.rows * s.cols).sum();
+    small.ram_headroom_bytes = total / 10; // holds a tenth of the rows at most
+    let p = place(&stages(), 1_000_000_000, &[small], &policy()).unwrap();
+    let rows = rows_of(&p, &Participant::Worker(key(1).address()));
+    let all_rows: u64 = stages().iter().map(|s| s.rows).sum();
+    assert!(
+        rows * 10 <= all_rows + stages().len() as u64,
+        "{rows} of {all_rows}"
+    );
+    assert!(covers_exactly(&p, &stages()));
+}
+
+#[test]
+fn stale_failing_and_simulated_links_are_not_used() {
+    let mut stale = link(50, 10_000_000_000);
+    stale.measured_at = 10;
+    let mut failing = link(50, 10_000_000_000);
+    failing.failure_per_mille = 300;
+    let mut simulated = link(50, 10_000_000_000);
+    simulated.simulated = true;
+    let cands = vec![
+        candidate(1, 8_000_000_000, stale),
+        candidate(2, 8_000_000_000, failing),
+        candidate(3, 8_000_000_000, simulated),
+    ];
+    let p = place(&stages(), 1_000_000_000, &cands, &policy()).unwrap();
+    assert!(p.workers.is_empty());
+    let mut allow = policy();
+    allow.allow_simulated_links = true;
+    let p = place(&stages(), 1_000_000_000, &cands, &allow).unwrap();
+    assert_eq!(
+        p.workers,
+        vec![key(3).address()],
+        "only when simulated links are allowed"
+    );
+}
+
+#[test]
+fn placement_is_the_same_whatever_order_the_inputs_arrive_in() {
+    let fast = link(50, 10_000_000_000);
+    let mut cands: Vec<Candidate> = (1..=5)
+        .map(|i| candidate(i, i as u64 * 1_000_000_000, fast))
+        .collect();
+    let a = place(&stages(), 1_000_000_000, &cands, &policy()).unwrap();
+    cands.reverse();
+    cands.swap(0, 2);
+    let b = place(&stages(), 1_000_000_000, &cands, &policy()).unwrap();
+    assert_eq!(a, b);
+    // One validator presenting two offers counts once.
+    let mut doubled = cands.clone();
+    let mut again = candidate(5, 5_000_000_000, fast);
+    again.transport_id = "second transport".into();
+    doubled.push(again);
+    let c = place(&stages(), 1_000_000_000, &doubled, &policy()).unwrap();
+    assert_eq!(c.workers.len(), a.workers.len());
+}
+
+#[test]
+fn without_the_coordinator_the_workers_must_hold_every_row() {
+    let fast = link(50, 10_000_000_000);
+    let mut tiny = candidate(1, 4_000_000_000, fast);
+    tiny.ram_headroom_bytes = 1 << 20;
+    let mut p = policy();
+    p.include_coordinator = false;
+    assert_eq!(
+        place(&stages(), 0, &[tiny], &p),
+        Err(PlacementError::Infeasible)
+    );
+    let roomy = candidate(2, 4_000_000_000, fast);
+    let placed = place(&stages(), 0, &[roomy], &p).unwrap();
+    assert!(covers_exactly(&placed, &stages()));
+}
+
+/// A worker that holds only some layers, as `--shard-range` configures.
+fn sharded(i: u8, rate: u64, link: LinkMeasurement, layers: &[(u32, u32)]) -> Candidate {
+    let mut c = candidate(i, rate, link);
+    c.resident_layers = layers.to_vec();
+    c
+}
+
+/// Rows a participant was given on one stage.
+fn rows_on(p: &Placement, si: usize, who: &Participant) -> u64 {
+    p.stages[si]
+        .slices
+        .iter()
+        .filter(|s| &s.participant == who)
+        .map(|s| s.row_end - s.row_start)
+        .sum()
+}
+
+#[test]
+fn a_worker_is_never_given_rows_of_a_layer_it_does_not_hold() {
+    let fast = link(50, 10_000_000_000);
+    let lower = sharded(1, 8_000_000_000, fast, &[(0, 2)]);
+    let upper = sharded(2, 8_000_000_000, fast, &[(2, 4)]);
+    let p = place(&stages(), 1_000_000_000, &[lower, upper], &policy()).unwrap();
+    let all = stages();
+    for (si, stage) in all.iter().enumerate() {
+        for slice in &p.stages[si].slices {
+            let Participant::Worker(w) = &slice.participant else {
+                continue;
+            };
+            let held: &[(u32, u32)] = if *w == key(1).address() {
+                &[(0, 2)]
+            } else {
+                &[(2, 4)]
+            };
+            let layer = stage.layer.expect("every stage here has a layer");
+            assert!(
+                held.iter().any(|(s, e)| layer >= *s && layer < *e),
+                "worker given layer {layer} it does not hold: {slice:?}"
+            );
+        }
+    }
+    assert!(covers_exactly(&p, &all));
+}
+
+#[test]
+fn each_half_of_the_model_is_served_by_the_worker_holding_it() {
+    let fast = link(50, 10_000_000_000);
+    let lower = sharded(1, 8_000_000_000, fast, &[(0, 2)]);
+    let upper = sharded(2, 8_000_000_000, fast, &[(2, 4)]);
+    let p = place(&stages(), 1_000_000_000, &[lower, upper], &policy()).unwrap();
+    let a = Participant::Worker(key(1).address());
+    let b = Participant::Worker(key(2).address());
+    // Stage 0 is layer 0; stage 21 is layer 3 (7 tensors per layer).
+    assert!(rows_on(&p, 0, &a) > 0, "the lower half must serve layer 0");
+    assert_eq!(rows_on(&p, 0, &b), 0, "the upper half holds no layer 0");
+    assert!(rows_on(&p, 21, &b) > 0, "the upper half must serve layer 3");
+    assert_eq!(rows_on(&p, 21, &a), 0, "the lower half holds no layer 3");
+}
+
+#[test]
+fn a_layer_nobody_holds_is_not_a_placement_without_the_coordinator() {
+    let fast = link(50, 10_000_000_000);
+    let mut p = policy();
+    p.include_coordinator = false;
+    let lower = sharded(1, 8_000_000_000, fast, &[(0, 2)]);
+    assert_eq!(
+        place(&stages(), 0, std::slice::from_ref(&lower), &p),
+        Err(PlacementError::Infeasible),
+        "layers 2 and 3 have no holder"
+    );
+    let upper = sharded(2, 8_000_000_000, fast, &[(2, 4)]);
+    let placed = place(&stages(), 0, &[lower, upper], &p).unwrap();
+    assert!(covers_exactly(&placed, &stages()));
+}
+
+#[test]
+fn a_layerless_stage_belongs_to_full_model_participants_only() {
+    let fast = link(50, 10_000_000_000);
+    let mixed = vec![
+        Stage {
+            layer: None,
+            tensor: "output".into(),
+            rows: 32000,
+            cols: 4096,
+        },
+        Stage {
+            layer: Some(0),
+            tensor: "wq".into(),
+            rows: 4096,
+            cols: 4096,
+        },
+    ];
+    let shard = sharded(1, 8_000_000_000, fast, &[(0, 1)]);
+    let p = place(
+        &mixed,
+        1_000_000_000,
+        std::slice::from_ref(&shard),
+        &policy(),
+    )
+    .unwrap();
+    let w = Participant::Worker(key(1).address());
+    assert_eq!(
+        rows_on(&p, 0, &w),
+        0,
+        "a layer-sharded worker holds no output projection"
+    );
+    assert!(rows_on(&p, 1, &w) > 0, "but it does hold layer 0");
+    assert!(covers_exactly(&p, &mixed));
+    // With no coordinator to hold it, that stage cannot be placed at all.
+    let mut solo = policy();
+    solo.include_coordinator = false;
+    assert_eq!(
+        place(&mixed, 0, &[shard], &solo),
+        Err(PlacementError::Infeasible)
+    );
+}
+
+#[test]
+fn memory_is_measured_against_the_layers_a_worker_actually_holds() {
+    let fast = link(50, 10_000_000_000);
+    let total: u64 = stages().iter().map(|s| s.rows * s.cols).sum();
+    // Room for its own quarter of the model and no more. Measured against
+    // the whole model this would cap it near a quarter of every stage;
+    // measured against what it holds, it can serve its own layer fully.
+    let mut shard = sharded(1, 8_000_000_000, fast, &[(0, 1)]);
+    shard.ram_headroom_bytes = total / 4;
+    let p = place(&stages(), 1_000_000_000, &[shard], &policy()).unwrap();
+    let w = Participant::Worker(key(1).address());
+    let layer0_rows = stages()[0].rows;
+    assert!(
+        rows_on(&p, 0, &w) * 2 > layer0_rows,
+        "{} of {layer0_rows} on its own layer",
+        rows_on(&p, 0, &w)
+    );
+    assert_eq!(rows_on(&p, 7, &w), 0, "and nothing on layer 1");
+    assert!(covers_exactly(&p, &stages()));
+}
+
+#[test]
+fn a_worker_too_small_for_its_own_layers_is_still_capped() {
+    let fast = link(50, 10_000_000_000);
+    let total: u64 = stages().iter().map(|s| s.rows * s.cols).sum();
+    let mut shard = sharded(1, 8_000_000_000, fast, &[(0, 1)]);
+    // A tenth of the one layer it holds (a quarter of the model).
+    shard.ram_headroom_bytes = total / 40;
+    let p = place(&stages(), 1_000_000_000, &[shard], &policy()).unwrap();
+    let w = Participant::Worker(key(1).address());
+    let layer0_rows = stages()[0].rows;
+    assert!(
+        rows_on(&p, 0, &w) * 10 <= layer0_rows + 1,
+        "{} of {layer0_rows} exceeds its headroom",
+        rows_on(&p, 0, &w)
+    );
+    assert!(covers_exactly(&p, &stages()));
+}
+
+fn rule() -> VerificationRule {
+    VerificationRule {
+        duplicate_per_mille: 250,
+        spot_rows_per_stage: 2,
+    }
+}
+
+fn issue() -> AssignmentCertificate {
+    let fast = link(50, 10_000_000_000);
+    let cands = vec![
+        candidate(1, 4_000_000_000, fast),
+        candidate(2, 2_000_000_000, fast),
+    ];
+    AssignmentCertificate::issue(
+        hash_bytes(b"request"),
+        hash_bytes(b"artifact"),
+        "arc.gguf-llama.i8-per-row.rope-interleaved.v1",
+        3,
+        stages(),
+        1_000_000_000,
+        cands,
+        vec![hash_bytes(b"lease-1"), hash_bytes(b"lease-2")],
+        policy(),
+        rule(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn stable_policy_binds_every_setting_but_not_observation_height() {
+    let original = policy();
+    let expected = policy_hash_v2(&original, &rule());
+    let mut later = original.clone();
+    later.now += 1;
+    assert_eq!(policy_hash_v2(&later, &rule()), expected);
+    assert_ne!(
+        policy_hash(&later, &rule()),
+        policy_hash(&original, &rule())
+    );
+    let changes: [fn(&mut Policy); 8] = [
+        |p| p.max_workers += 1,
+        |p| p.max_link_age += 1,
+        |p| p.max_failure_per_mille += 1,
+        |p| p.allow_simulated_links = !p.allow_simulated_links,
+        |p| p.input_element_bytes += 1,
+        |p| p.output_element_bytes += 1,
+        |p| p.weight_bytes_per_element += 1,
+        |p| p.include_coordinator = !p.include_coordinator,
+    ];
+    for change in changes {
+        let mut changed = original.clone();
+        change(&mut changed);
+        assert_ne!(policy_hash_v2(&changed, &rule()), expected);
+    }
+    let mut checks = rule();
+    checks.duplicate_per_mille += 1;
+    assert_ne!(policy_hash_v2(&original, &checks), expected);
+    checks = rule();
+    checks.spot_rows_per_stage += 1;
+    assert_ne!(policy_hash_v2(&original, &checks), expected);
+    assert_ne!(expected, policy_hash(&original, &rule()));
+}
+
+#[test]
+fn v2_certificate_verifies_authorization_and_recomputes_the_recorded_placement() {
+    let v1 = issue();
+    let cert = AssignmentCertificate::issue_v2(
+        v1.request_id,
+        v1.artifact_id,
+        &v1.execution_profile,
+        v1.epoch,
+        v1.stages.clone(),
+        v1.coordinator_macs_per_s,
+        v1.candidates.clone(),
+        v1.lease_digests.clone(),
+        v1.policy.clone(),
+        v1.verification,
+    )
+    .unwrap();
+    let authorized = policy_hash_v2(&policy(), &rule());
+    cert.verify(&authorized).unwrap();
+    assert_eq!(cert.placement, v1.placement);
+    assert_ne!(cert.hash(), v1.hash());
+    assert_eq!(
+        cert.verify(&policy_hash(&policy(), &rule())),
+        Err(CertificateError::WrongPolicy)
+    );
+    assert_eq!(v1.verify(&authorized), Err(CertificateError::WrongPolicy));
+    let mut forged = cert.clone();
+    forged.placement.stages[0].slices[0].row_end -= 1;
+    assert_eq!(
+        forged.verify(&authorized),
+        Err(CertificateError::PlacementMismatch)
+    );
+    forged = cert.clone();
+    forged.verification.spot_rows_per_stage = 0;
+    assert_eq!(
+        forged.verify(&authorized),
+        Err(CertificateError::WrongPolicy)
+    );
+    // A stable policy cannot make expired observations usable: the recorded
+    // actual height still changes the recomputed placement.
+    forged = cert;
+    forged.policy.now += 10_000;
+    assert_eq!(
+        forged.verify(&authorized),
+        Err(CertificateError::PlacementMismatch)
+    );
+}
+
+#[test]
+fn v1_policy_and_certificate_keep_the_original_fixed_binary_transcripts() {
+    fn bytes(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+    fn original_hash(domain: &str, transcript: &[u8]) -> Hash256 {
+        let mut h = blake3::Hasher::new_derive_key(domain);
+        h.update(transcript);
+        Hash256(*h.finalize().as_bytes())
+    }
+    let policy_bytes = bytes(
+        "01000000080000000000000032000000000000006e00000000000000140000000008000000000000000800000000000000010000000000000001fa00000002000000",
+    );
+    assert_eq!(
+        bincode::serialize(&(1u32, policy(), rule())).unwrap(),
+        policy_bytes
+    );
+    assert_eq!(
+        policy_hash(&policy(), &rule()),
+        original_hash("ARC-assign-policy-v1", &policy_bytes)
+    );
+    let cert = AssignmentCertificate::issue(
+        Hash256([1; 32]),
+        Hash256([2; 32]),
+        "p",
+        3,
+        vec![Stage {
+            layer: None,
+            tensor: "lm_head".into(),
+            rows: 2,
+            cols: 1,
+        }],
+        1_000_000,
+        vec![],
+        vec![],
+        policy(),
+        rule(),
+    )
+    .unwrap();
+    let certificate_bytes = bytes(
+        "0100000001010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202010000000000000070030000000000000001000000000000000007000000000000006c6d5f686561640200000000000000010000000000000040420f000000000000000000000000000000000000000000080000000000000032000000000000006e00000000000000140000000008000000000000000800000000000000010000000000000001fa000000020000000000000000000000010000000000000000000000000000000100000000000000000000000000000000000000020000000000000002000000000000000200000000000000",
+    );
+    assert_eq!(bincode::serialize(&cert).unwrap(), certificate_bytes);
+    assert_eq!(
+        cert.hash(),
+        original_hash("ARC-assign-certificate-v1", &certificate_bytes)
+    );
+    cert.verify(&policy_hash(&policy(), &rule())).unwrap();
+}
+
+#[test]
+fn any_validator_can_recompute_a_certificate_and_refuse_a_forged_one() {
+    let cert = issue();
+    let authorised = policy_hash(&policy(), &rule());
+    cert.verify(&authorised).unwrap();
+
+    let mut forged = cert.clone();
+    forged.placement.stages[0].slices.swap(0, 1);
+    assert_eq!(
+        forged.verify(&authorised),
+        Err(CertificateError::PlacementMismatch)
+    );
+    let mut inflated = cert.clone();
+    inflated.candidates[0].macs_per_s *= 10; // claims its worker is faster
+    assert_eq!(
+        inflated.verify(&authorised),
+        Err(CertificateError::PlacementMismatch)
+    );
+    let other_policy = policy_hash(
+        &policy(),
+        &VerificationRule {
+            duplicate_per_mille: 0,
+            spot_rows_per_stage: 0,
+        },
+    );
+    assert_eq!(
+        cert.verify(&other_policy),
+        Err(CertificateError::WrongPolicy)
+    );
+    assert_ne!(cert.hash(), forged.hash());
+}
+
+#[test]
+fn the_verification_plan_is_reproducible_and_never_checks_a_slice_with_itself() {
+    let cert = issue();
+    let seed = cert.hash();
+    let a = plan(seed, &cert.placement, &cert.verification);
+    let b = plan(seed, &cert.placement, &cert.verification);
+    assert_eq!(a, b, "the same seed gives the same plan");
+    assert_ne!(
+        a,
+        plan(
+            hash_bytes(b"another seed"),
+            &cert.placement,
+            &cert.verification
+        )
+    );
+    let all = plan(
+        seed,
+        &cert.placement,
+        &VerificationRule {
+            duplicate_per_mille: 1000,
+            spot_rows_per_stage: 1,
+        },
+    );
+    for d in &all.duplicates {
+        let slice = &cert.placement.stages[d.stage].slices[d.slice];
+        assert_ne!(
+            d.checker, slice.participant,
+            "a slice is never checked by its own worker"
+        );
+    }
+    let worker_slices = cert
+        .placement
+        .stages
+        .iter()
+        .flat_map(|s| &s.slices)
+        .filter(|s| s.participant != Participant::Coordinator)
+        .count();
+    assert_eq!(
+        all.duplicates.len(),
+        worker_slices,
+        "1000 per mille checks every worker slice"
+    );
+    for (stage, row) in &all.spot_rows {
+        assert!(*row < stages()[*stage].rows);
+    }
+}
+
+fn call(req: u8, n: u8, deadline: u64) -> Call {
+    Call {
+        request: hash_bytes(&[b'r', req]),
+        call_id: hash_bytes(&[b'c', req, n]),
+        deadline,
+    }
+}
+
+#[test]
+fn the_queue_is_fair_bounded_and_honours_deadlines_and_cancellation() {
+    let mut q = FairQueue::new(5);
+    for n in 0..3 {
+        q.push(call(1, n, 100)).unwrap();
+    }
+    q.push(call(2, 0, 100)).unwrap();
+    q.push(call(3, 0, 5)).unwrap();
+    assert_eq!(q.push(call(4, 0, 100)), Err(QueueError::Full(5)));
+
+    // Past request 3's deadline: its call is expired, not run.
+    match q.next(10) {
+        Next::Expired(calls) => assert_eq!(calls, vec![call(3, 0, 5)]),
+        other => panic!("{other:?}"),
+    }
+    // Requests alternate: 1, 2, then 1 again - request 1's three calls do
+    // not all go first.
+    let order: Vec<Hash256> = (0..3)
+        .map(|_| match q.next(10) {
+            Next::Run(c) => c.request,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            hash_bytes(&[b'r', 1]),
+            hash_bytes(&[b'r', 2]),
+            hash_bytes(&[b'r', 1])
+        ]
+    );
+    assert_eq!(q.cancel(&hash_bytes(&[b'r', 1])), 1);
+    assert_eq!(q.next(10), Next::Idle);
+    assert!(q.is_empty());
+}
+
+#[test]
+fn ranged_workers_need_explicit_output_head_coverage_without_a_coordinator() {
+    let mut stages = stages();
+    stages.push(Stage {
+        layer: None,
+        tensor: "lm_head".into(),
+        rows: 32000,
+        cols: 4096,
+    });
+    let fast = link(50, 10_000_000_000);
+    let lower = sharded(1, 8_000_000_000, fast, &[(0, 2)]);
+    let mut upper = sharded(2, 8_000_000_000, fast, &[(2, 4)]);
+    let mut p = policy();
+    p.include_coordinator = false;
+    assert_eq!(
+        place(&stages, 0, &[lower.clone(), upper.clone()], &p),
+        Err(PlacementError::Infeasible)
+    );
+    upper.resident_output = true;
+    let placed = place(&stages, 0, &[lower.clone(), upper.clone()], &p).unwrap();
+    assert!(covers_exactly(&placed, &stages));
+    let output = placed.stages.last().unwrap();
+    assert!(
+        output
+            .slices
+            .iter()
+            .all(|s| s.participant == Participant::Worker(upper.worker))
+    );
+    // The explicit output capability cannot invent embedding residency.
+    stages.last_mut().unwrap().tensor = "embedding".into();
+    assert_eq!(
+        place(&stages, 0, &[lower, upper], &p),
+        Err(PlacementError::Infeasible)
+    );
+}

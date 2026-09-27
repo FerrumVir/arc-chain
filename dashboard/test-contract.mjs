@@ -193,6 +193,28 @@ await test("same-height matching v3 commitments produce a healthy fleet", async 
   assert.equal(result.commonAudit.state, "consistent");
 });
 
+await test("latest block fallback is 404-only and validates height", async () => {
+  const source = makeResolver().source("v3-a");
+  const latest = { header: { height: 12, hash: hex("1"), state_root: hex("2") } };
+  assert.deepEqual(await app.requestLatestBlock(mockFetch({
+    "https://v3-a.example.test/block/latest": { status: 404, body: {} },
+    "https://v3-a.example.test/info": { body: { block_height: 12 } },
+    "https://v3-a.example.test/block/12": { body: latest },
+  }), source), latest);
+  await assert.rejects(app.requestLatestBlock(mockFetch({
+    "https://v3-a.example.test/block/latest": { status: 500, body: {} },
+  }), source), /HTTP 500/);
+  await assert.rejects(app.requestLatestBlock(mockFetch({
+    "https://v3-a.example.test/block/latest": { status: 404, body: {} },
+    "https://v3-a.example.test/info": { body: { block_height: "9007199254740992" } },
+  }), source), /HTTP 404/);
+  await assert.rejects(app.requestLatestBlock(mockFetch({
+    "https://v3-a.example.test/block/latest": { status: 404, body: {} },
+    "https://v3-a.example.test/info": { body: { block_height: 12 } },
+    "https://v3-a.example.test/block/12": { body: { header: { height: 13 } } },
+  }), source), /height did not match/);
+});
+
 await test("same-height state-root disagreement confirms a fork", async () => {
   const result = await app.collectFleetHealth({ resolver: makeResolver(), fetchImpl: mockFetch(healthyFleetRoutes({ fork: true })), nowMs: 2_005_000 });
   assert.equal(result.state, "fork");

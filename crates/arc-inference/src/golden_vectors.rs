@@ -7,7 +7,8 @@
 //! against the same reviewed constants.
 
 use crate::cached_integer_model::{
-    CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig, ShardInput, ShardOutput,
+    ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig,
+    ShardInput, ShardOutput,
 };
 use crate::integer_lut::ONE;
 use arc_crypto::hash_bytes;
@@ -188,6 +189,7 @@ fn build_fixture_model(fixture: &GoldenFixture) -> CachedIntegerModel {
             eos_tokens: Vec::new(),
             bos_token: 1,
             chat_template: String::new(),
+            arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
         },
         embedding_q16,
         embedding_i8,
@@ -470,5 +472,470 @@ fn golden_cached_integer_autoregressive_output_matches_known_answer() {
             fixture.expected.generated_output_hash,
             "{threads}-thread generation changed the output hash"
         );
+    }
+}
+
+// ── Operator vectors from the independent reference ─────────────────────────
+//
+// `integer_operator_kat.json` is produced by `scripts/arc_conformance`, a
+// Python executor written from docs/protocol/integer-profile-contract-v1.md.
+// These tests hold the engine to it, so agreement is between two separately
+// written implementations rather than a run compared with its own output.
+
+const OPERATOR_JSON: &str = include_str!("../tests/fixtures/integer_operator_kat.json");
+
+fn operators() -> serde_json::Value {
+    let document: serde_json::Value =
+        serde_json::from_str(OPERATOR_JSON).expect("operator vectors must be valid JSON");
+    assert_eq!(document["schema"], 1, "unsupported operator vector schema");
+    document
+}
+
+fn ints(value: &serde_json::Value) -> Vec<i64> {
+    value
+        .as_array()
+        .expect("vector field must be an array")
+        .iter()
+        .map(|v| v.as_i64().expect("vector entries must be i64"))
+        .collect()
+}
+
+fn token_ids(value: &serde_json::Value) -> Vec<u32> {
+    ints(value)
+        .into_iter()
+        .map(|v| u32::try_from(v).expect("token ids are u32"))
+        .collect()
+}
+
+fn text(value: &serde_json::Value) -> &str {
+    value.as_str().expect("vector field must be a string")
+}
+
+#[test]
+fn integer_operators_match_the_independent_reference() {
+    use crate::cached_integer_model::{
+        apply_rope, apply_rope_interleaved, flash_attention_i64, layernorm, matmul_fast,
+        select_next_token_with_repetition_penalty, silu_i64,
+    };
+    use crate::integer_lut::{EXP_LUT, argmax_i64, integer_exp, integer_isqrt};
+
+    let doc = operators();
+    assert_eq!(hash_i64(&EXP_LUT[..]), text(&doc["exp_lut_blake3"]));
+    for pair in doc["integer_exp"].as_array().unwrap() {
+        let pair = ints(pair);
+        assert_eq!(integer_exp(pair[0]), pair[1], "exp({})", pair[0]);
+    }
+    for pair in doc["integer_isqrt"].as_array().unwrap() {
+        let pair = ints(pair);
+        assert_eq!(integer_isqrt(pair[0]), pair[1], "isqrt({})", pair[0]);
+    }
+    for (index, case) in doc["rms_norm"].as_array().unwrap().iter().enumerate() {
+        let output = layernorm(&ints(&case["input"]), &ints(&case["gamma"]));
+        assert_eq!(output, ints(&case["output"]), "rms_norm case {index}");
+    }
+    for pair in doc["silu"].as_array().unwrap() {
+        let pair = ints(pair);
+        assert_eq!(silu_i64(pair[0]), pair[1], "silu({})", pair[0]);
+    }
+    for (index, case) in doc["matmul_rows"].as_array().unwrap().iter().enumerate() {
+        let rows = case["rows"].as_u64().unwrap() as usize;
+        let cols = case["cols"].as_u64().unwrap() as usize;
+        let weights = I8Weights {
+            data: ints(&case["weights"])
+                .into_iter()
+                .map(|w| w as i8)
+                .collect(),
+            scales: ints(&case["scales"]),
+            n_rows: rows,
+            n_cols: cols,
+        };
+        let output = matmul_fast(&weights, &ints(&case["input"]), cols, rows);
+        assert_eq!(output, ints(&case["output"]), "projection case {index}");
+    }
+    let rope = &doc["rope"];
+    let d_head = rope["d_head"].as_u64().unwrap() as usize;
+    let (cos, sin) = (ints(&rope["cos"]), ints(&rope["sin"]));
+    for (index, case) in rope["cases"].as_array().unwrap().iter().enumerate() {
+        let mut values = ints(&case["input"]);
+        let pos = case["pos"].as_u64().unwrap() as usize;
+        match text(&case["layout"]) {
+            "split_half" => apply_rope(&mut values, pos, d_head, &cos, &sin),
+            "interleaved" => apply_rope_interleaved(&mut values, pos, d_head, &cos, &sin),
+            other => panic!("unknown RoPE layout {other}"),
+        }
+        assert_eq!(values, ints(&case["output"]), "RoPE case {index}");
+    }
+    for case in doc["attention_head"].as_array().unwrap() {
+        let q = ints(&case["q"]);
+        let keys: Vec<i64> = case["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(ints)
+            .collect();
+        let values: Vec<i64> = case["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(ints)
+            .collect();
+        let positions = keys.len() / q.len();
+        let output = flash_attention_i64(
+            &q,
+            &keys,
+            &values,
+            q.len(),
+            0,
+            q.len(),
+            positions,
+            case["attn_scale"].as_i64().unwrap(),
+        );
+        assert_eq!(
+            output,
+            ints(&case["output"]),
+            "attention: {}",
+            text(&case["note"])
+        );
+    }
+    for case in doc["repetition_penalty"].as_array().unwrap() {
+        let mut logits = ints(&case["logits"]);
+        let token =
+            select_next_token_with_repetition_penalty(&mut logits, &token_ids(&case["generated"]));
+        let note = text(&case["note"]);
+        assert_eq!(logits, ints(&case["penalized"]), "penalty logits: {note}");
+        assert_eq!(
+            i64::from(token),
+            case["token"].as_i64().unwrap(),
+            "penalty token: {note}"
+        );
+    }
+    for case in doc["argmax"].as_array().unwrap() {
+        let index = argmax_i64(&ints(&case["values"]));
+        assert_eq!(
+            index as i64,
+            case["index"].as_i64().unwrap(),
+            "argmax {:?}",
+            case["values"]
+        );
+    }
+}
+
+#[test]
+fn interleaved_profile_and_generation_v2_match_the_independent_reference() {
+    let doc = operators();
+    let section = &doc["interleaved_generation_v2"];
+    let fixture = fixture();
+    for threads in [1, 4] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("determinism test pool");
+        pool.install(|| {
+            let mut model = build_fixture_model(&fixture);
+            assert_eq!(
+                hex::encode(model.weight_hash().0),
+                text(&section["model_weight_hash_before_row_rewrite"])
+            );
+            model
+                .canonicalize_gguf_interleaved_rope_rows()
+                .expect("the fixture is a complete canonical I8 model");
+            assert_eq!(model.arithmetic_profile(), text(&section["profile"]));
+
+            let sequence = run_whole_model(&model, &token_ids(&section["sequence_tokens"]));
+            assert_eq!(sequence.next_tokens, token_ids(&section["next_tokens"]));
+            let expected_logits: Vec<String> = section["logits_hashes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| text(v).to_owned())
+                .collect();
+            assert_eq!(sequence.logits_hashes, expected_logits, "{threads} threads");
+            assert_eq!(
+                sequence.kv_cache_hash,
+                text(&section["kv_cache_hash_split_half_layout"])
+            );
+
+            for run in section["generation_v2"].as_array().unwrap() {
+                let prompt = token_ids(&run["prompt"]);
+                let max_tokens = run["max_tokens"].as_u64().unwrap() as u32;
+                let eos = token_ids(&run["eos_tokens"]);
+                let (tokens, hash) = if run["repetition_penalty"].as_bool().unwrap() {
+                    model.try_generate_v2(&prompt, max_tokens, &eos)
+                } else {
+                    model.try_generate_v2_greedy(&prompt, max_tokens, &eos)
+                }
+                .expect("the vectors fit the fixture context window");
+                assert_eq!(tokens, token_ids(&run["tokens"]), "{threads} threads");
+                assert_eq!(hex::encode(hash.0), text(&run["output_hash"]));
+            }
+        });
+    }
+}
+
+#[cfg(feature = "candle")]
+mod gguf_preparation {
+    //! A tiny Llama GGUF, written with candle and loaded by the production
+    //! canonical loader, must prepare to the state the contract's §8 rules
+    //! produce in the independent reference, and then run identically.
+
+    use super::*;
+    use crate::cached_integer_model::{
+        GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, load_cached_model_canonical_i8_interleaved_rope,
+    };
+    use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
+    use candle_core::{Device, Tensor};
+
+    struct RecipeRng(u64);
+
+    impl RecipeRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+
+        // k / 2^22 with |k| < 2^23: exact in f32.
+        fn weight(&mut self) -> f32 {
+            ((self.next_u64() >> 40) as i64 - (1 << 23)) as f32 / (1u32 << 22) as f32
+        }
+
+        fn norm(&mut self) -> f32 {
+            ((self.next_u64() >> 43) as i64 - (1 << 20) + (1 << 22)) as f32 / (1u32 << 22) as f32
+        }
+    }
+
+    struct Recipe {
+        shape: serde_json::Value,
+        tensors: Vec<RecipeTensor>,
+    }
+
+    type RecipeTensor = (String, Vec<usize>, Vec<f32>);
+
+    fn matrix(rng: &mut RecipeRng, name: String, rows: usize, cols: usize) -> RecipeTensor {
+        let values = (0..rows * cols).map(|_| rng.weight()).collect();
+        (name, vec![rows, cols], values)
+    }
+
+    fn norm(rng: &mut RecipeRng, name: String, size: usize) -> RecipeTensor {
+        (name, vec![size], (0..size).map(|_| rng.norm()).collect())
+    }
+
+    fn recipe(section: &serde_json::Value) -> Recipe {
+        let shape = section["recipe"]["shape"].clone();
+        let dim = |key: &str| shape[key].as_u64().unwrap() as usize;
+        let (d, vocab, d_ff) = (dim("d_model"), dim("vocab_size"), dim("d_ff"));
+        let d_kv = d / dim("n_heads") * dim("n_kv_heads");
+        let mut rng = RecipeRng(section["recipe"]["seed"].as_u64().unwrap());
+        let mut tensors = vec![
+            matrix(&mut rng, "token_embd.weight".into(), vocab, d),
+            matrix(&mut rng, "output.weight".into(), vocab, d),
+            norm(&mut rng, "output_norm.weight".into(), d),
+        ];
+        for layer in 0..dim("n_layers") {
+            let p = format!("blk.{layer}");
+            tensors.push(matrix(&mut rng, format!("{p}.attn_q.weight"), d, d));
+            tensors.push(matrix(&mut rng, format!("{p}.attn_k.weight"), d_kv, d));
+            tensors.push(matrix(&mut rng, format!("{p}.attn_v.weight"), d_kv, d));
+            tensors.push(matrix(&mut rng, format!("{p}.attn_output.weight"), d, d));
+            tensors.push(matrix(&mut rng, format!("{p}.ffn_gate.weight"), d_ff, d));
+            tensors.push(matrix(&mut rng, format!("{p}.ffn_up.weight"), d_ff, d));
+            tensors.push(matrix(&mut rng, format!("{p}.ffn_down.weight"), d, d_ff));
+            tensors.push(norm(&mut rng, format!("{p}.attn_norm.weight"), d));
+            tensors.push(norm(&mut rng, format!("{p}.ffn_norm.weight"), d));
+        }
+        // Token 0's embedding row is all zero, as in the reference recipe.
+        tensors[0].2[..d].fill(0.0);
+        let order: Vec<&str> = tensors.iter().map(|(name, _, _)| name.as_str()).collect();
+        let expected: Vec<&str> = section["recipe"]["tensor_order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(text)
+            .collect();
+        assert_eq!(
+            order, expected,
+            "recipe draw order must match the reference"
+        );
+        Recipe { shape, tensors }
+    }
+
+    fn write_gguf(recipe: &Recipe, omit: Option<&str>) -> std::path::PathBuf {
+        let dim = |key: &str| recipe.shape[key].as_u64().unwrap() as u32;
+        let vocab: Vec<gguf_file::Value> = (0..dim("vocab_size"))
+            .map(|token| gguf_file::Value::String(format!("kat_{token}")))
+            .collect();
+        let metadata = [
+            (
+                "general.architecture",
+                gguf_file::Value::String("llama".into()),
+            ),
+            ("llama.block_count", gguf_file::Value::U32(dim("n_layers"))),
+            (
+                "llama.embedding_length",
+                gguf_file::Value::U32(dim("d_model")),
+            ),
+            (
+                "llama.attention.head_count",
+                gguf_file::Value::U32(dim("n_heads")),
+            ),
+            (
+                "llama.attention.head_count_kv",
+                gguf_file::Value::U32(dim("n_kv_heads")),
+            ),
+            (
+                "llama.feed_forward_length",
+                gguf_file::Value::U32(dim("d_ff")),
+            ),
+            ("tokenizer.ggml.bos_token_id", gguf_file::Value::U32(1)),
+            ("tokenizer.ggml.eos_token_id", gguf_file::Value::U32(2)),
+            ("tokenizer.ggml.tokens", gguf_file::Value::Array(vocab)),
+        ];
+        let tensors: Vec<(String, QTensor)> = recipe
+            .tensors
+            .iter()
+            .filter(|(name, _, _)| Some(name.as_str()) != omit)
+            .map(|(name, shape, values)| {
+                let tensor = Tensor::from_vec(values.clone(), shape.as_slice(), &Device::Cpu)
+                    .expect("recipe tensor");
+                let tensor = QTensor::quantize(&tensor, GgmlDType::F32).expect("f32 GGUF tensor");
+                (name.clone(), tensor)
+            })
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "arc-prep-{}-{}.gguf",
+            std::process::id(),
+            omit.unwrap_or("complete").replace('.', "_")
+        ));
+        let mut file = std::fs::File::create(&path).expect("create test GGUF");
+        let metadata: Vec<(&str, &gguf_file::Value)> =
+            metadata.iter().map(|(key, value)| (*key, value)).collect();
+        let tensors: Vec<(&str, &QTensor)> = tensors
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect();
+        gguf_file::write(&mut file, &metadata, &tensors).expect("write test GGUF");
+        path
+    }
+
+    fn prepared_digest(model: &CachedIntegerModel) -> String {
+        let cfg = &model.config;
+        let mut bytes = Vec::new();
+        for value in [
+            cfg.n_layers,
+            cfg.d_model,
+            cfg.n_heads,
+            cfg.n_kv_heads,
+            cfg.d_ff,
+            cfg.vocab_size,
+            cfg.max_seq,
+        ] {
+            bytes.extend_from_slice(&(value as u64).to_le_bytes());
+        }
+        let push = |bytes: &mut Vec<u8>, values: &[i64]| {
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        };
+        let matrix = |bytes: &mut Vec<u8>, weights: &I8Weights| {
+            bytes.extend(weights.data.iter().map(|&w| w as u8));
+            for scale in &weights.scales {
+                bytes.extend_from_slice(&scale.to_le_bytes());
+            }
+        };
+        push(&mut bytes, &[cfg.attn_scale]);
+        push(&mut bytes, &cfg.rope_cos);
+        push(&mut bytes, &cfg.rope_sin);
+        push(&mut bytes, &model.embedding_q16);
+        matrix(&mut bytes, &model.embedding_i8);
+        matrix(&mut bytes, &model.output_weight);
+        push(&mut bytes, &model.final_norm);
+        for layer in &model.layers {
+            for weights in [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ] {
+                matrix(&mut bytes, weights);
+            }
+            push(&mut bytes, &layer.attn_norm);
+            push(&mut bytes, &layer.ffn_norm);
+        }
+        hex::encode(hash_bytes(&bytes).0)
+    }
+
+    #[test]
+    fn a_gguf_prepared_by_the_canonical_loader_matches_the_independent_reference() {
+        let doc = operators();
+        let section = &doc["gguf_preparation"];
+        let recipe = recipe(section);
+        assert_eq!(
+            1e-10f32.to_bits() as u64,
+            section["f32_1e_10_bits"].as_u64().unwrap(),
+            "the reference must floor abs_max at Rust's own 1e-10 literal"
+        );
+        let path = write_gguf(&recipe, None);
+        let model = load_cached_model_canonical_i8_interleaved_rope(path.to_str().unwrap())
+            .expect("the canonical loader accepts the complete test GGUF");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            model.canonical_execution_profile(),
+            Some(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
+        );
+        assert_eq!(
+            model.embedding_i8.scales[0],
+            section["embedding_row0_scale"].as_i64().unwrap()
+        );
+        assert_eq!(
+            model.config.attn_scale,
+            section["attn_scale"].as_i64().unwrap()
+        );
+        assert_eq!(
+            prepared_digest(&model),
+            text(&section["prepared_state_blake3"])
+        );
+
+        let sequence = run_whole_model(&model, &token_ids(&section["sequence_tokens"]));
+        assert_eq!(sequence.next_tokens, token_ids(&section["next_tokens"]));
+        let expected_logits: Vec<String> = section["logits_hashes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| text(v).to_owned())
+            .collect();
+        assert_eq!(sequence.logits_hashes, expected_logits);
+
+        let run = &section["generation_v2"];
+        let (tokens, hash) = model
+            .try_generate_v2(
+                &token_ids(&run["prompt"]),
+                run["max_tokens"].as_u64().unwrap() as u32,
+                &token_ids(&run["eos_tokens"]),
+            )
+            .expect("fits the context window");
+        assert_eq!(tokens, token_ids(&run["tokens"]));
+        assert_eq!(hex::encode(hash.0), text(&run["output_hash"]));
+    }
+
+    #[test]
+    fn a_gguf_missing_a_norm_weight_is_refused_by_the_canonical_loader() {
+        let doc = operators();
+        let recipe = recipe(&doc["gguf_preparation"]);
+        let path = write_gguf(&recipe, Some("blk.0.ffn_norm.weight"));
+        let result = load_cached_model_canonical_i8_interleaved_rope(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        match result {
+            Err(error) => assert!(
+                error.to_string().contains("blk.0.ffn_norm.weight"),
+                "unexpected error: {error}"
+            ),
+            Ok(_) => panic!("a GGUF without blk.0.ffn_norm.weight must not load"),
+        }
     }
 }

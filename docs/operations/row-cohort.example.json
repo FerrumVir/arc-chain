@@ -1,0 +1,24 @@
+{
+  "max_workers": 4,
+  "duplicate_per_mille": 50,
+  "spot_rows_per_stage": 2,
+  "workers": [
+    {
+      "id": "machine-b",
+      "ssh_program": "/usr/bin/ssh",
+      "target": "arc@10.0.0.11",
+      "known_hosts": "/Users/OPERATOR/.arc/cohort/known_hosts",
+      "remote_command": [
+        "/opt/arc/bin/tensor_row_model_worker",
+        "--model",
+        "/opt/arc/models/standard.gguf",
+        "--artifact",
+        "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67"
+      ],
+      "timeout_ms": 120000,
+      "startup_timeout_ms": 600000,
+      "ram_headroom_bytes": 2147483648,
+      "max_concurrency": 1
+    }
+  ]
+}

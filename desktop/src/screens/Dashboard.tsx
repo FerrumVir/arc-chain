@@ -65,6 +65,17 @@ export function Dashboard() {
     queryFn: api.fetchNetworkStats,
     refetchInterval: 10_000,
   });
+  // Share Network's host overview so chain height and block age come from the
+  // same current source. `nodeStatus` only has the age from the first host
+  // election; using it here lets that timestamp grow stale while height moves.
+  const {
+    data: networkOverview,
+    isError: networkOverviewError,
+  } = useQuery({
+    queryKey: ["network-overview"],
+    queryFn: api.fetchNetworkOverview,
+    refetchInterval: 10_000,
+  });
   // Whether the OS will bring the node back by itself. Polled rather than
   // assumed from the config flag: the login item is registered separately, so
   // the two can disagree and that disagreement is worth seeing.
@@ -73,6 +84,22 @@ export function Dashboard() {
     queryFn: api.getAutostart,
     refetchInterval: 30_000,
   });
+  const chainHeight = networkOverviewError
+    ? "Unavailable"
+    : networkOverview?.height != null
+      ? formatInt(networkOverview.height)
+      : "—";
+  const chainBlockAge = networkOverviewError
+    ? "Unavailable"
+    : networkOverview
+      ? networkOverview.lastBlockAgeSecs != null
+        ? `${formatUptime(networkOverview.lastBlockAgeSecs)} ago`
+        : "Unavailable"
+      : "—";
+  const chainBlockAgeIsStale =
+    !networkOverviewError &&
+    networkOverview?.lastBlockAgeSecs != null &&
+    networkOverview.lastBlockAgeSecs > 3600;
   const inferenceActivity = (attestations ?? []).filter((row) =>
     row.txType == null
     || row.txType === "Inference"
@@ -866,7 +893,7 @@ export function Dashboard() {
           <div className="section-heading">
             <h2 style={{ fontSize: "var(--text-base)" }}>
               Network
-              {status?.chainHost && (
+              {networkOverview?.sourceHost && (
                 <span
                   style={{
                     marginLeft: 8,
@@ -875,7 +902,7 @@ export function Dashboard() {
                     fontWeight: 400,
                   }}
                 >
-                  via {hostLabel(status.chainHost)}
+                  via {hostLabel(networkOverview.sourceHost)}
                 </span>
               )}
             </h2>
@@ -887,35 +914,19 @@ export function Dashboard() {
                 ? formatInt(network.totalInferences)
                 : "—"}
             </dd>
-            <dt>Host-reported TPS</dt>
-            <dd>
-              {network?.avgTps != null ? formatInt(network.avgTps) : "—"}
-            </dd>
             <dt>Host block height</dt>
-            <dd>
-              {network?.latestBlock != null
-                ? formatInt(network.latestBlock)
-                : "—"}
+            <dd data-testid="dashboard-chain-height">{chainHeight}</dd>
+            {/* DAG rounds and health can advance without sealed blocks.
+                Height and age both come from the fresh host overview. */}
+            <dt>Last block</dt>
+            <dd
+              data-testid="chain-block-age"
+              style={{
+                color: chainBlockAgeIsStale ? "var(--warning)" : undefined,
+              }}
+            >
+              {chainBlockAge}
             </dd>
-            {/* Block production has been stalled on most seeds for days.
-                `/health` still reports "ok" because DAG rounds keep
-                advancing, so without this the network looks healthy. */}
-            {status?.chainBlockAgeSeconds != null && (
-              <>
-                <dt>Last block</dt>
-                <dd
-                  data-testid="chain-block-age"
-                  style={{
-                    color:
-                      status.chainBlockAgeSeconds > 3600
-                        ? "var(--warning)"
-                        : undefined,
-                  }}
-                >
-                  {formatUptime(status.chainBlockAgeSeconds)} ago
-                </dd>
-              </>
-            )}
           </div>
 
           {/* Was `openExternal("http://140.82.16.112:3200")` labelled "Open
@@ -935,7 +946,9 @@ export function Dashboard() {
             data-testid="btn-open-network"
           >
             <ArrowUpRight size={14} /> Check the chain
-            {status?.chainHost && <> ({hostLabel(status.chainHost)})</>}
+            {networkOverview?.sourceHost && (
+              <> ({hostLabel(networkOverview.sourceHost)})</>
+            )}
           </button>
         </Card>
       </div>

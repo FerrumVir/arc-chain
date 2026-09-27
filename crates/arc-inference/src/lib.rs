@@ -8,15 +8,26 @@
 pub mod block_i8;
 pub mod cached_integer_model;
 pub mod candle_backend;
+pub mod canonical_prefill;
+pub mod canonical_simd;
 pub mod committee;
 pub mod distributed;
 pub mod gas;
 pub mod gguf_integer;
+pub mod gguf_meta;
 pub mod integer_engine;
 pub mod integer_lut;
+pub mod llama_spm_tokenizer;
+pub mod low_residency;
 pub mod model_artifact;
+pub mod model_package;
 pub mod q4_engine;
+#[cfg(unix)]
+pub mod row_service;
 pub mod streaming;
+/// Private-cohort, within-query tensor row partitioning.  This deliberately
+/// has no dependency on validator RPC or the public layer-pipeline endpoint.
+pub mod tensor_parallel;
 
 #[cfg(test)]
 mod golden_vectors;
