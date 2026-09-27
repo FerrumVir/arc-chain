@@ -313,6 +313,10 @@ impl RowServiceLimits {
 #[derive(Debug, serde::Serialize)]
 pub struct RowServiceStats {
     pub worker_id: String,
+    pub fast_kernel_requested: bool,
+    pub fast_kernel_enabled: bool,
+    pub simd_available: bool,
+    pub projection_census: Option<crate::canonical_simd::ProjectionCensus>,
     pub resident_bundle_copies: usize,
     pub resident_row_files: usize,
     pub resident_row_bytes: usize,
@@ -351,8 +355,13 @@ impl SharedRowService {
         }))
     }
     pub fn stats(&self) -> RowServiceStats {
+        let census_enabled = std::env::var("ARC_QUALIFICATION_SIMD_CENSUS").as_deref() == Ok("1");
         RowServiceStats {
             worker_id: self.bundle.worker_id.clone(),
+            fast_kernel_requested: std::env::var("ARC_FAST_CANONICAL_KERNEL").as_deref() == Ok("1"),
+            fast_kernel_enabled: crate::canonical_simd::fast_canonical_kernel_enabled(),
+            simd_available: crate::canonical_simd::dotprod_available(),
+            projection_census: census_enabled.then(crate::canonical_simd::projection_census),
             resident_bundle_copies: 1,
             resident_row_files: self.bundle.shards.len(),
             resident_row_bytes: self

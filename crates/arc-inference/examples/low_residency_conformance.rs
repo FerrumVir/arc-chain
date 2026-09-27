@@ -503,6 +503,13 @@ mod unix {
         let mode = args
             .first()
             .ok_or("required mode: inspect, reference, coordinator")?;
+        let fast_kernel_requested =
+            std::env::var("ARC_FAST_CANONICAL_KERNEL").as_deref() == Ok("1");
+        let census_enabled = std::env::var("ARC_QUALIFICATION_SIMD_CENSUS").as_deref() == Ok("1");
+        if census_enabled {
+            arc_inference::canonical_simd::reset_projection_census();
+            arc_inference::canonical_simd::set_projection_census_enabled(true);
+        }
         let mut values = BTreeMap::new();
         for pair in args[1..].chunks(2) {
             if pair.len() != 2
@@ -644,7 +651,13 @@ mod unix {
             json!(hash_file(&std::env::current_exe().map_err(|e| e.to_string())?)?.to_hex());
         result["fast_kernel_enabled"] =
             json!(arc_inference::canonical_simd::fast_canonical_kernel_enabled());
+        result["fast_kernel_requested"] = json!(fast_kernel_requested);
         result["simd_available"] = json!(arc_inference::canonical_simd::dotprod_available());
+        result["simd_projection_census"] = if census_enabled {
+            json!(arc_inference::canonical_simd::projection_census())
+        } else {
+            Value::Null
+        };
         result["elapsed_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
         result["max_rss_bytes_process_only"] = json!(max_rss_bytes());
         result["scope"] = json!(

@@ -41,6 +41,81 @@ def write_json(path, value, indent=2):
         out.write("\n")
 
 
+def kernel_environment(base, kernel, census=False):
+    """Return an explicit child env; never let reference inherit coordinator mode."""
+    return dict(base, ARC_FAST_CANONICAL_KERNEL="1" if kernel == "fast" else "0",
+                ARC_QUALIFICATION_SIMD_CENSUS="1" if census else "0")
+
+
+def validate_kernel_selection(kernel, reference_kernel):
+    if kernel == "fast" and reference_kernel != "scalar":
+        raise RuntimeError("fast distributed conformance requires a scalar reference")
+
+
+def validate_kernel_report(report, expected, role, census):
+    requested = report.get("fast_kernel_requested")
+    enabled = report.get("fast_kernel_enabled")
+    available = report.get("simd_available")
+    if any(type(value) is not bool for value in (requested, enabled, available)):
+        raise RuntimeError(f"{role} omitted observed kernel mode/availability")
+    expected_fast = expected == "fast"
+    if requested != expected_fast or enabled != expected_fast or (expected_fast and not available):
+        raise RuntimeError(f"{role} observed kernel mode differs from requested {expected}")
+    observation = {"requested_kernel": expected, "requested_fast_kernel": requested,
+                   "effective_fast_kernel": enabled, "simd_available": available,
+                   "projection_census": report.get("simd_projection_census")}
+    if census and expected_fast:
+        validate_projection_census(observation["projection_census"], role)
+    elif observation["projection_census"] is not None:
+        raise RuntimeError(f"{role} unexpectedly enabled SIMD census")
+    return observation
+
+
+def validate_projection_census(census, role):
+    fields = ("attempted", "accepted", "refused_unavailable", "refused_shape",
+              "refused_inner_dim_above_i32_bound", "refused_activation_out_of_domain",
+              "refused_scale_multiply_would_overflow")
+    if not isinstance(census, dict) or any(type(census.get(field)) is not int or census[field] < 0 for field in fields):
+        raise RuntimeError(f"{role} omitted valid projection census")
+    if census["attempted"] == 0 or census["accepted"] != census["attempted"] or any(census[field] for field in fields[2:]):
+        raise RuntimeError(f"{role} fast path was unavailable or refused one or more projections")
+    return census
+
+
+def read_daemon_simd_report(path, worker_id, expected, census):
+    events = []
+    for line in path.read_text().splitlines():
+        if line.startswith("{"):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("event") == "row_service_stopped":
+                events.append(event)
+    if len(events) != 1 or not isinstance(events[0].get("stats"), dict):
+        raise RuntimeError(f"worker {worker_id} omitted final service diagnostics")
+    stats = events[0]["stats"]
+    requested = stats.get("fast_kernel_requested")
+    enabled = stats.get("fast_kernel_enabled")
+    available = stats.get("simd_available")
+    if stats.get("worker_id") != worker_id or any(type(value) is not bool for value in (requested, enabled, available)):
+        raise RuntimeError(f"worker {worker_id} omitted its observed kernel identity/mode")
+    expected_fast = expected == "fast"
+    if requested != expected_fast or enabled != expected_fast or (expected_fast and not available):
+        raise RuntimeError(f"worker {worker_id} did not run requested {expected} mode")
+    if stats.get("completed_calls", 0) <= 0 or stats.get("refused_calls", 0) != 0:
+        raise RuntimeError(f"worker {worker_id} did not serve clean projection calls")
+    census_data = stats.get("projection_census")
+    if census and expected_fast:
+        validate_projection_census(census_data, "worker " + worker_id)
+    elif census_data is not None:
+        raise RuntimeError(f"worker {worker_id} unexpectedly enabled SIMD census")
+    return {"worker_id": worker_id, "requested_kernel": expected,
+            "requested_fast_kernel": requested, "effective_fast_kernel": enabled,
+            "simd_available": available, "completed_calls": stats["completed_calls"],
+            "refused_calls": stats["refused_calls"], "projection_census": census_data}
+
+
 def read_numbers(path):
     values = {}
     for line in Path(path).read_text().splitlines():
@@ -190,7 +265,7 @@ def validate_trace(trace, report):
 def compare(reference, coordinator):
     """Equality excludes timing/RSS; never let empty matching reports pass."""
     for key in ("schema", "artifact_blake3", "artifact_bytes", "profile", "graph", "prompt_token_ids",
-                "max_tokens", "generation_semantics", "warmup_count", "binary_blake3", "fast_kernel_enabled"):
+                "max_tokens", "generation_semantics", "warmup_count", "binary_blake3"):
         if key not in reference or reference[key] != coordinator.get(key):
             raise RuntimeError(f"conformance input/identity mismatch: {key}")
     if reference.get("mode") != "reference" or coordinator.get("mode") != "coordinator":
@@ -255,20 +330,46 @@ class Children:
                     pass
         self.sampled_aggregate_rss_peak_bytes = max(self.sampled_aggregate_rss_peak_bytes, total)
 
-    def start(self, name, command):
+    def start(self, name, command, environment=None):
         stdout = (self.output / (name + ".stdout.log")).open("x")
         stderr = (self.output / (name + ".stderr.log")).open("x")
         try:
             process = subprocess.Popen([str(x) for x in command], stdout=stdout, stderr=stderr,
-                                       env=self.environment, start_new_session=True)
+                                       env=self.environment if environment is None else environment,
+                                       start_new_session=True)
         finally:
             stdout.close()
             stderr.close()
         record = {"name": name, "pid": process.pid, "argv": [str(x) for x in command],
                   "started_unix_seconds": time.time(), "returncode": None}
+        selected_environment = self.environment if environment is None else environment
+        record["kernel_environment"] = {
+            "ARC_FAST_CANONICAL_KERNEL": selected_environment.get("ARC_FAST_CANONICAL_KERNEL", "0"),
+            "ARC_QUALIFICATION_SIMD_CENSUS": selected_environment.get("ARC_QUALIFICATION_SIMD_CENSUS", "0"),
+        }
         self.items.append((process, record))
         self.records.append(record)
         return process
+
+    def stop(self, processes, timeout=20):
+        """Gracefully stop selected long-lived daemons for final diagnostics."""
+        running = [process for process in processes if process.poll() is None]
+        for process in running:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + timeout
+        for process in running:
+            try:
+                process.wait(timeout=max(0.01, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=10)
+            self.record_exit(process)
 
     def wait(self, process, timeout):
         end = time.monotonic() + timeout
@@ -316,6 +417,8 @@ def parser():
     result.add_argument("--max-tokens", default=2, type=int, choices=range(1, 5))
     result.add_argument("--warmups", default=0, type=int, choices=(0, 1))
     result.add_argument("--kernel", default="scalar", choices=("scalar", "fast"))
+    result.add_argument("--reference-kernel", default="scalar", choices=("scalar", "fast"),
+                        help="independent reference mode; fast distributed mode requires scalar reference")
     result.add_argument("--row-partitions", type=int, choices=range(2, 17),
                         help="offline-only disjoint rows per tensor on 2..16 daemons; default uses layer bundles")
     result.add_argument("--timeout-seconds", default=1800, type=int)
@@ -332,6 +435,7 @@ def run(args):
     if (not 1 <= len(prompt) <= 16 or not 60 <= args.timeout_seconds <= 3600
             or not 60 <= args.total_timeout_seconds <= 5400):
         raise RuntimeError("prompt count or timeout outside bounded limits")
+    validate_kernel_selection(args.kernel, args.reference_kernel)
     output.mkdir(mode=0o700, exist_ok=False)
     package = json.loads(PACKAGE.read_text())
     if package["execution"]["profile"] != PROFILE:
@@ -339,20 +443,31 @@ def run(args):
     if prompt[0] == package["tokenizer"]["bos"] or any(not 0 <= n < package["graph"]["vocab_size"] for n in prompt):
         raise RuntimeError("invalid prompt IDs or leading BOS")
     binaries = {name: args.binaries_dir / name for name in BINARIES}
-    environment = dict(os.environ, ARC_FAST_CANONICAL_KERNEL="1" if args.kernel == "fast" else "0",
-                       ARC_BATCHED_PREFILL="0")
-    children = Children(output, environment)
+    census_enabled = args.kernel == "fast" or args.reference_kernel == "fast"
+    base_environment = dict(os.environ, ARC_BATCHED_PREFILL="0",
+                            ARC_QUALIFICATION_SIMD_CENSUS="1" if census_enabled else "0")
+    environments = {
+        "inspect": kernel_environment(base_environment, "scalar", False),
+        "reference": kernel_environment(base_environment, args.reference_kernel, args.reference_kernel == "fast"),
+        "coordinator": kernel_environment(base_environment, args.kernel, args.kernel == "fast"),
+        "worker": kernel_environment(base_environment, args.kernel, args.kernel == "fast"),
+        "export": kernel_environment(base_environment, "scalar", False),
+    }
+    children = Children(output, base_environment)
     summary = {"schema": "arc.low-residency-conformance-run.v1", "pass": False,
                "scope": "offline numerical comparison only; not quality, paid path, SSH, distributed latency or fleet readiness",
                "inputs": {"prompt_token_ids": prompt, "max_tokens": args.max_tokens, "warmups": args.warmups,
-                          "kernel": args.kernel, "model": str(args.model), "row_partitions": args.row_partitions},
+                          "kernel": args.kernel, "reference_kernel": args.reference_kernel,
+                          "simd_census_enabled": census_enabled,
+                          "model": str(args.model), "row_partitions": args.row_partitions},
                "package_manifest_sha256": digest(PACKAGE), "resource_checks": [],
                "package_manifest_blake3": package["manifest_blake3"],
                "profile_commitment": package["execution"]["profile_commitment"],
                "generation_commitment": package["generation"]["commitment"],
                "measurement_caveat": "RSS samples cover direct child processes at ~100ms and may miss peaks; "
                    "process getrusage excludes daemons; existing cgroup peak is not reset and can include unrelated/prior work. "
-                   "No validator, legacy shard, SSH relay, OS overhead or real-host capacity qualification is performed."}
+                   "No validator, legacy shard, SSH relay, OS overhead or real-host capacity qualification is performed. "
+                   "When SIMD census is enabled, counter atomics add measurement overhead and timings are not speed evidence."}
     runtime = None
     def expired(_signum, _frame):
         raise TimeoutError(f"global conformance deadline expired after {args.total_timeout_seconds}s")
@@ -376,7 +491,7 @@ def run(args):
 
         checkpoint("inspect", 2 * GIB)
         layout_args = [] if args.row_partitions is None else ["--row-partitions", str(args.row_partitions)]
-        child = children.start("inspect", [binaries[BINARIES[0]], "inspect", *common, *layout_args, "--output", output / "inspect.json"])
+        child = children.start("inspect", [binaries[BINARIES[0]], "inspect", *common, *layout_args, "--output", output / "inspect.json"], environments["inspect"])
         children.wait(child, args.timeout_seconds)
         plan = json.loads((output / "inspect.json").read_text())
         if plan["artifact_blake3"] != package["artifact"]["blake3"] or plan["profile"] != PROFILE:
@@ -389,7 +504,7 @@ def run(args):
         baseline_budget = max(12 * GIB, package["memory"]["prepared_total_bytes"] + kv_bytes + 3 * GIB)
         checkpoint("reference", baseline_budget, disk)
         reference = children.start("reference", [binaries[BINARIES[0]], "reference", *common,
-                                                  "--output", output / "reference.json"])
+                                                  "--output", output / "reference.json"], environments["reference"])
         children.wait(reference, args.timeout_seconds)
         summary["reference_exited_before_row_preparation"] = reference.returncode == 0
         bundles = output / "bundles"
@@ -404,7 +519,7 @@ def run(args):
                 command.append("--include-output")
             if spec.get("row_partition") is not None:
                 command.extend(["--row-partition", spec["row_partition"]])
-            children.wait(children.start("export-" + spec["worker_id"], command), args.timeout_seconds)
+            children.wait(children.start("export-" + spec["worker_id"], command, environments["export"]), args.timeout_seconds)
             manifest = json.loads((dest / "manifest.json").read_text())
             validate_export_manifest(spec, manifest, plan, package["artifact"]["blake3"])
             manifests.append((dest, manifest))
@@ -417,7 +532,8 @@ def run(args):
             socket = runtime / (manifest["worker_id"] + ".sock")
             name = "daemon-" + manifest["worker_id"]
             daemon = children.start(name, [binaries[BINARIES[2]], "serve", "--rows-dir", dest / "rows",
-                "--artifact", package["artifact"]["blake3"], "--socket", socket, "--max-clients", "2"])
+                "--artifact", package["artifact"]["blake3"], "--socket", socket, "--max-clients", "2"],
+                environments["worker"])
             daemons.append(daemon)
             end = time.monotonic() + 180
             while True:
@@ -443,14 +559,32 @@ def run(args):
         write_json(output / "workers.json", config, indent=None)
         checkpoint("coordinator", kv_bytes + 2 * GIB)
         coordinator = children.start("coordinator", [binaries[BINARIES[0]], "coordinator", *common, *layout_args,
-            "--workers", output / "workers.json", "--output", output / "coordinator.json"])
+            "--workers", output / "workers.json", "--output", output / "coordinator.json"], environments["coordinator"])
         children.wait(coordinator, args.timeout_seconds)
         if any(daemon.poll() is not None for daemon in daemons):
             raise RuntimeError("a row daemon exited before comparison completed")
+        children.stop(daemons)
+        daemon_reports = [read_daemon_simd_report(output / ("daemon-" + manifest["worker_id"] + ".stderr.log"),
+                                                   manifest["worker_id"], args.kernel, census_enabled)
+                          for _, manifest in manifests]
         expected = json.loads((output / "reference.json").read_text())
         actual = json.loads((output / "coordinator.json").read_text())
         if actual.get("row_partitions") != args.row_partitions:
             raise RuntimeError("coordinator did not use the requested partial-row proof")
+        reference_kernel = validate_kernel_report(expected, args.reference_kernel, "reference", census_enabled)
+        coordinator_kernel = validate_kernel_report(actual, args.kernel, "coordinator", census_enabled)
+        summary["kernel_observations"] = {
+            "reference": reference_kernel,
+            "coordinator": coordinator_kernel,
+            "workers": daemon_reports,
+            "simd_path_qualified": bool(args.kernel == "fast" and args.reference_kernel == "scalar" and census_enabled and
+                all(item["effective_fast_kernel"] for item in [reference_kernel, coordinator_kernel, *daemon_reports]
+                    if item["requested_kernel"] == "fast")),
+            "measurement_overhead": "projection census atomics enabled; do not use these timings as a speedup claim"
+                if census_enabled else "projection census disabled",
+        }
+        if args.kernel == "fast" and not summary["kernel_observations"]["simd_path_qualified"]:
+            raise RuntimeError("fast distributed run lacks accepted SIMD census from every compute process")
         summary.update(compare(expected, actual))
         summary["pass"] = True
     except Exception as error:

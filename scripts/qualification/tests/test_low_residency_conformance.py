@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -20,7 +21,8 @@ def report(mode):
              "artifact_blake3": "a" * 64, "artifact_bytes": 100, "profile": runner.PROFILE,
              "graph": {"bos": 1, "eos": [2], "vocab": 5, "max_seq": 8}, "prompt_token_ids": [4], "max_tokens": 2,
              "generation_semantics": "generation-v2/BOS-once/repetition-penalty/EOS-included", "warmup_count": 0, "binary_blake3": "b" * 64,
-             "fast_kernel_enabled": False, "warmup_runs": [],
+             "fast_kernel_enabled": False, "fast_kernel_requested": False, "simd_available": True,
+             "simd_projection_census": None, "warmup_runs": [],
              "measured": {"output_token_ids": [3, 2], "output_hash": "c" * 64,
                           "positions": [{"position": i, "input_token": token, "logit_count": 5,
                                          "logits_blake3_le_i64": "d" * 64, "kv_blake3": "e" * 64}
@@ -37,9 +39,14 @@ class Comparison(unittest.TestCase):
         b["measured"]["forward_ms"] = [5000, 5000, 5000]
         self.assertEqual(runner.compare(a, b)["compared_positions"], 3)
 
+    def test_scalar_reference_and_fast_coordinator_modes_may_differ(self):
+        a, b = report("reference"), report("coordinator")
+        b["fast_kernel_enabled"] = True
+        self.assertEqual(runner.compare(a, b)["compared_positions"], 3)
+
     def test_every_position_digest_token_and_identity_mismatch_refuses(self):
         a = report("reference")
-        for field in ("artifact_blake3", "profile", "prompt_token_ids", "binary_blake3", "fast_kernel_enabled"):
+        for field in ("artifact_blake3", "profile", "prompt_token_ids", "binary_blake3"):
             b = report("coordinator")
             b[field] = "wrong"
             with self.subTest(field=field), self.assertRaises(RuntimeError):
@@ -207,6 +214,58 @@ class PartialLayout(unittest.TestCase):
             self.assertEqual(len({a["worker_id"] for a in assignments}), 3)
         self.assertEqual(assignments[-1]["tensor"], "lm_head")
         self.assertEqual(assignments[-1]["row_end"], 13)
+
+
+def census(attempted=3, accepted=3):
+    return {"attempted": attempted, "accepted": accepted, "refused_unavailable": 0,
+            "refused_shape": 0, "refused_inner_dim_above_i32_bound": 0,
+            "refused_activation_out_of_domain": 0, "refused_scale_multiply_would_overflow": 0}
+
+
+class KernelQualification(unittest.TestCase):
+    fixture = PartialLayout.fixture
+
+    def test_default_modes_and_independent_child_environment(self):
+        args = runner.parser().parse_args(["--binaries-dir", "/bin", "--model", "/model", "--output-dir", "/out"])
+        self.assertEqual(args.kernel, "scalar")
+        self.assertEqual(args.reference_kernel, "scalar")
+        inherited = {"ARC_FAST_CANONICAL_KERNEL": "1", "ARC_QUALIFICATION_SIMD_CENSUS": "1"}
+        scalar = runner.kernel_environment(inherited, "scalar", False)
+        fast = runner.kernel_environment(inherited, "fast", True)
+        self.assertEqual((scalar["ARC_FAST_CANONICAL_KERNEL"], scalar["ARC_QUALIFICATION_SIMD_CENSUS"]), ("0", "0"))
+        self.assertEqual((fast["ARC_FAST_CANONICAL_KERNEL"], fast["ARC_QUALIFICATION_SIMD_CENSUS"]), ("1", "1"))
+
+    def test_fast_distributed_requires_scalar_reference(self):
+        runner.validate_kernel_selection("scalar", "fast")
+        runner.validate_kernel_selection("fast", "scalar")
+        with self.assertRaisesRegex(RuntimeError, "scalar reference"):
+            runner.validate_kernel_selection("fast", "fast")
+
+    def test_fast_report_requires_available_effective_backend_and_clean_census(self):
+        value = report("coordinator")
+        value.update(fast_kernel_requested=True, fast_kernel_enabled=True, simd_available=True,
+                     simd_projection_census=census())
+        observed = runner.validate_kernel_report(value, "fast", "coordinator", True)
+        self.assertTrue(observed["effective_fast_kernel"])
+        for fields in ({"simd_available": False}, {"fast_kernel_enabled": False},
+                       {"simd_projection_census": census(attempted=0, accepted=0)},
+                       {"simd_projection_census": census(attempted=3, accepted=2)}):
+            bad = dict(value, **fields)
+            with self.subTest(fields=fields), self.assertRaises(RuntimeError):
+                runner.validate_kernel_report(bad, "fast", "coordinator", True)
+
+    def test_fast_worker_final_stats_require_real_accepted_projection_calls(self):
+        stats = {"worker_id": "proof-0", "fast_kernel_requested": True, "fast_kernel_enabled": True,
+                 "simd_available": True, "projection_census": census(), "completed_calls": 3, "refused_calls": 0}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "daemon.log"
+            path.write_text(json.dumps({"event": "row_service_stopped", "stats": stats}) + "\n")
+            self.assertEqual(runner.read_daemon_simd_report(path, "proof-0", "fast", True)["completed_calls"], 3)
+            stats["projection_census"] = census(attempted=2, accepted=1)
+            path.write_text(json.dumps({"event": "row_service_stopped", "stats": stats}) + "\n")
+            with self.assertRaisesRegex(RuntimeError, "refused"):
+                runner.read_daemon_simd_report(path, "proof-0", "fast", True)
+
 
     def test_ignored_layout_flags_duplicate_worker_and_capacity_refuse(self):
         for case in range(6):

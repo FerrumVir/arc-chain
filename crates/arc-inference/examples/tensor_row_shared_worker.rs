@@ -55,6 +55,12 @@ fn main() -> Result<(), String> {
     if mode != "serve" {
         return Err("mode must be serve or relay".into());
     }
+    if std::env::var("ARC_QUALIFICATION_SIMD_CENSUS").as_deref() == Ok("1") {
+        // Diagnostic-only qualification path. Normal production starts leave
+        // the census disabled; this adds atomic counter work during inference.
+        arc_inference::canonical_simd::reset_projection_census();
+        arc_inference::canonical_simd::set_projection_census_enabled(true);
+    }
     let rows = std::path::Path::new(values.get("--rows-dir").ok_or("required --rows-dir")?);
     let artifact = arc_crypto::Hash256::from_hex(
         values

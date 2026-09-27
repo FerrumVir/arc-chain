@@ -141,7 +141,7 @@ static N_DOMAIN: AtomicU64 = AtomicU64::new(0);
 static N_SCALE: AtomicU64 = AtomicU64::new(0);
 
 /// Counts of attempted / accepted / refused vectorised projections.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ProjectionCensus {
     pub attempted: u64,
     pub accepted: u64,
