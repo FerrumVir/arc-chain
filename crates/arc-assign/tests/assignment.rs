@@ -1,6 +1,8 @@
 //! S9: synthetic assignment scenarios - no network, no model.
 
-use arc_assign::certificate::{AssignmentCertificate, CertificateError, policy_hash};
+use arc_assign::certificate::{
+    AssignmentCertificate, CertificateError, policy_hash, policy_hash_v2,
+};
 use arc_assign::lease::{
     self, CapabilityLease, ChallengeResult, LeaseBody, LeaseError, LeaseRequirements,
     OP_ROW_PROJECTION_I8,
@@ -521,6 +523,141 @@ fn issue() -> AssignmentCertificate {
         rule(),
     )
     .unwrap()
+}
+
+#[test]
+fn stable_policy_binds_every_setting_but_not_observation_height() {
+    let original = policy();
+    let expected = policy_hash_v2(&original, &rule());
+    let mut later = original.clone();
+    later.now += 1;
+    assert_eq!(policy_hash_v2(&later, &rule()), expected);
+    assert_ne!(
+        policy_hash(&later, &rule()),
+        policy_hash(&original, &rule())
+    );
+    let changes: [fn(&mut Policy); 8] = [
+        |p| p.max_workers += 1,
+        |p| p.max_link_age += 1,
+        |p| p.max_failure_per_mille += 1,
+        |p| p.allow_simulated_links = !p.allow_simulated_links,
+        |p| p.input_element_bytes += 1,
+        |p| p.output_element_bytes += 1,
+        |p| p.weight_bytes_per_element += 1,
+        |p| p.include_coordinator = !p.include_coordinator,
+    ];
+    for change in changes {
+        let mut changed = original.clone();
+        change(&mut changed);
+        assert_ne!(policy_hash_v2(&changed, &rule()), expected);
+    }
+    let mut checks = rule();
+    checks.duplicate_per_mille += 1;
+    assert_ne!(policy_hash_v2(&original, &checks), expected);
+    checks = rule();
+    checks.spot_rows_per_stage += 1;
+    assert_ne!(policy_hash_v2(&original, &checks), expected);
+    assert_ne!(expected, policy_hash(&original, &rule()));
+}
+
+#[test]
+fn v2_certificate_verifies_authorization_and_recomputes_the_recorded_placement() {
+    let v1 = issue();
+    let cert = AssignmentCertificate::issue_v2(
+        v1.request_id,
+        v1.artifact_id,
+        &v1.execution_profile,
+        v1.epoch,
+        v1.stages.clone(),
+        v1.coordinator_macs_per_s,
+        v1.candidates.clone(),
+        v1.lease_digests.clone(),
+        v1.policy.clone(),
+        v1.verification,
+    )
+    .unwrap();
+    let authorized = policy_hash_v2(&policy(), &rule());
+    cert.verify(&authorized).unwrap();
+    assert_eq!(cert.placement, v1.placement);
+    assert_ne!(cert.hash(), v1.hash());
+    assert_eq!(
+        cert.verify(&policy_hash(&policy(), &rule())),
+        Err(CertificateError::WrongPolicy)
+    );
+    assert_eq!(v1.verify(&authorized), Err(CertificateError::WrongPolicy));
+    let mut forged = cert.clone();
+    forged.placement.stages[0].slices[0].row_end -= 1;
+    assert_eq!(
+        forged.verify(&authorized),
+        Err(CertificateError::PlacementMismatch)
+    );
+    forged = cert.clone();
+    forged.verification.spot_rows_per_stage = 0;
+    assert_eq!(
+        forged.verify(&authorized),
+        Err(CertificateError::WrongPolicy)
+    );
+    // A stable policy cannot make expired observations usable: the recorded
+    // actual height still changes the recomputed placement.
+    forged = cert;
+    forged.policy.now += 10_000;
+    assert_eq!(
+        forged.verify(&authorized),
+        Err(CertificateError::PlacementMismatch)
+    );
+}
+
+#[test]
+fn v1_policy_and_certificate_keep_the_original_fixed_binary_transcripts() {
+    fn bytes(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+    fn original_hash(domain: &str, transcript: &[u8]) -> Hash256 {
+        let mut h = blake3::Hasher::new_derive_key(domain);
+        h.update(transcript);
+        Hash256(*h.finalize().as_bytes())
+    }
+    let policy_bytes = bytes(
+        "01000000080000000000000032000000000000006e00000000000000140000000008000000000000000800000000000000010000000000000001fa00000002000000",
+    );
+    assert_eq!(
+        bincode::serialize(&(1u32, policy(), rule())).unwrap(),
+        policy_bytes
+    );
+    assert_eq!(
+        policy_hash(&policy(), &rule()),
+        original_hash("ARC-assign-policy-v1", &policy_bytes)
+    );
+    let cert = AssignmentCertificate::issue(
+        Hash256([1; 32]),
+        Hash256([2; 32]),
+        "p",
+        3,
+        vec![Stage {
+            layer: None,
+            tensor: "lm_head".into(),
+            rows: 2,
+            cols: 1,
+        }],
+        1_000_000,
+        vec![],
+        vec![],
+        policy(),
+        rule(),
+    )
+    .unwrap();
+    let certificate_bytes = bytes(
+        "0100000001010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202010000000000000070030000000000000001000000000000000007000000000000006c6d5f686561640200000000000000010000000000000040420f000000000000000000000000000000000000000000080000000000000032000000000000006e00000000000000140000000008000000000000000800000000000000010000000000000001fa000000020000000000000000000000010000000000000000000000000000000100000000000000000000000000000000000000020000000000000002000000000000000200000000000000",
+    );
+    assert_eq!(bincode::serialize(&cert).unwrap(), certificate_bytes);
+    assert_eq!(
+        cert.hash(),
+        original_hash("ARC-assign-certificate-v1", &certificate_bytes)
+    );
+    cert.verify(&policy_hash(&policy(), &rule())).unwrap();
 }
 
 #[test]

@@ -563,6 +563,14 @@ struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum OperatorCommand {
+    /// Print the actual native assignment policy commitment without starting
+    /// a node, connecting workers, reading chain state, or loading a model.
+    NativeAssignmentPolicy {
+        #[arg(long)]
+        row_workers: Option<PathBuf>,
+        #[arg(long, requires = "row_workers")]
+        low_residency: bool,
+    },
     /// Create or finalize offline, create-only v0.7 community retirement evidence.
     LegacyRetirement {
         #[command(subcommand)]
@@ -4563,6 +4571,19 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
 
 async fn run_operator_command(command: OperatorCommand) -> Result<()> {
     match command {
+        OperatorCommand::NativeAssignmentPolicy {
+            row_workers,
+            low_residency,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&native_assignment_policy_report(
+                    row_workers.as_deref(),
+                    low_residency,
+                )?)?
+            );
+            Ok(())
+        }
         OperatorCommand::LegacyRetirement { command } => legacy_retirement::run(command),
         OperatorCommand::Recovery { command } => run_recovery_operator_command(command),
         OperatorCommand::Archive {
@@ -4608,6 +4629,31 @@ async fn run_operator_command(command: OperatorCommand) -> Result<()> {
             .await
         }
     }
+}
+
+fn native_assignment_policy_report(
+    row_workers: Option<&std::path::Path>,
+    low_residency: bool,
+) -> Result<serde_json::Value> {
+    let config = row_workers
+        .map(arc_node::row_cohort::RowCohortConfig::load)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let assignment =
+        arc_node::native_inference::runtime_assignment_hash(config.as_ref(), low_residency)?;
+    Ok(serde_json::json!({
+        "format": "arc.native-assignment-policy-report.v1",
+        "assignment_hash": assignment.to_hex(),
+        "mode": if low_residency { "private-row-remote-only-strict-v1" }
+            else if config.is_some() { "private-row-resident-with-local-fallback-v1" }
+            else { "local-canonical-i8-v1" },
+        "assignment_certificate_version": config.as_ref().map(|_| 2),
+        "max_workers": config.as_ref().map(|c| c.max_workers),
+        "duplicate_per_mille": config.as_ref().map(|c| c.duplicate_per_mille),
+        "spot_rows_per_stage": config.as_ref().map(|c| c.spot_rows_per_stage),
+        "qualified": false,
+        "note": "Computed configuration identity only. Does not activate, approve, qualify, or establish worker readiness."
+    }))
 }
 
 /// Return the first candidate whose complete SHA-256 matches the canonical
@@ -7482,6 +7528,27 @@ async fn run_arc_node() -> Result<()> {
                 )
                 .map_err(|e| anyhow::anyhow!("real-model execution refused: {e}"))?;
                 let qualification = decision.qualification;
+                let row_config = cli
+                    .native_row_workers
+                    .as_ref()
+                    .map(|path| arc_node::row_cohort::RowCohortConfig::load(path))
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("--native-row-workers: {e}"))?;
+                let assignment =
+                    ni::runtime_assignment_hash(row_config.as_ref(), cli.native_low_residency)
+                        .map_err(|e| anyhow::anyhow!("native assignment policy refused: {e}"))?;
+                anyhow::ensure!(
+                    context.allowed_executions.iter().any(|entry| {
+                        entry.model_hash == qualification.artifact_hash
+                            && entry.profile_hash == qualification.profile_hash
+                            && entry.generation_hash == qualification.generation_hash
+                            && entry.assignment_hash == assignment
+                    }),
+                    "actual native runtime assignment policy {} is not in the activated execution \
+                     allowlist; refusing before model load. Existing assignment hashes are not \
+                     reinterpreted or automatically approved",
+                    assignment.to_hex()
+                );
                 let artifact = cli.native_inference_artifact.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "--native-inference-runtime needs --native-inference-artifact \
@@ -7559,10 +7626,8 @@ async fn run_arc_node() -> Result<()> {
                 );
                 // After the package check: only the approved package is ever
                 // placed on this operator's machines.
-                let executor = match cli.native_row_workers.as_ref() {
-                    Some(path) => {
-                        let config = arc_node::row_cohort::RowCohortConfig::load(path)
-                            .map_err(|e| anyhow::anyhow!("--native-row-workers: {e}"))?;
+                let executor = match row_config {
+                    Some(config) => {
                         let executor = executor
                             .connect_row_cohort(config, validator_keypair.address(), state.height())
                             .map_err(|e| anyhow::anyhow!("--native-row-workers: {e}"))?;
@@ -9464,6 +9529,64 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn native_assignment_policy_command_is_offline_and_matches_runtime_configuration() {
+        let parsed = Cli::try_parse_from(["arc-node", "native-assignment-policy"]).unwrap();
+        assert!(matches!(
+            parsed.operator_command,
+            Some(OperatorCommand::NativeAssignmentPolicy {
+                row_workers: None,
+                low_residency: false
+            })
+        ));
+        assert!(!parsed.native_inference_runtime);
+        assert!(
+            Cli::try_parse_from(["arc-node", "native-assignment-policy", "--low-residency"])
+                .is_err()
+        );
+        let local = native_assignment_policy_report(None, false).unwrap();
+        assert_eq!(
+            local["assignment_hash"],
+            arc_node::native_inference::local_canonical_assignment_hash().to_hex()
+        );
+        assert_eq!(local["qualified"], false);
+        assert!(native_assignment_policy_report(None, true).is_err());
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/operations/row-cohort.example.json");
+        let parsed = Cli::try_parse_from([
+            "arc-node",
+            "native-assignment-policy",
+            "--row-workers",
+            path.to_str().unwrap(),
+            "--low-residency",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.operator_command,
+            Some(OperatorCommand::NativeAssignmentPolicy {
+                row_workers: Some(_),
+                low_residency: true
+            })
+        ));
+        assert!(!parsed.native_inference_runtime);
+        let cfg = arc_node::row_cohort::RowCohortConfig::load(&path).unwrap();
+        let report = native_assignment_policy_report(Some(&path), true).unwrap();
+        assert_eq!(
+            report["assignment_hash"],
+            cfg.assignment_hash(true).to_hex()
+        );
+        assert_eq!(report["assignment_certificate_version"], 2);
+        assert_eq!(report["qualified"], false);
+        assert_ne!(report["assignment_hash"], local["assignment_hash"]);
+        assert!(
+            native_assignment_policy_report(
+                Some(std::path::Path::new("/nonexistent/row-policy.json")),
+                true
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn native_request_opt_in_is_default_closed_and_requires_runtime_before_state_open() {

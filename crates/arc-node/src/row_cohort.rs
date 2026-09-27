@@ -182,6 +182,33 @@ pub struct RowWorkerEntry {
 }
 
 impl RowCohortConfig {
+    fn placement_policy(&self, low_residency: bool, now: u64) -> (Policy, VerificationRule) {
+        (
+            Policy {
+                max_workers: self.max_workers,
+                max_link_age: LINK_MAX_AGE_HEIGHTS,
+                now,
+                max_failure_per_mille: LINK_MAX_FAILURE_PER_MILLE,
+                allow_simulated_links: false,
+                input_element_bytes: 8,
+                output_element_bytes: 8,
+                weight_bytes_per_element: 1,
+                include_coordinator: !low_residency,
+            },
+            VerificationRule {
+                duplicate_per_mille: self.duplicate_per_mille,
+                spot_rows_per_stage: self.spot_rows_per_stage,
+            },
+        )
+    }
+
+    /// The actual private-cohort policy authorized by a native request.
+    /// Workers and live observations remain certificate inputs, not policy.
+    pub fn assignment_hash(&self, low_residency: bool) -> Hash256 {
+        let (policy, verification) = self.placement_policy(low_residency, 0);
+        arc_assign::certificate::policy_hash_v2(&policy, &verification)
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
         let metadata = std::fs::metadata(path)
             .map_err(|error| format!("row cohort config {}: {error}", path.display()))?;
@@ -352,6 +379,30 @@ fn entry_digest(entry: &RowWorkerEntry) -> Hash256 {
     let mut hasher = blake3::Hasher::new_derive_key("ARC-operator-row-entry-v1");
     hasher.update(&serde_json::to_vec(entry).expect("a config entry serialises"));
     Hash256(*hasher.finalize().as_bytes())
+}
+
+fn verify_row_certificate(
+    certificate: &AssignmentCertificate,
+    request: Hash256,
+    artifact: Hash256,
+    profile: &str,
+    assignment: Hash256,
+    now: u64,
+) -> Result<(), NativeInferenceError> {
+    if certificate.version != 2
+        || certificate.request_id != request
+        || certificate.artifact_id != artifact
+        || certificate.execution_profile != profile
+        || certificate.policy.now != now
+        || certificate.epoch != now / EPOCH_HEIGHTS
+    {
+        return Err(NativeInferenceError::Executor(
+            "row assignment certificate does not match this job and observation".into(),
+        ));
+    }
+    certificate
+        .verify(&assignment)
+        .map_err(|error| NativeInferenceError::Executor(error.to_string()))
 }
 
 fn tensor_name(tensor: TensorKey) -> &'static str {
@@ -778,6 +829,67 @@ impl Drop for Reserved<'_> {
 }
 
 impl RowCohort {
+    pub fn assignment_hash(&self) -> Hash256 {
+        self.config.assignment_hash(self.model.is_low_residency())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnected_policy_fixture(
+        config: RowCohortConfig,
+        model: Arc<CachedIntegerModel>,
+        artifact: Hash256,
+    ) -> Arc<Self> {
+        // No model load, connections, measurement threads or qualification.
+        // Tests exercise policy refusal before any of those may be used.
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            model: CoordinatorModel::Resident(model),
+            artifact,
+            config,
+            machines: vec![],
+            workers: Mutex::new(BTreeMap::new()),
+            coordinator_macs_per_s: 1,
+            books: Mutex::new(Books {
+                epoch: 0,
+                challenges: ChallengeBook::new(0),
+                probes: ProbeBook::new(false),
+                ledger: ReservationLedger::new(),
+                exclusions: Exclusions::new(0),
+                attempted: BTreeMap::new(),
+                measuring: BTreeSet::new(),
+                material_failed_at: None,
+                forgiven: BTreeSet::new(),
+            }),
+            recent: Mutex::new(VecDeque::new()),
+            last_height: AtomicU64::new(0),
+        })
+    }
+
+    fn verify_certificate(
+        &self,
+        certificate: &AssignmentCertificate,
+        request: Hash256,
+        assignment: Hash256,
+        now: u64,
+    ) -> Result<(), NativeInferenceError> {
+        if assignment != self.assignment_hash() {
+            return Err(NativeInferenceError::Executor(
+                "row assignment certificate does not match this job and runtime policy".into(),
+            ));
+        }
+        verify_row_certificate(
+            certificate,
+            request,
+            self.artifact,
+            self.model
+                .source()
+                .canonical_execution_profile()
+                .unwrap_or_default(),
+            assignment,
+            now,
+        )
+    }
+
     /// Build the cohort and measure every listed machine on a background
     /// thread (connecting, timing and challenging it). Until a machine is
     /// measured it is not placed, and the node computes those rows itself, so
@@ -1324,22 +1436,10 @@ impl RowCohort {
             &books.ledger,
             &books.exclusions,
         );
-        let policy = Policy {
-            max_workers: self.config.max_workers,
-            max_link_age: LINK_MAX_AGE_HEIGHTS,
-            now,
-            max_failure_per_mille: LINK_MAX_FAILURE_PER_MILLE,
-            allow_simulated_links: false,
-            input_element_bytes: 8,
-            output_element_bytes: 8,
-            weight_bytes_per_element: 1,
-            include_coordinator: !self.model.is_low_residency(),
-        };
-        let rule = VerificationRule {
-            duplicate_per_mille: self.config.duplicate_per_mille,
-            spot_rows_per_stage: self.config.spot_rows_per_stage,
-        };
-        AssignmentCertificate::issue(
+        let (policy, rule) = self
+            .config
+            .placement_policy(self.model.is_low_residency(), now);
+        AssignmentCertificate::issue_v2(
             request,
             self.artifact,
             self.model
@@ -1375,6 +1475,12 @@ impl RowCohort {
         let Ok(certificate) = self.issue_placement(Hash256::ZERO, now, stages, &open) else {
             return false;
         };
+        if self
+            .verify_certificate(&certificate, Hash256::ZERO, self.assignment_hash(), now)
+            .is_err()
+        {
+            return false;
+        }
         let id_of = self
             .machines
             .iter()
@@ -1412,15 +1518,22 @@ impl RowCohort {
     /// predicts the machines make it faster, locally otherwise. Either way the
     /// tokens equal local execution's (see the module documentation). Never
     /// waits on a machine's connect or measurement.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
         request: Hash256,
+        assignment: Hash256,
         expires_at: u64,
         now: u64,
         prompt: &[u32],
         max_tokens: u32,
         eos_tokens: &[u32],
     ) -> Generated {
+        if assignment != self.assignment_hash() {
+            return Err(NativeInferenceError::Executor(
+                "native request assignment does not authorize this row-cohort policy".into(),
+            ));
+        }
         let started = Instant::now();
         self.begin(now);
         let model = self.model.source();
@@ -1460,6 +1573,9 @@ impl RowCohort {
         let (result, outcome) = match issued {
             Err(error) => local(format!("local: placement failed: {error}")),
             Ok(certificate) => {
+                // Authorization failures never enter the local-fallback
+                // branch and precede every plan, reservation and generation.
+                self.verify_certificate(&certificate, request, assignment, now)?;
                 record.certificate = Some(certificate.hash().to_hex());
                 record.predicted_token_us = certificate.placement.predicted_token_us;
                 record.coordinator_only_token_us = certificate.placement.coordinator_only_token_us;
@@ -1734,6 +1850,56 @@ mod tests {
             duplicate_per_mille: default_duplicate_per_mille(),
             spot_rows_per_stage: default_spot_rows(),
         }
+    }
+
+    #[test]
+    fn native_row_certificate_binds_the_job_policy_and_live_observation() {
+        let cfg = config(vec![entry("fixture")]);
+        let (policy, rule) = cfg.placement_policy(false, 10);
+        let request = Hash256([1; 32]);
+        let artifact = Hash256([2; 32]);
+        let assignment = cfg.assignment_hash(false);
+        let cert = AssignmentCertificate::issue_v2(
+            request,
+            artifact,
+            "fixture-profile",
+            0,
+            vec![Stage {
+                layer: None,
+                tensor: "lm_head".into(),
+                rows: 2,
+                cols: 1,
+            }],
+            1_000_000,
+            vec![],
+            vec![],
+            policy,
+            rule,
+        )
+        .unwrap();
+        verify_row_certificate(&cert, request, artifact, "fixture-profile", assignment, 10)
+            .unwrap();
+        for (r, a, p, authorized, now) in [
+            (Hash256::ZERO, artifact, "fixture-profile", assignment, 10),
+            (request, Hash256::ZERO, "fixture-profile", assignment, 10),
+            (request, artifact, "other-profile", assignment, 10),
+            (request, artifact, "fixture-profile", Hash256::ZERO, 10),
+            (request, artifact, "fixture-profile", assignment, 11),
+        ] {
+            assert!(verify_row_certificate(&cert, r, a, p, authorized, now).is_err());
+        }
+        let mut wrong = cert.clone();
+        wrong.epoch += 1;
+        assert!(
+            verify_row_certificate(&wrong, request, artifact, "fixture-profile", assignment, 10)
+                .is_err()
+        );
+        wrong = cert;
+        wrong.placement.stages[0].slices[0].row_end -= 1;
+        assert!(
+            verify_row_certificate(&wrong, request, artifact, "fixture-profile", assignment, 10)
+                .is_err()
+        );
     }
 
     /// The operator-facing template must be a config the real loader accepts.

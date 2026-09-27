@@ -299,6 +299,14 @@ pub trait NativeExecutor: Send + Sync {
         false
     }
 
+    /// Identity/policy authorization, independent of live compute readiness.
+    /// Called before durable replay as well as new execution. Explicit
+    /// synthetic executors retain their own fixture contract; the canonical
+    /// production executor binds every job to its actual assignment policy.
+    fn validate_job(&self, _job: &PendingJob) -> Result<(), NativeInferenceError> {
+        Ok(())
+    }
+
     fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError>;
 
     /// [`Self::execute`] at chain height `now`, which is what the worker
@@ -325,6 +333,27 @@ pub struct CanonicalI8Qualification {
     pub profile_hash: Hash256,
     pub generation_hash: Hash256,
     pub reference_generation_qualified: bool,
+}
+
+/// Local-only execution has its own policy identity and cannot satisfy a
+/// request authorizing private row machines (or vice versa).
+pub fn local_canonical_assignment_hash() -> Hash256 {
+    hash_bytes(b"ARC-native-local-canonical-i8-assignment-v1")
+}
+
+/// Derive the policy from actual startup configuration before loading a model.
+/// No caller-supplied assignment label is accepted as evidence of its policy.
+pub fn runtime_assignment_hash(
+    cohort: Option<&crate::row_cohort::RowCohortConfig>,
+    low_residency: bool,
+) -> Result<Hash256, NativeInferenceError> {
+    match cohort {
+        Some(config) => Ok(config.assignment_hash(low_residency)),
+        None if !low_residency => Ok(local_canonical_assignment_hash()),
+        None => Err(NativeInferenceError::Executor(
+            "low-residency assignment requires a private row cohort".into(),
+        )),
+    }
 }
 
 /// Default KV-cache budget for one native job: 4 GiB, which is 2,048
@@ -406,6 +435,13 @@ pub struct CanonicalI8NativeExecutor {
 }
 
 impl CanonicalI8NativeExecutor {
+    fn assignment_hash(&self) -> Result<Hash256, NativeInferenceError> {
+        match &self.row_cohort {
+            Some(cohort) => Ok(cohort.assignment_hash()),
+            None => runtime_assignment_hash(None, self.model.is_low_residency()),
+        }
+    }
+
     /// Load the artifact and prove its byte commitment before model loading.
     /// This is the production-facing constructor; it cannot be pointed at an
     /// already-resident arbitrary model with a claimed source hash.
@@ -709,15 +745,11 @@ impl CanonicalI8NativeExecutor {
         job: &PendingJob,
         now: Option<u64>,
     ) -> Result<ExecutionOutput, NativeInferenceError> {
-        if job.model_hash != self.qualification.artifact_hash
-            || job.artifact != self.qualification.artifact_hash
-            || job.profile_hash != self.qualification.profile_hash
-            || job.generation_hash != self.qualification.generation_hash
-        {
-            // A property of this request (another allowlisted tuple), so a
-            // refusal of it, not a failure of this node.
+        self.validate_job(job)?;
+        if self.row_cohort.is_some() && now.is_none() {
             return Err(NativeInferenceError::Executor(
-                "this node's executor does not run this request's model/profile/generation".into(),
+                "a row-cohort assignment requires a chain height; local execution is not a substitute"
+                    .into(),
             ));
         }
         let prompt = Self::prequalified_prompt(
@@ -737,6 +769,7 @@ impl CanonicalI8NativeExecutor {
         let (tokens, output_hash) = match (&self.row_cohort, now) {
             (Some(cohort), Some(now)) => cohort.generate(
                 job.request_id,
+                job.assignment_hash,
                 job.expires_at,
                 now,
                 &prompt,
@@ -766,11 +799,30 @@ impl CanonicalI8NativeExecutor {
 }
 
 impl NativeExecutor for CanonicalI8NativeExecutor {
+    fn validate_job(&self, job: &PendingJob) -> Result<(), NativeInferenceError> {
+        if job.model_hash != self.qualification.artifact_hash
+            || job.artifact != self.qualification.artifact_hash
+            || job.profile_hash != self.qualification.profile_hash
+            || job.generation_hash != self.qualification.generation_hash
+            || job.assignment_hash != self.assignment_hash()?
+        {
+            return Err(NativeInferenceError::Executor(
+                "this node's executor does not run this request's model/profile/generation/assignment policy"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn ready_for_requests(&self, context: &InferenceAdmissionContext, now: u64) -> bool {
+        let Ok(assignment) = self.assignment_hash() else {
+            return false;
+        };
         context.allowed_executions.iter().any(|allowed| {
             allowed.model_hash == self.qualification.artifact_hash
                 && allowed.profile_hash == self.qualification.profile_hash
                 && allowed.generation_hash == self.qualification.generation_hash
+                && allowed.assignment_hash == assignment
         }) && match &self.row_cohort {
             Some(cohort) => cohort.ready_for_requests(now),
             None => !self.model.is_low_residency(),
@@ -1857,6 +1909,10 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         if arc_crypto::hash_bytes(&job.input) != job.input_hash {
             return Err(NativeInferenceError::ContextMismatch);
         }
+        // Policy mismatch must not re-emit a vote made under another runtime
+        // policy. The original durable decision remains intact; it is never
+        // deleted, overwritten or replaced by a second output.
+        self.executor.validate_job(&job)?;
         if let Some(vote) = self.store.load_existing_valid(&job)? {
             self.source.ensure_live(&job, now)?;
             self.sink.emit(&vote)?;
@@ -3223,6 +3279,210 @@ mod tests {
             input: b"input".to_vec(),
         }
     }
+
+    fn policy_executor_fixture() -> CanonicalI8NativeExecutor {
+        use arc_inference::cached_integer_model::{
+            ArithmeticProfile, CachedIntegerModel, I8Weights, ModelConfig,
+        };
+        let empty = || I8Weights {
+            data: vec![],
+            scales: vec![],
+            n_rows: 0,
+            n_cols: 0,
+        };
+        // Deliberately no weights and no qualification claim. A policy
+        // refusal must precede all model/input processing in this fixture.
+        let model = Arc::new(CachedIntegerModel {
+            config: ModelConfig {
+                n_layers: 0,
+                d_model: 2,
+                n_heads: 1,
+                n_kv_heads: 1,
+                d_ff: 2,
+                d_head: 2,
+                d_kv: 2,
+                vocab_size: 2,
+                attn_scale: 1,
+                rope_cos: vec![],
+                rope_sin: vec![],
+                max_seq: 8,
+                eos_tokens: vec![],
+                bos_token: 1,
+                chat_template: String::new(),
+                arithmetic_profile: ArithmeticProfile::GgufInterleavedRowsV1,
+            },
+            embedding_q16: vec![],
+            embedding_i8: empty(),
+            layers: vec![],
+            final_norm: vec![],
+            output_weight: empty(),
+            vocab: vec![],
+            q4_layers: None,
+            q4_output: None,
+            i16_layers: None,
+            i16_output: None,
+            block_i8_layers: None,
+            block_i8_output: None,
+            ternary_layers: None,
+            ternary_output: None,
+            ternary_hybrid_layers: None,
+            ternary_hybrid_output: None,
+        });
+        CanonicalI8NativeExecutor {
+            model: crate::row_cohort::CoordinatorModel::Resident(model),
+            qualification: CanonicalI8Qualification {
+                artifact_hash: job().artifact,
+                profile_hash: job().profile_hash,
+                generation_hash: job().generation_hash,
+                reference_generation_qualified: false,
+            },
+            kv_budget_bytes: DEFAULT_NATIVE_KV_BUDGET_BYTES,
+            row_cohort: None,
+        }
+    }
+
+    #[test]
+    fn canonical_assignment_policy_refuses_mismatched_jobs_and_closes_readiness() {
+        let mut executor = policy_executor_fixture();
+        let mut j = job();
+        j.model_hash = j.artifact;
+        let mut context = InferenceAdmissionContext {
+            domain: InferenceDomain {
+                chain_genesis: j.genesis,
+                recovery_epoch: 0,
+                validator_set_hash: Hash256::ZERO,
+            },
+            members: vec![],
+            allowed_executions: vec![AllowedExecution {
+                model_hash: j.model_hash,
+                profile_hash: j.profile_hash,
+                generation_hash: j.generation_hash,
+                assignment_hash: j.assignment_hash,
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        assert!(!executor.ready_for_requests(&context, 1));
+        assert!(
+            matches!(executor.execute_at(&j, 1), Err(NativeInferenceError::Executor(e)) if e.contains("assignment policy"))
+        );
+        j.assignment_hash = local_canonical_assignment_hash();
+        context.allowed_executions[0].assignment_hash = j.assignment_hash;
+        executor.validate_job(&j).unwrap();
+        assert!(executor.ready_for_requests(&context, 1));
+        let config = crate::row_cohort::RowCohortConfig {
+            workers: vec![],
+            max_workers: 4,
+            duplicate_per_mille: 50,
+            spot_rows_per_stage: 2,
+        };
+        let crate::row_cohort::CoordinatorModel::Resident(model) = &executor.model else {
+            unreachable!()
+        };
+        let cohort = crate::row_cohort::RowCohort::disconnected_policy_fixture(
+            config.clone(),
+            model.clone(),
+            j.artifact,
+        );
+        let cohort_policy = cohort.assignment_hash();
+        assert_ne!(cohort_policy, j.assignment_hash);
+        assert_ne!(cohort_policy, config.assignment_hash(true));
+        executor.row_cohort = Some(cohort.clone());
+        assert!(!executor.ready_for_requests(&context, 1));
+        assert!(
+            matches!(executor.execute_at(&j, 1), Err(NativeInferenceError::Executor(e)) if e.contains("assignment policy"))
+        );
+        assert!(
+            cohort
+                .generate(j.request_id, j.assignment_hash, 100, 1, &[1], 1, &[])
+                .is_err()
+        );
+        j.assignment_hash = cohort_policy;
+        context.allowed_executions[0].assignment_hash = cohort_policy;
+        executor.validate_job(&j).unwrap();
+        assert!(executor.ready_for_requests(&context, 1));
+        assert!(
+            matches!(executor.execute(&j), Err(NativeInferenceError::Executor(e)) if e.contains("chain height"))
+        );
+        for change in [0, 1, 2] {
+            let mut changed = config.clone();
+            match change {
+                0 => changed.max_workers += 1,
+                1 => changed.duplicate_per_mille += 1,
+                _ => changed.spot_rows_per_stage += 1,
+            }
+            assert_ne!(changed.assignment_hash(false), cohort_policy);
+        }
+    }
+
+    #[test]
+    fn mismatched_assignment_cannot_reemit_or_replace_a_durable_vote() {
+        struct CountSink(std::sync::atomic::AtomicUsize);
+        impl VoteSink for CountSink {
+            fn emit(&self, _: &StoredVote) -> Result<(), NativeInferenceError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = tempdir().unwrap();
+        let mut j = job();
+        j.model_hash = j.artifact;
+        let store =
+            DecisionStore::open(dir.path(), test_signer().address(), j.genesis, j.context).unwrap();
+        let saved = StoredVote {
+            request_id: j.request_id,
+            output_hash: token_hash(&[1, 2]),
+            tokens: vec![1, 2],
+            vote: sign_vote(j.request_id, &token_bytes(&[1, 2]), test_signer()).unwrap(),
+        };
+        store.persist_signed(saved.clone(), &j).unwrap();
+        let path = store.path(j.context, j.request_id);
+        let bytes = fs::read(&path).unwrap();
+        let sink = Arc::new(CountSink(std::sync::atomic::AtomicUsize::new(0)));
+        let worker = NativeWorker::new(
+            Arc::new(Source(j.clone())),
+            Arc::new(policy_executor_fixture()),
+            Arc::new(Sign),
+            sink.clone(),
+            store,
+        );
+        assert!(
+            matches!(worker.run_request(j.request_id, 1), Err(NativeInferenceError::Executor(e)) if e.contains("assignment policy"))
+        );
+        assert_eq!(sink.0.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            worker.store.load_existing_valid(&j).unwrap().unwrap(),
+            saved
+        );
+
+        // A matching-policy replay still uses the original signed bytes; it
+        // must not touch this deliberately weightless executor's forward path.
+        let dir = tempdir().unwrap();
+        j.assignment_hash = local_canonical_assignment_hash();
+        j.request_id = hash_bytes(b"matching-policy-replay-fixture");
+        let saved = StoredVote {
+            request_id: j.request_id,
+            output_hash: token_hash(&[1, 2]),
+            tokens: vec![1, 2],
+            vote: sign_vote(j.request_id, &token_bytes(&[1, 2]), test_signer()).unwrap(),
+        };
+        let store =
+            DecisionStore::open(dir.path(), test_signer().address(), j.genesis, j.context).unwrap();
+        store.persist_signed(saved.clone(), &j).unwrap();
+        let path = store.path(j.context, j.request_id);
+        let before = fs::read(&path).unwrap();
+        let worker = NativeWorker::new(
+            Arc::new(Source(j.clone())),
+            Arc::new(policy_executor_fixture()),
+            Arc::new(Sign),
+            sink.clone(),
+            store,
+        );
+        assert_eq!(worker.run_request(j.request_id, 1).unwrap(), saved);
+        assert_eq!(sink.0.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
     #[test]
     fn a_job_whose_kv_cache_exceeds_the_budget_is_refused_before_execution() {
         // Canonical 7B: 32 layers x 4096 KV width -> 2 MiB per position.
