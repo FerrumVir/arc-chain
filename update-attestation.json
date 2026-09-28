@@ -1,0 +1,150 @@
+{
+  "checkpoint": {
+    "chain_id": "0x415243",
+    "checkpoint_sha256": "b3712cd2b89e916170e5cdfab4574a4642bee0bad8744c23906bd00bf7907fea",
+    "checkpoint_size": 49465221,
+    "created_at_unix_ms": 1789000000000,
+    "full_state_root": "d103671a855f22414f4c9546eb329d6e1d1c5c1676781583900fe28622061c33",
+    "genesis_hash": "97e45b43086d1fdcd69accc9c1bb5020496983f3739b7ede3c4d24c03f608eb3",
+    "manifest_hash": "9c6aa3ec659b101751bf58a8a24c655f0e4fba79596e9b44f87a30f98f08acc0",
+    "payload_hash": "d9e025f98c77315e79a0c180e9d8bcdc41d894e63811b5808853d023d1093451",
+    "protocol_version": "3.0.0",
+    "recovery_domain": "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f",
+    "recovery_epoch": 1,
+    "signature_count": 5,
+    "signatures": [
+      {
+        "public_key": "f9a7d0ce6902926e7626d9802dc6ed92866ea402f693ef0f9c8ffaa091fff3da",
+        "signature": "a9fd94deb552cfbc6deaa74a452694eef72a10d44573114474fc974b3a64bb74fc423506d3fcf8e563836f948f3d6f7420c0e16e28883a4b889c97901acb0e0a",
+        "validator": "0x228787281308d6c1a560848c2c168814bde1b6153e9e65a286d7211f04628fdd"
+      },
+      {
+        "public_key": "176085d7f4dee7f694fe33d63a11e8bc0a3217b93b2ee5032f16352e54cd1500",
+        "signature": "be3e874ef075f9b1bfe233e4338b4814aa3264765481088f8936b3630eef5e6ecfcde233c56a26b0f993f814ba6d1b890b897c8bf68974a596341e7014a3c50f",
+        "validator": "0x44d20543df6e76696da2ebbbd79e4243cd41729fa5b890e2618991e489314780"
+      },
+      {
+        "public_key": "d75c89f80039cb001878ef5322c2edcceb4190892a17e5c6ac13da7420ffb119",
+        "signature": "e6d4a7e69cabcb90c1c9f85a6fb4e9613021181ba3732ff681855974238a1628167e0297af08880287070b5e68089e7f60540a23c686e059332aa1d02e0b420c",
+        "validator": "0x5772741c93d8a4b04ec39007cb568a31e13ffba0d3e786596d1900d30e529f21"
+      },
+      {
+        "public_key": "99e14dcc8d8c7861e42698caed1b1fbc7dabce7aed4b346b2265c3019116ee32",
+        "signature": "f7c1717e2638df712cce85f4b483ea6c07554f0adfbedbfd1e8ce23da64c0dcd526d86491146fbd142984eab4a5df656d574afa2293ef95db9f2553fc93c4205",
+        "validator": "0xadf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f"
+      },
+      {
+        "public_key": "0b9e69378a3ba533c341134e35bd28a5f6ff10e112e4e7511add3706f9a16d9f",
+        "signature": "d0b2b5410d8c7c4fa56a28732140cd5a47b80f4318790dbe280cc0be9c7457adc7ac34bb3a155292a3b0998912434f368c2ebab8f40c6603c7b742d5af44d800",
+        "validator": "0xf03cbab49cf553a05541ddebc09b32a4c5507efb157d354b6d7f8c6682c32f5f"
+      }
+    ],
+    "signing_hash": "b271b61a2c3763421a554b6a30822f9700f53c71dc64f7c7dd97b8d640c72831",
+    "source_block_hash": "11fea52a3a39db994e588e85e83381134caccef7d05673a2c834e0d22049f551",
+    "source_consensus_round": 10483120,
+    "source_height": 138310,
+    "source_state_root": "9ec6c114b24fac80c2a7e3645f36670cf89ba6bc075ef78782a99e1728b870ae",
+    "transition_block_hash": "d74321c2400fbb401b904b9e3c61cb751fd62fa7c9c7e0c23905d7c19159aae6",
+    "transition_height": 138311,
+    "validator_set_id": 1,
+    "validators": [
+      {
+        "address": "0x228787281308d6c1a560848c2c168814bde1b6153e9e65a286d7211f04628fdd",
+        "public_key": "f9a7d0ce6902926e7626d9802dc6ed92866ea402f693ef0f9c8ffaa091fff3da",
+        "stake": 6666667
+      },
+      {
+        "address": "0x44d20543df6e76696da2ebbbd79e4243cd41729fa5b890e2618991e489314780",
+        "public_key": "176085d7f4dee7f694fe33d63a11e8bc0a3217b93b2ee5032f16352e54cd1500",
+        "stake": 6666667
+      },
+      {
+        "address": "0x5772741c93d8a4b04ec39007cb568a31e13ffba0d3e786596d1900d30e529f21",
+        "public_key": "d75c89f80039cb001878ef5322c2edcceb4190892a17e5c6ac13da7420ffb119",
+        "stake": 6666667
+      },
+      {
+        "address": "0xadf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f",
+        "public_key": "99e14dcc8d8c7861e42698caed1b1fbc7dabce7aed4b346b2265c3019116ee32",
+        "stake": 6666667
+      },
+      {
+        "address": "0xf03cbab49cf553a05541ddebc09b32a4c5507efb157d354b6d7f8c6682c32f5f",
+        "public_key": "0b9e69378a3ba533c341134e35bd28a5f6ff10e112e4e7511add3706f9a16d9f",
+        "stake": 6666666
+      },
+      {
+        "address": "0xf521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b",
+        "public_key": "2073774540e9577164890f15add393f4ce66c9eace696a0546d96338bef836cf",
+        "stake": 6666666
+      }
+    ],
+    "verification_status": "VERIFIED_QUORUM"
+  },
+  "claim": {
+    "existing_recovered_chain_update": true,
+    "original_cutover_archive_present": false,
+    "original_cutover_ceremony_verified": false,
+    "validator_retirement_authorized": false
+  },
+  "fresh_six_host_proof": {
+    "captured_at_unix": 1790595816.312531,
+    "common_hash": "9e03527a51e19a3a652c235b76e5d60bf93d65ba349b9bc1bc98c13d6ea8f97a",
+    "common_height": 3200932,
+    "common_state_root": "d103671a855f22414f4c9546eb329d6e1d1c5c1676781583900fe28622061c33",
+    "host_count": 6,
+    "online_stake": 40000000,
+    "proof_sha256": "18565ce5267536aeae6b7ac9786d2da6aadb507694535bea76a03c35d066b1a9",
+    "quorum_stake": 26666667,
+    "rpc_genesis_network_hash": "fc82b5b6f541b8b902a23cfb653b813442431f104a9c262c5076da436e2bd53f",
+    "schema": "arc.rollout.fresh-quorum.v1",
+    "total_stake": 40000000
+  },
+  "generated_at_unix": 1790595822.5435662,
+  "network": {
+    "approved_genesis_network_hash_file_sha256": "c6ab1d9d24717e367d74d3fd6f2a1b17cd264eb083b59b09415809dda0b2e71b",
+    "checkpoint_manifest_hash": "9c6aa3ec659b101751bf58a8a24c655f0e4fba79596e9b44f87a30f98f08acc0",
+    "checkpoint_signed_genesis_hash": "97e45b43086d1fdcd69accc9c1bb5020496983f3739b7ede3c4d24c03f608eb3",
+    "genesis_file_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+    "host_config_sha256": "e7e96a4ac29fb7d0e6cdc71cc3d6355f9a58e11f345f13cd5f9ed3e7a45ad6be",
+    "quorum_stake": 26666667,
+    "recovery_domain": "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f",
+    "rpc_genesis_network_hash": "fc82b5b6f541b8b902a23cfb653b813442431f104a9c262c5076da436e2bd53f",
+    "total_stake": 40000000,
+    "validator_set_id": 1
+  },
+  "release": {
+    "api_artifact_response_sha256": "b269109d3ec94fb201fc3ae80b693afc2fce3f0e9e42c657dead6e822fc52763",
+    "checkpoint_verifier_artifact": {
+      "archive_sha256": "41455aa65039f35965f31d1e2829c1e59423505f4ba2cfa27fc5e9c0a9cf04f7",
+      "artifact_digest": "sha256:83931a16eb9a2eb35139392ae1ad64eb7e78c129909d218e54ce123030d9725f",
+      "artifact_id": 10963556420,
+      "binary_sha256": "50257fb75b4b0303545d2add608dd8e02d6f823cff68ce091732ff8fe13796b9",
+      "build_metadata_sha256": "cce92b6563450cbe852ae6496c29ca1cbf27bb23686a88d492a0ec423067358e",
+      "genesis_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+      "materialization_receipt_sha256": "f4b9c46e3dc45d3cc6a47fa772f2bf2479b9a7ad9300baf347b49e5d954db81e",
+      "platform": "linux-x86_64"
+    },
+    "commit": "183c9f6523504c5021f1e0655587bf2a3e6590f5",
+    "main_sha": "183c9f6523504c5021f1e0655587bf2a3e6590f5",
+    "materializer_sha256": "12c602c41cb61b339d5e271919591cf531cb429fd9302150a6b638dcb7269394",
+    "preflight_run_attempt": 1,
+    "preflight_run_id": 36407105898,
+    "production_artifact": {
+      "archive_sha256": "41455aa65039f35965f31d1e2829c1e59423505f4ba2cfa27fc5e9c0a9cf04f7",
+      "artifact_digest": "sha256:83931a16eb9a2eb35139392ae1ad64eb7e78c129909d218e54ce123030d9725f",
+      "artifact_id": 10963556420,
+      "binary_sha256": "50257fb75b4b0303545d2add608dd8e02d6f823cff68ce091732ff8fe13796b9",
+      "build_metadata_sha256": "cce92b6563450cbe852ae6496c29ca1cbf27bb23686a88d492a0ec423067358e",
+      "genesis_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+      "materialization_receipt_sha256": "f4b9c46e3dc45d3cc6a47fa772f2bf2479b9a7ad9300baf347b49e5d954db81e",
+      "platform": "linux-x86_64"
+    },
+    "repository": "FerrumVir/arc-chain",
+    "selection_sha256": "9eb354026c2ee9996f816824fe6a9a29a950cf6a395a04aff77449c766f6b760",
+    "selector_sha256": "f7c79563184e4465a69d92463698d513b24d60d1d5eab9c9c0025349bfbdfafe",
+    "tag": "v0.8.0"
+  },
+  "rollout_validator_sha256": "2bb55206cd65b8db382f8b52b92c3c9203fc7074c23df9b5c9aae9bb7e7ee965",
+  "schema": "arc.existing-recovered-chain-update/v1"
+}
