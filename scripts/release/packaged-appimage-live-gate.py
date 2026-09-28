@@ -1655,6 +1655,12 @@ def terminate_process(process: subprocess.Popen[bytes], label: str) -> bool:
         return True
 
 
+def require_managed_node_version(node_version: str) -> None:
+    expected = re.escape(TAG.removeprefix("v"))
+    if not re.search(rf"(?:^|\s)(?:v)?{expected}(?:\s|$)", node_version):
+        raise GateError(f"published managed node does not report {TAG}: {node_version!r}")
+
+
 def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
     started_at = utc_now()
     started_monotonic = time.monotonic()
@@ -1735,8 +1741,7 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
     node_version = (node_version_result.stdout + node_version_result.stderr).decode(
         "utf-8", "replace"
     ).strip()
-    if not re.search(r"(?:^|\s)(?:v)?0\.8\.0(?:\s|$)", node_version):
-        raise GateError(f"published managed node does not report v0.8.1: {node_version!r}")
+    require_managed_node_version(node_version)
 
     os.chmod(appimage, 0o500)
     extraction = run_command([os.fspath(appimage), "--appimage-extract"], cwd=work, timeout=180)
