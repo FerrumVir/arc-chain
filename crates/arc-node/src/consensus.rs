@@ -22,6 +22,39 @@ use tracing::{debug, error, info, warn};
 const MAX_PENDING_DAG_PREIMAGES: usize = 100_000;
 const RECOVERY_DAG_REBROADCAST_INTERVAL: Duration = Duration::from_secs(1);
 
+enum DurableAbsenceVoteCollection {
+    Withheld,
+    Added(Option<arc_consensus::view_change::SkipCertificate>),
+}
+
+/// Add a locally signed absence vote only after its no-equivocation decision
+/// is already durable. Peer votes use the same collector through the inbound
+/// path; counting the local vote here makes the threshold identical for both.
+fn persist_then_collect_absence_vote(
+    vote: arc_consensus::view_change::SkipVote,
+    decision_already_durable: bool,
+    record: &arc_consensus::view_change::ConsensusSigningRecord,
+    persist: impl FnOnce(&arc_consensus::view_change::ConsensusSigningRecord) -> bool,
+    collector: &mut arc_consensus::view_change::SkipVoteCollector,
+    domain: &arc_consensus::ConsensusDomain,
+    set: &ValidatorSet,
+) -> Result<DurableAbsenceVoteCollection, arc_consensus::view_change::CertificateError> {
+    let decision_recorded = record
+        .skipped_rounds
+        .get(&vote.round)
+        .and_then(|members| members.get(&vote.absentee))
+        .is_some_and(|reason| *reason == vote.reason);
+    if !decision_recorded {
+        return Ok(DurableAbsenceVoteCollection::Withheld);
+    }
+    if !decision_already_durable && !persist(record) {
+        return Ok(DurableAbsenceVoteCollection::Withheld);
+    }
+    collector
+        .add(vote, domain, set)
+        .map(DurableAbsenceVoteCollection::Added)
+}
+
 /// Runtime policy that may replace a bounded recovery-DAG writer with a
 /// compacted successor. The caller hands over exclusive ownership of the
 /// writer so its advisory store lock is released before generation publish.
@@ -1627,6 +1660,10 @@ impl ConsensusManager {
         // because the recovery domain is installed after this manager is built.
         let mut skip_tracker: Option<arc_consensus::view_change::SkipTracker> = None;
         let mut skip_vote_collector = arc_consensus::view_change::SkipVoteCollector::new();
+        // A tracker record also contains a decision made during this process
+        // before its first persist attempt. Track durability separately so a
+        // failed fsync can never be mistaken for a durable prior decision.
+        let mut durable_skip_decisions = std::collections::HashSet::<(u64, Hash256)>::new();
         let mut finality_vote_collector = arc_consensus::view_change::FinalityVoteCollector::new();
         let mut finality_signed_heights: std::collections::HashSet<u64> =
             std::collections::HashSet::new();
@@ -3539,6 +3576,9 @@ impl ConsensusManager {
             {
                 if skip_tracker.is_none() {
                     let record = self.load_signing_record();
+                    durable_skip_decisions.extend(record.skipped_rounds.iter().flat_map(
+                        |(round, members)| members.keys().map(|member| (*round, *member)),
+                    ));
                     // Restore durable signing observations, not participation
                     // exceptions. Only register_skip_certificate can excuse a
                     // member after verifying the complete quorum certificate.
@@ -3554,6 +3594,7 @@ impl ConsensusManager {
                 let cursor = self.engine.last_committed_round();
                 let now_ms = absence_clock.elapsed().as_millis() as u64;
                 let scan_round = self.engine.current_round();
+                let mut locally_assembled_absence_certificates = Vec::new();
                 // Bounded: only the rounds the cursor is actually waiting on,
                 // and never more than a fixed window of them.
                 let window_start = cursor.max(scan_round.saturating_sub(ABSENCE_SCAN_ROUNDS));
@@ -3599,16 +3640,9 @@ impl ConsensusManager {
                         // self-test. The re-gossip is still needed, because a
                         // peer may have missed it, so it is rate-limited rather
                         // than removed.
-                        let already_durable = tracker
-                            .record()
-                            .skipped_rounds
-                            .get(&round)
-                            .and_then(|members| members.get(&member))
-                            .is_some_and(|reason| {
-                                *reason == arc_consensus::view_change::AbsenceReason::NoBlock
-                            });
+                        let decision_durable = durable_skip_decisions.contains(&(round, member));
                         let gossip_key = (round, member);
-                        if already_durable
+                        if decision_durable
                             && absence_gossiped_at.get(&gossip_key).is_some_and(
                                 |at: &std::time::Instant| at.elapsed() < ABSENCE_REGOSSIP_INTERVAL,
                             )
@@ -3624,19 +3658,50 @@ impl ConsensusManager {
                             now_ms,
                             keypair,
                         ) {
-                            // S5: durable BEFORE the signature is emitted. A
-                            // decision that is already in the record is already
-                            // durable, so it is not rewritten - that fsync was
-                            // the expensive half of the loop.
-                            if !already_durable && !self.persist_signing_record(tracker.record()) {
-                                tracing::error!(
-                                    round,
-                                    %member,
-                                    "Withholding an absence vote: its decision is not durable"
-                                );
-                                continue;
+                            // S5: persist before the local collector can use
+                            // this vote or it can leave the process. Previously
+                            // only the outbound path counted it, so four
+                            // quorum-stake validators each saw only three
+                            // sub-quorum peer votes.
+                            let mut persisted_now = false;
+                            let collection = persist_then_collect_absence_vote(
+                                vote.clone(),
+                                decision_durable,
+                                tracker.record(),
+                                |record| {
+                                    persisted_now = self.persist_signing_record(record);
+                                    persisted_now
+                                },
+                                &mut skip_vote_collector,
+                                &domain,
+                                &vs,
+                            );
+                            if persisted_now {
+                                durable_skip_decisions.insert((round, member));
                             }
-                            if already_durable {
+                            match collection {
+                                Ok(DurableAbsenceVoteCollection::Withheld) => {
+                                    tracing::error!(
+                                        round,
+                                        %member,
+                                        "Withholding an absence vote: its decision is not durable"
+                                    );
+                                    continue;
+                                }
+                                Ok(DurableAbsenceVoteCollection::Added(Some(certificate))) => {
+                                    locally_assembled_absence_certificates.push(certificate);
+                                }
+                                Ok(DurableAbsenceVoteCollection::Added(None)) => {}
+                                Err(error) => {
+                                    tracing::error!(
+                                        round,
+                                        %member,
+                                        %error,
+                                        "Could not collect the locally signed absence vote"
+                                    );
+                                }
+                            }
+                            if decision_durable {
                                 debug!(round, %member, "Re-gossiping an absence attestation");
                             } else {
                                 info!(
@@ -3654,8 +3719,27 @@ impl ConsensusManager {
                         }
                     }
                 }
-                tracker.prune_observations_below(cursor.saturating_sub(ABSENCE_SCAN_ROUNDS));
-                skip_vote_collector.prune_below(cursor.saturating_sub(ABSENCE_SCAN_ROUNDS));
+                // The tracker is no longer used here, so the mutable borrow
+                // ends before the shared adoption helper updates its record.
+                for certificate in locally_assembled_absence_certificates {
+                    if self.adopt_absence_certificate(
+                        &certificate,
+                        &mut skip_tracker,
+                        outbound_tx.as_ref(),
+                    ) {
+                        info!(
+                            round = certificate.round,
+                            absentee = %certificate.absentee,
+                            "Assembled an absence certificate from peer votes"
+                        );
+                    }
+                }
+                if let Some(tracker) = skip_tracker.as_mut() {
+                    tracker.prune_observations_below(cursor.saturating_sub(ABSENCE_SCAN_ROUNDS));
+                }
+                let absence_floor = cursor.saturating_sub(ABSENCE_SCAN_ROUNDS);
+                durable_skip_decisions.retain(|(round, _)| *round >= absence_floor);
+                skip_vote_collector.prune_below(absence_floor);
             }
 
             // A PeerConnected event can discover backpressure while enqueueing
@@ -5132,6 +5216,218 @@ mod tests {
     use super::*;
     use arc_crypto::{KeyPair, Signature, hash_bytes};
     use arc_types::{Account, AccountChange, StateDiff, Transaction, TxType};
+
+    #[test]
+    fn durable_local_absence_vote_completes_exact_four_of_six_quorum() {
+        use arc_consensus::view_change::{
+            AbsenceReason, ConsensusSigningRecord, SkipVote, validator_set_hash,
+        };
+
+        let keys: Vec<_> = (0..6)
+            .map(|index| {
+                KeyPair::from_ed25519_secret_bytes(
+                    &hash_bytes(format!("absence-local-quorum-{index}").as_bytes()).0,
+                )
+            })
+            .collect();
+        let set = ValidatorSet::new(
+            keys.iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    let stake = if index < 4 { 6_666_667 } else { 6_666_666 };
+                    Validator::new(key.address(), stake, 0).unwrap()
+                })
+                .collect(),
+            1,
+        );
+        assert_eq!(set.total_stake, 40_000_000);
+        assert_eq!(set.quorum, 26_666_667);
+        assert_eq!(
+            set.stake_for_addresses(&keys[..4].iter().map(KeyPair::address).collect::<Vec<_>>()),
+            26_666_668
+        );
+
+        let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"local-absence-quorum"), 1, 1);
+        let set_hash = validator_set_hash(&set);
+        let absentee = keys[5].address();
+        let mut record = ConsensusSigningRecord::default();
+        record
+            .skipped_rounds
+            .entry(123)
+            .or_default()
+            .insert(absentee, AbsenceReason::NoBlock);
+
+        // Each enabled validator receives the other three enabled votes. That
+        // is below quorum; adding its own vote reaches quorum, matching the
+        // four enabled validators in the six-member live fleet.
+        for local in 0..4 {
+            let mut collector = arc_consensus::view_change::SkipVoteCollector::new();
+            for (peer, key) in keys.iter().take(4).enumerate() {
+                if peer == local {
+                    continue;
+                }
+                let vote = SkipVote::sign(
+                    domain,
+                    set_hash,
+                    123,
+                    absentee,
+                    AbsenceReason::NoBlock,
+                    set.quorum,
+                    key,
+                )
+                .unwrap();
+                assert!(collector.add(vote, &domain, &set).unwrap().is_none());
+            }
+
+            // Repeated peer traffic cannot inflate the distinct-voter stake.
+            let repeated = SkipVote::sign(
+                domain,
+                set_hash,
+                123,
+                absentee,
+                AbsenceReason::NoBlock,
+                set.quorum,
+                &keys[(local + 1) % 4],
+            )
+            .unwrap();
+            assert!(collector.add(repeated, &domain, &set).unwrap().is_none());
+
+            let own_vote = SkipVote::sign(
+                domain,
+                set_hash,
+                123,
+                absentee,
+                AbsenceReason::NoBlock,
+                set.quorum,
+                &keys[local],
+            )
+            .unwrap();
+            let mut writes = 0;
+            let result = persist_then_collect_absence_vote(
+                own_vote,
+                false,
+                &record,
+                |_| {
+                    writes += 1;
+                    true
+                },
+                &mut collector,
+                &domain,
+                &set,
+            )
+            .unwrap();
+            assert_eq!(
+                writes, 1,
+                "the signed choice must persist before collection"
+            );
+            let DurableAbsenceVoteCollection::Added(Some(certificate)) = result else {
+                panic!("four enabled votes should form quorum after the durable local vote");
+            };
+            assert_eq!(certificate.verify(&domain, &set).unwrap(), 26_666_668);
+        }
+
+        // A failed signing-record write must leave the local vote out of the
+        // collector. Retrying after the decision is durable then completes it.
+        let mut collector = arc_consensus::view_change::SkipVoteCollector::new();
+        for key in keys.iter().take(4).skip(1) {
+            let vote = SkipVote::sign(
+                domain,
+                set_hash,
+                124,
+                absentee,
+                AbsenceReason::NoBlock,
+                set.quorum,
+                key,
+            )
+            .unwrap();
+            assert!(collector.add(vote, &domain, &set).unwrap().is_none());
+        }
+        let mut tracker = arc_consensus::view_change::SkipTracker::new(
+            domain,
+            set_hash,
+            arc_consensus::view_change::DEFAULT_SKIP_GRACE_MS,
+            ConsensusSigningRecord::default(),
+        );
+        tracker.observe(
+            124,
+            &absentee,
+            AbsenceReason::NoBlock,
+            set.quorum,
+            true,
+            set.quorum,
+            0,
+        );
+        let own_vote = tracker
+            .sign_if_permitted(
+                124,
+                absentee,
+                AbsenceReason::NoBlock,
+                0,
+                set.quorum,
+                arc_consensus::view_change::DEFAULT_SKIP_GRACE_MS,
+                &keys[0],
+            )
+            .unwrap();
+        assert!(matches!(
+            persist_then_collect_absence_vote(
+                own_vote.clone(),
+                false,
+                tracker.record(),
+                |_| false,
+                &mut collector,
+                &domain,
+                &set,
+            )
+            .unwrap(),
+            DurableAbsenceVoteCollection::Withheld
+        ));
+        assert!(
+            collector
+                .add(
+                    SkipVote::sign(
+                        domain,
+                        set_hash,
+                        124,
+                        absentee,
+                        AbsenceReason::NoBlock,
+                        set.quorum,
+                        &keys[3],
+                    )
+                    .unwrap(),
+                    &domain,
+                    &set,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let retry_vote = tracker
+            .sign_if_permitted(
+                124,
+                absentee,
+                AbsenceReason::NoBlock,
+                0,
+                set.quorum,
+                arc_consensus::view_change::DEFAULT_SKIP_GRACE_MS + 1,
+                &keys[0],
+            )
+            .unwrap();
+        assert_eq!(retry_vote, own_vote);
+        let DurableAbsenceVoteCollection::Added(Some(certificate)) =
+            persist_then_collect_absence_vote(
+                retry_vote,
+                false,
+                tracker.record(),
+                |_| true,
+                &mut collector,
+                &domain,
+                &set,
+            )
+            .unwrap()
+        else {
+            panic!("retry with a durable decision should complete the quorum");
+        };
+        assert_eq!(certificate.verify(&domain, &set).unwrap(), 26_666_668);
+    }
 
     fn signed_transfer(key: &KeyPair, recipient: u8, nonce: u64) -> Transaction {
         let mut tx =
