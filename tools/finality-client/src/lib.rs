@@ -363,7 +363,8 @@ mod tests {
                     height: 7,
                     timestamp: 123,
                     parent_hash: hash_bytes(b"parent"),
-                    tx_root: hash_bytes(b"tx-root"),
+                    // The source MerkleTree defines the empty tx root as zero.
+                    tx_root: Hash256::ZERO,
                     state_root: hash_bytes(b"state-root"),
                     proof_hash: Hash256::ZERO,
                     tx_count: 0,
