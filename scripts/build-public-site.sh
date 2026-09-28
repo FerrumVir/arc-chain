@@ -53,7 +53,11 @@ for required in \
     dashboard/index.html dashboard/tailwind.css dashboard/app.css dashboard/app.js \
     explorer/index.html explorer/app.js explorer/native-receipts.js explorer/styles.css \
     shared/frontend/arc-network.js shared/frontend/arc-network.json \
-    shared/frontend/production-status.json; do
+    shared/frontend/production-status.json \
+    dashboard/fonts/hanken-grotesk-latin-ext.woff2 dashboard/fonts/hanken-grotesk-latin.woff2 dashboard/fonts/jetbrains-mono-latin-ext.woff2 dashboard/fonts/jetbrains-mono-latin.woff2 dashboard/fonts/marcellus-latin-ext.woff2 dashboard/fonts/marcellus-latin.woff2 dashboard/fonts/OFL.txt \
+    dashboard/aqueduct/engine.js dashboard/aqueduct/archchain.js dashboard/aqueduct/band.js \
+    explorer/fonts/hanken-grotesk-latin-ext.woff2 explorer/fonts/hanken-grotesk-latin.woff2 explorer/fonts/jetbrains-mono-latin-ext.woff2 explorer/fonts/jetbrains-mono-latin.woff2 explorer/fonts/marcellus-latin-ext.woff2 explorer/fonts/marcellus-latin.woff2 explorer/fonts/OFL.txt \
+    explorer/aqueduct/engine.js explorer/aqueduct/archchain.js explorer/aqueduct/band.js; do
     [ -f "$required" ] && [ ! -L "$required" ] && [ -s "$required" ] \
         || die "required source is missing, empty, or not a regular file: $required"
 done
@@ -77,6 +81,10 @@ trap cleanup_output_stage EXIT
 OUTPUT_DIR="$OUTPUT_STAGE_DIR"
 mkdir -p -- \
     "$OUTPUT_DIR/explorer" \
+    "$OUTPUT_DIR/explorer/fonts" \
+    "$OUTPUT_DIR/explorer/aqueduct" \
+    "$OUTPUT_DIR/fonts" \
+    "$OUTPUT_DIR/aqueduct" \
     "$OUTPUT_DIR/shared/frontend"
 
 # The source dashboard lives under dashboard/, but the deployed dashboard lives
@@ -108,6 +116,12 @@ if grep -Fq '../explorer/' "$OUTPUT_DIR/app.js"; then
     die "dashboard retained a source-tree-only receipt URL"
 fi
 cp -- explorer/index.html explorer/app.js explorer/native-receipts.js explorer/styles.css "$OUTPUT_DIR/explorer/"
+# The engraved theme's self-hosted fonts (with their SIL OFL licence) and the aqueduct band's scripts. Named one by one,
+# like everything else here, so nothing else in those folders can ship by accident.
+(cd dashboard/fonts && cp -- hanken-grotesk-latin-ext.woff2 hanken-grotesk-latin.woff2 jetbrains-mono-latin-ext.woff2 jetbrains-mono-latin.woff2 marcellus-latin-ext.woff2 marcellus-latin.woff2 OFL.txt "$OUTPUT_DIR/fonts/")
+(cd dashboard/aqueduct && cp -- engine.js archchain.js band.js "$OUTPUT_DIR/aqueduct/")
+(cd explorer/fonts && cp -- hanken-grotesk-latin-ext.woff2 hanken-grotesk-latin.woff2 jetbrains-mono-latin-ext.woff2 jetbrains-mono-latin.woff2 marcellus-latin-ext.woff2 marcellus-latin.woff2 OFL.txt "$OUTPUT_DIR/explorer/fonts/")
+(cd explorer/aqueduct && cp -- engine.js archchain.js band.js "$OUTPUT_DIR/explorer/aqueduct/")
 cp -- shared/frontend/arc-network.js shared/frontend/arc-network.json \
     shared/frontend/production-status.json \
     "$OUTPUT_DIR/shared/frontend/"

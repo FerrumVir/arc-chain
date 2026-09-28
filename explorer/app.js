@@ -496,9 +496,17 @@
       blocksStatus: $("blocks-status"), blocksBody: $("blocks-body"), blocksPageLink: $("blocks-page-link"), sourceFacts: $("source-facts"), inferenceStatus: $("inference-status"), inferenceList: $("inference-list"), rewardsStatus: $("rewards-status"), rewardsList: $("rewards-list"),
       searchForm: $("search-form"), searchInput: $("search-input"), searchKind: $("search-kind"), searchError: $("search-error"), inspector: $("inspector"), inspectorKicker: $("inspector-kicker"), inspectorTitle: $("inspector-title"), inspectorClose: $("inspector-close"), inspectorContent: $("inspector-content"),
     };
-    const state = { config: null, resolver: null, sourceId: "canonical", checkpointAudit: { state: "unknown", reason: "not-audited" }, refreshController: null, lookupController: null, timer: null, lastKnownHeight: null };
+    // renderedView: the source view whose result is on screen, so a refresh of that same view runs in the background.
+    // refreshedLabel: what "Last refreshed" settles to once a refresh ends.
+    const state = { config: null, resolver: null, sourceId: "canonical", checkpointAudit: { state: "unknown", reason: "not-audited" }, refreshController: null, lookupController: null, timer: null, lastKnownHeight: null, renderedView: null, refreshedLabel: elements.lastRefreshed.textContent };
 
-    const text = (node, value) => { if (node) node.textContent = value == null ? "" : String(value); };
+    // A write that would not change a node is skipped: a background refresh that finds the same evidence rewrites
+    // nothing, so nothing flickers and the live banner does not announce it again.
+    const text = (node, value) => {
+      if (!node) return;
+      const next = value == null ? "" : String(value);
+      if (node.textContent !== next) node.textContent = next;
+    };
     const clear = (node) => { if (node) node.replaceChildren(); };
     const create = (tag, className, content) => {
       const node = document.createElement(tag);
@@ -514,6 +522,57 @@
       return Number.isNaN(date.getTime()) ? "Unavailable" : date.toLocaleString();
     };
     const sourceDisplay = (source) => `${source.name}${source.region ? ` · ${source.region}` : ""}`;
+
+    // The aqueduct in the page header (aqueduct/band.js) draws only blocks this page read: the blocks of each refresh
+    // and a light poll of the same source's latest block. Its water runs with the confirmed inference receipts each
+    // refresh reads. It is optional; without it every aqueduct call below does nothing.
+    const aqueduct = (() => {
+      const band = window.ArcAqueductBand;
+      if (!band || typeof band.mount !== "function") return null;
+      let mounted = null;
+      try { mounted = band.mount(document.getElementById("aqueduct"), { bot: 340 }); } catch (_error) { return null; }
+      if (!mounted) return null;
+      // The band only illustrates evidence the page already shows: a failure inside it must never change that evidence.
+      const safely = (method) => (options) => { try { mounted[method](options); } catch (_error) { /* the picture stays as it was */ } };
+      return { follow: safely("follow"), clear: safely("clear") };
+    })();
+    const aqueductBlock = (block) => ({ height: network.blockHeight(block), txCount: txCount(block), timestamp: blockTimestamp(block) });
+    function followAqueduct(source, snapshot, liveness, alternate, checkpointAudit, receipts) {
+      if (!aqueduct) return;
+      // The band withdraws its picture whenever the page withdraws its claim, and never draws two sources as one chain.
+      if (checkpointAudit.state === "mismatch") {
+        aqueduct.clear({ tone: "bad", title: "Recovery checkpoint mismatch", detail: "Canonical labels are paused, so no blocks are drawn." });
+        return;
+      }
+      const name = sourceDisplay(source);
+      const blocks = snapshot.blocks.map(aqueductBlock).filter((block) => block.height !== null);
+      if (!blocks.length) {
+        aqueduct.clear({ tone: "warn", title: "No block to draw", detail: `${name} answered, but returned no block, so nothing is drawn.` });
+        return;
+      }
+      const stalled = liveness.state === "stalled";
+      const view = alternate ? "alternate" : checkpointAudit.state === "verified" ? "verified" : "incomplete";
+      const told = {
+        verified: ["Live · canonical v3 continuation", `Each stone is a block ${name} reported for the canonical timeline. The recovery checkpoint and every v3 replica identity are verified.`],
+        alternate: ["Non-canonical source view", `Each stone is a block reported by ${name}, an explicit alternate source that is not part of the canonical timeline.`],
+        incomplete: ["Canonical evidence incomplete", `Each stone is a block reported by ${name}. Exact checkpoint evidence is unavailable, so none of it is labeled canonical.`],
+      }[view];
+      aqueduct.follow({
+        key: `${state.sourceId}|${source.id}`,
+        tone: view === "verified" && !stalled ? "good" : "warn",
+        title: stalled ? "Chain appears stalled" : told[0],
+        detail: stalled ? `${told[1]} Its newest block is stale, so building has stopped where the chain stopped.` : told[1],
+        source: name,
+        stalled,
+        blocks,
+        poll: (signal) => requestLatestBlock(window.fetch.bind(window), source, { signal }).then((block) => [aqueductBlock(block)]),
+        // Only a verified canonical view feeds the water: the receipts Inference activity lists as confirmed. Any
+        // other view, or a refresh whose receipt request failed, feeds nothing and withdraws the line.
+        inference: view === "verified" && Array.isArray(receipts)
+          ? receipts.map(({ receipt }) => ({ id: receipt.txHash, height: receipt.height }))
+          : null,
+      });
+    }
     const currentSource = () => state.sourceId === "canonical" ? state.resolver?.currentSource() : state.resolver?.source(state.sourceId);
 
     function setBanner(kind, title, detail) {
@@ -523,10 +582,19 @@
       elements.sourceDot.className = `status-dot ${kind === "online" ? "online" : kind === "degraded" ? "stalled" : kind === "error" ? "offline" : "unknown"}`;
     }
 
+    // A refresh of the view already on screen runs in the background: the banner keeps the last result and its signal
+    // pulses, and "Last refreshed" reads "Refreshing…" until the new result is in.
+    function setRefreshing(on) {
+      if (on) elements.banner.classList.add("refreshing");
+      else elements.banner.classList.remove("refreshing");
+      text(elements.lastRefreshed, on ? "Refreshing…" : state.refreshedLabel);
+    }
+
     function fact(label, value, title) {
       const row = create("div");
       row.append(create("dt", "", label));
-      const dd = create("dd", "", value ?? "Unavailable");
+      // a hash is set in the monospace face; words and numbers are set as text
+      const dd = create("dd", /^0x[0-9a-f]/i.test(String(value ?? "")) ? "hash" : "", value ?? "Unavailable");
       if (title) dd.title = title;
       row.append(dd);
       return row;
@@ -550,6 +618,10 @@
       if (!checkpoint) {
         text(elements.recoveryTitle, "Recovery checkpoint unavailable");
         text(elements.recoverySummary, "Canonical claims are paused. Legacy peers are not automatically treated as one chain.");
+        // The loading placeholders settle to what is known without a checkpoint: nothing.
+        text(elements.checkpointHash, "Signed checkpoint unavailable");
+        text(elements.boundaryState, "Parent link not checked");
+        text(elements.manifestHash, "Manifest unavailable");
         return;
       }
       text(elements.recoveryTitle, `Signed checkpoint #${formatInteger(checkpoint.height)} → protocol v3`);
@@ -563,9 +635,11 @@
         mismatch: "PARENT HASH MISMATCH",
         unknown: "Parent link unavailable",
         "not-boundary": "Boundary response unavailable",
+        // configuration loaded, first audit not yet answered: neutral, neither a pass nor a warning
+        auditing: "Checking parent link…",
       };
       text(elements.boundaryState, messages[boundary?.state] || "Parent link not checked");
-      elements.boundaryState.className = boundary?.state === "verified" ? "truth-good" : boundary?.state === "mismatch" ? "truth-bad" : "truth-warn";
+      elements.boundaryState.className = boundary?.state === "verified" ? "truth-good" : boundary?.state === "mismatch" ? "truth-bad" : boundary?.state === "auditing" ? "" : "truth-warn";
       text(elements.continuationLabel, `Continuation #${formatInteger(checkpoint.recoveryHeight + 1)}+`);
       text(elements.manifestHash, `Manifest ${network.formatHash(checkpoint.manifestHash, 8, 6)}`);
       elements.manifestHash.title = `0x${checkpoint.manifestHash}`;
@@ -653,7 +727,7 @@
         const segment = canonical.canonical ? canonical.segment.replaceAll("-", " ") : "non-canonical / unverified";
         const stamp = blockTimestamp(block);
         const age = stamp === null ? null : Math.max(0, Math.round((Date.now() - (stamp < 10_000_000_000 ? stamp * 1000 : stamp)) / 1000));
-        tr.append(heightCell, create("td", canonical.canonical ? "truth-good" : "truth-warn", segment), create("td", "", age === null ? "Unavailable" : network.formatDuration(age)), create("td", "", formatInteger(txCount(block))), create("td", "", network.formatHash(network.blockHash(block))));
+        tr.append(heightCell, create("td", canonical.canonical ? "truth-good" : "truth-warn", segment), create("td", "", age === null ? "Unavailable" : network.formatDuration(age)), create("td", "", formatInteger(txCount(block))), create("td", "hash", network.formatHash(network.blockHash(block))));
         elements.blocksBody.append(tr);
       }
       text(elements.blocksStatus, `${Math.min(12, blocks.length)} shown · ${source.name}`);
@@ -675,10 +749,16 @@
         heading.append(create("strong", "", `Inference receipt · #${formatInteger(receipt.height)}`), create("span", "status-pill online", receipt.paymentConfirmed ? "COMPUTED + PAID" : "COMPUTED · NOT PAYMENT"));
         const model = row.inference?.model_hash ?? row.model_id;
         card.append(heading, create("code", "", receipt.txHash ? `0x${receipt.txHash}` : "Transaction hash unavailable"), create("small", "", `Source: ${source.name} · ${model ? `model ${network.formatHash(model)}` : "model unavailable"}`));
-        if (receipt.txHash) card.addEventListener("click", () => navigate("tx", receipt.txHash));
+        if (receipt.txHash) {
+          card.tabIndex = 0;
+          card.role = "link";
+          card.addEventListener("click", () => navigate("tx", receipt.txHash));
+          card.addEventListener("keydown", (event) => { if (event.key === "Enter") navigate("tx", receipt.txHash); });
+        }
         elements.inferenceList.append(card);
       }
       text(elements.inferenceStatus, `${confirmed.length} confirmed${excluded ? ` · ${excluded} excluded` : ""}`);
+      return confirmed;
     }
 
     function economicValue(payload, keys) {
@@ -711,6 +791,21 @@
       text(elements.rewardsStatus, payload ? "Current source report" : "Unavailable");
     }
 
+    // The evidence panels start on neutral loading placeholders (index.html). A path that ends with no source to read
+    // (no canonical route, or a rejected configuration) settles them to the explicit wording instead of loading forever.
+    function renderWithoutSource(status) {
+      clear(elements.blocksBody);
+      const tr = create("tr");
+      const td = create("td", "empty-cell", "No canonical source configured.");
+      td.colSpan = 5;
+      tr.append(td);
+      elements.blocksBody.append(tr);
+      clear(elements.inferenceList);
+      elements.inferenceList.append(create("p", "empty-cell", "No confirmed inference receipts loaded."));
+      renderRewards(null);
+      for (const node of [elements.blocksStatus, elements.inferenceStatus, elements.rewardsStatus]) text(node, status);
+    }
+
     async function loadSnapshot(source, signal) {
       const requests = await Promise.all([
         optionalRequest(window.fetch.bind(window), source, "/health", { signal }),
@@ -734,8 +829,9 @@
     async function refresh() {
       if (!state.resolver) return;
       state.refreshController?.abort();
-      state.refreshController = new AbortController();
-      const signal = state.refreshController.signal;
+      const controller = new AbortController();
+      state.refreshController = controller;
+      const signal = controller.signal;
       const auditBeforeRefresh = state.checkpointAudit;
       elements.refreshButton.classList.add("spinning");
       const source = currentSource();
@@ -744,15 +840,23 @@
         resetMetrics();
         renderFacts(null, null, null);
         renderRecovery(null);
+        renderWithoutSource("Paused");
         setBanner("degraded", "Canonical recovery is not configured", state.config.notices[0] || "No approved checkpoint and v3 source are available.");
-        text(elements.blocksStatus, "Paused");
-        text(elements.inferenceStatus, "Paused");
-        text(elements.rewardsStatus, "Paused");
+        aqueduct?.clear({ tone: "warn", title: "Recovery not configured", detail: "No approved checkpoint and v3 source are configured, so no blocks are drawn." });
         elements.refreshButton.classList.remove("spinning");
+        setRefreshing(false);
+        state.renderedView = state.sourceId;
         return;
       }
       const alternate = state.sourceId !== "canonical" && source.id !== state.config.checkpoint?.v3SourceId && source.id !== state.config.checkpoint?.legacySourceId;
-      setBanner("loading", alternate ? "Loading explicit alternate source…" : "Loading canonical source…", sourceDisplay(source));
+      // The view on screen stays up while it refreshes (the 30-second timer, a return to the tab, the refresh button);
+      // only a first load, or a switch to another source, replaces it with a loading banner, after which no finished
+      // result is on screen until this one lands.
+      if (state.renderedView === state.sourceId) setRefreshing(true);
+      else {
+        state.renderedView = null;
+        setBanner("loading", alternate ? "Loading explicit alternate source…" : "Loading canonical source…", sourceDisplay(source));
+      }
       try {
         await requireLegacyArchiveProvenance(source, window.fetch.bind(window), signal);
         const [snapshotResult, checkpointAudit, inferenceResult, rewardsResult, maintenanceAudit] = await Promise.all([
@@ -775,6 +879,7 @@
           text(elements.inferenceStatus, "Paused by maintenance interlock");
           text(elements.rewardsStatus, "Paused by maintenance interlock");
           setBanner("error", "Network maintenance safety interlock active", `Canonical publication is paused: ${maintenanceAudit.reason || "fresh six-validator maintenance evidence is unavailable"}. Preserved alternate archives remain explicitly queryable.`);
+          aqueduct?.clear({ tone: "bad", title: "Paused by the maintenance safety interlock", detail: "Canonical publication is paused, so no blocks are drawn." });
           if (shouldReinspectOpenBlock(auditBeforeRefresh, state.checkpointAudit, state.sourceId,
                                        parseRoute(), !elements.inspectorClose.hidden)) handleRoute();
           return;
@@ -799,9 +904,11 @@
         renderFacts(source, snapshot, liveness);
         renderBlocks(snapshot.blocks, source);
         renderRecovery(checkpointAudit);
-        renderInference(inferenceResult.ok ? inferenceResult.value : null, source);
+        const confirmedInference = renderInference(inferenceResult.ok ? inferenceResult.value : null, source);
         renderRewards(rewardsResult.ok ? rewardsResult.value : null);
-        text(elements.lastRefreshed, new Date().toLocaleTimeString());
+        followAqueduct(source, snapshot, liveness, alternate, checkpointAudit, inferenceResult.ok ? confirmedInference : null);
+        state.refreshedLabel = new Date().toLocaleTimeString();
+        text(elements.lastRefreshed, state.refreshedLabel);
         if (checkpointAudit.state === "mismatch") setBanner("error", "Recovery checkpoint mismatch", "Exact H, H+1, chain identity, epoch, validator set, domain, or manifest differs. Canonical labels are paused.");
         else if (alternate) setBanner("degraded", "NON-CANONICAL source view", `${sourceDisplay(source)} is being queried explicitly and is not merged into canonical results.`);
         else if (liveness.state === "stalled") setBanner("degraded", "RPC reachable, chain appears stalled", `${sourceDisplay(source)} answered, but its newest block is stale.`);
@@ -825,19 +932,27 @@
           text(elements.blocksStatus, "Unavailable");
           text(elements.inferenceStatus, "Unavailable");
           text(elements.rewardsStatus, "Unavailable");
-          text(elements.lastRefreshed, "Refresh failed");
+          state.refreshedLabel = "Refresh failed";
+          text(elements.lastRefreshed, state.refreshedLabel);
           setBanner("error", "Selected source is unreachable", `${sourceDisplay(source)}: ${error.message}`);
+          aqueduct?.clear({ tone: "bad", title: "Source unreachable", detail: `${sourceDisplay(source)} did not answer, so no blocks are drawn.` });
           if (shouldReinspectOpenBlock(auditBeforeRefresh, state.checkpointAudit, state.sourceId,
                                        parseRoute(), !elements.inspectorClose.hidden)) handleRoute();
         }
       } finally {
-        elements.refreshButton.classList.remove("spinning");
+        // Only the newest refresh settles the controls: one it cancelled must not end the indicator of its replacement.
+        if (state.refreshController === controller) {
+          elements.refreshButton.classList.remove("spinning");
+          setRefreshing(false);
+          state.renderedView = state.sourceId;
+        }
       }
     }
 
     function setInspector(kicker, title) {
       text(elements.inspectorKicker, kicker);
       text(elements.inspectorTitle, title);
+      elements.inspectorTitle.className = /^0x[0-9a-f]/i.test(String(title)) ? "is-hash" : "";
       elements.inspectorClose.hidden = false;
       clear(elements.inspectorContent);
     }
@@ -984,7 +1099,7 @@
             heightCell,
             create("td", canonical.canonical ? "truth-good" : "truth-warn", segment),
             create("td", "", formatInteger(txCount(row.block))),
-            create("td", "", network.formatHash(network.blockHash(row.block))),
+            create("td", "hash", network.formatHash(network.blockHash(row.block))),
             create("td", "", sourceDisplay(row.source)),
           );
           tbody.append(tr);
@@ -1220,6 +1335,7 @@
         elements.inspectorClose.hidden = true;
         text(elements.inspectorKicker, "Lookup");
         text(elements.inspectorTitle, "Search canonical history or select an alternate source");
+        elements.inspectorTitle.className = "";
         clear(elements.inspectorContent);
         const empty = create("div", "inspector-empty");
         empty.append(create("span", "", "⌕"), create("p", "", "Block lookup resolves by checkpoint height. Transaction and address searches retain source provenance for every result."));
@@ -1244,6 +1360,7 @@
 
     elements.sourceSelect.addEventListener("change", () => {
       state.sourceId = elements.sourceSelect.value;
+      aqueduct?.clear({ tone: "neutral", title: "Loading the selected view…", detail: "A new source is a new picture: nothing is carried over from the previous view." });
       updateSourceChrome();
       refresh();
       handleRoute();
@@ -1272,14 +1389,18 @@
         text(elements.networkLabel, `${state.config.network.name} / ${state.config.state.toUpperCase()}`);
         populateSources();
         updateSourceChrome();
-        renderRecovery(null);
+        renderRecovery({ state: "auditing" });
         await refresh();
         handleRoute();
         state.timer = window.setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_INTERVAL_MS);
       } catch (error) {
         resetMetrics();
         renderFacts(null, null, null);
+        // Nothing loaded, so nothing is left loading.
+        renderRecovery(null);
+        renderWithoutSource("Unavailable");
         setBanner("error", "Explorer configuration rejected", error.message);
+        aqueduct?.clear({ tone: "bad", title: "Configuration rejected", detail: "No canonical chain view is configured, so no blocks are drawn." });
         inspectorError("Configuration", "No canonical chain view", "Publish a valid arc.frontend.network.v1 configuration. No legacy peer was selected automatically.");
       }
     })();

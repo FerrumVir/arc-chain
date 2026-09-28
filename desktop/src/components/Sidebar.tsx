@@ -12,7 +12,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useAppStore } from "../lib/store";
 import { api } from "../lib/tauri";
 import { PulseDot } from "./PulseDot";
-import { LogoMark, Tagline, Wordmark } from "./Logo";
+import { Tagline, Wordmark } from "./Logo";
 import { formatUptime } from "../lib/format";
 import type { Route } from "../lib/store";
 
@@ -37,22 +37,13 @@ export function Sidebar() {
   });
 
   const level = status?.health ?? "offline";
+  const checking = status === undefined;   // no status yet: the node may well be running or starting
 
   return (
     <aside className="sidebar" data-testid="sidebar">
       <div className="sidebar-brand">
-        <LogoMark size={28} />
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: 2,
-            lineHeight: 1,
-          }}
-        >
-          <Wordmark size={18} />
-          <Tagline size="xs" />
-        </div>
+        <Wordmark height={28} />
+        <Tagline size="sm" />
       </div>
 
       <nav className="sidebar-nav" aria-label="Primary">
@@ -74,20 +65,24 @@ export function Sidebar() {
         <div className="node-status-chip" data-testid="sidebar-status">
           <PulseDot
             level={
-              status?.running
-                ? level
-                : status?.pid != null
-                  ? "syncing"
-                  : level
+              checking
+                ? "checking"
+                : status?.running
+                  ? level
+                  : status?.pid != null
+                    ? "syncing"
+                    : level
             }
           />
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text)" }}>
-              {status?.running
-                ? "Running"
-                : status?.pid != null
-                  ? "Starting"
-                  : "Stopped"}
+              {checking
+                ? "Checking…"
+                : status?.running
+                  ? "Running"
+                  : status?.pid != null
+                    ? "Starting"
+                    : "Stopped"}
             </div>
             {status?.running && (
               <div style={{ fontSize: 11, color: "var(--text-muted)" }}>

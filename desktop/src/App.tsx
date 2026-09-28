@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { useEffect, useRef, useState } from "react";
+import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { DataMigrationBanner } from "./components/DataMigrationBanner";
@@ -18,7 +18,12 @@ import {
   isSyntheticPreview,
 } from "./lib/tauri";
 import { appUpdater } from "./lib/updater";
+import { dismissBootSplash } from "./lib/boot";
+import { EASE_OUT } from "./lib/motion";
 import type { DataMigrationNotice } from "./lib/types";
+
+// If the native store never answers, stop waiting and show what the local state says.
+const BOOT_TIMEOUT_MS = 4_000;
 
 const SCREENS = {
   dashboard: Dashboard,
@@ -75,8 +80,21 @@ export function App() {
   const setIdentity = useAppStore((s) => s.setIdentity);
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const [configHydrated, setConfigHydrated] = useState(false);
+  const [bootTimedOut, setBootTimedOut] = useState(false);
   const [dataMigration, setDataMigration] =
     useState<DataMigrationNotice | null>(null);
+  const mainRef = useRef<HTMLElement>(null);
+
+  // The launch screen (index.html) stays up until the saved identity and config have loaded. Deciding between the
+  // wizard and the app before then showed returning users "Welcome to Arc" until the native store replied.
+  const ready = configHydrated || bootTimedOut || isBlockedProductionBrowser;
+  useEffect(() => {
+    const timer = window.setTimeout(() => setBootTimedOut(true), BOOT_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, []);
+  useEffect(() => {
+    if (ready) dismissBootSplash();
+  }, [ready]);
 
   // The wizard stages identity/config before downloading and starting the
   // node. Those drafts must not unmount it while setup can still fail.
@@ -123,45 +141,71 @@ export function App() {
     return <ProductionBrowserBlocker />;
   }
 
-  if (!onboarded) {
-    if (!isSyntheticPreview) return <Onboarding />;
-    return (
-      <div className="synthetic-preview-page">
-        <Onboarding />
-        <SyntheticPreviewBanner />
-      </div>
-    );
-  }
+  // Still under the launch screen: render nothing rather than guess.
+  if (!ready) return null;
 
   const Screen = SCREENS[route];
 
+  // reducedMotion="user": every framer-motion animation below follows the OS "reduce motion" setting.
   return (
-    <div
-      className={`app-shell${isSyntheticPreview ? " synthetic-preview" : ""}`}
-      data-testid="app-shell"
-    >
-      <Titlebar />
-      <Sidebar />
-      <main className="main" data-testid="main">
-        {dataMigration && (
-          <DataMigrationBanner
-            notice={dataMigration}
-            onDismissed={() => setDataMigration(null)}
-          />
-        )}
-        <AnimatePresence mode="wait">
+    <MotionConfig reducedMotion="user">
+      <AnimatePresence mode="wait" initial={false}>
+        {!onboarded ? (
           <motion.div
-            key={route}
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+            key="onboarding"
+            className="app-phase"
+            exit={{ opacity: 0, transition: { duration: 0.24, ease: EASE_OUT } }}
           >
-            <Screen />
+            {isSyntheticPreview ? (
+              <div className="synthetic-preview-page">
+                <Onboarding />
+                <SyntheticPreviewBanner />
+              </div>
+            ) : (
+              <Onboarding />
+            )}
           </motion.div>
-        </AnimatePresence>
-      </main>
-      <SyntheticPreviewBanner />
-    </div>
+        ) : (
+          <motion.div
+            key="app"
+            className="app-phase"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1, transition: { duration: 0.36, ease: EASE_OUT } }}
+          >
+            <div
+              className={`app-shell${isSyntheticPreview ? " synthetic-preview" : ""}`}
+              data-testid="app-shell"
+            >
+              <Titlebar />
+              <Sidebar />
+              <main className="main" data-testid="main" ref={mainRef}>
+                {dataMigration && (
+                  <DataMigrationBanner
+                    notice={dataMigration}
+                    onDismissed={() => setDataMigration(null)}
+                  />
+                )}
+                {/* Screen changes: a short exit, then the new screen from the top. The main area scrolls, so without
+                    the reset a screen could open part-way down. */}
+                <AnimatePresence
+                  mode="wait"
+                  onExitComplete={() => mainRef.current?.scrollTo({ top: 0 })}
+                >
+                  <motion.div
+                    key={route}
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0, transition: { duration: 0.2, ease: EASE_OUT } }}
+                    exit={{ opacity: 0, y: -4, transition: { duration: 0.12, ease: EASE_OUT } }}
+                  >
+                    <Screen />
+                  </motion.div>
+                </AnimatePresence>
+              </main>
+              <SyntheticPreviewBanner />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </MotionConfig>
   );
 }

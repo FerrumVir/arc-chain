@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { TrendingUp } from "lucide-react";
 import { Card, CardHeader } from "./Card";
+import { SkeletonLines } from "./Skeleton";
 import { NotAvailable } from "./NotAvailable";
 import { api } from "../lib/tauri";
 import { formatArc, formatInt } from "../lib/format";
@@ -390,17 +391,18 @@ export function ProjectedEarnings({
   // ── Still reading ──────────────────────────────────────────────────────
   if (!projection) {
     return (
-      <Card data-testid="projection-loading">
+      <Card data-testid="projection-loading" aria-busy="true">
         <CardHeader title="Observed-rate reward projection" />
         <p
           style={{
             color: "var(--text-muted)",
             fontSize: "var(--text-sm)",
-            margin: 0,
+            margin: "0 0 var(--space-4)",
           }}
         >
           Reading the chain host…
         </p>
+        <SkeletonLines lines={compact ? 2 : 4} gap={10} />
       </Card>
     );
   }

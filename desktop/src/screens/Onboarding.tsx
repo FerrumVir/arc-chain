@@ -3,7 +3,6 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowRight,
   Check,
-  CheckCircle2,
   Copy,
   Cpu,
   HardDrive,
@@ -45,9 +44,14 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
 
+// How long "Connected via … ✓" stays up before the app takes over.
+const CONNECTED_PAUSE_MS = 1_400;
+
 export function Onboarding() {
   const [step, setStep] = useState<Step>("welcome");
   const [identity, setIdentity] = useState<Identity | null>(null);
+  const [identityError, setIdentityError] = useState<string | null>(null);
+  const [identityAttempt, setIdentityAttempt] = useState(0);
   const [copied, setCopied] = useState(false);
   const [seedShown, setSeedShown] = useState(false);
   // Held in component state only, for as long as this screen is mounted.
@@ -58,6 +62,9 @@ export function Onboarding() {
 
   // Model picker state — populated when entering the "model" step.
   const [tiers, setTiers] = useState<ModelTierInfo[]>([]);
+  const [tiersLoaded, setTiersLoaded] = useState(false);
+  const [tiersError, setTiersError] = useState<string | null>(null);
+  const [tiersAttempt, setTiersAttempt] = useState(0);
   const [recommendedTier, setRecommendedTier] = useState<string>("standard");
   const [selectedTier, setSelectedTier] = useState<string | null>(null);
 
@@ -84,9 +91,13 @@ export function Onboarding() {
 
   useEffect(() => {
     if (step === "identity" && !identity) {
-      api.generateIdentity().then(setIdentity);
+      setIdentityError(null);
+      api
+        .generateIdentity()
+        .then(setIdentity)
+        .catch((err) => setIdentityError(err instanceof Error ? err.message : String(err)));
     }
-  }, [step, identity]);
+  }, [step, identity, identityAttempt]);
 
   // Load the network-compatible model and recommend it only when local RAM is
   // sufficient. Lower-memory machines default to observer/router mode rather
@@ -94,18 +105,23 @@ export function Onboarding() {
   useEffect(() => {
     if (step !== "model" || tiers.length > 0) return;
     let cancelled = false;
+    setTiersError(null);
     Promise.all([api.listModelTiers(), api.recommendedTier()]).then(
       ([loadedTiers, rec]) => {
         if (cancelled) return;
         setTiers(loadedTiers);
         setRecommendedTier(rec);
         setSelectedTier(rec === "none" ? "skip" : rec);
+        setTiersLoaded(true);
+      },
+      (err) => {
+        if (!cancelled) setTiersError(err instanceof Error ? err.message : String(err));
       },
     );
     return () => {
       cancelled = true;
     };
-  }, [step, tiers.length]);
+  }, [step, tiers.length, tiersAttempt]);
 
   // Subscribe to model-download-progress events from the Rust side. Outside
   // a Tauri shell (dev / browser preview) the mock just resolves the
@@ -188,6 +204,8 @@ export function Onboarding() {
       }
       if (joinResult) {
         setConnectedVia(joinResult.via ?? null);
+        // The finish line used to be skipped: onboarding ended in the same tick the confirmation would have shown.
+        await new Promise((resolve) => setTimeout(resolve, CONNECTED_PAUSE_MS));
       }
       setOnboarded(true);
     } catch (err) {
@@ -237,10 +255,10 @@ export function Onboarding() {
                     marginBottom: "var(--space-8)",
                   }}
                 >
-                  <LogoMark size={64} radius={18} variant="gradient" />
-                  <Tagline size="sm" />
+                  <LogoMark size={84} radius={20} variant="gradient" />
+                  <Tagline size="md" />
                 </div>
-                <h1 className="onboarding-title">welcome to arc</h1>
+                <h1 className="onboarding-title">Welcome to Arc</h1>
                 <p className="onboarding-subtitle">
                   Run a node on your machine. Offer compatible compute. Verify
                   every result and reward from the selected chain host.
@@ -341,7 +359,16 @@ export function Onboarding() {
                 </p>
 
                 {!identity ? (
-                  <div className="shimmer" style={{ height: 220 }} />
+                  identityError ? (
+                    <div className="onboarding-load-error" role="alert" data-testid="identity-error">
+                      <p>Could not create your node identity: {identityError}</p>
+                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => setIdentityAttempt((n) => n + 1)}>
+                        Try again
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="shimmer" style={{ height: 220 }} aria-busy="true" />
+                  )
                 ) : (
                   <>
                     <div
@@ -560,9 +587,21 @@ export function Onboarding() {
                     margin: "var(--space-6) 0",
                   }}
                 >
-                  {tiers.length === 0 && (
-                    <div className="shimmer" style={{ height: 220 }} />
-                  )}
+                  {tiers.length === 0 &&
+                    (tiersError ? (
+                      <div className="onboarding-load-error" role="alert" data-testid="tiers-error">
+                        <p>Could not read the model options: {tiersError}</p>
+                        <button type="button" className="btn btn-secondary btn-sm" onClick={() => setTiersAttempt((n) => n + 1)}>
+                          Try again
+                        </button>
+                      </div>
+                    ) : tiersLoaded ? (
+                      <p className="onboarding-load-error" data-testid="tiers-empty">
+                        No model options were offered for this machine. You can continue as an observer.
+                      </p>
+                    ) : (
+                      <div className="shimmer" style={{ height: 220 }} aria-busy="true" />
+                    ))}
                   {tiers.map((tier) => {
                     const isSelected = selectedTier === tier.id;
                     const isRecommended = recommendedTier === tier.id;
@@ -715,9 +754,9 @@ export function Onboarding() {
                   {launching ? (
                     <div
                       style={{
-                        width: 64,
-                        height: 64,
-                        borderRadius: 18,
+                        width: 84,
+                        height: 84,
+                        borderRadius: 20,
                         background: "var(--arc-gradient)",
                         display: "grid",
                         placeItems: "center",
@@ -725,10 +764,10 @@ export function Onboarding() {
                         boxShadow: "var(--shadow-glow-strong)",
                       }}
                     >
-                      <Loader2 size={26} className="spin" />
+                      <Loader2 size={28} className="spin" />
                     </div>
                   ) : (
-                    <LogoMark size={64} radius={18} variant="gradient" />
+                    <LogoMark size={84} radius={20} variant="gradient" />
                   )}
                 </div>
                 <h1 className="onboarding-title">
@@ -945,7 +984,6 @@ function ConnectingStatus({
               }}
             >
               {isActive && <Loader2 size={9} className="spin" />}
-              {isPast && !isActive && <CheckCircle2 size={9} />}
               {seed.label}
             </span>
           );

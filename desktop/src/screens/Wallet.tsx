@@ -11,13 +11,18 @@ import {
 import { FormEvent, useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
+import { Skeleton } from "../components/Skeleton";
 import { api } from "../lib/tauri";
 import { isNativeOnlyChain } from "../lib/native-request";
 import { useAppStore } from "../lib/store";
 import { formatArcExact, formatInt } from "../lib/format";
 import type { TxLookup, WalletTxResult } from "../lib/types";
 
-function receiptView(result: WalletTxResult, lookup?: TxLookup) {
+// How long the wallet keeps checking a submitted transaction for its mined receipt before it says so and stops.
+// It used to poll every 2 s for as long as the screen stayed open.
+const RECEIPT_WAIT_MS = 3 * 60_000;
+
+function receiptView(result: WalletTxResult, lookup?: TxLookup, timedOut = false) {
   const mined = lookup ? lookup.status === "mined" : result.mined;
   const success = lookup
     ? lookup.status === "mined"
@@ -55,6 +60,12 @@ function receiptView(result: WalletTxResult, lookup?: TxLookup) {
       text: "Mined, but the receipt did not report execution success",
     };
   }
+  if (timedOut) {
+    return {
+      tone: "var(--warning)",
+      text: `Submitted ${formatArcExact(result.amountArc)} ARC · no mined receipt after 3 minutes. The wallet stopped checking; look the hash up on the Network screen.`,
+    };
+  }
   return {
     tone: "var(--warning)",
     text: `Submitted ${formatArcExact(result.amountArc)} ARC · waiting for a mined receipt`,
@@ -78,6 +89,13 @@ export function Wallet() {
   const [recipient, setRecipient] = useState("");
   const [amountArc, setAmountArc] = useState("");
   const [trackedTx, setTrackedTx] = useState<WalletTxResult | null>(null);
+  const [receiptTimedOut, setReceiptTimedOut] = useState(false);
+  useEffect(() => {
+    setReceiptTimedOut(false);
+    if (!trackedTx?.txHash) return;
+    const timer = setTimeout(() => setReceiptTimedOut(true), RECEIPT_WAIT_MS);
+    return () => clearTimeout(timer);
+  }, [trackedTx?.txHash]);
 
   const faucet = useMutation({
     mutationFn: () => api.faucetClaim(),
@@ -107,7 +125,7 @@ export function Wallet() {
     queryFn: () => api.lookupTx(trackedTx!.txHash),
     enabled: Boolean(trackedTx?.txHash),
     refetchInterval: (query) =>
-      query.state.data?.status === "mined" ? false : 2000,
+      query.state.data?.status === "mined" || receiptTimedOut ? false : 2000,
   });
 
   useEffect(() => {
@@ -133,6 +151,8 @@ export function Wallet() {
 
   const receiptFor = (result: WalletTxResult | undefined) =>
     result?.txHash === trackedTx?.txHash ? trackedReceipt : undefined;
+  const timedOutFor = (result: WalletTxResult | undefined) =>
+    receiptTimedOut && result?.txHash === trackedTx?.txHash && trackedReceipt?.status !== "mined";
 
   return (
     <div className="main-inner" data-testid="wallet-screen">
@@ -182,7 +202,7 @@ export function Wallet() {
               data-testid="wallet-nonce"
               title="Transaction counter - increments with every tx you send"
             >
-              Nonce {balance ? formatInt(balance.nonce) : "—"}
+              Nonce {balance ? formatInt(balance.nonce) : balanceIsError ? "—" : <Skeleton width="2ch" />}
             </span>
           }
         />
@@ -200,7 +220,7 @@ export function Wallet() {
               data-testid="wallet-balance"
               style={{ fontSize: "var(--text-4xl)" }}
             >
-              {balance ? formatArcExact(balance.balanceArc) : "—"}
+              {balance ? formatArcExact(balance.balanceArc) : balanceIsError ? "—" : <Skeleton width="5ch" height="0.7em" />}
               <span className="unit">ARC</span>
             </div>
             {balanceIsError && (
@@ -231,7 +251,7 @@ export function Wallet() {
             <button
               className="btn btn-primary btn-lg"
               onClick={() => faucet.mutate()}
-              disabled={faucet.isPending || nativeOnly}
+              disabled={faucet.isPending || nativeOnly || nativeContext.isLoading}
               data-testid="btn-faucet"
             >
               <Droplet size={16} />{" "}
@@ -257,16 +277,13 @@ export function Wallet() {
                 style={{
                   marginTop: "var(--space-2)",
                   fontSize: "var(--text-xs)",
-                  color: receiptView(
-                    faucet.data,
-                    receiptFor(faucet.data),
-                  ).tone,
+                  color: receiptView(faucet.data, receiptFor(faucet.data), timedOutFor(faucet.data)).tone,
                   textAlign: "right",
                   fontFamily: "var(--font-mono)",
                 }}
                 data-testid="faucet-success"
               >
-                {receiptView(faucet.data, receiptFor(faucet.data)).text}
+                {receiptView(faucet.data, receiptFor(faucet.data), timedOutFor(faucet.data)).text}
                 <br />tx {faucet.data.txHash.slice(0, 10)}…
               </div>
             )}
@@ -405,6 +422,7 @@ export function Wallet() {
               type="submit"
               disabled={
                 nativeOnly ||
+                nativeContext.isLoading ||
                 send.isPending ||
                 recipient.trim() === "" ||
                 amountArc.trim() === ""
@@ -433,13 +451,13 @@ export function Wallet() {
               data-testid="send-status"
               style={{
                 marginTop: "var(--space-3)",
-                color: receiptView(send.data, receiptFor(send.data)).tone,
+                color: receiptView(send.data, receiptFor(send.data), timedOutFor(send.data)).tone,
                 fontFamily: "var(--font-mono)",
                 fontSize: "var(--text-xs)",
                 lineHeight: 1.6,
               }}
             >
-              {receiptView(send.data, receiptFor(send.data)).text}
+              {receiptView(send.data, receiptFor(send.data), timedOutFor(send.data)).text}
               <br />tx {send.data.txHash.slice(0, 12)}…
             </div>
           )}
