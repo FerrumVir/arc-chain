@@ -6450,6 +6450,26 @@ fn p2p_listen_ip(
     }
 }
 
+/// Select the certificate identity once, before any DAG recovery or signing.
+/// Recovery certificates share the exact recovery domain with DAG decisions;
+/// only chains without a recovery context use the genesis/epoch-zero identity.
+fn install_startup_consensus_domains(
+    engine: &arc_consensus::ConsensusEngine,
+    genesis_hash: Hash256,
+    recovery_domain: Option<arc_consensus::ConsensusDomain>,
+) -> std::result::Result<(), arc_consensus::ConsensusError> {
+    if let Some(domain) = recovery_domain {
+        engine.install_consensus_domain(domain)
+    } else {
+        let epoch = engine.frozen_validator_set().epoch;
+        engine.install_certificate_domain(arc_consensus::ConsensusDomain::new(
+            genesis_hash,
+            0,
+            epoch,
+        ))
+    }
+}
+
 #[cfg(windows)]
 fn main() -> Result<()> {
     // The MSVC process entry thread reserves a substantially smaller stack
@@ -8068,21 +8088,6 @@ async fn run_arc_node() -> Result<()> {
         // absence or finality transcripts at all, which is the safe default.
         consensus.signing_record_path =
             Some(Path::new(&data_dir).join("consensus-signing-record.bin"));
-        // Absence and finality transcripts need domain separation on EVERY
-        // chain, not only one with a recovery context. A from-genesis chain
-        // binds them to its own genesis identity and frozen validator epoch;
-        // a recovery chain re-binds them to its recovery domain below, and
-        // rebinding to a different domain is refused.
-        {
-            let epoch = consensus.engine.frozen_validator_set().epoch;
-            let certificate_domain = arc_consensus::ConsensusDomain::new(genesis_hash, 0, epoch);
-            if let Err(error) = consensus
-                .engine
-                .install_certificate_domain(certificate_domain)
-            {
-                tracing::warn!(%error, "Could not bind the certificate domain");
-            }
-        }
         if let Some(rounds) = cli.dag_retained_rounds {
             consensus.engine.set_retained_rounds(rounds);
         }
@@ -8127,12 +8132,14 @@ async fn run_arc_node() -> Result<()> {
                     "recovery DAG binding differs from the active consensus domain"
                 );
             }
-            consensus
-                .engine
-                .install_consensus_domain(domain)
+            install_startup_consensus_domains(&consensus.engine, genesis_hash, Some(domain))
                 .map_err(|error| {
                     anyhow::anyhow!("failed to install recovery consensus domain: {error}")
                 })?;
+        } else {
+            install_startup_consensus_domains(&consensus.engine, genesis_hash, None).map_err(
+                |error| anyhow::anyhow!("failed to install certificate domain: {error}"),
+            )?;
         }
         consensus.dag_validators = Some(dag_validators.clone());
         consensus.dag_round = Some(dag_round.clone());
@@ -9642,6 +9649,28 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn startup_selects_recovery_certificate_domain_without_first_binding_genesis() {
+        let address = hash_bytes(b"startup-domain-validator");
+        let set = ValidatorSet::new(vec![Validator::new(address, STAKE_ARC, 0).unwrap()], 7);
+        let genesis = hash_bytes(b"startup-genesis");
+        let recovery = arc_consensus::ConsensusDomain::new(hash_bytes(b"startup-recovery"), 2, 9);
+        let engine = ConsensusEngine::new(set.clone(), address);
+        install_startup_consensus_domains(&engine, genesis, Some(recovery)).unwrap();
+        assert_eq!(engine.consensus_domain(), Some(recovery));
+        assert_eq!(engine.certificate_domain(), Some(recovery));
+
+        // A chain without recovery keeps its legacy DAG hashing while its
+        // certificates are still bound to the actual genesis and set epoch.
+        let from_genesis = ConsensusEngine::new(set, address);
+        install_startup_consensus_domains(&from_genesis, genesis, None).unwrap();
+        assert_eq!(from_genesis.consensus_domain(), None);
+        assert_eq!(
+            from_genesis.certificate_domain(),
+            Some(arc_consensus::ConsensusDomain::new(genesis, 0, 7))
+        );
+    }
 
     #[test]
     fn native_assignment_policy_command_is_offline_and_matches_runtime_configuration() {

@@ -993,13 +993,12 @@ impl ConsensusEngine {
         let mut active = self.consensus_domain.write();
         if let Some(existing) = active.as_ref() {
             if existing == &domain {
-                return Ok(());
+                return self.install_certificate_domain(domain);
             }
             return Err(ConsensusError::InvalidBlock(
                 "consensus recovery domain is already bound to another epoch/set".into(),
             ));
         }
-        let _ = self.install_certificate_domain(domain);
         if !self.dag.is_empty()
             || self.current_round.load(Ordering::SeqCst) != 0
             || self.last_committed_round.load(Ordering::SeqCst) != 0
@@ -1008,6 +1007,10 @@ impl ConsensusEngine {
                 "consensus recovery domain must be installed before DAG/cursor recovery".into(),
             ));
         }
+        // Check both bindings before publishing the recovery domain. A
+        // conflicting certificate domain must never leave the engine signing
+        // certificates for one epoch and accepting DAG blocks for another.
+        self.install_certificate_domain(domain)?;
         *active = Some(domain);
         Ok(())
     }
@@ -4408,6 +4411,41 @@ mod tests {
         // Block should be in the DAG
         assert_eq!(engine.dag_size(), 1);
         assert_eq!(engine.blocks_in_round(0).len(), 1);
+    }
+
+    #[test]
+    fn recovery_domain_refuses_a_conflicting_certificate_binding_without_partial_install() {
+        let engine = ConsensusEngine::new(test_validator_set(4), test_addr(0));
+        let genesis_domain = ConsensusDomain::new(hash_bytes(b"genesis-domain"), 0, 1);
+        let recovery_domain = ConsensusDomain::new(hash_bytes(b"recovery-domain"), 1, 1);
+        engine.install_certificate_domain(genesis_domain).unwrap();
+
+        assert!(engine.install_consensus_domain(recovery_domain).is_err());
+        assert_eq!(engine.consensus_domain(), None);
+        assert_eq!(engine.certificate_domain(), Some(genesis_domain));
+    }
+
+    #[test]
+    fn recovery_domain_rejection_after_dag_activity_does_not_install_certificate_domain() {
+        let engine = ConsensusEngine::new(test_validator_set(4), test_addr(0));
+        engine.propose_block(Vec::new(), 1_000).unwrap();
+        let domain = ConsensusDomain::new(hash_bytes(b"late-recovery-domain"), 1, 1);
+
+        assert!(engine.install_consensus_domain(domain).is_err());
+        assert_eq!(engine.consensus_domain(), None);
+        assert_eq!(engine.certificate_domain(), None);
+    }
+
+    #[test]
+    fn recovery_domain_binds_both_identities_and_remains_idempotent_after_activity() {
+        let engine = ConsensusEngine::new(test_validator_set(4), test_addr(0));
+        let domain = ConsensusDomain::new(hash_bytes(b"shared-recovery-domain"), 1, 1);
+        engine.install_consensus_domain(domain).unwrap();
+        engine.propose_block(Vec::new(), 1_000).unwrap();
+        engine.install_consensus_domain(domain).unwrap();
+
+        assert_eq!(engine.consensus_domain(), Some(domain));
+        assert_eq!(engine.certificate_domain(), Some(domain));
     }
 
     #[test]
