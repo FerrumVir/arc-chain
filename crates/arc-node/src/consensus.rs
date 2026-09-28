@@ -5262,7 +5262,7 @@ mod tests {
         // four enabled validators in the six-member live fleet.
         for local in 0..4 {
             let mut collector = arc_consensus::view_change::SkipVoteCollector::new();
-            for peer in 0..4 {
+            for (peer, key) in keys.iter().take(4).enumerate() {
                 if peer == local {
                     continue;
                 }
@@ -5273,7 +5273,7 @@ mod tests {
                     absentee,
                     AbsenceReason::NoBlock,
                     set.quorum,
-                    &keys[peer],
+                    key,
                 )
                 .unwrap();
                 assert!(collector.add(vote, &domain, &set).unwrap().is_none());
@@ -5329,7 +5329,7 @@ mod tests {
         // A failed signing-record write must leave the local vote out of the
         // collector. Retrying after the decision is durable then completes it.
         let mut collector = arc_consensus::view_change::SkipVoteCollector::new();
-        for peer in 1..4 {
+        for key in keys.iter().take(4).skip(1) {
             let vote = SkipVote::sign(
                 domain,
                 set_hash,
@@ -5337,7 +5337,7 @@ mod tests {
                 absentee,
                 AbsenceReason::NoBlock,
                 set.quorum,
-                &keys[peer],
+                key,
             )
             .unwrap();
             assert!(collector.add(vote, &domain, &set).unwrap().is_none());
