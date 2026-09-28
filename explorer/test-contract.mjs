@@ -236,6 +236,23 @@ await test("reports the highest evidence within one source snapshot", () => {
   assert.equal(app.reportedHeight({ health: { height: "9007199254740992" } }), null);
 });
 
+await test("open canonical block inspector re-resolves only when checkpoint eligibility changes", () => {
+  const block = { kind: "block", value: "3166520" };
+  const verified = { state: "verified" };
+  const missingReplica = { state: "unknown", legacy: { state: "verified" },
+    replicas: [{ sourceId: "ams", state: "unknown", reason: "replica-evidence-unavailable" }] };
+  assert.equal(app.shouldReinspectOpenBlock(verified, missingReplica, "canonical", block, true), true);
+  assert.equal(app.shouldReinspectOpenBlock(missingReplica, verified, "canonical", block, true), true);
+  assert.equal(app.shouldReinspectOpenBlock(missingReplica, { ...missingReplica, reason: "still-missing" },
+    "canonical", block, true), false);
+  assert.equal(app.shouldReinspectOpenBlock(verified, missingReplica, "nyc", block, true), false);
+  assert.equal(app.shouldReinspectOpenBlock(verified, missingReplica, "canonical", { kind: "tx" }, true), false);
+  assert.equal(app.shouldReinspectOpenBlock(verified, missingReplica, "canonical", block, false), false);
+  assert.match(app.checkpointIncompleteMessage(missingReplica), /Signed H checkpoint is verified.*ams/);
+  assert.match(app.checkpointIncompleteMessage({ state: "unknown", legacy: { state: "unknown" } }),
+    /Signed H checkpoint evidence is unavailable or unverified/);
+});
+
 await test("raw u64 strings format exactly while unsafe JSON numbers fail closed", () => {
   assert.equal(app.formatExactInteger("18446744073709551615").replace(/\D/g, ""), "18446744073709551615");
   assert.equal(app.formatExactInteger(Number.MAX_SAFE_INTEGER + 1), "Unavailable");
@@ -823,6 +840,86 @@ function freshMaintenanceStatus() {
     global_absence_claimed: false,
   };
 }
+
+await test("open block inspector follows audit transitions and ignores an aborted stale lookup", async () => {
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const block = (height, hash) => ({ header: { height, hash, parent_hash: hex("a"), state_root: hex("e"), timestamp: nowSecs } });
+  let replicasReady = true;
+  let blockLookupCount = 0;
+  let releaseFirstLookup;
+  const calls = [];
+  const dom = installFakeDom(domConfig, async (url) => {
+    const parsed = new URL(url);
+    const path = `${parsed.origin}${parsed.pathname}${parsed.search}`;
+    calls.push(path);
+    if (path === "https://v3-1.example.test/block/99") {
+      blockLookupCount += 1;
+      if (blockLookupCount === 1) return new Promise((resolve) => { releaseFirstLookup = resolve; });
+      return response(200, block(H + 11, blockLookupCount === 2 ? hex("2") : hex("3")));
+    }
+    if (path === "https://v3-1.example.test/block/99/txs?offset=0&limit=100") {
+      return response(200, { tx_hashes: [] });
+    }
+    if (path === "https://v3-1.example.test/health") {
+      return response(200, { chain_advancing: true, last_block_age_secs: 1, peers: 5, version: "3.0.0" });
+    }
+    if (path === "https://v3-1.example.test/info") return response(200, { block_height: H + 11 });
+    if (path === "https://v3-1.example.test/stats") return response(200, { block_height: H + 11, total_transactions: 42, validators: 6 });
+    if (path === "https://v3-1.example.test/validators") return response(200, { validators: [] });
+    if (path === "https://v3-1.example.test/block/latest") return response(200, block(H + 11, hex("3")));
+    if (path === "https://v3-1.example.test/blocks?from=88&to=99&limit=12") {
+      return response(200, { blocks: [block(H + 11, hex("3"))] });
+    }
+    if (path === "https://v3-1.example.test/inference/attestations?limit=20" ||
+        path === "https://v3-1.example.test/economics/rewards") return response(200, {});
+    if (path === "https://legacy.example.test/block/88") {
+      return response(200, { header: { height: H, hash: hex("a"), state_root: hex("b") } });
+    }
+    for (const id of REPLICA_IDS) {
+      if (path === `https://${id}.example.test/maintenance/status`) return response(200, freshMaintenanceStatus());
+      if (path === `https://${id}.example.test/block/89`) return response(200, block(H + 1, hex("d")));
+      if (path === `https://${id}.example.test/network/info`) {
+        if (!replicasReady && id === "v3-2") return response(503, { error: "replica restarting" });
+        return response(200, exactNetworkInfo());
+      }
+    }
+    return response(503, { error: "unreachable" });
+  });
+  globalThis.document.getElementById("inspector-close").hidden = true;
+  dom.win.location.hash = "#/block/99";
+  app.boot();
+  await dom.settled;
+  assert.equal(dom.said("banner-title"), "Canonical recovery verified");
+  assert.equal(blockLookupCount, 1, "boot opened the requested block route once");
+
+  replicasReady = false;
+  await dom.byId.get("refresh-button").listeners.get("click")[0]();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(blockLookupCount, 2, "verified→unknown re-resolves the open block once");
+  assert.equal(dom.said("inspector-kicker"), "NON-CANONICAL BLOCK");
+  assert.match(dom.byId.get("inspector-content").children[0].textContent, /not been verified/);
+
+  const textOf = (node) => [node.textContent, ...(node.children || []).map(textOf)].join(" ");
+  assert.ok(textOf(dom.byId.get("inspector-content")).includes(`0x${hex("2")}`),
+    "the refreshed inspector shows the response fetched under unknown audit");
+  releaseFirstLookup(response(200, block(H + 11, hex("1"))));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(dom.said("inspector-kicker"), "NON-CANONICAL BLOCK",
+    "a delayed aborted canonical lookup cannot overwrite the downgraded inspector");
+  assert.ok(textOf(dom.byId.get("inspector-content")).includes(`0x${hex("2")}`));
+  assert.ok(!textOf(dom.byId.get("inspector-content")).includes(`0x${hex("1")}`));
+
+  await dom.byId.get("refresh-button").listeners.get("click")[0]();
+  assert.equal(blockLookupCount, 2, "repeated unknown refresh does not issue another inspector fetch");
+
+  replicasReady = true;
+  await dom.byId.get("refresh-button").listeners.get("click")[0]();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(blockLookupCount, 3, "unknown→verified re-resolves the open block once");
+  assert.equal(dom.said("inspector-kicker"), "Canonical block");
+  assert.ok(textOf(dom.byId.get("inspector-content")).includes(`0x${hex("3")}`));
+  assert.ok(calls.includes("https://v3-2.example.test/network/info"));
+});
 
 await test("a failed refresh clears canonical evidence instead of leaving stale rows on screen", async () => {
   const nowSecs = Math.floor(Date.now() / 1000);
