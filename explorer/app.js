@@ -893,6 +893,7 @@
       inspectorLoading("Block", `#${formatInteger(parsed.value)}`);
       try {
         const result = await queryBlock({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), height: parsed.value, sourceId: state.sourceId, signal: controller.signal, checkpointAudit: state.checkpointAudit });
+        if (controller.signal.aborted || state.lookupController !== controller) return;
         setInspector(result.route.canonical ? "Canonical block" : "NON-CANONICAL BLOCK", `Block #${formatInteger(result.route.height)}`);
         const warning = !result.route.canonical ? create("p", "inspector-note warning", result.route.warning || "This result is outside the configured canonical route.") : null;
         if (warning) elements.inspectorContent.append(warning);
