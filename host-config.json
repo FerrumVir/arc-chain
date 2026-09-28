@@ -1,0 +1,109 @@
+{
+  "checkpoint_manifest_hash": "9c6aa3ec659b101751bf58a8a24c655f0e4fba79596e9b44f87a30f98f08acc0",
+  "genesis_file_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+  "genesis_network_hash": "fc82b5b6f541b8b902a23cfb653b813442431f104a9c262c5076da436e2bd53f",
+  "hosts": [
+    {
+      "baseline_binary_sha256": "323d78c3df6ac1634ef4a050b5c80a038469b5e387673fac345888f8aa4c13fe",
+      "data_dir": "/root/arc-v3-data",
+      "genesis_path": "/root/arc-v3/genesis.toml",
+      "genesis_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+      "hostname": "arc-node-nyc",
+      "ip": "149.28.32.76",
+      "legacy_v3_wire": false,
+      "site": "nyc",
+      "stake": 6666667,
+      "unit": "arc-node-v3-nyc.service",
+      "validator": "adf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f"
+    },
+    {
+      "baseline_binary_sha256": "323d78c3df6ac1634ef4a050b5c80a038469b5e387673fac345888f8aa4c13fe",
+      "data_dir": "/root/arc-v3-data",
+      "genesis_path": "/root/arc-v3/genesis.toml",
+      "genesis_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+      "hostname": "arc-node-ams",
+      "ip": "136.244.109.1",
+      "legacy_v3_wire": false,
+      "site": "ams",
+      "stake": 6666667,
+      "unit": "arc-node-v3-ams.service",
+      "validator": "5772741c93d8a4b04ec39007cb568a31e13ffba0d3e786596d1900d30e529f21"
+    },
+    {
+      "baseline_binary_sha256": "323d78c3df6ac1634ef4a050b5c80a038469b5e387673fac345888f8aa4c13fe",
+      "data_dir": "/root/arc-v3-data",
+      "genesis_path": "/root/arc-v3/genesis.toml",
+      "genesis_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+      "hostname": "arc-node-lhr",
+      "ip": "104.238.171.11",
+      "legacy_v3_wire": false,
+      "site": "lhr",
+      "stake": 6666667,
+      "unit": "arc-node-v3-lhr.service",
+      "validator": "228787281308d6c1a560848c2c168814bde1b6153e9e65a286d7211f04628fdd"
+    },
+    {
+      "baseline_binary_sha256": "323d78c3df6ac1634ef4a050b5c80a038469b5e387673fac345888f8aa4c13fe",
+      "data_dir": "/root/arc-v3-data",
+      "genesis_path": "/root/arc-v3/genesis.toml",
+      "genesis_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+      "hostname": "arc-node-nrt",
+      "ip": "202.182.107.41",
+      "legacy_v3_wire": false,
+      "site": "nrt",
+      "stake": 6666666,
+      "unit": "arc-node-v3-nrt.service",
+      "validator": "f03cbab49cf553a05541ddebc09b32a4c5507efb157d354b6d7f8c6682c32f5f"
+    },
+    {
+      "baseline_binary_sha256": "323d78c3df6ac1634ef4a050b5c80a038469b5e387673fac345888f8aa4c13fe",
+      "data_dir": "/root/arc-v3-data",
+      "genesis_path": "/root/arc-v3/genesis.toml",
+      "genesis_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+      "hostname": "arc-node-sgp",
+      "ip": "149.28.153.31",
+      "legacy_v3_wire": false,
+      "site": "sgp",
+      "stake": 6666666,
+      "unit": "arc-node-v3-sgp.service",
+      "validator": "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b"
+    },
+    {
+      "baseline_binary_sha256": "323d78c3df6ac1634ef4a050b5c80a038469b5e387673fac345888f8aa4c13fe",
+      "data_dir": "/root/arc-v3-data",
+      "genesis_path": "/root/arc-v3/genesis.toml",
+      "genesis_sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+      "hostname": "arc-node-lax",
+      "ip": "140.82.16.112",
+      "legacy_v3_wire": false,
+      "site": "lax",
+      "stake": 6666667,
+      "unit": "arc-node-v3-lax.service",
+      "validator": "44d20543df6e76696da2ebbbd79e4243cd41729fa5b890e2618991e489314780"
+    }
+  ],
+  "lax_access": "Strict SSH restored and identity/binary/genesis read in current session; same deployment key, no restart",
+  "quorum_sites": [
+    "nyc",
+    "ams",
+    "lhr",
+    "nrt",
+    "sgp",
+    "lax"
+  ],
+  "quorum_stake": 26666667,
+  "recovery_domain": "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f",
+  "schema": "arc.rollout.host-config.v1",
+  "source_reference": {
+    "full_state_copy_qualification": "/Users/excaulibur/work/outputs/arc-chain-readiness-20260919/sep26-handoff/release-handoff-current/final-main-79a39406/protected-linux/20260928T165200Z-cohort-v1/qualification/qualification-set.json",
+    "full_state_copy_qualification_sha256": "4dd140fa1fe3ff03d4321613149d0eedd2c1caed545a7ca315e79cf3d8f1bb24",
+    "recovery_proof": "/Users/excaulibur/work/outputs/arc-chain-readiness-20260919/sep26-handoff/release-handoff-current/final-main-79a39406/protected-linux/20260928T165200Z-cohort-v1/verify-after-rpc-ready/six-quorum.json",
+    "recovery_proof_sha256": "c13f557de374f866a0661443aede5894b779d3d6fc2b44f2f326401829400dce",
+    "scope": "All6 candidate full-state qualification and subsequent advancing common block proof; exact candidate remains deployed. Fresh owner proof captured by assembler.",
+    "source_sha": "79a39406b48cde12f7ba37741274c6d0f00b961b",
+    "workflow_run_id": 36445943648
+  },
+  "total_stake": 40000000,
+  "unobserved_stake": 0,
+  "validator_set_id": 1
+}
