@@ -27,6 +27,65 @@ enum DurableAbsenceVoteCollection {
     Added(Option<arc_consensus::view_change::SkipCertificate>),
 }
 
+/// Connectivity is a transport readiness check, not an authority decision.
+/// Keep the historical full-committee barrier only at explicitly configured
+/// genesis; recovery-round participation is enforced separately by the
+/// engine's verified-parent quorum gate.
+fn connected_validator_quorum(
+    validator_set: &ValidatorSet,
+    connected: &std::collections::HashSet<Hash256>,
+    require_full_committee: bool,
+) -> bool {
+    if require_full_committee
+        && !validator_set
+            .validators
+            .iter()
+            .filter(|validator| validator.stake > 0)
+            .all(|validator| connected.contains(&validator.address))
+    {
+        return false;
+    }
+    let connected: Vec<_> = connected.iter().copied().collect();
+    validator_set.stake_for_addresses(&connected) >= validator_set.quorum
+}
+
+/// The node checks this before draining its mempool. Delegate parent
+/// authority to the same engine rule used by advance/receive/propose.
+fn proposal_parent_quorum(engine: &ConsensusEngine, current_round: u64) -> bool {
+    current_round == 0
+        || engine.is_recovery_bootstrap_round(current_round)
+        || engine.has_quorum_parents_for_round(current_round.saturating_sub(1))
+}
+
+/// Supply the exact verified authority needed by this bounded history window.
+/// A peer that was offline during the original gossip cannot reconstruct a
+/// quorum certificate from blocks or from its own absence observation.
+fn history_absence_certificates(
+    engine: &ConsensusEngine,
+    blocks: &[arc_consensus::DagBlock],
+) -> Vec<arc_consensus::view_change::SkipCertificate> {
+    let mut rounds = std::collections::BTreeSet::new();
+    for block in blocks.iter().take(HISTORY_MAX_BLOCKS) {
+        rounds.insert(block.round);
+        if let Some(parent_round) = block.round.checked_sub(1) {
+            rounds.insert(parent_round);
+        }
+    }
+    let validators = engine.frozen_validator_set();
+    let mut certificates = Vec::new();
+    for round in rounds {
+        for validator in &validators.validators {
+            if let Some(certificate) = engine.skip_certificate(round, &validator.address) {
+                certificates.push(certificate);
+                if certificates.len() == HISTORY_MAX_BLOCKS {
+                    return certificates;
+                }
+            }
+        }
+    }
+    certificates
+}
+
 /// Add a locally signed absence vote only after its no-equivocation decision
 /// is already durable. Peer votes use the same collector through the inbound
 /// path; counting the local vote here makes the threshold identical for both.
@@ -1390,22 +1449,101 @@ impl ConsensusManager {
     /// in that case.
     fn adopt_absence_certificate(
         &self,
+        state: &StateDB,
         certificate: &arc_consensus::view_change::SkipCertificate,
         tracker: &mut Option<arc_consensus::view_change::SkipTracker>,
         outbound: Option<&tokio::sync::mpsc::Sender<OutboundMessage>>,
     ) -> bool {
+        let Some(domain) = self.engine.certificate_domain() else {
+            return false;
+        };
+        let frozen = self.engine.frozen_validator_set();
+        if certificate.verify(&domain, &frozen).is_err() {
+            return false;
+        }
+        drop(frozen);
+        if self
+            .engine
+            .has_skip_certificate(certificate.round, &certificate.absentee)
+        {
+            return true;
+        }
+
+        if self.engine.requires_full_round_participation() {
+            let Some(writer_slot) = &self.recovery_dag_writer else {
+                return false;
+            };
+            let (floor, ceiling) = {
+                let slot = writer_slot.lock();
+                let Some(writer) = slot.as_ref() else {
+                    return false;
+                };
+                (
+                    writer.retention_floor_round(),
+                    writer.retention_ceiling_round(),
+                )
+            };
+            if certificate.round < floor || certificate.round > ceiling {
+                return false;
+            }
+            let Ok(payload) = bincode::serialize(certificate) else {
+                return false;
+            };
+            let record = RetainedDagRecord::absence_certificate(
+                certificate.round,
+                arc_crypto::hash_bytes(&payload),
+                payload,
+            );
+            let mut slot = writer_slot.lock();
+            let Some(mut writer) = slot.take() else {
+                return false;
+            };
+            // Compaction must account for the upcoming certificate before it
+            // is appended. A rollover may move the retention floor, so check
+            // the exact resulting writer again before authorizing anything.
+            if let Some(rollover) = &self.recovery_dag_rollover {
+                writer = match rollover.prepare_append(
+                    state,
+                    &self.engine,
+                    writer,
+                    std::slice::from_ref(&record),
+                ) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        error!(%error, round = certificate.round, "Could not prepare durable absence-certificate append");
+                        return false;
+                    }
+                };
+            }
+            if certificate.round < writer.retention_floor_round()
+                || certificate.round > writer.retention_ceiling_round()
+            {
+                *slot = Some(writer);
+                return false;
+            }
+            if let Err(error) = writer.append_batch(&[record], ActiveDurability::Fsync) {
+                error!(%error, round = certificate.round, "Could not fsync durable absence certificate");
+                *slot = Some(writer);
+                return false;
+            }
+            *slot = Some(writer);
+        }
+
+        if let Some(tracker) = tracker.as_mut() {
+            tracker.adopt_certificate(certificate);
+            // Preserve the observed choice before using the certificate. The
+            // typed recovery-DAG record remains the participation authority.
+            if !self.persist_signing_record(tracker.record()) && self.signing_record_path.is_some()
+            {
+                return false;
+            }
+        }
         if self
             .engine
             .register_skip_certificate(certificate.clone())
             .is_err()
         {
             return false;
-        }
-        if let Some(tracker) = tracker.as_mut() {
-            tracker.adopt_certificate(certificate);
-            // Adopting inherits the permanent refusal, so it must be durable
-            // before this node acts on it.
-            let _ = self.persist_signing_record(tracker.record());
         }
         if let Some(tx_chan) = outbound {
             let _ = tx_chan.try_send(OutboundMessage::BroadcastAbsenceCertificate(
@@ -2767,6 +2905,7 @@ impl ConsensusManager {
                 match skip_vote_collector.add(vote, &domain, &set) {
                     Ok(Some(certificate)) => {
                         if self.adopt_absence_certificate(
+                            &state,
                             &certificate,
                             &mut skip_tracker,
                             outbound_tx.as_ref(),
@@ -2792,6 +2931,7 @@ impl ConsensusManager {
                     continue;
                 }
                 if !self.adopt_absence_certificate(
+                    &state,
                     &certificate,
                     &mut skip_tracker,
                     outbound_tx.as_ref(),
@@ -3200,11 +3340,14 @@ impl ConsensusManager {
                     "Serving bounded DAG history"
                 );
                 if let Some(ref tx_chan) = outbound_tx {
-                    let _ = tx_chan.try_send(OutboundMessage::SendDagHistoryResponse {
+                    let absence_certificates = history_absence_certificates(&self.engine, &blocks);
+                    let sent = tx_chan.try_send(OutboundMessage::SendDagHistoryResponse {
                         target: source,
                         blocks,
                         transactions,
+                        absence_certificates,
                     });
+                    crate::consensus_diagnostics::note_send(&sent);
                 }
             }
             let mut bootstrap_reject_logged = false;
@@ -3723,6 +3866,7 @@ impl ConsensusManager {
                 // ends before the shared adoption helper updates its record.
                 for certificate in locally_assembled_absence_certificates {
                     if self.adopt_absence_certificate(
+                        &state,
                         &certificate,
                         &mut skip_tracker,
                         outbound_tx.as_ref(),
@@ -3795,31 +3939,15 @@ impl ConsensusManager {
             let already_proposed = last_proposed_round == Some(current_round);
             let has_connected_quorum = if multi_validator {
                 let vs = self.engine.validator_set();
-                let mut connected_stake = 0u64;
-                let mut seen_validators = std::collections::HashSet::new();
-                seen_validators.insert(self.validator_address);
-                if let Some(validator) = vs.get_validator(&self.validator_address) {
-                    connected_stake = validator.stake;
-                }
+                let mut connected = std::collections::HashSet::new();
+                connected.insert(self.validator_address);
                 for (address, generation) in connected_validators.iter() {
-                    if generation.connected
-                        && seen_validators.insert(*address)
-                        && let Some(validator) = vs.get_validator(address)
-                    {
-                        connected_stake = connected_stake
-                            .checked_add(validator.stake)
-                            .expect("unique connected stake cannot exceed validator-set total");
+                    if generation.connected && vs.is_validator(address) {
+                        connected.insert(*address);
                     }
                 }
                 let genesis_barrier = self.require_full_committee_at_genesis && current_round == 0;
-                if self.engine.requires_full_round_participation() || genesis_barrier {
-                    vs.validators
-                        .iter()
-                        .filter(|validator| validator.stake > 0)
-                        .all(|validator| seen_validators.contains(&validator.address))
-                } else {
-                    connected_stake >= vs.quorum
-                }
+                connected_validator_quorum(&vs, &connected, genesis_barrier)
             } else {
                 true
             };
@@ -3859,33 +3987,7 @@ impl ConsensusManager {
             // IMPORTANT: Check parent readiness BEFORE draining the mempool.
             // If the peer's block from the previous round hasn't arrived yet,
             // we would fail to propose and lose the drained transactions.
-            let has_quorum_parents =
-                if current_round == 0 || self.engine.is_recovery_bootstrap_round(current_round) {
-                    true // Genesis of a legacy or signed recovery DAG domain
-                } else {
-                    let vs = self.engine.validator_set();
-                    let prev_blocks = self.engine.blocks_in_round(current_round - 1);
-                    let mut parent_stake = 0u64;
-                    let mut seen_authors = std::collections::HashSet::new();
-                    for hash in &prev_blocks {
-                        if let Some(block) = self.engine.get_block(hash)
-                            && let Some(validator) = vs.get_validator(&block.author)
-                            && seen_authors.insert(block.author)
-                        {
-                            parent_stake = parent_stake
-                                .checked_add(validator.stake)
-                                .expect("unique parent stake cannot exceed validator-set total");
-                        }
-                    }
-                    if self.engine.requires_full_round_participation() {
-                        vs.validators
-                            .iter()
-                            .filter(|validator| validator.stake > 0)
-                            .all(|validator| seen_authors.contains(&validator.address))
-                    } else {
-                        parent_stake >= vs.quorum
-                    }
-                };
+            let has_quorum_parents = proposal_parent_quorum(&self.engine, current_round);
 
             // ── VRF proposer eligibility check ──────────────────────────
             // In DAG consensus, ALL validators propose every round - that's
@@ -5218,6 +5320,212 @@ mod tests {
     use arc_types::{Account, AccountChange, StateDiff, Transaction, TxType};
 
     #[test]
+    fn recovery_parent_gate_uses_quorum_and_exact_verified_absences() {
+        use arc_consensus::view_change::{
+            AbsenceReason, SkipCertificate, SkipVote, validator_set_hash,
+        };
+
+        let keys: Vec<_> = (0..6)
+            .map(|index| {
+                KeyPair::from_ed25519_secret_bytes(
+                    &hash_bytes(format!("proposal-parent-gate-{index}").as_bytes()).0,
+                )
+            })
+            .collect();
+        let set = ValidatorSet::new(
+            keys.iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    let stake = if index < 4 { 6_666_667 } else { 6_666_666 };
+                    Validator::new(key.address(), stake, index as u16).unwrap()
+                })
+                .collect(),
+            1,
+        );
+        assert_eq!(set.quorum, 26_666_667);
+        let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"proposal-parent-gate"), 2, 7);
+        let engines: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let engine =
+                    ConsensusEngine::new_with_keypair(set.clone(), key.address(), key.clone());
+                for registered in &keys {
+                    engine.register_validator_key(
+                        registered.address(),
+                        registered.public_key_bytes().try_into().unwrap(),
+                    );
+                }
+                engine.install_consensus_domain(domain).unwrap();
+                engine.install_recovery_cursor(100).unwrap();
+                engine
+            })
+            .collect();
+        let bootstrap: Vec<_> = engines
+            .iter()
+            .enumerate()
+            .map(|(index, engine)| engine.propose_block(vec![], 1_000 + index as u64).unwrap())
+            .collect();
+        for block in bootstrap.iter().skip(1).take(3) {
+            engines[0].receive_block(block).unwrap();
+        }
+        assert!(
+            !proposal_parent_quorum(&engines[0], 102),
+            "a stake quorum still needs exact certificates for both absent members"
+        );
+
+        let set_hash = validator_set_hash(&set);
+        for absentee_index in [4usize, 5] {
+            let votes = keys[..4]
+                .iter()
+                .map(|key| {
+                    SkipVote::sign(
+                        domain,
+                        set_hash,
+                        101,
+                        keys[absentee_index].address(),
+                        AbsenceReason::NoBlock,
+                        set.quorum,
+                        key,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            engines[0]
+                .register_skip_certificate(SkipCertificate::new(
+                    domain,
+                    set_hash,
+                    101,
+                    keys[absentee_index].address(),
+                    AbsenceReason::NoBlock,
+                    votes,
+                ))
+                .unwrap();
+        }
+        assert!(proposal_parent_quorum(&engines[0], 102));
+        assert!(engines[0].advance_round());
+        assert_eq!(
+            engines[0]
+                .propose_block(vec![], 2_000)
+                .unwrap()
+                .parents
+                .len(),
+            4
+        );
+
+        // Certificates never contribute stake. Three parent authors remain
+        // below quorum even when every other member has a valid certificate.
+        let under_quorum = &engines[2];
+        for block in bootstrap.iter().take(2) {
+            under_quorum.receive_block(block).unwrap();
+        }
+        for absentee_index in [3usize, 4, 5] {
+            let votes = keys[..4]
+                .iter()
+                .map(|key| {
+                    SkipVote::sign(
+                        domain,
+                        set_hash,
+                        101,
+                        keys[absentee_index].address(),
+                        AbsenceReason::NoBlock,
+                        set.quorum,
+                        key,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            under_quorum
+                .register_skip_certificate(SkipCertificate::new(
+                    domain,
+                    set_hash,
+                    101,
+                    keys[absentee_index].address(),
+                    AbsenceReason::NoBlock,
+                    votes,
+                ))
+                .unwrap();
+        }
+        assert!(
+            !proposal_parent_quorum(under_quorum, 102),
+            "certificates replace missing membership only; they do not count stake"
+        );
+
+        // A certificate for the wrong round must not excuse either absent
+        // author from the parent round being checked.
+        let wrong_round = &engines[1];
+        for block in bootstrap.iter().take(4) {
+            if block.author != keys[1].address() {
+                wrong_round.receive_block(block).unwrap();
+            }
+        }
+        for absentee_index in [4usize, 5] {
+            let votes = keys[..4]
+                .iter()
+                .map(|key| {
+                    SkipVote::sign(
+                        domain,
+                        set_hash,
+                        100,
+                        keys[absentee_index].address(),
+                        AbsenceReason::NoBlock,
+                        set.quorum,
+                        key,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            wrong_round
+                .register_skip_certificate(SkipCertificate::new(
+                    domain,
+                    set_hash,
+                    100,
+                    keys[absentee_index].address(),
+                    AbsenceReason::NoBlock,
+                    votes,
+                ))
+                .unwrap();
+        }
+        assert!(
+            !proposal_parent_quorum(wrong_round, 102),
+            "certificates for round 100 cannot excuse missing parents in round 101"
+        );
+        assert!(!wrong_round.advance_round());
+    }
+
+    #[test]
+    fn connected_quorum_is_not_a_full_committee_gate_except_at_genesis() {
+        let keys: Vec<_> = (0..6)
+            .map(|index| {
+                KeyPair::from_ed25519_secret_bytes(
+                    &hash_bytes(format!("connected-quorum-{index}").as_bytes()).0,
+                )
+            })
+            .collect();
+        let set = ValidatorSet::new(
+            keys.iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    let stake = if index < 4 { 6_666_667 } else { 6_666_666 };
+                    Validator::new(key.address(), stake, index as u16).unwrap()
+                })
+                .collect(),
+            1,
+        );
+        let four_connected: std::collections::HashSet<_> =
+            keys[..4].iter().map(KeyPair::address).collect();
+        assert!(connected_validator_quorum(&set, &four_connected, false));
+        assert!(!connected_validator_quorum(&set, &four_connected, true));
+
+        let three_connected: std::collections::HashSet<_> =
+            keys[..3].iter().map(KeyPair::address).collect();
+        assert!(!connected_validator_quorum(&set, &three_connected, false));
+
+        let all_connected: std::collections::HashSet<_> =
+            keys.iter().map(KeyPair::address).collect();
+        assert!(connected_validator_quorum(&set, &all_connected, true));
+    }
+
+    #[test]
     fn durable_local_absence_vote_completes_exact_four_of_six_quorum() {
         use arc_consensus::view_change::{
             AbsenceReason, ConsensusSigningRecord, SkipVote, validator_set_hash,
@@ -6313,6 +6621,7 @@ mod tests {
                             height: baseline.header.height,
                             block_hash: baseline.hash,
                             state_root: baseline.header.state_root,
+                            dag_anchor: None,
                         },
                         dag_cursor: DagCursor {
                             committed_block_count: 0,
@@ -6409,6 +6718,227 @@ mod tests {
                 .unwrap();
             records
         }
+    }
+
+    #[test]
+    fn recovery_absence_certificate_is_fsynced_before_engine_authority() {
+        use crate::recovery_dag_wal::RetainedRecordKind;
+        use arc_consensus::view_change::{
+            AbsenceReason, SkipCertificate, SkipVote, validator_set_hash,
+        };
+
+        let f = HistoryDurabilityFixture::new();
+        let absentee = f.keys[5].address();
+        let set = f.manager.engine.frozen_validator_set();
+        let set_hash = validator_set_hash(&set);
+        let votes = f.keys[..4]
+            .iter()
+            .map(|key| {
+                SkipVote::sign(
+                    f.domain,
+                    set_hash,
+                    65,
+                    absentee,
+                    AbsenceReason::NoBlock,
+                    set.quorum,
+                    key,
+                )
+                .unwrap()
+            })
+            .collect();
+        drop(set);
+        let certificate = SkipCertificate::new(
+            f.domain,
+            set_hash,
+            65,
+            absentee,
+            AbsenceReason::NoBlock,
+            votes,
+        );
+
+        assert!(
+            f.manager
+                .adopt_absence_certificate(&f.state, &certificate, &mut None, None,)
+        );
+        assert!(f.manager.engine.has_skip_certificate(65, &absentee));
+        let writer_slot = f.manager.recovery_dag_writer.as_ref().unwrap();
+        assert_eq!(
+            writer_slot
+                .lock()
+                .as_ref()
+                .unwrap()
+                .inspection()
+                .record_count,
+            1
+        );
+        assert!(
+            f.manager
+                .adopt_absence_certificate(&f.state, &certificate, &mut None, None,)
+        );
+        assert_eq!(
+            writer_slot
+                .lock()
+                .as_ref()
+                .unwrap()
+                .inspection()
+                .record_count,
+            1,
+            "already-held certificates must not append a duplicate"
+        );
+
+        let future_votes = f.keys[..4]
+            .iter()
+            .map(|key| {
+                SkipVote::sign(
+                    f.domain,
+                    set_hash,
+                    66,
+                    absentee,
+                    AbsenceReason::NoBlock,
+                    26_666_667,
+                    key,
+                )
+                .unwrap()
+            })
+            .collect();
+        let future_certificate = SkipCertificate::new(
+            f.domain,
+            set_hash,
+            66,
+            absentee,
+            AbsenceReason::NoBlock,
+            future_votes,
+        );
+        assert!(f.manager.adopt_absence_certificate(
+            &f.state,
+            &future_certificate,
+            &mut None,
+            None,
+        ));
+        assert!(f.manager.engine.has_skip_certificate(66, &absentee));
+
+        // A peer offline during the original certificate gossip must receive
+        // the needed parent-round authority with its requested history.
+        let child = f.block(0, 66, vec![], vec![]);
+        let certificates = history_absence_certificates(&f.manager.engine, &[child.clone(), child]);
+        assert_eq!(
+            certificates.len(),
+            2,
+            "duplicate blocks must not duplicate certificates"
+        );
+        assert!(history_absence_certificates(&f.manager.engine, &[]).is_empty());
+        let catchup = HistoryDurabilityFixture::new();
+        let parents: Vec<_> = (0..5)
+            .map(|author| f.block(author, 65, vec![], vec![]))
+            .collect();
+        catchup.import(&parents, &[]).unwrap();
+        assert_eq!(catchup.manager.engine.current_round(), 65);
+        let dependent = f.block(
+            0,
+            66,
+            parents.iter().map(|block| block.hash).collect(),
+            vec![],
+        );
+        assert!(catchup.manager.engine.receive_block(&dependent).is_err());
+        for certificate in certificates {
+            assert!(catchup.manager.adopt_absence_certificate(
+                &catchup.state,
+                &certificate,
+                &mut None,
+                None,
+            ));
+        }
+        catchup.import(&parents, &[]).unwrap();
+        assert_eq!(catchup.manager.engine.current_round(), 66);
+        catchup.manager.engine.receive_block(&dependent).unwrap();
+
+        let records = f.records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].kind, RetainedRecordKind::AbsenceCertificate);
+        assert_eq!(records[0].round, 65);
+        assert_eq!(
+            bincode::deserialize::<SkipCertificate>(&records[0].payload).unwrap(),
+            certificate
+        );
+        assert_eq!(records[1].round, 66);
+        assert_eq!(
+            bincode::deserialize::<SkipCertificate>(&records[1].payload).unwrap(),
+            future_certificate
+        );
+
+        let above_ceiling = HistoryDurabilityFixture::new();
+        let above_votes = above_ceiling.keys[..4]
+            .iter()
+            .map(|key| {
+                SkipVote::sign(
+                    above_ceiling.domain,
+                    set_hash,
+                    101,
+                    above_ceiling.keys[5].address(),
+                    AbsenceReason::NoBlock,
+                    26_666_667,
+                    key,
+                )
+                .unwrap()
+            })
+            .collect();
+        let above_certificate = SkipCertificate::new(
+            above_ceiling.domain,
+            set_hash,
+            101,
+            above_ceiling.keys[5].address(),
+            AbsenceReason::NoBlock,
+            above_votes,
+        );
+        assert!(!above_ceiling.manager.adopt_absence_certificate(
+            &above_ceiling.state,
+            &above_certificate,
+            &mut None,
+            None,
+        ));
+        assert!(
+            !above_ceiling
+                .manager
+                .engine
+                .has_skip_certificate(101, &above_ceiling.keys[5].address())
+        );
+
+        let mut missing_writer = HistoryDurabilityFixture::new();
+        missing_writer.manager.recovery_dag_writer = None;
+        let fresh_certificate = SkipCertificate::new(
+            missing_writer.domain,
+            set_hash,
+            65,
+            missing_writer.keys[5].address(),
+            AbsenceReason::NoBlock,
+            f.keys[..4]
+                .iter()
+                .map(|key| {
+                    SkipVote::sign(
+                        missing_writer.domain,
+                        set_hash,
+                        65,
+                        missing_writer.keys[5].address(),
+                        AbsenceReason::NoBlock,
+                        26_666_667,
+                        key,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+        assert!(!missing_writer.manager.adopt_absence_certificate(
+            &missing_writer.state,
+            &fresh_certificate,
+            &mut None,
+            None,
+        ));
+        assert!(
+            !missing_writer
+                .manager
+                .engine
+                .has_skip_certificate(65, &missing_writer.keys[5].address())
+        );
     }
 
     #[test]
@@ -6530,6 +7060,7 @@ mod tests {
                         height: baseline.header.height,
                         block_hash: baseline.hash,
                         state_root: baseline.header.state_root,
+                        dag_anchor: None,
                     },
                     dag_cursor: DagCursor {
                         committed_block_count: 1,

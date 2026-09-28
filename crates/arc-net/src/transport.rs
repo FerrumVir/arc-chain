@@ -288,6 +288,10 @@ pub enum OutboundMessage {
         target: Hash256,
         blocks: Vec<DagBlock>,
         transactions: Vec<Transaction>,
+        /// Existing certificate messages sent to this requester before the
+        /// unchanged history message. They restore missing-parent authority
+        /// even when the original certificate gossip happened while offline.
+        absence_certificates: Vec<arc_consensus::view_change::SkipCertificate>,
     },
     SendCheckpointRequest {
         target: Hash256,
@@ -1668,7 +1672,17 @@ async fn run_transport_inner(
                     target,
                     blocks,
                     transactions,
+                    absence_certificates,
                 } => {
+                    for certificate in absence_certificates {
+                        let payload =
+                            crate::protocol::ConsensusAbsenceCertificateMessage { certificate };
+                        if let Ok(bytes) = bincode::serialize(&payload) {
+                            conn_out
+                                .send_to(&target, MessageType::ConsensusAbsenceCertificate, &bytes)
+                                .await;
+                        }
+                    }
                     let payload = crate::protocol::DagHistoryResponseMessage {
                         blocks,
                         transactions,

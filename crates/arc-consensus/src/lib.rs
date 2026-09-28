@@ -1291,6 +1291,49 @@ impl ConsensusEngine {
         self.consensus_domain.read().is_some()
     }
 
+    /// Whether the unique authors in a round satisfy stake quorum and the
+    /// recovery-domain absence-certificate rule. This is shared by round
+    /// advancement, block validation, and the node's pre-drain proposal gate
+    /// so those paths cannot disagree about a certified missing parent.
+    fn round_participation_satisfies_quorum(
+        &self,
+        validator_set: &ValidatorSet,
+        round: u64,
+        authors: &HashSet<Address>,
+        stake: u64,
+    ) -> bool {
+        stake >= validator_set.quorum
+            && (!self.requires_full_round_participation()
+                || validator_set
+                    .validators
+                    .iter()
+                    .filter(|validator| validator.stake > 0)
+                    .all(|validator| {
+                        authors.contains(&validator.address)
+                            || self.is_excused_for_round(round, &validator.address)
+                    }))
+    }
+
+    /// Check whether `round` contains enough authenticated parent authors for
+    /// the next proposal. Certified absences satisfy only the fixed-member
+    /// participation rule; they never contribute stake toward quorum.
+    pub fn has_quorum_parents_for_round(&self, round: u64) -> bool {
+        let validator_set = self.validator_set.read();
+        let mut authors = HashSet::new();
+        let mut stake = 0u64;
+        for hash in self.blocks_in_round(round) {
+            if let Some(block) = self.dag.get(&hash)
+                && authors.insert(block.author)
+                && let Some(validator) = validator_set.get_validator(&block.author)
+            {
+                stake = stake
+                    .checked_add(validator.stake)
+                    .expect("unique parent stake cannot exceed validator-set total");
+            }
+        }
+        self.round_participation_satisfies_quorum(&validator_set, round, &authors, stake)
+    }
+
     /// Get the current round number.
     pub fn current_round(&self) -> u64 {
         self.current_round.load(Ordering::SeqCst)
@@ -1331,100 +1374,43 @@ impl ConsensusEngine {
         }
     }
 
-    /// Restore one locally persisted commit after its complete DAG block has
-    /// been revalidated in the active recovery domain.
-    ///
-    /// Commit records must be contiguous from the signed bootstrap cursor and
-    /// can only name a block for which the local WAL also contains the full
-    /// two-round DAG window. The state layer separately checks that the count
-    /// of these records matches the post-transition canonical block count.
+    /// Reconstruct exactly one canonical decision from the authenticated local
+    /// recovery DAG. This shares the live commit rule, so absent leader rounds
+    /// are passed only when a later certified anchor's causal history decides
+    /// them. Absence certificates by themselves never authorize a commit skip.
+    /// No live pruning/slashing runs while startup is validating the history.
+    pub fn restore_next_recovery_commit_from_local_wal(&self) -> Result<DagBlock, ConsensusError> {
+        if self.consensus_domain.read().is_none()
+            || !self.local_recovery_replay_active.load(Ordering::SeqCst)
+        {
+            return Err(ConsensusError::InvalidBlock(
+                "recovery commit replay requires an active bound local generation".into(),
+            ));
+        }
+        self.try_commit_limited(1, false)
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ConsensusError::InvalidBlock(
+                    "recovery DAG has no certified next canonical decision".into(),
+                )
+            })
+    }
+
+    /// Match a durable commit record against the next actual consensus
+    /// decision. Startup aborts on any mismatch before networking can start.
     pub fn restore_recovery_commit_from_local_wal(
         &self,
         block_hash: Hash256,
     ) -> Result<u64, ConsensusError> {
-        if self.consensus_domain.read().is_none() || self.recovery_bootstrap_round.read().is_none()
-        {
-            return Err(ConsensusError::InvalidBlock(
-                "recovery commit replay requires a bound recovery domain/cursor".into(),
-            ));
-        }
-        let block = self.dag.get(&block_hash).ok_or_else(|| {
-            ConsensusError::InvalidBlock(format!(
-                "recovery commit {} has no validated DAG block",
-                block_hash
-            ))
-        })?;
-        let expected_round = self.last_committed_round.load(Ordering::SeqCst);
-        if block.round != expected_round {
+        let block = self.restore_next_recovery_commit_from_local_wal()?;
+        if block.hash != block_hash {
             return Err(ConsensusError::InvalidBlock(format!(
-                "non-contiguous recovery commit: expected round {expected_round}, got {}",
-                block.round
+                "recovery commit {block_hash} differs from next certified decision {}",
+                block.hash
             )));
         }
-        let proof_round = block.round.checked_add(2).ok_or_else(|| {
-            ConsensusError::InvalidBlock("recovery commit proof round overflows u64".into())
-        })?;
-        if self.current_round.load(Ordering::SeqCst) < proof_round {
-            return Err(ConsensusError::InvalidBlock(format!(
-                "recovery commit for round {} lacks its complete two-round DAG window",
-                block.round
-            )));
-        }
-        let mut leaders: Vec<_> = self
-            .frozen_validator_set
-            .read()
-            .validators
-            .iter()
-            .map(|validator| validator.address)
-            .collect();
-        leaders.sort_by_key(|address| address.0);
-        let Some(leader) = leaders.get(block.round as usize % leaders.len().max(1)) else {
-            return Err(ConsensusError::InvalidBlock(
-                "recovery commit cannot be verified with an empty validator set".into(),
-            ));
-        };
-        if &block.author != leader {
-            return Err(ConsensusError::InvalidBlock(format!(
-                "recovery commit {} is not the deterministic leader block for round {}",
-                block_hash, block.round
-            )));
-        }
-        let vs = self.frozen_validator_set.read();
-        let certified = self
-            .blocks_in_round(block.round + 1)
-            .into_iter()
-            .filter_map(|hash| self.dag.get(&hash).map(|candidate| candidate.clone()))
-            .filter(|candidate| candidate.parents.contains(&block_hash))
-            .any(|candidate| {
-                let mut support = 0u64;
-                let mut authors = HashSet::new();
-                for hash in self.blocks_in_round(block.round + 2) {
-                    if let Some(certifier) = self.dag.get(&hash)
-                        && certifier.parents.contains(&candidate.hash)
-                        && authors.insert(certifier.author)
-                        && let Some(validator) = vs.get_validator(&certifier.author)
-                    {
-                        support = support
-                            .checked_add(validator.stake)
-                            .expect("unique certifier stake cannot exceed total stake");
-                    }
-                }
-                support >= vs.quorum
-            });
-        if !certified {
-            return Err(ConsensusError::InvalidBlock(format!(
-                "recovery commit {} lacks a valid two-round quorum certificate",
-                block_hash
-            )));
-        }
-        let next = block.round.checked_add(1).ok_or_else(|| {
-            ConsensusError::InvalidBlock("recovery commit cursor overflows u64".into())
-        })?;
-        if !self.committed.read().contains(&block_hash) {
-            self.committed.write().push(block_hash);
-        }
-        self.last_committed_round.store(next, Ordering::SeqCst);
-        Ok(next)
+        Ok(self.last_committed_round())
     }
 
     /// Record an unauthenticated peer round hint without mutating consensus
@@ -1710,20 +1696,16 @@ impl ConsensusEngine {
                 }
             }
 
-            let full_recovery_participation = !self.requires_full_round_participation()
-                || vs
-                    .validators
-                    .iter()
-                    .filter(|v| v.stake > 0)
-                    .all(|validator| {
-                        seen_parent_authors.contains(&validator.address)
-                            || self.is_excused_for_round(prev_round, &validator.address)
-                    });
             // A local timeout or testnet flag is still not a quorum
             // certificate. The only thing that excuses a missing fixed
             // validator parent is an authenticated quorum skip certificate for
             // that exact round. Late blocks may still be committed.
-            if accumulated_stake < vs.quorum || !full_recovery_participation {
+            if !self.round_participation_satisfies_quorum(
+                &vs,
+                prev_round,
+                &seen_parent_authors,
+                accumulated_stake,
+            ) {
                 return Err(ConsensusError::InsufficientParents);
             }
 
@@ -2012,20 +1994,16 @@ impl ConsensusEngine {
             }
 
             let parent_round = block.round.saturating_sub(1);
-            let full_recovery_participation = !self.requires_full_round_participation()
-                || vs
-                    .validators
-                    .iter()
-                    .filter(|v| v.stake > 0)
-                    .all(|validator| {
-                        seen_parent_authors.contains(&validator.address)
-                            || self.is_excused_for_round(parent_round, &validator.address)
-                    });
             // A local timeout or testnet flag is still not a parent
             // certificate. Recovery blocks must carry one known prior-round
             // parent author for every fixed positive-stake validator that an
             // authenticated skip certificate has not excused for that round.
-            if parent_stake < vs.quorum || !full_recovery_participation {
+            if !self.round_participation_satisfies_quorum(
+                &vs,
+                parent_round,
+                &seen_parent_authors,
+                parent_stake,
+            ) {
                 return Err(ConsensusError::InsufficientParents);
             }
         }
@@ -2712,6 +2690,14 @@ impl ConsensusEngine {
     /// # Returns
     /// Newly committed blocks in causal order.
     pub fn try_commit(&self) -> Vec<DagBlock> {
+        self.try_commit_limited(usize::MAX, true)
+    }
+
+    fn try_commit_limited(
+        &self,
+        maximum_blocks: usize,
+        maintain_live_state: bool,
+    ) -> Vec<DagBlock> {
         // Before first epoch freeze (epoch=0), DON'T commit - wait for
         // the validator set to stabilize. This prevents nodes from
         // committing their own blocks with a 1-validator frozen set.
@@ -2775,7 +2761,7 @@ impl ConsensusEngine {
         };
 
         let mut r = scan_start;
-        while r <= scan_end {
+        while r <= scan_end && newly_committed.len() < maximum_blocks {
             if frozen_vals.is_empty() {
                 break;
             }
@@ -2931,6 +2917,10 @@ impl ConsensusEngine {
                     committed.push(block.hash);
                 }
             }
+        }
+
+        if !maintain_live_state {
+            return newly_committed;
         }
 
         // Drop the read lock before security checks that may need write access
@@ -3217,16 +3207,9 @@ impl ConsensusEngine {
             }
         }
 
-        let full_recovery_participation = !self.requires_full_round_participation()
-            || vs
-                .validators
-                .iter()
-                .filter(|v| v.stake > 0)
-                .all(|validator| {
-                    seen_authors.contains(&validator.address)
-                        || self.is_excused_for_round(current, &validator.address)
-                });
-        if round_stake >= vs.quorum && full_recovery_participation {
+        let certified_participation =
+            self.round_participation_satisfies_quorum(&vs, current, &seen_authors, round_stake);
+        if certified_participation {
             let Some(new_round) = current.checked_add(1) else {
                 warn!(round = current, "Cannot advance beyond u64::MAX round");
                 return false;
@@ -3249,7 +3232,7 @@ impl ConsensusEngine {
                 round = current,
                 stake = round_stake,
                 quorum = vs.quorum,
-                full_recovery_participation,
+                certified_participation,
                 "Cannot advance round: insufficient certified participation"
             );
             false
