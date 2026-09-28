@@ -18,6 +18,19 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.2 - Release-preparation snapshot (2026-09-28)
+
+> **Publication retry note:** The protected v0.8.1 tag is immutable, but its
+> publication workflow failed before assets were uploaded. This source targets
+> v0.8.2; this entry does not claim that release assets are published or that
+> the fleet has been upgraded. Verify those states only from exact release and
+> signed rollout evidence.
+
+- Retargets application manifests, release acceptance, and install guidance to
+  the new exact v0.8.2 tag while preserving v0.8.1 and v0.8.0 records below.
+- Fixes nested health-regex shell quoting and adds a focused workflow smoke
+  regression before attempting publication under the new immutable tag.
+
 ## v0.8.1 - Release-preparation snapshot (2026-09-28)
 
 > **Release-preparation note:** This source snapshot prepares v0.8.1; it does

@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn ignores_untrusted_or_unpublished_releases() {
-        let trusted = release("0.8.1");
+        let trusted = release("0.8.2");
         for mutate in [
             |release: &mut GithubRelease| release.draft = true,
             |release: &mut GithubRelease| release.prerelease = true,
@@ -465,26 +465,26 @@ mod tests {
             let selected = select_release(&[untrusted, trusted.clone()])
                 .unwrap()
                 .unwrap();
-            assert_eq!(selected.tag, "v0.8.1");
+            assert_eq!(selected.tag, "v0.8.2");
         }
     }
 
     #[test]
     fn rejects_tampered_required_asset_metadata() {
-        let mut bad_digest = release("0.8.1");
+        let mut bad_digest = release("0.8.2");
         bad_digest.assets[0].digest = Some("sha256:not-a-digest".into());
         assert!(select_release(&[bad_digest]).is_err());
 
-        let mut wrong_uploader = release("0.8.1");
+        let mut wrong_uploader = release("0.8.2");
         wrong_uploader.assets[0].uploader = Some(actor("attacker"));
         assert!(select_release(&[wrong_uploader]).is_err());
 
-        let mut moving_url = release("0.8.1");
+        let mut moving_url = release("0.8.2");
         moving_url.assets[0].browser_download_url =
             "https://github.com/FerrumVir/arc-chain/releases/latest/download/latest.json".into();
         assert!(select_release(&[moving_url]).is_err());
 
-        let mut duplicate = release("0.8.1");
+        let mut duplicate = release("0.8.2");
         duplicate.assets.push(duplicate.assets[0].clone());
         assert!(select_release(&[duplicate]).is_err());
     }
@@ -492,17 +492,17 @@ mod tests {
     #[test]
     fn rejects_non_strict_tags_and_ambiguous_versions() {
         for tag in [
-            "0.8.1",
+            "0.8.2",
             "v0.8",
-            "v00.8.1",
-            "v0.8.1-rc.1",
-            "v0.8.1+build",
-            "v0.8.1/latest",
+            "v00.8.2",
+            "v0.8.2-rc.1",
+            "v0.8.2+build",
+            "v0.8.2/latest",
         ] {
             assert_eq!(strict_release_version(tag), None, "accepted {tag}");
         }
 
-        let first = release("0.8.1");
+        let first = release("0.8.2");
         let mut duplicate = first.clone();
         duplicate.id += 100;
         assert!(select_release(&[first, duplicate]).is_err());
@@ -521,19 +521,19 @@ mod tests {
 
     #[test]
     fn manifest_must_bind_version_target_and_exact_tag_payload() {
-        let selected = validate_channel_release(&release("0.8.1"), Version::new(0, 8, 1)).unwrap();
-        let exact = release_asset_url("v0.8.1", "arc-desktop-windows-x86_64-setup.exe");
-        validate_manifest_binding("0.8.1", "windows-x86_64", &exact, &selected).unwrap();
+        let selected = validate_channel_release(&release("0.8.2"), Version::new(0, 8, 2)).unwrap();
+        let exact = release_asset_url("v0.8.2", "arc-desktop-windows-x86_64-setup.exe");
+        validate_manifest_binding("0.8.2", "windows-x86_64", &exact, &selected).unwrap();
 
         assert!(validate_manifest_binding("9.9.9", "windows-x86_64", &exact, &selected).is_err());
         assert!(validate_manifest_binding(
-            "0.8.1",
+            "0.8.2",
             "windows-x86_64",
             "https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/arc-desktop-windows-x86_64-setup.exe",
             &selected
         )
         .is_err());
-        assert!(validate_manifest_binding("0.8.1", "windows-aarch64", &exact, &selected).is_err());
+        assert!(validate_manifest_binding("0.8.2", "windows-aarch64", &exact, &selected).is_err());
     }
 
     // ---- R3/U7: signing-path FIXTURE tests --------------------------------

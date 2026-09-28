@@ -51,6 +51,9 @@ python3 "$TEST_DIR/test_packaged_appimage_live_gate.py" || status=1
 printf '# %s\n' "test_seal_macos_app_bundle.py"
 python3 "$TEST_DIR/test_seal_macos_app_bundle.py" || status=1
 
+printf '# %s\n' "test_ubuntu_server_smoke_script.py"
+python3 "$TEST_DIR/test_ubuntu_server_smoke_script.py" || status=1
+
 printf '# %s\n' "test_build_macos_package_provenance.py"
 python3 "$TEST_DIR/../../scripts/recovery/test_build_macos_package_provenance.py" || status=1
 
