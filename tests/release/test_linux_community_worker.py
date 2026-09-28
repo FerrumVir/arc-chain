@@ -13,6 +13,19 @@ SPEC.loader.exec_module(WORKER)
 
 
 class WorkerReadinessTests(unittest.TestCase):
+    def test_verified_worker_binaries_remain_executable_and_receipt_is_read_only(self) -> None:
+        workflow = Path(__file__).parents[2] / ".github/workflows/linux-community-worker-verification.yml"
+        text = workflow.read_text()
+        verified = text.index("--output evidence/published-files.json")
+        executable_mode = text.index(
+            "chmod 0500 published/arc-node-linux-x86_64 published/arc-cli-linux-x86_64",
+            verified,
+        )
+        receipt_mode = text.index("chmod 0400 evidence/published-files.json", executable_mode)
+        self.assertLess(verified, executable_mode)
+        self.assertLess(executable_mode, receipt_mode)
+        self.assertNotIn("chmod 0400 published/*", text)
+
     def test_arc_cli_verify_keyfile_hex_is_normalized_for_worker_scoreboard(self) -> None:
         source = Path(__file__).parents[2] / "crates/arc-cli/src/keygen.rs"
         self.assertIn("println!(\"{}\", keypair.address().to_hex());", source.read_text())

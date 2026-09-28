@@ -147,7 +147,8 @@ jobs:
             --binding release-binding.json --directory published \
             --asset arc-node-linux-x86_64 --asset arc-cli-linux-x86_64 \
             --output evidence/published-files.json
-          chmod 0400 published/* evidence/published-files.json
+          chmod 0500 published/arc-node-linux-x86_64 published/arc-cli-linux-x86_64
+          chmod 0400 evidence/published-files.json
           jq '.assets' evidence/published-files.json > evidence/linux-assets.json
 
       - name: Start worker only after host and asset gates pass
