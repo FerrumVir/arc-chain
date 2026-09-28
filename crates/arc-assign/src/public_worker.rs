@@ -14,7 +14,7 @@ use arc_crypto::{
     KeyPair, Signature,
     secret_file::{
         create_new_private, create_new_private_directory,
-        durably_publish_existing_private_no_replace, open_owned_nofollow_directory,
+        durably_publish_existing_private_no_replace, open_owned_nofollow_directory, open_private,
         open_private_append_owned_migration, sync_parent_directory,
         try_acquire_private_directory_namespace_lock,
     },
@@ -32,6 +32,9 @@ pub const PUBLIC_WORKER_OFFER_VERSION: u16 = 1;
 pub const PUBLIC_WORKER_EXECUTION_BINDING_V1_DOMAIN: &str =
     "ARC-public-worker-execution-binding-v1";
 pub const PUBLIC_WORKER_EXECUTION_BINDING_V1_VERSION: u16 = 1;
+pub const PUBLIC_WORKER_EXECUTION_BINDING_V1_SCHEMA: &str =
+    "arc.public-worker-execution-binding.v1";
+pub const MAX_PUBLIC_WORKER_EXECUTION_BINDING_FILE_BYTES: u64 = 4 * 1024;
 pub const MAX_TENSOR_RANGES: usize = 256;
 pub const MAX_TENSOR_DIMENSION: u32 = 1_048_576;
 pub const MAX_MEMORY_CAPACITY_BYTES: u64 = 1 << 60;
@@ -87,7 +90,8 @@ pub struct PublicWorkerExecutionBindingV1 {
 /// Independently observed identity snapshot. Populate these values from the
 /// recovered node state, the validated loaded-package record, and pinned
 /// kernel/row-bundle manifests; never from an offer or request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicWorkerExecutionIdentities {
     pub chain_genesis: Hash256,
     pub recovery_epoch: u64,
@@ -97,6 +101,36 @@ pub struct PublicWorkerExecutionIdentities {
     pub generation_hash: Hash256,
     pub kernel_hash: Hash256,
     pub bundle_hash: Hash256,
+}
+
+/// Strict operator-owned file representation of the public execution binding.
+///
+/// This file is only a local pin. It does not establish the provenance of its
+/// identities; callers must independently derive `current` from recovered
+/// node state and validated loaded-package/kernel/bundle records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicWorkerExecutionBindingConfigV1 {
+    pub schema: String,
+    pub version: u16,
+    pub domain: String,
+    pub identities: PublicWorkerExecutionIdentities,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PublicWorkerExecutionBindingLoadError {
+    #[error("could not read the private operator execution-binding file: {0}")]
+    Io(#[from] io::Error),
+    #[error("operator execution-binding file exceeds the bounded size limit")]
+    TooLarge,
+    #[error("operator execution-binding file changed while it was read")]
+    ChangedDuringRead,
+    #[error("operator execution-binding file is not valid strict JSON: {0}")]
+    Encoding(#[from] serde_json::Error),
+    #[error("operator execution-binding schema, version, or domain is unsupported")]
+    Schema,
+    #[error(transparent)]
+    Offer(#[from] PublicWorkerOfferError),
 }
 
 impl PublicWorkerExecutionBindingV1 {
@@ -114,6 +148,39 @@ impl PublicWorkerExecutionBindingV1 {
             kernel_hash: identities.kernel_hash,
             bundle_hash: identities.bundle_hash,
         })
+    }
+
+    /// Load one explicit owner-private operator file and require an exact
+    /// match with identities independently observed by the caller. The file
+    /// must be a private regular file (mode 0600 / protected owner ACL), and
+    /// its JSON is bounded and rejects unknown fields. This does not validate
+    /// how the caller obtained `current` and does not authorize network work.
+    pub fn load_operator_file(
+        path: impl AsRef<Path>,
+        current: &PublicWorkerExecutionIdentities,
+    ) -> Result<Self, PublicWorkerExecutionBindingLoadError> {
+        let mut file = open_private(path.as_ref())?;
+        let expected_len = file.metadata()?.len();
+        if expected_len > MAX_PUBLIC_WORKER_EXECUTION_BINDING_FILE_BYTES {
+            return Err(PublicWorkerExecutionBindingLoadError::TooLarge);
+        }
+        let mut bytes = Vec::with_capacity(expected_len as usize);
+        file.take(MAX_PUBLIC_WORKER_EXECUTION_BINDING_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != expected_len {
+            return Err(PublicWorkerExecutionBindingLoadError::ChangedDuringRead);
+        }
+
+        let config: PublicWorkerExecutionBindingConfigV1 = serde_json::from_slice(&bytes)?;
+        if config.schema != PUBLIC_WORKER_EXECUTION_BINDING_V1_SCHEMA
+            || config.version != PUBLIC_WORKER_EXECUTION_BINDING_V1_VERSION
+            || config.domain != PUBLIC_WORKER_EXECUTION_BINDING_V1_DOMAIN
+        {
+            return Err(PublicWorkerExecutionBindingLoadError::Schema);
+        }
+        let binding = Self::new(config.identities)?;
+        binding.validate_identities(current)?;
+        Ok(binding)
     }
 
     /// Domain-separated commitment over a fixed-width, versioned encoding.
@@ -139,10 +206,7 @@ impl PublicWorkerExecutionBindingV1 {
         current: &PublicWorkerExecutionIdentities,
         now_height: u64,
     ) -> Result<PublicWorkerOfferRequirements, PublicWorkerOfferError> {
-        validate_execution_identities(current)?;
-        if self.identities() != *current {
-            return Err(PublicWorkerOfferError::ExecutionIdentityMismatch);
-        }
+        self.validate_identities(current)?;
         Ok(PublicWorkerOfferRequirements {
             chain_genesis: self.chain_genesis,
             recovery_epoch: self.recovery_epoch,
@@ -155,6 +219,17 @@ impl PublicWorkerExecutionBindingV1 {
             bundle_hash: self.bundle_hash,
             now_height,
         })
+    }
+
+    fn validate_identities(
+        &self,
+        current: &PublicWorkerExecutionIdentities,
+    ) -> Result<(), PublicWorkerOfferError> {
+        validate_execution_identities(current)?;
+        if self.identities() != *current {
+            return Err(PublicWorkerOfferError::ExecutionIdentityMismatch);
+        }
+        Ok(())
     }
 
     fn identities(&self) -> PublicWorkerExecutionIdentities {
@@ -1655,6 +1730,33 @@ mod tests {
         PublicWorkerExecutionBindingV1::new(identities()).unwrap()
     }
 
+    fn operator_binding_config(
+        identities: PublicWorkerExecutionIdentities,
+    ) -> PublicWorkerExecutionBindingConfigV1 {
+        PublicWorkerExecutionBindingConfigV1 {
+            schema: PUBLIC_WORKER_EXECUTION_BINDING_V1_SCHEMA.into(),
+            version: PUBLIC_WORKER_EXECUTION_BINDING_V1_VERSION,
+            domain: PUBLIC_WORKER_EXECUTION_BINDING_V1_DOMAIN.into(),
+            identities,
+        }
+    }
+
+    fn write_private_bytes(directory: &Path, bytes: &[u8]) -> PathBuf {
+        let path = directory.join("public-worker-binding.json");
+        let mut file = create_new_private(&path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        path
+    }
+
+    fn write_operator_binding(
+        directory: &Path,
+        identities: PublicWorkerExecutionIdentities,
+    ) -> PathBuf {
+        let bytes = serde_json::to_vec(&operator_binding_config(identities)).unwrap();
+        write_private_bytes(directory, &bytes)
+    }
+
     fn body(worker: Address) -> PublicWorkerOfferBody {
         PublicWorkerOfferBody {
             version: PUBLIC_WORKER_OFFER_VERSION,
@@ -1704,6 +1806,113 @@ mod tests {
         assert_eq!(requirements.public_binding, commitment);
         assert_eq!(requirements.coordinator, h(3));
         assert_eq!(requirements.artifact_hash, h(4));
+    }
+
+    #[test]
+    fn operator_binding_file_is_private_bounded_and_matches_runtime_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_operator_binding(directory.path(), identities());
+        let loaded = PublicWorkerExecutionBindingV1::load_operator_file(&path, &identities())
+            .expect("matching explicit operator binding should load");
+        assert_eq!(loaded.commitment(), binding().commitment());
+        let requirements = loaded.requirements(&identities(), 150).unwrap();
+        assert_eq!(requirements.public_binding, binding().commitment());
+        assert_eq!(requirements.now_height, 150);
+    }
+
+    #[test]
+    fn operator_binding_file_rejects_each_runtime_identity_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_operator_binding(directory.path(), identities());
+        for field in 0..8 {
+            let mut changed = identities();
+            match field {
+                0 => changed.chain_genesis = h(21),
+                1 => changed.recovery_epoch += 1,
+                2 => changed.coordinator = h(22),
+                3 => changed.artifact_hash = h(23),
+                4 => changed.profile_hash = h(24),
+                5 => changed.generation_hash = h(25),
+                6 => changed.kernel_hash = h(26),
+                7 => changed.bundle_hash = h(27),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                PublicWorkerExecutionBindingV1::load_operator_file(&path, &changed),
+                Err(PublicWorkerExecutionBindingLoadError::Offer(
+                    PublicWorkerOfferError::ExecutionIdentityMismatch
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn operator_binding_file_rejects_unsupported_schema_version_and_domain() {
+        let directory = tempfile::tempdir().unwrap();
+        for mutation in 0..3 {
+            let mut config = operator_binding_config(identities());
+            match mutation {
+                0 => config.schema.push_str("-unknown"),
+                1 => config.version += 1,
+                2 => config.domain.push_str("-unknown"),
+                _ => unreachable!(),
+            }
+            let path = directory.path().join(format!("binding-{mutation}.json"));
+            let mut file = create_new_private(&path).unwrap();
+            file.write_all(&serde_json::to_vec(&config).unwrap())
+                .unwrap();
+            file.sync_all().unwrap();
+            assert!(matches!(
+                PublicWorkerExecutionBindingV1::load_operator_file(&path, &identities()),
+                Err(PublicWorkerExecutionBindingLoadError::Schema)
+            ));
+        }
+    }
+
+    #[test]
+    fn operator_binding_file_rejects_unknown_json_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut value = serde_json::to_value(operator_binding_config(identities())).unwrap();
+        value["unrecognized"] = serde_json::json!(true);
+        let path = write_private_bytes(directory.path(), &serde_json::to_vec(&value).unwrap());
+        assert!(matches!(
+            PublicWorkerExecutionBindingV1::load_operator_file(&path, &identities()),
+            Err(PublicWorkerExecutionBindingLoadError::Encoding(_))
+        ));
+    }
+
+    #[test]
+    fn operator_binding_file_rejects_oversize_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_private_bytes(
+            directory.path(),
+            &vec![b' '; MAX_PUBLIC_WORKER_EXECUTION_BINDING_FILE_BYTES as usize + 1],
+        );
+        assert!(matches!(
+            PublicWorkerExecutionBindingV1::load_operator_file(&path, &identities()),
+            Err(PublicWorkerExecutionBindingLoadError::TooLarge)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_binding_file_rejects_symlink_and_nonprivate_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_operator_binding(directory.path(), identities());
+        let link = directory.path().join("binding-link.json");
+        symlink(&path, &link).unwrap();
+        assert!(matches!(
+            PublicWorkerExecutionBindingV1::load_operator_file(&link, &identities()),
+            Err(PublicWorkerExecutionBindingLoadError::Io(_))
+        ));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            PublicWorkerExecutionBindingV1::load_operator_file(&path, &identities()),
+            Err(PublicWorkerExecutionBindingLoadError::Io(_))
+        ));
     }
 
     #[test]
