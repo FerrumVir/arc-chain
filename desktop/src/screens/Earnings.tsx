@@ -108,7 +108,7 @@ export function Earnings() {
             <p style={{ marginTop: 0 }}>
               {hasCompleteCanonicalHistory
                 ? "This archive-backed host has no successful mined reward receipt for this address since the canonical v3 recovery boundary. It is a confirmed gross-reward zero for that chain segment, not a claim about wallet transfers or any earlier legacy history."
-                : "This is a confirmed zero in the selected host's current retained receipt window—not proof that this address has never earned a reward. Older rows can be pruned on a non-archive host."}
+                : "This is a confirmed zero only in the selected host's current retained receipt window. Complete history since the v3 recovery boundary is unproven, so earlier receipts may be absent even when archive retention is enabled."}
             </p>
             <p>
               A raw <code>InferenceAttestation</code> (<code>0x16</code>) is a
@@ -203,7 +203,7 @@ export function Earnings() {
             >
               {hasCompleteCanonicalHistory
                 ? "Archive-backed successful 0x25 receipts since the v3 recovery boundary. Gross rewards are not the same as the wallet's current balance after spending or transfers."
-                : "Current host-retained receipt window; older rows may be pruned. This is not lifetime earnings."}
+                : "Current host-retained receipt window; completeness since the v3 recovery boundary is unproven. This is not lifetime earnings."}
             </div>
           </Card>
           <Card>

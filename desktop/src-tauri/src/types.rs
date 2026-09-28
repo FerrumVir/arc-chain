@@ -192,8 +192,8 @@ pub struct ConfirmedRewardReceipt {
 #[serde(rename_all = "camelCase")]
 pub struct Earnings {
     /// Gross rewards visible in the selected host's current retained receipt
-    /// window. This is deliberately not a lifetime ledger: a non-archive host
-    /// can prune old rows and restart with an empty in-memory index.
+    /// window. This is deliberately not a lifetime ledger unless the separate
+    /// history-complete contract proves canonical coverage from recovery.
     pub total_arc: f64,
     /// Earned since 00:00 UTC. `None` when the chain does not report it —
     /// which is not the same as zero, and must not be rendered as "0.00".
@@ -224,7 +224,8 @@ pub struct Earnings {
     pub unavailable_reason: Option<String>,
     /// Backend-declared source of the retained receipt window.
     pub receipt_source: Option<String>,
-    /// Whether the selected host reports archival state.
+    /// Whether the selected host reports archive retention configured. This
+    /// alone does not prove complete history from the recovery boundary.
     pub archive_mode: Option<bool>,
     /// Explicit backend assertion that archive history is complete from the
     /// canonical v3 recovery boundary.

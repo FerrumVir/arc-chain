@@ -238,10 +238,13 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
     if history_domain != EARNINGS_HISTORY_DOMAIN {
         return None;
     }
-    if (archive_mode
-        && (!history_complete_since_recovery || history_scope != ARCHIVE_EARNINGS_SCOPE))
-        || (!archive_mode
-            && (history_complete_since_recovery || history_scope != RETAINED_EARNINGS_SCOPE))
+    // `archive_mode` describes the host's configured retention mode, not
+    // whether it has proved a complete index from the v3 recovery boundary.
+    // An archive host without that proof still returns a valid retained
+    // window. Only a complete-history claim requires archive mode.
+    if (history_complete_since_recovery
+        && (!archive_mode || history_scope != ARCHIVE_EARNINGS_SCOPE))
+        || (!history_complete_since_recovery && history_scope != RETAINED_EARNINGS_SCOPE)
     {
         return None;
     }
@@ -1614,10 +1617,7 @@ fn parse_inference_run_value(
 /// (the tags then appear twice in the tokenized input). arc-node accepts
 /// `"chat_template": true` and applies the loaded model's own template,
 /// which is correct for whatever is actually loaded.
-pub async fn inference_readiness(
-    http: &reqwest::Client,
-    base_url: &str,
-) -> Result<bool, String> {
+pub async fn inference_readiness(http: &reqwest::Client, base_url: &str) -> Result<bool, String> {
     const SCHEMA: &str = "arc.inference.readiness.v1";
     const PROFILE: &str = arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
     const KEYS: [&str; 9] = [
@@ -1644,7 +1644,10 @@ pub async fn inference_readiness(
             response.status()
         ));
     }
-    if response.content_length().is_some_and(|length| length > 8_192) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > 8_192)
+    {
         return Err(format!("{base_url} readiness response exceeds 8192 bytes"));
     }
     let bytes = response
@@ -3162,7 +3165,8 @@ mod chain_read_tests {
             }
         });
 
-        let stats = fetch_network_stats(&reqwest::Client::new(), &format!("http://{address}")).await;
+        let stats =
+            fetch_network_stats(&reqwest::Client::new(), &format!("http://{address}")).await;
         server.await.unwrap();
         stats
     }
@@ -3219,7 +3223,9 @@ mod chain_read_tests {
             match mutation {
                 "profile" => changed["models"][0]["execution_profile"] = json!("other"),
                 "coverage" => changed["models"][0]["covered_layers"] = json!(31),
-                "identity" => changed["models"][0]["model_id"] = json!(format!("0x{}", "cd".repeat(32))),
+                "identity" => {
+                    changed["models"][0]["model_id"] = json!(format!("0x{}", "cd".repeat(32)))
+                }
                 "schema" => changed["unexpected"] = json!(true),
                 _ => unreachable!(),
             }
@@ -3545,12 +3551,15 @@ mod chain_read_tests {
             Some("future_attestation_state")
         );
         assert_eq!(parsed.attestation_hash, candidate_hash);
-        assert!(parsed.tx_hash.is_empty(), "unknown status cannot prove send");
+        assert!(
+            parsed.tx_hash.is_empty(),
+            "unknown status cannot prove send"
+        );
 
         let mut submitted = base;
         submitted["attestation"]["status"] = json!("submitted_to_mempool");
-        let parsed = parse_inference_run_value(&submitted, None, true)
-            .expect("submitted result parses");
+        let parsed =
+            parse_inference_run_value(&submitted, None, true).expect("submitted result parses");
         assert_eq!(parsed.tx_hash, candidate_hash);
     }
 
@@ -4202,12 +4211,43 @@ mod chain_read_tests {
         assert_eq!(parsed.archive_mode, Some(true));
         assert_eq!(parsed.history_complete_since_recovery, Some(true));
 
-        archive["history_complete_since_recovery"] = json!(false);
-        assert!(confirmed_earnings_from_value(&archive).is_none());
-        archive["history_complete_since_recovery"] = json!(true);
-        archive["history_scope"] = json!("retained window");
-        assert!(confirmed_earnings_from_value(&archive).is_none());
-        archive["history_scope"] = json!(ARCHIVE_EARNINGS_SCOPE);
+        // Mirrors the live LAX and SGP response: archive retention is enabled,
+        // but the host cannot prove completeness from the v3 recovery boundary.
+        let mut incomplete_archive = candidate_earnings_value();
+        incomplete_archive["archive_mode"] = json!(true);
+        incomplete_archive["history_complete_since_recovery"] = json!(false);
+        incomplete_archive["history_scope"] = json!(RETAINED_EARNINGS_SCOPE);
+        incomplete_archive["total_rewards"] = json!(0);
+        incomplete_archive["total_attestations"] = json!(0);
+        incomplete_archive["confirmed_receipt_count"] = json!(0);
+        incomplete_archive["confirmed_gross_earnings_base"] = json!(0);
+        incomplete_archive["confirmed_gross_earnings_arc"] = json!(0.0);
+        incomplete_archive["confirmed_receipts"] = json!([]);
+        incomplete_archive["estimated_total_arc_note"] =
+            json!("retained-window gross rewards = successful CommunityInferenceReward receipts");
+        incomplete_archive["last_reward_block"] = json!(null);
+        incomplete_archive["last_reward_tx_hash"] = json!(null);
+        let retained = confirmed_earnings_from_value(&incomplete_archive)
+            .expect("configured archive retention can report an incomplete retained window");
+        assert_eq!(retained.total_arc, 0.0);
+        assert!(retained.confirmed_receipts.is_empty());
+        assert_eq!(retained.archive_mode, Some(true));
+        assert_eq!(retained.history_complete_since_recovery, Some(false));
+        assert_eq!(
+            retained.history_scope.as_deref(),
+            Some(RETAINED_EARNINGS_SCOPE)
+        );
+
+        incomplete_archive["history_complete_since_recovery"] = json!(true);
+        assert!(confirmed_earnings_from_value(&incomplete_archive).is_none());
+        incomplete_archive["history_complete_since_recovery"] = json!(false);
+        incomplete_archive["history_scope"] = json!("retained window");
+        assert!(confirmed_earnings_from_value(&incomplete_archive).is_none());
+        incomplete_archive["history_scope"] = json!(ARCHIVE_EARNINGS_SCOPE);
+        incomplete_archive["archive_mode"] = json!(false);
+        incomplete_archive["history_complete_since_recovery"] = json!(true);
+        assert!(confirmed_earnings_from_value(&incomplete_archive).is_none());
+
         archive["history_domain"] = json!("current recovery epoch only");
         assert!(confirmed_earnings_from_value(&archive).is_none());
     }

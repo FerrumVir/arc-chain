@@ -271,7 +271,7 @@ jobs:
             /^\[workspace\.package\]$/ { in_package=1; next }
             /^\[/ { in_package=0 }
             in_package && /^version[[:space:]]*=/ {
-              gsub(/[[:space:]\"]/], "", $0)
+              gsub(/[[:space:]"]/, "", $0)
               sub(/^version=/, "", $0)
               print
               exit
@@ -285,7 +285,7 @@ jobs:
             /^\[package\]$/ { in_package=1; next }
             /^\[/ { in_package=0 }
             in_package && /^version[[:space:]]*=/ {
-              gsub(/[[:space:]\"]/], "", $0)
+              gsub(/[[:space:]"]/, "", $0)
               sub(/^version=/, "", $0)
               print
               exit
