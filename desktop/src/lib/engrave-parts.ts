@@ -83,4 +83,3 @@ export function ground(pl: Plate, W: number, y: number, seed = 3) {
   const r = rng(seed);
   for (let i = 0; i < W / 14; i++) { const x = r() * W, yy = y + 1.5 + r() * 5; pl.seg(x, yy, x + 3 + r() * 9, yy, 0.26, 4); }
 }
-
