@@ -12454,7 +12454,7 @@ mod tests {
         let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"certified-gap-domain"), 3, 9);
         let mut binding = recovery_test_binding(domain);
         binding.source_height = 0;
-        binding.transition_height = 0;
+        binding.transition_height = 1;
         let startup = RecoveryDagStartup {
             data_dir: data_dir.clone(),
             wal_dir: data_dir.join("generation-store"),
@@ -12524,7 +12524,16 @@ mod tests {
         // but its separate DAG Commit record is absent. Replay must derive the
         // next choice through `try_commit`, not from a local absence vote alone.
         let state = StateDB::with_genesis(&[(hash_bytes(b"gap-funded"), 100)]);
-        let genesis = state.get_block(0).unwrap();
+        state
+            .execute_block_adaptive_at_with_proof(
+                &[],
+                validators[0],
+                bootstrap,
+                hash_bytes(b"certified-gap-baseline"),
+            )
+            .unwrap();
+        let baseline = state.get_block(1).unwrap();
+        assert_ne!(baseline.header.state_root, Hash256::ZERO);
         state
             .execute_block_adaptive_at_with_proof(
                 &[],
@@ -12533,9 +12542,9 @@ mod tests {
                 candidate.state_decision_commitment(&domain),
             )
             .unwrap();
-        assert_eq!(state.height(), 1);
+        assert_eq!(state.height(), 2);
         assert_eq!(
-            state.get_block(1).unwrap().header.proof_hash,
+            state.get_block(2).unwrap().header.proof_hash,
             candidate.state_decision_commitment(&domain)
         );
 
@@ -12561,9 +12570,9 @@ mod tests {
                 GenerationInput {
                     binding: recovery_test_generation_binding(&startup.binding),
                     baseline_state: DagBaselineState {
-                        height: 0,
-                        block_hash: genesis.hash,
-                        state_root: genesis.header.state_root,
+                        height: 1,
+                        block_hash: baseline.hash,
+                        state_root: baseline.header.state_root,
                         dag_anchor: None,
                     },
                     dag_cursor: DagCursor {
@@ -12578,6 +12587,7 @@ mod tests {
                 records.clone(),
             )
             .unwrap();
+        validate_recovery_generation_anchor(&state, &startup, &generation).unwrap();
         let (staged, staged_summary) =
             stage_recovery_generation_records(&store, &generation).unwrap();
         assert_eq!(staged, records);
@@ -12660,7 +12670,7 @@ mod tests {
         assert!(compacted_records.iter().all(|record| {
             record.kind != RetainedRecordKind::AbsenceCertificate
                 && record.kind != RetainedRecordKind::Commit
-                && record.round >= candidate.round + 1
+                && record.round > candidate.round
         }));
 
         // Tampering with the retained anchor cannot rebind the canonical state
@@ -12691,7 +12701,7 @@ mod tests {
         assert_eq!(second.repaired_commit, None);
         assert_eq!(second.current_round, bootstrap + 6);
         assert_eq!(second.next_commit_round, candidate.round + 1);
-        assert_eq!(state.height(), 1);
+        assert_eq!(state.height(), 2);
         let (_, reopened_summary) = stage_recovery_generation_records(&store, &compacted).unwrap();
         let unchanged = compact_replayed_recovery_generation(
             &store,
