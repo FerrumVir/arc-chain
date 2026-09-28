@@ -64,6 +64,16 @@ export function Answer({
   const settlement = result.settlement;
   const isCommunityRewardTx = Boolean(settlement?.submitted === true && settlement.txType === "0x25" && ARC_HASH_RE.test(settlement.txHash));
   const exactCommunityReceiptUrl = settlement?.txHash ? `/community/reward_receipt/${settlement.txHash}` : "";
+  // A 0x16 claim was sent only when the serving node reports "submitted_to_mempool" with a real hash. Any other status
+  // is at most a candidate claim, and is shown as one (main #113, carried into the per-answer view).
+  const submittedAttestationTx = Boolean(result.attestationStatus === "submitted_to_mempool" && ARC_HASH_RE.test(result.txHash));
+  const attestationLine = !result.attestationStatus
+    ? null
+    : result.attestationStatus === "certificate_only_v3_not_submitted"
+      ? "Certificate only; no 0x16 transaction was submitted."
+      : submittedAttestationTx
+        ? "0x16 claim submitted to the mempool; mined inclusion is not confirmed."
+        : `Attestation status ${result.attestationStatus}; transaction submission is not confirmed.`;
   const receiptExpectation =
     settlement?.submitted === true &&
     settlement.txType === "0x25" &&
@@ -207,9 +217,9 @@ export function Answer({
         : "Not checked by a second computer";
   const chainLine = settlement
     ? communitySettlementMessage
-    : result.txHash
+    : submittedAttestationTx
       ? "Computation claim (0x16) submitted: a claim, not proof or payment"
-      : "No on-chain claim came back";
+      : attestationLine ?? "No on-chain claim came back";
   const same = earlier?.result?.outputHash ? earlier.result.outputHash === result.outputHash : null;
   const output = result.output.trim();
 
@@ -262,7 +272,7 @@ export function Answer({
             }${turn.settledAt ? ` · ${((turn.settledAt - turn.sentAt) / 1000).toFixed(1)} s` : ""}`,
           },
           { name: "Checked", state: check === "agreed" ? "done" : "open", detail: checkLine },
-          { name: "On chain", state: confirmedCommunityReward ? "done" : settlement || result.txHash ? "wait" : "open", detail: chainLine },
+          { name: "On chain", state: confirmedCommunityReward ? "done" : settlement || submittedAttestationTx ? "wait" : "open", detail: chainLine },
         ]}
       />
 
@@ -310,6 +320,13 @@ export function Answer({
           </span>
         </div>
 
+        {attestationLine && (
+          <div className="evidence-line" data-testid={tid("inference-attestation-status")} data-status={result.attestationStatus}>
+            <Sparkles size={14} aria-hidden="true" />
+            <span>{attestationLine}</span>
+          </div>
+        )}
+
         {settlement && (
           <div
             className={`evidence-line evidence-settlement${confirmedCommunityReward ? " is-confirmed" : ""}`}
@@ -352,7 +369,16 @@ export function Answer({
         )}
 
         <div className="hash-rows">
-          {result.txHash && <HashRow label="0x16 claim tx (unpaid)" value={result.txHash} copied={copied === "tx"} onCopy={() => void copy("tx", result.txHash)} icon={Sparkles} />}
+          {result.attestationHash && !submittedAttestationTx && (
+            <HashRow
+              label={result.attestationStatus === "certificate_only_v3_not_submitted" ? "Candidate claim hash (not submitted)" : "Attestation hash (submission unconfirmed)"}
+              value={result.attestationHash}
+              copied={copied === "attestation"}
+              onCopy={() => void copy("attestation", result.attestationHash!)}
+              icon={Sparkles}
+            />
+          )}
+          {submittedAttestationTx && <HashRow label="0x16 claim tx (submitted; unpaid)" value={result.txHash} copied={copied === "tx"} onCopy={() => void copy("tx", result.txHash)} icon={Sparkles} />}
           {isCommunityRewardTx && settlement?.txHash && (
             <HashRow label="0x25 reward tx" value={settlement.txHash} copied={copied === "reward"} onCopy={() => void copy("reward", settlement.txHash)} icon={Coins} />
           )}
@@ -372,7 +398,7 @@ export function Answer({
                 Track reward receipt <Search size={12} />
               </button>
             )}
-            {result.txHash && (
+            {submittedAttestationTx && (
               <button className="btn btn-ghost btn-sm" onClick={() => lookupHash(result.txHash)} data-testid={tid("btn-lookup-tx")}>
                 Look up this claim <Search size={12} />
               </button>
