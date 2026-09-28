@@ -9,6 +9,7 @@ import plistlib
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -134,6 +135,23 @@ class BundleSealingTests(unittest.TestCase):
                 seal.seal_and_repackage(self.bundle)
         self.assertEqual(self.archive.read_bytes(), b"old archive")
         self.assertEqual(self.dmg.read_bytes(), b"old disk image")
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires native macOS codesign and hdiutil")
+    def test_native_codesign_archive_and_dmg_round_trip(self) -> None:
+        if not all(Path(tool).is_file() for tool in ("/usr/bin/codesign", "/usr/bin/hdiutil", "/usr/bin/tar")):
+            self.skipTest("native macOS packaging tools are unavailable")
+        executable = self.macos / seal.APP_NAME / "Contents/MacOS/arc-desktop"
+        shutil.copyfile("/usr/bin/true", executable)
+        executable.chmod(0o755)
+        seal.CODE_SIGN = Path("/usr/bin/codesign")
+        seal.HDITIL = Path("/usr/bin/hdiutil")
+        seal.TAR = Path("/usr/bin/tar")
+
+        receipt = seal.seal_and_repackage(self.bundle)
+
+        self.assertTrue(receipt["executable_sha256"])
+        self.assertGreater(self.archive.stat().st_size, len(b"old archive"))
+        self.assertGreater(self.dmg.stat().st_size, len(b"old disk image"))
 
 
 if __name__ == "__main__":

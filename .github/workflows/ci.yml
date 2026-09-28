@@ -444,6 +444,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Verify macOS ad-hoc app sealing and package round-trip
+        if: startsWith(matrix.os, 'macos-')
+        run: python3 tests/release/test_seal_macos_app_bundle.py -v
       - name: Native Windows signer handoff permission boundary
         if: runner.os == 'Windows'
         shell: bash
