@@ -325,7 +325,38 @@ test.describe("Dashboard", () => {
     );
     await page.getByTestId("nav-earnings").click();
     await expect(page.getByTestId("earnings-empty")).toContainText(
-      "confirmed zero in the selected host's current retained receipt window",
+      "confirmed zero only in the selected host's current retained receipt window",
+    );
+    await expect(page.getByTestId("earnings-unavailable")).toHaveCount(0);
+  });
+
+  test("archive-configured but incomplete history stays a retained-window zero", async ({ page }) => {
+    await useLiveEarningsBody(page, candidateEarningsBody({
+      total_rewards: 0,
+      estimated_total_arc: 0,
+      confirmed_receipt_count: 0,
+      confirmed_gross_earnings_base: 0,
+      confirmed_gross_earnings_arc: 0,
+      confirmed_receipts: [],
+      last_reward_block: null,
+      last_reward_tx_hash: null,
+      archive_mode: true,
+      history_complete_since_recovery: false,
+      history_scope: "this node's bounded retained reward-receipt window",
+    }));
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toContainText(
+      "ARC confirmed in retained window",
+    );
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("earnings-empty")).toContainText(
+      "confirmed zero only in the selected host's current retained receipt window",
+    );
+    await expect(page.getByTestId("earnings-empty")).toContainText(
+      "even when archive retention is enabled",
+    );
+    await expect(page.getByTestId("earnings-empty")).not.toContainText(
+      "confirmed gross-reward zero for that chain segment",
     );
     await expect(page.getByTestId("earnings-unavailable")).toHaveCount(0);
   });
@@ -484,11 +515,11 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("earnings-total")).toContainText("not confirmed");
   });
 
-  test("archive copy requires the explicit canonical recovery-history scope", async ({ page }) => {
+  test("a full-history claim without archive backing fails closed", async ({ page }) => {
     await useLiveEarningsBody(page, candidateEarningsBody({
-      archive_mode: true,
-      history_complete_since_recovery: false,
-      history_scope: "this node's bounded retained reward-receipt window",
+      archive_mode: false,
+      history_complete_since_recovery: true,
+      history_scope: "complete canonical reward history since the v3 recovery boundary",
     }));
     await page.goto("/");
     await page.getByTestId("nav-earnings").click();

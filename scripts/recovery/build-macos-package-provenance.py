@@ -45,7 +45,8 @@ from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
 
 REPOSITORY = "FerrumVir/arc-chain"
-TAG = "v0.8.0"
+TAG = "v0.8.1"
+VERSION = "0.8.1"
 RELEASE_SCHEMA = "arc.published-release-binding.v1"
 SIGNATURE_SCHEMA = "arc.macos-updater-signature-verification.v1"
 GUEST_SIGNATURE_SCHEMA = "arc.macos-updater-signature-guest.v1"
@@ -2509,7 +2510,7 @@ def validate_native_input(
         value["schema"] != NATIVE_INPUT_SCHEMA
         or value["repository"] != REPOSITORY
         or value["sourceCommit"] != binding["commit"]
-        or value["releaseVersion"] != "0.8.0"
+        or value["releaseVersion"] != VERSION
         or value["releaseId"] != binding["release"]["id"]
         or value["releaseRunId"] != binding["release_workflow"]["run_id"]
         or value["releaseRunAttempt"] != binding["release_workflow"]["run_attempt"]
@@ -2638,7 +2639,7 @@ def build_native_input(args: argparse.Namespace) -> dict[str, Any]:
         "releaseId": binding["release"]["id"],
         "releaseRunAttempt": binding["release_workflow"]["run_attempt"],
         "releaseRunId": binding["release_workflow"]["run_id"],
-        "releaseVersion": "0.8.0",
+        "releaseVersion": VERSION,
         "repository": REPOSITORY,
         "rolloutManifestSha256": rollout,
         "schema": NATIVE_INPUT_SCHEMA,

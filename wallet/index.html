@@ -3,59 +3,99 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#002dde">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%23002dde'/%3E%3Csvg x='10' y='24.2' width='44.001' height='17.108' viewBox='0 0 241.87 94.04'%3E%3Cpath fill='%23ffffff' fill-rule='evenodd' d='M36.85 0.05C36.66 0.08 36.01 0.14 35.4 0.2C21.46 1.57 9.65 11 3.97 25.31C-1.25 38.46 -1.33 55.12 3.78 68.04C8.89 80.98 17.69 89.34 29.75 92.73C30.53 92.95 34.39 93.65 35.7 93.81C37.46 94.02 42.91 93.99 44.3 93.76C52.02 92.48 57.5 89.82 62.61 84.89C64.67 82.9 65.01 82.66 65.44 82.9C66.05 83.24 66.1 83.5 66.15 87.29L66.2 90.74L66.46 91.19C66.62 91.49 66.86 91.73 67.16 91.89L67.6 92.14L77.86 92.14L88.11 92.14L88.61 91.89C88.97 91.71 89.17 91.51 89.35 91.19L89.6 90.74L89.63 46.26C89.66 -0.35 89.67 1.27 89.2 0.71C88.61 0.01 89.21 0.05 78.21 0.02C66.63 -0.02 66.98 -0.05 66.41 1.04L66.2 1.44L66.15 5.79L66.1 10.14L65.89 10.62C65.42 11.62 65 11.43 62.72 9.2C57.92 4.47 52.27 1.6 45.35 0.38L43.6 0.07L40.4 0.04C38.64 0.03 37.05 0.03 36.85 0.05M197.85 0.11C192.95 0.46 186.55 2.24 182.06 4.49C169.76 10.67 161.35 22.56 158.87 37.29C158.36 40.28 158.38 40.16 158.2 42.64C157 59.78 162.67 75.05 173.66 84.24C180.23 89.73 188.9 93.28 197.27 93.89C207.71 94.65 219.21 92.59 225.83 88.78C234.78 83.63 239.63 76.18 241.71 64.34C242.06 62.37 241.83 61.37 240.9 60.9L240.41 60.64L230.41 60.64C219.32 60.64 219.8 60.62 219.02 61.3C218.53 61.73 218.38 62.06 217.8 63.94C216.87 66.99 215.79 68.77 213.58 70.9C211.41 73 209.29 74.05 205.79 74.76C204.48 75.03 198.8 75.03 197.55 74.76C192.44 73.68 189.05 71.32 186.21 66.89C182.13 60.54 180.57 49.67 182.16 38.69C183.2 31.48 186.78 24.68 191 21.9C192.82 20.71 195.67 19.56 197.75 19.18C198.97 18.96 204.22 18.99 205.5 19.23C211.95 20.42 216.22 24.33 217.97 30.64C218.5 32.55 218.87 33.05 220 33.34C220.75 33.53 239.57 33.58 240.46 33.38C242.01 33.05 242.19 32.02 241.41 28.16C240.08 21.57 237.82 16.72 233.95 12.09C228.64 5.77 219.12 1.38 208.35 0.3C205.33 0 200.6 -0.09 197.85 0.11M142.3 0.96C134.35 1.38 126.34 3.53 120.73 6.76C110.92 12.41 104.48 20.92 101.65 31.94C101.11 34.06 100.34 38.49 100.14 40.64C100.03 41.76 100 46.98 100 66.35L100 90.65L100.26 91.15C100.44 91.51 100.64 91.71 100.96 91.89L101.4 92.14L111.4 92.17C122.48 92.2 122.12 92.22 122.78 91.56C123.45 90.9 123.39 92.87 123.46 66.04C123.52 39.67 123.48 41.6 124.01 38.44C124.94 32.95 127.79 28.36 131.8 25.89C135.94 23.35 140.23 22.5 148.82 22.5C153.06 22.49 153.47 22.39 153.92 21.21C154.12 20.71 154.21 3.25 154.02 2.37C153.93 1.91 153.43 1.32 152.96 1.1C152.62 0.95 144.51 0.84 142.3 0.96M42.05 19.06C29.13 20.66 21.53 34.96 23.95 53.09C24.78 59.24 26.93 64.44 30.34 68.5C33.01 71.69 36.97 73.99 41.1 74.76C42.55 75.03 46.76 75.03 48.2 74.76C58.3 72.87 65.37 62.78 66.07 49.27C66.87 34 59.87 21.87 48.78 19.28C47.93 19.08 43.14 18.92 42.05 19.06'/%3E%3C/svg%3E%3C/svg%3E">
 <title>ARC Wallet</title>
 <style>
+/* The engraved Arc look of the desktop app: white line on Arc blue #002dde. Marcellus is for words only;
+   every number is set in Hanken Grotesk with lining tabular figures, and keys and hashes in JetBrains Mono.
+   Fonts are self-hosted under ./fonts (SIL Open Font License 1.1, ./fonts/OFL.txt); without them the page
+   falls back to system faces. */
+@font-face{font-family:"Hanken Grotesk";font-style:normal;font-weight:100 900;font-display:swap;src:url("./fonts/hanken-grotesk-latin-ext.woff2") format("woff2");unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+@font-face{font-family:"Hanken Grotesk";font-style:normal;font-weight:100 900;font-display:swap;src:url("./fonts/hanken-grotesk-latin.woff2") format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:100 800;font-display:swap;src:url("./fonts/jetbrains-mono-latin-ext.woff2") format("woff2");unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+@font-face{font-family:"JetBrains Mono";font-style:normal;font-weight:100 800;font-display:swap;src:url("./fonts/jetbrains-mono-latin.woff2") format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"Marcellus";font-style:normal;font-weight:400;font-display:swap;src:url("./fonts/marcellus-latin-ext.woff2") format("woff2");unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+@font-face{font-family:"Marcellus";font-style:normal;font-weight:400;font-display:swap;src:url("./fonts/marcellus-latin.woff2") format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+/* figures for the display face come from Hanken Grotesk, so a number is never cut in Marcellus */
+@font-face{font-family:"Arc Figures";font-style:normal;font-weight:100 900;font-display:swap;src:url("./fonts/hanken-grotesk-latin.woff2") format("woff2");unicode-range:U+0023,U+0025,U+002B,U+0030-0039}
+:root{color-scheme:dark;--ground:#002dde;--ground-deep:#0026c4;--well:rgba(0,16,120,.4);--ink:#fff;--ink-soft:rgba(255,255,255,.88);--ink-muted:rgba(255,255,255,.76);--line:rgba(255,255,255,.2);--line-strong:rgba(255,255,255,.44);--good:#8af2cb;--warn:#ffd98c;--bad:#ffb0b0;--info:#b3dcff;--display:"Arc Figures","Marcellus",Georgia,"Times New Roman",serif;--body:"Hanken Grotesk",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--mono:"JetBrains Mono","SF Mono",ui-monospace,Menlo,Consolas,monospace;--hatch:repeating-linear-gradient(90deg,rgba(255,255,255,.8) 0 1px,transparent 1px 3px)}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0f;color:#e0e0e0;min-height:100vh}
-.container{max-width:480px;margin:0 auto;padding:20px}
-h1{font-size:24px;text-align:center;margin:20px 0;color:#fff}
-h1 span{color:#6366f1}
-.card{background:#13131f;border:1px solid #1e1e3a;border-radius:12px;padding:20px;margin-bottom:16px}
-.card h2{font-size:14px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}
-.balance{font-size:36px;font-weight:700;color:#fff}
-.balance small{font-size:14px;color:#888;font-weight:400}
-.addr{font-size:11px;color:#6366f1;word-break:break-all;cursor:pointer;margin-top:8px}
-.addr:hover{color:#818cf8}
-input,select{width:100%;padding:12px;background:#0a0a0f;border:1px solid #2a2a4a;border-radius:8px;color:#fff;font-size:14px;margin-bottom:10px;outline:none}
-input:focus{border-color:#6366f1}
-button{width:100%;padding:12px;background:#6366f1;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:8px}
-button:hover{background:#4f46e5}
-button:disabled{background:#333;cursor:not-allowed}
-button.secondary{background:transparent;border:1px solid #2a2a4a;color:#888}
-button.secondary:hover{border-color:#6366f1;color:#fff}
-.status{font-size:12px;padding:8px 12px;border-radius:6px;margin-top:8px}
-.status.ok{background:#0a2e1a;color:#4ade80;border:1px solid #166534}
-.status.err{background:#2e0a0a;color:#f87171;border:1px solid #7f1d1d}
-.status.info{background:#0a1a2e;color:#60a5fa;border:1px solid #1e3a5f}
-.tx-list{max-height:200px;overflow-y:auto}
-.tx-item{padding:8px 0;border-bottom:1px solid #1a1a2f;font-size:12px}
-.tx-item .hash{color:#6366f1;font-family:monospace}
-.tx-item .amount{float:right;font-weight:600}
-.tx-item .amount.plus{color:#4ade80}
-.tx-item .amount.minus{color:#f87171}
-.net{display:flex;gap:8px;align-items:center;justify-content:center;margin-bottom:16px;font-size:12px}
-.net .dot{width:8px;height:8px;border-radius:50%;background:#4ade80;display:inline-block}
-.net .dot.off{background:#f87171}
+body{font-family:var(--body);font-variant-numeric:lining-nums tabular-nums;background-color:var(--ground);background-image:repeating-linear-gradient(0deg,rgba(255,255,255,.028) 0 1px,transparent 1px 4px);color:var(--ink);min-height:100vh;line-height:1.5;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+:focus-visible{outline:2px solid #fff;outline-offset:3px}
+::selection{background:rgba(255,255,255,.86);color:var(--ground)}
+.container{max-width:480px;margin:0 auto;padding:36px 20px 56px}
+.masthead{display:flex;flex-direction:column;align-items:center;gap:20px;margin:0 0 18px;text-align:center;font-weight:400}
+/* the arc.ai wordmark itself, white, with its tagline; never "arc" typed in a font */
+.masthead .brand{display:flex;flex-direction:column;align-items:center;gap:7px}
+.masthead .wordmark{display:block;width:calc(30px * 241.87 / 94.04);height:30px;fill:#fff}
+.masthead .tagline{font:400 13px/1.3 var(--body);letter-spacing:.01em;color:var(--ink-muted)}
+.masthead .title{font:400 46px/1 var(--display)}
+.masthead .title::after{content:"";display:block;width:72px;height:6px;margin:16px auto 0;background:var(--hatch)}
+.card{background:var(--ground-deep);border:1px solid var(--line);border-radius:6px;padding:22px;margin-bottom:16px;box-shadow:inset 0 0 0 4px var(--ground-deep),inset 0 0 0 5px rgba(255,255,255,.07)}
+.card h2{font-size:11px;font-weight:600;color:var(--ink-muted);text-transform:uppercase;letter-spacing:.14em;margin-bottom:14px}
+.balance{font:500 40px/1.1 var(--body);letter-spacing:-.02em;color:#fff}
+.balance small{font:600 13px var(--body);color:var(--ink-muted);letter-spacing:.1em}
+.addr{display:block;width:100%;margin:12px 0 0;padding:0;background:none;border:0;border-radius:2px;text-align:left;font:12px/1.55 var(--mono);color:var(--info);word-break:break-all;cursor:pointer;text-decoration:underline;text-decoration-color:rgba(179,220,255,.4);text-underline-offset:4px}
+.addr:hover{background:none;color:#fff;text-decoration-color:#fff}
+input,select{width:100%;padding:12px 14px;background:var(--well);border:1px solid var(--line-strong);border-radius:4px;color:#fff;font:14px var(--mono);margin-bottom:10px;outline:none}
+input::placeholder{color:rgba(255,255,255,.66)}
+input:focus-visible{border-color:#fff;box-shadow:0 0 0 3px rgba(255,255,255,.2);outline:none}
+button{width:100%;padding:13px;background:#fff;color:var(--ground);border:none;border-radius:4px;font:700 14px var(--body);cursor:pointer;margin-bottom:8px}
+button:hover{background:#e3eaff}
+button:disabled{background:rgba(255,255,255,.35);color:#001a99;cursor:not-allowed}
+button.secondary{background:transparent;border:1px solid rgba(255,255,255,.62);color:#fff;font-weight:600}
+button.secondary:hover{border-color:#fff;background:rgba(255,255,255,.1)}
+button.quiet{margin-top:8px;font-size:12px}
+.status{font-size:13px;line-height:1.5;padding:9px 12px;border-radius:4px;margin-top:8px;border:1px solid;border-left-width:3px;word-break:break-word}
+.status.ok{background:rgba(138,242,203,.13);color:#e3fbf2;border-color:rgba(138,242,203,.6)}
+.status.err{background:rgba(255,150,150,.15);color:#ffe6e6;border-color:rgba(255,176,176,.6)}
+.status.info{background:rgba(179,220,255,.13);color:#eaf5ff;border-color:rgba(179,220,255,.55)}
+.tx-list{max-height:220px;overflow-y:auto}
+.tx-item{padding:10px 0;border-bottom:1px solid rgba(255,255,255,.12);font-size:13px}
+.tx-item .hash{color:var(--info);font-family:var(--mono)}
+.tx-item .amount{float:right;font-weight:600;font-family:var(--mono)}
+.tx-item .amount.plus{color:var(--good)}
+.tx-item .amount.minus{color:var(--bad)}
+.tx-time{color:var(--ink-muted)}
+.net{margin-bottom:22px;font-size:13px;line-height:1.6;color:var(--ink-soft);text-align:center}
+.net .dot{width:8px;height:8px;margin:0 8px 1px 0;border-radius:50%;background:var(--good);box-shadow:0 0 0 3px rgba(138,242,203,.14);display:inline-block;vertical-align:middle}
+.net .dot.pending{background:rgba(255,255,255,.55);box-shadow:0 0 0 3px rgba(255,255,255,.12)}
+.net .dot.off{background:var(--bad);box-shadow:0 0 0 3px rgba(255,150,150,.16)}
 .tabs{display:flex;gap:8px;margin-bottom:16px}
-.tab{flex:1;padding:10px;text-align:center;background:#13131f;border:1px solid #1e1e3a;border-radius:8px;cursor:pointer;font-size:13px;color:#888}
-.tab.active{border-color:#6366f1;color:#fff}
+.tab{flex:1;width:auto;margin:0;padding:11px;text-align:center;background:transparent;border:1px solid var(--line-strong);border-radius:4px;cursor:pointer;font:600 13px var(--body);color:var(--ink-soft)}
+.tab:hover{background:rgba(255,255,255,.08);color:#fff}
+.tab.active{background:#fff;border-color:#fff;color:var(--ground)}
+.note{color:var(--ink-muted);font-size:13px;line-height:1.6;margin-bottom:14px}
+.muted{color:var(--ink-muted);font-size:13px}
 #app{display:none}
-#setup{text-align:center;padding:40px 20px}
-#setup p{color:#888;margin:16px 0}
+#setup{text-align:center;padding:8px 0 0}
+.emblem{display:block;max-width:100%;height:auto;margin:2px auto 16px}
+#setup p{color:var(--ink-soft);margin:14px 0 18px;line-height:1.6}
+/* the balance before its first read is a neutral placeholder, never a figure */
+.balance .pending{font:500 15px/1.1 var(--body);letter-spacing:.02em;color:var(--ink-muted)}
+/* replacing a saved key is never one click: a create or import waits on this inline confirmation */
+#replaceBox{margin-top:14px;text-align:left}
+#replaceBox .status{margin:0 0 12px}
+#disconnectBox{margin-top:12px;text-align:left}
+#disconnectBox .status{margin:0 0 12px}
+button.danger{background:transparent;border:1px solid rgba(255,176,176,.7);color:#ffe6e6;font-weight:600}
+button.danger:hover{border-color:var(--bad);background:rgba(255,150,150,.15)}
 </style>
 </head>
 <body>
 <div class="container">
-<h1><span>ARC</span> Wallet</h1>
+<header class="masthead"><span class="brand"><svg class="wordmark" viewBox="0 0 241.87 94.04" role="img" aria-label="arc" focusable="false"><path fill-rule="evenodd" d="M36.85 0.05C36.66 0.08 36.01 0.14 35.4 0.2C21.46 1.57 9.65 11 3.97 25.31C-1.25 38.46 -1.33 55.12 3.78 68.04C8.89 80.98 17.69 89.34 29.75 92.73C30.53 92.95 34.39 93.65 35.7 93.81C37.46 94.02 42.91 93.99 44.3 93.76C52.02 92.48 57.5 89.82 62.61 84.89C64.67 82.9 65.01 82.66 65.44 82.9C66.05 83.24 66.1 83.5 66.15 87.29L66.2 90.74L66.46 91.19C66.62 91.49 66.86 91.73 67.16 91.89L67.6 92.14L77.86 92.14L88.11 92.14L88.61 91.89C88.97 91.71 89.17 91.51 89.35 91.19L89.6 90.74L89.63 46.26C89.66 -0.35 89.67 1.27 89.2 0.71C88.61 0.01 89.21 0.05 78.21 0.02C66.63 -0.02 66.98 -0.05 66.41 1.04L66.2 1.44L66.15 5.79L66.1 10.14L65.89 10.62C65.42 11.62 65 11.43 62.72 9.2C57.92 4.47 52.27 1.6 45.35 0.38L43.6 0.07L40.4 0.04C38.64 0.03 37.05 0.03 36.85 0.05M197.85 0.11C192.95 0.46 186.55 2.24 182.06 4.49C169.76 10.67 161.35 22.56 158.87 37.29C158.36 40.28 158.38 40.16 158.2 42.64C157 59.78 162.67 75.05 173.66 84.24C180.23 89.73 188.9 93.28 197.27 93.89C207.71 94.65 219.21 92.59 225.83 88.78C234.78 83.63 239.63 76.18 241.71 64.34C242.06 62.37 241.83 61.37 240.9 60.9L240.41 60.64L230.41 60.64C219.32 60.64 219.8 60.62 219.02 61.3C218.53 61.73 218.38 62.06 217.8 63.94C216.87 66.99 215.79 68.77 213.58 70.9C211.41 73 209.29 74.05 205.79 74.76C204.48 75.03 198.8 75.03 197.55 74.76C192.44 73.68 189.05 71.32 186.21 66.89C182.13 60.54 180.57 49.67 182.16 38.69C183.2 31.48 186.78 24.68 191 21.9C192.82 20.71 195.67 19.56 197.75 19.18C198.97 18.96 204.22 18.99 205.5 19.23C211.95 20.42 216.22 24.33 217.97 30.64C218.5 32.55 218.87 33.05 220 33.34C220.75 33.53 239.57 33.58 240.46 33.38C242.01 33.05 242.19 32.02 241.41 28.16C240.08 21.57 237.82 16.72 233.95 12.09C228.64 5.77 219.12 1.38 208.35 0.3C205.33 0 200.6 -0.09 197.85 0.11M142.3 0.96C134.35 1.38 126.34 3.53 120.73 6.76C110.92 12.41 104.48 20.92 101.65 31.94C101.11 34.06 100.34 38.49 100.14 40.64C100.03 41.76 100 46.98 100 66.35L100 90.65L100.26 91.15C100.44 91.51 100.64 91.71 100.96 91.89L101.4 92.14L111.4 92.17C122.48 92.2 122.12 92.22 122.78 91.56C123.45 90.9 123.39 92.87 123.46 66.04C123.52 39.67 123.48 41.6 124.01 38.44C124.94 32.95 127.79 28.36 131.8 25.89C135.94 23.35 140.23 22.5 148.82 22.5C153.06 22.49 153.47 22.39 153.92 21.21C154.12 20.71 154.21 3.25 154.02 2.37C153.93 1.91 153.43 1.32 152.96 1.1C152.62 0.95 144.51 0.84 142.3 0.96M42.05 19.06C29.13 20.66 21.53 34.96 23.95 53.09C24.78 59.24 26.93 64.44 30.34 68.5C33.01 71.69 36.97 73.99 41.1 74.76C42.55 75.03 46.76 75.03 48.2 74.76C58.3 72.87 65.37 62.78 66.07 49.27C66.87 34 59.87 21.87 48.78 19.28C47.93 19.08 43.14 18.92 42.05 19.06"/></svg><span class="tagline">Own your AI</span></span><h1 class="title">Wallet</h1></header>
 
 <div class="net">
-  <span class="dot" id="netDot"></span>
+  <span class="dot pending" id="netDot"></span>
   <span id="netStatus">Connecting...</span>
 </div>
 
 <!-- Setup (no wallet) -->
 <div id="setup">
   <div class="card">
+    <img class="emblem" src="./tablet.png" width="190" height="92" alt="" aria-hidden="true">
     <h2>Get Started</h2>
     <p>Create a new wallet or import an existing one to start using ARC Chain testnet.</p>
     <button onclick="try{createWallet()}catch(e){alert('Error: '+e.message)}">Create New Wallet</button>
@@ -63,6 +103,13 @@ button.secondary:hover{border-color:#6366f1;color:#fff}
     <div id="importBox" style="display:none;margin-top:12px">
       <input type="password" id="importKey" placeholder="Paste 64-char hex private key">
       <button onclick="importWallet()">Import</button>
+    </div>
+    <!-- Asked instead of acting when a wallet is already saved in this browser (another tab saved one after this page
+         loaded, or the saved entry could not be read). -->
+    <div id="replaceBox" hidden>
+      <div class="status err" id="replaceNote" role="alert"></div>
+      <button type="button" class="danger" onclick="try{confirmReplace()}catch(e){alert('Error: '+e.message)}">Replace saved key</button>
+      <button type="button" class="secondary" id="keepKey" onclick="cancelReplace()">Keep saved key</button>
     </div>
   </div>
 </div>
@@ -72,16 +119,16 @@ button.secondary:hover{border-color:#6366f1;color:#fff}
   <!-- Balance -->
   <div class="card">
     <h2>Balance</h2>
-    <div class="balance" id="bal">0 <small>ARC</small></div>
+    <div class="balance" id="bal"><span class="pending">Loading balance...</span></div>
     <div id="balStatus"></div>
-    <div class="addr" id="myAddr" onclick="copyAddr()" title="Click to copy"></div>
+    <button type="button" class="addr" id="myAddr" onclick="copyAddr()" title="Click to copy"></button>
   </div>
 
   <!-- Tabs -->
   <div class="tabs">
-    <div class="tab active" onclick="switchTab('send',this)">Send</div>
-    <div class="tab" onclick="switchTab('faucet',this)">Faucet</div>
-    <div class="tab" onclick="switchTab('txs',this)">History</div>
+    <button type="button" class="tab active" onclick="switchTab('send',this)">Send</button>
+    <button type="button" class="tab" onclick="switchTab('faucet',this)">Faucet</button>
+    <button type="button" class="tab" onclick="switchTab('txs',this)">History</button>
   </div>
 
   <!-- Send -->
@@ -89,27 +136,56 @@ button.secondary:hover{border-color:#6366f1;color:#fff}
     <h2>Send ARC</h2>
     <input id="sendTo" placeholder="Recipient address (64 hex chars)">
     <input id="sendAmt" type="number" placeholder="Amount" min="1">
-    <button onclick="sendTx()">Send</button>
+    <button id="sendBtn" onclick="sendTx()">Send</button>
     <div id="sendStatus"></div>
   </div>
 
   <!-- Faucet -->
   <div id="tab-faucet" class="card" style="display:none">
     <h2>Claim Testnet Tokens</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:12px">Get 10,000 free ARC tokens for testing. One claim per hour.</p>
-    <button onclick="claimFaucet()">Claim 10,000 ARC</button>
+    <p class="note">Get 10,000 free ARC tokens for testing. One claim per hour.</p>
+    <button id="faucetBtn" onclick="claimFaucet()">Claim 10,000 ARC</button>
     <div id="faucetStatus"></div>
   </div>
 
   <!-- History -->
   <div id="tab-txs" class="card" style="display:none">
     <h2>Recent Transactions</h2>
-    <div class="tx-list" id="txList"><p style="color:#666;font-size:13px">No transactions yet</p></div>
+    <div class="tx-list" id="txList"><p class="muted">No transactions yet</p></div>
   </div>
 
-  <button class="secondary" onclick="logout()" style="margin-top:8px;font-size:12px">Disconnect Wallet</button>
+  <button class="secondary quiet" onclick="logout()">Disconnect Wallet</button>
+  <!-- Disconnecting deletes the private key saved in this browser, so it is never one click. -->
+  <div id="disconnectBox" hidden>
+    <div class="status err" role="alert">Disconnecting deletes the private key saved in this browser. Unless you kept a copy, this wallet cannot be recovered.</div>
+    <button type="button" class="danger" onclick="confirmLogout()">Delete key and disconnect</button>
+    <button type="button" class="secondary" id="keepWallet" onclick="cancelLogout()">Keep wallet</button>
+  </div>
 </div>
 </div>
+
+<script>
+// Runs as the page parses. The module below cannot start until its crypto imports have downloaded, and it then probes
+// the seeds, so a saved wallet is restored here first, synchronously, before any of that network work: it is never
+// left behind the "Create New Wallet" card while the page connects. The module takes the key from the same function.
+function readSavedWallet() {
+  const raw = localStorage.getItem('arc_wallet');
+  if (raw === null) return {state: 'none'};
+  try {
+    const w = JSON.parse(raw);
+    return w && w.version === 2 && w.pubKey ? {state: 'ok', wallet: w} : {state: 'legacy'};
+  } catch (e) {
+    return {state: 'unreadable'};
+  }
+}
+(function restoreSavedWallet() {
+  const saved = readSavedWallet();
+  if (saved.state !== 'ok') return;
+  document.getElementById('setup').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  document.getElementById('myAddr').textContent = saved.wallet.address;
+})();
+</script>
 
 <script type="module">
 // Real Ed25519 + BLAKE3 keyed hashing matching arc-chain server-side verification:
@@ -131,16 +207,33 @@ const NODES = [
   {name:'SGP', ip:'149.28.153.31'},
 ];
 let RPC = '';
+let seedsProbed = false; // every seed has been tried once
 let wallet = null; // {version, privKey, pubKey, address}
 
 // ── Startup ──
-(async function init() {
+// The saved wallet comes back first, synchronously, before any network call: the classic script above already put
+// its view on screen while this module's imports loaded, and its key is taken here before a seed is probed. A legacy
+// wallet (random-bytes "key", sha256 address) couldn't sign: drop it and start fresh with a real Ed25519 keypair. An
+// entry that cannot be read is left in place; replacing it goes through the same inline confirmation as any saved key.
+const saved = readSavedWallet();
+if (saved.state === 'ok') {
+  wallet = saved.wallet;
+  showApp();
+} else if (saved.state === 'legacy') {
+  localStorage.removeItem('arc_wallet');
+  localStorage.removeItem('arc_txs');
+}
+
+// Then the seeds, one at a time in list order; the first healthy one serves the whole session. A send or faucet claim
+// made before this settles waits for it, rather than posting to no seed.
+const seedProbe = (async function connect() {
   for (const n of NODES) {
     try {
       const r = await fetch(`http://${n.ip}:9090/health`, {signal: AbortSignal.timeout(3000)});
       if (r.ok) { RPC = `http://${n.ip}:9090`; break; }
     } catch(e) { /* probing: an unreachable seed is the expected case, try the next */ }
   }
+  seedsProbed = true;
   if (RPC) {
     try {
       const h = await (await fetch(RPC+'/health')).json();
@@ -158,19 +251,7 @@ let wallet = null; // {version, privKey, pubKey, address}
     document.getElementById('netDot').className = 'dot off';
     document.getElementById('netStatus').textContent = 'Testnet unreachable';
   }
-  const saved = localStorage.getItem('arc_wallet');
-  if (saved) {
-    const w = JSON.parse(saved);
-    if (w.version === 2 && w.pubKey) {
-      wallet = w;
-      showApp();
-    } else {
-      // Legacy wallet (random-bytes "key", sha256 address) couldn't sign. Drop it
-      // and start fresh with a real Ed25519 keypair.
-      localStorage.removeItem('arc_wallet');
-      localStorage.removeItem('arc_txs');
-    }
-  }
+  refreshBalance();
 })();
 
 // ── Hex helpers ──
@@ -215,28 +296,57 @@ function generateKeypair() {
 }
 
 function createWallet() {
-  wallet = generateKeypair();
-  localStorage.setItem('arc_wallet', JSON.stringify(wallet));
-  showKeyModal(wallet.privKey, wallet.address);
-  showApp();
-  claimFaucet().then(() => { setTimeout(refreshBalance, 1000); });
+  afterReplaceConfirmed('Creating a new wallet', () => {
+    wallet = generateKeypair();
+    localStorage.setItem('arc_wallet', JSON.stringify(wallet));
+    showKeyModal(wallet.privKey, wallet.address);
+    showApp();
+    claimFaucet().then(() => { setTimeout(refreshBalance, 1000); });
+  });
+}
+
+// ── Replacing a saved key ──
+// The create card is hidden whenever a readable wallet is saved, so this is reached only when another tab saved one
+// after this page loaded, or the saved entry could not be read. Either way a create or import replaces the saved key
+// only after this inline step says so and is confirmed, never on the first click.
+let pendingReplace = null;
+
+function afterReplaceConfirmed(doing, action) {
+  if (localStorage.getItem('arc_wallet') === null) return action();
+  pendingReplace = action;
+  document.getElementById('replaceNote').textContent =
+    `A wallet is already saved in this browser. ${doing} will replace the private key saved here. ` +
+    'Unless you kept a copy of that key, it cannot be recovered.';
+  document.getElementById('replaceBox').hidden = false;
+  document.getElementById('keepKey').focus();
+}
+
+function confirmReplace() {
+  const action = pendingReplace;
+  cancelReplace();
+  if (action) action();
+}
+
+function cancelReplace() {
+  pendingReplace = null;
+  document.getElementById('replaceBox').hidden = true;
 }
 
 function showKeyModal(privKey, address) {
   const overlay = document.createElement('div');
-  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px';
-  overlay.innerHTML = `<div style="background:#13131f;border:1px solid #6366f1;border-radius:12px;padding:24px;max-width:440px;width:100%">
-    <h3 style="color:#f87171;font-size:16px;margin-bottom:12px">Save Your Private Key</h3>
-    <p style="color:#888;font-size:13px;margin-bottom:16px">This is shown only once. Copy it now and store it safely.</p>
-    <div style="background:#0a0a0f;border:1px solid #2a2a4a;border-radius:8px;padding:12px;margin-bottom:12px">
-      <div style="color:#888;font-size:11px;margin-bottom:4px">PRIVATE KEY (tap to copy)</div>
-      <div id="pkDisplay" onclick="navigator.clipboard.writeText('${privKey}');this.style.color='#4ade80';this.textContent='Copied!';setTimeout(()=>{this.textContent='${privKey}';this.style.color='#f87171'},1500)" style="font-family:monospace;font-size:11px;color:#f87171;word-break:break-all;cursor:pointer;user-select:all">${privKey}</div>
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,18,110,0.88);z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.innerHTML = `<div style="background:#0026c4;border:1px solid rgba(255,255,255,.55);border-radius:6px;padding:26px;max-width:440px;width:100%;box-shadow:inset 0 0 0 4px #0026c4,inset 0 0 0 5px rgba(255,255,255,.1),0 24px 60px rgba(0,8,70,.5)">
+    <h3 style="color:#ffb0b0;font:400 24px/1.2 Marcellus,Georgia,serif;margin-bottom:10px">Save Your Private Key</h3>
+    <p style="color:rgba(255,255,255,.86);font-size:14px;line-height:1.55;margin-bottom:16px">This is shown only once. Copy it now and store it safely.</p>
+    <div style="background:rgba(0,16,120,.45);border:1px solid rgba(255,176,176,.6);border-radius:4px;padding:12px 14px;margin-bottom:12px">
+      <div style="color:rgba(255,255,255,.8);font-size:11px;letter-spacing:.12em;margin-bottom:6px">PRIVATE KEY (tap to copy)</div>
+      <div id="pkDisplay" onclick="navigator.clipboard.writeText('${privKey}');this.style.color='#8af2cb';this.textContent='Copied!';setTimeout(()=>{this.textContent='${privKey}';this.style.color='#ffb0b0'},1500)" style="font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;line-height:1.55;color:#ffb0b0;word-break:break-all;cursor:pointer;user-select:all">${privKey}</div>
     </div>
-    <div style="background:#0a0a0f;border:1px solid #2a2a4a;border-radius:8px;padding:12px;margin-bottom:16px">
-      <div style="color:#888;font-size:11px;margin-bottom:4px">YOUR ADDRESS</div>
-      <div style="font-family:monospace;font-size:11px;color:#6366f1;word-break:break-all;user-select:all">${address}</div>
+    <div style="background:rgba(0,16,120,.45);border:1px solid rgba(255,255,255,.3);border-radius:4px;padding:12px 14px;margin-bottom:18px">
+      <div style="color:rgba(255,255,255,.8);font-size:11px;letter-spacing:.12em;margin-bottom:6px">YOUR ADDRESS</div>
+      <div style="font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;line-height:1.55;color:#b3dcff;word-break:break-all;user-select:all">${address}</div>
     </div>
-    <button onclick="this.parentElement.parentElement.remove()" style="width:100%;padding:12px;background:#6366f1;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">I've Saved My Key</button>
+    <button onclick="this.parentElement.parentElement.remove()" style="width:100%;padding:13px;background:#fff;color:#002dde;border:none;border-radius:4px;font-size:14px;font-weight:700;cursor:pointer">I've Saved My Key</button>
   </div>`;
   document.body.appendChild(overlay);
 }
@@ -251,22 +361,35 @@ function importWallet() {
     alert('Invalid key - must be 64 hex characters');
     return;
   }
-  const privBytes = fromHex(key);
-  const pubBytes  = ed.getPublicKey(privBytes);
-  const address   = toHex(blake3(pubBytes, {dkLen: 32}));
-  wallet = {version:2, privKey: key, pubKey: toHex(pubBytes), address};
-  localStorage.setItem('arc_wallet', JSON.stringify(wallet));
-  showApp();
+  afterReplaceConfirmed('Importing this key', () => {
+    const privBytes = fromHex(key);
+    const pubBytes  = ed.getPublicKey(privBytes);
+    const address   = toHex(blake3(pubBytes, {dkLen: 32}));
+    wallet = {version:2, privKey: key, pubKey: toHex(pubBytes), address};
+    localStorage.setItem('arc_wallet', JSON.stringify(wallet));
+    showApp();
+  });
 }
 
 function showApp() {
   document.getElementById('setup').style.display = 'none';
   document.getElementById('app').style.display = 'block';
   document.getElementById('myAddr').textContent = wallet.address;
+  showBalanceLoading();
   refreshBalance();
 }
 
 function logout() {
+  document.getElementById('disconnectBox').hidden = false;
+  document.getElementById('keepWallet').focus();
+}
+
+function cancelLogout() {
+  document.getElementById('disconnectBox').hidden = true;
+}
+
+function confirmLogout() {
+  cancelLogout();
   localStorage.removeItem('arc_wallet');
   wallet = null;
   document.getElementById('setup').style.display = 'block';
@@ -279,26 +402,81 @@ function copyAddr() {
   setTimeout(() => document.getElementById('myAddr').textContent = wallet.address, 1500);
 }
 
+// ── Status text ──
+// Anything a seed sends back (errors, hashes, amounts, the balance) is written as text, never parsed as HTML: this page
+// keeps the private key in browser storage and talks to the seeds over plain http, so a hostile or intercepted reply
+// must not be able to run script here.
+function setStatus(el, kind, text) {
+  const div = document.createElement('div');
+  div.className = `status ${kind}`;
+  div.textContent = String(text);
+  el.replaceChildren(div);
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
 // ── Balance ──
+// Until the first read answers, the balance is a neutral placeholder rather than a "0 ARC" nobody fetched.
+function showBalanceLoading() {
+  document.getElementById('bal').innerHTML = '<span class="pending">Loading balance...</span>';
+  document.getElementById('balStatus').innerHTML = '';
+}
+
+function showBalanceUnavailable(reason) {
+  document.getElementById('bal').innerHTML = '&mdash; <small>ARC</small>';
+  setStatus(document.getElementById('balStatus'), 'err', `Balance unavailable: ${reason}`);
+}
+
 async function refreshBalance() {
-  if (!wallet || !RPC) return;
-  const note = document.getElementById('balStatus');
+  if (!wallet) return;
+  // Still probing: keep the placeholder. Every seed failed: say so, rather than loading forever.
+  if (!RPC) { if (seedsProbed) showBalanceUnavailable('testnet unreachable'); return; }
+  const address = wallet.address;
   try {
-    const r = await fetch(`${RPC}/account/${wallet.address}`);
+    const r = await fetch(`${RPC}/account/${address}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
+    if (wallet?.address !== address) return; // another wallet was opened while this read was in flight
+    const balance = Number(d.balance || 0);   // a number or nothing: a string from the seed is never rendered as markup
     document.getElementById('bal').innerHTML =
-      `${(d.balance||0).toLocaleString()} <small>ARC</small>`;
-    note.innerHTML = '';
+      `${Number.isFinite(balance) ? balance.toLocaleString() : '&mdash;'} <small>ARC</small>`;
+    document.getElementById('balStatus').innerHTML = '';
   } catch(e) {
-    document.getElementById('bal').innerHTML = '&mdash; <small>ARC</small>';
-    note.innerHTML = `<div class="status err">Balance unavailable: ${e.message}</div>`;
+    if (wallet?.address !== address) return;
+    showBalanceUnavailable(e.message);
   }
 }
 setInterval(refreshBalance, 5000);
 
+// ── Requests in flight ──
+// A button whose request is in flight is disabled and says so, so a second click cannot submit the same transfer or
+// claim twice.
+function setPending(btn, label) {
+  btn.dataset.idleLabel = btn.textContent;
+  btn.textContent = label;
+  btn.disabled = true;
+}
+
+function clearPending(btn) {
+  btn.textContent = btn.dataset.idleLabel;
+  btn.disabled = false;
+}
+
+// A request made while the startup probe is still running waits for it; once every seed has failed it stops there.
+async function requireSeed(el) {
+  if (!RPC) {
+    el.innerHTML='<div class="status info">Connecting to the testnet...</div>';
+    await seedProbe;
+  }
+  if (!RPC) throw new Error('Testnet unreachable');
+}
+
 // ── Send (Ed25519-signed) ──
 async function sendTx() {
+  const btn = document.getElementById('sendBtn');
+  if (btn.disabled) return;
   const to  = document.getElementById('sendTo').value.trim();
   const amt = parseInt(document.getElementById('sendAmt').value);
   const el  = document.getElementById('sendStatus');
@@ -306,8 +484,10 @@ async function sendTx() {
     el.innerHTML='<div class="status err">Invalid address (need 64 hex chars)</div>'; return;
   }
   if (!amt || amt<=0) { el.innerHTML='<div class="status err">Invalid amount</div>'; return; }
-  el.innerHTML='<div class="status info">Signing & submitting...</div>';
+  setPending(btn, 'Sending...');
   try {
+    await requireSeed(el);
+    el.innerHTML='<div class="status info">Signing & submitting...</div>';
     // Fetch fresh nonce
     const acct = await (await fetch(`${RPC}/account/${wallet.address}`)).json();
     const nonce = acct.nonce || 0;
@@ -333,35 +513,41 @@ async function sendTx() {
     });
     const d = await r.json();
     if (r.ok && d.tx_hash) {
-      el.innerHTML=`<div class="status ok">Sent! TX: ${d.tx_hash.slice(0,16)}...</div>`;
+      setStatus(el, 'ok', `Sent! TX: ${String(d.tx_hash).slice(0,16)}...`);
       addTxToHistory({hash:d.tx_hash, to, amount:-amt});
       document.getElementById('sendTo').value='';
       document.getElementById('sendAmt').value='';
       setTimeout(refreshBalance, 2000);
     } else {
-      el.innerHTML=`<div class="status err">${d.error||d.message||JSON.stringify(d)}</div>`;
+      setStatus(el, 'err', d.error||d.message||JSON.stringify(d));
     }
-  } catch(e) { el.innerHTML=`<div class="status err">${e.message}</div>`; }
+  } catch(e) { setStatus(el, 'err', e.message); }
+  finally { clearPending(btn); }
 }
 
 // ── Faucet ──
 async function claimFaucet() {
+  const btn = document.getElementById('faucetBtn');
+  if (btn.disabled) return;
   const el = document.getElementById('faucetStatus');
-  el.innerHTML='<div class="status info">Claiming...</div>';
+  setPending(btn, 'Claiming...');
   try {
+    await requireSeed(el);
+    el.innerHTML='<div class="status info">Claiming...</div>';
     const r = await fetch(`${RPC}/faucet/claim`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({address:wallet.address})
     });
     const d = await r.json();
     if (r.ok && d.tx_hash) {
-      el.innerHTML=`<div class="status ok">Received ${d.amount||10000} ARC!</div>`;
+      setStatus(el, 'ok', `Received ${d.amount||10000} ARC!`);
       addTxToHistory({hash:d.tx_hash, from:'faucet', amount:d.amount||10000});
       refreshBalance();
     } else {
-      el.innerHTML=`<div class="status err">${d.error||d.message||JSON.stringify(d)}</div>`;
+      setStatus(el, 'err', d.error||d.message||JSON.stringify(d));
     }
-  } catch(e) { el.innerHTML=`<div class="status err">${e.message}</div>`; }
+  } catch(e) { setStatus(el, 'err', e.message); }
+  finally { clearPending(btn); }
 }
 
 // ── Tabs ──
@@ -386,14 +572,14 @@ function addTxToHistory(tx) {
 
 function loadHistory() {
   const el = document.getElementById('txList');
-  if (!txHistory.length) { el.innerHTML='<p style="color:#666;font-size:13px">No transactions yet</p>'; return; }
+  if (!txHistory.length) { el.innerHTML='<p class="muted">No transactions yet</p>'; return; }
   el.innerHTML = txHistory.map(tx=>{
     const isIn = tx.amount > 0;
     const time = new Date(tx.time).toLocaleTimeString();
     return `<div class="tx-item">
-      <span class="hash">${(tx.hash||'').slice(0,12)}...</span>
-      <span class="amount ${isIn?'plus':'minus'}">${isIn?'+':''}${tx.amount} ARC</span>
-      <br><span style="color:#555">${time}</span>
+      <span class="hash">${escapeHtml((tx.hash||'').slice(0,12))}...</span>
+      <span class="amount ${isIn?'plus':'minus'}">${isIn?'+':''}${escapeHtml(tx.amount)} ARC</span>
+      <br><span class="tx-time">${time}</span>
     </div>`;
   }).join('');
 }
@@ -401,7 +587,7 @@ function loadHistory() {
 // Expose handlers for inline onclick="..." attributes (module scope is local).
 Object.assign(window, {
   createWallet, importWallet, showImport, sendTx, claimFaucet,
-  switchTab, copyAddr, logout, loadHistory,
+  switchTab, copyAddr, logout, confirmLogout, cancelLogout, loadHistory, confirmReplace, cancelReplace,
 });
 </script>
 </body>

@@ -2,7 +2,7 @@ import { ExternalLink, Moon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { api, isSyntheticPreview } from "../lib/tauri";
 import { StatusPill } from "./StatusPill";
-import { ArcDevice } from "./Logo";
+import { Wordmark } from "./Logo";
 
 export function Titlebar() {
   const { data: status } = useQuery({
@@ -11,42 +11,33 @@ export function Titlebar() {
     refetchInterval: 2000,
   });
 
-  const level = status?.health ?? "offline";
+  // Until the first status arrives nothing is known: say "Checking", not "Offline".
+  const level = status ? status.health : "checking";
 
   return (
     <div className="titlebar" data-testid="titlebar" data-tauri-drag-region>
       <div className="titlebar-center">
-        <ArcDevice size={14} color="var(--arc)" />
-        <span style={{ color: "var(--text)" }}>arc</span>
-        <span style={{ opacity: 0.4 }}>·</span>
+        <Wordmark height={13} />
+        <span className="titlebar-sep" aria-hidden="true">·</span>
         <span>node</span>
-        <span style={{ opacity: 0.4 }}>·</span>
+        <span className="titlebar-sep" aria-hidden="true">·</span>
         <span>testnet</span>
       </div>
 
       <div className="titlebar-right">
         <StatusPill level={level} />
         {isSyntheticPreview && (
-          <span
-            style={{
-              fontSize: 10,
-              color: "var(--text-faint)",
-              display: "flex",
-              alignItems: "center",
-              gap: 4,
-            }}
-            data-testid="preview-mode"
-          >
+          <span className="titlebar-preview" data-testid="preview-mode">
             <Moon size={10} /> Synthetic preview · not live
           </span>
         )}
         <button
-          className="btn btn-ghost btn-sm"
+          className="btn btn-ghost btn-sm titlebar-github"
           onClick={() => api.openExternal("https://github.com/FerrumVir/arc-chain")}
           data-testid="open-github"
           aria-label="Open GitHub"
         >
-          <ExternalLink size={13} /> GitHub
+          <ExternalLink size={13} /> <span className="titlebar-github-label">GitHub</span>
         </button>
       </div>
     </div>

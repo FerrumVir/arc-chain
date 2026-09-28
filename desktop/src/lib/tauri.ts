@@ -171,9 +171,12 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     typeof historyScope !== "string" ||
     historyDomain !== EARNINGS_HISTORY_DOMAIN ||
     responseAddress === null ||
-    (archiveMode
-      ? historyCompleteSinceRecovery !== true || historyScope !== ARCHIVE_EARNINGS_SCOPE
-      : historyCompleteSinceRecovery !== false || historyScope !== RETAINED_EARNINGS_SCOPE)
+    // Archive mode describes configured retention. It does not certify that
+    // the host can prove complete history from the v3 recovery boundary.
+    // Such a host may still report a valid retained receipt window.
+    (historyCompleteSinceRecovery
+      ? archiveMode !== true || historyScope !== ARCHIVE_EARNINGS_SCOPE
+      : historyScope !== RETAINED_EARNINGS_SCOPE)
   ) {
     return null;
   }
@@ -583,6 +586,18 @@ function parseCommunityRewardReceiptBody(
  * outside Tauri (which refuses to mock at all — see the guard in
  * `mockInvoke`). Setting it cannot make the real app show a fabricated number.
  */
+/**
+ * Preview seam: `?slow=1500` holds every mock reply that long, so the launch screen, the "Checking" states and the
+ * loading placeholders can be seen and reviewed in the browser preview (the mock otherwise answers instantly). Like
+ * `mockOverride`, it lives inside `mockInvoke` only: the Tauri app never calls the mock, and a production bundle
+ * refuses to mock at all.
+ */
+function mockLatencyMs(): number {
+  if (typeof window === "undefined") return 0;
+  const value = Number(new URLSearchParams(window.location.search).get("slow"));
+  return Number.isFinite(value) && value > 0 ? Math.min(value, 10_000) : 0;
+}
+
 type MockOverrides = Record<string, unknown>;
 function mockOverride<T>(cmd: string): T | undefined {
   if (typeof window === "undefined") return undefined;
@@ -2397,6 +2412,9 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       "ARC desktop is running outside its native host. Open the arc app, not the HTML bundle.",
     );
   }
+  // Preview latency (see `mockLatencyMs`), also after the production guard.
+  const slow = mockLatencyMs();
+  if (slow) await new Promise((resolve) => setTimeout(resolve, slow));
   // Test seam (see `mockOverride`). Checked after the production guard above,
   // so it cannot fabricate anything in a real bundle.
   const override = mockOverride<T>(cmd);
@@ -2444,7 +2462,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         running,
         pid: running && !external ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
-        version: "0.8.0",
+        version: "0.8.1",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,

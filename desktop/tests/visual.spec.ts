@@ -17,7 +17,7 @@ test.describe("Visual polish smoke tests", () => {
     expect(bg).toContain("linear-gradient");
     // Tagline is present
     await expect(page.getByTestId("tagline")).toBeVisible();
-    await expect(page.getByTestId("tagline")).toContainText(/ai for humans first/i);
+    await expect(page.getByTestId("tagline")).toContainText(/own your ai/i);
   });
 
   test("dashboard earnings uses gradient text", async ({ page }) => {

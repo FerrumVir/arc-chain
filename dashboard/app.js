@@ -431,12 +431,75 @@
       workerForm: $("worker-form"), workerId: $("worker-id"), workerError: $("worker-error"), workerBalance: $("worker-balance"), workerRewards: $("worker-rewards"), workerRewardsDetail: $("worker-rewards-detail"), workerRate: $("worker-rate"), workerProjection: $("worker-projection"), workerReadiness: $("worker-readiness"),
       receiptForm: $("receipt-form"), receiptHash: $("receipt-hash"), receiptError: $("receipt-error"), receiptResult: $("receipt-result"),
     };
-    const state = { config: null, resolver: null, checkpointAudit: { state: "unknown", reason: "not-audited" }, controller: null, timer: null };
-    const text = (node, value) => { if (node) node.textContent = value == null ? "" : String(value); };
+    // audited: an audit has finished and its result is on screen, so later refreshes run in the background.
+    // updatedLabel: the timestamp that result earned, shown again once a background refresh settles.
+    const state = { config: null, resolver: null, checkpointAudit: { state: "unknown", reason: "not-audited" }, controller: null, timer: null, audited: false, updatedLabel: elements.lastUpdated.textContent };
+    // A write that would not change a node is skipped: a background refresh that finds the same evidence rewrites
+    // nothing, so nothing flickers and the live banner does not announce it again.
+    const text = (node, value) => {
+      if (!node) return;
+      const next = value == null ? "" : String(value);
+      if (node.textContent !== next) node.textContent = next;
+    };
     const clear = (node) => { if (node) node.replaceChildren(); };
     const create = (tag, className, content) => { const node = document.createElement(tag); if (className) node.className = className; if (content !== undefined && content !== null) node.textContent = String(content); return node; };
     const formatInteger = (value) => value === null || value === undefined ? "—" : new Intl.NumberFormat().format(value);
     const formatArc = (value) => value === null || value === undefined ? "—" : `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 4 }).format(value)} ARC`;
+
+    // The aqueduct in the page header (aqueduct/band.js) draws only blocks this console read: the checkpoint-selected
+    // v3 source's latest block at each audit, and a light poll of that same source's latest block. Its water runs with
+    // the confirmed inference receipts each audit reads. It is optional; without it every aqueduct call below does
+    // nothing.
+    const aqueduct = (() => {
+      const band = window.ArcAqueductBand;
+      if (!band || typeof band.mount !== "function") return null;
+      let mounted = null;
+      try { mounted = band.mount(document.getElementById("aqueduct"), { bot: 340 }); } catch (_error) { return null; }
+      if (!mounted) return null;
+      // The band only illustrates evidence the console already shows: a failure inside it must never change that evidence.
+      const safely = (method) => (options) => { try { mounted[method](options); } catch (_error) { /* the picture stays as it was */ } };
+      return { follow: safely("follow"), clear: safely("clear") };
+    })();
+    function blockTxCount(block) {
+      const header = network.blockHeader(block);
+      const explicit = numberOrNull(block?.tx_count, header.tx_count, block?.transactions_count);
+      if (explicit !== null) return explicit;
+      if (Array.isArray(block?.transactions)) return block.transactions.length;
+      if (Array.isArray(block?.tx_hashes)) return block.tx_hashes.length;
+      return null;
+    }
+    const aqueductBlock = (block) => ({ height: network.blockHeight(block), txCount: blockTxCount(block), timestamp: network.blockHeader(block).timestamp ?? null });
+    function followAqueduct(fleet, boundary, maintenanceAudit, publicationError, inference) {
+      if (!aqueduct) return;
+      // The band withdraws its picture whenever the console withdraws its claim.
+      if (maintenanceAudit.state !== "healthy") return aqueduct.clear({ tone: "bad", title: "Paused by the maintenance safety interlock", detail: "Public canonical claims are paused, so no blocks are drawn." });
+      if (boundary.state === "mismatch") return aqueduct.clear({ tone: "bad", title: "Recovery checkpoint mismatch", detail: "Canonical and earnings claims are paused, so no blocks are drawn." });
+      if (fleet.state === "fork") return aqueduct.clear({ tone: "bad", title: "Common-height fork confirmed", detail: "Configured v3 replicas disagree, so no blocks are drawn until recovery selection is resolved." });
+      const current = fleet.current;
+      if (!current) return aqueduct.clear({ tone: "warn", title: "Recovery not configured", detail: "No checkpoint-selected v3 source is configured, so no blocks are drawn." });
+      const tip = current.latest ? aqueductBlock(current.latest) : current.height !== null ? { height: current.height } : null;
+      if (!current.reachable || !tip || tip.height === null) return aqueduct.clear({ tone: "bad", title: "Canonical source unreachable", detail: `${current.source.name} did not report a block, so no blocks are drawn.` });
+      const verified = !publicationError && fleet.state === "healthy" && boundary.state === "verified";
+      const stalled = current.liveness.state === "stalled";
+      const told = verified
+        ? `Each stone is a block ${current.source.name} reported for the canonical timeline. Signed H, exact H+1, and all six maintenance interlocks are verified.`
+        : `Each stone is a block reported by ${current.source.name}. Evidence is incomplete${publicationError ? ` (${publicationError})` : ""}, so none of it is presented as verified.`;
+      return aqueduct.follow({
+        key: current.source.id,
+        tone: verified && !stalled ? "good" : "warn",
+        title: stalled ? "Chain appears stalled" : verified ? "Live · canonical v3 continuation" : "Canonical evidence incomplete",
+        detail: stalled ? `${told} Its newest block is stale, so building has stopped where the chain stopped.` : told,
+        source: current.source.name,
+        stalled,
+        blocks: [tip],
+        poll: (signal) => requestLatestBlock(window.fetch.bind(window), current.source, { signal }).then((block) => [aqueductBlock(block)]),
+        // Only verified evidence feeds the water: the receipts the inference table lists as confirmed, read from this
+        // same source. Anything less feeds nothing and withdraws the line under the headline.
+        inference: verified && inference && !inference.error && inference.source?.id === current.source.id
+          ? inference.confirmed.map(({ receipt }) => ({ id: receipt.txHash, height: receipt.height }))
+          : null,
+      });
+    }
 
     function setBadge(node, kind, label) { node.className = `badge ${kind}`; text(node, label); }
     function setTruth(kind, title, detail) {
@@ -447,12 +510,26 @@
       text(elements.navState, title);
     }
 
+    // A background refresh keeps the last result's banner up: its signal pulses, the timestamp reads "Refreshing…", and
+    // aria-busy holds the live region's announcements until the new result is in.
+    function setRefreshing(on) {
+      if (on) elements.truthBanner.classList.add("refreshing");
+      else elements.truthBanner.classList.remove("refreshing");
+      elements.truthBanner.setAttribute("aria-busy", on ? "true" : "false");
+      text(elements.lastUpdated, on ? "Refreshing…" : state.updatedLabel);
+    }
+
     function renderContinuity(boundary) {
       const checkpoint = state.config?.checkpoint;
       text(elements.chainId, state.config?.network.chainId ?? "Unavailable");
       if (!checkpoint) {
         text(elements.continuityTitle, "Recovery metadata unavailable");
         text(elements.continuityCopy, "Canonical claims are paused until a signed legacy checkpoint and a protocol-v3 continuation source are published.");
+        // The loading placeholders settle to what is known without a checkpoint: nothing.
+        text(elements.manifestValue, "Unavailable");
+        text(elements.legacyAnchor, "No signed anchor");
+        text(elements.boundaryProof, "Parent unverified");
+        text(elements.v3Source, "No source");
         setBadge(elements.boundaryBadge, "unknown", "NOT VERIFIED");
         return;
       }
@@ -467,6 +544,8 @@
       text(elements.v3Source, state.resolver.currentSource()?.name ?? "Source unavailable");
       if (boundary?.state === "verified") { setBadge(elements.boundaryBadge, "good", "CHECKPOINT VERIFIED"); text(elements.boundaryProof, "Exact H, H+1, and every v3 identity match"); }
       else if (boundary?.state === "mismatch") { setBadge(elements.boundaryBadge, "bad", "CHECKPOINT MISMATCH"); text(elements.boundaryProof, "A signed commitment or replica identity differs"); }
+      // configuration loaded, first audit not yet answered: nothing is proven or disproven
+      else if (boundary?.state === "auditing") { setBadge(elements.boundaryBadge, "unknown", "AUDITING"); text(elements.boundaryProof, "Checking exact H and H+1…"); }
       else { setBadge(elements.boundaryBadge, "warn", "PROOF UNAVAILABLE"); text(elements.boundaryProof, boundary?.reason || "Exact checkpoint evidence unavailable"); }
     }
 
@@ -525,11 +604,26 @@
         if (entry.receipt.txHash) link.href = `../explorer/#/tx/${entry.receipt.txHash}`;
         hashCell.append(link);
         const paid = entry.receipt.paymentConfirmed;
-        row.append(create("td", "", formatInteger(entry.receipt.height)), hashCell, create("td", "", network.formatHash(entry.row.inference?.model_hash ?? entry.row.model_id ?? entry.row.model)), create("td", "", network.formatHash(entry.row.worker_id ?? entry.row.worker)), create("td", "receipt-ok", paid ? "COMPUTED + PAID" : "COMPUTED · NOT PAYMENT"));
+        row.append(create("td", "", formatInteger(entry.receipt.height)), hashCell, create("td", "hash", network.formatHash(entry.row.inference?.model_hash ?? entry.row.model_id ?? entry.row.model)), create("td", "hash", network.formatHash(entry.row.worker_id ?? entry.row.worker)), create("td", "receipt-ok", paid ? "COMPUTED + PAID" : "COMPUTED · NOT PAYMENT"));
         elements.inferenceBody.append(row);
       }
       text(elements.inferenceSummary, `${result.confirmed.length} confirmed · ${result.excluded} unproven or non-canonical excluded · source ${result.source?.name ?? "unavailable"}`);
       setBadge(elements.inferenceBadge, result.confirmed.length ? "good" : result.error ? "warn" : "unknown", result.confirmed.length ? `${result.confirmed.length} CONFIRMED` : "NO RECEIPTS");
+    }
+
+    // Evidence fields start on neutral loading placeholders (index.html), none of which is a claim. When the first audit
+    // cannot finish, or the configuration is rejected, they settle to the explicit unknown wording instead of loading
+    // forever.
+    function renderNoEvidence() {
+      text(elements.heightNote, "No v3 evidence");
+      text(elements.livenessNote, "Liveness unknown");
+      text(elements.replicaNote, "No completed audit");
+      text(elements.forkNote, "Agreement unknown");
+      setBadge(elements.fleetBadge, "unknown", "UNKNOWN");
+      clear(elements.inferenceBody);
+      const row = create("tr"); const cell = create("td", "empty", "No confirmed inference receipts loaded."); cell.colSpan = 5; row.append(cell); elements.inferenceBody.append(row);
+      text(elements.inferenceSummary, "Inference evidence unavailable");
+      setBadge(elements.inferenceBadge, "unknown", "NO EVIDENCE");
     }
 
     function renderWorker(result) {
@@ -549,6 +643,17 @@
       elements.workerReadiness.className = `readiness ${className}`;
       clear(elements.workerReadiness);
       elements.workerReadiness.append(create("span", `dot ${dot}`));
+      const copy = create("div"); copy.append(create("strong", "", title), create("p", "", detail)); elements.workerReadiness.append(copy);
+    }
+
+    // While a lookup runs, and after one fails, the earnings cards hold no figures: a previous worker's numbers are never
+    // left standing under another address.
+    function renderWorkerNotice(title, detail) {
+      for (const node of [elements.workerBalance, elements.workerRewards, elements.workerRate, elements.workerProjection]) text(node, "—");
+      text(elements.workerRewardsDetail, "Successful retained 0x25 receipts only");
+      elements.workerReadiness.className = "readiness neutral";
+      clear(elements.workerReadiness);
+      elements.workerReadiness.append(create("span", "dot unknown"));
       const copy = create("div"); copy.append(create("strong", "", title), create("p", "", detail)); elements.workerReadiness.append(copy);
     }
 
@@ -577,10 +682,14 @@
     async function refresh() {
       if (!state.resolver) return;
       state.controller?.abort();
-      state.controller = new AbortController();
-      const signal = state.controller.signal;
+      const controller = new AbortController();
+      state.controller = controller;
+      const signal = controller.signal;
       elements.refresh.classList.add("spinning"); elements.refresh.disabled = true;
-      setTruth("loading", "Auditing configured canonical sources…", "Checking H+1 parent linkage, replica freshness, and one common-height commitment.");
+      // Only the first audit has nothing to keep on screen, so only it says "Auditing…". Every later refresh (the
+      // 30-second timer, a return to the tab, the Refresh button) leaves the last result up and marks it as refreshing.
+      if (state.audited) setRefreshing(true);
+      else setTruth("loading", "Auditing configured canonical sources…", "Checking H+1 parent linkage, replica freshness, and one common-height commitment.");
       try {
         const [fleet, boundary, maintenanceAudit] = await Promise.all([
           collectFleetHealth({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
@@ -596,17 +705,28 @@
         const inference = await loadInferenceEvidence({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal, checkpointAudit: effectiveBoundary });
         if (signal.aborted) return;
         renderContinuity(effectiveBoundary); renderFleet(fleet); renderInference(inference);
+        followAqueduct(fleet, boundary, maintenanceAudit, publicationError, inference);
         if (maintenanceAudit.state !== "healthy") setTruth("bad", "Network maintenance safety interlock active", `Public canonical and earnings claims are paused: ${maintenanceAudit.reason || "fresh six-validator maintenance evidence is unavailable"}.`);
         else if (boundary.state === "mismatch") setTruth("bad", "Recovery checkpoint mismatch", "Exact H, H+1, chain identity, recovery epoch, validator set, domain, or manifest differs on a configured replica. Canonical and earnings claims are paused.");
         else if (fleet.state === "fork") setTruth("bad", "COMMON-HEIGHT FORK CONFIRMED", `Configured v3 replicas disagree at #${formatInteger(fleet.commonHeight)}. Stop canonical and reward claims until recovery selection is resolved.`);
         else if (!publicationError && fleet.state === "healthy" && boundary.state === "verified") setTruth("good", "Canonical v3 continuation verified", `Signed H, exact H+1, chain/recovery identity, and all six maintenance interlocks are verified; ${fleet.reachable.length}/${fleet.replicaCount} validators are healthy.`);
         else if (fleet.state === "unconfigured") setTruth("warn", "Canonical recovery is not configured", state.config.notices[0] || "Publish signed checkpoint and endpoint metadata before using this console.");
         else setTruth("warn", "Canonical evidence is incomplete", `${publicationError || `Fleet ${fleet.state}; boundary ${boundary.state}`}. Missing evidence is not treated as success.`);
-        text(elements.lastUpdated, `Updated ${new Date().toLocaleTimeString()}`);
+        state.updatedLabel = `Updated ${new Date().toLocaleTimeString()}`;
+        state.audited = true;
       } catch (error) {
-        if (!signal.aborted) { renderContinuity({ state: "unknown", reason: error.message }); renderSources(null); setTruth("bad", "Dashboard audit failed", error.message); }
+        if (!signal.aborted) {
+          renderContinuity({ state: "unknown", reason: error.message }); renderSources(null); setTruth("bad", "Dashboard audit failed", error.message);
+          aqueduct?.clear({ tone: "bad", title: "Dashboard audit failed", detail: "The console could not complete its audit, so no blocks are drawn." });
+          if (!state.audited) renderNoEvidence();
+          state.audited = true;
+        }
       } finally {
-        elements.refresh.classList.remove("spinning"); elements.refresh.disabled = false;
+        // Only the newest refresh settles the controls: one it cancelled must not end the indicator of its replacement.
+        if (state.controller === controller) {
+          elements.refresh.classList.remove("spinning"); elements.refresh.disabled = false;
+          setRefreshing(false);
+        }
       }
     }
 
@@ -614,8 +734,9 @@
     elements.workerForm.addEventListener("submit", async (event) => {
       event.preventDefault(); text(elements.workerError, "");
       const button = elements.workerForm.querySelector("button"); button.disabled = true;
+      renderWorkerNotice("Loading worker earnings…", "Reading issuance readiness and settlement evidence from the canonical v3 source.");
       try { renderWorker(await loadWorkerEarnings({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), workerId: elements.workerId.value, checkpointAudit: state.checkpointAudit })); }
-      catch (error) { text(elements.workerError, error.message); }
+      catch (error) { text(elements.workerError, error.message); renderWorkerNotice("Worker earnings not loaded", "The lookup did not complete; the reason is shown above."); }
       finally { button.disabled = false; }
     });
     elements.receiptForm.addEventListener("submit", async (event) => {
@@ -634,11 +755,17 @@
         state.resolver = network.createCanonicalResolver(state.config);
         text(elements.networkName, state.config.network.name);
         text(elements.chainId, state.config.network.chainId);
-        renderContinuity({ state: "unknown" }); renderSources(null);
+        renderContinuity({ state: "auditing" }); renderSources(null);
         await refresh();
         state.timer = window.setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_INTERVAL_MS);
       } catch (error) {
         setTruth("bad", "Dashboard configuration rejected", error.message);
+        aqueduct?.clear({ tone: "bad", title: "Configuration rejected", detail: "No canonical chain view is configured, so no blocks are drawn." });
+        // Nothing loaded, so nothing is left loading. "No sources configured" is reserved for a configuration that
+        // loaded with an empty inventory.
+        renderNoEvidence();
+        clear(elements.sourceGrid);
+        elements.sourceGrid.append(create("div", "empty", "Source inventory unavailable: the network configuration was rejected."));
         renderContinuity({ state: "unknown", reason: error.message });
       }
     })();

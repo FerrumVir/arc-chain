@@ -1,4 +1,5 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { Skeleton, SkeletonLines } from "../components/Skeleton";
 import { AlertTriangle, Check, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
@@ -9,6 +10,7 @@ import { formatInt } from "../lib/format";
 import { useAppStore } from "../lib/store";
 import { DEFAULT_NODE_CONFIG, type NodeConfig } from "../lib/types";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
+import { setTheme, useTheme, type Theme } from "../lib/theme";
 
 export function Settings() {
   const config = useAppStore((s) => s.config);
@@ -32,6 +34,7 @@ export function Settings() {
   const [autoStart, setAutoStart] = useState(config?.autoStart ?? true);
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
   // One app-wide updater state is shared by startup, periodic, and manual
   // checks. Settings only renders it; navigating here cannot start a second
@@ -68,6 +71,7 @@ export function Settings() {
     // config is null, Save silently did nothing and never showed the Saved
     // state. Fall back to defaults instead of no-oping, and surface errors.
     setSaveError(null);
+    setSaving(true);
     const next: NodeConfig = {
       ...(config ?? DEFAULT_NODE_CONFIG),
       rpcPort,
@@ -87,6 +91,8 @@ export function Settings() {
       setTimeout(() => setSaved(false), 2500);
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -222,9 +228,15 @@ export function Settings() {
             <button
               className="btn btn-primary"
               onClick={save}
+              disabled={saving}
+              aria-busy={saving || undefined}
               data-testid="btn-save-settings"
             >
-              {saved ? (
+              {saving ? (
+                <>
+                  <RefreshCw size={14} className="spin" /> Saving…
+                </>
+              ) : saved ? (
                 <>
                   <Check size={14} /> Saved
                 </>
@@ -260,6 +272,11 @@ export function Settings() {
       <Card style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader title="Inference" />
         <InferenceModeToggle />
+      </Card>
+
+      <Card style={{ marginBottom: "var(--space-6)" }} data-testid="appearance-card">
+        <CardHeader title="Appearance" />
+        <AppearanceToggle />
       </Card>
 
       <Card style={{ marginBottom: "var(--space-6)" }}>
@@ -506,6 +523,7 @@ function ComputeContribution() {
           step={1}
           value={shown}
           onChange={(e) => setValue(parseInt(e.target.value, 10))}
+          disabled={status === undefined}
           style={{ flex: 1 }}
           data-testid="slider-worker-threads"
           aria-valuemin={1}
@@ -517,7 +535,7 @@ function ComputeContribution() {
           style={{ minWidth: 72, textAlign: "right" }}
           data-testid="worker-threads-value"
         >
-          {shown} / {maxCores}
+          {status === undefined ? <Skeleton width="5ch" /> : <>{shown} / {maxCores}</>}
         </span>
         <button
           className="btn btn-secondary"
@@ -588,7 +606,13 @@ function ActualContribution() {
     refetchInterval: 10_000,
   });
 
-  if (!c) return null;
+  if (!c) {
+    return (
+      <div style={{ marginTop: "var(--space-3)" }} aria-busy="true" data-testid="contribution-loading">
+        <SkeletonLines lines={3} gap={8} />
+      </div>
+    );
+  }
 
   if (c.unavailable) {
     return (
@@ -751,10 +775,14 @@ function PersistenceCard() {
       <CardHeader
         title="Startup readiness"
         action={
-          <StatusPill
-            level={running ? "live" : "offline"}
-            label={running ? "Node running" : "Node stopped"}
-          />
+          status === undefined ? (
+            <StatusPill level="checking" label="Checking" />
+          ) : (
+            <StatusPill
+              level={running ? "live" : "offline"}
+              label={running ? "Node running" : "Node stopped"}
+            />
+          )
         }
       />
       <div
@@ -774,7 +802,9 @@ function PersistenceCard() {
                 ? "The OS login item is registered, so ARC can reopen after login. Check “Right now” after a reboot; process startup does not prove peers, work, or payment."
                 : loginItem === false
                   ? "No OS login item is registered, so this setting alone cannot reopen ARC after login. Open ARC manually or repair the login item."
-                  : "OS login-item registration has not been verified yet. Until it is, do not assume ARC will reopen after login."}
+                  : loginItem === undefined
+                    ? "Checking the OS login item…"
+                    : "OS login-item registration has not been verified yet. Until it is, do not assume ARC will reopen after login."}
             </>
           ) : (
             <>
@@ -818,14 +848,16 @@ function PersistenceCard() {
               separately so a disagreement between the two is visible rather
               than averaged into one reassuring line. */}
           <dd data-testid="persistence-login-item">
-            {loginItem == null
+            {loginItem === undefined
+              ? <Skeleton width="10ch" />
+              : loginItem === null
               ? "—"
               : loginItem
                 ? "yes — login item registered"
                 : "no login item"}
           </dd>
           <dt>Right now</dt>
-          <dd>{running ? "running" : "stopped"}</dd>
+          <dd>{status === undefined ? <Skeleton width="6ch" /> : running ? "running" : "stopped"}</dd>
         </div>
       </div>
     </Card>
@@ -862,6 +894,28 @@ function InferenceModeToggle() {
           </div>
         </div>
       </label>
+    </div>
+  );
+}
+
+/** One switch for the whole look: the site's engraved language or the original dark theme (lib/theme.ts). */
+function AppearanceToggle() {
+  const theme = useTheme();
+  const options: { value: Theme; title: string; body: string }[] = [
+    { value: "engraved", title: "Engraved", body: "The website's language: white line on Arc blue, with engraved illustrations." },
+    { value: "classic", title: "Classic", body: "The original dark theme." },
+  ];
+  return (
+    <div style={{ display: "grid", gap: "var(--space-3)" }} role="radiogroup" aria-label="Appearance">
+      {options.map((o) => (
+        <label key={o.value} style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", cursor: "pointer" }}>
+          <input type="radio" name="appearance" checked={theme === o.value} onChange={() => setTheme(o.value)} data-testid={`theme-${o.value}`} />
+          <div>
+            <div style={{ fontWeight: 500 }}>{o.title}</div>
+            <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>{o.body} Saved on this device only.</div>
+          </div>
+        </label>
+      ))}
     </div>
   );
 }

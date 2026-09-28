@@ -15,7 +15,13 @@ import {
   Zap,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { Card, CardHeader } from "../components/Card";
+import { StartStage } from "../components/StartStage";
+import { Skeleton } from "../components/Skeleton";
+import { EASE_OUT } from "../lib/motion";
+import { prefersReducedMotion } from "../components/Engraving";
+import type { ArchChainPhase } from "../lib/aqueduct/archchain";
 import { CrashBanner } from "../components/CrashBanner";
 import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
@@ -38,6 +44,12 @@ import { DEFAULT_NODE_CONFIG } from "../lib/types";
 // Host labels live in lib/hosts.ts so every screen names a seed identically.
 // "Which host" is load-bearing context for any chain number here, because the
 // seeds are independent chains (CLAUDE.md rule 4).
+
+// A running node that finds no peers for this long is in client mode, a normal way to run: the start-up stage then
+// steps aside for the dashboard and its peer banners instead of holding the whole screen.
+const PEER_WAIT_MS = 45_000;
+// How long the stage shows "Your node is live" when start-up finishes, before it steps aside.
+const LIVE_MOMENT_MS = 2_600;
 
 export function Dashboard() {
   const queryClient = useQueryClient();
@@ -150,6 +162,9 @@ export function Dashboard() {
 
   const running = !!status?.running;
   const isExternal = running && status?.pid == null;
+  // Nothing is known until the first status arrives: the node may be running, or auto-starting in the background, so
+  // the screen says "Checking" rather than "stopped" and offers no Start button yet.
+  const statusKnown = status !== undefined;
   // The node is up but not peered — the state "Reset peer state" exists to
   // fix. Covers both "lite" (a seed is reachable over HTTP) and "syncing"
   // (nothing is).
@@ -167,6 +182,57 @@ export function Dashboard() {
   const isStarting =
     (!running && status?.pid != null) || startMutation.isPending;
 
+  // The node's start, drawn as the first arch of an aqueduct: every step is one the node actually reports. No model-load
+  // percentage exists, so that step shows work under way without claiming progress; catching up is drawn from the real
+  // local and chain heights. Once caught up, the Network screen carries the live aqueduct.
+  const localHeight = status?.height ?? null;
+  // the chain's tip as the node reports it (the display string chainHeight above is the network overview's)
+  const tipHeight = status?.chainHeight ?? null;
+  const catchingUp =
+    running && localHeight != null && tipHeight != null && tipHeight - localHeight > 50;
+  // "running" means the node's RPC already answers, so a running node without peers is finding peers, not opening
+  // its port. With no model configured (an observer) there is no model to load: that process is opening its port.
+  const findingPeers = running && (status?.peers ?? 0) === 0 && !catchingUp;
+  const [peerWaitOver, setPeerWaitOver] = useState(false);
+  useEffect(() => {
+    if (!findingPeers) {
+      setPeerWaitOver(false);
+      return;
+    }
+    const timer = setTimeout(() => setPeerWaitOver(true), PEER_WAIT_MS);
+    return () => clearTimeout(timer);
+  }, [findingPeers]);
+  const startupPhase: ArchChainPhase | null =
+    startMutation.isPending && status?.pid == null
+      ? "survey"
+      : isStarting
+        ? config?.modelPath
+          ? "model"
+          : "rpc"
+        : findingPeers && !peerWaitOver && !status?.coordinatorUrl
+          ? "peers"
+          : catchingUp
+            ? "sync"
+            : null;
+  // When start-up finishes with peers, the stage says so for a moment ("Your node is live"), then steps aside.
+  const [liveUntil, setLiveUntil] = useState<number | null>(null);
+  const prevStartupPhase = useRef<ArchChainPhase | null>(null);
+  useEffect(() => {
+    const was = prevStartupPhase.current;
+    prevStartupPhase.current = startupPhase;
+    if (was && !startupPhase && running && (status?.peers ?? 0) > 0) {
+      setLiveUntil(Date.now() + LIVE_MOMENT_MS);
+    }
+  }, [startupPhase, running, status?.peers]);
+  useEffect(() => {
+    if (liveUntil == null) return;
+    const timer = setTimeout(() => setLiveUntil(null), Math.max(0, liveUntil - Date.now()));
+    return () => clearTimeout(timer);
+  }, [liveUntil]);
+  const startPhase: ArchChainPhase | null =
+    startupPhase ?? (liveUntil != null && running ? "live" : null);
+
+  const detailsRef = useRef<HTMLDivElement>(null);
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [tick, setTick] = useState(0);
   useEffect(() => {
@@ -207,23 +273,13 @@ export function Dashboard() {
     [],
   );
 
-  return (
-    <div className="main-inner" data-testid="dashboard">
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">Dashboard</h1>
-          <p className="page-subtitle">
-            {running
-              ? isExternal
-                ? "The node process is running under launchd or systemd. Peering, compatible work, and reward settlement are separate checks."
-                : "The node process is running. Peering, compatible work, and reward settlement are separate checks."
-              : isStarting
-                ? "Starting node — loading model and binding RPC. This can take a few minutes on first run."
-                : "Your node is stopped. Start it to sync and make configured compute available."}
-          </p>
-        </div>
+  const controls = (
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
-          {running ? (
+          {!statusKnown ? (
+            <button className="btn btn-secondary" disabled aria-busy="true" data-testid="btn-checking">
+              <RotateCw size={14} className="spin" /> Checking…
+            </button>
+          ) : running ? (
             <>
               {isExternal && (
                 <span
@@ -241,16 +297,27 @@ export function Dashboard() {
                 disabled={restartMutation.isPending || isExternal}
                 title={isExternal ? "Node is managed externally — stop it first before restarting via desktop" : undefined}
                 data-testid="btn-restart"
+                aria-busy={restartMutation.isPending || undefined}
               >
-                <RotateCw size={14} /> Restart
+                <RotateCw size={14} className={restartMutation.isPending ? "spin" : undefined} />
+                {restartMutation.isPending ? " Restarting…" : " Restart"}
               </button>
               <button
                 className="btn btn-danger"
                 onClick={() => stopMutation.mutate()}
                 disabled={stopMutation.isPending}
                 data-testid="btn-stop"
+                aria-busy={stopMutation.isPending || undefined}
               >
-                <CircleStop size={14} /> Stop
+                {stopMutation.isPending ? (
+                  <>
+                    <RotateCw size={14} className="spin" /> Stopping…
+                  </>
+                ) : (
+                  <>
+                    <CircleStop size={14} /> Stop
+                  </>
+                )}
               </button>
             </>
           ) : isStarting ? (
@@ -260,10 +327,7 @@ export function Dashboard() {
               data-testid="btn-starting"
               style={{ opacity: 0.85 }}
             >
-              <RotateCw
-                size={14}
-                style={{ animation: "spin 1s linear infinite" }}
-              /> Starting
+              <RotateCw size={14} className="spin" /> Starting
               {startedAt ? `… ${startingElapsedSec}s` : "…"}
             </button>
           ) : (
@@ -277,6 +341,45 @@ export function Dashboard() {
             </button>
           )}
         </div>
+  );
+
+  return (
+    <div className="main-inner" data-testid="dashboard">
+      <AnimatePresence initial={false}>
+        {startPhase && (
+          <motion.div
+            key="start-stage"
+            style={{ overflow: "hidden" }}
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto", transition: { duration: 0.42, ease: EASE_OUT } }}
+            exit={{ opacity: 0, height: 0, transition: { duration: 0.42, ease: EASE_OUT } }}
+          >
+            <StartStage
+              phase={startPhase}
+              localHeight={localHeight}
+              chainHeight={tipHeight}
+              actions={controls}
+              onDetails={() => detailsRef.current?.scrollIntoView({ block: "start", behavior: prefersReducedMotion() ? "auto" : "smooth" })}
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <div className="page-header" ref={detailsRef}>
+        <div>
+          <h1 className="page-title">Dashboard</h1>
+          <p className="page-subtitle">
+            {!statusKnown
+              ? "Reading your node's status…"
+              : running
+              ? isExternal
+                ? "The node process is running under launchd or systemd. Peering, compatible work, and reward settlement are separate checks."
+                : "The node process is running. Peering, compatible work, and reward settlement are separate checks."
+              : isStarting
+                ? "Starting node — loading model and binding RPC. This can take a few minutes on first run."
+                : "Your node is stopped. Start it to sync and make configured compute available."}
+          </p>
+        </div>
+        {!startPhase && controls}
       </div>
 
       {isStarting && (
@@ -296,10 +399,7 @@ export function Dashboard() {
             gap: 12,
           }}
         >
-          <RotateCw
-            size={16}
-            style={{ animation: "spin 1s linear infinite" }}
-          />
+          <RotateCw size={16} className="spin" />
           <div>
             <strong>Node is starting</strong>
             {startedAt ? ` (${startingElapsedSec}s elapsed)` : ""} — arc-node is
@@ -491,10 +591,16 @@ export function Dashboard() {
         >
           <div>
             <div className="big-number gradient" data-testid="earnings-total">
-              {earnings?.fromChain === true ? (
+              {earnings === undefined ? (
+                <Skeleton width="6ch" height="0.8em" />
+              ) : earnings.fromChain === true ? (
                 <>
                   <NumberTicker value={earnings.totalArc} digits={2} />
-                  <span className="unit">ARC confirmed</span>
+                  <span className="unit">
+                    {earnings.historyCompleteSinceRecovery === true
+                      ? "ARC confirmed since recovery"
+                      : "ARC confirmed in retained window"}
+                  </span>
                 </>
               ) : (
                 <span
@@ -553,9 +659,13 @@ export function Dashboard() {
             <div className="kv">
               <dt>Reward receipts</dt>
               <dd>
-                {earnings?.fromChain === true
-                  ? formatInt(earnings.attestations)
-                  : "—"}
+                {earnings === undefined ? (
+                  <Skeleton width="3ch" />
+                ) : earnings.fromChain === true ? (
+                  formatInt(earnings.attestations)
+                ) : (
+                  "—"
+                )}
               </dd>
               <dt>Last payout</dt>
               {/* A block height is not a timestamp. Passing
@@ -611,7 +721,7 @@ export function Dashboard() {
         <StatTile
           icon={running ? Wifi : WifiOff}
           label="Peers"
-          value={formatInt(status?.peers ?? 0)}
+          value={status ? formatInt(status.peers) : <Skeleton width="2.5ch" height="0.8em" />}
           info={{
             title: "Peers",
             children: (
@@ -627,7 +737,7 @@ export function Dashboard() {
         <StatTile
           icon={Users}
           label="Host validator records"
-          value={formatInt(network?.totalNodes ?? 0)}
+          value={network ? formatInt(network.totalNodes) : <Skeleton width="2.5ch" height="0.8em" />}
           info={{
             title: "Host validator records",
             children: (
@@ -642,7 +752,7 @@ export function Dashboard() {
         <StatTile
           icon={Waypoints}
           label="DAG round"
-          value={formatInt(status?.round ?? 0)}
+          value={status ? formatInt(status.round) : <Skeleton width="4ch" height="0.8em" />}
           info={{
             title: "DAG round",
             children: (
@@ -734,7 +844,16 @@ export function Dashboard() {
             }
           />
           <div className="feed" data-testid="attestation-feed">
-            {inferenceActivity.length === 0 ? (
+            {attestations === undefined ? (
+              <div className="feed-loading" aria-busy="true" data-testid="attestation-feed-loading">
+                {[0, 1, 2].map((i) => (
+                  <div key={i} className="feed-skeleton-row">
+                    <Skeleton width={i === 1 ? "48%" : "62%"} />
+                    <Skeleton width="18%" />
+                  </div>
+                ))}
+              </div>
+            ) : inferenceActivity.length === 0 ? (
               <EmptyState
                 icon={FileSignature}
                 title="No inference claims on this host"
@@ -808,7 +927,7 @@ export function Dashboard() {
           <div className="kv">
             <dt>Health</dt>
             <dd>
-              <StatusPill level={status?.health ?? "offline"} />
+              <StatusPill level={status ? status.health : "checking"} />
             </dd>
             <dt>Version</dt>
             <dd>{status?.running ? `v${status.version}` : "-"}</dd>
@@ -840,7 +959,9 @@ export function Dashboard() {
                   ? "yes"
                   : loginItem === false
                     ? "set, but no login item"
-                    : "not verified"
+                    : loginItem === undefined
+                      ? <Skeleton width="6ch" />
+                      : "not verified"
                 : "no"}
             </dd>
           </div>
@@ -980,7 +1101,7 @@ function StatTile({
 }: {
   icon: typeof Wifi;
   label: string;
-  value: string;
+  value: React.ReactNode;
   info?: { title: string; children: React.ReactNode };
 }) {
   return (

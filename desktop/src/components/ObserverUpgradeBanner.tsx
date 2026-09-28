@@ -33,6 +33,8 @@ export function ObserverUpgradeBanner() {
   const [dismissed, setDismissed] = useState(false);
   const [open, setOpen] = useState(false);
   const [tiers, setTiers] = useState<ModelTierInfo[]>([]);
+  const [tiersError, setTiersError] = useState<string | null>(null);
+  const [tiersAttempt, setTiersAttempt] = useState(0);
   const [recommendedTier, setRecommendedTier] = useState<string>("standard");
   const [selectedTier, setSelectedTier] = useState<string | null>(null);
 
@@ -51,6 +53,7 @@ export function ObserverUpgradeBanner() {
   useEffect(() => {
     if (!open || tiers.length > 0) return;
     let cancelled = false;
+    setTiersError(null);
     Promise.all([api.listModelTiers(), api.recommendedTier()]).then(
       ([loadedTiers, rec]) => {
         if (cancelled) return;
@@ -58,11 +61,14 @@ export function ObserverUpgradeBanner() {
         setRecommendedTier(rec);
         setSelectedTier(rec === "none" ? null : rec);
       },
+      (err) => {
+        if (!cancelled) setTiersError(err instanceof Error ? err.message : String(err));
+      },
     );
     return () => {
       cancelled = true;
     };
-  }, [open, tiers.length]);
+  }, [open, tiers.length, tiersAttempt]);
 
   useEffect(() => {
     if (!isTauri || !open) return;
@@ -239,9 +245,17 @@ export function ObserverUpgradeBanner() {
               <div
                 style={{ display: "grid", gap: "var(--space-3)", marginBottom: "var(--space-5)" }}
               >
-                {tiers.length === 0 && (
-                  <div className="shimmer" style={{ height: 200 }} />
-                )}
+                {tiers.length === 0 &&
+                  (tiersError ? (
+                    <div className="onboarding-load-error" role="alert" data-testid="upgrade-tiers-error">
+                      <p>Could not read the model options: {tiersError}</p>
+                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => setTiersAttempt((n) => n + 1)}>
+                        Try again
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="shimmer" style={{ height: 200 }} aria-busy="true" />
+                  ))}
                 {tiers.map((tier) => {
                   const isSelected = selectedTier === tier.id;
                   const isRec = recommendedTier === tier.id;

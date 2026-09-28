@@ -14,6 +14,7 @@ import {
 import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { EmptyState } from "../components/EmptyState";
+import { Skeleton, SkeletonLines } from "../components/Skeleton";
 import { NotAvailable } from "../components/NotAvailable";
 import { api } from "../lib/tauri";
 import { formatHash, formatInt, formatRelativeTime, formatUptime } from "../lib/format";
@@ -119,7 +120,9 @@ export function Network() {
               deployment, so it cannot tell a testnet from a mainnet and is
               deliberately not used as a substitute. */}
           <p className="page-subtitle" data-testid="network-identity">
-            {overview?.networkName ? (
+            {overview === undefined ? (
+              <>Reading {hostLabelVerbose(host)}…</>
+            ) : overview.networkName ? (
               <>
                 <strong>{overview.networkName}</strong>, read from{" "}
                 {hostLabelVerbose(host)}
@@ -237,12 +240,14 @@ export function Network() {
       <div className="grid-stats" style={{ marginBottom: "var(--space-6)" }}>
         <StatCard
           label="Block height"
+          loading={overview === undefined}
           icon={Blocks}
           value={overview?.height != null ? formatInt(overview.height) : null}
           note={host ? `on ${hostLabel(host)}` : undefined}
         />
         <StatCard
           label="Last block"
+          loading={overview === undefined}
           icon={Blocks}
           value={age != null ? `${formatUptime(age)} ago` : null}
           tone={stalled ? "danger" : lagging ? "warning" : undefined}
@@ -250,6 +255,7 @@ export function Network() {
         />
         <StatCard
           label="Validators"
+          loading={overview === undefined}
           icon={Users}
           value={
             overview?.validatorsActive != null &&
@@ -261,12 +267,14 @@ export function Network() {
         />
         <StatCard
           label="Peers"
+          loading={overview === undefined}
           icon={Server}
           value={overview?.peers != null ? formatInt(overview.peers) : null}
           note={`this host's peers, not yours`}
         />
         <StatCard
           label="DAG round"
+          loading={overview === undefined}
           icon={Waypoints}
           value={
             overview?.dagRound != null ? formatInt(overview.dagRound) : null
@@ -301,9 +309,12 @@ function StatCard({
   icon: Icon,
   note,
   tone,
+  loading = false,
 }: {
   label: string;
   value: string | null;
+  /** The first read has not come back: a placeholder, not the em dash that means "not reported". */
+  loading?: boolean;
   icon: typeof Blocks;
   note?: string;
   tone?: "warning" | "danger";
@@ -338,7 +349,11 @@ function StatCard({
         }}
       >
         {/* null = the host did not report it. Never rendered as 0. */}
-        {value ?? <span style={{ color: "var(--text-muted)" }}>—</span>}
+        {loading ? (
+          <Skeleton width="4ch" height="0.8em" />
+        ) : (
+          value ?? <span style={{ color: "var(--text-muted)" }}>—</span>
+        )}
       </div>
       {note && (
         <div
@@ -592,6 +607,13 @@ function ValidatorSplit({
   const list = overview?.validators ?? [];
   const inactive = list.filter((v) => !v.active).length;
 
+  if (overview === undefined) {
+    return (
+      <Card style={{ marginBottom: "var(--space-6)" }} aria-busy="true" data-testid="validator-split-loading">
+        <SkeletonLines lines={2} gap={10} />
+      </Card>
+    );
+  }
   if (list.length === 0) return null;
 
   return (
@@ -795,7 +817,20 @@ function BlockTxList({ height }: { height: number }) {
       </div>
     );
   }
-  if (!data) return null;
+  if (!data) {
+    return (
+      <div
+        role="status"
+        style={{
+          padding: "var(--space-3) var(--space-6)",
+          fontSize: "var(--text-sm)",
+          color: "var(--text-muted)",
+        }}
+      >
+        Could not read block #{formatInt(height)}. Collapse and expand it to try again.
+      </div>
+    );
+  }
   if (data.unavailable) {
     return (
       <div style={{ padding: "var(--space-3) var(--space-6)" }}>
@@ -886,8 +921,14 @@ function RecentInferenceCard({
         title="Recent inference activity"
         action={
           <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-            {formatInt(real.length)} shown
-            {dropped > 0 && <> · {formatInt(dropped)} filtered</>}
+            {attestations === undefined ? (
+              <Skeleton width="6ch" />
+            ) : (
+              <>
+                {formatInt(real.length)} shown
+                {dropped > 0 && <> · {formatInt(dropped)} filtered</>}
+              </>
+            )}
           </span>
         }
       />
@@ -909,7 +950,16 @@ function RecentInferenceCard({
         </p>
       )}
       <div className="feed">
-        {real.length === 0 ? (
+        {attestations === undefined ? (
+          <div className="feed-loading" aria-busy="true" data-testid="recent-inference-loading">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="feed-skeleton-row">
+                <Skeleton width={i === 1 ? "44%" : "56%"} />
+                <Skeleton width="16%" />
+              </div>
+            ))}
+          </div>
+        ) : real.length === 0 ? (
           <EmptyState
             icon={FileSignature}
             title="No inference claims on this host"

@@ -1,8 +1,8 @@
 import clsx from "clsx";
-import { PulseDot } from "./PulseDot";
-import type { HealthLevel } from "../lib/types";
+import { PulseDot, type DotLevel } from "./PulseDot";
 
-const labels: Record<HealthLevel | "info", string> = {
+const labels: Record<DotLevel | "info", string> = {
+  checking: "Checking",
   live: "Live",
   lite: "Lite",
   syncing: "Syncing",
@@ -15,7 +15,7 @@ export function StatusPill({
   label,
   showDot = true,
 }: {
-  level: HealthLevel | "info";
+  level: DotLevel | "info";
   label?: string;
   showDot?: boolean;
 }) {
@@ -25,7 +25,7 @@ export function StatusPill({
       data-testid={`status-pill-${level}`}
     >
       {showDot && level !== "info" && (
-        <PulseDot level={level as HealthLevel} />
+        <PulseDot level={level as DotLevel} />
       )}
       {label ?? labels[level]}
     </span>

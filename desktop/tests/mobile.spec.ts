@@ -44,15 +44,17 @@ test.describe("Mobile layout (Pixel 7, 412×915) - seeded", () => {
     const title = page.locator("h1.page-title").first();
     await expect(title).toBeVisible();
     const titleBox = await title.boundingBox();
+    // The dashboard says "Checking" until the first node status arrives; the mock node then reads as stopped.
     const startBtn = page.getByTestId("btn-start");
-    if (await startBtn.count()) {
-      const btnBox = await startBtn.boundingBox();
-      expect(btnBox!.y).toBeGreaterThan(titleBox!.y + titleBox!.height - 4);
-    }
+    await expect(startBtn).toBeVisible();
+    const btnBox = await startBtn.boundingBox();
+    expect(btnBox!.y).toBeGreaterThan(titleBox!.y + titleBox!.height - 4);
   });
 
   test("primary buttons meet 44px tap-target minimum", async ({ page }) => {
     await page.goto("/");
+    // Wait for the dashboard to know the node's state: before that it offers no primary action.
+    await expect(page.getByTestId("btn-start")).toBeVisible();
     const buttons = page.locator(".btn-primary");
     const count = await buttons.count();
     expect(count).toBeGreaterThan(0);

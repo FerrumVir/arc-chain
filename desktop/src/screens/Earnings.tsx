@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { FileSignature, Search } from "lucide-react";
 import { Card, CardHeader } from "../components/Card";
 import { EmptyState } from "../components/EmptyState";
+import { Skeleton, SkeletonLines } from "../components/Skeleton";
 import { NumberTicker } from "../components/NumberTicker";
 import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { api } from "../lib/tauri";
@@ -78,8 +79,9 @@ export function Earnings() {
           it separate from the valid candidate response whose retained row
           count is exactly zero. */}
       {earnings == null ? (
-        <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-loading">
+        <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-loading" aria-busy="true">
           <CardHeader title="Checking retained reward receipts…" />
+          <SkeletonLines lines={3} gap={10} />
         </Card>
       ) : !earnings.fromChain ? (
         <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-unavailable">
@@ -108,7 +110,7 @@ export function Earnings() {
             <p style={{ marginTop: 0 }}>
               {hasCompleteCanonicalHistory
                 ? "This archive-backed host has no successful mined reward receipt for this address since the canonical v3 recovery boundary. It is a confirmed gross-reward zero for that chain segment, not a claim about wallet transfers or any earlier legacy history."
-                : "This is a confirmed zero in the selected host's current retained receipt window—not proof that this address has never earned a reward. Older rows can be pruned on a non-archive host."}
+                : "This is a confirmed zero only in the selected host's current retained receipt window. Complete history since the v3 recovery boundary is unproven, so earlier receipts may be absent even when archive retention is enabled."}
             </p>
             <p>
               A raw <code>InferenceAttestation</code> (<code>0x16</code>) is a
@@ -203,7 +205,7 @@ export function Earnings() {
             >
               {hasCompleteCanonicalHistory
                 ? "Archive-backed successful 0x25 receipts since the v3 recovery boundary. Gross rewards are not the same as the wallet's current balance after spending or transfers."
-                : "Current host-retained receipt window; older rows may be pruned. This is not lifetime earnings."}
+                : "Current host-retained receipt window; completeness since the v3 recovery boundary is unproven. This is not lifetime earnings."}
             </div>
           </Card>
           <Card>
@@ -290,13 +292,27 @@ export function Earnings() {
                 color: "var(--text-muted)",
               }}
             >
-              {formatInt(mineCount)} yours ·{" "}
-              {formatInt(activity.length)} shown
+              {attestations === undefined ? (
+                <Skeleton width="9ch" />
+              ) : (
+                <>
+                  {formatInt(mineCount)} yours · {formatInt(activity.length)} shown
+                </>
+              )}
             </span>
           }
         />
         <div className="feed" data-testid="all-attestations">
-          {activity.length === 0 ? (
+          {attestations === undefined ? (
+            <div className="feed-loading" aria-busy="true" data-testid="all-attestations-loading">
+              {[0, 1, 2, 3].map((i) => (
+                <div key={i} className="feed-skeleton-row">
+                  <Skeleton width={i % 2 ? "46%" : "58%"} />
+                  <Skeleton width="16%" />
+                </div>
+              ))}
+            </div>
+          ) : activity.length === 0 ? (
             <EmptyState
               icon={FileSignature}
               title="No inference claims on this host"

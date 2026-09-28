@@ -36,6 +36,15 @@ def digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+class ManagedVersionContract(unittest.TestCase):
+    def test_matches_selected_release_and_refuses_old_or_prefix_versions(self):
+        for output in ("arc-node 0.8.1", "arc-node v0.8.1"):
+            GATE.require_managed_node_version(output)
+        for output in ("arc-node 0.8.0", "arc-node 0.8.10", "arc-node 0.8.1-beta"):
+            with self.assertRaises(GATE.GateError):
+                GATE.require_managed_node_version(output)
+
+
 class Fixture:
     def __init__(self, root: Path) -> None:
         self.root = root
