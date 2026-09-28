@@ -764,7 +764,7 @@ jobs:
                     # An isolated stake-zero node has no advancing chain, so
                     # truthful health is normally `degraded`; the smoke needs
                     # a valid liveness classification, not a false green claim.
-                    printf "%s\n" "$response" | grep -Eq '"status":"(ok|degraded)"'
+                    printf "%s\n" "$response" | grep -Eq "\"status\":\"(ok|degraded)\""
                     exit 0
                   fi
                   sleep 0.25

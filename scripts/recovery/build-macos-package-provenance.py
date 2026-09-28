@@ -45,8 +45,8 @@ from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
 
 REPOSITORY = "FerrumVir/arc-chain"
-TAG = "v0.8.1"
-VERSION = "0.8.1"
+TAG = "v0.8.2"
+VERSION = "0.8.2"
 RELEASE_SCHEMA = "arc.published-release-binding.v1"
 SIGNATURE_SCHEMA = "arc.macos-updater-signature-verification.v1"
 GUEST_SIGNATURE_SCHEMA = "arc.macos-updater-signature-guest.v1"
