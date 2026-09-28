@@ -176,6 +176,11 @@ def norm_hash(value: object, label: str) -> str:
 
 def verify_checkpoint(binary: Path, checkpoint: Path, genesis: Path, manifest_hash: str,
                       epoch: int, set_id: int, expected_domain: str) -> dict:
+    # The verifier runs with cwd="/". Normalize lexically before that chdir;
+    # abspath preserves a symlink at the final component for `regular()` to reject.
+    binary = Path(os.path.abspath(binary))
+    checkpoint = Path(os.path.abspath(checkpoint))
+    genesis = Path(os.path.abspath(genesis))
     need(regular(binary) and binary.stat().st_mode & 0o111, "selected verifier binary is not executable")
     need(regular(checkpoint) and regular(genesis), "checkpoint and genesis must be regular files")
     before = (checkpoint.stat().st_dev, checkpoint.stat().st_ino, checkpoint.stat().st_size,
