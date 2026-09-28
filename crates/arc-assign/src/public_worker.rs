@@ -159,7 +159,7 @@ impl PublicWorkerExecutionBindingV1 {
         path: impl AsRef<Path>,
         current: &PublicWorkerExecutionIdentities,
     ) -> Result<Self, PublicWorkerExecutionBindingLoadError> {
-        let mut file = open_private(path.as_ref())?;
+        let file = open_private(path.as_ref())?;
         let expected_len = file.metadata()?.len();
         if expected_len > MAX_PUBLIC_WORKER_EXECUTION_BINDING_FILE_BYTES {
             return Err(PublicWorkerExecutionBindingLoadError::TooLarge);
