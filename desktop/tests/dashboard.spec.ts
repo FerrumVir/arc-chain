@@ -355,8 +355,8 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("earnings-empty")).toContainText(
       "even when archive retention is enabled",
     );
-    await expect(page.getByTestId("earnings-retained-window-note")).toContainText(
-      "This is not lifetime earnings",
+    await expect(page.getByTestId("earnings-empty")).not.toContainText(
+      "confirmed gross-reward zero for that chain segment",
     );
     await expect(page.getByTestId("earnings-unavailable")).toHaveCount(0);
   });

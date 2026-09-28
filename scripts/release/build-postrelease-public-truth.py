@@ -1631,15 +1631,15 @@ def validate_desktop_live_receipt(
         "validatorRpcSocket": expected_socket,
     }:
         fail("desktop live RPC was not the exact authenticated validator Unix-socket forward")
-    inference_path, _ = repository_tool(
-        Path("desktop/src/screens/Inference.tsx"), "desktop inference screen"
+    answer_path, _ = repository_tool(
+        Path("desktop/src/components/chat/Answer.tsx"), "desktop inference answer component"
     )
-    inference_text = load_bytes(
-        inference_path, "desktop inference screen", maximum=4 * 1024 * 1024
+    answer_text = load_bytes(
+        answer_path, "desktop inference answer component", maximum=4 * 1024 * 1024
     ).decode("utf-8", errors="strict")
     if (
-        "const MAX_RECEIPT_POLLS = 61;" not in inference_text
-        or "const MAX_RECEIPT_POLL_MS = 180_000;" not in inference_text
+        "const MAX_RECEIPT_POLLS = 61;" not in answer_text
+        or "const MAX_RECEIPT_POLL_MS = 180_000;" not in answer_text
     ):
         fail("protected desktop source does not implement the accepted receipt poll budget")
 

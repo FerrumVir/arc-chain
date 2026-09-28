@@ -1694,11 +1694,11 @@ export async function buildDesktopLiveProductReceipt(options) {
   const worker = canonicalHash(options.worker, "live worker");
   const rewardTx = canonicalHash(options.rewardTx, "live reward transaction");
 
-  const [{ raw: reportRaw, value: report }, { raw: lockRaw, value: packageLock }, configRaw, inferenceRaw] = await Promise.all([
+  const [{ raw: reportRaw, value: report }, { raw: lockRaw, value: packageLock }, configRaw, answerRaw] = await Promise.all([
     jsonFile(reportPath, "Playwright JSON report"),
     jsonFile(resolve(root, "desktop/package-lock.json"), "desktop package lock"),
     regularBytes(configPath, "frontend config"),
-    regularBytes(resolve(root, "desktop/src/screens/Inference.tsx"), "desktop inference screen", 4 * 1024 * 1024),
+    regularBytes(resolve(root, "desktop/src/components/chat/Answer.tsx"), "desktop inference answer component", 4 * 1024 * 1024),
   ]);
   const suiteResult = validatePlaywrightReport(report, packageLock);
   const configSha256 = sha256(configRaw);
@@ -1722,9 +1722,9 @@ export async function buildDesktopLiveProductReceipt(options) {
     options.sourceCommit,
     root,
   );
-  const inferenceText = inferenceRaw.toString("utf8");
-  assert.match(inferenceText, /const MAX_RECEIPT_POLLS = 61;/, "desktop receipt poll count differs from 61");
-  assert.match(inferenceText, /const MAX_RECEIPT_POLL_MS = 180_000;/, "desktop receipt wait differs from 180 seconds");
+  const answerText = answerRaw.toString("utf8");
+  assert.match(answerText, /const MAX_RECEIPT_POLLS = 61;/, "desktop receipt poll count differs from 61");
+  assert.match(answerText, /const MAX_RECEIPT_POLL_MS = 180_000;/, "desktop receipt wait differs from 180 seconds");
 
   const suiteSha256 = {};
   for (const name of SUITE_FILES) {
