@@ -1849,6 +1849,8 @@ mod inference_retry_tests {
             model_hash: format!("0x{}", "44".repeat(32)),
             tokens_generated: 1,
             inference_ms: 1,
+            attestation_status: None,
+            attestation_hash: String::new(),
             tx_hash: String::new(),
             deterministic: true,
             profile_bound: true,

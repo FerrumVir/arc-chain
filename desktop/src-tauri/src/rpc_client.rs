@@ -1558,7 +1558,19 @@ fn parse_inference_run_value(
             .and_then(Value::as_u64)
             .or_else(|| inf.get("total_ms").and_then(Value::as_u64))
             .unwrap_or(0) as u32,
+        attestation_status: att
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        attestation_hash: att
+            .and_then(|value| value.get("tx_hash"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         tx_hash: att
+            .filter(|value| {
+                value.get("status").and_then(Value::as_str) == Some("submitted_to_mempool")
+            })
             .and_then(|value| value.get("tx_hash"))
             .and_then(Value::as_str)
             .unwrap_or("")
@@ -1845,6 +1857,8 @@ pub async fn run_inference_consensus(
         // pipeline × every token). Use it as `inference_ms` so the UI's
         // "Xms" label still works.
         inference_ms: v.get("total_ms").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        attestation_status: None,
+        attestation_hash: String::new(),
         tx_hash: String::new(),
         deterministic: v
             .get("deterministic")
@@ -3499,6 +3513,45 @@ mod chain_read_tests {
         )
         .expect_err("failed endpoint result must remain an error");
         assert_eq!(error, "No model loaded");
+    }
+
+    #[test]
+    fn inference_parser_preserves_certificate_status_without_claiming_submission() {
+        let candidate_hash = format!("0x{}", "88".repeat(32));
+        let base = json!({
+            "success": true,
+            "inference": { "output": "verified output" },
+            "attestation": {
+                "status": "certificate_only_v3_not_submitted",
+                "tx_hash": candidate_hash
+            }
+        });
+
+        let parsed = parse_inference_run_value(&base, Some("https://seed.example"), false)
+            .expect("certificate-only result parses");
+        assert_eq!(
+            parsed.attestation_status.as_deref(),
+            Some("certificate_only_v3_not_submitted")
+        );
+        assert_eq!(parsed.attestation_hash, candidate_hash);
+        assert!(parsed.tx_hash.is_empty(), "candidate hash is not a tx");
+
+        let mut unknown = base.clone();
+        unknown["attestation"]["status"] = json!("future_attestation_state");
+        let parsed = parse_inference_run_value(&unknown, None, true)
+            .expect("unknown status remains observable");
+        assert_eq!(
+            parsed.attestation_status.as_deref(),
+            Some("future_attestation_state")
+        );
+        assert_eq!(parsed.attestation_hash, candidate_hash);
+        assert!(parsed.tx_hash.is_empty(), "unknown status cannot prove send");
+
+        let mut submitted = base;
+        submitted["attestation"]["status"] = json!("submitted_to_mempool");
+        let parsed = parse_inference_run_value(&submitted, None, true)
+            .expect("submitted result parses");
+        assert_eq!(parsed.tx_hash, candidate_hash);
     }
 
     #[test]

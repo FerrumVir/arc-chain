@@ -711,7 +711,12 @@ function parseInferenceRunBody(
         ? numberField(inference, "inference_ms")
         : numberField(inference, "total_ms"),
     // Keep the unpaid 0x16 claim separate from community 0x25 settlement.
-    txHash: stringField(attestation, "tx_hash"),
+    attestationStatus: stringField(attestation, "status") || undefined,
+    attestationHash: stringField(attestation, "tx_hash") || undefined,
+    txHash:
+      stringField(attestation, "status") === "submitted_to_mempool"
+        ? stringField(attestation, "tx_hash")
+        : "",
     deterministic: inference.deterministic === true,
     profileBound:
       typeof verification?.profile_bound === "boolean"

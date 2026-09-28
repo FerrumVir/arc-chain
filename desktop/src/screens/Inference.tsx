@@ -132,6 +132,10 @@ export function Inference() {
     settlement.txType === "0x25" &&
     ARC_HASH_RE.test(settlement.txHash),
   );
+  const submittedAttestationTx = Boolean(
+    run.data?.attestationStatus === "submitted_to_mempool" &&
+      ARC_HASH_RE.test(run.data.txHash),
+  );
   const exactCommunityReceiptUrl = settlement?.txHash
     ? `/community/reward_receipt/${settlement.txHash}`
     : "";
@@ -780,9 +784,36 @@ export function Inference() {
               fontSize: "var(--text-sm)",
             }}
           >
-            {run.data.txHash && (
+            {run.data.attestationStatus && (
+              <div
+                data-testid="inference-attestation-status"
+                data-status={run.data.attestationStatus}
+              >
+                {run.data.attestationStatus ===
+                "certificate_only_v3_not_submitted"
+                  ? "Certificate only; no 0x16 transaction was submitted."
+                  : submittedAttestationTx
+                    ? "0x16 claim submitted to the mempool; mined inclusion is not confirmed."
+                    : `Attestation status ${run.data.attestationStatus}; transaction submission is not confirmed.`}
+              </div>
+            )}
+            {run.data.attestationHash && !submittedAttestationTx && (
               <HashRow
-                label="0x16 claim tx (unpaid)"
+                label={
+                  run.data.attestationStatus ===
+                  "certificate_only_v3_not_submitted"
+                    ? "Candidate claim hash (not submitted)"
+                    : "Attestation hash (submission unconfirmed)"
+                }
+                value={run.data.attestationHash}
+                copied={copied === "attestation"}
+                onCopy={() => copy("attestation", run.data!.attestationHash!)}
+                icon={Sparkles}
+              />
+            )}
+            {submittedAttestationTx && (
+              <HashRow
+                label="0x16 claim tx (submitted; unpaid)"
                 value={run.data.txHash}
                 copied={copied === "tx"}
                 onCopy={() => copy("tx", run.data!.txHash)}
@@ -849,7 +880,7 @@ export function Inference() {
                   Track reward receipt <Search size={12} />
                 </button>
               )}
-              {run.data.txHash && (
+              {submittedAttestationTx && (
                 <button
                   className="btn btn-ghost btn-sm"
                   onClick={() => lookupHash(run.data!.txHash)}
