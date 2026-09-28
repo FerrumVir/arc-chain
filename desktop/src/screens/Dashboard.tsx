@@ -186,9 +186,10 @@ export function Dashboard() {
   // percentage exists, so that step shows work under way without claiming progress; catching up is drawn from the real
   // local and chain heights. Once caught up, the Network screen carries the live aqueduct.
   const localHeight = status?.height ?? null;
-  const chainHeight = status?.chainHeight ?? null;
+  // the chain's tip as the node reports it (the display string chainHeight above is the network overview's)
+  const tipHeight = status?.chainHeight ?? null;
   const catchingUp =
-    running && localHeight != null && chainHeight != null && chainHeight - localHeight > 50;
+    running && localHeight != null && tipHeight != null && tipHeight - localHeight > 50;
   // "running" means the node's RPC already answers, so a running node without peers is finding peers, not opening
   // its port. With no model configured (an observer) there is no model to load: that process is opening its port.
   const findingPeers = running && (status?.peers ?? 0) === 0 && !catchingUp;
@@ -356,7 +357,7 @@ export function Dashboard() {
             <StartStage
               phase={startPhase}
               localHeight={localHeight}
-              chainHeight={chainHeight}
+              chainHeight={tipHeight}
               actions={controls}
               onDetails={() => detailsRef.current?.scrollIntoView({ block: "start", behavior: prefersReducedMotion() ? "auto" : "smooth" })}
             />
