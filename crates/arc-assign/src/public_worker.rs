@@ -1691,7 +1691,14 @@ mod tests {
     fn execution_binding_is_deterministic_versioned_and_derives_requirements() {
         let binding = binding();
         let commitment = binding.commitment();
-        assert_ne!(commitment, Hash256::ZERO);
+        assert_eq!(
+            commitment,
+            Hash256([
+                0x04, 0xcc, 0xc6, 0x9a, 0xc1, 0xc1, 0xa5, 0x97, 0x63, 0x28, 0x3f, 0x1e, 0xcb, 0x16,
+                0x61, 0x6d, 0x85, 0xf0, 0x5e, 0xba, 0x69, 0xe6, 0x68, 0x76, 0x9d, 0xfc, 0xb6, 0x1c,
+                0x8f, 0x87, 0x42, 0x49,
+            ])
+        );
         assert_eq!(binding.commitment(), commitment);
         let requirements = binding.requirements(&identities(), 150).unwrap();
         assert_eq!(requirements.public_binding, commitment);
@@ -1715,6 +1722,12 @@ mod tests {
         for mutate in mutations {
             let mut changed = identities();
             mutate(&mut changed);
+            assert_ne!(
+                PublicWorkerExecutionBindingV1::new(changed)
+                    .unwrap()
+                    .commitment(),
+                binding.commitment()
+            );
             assert_eq!(
                 binding.requirements(&changed, 150),
                 Err(PublicWorkerOfferError::ExecutionIdentityMismatch)
@@ -1764,13 +1777,16 @@ mod tests {
 
     #[test]
     fn canonical_transcript_has_a_golden_hash() {
-        let body = body(h(10));
+        let mut body = body(h(10));
+        // Preserve the original generic offer transcript vector independently
+        // of the V1 binding-commitment vector above.
+        body.public_binding = h(2);
         assert_eq!(
             body.transcript().unwrap(),
             Hash256([
-                0x3f, 0x5e, 0x83, 0x5d, 0x5d, 0xd9, 0xc9, 0x2e, 0xf8, 0xf2, 0x0c, 0xb4, 0x14, 0xe7,
-                0x8b, 0x25, 0xdb, 0x4e, 0x5f, 0xae, 0x42, 0x97, 0x42, 0xb1, 0x48, 0xa2, 0xe5, 0x39,
-                0x83, 0xdf, 0x61, 0xd4,
+                0xbc, 0x24, 0x56, 0x88, 0x0e, 0xfc, 0xdf, 0x6f, 0x0b, 0x42, 0x9f, 0x0b, 0x6f, 0x74,
+                0x72, 0xc0, 0x98, 0x38, 0xc5, 0xd2, 0x6f, 0x8b, 0xa4, 0x8f, 0x6b, 0x6d, 0x8d, 0x54,
+                0xcb, 0x47, 0xb9, 0xe2,
             ])
         );
     }
