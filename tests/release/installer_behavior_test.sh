@@ -1855,7 +1855,7 @@ v08_channel_skips_higher_untrusted_tags_for_stable_release() {
     done
     assert_log_contains_literal "$sandbox/curl.log" '/releases/tags/v0.8.2' \
         'installer did not fall through to the trusted stable tag' || return 1
-    assert_file_contains "$sandbox/arc/bin/arc-node" 'arc-node 0\.8\.1' \
+    assert_file_contains "$sandbox/arc/bin/arc-node" 'arc-node 0\.8\.2' \
         'installer did not commit the highest trusted stable release' || return 1
 }
 

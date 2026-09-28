@@ -862,7 +862,7 @@ linux_compat_smoke_executes_real_headless_node() {
         '--no-community' \
         'GET /health HTTP/1.1' \
         'grep -q "HTTP/1.1 200"' \
-        '"status":"(ok|degraded)"'
+        'grep -Eq "\"status\":\"(ok|degraded)\""'
     do
         printf '%s\n' "$smoke_block" | grep -Fq -- "$required" || {
             printf 'Ubuntu compatibility smoke is missing: %s\n' "$required"
