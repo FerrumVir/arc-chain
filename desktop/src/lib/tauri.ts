@@ -171,9 +171,12 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     typeof historyScope !== "string" ||
     historyDomain !== EARNINGS_HISTORY_DOMAIN ||
     responseAddress === null ||
-    (archiveMode
-      ? historyCompleteSinceRecovery !== true || historyScope !== ARCHIVE_EARNINGS_SCOPE
-      : historyCompleteSinceRecovery !== false || historyScope !== RETAINED_EARNINGS_SCOPE)
+    // Archive mode describes configured retention. It does not certify that
+    // the host can prove complete history from the v3 recovery boundary.
+    // Such a host may still report a valid retained receipt window.
+    (historyCompleteSinceRecovery
+      ? archiveMode !== true || historyScope !== ARCHIVE_EARNINGS_SCOPE
+      : historyScope !== RETAINED_EARNINGS_SCOPE)
   ) {
     return null;
   }

@@ -93,9 +93,9 @@ export interface Earnings {
   unavailableReason: string | null;
   /** Backend-declared source of the bounded receipt window. */
   receiptSource: string | null;
-  /** Whether the selected host reports archival state. */
+  /** Whether the selected host reports archive retention configured. */
   archiveMode: boolean | null;
-  /** True only when the host explicitly binds archive retention to v3 recovery. */
+  /** True only when archive retention proves complete history from v3 recovery. */
   historyCompleteSinceRecovery: boolean | null;
   /** Exact backend-declared reward-history boundary/window. */
   historyScope: string | null;

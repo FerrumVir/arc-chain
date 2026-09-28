@@ -494,7 +494,11 @@ export function Dashboard() {
               {earnings?.fromChain === true ? (
                 <>
                   <NumberTicker value={earnings.totalArc} digits={2} />
-                  <span className="unit">ARC confirmed</span>
+                  <span className="unit">
+                    {earnings.historyCompleteSinceRecovery === true
+                      ? "ARC confirmed since recovery"
+                      : "ARC confirmed in retained window"}
+                  </span>
                 </>
               ) : (
                 <span
