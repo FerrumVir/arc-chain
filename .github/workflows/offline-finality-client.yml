@@ -1,0 +1,66 @@
+name: Offline finality client
+
+on:
+  push:
+    branches:
+      - codex/offline-finality-client-20260928
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-build:
+    name: Test and build pinned finality verifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/finality-client-target
+      PINNED_SOURCE_SHA: 5fa4db09e6fe41c1f433133acbab270ae10cd4ee
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: rustfmt
+      - name: Confirm pinned source ancestry
+        run: git merge-base --is-ancestor "$PINNED_SOURCE_SHA" "$GITHUB_SHA"
+      - name: Seed isolated lockfile from pinned workspace
+        run: |
+          cp Cargo.lock tools/finality-client/Cargo.lock
+          cargo generate-lockfile --manifest-path tools/finality-client/Cargo.toml
+      - name: Check formatting
+        run: cargo fmt --manifest-path tools/finality-client/Cargo.toml -- --check
+      - name: Run verifier tests
+        run: cargo test --locked --manifest-path tools/finality-client/Cargo.toml
+      - name: Build release verifier
+        run: cargo build --release --locked --manifest-path tools/finality-client/Cargo.toml
+      - name: Stage verifier and build receipt
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/finality-client-artifact"
+          if [ -f tools/finality-client/Cargo.lock ]; then
+            cp tools/finality-client/Cargo.lock "$RUNNER_TEMP/finality-client-artifact/Cargo.lock"
+          fi
+          if [ -f "$CARGO_TARGET_DIR/release/arc-finality-client" ]; then
+            cp "$CARGO_TARGET_DIR/release/arc-finality-client" "$RUNNER_TEMP/finality-client-artifact/arc-finality-client"
+          fi
+          {
+            printf 'pinned_source_sha=%s\n' "$PINNED_SOURCE_SHA"
+            printf 'tested_commit=%s\n' "$GITHUB_SHA"
+            printf 'rust_toolchain=nightly-2026-03-16\n'
+            if [ -f "$RUNNER_TEMP/finality-client-artifact/Cargo.lock" ]; then
+              sha256sum "$RUNNER_TEMP/finality-client-artifact/Cargo.lock"
+            fi
+            if [ -f "$RUNNER_TEMP/finality-client-artifact/arc-finality-client" ]; then
+              sha256sum "$RUNNER_TEMP/finality-client-artifact/arc-finality-client"
+            fi
+          } > "$RUNNER_TEMP/finality-client-artifact/build-receipt.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: offline-finality-client-${{ github.sha }}
+          path: ${{ runner.temp }}/finality-client-artifact/
+          retention-days: 7

@@ -1,0 +1,19 @@
+[package]
+name = "arc-finality-client"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+arc-bincode = { path = "../../crates/arc-bincode" }
+arc-consensus = { path = "../../crates/arc-consensus" }
+arc-crypto = { path = "../../crates/arc-crypto" }
+arc-types = { path = "../../crates/arc-types" }
+hex = "=0.4.3"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+thiserror = "=2.0.20"
+
+[workspace]
+resolver = "2"
