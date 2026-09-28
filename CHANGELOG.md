@@ -18,6 +18,21 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.1 - Release-preparation snapshot (2026-09-28)
+
+> **Release-preparation note:** This source snapshot prepares v0.8.1; it does
+> not claim that the tag has been published or that the fleet has been
+> upgraded. Verify those states only from the exact immutable release and
+> signed rollout evidence.
+
+- Retargets published-artifact acceptance and installer checks to the exact
+  v0.8.1 release while preserving the older v0.8.0 source-freeze record.
+- Improves the desktop earnings view and explorer copy so retained historical
+  receipts are shown only when available and a signed checkpoint is not treated
+  as proof that older transaction bodies were retained.
+- Keeps the Linux packaged-node acceptance check bound to the selected release
+  version and rejects version-prefix matches.
+
 ## v0.8.0 - Release-preparation snapshot (2026-08-31)
 
 > **Tag-stable lifecycle note:** At this review cutoff, v0.8.0 was an

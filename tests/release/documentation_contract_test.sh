@@ -38,7 +38,7 @@ DESKTOP_DISTRIBUTION="$REPO_ROOT/desktop/DISTRIBUTION.md"
 DESKTOP_GAPS="$REPO_ROOT/desktop/PRODUCTION_GAPS.md"
 CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
-CANDIDATE_VERSION=0.8.0
+CANDIDATE_VERSION=0.8.1
 
 require_literal() {
     local file="$1" literal="$2" message="$3"
@@ -103,12 +103,14 @@ candidate_version_is_consistent() {
         'desktop npm lock package root does not match the recovery candidate' || return 1
     require_literal "$RELEASE_WORKFLOW" '"desktop-npm-lock-root:$DESKTOP_NPM_LOCK_ROOT_VERSION"' \
         'release tag gate does not validate the npm lock package root' || return 1
-    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot (2026-08-31)" \
-        'changelog is missing the dated release-preparation heading' || return 1
+    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot (2026-09-28)" \
+        'changelog is missing the current release-preparation entry' || return 1
+    require_literal "$CHANGELOG" '## v0.8.0 - Release-preparation snapshot (2026-08-31)' \
+        'changelog no longer preserves the historical v0.8.0 source-freeze heading' || return 1
     require_literal "$CHANGELOG" 'Tag-stable lifecycle note' \
         'changelog lifecycle statement can become false after publication' || return 1
-    require_literal "$README" "v$CANDIDATE_VERSION / protocol v3" \
-        'README does not identify the candidate version' || return 1
+    require_literal "$README" "## v$CANDIDATE_VERSION release status and quickstart" \
+        'README does not identify the current release target' || return 1
     require_literal "$README" 'Source-freeze snapshot (2026-08-31; tag-stable)' \
         'README release status is not preserved as a dated source-freeze fact' || return 1
     require_literal "$README" 'pre-tag statement, not a live status probe' \
@@ -226,7 +228,7 @@ manual_updater_commands_are_identical() {
         require_literal "$file" "$system_command" \
             'system updater command drifted between operator docs' || return 1
     done
-    require_literal "$HEADLESS" 'do not pin v0.8.0' \
+    require_literal "$HEADLESS" "do not pin v$CANDIDATE_VERSION" \
         'updater docs do not distinguish discovery from the pinned initial install' || return 1
 }
 
@@ -408,7 +410,7 @@ readme_counts_and_desktop_secret_copy_match_the_tree() {
     fi
     require_literal "$DESKTOP_README" 'recovery phrase is present' \
         'desktop README falsely implies the native store excludes its signing secret' || return 1
-    require_literal "$GETTING_STARTED" 'v0.8.0 does not yet use an OS keychain' \
+    require_literal "$GETTING_STARTED" "v$CANDIDATE_VERSION does not yet use an OS keychain" \
         'user guide omits the desktop recovery-secret storage boundary' || return 1
     require_literal "$DESKTOP_FIRST_RUN" 'only a successful mined receipt' \
         'first-run guide still upgrades faucet submission into confirmed credit' || return 1
@@ -422,7 +424,7 @@ persistence_rpc_and_transaction_copy_match_the_installer() {
     done
     require_literal "$README" 'Do not reuse a v0.7.11-or-earlier data directory.' \
         'README does not fail closed on v2 WAL reuse' || return 1
-    require_literal "$HEADLESS" 'Do not point v0.8.0 at a v0.7.11-or-earlier data directory.' \
+    require_literal "$HEADLESS" "Do not point v$CANDIDATE_VERSION at a v0.7.11-or-earlier data directory." \
         'headless guide does not require a fresh observer data directory' || return 1
     require_literal "$WALKTHROUGH" 'Validators need the approved canonical checkpoint migration instead.' \
         'walkthrough omits the validator checkpoint-only migration rule' || return 1
@@ -1796,11 +1798,11 @@ PY
         'repos/FerrumVir/arc-chain/deployments' \
         './shared/frontend/arc-network.json' \
         'arc.post-release-installer-canary.v1' \
-        'Already up to date at v0.8.0' \
+        'Already up to date at v0.8.1' \
         'scripts/recovery/recovery_rollout.py verify' \
         'POST-RELEASE-ACCEPTANCE.json' \
         'scripts/release/build-postrelease-public-truth.py' \
-        "public_truth_branch='arc-recovery/public-truth-v0.8.0'" \
+        "public_truth_branch='arc-recovery/public-truth-v0.8.1'" \
         'repos/FerrumVir/arc-chain/git/matching-refs/heads/$public_truth_branch' \
         'PUBLIC-TRUTH-RULESETS-BASELINE.json' \
         'PUBLIC-TRUTH-REVIEW-AUTHORIZATION.json' \
@@ -2394,8 +2396,8 @@ PY
     }
 }
 
-run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.0' candidate_version_is_consistent
-run_test 'candidate install commands pin exact v0.8.0 without claiming publication' candidate_install_commands_are_exact_and_honest
+run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.1' candidate_version_is_consistent
+run_test 'candidate install commands pin exact v0.8.1 without claiming publication' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
 run_test 'desktop docs and generated release notes match artifacts, updater, and reward evidence' desktop_and_release_notes_match_the_artifact_and_reward_contract
