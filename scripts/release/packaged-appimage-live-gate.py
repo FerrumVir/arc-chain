@@ -47,7 +47,7 @@ SCHEMA = "arc.packaged-appimage-live-product.v1"
 HOST_SCHEMA = "arc.packaged-appimage-live-host.v1"
 RELEASE_SCHEMA = "arc.published-release-binding.v1"
 REPOSITORY = "FerrumVir/arc-chain"
-TAG = "v0.8.0"
+TAG = "v0.8.1"
 LAX_HOST = "140.82.16.112"
 LAX_PORT = 443
 LAX_USER = "root"
@@ -1736,7 +1736,7 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
         "utf-8", "replace"
     ).strip()
     if not re.search(r"(?:^|\s)(?:v)?0\.8\.0(?:\s|$)", node_version):
-        raise GateError(f"published managed node does not report v0.8.0: {node_version!r}")
+        raise GateError(f"published managed node does not report v0.8.1: {node_version!r}")
 
     os.chmod(appimage, 0o500)
     extraction = run_command([os.fspath(appimage), "--appimage-extract"], cwd=work, timeout=180)

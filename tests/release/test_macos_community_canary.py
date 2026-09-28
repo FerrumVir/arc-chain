@@ -355,7 +355,7 @@ class CanaryFixture:
             "commit": self.COMMIT,
             "platform": canary.PLATFORM,
             "rust_target": canary.RUST_TARGET,
-            "version": "0.8.0",
+            "version": "0.8.1",
             "workflow_run_id": self.RUN_ID,
             "workflow_run_attempt": self.RUN_ATTEMPT,
             "files": files,
@@ -407,7 +407,7 @@ class CanaryFixture:
             "artifact": {
                 "kind": "headless",
                 "platform": canary.PLATFORM,
-                "version": "0.8.0",
+                "version": "0.8.1",
                 "raw_actions_zip_sha256": hashlib.sha256(
                     self.actions_zip.read_bytes()
                 ).hexdigest(),

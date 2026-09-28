@@ -6,7 +6,7 @@ model loading, assignment, block inclusion, or the two-receipt earnings proof co
 in three minutes of wall-clock time. Record the verified waits, then cut them.
 At the 2026-08-31 source-freeze review cutoff, the v0.8.0 recovery candidate
 was not published or deployed; that is a tag-stable historical statement, not
-a live probe. Use this script only when the complete v0.8.0 CLI release is
+a live probe. Use this script only when the complete v0.8.1 CLI release is
 visible on GitHub and signed evidence proves the seed rollout checklist below
 has been completed. Do not record against a mixed v0.7.2/v0.7.9 fleet as
 though these branch fixes are already live.
@@ -22,7 +22,7 @@ though these branch fixes are already live.
 - Use a clean SSH-only x86_64 Ubuntu 22.04, 24.04, or 26.04 machine, or an
   ARM64 Ubuntu 24.04 or 26.04 machine; those are the release-gated Linux
   environments.
-- Use a fresh data directory. v0.8.0 writes `genesis.network-hash` and fails
+- Use a fresh data directory. v0.8.1 writes `genesis.network-hash` and fails
   closed when an existing WAL has no marker or a different genesis hash. Back
   up old v2 identity/data for forensics, but do not reuse or copy the v2 WAL.
   Validators need the approved canonical checkpoint migration instead.
@@ -76,14 +76,14 @@ closed; the CLI flag alone cannot turn issuance on.
 Narration: “This is a plain server over SSH—no desktop and no GUI.”
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.1/install.sh
 ARC_INSTALL_SHA256=0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
+bash install.sh --version 0.8.1 --model /absolute/path/to/model.gguf
 ```
 
 The pinned installer SHA-256 is

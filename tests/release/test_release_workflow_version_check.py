@@ -26,7 +26,7 @@ class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
         return subprocess.run(
             ["bash", "-euo", "pipefail", "-c", version_check_shell()],
             cwd=root,
-            env={**os.environ, "VERSION": "0.8.0", "TAG": "v0.8.0"},
+            env={**os.environ, "VERSION": "0.8.1", "TAG": "v0.8.1"},
             text=True,
             capture_output=True,
             check=False,
@@ -51,12 +51,13 @@ class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
                 shutil.copy2(ROOT / relative, destination)
             package_json = fixture / "desktop/package.json"
             package = json.loads(package_json.read_text())
-            package["version"] = "0.8.1"
+            # Previously published v0.8.0 bytes cannot satisfy the v0.8.1 tag.
+            package["version"] = "0.8.0"
             package_json.write_text(json.dumps(package))
 
             result = self.run_check(fixture)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("desktop-npm version is 0.8.1", result.stdout + result.stderr)
+            self.assertIn("desktop-npm version is 0.8.0", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

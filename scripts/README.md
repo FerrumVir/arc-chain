@@ -76,21 +76,21 @@ resolves either the latest release or one exact pin, requires every platform
 asset, and verifies all downloads with that release's `SHA256SUMS`. It does not
 walk backward through old tags: an incomplete release fails closed.
 
-Public v0.7.10 and v0.7.11 were desktop-only releases. The v0.8.0 recovery
-candidate and its restored headless asset matrix are not published yet, so the
+Public v0.7.10 and v0.7.11 were desktop-only releases. The protected v0.8.0
+tag has no published assets; v0.8.1 is the current release target. The
 commands below are release-shape examples, not a claim that GitHub's current
 `latest` release can install every platform today.
 
 ```bash
-# Example only after the v0.8.0 release is explicitly approved and published:
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
+# Example only after the v0.8.1 release is explicitly approved and published:
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.1/install.sh
 ARC_INSTALL_SHA256=0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.0
+bash install.sh --version 0.8.1
 ```
 
 The candidate service launches with `--stake 0 --min-stake 0 --community-mode`.
@@ -180,15 +180,15 @@ ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
 
 **I want to join the network as a community node:**
 ```bash
-# Only after v0.8.0 is explicitly approved and published:
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
+# Only after v0.8.1 is explicitly approved and published:
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.1/install.sh
 ARC_INSTALL_SHA256=0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.0
+bash install.sh --version 0.8.1
 ```
 
 **I want to reproduce the factual benchmark:**
