@@ -3737,7 +3737,9 @@ impl ConsensusManager {
                 if let Some(tracker) = skip_tracker.as_mut() {
                     tracker.prune_observations_below(cursor.saturating_sub(ABSENCE_SCAN_ROUNDS));
                 }
-                skip_vote_collector.prune_below(cursor.saturating_sub(ABSENCE_SCAN_ROUNDS));
+                let absence_floor = cursor.saturating_sub(ABSENCE_SCAN_ROUNDS);
+                durable_skip_decisions.retain(|(round, _)| *round >= absence_floor);
+                skip_vote_collector.prune_below(absence_floor);
             }
 
             // A PeerConnected event can discover backpressure while enqueueing
