@@ -4725,7 +4725,7 @@ mod release_binary_tests {
                 manifest.as_bytes(),
                 signature.as_bytes(),
                 &allowed_signers,
-                "0.8.1",
+                "0.8.0",
             )
             .is_err(),
             "a valid signature must not be replayable across release tags"
