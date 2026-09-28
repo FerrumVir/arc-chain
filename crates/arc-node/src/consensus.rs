@@ -1506,7 +1506,7 @@ impl ConsensusManager {
                     state,
                     &self.engine,
                     writer,
-                    &[record.clone()],
+                    std::slice::from_ref(&record),
                 ) {
                     Ok(writer) => writer,
                     Err(error) => {
