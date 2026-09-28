@@ -236,6 +236,23 @@ await test("reports the highest evidence within one source snapshot", () => {
   assert.equal(app.reportedHeight({ health: { height: "9007199254740992" } }), null);
 });
 
+await test("open canonical block inspector re-resolves only when checkpoint eligibility changes", () => {
+  const block = { kind: "block", value: "3166520" };
+  const verified = { state: "verified" };
+  const missingReplica = { state: "unknown", legacy: { state: "verified" },
+    replicas: [{ sourceId: "ams", state: "unknown", reason: "replica-evidence-unavailable" }] };
+  assert.equal(app.shouldReinspectOpenBlock(verified, missingReplica, "canonical", block, true), true);
+  assert.equal(app.shouldReinspectOpenBlock(missingReplica, verified, "canonical", block, true), true);
+  assert.equal(app.shouldReinspectOpenBlock(missingReplica, { ...missingReplica, reason: "still-missing" },
+    "canonical", block, true), false);
+  assert.equal(app.shouldReinspectOpenBlock(verified, missingReplica, "nyc", block, true), false);
+  assert.equal(app.shouldReinspectOpenBlock(verified, missingReplica, "canonical", { kind: "tx" }, true), false);
+  assert.equal(app.shouldReinspectOpenBlock(verified, missingReplica, "canonical", block, false), false);
+  assert.match(app.checkpointIncompleteMessage(missingReplica), /Signed H checkpoint is verified.*ams/);
+  assert.match(app.checkpointIncompleteMessage({ state: "unknown", legacy: { state: "unknown" } }),
+    /Signed H checkpoint evidence is unavailable or unverified/);
+});
+
 await test("raw u64 strings format exactly while unsafe JSON numbers fail closed", () => {
   assert.equal(app.formatExactInteger("18446744073709551615").replace(/\D/g, ""), "18446744073709551615");
   assert.equal(app.formatExactInteger(Number.MAX_SAFE_INTEGER + 1), "Unavailable");

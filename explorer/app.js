@@ -100,6 +100,28 @@
     return values.length ? Math.max(...values) : null;
   }
 
+  function checkpointEligibilityChanged(previous, next) {
+    return (previous?.state === "verified") !== (next?.state === "verified");
+  }
+
+  function shouldReinspectOpenBlock(previous, next, sourceId, route, inspectorOpen) {
+    return sourceId === "canonical" && route?.kind === "block" && inspectorOpen &&
+      checkpointEligibilityChanged(previous, next);
+  }
+
+  function checkpointIncompleteMessage(audit) {
+    if (audit?.legacy?.state === "verified") {
+      const incomplete = (audit.replicas || []).filter((replica) => replica.state !== "verified")
+        .map((replica) => replica.sourceId).filter(Boolean);
+      const suffix = incomplete.length ? ` (${incomplete.join(", ")})` : "";
+      return `Signed H checkpoint is verified, but v3 replica evidence is incomplete${suffix}. No result is labeled canonical.`;
+    }
+    if (audit?.legacy?.state === "unknown") {
+      return "Signed H checkpoint evidence is unavailable or unverified. No result is labeled canonical.";
+    }
+    return "Canonical checkpoint or replica evidence is incomplete. No result is labeled canonical.";
+  }
+
   async function requestJson(fetchImpl, source, path, options) {
     const settings = options || {};
     const controller = new AbortController();
@@ -714,6 +736,7 @@
       state.refreshController?.abort();
       state.refreshController = new AbortController();
       const signal = state.refreshController.signal;
+      const auditBeforeRefresh = state.checkpointAudit;
       elements.refreshButton.classList.add("spinning");
       const source = currentSource();
       updateSourceChrome();
@@ -752,6 +775,8 @@
           text(elements.inferenceStatus, "Paused by maintenance interlock");
           text(elements.rewardsStatus, "Paused by maintenance interlock");
           setBanner("error", "Network maintenance safety interlock active", `Canonical publication is paused: ${maintenanceAudit.reason || "fresh six-validator maintenance evidence is unavailable"}. Preserved alternate archives remain explicitly queryable.`);
+          if (shouldReinspectOpenBlock(auditBeforeRefresh, state.checkpointAudit, state.sourceId,
+                                       parseRoute(), !elements.inspectorClose.hidden)) handleRoute();
           return;
         }
         if (!snapshotResult.ok) throw snapshotResult.error;
@@ -781,13 +806,16 @@
         else if (alternate) setBanner("degraded", "NON-CANONICAL source view", `${sourceDisplay(source)} is being queried explicitly and is not merged into canonical results.`);
         else if (liveness.state === "stalled") setBanner("degraded", "RPC reachable, chain appears stalled", `${sourceDisplay(source)} answered, but its newest block is stale.`);
         else if (checkpointAudit.state === "verified") setBanner("online", "Canonical recovery verified", `${sourceDisplay(source)} · exact checkpoint and ${checkpointAudit.replicas.length} v3 replica identities verified · liveness ${liveness.state}`);
-        else setBanner("degraded", "Canonical evidence incomplete", `${sourceDisplay(source)} is reachable, but exact checkpoint evidence is unavailable. No result is labeled canonical.`);
+        else setBanner("degraded", "Canonical evidence incomplete", `${sourceDisplay(source)} is reachable, but ${checkpointIncompleteMessage(checkpointAudit)}`);
+        if (shouldReinspectOpenBlock(auditBeforeRefresh, checkpointAudit, state.sourceId,
+                                     parseRoute(), !elements.inspectorClose.hidden)) handleRoute();
       } catch (error) {
         if (!signal.aborted) {
           // Evidence panels are cleared with the metrics. Leaving the previous
           // block, inference, and reward renders on screen would present stale
           // rows - possibly from a different source - as current evidence while
           // the banner reports the selected source as unreachable.
+          state.checkpointAudit = { state: "unknown", reason: "selected-source-unreachable" };
           resetMetrics();
           renderFacts(source, null, null);
           renderRecovery(null);
@@ -799,6 +827,8 @@
           text(elements.rewardsStatus, "Unavailable");
           text(elements.lastRefreshed, "Refresh failed");
           setBanner("error", "Selected source is unreachable", `${sourceDisplay(source)}: ${error.message}`);
+          if (shouldReinspectOpenBlock(auditBeforeRefresh, state.checkpointAudit, state.sourceId,
+                                       parseRoute(), !elements.inspectorClose.hidden)) handleRoute();
         }
       } finally {
         elements.refreshButton.classList.remove("spinning");
@@ -1263,6 +1293,9 @@
     formatExactInteger,
     describeSilentSource,
     reportedHeight,
+    checkpointEligibilityChanged,
+    shouldReinspectOpenBlock,
+    checkpointIncompleteMessage,
     requestJson,
     requestLatestBlock,
     verifyRecoveryCheckpoint,
