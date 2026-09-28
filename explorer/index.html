@@ -11,13 +11,13 @@
     <title>ARC Composite Explorer</title>
     <link rel="preload" href="./fonts/marcellus-latin.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="preload" href="./fonts/hanken-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="stylesheet" href="./styles.css?v=5" />
+    <link rel="stylesheet" href="./styles.css?v=6" />
     <script src="../shared/frontend/arc-network.js?v=3" defer></script>
     <script src="./native-receipts.js?v=3" defer></script>
     <script src="./aqueduct/engine.js?v=1" defer></script>
     <script src="./aqueduct/archchain.js?v=2" defer></script>
     <script src="./aqueduct/band.js?v=2" defer></script>
-    <script src="./app.js?v=5" defer></script>
+    <script src="./app.js?v=6" defer></script>
   </head>
   <body>
     <svg class="symbols" width="0" height="0" aria-hidden="true" focusable="false"><symbol id="arc-wordmark" viewBox="0 0 241.87 94.04"><path fill-rule="evenodd" d="M36.85 0.05C36.66 0.08 36.01 0.14 35.4 0.2C21.46 1.57 9.65 11 3.97 25.31C-1.25 38.46 -1.33 55.12 3.78 68.04C8.89 80.98 17.69 89.34 29.75 92.73C30.53 92.95 34.39 93.65 35.7 93.81C37.46 94.02 42.91 93.99 44.3 93.76C52.02 92.48 57.5 89.82 62.61 84.89C64.67 82.9 65.01 82.66 65.44 82.9C66.05 83.24 66.1 83.5 66.15 87.29L66.2 90.74L66.46 91.19C66.62 91.49 66.86 91.73 67.16 91.89L67.6 92.14L77.86 92.14L88.11 92.14L88.61 91.89C88.97 91.71 89.17 91.51 89.35 91.19L89.6 90.74L89.63 46.26C89.66 -0.35 89.67 1.27 89.2 0.71C88.61 0.01 89.21 0.05 78.21 0.02C66.63 -0.02 66.98 -0.05 66.41 1.04L66.2 1.44L66.15 5.79L66.1 10.14L65.89 10.62C65.42 11.62 65 11.43 62.72 9.2C57.92 4.47 52.27 1.6 45.35 0.38L43.6 0.07L40.4 0.04C38.64 0.03 37.05 0.03 36.85 0.05M197.85 0.11C192.95 0.46 186.55 2.24 182.06 4.49C169.76 10.67 161.35 22.56 158.87 37.29C158.36 40.28 158.38 40.16 158.2 42.64C157 59.78 162.67 75.05 173.66 84.24C180.23 89.73 188.9 93.28 197.27 93.89C207.71 94.65 219.21 92.59 225.83 88.78C234.78 83.63 239.63 76.18 241.71 64.34C242.06 62.37 241.83 61.37 240.9 60.9L240.41 60.64L230.41 60.64C219.32 60.64 219.8 60.62 219.02 61.3C218.53 61.73 218.38 62.06 217.8 63.94C216.87 66.99 215.79 68.77 213.58 70.9C211.41 73 209.29 74.05 205.79 74.76C204.48 75.03 198.8 75.03 197.55 74.76C192.44 73.68 189.05 71.32 186.21 66.89C182.13 60.54 180.57 49.67 182.16 38.69C183.2 31.48 186.78 24.68 191 21.9C192.82 20.71 195.67 19.56 197.75 19.18C198.97 18.96 204.22 18.99 205.5 19.23C211.95 20.42 216.22 24.33 217.97 30.64C218.5 32.55 218.87 33.05 220 33.34C220.75 33.53 239.57 33.58 240.46 33.38C242.01 33.05 242.19 32.02 241.41 28.16C240.08 21.57 237.82 16.72 233.95 12.09C228.64 5.77 219.12 1.38 208.35 0.3C205.33 0 200.6 -0.09 197.85 0.11M142.3 0.96C134.35 1.38 126.34 3.53 120.73 6.76C110.92 12.41 104.48 20.92 101.65 31.94C101.11 34.06 100.34 38.49 100.14 40.64C100.03 41.76 100 46.98 100 66.35L100 90.65L100.26 91.15C100.44 91.51 100.64 91.71 100.96 91.89L101.4 92.14L111.4 92.17C122.48 92.2 122.12 92.22 122.78 91.56C123.45 90.9 123.39 92.87 123.46 66.04C123.52 39.67 123.48 41.6 124.01 38.44C124.94 32.95 127.79 28.36 131.8 25.89C135.94 23.35 140.23 22.5 148.82 22.5C153.06 22.49 153.47 22.39 153.92 21.21C154.12 20.71 154.21 3.25 154.02 2.37C153.93 1.91 153.43 1.32 152.96 1.1C152.62 0.95 144.51 0.84 142.3 0.96M42.05 19.06C29.13 20.66 21.53 34.96 23.95 53.09C24.78 59.24 26.93 64.44 30.34 68.5C33.01 71.69 36.97 73.99 41.1 74.76C42.55 75.03 46.76 75.03 48.2 74.76C58.3 72.87 65.37 62.78 66.07 49.27C66.87 34 59.87 21.87 48.78 19.28C47.93 19.08 43.14 18.92 42.05 19.06" /></symbol></svg>
@@ -81,11 +81,11 @@
       <section id="connection-banner" class="connection-banner loading" aria-live="polite"><span class="banner-pulse" aria-hidden="true"></span><div><strong id="banner-title">Loading canonical configuration…</strong><span id="banner-detail">No chain claim has been made yet.</span></div></section>
 
       <section class="recovery-ribbon" aria-labelledby="recovery-title">
-        <div class="recovery-heading"><span class="micro-label">Canonical continuity</span><h2 id="recovery-title">Recovery checkpoint unavailable</h2><p id="recovery-summary">The explorer is paused until approved recovery metadata is published.</p></div>
+        <div class="recovery-heading"><span class="micro-label">Canonical continuity</span><h2 id="recovery-title">Loading recovery checkpoint…</h2><p id="recovery-summary">Reading the approved recovery metadata…</p></div>
         <ol class="continuity-track">
-          <li><span>Legacy</span><strong id="checkpoint-height">H —</strong><small id="checkpoint-hash">Signed checkpoint unavailable</small></li>
-          <li class="boundary"><span>Boundary</span><strong id="boundary-height">H+1 —</strong><small id="boundary-state">Parent link not checked</small></li>
-          <li><span>Protocol v3</span><strong id="continuation-label">Continuation —</strong><small id="manifest-hash">Manifest unavailable</small></li>
+          <li><span>Legacy</span><strong id="checkpoint-height">H —</strong><small id="checkpoint-hash">Loading…</small></li>
+          <li class="boundary"><span>Boundary</span><strong id="boundary-height">H+1 —</strong><small id="boundary-state">Loading…</small></li>
+          <li><span>Protocol v3</span><strong id="continuation-label">Continuation —</strong><small id="manifest-hash">Loading…</small></li>
         </ol>
       </section>
 
@@ -97,29 +97,29 @@
       </section>
 
       <section class="metric-grid" aria-label="Canonical source metrics">
-        <article class="metric-card accent"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 4.8-9 4.8-9-4.8zM3 12.2l9 4.8 9-4.8M3 16.6l9 4.8 9-4.8" /></svg><p>Canonical height</p><strong id="metric-height">—</strong><small id="metric-height-note">Awaiting v3 source</small></article>
-        <article class="metric-card"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9zM4 7.5l8 4.5 8-4.5M12 12v9" /></svg><p>Latest block</p><strong id="metric-stored-height">—</strong><small id="metric-stored-note">No block header loaded</small></article>
-        <article class="metric-card"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 2" /></svg><p>Block age</p><strong id="metric-block-age">—</strong><small id="metric-liveness-note">Liveness unknown</small></article>
+        <article class="metric-card accent"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 4.8-9 4.8-9-4.8zM3 12.2l9 4.8 9-4.8M3 16.6l9 4.8 9-4.8" /></svg><p>Canonical height</p><strong id="metric-height">—</strong><small id="metric-height-note">Loading…</small></article>
+        <article class="metric-card"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9zM4 7.5l8 4.5 8-4.5M12 12v9" /></svg><p>Latest block</p><strong id="metric-stored-height">—</strong><small id="metric-stored-note">Loading…</small></article>
+        <article class="metric-card"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 2" /></svg><p>Block age</p><strong id="metric-block-age">—</strong><small id="metric-liveness-note">Loading…</small></article>
         <article class="metric-card"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h9" /></svg><p>Transactions</p><strong id="metric-transactions">—</strong><small>Current source report</small></article>
         <article class="metric-card"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.5" /><circle cx="18" cy="6" r="2.5" /><circle cx="18" cy="18" r="2.5" /><path d="m8.2 10.8 7.6-3.6M8.2 13.2l7.6 3.6" /></svg><p>Connected peers</p><strong id="metric-peers">—</strong><small>Current source local view</small></article>
-        <article class="metric-card"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5.5c0 4.2 2.9 7.8 7 9.5 4.1-1.7 7-5.3 7-9.5V6z" /><path d="m9 12 2.2 2.2L15.5 10" /></svg><p>Validators</p><strong id="metric-validators">—</strong><small id="metric-validator-note">Availability unknown</small></article>
+        <article class="metric-card"><svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5.5c0 4.2 2.9 7.8 7 9.5 4.1-1.7 7-5.3 7-9.5V6z" /><path d="m9 12 2.2 2.2L15.5 10" /></svg><p>Validators</p><strong id="metric-validators">—</strong><small id="metric-validator-note">Loading…</small></article>
       </section>
 
       <section class="content-grid">
         <article class="panel blocks-panel">
-          <div class="panel-heading"><div><span class="micro-label">Resolved canonical segment</span><h2>Recent protocol-v3 blocks</h2></div><span id="blocks-status" class="quiet-pill">Waiting</span><button id="blocks-page-link" class="text-button" type="button">Paged history →</button></div>
-          <div class="table-scroll"><table><thead><tr><th>Height</th><th>Segment</th><th>Age</th><th>Transactions</th><th>Block hash</th></tr></thead><tbody id="blocks-body"><tr><td colspan="5" class="empty-cell">No canonical source configured.</td></tr></tbody></table></div>
+          <div class="panel-heading"><div><span class="micro-label">Resolved canonical segment</span><h2>Recent protocol-v3 blocks</h2></div><span id="blocks-status" class="quiet-pill">Loading…</span><button id="blocks-page-link" class="text-button" type="button">Paged history →</button></div>
+          <div class="table-scroll"><table><thead><tr><th>Height</th><th>Segment</th><th>Age</th><th>Transactions</th><th>Block hash</th></tr></thead><tbody id="blocks-body"><tr><td colspan="5" class="empty-cell">Loading recent blocks…</td></tr></tbody></table></div>
         </article>
         <aside class="panel facts-panel">
           <div class="panel-heading"><div><span class="micro-label">Current source truth</span><h2>Health and commitments</h2></div></div>
-          <dl class="facts" id="source-facts"><div><dt>Source</dt><dd>Unavailable</dd></div><div><dt>Node version</dt><dd>Unavailable</dd></div><div><dt>Reachability</dt><dd>Unknown</dd></div><div><dt>Chain liveness</dt><dd>Unknown</dd></div><div><dt>Latest block hash</dt><dd>Unavailable</dd></div><div><dt>Latest state root</dt><dd>Unavailable</dd></div></dl>
+          <dl class="facts" id="source-facts"><div><dt>Source</dt><dd>Loading…</dd></div><div><dt>Node version</dt><dd>Loading…</dd></div><div><dt>Reachability</dt><dd>Loading…</dd></div><div><dt>Chain liveness</dt><dd>Loading…</dd></div><div><dt>Latest block hash</dt><dd>Loading…</dd></div><div><dt>Latest state root</dt><dd>Loading…</dd></div></dl>
           <p class="facts-note">Reachability, liveness, canonicality, and replica agreement are separate claims. Missing values stay unavailable.</p>
         </aside>
       </section>
 
       <section class="activity-grid" aria-label="Inference and reward evidence">
-        <article class="panel"><div class="panel-heading"><div><span class="micro-label">Receipt-backed only</span><h2>Inference activity</h2></div><span id="inference-status" class="quiet-pill">Waiting</span></div><div id="inference-list" class="evidence-list"><p class="empty-cell">No confirmed inference receipts loaded.</p></div></article>
-        <article class="panel"><div class="panel-heading"><div><span class="micro-label">Protocol economics</span><h2>Reward readiness</h2></div><span id="rewards-status" class="quiet-pill">Waiting</span></div><dl id="rewards-list" class="facts"><div><dt>Issuance</dt><dd>Unavailable</dd></div><div><dt>Attestation reward</dt><dd>Unavailable</dd></div><div><dt>Projected earnings</dt><dd>Unavailable without worker evidence</dd></div></dl><p class="facts-note">A configured rate is not an earning. ARC is counted as earned only after a successful mined reward receipt.</p></article>
+        <article class="panel"><div class="panel-heading"><div><span class="micro-label">Receipt-backed only</span><h2>Inference activity</h2></div><span id="inference-status" class="quiet-pill">Loading…</span></div><div id="inference-list" class="evidence-list"><p class="empty-cell">Loading inference receipts…</p></div></article>
+        <article class="panel"><div class="panel-heading"><div><span class="micro-label">Protocol economics</span><h2>Reward readiness</h2></div><span id="rewards-status" class="quiet-pill">Loading…</span></div><dl id="rewards-list" class="facts"><div><dt>Issuance</dt><dd>Loading…</dd></div><div><dt>Attestation reward</dt><dd>Loading…</dd></div><div><dt>Projected earnings</dt><dd>Unavailable without worker evidence</dd></div></dl><p class="facts-note">A configured rate is not an earning. ARC is counted as earned only after a successful mined reward receipt.</p></article>
       </section>
 
       <section id="inspector" class="panel inspector" aria-labelledby="inspector-title">

@@ -386,7 +386,7 @@ export function NativePaidRequests() {
   const visible = [...requests].reverse();
 
   return (
-    <Card data-testid="native-paid-card" className="native-card">
+    <Card data-testid="native-paid-card" className="native-card arrive">
       {header}
       <div role="status" data-testid="native-chain-status" className="native-chain">
         Chain at block {view.height} · {view.members} validators · executor: {executor}

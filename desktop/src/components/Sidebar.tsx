@@ -37,6 +37,7 @@ export function Sidebar() {
   });
 
   const level = status?.health ?? "offline";
+  const checking = status === undefined;   // no status yet: the node may well be running or starting
 
   return (
     <aside className="sidebar" data-testid="sidebar">
@@ -64,20 +65,24 @@ export function Sidebar() {
         <div className="node-status-chip" data-testid="sidebar-status">
           <PulseDot
             level={
-              status?.running
-                ? level
-                : status?.pid != null
-                  ? "syncing"
-                  : level
+              checking
+                ? "checking"
+                : status?.running
+                  ? level
+                  : status?.pid != null
+                    ? "syncing"
+                    : level
             }
           />
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text)" }}>
-              {status?.running
-                ? "Running"
-                : status?.pid != null
-                  ? "Starting"
-                  : "Stopped"}
+              {checking
+                ? "Checking…"
+                : status?.running
+                  ? "Running"
+                  : status?.pid != null
+                    ? "Starting"
+                    : "Stopped"}
             </div>
             {status?.running && (
               <div style={{ fontSize: 11, color: "var(--text-muted)" }}>

@@ -3,10 +3,11 @@ import { Download, ScrollText } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { EmptyState } from "../components/EmptyState";
+import { Skeleton } from "../components/Skeleton";
 import { api } from "../lib/tauri";
 
 export function Logs() {
-  const { data: logs } = useQuery({
+  const { data: logs, isError: logsError } = useQuery({
     queryKey: ["logs"],
     queryFn: () => api.fetchLogs(500),
     refetchInterval: 2000,
@@ -22,11 +23,17 @@ export function Logs() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Follow new lines only while the reader is at the bottom. Someone who scrolled up to read is left where they are;
+  // this used to pull them back down at every 2 s poll.
+  const followRef = useRef(true);
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
+    const el = scrollRef.current;
+    if (el && followRef.current) el.scrollTop = el.scrollHeight;
   }, [logs]);
+  const onConsoleScroll = () => {
+    const el = scrollRef.current;
+    if (el) followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 32;
+  };
 
   // The write happens in Rust behind a native save dialog.
   //
@@ -88,8 +95,22 @@ export function Logs() {
 
       <Card>
         <CardHeader title="Console" />
-        <div className="log-console" ref={scrollRef} data-testid="log-console">
-          {!logs || logs.length === 0 ? (
+        <div className="log-console" ref={scrollRef} onScroll={onConsoleScroll} data-testid="log-console">
+          {logs === undefined ? (
+            logsError ? (
+              <EmptyState
+                icon={ScrollText}
+                title="Could not read the log"
+                description="The app could not read this node's log buffer. It keeps trying every few seconds."
+              />
+            ) : (
+              <div className="log-loading" aria-busy="true" data-testid="log-loading">
+                {[74, 58, 66, 40].map((w, i) => (
+                  <Skeleton key={i} block width={`${w}%`} height="0.75em" />
+                ))}
+              </div>
+            )
+          ) : logs.length === 0 ? (
             isExternal ? (
               <EmptyState
                 icon={ScrollText}

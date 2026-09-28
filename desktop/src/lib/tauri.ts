@@ -583,6 +583,18 @@ function parseCommunityRewardReceiptBody(
  * outside Tauri (which refuses to mock at all — see the guard in
  * `mockInvoke`). Setting it cannot make the real app show a fabricated number.
  */
+/**
+ * Preview seam: `?slow=1500` holds every mock reply that long, so the launch screen, the "Checking" states and the
+ * loading placeholders can be seen and reviewed in the browser preview (the mock otherwise answers instantly). Like
+ * `mockOverride`, it lives inside `mockInvoke` only: the Tauri app never calls the mock, and a production bundle
+ * refuses to mock at all.
+ */
+function mockLatencyMs(): number {
+  if (typeof window === "undefined") return 0;
+  const value = Number(new URLSearchParams(window.location.search).get("slow"));
+  return Number.isFinite(value) && value > 0 ? Math.min(value, 10_000) : 0;
+}
+
 type MockOverrides = Record<string, unknown>;
 function mockOverride<T>(cmd: string): T | undefined {
   if (typeof window === "undefined") return undefined;
@@ -2397,6 +2409,9 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       "ARC desktop is running outside its native host. Open the arc app, not the HTML bundle.",
     );
   }
+  // Preview latency (see `mockLatencyMs`), also after the production guard.
+  const slow = mockLatencyMs();
+  if (slow) await new Promise((resolve) => setTimeout(resolve, slow));
   // Test seam (see `mockOverride`). Checked after the production guard above,
   // so it cannot fabricate anything in a real bundle.
   const override = mockOverride<T>(cmd);

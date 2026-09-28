@@ -33,10 +33,24 @@ export function readStoredTheme(): Theme {
   return DEFAULT_THEME;
 }
 
+// Only the classic theme sets Inter. It used to be a render-blocking remote stylesheet in index.html that every
+// launch waited on, including the engraved default and offline starts; now it is fetched only when classic is used.
+const INTER_HREF = "https://rsms.me/inter/inter.css";
+
+function ensureClassicFont(): void {
+  if (typeof document === "undefined") return;
+  if (document.querySelector(`link[href="${INTER_HREF}"]`)) return;
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = INTER_HREF;
+  document.head.appendChild(link);
+}
+
 export function applyTheme(theme: Theme): void {
   current = theme;
   if (typeof document !== "undefined") {
     document.documentElement.dataset.theme = theme;
+    if (theme === "classic") ensureClassicFont();
   }
   listeners.forEach((listener) => listener());
 }

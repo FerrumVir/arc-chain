@@ -496,9 +496,17 @@
       blocksStatus: $("blocks-status"), blocksBody: $("blocks-body"), blocksPageLink: $("blocks-page-link"), sourceFacts: $("source-facts"), inferenceStatus: $("inference-status"), inferenceList: $("inference-list"), rewardsStatus: $("rewards-status"), rewardsList: $("rewards-list"),
       searchForm: $("search-form"), searchInput: $("search-input"), searchKind: $("search-kind"), searchError: $("search-error"), inspector: $("inspector"), inspectorKicker: $("inspector-kicker"), inspectorTitle: $("inspector-title"), inspectorClose: $("inspector-close"), inspectorContent: $("inspector-content"),
     };
-    const state = { config: null, resolver: null, sourceId: "canonical", checkpointAudit: { state: "unknown", reason: "not-audited" }, refreshController: null, lookupController: null, timer: null, lastKnownHeight: null };
+    // renderedView: the source view whose result is on screen, so a refresh of that same view runs in the background.
+    // refreshedLabel: what "Last refreshed" settles to once a refresh ends.
+    const state = { config: null, resolver: null, sourceId: "canonical", checkpointAudit: { state: "unknown", reason: "not-audited" }, refreshController: null, lookupController: null, timer: null, lastKnownHeight: null, renderedView: null, refreshedLabel: elements.lastRefreshed.textContent };
 
-    const text = (node, value) => { if (node) node.textContent = value == null ? "" : String(value); };
+    // A write that would not change a node is skipped: a background refresh that finds the same evidence rewrites
+    // nothing, so nothing flickers and the live banner does not announce it again.
+    const text = (node, value) => {
+      if (!node) return;
+      const next = value == null ? "" : String(value);
+      if (node.textContent !== next) node.textContent = next;
+    };
     const clear = (node) => { if (node) node.replaceChildren(); };
     const create = (tag, className, content) => {
       const node = document.createElement(tag);
@@ -574,6 +582,14 @@
       elements.sourceDot.className = `status-dot ${kind === "online" ? "online" : kind === "degraded" ? "stalled" : kind === "error" ? "offline" : "unknown"}`;
     }
 
+    // A refresh of the view already on screen runs in the background: the banner keeps the last result and its signal
+    // pulses, and "Last refreshed" reads "Refreshing…" until the new result is in.
+    function setRefreshing(on) {
+      if (on) elements.banner.classList.add("refreshing");
+      else elements.banner.classList.remove("refreshing");
+      text(elements.lastRefreshed, on ? "Refreshing…" : state.refreshedLabel);
+    }
+
     function fact(label, value, title) {
       const row = create("div");
       row.append(create("dt", "", label));
@@ -602,6 +618,10 @@
       if (!checkpoint) {
         text(elements.recoveryTitle, "Recovery checkpoint unavailable");
         text(elements.recoverySummary, "Canonical claims are paused. Legacy peers are not automatically treated as one chain.");
+        // The loading placeholders settle to what is known without a checkpoint: nothing.
+        text(elements.checkpointHash, "Signed checkpoint unavailable");
+        text(elements.boundaryState, "Parent link not checked");
+        text(elements.manifestHash, "Manifest unavailable");
         return;
       }
       text(elements.recoveryTitle, `Signed checkpoint #${formatInteger(checkpoint.height)} → protocol v3`);
@@ -615,9 +635,11 @@
         mismatch: "PARENT HASH MISMATCH",
         unknown: "Parent link unavailable",
         "not-boundary": "Boundary response unavailable",
+        // configuration loaded, first audit not yet answered: neutral, neither a pass nor a warning
+        auditing: "Checking parent link…",
       };
       text(elements.boundaryState, messages[boundary?.state] || "Parent link not checked");
-      elements.boundaryState.className = boundary?.state === "verified" ? "truth-good" : boundary?.state === "mismatch" ? "truth-bad" : "truth-warn";
+      elements.boundaryState.className = boundary?.state === "verified" ? "truth-good" : boundary?.state === "mismatch" ? "truth-bad" : boundary?.state === "auditing" ? "" : "truth-warn";
       text(elements.continuationLabel, `Continuation #${formatInteger(checkpoint.recoveryHeight + 1)}+`);
       text(elements.manifestHash, `Manifest ${network.formatHash(checkpoint.manifestHash, 8, 6)}`);
       elements.manifestHash.title = `0x${checkpoint.manifestHash}`;
@@ -769,6 +791,21 @@
       text(elements.rewardsStatus, payload ? "Current source report" : "Unavailable");
     }
 
+    // The evidence panels start on neutral loading placeholders (index.html). A path that ends with no source to read
+    // (no canonical route, or a rejected configuration) settles them to the explicit wording instead of loading forever.
+    function renderWithoutSource(status) {
+      clear(elements.blocksBody);
+      const tr = create("tr");
+      const td = create("td", "empty-cell", "No canonical source configured.");
+      td.colSpan = 5;
+      tr.append(td);
+      elements.blocksBody.append(tr);
+      clear(elements.inferenceList);
+      elements.inferenceList.append(create("p", "empty-cell", "No confirmed inference receipts loaded."));
+      renderRewards(null);
+      for (const node of [elements.blocksStatus, elements.inferenceStatus, elements.rewardsStatus]) text(node, status);
+    }
+
     async function loadSnapshot(source, signal) {
       const requests = await Promise.all([
         optionalRequest(window.fetch.bind(window), source, "/health", { signal }),
@@ -792,8 +829,9 @@
     async function refresh() {
       if (!state.resolver) return;
       state.refreshController?.abort();
-      state.refreshController = new AbortController();
-      const signal = state.refreshController.signal;
+      const controller = new AbortController();
+      state.refreshController = controller;
+      const signal = controller.signal;
       const auditBeforeRefresh = state.checkpointAudit;
       elements.refreshButton.classList.add("spinning");
       const source = currentSource();
@@ -802,16 +840,23 @@
         resetMetrics();
         renderFacts(null, null, null);
         renderRecovery(null);
+        renderWithoutSource("Paused");
         setBanner("degraded", "Canonical recovery is not configured", state.config.notices[0] || "No approved checkpoint and v3 source are available.");
         aqueduct?.clear({ tone: "warn", title: "Recovery not configured", detail: "No approved checkpoint and v3 source are configured, so no blocks are drawn." });
-        text(elements.blocksStatus, "Paused");
-        text(elements.inferenceStatus, "Paused");
-        text(elements.rewardsStatus, "Paused");
         elements.refreshButton.classList.remove("spinning");
+        setRefreshing(false);
+        state.renderedView = state.sourceId;
         return;
       }
       const alternate = state.sourceId !== "canonical" && source.id !== state.config.checkpoint?.v3SourceId && source.id !== state.config.checkpoint?.legacySourceId;
-      setBanner("loading", alternate ? "Loading explicit alternate source…" : "Loading canonical source…", sourceDisplay(source));
+      // The view on screen stays up while it refreshes (the 30-second timer, a return to the tab, the refresh button);
+      // only a first load, or a switch to another source, replaces it with a loading banner, after which no finished
+      // result is on screen until this one lands.
+      if (state.renderedView === state.sourceId) setRefreshing(true);
+      else {
+        state.renderedView = null;
+        setBanner("loading", alternate ? "Loading explicit alternate source…" : "Loading canonical source…", sourceDisplay(source));
+      }
       try {
         await requireLegacyArchiveProvenance(source, window.fetch.bind(window), signal);
         const [snapshotResult, checkpointAudit, inferenceResult, rewardsResult, maintenanceAudit] = await Promise.all([
@@ -862,7 +907,8 @@
         const confirmedInference = renderInference(inferenceResult.ok ? inferenceResult.value : null, source);
         renderRewards(rewardsResult.ok ? rewardsResult.value : null);
         followAqueduct(source, snapshot, liveness, alternate, checkpointAudit, inferenceResult.ok ? confirmedInference : null);
-        text(elements.lastRefreshed, new Date().toLocaleTimeString());
+        state.refreshedLabel = new Date().toLocaleTimeString();
+        text(elements.lastRefreshed, state.refreshedLabel);
         if (checkpointAudit.state === "mismatch") setBanner("error", "Recovery checkpoint mismatch", "Exact H, H+1, chain identity, epoch, validator set, domain, or manifest differs. Canonical labels are paused.");
         else if (alternate) setBanner("degraded", "NON-CANONICAL source view", `${sourceDisplay(source)} is being queried explicitly and is not merged into canonical results.`);
         else if (liveness.state === "stalled") setBanner("degraded", "RPC reachable, chain appears stalled", `${sourceDisplay(source)} answered, but its newest block is stale.`);
@@ -886,14 +932,20 @@
           text(elements.blocksStatus, "Unavailable");
           text(elements.inferenceStatus, "Unavailable");
           text(elements.rewardsStatus, "Unavailable");
-          text(elements.lastRefreshed, "Refresh failed");
+          state.refreshedLabel = "Refresh failed";
+          text(elements.lastRefreshed, state.refreshedLabel);
           setBanner("error", "Selected source is unreachable", `${sourceDisplay(source)}: ${error.message}`);
           aqueduct?.clear({ tone: "bad", title: "Source unreachable", detail: `${sourceDisplay(source)} did not answer, so no blocks are drawn.` });
           if (shouldReinspectOpenBlock(auditBeforeRefresh, state.checkpointAudit, state.sourceId,
                                        parseRoute(), !elements.inspectorClose.hidden)) handleRoute();
         }
       } finally {
-        elements.refreshButton.classList.remove("spinning");
+        // Only the newest refresh settles the controls: one it cancelled must not end the indicator of its replacement.
+        if (state.refreshController === controller) {
+          elements.refreshButton.classList.remove("spinning");
+          setRefreshing(false);
+          state.renderedView = state.sourceId;
+        }
       }
     }
 
@@ -1337,13 +1389,16 @@
         text(elements.networkLabel, `${state.config.network.name} / ${state.config.state.toUpperCase()}`);
         populateSources();
         updateSourceChrome();
-        renderRecovery(null);
+        renderRecovery({ state: "auditing" });
         await refresh();
         handleRoute();
         state.timer = window.setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_INTERVAL_MS);
       } catch (error) {
         resetMetrics();
         renderFacts(null, null, null);
+        // Nothing loaded, so nothing is left loading.
+        renderRecovery(null);
+        renderWithoutSource("Unavailable");
         setBanner("error", "Explorer configuration rejected", error.message);
         aqueduct?.clear({ tone: "bad", title: "Configuration rejected", detail: "No canonical chain view is configured, so no blocks are drawn." });
         inspectorError("Configuration", "No canonical chain view", "Publish a valid arc.frontend.network.v1 configuration. No legacy peer was selected automatically.");

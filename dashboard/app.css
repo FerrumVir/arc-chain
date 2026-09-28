@@ -296,6 +296,9 @@ main { width: min(var(--measure), calc(100% - 48px)); margin: 0 auto; padding: 3
 
 .truth-banner .signal { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: rgba(255, 255, 255, 0.6); }
 .truth-banner.loading .signal { animation: pulse 1.1s ease-in-out infinite; }
+/* a background refresh keeps the last result on screen; only its signal pulses until the new one is in
+   (prefers-reduced-motion stills it, with every other animation, at the end of this file) */
+.truth-banner.refreshing .signal { animation: pulse 1.1s ease-in-out infinite; }
 .truth-banner.good { box-shadow: inset 3px 0 0 var(--good); }
 .truth-banner.good .signal { background: var(--good); box-shadow: 0 0 0 3px var(--good-bg); }
 .truth-banner.warn { box-shadow: inset 3px 0 0 var(--warn); }

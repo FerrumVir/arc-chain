@@ -1,5 +1,10 @@
 /* App shell layout: titlebar + sidebar + main */
 
+/* The wrapper App.tsx animates between the wizard and the app: full height, no layout of its own. */
+.app-phase {
+  height: 100%;
+}
+
 .app-shell {
   display: grid;
   grid-template-columns: 240px 1fr;
@@ -1486,4 +1491,79 @@
   .start-stage-top {
     padding-top: 56px;
   }
+}
+
+/* "Checking": no node status has arrived yet. Neutral, and still pulsing, so it never reads as Offline or Stopped. */
+.pulse-dot.checking {
+  background: var(--text-muted);
+}
+.status-pill.checking {
+  background: var(--surface-elevated);
+  color: var(--text-muted);
+}
+
+/* - Skeleton: loading placeholders (components/Skeleton.tsx), built on .shimmer - */
+.skeleton {
+  display: inline-block;
+  vertical-align: middle;
+  max-width: 100%;
+}
+.skeleton-block {
+  display: block;
+}
+.skeleton-lines {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+/* Loading rows for feeds: the same rhythm as .feed-item, so the list does not jump when real rows arrive. */
+.feed-loading {
+  display: flex;
+  flex-direction: column;
+}
+.feed-skeleton-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--text-sm);
+}
+.feed-skeleton-row:last-child {
+  border-bottom: none;
+}
+
+/* Content that arrives after a load fades in rather than popping. */
+@keyframes arrive {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+.arrive {
+  animation: arrive var(--dur-slow) var(--ease-out) both;
+}
+
+.log-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: var(--space-2) 0;
+}
+
+/* A load that failed during onboarding: what happened and a way to retry, in place of a shimmer that never ends. */
+.onboarding-load-error {
+  display: grid;
+  gap: var(--space-3);
+  justify-items: start;
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 10px);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+}
+.onboarding-load-error p {
+  margin: 0;
 }

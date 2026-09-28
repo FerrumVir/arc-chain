@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { FileSignature, Search } from "lucide-react";
 import { Card, CardHeader } from "../components/Card";
 import { EmptyState } from "../components/EmptyState";
+import { Skeleton, SkeletonLines } from "../components/Skeleton";
 import { NumberTicker } from "../components/NumberTicker";
 import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { api } from "../lib/tauri";
@@ -78,8 +79,9 @@ export function Earnings() {
           it separate from the valid candidate response whose retained row
           count is exactly zero. */}
       {earnings == null ? (
-        <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-loading">
+        <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-loading" aria-busy="true">
           <CardHeader title="Checking retained reward receipts…" />
+          <SkeletonLines lines={3} gap={10} />
         </Card>
       ) : !earnings.fromChain ? (
         <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-unavailable">
@@ -290,13 +292,27 @@ export function Earnings() {
                 color: "var(--text-muted)",
               }}
             >
-              {formatInt(mineCount)} yours ·{" "}
-              {formatInt(activity.length)} shown
+              {attestations === undefined ? (
+                <Skeleton width="9ch" />
+              ) : (
+                <>
+                  {formatInt(mineCount)} yours · {formatInt(activity.length)} shown
+                </>
+              )}
             </span>
           }
         />
         <div className="feed" data-testid="all-attestations">
-          {activity.length === 0 ? (
+          {attestations === undefined ? (
+            <div className="feed-loading" aria-busy="true" data-testid="all-attestations-loading">
+              {[0, 1, 2, 3].map((i) => (
+                <div key={i} className="feed-skeleton-row">
+                  <Skeleton width={i % 2 ? "46%" : "58%"} />
+                  <Skeleton width="16%" />
+                </div>
+              ))}
+            </div>
+          ) : activity.length === 0 ? (
             <EmptyState
               icon={FileSignature}
               title="No inference claims on this host"

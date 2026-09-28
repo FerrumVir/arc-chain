@@ -943,7 +943,7 @@
       var a0 = performance.now();
       resize(); st.clock = t; if (!st.inited) { if (ph.name) renderStart(t); return; }
       update(t, dt); render(t);
-      if (!reduced && settled(t)) { if (calmSince == null) calmSince = t; else if (t - calmSince > 1.5) { asleep = true; cancelAnimationFrame(raf); raf = 0; } } else calmSince = null;
+      if (settled(t)) { if (calmSince == null) calmSince = t; else if (t - calmSince > 1.5) { asleep = true; cancelAnimationFrame(raf); raf = 0; } } else calmSince = null;
       // a slow machine: after a few seconds of long frames, draw at a lower pixel density
       cost = cost * 0.94 + (performance.now() - a0) * 0.06;
       if (++costN > 120 && cost > 9 && dprCap > 1) { dprCap = dprCap > 1.5 ? 1.5 : 1; needSize = true; costN = 0; cost = 0; }

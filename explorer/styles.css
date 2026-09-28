@@ -506,6 +506,9 @@ main {
 
 .banner-pulse { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: rgba(255, 255, 255, 0.6); }
 .loading .banner-pulse { animation: pulse 1.2s ease-in-out infinite; }
+/* a background refresh keeps the last result on screen; only its signal pulses until the new one is in
+   (prefers-reduced-motion stills it, with every other animation, at the end of this file) */
+.connection-banner.refreshing .banner-pulse { animation: pulse 1.2s ease-in-out infinite; }
 .online .banner-pulse { background: var(--good); box-shadow: 0 0 0 3px var(--good-bg); }
 .degraded .banner-pulse { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-bg); }
 .error .banner-pulse { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-bg); }

@@ -910,3 +910,22 @@
     transition: none;
   }
 }
+
+/* Motion while an answer is on its way, and when it lands (the global reduced-motion rule in reset.css stops both). */
+.stage.wait::before {
+  animation: stage-wait 1.6s ease-in-out infinite;
+}
+@keyframes stage-wait {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.35); }
+  50% { box-shadow: 0 0 0 4px rgba(255, 255, 255, 0); }
+}
+.answer-pending .answer-mark {
+  animation: answer-breathe 1.8s ease-in-out infinite;
+}
+@keyframes answer-breathe {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+.turn .answer {
+  animation: arrive var(--dur-slow) var(--ease-out) both;
+}

@@ -72,6 +72,15 @@ button.quiet{margin-top:8px;font-size:12px}
 #setup{text-align:center;padding:8px 0 0}
 .emblem{display:block;max-width:100%;height:auto;margin:2px auto 16px}
 #setup p{color:var(--ink-soft);margin:14px 0 18px;line-height:1.6}
+/* the balance before its first read is a neutral placeholder, never a figure */
+.balance .pending{font:500 15px/1.1 var(--body);letter-spacing:.02em;color:var(--ink-muted)}
+/* replacing a saved key is never one click: a create or import waits on this inline confirmation */
+#replaceBox{margin-top:14px;text-align:left}
+#replaceBox .status{margin:0 0 12px}
+#disconnectBox{margin-top:12px;text-align:left}
+#disconnectBox .status{margin:0 0 12px}
+button.danger{background:transparent;border:1px solid rgba(255,176,176,.7);color:#ffe6e6;font-weight:600}
+button.danger:hover{border-color:var(--bad);background:rgba(255,150,150,.15)}
 </style>
 </head>
 <body>
@@ -95,6 +104,13 @@ button.quiet{margin-top:8px;font-size:12px}
       <input type="password" id="importKey" placeholder="Paste 64-char hex private key">
       <button onclick="importWallet()">Import</button>
     </div>
+    <!-- Asked instead of acting when a wallet is already saved in this browser (another tab saved one after this page
+         loaded, or the saved entry could not be read). -->
+    <div id="replaceBox" hidden>
+      <div class="status err" id="replaceNote" role="alert"></div>
+      <button type="button" class="danger" onclick="try{confirmReplace()}catch(e){alert('Error: '+e.message)}">Replace saved key</button>
+      <button type="button" class="secondary" id="keepKey" onclick="cancelReplace()">Keep saved key</button>
+    </div>
   </div>
 </div>
 
@@ -103,7 +119,7 @@ button.quiet{margin-top:8px;font-size:12px}
   <!-- Balance -->
   <div class="card">
     <h2>Balance</h2>
-    <div class="balance" id="bal">0 <small>ARC</small></div>
+    <div class="balance" id="bal"><span class="pending">Loading balance...</span></div>
     <div id="balStatus"></div>
     <button type="button" class="addr" id="myAddr" onclick="copyAddr()" title="Click to copy"></button>
   </div>
@@ -120,7 +136,7 @@ button.quiet{margin-top:8px;font-size:12px}
     <h2>Send ARC</h2>
     <input id="sendTo" placeholder="Recipient address (64 hex chars)">
     <input id="sendAmt" type="number" placeholder="Amount" min="1">
-    <button onclick="sendTx()">Send</button>
+    <button id="sendBtn" onclick="sendTx()">Send</button>
     <div id="sendStatus"></div>
   </div>
 
@@ -128,7 +144,7 @@ button.quiet{margin-top:8px;font-size:12px}
   <div id="tab-faucet" class="card" style="display:none">
     <h2>Claim Testnet Tokens</h2>
     <p class="note">Get 10,000 free ARC tokens for testing. One claim per hour.</p>
-    <button onclick="claimFaucet()">Claim 10,000 ARC</button>
+    <button id="faucetBtn" onclick="claimFaucet()">Claim 10,000 ARC</button>
     <div id="faucetStatus"></div>
   </div>
 
@@ -139,8 +155,37 @@ button.quiet{margin-top:8px;font-size:12px}
   </div>
 
   <button class="secondary quiet" onclick="logout()">Disconnect Wallet</button>
+  <!-- Disconnecting deletes the private key saved in this browser, so it is never one click. -->
+  <div id="disconnectBox" hidden>
+    <div class="status err" role="alert">Disconnecting deletes the private key saved in this browser. Unless you kept a copy, this wallet cannot be recovered.</div>
+    <button type="button" class="danger" onclick="confirmLogout()">Delete key and disconnect</button>
+    <button type="button" class="secondary" id="keepWallet" onclick="cancelLogout()">Keep wallet</button>
+  </div>
 </div>
 </div>
+
+<script>
+// Runs as the page parses. The module below cannot start until its crypto imports have downloaded, and it then probes
+// the seeds, so a saved wallet is restored here first, synchronously, before any of that network work: it is never
+// left behind the "Create New Wallet" card while the page connects. The module takes the key from the same function.
+function readSavedWallet() {
+  const raw = localStorage.getItem('arc_wallet');
+  if (raw === null) return {state: 'none'};
+  try {
+    const w = JSON.parse(raw);
+    return w && w.version === 2 && w.pubKey ? {state: 'ok', wallet: w} : {state: 'legacy'};
+  } catch (e) {
+    return {state: 'unreadable'};
+  }
+}
+(function restoreSavedWallet() {
+  const saved = readSavedWallet();
+  if (saved.state !== 'ok') return;
+  document.getElementById('setup').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  document.getElementById('myAddr').textContent = saved.wallet.address;
+})();
+</script>
 
 <script type="module">
 // Real Ed25519 + BLAKE3 keyed hashing matching arc-chain server-side verification:
@@ -162,16 +207,33 @@ const NODES = [
   {name:'SGP', ip:'149.28.153.31'},
 ];
 let RPC = '';
+let seedsProbed = false; // every seed has been tried once
 let wallet = null; // {version, privKey, pubKey, address}
 
 // ── Startup ──
-(async function init() {
+// The saved wallet comes back first, synchronously, before any network call: the classic script above already put
+// its view on screen while this module's imports loaded, and its key is taken here before a seed is probed. A legacy
+// wallet (random-bytes "key", sha256 address) couldn't sign: drop it and start fresh with a real Ed25519 keypair. An
+// entry that cannot be read is left in place; replacing it goes through the same inline confirmation as any saved key.
+const saved = readSavedWallet();
+if (saved.state === 'ok') {
+  wallet = saved.wallet;
+  showApp();
+} else if (saved.state === 'legacy') {
+  localStorage.removeItem('arc_wallet');
+  localStorage.removeItem('arc_txs');
+}
+
+// Then the seeds, one at a time in list order; the first healthy one serves the whole session. A send or faucet claim
+// made before this settles waits for it, rather than posting to no seed.
+const seedProbe = (async function connect() {
   for (const n of NODES) {
     try {
       const r = await fetch(`http://${n.ip}:9090/health`, {signal: AbortSignal.timeout(3000)});
       if (r.ok) { RPC = `http://${n.ip}:9090`; break; }
     } catch(e) { /* probing: an unreachable seed is the expected case, try the next */ }
   }
+  seedsProbed = true;
   if (RPC) {
     try {
       const h = await (await fetch(RPC+'/health')).json();
@@ -189,19 +251,7 @@ let wallet = null; // {version, privKey, pubKey, address}
     document.getElementById('netDot').className = 'dot off';
     document.getElementById('netStatus').textContent = 'Testnet unreachable';
   }
-  const saved = localStorage.getItem('arc_wallet');
-  if (saved) {
-    const w = JSON.parse(saved);
-    if (w.version === 2 && w.pubKey) {
-      wallet = w;
-      showApp();
-    } else {
-      // Legacy wallet (random-bytes "key", sha256 address) couldn't sign. Drop it
-      // and start fresh with a real Ed25519 keypair.
-      localStorage.removeItem('arc_wallet');
-      localStorage.removeItem('arc_txs');
-    }
-  }
+  refreshBalance();
 })();
 
 // ── Hex helpers ──
@@ -246,11 +296,40 @@ function generateKeypair() {
 }
 
 function createWallet() {
-  wallet = generateKeypair();
-  localStorage.setItem('arc_wallet', JSON.stringify(wallet));
-  showKeyModal(wallet.privKey, wallet.address);
-  showApp();
-  claimFaucet().then(() => { setTimeout(refreshBalance, 1000); });
+  afterReplaceConfirmed('Creating a new wallet', () => {
+    wallet = generateKeypair();
+    localStorage.setItem('arc_wallet', JSON.stringify(wallet));
+    showKeyModal(wallet.privKey, wallet.address);
+    showApp();
+    claimFaucet().then(() => { setTimeout(refreshBalance, 1000); });
+  });
+}
+
+// ── Replacing a saved key ──
+// The create card is hidden whenever a readable wallet is saved, so this is reached only when another tab saved one
+// after this page loaded, or the saved entry could not be read. Either way a create or import replaces the saved key
+// only after this inline step says so and is confirmed, never on the first click.
+let pendingReplace = null;
+
+function afterReplaceConfirmed(doing, action) {
+  if (localStorage.getItem('arc_wallet') === null) return action();
+  pendingReplace = action;
+  document.getElementById('replaceNote').textContent =
+    `A wallet is already saved in this browser. ${doing} will replace the private key saved here. ` +
+    'Unless you kept a copy of that key, it cannot be recovered.';
+  document.getElementById('replaceBox').hidden = false;
+  document.getElementById('keepKey').focus();
+}
+
+function confirmReplace() {
+  const action = pendingReplace;
+  cancelReplace();
+  if (action) action();
+}
+
+function cancelReplace() {
+  pendingReplace = null;
+  document.getElementById('replaceBox').hidden = true;
 }
 
 function showKeyModal(privKey, address) {
@@ -282,22 +361,35 @@ function importWallet() {
     alert('Invalid key - must be 64 hex characters');
     return;
   }
-  const privBytes = fromHex(key);
-  const pubBytes  = ed.getPublicKey(privBytes);
-  const address   = toHex(blake3(pubBytes, {dkLen: 32}));
-  wallet = {version:2, privKey: key, pubKey: toHex(pubBytes), address};
-  localStorage.setItem('arc_wallet', JSON.stringify(wallet));
-  showApp();
+  afterReplaceConfirmed('Importing this key', () => {
+    const privBytes = fromHex(key);
+    const pubBytes  = ed.getPublicKey(privBytes);
+    const address   = toHex(blake3(pubBytes, {dkLen: 32}));
+    wallet = {version:2, privKey: key, pubKey: toHex(pubBytes), address};
+    localStorage.setItem('arc_wallet', JSON.stringify(wallet));
+    showApp();
+  });
 }
 
 function showApp() {
   document.getElementById('setup').style.display = 'none';
   document.getElementById('app').style.display = 'block';
   document.getElementById('myAddr').textContent = wallet.address;
+  showBalanceLoading();
   refreshBalance();
 }
 
 function logout() {
+  document.getElementById('disconnectBox').hidden = false;
+  document.getElementById('keepWallet').focus();
+}
+
+function cancelLogout() {
+  document.getElementById('disconnectBox').hidden = true;
+}
+
+function confirmLogout() {
+  cancelLogout();
   localStorage.removeItem('arc_wallet');
   wallet = null;
   document.getElementById('setup').style.display = 'block';
@@ -310,26 +402,81 @@ function copyAddr() {
   setTimeout(() => document.getElementById('myAddr').textContent = wallet.address, 1500);
 }
 
+// ── Status text ──
+// Anything a seed sends back (errors, hashes, amounts, the balance) is written as text, never parsed as HTML: this page
+// keeps the private key in browser storage and talks to the seeds over plain http, so a hostile or intercepted reply
+// must not be able to run script here.
+function setStatus(el, kind, text) {
+  const div = document.createElement('div');
+  div.className = `status ${kind}`;
+  div.textContent = String(text);
+  el.replaceChildren(div);
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
 // ── Balance ──
+// Until the first read answers, the balance is a neutral placeholder rather than a "0 ARC" nobody fetched.
+function showBalanceLoading() {
+  document.getElementById('bal').innerHTML = '<span class="pending">Loading balance...</span>';
+  document.getElementById('balStatus').innerHTML = '';
+}
+
+function showBalanceUnavailable(reason) {
+  document.getElementById('bal').innerHTML = '&mdash; <small>ARC</small>';
+  setStatus(document.getElementById('balStatus'), 'err', `Balance unavailable: ${reason}`);
+}
+
 async function refreshBalance() {
-  if (!wallet || !RPC) return;
-  const note = document.getElementById('balStatus');
+  if (!wallet) return;
+  // Still probing: keep the placeholder. Every seed failed: say so, rather than loading forever.
+  if (!RPC) { if (seedsProbed) showBalanceUnavailable('testnet unreachable'); return; }
+  const address = wallet.address;
   try {
-    const r = await fetch(`${RPC}/account/${wallet.address}`);
+    const r = await fetch(`${RPC}/account/${address}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
+    if (wallet?.address !== address) return; // another wallet was opened while this read was in flight
+    const balance = Number(d.balance || 0);   // a number or nothing: a string from the seed is never rendered as markup
     document.getElementById('bal').innerHTML =
-      `${(d.balance||0).toLocaleString()} <small>ARC</small>`;
-    note.innerHTML = '';
+      `${Number.isFinite(balance) ? balance.toLocaleString() : '&mdash;'} <small>ARC</small>`;
+    document.getElementById('balStatus').innerHTML = '';
   } catch(e) {
-    document.getElementById('bal').innerHTML = '&mdash; <small>ARC</small>';
-    note.innerHTML = `<div class="status err">Balance unavailable: ${e.message}</div>`;
+    if (wallet?.address !== address) return;
+    showBalanceUnavailable(e.message);
   }
 }
 setInterval(refreshBalance, 5000);
 
+// ── Requests in flight ──
+// A button whose request is in flight is disabled and says so, so a second click cannot submit the same transfer or
+// claim twice.
+function setPending(btn, label) {
+  btn.dataset.idleLabel = btn.textContent;
+  btn.textContent = label;
+  btn.disabled = true;
+}
+
+function clearPending(btn) {
+  btn.textContent = btn.dataset.idleLabel;
+  btn.disabled = false;
+}
+
+// A request made while the startup probe is still running waits for it; once every seed has failed it stops there.
+async function requireSeed(el) {
+  if (!RPC) {
+    el.innerHTML='<div class="status info">Connecting to the testnet...</div>';
+    await seedProbe;
+  }
+  if (!RPC) throw new Error('Testnet unreachable');
+}
+
 // ── Send (Ed25519-signed) ──
 async function sendTx() {
+  const btn = document.getElementById('sendBtn');
+  if (btn.disabled) return;
   const to  = document.getElementById('sendTo').value.trim();
   const amt = parseInt(document.getElementById('sendAmt').value);
   const el  = document.getElementById('sendStatus');
@@ -337,8 +484,10 @@ async function sendTx() {
     el.innerHTML='<div class="status err">Invalid address (need 64 hex chars)</div>'; return;
   }
   if (!amt || amt<=0) { el.innerHTML='<div class="status err">Invalid amount</div>'; return; }
-  el.innerHTML='<div class="status info">Signing & submitting...</div>';
+  setPending(btn, 'Sending...');
   try {
+    await requireSeed(el);
+    el.innerHTML='<div class="status info">Signing & submitting...</div>';
     // Fetch fresh nonce
     const acct = await (await fetch(`${RPC}/account/${wallet.address}`)).json();
     const nonce = acct.nonce || 0;
@@ -364,35 +513,41 @@ async function sendTx() {
     });
     const d = await r.json();
     if (r.ok && d.tx_hash) {
-      el.innerHTML=`<div class="status ok">Sent! TX: ${d.tx_hash.slice(0,16)}...</div>`;
+      setStatus(el, 'ok', `Sent! TX: ${String(d.tx_hash).slice(0,16)}...`);
       addTxToHistory({hash:d.tx_hash, to, amount:-amt});
       document.getElementById('sendTo').value='';
       document.getElementById('sendAmt').value='';
       setTimeout(refreshBalance, 2000);
     } else {
-      el.innerHTML=`<div class="status err">${d.error||d.message||JSON.stringify(d)}</div>`;
+      setStatus(el, 'err', d.error||d.message||JSON.stringify(d));
     }
-  } catch(e) { el.innerHTML=`<div class="status err">${e.message}</div>`; }
+  } catch(e) { setStatus(el, 'err', e.message); }
+  finally { clearPending(btn); }
 }
 
 // ── Faucet ──
 async function claimFaucet() {
+  const btn = document.getElementById('faucetBtn');
+  if (btn.disabled) return;
   const el = document.getElementById('faucetStatus');
-  el.innerHTML='<div class="status info">Claiming...</div>';
+  setPending(btn, 'Claiming...');
   try {
+    await requireSeed(el);
+    el.innerHTML='<div class="status info">Claiming...</div>';
     const r = await fetch(`${RPC}/faucet/claim`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({address:wallet.address})
     });
     const d = await r.json();
     if (r.ok && d.tx_hash) {
-      el.innerHTML=`<div class="status ok">Received ${d.amount||10000} ARC!</div>`;
+      setStatus(el, 'ok', `Received ${d.amount||10000} ARC!`);
       addTxToHistory({hash:d.tx_hash, from:'faucet', amount:d.amount||10000});
       refreshBalance();
     } else {
-      el.innerHTML=`<div class="status err">${d.error||d.message||JSON.stringify(d)}</div>`;
+      setStatus(el, 'err', d.error||d.message||JSON.stringify(d));
     }
-  } catch(e) { el.innerHTML=`<div class="status err">${e.message}</div>`; }
+  } catch(e) { setStatus(el, 'err', e.message); }
+  finally { clearPending(btn); }
 }
 
 // ── Tabs ──
@@ -422,8 +577,8 @@ function loadHistory() {
     const isIn = tx.amount > 0;
     const time = new Date(tx.time).toLocaleTimeString();
     return `<div class="tx-item">
-      <span class="hash">${(tx.hash||'').slice(0,12)}...</span>
-      <span class="amount ${isIn?'plus':'minus'}">${isIn?'+':''}${tx.amount} ARC</span>
+      <span class="hash">${escapeHtml((tx.hash||'').slice(0,12))}...</span>
+      <span class="amount ${isIn?'plus':'minus'}">${isIn?'+':''}${escapeHtml(tx.amount)} ARC</span>
       <br><span class="tx-time">${time}</span>
     </div>`;
   }).join('');
@@ -432,7 +587,7 @@ function loadHistory() {
 // Expose handlers for inline onclick="..." attributes (module scope is local).
 Object.assign(window, {
   createWallet, importWallet, showImport, sendTx, claimFaucet,
-  switchTab, copyAddr, logout, loadHistory,
+  switchTab, copyAddr, logout, confirmLogout, cancelLogout, loadHistory, confirmReplace, cancelReplace,
 });
 </script>
 </body>

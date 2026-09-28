@@ -11,7 +11,8 @@ export function Titlebar() {
     refetchInterval: 2000,
   });
 
-  const level = status?.health ?? "offline";
+  // Until the first status arrives nothing is known: say "Checking", not "Offline".
+  const level = status ? status.health : "checking";
 
   return (
     <div className="titlebar" data-testid="titlebar" data-tauri-drag-region>
