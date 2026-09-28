@@ -1088,6 +1088,16 @@ jobs:
           npm exec --offline -- tauri bundle --ci --no-sign \
             ${{ matrix.tauri-args }}
 
+      - name: Ad-hoc seal macOS app and rebuild verified packages
+        if: startsWith(matrix.platform, 'macos-')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.rust-target }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/release/seal_macos_app_bundle.py \
+            --bundle-root "desktop/src-tauri/target/$TARGET/release/bundle"
+
       - name: Normalize and package the exact no-key bundle handoff
         id: handoff
         shell: bash

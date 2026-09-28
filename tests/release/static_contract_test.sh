@@ -1399,6 +1399,7 @@ release_secret_jobs_require_the_owner_environment() {
         'npm exec --offline -- tauri build --ci --no-bundle' \
         'ARC_BUILD_SOURCE_COMMIT: ${{ needs.validate.outputs.sha }}' \
         'npm exec --offline -- tauri bundle --ci --no-sign' \
+        'python3 scripts/release/seal_macos_app_bundle.py' \
         'unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD' \
         'Normalize and package the exact no-key bundle handoff' \
         'overwrite: false'
@@ -1408,6 +1409,10 @@ release_secret_jobs_require_the_owner_environment() {
             return 1
         }
     done
+    grep -Fq '"--verify", "--deep", "--strict"' "$REPO_ROOT/scripts/release/seal_macos_app_bundle.py" || {
+        printf 'macOS app sealing helper does not strictly verify the signed bundle\n'
+        return 1
+    }
     for required in \
         'cargo:rerun-if-env-changed=ARC_BUILD_SOURCE_COMMIT' \
         'ARC_BUILD_SOURCE_COMMIT must equal the exact checked-out Git HEAD' \
