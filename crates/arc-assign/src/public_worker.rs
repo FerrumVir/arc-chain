@@ -874,6 +874,628 @@ fn put_len_and_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+// The complete-offer store is intentionally a separate, opt-in journal from
+// `PublicWorkerOfferAdmissionBook`. The latter's fixed digest-only v1 format
+// and API remain unchanged; callers must provision this store in its own new
+// dedicated private directory. No endpoint or scheduler is wired to it here.
+pub const DEFAULT_PUBLIC_WORKER_OFFER_STORE_ENTRIES: usize = 128;
+pub const MAX_PUBLIC_WORKER_OFFER_STORE_ENTRIES: usize = 256;
+pub const DEFAULT_PUBLIC_WORKER_OFFER_STORE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_PUBLIC_WORKER_OFFER_STORE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STORED_OFFER_BYTES: usize = 96 * 1024;
+const OFFER_STORE_JOURNAL_FILE: &str = "public-worker-offers.v1.full.journal";
+const OFFER_STORE_STAGE_FILE: &str = ".public-worker-offers.v1.full.journal.stage";
+const OFFER_STORE_MAGIC: &[u8; 8] = b"ARCPWFS1";
+const OFFER_STORE_VERSION: u16 = 1;
+const OFFER_STORE_HEADER_PREFIX_LEN: usize = 8 + 2 + 4 + 8;
+const OFFER_STORE_HEADER_LEN: usize = OFFER_STORE_HEADER_PREFIX_LEN + 32;
+const OFFER_STORE_FRAME_PREFIX_LEN: usize = 8 + 4 + 32 + 8 + 32 + 32 + 8 + 32;
+const OFFER_STORE_FRAME_HASH_LEN: usize = 32;
+
+/// Bounded append-only storage for complete, signed public-worker offers.
+///
+/// The journal stores each complete offer and its nonce replay key in the
+/// same hash-chained frame. Entries are never evicted, even after expiry, so
+/// an expired nonce cannot be reused. A valid-prefix rollback cannot be
+/// detected without an independent monotonic anchor. Callers remain
+/// responsible for supplying authoritative requirements; offers are claims,
+/// not proof of capacity, entitlement, payment, or scheduled work.
+#[derive(Debug, Clone)]
+pub struct PublicWorkerOfferStore {
+    directory: PathBuf,
+    entry_capacity: usize,
+    byte_capacity: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PublicWorkerOfferStoreError {
+    #[error(transparent)]
+    Offer(#[from] PublicWorkerOfferError),
+    #[error("public-worker offer store is busy; retry without blocking the runtime")]
+    Busy,
+    #[error("public-worker offer store is full at its configured entry or byte limit")]
+    Full,
+    #[error("public-worker offer store limits are invalid or differ from its durable header")]
+    LimitsMismatch,
+    #[error("public-worker offer store limits are invalid or exceed hard bounds")]
+    InvalidLimits,
+    #[error("public-worker offer nonce was already stored for this worker and audience")]
+    Replay,
+    #[error("public-worker offer store is corrupt, truncated, oversized, or unsupported")]
+    Corrupt,
+    #[error("serialized signed offer exceeds the bounded offer-store limit")]
+    OfferTooLarge,
+    #[error("public-worker offer could not be encoded canonically")]
+    Encoding,
+    #[error("public-worker offer append could not be confirmed durable")]
+    PersistenceUncertain,
+    #[error("public-worker offer store I/O failed: {0}")]
+    Io(#[from] io::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct OfferStoreReplayKey {
+    chain_genesis: Hash256,
+    recovery_epoch: u64,
+    coordinator: Address,
+    worker: Address,
+    nonce: u64,
+}
+
+impl OfferStoreReplayKey {
+    fn from_offer(offer: &PublicWorkerOffer) -> Self {
+        Self {
+            chain_genesis: offer.body.chain_genesis,
+            recovery_epoch: offer.body.recovery_epoch,
+            coordinator: offer.body.coordinator,
+            worker: offer.body.worker,
+            nonce: offer.body.nonce,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OfferStoreJournal {
+    offers: Vec<PublicWorkerOffer>,
+    replay_keys: HashSet<OfferStoreReplayKey>,
+    last_record_hash: Hash256,
+    encoded_len: usize,
+}
+
+struct BoundedOfferWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl Write for BoundedOfferWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(next_len) = self.bytes.len().checked_add(bytes.len()) else {
+            self.overflowed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "offer encoding overflow",
+            ));
+        };
+        if next_len > self.limit {
+            self.overflowed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "offer encoding too large",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_stored_offer(offer: &PublicWorkerOffer) -> Result<Vec<u8>, PublicWorkerOfferStoreError> {
+    offer.body.validate()?;
+    if signature_material_len(&offer.signature) > MAX_SIGNATURE_MATERIAL_BYTES {
+        return Err(PublicWorkerOfferError::SignatureTooLarge.into());
+    }
+    let mut writer = BoundedOfferWriter {
+        bytes: Vec::with_capacity(4096),
+        limit: MAX_STORED_OFFER_BYTES,
+        overflowed: false,
+    };
+    if serde_json::to_writer(&mut writer, offer).is_err() {
+        return if writer.overflowed {
+            Err(PublicWorkerOfferStoreError::OfferTooLarge)
+        } else {
+            Err(PublicWorkerOfferStoreError::Encoding)
+        };
+    }
+    Ok(writer.bytes)
+}
+
+impl PublicWorkerOfferStore {
+    /// Open or initialize the complete-offer journal in a dedicated private
+    /// directory. An existing directory without this journal fails closed;
+    /// in particular, this does not migrate or reset a digest-only admission
+    /// book. Capacity is fixed by the durable header.
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self, PublicWorkerOfferStoreError> {
+        Self::open_with_limits(
+            directory,
+            DEFAULT_PUBLIC_WORKER_OFFER_STORE_ENTRIES,
+            DEFAULT_PUBLIC_WORKER_OFFER_STORE_BYTES,
+        )
+    }
+
+    pub fn open_with_limits(
+        directory: impl AsRef<Path>,
+        entry_capacity: usize,
+        byte_capacity: usize,
+    ) -> Result<Self, PublicWorkerOfferStoreError> {
+        validate_offer_store_limits(entry_capacity, byte_capacity)?;
+        let _lock = acquire_offer_store_lock(directory.as_ref())?;
+        let directory = _lock.target().to_path_buf();
+        let created = ensure_offer_store_directory(&directory)?;
+        let mut journal = if created {
+            initialize_offer_store_journal(&directory, entry_capacity, byte_capacity)?
+        } else {
+            open_existing_offer_store_journal(&directory)?
+        };
+        let _snapshot = read_offer_store_journal(&mut journal, entry_capacity, byte_capacity)?;
+        Ok(Self {
+            directory,
+            entry_capacity,
+            byte_capacity,
+        })
+    }
+
+    /// Verify and append the complete offer plus its replay key. Success is
+    /// returned only after the appended frame is synced and a complete bounded
+    /// reread verifies its hash chain, signature, payload, and replay key.
+    pub fn store(
+        &self,
+        offer: &PublicWorkerOffer,
+        requirements: &PublicWorkerOfferRequirements,
+    ) -> Result<Hash256, PublicWorkerOfferStoreError> {
+        offer.verify(requirements)?;
+        let digest = offer.digest()?;
+        let payload = encode_stored_offer(offer)?;
+        let replay_key = OfferStoreReplayKey::from_offer(offer);
+
+        let _lock = acquire_offer_store_lock(&self.directory)?;
+        let directory = _lock.target();
+        let _directory_pin = open_owned_nofollow_directory(directory)?;
+        let mut journal = open_existing_offer_store_journal(directory)?;
+        let mut state =
+            read_offer_store_journal(&mut journal, self.entry_capacity, self.byte_capacity)?;
+        if state.replay_keys.contains(&replay_key) {
+            return Err(PublicWorkerOfferStoreError::Replay);
+        }
+        if state.offers.len() >= self.entry_capacity {
+            return Err(PublicWorkerOfferStoreError::Full);
+        }
+
+        let sequence =
+            u64::try_from(state.offers.len()).map_err(|_| PublicWorkerOfferStoreError::Corrupt)?;
+        let frame =
+            encode_offer_store_frame(sequence, replay_key, state.last_record_hash, &payload)?;
+        let next_len = state
+            .encoded_len
+            .checked_add(frame.len())
+            .ok_or(PublicWorkerOfferStoreError::Full)?;
+        if next_len > self.byte_capacity {
+            return Err(PublicWorkerOfferStoreError::Full);
+        }
+        if journal.write_all(&frame).is_err() || journal.sync_all().is_err() {
+            return Err(PublicWorkerOfferStoreError::PersistenceUncertain);
+        }
+        state = read_offer_store_journal(&mut journal, self.entry_capacity, self.byte_capacity)?;
+        if state.offers.last() != Some(offer)
+            || state.replay_keys.len() != sequence as usize + 1
+            || state.encoded_len != next_len
+        {
+            return Err(PublicWorkerOfferStoreError::PersistenceUncertain);
+        }
+        Ok(digest)
+    }
+
+    /// Return a stable snapshot of offers that match all caller-supplied
+    /// context and are valid at `requirements.now_height`. Every stored entry
+    /// is structurally and cryptographically verified during the bounded
+    /// journal reread; expired entries remain in the replay set and are never
+    /// evicted here.
+    pub fn verified_unexpired_offers(
+        &self,
+        requirements: &PublicWorkerOfferRequirements,
+    ) -> Result<Vec<PublicWorkerOffer>, PublicWorkerOfferStoreError> {
+        let _lock = acquire_offer_store_lock(&self.directory)?;
+        let directory = _lock.target();
+        let _directory_pin = open_owned_nofollow_directory(directory)?;
+        let mut journal = open_existing_offer_store_journal(directory)?;
+        let state =
+            read_offer_store_journal(&mut journal, self.entry_capacity, self.byte_capacity)?;
+        let mut matches = Vec::new();
+        for offer in state.offers {
+            if !offer_matches_context(&offer, requirements) {
+                continue;
+            }
+            match offer.verify(requirements) {
+                Ok(()) => matches.push(offer),
+                Err(PublicWorkerOfferError::Expired { .. })
+                | Err(PublicWorkerOfferError::NotYetValid { .. }) => {}
+                Err(_) => return Err(PublicWorkerOfferStoreError::Corrupt),
+            }
+        }
+        Ok(matches)
+    }
+}
+
+fn validate_offer_store_limits(
+    entry_capacity: usize,
+    byte_capacity: usize,
+) -> Result<(), PublicWorkerOfferStoreError> {
+    let minimum = OFFER_STORE_HEADER_LEN
+        .checked_add(OFFER_STORE_FRAME_PREFIX_LEN + OFFER_STORE_FRAME_HASH_LEN + 1)
+        .ok_or(PublicWorkerOfferStoreError::InvalidLimits)?;
+    if entry_capacity == 0
+        || entry_capacity > MAX_PUBLIC_WORKER_OFFER_STORE_ENTRIES
+        || byte_capacity < minimum
+        || byte_capacity > MAX_PUBLIC_WORKER_OFFER_STORE_BYTES
+    {
+        return Err(PublicWorkerOfferStoreError::InvalidLimits);
+    }
+    Ok(())
+}
+
+fn acquire_offer_store_lock(
+    directory: &Path,
+) -> Result<arc_crypto::secret_file::PrivateDirectoryNamespaceLock, PublicWorkerOfferStoreError> {
+    match try_acquire_private_directory_namespace_lock(directory) {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(PublicWorkerOfferStoreError::Busy)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_offer_store_directory(directory: &Path) -> Result<bool, PublicWorkerOfferStoreError> {
+    match open_owned_nofollow_directory(directory) {
+        Ok(pin) => {
+            drop(pin);
+            Ok(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_new_private_directory(directory)?;
+            sync_parent_directory(directory)?;
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn offer_store_journal_path(directory: &Path) -> PathBuf {
+    directory.join(OFFER_STORE_JOURNAL_FILE)
+}
+
+fn open_existing_offer_store_journal(
+    directory: &Path,
+) -> Result<fs::File, PublicWorkerOfferStoreError> {
+    let path = offer_store_journal_path(directory);
+    match open_private_append_owned_migration(&path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(PublicWorkerOfferStoreError::Corrupt)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn initialize_offer_store_journal(
+    directory: &Path,
+    entry_capacity: usize,
+    byte_capacity: usize,
+) -> Result<fs::File, PublicWorkerOfferStoreError> {
+    let path = offer_store_journal_path(directory);
+    let stage = directory.join(OFFER_STORE_STAGE_FILE);
+    let mut file = match create_new_private(&stage) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(PublicWorkerOfferStoreError::Corrupt);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    file.write_all(&encode_offer_store_header(entry_capacity, byte_capacity))?;
+    file.sync_all()?;
+    drop(file);
+    match durably_publish_existing_private_no_replace(&stage, &path) {
+        Ok(()) => {
+            sync_parent_directory(&path)?;
+            open_private_append_owned_migration(&path).map_err(Into::into)
+        }
+        Err(publish_error) => {
+            // The no-replace publish can report an error after the name was
+            // committed. Only accept that state after revalidating and
+            // syncing the exact published journal; never reset ambiguous data.
+            if let Ok(mut published) = open_private_append_owned_migration(&path)
+                && read_offer_store_journal(&mut published, entry_capacity, byte_capacity).is_ok()
+                && published.sync_all().is_ok()
+                && sync_parent_directory(&path).is_ok()
+            {
+                return Ok(published);
+            }
+            Err(publish_error.into())
+        }
+    }
+}
+
+fn encode_offer_store_header(entry_capacity: usize, byte_capacity: usize) -> Vec<u8> {
+    let mut header = Vec::with_capacity(OFFER_STORE_HEADER_LEN);
+    header.extend_from_slice(OFFER_STORE_MAGIC);
+    header.extend_from_slice(&OFFER_STORE_VERSION.to_le_bytes());
+    header.extend_from_slice(&(entry_capacity as u32).to_le_bytes());
+    header.extend_from_slice(&(byte_capacity as u64).to_le_bytes());
+    let checksum = offer_store_hash("ARC-public-worker-offer-store-header-v1", &header);
+    header.extend_from_slice(&checksum);
+    header
+}
+
+fn encode_offer_store_frame(
+    sequence: u64,
+    replay_key: OfferStoreReplayKey,
+    previous_record_hash: Hash256,
+    payload: &[u8],
+) -> Result<Vec<u8>, PublicWorkerOfferStoreError> {
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| PublicWorkerOfferStoreError::OfferTooLarge)?;
+    if payload.is_empty() || payload.len() > MAX_STORED_OFFER_BYTES {
+        return Err(PublicWorkerOfferStoreError::OfferTooLarge);
+    }
+    let total_len = OFFER_STORE_FRAME_PREFIX_LEN
+        .checked_add(payload.len())
+        .and_then(|len| len.checked_add(OFFER_STORE_FRAME_HASH_LEN))
+        .ok_or(PublicWorkerOfferStoreError::OfferTooLarge)?;
+    let mut frame = Vec::with_capacity(total_len);
+    frame.extend_from_slice(&sequence.to_le_bytes());
+    frame.extend_from_slice(&payload_len.to_le_bytes());
+    frame.extend_from_slice(replay_key.chain_genesis.as_bytes());
+    frame.extend_from_slice(&replay_key.recovery_epoch.to_le_bytes());
+    frame.extend_from_slice(replay_key.coordinator.as_bytes());
+    frame.extend_from_slice(replay_key.worker.as_bytes());
+    frame.extend_from_slice(&replay_key.nonce.to_le_bytes());
+    frame.extend_from_slice(previous_record_hash.as_bytes());
+    frame.extend_from_slice(payload);
+    let checksum = offer_store_hash("ARC-public-worker-offer-store-frame-v1", &frame);
+    frame.extend_from_slice(&checksum);
+    Ok(frame)
+}
+
+fn offer_store_hash(domain: &str, bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(domain);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+fn read_offer_store_journal(
+    file: &mut fs::File,
+    expected_entries: usize,
+    expected_bytes: usize,
+) -> Result<OfferStoreJournal, PublicWorkerOfferStoreError> {
+    let length = file.metadata()?.len();
+    if length < OFFER_STORE_HEADER_LEN as u64 || length > expected_bytes as u64 {
+        return Err(PublicWorkerOfferStoreError::Corrupt);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    // `expected_bytes` is validated against the fixed hard bound before this
+    // allocation. The file length check above precedes every payload allocation.
+    let mut bytes = Vec::with_capacity(length as usize);
+    (&mut *file)
+        .take(expected_bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != length || bytes.len() > expected_bytes {
+        return Err(PublicWorkerOfferStoreError::Corrupt);
+    }
+    parse_offer_store_journal(&bytes, expected_entries, expected_bytes)
+}
+
+fn parse_offer_store_journal(
+    bytes: &[u8],
+    expected_entries: usize,
+    expected_bytes: usize,
+) -> Result<OfferStoreJournal, PublicWorkerOfferStoreError> {
+    if bytes.len() < OFFER_STORE_HEADER_LEN
+        || &bytes[..8] != OFFER_STORE_MAGIC
+        || u16::from_le_bytes([bytes[8], bytes[9]]) != OFFER_STORE_VERSION
+    {
+        return Err(PublicWorkerOfferStoreError::Corrupt);
+    }
+    let entry_capacity = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
+    let byte_capacity = usize::try_from(u64::from_le_bytes([
+        bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21],
+    ]))
+    .map_err(|_| PublicWorkerOfferStoreError::Corrupt)?;
+    if entry_capacity != expected_entries || byte_capacity != expected_bytes {
+        return Err(PublicWorkerOfferStoreError::LimitsMismatch);
+    }
+    if offer_store_hash(
+        "ARC-public-worker-offer-store-header-v1",
+        &bytes[..OFFER_STORE_HEADER_PREFIX_LEN],
+    ) != bytes[OFFER_STORE_HEADER_PREFIX_LEN..OFFER_STORE_HEADER_LEN]
+    {
+        return Err(PublicWorkerOfferStoreError::Corrupt);
+    }
+
+    let mut cursor = OFFER_STORE_HEADER_LEN;
+    let mut offers = Vec::new();
+    let mut replay_keys = HashSet::new();
+    let mut previous_record_hash = Hash256::ZERO;
+    while cursor < bytes.len() {
+        if offers.len() >= expected_entries
+            || bytes.len() - cursor < OFFER_STORE_FRAME_PREFIX_LEN + OFFER_STORE_FRAME_HASH_LEN
+        {
+            return Err(PublicWorkerOfferStoreError::Corrupt);
+        }
+        let frame_start = cursor;
+        let sequence = store_read_u64(bytes, &mut cursor)?;
+        let payload_len = store_read_u32(bytes, &mut cursor)? as usize;
+        if payload_len == 0 || payload_len > MAX_STORED_OFFER_BYTES {
+            return Err(PublicWorkerOfferStoreError::Corrupt);
+        }
+        let replay_key = store_read_replay_key(bytes, &mut cursor)?;
+        let stored_previous_hash = store_read_hash(bytes, &mut cursor)?;
+        let frame_end = frame_start
+            .checked_add(OFFER_STORE_FRAME_PREFIX_LEN)
+            .and_then(|end| end.checked_add(payload_len))
+            .and_then(|end| end.checked_add(OFFER_STORE_FRAME_HASH_LEN))
+            .ok_or(PublicWorkerOfferStoreError::Corrupt)?;
+        if frame_end > bytes.len() {
+            return Err(PublicWorkerOfferStoreError::Corrupt);
+        }
+        let payload_end = cursor
+            .checked_add(payload_len)
+            .ok_or(PublicWorkerOfferStoreError::Corrupt)?;
+        let payload = &bytes[cursor..payload_end];
+        cursor = payload_end;
+        let stored_hash = &bytes[cursor..frame_end];
+        let calculated_hash = offer_store_hash(
+            "ARC-public-worker-offer-store-frame-v1",
+            &bytes[frame_start..cursor],
+        );
+        if stored_hash != calculated_hash || stored_previous_hash != previous_record_hash {
+            return Err(PublicWorkerOfferStoreError::Corrupt);
+        }
+        let expected_sequence =
+            u64::try_from(offers.len()).map_err(|_| PublicWorkerOfferStoreError::Corrupt)?;
+        if sequence != expected_sequence {
+            return Err(PublicWorkerOfferStoreError::Corrupt);
+        }
+
+        let offer: PublicWorkerOffer =
+            serde_json::from_slice(payload).map_err(|_| PublicWorkerOfferStoreError::Corrupt)?;
+        let canonical =
+            encode_stored_offer(&offer).map_err(|_| PublicWorkerOfferStoreError::Corrupt)?;
+        if canonical != payload {
+            return Err(PublicWorkerOfferStoreError::Corrupt);
+        }
+        verify_offer_signature_only(&offer).map_err(|_| PublicWorkerOfferStoreError::Corrupt)?;
+        if OfferStoreReplayKey::from_offer(&offer) != replay_key || !replay_keys.insert(replay_key)
+        {
+            return Err(PublicWorkerOfferStoreError::Corrupt);
+        }
+        previous_record_hash = Hash256(
+            stored_hash
+                .try_into()
+                .map_err(|_| PublicWorkerOfferStoreError::Corrupt)?,
+        );
+        cursor = frame_end;
+        offers.push(offer);
+    }
+    Ok(OfferStoreJournal {
+        offers,
+        replay_keys,
+        last_record_hash: previous_record_hash,
+        encoded_len: bytes.len(),
+    })
+}
+
+fn verify_offer_signature_only(offer: &PublicWorkerOffer) -> Result<(), PublicWorkerOfferError> {
+    if signature_material_len(&offer.signature) > MAX_SIGNATURE_MATERIAL_BYTES {
+        return Err(PublicWorkerOfferError::SignatureTooLarge);
+    }
+    offer.body.validate()?;
+    offer
+        .signature
+        .verify(&offer.body.transcript()?, &offer.body.worker)
+        .map_err(|_| PublicWorkerOfferError::Signature)
+}
+
+fn offer_matches_context(
+    offer: &PublicWorkerOffer,
+    requirements: &PublicWorkerOfferRequirements,
+) -> bool {
+    let body = &offer.body;
+    body.chain_genesis == requirements.chain_genesis
+        && body.recovery_epoch == requirements.recovery_epoch
+        && body.public_binding == requirements.public_binding
+        && body.coordinator == requirements.coordinator
+        && body.artifact_hash == requirements.artifact_hash
+        && body.profile_hash == requirements.profile_hash
+        && body.generation_hash == requirements.generation_hash
+        && body.kernel_hash == requirements.kernel_hash
+        && body.bundle_hash == requirements.bundle_hash
+}
+
+fn store_read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, PublicWorkerOfferStoreError> {
+    let end = cursor
+        .checked_add(4)
+        .ok_or(PublicWorkerOfferStoreError::Corrupt)?;
+    let value = u32::from_le_bytes(
+        bytes
+            .get(*cursor..end)
+            .ok_or(PublicWorkerOfferStoreError::Corrupt)?
+            .try_into()
+            .map_err(|_| PublicWorkerOfferStoreError::Corrupt)?,
+    );
+    *cursor = end;
+    Ok(value)
+}
+
+fn store_read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, PublicWorkerOfferStoreError> {
+    let end = cursor
+        .checked_add(8)
+        .ok_or(PublicWorkerOfferStoreError::Corrupt)?;
+    let value = u64::from_le_bytes(
+        bytes
+            .get(*cursor..end)
+            .ok_or(PublicWorkerOfferStoreError::Corrupt)?
+            .try_into()
+            .map_err(|_| PublicWorkerOfferStoreError::Corrupt)?,
+    );
+    *cursor = end;
+    Ok(value)
+}
+
+fn store_read_hash(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<Hash256, PublicWorkerOfferStoreError> {
+    let end = cursor
+        .checked_add(32)
+        .ok_or(PublicWorkerOfferStoreError::Corrupt)?;
+    let mut value = [0u8; 32];
+    value.copy_from_slice(
+        bytes
+            .get(*cursor..end)
+            .ok_or(PublicWorkerOfferStoreError::Corrupt)?,
+    );
+    *cursor = end;
+    Ok(Hash256(value))
+}
+
+fn store_read_replay_key(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<OfferStoreReplayKey, PublicWorkerOfferStoreError> {
+    let chain_genesis = store_read_hash(bytes, cursor)?;
+    let recovery_epoch = store_read_u64(bytes, cursor)?;
+    let coordinator = store_read_hash(bytes, cursor)?;
+    let worker = store_read_hash(bytes, cursor)?;
+    let nonce = store_read_u64(bytes, cursor)?;
+    if chain_genesis == Hash256::ZERO
+        || coordinator == Hash256::ZERO
+        || worker == Hash256::ZERO
+        || nonce == 0
+    {
+        return Err(PublicWorkerOfferStoreError::Corrupt);
+    }
+    Ok(OfferStoreReplayKey {
+        chain_genesis,
+        recovery_epoch,
+        coordinator,
+        worker,
+        nonce,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1339,5 +1961,183 @@ mod tests {
                 Err(PublicWorkerOfferAdmissionError::Corrupt)
             ));
         }
+    }
+
+    fn full_store_journal_path(directory: &Path) -> PathBuf {
+        offer_store_journal_path(directory)
+    }
+
+    #[test]
+    fn full_offer_store_reopens_and_returns_only_matching_unexpired_offers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("full-store");
+        let key = KeyPair::generate_ed25519();
+        let offer = signed_offer(&key, 41);
+        {
+            let store = PublicWorkerOfferStore::open_with_limits(&path, 4, 1 << 20).unwrap();
+            assert_eq!(
+                store.store(&offer, &requirements()).unwrap(),
+                offer.digest().unwrap()
+            );
+        }
+
+        let store = PublicWorkerOfferStore::open_with_limits(&path, 4, 1 << 20).unwrap();
+        assert_eq!(
+            store.verified_unexpired_offers(&requirements()).unwrap(),
+            vec![offer.clone()]
+        );
+        assert!(matches!(
+            store.store(&offer, &requirements()),
+            Err(PublicWorkerOfferStoreError::Replay)
+        ));
+
+        let mut expired = requirements();
+        expired.now_height = offer.body.expires_at_height;
+        assert!(
+            store
+                .verified_unexpired_offers(&expired)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Expiry filters the read result, but never removes its replay key.
+        let mut renewed_body = offer.body.clone();
+        renewed_body.issued_at_height = 200;
+        renewed_body.expires_at_height = 300;
+        let renewed = PublicWorkerOffer::sign(renewed_body, &key).unwrap();
+        let mut renewed_requirements = requirements();
+        renewed_requirements.now_height = 250;
+        assert!(matches!(
+            store.store(&renewed, &renewed_requirements),
+            Err(PublicWorkerOfferStoreError::Replay)
+        ));
+
+        let mut wrong_context = requirements();
+        wrong_context.public_binding = h(88);
+        assert!(
+            store
+                .verified_unexpired_offers(&wrong_context)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn full_offer_store_fails_closed_on_torn_frame_and_never_resets_missing_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("torn-store");
+        let key = KeyPair::generate_ed25519();
+        let store = PublicWorkerOfferStore::open_with_limits(&path, 4, 1 << 20).unwrap();
+        store
+            .store(&signed_offer(&key, 1), &requirements())
+            .unwrap();
+        let journal = full_store_journal_path(&path);
+        drop(store);
+
+        OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(&[0xa5; 7])
+            .unwrap();
+        assert!(matches!(
+            PublicWorkerOfferStore::open_with_limits(&path, 4, 1 << 20),
+            Err(PublicWorkerOfferStoreError::Corrupt)
+        ));
+        fs::remove_file(&journal).unwrap();
+        assert!(matches!(
+            PublicWorkerOfferStore::open_with_limits(&path, 4, 1 << 20),
+            Err(PublicWorkerOfferStoreError::Corrupt)
+        ));
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn full_offer_store_rejects_body_tampering_even_with_recomputed_frame_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body-tamper");
+        let key = KeyPair::generate_ed25519();
+        let store = PublicWorkerOfferStore::open_with_limits(&path, 4, 1 << 20).unwrap();
+        store
+            .store(&signed_offer(&key, 2), &requirements())
+            .unwrap();
+        drop(store);
+
+        let journal = full_store_journal_path(&path);
+        let mut bytes = fs::read(&journal).unwrap();
+        let payload_start = OFFER_STORE_HEADER_LEN + OFFER_STORE_FRAME_PREFIX_LEN;
+        let frame_end = bytes.len();
+        let payload_end = frame_end - OFFER_STORE_FRAME_HASH_LEN;
+        let payload = std::str::from_utf8(&bytes[payload_start..payload_end]).unwrap();
+        let modified = payload.replace(
+            "\"memory_capacity_bytes\":1073741824",
+            "\"memory_capacity_bytes\":1073741825",
+        );
+        assert_ne!(modified, payload, "test offer JSON field spelling changed");
+        assert_eq!(modified.len(), payload.len());
+        bytes[payload_start..payload_end].copy_from_slice(modified.as_bytes());
+        let frame_hash = offer_store_hash(
+            "ARC-public-worker-offer-store-frame-v1",
+            &bytes[OFFER_STORE_HEADER_LEN..payload_end],
+        );
+        bytes[payload_end..].copy_from_slice(&frame_hash);
+        fs::write(&journal, bytes).unwrap();
+
+        assert!(matches!(
+            PublicWorkerOfferStore::open_with_limits(&path, 4, 1 << 20),
+            Err(PublicWorkerOfferStoreError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn full_offer_store_enforces_persisted_entry_and_byte_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = KeyPair::generate_ed25519();
+        let path = directory.path().join("entry-cap");
+        let store = PublicWorkerOfferStore::open_with_limits(&path, 1, 1 << 20).unwrap();
+        store
+            .store(&signed_offer(&key, 1), &requirements())
+            .unwrap();
+        assert!(matches!(
+            store.store(&signed_offer(&key, 2), &requirements()),
+            Err(PublicWorkerOfferStoreError::Full)
+        ));
+        assert!(matches!(
+            PublicWorkerOfferStore::open_with_limits(&path, 2, 1 << 20),
+            Err(PublicWorkerOfferStoreError::LimitsMismatch)
+        ));
+
+        let byte_path = directory.path().join("byte-cap");
+        let offer = signed_offer(&key, 3);
+        let payload_len = encode_stored_offer(&offer).unwrap().len();
+        let byte_capacity = OFFER_STORE_HEADER_LEN
+            + OFFER_STORE_FRAME_PREFIX_LEN
+            + payload_len
+            + OFFER_STORE_FRAME_HASH_LEN
+            - 1;
+        let bounded =
+            PublicWorkerOfferStore::open_with_limits(&byte_path, 2, byte_capacity).unwrap();
+        let journal = full_store_journal_path(&byte_path);
+        let before = fs::metadata(&journal).unwrap().len();
+        assert!(matches!(
+            bounded.store(&offer, &requirements()),
+            Err(PublicWorkerOfferStoreError::Full)
+        ));
+        assert_eq!(fs::metadata(journal).unwrap().len(), before);
+    }
+
+    #[test]
+    fn full_store_does_not_migrate_or_overwrite_digest_only_admission_book() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing-admission-book");
+        PublicWorkerOfferAdmissionBook::open_with_capacity(&path, 4).unwrap();
+        let old_journal = journal_path(&path);
+        let old_bytes = fs::read(&old_journal).unwrap();
+        assert!(matches!(
+            PublicWorkerOfferStore::open_with_limits(&path, 4, 1 << 20),
+            Err(PublicWorkerOfferStoreError::Corrupt)
+        ));
+        assert_eq!(fs::read(old_journal).unwrap(), old_bytes);
+        assert!(!full_store_journal_path(&path).exists());
     }
 }
