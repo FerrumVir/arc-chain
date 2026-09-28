@@ -14,6 +14,7 @@ import { seedOnboarded } from "./helpers";
 
 const COMMUNITY_WORKER = `0x${"11".repeat(32)}`;
 const REWARD_TX = `0x${"44".repeat(32)}`;
+const CANDIDATE_CLAIM_HASH = `0x${"66".repeat(32)}`;
 const REWARD_JOB = `0x${"55".repeat(32)}`;
 const RECEIPT_URL = `/community/reward_receipt/${REWARD_TX}`;
 const BLOCK_HASH = `0x${"77".repeat(32)}`;
@@ -226,6 +227,70 @@ test.describe("Inference - community-first coordinator routing", () => {
     });
     await expect(page.getByTestId("inference-output")).toHaveText("one result");
     expect(inferencePosts).toBe(1);
+  });
+
+  test("certificate-only claim hashes are labeled unsubmitted and cannot be looked up as transactions", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    let attestationStatus = "certificate_only_v3_not_submitted";
+    let transactionLookups = 0;
+    await page.route("**/inference/run", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          success: true,
+          inference: {
+            input: "Say hi",
+            output: "Hello.",
+            output_hash: OUTPUT_HASH,
+            model_hash: MODEL_HASH,
+            tokens_generated: 1,
+            inference_ms: 12,
+            deterministic: true,
+            engine: "test",
+          },
+          attestation: {
+            status: attestationStatus,
+            tx_hash: CANDIDATE_CLAIM_HASH,
+          },
+        }),
+      }),
+    );
+    await page.route("**/tx/**", (route) => {
+      transactionLookups += 1;
+      return route.fulfill({ status: 404, body: "not found" });
+    });
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("Say hi");
+    await page.getByTestId("btn-run-inference").click();
+
+    await expect(page.getByTestId("inference-attestation-status")).toContainText(
+      "Certificate only; no 0x16 transaction was submitted.",
+    );
+    await expect(page.getByTestId("inference-result")).toContainText(
+      "Candidate claim hash (not submitted)",
+    );
+    await expect(page.getByTestId("btn-lookup-tx")).toHaveCount(0);
+    expect(transactionLookups).toBe(0);
+
+    attestationStatus = "future_attestation_state";
+    await page.getByTestId("inference-prompt").fill("Say hi again");
+    await page.getByTestId("btn-run-inference").click();
+    await expect(page.getByTestId("inference-attestation-status")).toContainText(
+      "transaction submission is not confirmed",
+    );
+    await expect(page.getByTestId("inference-result")).toContainText(
+      "Attestation hash (submission unconfirmed)",
+    );
+    await expect(page.getByTestId("btn-lookup-tx")).toHaveCount(0);
+    expect(transactionLookups).toBe(0);
   });
 
   test("free prompts explain requester escrow separately from receipt-backed worker rewards", async ({
@@ -1038,7 +1103,10 @@ test.describe("Inference - community-first coordinator routing", () => {
             deterministic: true,
             engine: "local-int16",
           },
-          attestation: { tx_hash: "0xcccc" },
+          attestation: {
+            status: "submitted_to_mempool",
+            tx_hash: "0xcccc",
+          },
           explorer_url: "/tx/0xcccc",
         }),
       }),

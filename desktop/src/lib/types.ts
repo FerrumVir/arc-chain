@@ -605,6 +605,11 @@ export interface InferenceResult {
   modelHash: string;
   tokensGenerated: number;
   inferenceMs: number;
+  /** Serving-node status; unknown values never prove transaction submission. */
+  attestationStatus?: string;
+  /** Candidate hash retained as evidence, separate from a submitted tx hash. */
+  attestationHash?: string;
+  /** Populated only when attestationStatus explicitly confirms submission. */
   txHash: string;
   deterministic: boolean;
   /** Every shard hop was selected under one exact execution profile. */

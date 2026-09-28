@@ -1,6 +1,8 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -103,6 +105,82 @@ class ExistingChainUpdateTests(unittest.TestCase):
         checkpoint_hash = mod.norm_hash(verified["genesis_hash"], "genesis_hash")
         self.assertEqual(checkpoint_hash, from_file)
         self.assertNotEqual(checkpoint_hash, config["genesis_network_hash"])
+
+    def test_checkpoint_verifier_resolves_relative_inputs_before_changing_directory(self):
+        verified = load("verified-checkpoint.json")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            checkpoint = inputs / "recovery.arcchkpt"
+            checkpoint.write_bytes(b"bounded test checkpoint")
+            genesis = inputs / "genesis.toml"
+            genesis.write_text("[genesis]\n", encoding="utf-8")
+            response = root / "verified.json"
+            response.write_text(json.dumps(verified), encoding="utf-8")
+            binary = root / "arc-node-test"
+            binary.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "checkpoint=\n"
+                "genesis=\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  case \"$1\" in\n"
+                "    --checkpoint) shift; checkpoint=\"$1\" ;;\n"
+                "    --genesis) shift; genesis=\"$1\" ;;\n"
+                "  esac\n"
+                "  shift\n"
+                "done\n"
+                "case \"$checkpoint\" in /*) ;; *) echo relative-checkpoint >&2; exit 20 ;; esac\n"
+                "[ -f \"$checkpoint\" ] || { echo missing-checkpoint >&2; exit 21; }\n"
+                "if [ -n \"$genesis\" ]; then\n"
+                "  case \"$genesis\" in /*) ;; *) echo relative-genesis >&2; exit 22 ;; esac\n"
+                "  [ -f \"$genesis\" ] || { echo missing-genesis >&2; exit 23; }\n"
+                "fi\n"
+                f"cat {shlex.quote(str(response))}\n",
+                encoding="utf-8")
+            binary.chmod(0o755)
+            prior_cwd = Path.cwd()
+            os.chdir(root)
+            try:
+                result = mod.verify_checkpoint(binary,
+                    Path("inputs/recovery.arcchkpt"), Path("inputs/genesis.toml"),
+                    mod.norm_hash(verified["manifest_hash"], "manifest_hash"), verified["recovery_epoch"],
+                    verified["validator_set_id"], mod.norm_hash(verified["recovery_domain"], "recovery_domain"))
+            finally:
+                os.chdir(prior_cwd)
+            self.assertEqual(result["checkpoint_sha256"], mod.sha_file(checkpoint))
+            self.assertEqual(result["transition_height"], verified["transition_height"])
+
+    def test_checkpoint_verifier_still_rejects_missing_and_symlink_inputs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            binary = root / "arc-node-test"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            linked_binary = root / "linked-arc-node"
+            linked_binary.symlink_to(binary)
+            checkpoint = root / "checkpoint"
+            checkpoint.write_bytes(b"checkpoint")
+            genesis = root / "genesis"
+            genesis.write_bytes(b"genesis")
+            linked_checkpoint = root / "linked-checkpoint"
+            linked_checkpoint.symlink_to(checkpoint)
+            linked_genesis = root / "linked-genesis"
+            linked_genesis.symlink_to(genesis)
+            with mock.patch.object(mod.subprocess, "run") as run:
+                for supplied_checkpoint, supplied_genesis in (
+                    (root / "missing-checkpoint", genesis),
+                    (linked_checkpoint, genesis),
+                    (checkpoint, linked_genesis),
+                ):
+                    with self.subTest(checkpoint=supplied_checkpoint, genesis=supplied_genesis):
+                        with self.assertRaisesRegex(mod.ProfileError, "regular files"):
+                            mod.verify_checkpoint(binary, supplied_checkpoint, supplied_genesis,
+                                "a" * 64, 1, 1, "b" * 64)
+                with self.assertRaisesRegex(mod.ProfileError, "selected verifier binary"):
+                    mod.verify_checkpoint(linked_binary, checkpoint, genesis, "a" * 64, 1, 1, "b" * 64)
+                run.assert_not_called()
 
     def test_hash_prefix_normalization_is_only_hex_prefix(self):
         self.assertEqual(mod.norm_hash("0x" + "a" * 64, "hash"), "a" * 64)

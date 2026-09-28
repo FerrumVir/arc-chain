@@ -462,6 +462,15 @@ pub struct InferenceResult {
     pub model_hash: String,
     pub tokens_generated: u32,
     pub inference_ms: u32,
+    /// Attestation outcome returned by the serving node. A candidate hash is
+    /// not a transaction unless this status explicitly says it was submitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_status: Option<String>,
+    /// Hash-shaped candidate returned alongside a certificate. Kept separate
+    /// from `tx_hash` because some protocol paths intentionally do not submit it.
+    #[serde(default)]
+    pub attestation_hash: String,
+    /// Only populated when the server explicitly reports mempool submission.
     pub tx_hash: String,
     pub deterministic: bool,
     /// True only when every shard hop was selected under one exact execution

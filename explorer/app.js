@@ -553,7 +553,7 @@
         return;
       }
       text(elements.recoveryTitle, `Signed checkpoint #${formatInteger(checkpoint.height)} → protocol v3`);
-      text(elements.recoverySummary, "History through H is served by the approved legacy archive. H+1 begins the configured v3 continuation.");
+      text(elements.recoverySummary, "The signed checkpoint anchors H; H+1 begins the configured v3 continuation. Earlier blocks, transaction bodies, and receipts are available only where the configured sources retain them.");
       text(elements.checkpointHeight, `H ${formatInteger(checkpoint.height)}`);
       text(elements.checkpointHash, network.formatHash(checkpoint.blockHash, 10, 8));
       elements.checkpointHash.title = `0x${checkpoint.blockHash}`;
@@ -590,7 +590,7 @@
       if (state.sourceId === "canonical") {
         text(elements.sourceName, "Canonical timeline");
         text(elements.sourceEndpoint, source ? `Height-routed · current ${source.name}` : "No canonical route configured");
-        text(elements.sourceHelp, "Blocks resolve to the signed legacy archive through H and protocol v3 from H+1 onward.");
+        text(elements.sourceHelp, "Block lookups use the configured source for each height. The signed checkpoint does not guarantee that earlier transaction bodies or receipts were retained.");
       } else {
         text(elements.sourceName, source ? sourceDisplay(source) : "Unavailable source");
         text(elements.sourceEndpoint, source?.baseUrl ?? "Unavailable");
