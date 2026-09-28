@@ -29,6 +29,9 @@ use std::{
 
 pub const PUBLIC_WORKER_OFFER_DOMAIN: &str = "ARC-public-worker-offer-v1";
 pub const PUBLIC_WORKER_OFFER_VERSION: u16 = 1;
+pub const PUBLIC_WORKER_EXECUTION_BINDING_V1_DOMAIN: &str =
+    "ARC-public-worker-execution-binding-v1";
+pub const PUBLIC_WORKER_EXECUTION_BINDING_V1_VERSION: u16 = 1;
 pub const MAX_TENSOR_RANGES: usize = 256;
 pub const MAX_TENSOR_DIMENSION: u32 = 1_048_576;
 pub const MAX_MEMORY_CAPACITY_BYTES: u64 = 1 << 60;
@@ -61,6 +64,130 @@ pub struct TensorRowRange {
     pub tensor_columns: u32,
     pub row_start: u32,
     pub row_end: u32,
+}
+
+/// Operator-pinned execution identity for a public worker offer audience.
+///
+/// This is a local immutable binding, not a consensus authorization, paid
+/// assignment, or proof that the loaded artifact has been verified. Callers
+/// must compare it to independently validated node and execution identities
+/// before deriving offer requirements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicWorkerExecutionBindingV1 {
+    chain_genesis: Hash256,
+    recovery_epoch: u64,
+    coordinator: Address,
+    artifact_hash: Hash256,
+    profile_hash: Hash256,
+    generation_hash: Hash256,
+    kernel_hash: Hash256,
+    bundle_hash: Hash256,
+}
+
+/// Independently observed identity snapshot. Populate these values from the
+/// recovered node state, the validated loaded-package record, and pinned
+/// kernel/row-bundle manifests; never from an offer or request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicWorkerExecutionIdentities {
+    pub chain_genesis: Hash256,
+    pub recovery_epoch: u64,
+    pub coordinator: Address,
+    pub artifact_hash: Hash256,
+    pub profile_hash: Hash256,
+    pub generation_hash: Hash256,
+    pub kernel_hash: Hash256,
+    pub bundle_hash: Hash256,
+}
+
+impl PublicWorkerExecutionBindingV1 {
+    pub fn new(
+        identities: PublicWorkerExecutionIdentities,
+    ) -> Result<Self, PublicWorkerOfferError> {
+        validate_execution_identities(&identities)?;
+        Ok(Self {
+            chain_genesis: identities.chain_genesis,
+            recovery_epoch: identities.recovery_epoch,
+            coordinator: identities.coordinator,
+            artifact_hash: identities.artifact_hash,
+            profile_hash: identities.profile_hash,
+            generation_hash: identities.generation_hash,
+            kernel_hash: identities.kernel_hash,
+            bundle_hash: identities.bundle_hash,
+        })
+    }
+
+    /// Domain-separated commitment over a fixed-width, versioned encoding.
+    pub fn commitment(&self) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key(PUBLIC_WORKER_EXECUTION_BINDING_V1_DOMAIN);
+        hasher.update(&PUBLIC_WORKER_EXECUTION_BINDING_V1_VERSION.to_be_bytes());
+        hasher.update(self.chain_genesis.as_bytes());
+        hasher.update(&self.recovery_epoch.to_be_bytes());
+        hasher.update(self.coordinator.as_bytes());
+        hasher.update(self.artifact_hash.as_bytes());
+        hasher.update(self.profile_hash.as_bytes());
+        hasher.update(self.generation_hash.as_bytes());
+        hasher.update(self.kernel_hash.as_bytes());
+        hasher.update(self.bundle_hash.as_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Validate the pinned binding against independently sourced current
+    /// identities, then derive requirements without accepting caller-supplied
+    /// hash fields.
+    pub fn requirements(
+        &self,
+        current: &PublicWorkerExecutionIdentities,
+        now_height: u64,
+    ) -> Result<PublicWorkerOfferRequirements, PublicWorkerOfferError> {
+        validate_execution_identities(current)?;
+        if self.identities() != *current {
+            return Err(PublicWorkerOfferError::ExecutionIdentityMismatch);
+        }
+        Ok(PublicWorkerOfferRequirements {
+            chain_genesis: self.chain_genesis,
+            recovery_epoch: self.recovery_epoch,
+            public_binding: self.commitment(),
+            coordinator: self.coordinator,
+            artifact_hash: self.artifact_hash,
+            profile_hash: self.profile_hash,
+            generation_hash: self.generation_hash,
+            kernel_hash: self.kernel_hash,
+            bundle_hash: self.bundle_hash,
+            now_height,
+        })
+    }
+
+    fn identities(&self) -> PublicWorkerExecutionIdentities {
+        PublicWorkerExecutionIdentities {
+            chain_genesis: self.chain_genesis,
+            recovery_epoch: self.recovery_epoch,
+            coordinator: self.coordinator,
+            artifact_hash: self.artifact_hash,
+            profile_hash: self.profile_hash,
+            generation_hash: self.generation_hash,
+            kernel_hash: self.kernel_hash,
+            bundle_hash: self.bundle_hash,
+        }
+    }
+}
+
+fn validate_execution_identities(
+    identities: &PublicWorkerExecutionIdentities,
+) -> Result<(), PublicWorkerOfferError> {
+    if [
+        identities.chain_genesis,
+        identities.coordinator,
+        identities.artifact_hash,
+        identities.profile_hash,
+        identities.generation_hash,
+        identities.kernel_hash,
+        identities.bundle_hash,
+    ]
+    .contains(&Hash256::ZERO)
+    {
+        return Err(PublicWorkerOfferError::ZeroCommitment);
+    }
+    Ok(())
 }
 
 /// Worker-authored claims for one public-native execution binding.
@@ -99,16 +226,16 @@ pub struct PublicWorkerOffer {
 /// Context a coordinator must supply when accepting an offer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicWorkerOfferRequirements {
-    pub chain_genesis: Hash256,
-    pub recovery_epoch: u64,
-    pub public_binding: Hash256,
-    pub coordinator: Address,
-    pub artifact_hash: Hash256,
-    pub profile_hash: Hash256,
-    pub generation_hash: Hash256,
-    pub kernel_hash: Hash256,
-    pub bundle_hash: Hash256,
-    pub now_height: u64,
+    chain_genesis: Hash256,
+    recovery_epoch: u64,
+    public_binding: Hash256,
+    coordinator: Address,
+    artifact_hash: Hash256,
+    profile_hash: Hash256,
+    generation_hash: Hash256,
+    kernel_hash: Hash256,
+    bundle_hash: Hash256,
+    now_height: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -139,7 +266,7 @@ pub enum PublicWorkerOfferError {
     WrongBinding,
     #[error("offer names another coordinator audience")]
     WrongAudience,
-    #[error("offer execution commitments do not match the required model binding")]
+    #[error("offer execution commitments do not match the required execution binding")]
     WrongExecution,
     #[error("offer was issued at height {issued}, but current height is {now}")]
     NotYetValid { issued: u64, now: u64 },
@@ -151,6 +278,8 @@ pub enum PublicWorkerOfferError {
     SignatureTooLarge,
     #[error("offer signature is invalid")]
     Signature,
+    #[error("offer binding differs from independently observed node or execution identity")]
+    ExecutionIdentityMismatch,
 }
 
 impl PublicWorkerOfferBody {
@@ -1509,12 +1638,29 @@ mod tests {
         Hash256([byte; 32])
     }
 
+    fn identities() -> PublicWorkerExecutionIdentities {
+        PublicWorkerExecutionIdentities {
+            chain_genesis: h(1),
+            recovery_epoch: 7,
+            coordinator: h(3),
+            artifact_hash: h(4),
+            profile_hash: h(5),
+            generation_hash: h(6),
+            kernel_hash: h(7),
+            bundle_hash: h(8),
+        }
+    }
+
+    fn binding() -> PublicWorkerExecutionBindingV1 {
+        PublicWorkerExecutionBindingV1::new(identities()).unwrap()
+    }
+
     fn body(worker: Address) -> PublicWorkerOfferBody {
         PublicWorkerOfferBody {
             version: PUBLIC_WORKER_OFFER_VERSION,
             chain_genesis: h(1),
             recovery_epoch: 7,
-            public_binding: h(2),
+            public_binding: binding().commitment(),
             coordinator: h(3),
             worker,
             artifact_hash: h(4),
@@ -1538,18 +1684,82 @@ mod tests {
     }
 
     fn requirements() -> PublicWorkerOfferRequirements {
-        PublicWorkerOfferRequirements {
-            chain_genesis: h(1),
-            recovery_epoch: 7,
-            public_binding: h(2),
-            coordinator: h(3),
-            artifact_hash: h(4),
-            profile_hash: h(5),
-            generation_hash: h(6),
-            kernel_hash: h(7),
-            bundle_hash: h(8),
-            now_height: 150,
+        binding().requirements(&identities(), 150).unwrap()
+    }
+
+    #[test]
+    fn execution_binding_is_deterministic_versioned_and_derives_requirements() {
+        let binding = binding();
+        let commitment = binding.commitment();
+        assert_ne!(commitment, Hash256::ZERO);
+        assert_eq!(binding.commitment(), commitment);
+        let requirements = binding.requirements(&identities(), 150).unwrap();
+        assert_eq!(requirements.public_binding, commitment);
+        assert_eq!(requirements.coordinator, h(3));
+        assert_eq!(requirements.artifact_hash, h(4));
+    }
+
+    #[test]
+    fn execution_binding_refuses_each_changed_identity_and_zero_hashes() {
+        let binding = binding();
+        let mutations: [fn(&mut PublicWorkerExecutionIdentities); 8] = [
+            |i| i.chain_genesis = h(11),
+            |i| i.recovery_epoch += 1,
+            |i| i.coordinator = h(12),
+            |i| i.artifact_hash = h(13),
+            |i| i.profile_hash = h(14),
+            |i| i.generation_hash = h(15),
+            |i| i.kernel_hash = h(16),
+            |i| i.bundle_hash = h(17),
+        ];
+        for mutate in mutations {
+            let mut changed = identities();
+            mutate(&mut changed);
+            assert_eq!(
+                binding.requirements(&changed, 150),
+                Err(PublicWorkerOfferError::ExecutionIdentityMismatch)
+            );
         }
+
+        let mut zero = identities();
+        zero.bundle_hash = Hash256::ZERO;
+        assert_eq!(
+            PublicWorkerExecutionBindingV1::new(zero),
+            Err(PublicWorkerOfferError::ZeroCommitment)
+        );
+    }
+
+    #[test]
+    fn execution_binding_changes_when_domain_or_version_changes() {
+        let binding = binding();
+        let expected = binding.commitment();
+        let commitment_for = |domain: &str, version: u16| {
+            let mut hasher = blake3::Hasher::new_derive_key(domain);
+            hasher.update(&version.to_be_bytes());
+            hasher.update(h(1).as_bytes());
+            hasher.update(&7_u64.to_be_bytes());
+            hasher.update(h(3).as_bytes());
+            hasher.update(h(4).as_bytes());
+            hasher.update(h(5).as_bytes());
+            hasher.update(h(6).as_bytes());
+            hasher.update(h(7).as_bytes());
+            hasher.update(h(8).as_bytes());
+            Hash256(*hasher.finalize().as_bytes())
+        };
+        assert_ne!(
+            commitment_for(
+                "ARC-other-domain-v1",
+                PUBLIC_WORKER_EXECUTION_BINDING_V1_VERSION
+            ),
+            expected
+        );
+        assert_ne!(
+            commitment_for(
+                PUBLIC_WORKER_EXECUTION_BINDING_V1_DOMAIN,
+                PUBLIC_WORKER_EXECUTION_BINDING_V1_VERSION + 1
+            ),
+            expected
+        );
     }
 
     #[test]
