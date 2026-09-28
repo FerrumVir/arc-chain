@@ -8,11 +8,54 @@
 //! This is a conformance experiment. It changes no admission, execution or
 //! consensus semantics: the vectorised kernel is opt-in and defaults to off.
 //!
-//! usage: canonical_kernel_conformance GGUF [n_positions] [repeats]
+//! usage: canonical_kernel_conformance GGUF [n_positions] [repeats] [profile]
+//! profile: interleaved-rope (default) or legacy-split-half
 
 use arc_inference::cached_integer_model::{CachedIntegerModel, KVCache};
 use arc_inference::canonical_simd;
 use std::time::Instant;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConformanceProfile {
+    InterleavedRope,
+    LegacySplitHalf,
+}
+
+impl ConformanceProfile {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("interleaved-rope") {
+            "interleaved-rope" => Ok(Self::InterleavedRope),
+            "legacy-split-half" => Ok(Self::LegacySplitHalf),
+            other => Err(format!(
+                "unsupported profile {other:?}; expected interleaved-rope or legacy-split-half"
+            )),
+        }
+    }
+
+    fn load(self, path: &str) -> Result<CachedIntegerModel, arc_inference::InferenceError> {
+        match self {
+            Self::InterleavedRope => {
+                arc_inference::cached_integer_model::load_cached_model_canonical_i8_interleaved_rope(
+                    path,
+                )
+            }
+            Self::LegacySplitHalf => {
+                arc_inference::cached_integer_model::load_cached_model_canonical_i8(path)
+            }
+        }
+    }
+
+    fn expected_execution_profile(self) -> &'static str {
+        match self {
+            Self::InterleavedRope => {
+                arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+            }
+            Self::LegacySplitHalf => {
+                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
+            }
+        }
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn max_rss_bytes() -> Option<u64> {
@@ -57,11 +100,14 @@ fn stats(v: &[f64]) -> (f64, f64, f64) {
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        return Err("usage: canonical_kernel_conformance GGUF [n_positions] [repeats]".into());
+    if !(2..=5).contains(&args.len()) {
+        return Err(
+            "usage: canonical_kernel_conformance GGUF [n_positions] [repeats] [interleaved-rope|legacy-split-half]".into(),
+        );
     }
     let n_pos: usize = args.get(2).map(|s| s.parse().unwrap_or(8)).unwrap_or(8);
     let repeats: usize = args.get(3).map(|s| s.parse().unwrap_or(3)).unwrap_or(3);
+    let selected_profile = ConformanceProfile::parse(args.get(4).map(String::as_str))?;
 
     // Fixed real Llama-2 token ids, independent of either kernel's output.
     let base: [u32; 12] = [
@@ -70,17 +116,19 @@ fn main() -> Result<(), String> {
     let tokens: Vec<u32> = (0..n_pos).map(|i| base[i % base.len()]).collect();
 
     let t0 = Instant::now();
-    let model =
-        arc_inference::cached_integer_model::load_cached_model_canonical_i8_interleaved_rope(
-            &args[1],
-        )
-        .map_err(|e| e.to_string())?;
+    let model = selected_profile.load(&args[1]).map_err(|e| e.to_string())?;
     let load_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     let profile = model
         .canonical_execution_profile()
         .ok_or("model is not complete canonical I8")?
         .to_string();
+    if profile != selected_profile.expected_execution_profile() {
+        return Err(format!(
+            "selected loader returned profile {profile:?}, expected {:?}",
+            selected_profile.expected_execution_profile()
+        ));
+    }
     eprintln!(
         "profile={profile} layers={} d_model={} vocab={} load_ms={load_ms:.0}",
         model.config.n_layers, model.config.d_model, model.config.vocab_size
@@ -225,6 +273,10 @@ fn main() -> Result<(), String> {
         serde_json::json!({
             "type": "canonical_kernel_conformance",
             "profile": profile,
+            "requested_profile": match selected_profile {
+                ConformanceProfile::InterleavedRope => "interleaved-rope",
+                ConformanceProfile::LegacySplitHalf => "legacy-split-half",
+            },
             "gguf": args[1],
             "positions_per_run": tokens.len(),
             "repeats_per_pass": repeats,
@@ -280,4 +332,30 @@ fn main() -> Result<(), String> {
         return Err("LOGIT MISMATCH - the vectorised kernel is not conformant".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConformanceProfile;
+
+    #[test]
+    fn old_cli_default_remains_interleaved_rope() {
+        assert_eq!(
+            ConformanceProfile::parse(None).unwrap(),
+            ConformanceProfile::InterleavedRope
+        );
+    }
+
+    #[test]
+    fn live_shard_profile_can_be_selected_explicitly() {
+        assert_eq!(
+            ConformanceProfile::parse(Some("legacy-split-half")).unwrap(),
+            ConformanceProfile::LegacySplitHalf
+        );
+    }
+
+    #[test]
+    fn unsupported_profile_is_rejected() {
+        assert!(ConformanceProfile::parse(Some("unknown")).is_err());
+    }
 }
