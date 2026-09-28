@@ -13,8 +13,8 @@ use arc_node::{
     benchmark::BenchmarkPool,
     consensus::{ConsensusManager, RecoveryDagRollover},
     recovery_dag_wal::{
-        BaselineState as DagBaselineState, CurrentStreamSummary, DagCursor, GenerationInput,
-        GenerationPin, GenerationStore, HARD_MAX_RETENTION_ROUND_SPAN,
+        BaselineDagAnchor, BaselineState as DagBaselineState, CurrentStreamSummary, DagCursor,
+        GenerationInput, GenerationPin, GenerationStore, HARD_MAX_RETENTION_ROUND_SPAN,
         RecoveryDagBinding as GenerationDagBinding, RetainedDagRecord, RetainedRecordKind,
         RetentionLimits, StoreAuditStatus, TornSuffix, VerifiedGeneration,
         create_private_directory_durably, rename_for_durable_publish,
@@ -3097,6 +3097,7 @@ fn canonical_dag_baseline(state: &StateDB) -> Result<DagBaselineState> {
         height,
         block_hash: block.hash,
         state_root,
+        dag_anchor: None,
     })
 }
 
@@ -3132,14 +3133,34 @@ fn validate_recovery_generation_anchor(
         generation.manifest.dag_cursor.committed_block_count == committed_block_count,
         "recovery DAG generation committed count does not match its canonical baseline"
     );
-    let expected_next_round = startup
+    let contiguous_next_round = startup
         .binding
         .initial_consensus_round
         .checked_add(committed_block_count)
         .ok_or_else(|| anyhow::anyhow!("recovery DAG next-commit round overflows"))?;
+    let expected_next_round = if let Some(anchor) = &baseline.dag_anchor {
+        ensure!(
+            committed_block_count > 0
+                && anchor.round >= contiguous_next_round.saturating_sub(1)
+                && arc_consensus::DagBlock::decision_commitment(
+                    &startup.binding.consensus_domain,
+                    &anchor.hash,
+                    anchor.round
+                ) == block.header.proof_hash,
+            "recovery DAG baseline anchor does not match the canonical decision commitment"
+        );
+        anchor
+            .round
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("recovery DAG anchor round overflows"))?
+    } else {
+        // Compatibility for generations published before an omitted leader
+        // could make consensus rounds differ from canonical block counts.
+        contiguous_next_round
+    };
     ensure!(
         generation.manifest.dag_cursor.next_dag_round == expected_next_round,
-        "recovery DAG generation next-commit round is not contiguous with canonical state"
+        "recovery DAG generation next-commit round differs from its canonical anchor"
     );
     Ok(())
 }
@@ -3461,8 +3482,27 @@ fn replay_recovery_dag_generation(
     let mut committed_hashes = Vec::new();
     let mut transactions = std::collections::HashMap::<[u8; 32], arc_types::Transaction>::new();
     let mut transaction_payloads = std::collections::HashMap::<[u8; 32], Vec<u8>>::new();
+    // A block's parent quorum can depend on an absence certificate. Rebuild
+    // that authority from the exact durable quorum signatures before replaying
+    // any block; an own signing observation is not a quorum certificate.
+    for record in records {
+        if record.kind == RetainedRecordKind::AbsenceCertificate {
+            let certificate: arc_consensus::view_change::SkipCertificate =
+                bincode::deserialize(&record.payload)
+                    .context("invalid retained absence certificate encoding")?;
+            ensure!(
+                certificate.round == record.round
+                    && hash_bytes(&record.payload) == record.object_hash,
+                "retained absence certificate key/round differs from its envelope"
+            );
+            engine.register_skip_certificate(certificate).context(
+                "retained absence certificate failed domain/committee/quorum validation",
+            )?;
+        }
+    }
     for record in records {
         match record.kind {
+            RetainedRecordKind::AbsenceCertificate => {}
             RetainedRecordKind::TransactionBody => {
                 let expected_hash = record.object_hash;
                 let transaction: arc_types::Transaction = bincode::deserialize(&record.payload)
@@ -3531,6 +3571,12 @@ fn replay_recovery_dag_generation(
             }
             RetainedRecordKind::Commit => {
                 let hash = record.object_hash;
+                ensure!(
+                    engine
+                        .get_block(&hash)
+                        .is_some_and(|block| block.round == record.round),
+                    "retained DAG commit round differs from its authenticated block"
+                );
                 engine
                     .restore_recovery_commit_from_local_wal(hash)
                     .map_err(|error| {
@@ -3559,50 +3605,23 @@ fn replay_recovery_dag_generation(
 
     // The state WAL fsync deliberately precedes the separate DAG commit
     // cursor fsync. A crash in that narrow window leaves exactly one extra
-    // canonical state block. Reconstruct only the deterministic next leader,
-    // verify its full two-round certificate and exact state-block binding, then
+    // canonical state block. Reconstruct the next real consensus decision,
+    // including causally justified skipped leaders, and its state binding, then
     // ask the caller to append the missing commit record before networking.
     let repaired_commit = if commits.checked_add(1) == Some(expected_commits) {
-        let round = engine.last_committed_round();
-        let mut validators: Vec<_> = engine
-            .frozen_validator_set()
-            .validators
-            .iter()
-            .map(|validator| validator.address)
-            .collect();
-        validators.sort_by_key(|address| address.0);
-        let leader = validators
-            .get(round as usize % validators.len().max(1))
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("cannot repair DAG commit with empty validator set"))?;
-        let candidates: Vec<_> = engine
-            .blocks_in_round(round)
-            .into_iter()
-            .filter_map(|hash| engine.get_block(&hash))
-            .filter(|block| block.author == leader)
-            .collect();
-        ensure!(
-            candidates.len() == 1,
-            "cannot uniquely repair DAG commit round {round}: found {} leader blocks",
-            candidates.len()
-        );
-        let candidate = &candidates[0];
+        // Re-run the actual commit rule, including causally justified omitted
+        // leaders. A local absence vote alone cannot select this next block.
+        let candidate = engine
+            .restore_next_recovery_commit_from_local_wal()
+            .map_err(|error| anyhow::anyhow!("cannot repair next DAG decision: {error}"))?;
         verify_canonical_state_block_for_dag_commit(
             state,
             generation.manifest.baseline_state.height,
             commits,
             &startup.binding.consensus_domain,
-            candidate,
+            &candidate,
             &transactions,
         )?;
-        engine
-            .restore_recovery_commit_from_local_wal(candidate.hash)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "canonical state tail names uncertified DAG commit {}: {error}",
-                    candidate.hash
-                )
-            })?;
         commits += 1;
         Some((candidate.hash, candidate.round))
     } else {
@@ -3645,19 +3664,37 @@ fn compact_replayed_recovery_generation(
         "recovery DAG compaction requires a clean active prefix"
     );
 
-    let baseline = canonical_dag_baseline(state)?;
+    let mut baseline = canonical_dag_baseline(state)?;
     let committed_block_count = baseline
         .height
         .checked_sub(startup.binding.transition_height)
         .ok_or_else(|| anyhow::anyhow!("recovery DAG committed-block count underflows"))?;
-    let next_dag_round = startup
-        .binding
-        .initial_consensus_round
-        .checked_add(committed_block_count)
-        .ok_or_else(|| anyhow::anyhow!("recovery DAG next-commit round overflows"))?;
+    let next_dag_round = if baseline.height == current.manifest.baseline_state.height {
+        // The preceding generation has already compacted away the anchor's
+        // block body. Reuse its independently pinned, state-validated binding;
+        // requiring that pruned body would make an ordinary reopen impossible.
+        validate_recovery_generation_anchor(state, startup, current)?;
+        baseline.dag_anchor = current.manifest.baseline_state.dag_anchor.clone();
+        current.manifest.dag_cursor.next_dag_round
+    } else if committed_block_count == 0 {
+        startup.binding.initial_consensus_round
+    } else {
+        let block = state
+            .get_block(baseline.height)
+            .ok_or_else(|| anyhow::anyhow!("canonical baseline disappeared"))?;
+        let (hash, round) = engine
+            .find_committed_anchor(&block.header.proof_hash, &startup.binding.consensus_domain)
+            .ok_or_else(|| {
+                anyhow::anyhow!("canonical baseline has no retained DAG decision anchor")
+            })?;
+        baseline.dag_anchor = Some(BaselineDagAnchor { hash, round });
+        round
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("recovery DAG next-commit round overflows"))?
+    };
     ensure!(
-        engine.last_committed_round() == next_dag_round,
-        "replayed DAG commit cursor {} differs from canonical baseline cursor {}",
+        engine.last_committed_round() >= next_dag_round,
+        "replayed DAG commit cursor {} precedes canonical baseline cursor {}",
         engine.last_committed_round(),
         next_dag_round
     );
@@ -3673,7 +3710,7 @@ fn compact_replayed_recovery_generation(
     );
 
     // Every commit in the staged delta is now bound into `baseline`. Preserve
-    // only bodies/blocks/cursors that can still participate in a future commit,
+    // only bodies/blocks/cursors/certificates needed for future decisions,
     // in their original physical order. The exact floor round is the sole
     // parent-compaction boundary accepted by the consensus replay API.
     let retained: Vec<_> = records
@@ -12081,6 +12118,7 @@ mod tests {
                     baseline_state: DagBaselineState {
                         height: 901,
                         block_hash: hash_bytes(b"block"),
+                        dag_anchor: None,
                         state_root: hash_bytes(b"root"),
                     },
                     dag_cursor: DagCursor {
@@ -12227,6 +12265,7 @@ mod tests {
                     baseline_state: DagBaselineState {
                         height: 1,
                         block_hash: hash_bytes(b"shared-body-baseline-block"),
+                        dag_anchor: None,
                         state_root: hash_bytes(b"shared-body-baseline-root"),
                     },
                     dag_cursor: DagCursor {
@@ -12285,6 +12324,464 @@ mod tests {
         drop(writer);
         drop(store);
         std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_generation_cursor_is_bound_to_the_canonical_anchor_after_skipped_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"gap-anchor-domain"), 7, 11);
+        let mut binding = recovery_test_binding(domain);
+        binding.source_height = 0;
+        binding.transition_height = 0;
+        let round = binding.initial_consensus_round + 6;
+        let anchor = hash_bytes(b"gap-anchor");
+        let state = StateDB::with_genesis(&[(hash_bytes(b"account"), 100)]);
+        state
+            .execute_block_adaptive_at_with_proof(
+                &[],
+                hash_bytes(b"producer"),
+                1000,
+                DagBlock::decision_commitment(&domain, &anchor, round),
+            )
+            .unwrap();
+        let startup = RecoveryDagStartup {
+            data_dir: dir.path().to_path_buf(),
+            wal_dir: dir.path().join("generations"),
+            binding,
+            archived_legacy_wal: None,
+        };
+        let mut baseline = canonical_dag_baseline(&state).unwrap();
+        baseline.dag_anchor = Some(BaselineDagAnchor {
+            hash: anchor,
+            round,
+        });
+        let generation = GenerationStore::new(&startup.wal_dir)
+            .create_initial(
+                GenerationInput {
+                    binding: recovery_test_generation_binding(&startup.binding),
+                    baseline_state: baseline,
+                    dag_cursor: DagCursor {
+                        committed_block_count: 1,
+                        next_dag_round: round + 1,
+                        current_round: round + 1,
+                        retention_floor_round: round + 1,
+                        retention_ceiling_round: recovery_retention_ceiling(round + 1).unwrap(),
+                    },
+                    retention_limits: RetentionLimits::default(),
+                },
+                std::iter::empty(),
+            )
+            .unwrap();
+        validate_recovery_generation_anchor(&state, &startup, &generation).unwrap();
+        for mutation in 0..4 {
+            let mut bad = generation.clone();
+            match mutation {
+                0 => {
+                    bad.manifest
+                        .baseline_state
+                        .dag_anchor
+                        .as_mut()
+                        .unwrap()
+                        .hash = hash_bytes(b"other")
+                }
+                1 => {
+                    bad.manifest
+                        .baseline_state
+                        .dag_anchor
+                        .as_mut()
+                        .unwrap()
+                        .round += 1
+                }
+                2 => bad.manifest.dag_cursor.next_dag_round += 1,
+                _ => bad.manifest.baseline_state.dag_anchor = None,
+            }
+            assert!(validate_recovery_generation_anchor(&state, &startup, &bad).is_err());
+        }
+    }
+
+    fn recovery_skip_certificate_for_test(
+        validators: &[Hash256],
+        keys: &[arc_crypto::KeyPair],
+        domain: arc_consensus::ConsensusDomain,
+        round: u64,
+        absentee: Hash256,
+        signer_count: usize,
+    ) -> arc_consensus::view_change::SkipCertificate {
+        use arc_consensus::view_change::{
+            AbsenceReason, SkipCertificate, SkipVote, validator_set_hash,
+        };
+
+        let committee_engine = recovery_test_engine(validators, &domain);
+        let committee = committee_engine.frozen_validator_set();
+        let committee_hash = validator_set_hash(&committee);
+        let votes = keys
+            .iter()
+            .filter(|key| key.address() != absentee)
+            .take(signer_count)
+            .map(|key| {
+                SkipVote::sign(
+                    domain,
+                    committee_hash,
+                    round,
+                    absentee,
+                    AbsenceReason::NoBlock,
+                    committee.quorum,
+                    key,
+                )
+                .unwrap()
+            })
+            .collect();
+        SkipCertificate::new(
+            domain,
+            committee_hash,
+            round,
+            absentee,
+            AbsenceReason::NoBlock,
+            votes,
+        )
+    }
+
+    #[test]
+    fn recovery_generation_replays_certified_leader_gap_compacts_and_restarts() {
+        use arc_node::recovery_dag_wal::BaselineDagAnchor;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-certified-gap-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+
+        let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"certified-gap-domain"), 3, 9);
+        let mut binding = recovery_test_binding(domain);
+        binding.source_height = 0;
+        binding.transition_height = 0;
+        let startup = RecoveryDagStartup {
+            data_dir: data_dir.clone(),
+            wal_dir: data_dir.join("generation-store"),
+            binding,
+            archived_legacy_wal: None,
+        };
+
+        // Six real Ed25519 keys form the frozen committee. The deterministic
+        // leader at the first recovery round is the one absent member; the other
+        // five sign its authenticated NoBlock certificate.
+        let keys: Vec<_> = (0..6)
+            .map(|index| {
+                arc_crypto::KeyPair::from_ed25519_secret_bytes(
+                    &hash_bytes(format!("recovery-gap-key-{index}").as_bytes()).0,
+                )
+            })
+            .collect();
+        let validators: Vec<_> = keys.iter().map(arc_crypto::KeyPair::address).collect();
+        let bootstrap = startup.binding.initial_consensus_round;
+        let mut sorted_validators = validators.clone();
+        sorted_validators.sort_by_key(|address| address.0);
+        let absentee = sorted_validators[bootstrap as usize % sorted_validators.len()];
+        let certificate =
+            recovery_skip_certificate_for_test(&validators, &keys, domain, bootstrap, absentee, 5);
+        let committee_engine = recovery_test_engine(&validators, &domain);
+        assert!(
+            certificate
+                .verify(&domain, &committee_engine.frozen_validator_set())
+                .is_ok()
+        );
+
+        // One omitted leader round followed by five complete rounds gives the
+        // live two-round rule both (a) an anchor that causally proves the gap and
+        // (b) the R+1/R+2 support needed for the next canonical decision.
+        let first_round: Vec<_> = validators
+            .iter()
+            .filter(|author| **author != absentee)
+            .map(|author| recovery_test_block(*author, bootstrap, Vec::new(), &domain))
+            .collect();
+        assert_eq!(first_round.len(), 5);
+        let mut blocks_by_round = vec![first_round];
+        for round in bootstrap + 1..=bootstrap + 5 {
+            let parents = blocks_by_round
+                .last()
+                .unwrap()
+                .iter()
+                .map(|block| block.hash)
+                .collect::<Vec<_>>();
+            blocks_by_round.push(
+                validators
+                    .iter()
+                    .map(|author| recovery_test_block(*author, round, parents.clone(), &domain))
+                    .collect(),
+            );
+        }
+
+        let candidate_round = bootstrap + 1;
+        let candidate_leader =
+            sorted_validators[candidate_round as usize % sorted_validators.len()];
+        let candidate = blocks_by_round[1]
+            .iter()
+            .find(|block| block.author == candidate_leader)
+            .unwrap()
+            .clone();
+
+        // Model the narrow crash window: the canonical state block is durable,
+        // but its separate DAG Commit record is absent. Replay must derive the
+        // next choice through `try_commit`, not from a local absence vote alone.
+        let state = StateDB::with_genesis(&[(hash_bytes(b"gap-funded"), 100)]);
+        let genesis = state.get_block(0).unwrap();
+        state
+            .execute_block_adaptive_at_with_proof(
+                &[],
+                candidate.author,
+                candidate.round,
+                candidate.state_decision_commitment(&domain),
+            )
+            .unwrap();
+        assert_eq!(state.height(), 1);
+        assert_eq!(
+            state.get_block(1).unwrap().header.proof_hash,
+            candidate.state_decision_commitment(&domain)
+        );
+
+        let certificate_payload = bincode::serialize(&certificate).unwrap();
+        let mut records = vec![RetainedDagRecord::absence_certificate(
+            bootstrap,
+            hash_bytes(&certificate_payload),
+            certificate_payload,
+        )];
+        for round_blocks in &blocks_by_round {
+            records.extend(round_blocks.iter().map(|block| {
+                RetainedDagRecord::dag_block(
+                    block.round,
+                    block.hash,
+                    bincode::serialize(block).unwrap(),
+                )
+            }));
+        }
+
+        let store = GenerationStore::new(&startup.wal_dir);
+        let generation = store
+            .create_initial(
+                GenerationInput {
+                    binding: recovery_test_generation_binding(&startup.binding),
+                    baseline_state: DagBaselineState {
+                        height: 0,
+                        block_hash: genesis.hash,
+                        state_root: genesis.header.state_root,
+                        dag_anchor: None,
+                    },
+                    dag_cursor: DagCursor {
+                        committed_block_count: 0,
+                        next_dag_round: bootstrap,
+                        current_round: bootstrap,
+                        retention_floor_round: bootstrap,
+                        retention_ceiling_round: recovery_retention_ceiling(bootstrap).unwrap(),
+                    },
+                    retention_limits: RetentionLimits::default(),
+                },
+                records.clone(),
+            )
+            .unwrap();
+        let (staged, staged_summary) =
+            stage_recovery_generation_records(&store, &generation).unwrap();
+        assert_eq!(staged, records);
+
+        // First restart repairs the already executed canonical state tail from
+        // the durable certificate plus the full causal DAG, with no Commit record.
+        let first_engine = recovery_test_engine(&validators, &domain);
+        let first =
+            replay_recovery_dag_generation(&first_engine, &state, &startup, &generation, &staged)
+                .unwrap();
+        assert_eq!(
+            first.repaired_commit,
+            Some((candidate.hash, candidate.round))
+        );
+        assert_eq!(first.next_commit_round, candidate.round + 1);
+        assert_eq!(first_engine.committed_blocks(), vec![candidate.hash]);
+
+        let mut with_commit = staged.clone();
+        with_commit.push(RetainedDagRecord::commit(candidate.round, candidate.hash));
+        let committed_engine = recovery_test_engine(&validators, &domain);
+        let committed_replay = replay_recovery_dag_generation(
+            &committed_engine,
+            &state,
+            &startup,
+            &generation,
+            &with_commit,
+        )
+        .unwrap();
+        assert!(committed_replay.repaired_commit.is_none());
+        assert_eq!(committed_replay.next_commit_round, candidate.round + 1);
+
+        // Storage integrity alone cannot authorize a certificate. Rehashing a
+        // changed envelope still has to pass domain/committee/quorum validation.
+        for mutation in 0..4 {
+            let mut invalid = staged.clone();
+            match mutation {
+                0 => invalid.retain(|record| record.kind != RetainedRecordKind::AbsenceCertificate),
+                1 => invalid[0].round += 1,
+                2 => invalid[0].object_hash = hash_bytes(b"altered-envelope"),
+                _ => {
+                    let mut thin = certificate.clone();
+                    thin.votes.truncate(4);
+                    invalid[0].payload = bincode::serialize(&thin).unwrap();
+                    invalid[0].object_hash = hash_bytes(&invalid[0].payload);
+                }
+            }
+            let engine = recovery_test_engine(&validators, &domain);
+            assert!(
+                replay_recovery_dag_generation(&engine, &state, &startup, &generation, &invalid,)
+                    .is_err(),
+                "mutation {mutation} must not authorize recovery"
+            );
+        }
+
+        // Compact only after the state block and its exact DAG anchor agree. The
+        // skipped leader's certificate is below the new floor; the canonical
+        // anchor, not a surviving local vote, preserves the chain-to-DAG mapping.
+        let compacted = compact_replayed_recovery_generation(
+            &store,
+            &state,
+            &startup,
+            &generation,
+            &staged_summary,
+            &first_engine,
+            &staged,
+        )
+        .unwrap();
+        assert_eq!(
+            compacted.manifest.baseline_state.dag_anchor,
+            Some(BaselineDagAnchor {
+                hash: candidate.hash,
+                round: candidate.round,
+            })
+        );
+        assert_eq!(
+            compacted.manifest.dag_cursor.next_dag_round,
+            candidate.round + 1
+        );
+        let (compacted_records, _) = stage_recovery_generation_records(&store, &compacted).unwrap();
+        assert!(compacted_records.iter().all(|record| {
+            record.kind != RetainedRecordKind::AbsenceCertificate
+                && record.kind != RetainedRecordKind::Commit
+                && record.round >= candidate.round + 1
+        }));
+
+        // Tampering with the retained anchor cannot rebind the canonical state
+        // root to a different DAG decision, even if the altered round is plausible.
+        let mut tampered = compacted.clone();
+        tampered
+            .manifest
+            .baseline_state
+            .dag_anchor
+            .as_mut()
+            .unwrap()
+            .hash = hash_bytes(b"not-the-canonical-decision");
+        assert!(validate_recovery_generation_anchor(&state, &startup, &tampered).is_err());
+
+        // Second restart uses the compacted canonical anchor as its trust floor;
+        // it reopens the retained suffix without recreating the pre-gap blocks or
+        // certifying another commit from discarded history.
+        validate_recovery_generation_anchor(&state, &startup, &compacted).unwrap();
+        let second_engine = recovery_test_engine(&validators, &domain);
+        let second = replay_recovery_dag_generation(
+            &second_engine,
+            &state,
+            &startup,
+            &compacted,
+            &compacted_records,
+        )
+        .unwrap();
+        assert_eq!(second.repaired_commit, None);
+        assert_eq!(second.current_round, bootstrap + 6);
+        assert_eq!(second.next_commit_round, candidate.round + 1);
+        assert_eq!(state.height(), 1);
+        let (_, reopened_summary) = stage_recovery_generation_records(&store, &compacted).unwrap();
+        let unchanged = compact_replayed_recovery_generation(
+            &store,
+            &state,
+            &startup,
+            &compacted,
+            &reopened_summary,
+            &second_engine,
+            &compacted_records,
+        )
+        .unwrap();
+        assert_eq!(unchanged.pin, compacted.pin);
+
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_gap_needs_a_valid_quorum_certificate_before_round_advance() {
+        let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"gap-negative-domain"), 3, 9);
+        let mut binding = recovery_test_binding(domain);
+        binding.source_consensus_round = 100;
+        binding.initial_consensus_round = 101;
+        let keys: Vec<_> = (0..6)
+            .map(|index| {
+                arc_crypto::KeyPair::from_ed25519_secret_bytes(
+                    &hash_bytes(format!("recovery-gap-key-{index}").as_bytes()).0,
+                )
+            })
+            .collect();
+        let validators: Vec<_> = keys.iter().map(arc_crypto::KeyPair::address).collect();
+        let bootstrap = binding.initial_consensus_round;
+        let mut sorted = validators.clone();
+        sorted.sort_by_key(|address| address.0);
+        let absentee = sorted[bootstrap as usize % sorted.len()];
+
+        let wrong_domain =
+            arc_consensus::ConsensusDomain::new(hash_bytes(b"wrong-gap-domain"), 3, 9);
+        let wrong_certificate = recovery_skip_certificate_for_test(
+            &validators,
+            &keys,
+            wrong_domain,
+            bootstrap,
+            absentee,
+            5,
+        );
+        let valid_domain_engine = recovery_test_engine(&validators, &domain);
+        assert!(
+            valid_domain_engine
+                .register_skip_certificate(wrong_certificate)
+                .is_err()
+        );
+        assert!(!valid_domain_engine.has_skip_certificate(bootstrap, &absentee));
+
+        // Four equal-stake signatures total 20,000,000, one ARC below the six
+        // member committee's 20,000,001 quorum; the forged threshold is refused.
+        let below_quorum =
+            recovery_skip_certificate_for_test(&validators, &keys, domain, bootstrap, absentee, 4);
+        let quorum_engine = recovery_test_engine(&validators, &domain);
+        assert!(
+            below_quorum
+                .verify(&domain, &quorum_engine.frozen_validator_set())
+                .is_err()
+        );
+        assert!(
+            quorum_engine
+                .register_skip_certificate(below_quorum)
+                .is_err()
+        );
+
+        // Even five surviving authors (stake quorum) cannot advance the recovery
+        // round without a verified certificate for the sixth fixed member.
+        let no_certificate_engine = recovery_test_engine(&validators, &domain);
+        no_certificate_engine
+            .install_recovery_cursor(binding.source_consensus_round)
+            .unwrap();
+        no_certificate_engine
+            .install_recovery_generation_cursor(bootstrap, bootstrap, bootstrap)
+            .unwrap();
+        let survivors: Vec<_> = validators
+            .iter()
+            .filter(|author| **author != absentee)
+            .map(|author| recovery_test_block(*author, bootstrap, Vec::new(), &domain))
+            .collect();
+        assert_eq!(survivors.len(), 5);
+        for block in survivors {
+            no_certificate_engine.receive_block(&block).unwrap();
+            no_certificate_engine.advance_round();
+        }
+        assert_eq!(no_certificate_engine.current_round(), bootstrap);
+        assert!(!no_certificate_engine.has_skip_certificate(bootstrap, &absentee));
     }
 
     #[test]
@@ -12389,6 +12886,7 @@ mod tests {
                     baseline_state: DagBaselineState {
                         height: 0,
                         block_hash: genesis.hash,
+                        dag_anchor: None,
                         state_root: hash_bytes(b"test-transition-root"),
                     },
                     dag_cursor: DagCursor {

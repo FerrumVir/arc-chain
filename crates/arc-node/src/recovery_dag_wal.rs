@@ -114,6 +114,18 @@ pub struct BaselineState {
     pub height: u64,
     pub block_hash: Hash256,
     pub state_root: Hash256,
+    /// The canonical header's decision commitment binds this exact anchor.
+    /// Missing in older, strictly contiguous generations; omitting None keeps
+    /// their canonical JSON and content-addressed hashes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dag_anchor: Option<BaselineDagAnchor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineDagAnchor {
+    pub hash: Hash256,
+    pub round: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +161,9 @@ pub enum RetainedRecordKind {
     DagBlock = 2,
     RoundCursor = 3,
     Commit = 4,
+    /// Verified quorum authority needed to replay parents from an incomplete
+    /// recovery-domain round. Durable before that authority is used live.
+    AbsenceCertificate = 5,
 }
 
 impl TryFrom<u8> for RetainedRecordKind {
@@ -160,6 +175,7 @@ impl TryFrom<u8> for RetainedRecordKind {
             2 => Ok(Self::DagBlock),
             3 => Ok(Self::RoundCursor),
             4 => Ok(Self::Commit),
+            5 => Ok(Self::AbsenceCertificate),
             _ => Err(GenerationError::Invalid(format!(
                 "unknown retained record kind {value}"
             ))),
@@ -176,6 +192,15 @@ pub struct RetainedDagRecord {
 }
 
 impl RetainedDagRecord {
+    pub fn absence_certificate(round: u64, certificate_hash: Hash256, bytes: Vec<u8>) -> Self {
+        Self {
+            kind: RetainedRecordKind::AbsenceCertificate,
+            round,
+            object_hash: certificate_hash,
+            payload: bytes,
+        }
+    }
+
     pub fn transaction(round: u64, transaction_hash: Hash256, bytes: Vec<u8>) -> Self {
         Self {
             kind: RetainedRecordKind::TransactionBody,
@@ -528,6 +553,10 @@ impl ActiveLogWriter {
     /// their ancestors are not part of the generation's replay window.
     pub fn retention_floor_round(&self) -> u64 {
         self.generation.manifest.dag_cursor.retention_floor_round
+    }
+
+    pub fn retention_ceiling_round(&self) -> u64 {
+        self.generation.manifest.dag_cursor.retention_ceiling_round
     }
 
     pub fn inspection(&self) -> &ActiveLogInspection {
@@ -2607,6 +2636,15 @@ fn validate_baseline(baseline: &BaselineState) -> Result<()> {
             "baseline block hash and state root must be nonzero".into(),
         ));
     }
+    if baseline
+        .dag_anchor
+        .as_ref()
+        .is_some_and(|anchor| anchor.hash == Hash256::ZERO)
+    {
+        return Err(GenerationError::Invalid(
+            "baseline DAG anchor must be nonzero".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2670,7 +2708,13 @@ fn validate_successor(previous: &VerifiedGeneration, successor: &GenerationManif
             "successor baseline height moves backwards".into(),
         ));
     }
-    if new_baseline.height == old_baseline.height && new_baseline != old_baseline {
+    if new_baseline.height == old_baseline.height
+        && (new_baseline.block_hash != old_baseline.block_hash
+            || new_baseline.state_root != old_baseline.state_root
+            || (old_baseline.dag_anchor.is_some()
+                && new_baseline.dag_anchor != old_baseline.dag_anchor)
+            || successor.dag_cursor.next_dag_round != previous.manifest.dag_cursor.next_dag_round)
+    {
         return Err(GenerationError::Invalid(
             "successor changes block hash/root at the same baseline height".into(),
         ));
@@ -2726,7 +2770,9 @@ fn validate_record(record: &RetainedDagRecord) -> Result<()> {
         )));
     }
     match record.kind {
-        RetainedRecordKind::TransactionBody | RetainedRecordKind::DagBlock => {
+        RetainedRecordKind::TransactionBody
+        | RetainedRecordKind::DagBlock
+        | RetainedRecordKind::AbsenceCertificate => {
             if record.object_hash == Hash256::ZERO || record.payload.is_empty() {
                 return Err(GenerationError::Invalid(
                     "transaction/DAG-block records require nonzero identity and payload".into(),
@@ -4064,6 +4110,7 @@ mod tests {
                 height,
                 block_hash: h(format!("block-{height}").as_bytes()),
                 state_root: h(format!("root-{height}").as_bytes()),
+                dag_anchor: None,
             },
             dag_cursor: DagCursor {
                 committed_block_count: committed,
@@ -4085,6 +4132,47 @@ mod tests {
             RetainedDagRecord::dag_block(round, h(b"dag"), vec![4, 5, 6]),
             RetainedDagRecord::round_cursor(round + 1),
         ]
+    }
+
+    #[test]
+    fn legacy_baseline_canonical_bytes_do_not_gain_an_optional_anchor() {
+        let baseline = input(9, 8, 100).baseline_state;
+        #[derive(Serialize)]
+        struct LegacyBaseline {
+            height: u64,
+            block_hash: Hash256,
+            state_root: Hash256,
+        }
+        let old_shape = LegacyBaseline {
+            height: baseline.height,
+            block_hash: baseline.block_hash,
+            state_root: baseline.state_root,
+        };
+        let old_bytes = canonical_json(&old_shape, "legacy baseline").unwrap();
+        let decoded: BaselineState = serde_json::from_slice(&old_bytes).unwrap();
+        assert_eq!(decoded.dag_anchor, None);
+        assert_eq!(canonical_json(&decoded, "baseline").unwrap(), old_bytes);
+    }
+
+    #[test]
+    fn absence_certificate_frames_round_trip_without_reinterpreting_old_kinds() {
+        for (tag, expected) in [
+            (1, RetainedRecordKind::TransactionBody),
+            (2, RetainedRecordKind::DagBlock),
+            (3, RetainedRecordKind::RoundCursor),
+            (4, RetainedRecordKind::Commit),
+        ] {
+            assert_eq!(RetainedRecordKind::try_from(tag).unwrap(), expected);
+        }
+        let record = RetainedDagRecord::absence_certificate(101, h(b"certificate"), vec![1, 3, 5]);
+        assert_eq!(
+            decode_record(&encode_record(&record).unwrap()).unwrap(),
+            record
+        );
+        let mut empty = record;
+        empty.payload.clear();
+        assert!(encode_record(&empty).is_err());
+        assert!(RetainedRecordKind::try_from(6).is_err());
     }
 
     #[test]
