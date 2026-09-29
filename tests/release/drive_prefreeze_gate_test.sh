@@ -483,7 +483,9 @@ token_config_and_tls_overrides_do_not_leak_or_bypass() (
 )
 
 identity_helper_unit_contract_and_real_rclone_capability() (
-    "$SYSTEM_PYTHON3" -I "$IDENTITY_UNIT_TEST" || return 1
+    # Isolated mode ignores PYTHONDONTWRITEBYTECODE and PYTHONPYCACHEPREFIX.
+    # Keep this import-based test from writing caches beside reviewed source.
+    "$SYSTEM_PYTHON3" -B -I "$IDENTITY_UNIT_TEST" || return 1
     ! grep -Fq 'config userinfo' "$GATE" || return 1
     ! grep -Fq 'config redacted' "$GATE" || return 1
 

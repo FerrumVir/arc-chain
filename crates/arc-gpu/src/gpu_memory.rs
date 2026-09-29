@@ -4,9 +4,9 @@
 //! are backed by unified memory - CPU and GPU share the same physical pages.
 //! Zero copy, zero sync overhead.
 //!
-//! On discrete GPUs (Vulkan/DX12), a staging buffer handles CPU↔GPU transfers.
-//! The `sync_to_gpu()` call copies staging → device-local; `sync_from_gpu()` does
-//! the reverse.
+//! On devices without mappable primary buffers, a staging buffer handles
+//! CPU↔GPU transfers. `sync_to_gpu()` copies staging → device-local;
+//! `sync_from_gpu()` does the reverse.
 //!
 //! On systems without a GPU, `CpuOnly` mode uses a plain `Vec<u8>` backing store
 //! so callers don't need conditional logic.
@@ -20,8 +20,9 @@ pub enum MemoryModel {
     /// Apple Silicon - `MAP_READ | MAP_WRITE | STORAGE` on a single buffer.
     /// CPU pointer and GPU pointer are the same physical memory. Zero copy.
     UnifiedMetal,
-    /// Discrete GPU - separate host-visible staging buffer + device-local storage buffer.
-    /// Requires explicit `sync_to_gpu()` / `sync_from_gpu()` calls.
+    /// Staged path - separate staging buffer + device-local storage buffer.
+    /// Used by discrete GPUs and devices without mappable primary buffers; it
+    /// requires explicit `sync_to_gpu()` / `sync_from_gpu()` calls.
     ManagedDiscrete,
     /// No GPU available - backed by a CPU-side `Vec<u8>`.
     CpuOnly,
@@ -85,8 +86,8 @@ unsafe impl Sync for GpuAccountBuffer {}
 impl GpuAccountBuffer {
     /// Probe the GPU and allocate a buffer for `max_accounts` account slots.
     ///
-    /// Detects Metal (unified memory) vs Vulkan/DX12 (discrete) vs no-GPU
-    /// and creates the appropriate buffer configuration.
+    /// Detects a Metal device with mappable primary buffers vs the staged path
+    /// vs no-GPU, and creates the appropriate buffer configuration.
     pub fn new(max_accounts: usize) -> Result<Self, crate::GpuError> {
         let buf_size = (max_accounts * ACCOUNT_SLOT_SIZE) as u64;
 
@@ -143,13 +144,28 @@ impl GpuAccountBuffer {
         })
         .map_err(|e| crate::GpuError::DeviceError(e.to_string()))?;
 
-        // Detect memory model from backend.
-        let is_metal = gpu_info.backend == wgpu::Backend::Metal;
-        let memory_model = if is_metal {
-            MemoryModel::UnifiedMetal
-        } else {
-            MemoryModel::ManagedDiscrete
-        };
+        Self::from_device(max_accounts, &gpu_info, device, queue)
+    }
+
+    /// Build the account buffer from a device whose enabled features are
+    /// authoritative. A Metal backend without `MAPPABLE_PRIMARY_BUFFERS` must
+    /// use the same staging path as other backends.
+    fn from_device(
+        max_accounts: usize,
+        gpu_info: &wgpu::AdapterInfo,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> Result<Self, crate::GpuError> {
+        let buf_size = (max_accounts * ACCOUNT_SLOT_SIZE) as u64;
+        let has_mappable_primary_buffers = device
+            .features()
+            .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
+        let memory_model =
+            if gpu_info.backend == wgpu::Backend::Metal && has_mappable_primary_buffers {
+                MemoryModel::UnifiedMetal
+            } else {
+                MemoryModel::ManagedDiscrete
+            };
 
         match memory_model {
             MemoryModel::UnifiedMetal => {
@@ -207,10 +223,11 @@ impl GpuAccountBuffer {
                 let staging = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("ARC GPU State (staging)"),
                     size: buf_size,
-                    usage: wgpu::BufferUsages::MAP_READ
-                        | wgpu::BufferUsages::MAP_WRITE
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::COPY_DST,
+                    // CPU writes use queue.write_buffer; reads go through a
+                    // separate MAP_READ | COPY_DST readback buffer. Mapping
+                    // this staging buffer is unnecessary and MAP_READ and
+                    // MAP_WRITE are restricted to different copy directions.
+                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: true,
                 });
 
@@ -667,6 +684,81 @@ mod tests {
         assert_eq!(read.balance, 42);
         assert_eq!(read.nonce, 1);
         assert_eq!(read.address, [1u8; 32]);
+    }
+
+    #[test]
+    fn test_device_without_optional_features_uses_staged_round_trip() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let adapter =
+            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })) {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    eprintln!(
+                        "SKIP: no GPU adapter available for staged-buffer regression: {error}"
+                    );
+                    return;
+                }
+            };
+
+        // Request the baseline feature set even when the adapter advertises
+        // MAPPABLE_PRIMARY_BUFFERS; the actual device must force the staged
+        // path instead of accidentally exercising the unified Metal path.
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("ARC GPU State staged-buffer regression"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("baseline-feature GPU device should be available");
+        assert!(
+            !device
+                .features()
+                .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
+        );
+
+        let gpu_info = adapter.get_info();
+        let buf = GpuAccountBuffer::from_device(2, &gpu_info, device, queue)
+            .expect("staged account buffer should allocate");
+        assert_eq!(buf.memory_model(), MemoryModel::ManagedDiscrete);
+
+        let first = GpuAccountRepr {
+            address: [0x11; 32],
+            balance: 17,
+            nonce: 3,
+            ..GpuAccountRepr::default()
+        };
+        buf.write_account(0, &first);
+        buf.sync_to_gpu();
+        buf.sync_from_gpu();
+        assert_eq!(buf.read_account(0), first);
+
+        // Write a distinct value to device storage, then exercise the reverse
+        // device→staging sync and staging→readback mapping path.
+        let second = GpuAccountRepr {
+            address: [0x22; 32],
+            balance: 29,
+            nonce: 5,
+            ..GpuAccountRepr::default()
+        };
+        buf.queue
+            .as_ref()
+            .expect("GPU-backed buffer retains its queue")
+            .write_buffer(
+                buf.gpu_buffer
+                    .as_ref()
+                    .expect("GPU-backed buffer retains device storage"),
+                0,
+                bytemuck::bytes_of(&second),
+            );
+        buf.sync_from_gpu();
+        assert_eq!(buf.read_account(0), second);
     }
 
     #[test]

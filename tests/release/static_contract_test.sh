@@ -492,11 +492,12 @@ pretag_exact_byte_handoff_is_fail_closed() {
         return 1
     }
     [ "$(grep -Fc 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
-        "$RELEASE_WORKFLOW")" -eq 4 ] || {
-        printf 'tag workflow must upload exactly unsigned, sealed, draft-evidence, and published-evidence handoffs\n'
+        "$RELEASE_WORKFLOW")" -eq 5 ] || {
+        printf 'tag workflow must upload quality diagnostics and exactly unsigned, sealed, draft-evidence, and published-evidence handoffs\n'
         return 1
     }
     for handoff_path in \
+        'target/ci-check/*.log' \
         'unsigned-release-handoff/*' \
         'sealed-release-handoff/*' \
         'draft-evidence/release-draft.json' \

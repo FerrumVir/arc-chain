@@ -26,7 +26,7 @@ class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
         return subprocess.run(
             ["bash", "-euo", "pipefail", "-c", version_check_shell()],
             cwd=root,
-            env={**os.environ, "VERSION": "0.8.2", "TAG": "v0.8.2"},
+            env={**os.environ, "VERSION": "0.8.3", "TAG": "v0.8.3"},
             text=True,
             capture_output=True,
             check=False,
@@ -51,7 +51,7 @@ class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
                 shutil.copy2(ROOT / relative, destination)
             package_json = fixture / "desktop/package.json"
             package = json.loads(package_json.read_text())
-            # Previously published v0.8.0 bytes cannot satisfy the v0.8.2 tag.
+            # Previously published v0.8.0 bytes cannot satisfy the v0.8.3 tag.
             package["version"] = "0.8.0"
             package_json.write_text(json.dumps(package))
 

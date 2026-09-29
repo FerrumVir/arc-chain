@@ -1397,7 +1397,7 @@ class CanaryController:
                 expected_artifact_id=expected_artifact_id,
                 kind="headless",
                 platform=PLATFORM,
-                expected_version="0.8.2",
+                expected_version="0.8.3",
                 curl=curl,
                 curl_sha256=curl_sha256,
                 ca_bundle=ca_bundle,
