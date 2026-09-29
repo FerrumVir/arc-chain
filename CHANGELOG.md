@@ -18,6 +18,19 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.5 - Release-preparation snapshot (2026-09-29)
+
+> **Candidate note:** This source prepares a new release after the immutable
+> v0.8.4 release attempt failed its release/installer contract gate. This entry
+> does not claim publication or fleet deployment; verify those states from the
+> exact release and signed rollout evidence.
+
+- Advances active release and acceptance pins to v0.8.5.
+- Corrects the documented Playwright inventory to 281 tests in 22 files and
+  checks it after dependency installation in required desktop CI.
+- Records the v0.8.4 failure caused by a stale documented Playwright inventory;
+  no runtime behavior changes are intended.
+
 ## v0.8.4 - Release-preparation snapshot (2026-09-29)
 
 > **Candidate note:** This source prepares a new release after the immutable

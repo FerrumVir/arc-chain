@@ -26,7 +26,7 @@ workflow_is_read_only_and_exercises_published_bytes() {
         'permissions:' \
         'actions: read' \
         'contents: read' \
-        '[ "$GITHUB_REF" = refs/tags/v0.8.4 ]' \
+        '[ "$GITHUB_REF" = refs/tags/v0.8.5 ]' \
         'releases/assets/$id' \
         '--appimage-extract > "$evidence/extract.stdout"' \
         'appimage_visible_window' \
@@ -54,7 +54,7 @@ workflow_is_read_only_and_exercises_published_bytes() {
         "MSI ProductVersion is \$msiProductVersion" \
         "msi_product_version = \$msiProductVersion" \
         'embedded_app_product_version = $embeddedProductVersion' \
-        'arc-published-artifact-acceptance-v0.8.4-' \
+        'arc-published-artifact-acceptance-v0.8.5-' \
         '[[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]' \
         'digest sha256:$ARTIFACT_DIGEST'
     do
@@ -98,7 +98,7 @@ workflow_is_read_only_and_exercises_published_bytes() {
 runbook_binds_the_exact_canonical_artifact() {
     local literal
     for literal in \
-        'post-release-acceptance.yml --repo FerrumVir/arc-chain --ref v0.8.4' \
+        'post-release-acceptance.yml --repo FerrumVir/arc-chain --ref v0.8.5' \
         'PUBLISHED-ARTIFACT-ACCEPTANCE-RUN.json' \
         'PUBLISHED-ARTIFACT-ACCEPTANCE-SELECTION.json' \
         'published_acceptance_run_attempt' \

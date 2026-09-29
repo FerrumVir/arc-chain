@@ -76,7 +76,7 @@ def verify_published_assets(
     spec.loader.exec_module(verifier)
     binding = verifier.load_object(binding_path, "exact published release binding")
     verifier.validate_binding(binding)
-    if binding.get("repository") != REPOSITORY or binding.get("tag") != "v0.8.4" or binding.get("commit") != commit:
+    if binding.get("repository") != REPOSITORY or binding.get("tag") != "v0.8.5" or binding.get("commit") != commit:
         fail("published release binding differs from requested source")
     if binary.name != "arc-node-linux-x86_64" or cli.name != "arc-cli-linux-x86_64" or binary.parent != cli.parent:
         fail("worker executables do not match the bound Linux release assets")
@@ -191,7 +191,7 @@ def run_worker(args: argparse.Namespace) -> None:
     evidence: dict[str, Any] = {
         "schema": "arc.linux.community-worker-canary.v1",
         "repository": REPOSITORY,
-        "tag": "v0.8.4",
+        "tag": "v0.8.5",
         "commit": args.commit,
         "node_sha256": asset_hash,
         "cli_sha256": cli_hash,

@@ -419,6 +419,8 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
       - run: npm ci
+      - name: Verify documentation against the installed Playwright inventory
+        run: bash ../tests/release/documentation_contract_test.sh
       - run: npx tsc --noEmit
 
   # ---------------------------------------------------- desktop Tauri Rust --
