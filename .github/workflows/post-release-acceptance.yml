@@ -1,22 +1,22 @@
 name: Published artifact acceptance
 
 # This workflow has no publication, deployment, environment, OIDC, or package
-# authority.  It is dispatched only after the exact v0.8.3 release attempt and
+# authority.  It is dispatched only after the exact v0.8.4 release attempt and
 # recovered validator rollout have succeeded.  Every job reuses a sealed API
 # binding and downloads public assets by immutable GitHub release asset ID.
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact immutable release tag; production acceptance is pinned to v0.8.3
+        description: Exact immutable release tag; production acceptance is pinned to v0.8.4
         required: true
         type: string
       release_source_sha:
-        description: Exact 40-character protected-main commit targeted by v0.8.3
+        description: Exact 40-character protected-main commit targeted by v0.8.4
         required: true
         type: string
       release_run_id:
-        description: Exact successful Release ARC workflow run ID that published v0.8.3
+        description: Exact successful Release ARC workflow run ID that published v0.8.4
         required: true
         type: string
       release_run_attempt:
@@ -66,8 +66,8 @@ jobs:
           [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RELEASE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$RELEASE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
-          [ "$RELEASE_TAG" = v0.8.3 ]
-          [ "$GITHUB_REF" = refs/tags/v0.8.3 ]
+          [ "$RELEASE_TAG" = v0.8.4 ]
+          [ "$GITHUB_REF" = refs/tags/v0.8.4 ]
           [ "$GITHUB_SHA" = "$RELEASE_COMMIT" ]
           [ "$(git rev-parse HEAD)" = "$RELEASE_COMMIT" ]
 
@@ -201,7 +201,7 @@ jobs:
           run-id: ${{ github.run_id }}
           digest-mismatch: error
 
-      - name: Download v0.8.3 Linux assets by immutable release asset ID
+      - name: Download v0.8.4 Linux assets by immutable release asset ID
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -331,13 +331,13 @@ jobs:
           data_root="$fresh/data"
           mkdir -m 0700 "$fresh"
           chmod 0500 published/install.sh
-          bash published/install.sh --version 0.8.3 \
+          bash published/install.sh --version 0.8.4 \
             --install-dir "$install_root" --data-dir "$data_root" \
             --no-service --no-auto-update \
             > evidence-linux/headless-install.stdout \
             2> evidence-linux/headless-install.stderr
-          "$install_root/bin/arc-node" --version | grep -F ' 0.8.3'
-          "$install_root/bin/arc-cli" --version | grep -F ' 0.8.3'
+          "$install_root/bin/arc-node" --version | grep -F ' 0.8.4'
+          "$install_root/bin/arc-cli" --version | grep -F ' 0.8.4'
           [ "$(sha256sum "$install_root/bin/arc-node" | awk '{print $1}')" = \
             "$(jq -er '.assets["arc-node-linux-x86_64"].sha256' binding/release-binding.json)" ]
           [ "$(sha256sum "$install_root/bin/arc-cli" | awk '{print $1}')" = \
@@ -346,7 +346,7 @@ jobs:
             --install-dir "$install_root" --no-service --no-auto-update \
             > evidence-linux/headless-update.stdout \
             2> evidence-linux/headless-update.stderr
-          grep -Fq 'Already up to date at v0.8.3' \
+          grep -Fq 'Already up to date at v0.8.4' \
             evidence-linux/headless-update.stdout
           if pgrep -f "$install_root/bin/arc-node" >/dev/null; then
             echo 'fresh --no-service install started an arc-node process' >&2
@@ -507,7 +507,7 @@ jobs:
             done
           done
 
-          HOME="$legacy_home" bash published/install.sh --version 0.8.3 \
+          HOME="$legacy_home" bash published/install.sh --version 0.8.4 \
             --model "$legacy_root/community-model.gguf" \
             --no-service --no-auto-update \
             > evidence-linux/legacy-migration.stdout \
@@ -517,8 +517,8 @@ jobs:
 
           grep -Fq 'Adopted the verified v0.7.7 default install' \
             evidence-linux/legacy-migration.stdout
-          "$legacy_root/bin/arc-node" --version | grep -F ' 0.8.3'
-          "$legacy_root/bin/arc-cli" --version | grep -F ' 0.8.3'
+          "$legacy_root/bin/arc-node" --version | grep -F ' 0.8.4'
+          "$legacy_root/bin/arc-cli" --version | grep -F ' 0.8.4'
           [ "$(sha256sum "$legacy_root/bin/arc-node" | awk '{print $1}')" = \
             "$(jq -er '.assets["arc-node-linux-x86_64"].sha256' binding/release-binding.json)" ]
           [ "$(sha256sum "$legacy_root/bin/arc-cli" | awk '{print $1}')" = \
@@ -570,7 +570,7 @@ jobs:
             --install-dir "$legacy_root" --no-service --no-auto-update \
             > evidence-linux/legacy-update.stdout \
             2> evidence-linux/legacy-update.stderr
-          grep -Fq 'Already up to date at v0.8.3' evidence-linux/legacy-update.stdout
+          grep -Fq 'Already up to date at v0.8.4' evidence-linux/legacy-update.stdout
           if pgrep -f "$legacy_root/bin/arc-node" >/dev/null; then
             echo 'migration or update-only started an arc-node service/process' >&2
             exit 1
@@ -746,7 +746,7 @@ jobs:
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info")" = \
             network.arc.desktop ]
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info")" = \
-            0.8.3 ]
+            0.8.4 ]
           executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info")"
           executable="$app/Contents/MacOS/$executable_name"
           [ -x "$executable" ]
@@ -770,7 +770,7 @@ jobs:
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$dmg_info")" = \
             network.arc.desktop ]
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$dmg_info")" = \
-            0.8.3 ]
+            0.8.4 ]
           dmg_executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$dmg_info")"
           dmg_executable="$dmg_app/Contents/MacOS/$dmg_executable_name"
           [ "$(lipo -archs "$dmg_executable")" = "$EXPECTED_ARCH" ]
@@ -883,7 +883,7 @@ jobs:
               "bundle_architecture": os.environ["EXPECTED_ARCH"],
               "bundle_codesign_valid": True,
               "bundle_identifier": "network.arc.desktop",
-              "bundle_version": "0.8.3",
+              "bundle_version": "0.8.4",
               "desktop_process_stable": True,
               "desktop_visible_window": True,
               "dmg_bundle_matches": True,
@@ -1052,7 +1052,7 @@ jobs:
               }
             }
           }
-          if ($msiProductVersion -cne '0.8.3') {
+          if ($msiProductVersion -cne '0.8.4') {
             throw "MSI ProductVersion is $msiProductVersion"
           }
           $serviceBefore = @(Get-Service | Where-Object {
@@ -1399,7 +1399,7 @@ jobs:
         name: Upload canonical published-artifact acceptance receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: arc-published-artifact-acceptance-v0.8.3-${{ inputs.release_source_sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          name: arc-published-artifact-acceptance-v0.8.4-${{ inputs.release_source_sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: canonical
           if-no-files-found: error
           compression-level: 9

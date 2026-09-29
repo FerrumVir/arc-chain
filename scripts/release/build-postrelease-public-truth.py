@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Derive the public ARC status files from sealed post-release evidence.
 
-The release source intentionally says that v0.8.3 is unpublished.  That text
+The release source intentionally says that v0.8.4 is unpublished.  That text
 must remain immutable in the tag.  After the release, fleet cutover, Pages
 deployment, installer canaries, and live reward verification have all passed,
 this helper creates three create-only evidence products:
@@ -42,8 +42,8 @@ ACCEPTANCE_SCHEMA = "arc.post-release-acceptance.v2"
 NETWORK_SCHEMA = "arc.frontend.network.v1"
 REWARD_SCHEMA = "arc.recovery.reward-evidence.v3"
 REPOSITORY = "FerrumVir/arc-chain"
-TAG = "v0.8.3"
-VERSION = "0.8.3"
+TAG = "v0.8.4"
+VERSION = "0.8.4"
 CHAIN_ID = "0x415243"
 PROTOCOL_VERSION_RE = re.compile(r"^3\.[0-9]+\.[0-9]+$")
 RECOVERY_EPOCH = 1
@@ -1370,7 +1370,7 @@ def validate_packaged_native_wrapper(
     for field in ("txHash", "jobId", "worker", "modelId", "inputHash", "outputHash"):
         canonical_chain_hash(terminal.get(field), f"packaged native terminal {field}")
     prompt = (
-        f"ARC packaged v0.8.3 production acceptance challenge {wrapper['challenge']} "
+        f"ARC packaged v0.8.4 production acceptance challenge {wrapper['challenge']} "
         f"input {wrapper['inputSha256']}"
     )
     if (
@@ -1925,7 +1925,7 @@ def validate_release(
         or not isinstance(release.get("author"), dict)
         or release["author"].get("login") != "github-actions[bot]"
     ):
-        fail("release API response does not prove the exact immutable v0.8.3 release")
+        fail("release API response does not prove the exact immutable v0.8.4 release")
     positive_int(release["id"], "release.id")
     if isinstance(release["assets"], list) and any(
         isinstance(asset, dict)
@@ -1987,7 +1987,7 @@ def validate_release(
             "size": asset["size"],
         }
     if names != EXPECTED_RELEASE_ASSETS:
-        fail("release asset names differ from the exact v0.8.3 contract")
+        fail("release asset names differ from the exact v0.8.4 contract")
     if total_size > 12 * 1024 * 1024 * 1024:
         fail("release assets exceed the reviewed aggregate size bound")
     return published_at, dict(sorted(normalized.items()))
@@ -3141,7 +3141,7 @@ def render_readme_block(
     )
     return f"""{BEGIN_MARKER}
 > **Live public testnet (evidence sealed after {published_at}):** The immutable
-> [v0.8.3 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.3)
+> [v0.8.4 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.4)
 > is built from [`{short_source}`](https://github.com/FerrumVir/arc-chain/commit/{source_sha}).
 > All six protocol-v3 validators serve the retained canonical chain through
 > block **{checkpoint['height']:,}**, continue at **{checkpoint['recoveryHeight']:,}**, and are
@@ -3168,14 +3168,14 @@ the exact tag. The published Linux x86_64 component proved this exact
 bootstrap in both fresh-install and update-only modes:
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.3/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.4/install.sh
 ARC_INSTALL_SHA256={installer_sha}
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.3
+bash install.sh --version 0.8.4
 ```
 
 The immutable release includes headless Linux amd64 and arm64 binaries, Intel
@@ -3201,7 +3201,7 @@ these scopes are recorded separately and are not presented as interchangeable.
 | Community question | Current evidence-backed answer |
 |---|---|
 | Can an SSH-only EC2/VPS install ARC? | **Yes, on Linux x86_64 as exercised.** Use the pinned command above. `arc-node-linux-x86_64` is the GUI-free amd64 binary; the immutable release also includes Linux arm64 assets without extending this canary claim. |
-| Are Intel and Apple Silicon Macs supported? | **Yes, with exact scope stated.** v0.8.3 publishes separate CLI and desktop bytes for x86_64 and arm64 macOS; published-package launch checks cover both, and the production inference/receipt/earnings native-core gate covers the arm64 package. The current app is updater-signature authenticated and ad-hoc code sealed, not claimed as Developer-ID notarized. |
+| Are Intel and Apple Silicon Macs supported? | **Yes, with exact scope stated.** v0.8.4 publishes separate CLI and desktop bytes for x86_64 and arm64 macOS; published-package launch checks cover both, and the production inference/receipt/earnings native-core gate covers the arm64 package. The current app is updater-signature authenticated and ad-hoc code sealed, not claimed as Developer-ID notarized. |
 | Does automatic update work? | **Yes, within the documented safety boundary.** v0.8 desktop checks automatically but requires confirmation; managed headless installs use the transactional daily updater. The one-time unsigned v0.7 migration is deliberately manual. |
 | Are the seed nodes upgraded? | **Yes.** Six protocol-v3 validators are bound to checkpoint H={checkpoint['height']:,}, transition H+1={checkpoint['recoveryHeight']:,}, and an all-six public health gate. |
 | Can a stake-zero community worker earn the configured {each_arc} ARC reward? | **Yes.** The production canary proved {receipt_count} distinct mined rewards totaling {total_arc} ARC for one exact-model stake-zero worker. Registration or a raw `0x16` inference attestation alone does not pay. |
