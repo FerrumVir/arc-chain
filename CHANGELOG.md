@@ -18,6 +18,23 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.6 - Release-preparation snapshot (2026-09-29)
+
+> **Candidate note:** This source prepares a new release after the immutable
+> v0.8.5 release attempt failed while staging its unsigned manifest. This entry
+> does not claim publication or fleet deployment; verify those states from the
+> exact release and signed rollout evidence.
+
+- Advances active release and acceptance pins to v0.8.6.
+- Excludes the exact sibling ownership receipt that `assemble-release.sh`
+  writes beside `release-files/` from the manifest-staging source check.
+- Runs the real staging cleanliness block against the assembler's outputs in
+  the release workflow contract test, so a rejected receipt fails in CI.
+- Records the v0.8.5 failure (Release ARC run 36569256300): every quality,
+  golden-vector and pre-tag verification job passed, then staging rejected
+  `.release-files.arc-release-output-owner`. No runtime behavior changes are
+  intended.
+
 ## v0.8.5 - Release-preparation snapshot (2026-09-29)
 
 > **Candidate note:** This source prepares a new release after the immutable

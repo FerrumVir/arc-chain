@@ -5252,7 +5252,7 @@ test "$legacy_provenance_count" = \
 ### Exercise the exact published packages and seal their acceptance artifact
 
 Dispatch the unprivileged `post-release-acceptance.yml` definition from the
-immutable `v0.8.5` tag, never from moving `main`. The workflow binds the exact
+immutable `v0.8.6` tag, never from moving `main`. The workflow binds the exact
 successful release run and attempt, downloads public assets only by numeric
 release-asset ID, and performs the following on hosted runners: fresh and
 update-only headless Linux installs; a real visible AppImage launch under
@@ -5294,8 +5294,8 @@ published_acceptance_runs() {
 if [ ! -e "$published_acceptance_run_selection" ]; then
   published_acceptance_before="$(published_acceptance_runs | /usr/bin/jq '[.[].id]')"
   arc_scoped_gh "$post_release_gh_token" workflow run \
-    post-release-acceptance.yml --repo FerrumVir/arc-chain --ref v0.8.5 \
-    -f tag=v0.8.5 -f release_source_sha="$protected_main_sha" \
+    post-release-acceptance.yml --repo FerrumVir/arc-chain --ref v0.8.6 \
+    -f tag=v0.8.6 -f release_source_sha="$protected_main_sha" \
     -f release_run_id="$release_run_id" \
     -f release_run_attempt="$release_run_attempt"
   published_acceptance_candidates='[]'
@@ -5323,7 +5323,7 @@ if [ ! -e "$published_acceptance_run_selection" ]; then
     {schema:"arc.published-artifact-acceptance-run-selection.v1",
      repository:"FerrumVir/arc-chain",workflow_id:$workflow_id,
      workflow_path:".github/workflows/post-release-acceptance.yml",
-     dispatch_ref:"v0.8.5",head_sha:$sha,run_id:$run_id,
+     dispatch_ref:"v0.8.6",head_sha:$sha,run_id:$run_id,
      run_attempt:$run_attempt,release_run_id:$release_run_id,
      release_run_attempt:$release_run_attempt}' \
     | write_once_or_compare "$published_acceptance_run_selection"
@@ -5336,7 +5336,7 @@ fi
   .schema == "arc.published-artifact-acceptance-run-selection.v1"
   and .repository == "FerrumVir/arc-chain" and .workflow_id == $workflow_id
   and .workflow_path == ".github/workflows/post-release-acceptance.yml"
-  and .dispatch_ref == "v0.8.5" and .head_sha == $sha
+  and .dispatch_ref == "v0.8.6" and .head_sha == $sha
   and .release_run_id == $release_run_id
   and .release_run_attempt == $release_run_attempt
   and (.run_id | type == "number" and . > 0)
@@ -5398,7 +5398,7 @@ numeric artifact ID and digest live outside the acceptance artifact because a
 ZIP cannot safely contain its own hash.
 
 ```bash
-published_acceptance_artifact_name="arc-published-artifact-acceptance-v0.8.5-$protected_main_sha-$published_acceptance_run_id-attempt-$published_acceptance_run_attempt"
+published_acceptance_artifact_name="arc-published-artifact-acceptance-v0.8.6-$protected_main_sha-$published_acceptance_run_id-attempt-$published_acceptance_run_attempt"
 published_acceptance_artifacts="$(
   arc_scoped_gh "$post_release_gh_token" api \
     "repos/FerrumVir/arc-chain/actions/runs/$published_acceptance_run_id/artifacts?per_page=100"
@@ -5596,7 +5596,7 @@ published_acceptance_selection="$release_control_root/PUBLISHED-ARTIFACT-ACCEPTA
   {schema:"arc.published-artifact-acceptance-selection.v1",
    repository:"FerrumVir/arc-chain",workflow_id:$workflow_id,
    workflow_path:".github/workflows/post-release-acceptance.yml",
-   dispatch_ref:"v0.8.5",head_sha:$head_sha,run_id:$run_id,
+   dispatch_ref:"v0.8.6",head_sha:$head_sha,run_id:$run_id,
    run_attempt:$run_attempt,artifact_name:$artifact_name,
    artifact_id:$artifact_id,artifact_digest:$artifact_digest,
    canonical_receipt_sha256:$receipt_sha}' \
@@ -5610,7 +5610,7 @@ The bootstrap is downloaded from the exact immutable release and matched to
 the API digest already sealed above. A partial canary root without its final
 receipt is preserved and stops; a completed exact root is read-only verified
 and reused. The update-only pass must resolve the public channel back to
-v0.8.5 and report equality without replacement. Finally, rerun the rollout's
+v0.8.6 and report equality without replacement. Finally, rerun the rollout's
 read-only live verifier against the immutable two-canary reward evidence. This
 does not issue a third reward: it re-proves all-six convergence, inference
 attestations, the two mined `0x25` receipts, exact baseline-plus-5-ARC history
@@ -5622,10 +5622,10 @@ six-replica-agreed superset strictly after that cutoff.
 installer_canary_root="$release_control_root/installer-canary-linux-x86_64"
 installer_canary_receipt="$installer_canary_root/ACCEPTED.json"
 release_api_canary="$(arc_scoped_gh "$post_release_gh_token" api \
-  repos/FerrumVir/arc-chain/releases/tags/v0.8.5)"
+  repos/FerrumVir/arc-chain/releases/tags/v0.8.6)"
 printf '%s' "$release_api_canary" | /usr/bin/jq -e \
   --argjson release_id "$release_id" --arg sha "$protected_main_sha" '
-  .id == $release_id and .tag_name == "v0.8.5" and .target_commitish == $sha
+  .id == $release_id and .tag_name == "v0.8.6" and .target_commitish == $sha
   and .draft == false and .prerelease == false and .immutable == true' >/dev/null
 installer_expected_digest="$(printf '%s' "$release_api_canary" | /usr/bin/jq -er \
   '.assets[] | select(.name == "install.sh") | .digest | sub("^sha256:"; "")')"
@@ -5645,26 +5645,26 @@ if [ ! -e "$installer_canary_root" ]; then
   /usr/bin/curl --fail --silent --show-error --location \
     --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 60 \
     --max-filesize 4194304 \
-    https://github.com/FerrumVir/arc-chain/releases/download/v0.8.5/install.sh \
+    https://github.com/FerrumVir/arc-chain/releases/download/v0.8.6/install.sh \
     -o "$installer_canary_root/install.sh"
   test "$(arc_sha256 "$installer_canary_root/install.sh")" = \
     "$installer_expected_digest"
   /usr/bin/chmod 0500 "$installer_canary_root/install.sh"
-  /usr/bin/bash "$installer_canary_root/install.sh" --version 0.8.5 \
+  /usr/bin/bash "$installer_canary_root/install.sh" --version 0.8.6 \
     --install-dir "$installer_canary_root/install" \
     --data-dir "$installer_canary_root/data" \
     --no-service --no-auto-update \
     >"$installer_canary_root/install.stdout" \
     2>"$installer_canary_root/install.stderr"
   "$installer_canary_root/install/bin/arc-node" --version \
-    | /usr/bin/grep -F ' 0.8.5'
+    | /usr/bin/grep -F ' 0.8.6'
   "$installer_canary_root/install/bin/arc-cli" --version \
-    | /usr/bin/grep -F ' 0.8.5'
+    | /usr/bin/grep -F ' 0.8.6'
   /usr/bin/bash "$installer_canary_root/install.sh" --update-only \
     --install-dir "$installer_canary_root/install" --no-service --no-auto-update \
     >"$installer_canary_root/update.stdout" \
     2>"$installer_canary_root/update.stderr"
-  /usr/bin/grep -Fq 'Already up to date at v0.8.5' \
+  /usr/bin/grep -Fq 'Already up to date at v0.8.6' \
     "$installer_canary_root/update.stdout"
   test "$(arc_sha256 "$installer_canary_root/install/bin/arc-node")" = \
     "$node_expected_digest"
@@ -5674,7 +5674,7 @@ if [ ! -e "$installer_canary_root" ]; then
     --argjson release_run_attempt "$release_run_attempt" --argjson release_id "$release_id" \
     --arg node_sha "$node_expected_digest" --arg cli_sha "$cli_expected_digest" \
     --arg update_sha "$(arc_sha256 "$installer_canary_root/update.stdout")" \
-    '{schema:"arc.post-release-installer-canary.v1",version:"0.8.5",
+    '{schema:"arc.post-release-installer-canary.v1",version:"0.8.6",
       platform:"linux-x86_64",release_run_id:$release_run_id,
       release_run_attempt:$release_run_attempt,release_id:$release_id,
       node_sha256:$node_sha,cli_sha256:$cli_sha,update_stdout_sha256:$update_sha,
@@ -5693,16 +5693,16 @@ test "$(arc_sha256 "$installer_canary_root/install/bin/arc-cli")" = \
   --argjson release_run_attempt "$release_run_attempt" --argjson release_id "$release_id" \
   --arg node_sha "$node_expected_digest" --arg cli_sha "$cli_expected_digest" \
   --arg update_sha "$(arc_sha256 "$installer_canary_root/update.stdout")" '
-  . == {schema:"arc.post-release-installer-canary.v1",version:"0.8.5",
+  . == {schema:"arc.post-release-installer-canary.v1",version:"0.8.6",
     platform:"linux-x86_64",release_run_id:$release_run_id,
     release_run_attempt:$release_run_attempt,release_id:$release_id,
     node_sha256:$node_sha,cli_sha256:$cli_sha,update_stdout_sha256:$update_sha,
     service_started:false,update_result:"already-up-to-date"}' \
   "$installer_canary_receipt" >/dev/null
-/usr/bin/grep -Fq 'Already up to date at v0.8.5' \
+/usr/bin/grep -Fq 'Already up to date at v0.8.6' \
   "$installer_canary_root/update.stdout"
-"$installer_canary_root/install/bin/arc-node" --version | /usr/bin/grep -F ' 0.8.5'
-"$installer_canary_root/install/bin/arc-cli" --version | /usr/bin/grep -F ' 0.8.5'
+"$installer_canary_root/install/bin/arc-node" --version | /usr/bin/grep -F ' 0.8.6'
+"$installer_canary_root/install/bin/arc-cli" --version | /usr/bin/grep -F ' 0.8.6'
 
 live_acceptance="$post_release_attempt_root/live-rollout-verify.txt"
 "$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py verify \
@@ -5812,7 +5812,7 @@ test -z "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
 ARC_DESKTOP_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"
 test -d "$ARC_DESKTOP_TRANSFER_PARENT" \
   && test ! -L "$ARC_DESKTOP_TRANSFER_PARENT"
-ARC_DESKTOP_TRANSFER_ROOT="$ARC_DESKTOP_TRANSFER_PARENT/desktop-live-v0.8.5-$ARC_DESKTOP_PROTECTED_MAIN_SHA"
+ARC_DESKTOP_TRANSFER_ROOT="$ARC_DESKTOP_TRANSFER_PARENT/desktop-live-v0.8.6-$ARC_DESKTOP_PROTECTED_MAIN_SHA"
 test ! -e "$ARC_DESKTOP_TRANSFER_ROOT" && test ! -L "$ARC_DESKTOP_TRANSFER_ROOT"
 /bin/mkdir -m 0700 "$ARC_DESKTOP_TRANSFER_ROOT"
 ARC_LIMACTL=/opt/homebrew/Cellar/lima/2.1.1/bin/limactl
@@ -6009,7 +6009,7 @@ PY
     /usr/bin/curl --fail --silent --show-error --location \
       --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 1800 \
       --max-filesize 2147483648 \
-      "https://github.com/FerrumVir/arc-chain/releases/download/v0.8.5/$asset_name" \
+      "https://github.com/FerrumVir/arc-chain/releases/download/v0.8.6/$asset_name" \
       > "$asset_path"
   )
   /bin/chmod 0400 "$asset_path"
@@ -6275,7 +6275,7 @@ desktop_live_sha256="$(/usr/bin/shasum -a 256 "$ARC_LIVE_RECEIPT_OUTPUT" \
 )
 /bin/chmod 0400 "$ARC_LIVE_RECEIPT_OUTPUT.sha256"
 
-desktop_live_drop=/var/tmp/arc-desktop-live-import-v0.8.5
+desktop_live_drop=/var/tmp/arc-desktop-live-import-v0.8.6
 "$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
   /usr/bin/test '!' -e "$desktop_live_drop"
 "$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
@@ -6313,7 +6313,7 @@ set -Eeuo pipefail
 test "$(/usr/bin/id -u)" = 0
 : "${post_release_attempt_root:?post-release attempt state was lost}"
 : "${protected_main_sha:?protected-main identity was lost}"
-desktop_live_drop=/var/tmp/arc-desktop-live-import-v0.8.5
+desktop_live_drop=/var/tmp/arc-desktop-live-import-v0.8.6
 test -d "$desktop_live_drop" && test ! -L "$desktop_live_drop"
 test -f "$desktop_live_drop/DESKTOP-LIVE-PRODUCT.json"
 test ! -L "$desktop_live_drop/DESKTOP-LIVE-PRODUCT.json"
@@ -6624,7 +6624,7 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
                      "recovery","release","repository","schema"] | sort)
   and .schema == "arc.post-release-acceptance.v2"
   and .repository == "FerrumVir/arc-chain"
-  and .release.id == $release_id and .release.tag == "v0.8.5"
+  and .release.id == $release_id and .release.tag == "v0.8.6"
   and .release.sourceCommit == $source
   and .release.runId == $release_run_id
   and .release.runAttempt == $release_run_attempt
@@ -6671,7 +6671,7 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
     "macos-arm64-packaged-native-core"
   and .productSurfaces.desktopLive.receipt.packagedNative.receipt.runtime ==
     {appDataRelativePath:"Library/Application Support/network.arc.desktop",
-     appVersion:"0.8.5",architecture:"aarch64",
+     appVersion:"0.8.6",architecture:"aarch64",
      buildSourceCommit:$source,
      environmentNames:["HOME","LANG","LC_ALL","PATH","TMPDIR"],
      environmentSha256:.productSurfaces.desktopLive.receipt.packagedNative.receipt.runtime.environmentSha256,
@@ -6700,7 +6700,7 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
   .schema == "arc.public-production-status.v1" and .state == "recovered"
   and .acceptance.receiptSha256 == $acceptance_sha
   and .acceptance.receipt == $receipt[0]
-  and .release.sourceCommit == $source and .release.tag == "v0.8.5"
+  and .release.sourceCommit == $source and .release.tag == "v0.8.6"
   and .release.immutable == true
   and .pages.acceptedConfigCommit == $accepted_config
   and .checkpoint.height == $manifest[0].chain.source_height
@@ -6723,7 +6723,7 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
 /usr/bin/jq -cS '.acceptance.receipt' "$public_truth_status" \
   | /usr/bin/cmp -s - "$acceptance_receipt"
 
-public_truth_branch='arc-recovery/public-truth-v0.8.5'
+public_truth_branch='arc-recovery/public-truth-v0.8.6'
 public_truth_index="$(/usr/bin/mktemp \
   "$release_control_root/public-truth-index.XXXXXXXX")"
 /usr/bin/rm -f -- "$public_truth_index"

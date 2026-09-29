@@ -1023,7 +1023,8 @@ jobs:
             ':(exclude)artifacts/**' \
             ':(exclude)cutover-handoff-download/**' \
             ':(exclude)cutover-handoff/**' \
-            ':(exclude)release-files/**')"
+            ':(exclude)release-files/**' \
+            ':(exclude,literal).release-files.arc-release-output-owner')"
           ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
             ':(exclude)target/**')"
           if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then

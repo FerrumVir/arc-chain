@@ -19,7 +19,7 @@ import tempfile
 
 APP_NAME = "ARC Node.app"
 APP_IDENTIFIER = "network.arc.desktop"
-APP_VERSION = "0.8.5"
+APP_VERSION = "0.8.6"
 EXECUTABLE_NAME = "arc-desktop"
 CODE_SIGN = Path("/usr/bin/codesign")
 HDITIL = Path("/usr/bin/hdiutil")
