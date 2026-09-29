@@ -1,0 +1,191 @@
+name: CI AppImage UI request
+
+# Branch-only operator workflow (never merged): drives the exact packaged Linux
+# AppImage through its real UI on a disposable runner. Parameters come from the
+# committed ci/appimage-ui-request/request.json on the pushed branch.
+on:
+  push:
+    branches:
+      - 'ci/appimage-ui-request-*'
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ci-appimage-ui-request-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  ui-request:
+    name: Packaged AppImage UI request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: request
+        name: Read the committed request
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, re
+          r = json.load(open("ci/appimage-ui-request/request.json"))
+          assert r["mode"] in ("rehearsal", "full")
+          assert re.fullmatch(r"[0-9a-f]{40}", r["gate_source_sha"])
+          assert re.fullmatch(r"[1-9][0-9]{0,2}", str(r["max_tokens"]))
+          for key in ("mode", "gate_source_sha", "max_tokens"):
+              print(f"{key}={r[key]}")
+          print(f"prompt_json={json.dumps(r['prompt'])}")
+          print(f"desktop_artifact_id={r.get('desktop_artifact_id', '')}")
+          print(f"headless_artifact_id={r.get('headless_artifact_id', '')}")
+          print(f"release_tag={r.get('release_tag', '')}")
+          print(f"worker_wait_minutes={int(r.get('worker_wait_minutes', 0))}")
+          PY
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.request.outputs.gate_source_sha }}
+          path: gate-src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Acquire exact package bytes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.request.outputs.mode }}
+          SOURCE_SHA: ${{ steps.request.outputs.gate_source_sha }}
+          DESKTOP_ARTIFACT: ${{ steps.request.outputs.desktop_artifact_id }}
+          HEADLESS_ARTIFACT: ${{ steps.request.outputs.headless_artifact_id }}
+          RELEASE_TAG: ${{ steps.request.outputs.release_tag }}
+        run: |
+          set -Eeuo pipefail
+          pkg="$RUNNER_TEMP/pkg"
+          mkdir -m 0700 "$pkg"
+          if [ "$MODE" = rehearsal ]; then
+            for id in "$DESKTOP_ARTIFACT" "$HEADLESS_ARTIFACT"; do
+              [[ "$id" =~ ^[1-9][0-9]*$ ]]
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" > "$pkg/$id.json"
+              python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); assert not a["expired"] and sys.argv[2] in a["name"], a["name"]' "$pkg/$id.json" "$SOURCE_SHA"
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$pkg/$id.zip"
+              want="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["digest"])' "$pkg/$id.json")"
+              [ "sha256:$(sha256sum "$pkg/$id.zip" | cut -d' ' -f1)" = "$want" ]
+              mkdir "$pkg/$id"
+              unzip -q "$pkg/$id.zip" -d "$pkg/$id"
+              (cd "$pkg/$id" && sha256sum -c SHA256SUMS)
+              for archive in "$pkg/$id"/*.tar.gz; do tar -xzf "$archive" -C "$pkg/$id"; done
+            done
+            appimage="$(find "$pkg/$DESKTOP_ARTIFACT" -type f -name 'arc-desktop-linux-x86_64.AppImage' | head -n1)"
+            node="$(find "$pkg/$HEADLESS_ARTIFACT" -type f -name 'arc-node-linux-x86_64' | head -n1)"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$pkg/release.json"
+            python3 - "$pkg/release.json" "$SOURCE_SHA" "$RELEASE_TAG" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          assert r["tag_name"] == sys.argv[3] and r["target_commitish"] == sys.argv[2]
+          assert r["immutable"] is True and r["draft"] is False and r["prerelease"] is False
+          assert r["author"]["login"] == "github-actions[bot]"
+          PY
+            for name in arc-desktop-linux-x86_64.AppImage arc-desktop-linux-x86_64.AppImage.sig arc-node-linux-x86_64; do
+              read -r id digest < <(python3 -c 'import json,sys; a=[x for x in json.load(open(sys.argv[1]))["assets"] if x["name"]==sys.argv[2]]; assert len(a)==1 and a[0]["uploader"]["login"]=="github-actions[bot]"; print(a[0]["id"], a[0]["digest"])' "$pkg/release.json" "$name")
+              gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "$pkg/$name"
+              [ "sha256:$(sha256sum "$pkg/$name" | cut -d' ' -f1)" = "$digest" ]
+            done
+            appimage="$pkg/arc-desktop-linux-x86_64.AppImage"
+            node="$pkg/arc-node-linux-x86_64"
+          fi
+          test -f "$appimage" && test -f "$node"
+          sha256sum "$appimage" "$node" | tee "$pkg/selected.sha256"
+          {
+            echo "APPIMAGE=$appimage"
+            echo "APPIMAGE_SIG=$appimage.sig"
+            echo "ARC_NODE=$node"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify the Tauri updater signature against the release-commit key
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ ! -f "$APPIMAGE_SIG" ]; then
+            [ "${{ steps.request.outputs.mode }}" = rehearsal ]
+            echo "::warning::rehearsal package has no detached updater signature beside the AppImage"
+            exit 0
+          fi
+          pubkey="$(python3 -c 'import json; print(json.load(open("gate-src/desktop/src-tauri/tauri.conf.json"))["plugins"]["updater"]["pubkey"])')"
+          cargo run --quiet --locked --manifest-path gate-src/tests/release/tauri-updater-verifier/Cargo.toml -- \
+            "$pubkey" "$APPIMAGE" "$APPIMAGE_SIG"
+
+      - name: Install the WebKitGTK automation runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends binutils ca-certificates dbus-x11 file \
+            libappindicator3-1 librsvg2-2 libwebkit2gtk-4.1-0 webkit2gtk-driver xvfb
+          /usr/bin/WebKitWebDriver --version
+
+      - name: Require exactly one live community worker on all six coordinators
+        if: steps.request.outputs.mode == 'full'
+        shell: bash
+        env:
+          WAIT_MINUTES: ${{ steps.request.outputs.worker_wait_minutes }}
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY' | tee "$RUNNER_TEMP/pkg/worker-gate.json"
+          import json, os, time, urllib.request
+          hosts = ["149.28.32.76", "140.82.16.112", "136.244.109.1", "104.238.171.11", "202.182.107.41", "149.28.153.31"]
+          def get(host, path):
+              with urllib.request.urlopen(f"https://{host}{path}", timeout=8) as r:
+                  return json.loads(r.read(4_000_000))
+          deadline = time.time() + int(os.environ["WAIT_MINUTES"]) * 60
+          while True:
+              ready = {}
+              for h in hosts:
+                  try:
+                      d = get(h, "/inference/readiness")
+                      ready[h] = d.get("community_dispatch_ready") is True and d.get("live_community_workers") == 1
+                  except Exception:
+                      ready[h] = False
+              try:
+                  board = get("140.82.16.112", "/workers/scoreboard?limit=500")
+                  eligible = [w for w in board.get("workers", []) if str(w.get("name", "")).startswith("github-linux-x86_64-community-verification")]
+              except Exception:
+                  board, eligible = {}, []
+              if all(ready.values()) and board.get("eligible_inference_workers") == 1 and len(eligible) == 1:
+                  print(json.dumps({"at": time.time(), "ready": ready, "worker": eligible[0]}, indent=2))
+                  break
+              if time.time() > deadline:
+                  raise SystemExit("community worker gate not satisfied: " + json.dumps(ready))
+              time.sleep(20)
+          PY
+
+      - name: Drive the real packaged UI
+        shell: bash
+        env:
+          PROMPT_JSON: ${{ steps.request.outputs.prompt_json }}
+        run: |
+          set -Eeuo pipefail
+          prompt="$(python3 -c 'import json,os; print(json.loads(os.environ["PROMPT_JSON"]))')"
+          dbus-run-session -- xvfb-run -a -s '-screen 0 1280x900x24' \
+            python3 ci/appimage-ui-request/drive.py \
+              --gate gate-src/scripts/release/packaged-appimage-live-gate.py \
+              --appimage "$APPIMAGE" --arc-node "$ARC_NODE" \
+              --runtime-root "$RUNNER_TEMP/arc-ui" \
+              --prompt "$prompt" --max-tokens "${{ steps.request.outputs.max_tokens }}" \
+              --mode "${{ steps.request.outputs.mode }}"
+
+      - name: Upload UI evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-appimage-ui-request-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/arc-ui/evidence
+            ${{ runner.temp }}/pkg/*.json
+            ${{ runner.temp }}/pkg/selected.sha256
+          if-no-files-found: warn
+          retention-days: 30
