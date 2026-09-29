@@ -38,9 +38,9 @@ def digest(raw: bytes) -> str:
 
 class ManagedVersionContract(unittest.TestCase):
     def test_matches_selected_release_and_refuses_old_or_prefix_versions(self):
-        for output in ("arc-node 0.8.5", "arc-node v0.8.5"):
+        for output in ("arc-node 0.8.6", "arc-node v0.8.6"):
             GATE.require_managed_node_version(output)
-        for output in ("arc-node 0.8.0", "arc-node 0.8.50", "arc-node 0.8.5-beta"):
+        for output in ("arc-node 0.8.0", "arc-node 0.8.60", "arc-node 0.8.6-beta"):
             with self.assertRaises(GATE.GateError):
                 GATE.require_managed_node_version(output)
 
@@ -161,6 +161,25 @@ class BindingTests(unittest.TestCase):
             ][GATE.APPIMAGE_NAME]["id"]
             fixture.binding_path.write_bytes(GATE.canonical_json(fixture.binding))
             with self.assertRaisesRegex(GATE.GateError, "IDs are not distinct"):
+                GATE.validate_release_binding(fixture.binding_path)
+
+    def test_existing_chain_update_binding_requires_exact_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            fixture.binding["schema"] = GATE.UPDATE_RELEASE_SCHEMA
+            fixture.binding["profile"] = GATE.UPDATE_RELEASE_PROFILE
+            fixture.binding_path.write_bytes(GATE.canonical_json(fixture.binding))
+            binding, _ = GATE.validate_release_binding(fixture.binding_path)
+            self.assertEqual(binding["profile"], "existing-recovered-chain-update-v1")
+
+            fixture.binding["profile"] = "cutover-v1"
+            fixture.binding_path.write_bytes(GATE.canonical_json(fixture.binding))
+            with self.assertRaisesRegex(GATE.GateError, "profile mismatch"):
+                GATE.validate_release_binding(fixture.binding_path)
+
+            del fixture.binding["profile"]
+            fixture.binding_path.write_bytes(GATE.canonical_json(fixture.binding))
+            with self.assertRaisesRegex(GATE.GateError, "fields differ"):
                 GATE.validate_release_binding(fixture.binding_path)
 
 

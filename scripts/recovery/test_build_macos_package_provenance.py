@@ -98,8 +98,8 @@ def valid_tar_rows() -> list[tuple[tarfile.TarInfo, bytes]]:
 
 class BindingTests(unittest.TestCase):
     def test_current_package_gate_is_bound_to_v081(self) -> None:
-        self.assertEqual(gate.TAG, "v0.8.5")
-        self.assertEqual(gate.VERSION, "0.8.5")
+        self.assertEqual(gate.TAG, "v0.8.6")
+        self.assertEqual(gate.VERSION, "0.8.6")
 
     def test_duplicate_required_macos_asset_ids_fail(self) -> None:
         with tempfile.TemporaryDirectory(dir=HELPER.parent) as raw:
@@ -139,6 +139,58 @@ class BindingTests(unittest.TestCase):
             path.chmod(0o400)
             with self.assertRaisesRegex(gate.ProvenanceError, "IDs are not distinct"):
                 gate.load_release_binding(path)
+
+    def test_existing_chain_update_binding_requires_exact_profile(self) -> None:
+        with tempfile.TemporaryDirectory(dir=HELPER.parent) as raw:
+            root = Path(raw)
+            root.chmod(0o700)
+            commit = "ab" * 20
+            binding = {
+                "assets": {
+                    name: {"id": index, "sha256": marker * 64, "size": 1}
+                    for index, (name, marker) in enumerate(
+                        (
+                            (gate.APP_ARCHIVE_NAME, "1"),
+                            (gate.APP_SIGNATURE_NAME, "2"),
+                            (gate.DMG_NAME, "3"),
+                        ),
+                        start=1,
+                    )
+                },
+                "commit": commit,
+                "legacy_source": {},
+                "profile": gate.UPDATE_RELEASE_PROFILE,
+                "published_evidence": {},
+                "release": {"id": 1, "immutable": True},
+                "release_workflow": {
+                    "event": "workflow_dispatch",
+                    "head_branch": "main",
+                    "head_sha": commit,
+                    "id": 1,
+                    "jobs_sha256": "4" * 64,
+                    "path": ".github/workflows/release.yml",
+                    "run_attempt": 1,
+                    "run_id": 1,
+                },
+                "repository": gate.REPOSITORY,
+                "schema": gate.UPDATE_RELEASE_SCHEMA,
+                "tag": gate.TAG,
+            }
+
+            def write(name: str, value: dict) -> Path:
+                path = root / name
+                path.write_bytes(gate.canonical_json(value))
+                path.chmod(0o400)
+                return path
+
+            loaded, _ = gate.load_release_binding(write("update.json", binding))
+            self.assertEqual(loaded["profile"], "existing-recovered-chain-update-v1")
+            with self.assertRaisesRegex(gate.ProvenanceError, "profile differs"):
+                gate.load_release_binding(write("wrong-profile.json", {**binding, "profile": "cutover-v1"}))
+            missing = dict(binding)
+            del missing["profile"]
+            with self.assertRaisesRegex(gate.ProvenanceError, "fields differ"):
+                gate.load_release_binding(write("missing-profile.json", missing))
 
 
 class ExtractionTests(unittest.TestCase):
@@ -524,7 +576,7 @@ class NativeInputTests(unittest.TestCase):
                 value = gate.build_native_input(args)
             self.assertEqual(value["assets"], inspection["assets"])
             self.assertEqual(value["expectedBundle"], bundle)
-            self.assertEqual(value["releaseVersion"], "0.8.5")
+            self.assertEqual(value["releaseVersion"], "0.8.6")
             self.assertRegex(value["challenge"], r"^[0-9a-f]{64}$")
             self.assertEqual(value["expiresAtUnix"] - value["issuedAtUnix"], 7200)
             self.assertEqual(output.read_bytes(), gate.canonical_json(value))

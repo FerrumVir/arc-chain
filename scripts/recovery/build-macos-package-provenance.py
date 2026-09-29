@@ -45,9 +45,13 @@ from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
 
 REPOSITORY = "FerrumVir/arc-chain"
-TAG = "v0.8.5"
-VERSION = "0.8.5"
+TAG = "v0.8.6"
+VERSION = "0.8.6"
 RELEASE_SCHEMA = "arc.published-release-binding.v1"
+# Existing-chain update releases are bound by the same acceptance tool with an
+# explicit profile; the asset/workflow contract is otherwise identical.
+UPDATE_RELEASE_SCHEMA = "arc.published-release-binding.v2"
+UPDATE_RELEASE_PROFILE = "existing-recovered-chain-update-v1"
 SIGNATURE_SCHEMA = "arc.macos-updater-signature-verification.v1"
 GUEST_SIGNATURE_SCHEMA = "arc.macos-updater-signature-guest.v1"
 INSPECTION_SCHEMA = "arc.macos-package-inspection.v1"
@@ -421,23 +425,29 @@ def create_root_system_file(path: Path, raw: bytes, label: str, mode: int) -> No
 
 def load_release_binding(path: Path) -> tuple[dict[str, Any], bytes]:
     value, raw = load_json(path, "published release binding")
-    require_exact_keys(
-        value,
-        {
-            "assets",
-            "commit",
-            "legacy_source",
-            "published_evidence",
-            "release",
-            "release_workflow",
-            "repository",
-            "schema",
-            "tag",
-        },
-        "published release binding",
-    )
-    if value["schema"] != RELEASE_SCHEMA or value["repository"] != REPOSITORY or value["tag"] != TAG:
+    expected_keys = {
+        "assets",
+        "commit",
+        "legacy_source",
+        "published_evidence",
+        "release",
+        "release_workflow",
+        "repository",
+        "schema",
+        "tag",
+    }
+    is_update = isinstance(value, dict) and value.get("schema") == UPDATE_RELEASE_SCHEMA
+    if is_update:
+        expected_keys.add("profile")
+    require_exact_keys(value, expected_keys, "published release binding")
+    if (
+        value["schema"] not in (RELEASE_SCHEMA, UPDATE_RELEASE_SCHEMA)
+        or value["repository"] != REPOSITORY
+        or value["tag"] != TAG
+    ):
         fail("published release binding repository/schema/tag differs")
+    if is_update and value["profile"] != UPDATE_RELEASE_PROFILE:
+        fail("published update release binding profile differs")
     commit = require_commit(value["commit"], "published release binding commit")
     release = value["release"]
     if not isinstance(release, dict) or set(release) != {"id", "immutable"}:

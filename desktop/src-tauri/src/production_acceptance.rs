@@ -40,7 +40,7 @@ const INPUT_SCHEMA: &str = "arc.packaged-desktop-native-input.v1";
 const OUTPUT_SCHEMA: &str = "arc.packaged-desktop-native-acceptance.v1";
 const ATTEMPT_SCHEMA: &str = "arc.packaged-desktop-native-dispatch-attempt.v1";
 const REPOSITORY: &str = "FerrumVir/arc-chain";
-const VERSION: &str = "0.8.5";
+const VERSION: &str = "0.8.6";
 const EXPECTED_ORIGIN: &str = "https://140.82.16.112";
 const MAX_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_BUNDLE_ENTRIES: usize = 20_000;
@@ -1548,7 +1548,7 @@ fn open_file_at(_directory: &File, name: &OsStr) -> Result<File, String> {
 
 fn acceptance_prompt(challenge: &str, input_sha256: &str) -> String {
     format!(
-        "ARC packaged v0.8.5 production acceptance challenge {challenge} input {input_sha256}"
+        "ARC packaged v0.8.6 production acceptance challenge {challenge} input {input_sha256}"
     )
 }
 

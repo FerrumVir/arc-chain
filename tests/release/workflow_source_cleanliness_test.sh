@@ -146,8 +146,56 @@ for exclusion in (
     "':(exclude)cutover-handoff-download/**'",
     "':(exclude)cutover-handoff/**'",
     "':(exclude)release-files/**'",
+    "':(exclude,literal).release-files.arc-release-output-owner'",
 ):
     require(assembler, exclusion, "release assembler")
+
+# Run the real staging cleanliness block against the exact files that
+# assemble-release.sh leaves beside release-files/. Release run 36569256300
+# failed because the sibling ownership receipt was not excluded.
+assemble_script = (Path(sys.argv[2]).parents[2] / "scripts/release/assemble-release.sh").read_text(
+    encoding="utf-8"
+)
+require(assemble_script, 'OUTPUT_DIR="${OUTPUT_DIR:-release-files}"', "release assembly script")
+require(
+    assemble_script,
+    'OUTPUT_OWNER_RECEIPT="$OUTPUT_PARENT/.${OUTPUT_BASENAME}.arc-release-output-owner"',
+    "release assembly script",
+)
+stage_step = assembler.index("name: Stage the exact unsigned manifest handoff")
+stage_start = assembler.index("git update-index --really-refresh", stage_step)
+stage_end = assembler.index("exit 1\n          fi\n", assembler.index("Release assembly changed source")) + len(
+    "exit 1\n          fi\n"
+)
+stage_block = "\n".join(
+    line[10:] if line.startswith("          ") else line
+    for line in assembler[stage_start - 10 : stage_end].splitlines()
+)
+
+import subprocess
+import tempfile
+
+with tempfile.TemporaryDirectory() as temp:
+    repo = Path(temp)
+    git = ["git", "-c", "user.name=arc-test", "-c", "user.email=arc-test@example.invalid", "-C", temp]
+    subprocess.run(["git", "init", "-q", temp], check=True)
+    (repo / ".gitignore").write_text("target/\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("source\n", encoding="utf-8")
+    subprocess.run([*git, "add", ".gitignore", "tracked.txt"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "fixture"], check=True)
+    for directory in ("pretag-downloads", "artifacts", "cutover-handoff-download", "cutover-handoff", "release-files", "target"):
+        (repo / directory).mkdir()
+        (repo / directory / "payload").write_text("materialized\n", encoding="utf-8")
+    (repo / ".release-files.arc-release-output-owner").write_text(
+        f"arc-release-output-v1:{repo / 'release-files'}\n", encoding="utf-8"
+    )
+    clean = subprocess.run(["bash", "-Eeuo", "pipefail", "-c", stage_block], cwd=temp, capture_output=True, text=True)
+    if clean.returncode != 0:
+        raise SystemExit("assembler staging check rejects its own outputs: " + clean.stderr)
+    (repo / "stray.txt").write_text("drift\n", encoding="utf-8")
+    drift = subprocess.run(["bash", "-Eeuo", "pipefail", "-c", stage_block], cwd=temp, capture_output=True, text=True)
+    if drift.returncode == 0 or "changed source outside its exact materialized inputs" not in drift.stderr:
+        raise SystemExit("assembler staging check no longer rejects stray source")
 
 manifest_signer = job(release, "manifest-sign")
 require_clean_checks(manifest_signer, 1, "manifest signer")

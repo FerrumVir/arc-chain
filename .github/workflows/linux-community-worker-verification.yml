@@ -1,6 +1,6 @@
 name: Linux community worker verification
 
-# Dispatch only after v0.8.5 publication. The exact release binding and asset
+# Dispatch only after v0.8.6 publication. The exact release binding and asset
 # checks reuse the existing read-only post-release acceptance verifier.
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
       tag:
         description: Exact published release tag
         required: true
-        default: v0.8.5
+        default: v0.8.6
         type: string
       release_source_sha:
         description: Full protected-main commit published as the selected tag
@@ -60,7 +60,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$GITHUB_REF" == refs/heads/main ]]
-          [[ "$RELEASE_TAG" == v0.8.5 ]]
+          [[ "$RELEASE_TAG" == v0.8.6 ]]
           [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RELEASE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$RELEASE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
