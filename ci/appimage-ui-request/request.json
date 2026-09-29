@@ -1,9 +1,9 @@
 {
   "mode": "full",
-  "gate_source_sha": "d087b2e6a95ccf50a00eb9aa45e3c0c5977255ae",
-  "release_tag": "v0.8.6",
+  "gate_source_sha": "3a610110ea0d68eaf58af32da5f82d5439a85a6d",
+  "release_tag": "v0.8.7",
   "prompt": "The largest planet is",
   "max_tokens": "8",
   "worker_wait_minutes": 75,
-  "note": "Published v0.8.6 AppImage via its real UI; one Inference-screen request only after exactly one live community worker (the GitHub Linux verification worker) is eligible on all six coordinators; waits for the UI's mined 0x25 settlement."
+  "note": "Published v0.8.7 AppImage via its real UI; one Inference-screen request only after exactly one live community worker (the GitHub Linux verification worker) is eligible on all six coordinators; waits for the UI's mined 0x25 settlement."
 }
