@@ -1053,12 +1053,13 @@ def validate_platform_checks(platform: str, checks: dict[str, Any]) -> None:
         exact(checks.get(name), expected, f"{platform} check {name}")
     if platform == "windows-x86_64":
         embedded_version = checks.get("embedded_app_product_version")
+        expected_version = REQUIRED_CHECKS[platform]["msi_product_version"]
         if not isinstance(embedded_version, str) or re.fullmatch(
-            r"0\.8\.2(?:\.0)?", embedded_version
+            re.escape(expected_version) + r"(?:\.0)?", embedded_version
         ) is None:
             raise AcceptanceError(
                 "windows-x86_64 check embedded_app_product_version is not an exact "
-                "0.8.3 Windows version"
+                f"{expected_version} Windows version"
             )
 
 
