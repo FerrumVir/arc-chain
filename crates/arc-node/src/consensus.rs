@@ -2521,11 +2521,16 @@ impl ConsensusManager {
                                         );
                                     }
                                     // Missing parents is the ordinary state of a
-                                    // node that is behind; it is counted above
-                                    // and would otherwise be tens of thousands of
-                                    // WARN lines a day. Everything else still
-                                    // warns.
-                                    if message.contains("missing or wrong-round parents") {
+                                    // node that is behind, and a duplicate is a
+                                    // redundant gossip delivery of a block already
+                                    // in the DAG. Both are counted above; as WARN
+                                    // the duplicates alone wrote ~2 GB/day of
+                                    // syslog per validator (2026-09-29). Everything
+                                    // else still warns.
+                                    if message.contains("missing or wrong-round parents")
+                                        || message
+                                            .contains("duplicate block: already exists in DAG")
+                                    {
                                         debug!(
                                             author = %block.author,
                                             round = block.round,

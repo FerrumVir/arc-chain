@@ -32,7 +32,7 @@ from typing import Any, BinaryIO, NoReturn, Sequence
 
 
 REPOSITORY = "FerrumVir/arc-chain"
-VERSION = "0.8.6"
+VERSION = "0.8.7"
 RESTORE_SCHEMA = "arc.validator-vault.restore.v1"
 INSTALL_SCHEMA = "arc.validator-vault.install.v1"
 OFFLINE_STOP_EVIDENCE_SCHEMA = "arc.validator-vault.offline-stop-evidence.v2"

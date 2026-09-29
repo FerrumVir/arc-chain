@@ -51,7 +51,7 @@ RELEASE_SCHEMA = "arc.published-release-binding.v1"
 UPDATE_RELEASE_SCHEMA = "arc.published-release-binding.v2"
 UPDATE_RELEASE_PROFILE = "existing-recovered-chain-update-v1"
 REPOSITORY = "FerrumVir/arc-chain"
-TAG = "v0.8.6"
+TAG = "v0.8.7"
 LAX_HOST = "140.82.16.112"
 LAX_PORT = 443
 LAX_USER = "root"
@@ -125,7 +125,6 @@ APT_PACKAGES = (
     "dbus-x11",
     "file",
     "iptables",
-    "libappindicator3-1",
     "libayatana-appindicator3-1",
     "librsvg2-2",
     "libwebkit2gtk-4.1-0",
