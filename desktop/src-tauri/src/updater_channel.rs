@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn manifest_must_bind_version_target_and_exact_tag_payload() {
-        let selected = validate_channel_release(&release("0.8.6"), Version::new(0, 8, 5)).unwrap();
+        let selected = validate_channel_release(&release("0.8.6"), Version::new(0, 8, 6)).unwrap();
         let exact = release_asset_url("v0.8.6", "arc-desktop-windows-x86_64-setup.exe");
         validate_manifest_binding("0.8.6", "windows-x86_64", &exact, &selected).unwrap();
 
@@ -563,7 +563,7 @@ mod tests {
         // client handed the Windows installer's URL. Distinct from the
         // existing "unsupported target string" case above: both platforms
         // here are individually valid, only the pairing is wrong.
-        let selected = validate_channel_release(&release("0.8.6"), Version::new(0, 8, 5)).unwrap();
+        let selected = validate_channel_release(&release("0.8.6"), Version::new(0, 8, 6)).unwrap();
         let windows_payload = release_asset_url("v0.8.6", "arc-desktop-windows-x86_64-setup.exe");
         assert!(
             validate_manifest_binding("0.8.6", "darwin-aarch64", &windows_payload, &selected)
