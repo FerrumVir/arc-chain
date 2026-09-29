@@ -98,8 +98,8 @@ def valid_tar_rows() -> list[tuple[tarfile.TarInfo, bytes]]:
 
 class BindingTests(unittest.TestCase):
     def test_current_package_gate_is_bound_to_v081(self) -> None:
-        self.assertEqual(gate.TAG, "v0.8.2")
-        self.assertEqual(gate.VERSION, "0.8.2")
+        self.assertEqual(gate.TAG, "v0.8.3")
+        self.assertEqual(gate.VERSION, "0.8.3")
 
     def test_duplicate_required_macos_asset_ids_fail(self) -> None:
         with tempfile.TemporaryDirectory(dir=HELPER.parent) as raw:
@@ -524,7 +524,7 @@ class NativeInputTests(unittest.TestCase):
                 value = gate.build_native_input(args)
             self.assertEqual(value["assets"], inspection["assets"])
             self.assertEqual(value["expectedBundle"], bundle)
-            self.assertEqual(value["releaseVersion"], "0.8.2")
+            self.assertEqual(value["releaseVersion"], "0.8.3")
             self.assertRegex(value["challenge"], r"^[0-9a-f]{64}$")
             self.assertEqual(value["expiresAtUnix"] - value["issuedAtUnix"], 7200)
             self.assertEqual(output.read_bytes(), gate.canonical_json(value))

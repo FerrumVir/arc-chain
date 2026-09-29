@@ -18,6 +18,20 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.3 - Release-preparation snapshot (2026-09-28)
+
+> **Candidate note:** This source prepares v0.8.3 after the immutable v0.8.2
+> publication gate failed. This entry does not claim publication or fleet
+> deployment; verify those states from the exact release and signed rollout
+> evidence.
+
+- Retargets the current release manifests, installer guidance, and acceptance
+  gates to v0.8.3 while retaining the historical v0.8.2 entry below.
+- Fixes GPU staging-buffer usage when mappable primary buffers are unavailable
+  and adds a staged upload/readback regression.
+- Retains failed quality-gate logs as diagnostics so release failures identify
+  their originating check.
+
 ## v0.8.2 - Release-preparation snapshot (2026-09-28)
 
 > **Publication retry note:** The protected v0.8.1 tag is immutable, but its

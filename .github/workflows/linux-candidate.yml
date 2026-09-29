@@ -1,9 +1,10 @@
 name: Linux candidate artifacts
 
-# This workflow is intentionally limited to the current implementation,
-# native-memory, and desktop-availability candidates. It builds review
-# artifacts only; it has no release, deployment, environment, or signing steps.
+# Candidate branches build automatically; manual runs can qualify a reviewed
+# release commit without changing those branches. Every artifact is bound to
+# github.sha. This has no release, deployment, environment, or signing steps.
 on:
+  workflow_dispatch:
   push:
     branches: [arc-chain-v2-implementation-20260919, arc-native-low-residency-20260927, arc-desktop-unattended-availability-20260927]
 

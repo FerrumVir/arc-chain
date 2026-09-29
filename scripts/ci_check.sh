@@ -53,7 +53,9 @@ run_check() {
         PASS=$((PASS + 1))
         RESULTS+=("[PASS] $name")
     else
-        tail -n 50 "$log_file"
+        # A suite can fail early and finish with many successful subtests.
+        # Retain the actual failure in the Actions log as well as on disk.
+        cat "$log_file"
         FAIL=$((FAIL + 1))
         RESULTS+=("[FAIL] $name ($log_file)")
     fi
@@ -214,6 +216,7 @@ printf ' Logs: %s\n' "$LOG_DIR"
 printf '================================================================\n'
 
 run_check "Toolchain preflight" require_commands
+run_check "Warm dependency cache for offline contracts" cargo fetch --locked
 run_check "Release + installer contracts" bash tests/release/run.sh
 run_check "Shell syntax" check_shell_syntax
 run_check "ShellCheck" check_shell_lint
