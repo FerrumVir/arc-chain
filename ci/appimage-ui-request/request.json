@@ -1,9 +1,9 @@
 {
-  "mode": "rehearsal",
-  "gate_source_sha": "d3d8c04c26cb8fa54febe0e394eecec6c7932a44",
-  "desktop_artifact_id": 11029951433,
-  "headless_artifact_id": 11027024767,
+  "mode": "full",
+  "gate_source_sha": "d087b2e6a95ccf50a00eb9aa45e3c0c5977255ae",
+  "release_tag": "v0.8.6",
   "prompt": "The largest planet is",
   "max_tokens": "8",
-  "note": "Rehearsal with protected pre-tag v0.8.5 packages from preflight 36553959571/1; expected free route without a community worker (no reward)."
+  "worker_wait_minutes": 75,
+  "note": "Published v0.8.6 AppImage via its real UI; one Inference-screen request only after exactly one live community worker (the GitHub Linux verification worker) is eligible on all six coordinators; waits for the UI's mined 0x25 settlement."
 }
