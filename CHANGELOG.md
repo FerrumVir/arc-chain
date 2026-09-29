@@ -18,6 +18,18 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.4 - Release-preparation snapshot (2026-09-29)
+
+> **Candidate note:** This source prepares a new release after the immutable
+> v0.8.3 attempt failed. This entry does not claim publication or fleet
+> deployment; verify those states from the exact release and signed rollout
+> evidence.
+
+- Advances the release source, exact-tag acceptance, installer guidance, and
+  application metadata to v0.8.4.
+- Fixes release fixture profile isolation so cutover assembly uses its intended
+  profile when the caller exports another profile.
+
 ## v0.8.3 - Release-preparation snapshot (2026-09-28)
 
 > **Candidate note:** This source prepares v0.8.3 after the immutable v0.8.2

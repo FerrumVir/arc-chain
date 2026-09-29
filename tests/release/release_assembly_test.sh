@@ -119,6 +119,7 @@ run_assembler() {
     (
         cd "$REPO_ROOT" || exit 1
         env \
+            RELEASE_PROFILE='cutover-v1' \
             ARTIFACTS_DIR="$sandbox/artifacts" \
             OUTPUT_DIR="$sandbox/output" \
             GENESIS_FILE="$genesis_file" \
@@ -628,6 +629,14 @@ assembler_preserves_unowned_and_last_good_outputs() {
     }
 }
 
+cutover_fixture_ignores_parent_release_profile() (
+    # The release workflow exports its production profile to all quality gates.
+    # These fixtures exercise cutover assembly even during an existing-chain update.
+    export RELEASE_PROFILE=existing-recovered-chain-update-v1
+    complete_fixture_produces_verifiable_contract
+)
+
+run_test 'cutover fixture ignores an inherited existing-chain update profile' cutover_fixture_ignores_parent_release_profile
 run_test 'complete fixture produces exact-tag manifest and verified SHA256SUMS' complete_fixture_produces_verifiable_contract
 run_test 'complete assembled cutover release crosses the signing handoff intact' complete_cutover_release_stages_through_signing_handoff
 run_test 'complete production genesis preserves its explicit activation schedule' complete_scheduled_genesis_is_preserved
