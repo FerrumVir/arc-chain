@@ -581,7 +581,7 @@ async function validatePackagedAppImage(options, sourceCommit, repositoryRoot) {
 
   exactKeys(receipt.release, ["assets", "binding_sha256", "commit", "release_id", "repository", "tag"], "packaged AppImage release");
   assert.equal(receipt.release.repository, "FerrumVir/arc-chain");
-  assert.equal(receipt.release.tag, "v0.8.4");
+  assert.equal(receipt.release.tag, "v0.8.5");
   assert.equal(receipt.release.commit, sourceCommit);
   assert.ok(Number.isSafeInteger(receipt.release.release_id) && receipt.release.release_id > 0);
   expectedHash(receipt.release.binding_sha256, "packaged AppImage release binding");
@@ -704,7 +704,7 @@ function validateNativeNetwork(networkValue, expectedSource, minimumHeight, maxi
   ], "packaged native network");
   assert.equal(networkValue.sourceHost, expectedSource, "native network crossed coordinator origins");
   assert.equal(networkValue.unavailable, null, "native network is unavailable");
-  assert.equal(networkValue.hostVersion, "0.8.4", "native network host version differs");
+  assert.equal(networkValue.hostVersion, "0.8.5", "native network host version differs");
   assert.ok(Number.isSafeInteger(networkValue.height) && networkValue.height >= minimumHeight, "native network tip is below the accepted receipt");
   assert.ok(Number.isSafeInteger(networkValue.lastBlockAgeSecs) && networkValue.lastBlockAgeSecs <= maximumAge, "native network tip is stale");
   assert.equal(networkValue.isBlockProducing, true, "native network is not producing blocks");
@@ -764,7 +764,7 @@ function validateMacosRelease(value, input, label) {
     id: input.releaseId,
     runAttempt: input.releaseRunAttempt,
     runId: input.releaseRunId,
-    tag: "v0.8.4",
+    tag: "v0.8.5",
   }, `${label} differs from the native release binding`);
 }
 
@@ -1225,7 +1225,7 @@ export async function validatePackagedNative(
   assert.equal(input.frontendConfigSha256, frontendConfigSha256, "packaged native input frontend config differs");
   assert.equal(input.expectedCoordinator, "https://140.82.16.112", "packaged native input selected another coordinator");
   canonicalHash(input.expectedModelId, "packaged native expected model");
-  assert.equal(input.releaseVersion, "0.8.4", "packaged native release version differs");
+  assert.equal(input.releaseVersion, "0.8.5", "packaged native release version differs");
   assert.ok(Number.isSafeInteger(input.releaseId) && input.releaseId > 0, "packaged native release ID is invalid");
   assert.ok(Number.isSafeInteger(input.releaseRunId) && input.releaseRunId > 0, "packaged native release run ID is invalid");
   assert.ok(Number.isSafeInteger(input.releaseRunAttempt) && input.releaseRunAttempt > 0, "packaged native release attempt is invalid");
@@ -1324,7 +1324,7 @@ export async function validatePackagedNative(
     "tauriBuilderStarted", "webviewsCreated",
   ], "packaged native runtime");
   assert.equal(receipt.runtime.appDataRelativePath, "Library/Application Support/network.arc.desktop");
-  assert.equal(receipt.runtime.appVersion, "0.8.4");
+  assert.equal(receipt.runtime.appVersion, "0.8.5");
   assert.equal(receipt.runtime.architecture, "aarch64");
   assert.equal(receipt.runtime.operatingSystem, "macos");
   assert.equal(receipt.runtime.buildSourceCommit, sourceCommit);
@@ -1361,7 +1361,7 @@ export async function validatePackagedNative(
   assert.ok(Number.isSafeInteger(receipt.dispatch.elapsedMs) && receipt.dispatch.elapsedMs <= receipt.dispatch.maxWaitMs);
   assert.equal(receipt.dispatch.sourceHost, input.expectedCoordinator);
   const inputSha256 = sha256(inputFile.raw);
-  const prompt = `ARC packaged v0.8.4 production acceptance challenge ${input.challenge} input ${inputSha256}`;
+  const prompt = `ARC packaged v0.8.5 production acceptance challenge ${input.challenge} input ${inputSha256}`;
   assert.equal(receipt.dispatch.promptSha256, sha256(Buffer.from(prompt)), "native dispatch prompt differs from challenge");
   const promptBlake3 = `0x${blake3Short(Buffer.from(prompt, "utf8"))}`;
   const result = receipt.dispatch.result;

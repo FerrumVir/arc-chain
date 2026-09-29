@@ -27,7 +27,7 @@ REPOSITORY = "FerrumVir/arc-chain"
 COMMIT = "a" * 40
 RUN_ID = 123456
 RUN_ATTEMPT = 2
-VERSION = "0.8.4"
+VERSION = "0.8.5"
 
 GROUPS = (
     ("headless", "linux-x86_64", "x86_64-unknown-linux-gnu"),

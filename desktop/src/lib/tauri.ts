@@ -2462,7 +2462,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         running,
         pid: running && !external ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
-        version: "0.8.4",
+        version: "0.8.5",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,
