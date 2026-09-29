@@ -46,6 +46,10 @@ from urllib.parse import quote
 SCHEMA = "arc.packaged-appimage-live-product.v1"
 HOST_SCHEMA = "arc.packaged-appimage-live-host.v1"
 RELEASE_SCHEMA = "arc.published-release-binding.v1"
+# Existing-chain update releases carry an explicit profile in the otherwise
+# identical binding produced by published-artifact-acceptance.py.
+UPDATE_RELEASE_SCHEMA = "arc.published-release-binding.v2"
+UPDATE_RELEASE_PROFILE = "existing-recovered-chain-update-v1"
 REPOSITORY = "FerrumVir/arc-chain"
 TAG = "v0.8.6"
 LAX_HOST = "140.82.16.112"
@@ -495,23 +499,25 @@ def require_exact_keys(value: Mapping[str, Any], expected: Iterable[str], label:
 
 def validate_release_binding(path: Path) -> tuple[dict[str, Any], bytes]:
     binding, raw = load_json(path, "published release binding")
-    require_exact_keys(
-        binding,
-        {
-            "assets",
-            "commit",
-            "legacy_source",
-            "published_evidence",
-            "release",
-            "release_workflow",
-            "repository",
-            "schema",
-            "tag",
-        },
-        "published release binding",
-    )
-    if binding.get("schema") != RELEASE_SCHEMA:
+    expected_keys = {
+        "assets",
+        "commit",
+        "legacy_source",
+        "published_evidence",
+        "release",
+        "release_workflow",
+        "repository",
+        "schema",
+        "tag",
+    }
+    is_update = isinstance(binding, Mapping) and binding.get("schema") == UPDATE_RELEASE_SCHEMA
+    if is_update:
+        expected_keys.add("profile")
+    require_exact_keys(binding, expected_keys, "published release binding")
+    if binding.get("schema") not in (RELEASE_SCHEMA, UPDATE_RELEASE_SCHEMA):
         raise GateError("published release binding schema mismatch")
+    if is_update and binding.get("profile") != UPDATE_RELEASE_PROFILE:
+        raise GateError("published update release binding profile mismatch")
     if binding.get("repository") != REPOSITORY or binding.get("tag") != TAG:
         raise GateError("published release binding repository/tag mismatch")
     if not SHA_RE.fullmatch(str(binding.get("commit", ""))):

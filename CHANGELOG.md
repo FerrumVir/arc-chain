@@ -30,6 +30,11 @@ All notable changes to ARC Chain are tracked here. This project follows
   writes beside `release-files/` from the manifest-staging source check.
 - Runs the real staging cleanliness block against the assembler's outputs in
   the release workflow contract test, so a rejected receipt fails in CI.
+- Lets the macOS package provenance controller and the AppImage live gate
+  accept the `arc.published-release-binding.v2` binding that
+  `published-artifact-acceptance.py bind` emits for existing-chain update
+  releases, only with the exact `existing-recovered-chain-update-v1` profile.
+  Both previously accepted only the cutover-profile v1 binding.
 - Records the v0.8.5 failure (Release ARC run 36569256300): every quality,
   golden-vector and pre-tag verification job passed, then staging rejected
   `.release-files.arc-release-output-owner`. No runtime behavior changes are

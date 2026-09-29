@@ -163,6 +163,25 @@ class BindingTests(unittest.TestCase):
             with self.assertRaisesRegex(GATE.GateError, "IDs are not distinct"):
                 GATE.validate_release_binding(fixture.binding_path)
 
+    def test_existing_chain_update_binding_requires_exact_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = Fixture(Path(raw))
+            fixture.binding["schema"] = GATE.UPDATE_RELEASE_SCHEMA
+            fixture.binding["profile"] = GATE.UPDATE_RELEASE_PROFILE
+            fixture.binding_path.write_bytes(GATE.canonical_json(fixture.binding))
+            binding, _ = GATE.validate_release_binding(fixture.binding_path)
+            self.assertEqual(binding["profile"], "existing-recovered-chain-update-v1")
+
+            fixture.binding["profile"] = "cutover-v1"
+            fixture.binding_path.write_bytes(GATE.canonical_json(fixture.binding))
+            with self.assertRaisesRegex(GATE.GateError, "profile mismatch"):
+                GATE.validate_release_binding(fixture.binding_path)
+
+            del fixture.binding["profile"]
+            fixture.binding_path.write_bytes(GATE.canonical_json(fixture.binding))
+            with self.assertRaisesRegex(GATE.GateError, "fields differ"):
+                GATE.validate_release_binding(fixture.binding_path)
+
 
 class AttemptTests(unittest.TestCase):
     def test_attempt_is_256_bit_release_and_plan_bound(self) -> None:
