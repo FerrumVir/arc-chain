@@ -73,9 +73,14 @@ def main() -> int:
     appimage.chmod(0o500)
     result["appimage_sha256"] = sha256(appimage)
     subprocess.run([str(appimage), "--appimage-extract"], cwd=work, check=True, capture_output=True, timeout=180)
-    app_binary = (work / "squashfs-root" / "AppRun").resolve(strict=True)
-    if app_binary.name != gate.EXPECTED_APP_BINARY:
-        raise RuntimeError(f"AppRun target is {app_binary.name}, not {gate.EXPECTED_APP_BINARY}")
+    squashfs = work / "squashfs-root"
+    app_run = squashfs / "AppRun"
+    result["apprun"] = {"is_symlink": app_run.is_symlink(), "resolves_to": str(app_run.resolve().relative_to(squashfs.resolve()))}
+    candidates = sorted(p for p in squashfs.rglob(gate.EXPECTED_APP_BINARY) if p.is_file() and not p.is_symlink())
+    if len(candidates) != 1:
+        raise RuntimeError(f"expected exactly one {gate.EXPECTED_APP_BINARY} ELF, found {candidates}")
+    app_binary = candidates[0]
+    result["app_binary_path"] = str(app_binary.relative_to(squashfs))
     result["app_binary_sha256"] = sha256(app_binary)
 
     environment = {key: os.environ[key] for key in ("DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR") if key in os.environ}
