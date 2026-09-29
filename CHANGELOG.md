@@ -18,6 +18,28 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.7 - Release-preparation snapshot (2026-09-29)
+
+> **Candidate note:** v0.8.6 was published and deployed on all six
+> validators. Post-release verification of v0.8.6 found the defects below;
+> this entry does not claim publication or fleet deployment of v0.8.7.
+
+- Fixes community-worker registration: coordinators publish
+  `validator_address` and `transaction_domain` 0x-prefixed, and the worker's
+  signed register/heartbeat path parsed them as bare hex, so every
+  registration failed before its POST (logged only at DEBUG). The audience is
+  now parsed exactly like the other validator HTTP audiences, with a
+  regression test on the live `/network/info` shape.
+- Logs redundant gossip deliveries of blocks already in the DAG at DEBUG
+  instead of WARN (still counted in consensus diagnostics); at WARN they wrote
+  about 2 GB of syslog per validator per day.
+- Published-artifact acceptance: installs only `libayatana-appindicator3-1`
+  (it conflicts with `libappindicator3-1` on Ubuntu 24.04), and accepts the
+  32-bit NSIS installer stub while still requiring the installed
+  `arc-desktop.exe` to be AMD64. The AppImage live gate drops the same
+  conflicting package, and the desktop runbook accepts the v2 update binding.
+- Advances active release and acceptance pins to v0.8.7.
+
 ## v0.8.6 - Release-preparation snapshot (2026-09-29)
 
 > **Candidate note:** This source prepares a new release after the immutable

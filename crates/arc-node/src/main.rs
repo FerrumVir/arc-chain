@@ -5270,6 +5270,45 @@ async fn run_signed_shard_announcement_loop_inner(
 /// POST one authenticated community mutation. A new timestamp and CSPRNG
 /// nonce are signed for every attempt; callers must invoke this again for a
 /// retry or a different coordinator rather than reusing the wire envelope.
+/// Read the audience a signed community request must bind to from a
+/// coordinator's `/network/info`. Coordinators publish both hashes
+/// 0x-prefixed, like every RPC hash, so parse them exactly as the other
+/// validator HTTP audiences are parsed.
+fn community_audience_from_network_info(
+    info: &serde_json::Value,
+) -> Result<(Hash256, Option<Hash256>)> {
+    let target_coordinator = info
+        .get("validator_address")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("coordinator omitted validator_address"))
+        .and_then(|value| {
+            parse_validator_http_audience_hash(value, "coordinator validator_address")
+        })?;
+    let transaction_domain = match info.get("transaction_domain") {
+        Some(serde_json::Value::String(value)) => Some(parse_validator_http_audience_hash(
+            value,
+            "coordinator transaction_domain",
+        )?),
+        Some(serde_json::Value::Null) | None => None,
+        Some(_) => {
+            return Err(anyhow::anyhow!(
+                "coordinator transaction_domain is malformed"
+            ));
+        }
+    };
+    if info
+        .get("recovery_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && transaction_domain.is_none()
+    {
+        return Err(anyhow::anyhow!(
+            "recovery coordinator omitted its required transaction_domain"
+        ));
+    }
+    Ok((target_coordinator, transaction_domain))
+}
+
 async fn post_signed_community<T: serde::Serialize>(
     client: &reqwest::Client,
     rpc_base: &str,
@@ -5289,37 +5328,7 @@ async fn post_signed_community<T: serde::Serialize>(
         .json::<serde_json::Value>()
         .await
         .context("decode community coordinator audience")?;
-    let target_coordinator = info
-        .get("validator_address")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("coordinator omitted validator_address"))
-        .and_then(|value| {
-            Hash256::from_hex(value)
-                .map_err(|error| anyhow::anyhow!("invalid coordinator validator_address: {error}"))
-        })?;
-    let transaction_domain = match info.get("transaction_domain") {
-        Some(serde_json::Value::String(value)) => {
-            Some(Hash256::from_hex(value).map_err(|error| {
-                anyhow::anyhow!("invalid coordinator transaction_domain: {error}")
-            })?)
-        }
-        Some(serde_json::Value::Null) | None => None,
-        Some(_) => {
-            return Err(anyhow::anyhow!(
-                "coordinator transaction_domain is malformed"
-            ));
-        }
-    };
-    if info
-        .get("recovery_active")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        && transaction_domain.is_none()
-    {
-        return Err(anyhow::anyhow!(
-            "recovery coordinator omitted its required transaction_domain"
-        ));
-    }
+    let (target_coordinator, transaction_domain) = community_audience_from_network_info(&info)?;
     let signed = rpc::sign_community_request(
         path,
         payload,
@@ -9686,6 +9695,37 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn community_audience_accepts_live_0x_prefixed_network_info() {
+        // Live v0.8.x coordinators publish 0x-prefixed hashes; before this
+        // parser existed every community registration failed before POSTing.
+        let validator = "44".repeat(32);
+        let domain = "3b".repeat(32);
+        let live = json!({
+            "validator_address": format!("0x{validator}"),
+            "transaction_domain": format!("0x{domain}"),
+            "recovery_active": true,
+        });
+        let (target, bound_domain) = community_audience_from_network_info(&live).unwrap();
+        assert_eq!(target, Hash256::from_hex(&validator).unwrap());
+        assert_eq!(bound_domain, Some(Hash256::from_hex(&domain).unwrap()));
+
+        let bare = json!({"validator_address": validator, "recovery_active": false});
+        assert_eq!(community_audience_from_network_info(&bare).unwrap().1, None);
+
+        let recovery_without_domain =
+            json!({"validator_address": validator, "recovery_active": true});
+        assert!(community_audience_from_network_info(&recovery_without_domain).is_err());
+        assert!(community_audience_from_network_info(&json!({"recovery_active": false})).is_err());
+        assert!(
+            community_audience_from_network_info(&json!({
+                "validator_address": "0xnot-hex",
+                "recovery_active": false,
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn startup_selects_recovery_certificate_domain_without_first_binding_genesis() {
