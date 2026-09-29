@@ -16,6 +16,6 @@ jobs:
         run: printf 'probe\n' > probe.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: arc-existing-chain-update-unsigned-release-handoff-d3d8c04c26cb8fa54febe0e394eecec6c7932a44-36569256300-1-0123456789abcdef0123456789abcdef-name-length-probe-165
+          name: arc-existing-chain-update-unsigned-release-handoff-d3d8c04c26cb8fa54febe0e394eecec6c7932a44-36569256300-1-0123456789abcdef0123456789abcdef-name-length-probe-xxxxxxxxxxxxx
           path: probe.txt
           retention-days: 1
