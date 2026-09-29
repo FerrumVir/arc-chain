@@ -106,6 +106,20 @@ def main() -> int:
     client = gate.W3CClient("127.0.0.1", port)
     testid = gate.testid
     failure = None
+    seed_visible = False
+
+    def snap(name: str) -> None:
+        """Best-effort evidence screenshot; the UI flow never depends on it."""
+        last = None
+        for _ in range(5):
+            try:
+                result["screenshots"].append(client.screenshot(evidence / name))
+                return
+            except Exception as error:  # small/blank frames are retried
+                last = error
+                time.sleep(2)
+        result["screenshots"].append({"name": name, "error": str(last)[:200]})
+
     try:
         gate.wait_tcp_listener(driver, port)
         client.new_session(appimage)
@@ -114,12 +128,13 @@ def main() -> int:
         if client.elements(testid("production-browser-blocker")) or client.elements(testid("synthetic-preview-banner")):
             raise RuntimeError("packaged app rendered a blocker/preview banner")
         client.wait_element(testid("step-welcome"), 30)
-        result["screenshots"].append(client.screenshot(evidence / "01-welcome.png"))
+        snap("01-welcome.png")
         client.click(client.element(testid("btn-continue-welcome")))
         client.wait_element(testid("step-identity"), 15)
         address = gate.element_text(client, "identity-address", 30).strip().lower()
         result["identity_address"] = address if address.startswith("0x") else "0x" + address
-        result["screenshots"].append(client.screenshot(evidence / "02-identity-blurred.png"))
+        snap("02-identity-blurred.png")
+        seed_visible = True
         client.click(client.element(testid("btn-reveal-seed")))
 
         def continue_ready():
@@ -132,10 +147,12 @@ def main() -> int:
 
         client.click(client.wait(continue_ready, "enabled identity acknowledgement", 30))
         client.wait_element(testid("step-model"), 15)
+        seed_visible = False
+        client.wait_element(testid("step-model"), 15)
         client.click(client.element(testid("tier-skip")))
         client.click(client.element(testid("btn-continue-model")))
         client.wait_element(testid("step-launch"), 15)
-        result["screenshots"].append(client.screenshot(evidence / "03-observer-launch.png"))
+        snap("03-observer-launch.png")
         client.click(client.element(testid("btn-launch")))
         result["tests"].append({"name": "onboarding observer launch", "status": "passed"})
 
@@ -154,7 +171,7 @@ def main() -> int:
         peers_tile = client.wait_element(f'{testid("stat-peers")} .stat-value', 30)
         sidebar = gate.element_text(client, "sidebar-status", 30)
         result["dashboard"] = {"local_block_height_text": height, "local_peers_text": client.text(peers_tile), "sidebar_status": sidebar}
-        result["screenshots"].append(client.screenshot(evidence / "04-dashboard.png"))
+        snap("04-dashboard.png")
         result["tests"].append({"name": "managed node started from dashboard", "status": "passed"})
 
         client.click(client.element(testid("nav-inference")))
@@ -189,7 +206,7 @@ def main() -> int:
         for label in ("inference-community-worker", "inference-coordinator"):
             found = client.elements(testid(label))
             result["inference"][label] = client.text(found[0]) if found else None
-        result["screenshots"].append(client.screenshot(evidence / "05-inference-result.png"))
+        snap("05-inference-result.png")
         result["tests"].append({"name": "inference screen request returned a result", "status": "passed"})
 
         settlements = client.elements(testid("community-settlement"))
@@ -206,12 +223,13 @@ def main() -> int:
             settlement = client.wait(mined, "mined 0x25 settlement in UI", gate.RECEIPT_UI_WAIT_SECONDS)
             result["settlement"] = {name: client.attribute(settlement, "data-" + name) for name in (
                 "receipt-status", "tx-type", "tx-hash", "job-id", "worker", "receipt-url", "submitted")}
-            result["screenshots"].append(client.screenshot(evidence / "06-settlement.png"))
+            snap("06-settlement.png")
             result["tests"].append({"name": "UI shows mined 0x25 settlement", "status": "passed"})
     except BaseException as error:  # preserve every partial observation
         failure = f"{type(error).__name__}: {error}"
         try:
-            result["screenshots"].append(client.screenshot(evidence / "99-failure.png"))
+            if not seed_visible:
+                snap("99-failure.png")
         except BaseException:
             pass
     finally:
