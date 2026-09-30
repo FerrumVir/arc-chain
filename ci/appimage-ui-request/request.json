@@ -5,5 +5,5 @@
   "prompt": "The largest planet is",
   "max_tokens": "8",
   "worker_wait_minutes": 75,
-  "note": "Published v0.8.7 AppImage via its real UI against the live v0.8.8 coordinators (idle-worker liveness fix); one Inference-screen request only after exactly one live community worker (branch run ci/community-worker-v087-1 of the published v0.8.7 worker) is eligible on all six coordinators; waits for the UI mined 0x25 settlement."
+  "note": "Published v0.8.7 AppImage via its real UI against the live v0.8.8 coordinators (idle-worker liveness fix); one Inference-screen request only after exactly one live community worker (branch run ci/community-worker-v087-1 of the published v0.8.7 worker) is eligible on all six coordinators; waits for the UI mined 0x25 settlement. Retry: run 36669577905 reached the worker (routed community, coordinator AMS) but AMS verification lacked a third live replica 7 min after its restart; all 18 shard replicas are listed again."
 }
