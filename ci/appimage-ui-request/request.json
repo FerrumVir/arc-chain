@@ -1,9 +1,14 @@
 {
-  "mode": "full",
+  "mode": "paid",
   "gate_source_sha": "3a610110ea0d68eaf58af32da5f82d5439a85a6d",
   "release_tag": "v0.8.7",
-  "prompt": "The largest planet is",
-  "max_tokens": "8",
-  "worker_wait_minutes": 75,
-  "note": "Published v0.8.7 AppImage via its real UI; one Inference-screen request only after exactly one live community worker (the GitHub Linux verification worker) is eligible on all six coordinators; waits for the UI's mined 0x25 settlement."
+  "prompt": "Hello",
+  "max_tokens": "2",
+  "wallet_host": "https://202.182.107.41",
+  "price": "0.01",
+  "reserve": "0.02",
+  "expiry_blocks": 6000,
+  "refund_expiry_blocks": 60,
+  "finalize_wait_minutes": 40,
+  "note": "Paid-mode REHEARSAL before native activation: validates onboarding, app-faucet funding and navigation on published v0.8.7; expected to stop waiting for native-paid-card because /native-inference/context is 404 until activation."
 }

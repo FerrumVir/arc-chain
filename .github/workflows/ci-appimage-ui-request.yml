@@ -34,7 +34,13 @@ jobs:
           python3 - >> "$GITHUB_OUTPUT" <<'PY'
           import json, re
           r = json.load(open("ci/appimage-ui-request/request.json"))
-          assert r["mode"] in ("rehearsal", "full")
+          assert r["mode"] in ("rehearsal", "full", "paid")
+          if r["mode"] == "paid":
+              assert r["wallet_host"] in {"https://" + ip for ip in ("149.28.32.76", "140.82.16.112", "136.244.109.1", "104.238.171.11", "202.182.107.41", "149.28.153.31")}
+              for key in ("price", "reserve"):
+                  assert re.fullmatch(r"0[.][0-9]{1,9}|[1-9][0-9]*([.][0-9]{1,9})?", str(r[key]))
+              for key in ("expiry_blocks", "refund_expiry_blocks"):
+                  assert re.fullmatch(r"[1-9][0-9]{1,4}", str(r[key]))
           assert re.fullmatch(r"[0-9a-f]{40}", r["gate_source_sha"])
           assert re.fullmatch(r"[1-9][0-9]{0,2}", str(r["max_tokens"]))
           for key in ("mode", "gate_source_sha", "max_tokens"):
@@ -44,6 +50,12 @@ jobs:
           print(f"headless_artifact_id={r.get('headless_artifact_id', '')}")
           print(f"release_tag={r.get('release_tag', '')}")
           print(f"worker_wait_minutes={int(r.get('worker_wait_minutes', 0))}")
+          print(f"wallet_host={r.get('wallet_host', '')}")
+          print(f"price={r.get('price', '0.01')}")
+          print(f"reserve={r.get('reserve', '0.02')}")
+          print(f"expiry_blocks={r.get('expiry_blocks', 6000)}")
+          print(f"refund_expiry_blocks={r.get('refund_expiry_blocks', 60)}")
+          print(f"finalize_wait_seconds={int(r.get('finalize_wait_minutes', 40)) * 60}")
           PY
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -176,7 +188,13 @@ jobs:
               --appimage "$APPIMAGE" --arc-node "$ARC_NODE" \
               --runtime-root "$RUNNER_TEMP/arc-ui" \
               --prompt "$prompt" --max-tokens "${{ steps.request.outputs.max_tokens }}" \
-              --mode "${{ steps.request.outputs.mode }}"
+              --mode "${{ steps.request.outputs.mode }}" \
+              --wallet-host "${{ steps.request.outputs.wallet_host }}" \
+              --price "${{ steps.request.outputs.price }}" \
+              --reserve "${{ steps.request.outputs.reserve }}" \
+              --expiry-blocks "${{ steps.request.outputs.expiry_blocks }}" \
+              --refund-expiry-blocks "${{ steps.request.outputs.refund_expiry_blocks }}" \
+              --finalize-wait-seconds "${{ steps.request.outputs.finalize_wait_seconds }}"
 
       - name: Upload UI evidence
         if: always()

@@ -6,7 +6,10 @@ release commit's scripts/release/packaged-appimage-live-gate.py. Unlike that
 gate, the runner itself is the disposable host (no Lima VM, no SSH relay), so
 production HTTPS egress is direct. The flow is the gate's: fresh onboarding
 (observer, no model), managed arc-node start, dashboard, one Inference-screen
-request, and (full mode) the UI's mined 0x25 settlement receipt.
+request, and (full mode) the UI's mined 0x25 settlement receipt. Paid mode
+instead funds the fresh wallet from the app's faucet, submits one native paid
+request that must finalize, replays its journaled signed bytes (must not be
+admitted twice), and submits a short-expiry request that must be refunded.
 
 No screenshot, page-source or element-text request is made while the fresh
 recovery phrase is revealed.
@@ -49,8 +52,19 @@ def main() -> int:
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--max-tokens", default="8")
-    parser.add_argument("--mode", choices=("rehearsal", "full"), required=True)
+    parser.add_argument("--mode", choices=("rehearsal", "full", "paid"), required=True)
+    parser.add_argument("--wallet-host", default="")
+    parser.add_argument("--price", default="0.01")
+    parser.add_argument("--reserve", default="0.02")
+    parser.add_argument("--expiry-blocks", default="6000")
+    parser.add_argument("--refund-expiry-blocks", default="60")
+    parser.add_argument("--finalize-wait-seconds", type=int, default=2400)
     args = parser.parse_args()
+    if args.mode == "paid":
+        allowed = {"https://" + ip for ip in ("149.28.32.76", "140.82.16.112", "136.244.109.1",
+                                               "104.238.171.11", "202.182.107.41", "149.28.153.31")}
+        if args.wallet_host not in allowed:
+            raise SystemExit("paid mode requires --wallet-host naming one validator's public HTTPS edge")
     gate = load_gate(args.gate)
 
     root = args.runtime_root
@@ -97,6 +111,11 @@ def main() -> int:
         "XDG_CONFIG_HOME": str(profile / "config"),
         "XDG_DATA_HOME": str(profile / "data"),
     })
+    if args.wallet_host:
+        # Documented chain-host override (commands.rs chain_host): pins balance,
+        # faucet, native context/submit/receipt reads to this one validator.
+        environment["ARC_WALLET_HOST"] = args.wallet_host
+        result["wallet_host"] = args.wallet_host
     port = gate.free_loopback_port()
     driver_out = (evidence / "webkit-driver.stdout").open("xb")
     driver_err = (evidence / "webkit-driver.stderr").open("xb")
@@ -174,6 +193,38 @@ def main() -> int:
         snap("04-dashboard.png")
         result["tests"].append({"name": "managed node started from dashboard", "status": "passed"})
 
+        if args.mode == "paid":
+            paid_flow(client, gate, testid, args, profile, evidence, result, snap)
+            return_value = None
+        else:
+            return_value = free_request(client, gate, testid, args, result, snap)
+    except BaseException as error:  # preserve every partial observation
+        failure = f"{type(error).__name__}: {error}"
+        try:
+            if not seed_visible:
+                snap("99-failure.png")
+        except BaseException:
+            pass
+    finally:
+        try:
+            client.close()
+        except BaseException as error:
+            result["session_close_error"] = str(error)[:300]
+        driver.terminate()
+        try:
+            driver.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            driver.kill()
+        result["finished_at_unix"] = time.time()
+        result["failure"] = failure
+        result["pass"] = failure is None
+        (evidence / "ui-request-result.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
+        print(json.dumps({k: result.get(k) for k in ("mode", "pass", "failure", "inference", "settlement", "dashboard", "paid")}, indent=2, default=str))
+    return 0 if failure is None else 1
+
+
+def free_request(client, gate, testid, args, result, snap):
+    if True:
         client.click(client.element(testid("nav-inference")))
         client.wait_element(testid("inference-screen"), 15)
         prompt_element = client.element(testid("inference-prompt"))
@@ -225,29 +276,172 @@ def main() -> int:
                 "receipt-status", "tx-type", "tx-hash", "job-id", "worker", "receipt-url", "submitted")}
             snap("06-settlement.png")
             result["tests"].append({"name": "UI shows mined 0x25 settlement", "status": "passed"})
-    except BaseException as error:  # preserve every partial observation
-        failure = f"{type(error).__name__}: {error}"
+    return None
+
+
+def read_journal(profile: Path) -> list:
+    found = sorted(profile.rglob("native-requests.json"))
+    if len(found) != 1:
+        raise RuntimeError(f"expected one native request journal, found {found}")
+    data = json.loads(found[0].read_text())
+    records = data.get("records", data) if isinstance(data, dict) else data
+    return records if isinstance(records, list) else []
+
+
+def journal_entry(profile: Path, known: set) -> dict:
+    fresh = [r for r in read_journal(profile) if r.get("request_id") and r.get("request_id") not in known
+             and str(r.get("kind", "")).lower().endswith("request")]
+    if len(fresh) != 1:
+        raise RuntimeError(f"expected exactly one new journaled request, found {len(fresh)}")
+    return fresh[0]
+
+
+def paid_flow(client, gate, testid, args, profile, evidence, result, snap):
+    import urllib.request
+
+    paid: dict = {"requests": []}
+    result["paid"] = paid
+
+    # 1. Fund the fresh wallet through the app's own faucet button.
+    client.click(client.element(testid("nav-wallet")))
+    client.wait_element(testid("wallet-screen"), 20)
+    client.click(client.wait_element(testid("btn-faucet"), 30))
+
+    def faucet_done():
+        errors = client.elements(testid("faucet-error"))
+        if errors:
+            raise RuntimeError("faucet failed: " + client.text(errors[0])[:300])
+        ok = client.elements(testid("faucet-success"))
+        return ok[0] if ok else None
+
+    paid["faucet"] = client.text(client.wait(faucet_done, "faucet result", 120))[:300]
+
+    def funded():
+        text = client.text(client.element(testid("wallet-balance"))).replace(",", "")
+        digits = "".join(ch for ch in text if ch.isdigit() or ch == ".")
         try:
-            if not seed_visible:
-                snap("99-failure.png")
-        except BaseException:
-            pass
-    finally:
+            return text if digits and float(digits) >= float(args.reserve) * 2 else None
+        except ValueError:
+            return None
+
+    paid["balance_after_faucet"] = client.wait(funded, "faucet credit mined into the wallet balance", 300)
+    snap("10-wallet-funded.png")
+    result["tests"].append({"name": "wallet funded from the app faucet", "status": "passed"})
+
+    # 2. The paid panel on the Inference screen.
+    client.click(client.element(testid("nav-inference")))
+    client.wait_element(testid("inference-screen"), 15)
+    client.wait_element(testid("native-paid-card"), 120)
+    status = client.elements(testid("native-context-status"))
+    paid["context_status"] = client.text(status[0])[:400] if status else None
+    snap("11-native-panel.png")
+    known: set = set()
+
+    def submit(expiry_blocks: str, label: str) -> dict:
+        for tid, value in (("native-prompt", args.prompt), ("native-max-tokens", args.max_tokens),
+                           ("native-price", args.price), ("native-reserve", args.reserve),
+                           ("native-expiry", expiry_blocks)):
+            field = client.element(testid(tid))
+            client.clear(field)
+            client.send_keys(field, value)
+        client.click(client.element(testid("btn-native-review")))
+
+        def reviewed():
+            errors = client.elements(testid("native-form-error"))
+            if errors:
+                raise RuntimeError("paid form refused: " + client.text(errors[0])[:300])
+            found = client.elements(testid("native-review"))
+            return found[0] if found else None
+
+        client.wait(reviewed, "paid request review", 60)
+        if client.elements(testid("native-positions-error")):
+            raise RuntimeError("paid request exceeds executor positions: " +
+                               client.text(client.element(testid("native-positions-error")))[:300])
+        sign = client.element(testid("btn-native-sign"))
+        if client.attribute(sign, "disabled") is not None:
+            raise RuntimeError("sign button disabled (panel not compatible or admission closed)")
+        snap(f"12-{label}-review.png")
+        client.click(sign)
+        started = time.time()
+
+        def journaled():
+            try:
+                return journal_entry(profile, known)
+            except RuntimeError:
+                return None
+
+        entry = client.wait(journaled, f"{label} signed and journaled", 120)
+        known.add(entry["request_id"])
+        record = {"label": label, "request_id": entry["request_id"], "tx_hash": entry.get("tx_hash"),
+                  "nonce": entry.get("nonce"), "expires_at": entry.get("expires_at"),
+                  "signed_at_unix": started}
+        paid["requests"].append(record)
+        return record, entry
+
+    def row_for(request_id: str):
+        prefix = request_id.lower().removeprefix("0x")[:8]
+        for row in client.elements(testid("native-request-row")):
+            if prefix in client.text(row).lower():
+                return row
+        return None
+
+    def wait_phase(record: dict, wanted: set, failing: set, seconds: int, what: str) -> str:
+        phases = []
+
+        def check():
+            row = row_for(record["request_id"])
+            if row is None:
+                return None
+            phase = client.attribute(row, "data-phase")
+            if not phases or phases[-1] != phase:
+                phases.append(phase)
+            if phase in failing:
+                raise RuntimeError(f"{record['label']} reached {phase}: " + client.text(row)[:400])
+            return phase if phase in wanted else None
+
         try:
-            client.close()
-        except BaseException as error:
-            result["session_close_error"] = str(error)[:300]
-        driver.terminate()
+            return client.wait(check, what, seconds)
+        finally:
+            record["phases_seen"] = phases
+
+    # 3. Request A must be admitted, executed by the validators and finalized.
+    a, a_entry = submit(args.expiry_blocks, "paid-a")
+    wait_phase(a, {"finalized"}, {"rejected", "dropped", "refund_due", "refunded"},
+               args.finalize_wait_seconds, "paid request A finalized")
+    row = row_for(a["request_id"])
+    a["row_text"] = client.text(row)[:1200]
+    outputs = client.elements(testid("native-output"))
+    a["output_text"] = client.text(outputs[0])[:800] if outputs else None
+    a["finalized_at_unix"] = time.time()
+    snap("13-paid-a-finalized.png")
+    result["tests"].append({"name": "native paid request finalized in the app", "status": "passed"})
+
+    # 4. Replay: resubmitting A's exact signed bytes must not admit or charge it twice.
+    signed = a_entry.get("signed_tx")
+    if signed:
+        body = json.dumps(signed).encode()
+        request = urllib.request.Request(args.wallet_host + "/tx/submit_signed", data=body,
+                                         headers={"Content-Type": "application/json"}, method="POST")
         try:
-            driver.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            driver.kill()
-        result["finished_at_unix"] = time.time()
-        result["failure"] = failure
-        result["pass"] = failure is None
-        (evidence / "ui-request-result.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
-        print(json.dumps({k: result.get(k) for k in ("mode", "pass", "failure", "inference", "settlement", "dashboard")}, indent=2, default=str))
-    return 0 if failure is None else 1
+            with urllib.request.urlopen(request, timeout=20) as response:
+                a["replay"] = {"http_status": response.status, "body": response.read(2000).decode("utf-8", "replace")}
+        except urllib.error.HTTPError as error:
+            a["replay"] = {"http_status": error.code, "body": error.read(2000).decode("utf-8", "replace")}
+    else:
+        a["replay"] = {"skipped": "journal no longer holds the signed bytes"}
+
+    # 5. Request B expires before any certificate can exist; the app claims the reservation back.
+    b, _ = submit(args.refund_expiry_blocks, "paid-b-refund")
+    wait_phase(b, {"refund_due"}, {"rejected", "dropped", "finalized"}, 900, "request B refund due")
+    snap("14-paid-b-refund-due.png")
+    client.click(client.wait_element(testid("btn-native-refund"), 60))
+    wait_phase(b, {"refunded"}, {"rejected"}, 900, "request B refunded")
+    b["row_text"] = client.text(row_for(b["request_id"]))[:1200]
+    snap("15-paid-b-refunded.png")
+    result["tests"].append({"name": "expired paid request refunded through the app", "status": "passed"})
+
+    journal_copy = evidence / "native-requests-journal.json"
+    journal_copy.write_text(json.dumps(read_journal(profile), indent=2, default=str) + "\n")
 
 
 if __name__ == "__main__":
