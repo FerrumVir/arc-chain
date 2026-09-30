@@ -14310,6 +14310,16 @@ async fn approve_community_reward_payload(
     payload: &CommunityRewardApprovalPayload,
 ) -> Result<arc_types::transaction::CommunityRewardValidatorApproval, String> {
     let (work_item, result) = validate_reward_approval_payload(node, payload)?;
+    // A coordinator retries until five approvals arrive in one collection.
+    // Recomputing an already-approved commitment on every retry put five
+    // full-model verifications on the same shard holders at once; each holds
+    // up to three in-flight ranges, which overflows the 12-request shard queue
+    // and left the fifth approval unreachable on the live fleet. This
+    // validator's earlier recomputation of the exact commitment is recorded,
+    // and re-signing it is deterministic, so it grants nothing new.
+    if reward_commitment_already_verified(node, &payload.reward) {
+        return sign_validated_reward_approval(node, &payload.reward);
+    }
     let verified = verify_community_result_with_quorum(node, &work_item, &result)
         .await
         .map_err(|error| error.to_string())?;
@@ -14320,6 +14330,23 @@ async fn approve_community_reward_payload(
     }
 
     sign_validated_reward_approval(node, &payload.reward)
+}
+
+/// True only when this process already signed the identical commitment for
+/// both the job and its worker certificate, which happens solely after its own
+/// independent recomputation (or, for the coordinator, its journaled one).
+fn reward_commitment_already_verified(
+    node: &NodeState,
+    reward: &arc_types::transaction::CommunityInferenceRewardBody,
+) -> bool {
+    let commitment = reward.validator_approval_commitment();
+    node.community_reward_approval_jobs
+        .get(&reward.job_id)
+        .is_some_and(|entry| *entry.value() == commitment)
+        && node
+            .community_reward_approval_certificates
+            .get(&reward.worker_certificate.attestation_hash)
+            .is_some_and(|entry| *entry.value() == commitment)
 }
 
 fn sign_validated_reward_approval(
@@ -20443,6 +20470,7 @@ mod tests {
         // that used to fail immediately at the third try_acquire and made
         // five-of-six mathematically unreachable under real fan-out.
         let mut approval_tasks = tokio::task::JoinSet::new();
+        let mut retry_approver = None;
         for key in validator_keys.iter().skip(1) {
             let key = key.clone();
             let mut approver = fake_node_with_workers(Vec::new());
@@ -20459,6 +20487,9 @@ mod tests {
             );
             *approver.dag_validators.write() = active.clone();
             approver.community_verification_pipeline_override = Some(pipeline.clone());
+            if retry_approver.is_none() {
+                retry_approver = Some(approver.clone());
+            }
             let signed = super::sign_community_request(
                 COMMUNITY_REWARD_APPROVE_PATH,
                 payload.clone(),
@@ -20480,6 +20511,64 @@ mod tests {
             approvals.push(approval.expect("parallel approval task joins"));
         }
         assert_eq!(approvals.len(), 5);
+
+        // A coordinator retry must not repeat a recomputation this validator
+        // already performed. With no reachable replicas left, the recorded
+        // commitment is re-signed identically, while a validator process that
+        // never recomputed it still must, and fails.
+        let mut retry_approver = retry_approver.expect("first approver retained");
+        let retry_address = retry_approver.validator_address;
+        let unreachable_pipeline = vec![((0, 1), Vec::new())];
+        retry_approver.community_verification_pipeline_override =
+            Some(unreachable_pipeline.clone());
+        let first_approval = approvals
+            .iter()
+            .find(|approval| approval.validator == retry_address)
+            .expect("first approver signed")
+            .clone();
+        let retry_signed = super::sign_community_request(
+            COMMUNITY_REWARD_APPROVE_PATH,
+            payload.clone(),
+            &validator_keys[0],
+            retry_address,
+            retry_approver.state.transaction_domain_hash(),
+        )
+        .unwrap();
+        let Json(retried) =
+            community_reward_approve_signed(AxumState(retry_approver.clone()), Json(retry_signed))
+                .await
+                .expect("a recorded commitment is re-signed without recomputation");
+        assert_eq!(retried, first_approval);
+
+        let mut unrecorded = fake_node_with_workers(Vec::new());
+        unrecorded.state = recovered.clone();
+        unrecorded.validator_address = retry_address;
+        unrecorded.validator_keypair = retry_approver.validator_keypair.clone();
+        unrecorded.community_rewards_v1_enabled = true;
+        unrecorded.inference_model = Some(model.clone());
+        unrecorded.model_artifact_id = Some(model_id);
+        unrecorded.community_rpc_bases = retry_approver.community_rpc_bases.clone();
+        *unrecorded.dag_validators.write() = active.clone();
+        unrecorded.community_verification_pipeline_override = Some(unreachable_pipeline);
+        let unrecorded_signed = super::sign_community_request(
+            COMMUNITY_REWARD_APPROVE_PATH,
+            payload.clone(),
+            &validator_keys[0],
+            retry_address,
+            unrecorded.state.transaction_domain_hash(),
+        )
+        .unwrap();
+        let unrecorded_error =
+            community_reward_approve_signed(AxumState(unrecorded), Json(unrecorded_signed))
+                .await
+                .expect_err("an unrecorded commitment still requires recomputation");
+        assert_eq!(unrecorded_error.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            unrecorded_error.1.contains("no replicas"),
+            "{}",
+            unrecorded_error.1
+        );
+
         let mut coordinator = fake_node_with_workers(Vec::new());
         coordinator.state = recovered;
         let collected =
