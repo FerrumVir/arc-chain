@@ -296,6 +296,20 @@ def journal_entry(profile: Path, known: set) -> dict:
     return fresh[0]
 
 
+
+def click_centered(client, element_id: str) -> None:
+    """Scroll the element to the viewport centre, then click it (as a user would).
+
+    At the 1280x900 window the native paid card's buttons sit at the bottom edge,
+    under the Inference screen's sticky composer, so a W3C click on the default
+    scroll position is intercepted (HTTP 400). Centring first keeps the click real.
+    """
+    client.request("POST", client._path("execute/sync"),
+                   {"script": "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+                    "args": [{client.ELEMENT_KEY: element_id}]})
+    time.sleep(0.3)
+    client.click(element_id)
+
 def paid_flow(client, gate, testid, args, profile, evidence, result, snap):
     import urllib.request
 
@@ -344,7 +358,7 @@ def paid_flow(client, gate, testid, args, profile, evidence, result, snap):
             field = client.element(testid(tid))
             client.clear(field)
             client.send_keys(field, value)
-        client.click(client.element(testid("btn-native-review")))
+        click_centered(client, client.element(testid("btn-native-review")))
 
         def reviewed():
             errors = client.elements(testid("native-form-error"))
@@ -361,7 +375,7 @@ def paid_flow(client, gate, testid, args, profile, evidence, result, snap):
         if client.attribute(sign, "disabled") is not None:
             raise RuntimeError("sign button disabled (panel not compatible or admission closed)")
         snap(f"12-{label}-review.png")
-        client.click(sign)
+        click_centered(client, sign)
         started = time.time()
 
         def journaled():
@@ -434,7 +448,7 @@ def paid_flow(client, gate, testid, args, profile, evidence, result, snap):
     b, _ = submit(args.refund_expiry_blocks, "paid-b-refund")
     wait_phase(b, {"refund_due"}, {"rejected", "dropped", "finalized"}, 900, "request B refund due")
     snap("14-paid-b-refund-due.png")
-    client.click(client.wait_element(testid("btn-native-refund"), 60))
+    click_centered(client, client.wait_element(testid("btn-native-refund"), 60))
     wait_phase(b, {"refunded"}, {"rejected"}, 900, "request B refunded")
     b["row_text"] = client.text(row_for(b["request_id"]))[:1200]
     snap("15-paid-b-refunded.png")
