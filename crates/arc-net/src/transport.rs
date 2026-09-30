@@ -1264,6 +1264,24 @@ async fn wait_for_transport_shutdown(receiver: &mut Option<tokio::sync::watch::R
     }
 }
 
+const TRANSPORT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn join_transport_task(
+    mut task: tokio::task::JoinHandle<()>,
+    grace: std::time::Duration,
+) -> Result<(), tokio::task::JoinError> {
+    match tokio::time::timeout(grace, &mut task).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("P2P task exceeded shutdown grace; aborting and joining");
+            task.abort();
+            // Aborting alone does not join: wait for cancellation to release
+            // task state before the node can cross its persistence barrier.
+            task.await
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_transport_inner(
     listen_addr: SocketAddr,
@@ -2141,13 +2159,24 @@ async fn run_transport_inner(
         outbound_task.abort();
         pex_task.abort();
     }
-    if let Err(error) = outbound_task.await {
+    let (outbound_result, pex_result) = tokio::join!(
+        join_transport_task(outbound_task, TRANSPORT_SHUTDOWN_GRACE),
+        join_transport_task(pex_task, TRANSPORT_SHUTDOWN_GRACE),
+    );
+    if let Err(error) = outbound_result {
         warn!(%error, "P2P outbound task failed during shutdown");
     }
-    if let Err(error) = pex_task.await {
+    if let Err(error) = pex_result {
         warn!(%error, "P2P peer-maintenance task failed during shutdown");
     }
-    endpoint.wait_idle().await;
+    // close() already sent CONNECTION_CLOSE; idle cleanup must not hold the
+    // lifecycle barrier until a peer's full QUIC idle timeout expires.
+    if tokio::time::timeout(TRANSPORT_SHUTDOWN_GRACE, endpoint.wait_idle())
+        .await
+        .is_err()
+    {
+        warn!("QUIC endpoint did not become idle within shutdown grace; continuing shutdown");
+    }
     connections.peers.clear();
     peer_count.store(0, Ordering::SeqCst);
     info!("P2P transport stopped at the lifecycle barrier");
@@ -3390,6 +3419,45 @@ mod tests {
 
         drop(outbound_tx);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn transport_shutdown_aborts_and_joins_stalled_task() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _drop_marker = dropped_tx;
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            join_transport_task(task, std::time::Duration::from_millis(10)),
+        )
+        .await
+        .expect("stalled transport task exceeded the shutdown bound");
+        assert!(result.unwrap_err().is_cancelled());
+        assert_eq!(
+            dropped_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+            "task state must be dropped before the join returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_shutdown_allows_task_to_finish_during_grace() {
+        let task = tokio::spawn(async {
+            tokio::task::yield_now().await;
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            join_transport_task(task, std::time::Duration::from_secs(1)),
+        )
+        .await
+        .expect("cooperative transport task exceeded the shutdown bound")
+        .expect("cooperative transport task was aborted");
     }
 
     #[tokio::test]
