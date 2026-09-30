@@ -1,0 +1,43 @@
+name: Render public ARC explorer
+
+on:
+  push:
+    branches: ['ci/explorer-render-*']
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Test render check assertions
+        run: node ci/explorer-render/test-check.mjs
+
+      - name: Install pinned Playwright and Chromium
+        run: |
+          npm install --prefix ci/explorer-render --no-save --package-lock=false --ignore-scripts playwright@1.59.1
+          npx -y playwright@1.59.1 install --with-deps chromium
+
+      - name: Observe the live public explorer
+        timeout-minutes: 28
+        run: node ci/explorer-render/check.mjs
+
+      - name: Preserve render evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: explorer-render-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci/explorer-render/results/
+          if-no-files-found: error
+          retention-days: 7
