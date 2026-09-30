@@ -9919,6 +9919,19 @@ fn fanout_divergence_evidence(
     (observed != majority).then(|| observed.map(FanoutVoteKey::evidence).unwrap_or_default())
 }
 
+/// Whether a fan-out hop may stop collecting once `needed` replicas agree.
+///
+/// A degraded-capable (free/demo) hop returns at the threshold and aborts its
+/// stragglers. A fixed quorum (community reward verification) must keep every
+/// selected replica's request running to completion: an aborted request never
+/// reaches that replica's stateful KV cache, the next position then finds it
+/// cold (`kv_cache_out_of_sync`) and evicts it, and an all-replica quorum
+/// becomes unsatisfiable after the first position on any WAN where one
+/// replica is reliably slower than the other two.
+fn fanout_stops_at_threshold(allow_degraded_quorum: bool) -> bool {
+    allow_degraded_quorum
+}
+
 /// Resolve one fan-out plan without silently weakening a fixed quorum.
 ///
 /// The free/demo endpoints deliberately preserve their old degraded behavior,
@@ -10510,7 +10523,9 @@ async fn pipeline_hop(
                             )
                         {
                             winner = Some(reached);
-                            break;
+                            if fanout_stops_at_threshold(allow_degraded_quorum) {
+                                break;
+                            }
                         }
                     }
                     Err((e, is_cold)) => {
@@ -27297,6 +27312,16 @@ mod tests {
         let got = tally_until_majority(&[Some("0xaa"), Some("0xbb")], 1).expect("first valid");
         assert_eq!(got.0, 0);
         assert_eq!(got.1, "0xaa");
+    }
+
+    #[test]
+    fn fixed_quorum_fanout_waits_for_every_replica_to_keep_kv_caches_warm() {
+        // Free fan-out may stop at the agreement threshold; reward
+        // verification (no degraded quorum) must never abort a replica,
+        // because an aborted position leaves that replica cold and the next
+        // position would evict it below the fixed three-replica quorum.
+        assert!(fanout_stops_at_threshold(true));
+        assert!(!fanout_stops_at_threshold(false));
     }
 
     #[test]

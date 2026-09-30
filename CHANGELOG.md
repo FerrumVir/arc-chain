@@ -29,9 +29,20 @@ All notable changes to ARC Chain are tracked here. This project follows
 > stays unpublished. This entry does not claim publication or deployment of
 > v0.8.9.
 
+- Fixes community reward verification never completing on the live fleet:
+  the fan-out hop returned as soon as two of three replicas agreed and aborted
+  the third request, so that replica missed the position, answered the next
+  one with `kv_cache_out_of_sync`, and was evicted below the fixed
+  three-replica quorum that reward verification requires ("fixed quorum
+  unavailable: 2 live replica(s) remain, but 3 are required"). Free fan-out
+  still returns at the threshold; a fixed quorum now waits for every selected
+  replica so each keeps its KV cache warm. Live v0.8.8 evidence: a published
+  v0.8.7 app request was routed to a Linux community worker and answered, but
+  every coordinator's verification failed this way, so no 0x25 reward could
+  be approved.
 - Updates `brace-expansion` 1.1.18 to 1.1.21 in the `sdks/typescript`
   lockfile (a lockfile-only `npm audit fix`), so every JavaScript lockfile the
-  release gate audits is clean again. No runtime or protocol change.
+  release gate audits is clean again.
 
 ## v0.8.8 - Release-preparation snapshot (2026-09-29)
 
