@@ -383,19 +383,32 @@ def paid_flow(client, gate, testid, args, profile, evidence, result, snap):
             field = client.element(testid(tid))
             client.clear(field)
             client.send_keys(field, value)
-        review_button = client.element(testid("btn-native-review"))
-        client.wait(lambda: client.attribute(review_button, "disabled") is None,
-                    "Review enabled (native admission open on the wallet host)", 900)
-        click_centered(client, review_button)
-
         def reviewed():
             errors = client.elements(testid("native-form-error"))
             if errors:
-                raise RuntimeError("paid form refused: " + client.text(errors[0])[:300])
+                return ("error", client.text(errors[0])[:300])
             found = client.elements(testid("native-review"))
-            return found[0] if found else None
+            return ("review", found[0]) if found else None
 
-        client.wait(reviewed, "paid request review", 60)
+        # Native admission flaps closed while the node executes or re-opens row relays,
+        # so a refusal that only says "not admitting" is retried after admission reopens.
+        refusals = []
+        for attempt in range(12):
+            wait_admission_open(args.wallet_host, 900)
+            review_button = client.element(testid("btn-native-review"))
+            client.wait(lambda: client.attribute(review_button, "disabled") is None,
+                        "Review enabled (native admission open on the wallet host)", 900)
+            click_centered(client, review_button)
+            kind, value = client.wait(reviewed, "paid request review", 60)
+            if kind == "review":
+                break
+            if "not admitting" not in value:
+                raise RuntimeError("paid form refused: " + value)
+            refusals.append({"attempt": attempt + 1, "unix": time.time(), "message": value})
+            time.sleep(5)
+        else:
+            raise RuntimeError(f"paid form refused {len(refusals)} times: {refusals[-1]['message']}")
+        paid.setdefault("review_refusals", {})[label] = refusals
         if client.elements(testid("native-positions-error")):
             raise RuntimeError("paid request exceeds executor positions: " +
                                client.text(client.element(testid("native-positions-error")))[:300])
@@ -465,11 +478,21 @@ def paid_flow(client, gate, testid, args, profile, evidence, result, snap):
         body = json.dumps(signed).encode()
         request = urllib.request.Request(args.wallet_host + "/tx/submit_signed", data=body,
                                          headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                a["replay"] = {"http_status": response.status, "body": response.read(2000).decode("utf-8", "replace")}
-        except urllib.error.HTTPError as error:
-            a["replay"] = {"http_status": error.code, "body": error.read(2000).decode("utf-8", "replace")}
+        attempts = []
+        for _ in range(60):
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    outcome = {"http_status": response.status, "body": response.read(2000).decode("utf-8", "replace")}
+            except urllib.error.HTTPError as error:
+                outcome = {"http_status": error.code, "body": error.read(2000).decode("utf-8", "replace")}
+            outcome["unix"] = time.time()
+            attempts.append(outcome)
+            # "closed on this node" is admission flapping, not a verdict on the bytes.
+            if not (outcome["http_status"] == 503 and "closed on this node" in outcome["body"]):
+                break
+            time.sleep(5)
+        a["replay"] = attempts[-1]
+        a["replay_attempts"] = attempts
     else:
         a["replay"] = {"skipped": "journal no longer holds the signed bytes"}
 
