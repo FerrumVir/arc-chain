@@ -182,7 +182,7 @@ function nativeNetwork(overrides = {}) {
     dagRound: 137_151,
     declaresMainnet: false,
     height: 137_151,
-    hostVersion: "0.8.7",
+    hostVersion: "0.8.8",
     isBlockProducing: true,
     isBlockProducingBasis: "fresh canonical block",
     lastBlockAgeSecs: 1,
@@ -350,7 +350,7 @@ async function fixture(overrides = {}) {
     releaseId: 10,
     releaseRunAttempt: 1,
     releaseRunId: 11,
-    releaseVersion: "0.8.7",
+    releaseVersion: "0.8.8",
     repository: "FerrumVir/arc-chain",
     rolloutManifestSha256: ROLLOUT,
     schema: "arc.packaged-desktop-native-input.v1",
@@ -376,7 +376,7 @@ async function fixture(overrides = {}) {
   const attemptRaw = Buffer.from(canonicalJson(nativeAttempt));
   await writeFile(nativeAttemptPath, attemptRaw, { mode: 0o400 });
   await chmod(nativeAttemptPath, 0o400);
-  const prompt = `ARC packaged v0.8.7 production acceptance challenge ${nativeInput.challenge} input ${sha256(inputRaw)}`;
+  const prompt = `ARC packaged v0.8.8 production acceptance challenge ${nativeInput.challenge} input ${sha256(inputRaw)}`;
   const promptInputHash = `0x${blake3Short(Buffer.from(prompt, "utf8"))}`;
   const nativeOutput = "accepted";
   const nativeOutputHash = `0x${blake3Short(Buffer.from(nativeOutput, "utf8"))}`;
@@ -521,7 +521,7 @@ async function fixture(overrides = {}) {
     rolloutManifestSha256: nativeInput.rolloutManifestSha256,
     runtime: {
       appDataRelativePath: "Library/Application Support/network.arc.desktop",
-      appVersion: "0.8.7",
+      appVersion: "0.8.8",
       architecture: "aarch64",
       buildSourceCommit: sourceCommit,
       environmentNames: ["HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"],
@@ -566,7 +566,7 @@ async function fixture(overrides = {}) {
     sha256: controllerSha256,
     treeClean: true,
   };
-  const macosRelease = { id: 10, runAttempt: 1, runId: 11, tag: "v0.8.7" };
+  const macosRelease = { id: 10, runAttempt: 1, runId: 11, tag: "v0.8.8" };
   const codeSignature = {
     appleDeveloperIdSigned: false,
     authorities: [],
@@ -872,7 +872,7 @@ async function fixture(overrides = {}) {
       commit: sourceCommit,
       release_id: 10,
       repository: "FerrumVir/arc-chain",
-      tag: "v0.8.7",
+      tag: "v0.8.8",
     },
     result: "passed",
     schema: "arc.packaged-appimage-live-host.v1",

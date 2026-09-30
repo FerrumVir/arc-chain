@@ -345,7 +345,7 @@ class Fixture:
         for platform in platforms:
             checks = dict(PUBLISHED.REQUIRED_CHECKS[platform])
             if platform == "windows-x86_64":
-                checks["embedded_app_product_version"] = "0.8.7"
+                checks["embedded_app_product_version"] = "0.8.8"
             component = {"acceptance_run_attempt": self.acceptance_run_attempt, "acceptance_run_id": self.acceptance_run_id, "assets": {name: self.assets[name] for name in PUBLISHED.EXPECTED_COMPONENTS[platform]}, "binding_sha256": binding_sha, "checks": checks, "commit": self.source_sha, "platform": platform, "release_id": 99, "release_run_attempt": self.release_run_attempt, "release_run_id": self.release_run_id, "repository": TRUTH.REPOSITORY, "schema": "arc.published-artifact-acceptance-component.v1", "tag": TRUTH.TAG}
             component_path = component_receipts / f"{platform}.json"
             write_json(component_path, component)
@@ -464,7 +464,7 @@ class Fixture:
             "releaseId": 99,
             "releaseRunAttempt": self.release_run_attempt,
             "releaseRunId": self.release_run_id,
-            "releaseVersion": "0.8.7",
+            "releaseVersion": "0.8.8",
             "repository": TRUTH.REPOSITORY,
             "rolloutManifestSha256": self.manifest_sha256,
             "schema": "arc.packaged-desktop-native-input.v1",
@@ -477,7 +477,7 @@ class Fixture:
         native_input_raw = TRUTH.canonical_json(native_input)
         native_input_sha = digest(native_input_raw)
         native_prompt = (
-            f"ARC packaged v0.8.7 production acceptance challenge {native_challenge} "
+            f"ARC packaged v0.8.8 production acceptance challenge {native_challenge} "
             f"input {native_input_sha}"
         )
         native_output = "accepted"
@@ -530,7 +530,7 @@ class Fixture:
             "rolloutManifestSha256": self.manifest_sha256,
             "runtime": {
                 "appDataRelativePath": "Library/Application Support/network.arc.desktop",
-                "appVersion": "0.8.7",
+                "appVersion": "0.8.8",
                 "architecture": "aarch64",
                 "buildSourceCommit": self.source_sha,
                 "environmentNames": ["HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"],

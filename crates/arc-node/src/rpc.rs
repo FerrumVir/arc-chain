@@ -6347,6 +6347,19 @@ fn community_dispatch_timeout_secs(required_positions: usize) -> Result<u64, Str
     Ok(est_secs.max(MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS))
 }
 
+/// True only while `worker_id` holds an ASSIGNED community job on this
+/// coordinator. Every worker long-polls `/community/claim_work` on all
+/// coordinators at once, and each pending long-poll keeps an EMPTY
+/// reservation in `community_active_jobs` until work arrives
+/// (`CommunityClaimReservation`); `commit` replaces it with the job id.
+/// A worker that is merely waiting for work is idle and is exactly the
+/// worker dispatch should target, so an empty reservation is not "busy".
+fn worker_has_assigned_community_job(node: &NodeState, worker_id: &str) -> bool {
+    node.community_active_jobs
+        .get(worker_id)
+        .is_some_and(|job_id| !job_id.value().is_empty())
+}
+
 /// Count community workers that haven't expired their TTL and advertise
 /// the "inference" capability. Used by the smart router to decide
 /// whether to dispatch externally or run locally.
@@ -6361,7 +6374,7 @@ fn live_inference_worker_count(node: &NodeState) -> usize {
         .filter(|e| {
             let (w, ts) = e.value();
             now.duration_since(*ts) <= ttl
-                && !node.community_active_jobs.contains_key(&w.worker_id)
+                && !worker_has_assigned_community_job(node, &w.worker_id)
                 && w.capabilities.iter().any(|c| c == "inference")
                 && w.execution_profile.as_deref()
                     == Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE)
@@ -6383,7 +6396,7 @@ fn exact_live_inference_worker(node: &NodeState, expected_worker: &str) -> bool 
     let (worker, refreshed_at) = entry.value();
     std::time::Instant::now().duration_since(*refreshed_at)
         <= std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS)
-        && !node.community_active_jobs.contains_key(expected_worker)
+        && !worker_has_assigned_community_job(node, expected_worker)
         && worker
             .capabilities
             .iter()
@@ -21771,6 +21784,32 @@ mod tests {
             0,
             "busy workers are not dispatch capacity"
         );
+    }
+
+    #[test]
+    fn idle_long_polling_worker_stays_dispatch_capacity_until_assigned() {
+        // Workers long-poll claim_work on every coordinator at once, and each
+        // pending poll holds an EMPTY reservation until work arrives. That
+        // waiting worker is idle capacity; only an assigned job id is busy.
+        let now = std::time::Instant::now();
+        let node = fake_node_with_workers(vec![(worker("polling", &["inference"]), now)]);
+        node.community_active_jobs
+            .insert("polling".to_string(), String::new());
+        assert_eq!(
+            live_inference_worker_count(&node),
+            1,
+            "a pending long-poll reservation is not a job"
+        );
+        assert!(exact_live_inference_worker(&node, "polling"));
+
+        node.community_active_jobs
+            .insert("polling".to_string(), "assigned-job".to_string());
+        assert_eq!(
+            live_inference_worker_count(&node),
+            0,
+            "an assigned job makes the worker busy"
+        );
+        assert!(!exact_live_inference_worker(&node, "polling"));
     }
 
     #[test]

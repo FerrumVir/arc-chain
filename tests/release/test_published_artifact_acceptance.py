@@ -40,7 +40,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         }
         self.release = {
             "id": 777,
-            "tag_name": "v0.8.7",
+            "tag_name": "v0.8.8",
             "target_commitish": self.commit,
             "draft": False,
             "prerelease": False,
@@ -57,7 +57,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
                     "uploader": {"login": "github-actions[bot]"},
                     "browser_download_url": (
                         f"https://github.com/{self.repository}/releases/download/"
-                        f"v0.8.7/{name}"
+                        f"v0.8.8/{name}"
                     ),
                 }
                 for index, name in enumerate(sorted(self.asset_bytes))
@@ -119,7 +119,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         self.write_api_documents()
 
     def test_production_binding_rejects_previously_published_v080_tag(self) -> None:
-        with self.assertRaisesRegex(acceptance.AcceptanceError, "pinned to v0.8.7"):
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "pinned to v0.8.8"):
             acceptance.command_bind(
                 Namespace(repository=self.repository, tag="v0.8.0")
             )
@@ -180,7 +180,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         self.tag_ref_json = self.write_json(
             "tag-ref.json",
             {
-                "ref": "refs/tags/v0.8.7",
+                "ref": "refs/tags/v0.8.8",
                 "object": {"type": "commit", "sha": self.commit},
             },
         )
@@ -211,7 +211,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         acceptance.command_bind(
             Namespace(
                 repository=self.repository,
-                tag="v0.8.7",
+                tag="v0.8.8",
                 commit=self.commit,
                 release_run_id=self.run_id,
                 release_run_attempt=self.run_attempt,
@@ -267,9 +267,9 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         for index, name in enumerate(sorted(update_names)):
             raw = dict(self.release["assets"][0])
             raw.update({"id": 20_000 + index, "name": name,
-                        "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.7/{name}"})
+                        "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.8/{name}"})
             update_release["assets"].append(raw)
-        resolved = acceptance.validate_release_assets(update_release, self.repository, "v0.8.7")
+        resolved = acceptance.validate_release_assets(update_release, self.repository, "v0.8.8")
         self.assertEqual(acceptance.release_profile_for_assets(set(resolved)),
                          acceptance.PROFILE_EXISTING_UPDATE_V1)
 
@@ -278,16 +278,16 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
                            if row["name"] != "arc-existing-chain-update-attestation.json"]
         extra = copy.deepcopy(self.release["assets"][0])
         extra.update({"id": 30_000, "name": "arc-cutover-policy.json",
-                      "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.7/arc-cutover-policy.json"})
+                      "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.8/arc-cutover-policy.json"})
         mixed["assets"].append(extra)
         with self.assertRaisesRegex(acceptance.AcceptanceError, "matches neither profile"):
-            acceptance.validate_release_assets(mixed, self.repository, "v0.8.7")
+            acceptance.validate_release_assets(mixed, self.repository, "v0.8.8")
 
     def test_update_binding_schema_cannot_be_downgraded_to_cutover_v1(self) -> None:
         binding = json.loads(self.bind().read_text(encoding="utf-8"))
         binding["schema"] = "arc.published-release-binding.v2"
         binding["profile"] = acceptance.PROFILE_EXISTING_UPDATE_V1
-        binding["tag"] = "v0.8.7"
+        binding["tag"] = "v0.8.8"
         assets = dict(binding["assets"])
         for name in ("arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json",
                      "arc-cutover-policy.json"):
@@ -488,17 +488,17 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
 
     def test_windows_receipt_distinguishes_exact_msi_and_embedded_versions(self) -> None:
         checks = dict(acceptance.REQUIRED_CHECKS["windows-x86_64"])
-        checks["embedded_app_product_version"] = "0.8.7.0"
+        checks["embedded_app_product_version"] = "0.8.8.0"
         acceptance.validate_platform_checks("windows-x86_64", checks)
-        for replacement in ("0.8.7-beta", "0.8.7.1"):
+        for replacement in ("0.8.8-beta", "0.8.8.1"):
             with self.subTest(embedded=replacement):
                 checks["embedded_app_product_version"] = replacement
                 with self.assertRaisesRegex(
                     acceptance.AcceptanceError, "embedded_app_product_version"
                 ):
                     acceptance.validate_platform_checks("windows-x86_64", checks)
-        checks["embedded_app_product_version"] = "0.8.7"
-        checks["msi_product_version"] = "0.8.7.1"
+        checks["embedded_app_product_version"] = "0.8.8"
+        checks["msi_product_version"] = "0.8.8.1"
         with self.assertRaisesRegex(acceptance.AcceptanceError, "msi_product_version"):
             acceptance.validate_platform_checks("windows-x86_64", checks)
 
@@ -539,7 +539,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         for platform, names in acceptance.EXPECTED_COMPONENTS.items():
             checks = dict(acceptance.REQUIRED_CHECKS[platform])
             if platform == "windows-x86_64":
-                checks["embedded_app_product_version"] = "0.8.7"
+                checks["embedded_app_product_version"] = "0.8.8"
             component = {
                 "acceptance_run_attempt": 2,
                 "acceptance_run_id": 2468,
