@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { CHECKS, REWARD, REQUESTS, runCheck, validateObservation } from "./check.mjs";
+import { CHECKS, REWARD, REWARD_BLOCK_ROOTS, REQUESTS, SOURCES, inspectorFacts, runCheck, validateObservation } from "./check.mjs";
 
 let count = 0;
 async function test(name, fn) {
@@ -33,6 +33,16 @@ function observation(check) {
         reward_arc: 2.5, reward_base: 2_500_000_000,
       }],
     }],
+  };
+  if (check.kind === "block-sources") return {
+    url: check.url,
+    perSource: SOURCES.map((sourceId) => ({
+      sourceId,
+      title: "Block #3,794,543",
+      source: `ARC v3 - ${sourceId.slice(3).toUpperCase()} · ${sourceId.slice(3)}`,
+      blockHash: REWARD_BLOCK_ROOTS.hash,
+      stateRoot: REWARD_BLOCK_ROOTS.stateRoot,
+    })),
   };
   if (check.kind === "block") return {
     ...result,
@@ -113,6 +123,30 @@ await test("labels rendered upper-case by CSS are matched case-insensitively", (
   }
 });
 
+await test("an opened block must render identical roots under every one of the six sources", () => {
+  const check = CHECKS.find((entry) => entry.kind === "block-sources");
+  assert.deepEqual([...check.sources].sort(), ["v3-ams", "v3-lax", "v3-lhr", "v3-nrt", "v3-nyc", "v3-sgp"]);
+  for (const mutate of [
+    (observed) => { observed.perSource.pop(); },
+    (observed) => { observed.perSource[5] = { ...observed.perSource[0] }; },
+    (observed) => { observed.perSource[2].stateRoot = "0x" + "0".repeat(64); },
+    (observed) => { observed.perSource[4].blockHash = "0x" + "f".repeat(64); },
+    (observed) => { observed.perSource[1].source = "ARC v3 - NYC · nyc"; },
+    (observed) => { observed.perSource[3].title = "Block #3,794,544"; },
+    (observed) => { observed.perSource[0].stateRoot = ""; },
+  ]) {
+    const observed = observation(check);
+    mutate(observed);
+    assert.throws(() => validateObservation(check, observed));
+  }
+  const facts = inspectorFacts({
+    title: "Block #3,794,543",
+    inspectorExcerpt: "CANONICAL STATUS\nCanonical\nSOURCE\nARC v3 - AMS · ams\nBLOCK HASH\n" + REWARD_BLOCK_ROOTS.hash +
+      "\nPARENT HASH\n0x3cae\nSTATE ROOT\n" + REWARD_BLOCK_ROOTS.stateRoot + "\nTRANSACTIONS\n1",
+  });
+  assert.deepEqual(facts, { title: "Block #3,794,543", source: "ARC v3 - AMS · ams", blockHash: REWARD_BLOCK_ROOTS.hash, stateRoot: REWARD_BLOCK_ROOTS.stateRoot });
+});
+
 await test("block evidence needs the actual transaction list entry", () => {
   const check = CHECKS[2];
   for (const transactionLinks of [[], [{ hash: REQUESTS[0].id, text: REWARD.hash }], [{ hash: REWARD.hash, text: "" }]]) {
@@ -187,13 +221,37 @@ await test("navigation and screenshot failures cannot produce passing checks", a
 });
 
 await test("reload performs a real reload and revalidates the deep link", async () => {
-  const check = CHECKS.at(-1);
+  const check = CHECKS.find((entry) => entry.reload);
   const page = fakePage(observation(check));
   assert.equal((await runCheck(page, check, "unused", 0)).pass, true);
   assert.deepEqual(page.calls[0], ["reload"]);
   const wrongRoute = fakePage({ ...observation(check), url: CHECKS[0].url });
   assert.equal((await runCheck(wrongRoute, check, "unused", 0)).pass, false);
   assert.equal(wrongRoute.calls.some(([method]) => method === "reload"), false);
+});
+
+await test("the six-source check selects every source and fails on one divergent root", async () => {
+  const check = CHECKS.find((entry) => entry.kind === "block-sources");
+  const rendered = (sourceId, stateRoot = REWARD_BLOCK_ROOTS.stateRoot) => ({
+    url: check.url,
+    title: "Block #3,794,543",
+    inspectorExcerpt: `SOURCE\nARC v3 - ${sourceId.slice(3).toUpperCase()} · ${sourceId.slice(3)}\nBLOCK HASH\n${REWARD_BLOCK_ROOTS.hash}\nSTATE ROOT\n${stateRoot}`,
+  });
+  const sourcePage = (divergent = null) => {
+    let selected = "canonical";
+    const page = fakePage({ url: check.url });
+    page.selectOption = async (selector, value) => { page.calls.push(["select", selector, value]); selected = value; };
+    page.evaluate = async () => rendered(selected, selected === divergent ? "0x" + "1".repeat(64) : REWARD_BLOCK_ROOTS.stateRoot);
+    return page;
+  };
+  const page = sourcePage();
+  const passed = await runCheck(page, check, "unused", 0);
+  assert.equal(passed.pass, true, passed.error);
+  assert.deepEqual(page.calls.filter(([method]) => method === "select").map((call) => call[2]), SOURCES);
+  const failed = await runCheck(sourcePage("v3-nrt"), check, "unused", 0);
+  assert.equal(failed.pass, false);
+  assert.match(failed.error, /v3-nrt state root/);
+  assert.equal(failed.observed.perSource.length, 6);
 });
 
 await test("workflow stays branch-only, read-only, pinned and always uploads evidence", () => {

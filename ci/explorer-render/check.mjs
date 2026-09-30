@@ -14,6 +14,12 @@ export const REWARD = {
   block: 3794543,
   worker: "0xfb1ac4793b45c45020ae0d9b1113bf249fe3e489664a418f456abec21ffcfa4f",
 };
+// The six v3 sources, and block 3794543 as all six edges served it on 2026-09-30.
+export const SOURCES = ["v3-nyc", "v3-lax", "v3-ams", "v3-lhr", "v3-nrt", "v3-sgp"];
+export const REWARD_BLOCK_ROOTS = {
+  hash: "0x1cb44285cb6dd39cbc53b55bb18b7d66269d83c9bb9191f259b6cdc14ffb651a",
+  stateRoot: "0x3013031e1f139f368923bd6f9ee43a58f0e5c51ecbcedd8153603a99ce331e32",
+};
 export const REQUESTS = [
   {
     id: "0x0d5f8286303b47a0bb6c11e9209cb79b9f3df4359a39ab52b5a14fd5d3e04283",
@@ -29,6 +35,7 @@ export const CHECKS = [
   { name: "reward-block", kind: "block", url: `${HOME}#/block/${REWARD.block}` },
   ...REQUESTS.map((request) => ({ name: `request-${request.status.toLowerCase()}`, kind: "request", url: `${HOME}#/request/${request.id}`, request })),
   { name: "deep-link-reload", kind: "request", url: `${HOME}#/request/${REQUESTS[1].id}`, request: REQUESTS[1], reload: true },
+  { name: "reward-block-six-sources", kind: "block-sources", url: `${HOME}#/block/${REWARD.block}`, sources: SOURCES },
 ];
 
 const bare = (value) => String(value ?? "").replace(/^0x/i, "").toLowerCase();
@@ -67,6 +74,18 @@ export function validateObservation(check, observed) {
     assert.equal(receipt.reward_base, 2_500_000_000);
     return;
   }
+  if (check.kind === "block-sources") {
+    assert.deepEqual(observed.perSource.map((entry) => entry.sourceId).sort(), [...check.sources].sort(),
+      "every v3 source must be selected and rendered");
+    for (const entry of observed.perSource) {
+      const region = entry.sourceId.replace(/^v3-/, "");
+      assert.equal(entry.title, "Block #3,794,543", `${entry.sourceId} must render the opened block`);
+      assert.ok(entry.source.toLowerCase().endsWith(`· ${region}`), `${entry.sourceId} must be the rendered source`);
+      assert.equal(entry.blockHash.toLowerCase(), REWARD_BLOCK_ROOTS.hash, `${entry.sourceId} block hash`);
+      assert.equal(entry.stateRoot.toLowerCase(), REWARD_BLOCK_ROOTS.stateRoot, `${entry.sourceId} state root`);
+    }
+    return;
+  }
   if (check.kind === "block") {
     assert.equal(observed.title, "Block #3,794,543");
     assert.ok(observed.transactionLinks.some((link) => bare(link.hash) === bare(REWARD.hash) && link.text), "transaction must be listed as a visible block transaction link");
@@ -90,6 +109,16 @@ export function validateObservation(check, observed) {
 
 // Read the rendered DOM, including the explorer's visible raw receipt panels.
 // No RPC client, fixture injection, or replacement network configuration is used.
+// The opened block's source, hash and state root, from its rendered inspector text.
+export function inspectorFacts(observed) {
+  const lines = String(observed.inspectorExcerpt ?? "").split("\n").map((line) => line.trim());
+  const after = (label) => {
+    const index = lines.findIndex((line) => line.toUpperCase() === label);
+    return index >= 0 && index + 1 < lines.length ? lines[index + 1] : "";
+  };
+  return { title: observed.title ?? "", source: after("SOURCE"), blockHash: after("BLOCK HASH"), stateRoot: after("STATE ROOT") };
+}
+
 export function readRenderedPage() {
   const visible = (element) => element && element.getClientRects().length > 0 && getComputedStyle(element).visibility !== "hidden";
   const text = (selector, scope = document) => {
@@ -133,6 +162,26 @@ export function readRenderedPage() {
   };
 }
 
+// Select each source in turn on the opened block and read what it renders.
+async function observeEachSource(page, check, deadline) {
+  const perSource = [];
+  for (const sourceId of check.sources) {
+    await page.selectOption("#source-select", sourceId);
+    const region = sourceId.replace(/^v3-/, "");
+    for (;;) {
+      const entry = { sourceId, ...inspectorFacts(await page.evaluate(readRenderedPage)) };
+      const rendered = entry.source.toLowerCase().endsWith(`· ${region}`) && entry.title === "Block #3,794,543" &&
+        entry.blockHash && entry.stateRoot;
+      if (rendered || Date.now() >= deadline) {
+        perSource.push(entry);
+        break;
+      }
+      await delay(1000);
+    }
+  }
+  return { url: page.url(), perSource };
+}
+
 export async function runCheck(page, check, outputDir, timeoutMs = 180_000) {
   const result = { name: check.name, url: check.url, pass: false, observed: {} };
   try {
@@ -143,20 +192,27 @@ export async function runCheck(page, check, outputDir, timeoutMs = 180_000) {
       await page.goto(check.url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     }
     const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      result.observed = await page.evaluate(readRenderedPage);
-      try {
-        validateObservation(check, result.observed);
-        break;
-      } catch (error) {
-        if (Date.now() >= deadline) throw error;
-        await delay(1000);
+    if (check.kind === "block-sources") {
+      result.observed = await observeEachSource(page, check, deadline);
+      validateObservation(check, result.observed);
+    } else {
+      for (;;) {
+        result.observed = await page.evaluate(readRenderedPage);
+        try {
+          validateObservation(check, result.observed);
+          break;
+        } catch (error) {
+          if (Date.now() >= deadline) throw error;
+          await delay(1000);
+        }
       }
     }
     result.pass = true;
   } catch (error) {
     result.error = error.message;
-    try { result.observed = await page.evaluate(readRenderedPage); } catch { /* Retain the last readable DOM. */ }
+    if (check.kind !== "block-sources") {
+      try { result.observed = await page.evaluate(readRenderedPage); } catch { /* Retain the last readable DOM. */ }
+    }
   }
   try {
     const screenshot = `${check.name}.png`;
