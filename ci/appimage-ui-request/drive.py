@@ -297,6 +297,29 @@ def journal_entry(profile: Path, known: set) -> dict:
 
 
 
+
+def wait_admission_open(host: str, seconds: int) -> dict:
+    """Wait until the host's native admission is open again.
+
+    The node's readiness is a 5 s heartbeat refreshed between executions, so it
+    reads closed for the whole time a paid request executes (minutes over WAN).
+    """
+    started = time.monotonic()
+    deadline = started + seconds
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(host + "/native-inference/context", timeout=10) as response:
+                context = json.loads(response.read(500_000))
+            admission = context.get("request_admission") or {}
+            last = admission
+            if admission.get("operator_enabled") is True and admission.get("runtime_ready") is True:
+                return {"open_after_seconds": round(time.monotonic() - started, 1), "request_admission": admission}
+        except Exception as error:  # noqa: BLE001 - recorded; the loop keeps polling until the deadline
+            last = str(error)[:200]
+        time.sleep(3)
+    raise RuntimeError(f"native admission on {host} did not reopen within {seconds} s: {last}")
+
 def click_centered(client, element_id: str) -> None:
     """Scroll the element to the viewport centre, then click it (as a user would).
 
@@ -358,7 +381,10 @@ def paid_flow(client, gate, testid, args, profile, evidence, result, snap):
             field = client.element(testid(tid))
             client.clear(field)
             client.send_keys(field, value)
-        click_centered(client, client.element(testid("btn-native-review")))
+        review_button = client.element(testid("btn-native-review"))
+        client.wait(lambda: client.attribute(review_button, "disabled") is None,
+                    "Review enabled (native admission open on the wallet host)", 900)
+        click_centered(client, review_button)
 
         def reviewed():
             errors = client.elements(testid("native-form-error"))
@@ -432,6 +458,7 @@ def paid_flow(client, gate, testid, args, profile, evidence, result, snap):
 
     # 4. Replay: resubmitting A's exact signed bytes must not admit or charge it twice.
     signed = a_entry.get("signed_tx")
+    a["admission_before_replay"] = wait_admission_open(args.wallet_host, 900)
     if signed:
         body = json.dumps(signed).encode()
         request = urllib.request.Request(args.wallet_host + "/tx/submit_signed", data=body,
