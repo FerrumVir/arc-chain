@@ -304,6 +304,8 @@ def wait_admission_open(host: str, seconds: int) -> dict:
     The node's readiness is a 5 s heartbeat refreshed between executions, so it
     reads closed for the whole time a paid request executes (minutes over WAN).
     """
+    import urllib.request
+
     started = time.monotonic()
     deadline = started + seconds
     last = None
