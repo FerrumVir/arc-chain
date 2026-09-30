@@ -207,7 +207,7 @@ REQUIRED_CHECKS = {
         "bundle_architecture": "arm64",
         "bundle_codesign_valid": True,
         "bundle_identifier": "network.arc.desktop",
-        "bundle_version": "0.8.8",
+        "bundle_version": "0.8.9",
         "desktop_process_stable": True,
         "desktop_visible_window": True,
         "dmg_bundle_matches": True,
@@ -221,7 +221,7 @@ REQUIRED_CHECKS = {
         "bundle_architecture": "x86_64",
         "bundle_codesign_valid": True,
         "bundle_identifier": "network.arc.desktop",
-        "bundle_version": "0.8.8",
+        "bundle_version": "0.8.9",
         "desktop_process_stable": True,
         "desktop_visible_window": True,
         "dmg_bundle_matches": True,
@@ -236,7 +236,7 @@ REQUIRED_CHECKS = {
         "embedded_app_pe_machine": "AMD64",
         "isolated_profile": True,
         "msi_administrative_extract": True,
-        "msi_product_version": "0.8.8",
+        "msi_product_version": "0.8.9",
         "no_installed_service": True,
         "setup_pe_machine": "AMD64",
         "updater_signature_valid": True,
@@ -538,7 +538,7 @@ def command_select_published_evidence(args: argparse.Namespace) -> None:
     run_attempt = positive_int(args.release_run_attempt, "release run attempt")
     release = load_object(args.release_json, "release API document")
     release_id = positive_int(release.get("id"), "release id")
-    exact(release.get("tag_name"), "v0.8.8", "release tag")
+    exact(release.get("tag_name"), "v0.8.9", "release tag")
     exact(release.get("target_commitish"), args.commit, "release target")
     exact(release.get("draft"), False, "release draft state")
     exact(release.get("immutable"), True, "release immutable state")
@@ -712,8 +712,8 @@ def command_bind(args: argparse.Namespace) -> None:
     exact(repository, EXPECTED_REPOSITORY, "production repository")
     if not STRICT_TAG.fullmatch(args.tag):
         raise AcceptanceError("release tag must be strict vMAJOR.MINOR.PATCH")
-    if args.tag != "v0.8.8":
-        raise AcceptanceError("this production acceptance is pinned to v0.8.8")
+    if args.tag != "v0.8.9":
+        raise AcceptanceError("this production acceptance is pinned to v0.8.9")
     if not SHA40.fullmatch(args.commit):
         raise AcceptanceError("release commit must be 40 lowercase hex characters")
     run_id = positive_int(args.release_run_id, "release run id")
@@ -884,9 +884,9 @@ def validate_binding(binding: dict[str, Any]) -> None:
     exact(binding.get("repository"), EXPECTED_REPOSITORY, "binding repository")
     if is_update:
         exact(binding.get("profile"), PROFILE_EXISTING_UPDATE_V1, "binding profile")
-        exact(binding.get("tag"), "v0.8.8", "binding tag")
+        exact(binding.get("tag"), "v0.8.9", "binding tag")
     else:
-        exact(binding.get("tag"), "v0.8.8", "binding tag")
+        exact(binding.get("tag"), "v0.8.9", "binding tag")
     exact(binding.get("legacy_source"), LEGACY_SOURCE, "binding v0.7.7 source")
     release = binding.get("release")
     if not isinstance(release, dict):

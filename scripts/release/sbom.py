@@ -177,7 +177,7 @@ def build(product: str, version: str, cargo_locks: list[Path], npm_locks: list[P
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--product", default="arc-chain")
-    parser.add_argument("--version", default="0.8.8")
+    parser.add_argument("--version", default="0.8.9")
     parser.add_argument("--cargo-lock", type=Path, action="append", default=[])
     parser.add_argument("--npm-lock", type=Path, action="append", default=[])
     parser.add_argument("--out", type=Path, required=True)

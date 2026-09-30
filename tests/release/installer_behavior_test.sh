@@ -1401,7 +1401,7 @@ managed_macos_update_drains_old_node_without_unloading_its_updater() {
     : >"$sandbox/service.log"
     output="$sandbox/macos-delayed-update.out"
     invoke_installer "$sandbox" Darwin x86_64 \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" 0.8.8 \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" 0.8.9 \
         --update-only >"$output" 2>&1
     status=$?
 
@@ -1418,8 +1418,8 @@ managed_macos_update_drains_old_node_without_unloading_its_updater() {
         sed -n '1,260p' "$output"
         return 1
     fi
-    "$sandbox/arc/bin/arc-node" --version | grep -Fq '0.8.8' || {
-        printf 'managed macOS delayed update did not commit v0.8.8\n'
+    "$sandbox/arc/bin/arc-node" --version | grep -Fq '0.8.9' || {
+        printf 'managed macOS delayed update did not commit v0.8.9\n'
         return 1
     }
     assert_file_contains "$sandbox/home/Library/LaunchAgents/network.arc.node.plist" \
@@ -1778,13 +1778,13 @@ v08_channel_selection_ignores_global_latest_and_nested_tags() {
         '[' \
         '  {"tag_name":"v0.8.0","body":"escaped \\"tag_name\\":\\"v99.0.0\\" text"},' \
         '  {"tag_name":"v0.7.11"},' \
-        '  {"tag_name":"v0.8.8","assets":[{"tag_name":"v98.0.0"}]}' \
+        '  {"tag_name":"v0.8.9","assets":[{"tag_name":"v98.0.0"}]}' \
         ']' > "$list_fixture"
     output="$sandbox/channel-install.out"
     ARC_NODE_VERSION_UNDER_TEST=''
     MOCK_RELEASE_LIST_FILE_UNDER_TEST="$list_fixture"
     invoke_installer "$sandbox" Linux x86_64 \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" '0.8.8' \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" '0.8.9' \
         --no-service --no-auto-update >"$output" 2>&1
     status=$?
     MOCK_RELEASE_LIST_FILE_UNDER_TEST=''
@@ -1795,7 +1795,7 @@ v08_channel_selection_ignores_global_latest_and_nested_tags() {
     fi
     assert_log_contains_literal "$sandbox/curl.log" '/releases?per_page=100' \
         'installer did not query the dedicated v0.8 release collection' || return 1
-    assert_log_contains_literal "$sandbox/curl.log" '/releases/tags/v0.8.8' \
+    assert_log_contains_literal "$sandbox/curl.log" '/releases/tags/v0.8.9' \
         'installer did not resolve the highest discovered v0.8 tag exactly' || return 1
     if grep -Fq '/releases/latest' "$sandbox/curl.log" \
         || grep -Eq '/releases/tags/v(98|99)\.' "$sandbox/curl.log"; then
@@ -1812,20 +1812,20 @@ v08_channel_skips_higher_untrusted_tags_for_stable_release() {
     fixture_dir="$sandbox/exact-releases"
     list_fixture="$sandbox/releases-list.json"
     mkdir -p "$fixture_dir"
-    cp "$TEST_DIR/fixtures/release-v0.8.8.json" "$fixture_dir/v0.8.8.json"
-    sed -e 's/"tag_name": "v0.8.8"/"tag_name": "v0.9.0"/' \
+    cp "$TEST_DIR/fixtures/release-v0.8.9.json" "$fixture_dir/v0.8.9.json"
+    sed -e 's/"tag_name": "v0.8.9"/"tag_name": "v0.9.0"/' \
         -e 's/"prerelease": false/"prerelease": true/' \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" > "$fixture_dir/v0.9.0.json"
-    sed -e 's/"tag_name": "v0.8.8"/"tag_name": "v0.10.0"/' \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" > "$fixture_dir/v0.9.0.json"
+    sed -e 's/"tag_name": "v0.8.9"/"tag_name": "v0.10.0"/' \
         -e 's/github-actions\[bot\]/manual-publisher/' \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" > "$fixture_dir/v0.10.0.json"
-    sed -e 's/"tag_name": "v0.8.8"/"tag_name": "v0.11.0"/' \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" > "$fixture_dir/v0.10.0.json"
+    sed -e 's/"tag_name": "v0.8.9"/"tag_name": "v0.11.0"/' \
         -e 's/"immutable": true/"immutable": false/' \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" > "$fixture_dir/v0.11.0.json"
+        "$TEST_DIR/fixtures/release-v0.8.9.json" > "$fixture_dir/v0.11.0.json"
     printf '%s\n' \
         '[' \
         '  {"tag_name":"v0.9.0"},' \
-        '  {"tag_name":"v0.8.8"},' \
+        '  {"tag_name":"v0.8.9"},' \
         '  {"tag_name":"v0.11.0"},' \
         '  {"tag_name":"v0.10.0"}' \
         ']' > "$list_fixture"
@@ -1835,7 +1835,7 @@ v08_channel_skips_higher_untrusted_tags_for_stable_release() {
     MOCK_RELEASE_LIST_FILE_UNDER_TEST="$list_fixture"
     MOCK_RELEASE_FIXTURE_DIR_UNDER_TEST="$fixture_dir"
     invoke_installer "$sandbox" Linux x86_64 \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" '0.8.8' \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" '0.8.9' \
         --no-service --no-auto-update >"$output" 2>&1
     status=$?
     MOCK_RELEASE_LIST_FILE_UNDER_TEST=''
@@ -1853,9 +1853,9 @@ v08_channel_skips_higher_untrusted_tags_for_stable_release() {
             return 1
         fi
     done
-    assert_log_contains_literal "$sandbox/curl.log" '/releases/tags/v0.8.8' \
+    assert_log_contains_literal "$sandbox/curl.log" '/releases/tags/v0.8.9' \
         'installer did not fall through to the trusted stable tag' || return 1
-    assert_equals 'arc-node 0.8.8' "$("$sandbox/arc/bin/arc-node" --version)" \
+    assert_equals 'arc-node 0.8.9' "$("$sandbox/arc/bin/arc-node" --version)" \
         'installer did not commit the highest trusted stable release' || return 1
 }
 
@@ -1868,13 +1868,13 @@ v08_channel_fails_closed_without_a_compatible_or_complete_list() {
         if [ "$case_name" = v07-only ]; then
             printf '%s\n' '[{"tag_name":"v0.7.11"}]' > "$list_fixture"
         else
-            printf '%s' '[{"tag_name":"v0.8.8"}' > "$list_fixture"
+            printf '%s' '[{"tag_name":"v0.8.9"}' > "$list_fixture"
         fi
         output="$sandbox/channel-rejected.out"
         ARC_NODE_VERSION_UNDER_TEST=''
         MOCK_RELEASE_LIST_FILE_UNDER_TEST="$list_fixture"
         invoke_installer "$sandbox" Linux x86_64 \
-            "$TEST_DIR/fixtures/release-v0.8.8.json" '0.8.8' \
+            "$TEST_DIR/fixtures/release-v0.8.9.json" '0.8.9' \
             --no-service --no-auto-update >"$output" 2>&1
         status=$?
         MOCK_RELEASE_LIST_FILE_UNDER_TEST=''
@@ -2275,13 +2275,13 @@ update_only_preserves_custom_port_and_empty_model() {
     ARC_NODE_VERSION_UNDER_TEST=''
     output="$sandbox/upgrade.out"
     if ! invoke_installer "$sandbox" Linux amd64 \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" '0.8.8' \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" '0.8.9' \
         --update-only --no-service --no-auto-update >"$output" 2>&1; then
         sed -n '1,140p' "$output"
         return 1
     fi
-    "$sandbox/arc/bin/arc-node" --version | grep -Fq '0.8.8' || {
-        printf 'update-only did not replace node with v0.8.8\n'
+    "$sandbox/arc/bin/arc-node" --version | grep -Fq '0.8.9' || {
+        printf 'update-only did not replace node with v0.8.9\n'
         return 1
     }
     assert_file_contains "$sandbox/arc/install.conf" '^rpc_port=18444$' \
@@ -2292,7 +2292,7 @@ update_only_preserves_custom_port_and_empty_model() {
         'update-only changed an intentionally empty model path' || return 1
     assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--model([[:space:]]|$)' \
         'update-only introduced an empty --model argument' || return 1
-    assert_log_contains_literal "$sandbox/curl.log" '/releases/download/v0.8.8/arc-node-linux-x86_64' \
+    assert_log_contains_literal "$sandbox/curl.log" '/releases/download/v0.8.9/arc-node-linux-x86_64' \
         'update-only did not use the exact newer tag' || return 1
     if grep -Fq '/health' "$sandbox/curl.log"; then
         printf 'no-service update unexpectedly health-probed a process it did not start\n'
@@ -2372,7 +2372,7 @@ managed_system_user_update_waits_past_thirty_seconds_for_graceful_restart() {
         "$sandbox/systemd-state/arc-node.service.restart-mainpid-seen"
     output="$sandbox/system-user-delayed-update.out"
     invoke_installer "$sandbox" Linux x86_64 \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" 0.8.8 \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" 0.8.9 \
         --install-dir "$legacy_root" --update-only >"$output" 2>&1
     status=$?
     wait "$old_pid" 2>/dev/null || true
@@ -2390,8 +2390,8 @@ managed_system_user_update_waits_past_thirty_seconds_for_graceful_restart() {
         printf 'delayed restart fixture did not hold the old PID past 30 lifecycle polls\n'
         return 1
     }
-    "$legacy_root/bin/arc-node" --version | grep -Fq '0.8.8' || {
-        printf 'system-user delayed restart did not commit the v0.8.8 binary\n'
+    "$legacy_root/bin/arc-node" --version | grep -Fq '0.8.9' || {
+        printf 'system-user delayed restart did not commit the v0.8.9 binary\n'
         return 1
     }
     assert_file_not_contains "$output" 'Install/update failed' \
@@ -2566,7 +2566,7 @@ mid_copy_update_failure_restores_full_install() {
     output="$sandbox/mid-copy-update.out"
     ARC_INSTALL_TEST_FAIL_AFTER_COPY_UNDER_TEST=4
     invoke_installer "$sandbox" Linux x86_64 \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" 0.8.8 \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" 0.8.9 \
         --update-only >"$output" 2>&1
     status=$?
     ARC_INSTALL_TEST_FAIL_AFTER_COPY_UNDER_TEST=''
@@ -2595,7 +2595,7 @@ service_failure_restores_full_install() {
     output="$sandbox/service-failure-update.out"
     MOCK_SERVICE_FAIL_MATCH_UNDER_TEST='restart arc-node.service'
     invoke_installer "$sandbox" Linux x86_64 \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" 0.8.8 \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" 0.8.9 \
         --update-only >"$output" 2>&1
     status=$?
     MOCK_SERVICE_FAIL_MATCH_UNDER_TEST=''
@@ -2624,7 +2624,7 @@ health_failure_restores_full_install() {
     MOCK_HEALTH_STATUS_UNDER_TEST=starting
     ARC_HEALTH_TIMEOUT_UNDER_TEST=2
     invoke_installer "$sandbox" Linux x86_64 \
-        "$TEST_DIR/fixtures/release-v0.8.8.json" 0.8.8 \
+        "$TEST_DIR/fixtures/release-v0.8.9.json" 0.8.9 \
         --update-only >"$output" 2>&1
     status=$?
     MOCK_HEALTH_STATUS_UNDER_TEST=ok
