@@ -53,7 +53,13 @@ pub const VALIDATOR_SET_DOMAIN: &[u8] = b"arc.consensus.validatorset.v1";
 ///
 /// Liveness knob only: a shorter grace never makes an unsafe skip safe, it only
 /// skips more eagerly over a leader whose block was merely slow.
+/// Recent absence can shorten this wait while normal operation keeps the full
+/// grace; certificates never encode elapsed time, so mixed policies interoperate.
 pub const DEFAULT_SKIP_GRACE_MS: u64 = 2_000;
+/// Grace after quorum for a member recently attested absent with `NoBlock`.
+pub const RECENT_ABSENCE_GRACE_MS: u64 = 250;
+/// Rounds after the latest `NoBlock` attestation eligible for the shorter grace.
+pub const RECENT_ABSENCE_ROUNDS: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CertificateError {
@@ -711,6 +717,9 @@ pub struct SkipTracker {
     domain: ConsensusDomain,
     validator_set_hash: Hash256,
     grace_ms: u64,
+    recent_absence_grace_ms: u64,
+    /// Highest `NoBlock` round signed or adopted from a verified certificate per member.
+    recent_absence: HashMap<Address, u64>,
     /// Keyed by `(round, absentee)`. Keying by round alone would let an
     /// observation about a member that IS present poison the observation about
     /// one that is absent, since `absentee_seen` is deliberately sticky.
@@ -745,14 +754,33 @@ impl SkipTracker {
             .iter()
             .flat_map(|(round, members)| members.keys().map(move |member| (*round, *member)))
             .collect();
+        let mut recent_absence: HashMap<Address, u64> = HashMap::new();
+        for (round, members) in &record.skipped_rounds {
+            for (member, reason) in members {
+                if *reason == AbsenceReason::NoBlock {
+                    recent_absence
+                        .entry(*member)
+                        .and_modify(|recent| *recent = (*recent).max(*round))
+                        .or_insert(*round);
+                }
+            }
+        }
         Self {
             domain,
             validator_set_hash,
             grace_ms,
+            recent_absence_grace_ms: grace_ms,
+            recent_absence,
             observations: HashMap::new(),
             record,
             refused,
         }
+    }
+
+    /// Set the grace for recent `NoBlock` absences, clamped to the full grace.
+    pub fn with_recent_absence_grace(mut self, grace_ms: u64) -> Self {
+        self.recent_absence_grace_ms = grace_ms.min(self.grace_ms);
+        self
     }
 
     pub fn record(&self) -> &ConsensusSigningRecord {
@@ -802,6 +830,12 @@ impl SkipTracker {
         quorum: u64,
         now_ms: u64,
     ) {
+        if reason == AbsenceReason::NoBlock
+            && !condition_holds
+            && self.recent_absence.get(member).is_some_and(|r| round > *r)
+        {
+            self.recent_absence.remove(member);
+        }
         let entry = self
             .observations
             .entry((round, *member, reason))
@@ -850,7 +884,17 @@ impl SkipTracker {
         let since = observation
             .holding_since
             .ok_or(SkipRefusal::RoundBelowQuorum)?;
-        if now_ms.saturating_sub(since) < self.grace_ms {
+        let grace_ms = if reason == AbsenceReason::NoBlock
+            && self
+                .recent_absence
+                .get(&absentee)
+                .is_some_and(|r| round <= r.saturating_add(RECENT_ABSENCE_ROUNDS))
+        {
+            self.recent_absence_grace_ms
+        } else {
+            self.grace_ms
+        };
+        if now_ms.saturating_sub(since) < grace_ms {
             return Err(SkipRefusal::WithinGrace);
         }
         let vote = SkipVote::sign(
@@ -869,6 +913,12 @@ impl SkipTracker {
             .or_default()
             .insert(absentee, reason);
         self.refused.insert((round, absentee));
+        if reason == AbsenceReason::NoBlock {
+            self.recent_absence
+                .entry(absentee)
+                .and_modify(|recent| *recent = (*recent).max(round))
+                .or_insert(round);
+        }
         Ok(vote)
     }
 
@@ -883,6 +933,12 @@ impl SkipTracker {
             .insert(certificate.absentee, certificate.reason);
         self.refused
             .insert((certificate.round, certificate.absentee));
+        if certificate.reason == AbsenceReason::NoBlock {
+            self.recent_absence
+                .entry(certificate.absentee)
+                .and_modify(|recent| *recent = (*recent).max(certificate.round))
+                .or_insert(certificate.round);
+        }
     }
 
     /// Drop observations for rounds the commit cursor has passed.
@@ -1387,6 +1443,56 @@ mod tests {
         )
     }
 
+    fn assert_no_block_grace(
+        tracker: &mut SkipTracker,
+        set: &ValidatorSet,
+        signer: &KeyPair,
+        member: Address,
+        round: u64,
+        now_ms: u64,
+        grace_ms: u64,
+    ) {
+        tracker.observe(
+            round,
+            &member,
+            AbsenceReason::NoBlock,
+            set.quorum,
+            true,
+            set.quorum,
+            now_ms,
+        );
+        assert_eq!(
+            tracker.sign_if_permitted(
+                round,
+                member,
+                AbsenceReason::NoBlock,
+                0,
+                set.quorum,
+                now_ms + grace_ms - 1,
+                signer,
+            ),
+            Err(SkipRefusal::WithinGrace)
+        );
+        let vote = tracker
+            .sign_if_permitted(
+                round,
+                member,
+                AbsenceReason::NoBlock,
+                0,
+                set.quorum,
+                now_ms + grace_ms,
+                signer,
+            )
+            .expect("grace elapsed");
+        assert_eq!(vote.round, round);
+        assert_eq!(vote.absentee, member);
+        assert!(tracker.refuses(round, &member));
+        assert_eq!(
+            tracker.record().skipped_rounds[&round].get(&member),
+            Some(&AbsenceReason::NoBlock)
+        );
+    }
+
     #[test]
     fn s1_a_round_below_quorum_cannot_be_skipped() {
         let (set, keys) = committee(4);
@@ -1492,6 +1598,210 @@ mod tests {
             .expect("grace elapsed");
         assert_eq!(vote.round, 5);
         assert_eq!(vote.absentee, leader);
+    }
+
+    #[test]
+    fn an_own_absence_signature_shortens_only_recent_absences_of_that_member() {
+        let (set, keys) = committee(4);
+        let mut tracker = tracker(&set).with_recent_absence_grace(RECENT_ABSENCE_GRACE_MS);
+        let member = keys[0].address();
+        let round = 5;
+        assert_no_block_grace(
+            &mut tracker,
+            &set,
+            &keys[1],
+            member,
+            round,
+            1_000,
+            DEFAULT_SKIP_GRACE_MS,
+        );
+        assert_no_block_grace(
+            &mut tracker,
+            &set,
+            &keys[1],
+            member,
+            round + 1,
+            4_000,
+            RECENT_ABSENCE_GRACE_MS,
+        );
+        assert_no_block_grace(
+            &mut tracker,
+            &set,
+            &keys[1],
+            member,
+            round + 1 + RECENT_ABSENCE_ROUNDS + 1,
+            5_000,
+            DEFAULT_SKIP_GRACE_MS,
+        );
+        assert_no_block_grace(
+            &mut tracker,
+            &set,
+            &keys[1],
+            keys[2].address(),
+            round + 2 + RECENT_ABSENCE_ROUNDS,
+            8_000,
+            DEFAULT_SKIP_GRACE_MS,
+        );
+    }
+
+    #[test]
+    fn only_a_newer_block_restores_the_full_absence_grace() {
+        let (set, keys) = committee(4);
+        let member = keys[0].address();
+        for block_round in [4, 5, 6] {
+            let mut tracker = tracker(&set).with_recent_absence_grace(RECENT_ABSENCE_GRACE_MS);
+            assert_no_block_grace(
+                &mut tracker,
+                &set,
+                &keys[1],
+                member,
+                5,
+                1_000,
+                DEFAULT_SKIP_GRACE_MS,
+            );
+            tracker.observe(
+                block_round,
+                &member,
+                AbsenceReason::NoBlock,
+                0,
+                false,
+                set.quorum,
+                4_000,
+            );
+            let grace_ms = if block_round > 5 {
+                DEFAULT_SKIP_GRACE_MS
+            } else {
+                RECENT_ABSENCE_GRACE_MS
+            };
+            assert_no_block_grace(&mut tracker, &set, &keys[1], member, 7, 5_000, grace_ms);
+        }
+    }
+
+    #[test]
+    fn recent_absence_grace_is_opt_in_and_clamped_to_the_full_grace() {
+        let (set, keys) = committee(4);
+        let member = keys[0].address();
+        for grace_ms in [None, Some(DEFAULT_SKIP_GRACE_MS + 1)] {
+            let mut tracker = tracker(&set);
+            if let Some(grace_ms) = grace_ms {
+                tracker = tracker.with_recent_absence_grace(grace_ms);
+            }
+            for (round, now_ms) in [(5, 1_000), (6, 4_000)] {
+                assert_no_block_grace(
+                    &mut tracker,
+                    &set,
+                    &keys[1],
+                    member,
+                    round,
+                    now_ms,
+                    DEFAULT_SKIP_GRACE_MS,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restarting_seeds_recent_absence_from_the_highest_recorded_round() {
+        let (set, keys) = committee(4);
+        let member = keys[0].address();
+        let mut record = ConsensusSigningRecord::default();
+        for round in [5, 1, 4] {
+            record
+                .skipped_rounds
+                .entry(round)
+                .or_default()
+                .insert(member, AbsenceReason::NoBlock);
+        }
+        for round in [6, 5 + RECENT_ABSENCE_ROUNDS] {
+            let restored = ConsensusSigningRecord::decode(&record.encode()).expect("decodes");
+            let mut tracker = SkipTracker::new(
+                domain(),
+                validator_set_hash(&set),
+                DEFAULT_SKIP_GRACE_MS,
+                restored,
+            )
+            .with_recent_absence_grace(RECENT_ABSENCE_GRACE_MS);
+            assert_no_block_grace(
+                &mut tracker,
+                &set,
+                &keys[1],
+                member,
+                round,
+                1_000,
+                RECENT_ABSENCE_GRACE_MS,
+            );
+        }
+    }
+
+    #[test]
+    fn older_attestations_cannot_lower_the_recent_absence_round() {
+        let (set, keys) = committee(4);
+        let member = keys[0].address();
+        let mut tracker = tracker(&set).with_recent_absence_grace(RECENT_ABSENCE_GRACE_MS);
+        assert_no_block_grace(
+            &mut tracker,
+            &set,
+            &keys[1],
+            member,
+            10,
+            1_000,
+            DEFAULT_SKIP_GRACE_MS,
+        );
+        assert_no_block_grace(
+            &mut tracker,
+            &set,
+            &keys[1],
+            member,
+            5,
+            4_000,
+            RECENT_ABSENCE_GRACE_MS,
+        );
+        let certificate = SkipCertificate::new(
+            domain(),
+            validator_set_hash(&set),
+            4,
+            member,
+            AbsenceReason::NoBlock,
+            skip_votes(&set, &keys, 4, member, 3),
+        );
+        certificate.verify(&domain(), &set).expect("valid");
+        tracker.adopt_certificate(&certificate);
+        assert_no_block_grace(
+            &mut tracker,
+            &set,
+            &keys[1],
+            member,
+            11,
+            5_000,
+            RECENT_ABSENCE_GRACE_MS,
+        );
+    }
+
+    #[test]
+    fn recent_absence_window_includes_its_last_round_and_saturates() {
+        let (set, keys) = committee(4);
+        let member = keys[0].address();
+        for (round, next_round) in [(5, 5 + RECENT_ABSENCE_ROUNDS), (u64::MAX - 1, u64::MAX)] {
+            let mut tracker = tracker(&set).with_recent_absence_grace(RECENT_ABSENCE_GRACE_MS);
+            assert_no_block_grace(
+                &mut tracker,
+                &set,
+                &keys[1],
+                member,
+                round,
+                1_000,
+                DEFAULT_SKIP_GRACE_MS,
+            );
+            assert_no_block_grace(
+                &mut tracker,
+                &set,
+                &keys[1],
+                member,
+                next_round,
+                4_000,
+                RECENT_ABSENCE_GRACE_MS,
+            );
+        }
     }
 
     #[test]
@@ -1828,7 +2138,7 @@ mod tests {
     #[test]
     fn adopting_a_peer_certificate_inherits_the_refusal() {
         let (set, keys) = committee(4);
-        let mut tracker = tracker(&set);
+        let mut tracker = tracker(&set).with_recent_absence_grace(RECENT_ABSENCE_GRACE_MS);
         let leader = keys[0].address();
         let votes = skip_votes(&set, &keys, 11, leader, 3);
         let certificate = SkipCertificate::new(
@@ -1845,6 +2155,15 @@ mod tests {
         // The refusal is specific to the member the certificate names.
         assert!(!tracker.refuses(11, &keys[2].address()));
         assert!(!tracker.refuses(12, &leader));
+        assert_no_block_grace(
+            &mut tracker,
+            &set,
+            &keys[1],
+            leader,
+            12,
+            1_000,
+            RECENT_ABSENCE_GRACE_MS,
+        );
     }
 
     // ── collectors ──────────────────────────────────────────────────────────

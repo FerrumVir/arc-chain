@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arc_consensus::view_change::{
     AbsenceReason, ConsensusSigningRecord, DEFAULT_SKIP_GRACE_MS, FinalityCertificate,
-    FinalityVote, FinalityVoteCollector, SkipCertificate, SkipTracker, SkipVote, SkipVoteCollector,
-    validator_set_hash,
+    FinalityVote, FinalityVoteCollector, RECENT_ABSENCE_GRACE_MS, SkipCertificate, SkipTracker,
+    SkipVote, SkipVoteCollector, validator_set_hash,
 };
 use arc_consensus::{
     ConsensusDomain, ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet,
@@ -173,6 +173,7 @@ struct Sim {
     set: ValidatorSet,
     nodes: Vec<Node>,
     now_ms: u64,
+    tick_ms: u64,
     /// Messages held back by a `delay` tick.
     pending: Vec<(usize, Msg)>,
 }
@@ -189,6 +190,7 @@ impl Sim {
             set,
             nodes,
             now_ms: 0,
+            tick_ms: TICK_MS,
             pending: Vec::new(),
         }
     }
@@ -201,7 +203,7 @@ impl Sim {
     /// messages are delivered under the tick's fault script, then every node
     /// tries to advance, skip, commit and finalise.
     fn tick(&mut self, faults: &Faults) {
-        self.now_ms += TICK_MS;
+        self.now_ms += self.tick_ms;
         let mut outbox: Vec<(usize, Msg)> = std::mem::take(&mut self.pending);
 
         // ── propose ──────────────────────────────────────────────────────────
@@ -567,6 +569,43 @@ fn a_permanently_silent_leader_is_skipped_and_the_chain_keeps_committing() {
             "n={n}: round 1 was neither committed nor certified-skipped"
         );
     }
+}
+
+#[test]
+fn adaptive_absence_grace_triples_throughput_with_a_silent_member() {
+    let committed_rounds = |grace_ms| {
+        let mut sim = Sim::new(6);
+        sim.tick_ms = 100;
+        let silent = leader_for_round(&sim.set, 1);
+        for node in &mut sim.nodes {
+            node.online = node.address != silent;
+            node.tracker = SkipTracker::new(
+                domain(),
+                validator_set_hash(&sim.set),
+                GRACE,
+                ConsensusSigningRecord::default(),
+            )
+            .with_recent_absence_grace(grace_ms);
+        }
+        // Both policies get the same 20 simulated seconds, including the first
+        // absence's full grace. Every live validator must commit the same sequence.
+        sim.run(200, &Faults::default());
+        assert_eq!(sim.now_ms, 20_000);
+        sim.assert_safety("silent member throughput");
+        let mut online = sim.nodes.iter().filter(|node| node.online);
+        let first = online.next().expect("five live validators");
+        for node in online {
+            assert_eq!(node.committed, first.committed);
+        }
+        first.committed.len()
+    };
+    let full = committed_rounds(GRACE);
+    let adaptive = committed_rounds(RECENT_ABSENCE_GRACE_MS);
+    assert!(full > 0, "the full-grace policy must also make progress");
+    assert!(
+        adaptive >= 3 * full,
+        "adaptive committed {adaptive} rounds versus {full} with full grace in 20 seconds"
+    );
 }
 
 #[test]

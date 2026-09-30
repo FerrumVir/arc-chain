@@ -23,6 +23,9 @@ All notable changes to ARC Chain are tracked here. This project follows
 > **Candidate note:** This entry records the v0.8.10 release-preparation
 > snapshot. It does not claim publication or deployment of v0.8.10.
 
+- Shortens local absence grace from 2,000 ms to 250 ms for recently absent
+  validators, restoring the full grace on newer blocks without changing
+  quorum, certificate validity, or commit rules.
 - Validators re-sign a reward commitment they already verified when a
   coordinator retries, instead of recomputing it. Reward approvals converge
   without five concurrent recomputations overloading the 12-slot shard queue;
