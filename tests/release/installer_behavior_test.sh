@@ -642,7 +642,8 @@ reset_legacy_supervisor_test_environment() {
 legacy_update_profile_refuses_migration_before_payload_download() {
     local sandbox legacy_root output mode file status expected
     local CUTOVER_ASSETS=arc-existing-chain-update-attestation.json
-    local MOCK_TARGET_UID_UNDER_TEST="$(id -u)"
+    local MOCK_TARGET_UID_UNDER_TEST
+    MOCK_TARGET_UID_UNDER_TEST="$(id -u)"
     local MOCK_TAMPER_MANIFEST_SIGNATURE_UNDER_TEST=0
     local -a mode_args=(--version 0.8.10)
     new_sandbox
