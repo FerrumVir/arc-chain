@@ -33,6 +33,12 @@ export const CHECKS = [
 
 const bare = (value) => String(value ?? "").replace(/^0x/i, "").toLowerCase();
 const integer = (value) => /^[\d,]+$/.test(value ?? "") ? Number(value.replaceAll(",", "")) : NaN;
+// Field labels are read with innerText, which applies the explorer's CSS
+// text-transform (for example "BLOCK"), so look them up case-insensitively.
+const field = (card, name) => {
+  const label = Object.keys(card.fields).find((key) => key.toLowerCase() === name.toLowerCase());
+  return label === undefined ? undefined : card.fields[label];
+};
 
 export function validateObservation(check, observed) {
   assert.equal(observed.url, check.url, "browser must remain on the requested public route");
@@ -50,8 +56,8 @@ export function validateObservation(check, observed) {
     const card = observed.cards.find((entry) => entry.receipts.some((receipt) =>
       receipt.label === "Community reward receipt" && bare(receipt.tx_hash) === bare(REWARD.hash)));
     assert.ok(card, "full transaction hash must appear in a rendered reward receipt");
-    assert.equal(integer(card.fields.Block), REWARD.block);
-    assert.equal(card.fields.Reward, "Earned · successful mined receipt");
+    assert.equal(integer(field(card, "Block")), REWARD.block);
+    assert.equal(field(card, "Reward"), "Earned · successful mined receipt");
     const receipt = card.receipts.find((entry) => entry.label === "Community reward receipt");
     assert.equal(receipt.status, "mined_success");
     assert.equal(receipt.tx_type, "0x25");
@@ -71,11 +77,11 @@ export function validateObservation(check, observed) {
   const cards = observed.cards.filter((card) => card.receipts.some((receipt) => bare(receipt.request_id) === bare(check.request.id)));
   assert.ok(cards.length > 0, "request identity must appear in a rendered receipt");
   for (const card of cards) {
-    assert.equal(card.fields["Chain status"], check.request.status);
+    assert.equal(field(card, "Chain status"), check.request.status);
     const receipt = card.receipts.find((entry) => bare(entry.request_id) === bare(check.request.id));
     assert.equal(receipt.observed_status, check.request.status);
     if (check.request.admissionBlock) {
-      assert.equal(integer(card.fields["Admitted at"]), check.request.admissionBlock);
+      assert.equal(integer(field(card, "Admitted at")), check.request.admissionBlock);
       assert.equal(receipt.admission_transaction?.block_height, check.request.admissionBlock);
       assert.equal(bare(receipt.admission_transaction?.tx_hash), bare(check.request.admissionHash));
     }

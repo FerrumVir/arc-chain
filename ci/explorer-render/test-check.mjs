@@ -97,6 +97,22 @@ await test("raw receipt numbers cannot replace the rendered earned reward and bl
   }
 });
 
+await test("labels rendered upper-case by CSS are matched case-insensitively", () => {
+  const reward = observation(CHECKS[1]);
+  reward.cards[0].fields = { BLOCK: "3,794,543", REWARD: "Earned · successful mined receipt" };
+  validateObservation(CHECKS[1], reward);
+  reward.cards[0].fields = { BLOCK: "3,794,544", REWARD: "Earned · successful mined receipt" };
+  assert.throws(() => validateObservation(CHECKS[1], reward));
+  for (const check of CHECKS.filter((entry) => entry.kind === "request")) {
+    const observed = observation(check);
+    const fields = observed.cards[0].fields;
+    observed.cards[0].fields = Object.fromEntries(Object.entries(fields).map(([key, value]) => [key.toUpperCase(), value]));
+    validateObservation(check, observed);
+    observed.cards[0].fields["CHAIN STATUS"] = "Pending";
+    assert.throws(() => validateObservation(check, observed));
+  }
+});
+
 await test("block evidence needs the actual transaction list entry", () => {
   const check = CHECKS[2];
   for (const transactionLinks of [[], [{ hash: REQUESTS[0].id, text: REWARD.hash }], [{ hash: REWARD.hash, text: "" }]]) {
