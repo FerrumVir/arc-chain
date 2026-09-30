@@ -22,6 +22,33 @@ def require(condition: bool, message: str) -> None:
         raise GateError(message)
 
 
+def is_native_arg(value: object) -> bool:
+    return str(value).startswith("--native") or str(value).startswith("--enable-native")
+
+
+def validate_native_pin(native: object, site: str) -> dict:
+    """An owner-pinned native inference tail, its file hashes and context commitment.
+
+    Native inference is irreversibly activated on the live chain, so an update proof
+    must accept exactly the pinned production tail on every host and nothing else.
+    """
+    require(isinstance(native, dict) and set(native) == {"argv_tail", "files_sha256", "context_commitment"},
+            "native pin schema differs at " + site)
+    tail = native["argv_tail"]
+    require(isinstance(tail, list) and tail and all(isinstance(value, str) and value for value in tail),
+            "native argv tail is malformed at " + site)
+    require(is_native_arg(tail[0]) and all(is_native_arg(value) or not value.startswith("-") for value in tail),
+            "native argv tail may carry only native flags and their values at " + site)
+    files = native["files_sha256"]
+    require(isinstance(files, dict) and files and
+            all(isinstance(path, str) and path.startswith("/") and ".." not in Path(path).parts and
+                SHA_RE.fullmatch(str(digest)) is not None for path, digest in files.items()),
+            "native file hash pins are malformed at " + site)
+    require(re.fullmatch(r"(?:0x)?[0-9a-f]{64}", str(native["context_commitment"])) is not None,
+            "native context commitment is malformed at " + site)
+    return native
+
+
 def validate_host_config(config: dict) -> tuple[dict[str, dict], int, int]:
     require(config.get("schema") == HOST_SCHEMA, "unsupported host config schema")
     total_stake = config.get("total_stake")
@@ -66,9 +93,16 @@ def validate_host_config(config: dict) -> tuple[dict[str, dict], int, int]:
             path = host[path_key]
             require(isinstance(path, str) and path.startswith("/") and ".." not in Path(path).parts,
                     "unsafe " + path_key + " for " + site)
+        if "native" in host:
+            validate_native_pin(host["native"], site)
         by_site[site] = host
         ips.add(host["ip"])
         identities.add(host["validator"])
+    natives = [host.get("native") for host in by_site.values()]
+    require(all(native is None for native in natives) or all(native is not None for native in natives),
+            "native pins must cover every host or none")
+    require(len({str(native["context_commitment"]).removeprefix("0x") for native in natives if native}) <= 1,
+            "hosts pin different native context commitments")
     require(len(quorum_sites) == len(set(quorum_sites)), "duplicate quorum site")
     require(set(quorum_sites) == set(by_site), "host config must contain exactly the authenticated quorum scope")
     require(set(quorum_sites) <= set(by_site), "quorum references a missing host")
@@ -122,8 +156,18 @@ def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
             argv = row.get("argv_redacted")
             require(isinstance(argv, list) and argv and Path(argv[0]).name.startswith("arc-node."),
                     "running argv is absent or not an immutable versioned binary at " + site)
-            require("--native" not in argv and not any(str(value).startswith("--native-") for value in argv),
-                    "native activation is forbidden during compatibility rollout at " + site)
+            native = pin.get("native")
+            if native is None:
+                require(not any(is_native_arg(value) for value in argv) and row.get("native") is None and
+                        not row.get("native_files_sha256"),
+                        "native activation is forbidden without pinned native evidence at " + site)
+            else:
+                tail = native["argv_tail"]
+                require(len(argv) > len(tail) and argv[-len(tail):] == tail and
+                        not any(is_native_arg(value) for value in argv[:-len(tail)]),
+                        "running argv differs from the exact pinned native tail at " + site)
+                require(row.get("native") == native and row.get("native_files_sha256") == native["files_sha256"],
+                        "native pin or observed native file hashes differ at " + site)
             require("--data-dir" in argv and argv[argv.index("--data-dir") + 1] == pin["data_dir"] and
                     "--genesis" in argv and argv[argv.index("--genesis") + 1] == pin["genesis_path"],
                     "data/genesis argv differs from host pin at " + site)

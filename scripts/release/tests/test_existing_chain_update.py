@@ -51,6 +51,84 @@ class ExistingChainUpdateTests(unittest.TestCase):
             validator.validate_quorum_proof(proof, hosts, total, quorum,
                 expected_network=expected, now=proof["captured_at_unix"] + 121)
 
+    NATIVE_TAIL = ["--native-inference-activation", "/etc/arc/native/activation.json",
+                   "--native-inference-runtime", "--native-row-workers", "/etc/arc/native/cohort.json",
+                   "--native-kv-budget-bytes", "67108864", "--enable-native-inference-requests"]
+    NATIVE_FILES = {"/etc/arc/native/activation.json": "a" * 64, "/etc/arc/native/cohort.json": "b" * 64}
+
+    def native_fixture(self):
+        config = load("host-config-six-current-20260927.json")
+        proof = load("six-host-before-cfd-20260927.json")
+        native = {"argv_tail": list(self.NATIVE_TAIL), "files_sha256": dict(self.NATIVE_FILES),
+                  "context_commitment": "d0" * 32}
+        for host in config["hosts"]:
+            host["native"] = copy.deepcopy(native)
+        for sample in proof["samples"]:
+            for node in sample["nodes"]:
+                node["argv_redacted"] = node["argv_redacted"] + list(self.NATIVE_TAIL)
+                node["native"] = copy.deepcopy(native)
+                node["native_files_sha256"] = dict(self.NATIVE_FILES)
+        expected = {key: config[key] for key in ("genesis_file_sha256", "genesis_network_hash",
+            "recovery_domain", "checkpoint_manifest_hash", "validator_set_id")}
+        return config, proof, expected
+
+    def check(self, config, proof, expected):
+        hosts, total, quorum = validator.validate_host_config(config)
+        return validator.validate_quorum_proof(proof, hosts, total, quorum,
+            expected_network=expected, now=proof["captured_at_unix"] + 60)
+
+    def test_native_pins_accept_only_the_exact_tail_with_matching_evidence(self):
+        config, proof, expected = self.native_fixture()
+        self.assertEqual(self.check(config, proof, expected)["host_count"], 6)
+
+        def nodes(p):
+            return [node for sample in p["samples"] for node in sample["nodes"]]
+
+        proof_mutations = [
+            lambda p: nodes(p)[0]["argv_redacted"].__setitem__(-1, "--native-inference-runtime"),
+            lambda p: nodes(p)[0]["argv_redacted"].insert(1, "--native-low-residency"),
+            lambda p: nodes(p)[0]["argv_redacted"].pop(),
+            lambda p: nodes(p)[0]["native_files_sha256"].__setitem__("/etc/arc/native/cohort.json", "c" * 64),
+            lambda p: nodes(p)[0]["native"].__setitem__("context_commitment", "e0" * 32),
+            lambda p: nodes(p)[0].pop("native"),
+        ]
+        for index, mutate in enumerate(proof_mutations):
+            with self.subTest(proof_mutation=index):
+                c, p, e = self.native_fixture()
+                mutate(p)
+                with self.assertRaises(validator.GateError):
+                    self.check(c, p, e)
+        config_mutations = [
+            lambda c: c["hosts"][0].pop("native"),
+            lambda c: c["hosts"][0]["native"].__setitem__("context_commitment", "e0" * 32),
+            lambda c: c["hosts"][0]["native"]["argv_tail"].append("--stake"),
+            lambda c: c["hosts"][0]["native"].__setitem__("argv_tail", ["67108864"]),
+            lambda c: c["hosts"][0]["native"]["files_sha256"].__setitem__("relative/path", "a" * 64),
+            lambda c: c["hosts"][0]["native"].__setitem__("extra", True),
+        ]
+        for index, mutate in enumerate(config_mutations):
+            with self.subTest(config_mutation=index):
+                c, p, e = self.native_fixture()
+                mutate(c)
+                with self.assertRaises(validator.GateError):
+                    self.check(c, p, e)
+
+    def test_native_flags_without_pins_stay_forbidden(self):
+        config = load("host-config-six-current-20260927.json")
+        proof = load("six-host-before-cfd-20260927.json")
+        expected = {key: config[key] for key in ("genesis_file_sha256", "genesis_network_hash",
+            "recovery_domain", "checkpoint_manifest_hash", "validator_set_id")}
+        for flag in ("--native-inference-activation", "--enable-native-inference-requests"):
+            with self.subTest(flag=flag):
+                p = copy.deepcopy(proof)
+                p["samples"][0]["nodes"][0]["argv_redacted"].append(flag)
+                with self.assertRaises(validator.GateError):
+                    self.check(config, p, expected)
+        p = copy.deepcopy(proof)
+        p["samples"][0]["nodes"][0]["native_files_sha256"] = dict(self.NATIVE_FILES)
+        with self.assertRaises(validator.GateError):
+            self.check(config, p, expected)
+
     def test_saved_selection_is_recomputed_from_exact_api_rows(self):
         commit = "cfd70e09ab1ea8ee7c7d948e86b47d3509e49119"
         selected, groups = mod.revalidate_api_selection(FIXTURES / "selection-live-all-nine.json",
