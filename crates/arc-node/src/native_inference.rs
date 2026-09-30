@@ -25,8 +25,8 @@ use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use thiserror::Error;
 use tokio::sync::Notify;
 
@@ -298,6 +298,12 @@ pub trait NativeExecutor: Send + Sync {
     /// closed by default; construction/identity checks alone are not liveness.
     fn ready_for_requests(&self, _context: &InferenceAdmissionContext, _now: u64) -> bool {
         false
+    }
+
+    /// Checked by admission even during execution. The default requires full
+    /// readiness; separating policy permits grace for compute availability.
+    fn policy_allows_requests(&self, context: &InferenceAdmissionContext, now: u64) -> bool {
+        self.ready_for_requests(context, now)
     }
 
     /// Identity/policy authorization, independent of live compute readiness.
@@ -821,6 +827,14 @@ impl NativeExecutor for CanonicalI8NativeExecutor {
     }
 
     fn ready_for_requests(&self, context: &InferenceAdmissionContext, now: u64) -> bool {
+        self.policy_allows_requests(context, now)
+            && match &self.row_cohort {
+                Some(cohort) => cohort.ready_for_requests(now),
+                None => !self.model.is_low_residency(),
+            }
+    }
+
+    fn policy_allows_requests(&self, context: &InferenceAdmissionContext, _now: u64) -> bool {
         let Ok(assignment) = self.assignment_hash() else {
             return false;
         };
@@ -829,10 +843,7 @@ impl NativeExecutor for CanonicalI8NativeExecutor {
                 && allowed.profile_hash == self.qualification.profile_hash
                 && allowed.generation_hash == self.qualification.generation_hash
                 && allowed.assignment_hash == assignment
-        }) && match &self.row_cohort {
-            Some(cohort) => cohort.ready_for_requests(now),
-            None => !self.model.is_low_residency(),
-        }
+        })
     }
 
     fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
@@ -2306,8 +2317,22 @@ impl NativeExecutor for DeterministicTestExecutor {
 pub struct NativeRequestAdmission {
     operator_enabled: bool,
     running: AtomicBool,
-    healthy_at: Mutex<Option<std::time::Instant>>,
+    health: Mutex<NativeRuntimeHealth>,
+    policy: Mutex<Option<NativeAdmissionPolicy>>,
     worker_execution: Arc<WorkerExecutionGate>,
+}
+
+#[derive(Default)]
+struct NativeRuntimeHealth {
+    healthy_at: Option<std::time::Instant>,
+    // Cleared with health on every poll error and by NativeReadinessGuard.
+    busy_since: Option<std::time::Instant>,
+    unavailable_since: Option<std::time::Instant>,
+}
+
+struct NativeAdmissionPolicy {
+    state: Weak<arc_state::StateDB>,
+    executor: Weak<dyn NativeExecutor>,
 }
 
 /// Process-local compute barrier shared by every local inference execution
@@ -2531,9 +2556,11 @@ impl WorkerExecutionGate {
     }
 }
 
-/// A busy or unresponsive worker cannot continue admitting new paid work on
-/// the strength of an old poll. Existing canonical jobs still run and settle.
+/// Idle workers need fresh polls; an active poll gets a bounded execution
+/// window. Neither window overrides a stop, poll error or policy mismatch.
 const NATIVE_READINESS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+const NATIVE_BUSY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const NATIVE_COHORT_READINESS_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl NativeRequestAdmission {
     pub fn new(operator_enabled: bool) -> Self {
@@ -2548,11 +2575,20 @@ impl NativeRequestAdmission {
     }
 
     pub fn runtime_ready(&self) -> bool {
+        if !self.running.load(Ordering::Acquire) || !self.policy_allows_requests() {
+            return false;
+        }
+        let health = self.health.lock();
         self.running.load(Ordering::Acquire)
-            && self
-                .healthy_at
-                .lock()
-                .is_some_and(|at| at.elapsed() < NATIVE_READINESS_MAX_AGE)
+            && health.healthy_at.is_some_and(|at| {
+                health.busy_since.map_or_else(
+                    || at.elapsed() < NATIVE_READINESS_MAX_AGE,
+                    |since| since.elapsed() < NATIVE_BUSY_MAX_AGE,
+                )
+            })
+            && health
+                .unavailable_since
+                .is_none_or(|since| since.elapsed() < NATIVE_COHORT_READINESS_GRACE)
     }
 
     pub fn accepting_requests(&self) -> bool {
@@ -2586,7 +2622,50 @@ impl NativeRequestAdmission {
     }
 
     fn record_health(&self, ready: bool) {
-        *self.healthy_at.lock() = ready.then(std::time::Instant::now);
+        *self.health.lock() = NativeRuntimeHealth {
+            healthy_at: ready.then(std::time::Instant::now),
+            ..NativeRuntimeHealth::default()
+        };
+    }
+
+    fn policy_allows_requests(&self) -> bool {
+        self.policy.lock().as_ref().is_none_or(|policy| {
+            let (Some(state), Some(executor)) = (policy.state.upgrade(), policy.executor.upgrade())
+            else {
+                return false;
+            };
+            state
+                .try_native_inference_context()
+                .ok()
+                .flatten()
+                .is_some_and(|context| executor.policy_allows_requests(&context, state.height()))
+        })
+    }
+
+    fn record_readiness(&self, ready: bool) {
+        if !self.policy_allows_requests() {
+            self.record_health(false);
+            return;
+        }
+        let mut health = self.health.lock();
+        health.busy_since = None;
+        let now = std::time::Instant::now();
+        if ready {
+            health.healthy_at = Some(now);
+            health.unavailable_since = None;
+        } else {
+            let since = *health.unavailable_since.get_or_insert(now);
+            // Grace preserves proven health; it never opens a cold runtime.
+            if health.healthy_at.is_some() && since.elapsed() < NATIVE_COHORT_READINESS_GRACE {
+                health.healthy_at = Some(now);
+            } else {
+                health.healthy_at = None;
+            }
+        }
+    }
+
+    fn begin_poll(&self) {
+        self.health.lock().busy_since = Some(std::time::Instant::now());
     }
 
     fn stopped(&self) {
@@ -2700,6 +2779,11 @@ where
 {
     let flag = cancel.clone();
     let worker_admission = admission.clone();
+    let executor: Arc<dyn NativeExecutor> = runtime.worker.executor.clone();
+    *admission.policy.lock() = Some(NativeAdmissionPolicy {
+        state: Arc::downgrade(&runtime.state),
+        executor: Arc::downgrade(&executor),
+    });
     let join = std::thread::Builder::new()
         .name("arc-native-worker".into())
         .spawn(move || {
@@ -2711,9 +2795,15 @@ where
                     std::thread::sleep(bounds.idle_interval);
                     continue;
                 };
+                // A failed poll stays closed until a poll succeeds, even if
+                // the executor's preflight still reports ready on retries.
+                if consecutive_errors == 0 {
+                    worker_admission.record_readiness(runtime.ready_for_requests());
+                }
+                worker_admission.begin_poll();
                 match runtime.poll_once() {
                     Ok(Some(vote)) => {
-                        worker_admission.record_health(runtime.ready_for_requests());
+                        worker_admission.record_readiness(runtime.ready_for_requests());
                         consecutive_errors = 0;
                         tracing::info!(
                             request = %vote.request_id.to_hex(),
@@ -2721,7 +2811,7 @@ where
                         );
                     }
                     Ok(None) => {
-                        worker_admission.record_health(runtime.ready_for_requests());
+                        worker_admission.record_readiness(runtime.ready_for_requests());
                         consecutive_errors = 0;
                         std::thread::sleep(bounds.idle_interval);
                     }
@@ -5432,10 +5522,219 @@ mod tests {
         handle.shutdown();
         assert!(!restarted.accepting_requests());
         let stale = NativeRequestAdmission::ready_for_test();
-        *stale.healthy_at.lock() = Some(std::time::Instant::now() - NATIVE_READINESS_MAX_AGE);
+        stale.health.lock().healthy_at = Some(std::time::Instant::now() - NATIVE_READINESS_MAX_AGE);
         assert!(
             !stale.accepting_requests(),
-            "a hung/occupied worker's old poll expires"
+            "an idle worker's old poll expires"
+        );
+    }
+
+    #[test]
+    fn request_gate_keeps_busy_poll_ready_until_error_panic_or_execution_bound() {
+        struct BlockingExecutor {
+            started: std::sync::mpsc::Sender<()>,
+            finish: Mutex<std::sync::mpsc::Receiver<bool>>,
+        }
+        impl NativeExecutor for BlockingExecutor {
+            fn ready_for_requests(&self, _: &InferenceAdmissionContext, _: u64) -> bool {
+                true
+            }
+            fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
+                self.started.send(()).unwrap();
+                let panic = self
+                    .finish
+                    .lock()
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap();
+                assert!(!panic, "synthetic execution panic");
+                FixtureExecutor.execute(job)
+            }
+        }
+        struct FailedSink(std::sync::atomic::AtomicUsize);
+        impl VoteSink for FailedSink {
+            fn emit(&self, _: &StoredVote) -> Result<(), NativeInferenceError> {
+                self.0.fetch_add(1, Ordering::Release);
+                Err(NativeInferenceError::Sink("synthetic sink failure".into()))
+            }
+        }
+        for panic in [false, true] {
+            let fixture = native_fixture();
+            admit_requests(&fixture, &[0]);
+            let (started, executing) = std::sync::mpsc::channel();
+            let (finish, released) = std::sync::mpsc::channel();
+            let key = fixture.validators[0].clone();
+            let store = DecisionStore::open(
+                fixture.directory.path().join("busy-decisions"),
+                key.address(),
+                fixture.genesis,
+                fixture.context.commitment().unwrap(),
+            )
+            .unwrap();
+            let sink = Arc::new(FailedSink(std::sync::atomic::AtomicUsize::new(0)));
+            let runtime = NativeWorkerRuntime::from_active(
+                fixture.state.clone(),
+                Arc::new(BlockingExecutor {
+                    started,
+                    finish: Mutex::new(released),
+                }),
+                Arc::new(KeyPairVoteSigner::new(key)),
+                sink.clone(),
+                store,
+            )
+            .unwrap();
+            let gate = Arc::new(NativeRequestAdmission::new(true));
+            let handle = spawn_native_runtime_with_admission(
+                runtime,
+                NativeRuntimeBounds {
+                    error_backoff: std::time::Duration::from_millis(5),
+                    max_consecutive_errors: None,
+                    ..NativeRuntimeBounds::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+                gate.clone(),
+            );
+            executing
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            {
+                let mut health = gate.health.lock();
+                assert!(health.busy_since.is_some(), "the worker marks active polls");
+                let old = std::time::Instant::now()
+                    - NATIVE_READINESS_MAX_AGE
+                    - std::time::Duration::from_secs(1);
+                health.healthy_at = Some(old);
+                health.busy_since = Some(old);
+            }
+            assert!(
+                gate.accepting_requests(),
+                "execution can outlast an idle poll"
+            );
+            gate.health.lock().busy_since = Some(std::time::Instant::now() - NATIVE_BUSY_MAX_AGE);
+            assert!(!gate.accepting_requests(), "a hung poll eventually expires");
+            gate.health.lock().busy_since = Some(std::time::Instant::now());
+            assert!(gate.accepting_requests());
+            finish.send(panic).unwrap();
+            if panic {
+                wait_until(|| !handle.is_running());
+                assert!(gate.health.lock().busy_since.is_none());
+            } else {
+                wait_until(|| sink.0.load(Ordering::Acquire) >= 2);
+                assert!(
+                    handle.is_running(),
+                    "poll errors close admission before exit"
+                );
+            }
+            assert!(!gate.accepting_requests());
+            assert!(gate.health.lock().healthy_at.is_none());
+            handle.shutdown();
+        }
+    }
+
+    #[test]
+    fn request_gate_cohort_grace_requires_health_and_continuous_failure() {
+        let gate = NativeRequestAdmission::new(true);
+        gate.running.store(true, Ordering::Release);
+        gate.record_readiness(false);
+        assert!(!gate.accepting_requests(), "a cold cohort has no grace");
+        gate.record_readiness(true);
+        gate.record_readiness(false);
+        assert!(
+            gate.accepting_requests(),
+            "a transient failure retains health"
+        );
+        let old = std::time::Instant::now() - NATIVE_COHORT_READINESS_GRACE
+            + std::time::Duration::from_secs(1);
+        gate.health.lock().unavailable_since = Some(old);
+        gate.record_readiness(false);
+        assert!(gate.accepting_requests());
+        assert_eq!(gate.health.lock().unavailable_since, Some(old));
+        gate.record_readiness(true);
+        assert!(gate.health.lock().unavailable_since.is_none());
+        gate.record_readiness(false);
+        assert!(
+            gate.accepting_requests(),
+            "recovery resets the grace window"
+        );
+        gate.begin_poll();
+        gate.health.lock().unavailable_since =
+            Some(std::time::Instant::now() - NATIVE_COHORT_READINESS_GRACE);
+        assert!(
+            !gate.accepting_requests(),
+            "busy polls cannot extend cohort grace"
+        );
+        gate.record_readiness(false);
+        gate.record_readiness(false);
+        assert!(
+            !gate.accepting_requests(),
+            "continued failures never renew grace"
+        );
+        gate.record_readiness(true);
+        assert!(gate.accepting_requests());
+        gate.record_health(false);
+        gate.record_readiness(false);
+        assert!(
+            !gate.accepting_requests(),
+            "poll errors discard prior health"
+        );
+        gate.record_readiness(true);
+        gate.begin_poll();
+        gate.stopped();
+        assert!(!gate.accepting_requests(), "stop overrides a busy poll");
+        assert!(gate.health.lock().busy_since.is_none());
+    }
+
+    #[test]
+    fn request_gate_policy_mismatch_overrides_busy_poll_and_cohort_grace() {
+        let fixture = native_fixture();
+        let executor = Arc::new(policy_executor_fixture());
+        let mut context = fixture.context.clone();
+        context.allowed_executions = vec![AllowedExecution {
+            model_hash: executor.qualification.artifact_hash,
+            profile_hash: executor.qualification.profile_hash,
+            generation_hash: executor.qualification.generation_hash,
+            assignment_hash: executor.assignment_hash().unwrap(),
+        }];
+        fixture
+            .state
+            .update_native_inference_binding(context.clone())
+            .unwrap();
+        let gate = NativeRequestAdmission::ready_for_test();
+        let executor: Arc<dyn NativeExecutor> = executor;
+        *gate.policy.lock() = Some(NativeAdmissionPolicy {
+            state: Arc::downgrade(&fixture.state),
+            executor: Arc::downgrade(&executor),
+        });
+        gate.record_readiness(false);
+        gate.begin_poll();
+        assert!(gate.accepting_requests());
+        for field in 0..4 {
+            let mut mismatch = context.clone();
+            let allowed = &mut mismatch.allowed_executions[0];
+            match field {
+                0 => allowed.model_hash = Hash256::ZERO,
+                1 => allowed.profile_hash = Hash256::ZERO,
+                2 => allowed.generation_hash = Hash256::ZERO,
+                _ => allowed.assignment_hash = Hash256::ZERO,
+            }
+            fixture
+                .state
+                .update_native_inference_binding(mismatch)
+                .unwrap();
+            assert!(
+                !gate.accepting_requests(),
+                "policy changes need no worker poll"
+            );
+            fixture
+                .state
+                .update_native_inference_binding(context.clone())
+                .unwrap();
+            assert!(gate.accepting_requests());
+        }
+        gate.record_health(false);
+        gate.record_readiness(false);
+        assert!(
+            !gate.accepting_requests(),
+            "policy alone cannot establish health"
         );
     }
 
