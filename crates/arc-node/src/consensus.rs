@@ -3730,12 +3730,17 @@ impl ConsensusManager {
                     // Restore durable signing observations, not participation
                     // exceptions. Only register_skip_certificate can excuse a
                     // member after verifying the complete quorum certificate.
-                    skip_tracker = Some(arc_consensus::view_change::SkipTracker::new(
-                        domain,
-                        self.engine.frozen_validator_set_hash(),
-                        arc_consensus::view_change::DEFAULT_SKIP_GRACE_MS,
-                        record,
-                    ));
+                    skip_tracker = Some(
+                        arc_consensus::view_change::SkipTracker::new(
+                            domain,
+                            self.engine.frozen_validator_set_hash(),
+                            arc_consensus::view_change::DEFAULT_SKIP_GRACE_MS,
+                            record,
+                        )
+                        .with_recent_absence_grace(
+                            arc_consensus::view_change::RECENT_ABSENCE_GRACE_MS,
+                        ),
+                    );
                 }
                 let tracker = skip_tracker.as_mut().expect("initialised just above");
                 let vs = self.engine.validator_set();
