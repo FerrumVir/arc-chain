@@ -18,6 +18,25 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.10 - Release-preparation snapshot (2026-09-30)
+
+> **Candidate note:** This entry records the v0.8.10 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.10.
+
+- Validators re-sign a reward commitment they already verified when a
+  coordinator retries, instead of recomputing it. Reward approvals converge
+  without five concurrent recomputations overloading the 12-slot shard queue;
+  the cached approval remains bound to the exact verified commitment.
+- Native paid request admission stays open during bounded request execution
+  and brief row-relay reconnects (30 seconds), while still closing immediately
+  on runtime errors or policy mismatch.
+- Clean validator stops exit immediately after the WAL durability barrier,
+  and P2P transport shutdown is bounded. This fixes stops lasting 150 seconds
+  or more that exceeded the 120-second cutover window, while preserving
+  durable state before exit.
+- Installers on update-profile releases explicitly refuse legacy v0.7.7
+  migration instead of failing later on a missing migration asset.
+
 ## v0.8.9 - Release-preparation snapshot (2026-09-29)
 
 > **Candidate note:** v0.8.8 was deployed on all six validators with strict

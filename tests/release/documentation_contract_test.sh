@@ -38,7 +38,7 @@ DESKTOP_DISTRIBUTION="$REPO_ROOT/desktop/DISTRIBUTION.md"
 DESKTOP_GAPS="$REPO_ROOT/desktop/PRODUCTION_GAPS.md"
 CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
-CANDIDATE_VERSION=0.8.9
+CANDIDATE_VERSION=0.8.10
 
 require_literal() {
     local file="$1" literal="$2" message="$3"
@@ -103,7 +103,7 @@ candidate_version_is_consistent() {
         'desktop npm lock package root does not match the recovery candidate' || return 1
     require_literal "$RELEASE_WORKFLOW" '"desktop-npm-lock-root:$DESKTOP_NPM_LOCK_ROOT_VERSION"' \
         'release tag gate does not validate the npm lock package root' || return 1
-    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot (2026-09-29)" \
+    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot (2026-09-30)" \
         'changelog is missing the current release-preparation entry' || return 1
     require_literal "$CHANGELOG" '## v0.8.0 - Release-preparation snapshot (2026-08-31)' \
         'changelog no longer preserves the historical v0.8.0 source-freeze heading' || return 1
@@ -1798,11 +1798,11 @@ PY
         'repos/FerrumVir/arc-chain/deployments' \
         './shared/frontend/arc-network.json' \
         'arc.post-release-installer-canary.v1' \
-        'Already up to date at v0.8.9' \
+        'Already up to date at v0.8.10' \
         'scripts/recovery/recovery_rollout.py verify' \
         'POST-RELEASE-ACCEPTANCE.json' \
         'scripts/release/build-postrelease-public-truth.py' \
-        "public_truth_branch='arc-recovery/public-truth-v0.8.9'" \
+        "public_truth_branch='arc-recovery/public-truth-v0.8.10'" \
         'repos/FerrumVir/arc-chain/git/matching-refs/heads/$public_truth_branch' \
         'PUBLIC-TRUTH-RULESETS-BASELINE.json' \
         'PUBLIC-TRUTH-REVIEW-AUTHORIZATION.json' \
@@ -2396,8 +2396,8 @@ PY
     }
 }
 
-run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.9' candidate_version_is_consistent
-run_test 'candidate install commands pin exact v0.8.9 without claiming publication' candidate_install_commands_are_exact_and_honest
+run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.10' candidate_version_is_consistent
+run_test 'candidate install commands pin exact v0.8.10 without claiming publication' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
 run_test 'desktop docs and generated release notes match artifacts, updater, and reward evidence' desktop_and_release_notes_match_the_artifact_and_reward_contract
