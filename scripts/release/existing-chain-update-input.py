@@ -103,7 +103,9 @@ def validate_public_fields(name, value):
                    "full_state_copy_qualification full_state_copy_qualification_sha256 scope")
         for host in value.get("hosts", []):
             fields(host, "site ip hostname validator stake unit data_dir genesis_path genesis_sha256 "
-                   "baseline_binary_sha256 legacy_v3_wire")
+                   "baseline_binary_sha256 legacy_v3_wire native")
+            if "native" in host:
+                fields(host["native"], "argv_tail files_sha256 context_commitment")
     elif name == "quorum-proof.json":
         fields(value, "schema scope transport captured_at_unix checkpoint_manifest_hash common_block "
                "genesis_file_sha256 genesis_network_hash quorum_stake recovery_domain samples total_stake validator_set_id")
@@ -116,7 +118,10 @@ def validate_public_fields(name, value):
             for node in sample.get("nodes", []):
                 fields(node, "active active_stake argv_redacted binary_sha256 checkpoint_manifest_hash "
                        "genesis_sha256 health height hostname invocation_id ip last_block_height network_genesis_hash "
-                       "network_total_stake pid recovery_domain restarts site stake validator validator_set_id")
+                       "network_total_stake pid recovery_domain restarts site stake validator validator_set_id "
+                       "native native_files_sha256")
+                if node.get("native") is not None:
+                    fields(node["native"], "argv_tail files_sha256 context_commitment")
                 fields(node.get("health", {}), "chain_advancing dag_committed dag_round height last_block_age_secs "
                        "peers status uptime_secs validators version binary_sha256 dag_bootstrapping "
                        "extended_consensus_wire_enabled features legacy_v3_wire wire_messages_suppressed "

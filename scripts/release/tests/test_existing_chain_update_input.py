@@ -94,6 +94,28 @@ class UpdateInputTests(unittest.TestCase):
                               ("quorum-proof.json", "six-host-before-cfd-20260927.json")):
             mod.validate_bytes(name, (fixtures / fixture).read_bytes())
 
+    def test_native_pins_and_evidence_are_public_fields_with_closed_contracts(self):
+        fixtures = SCRIPT.parent / "tests" / "fixtures"
+        native = {"argv_tail": ["--native-inference-activation", "/etc/arc/native/activation.json"],
+                  "files_sha256": {"/etc/arc/native/activation.json": "a" * 64},
+                  "context_commitment": "d0" * 32}
+        config = json.loads((fixtures / "host-config-six-current-20260927.json").read_text())
+        proof = json.loads((fixtures / "six-host-before-cfd-20260927.json").read_text())
+        for host in config["hosts"]:
+            host["native"] = dict(native)
+        for sample in proof["samples"]:
+            for node in sample["nodes"]:
+                node["native"] = dict(native)
+                node["native_files_sha256"] = dict(native["files_sha256"])
+        mod.validate_bytes("host-config.json", json.dumps(config).encode())
+        mod.validate_bytes("quorum-proof.json", json.dumps(proof).encode())
+        config["hosts"][0]["native"]["extra"] = 1
+        with self.assertRaises(mod.InputError):
+            mod.validate_bytes("host-config.json", json.dumps(config).encode())
+        proof["samples"][0]["nodes"][0]["native"]["extra"] = 1
+        with self.assertRaises(mod.InputError):
+            mod.validate_bytes("quorum-proof.json", json.dumps(proof).encode())
+
     def test_symlink_and_wrong_parent_rejected(self):
         commit = mod.create(self.repo, self.inputs, self.main)
         with self.assertRaisesRegex(mod.InputError, "sole parent"):
