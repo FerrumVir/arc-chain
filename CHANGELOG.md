@@ -35,6 +35,10 @@ All notable changes to ARC Chain are tracked here. This project follows
   instead of earning community work. A worker is now busy only while its
   reservation holds an assigned job id, with a regression test for both
   states.
+- Published-artifact acceptance: the extracted Windows desktop version check
+  now follows the verified MSI ProductVersion instead of a stale `0.8.0`
+  pattern, and a failing Linux acceptance job prints and uploads the
+  installer evidence it redirects to files, so a failure shows its reason.
 
 ## v0.8.7 - Release-preparation snapshot (2026-09-29)
 

@@ -576,6 +576,27 @@ jobs:
             exit 1
           fi
 
+      - name: Show Linux acceptance evidence after a failure
+        if: failure()
+        shell: bash
+        run: |
+          # Every installer invocation above redirects stdout/stderr into
+          # evidence-linux/, so a failing step otherwise shows no reason.
+          for f in evidence-linux/*.stdout evidence-linux/*.stderr; do
+            [ -f "$f" ] || continue
+            printf '===== %s (last 80 lines)\n' "$f"
+            tail -n 80 "$f"
+          done
+
+      - name: Upload Linux failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-published-acceptance-linux-x86_64-failure-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: evidence-linux
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Seal Linux component receipt
         shell: bash
         env:
@@ -1078,7 +1099,7 @@ jobs:
             throw 'extracted desktop is not AMD64'
           }
           $embeddedProductVersion = $applications[0].VersionInfo.ProductVersion
-          if ($embeddedProductVersion -notmatch '^0[.]8[.]0(?:[.]0)?$') {
+          if ($embeddedProductVersion -notmatch ('^' + [regex]::Escape($msiProductVersion) + '(?:[.]0)?$')) {
             throw "extracted desktop ProductVersion is $embeddedProductVersion"
           }
 
