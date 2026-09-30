@@ -479,7 +479,7 @@ jobs:
             > evidence-linux/legacy-model-before.sha256
           printf '%s\n' "$legacy_home" > evidence-linux/legacy-home.txt
 
-      - name: Migrate the exact stopped v0.7.7 layout without legacy egress
+      - name: Verify the stopped v0.7.7 migration contract without legacy egress
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -507,40 +507,74 @@ jobs:
             done
           done
 
+          profile="$(jq -er '.profile // "cutover-v1"' binding/release-binding.json)"
+          migration_status=0
           HOME="$legacy_home" bash published/install.sh --version 0.8.9 \
             --model "$legacy_root/community-model.gguf" \
             --no-service --no-auto-update \
             > evidence-linux/legacy-migration.stdout \
-            2> evidence-linux/legacy-migration.stderr
-          cleanup_rules
-          trap - EXIT HUP INT TERM
+            2> evidence-linux/legacy-migration.stderr || migration_status=$?
+          if [ "$profile" = existing-recovered-chain-update-v1 ]; then
+            [ "$migration_status" -ne 0 ]
+            grep -Fq 'Legacy v0.7 migration is unsupported by existing-recovered-chain-update-v1 releases' \
+              evidence-linux/legacy-migration.stderr
+          else
+            [ "$profile" = cutover-v1 ]
+            [ "$migration_status" -eq 0 ]
+            grep -Fq 'Adopted the verified v0.7.7 default install' \
+              evidence-linux/legacy-migration.stdout
+            "$legacy_root/bin/arc-node" --version | grep -F ' 0.8.9'
+            "$legacy_root/bin/arc-cli" --version | grep -F ' 0.8.9'
+            [ "$(sha256sum "$legacy_root/bin/arc-node" | awk '{print $1}')" = \
+              "$(jq -er '.assets["arc-node-linux-x86_64"].sha256' binding/release-binding.json)" ]
+            [ "$(sha256sum "$legacy_root/bin/arc-cli" | awk '{print $1}')" = \
+              "$(jq -er '.assets["arc-cli-linux-x86_64"].sha256' binding/release-binding.json)" ]
+            cmp "$legacy_root/legacy-v0.7-preserved/version.txt" \
+              <(printf '%s\n' '0.7.7')
+            cmp "$legacy_root/legacy-v0.7-preserved/identity.seed" \
+              <(printf '%s\n' 'community-post-release-acceptance-0707')
+            [ "$(sha256sum "$legacy_root/community-model.gguf")" = \
+              "$(cat evidence-linux/legacy-model-before.sha256)" ]
+            jq -e '
+              .schema == "arc.migration.legacy-v07-preexisting-offline-evidence.v1"
+              and .process_identity == null
+              and .supervisor.signals_sent == []
+              and .supervisor.sigkill_sent == false
+            ' "$legacy_root/legacy-v0.7-preserved/retirement-v0.8/stop-evidence.json" \
+              >/dev/null
+            [ -d "$legacy_root/data-v0.8" ]
+            [ ! -L "$legacy_root/data-v0.8" ]
+            if find "$legacy_root/data-v0.8" -mindepth 1 -print -quit | grep -q .; then
+              echo 'no-service migration reused or initialized the fresh v0.8 state directory' >&2
+              exit 1
+            fi
+          fi
 
-          grep -Fq 'Adopted the verified v0.7.7 default install' \
-            evidence-linux/legacy-migration.stdout
-          "$legacy_root/bin/arc-node" --version | grep -F ' 0.8.9'
-          "$legacy_root/bin/arc-cli" --version | grep -F ' 0.8.9'
-          [ "$(sha256sum "$legacy_root/bin/arc-node" | awk '{print $1}')" = \
-            "$(jq -er '.assets["arc-node-linux-x86_64"].sha256' binding/release-binding.json)" ]
-          [ "$(sha256sum "$legacy_root/bin/arc-cli" | awk '{print $1}')" = \
-            "$(jq -er '.assets["arc-cli-linux-x86_64"].sha256' binding/release-binding.json)" ]
-          cmp "$legacy_root/legacy-v0.7-preserved/version.txt" \
-            <(printf '%s\n' '0.7.7')
-          cmp "$legacy_root/legacy-v0.7-preserved/identity.seed" \
-            <(printf '%s\n' 'community-post-release-acceptance-0707')
-          [ "$(sha256sum "$legacy_root/community-model.gguf")" = \
-            "$(cat evidence-linux/legacy-model-before.sha256)" ]
-          jq -e '
-            .schema == "arc.migration.legacy-v07-preexisting-offline-evidence.v1"
-            and .process_identity == null
-            and .supervisor.signals_sent == []
-            and .supervisor.sigkill_sent == false
-          ' "$legacy_root/legacy-v0.7-preserved/retirement-v0.8/stop-evidence.json" \
-            >/dev/null
-          [ -d "$legacy_root/data-v0.8" ]
-          [ ! -L "$legacy_root/data-v0.8" ]
-          if find "$legacy_root/data-v0.8" -mindepth 1 -print -quit | grep -q .; then
-            echo 'no-service migration reused or initialized the fresh v0.8 state directory' >&2
-            exit 1
+          update_status=0
+          bash published/install.sh --update-only \
+            --install-dir "$legacy_root" --no-service --no-auto-update \
+            > evidence-linux/legacy-update.stdout \
+            2> evidence-linux/legacy-update.stderr || update_status=$?
+          if [ "$profile" = existing-recovered-chain-update-v1 ]; then
+            [ "$update_status" -ne 0 ]
+            grep -Fq 'Legacy v0.7 migration is unsupported by existing-recovered-chain-update-v1 releases' \
+              evidence-linux/legacy-update.stderr
+            "$legacy_root/bin/arc-node" --version | grep -F ' 0.7.7'
+            [ "$(sha256sum "$legacy_root/bin/arc-node" | awk '{print $1}')" = \
+              "$(jq -er '.legacy_source.asset.sha256' binding/release-binding.json)" ]
+            [ ! -e "$legacy_root/bin/arc-cli" ]
+            [ ! -e "$legacy_root/data-v0.8" ]
+            [ ! -e "$legacy_root/legacy-v0.7-preserved/retirement-v0.8" ]
+            cmp "$legacy_root/version.txt" <(printf '%s\n' '0.7.7')
+            cmp "$legacy_root/identity.seed" \
+              <(printf '%s\n' 'community-post-release-acceptance-0707')
+            cmp "$legacy_root/seeds.txt" "$RUNNER_TEMP/legacy-source/testnet-seeds.txt"
+            cmp "$legacy_root/genesis.toml" "$RUNNER_TEMP/legacy-source/genesis.toml"
+            [ "$(sha256sum "$legacy_root/community-model.gguf")" = \
+              "$(cat evidence-linux/legacy-model-before.sha256)" ]
+          else
+            [ "$update_status" -eq 0 ]
+            grep -Fq 'Already up to date at v0.8.9' evidence-linux/legacy-update.stdout
           fi
 
           LEGACY_ROOT="$legacy_root" python3 - <<'PY'
@@ -566,15 +600,12 @@ jobs:
           )
           PY
           cmp evidence-linux/legacy-data-before.json evidence-linux/legacy-data-after.json
-          bash published/install.sh --update-only \
-            --install-dir "$legacy_root" --no-service --no-auto-update \
-            > evidence-linux/legacy-update.stdout \
-            2> evidence-linux/legacy-update.stderr
-          grep -Fq 'Already up to date at v0.8.9' evidence-linux/legacy-update.stdout
           if pgrep -f "$legacy_root/bin/arc-node" >/dev/null; then
             echo 'migration or update-only started an arc-node service/process' >&2
             exit 1
           fi
+          cleanup_rules
+          trap - EXIT HUP INT TERM
 
       - name: Show Linux acceptance evidence after a failure
         if: failure()
@@ -609,6 +640,8 @@ jobs:
           from pathlib import Path
           def digest(path):
               return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          binding = json.loads(Path("binding/release-binding.json").read_text())
+          migration_refused = binding.get("profile") == "existing-recovered-chain-update-v1"
           checks = {
               "appimage_process_stable": True,
               "appimage_updater_signature_valid": True,
@@ -621,12 +654,13 @@ jobs:
               "legacy_data_manifest_sha256": digest("evidence-linux/legacy-data-after.json"),
               "legacy_history_preserved": True,
               "legacy_installer_source_pinned": True,
+              "legacy_migration_refused": migration_refused,
               "legacy_model_preserved": True,
               "legacy_preexisting_offline": True,
               "legacy_source_receipt_sha256": digest("evidence-linux/legacy-source.json"),
               "legacy_state_preserved": True,
               "service_started": False,
-              "v08_fresh_data": True,
+              "v08_fresh_data": not migration_refused,
           }
           Path("linux-checks.json").write_text(
               json.dumps(checks, sort_keys=True, separators=(",", ":")) + "\n"

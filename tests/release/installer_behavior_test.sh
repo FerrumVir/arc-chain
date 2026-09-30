@@ -639,6 +639,56 @@ reset_legacy_supervisor_test_environment() {
     MOCK_RETIREMENT_FINALIZE_FAIL_UNDER_TEST=''
 }
 
+legacy_update_profile_refuses_migration_before_payload_download() {
+    local sandbox legacy_root output mode file status expected
+    local CUTOVER_ASSETS=arc-existing-chain-update-attestation.json
+    local MOCK_TARGET_UID_UNDER_TEST="$(id -u)"
+    local MOCK_TAMPER_MANIFEST_SIGNATURE_UNDER_TEST=0
+    local -a mode_args=(--version 0.8.9)
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    legacy_root="$sandbox/home/.arc"
+    write_legacy_v07_fixture "$legacy_root" 0.7.7
+    for file in bin/arc-node version.txt seeds.txt genesis.toml identity.seed \
+        data/state.wal community-model.gguf; do
+        printf '%s %s\n' "$(file_sha256 "$legacy_root/$file")" "$file"
+    done > "$sandbox/legacy-before.sha256"
+
+    for mode in invalid-signature install update-only; do
+        MOCK_TAMPER_MANIFEST_SIGNATURE_UNDER_TEST=0
+        expected='Legacy v0.7 migration is unsupported by existing-recovered-chain-update-v1 releases'
+        case "$mode" in
+            invalid-signature)
+                MOCK_TAMPER_MANIFEST_SIGNATURE_UNDER_TEST=1
+                expected='Release SHA256SUMS signature is invalid' ;;
+            update-only) mode_args=(--version 0.8.9 --update-only) ;;
+        esac
+        output="$sandbox/$mode.out"
+        invoke_installer "$sandbox" Linux x86_64 \
+            "$TEST_DIR/fixtures/release-v0.8.9.json" 0.8.9 \
+            --install-dir "$legacy_root" --model "$legacy_root/community-model.gguf" \
+            --no-service --no-auto-update "${mode_args[@]}" >"$output" 2>&1
+        status=$?
+        [ "$status" -ne 0 ] || { printf 'update profile migrated v0.7.7\n'; return 1; }
+        assert_log_contains_literal "$output" "$expected" \
+            "update profile did not fail at the expected gate ($mode)" || return 1
+        while read -r expected file; do
+            assert_equals "$expected" "$(file_sha256 "$legacy_root/$file")" \
+                "update profile changed legacy $file ($mode)" || return 1
+        done < "$sandbox/legacy-before.sha256"
+        [ ! -e "$legacy_root/bin/arc-cli" ] \
+            && [ ! -e "$legacy_root/data-v0.8" ] \
+            && [ ! -e "$legacy_root/legacy-v0.7-preserved/retirement-v0.8" ] \
+            && [ ! -e "$legacy_root/.arc-chain-install-root" ] \
+            || { printf 'update profile crossed the retirement boundary\n'; return 1; }
+    done
+    assert_file_not_contains "$sandbox/curl.log" \
+        '/(arc-node-|arc-cli-|arc-legacy-maintenance-boundary|arc-recovery-checkpoint-descriptor|arc-cutover-policy)' \
+        'unsupported migration downloaded payload or cutover assets' || return 1
+    [ ! -s "$sandbox/node-args.log" ] && [ ! -s "$sandbox/service.log" ] \
+        || { printf 'unsupported migration started a node or service\n'; return 1; }
+}
+
 legacy_default_adoption_preserves_state_config_model_and_identity() {
     local sandbox legacy_root output status host_uid data_hash model_hash
     local version_hash seeds_hash genesis_hash identity_hash legacy_address
@@ -2258,6 +2308,11 @@ update_only_refuses_downgrade() {
     fi
 }
 
+existing_update_profile_preserves_managed_installs() {
+    local CUTOVER_ASSETS=arc-existing-chain-update-attestation.json
+    update_only_preserves_custom_port_and_empty_model
+}
+
 update_only_preserves_custom_port_and_empty_model() {
     local sandbox output
     new_sandbox
@@ -2687,6 +2742,8 @@ run_test 'an existing unmarked directory is neither claimed, uninstalled, nor pu
 run_test 'a marked install root purges only its exact bound tree' marked_install_root_purges_only_its_bound_tree
 run_test 'copied and symlinked markers cannot authorize purge of another tree' copied_or_symlinked_marker_cannot_authorize_purge
 run_test 'verified v0.7 default adoption preserves state, config, model, and identity' legacy_default_adoption_preserves_state_config_model_and_identity
+run_test 'update profile refuses legacy migration after signature verification and before payload download' legacy_update_profile_refuses_migration_before_payload_download
+run_test 'update profile allows fresh installs and managed updates' existing_update_profile_preserves_managed_installs
 run_test 'legacy adoption rejects custom roots and hostile default lookalikes' legacy_adoption_refuses_custom_and_hostile_lookalikes
 run_test 'real v0.7 Linux global supervisor is retired into a target-user managed bridge' legacy_linux_system_supervisor_is_transactionally_adopted
 run_test 'post-intent v0.7 Linux failure restores files but never revives the retired node' legacy_linux_post_intent_failure_restores_files_but_stays_stopped

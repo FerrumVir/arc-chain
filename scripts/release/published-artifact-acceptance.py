@@ -1048,8 +1048,20 @@ def command_verify_legacy(args: argparse.Namespace) -> None:
     write_canonical(args.output, receipt)
 
 
-def validate_platform_checks(platform: str, checks: dict[str, Any]) -> None:
-    for name, expected in REQUIRED_CHECKS[platform].items():
+def validate_platform_checks(
+    platform: str, checks: dict[str, Any], profile: str = PROFILE_CUTOVER_V1
+) -> None:
+    if profile not in {PROFILE_CUTOVER_V1, PROFILE_EXISTING_UPDATE_V1}:
+        raise AcceptanceError(f"unsupported release profile: {profile!r}")
+    required = dict(REQUIRED_CHECKS[platform])
+    if platform == "linux-x86_64":
+        is_update = profile == PROFILE_EXISTING_UPDATE_V1
+        exact(
+            checks.get("legacy_migration_refused", False), is_update,
+            "linux-x86_64 check legacy_migration_refused",
+        )
+        required["v08_fresh_data"] = not is_update
+    for name, expected in required.items():
         exact(checks.get(name), expected, f"{platform} check {name}")
     if platform == "windows-x86_64":
         embedded_version = checks.get("embedded_app_product_version")
@@ -1092,7 +1104,9 @@ def command_component(args: argparse.Namespace) -> None:
         exact(value, binding["assets"][name], f"files asset {name}")
 
     checks = load_object(args.checks_json, "component checks")
-    validate_platform_checks(args.platform, checks)
+    validate_platform_checks(
+        args.platform, checks, binding.get("profile", PROFILE_CUTOVER_V1)
+    )
     component = {
         "acceptance_run_attempt": positive_int(
             args.acceptance_run_attempt, "acceptance run attempt"
@@ -1152,7 +1166,7 @@ def validate_component(
     checks = component.get("checks")
     if not isinstance(checks, dict):
         raise AcceptanceError(f"{platform} checks must be an object")
-    validate_platform_checks(platform, checks)
+    validate_platform_checks(platform, checks, binding.get("profile", PROFILE_CUTOVER_V1))
     return platform
 
 

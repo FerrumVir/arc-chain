@@ -502,6 +502,64 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(acceptance.AcceptanceError, "msi_product_version"):
             acceptance.validate_platform_checks("windows-x86_64", checks)
 
+    def test_legacy_migration_checks_follow_the_release_profile(self) -> None:
+        cutover = dict(acceptance.REQUIRED_CHECKS["linux-x86_64"])
+        update = {**cutover, "legacy_migration_refused": True, "v08_fresh_data": False}
+        acceptance.validate_platform_checks("linux-x86_64", cutover)
+        acceptance.validate_platform_checks(
+            "linux-x86_64", update, acceptance.PROFILE_EXISTING_UPDATE_V1
+        )
+        for checks, profile in (
+            (cutover, acceptance.PROFILE_EXISTING_UPDATE_V1),
+            (update, acceptance.PROFILE_CUTOVER_V1),
+            ({**update, "v08_fresh_data": True}, acceptance.PROFILE_EXISTING_UPDATE_V1),
+            ({**update, "legacy_state_preserved": False}, acceptance.PROFILE_EXISTING_UPDATE_V1),
+            ({**update, "service_started": True}, acceptance.PROFILE_EXISTING_UPDATE_V1),
+            (update, "unknown-profile"),
+        ):
+            with self.subTest(checks=checks, profile=profile):
+                with self.assertRaises(acceptance.AcceptanceError):
+                    acceptance.validate_platform_checks("linux-x86_64", checks, profile)
+
+    def test_update_component_requires_refusal_at_creation_and_aggregation(self) -> None:
+        binding = json.loads(self.bind().read_text(encoding="utf-8"))
+        binding["schema"] = "arc.published-release-binding.v2"
+        binding["profile"] = acceptance.PROFILE_EXISTING_UPDATE_V1
+        for name in acceptance.EXPECTED_RELEASE_ASSETS - acceptance.EXISTING_UPDATE_RELEASE_ASSETS:
+            binding["assets"].pop(name)
+        binding["assets"]["arc-existing-chain-update-attestation.json"] = binding["assets"]["latest.json"]
+        binding_path = self.write_json("update-binding.json", binding)
+        downloads = self.root / "downloads"
+        downloads.mkdir()
+        for name in acceptance.EXPECTED_COMPONENTS["linux-x86_64"]:
+            (downloads / name).write_bytes(self.asset_bytes[name])
+        files_receipt = self.root / "files.json"
+        acceptance.command_verify_files(Namespace(
+            binding=binding_path, directory=downloads,
+            asset=sorted(acceptance.EXPECTED_COMPONENTS["linux-x86_64"]),
+            output=files_receipt,
+        ))
+        checks = {**acceptance.REQUIRED_CHECKS["linux-x86_64"],
+                  "legacy_migration_refused": True, "v08_fresh_data": False}
+        checks_path = self.write_json("checks.json", checks)
+        output = self.root / "component.json"
+        args = Namespace(
+            binding=binding_path, files_receipt=files_receipt, checks_json=checks_path,
+            platform="linux-x86_64", acceptance_run_id=2468, acceptance_run_attempt=2,
+            output=output,
+        )
+        acceptance.command_component(args)
+        component = json.loads(output.read_text())
+        self.assertEqual(acceptance.validate_component(
+            component, binding, acceptance.sha256_file(binding_path)
+        ), "linux-x86_64")
+        component["checks"] = dict(acceptance.REQUIRED_CHECKS["linux-x86_64"])
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "legacy_migration_refused"):
+            acceptance.validate_component(component, binding, acceptance.sha256_file(binding_path))
+        self.write_json("checks.json", component["checks"])
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "legacy_migration_refused"):
+            acceptance.command_component(args)
+
     def test_download_verifier_and_aggregate_fail_closed(self) -> None:
         binding_path = self.bind()
         binding = json.loads(binding_path.read_text(encoding="utf-8"))
