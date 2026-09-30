@@ -1,7 +1,7 @@
 {
   "mode": "paid",
-  "gate_source_sha": "3a610110ea0d68eaf58af32da5f82d5439a85a6d",
-  "release_tag": "v0.8.7",
+  "gate_source_sha": "df10c30538b3206248d7954d24d2e5e539df22b3",
+  "release_tag": "v0.8.9",
   "prompt": "Hello",
   "max_tokens": "2",
   "wallet_host": "https://202.182.107.41",
@@ -10,5 +10,5 @@
   "expiry_blocks": 6000,
   "refund_expiry_blocks": 60,
   "finalize_wait_minutes": 40,
-  "note": "Paid-mode REHEARSAL before native activation: validates onboarding, app-faucet funding and navigation on published v0.8.7; expected to stop waiting for native-paid-card because /native-inference/context is 404 until activation."
+  "note": "Paid mode on published v0.8.9 after native activation (height 3816800) with runtime on all six and request admission on NRT only: app-faucet funding, request A to finalization, replay of the journaled signed transaction, request B with a 60-block expiry to exercise the refund."
 }
