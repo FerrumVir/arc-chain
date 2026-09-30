@@ -18,6 +18,28 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.8 - Release-preparation snapshot (2026-09-29)
+
+> **Candidate note:** v0.8.7 was published and deployed on all six
+> validators, and its registration fix works: a community worker now
+> registers on every coordinator. Post-release verification of v0.8.7 found
+> the defect below; this entry does not claim publication or fleet deployment
+> of v0.8.8.
+
+- Fixes community dispatch never reaching an idle worker: workers long-poll
+  `/community/claim_work` on every coordinator at once, and each pending poll
+  holds an empty reservation in the coordinator's active-job map until work
+  arrives. Readiness and routing treated any reservation as a busy worker, so
+  a registered, idle worker was counted as zero dispatch capacity on all six
+  coordinators (except in the gaps between polls) and requests ran locally
+  instead of earning community work. A worker is now busy only while its
+  reservation holds an assigned job id, with a regression test for both
+  states.
+- Published-artifact acceptance: the extracted Windows desktop version check
+  now follows the verified MSI ProductVersion instead of a stale `0.8.0`
+  pattern, and a failing Linux acceptance job prints and uploads the
+  installer evidence it redirects to files, so a failure shows its reason.
+
 ## v0.8.7 - Release-preparation snapshot (2026-09-29)
 
 > **Candidate note:** v0.8.6 was published and deployed on all six
