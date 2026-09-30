@@ -16,7 +16,7 @@ version = 4
 
 [[package]]
 name = "arc-node"
-version = "0.8.8"
+version = "0.8.9"
 dependencies = [
  "serde",
  "rand 0.8.5",
@@ -44,7 +44,7 @@ dependencies = ["rand 0.9.0"]
 NPM = {
     "lockfileVersion": 3,
     "packages": {
-        "": {"name": "arc-desktop", "version": "0.8.8"},
+        "": {"name": "arc-desktop", "version": "0.8.9"},
         "node_modules/@scope/pkg": {
             "version": "1.2.3",
             "resolved": "https://registry.npmjs.org/@scope/pkg/-/pkg-1.2.3.tgz",
@@ -69,11 +69,11 @@ class Sbom(unittest.TestCase):
         self.dir.cleanup()
 
     def test_components_hashes_sources_and_the_dependency_graph(self):
-        doc = sbom.build("arc-chain", "0.8.8", [self.cargo], [self.npm])
+        doc = sbom.build("arc-chain", "0.8.9", [self.cargo], [self.npm])
         by_ref = {c["bom-ref"]: c for c in doc["components"]}
         self.assertEqual(by_ref["pkg:cargo/rand@0.8.5"]["hashes"],
                          [{"alg": "SHA-256", "content": "aa"}])
-        self.assertNotIn("hashes", by_ref["pkg:cargo/arc-node@0.8.8"], "workspace crates have no checksum")
+        self.assertNotIn("hashes", by_ref["pkg:cargo/arc-node@0.8.9"], "workspace crates have no checksum")
         git = [c for c in doc["components"] if c["name"] == "serde"][0]
         self.assertIn("vcs_url=", git["purl"])
         scoped = by_ref["pkg:npm/%40scope%2Fpkg@1.2.3"]
@@ -81,14 +81,14 @@ class Sbom(unittest.TestCase):
         self.assertIn({"name": "arc:scope", "value": "dev"}, scoped["properties"])
         deps = {d["ref"]: d["dependsOn"] for d in doc["dependencies"]}
         # "rand 0.8.5" resolves to the exact version, not the other rand.
-        self.assertIn("pkg:cargo/rand@0.8.5", deps["pkg:cargo/arc-node@0.8.8"])
-        self.assertNotIn("pkg:cargo/rand@0.9.0", deps["pkg:cargo/arc-node@0.8.8"])
+        self.assertIn("pkg:cargo/rand@0.8.5", deps["pkg:cargo/arc-node@0.8.9"])
+        self.assertNotIn("pkg:cargo/rand@0.9.0", deps["pkg:cargo/arc-node@0.8.9"])
         self.assertEqual(doc["bomFormat"], "CycloneDX")
         self.assertTrue(doc["serialNumber"].startswith("urn:uuid:"))
 
     def test_the_same_lock_files_give_the_same_bytes(self):
-        first = json.dumps(sbom.build("arc-chain", "0.8.8", [self.cargo], [self.npm]), sort_keys=True)
-        second = json.dumps(sbom.build("arc-chain", "0.8.8", [self.cargo], [self.npm]), sort_keys=True)
+        first = json.dumps(sbom.build("arc-chain", "0.8.9", [self.cargo], [self.npm]), sort_keys=True)
+        second = json.dumps(sbom.build("arc-chain", "0.8.9", [self.cargo], [self.npm]), sort_keys=True)
         self.assertEqual(first, second)
 
 

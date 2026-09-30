@@ -18,6 +18,21 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.9 - Release-preparation snapshot (2026-09-29)
+
+> **Candidate note:** v0.8.8 was deployed on all six validators with strict
+> post-start agreement and independent finality, and its community dispatch
+> fix is live on the fleet. Its Release ARC run (36668823549) stopped in the
+> full quality gate before any signing or publication because a new advisory
+> against `brace-expansion <=1.1.20` (GHSA-q2hr-2g5m-vwhr, GHSA-qhr7-859c-m2p7,
+> GHSA-6j4f-fj2g-mc7p) was published after the v0.8.7 release; the v0.8.8 tag
+> stays unpublished. This entry does not claim publication or deployment of
+> v0.8.9.
+
+- Updates `brace-expansion` 1.1.18 to 1.1.21 in the `sdks/typescript`
+  lockfile (a lockfile-only `npm audit fix`), so every JavaScript lockfile the
+  release gate audits is clean again. No runtime or protocol change.
+
 ## v0.8.8 - Release-preparation snapshot (2026-09-29)
 
 > **Candidate note:** v0.8.7 was published and deployed on all six
