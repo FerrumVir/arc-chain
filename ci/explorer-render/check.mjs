@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+// Headings are uppercased by CSS text-transform; innerText returns the rendered case.
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -45,7 +46,7 @@ export function validateObservation(check, observed) {
     return;
   }
   if (check.kind === "tx") {
-    assert.equal(observed.kicker, "Transaction / receipt");
+    assert.equal(observed.kicker.toLowerCase(), "transaction / receipt");
     const card = observed.cards.find((entry) => entry.receipts.some((receipt) =>
       receipt.label === "Community reward receipt" && bare(receipt.tx_hash) === bare(REWARD.hash)));
     assert.ok(card, "full transaction hash must appear in a rendered reward receipt");
@@ -66,7 +67,7 @@ export function validateObservation(check, observed) {
     return;
   }
   assert.equal(check.kind, "request");
-  assert.equal(observed.kicker, "Native request · per-source receipts");
+  assert.equal(observed.kicker.toLowerCase(), "native request · per-source receipts");
   const cards = observed.cards.filter((card) => card.receipts.some((receipt) => bare(receipt.request_id) === bare(check.request.id)));
   assert.ok(cards.length > 0, "request identity must appear in a rendered receipt");
   for (const card of cards) {
