@@ -5609,8 +5609,12 @@ mod tests {
                 gate.accepting_requests(),
                 "execution can outlast an idle poll"
             );
-            gate.health.lock().busy_since = Some(std::time::Instant::now() - NATIVE_BUSY_MAX_AGE);
-            assert!(!gate.accepting_requests(), "a hung poll eventually expires");
+            // Windows measures `Instant` from boot, so a CI runner up for less
+            // than NATIVE_BUSY_MAX_AGE cannot represent an instant that old.
+            if let Some(expired) = std::time::Instant::now().checked_sub(NATIVE_BUSY_MAX_AGE) {
+                gate.health.lock().busy_since = Some(expired);
+                assert!(!gate.accepting_requests(), "a hung poll eventually expires");
+            }
             gate.health.lock().busy_since = Some(std::time::Instant::now());
             assert!(gate.accepting_requests());
             finish.send(panic).unwrap();
