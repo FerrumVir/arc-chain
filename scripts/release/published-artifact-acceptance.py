@@ -207,7 +207,7 @@ REQUIRED_CHECKS = {
         "bundle_architecture": "arm64",
         "bundle_codesign_valid": True,
         "bundle_identifier": "network.arc.desktop",
-        "bundle_version": "0.8.9",
+        "bundle_version": "0.8.10",
         "desktop_process_stable": True,
         "desktop_visible_window": True,
         "dmg_bundle_matches": True,
@@ -221,7 +221,7 @@ REQUIRED_CHECKS = {
         "bundle_architecture": "x86_64",
         "bundle_codesign_valid": True,
         "bundle_identifier": "network.arc.desktop",
-        "bundle_version": "0.8.9",
+        "bundle_version": "0.8.10",
         "desktop_process_stable": True,
         "desktop_visible_window": True,
         "dmg_bundle_matches": True,
@@ -236,7 +236,7 @@ REQUIRED_CHECKS = {
         "embedded_app_pe_machine": "AMD64",
         "isolated_profile": True,
         "msi_administrative_extract": True,
-        "msi_product_version": "0.8.9",
+        "msi_product_version": "0.8.10",
         "no_installed_service": True,
         "setup_pe_machine": "AMD64",
         "updater_signature_valid": True,
@@ -538,7 +538,7 @@ def command_select_published_evidence(args: argparse.Namespace) -> None:
     run_attempt = positive_int(args.release_run_attempt, "release run attempt")
     release = load_object(args.release_json, "release API document")
     release_id = positive_int(release.get("id"), "release id")
-    exact(release.get("tag_name"), "v0.8.9", "release tag")
+    exact(release.get("tag_name"), "v0.8.10", "release tag")
     exact(release.get("target_commitish"), args.commit, "release target")
     exact(release.get("draft"), False, "release draft state")
     exact(release.get("immutable"), True, "release immutable state")
@@ -712,8 +712,8 @@ def command_bind(args: argparse.Namespace) -> None:
     exact(repository, EXPECTED_REPOSITORY, "production repository")
     if not STRICT_TAG.fullmatch(args.tag):
         raise AcceptanceError("release tag must be strict vMAJOR.MINOR.PATCH")
-    if args.tag != "v0.8.9":
-        raise AcceptanceError("this production acceptance is pinned to v0.8.9")
+    if args.tag != "v0.8.10":
+        raise AcceptanceError("this production acceptance is pinned to v0.8.10")
     if not SHA40.fullmatch(args.commit):
         raise AcceptanceError("release commit must be 40 lowercase hex characters")
     run_id = positive_int(args.release_run_id, "release run id")
@@ -884,9 +884,9 @@ def validate_binding(binding: dict[str, Any]) -> None:
     exact(binding.get("repository"), EXPECTED_REPOSITORY, "binding repository")
     if is_update:
         exact(binding.get("profile"), PROFILE_EXISTING_UPDATE_V1, "binding profile")
-        exact(binding.get("tag"), "v0.8.9", "binding tag")
+        exact(binding.get("tag"), "v0.8.10", "binding tag")
     else:
-        exact(binding.get("tag"), "v0.8.9", "binding tag")
+        exact(binding.get("tag"), "v0.8.10", "binding tag")
     exact(binding.get("legacy_source"), LEGACY_SOURCE, "binding v0.7.7 source")
     release = binding.get("release")
     if not isinstance(release, dict):
@@ -1048,8 +1048,20 @@ def command_verify_legacy(args: argparse.Namespace) -> None:
     write_canonical(args.output, receipt)
 
 
-def validate_platform_checks(platform: str, checks: dict[str, Any]) -> None:
-    for name, expected in REQUIRED_CHECKS[platform].items():
+def validate_platform_checks(
+    platform: str, checks: dict[str, Any], profile: str = PROFILE_CUTOVER_V1
+) -> None:
+    if profile not in {PROFILE_CUTOVER_V1, PROFILE_EXISTING_UPDATE_V1}:
+        raise AcceptanceError(f"unsupported release profile: {profile!r}")
+    required = dict(REQUIRED_CHECKS[platform])
+    if platform == "linux-x86_64":
+        is_update = profile == PROFILE_EXISTING_UPDATE_V1
+        exact(
+            checks.get("legacy_migration_refused", False), is_update,
+            "linux-x86_64 check legacy_migration_refused",
+        )
+        required["v08_fresh_data"] = not is_update
+    for name, expected in required.items():
         exact(checks.get(name), expected, f"{platform} check {name}")
     if platform == "windows-x86_64":
         embedded_version = checks.get("embedded_app_product_version")
@@ -1092,7 +1104,9 @@ def command_component(args: argparse.Namespace) -> None:
         exact(value, binding["assets"][name], f"files asset {name}")
 
     checks = load_object(args.checks_json, "component checks")
-    validate_platform_checks(args.platform, checks)
+    validate_platform_checks(
+        args.platform, checks, binding.get("profile", PROFILE_CUTOVER_V1)
+    )
     component = {
         "acceptance_run_attempt": positive_int(
             args.acceptance_run_attempt, "acceptance run attempt"
@@ -1152,7 +1166,7 @@ def validate_component(
     checks = component.get("checks")
     if not isinstance(checks, dict):
         raise AcceptanceError(f"{platform} checks must be an object")
-    validate_platform_checks(platform, checks)
+    validate_platform_checks(platform, checks, binding.get("profile", PROFILE_CUTOVER_V1))
     return platform
 
 

@@ -163,7 +163,7 @@ function context(): NativeContextView {
           maxPositions: null,
         },
     inputKind: incompatible ? null : "test_executor_bytes",
-    nodeVersion: "0.8.9",
+    nodeVersion: "0.8.10",
     appContractVersion: 1,
     chainProtocol: 4,
     nativeOnlyChain: true,

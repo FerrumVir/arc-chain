@@ -2461,7 +2461,7 @@ pub(crate) async fn run_inference_via_exact_production_coordinator_inner(
     .await
 }
 
-const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.9 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
+const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.10 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
 
 fn settlement_write_unavailable<T>(flow: &str) -> CmdResult<T> {
     Err(format!("{} {}", flow, SETTLEMENT_WRITE_UNAVAILABLE))
@@ -4943,6 +4943,9 @@ mod release_binary_tests {
     #[test]
     fn version_comparison_rejects_non_strict_values() {
         assert!(semver_gt("0.8.0", "0.7.11"));
+        assert!(semver_gt("0.8.10", "0.8.9"));
+        assert!(!semver_gt("0.8.9", "0.8.10"));
+        assert!(!semver_gt("0.8.10", "0.8.10"));
         assert!(!semver_gt("0.8.0-beta", "0.7.11"));
         assert!(!semver_gt("0.7", "0.6.99"));
         assert!(!semver_gt("0.8.0.1", "0.8.0"));

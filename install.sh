@@ -3117,6 +3117,16 @@ download_checked() {
     verify_file "$destination" "$asset"
 }
 
+# The signed asset set identifies the update profile, which cannot authorize
+# retirement even for an already stopped legacy install.
+if [ "$LEGACY_ADOPTION_ACTIVE" = true ] && awk '
+    $2 == "arc-existing-chain-update-attestation.json" \
+        || $2 == "*arc-existing-chain-update-attestation.json" { found = 1 }
+    END { exit !found }
+' "$TMP_DIR/SHA256SUMS"; then
+    die "Legacy v0.7 migration is unsupported by existing-recovered-chain-update-v1 releases: the signed update profile does not authorize legacy retirement. Migration requires verified cutover boundary, checkpoint descriptor, and policy assets."
+fi
+
 download_checked "$NODE_ASSET"
 download_checked "$CLI_ASSET"
 download_checked testnet-seeds.txt

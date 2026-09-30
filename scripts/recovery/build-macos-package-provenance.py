@@ -45,8 +45,8 @@ from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
 
 REPOSITORY = "FerrumVir/arc-chain"
-TAG = "v0.8.9"
-VERSION = "0.8.9"
+TAG = "v0.8.10"
+VERSION = "0.8.10"
 RELEASE_SCHEMA = "arc.published-release-binding.v1"
 # Existing-chain update releases are bound by the same acceptance tool with an
 # explicit profile; the asset/workflow contract is otherwise identical.

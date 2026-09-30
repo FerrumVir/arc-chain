@@ -40,7 +40,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         }
         self.release = {
             "id": 777,
-            "tag_name": "v0.8.9",
+            "tag_name": "v0.8.10",
             "target_commitish": self.commit,
             "draft": False,
             "prerelease": False,
@@ -57,7 +57,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
                     "uploader": {"login": "github-actions[bot]"},
                     "browser_download_url": (
                         f"https://github.com/{self.repository}/releases/download/"
-                        f"v0.8.9/{name}"
+                        f"v0.8.10/{name}"
                     ),
                 }
                 for index, name in enumerate(sorted(self.asset_bytes))
@@ -119,7 +119,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         self.write_api_documents()
 
     def test_production_binding_rejects_previously_published_v080_tag(self) -> None:
-        with self.assertRaisesRegex(acceptance.AcceptanceError, "pinned to v0.8.9"):
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "pinned to v0.8.10"):
             acceptance.command_bind(
                 Namespace(repository=self.repository, tag="v0.8.0")
             )
@@ -180,7 +180,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         self.tag_ref_json = self.write_json(
             "tag-ref.json",
             {
-                "ref": "refs/tags/v0.8.9",
+                "ref": "refs/tags/v0.8.10",
                 "object": {"type": "commit", "sha": self.commit},
             },
         )
@@ -211,7 +211,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         acceptance.command_bind(
             Namespace(
                 repository=self.repository,
-                tag="v0.8.9",
+                tag="v0.8.10",
                 commit=self.commit,
                 release_run_id=self.run_id,
                 release_run_attempt=self.run_attempt,
@@ -267,9 +267,9 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         for index, name in enumerate(sorted(update_names)):
             raw = dict(self.release["assets"][0])
             raw.update({"id": 20_000 + index, "name": name,
-                        "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.9/{name}"})
+                        "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.10/{name}"})
             update_release["assets"].append(raw)
-        resolved = acceptance.validate_release_assets(update_release, self.repository, "v0.8.9")
+        resolved = acceptance.validate_release_assets(update_release, self.repository, "v0.8.10")
         self.assertEqual(acceptance.release_profile_for_assets(set(resolved)),
                          acceptance.PROFILE_EXISTING_UPDATE_V1)
 
@@ -278,16 +278,16 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
                            if row["name"] != "arc-existing-chain-update-attestation.json"]
         extra = copy.deepcopy(self.release["assets"][0])
         extra.update({"id": 30_000, "name": "arc-cutover-policy.json",
-                      "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.9/arc-cutover-policy.json"})
+                      "browser_download_url": f"https://github.com/{self.repository}/releases/download/v0.8.10/arc-cutover-policy.json"})
         mixed["assets"].append(extra)
         with self.assertRaisesRegex(acceptance.AcceptanceError, "matches neither profile"):
-            acceptance.validate_release_assets(mixed, self.repository, "v0.8.9")
+            acceptance.validate_release_assets(mixed, self.repository, "v0.8.10")
 
     def test_update_binding_schema_cannot_be_downgraded_to_cutover_v1(self) -> None:
         binding = json.loads(self.bind().read_text(encoding="utf-8"))
         binding["schema"] = "arc.published-release-binding.v2"
         binding["profile"] = acceptance.PROFILE_EXISTING_UPDATE_V1
-        binding["tag"] = "v0.8.9"
+        binding["tag"] = "v0.8.10"
         assets = dict(binding["assets"])
         for name in ("arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json",
                      "arc-cutover-policy.json"):
@@ -488,19 +488,77 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
 
     def test_windows_receipt_distinguishes_exact_msi_and_embedded_versions(self) -> None:
         checks = dict(acceptance.REQUIRED_CHECKS["windows-x86_64"])
-        checks["embedded_app_product_version"] = "0.8.9.0"
+        checks["embedded_app_product_version"] = "0.8.10.0"
         acceptance.validate_platform_checks("windows-x86_64", checks)
-        for replacement in ("0.8.9-beta", "0.8.9.1"):
+        for replacement in ("0.8.10-beta", "0.8.10.1"):
             with self.subTest(embedded=replacement):
                 checks["embedded_app_product_version"] = replacement
                 with self.assertRaisesRegex(
                     acceptance.AcceptanceError, "embedded_app_product_version"
                 ):
                     acceptance.validate_platform_checks("windows-x86_64", checks)
-        checks["embedded_app_product_version"] = "0.8.9"
-        checks["msi_product_version"] = "0.8.9.1"
+        checks["embedded_app_product_version"] = "0.8.10"
+        checks["msi_product_version"] = "0.8.10.1"
         with self.assertRaisesRegex(acceptance.AcceptanceError, "msi_product_version"):
             acceptance.validate_platform_checks("windows-x86_64", checks)
+
+    def test_legacy_migration_checks_follow_the_release_profile(self) -> None:
+        cutover = dict(acceptance.REQUIRED_CHECKS["linux-x86_64"])
+        update = {**cutover, "legacy_migration_refused": True, "v08_fresh_data": False}
+        acceptance.validate_platform_checks("linux-x86_64", cutover)
+        acceptance.validate_platform_checks(
+            "linux-x86_64", update, acceptance.PROFILE_EXISTING_UPDATE_V1
+        )
+        for checks, profile in (
+            (cutover, acceptance.PROFILE_EXISTING_UPDATE_V1),
+            (update, acceptance.PROFILE_CUTOVER_V1),
+            ({**update, "v08_fresh_data": True}, acceptance.PROFILE_EXISTING_UPDATE_V1),
+            ({**update, "legacy_state_preserved": False}, acceptance.PROFILE_EXISTING_UPDATE_V1),
+            ({**update, "service_started": True}, acceptance.PROFILE_EXISTING_UPDATE_V1),
+            (update, "unknown-profile"),
+        ):
+            with self.subTest(checks=checks, profile=profile):
+                with self.assertRaises(acceptance.AcceptanceError):
+                    acceptance.validate_platform_checks("linux-x86_64", checks, profile)
+
+    def test_update_component_requires_refusal_at_creation_and_aggregation(self) -> None:
+        binding = json.loads(self.bind().read_text(encoding="utf-8"))
+        binding["schema"] = "arc.published-release-binding.v2"
+        binding["profile"] = acceptance.PROFILE_EXISTING_UPDATE_V1
+        for name in acceptance.EXPECTED_RELEASE_ASSETS - acceptance.EXISTING_UPDATE_RELEASE_ASSETS:
+            binding["assets"].pop(name)
+        binding["assets"]["arc-existing-chain-update-attestation.json"] = binding["assets"]["latest.json"]
+        binding_path = self.write_json("update-binding.json", binding)
+        downloads = self.root / "downloads"
+        downloads.mkdir()
+        for name in acceptance.EXPECTED_COMPONENTS["linux-x86_64"]:
+            (downloads / name).write_bytes(self.asset_bytes[name])
+        files_receipt = self.root / "files.json"
+        acceptance.command_verify_files(Namespace(
+            binding=binding_path, directory=downloads,
+            asset=sorted(acceptance.EXPECTED_COMPONENTS["linux-x86_64"]),
+            output=files_receipt,
+        ))
+        checks = {**acceptance.REQUIRED_CHECKS["linux-x86_64"],
+                  "legacy_migration_refused": True, "v08_fresh_data": False}
+        checks_path = self.write_json("checks.json", checks)
+        output = self.root / "component.json"
+        args = Namespace(
+            binding=binding_path, files_receipt=files_receipt, checks_json=checks_path,
+            platform="linux-x86_64", acceptance_run_id=2468, acceptance_run_attempt=2,
+            output=output,
+        )
+        acceptance.command_component(args)
+        component = json.loads(output.read_text())
+        self.assertEqual(acceptance.validate_component(
+            component, binding, acceptance.sha256_file(binding_path)
+        ), "linux-x86_64")
+        component["checks"] = dict(acceptance.REQUIRED_CHECKS["linux-x86_64"])
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "legacy_migration_refused"):
+            acceptance.validate_component(component, binding, acceptance.sha256_file(binding_path))
+        self.write_json("checks.json", component["checks"])
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "legacy_migration_refused"):
+            acceptance.command_component(args)
 
     def test_download_verifier_and_aggregate_fail_closed(self) -> None:
         binding_path = self.bind()
@@ -539,7 +597,7 @@ class PublishedArtifactAcceptanceTests(unittest.TestCase):
         for platform, names in acceptance.EXPECTED_COMPONENTS.items():
             checks = dict(acceptance.REQUIRED_CHECKS[platform])
             if platform == "windows-x86_64":
-                checks["embedded_app_product_version"] = "0.8.9"
+                checks["embedded_app_product_version"] = "0.8.10"
             component = {
                 "acceptance_run_attempt": 2,
                 "acceptance_run_id": 2468,

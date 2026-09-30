@@ -6031,6 +6031,15 @@ fn shutdown_exit_code(wal_result: &Result<(), arc_state::StateError>) -> i32 {
     if wal_result.is_ok() { 0 } else { 1 }
 }
 
+fn exit_after_clean_shutdown() -> ! {
+    // The fmt subscriber writes synchronously to stdout; there is no logging
+    // worker to drain. Flush both streams before skipping runtime/heap drops.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // This exits the whole process, including from the Windows node thread.
+    std::process::exit(0);
+}
+
 const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str = ".arc-desktop-control";
 const DESKTOP_SHUTDOWN_TOKEN_FILE_NAME: &str = "token";
 const DESKTOP_SHUTDOWN_REQUEST_FILE_NAME: &str = "request";
@@ -9681,7 +9690,10 @@ async fn run_arc_node() -> Result<()> {
         tracing::info!(
             "RPC handlers drained, node writers joined, WAL durability barrier completed, and the desktop receipt was acknowledged; shutdown is clean"
         );
-        return Ok(());
+        // All mutation producers are joined and the WAL is already fsynced.
+        // Avoid paging state back in for Drop; the kernel releases file
+        // handles and advisory locks on process exit.
+        exit_after_clean_shutdown();
     }
 
     rpc_result?;
@@ -10290,6 +10302,46 @@ mod tests {
             ))),
             1
         );
+    }
+
+    #[test]
+    fn clean_shutdown_exits_without_running_destructors() {
+        const CHILD_ENV: &str = "ARC_TEST_CLEAN_SHUTDOWN_EXIT";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            struct FailOnDrop;
+            impl Drop for FailOnDrop {
+                fn drop(&mut self) {
+                    std::process::exit(99);
+                }
+            }
+
+            std::thread::spawn(|| {
+                let _guard = FailOnDrop;
+                std::io::stdout()
+                    .write_all(b"clean shutdown stdout")
+                    .unwrap();
+                std::io::stderr()
+                    .write_all(b"clean shutdown stderr")
+                    .unwrap();
+                exit_after_clean_shutdown();
+            })
+            .join()
+            .unwrap();
+            panic!("clean shutdown returned to the parent thread");
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::clean_shutdown_exits_without_running_destructors",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("clean shutdown stdout"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("clean shutdown stderr"));
     }
 
     #[test]
