@@ -551,7 +551,10 @@ jobs:
           fi
 
           update_status=0
-          bash published/install.sh --update-only \
+          # Same user as the migration attempt above: without its HOME the installer
+          # does not recognize $HOME/.arc as the legacy root and refuses earlier as an
+          # unmarked directory (v0.8.10 acceptance run 36801683529).
+          HOME="$legacy_home" bash published/install.sh --update-only \
             --install-dir "$legacy_root" --no-service --no-auto-update \
             > evidence-linux/legacy-update.stdout \
             2> evidence-linux/legacy-update.stderr || update_status=$?
