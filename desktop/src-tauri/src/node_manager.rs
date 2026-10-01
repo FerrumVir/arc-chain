@@ -2168,8 +2168,35 @@ impl NodeManager {
             }
         }
 
+        // Pre-flight: if a model path is configured but the file does not
+        // exist arc-node will exit immediately with code 1 before it can
+        // prove WAL durability. That orphaned shutdown-unproven marker then
+        // causes every subsequent launch to fail with a misleading
+        // "unauthenticated force-stop" error that obscures the real cause.
+        // Detect the missing file here, warn clearly, and fall back to
+        // community routing mode (no local inference) so the node can still
+        // participate in the network.
         if let Some(model) = &config.model_path {
-            cmd.arg("--model").arg(model);
+            if !std::path::Path::new(model).exists() {
+                push_log(
+                    &self.logs,
+                    "warn",
+                    format!(
+                        "configured model file does not exist: {}; \
+                         clearing model_path and starting in community routing mode \
+                         (no local inference). Update the model path in Settings to \
+                         re-enable local inference.",
+                        model
+                    ),
+                )
+                .await;
+                // Clear in the local config copy so --model is not passed to
+                // arc-node. The caller's store is not mutated here; the user
+                // can correct the path in Settings at any time.
+                config.model_path = None;
+            } else {
+                cmd.arg("--model").arg(model);
+            }
         }
 
         // Capture every launch identity before arming the shutdown receipt or
