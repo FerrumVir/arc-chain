@@ -1,0 +1,135 @@
+name: v3 transfer throughput
+
+# Relative before/after measurement of block-level protocol-v3 fee
+# settlement on the six-process recovered-v3 fixture
+# (crates/arc-node/tests/v3_transfer_throughput.rs). Phase A runs the launch
+# rule with no schedule; phase B activates block-level settlement through the
+# harness-only `--test-v3-fee-settlement-activation-height` override, which
+# exists only in builds with the `v3-fee-settlement-test-override` feature.
+# The job uploads a JSON report with TPS, tx_count per block and
+# commit_execute_us per block for both phases. GitHub runner numbers are
+# meaningful only relative to each other.
+#
+# Ordinary CI never runs this. It runs on demand (workflow_dispatch, once the
+# workflow is on the default branch) and on pull requests that change the
+# harness or this workflow, so the change that introduces them can be
+# measured before it merges.
+
+on:
+  workflow_dispatch:
+    inputs:
+      senders:
+        description: Funded senders, each keeping one transfer in flight
+        required: false
+        default: '800'
+      warmup_seconds:
+        description: Load before measurement starts, per phase
+        required: false
+        default: '15'
+      measure_seconds:
+        description: Measurement window per phase
+        required: false
+        default: '60'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/v3-transfer-throughput.yml'
+      - 'crates/arc-node/tests/v3_transfer_throughput.rs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v3-transfer-throughput-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  throughput:
+    name: v3 transfer throughput (phase A launch rule vs phase B block settlement)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-03-16
+      CARGO_TARGET_DIR: target-v3-throughput
+      # The comparison is relative, so trade the release profile's fat LTO
+      # and single codegen unit for a build that fits the job budget.
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      ARC_V3_THROUGHPUT_SENDERS: ${{ inputs.senders || '800' }}
+      ARC_V3_THROUGHPUT_WARMUP_SECONDS: ${{ inputs.warmup_seconds || '15' }}
+      ARC_V3_THROUGHPUT_MEASURE_SECONDS: ${{ inputs.measure_seconds || '60' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: v3-transfer-throughput
+          workspaces: . -> target-v3-throughput
+          cache-on-failure: true
+
+      - name: Build the harness and node (release, test-override feature)
+        run: |
+          cargo test --locked --release -p arc-node \
+            --features v3-fee-settlement-test-override \
+            --test v3_transfer_throughput --no-run
+
+      - name: Measure phase A and phase B
+        env:
+          ARC_V3_THROUGHPUT_REPORT: ${{ runner.temp }}/v3-throughput/report.json
+          ARC_V3_THROUGHPUT_LOG_DIR: ${{ runner.temp }}/v3-throughput/node-logs
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARC_V3_THROUGHPUT_LOG_DIR"
+          cargo test --locked --release -p arc-node \
+            --features v3-fee-settlement-test-override \
+            --test v3_transfer_throughput \
+            -- --exact v3_transfer_throughput_launch_rule_vs_block_settlement \
+            --nocapture --test-threads=1
+
+      - name: Summarize the report
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/v3-throughput/report.json
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$REPORT" ]]; then
+            echo "No throughput report was written." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - "$REPORT" >> "$GITHUB_STEP_SUMMARY" <<'PYTHON'
+          import json
+          import sys
+
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          print("## v3 transfer throughput (relative, GitHub runner)")
+          print()
+          print("| phase | rule | TPS | blocks/s | tx_count max | tx_count mean | commit_execute_us/block |")
+          print("|---|---|---|---|---|---|---|")
+          for key in ("phase_a", "phase_b"):
+              phase = report[key]
+              counts = phase["tx_count_per_block"]
+              execute = phase["commit_execute_us_per_block"]["mean_over_validators"]
+              print(
+                  f"| {key} | {phase['rule']} | {phase['tps']:.1f} | "
+                  f"{phase['blocks_per_second']:.2f} | {counts['max']} | {counts['mean']:.1f} | {execute:.0f} |"
+              )
+          print()
+          print(f"TPS ratio B/A: {report['comparison']['tps_ratio_b_over_a']:.1f}")
+          PYTHON
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: v3-transfer-throughput-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/v3-throughput
+          if-no-files-found: warn
+          retention-days: 14
