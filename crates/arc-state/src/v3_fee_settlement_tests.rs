@@ -629,3 +629,93 @@ fn v3_block_admission_builder_refuses_without_recording() {
         .validate_v3_block_admission(&[first, claim])
         .expect("the builder's block is valid");
 }
+
+#[test]
+fn v3_fee_settlement_is_dormant_without_a_schedule_entry() {
+    use block_stm::FeeTreasuryAccess::{BlockEpilogue, PerTransaction};
+
+    let state = v3_fixture_state(&[]);
+    assert_eq!(state.v3_fee_settlement_activation_height(), None);
+    assert!(!state.v3_fee_settlement_activation_overridden());
+    for height in [0, 1, u64::MAX] {
+        assert!(!state.v3_fee_settlement_active_at(height));
+        assert_eq!(state.v3_fee_access_at(height), PerTransaction);
+    }
+
+    // The override activates from exactly its height on a v3 state.
+    state.set_v3_fee_settlement_activation_override(Some(10));
+    assert!(state.v3_fee_settlement_activation_overridden());
+    assert_eq!(state.v3_fee_settlement_activation_height(), Some(10));
+    assert!(!state.v3_fee_settlement_active_at(9));
+    assert!(state.v3_fee_settlement_active_at(10));
+    assert!(state.v3_fee_settlement_active_at(u64::MAX));
+    assert_eq!(state.v3_fee_access_at(9), PerTransaction);
+    assert_eq!(state.v3_fee_access_at(10), BlockEpilogue);
+
+    // An explicit `None` override disables it again.
+    state.set_v3_fee_settlement_activation_override(None);
+    assert!(state.v3_fee_settlement_activation_overridden());
+    assert_eq!(state.v3_fee_settlement_activation_height(), None);
+    assert!(!state.v3_fee_settlement_active_at(u64::MAX));
+
+    // A legacy (non-recovered) chain never leaves the launch rule.
+    let legacy = StateDB::with_genesis(&[]);
+    legacy.set_v3_fee_settlement_activation_override(Some(0));
+    assert_eq!(legacy.v3_fee_settlement_activation_height(), Some(0));
+    assert!(!legacy.v3_fee_settlement_active_at(1));
+    assert_eq!(legacy.v3_fee_access_at(1), PerTransaction);
+}
+
+#[test]
+fn v3_fee_settlement_schedule_matches_only_the_exact_transaction_domain() {
+    let domain = hash_bytes(b"scheduled-transaction-domain");
+    let other = hash_bytes(b"another-transaction-domain");
+    let entry = domain.to_hex();
+    let upper = entry.to_uppercase();
+    let prefixed = format!("0x{entry}");
+    let schedule = [(entry.as_str(), 77)];
+    assert_eq!(
+        scheduled_v3_fee_settlement_activation(&schedule, || Some(domain)),
+        Some(77)
+    );
+    assert_eq!(
+        scheduled_v3_fee_settlement_activation(&schedule, || Some(other)),
+        None
+    );
+    assert_eq!(
+        scheduled_v3_fee_settlement_activation(&schedule, || None),
+        None,
+        "a chain without a recovery domain never activates"
+    );
+    for malformed in [upper.as_str(), prefixed.as_str()] {
+        assert_eq!(
+            scheduled_v3_fee_settlement_activation(&[(malformed, 77)], || Some(domain)),
+            None
+        );
+    }
+    let mut derived = false;
+    assert_eq!(
+        scheduled_v3_fee_settlement_activation(&[], || {
+            derived = true;
+            Some(domain)
+        }),
+        None
+    );
+    assert!(!derived, "an empty schedule never derives the domain");
+}
+
+#[test]
+fn v3_fee_settlement_schedule_is_well_formed() {
+    let mut domains = HashSet::new();
+    for (domain, height) in V3_BLOCK_FEE_SETTLEMENT_SCHEDULE {
+        assert_eq!(domain.len(), 64, "{domain}");
+        assert!(
+            domain
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "{domain} is not lower-case hex"
+        );
+        assert!(domains.insert(*domain), "duplicate entry for {domain}");
+        assert!(*height > 0, "{domain} activates at genesis");
+    }
+}

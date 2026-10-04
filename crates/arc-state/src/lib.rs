@@ -67,6 +67,38 @@ pub fn v3_fee_treasury_address() -> Address {
     hash_bytes(b"arc-treasury")
 }
 
+/// Compiled-in activation schedule for block-level protocol-v3 fee
+/// settlement, keyed by the exact recovery transaction domain
+/// (`StateDB::transaction_domain_hash`, 64 lower-case hex digits, no prefix).
+///
+/// From an entry's height on, transfers in a v3 block no longer write the
+/// shared fee treasury one by one: the block credits it once with the fees of
+/// its successful transfers, in an epilogue after every transaction. Every
+/// validator running the same binary therefore activates at the same height.
+/// Domains without an entry (tests, devnets, other chains, future recovery
+/// epochs) keep the launch rule.
+///
+/// Deliberately empty: an entry is added only by a separately approved
+/// release once its height has been chosen for a coordinated fleet rollout.
+const V3_BLOCK_FEE_SETTLEMENT_SCHEDULE: &[(&str, u64)] = &[];
+
+/// The activation height `schedule` assigns to the transaction domain
+/// `domain` returns, if any. The domain is derived only when the schedule has
+/// entries, so an empty schedule costs nothing per transaction.
+fn scheduled_v3_fee_settlement_activation(
+    schedule: &[(&str, u64)],
+    domain: impl FnOnce() -> Option<Hash256>,
+) -> Option<u64> {
+    if schedule.is_empty() {
+        return None;
+    }
+    let domain = domain()?.to_hex();
+    schedule
+        .iter()
+        .find(|(entry, _)| *entry == domain)
+        .map(|(_, height)| *height)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct CommunityRewardIssuancePolicy {
     pub reward_amount: u64,
@@ -810,6 +842,12 @@ pub struct StateDB {
     native_inference_pending: DashMap<[u8; 32], u64>,
     native_inference_execution: parking_lot::Mutex<()>,
     native_inference_publication: RwLock<()>,
+    /// Test and harness override of `V3_BLOCK_FEE_SETTLEMENT_SCHEDULE`.
+    /// `None` derives the activation from the compiled schedule and this
+    /// chain's recovery transaction domain; `Some(activation)` replaces it for
+    /// this process (`Some(None)`: never active). Process configuration, not
+    /// state: it is neither persisted nor part of any root.
+    v3_fee_settlement_override: RwLock<Option<Option<u64>>>,
 }
 
 impl StateDB {
@@ -901,6 +939,7 @@ impl StateDB {
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
+            v3_fee_settlement_override: RwLock::new(None),
         }
     }
 
@@ -959,6 +998,7 @@ impl StateDB {
             native_inference_pending: DashMap::new(),
             native_inference_execution: parking_lot::Mutex::new(()),
             native_inference_publication: RwLock::new(()),
+            v3_fee_settlement_override: RwLock::new(None),
         })
     }
 
@@ -2075,6 +2115,57 @@ impl StateDB {
     pub fn community_rewards_v1_active(&self) -> bool {
         self.community_rewards_v1_activation_height()
             .is_some_and(|activation| self.height() >= activation)
+    }
+
+    /// Height from which protocol-v3 blocks settle transfer fees once per
+    /// block, if any: the test/harness override when one is installed,
+    /// otherwise the compiled schedule entry for this chain's exact recovery
+    /// transaction domain. `None` keeps the launch rule, under which every
+    /// transfer credits the fee treasury itself.
+    pub fn v3_fee_settlement_activation_height(&self) -> Option<u64> {
+        if let Some(activation) = *self.v3_fee_settlement_override.read() {
+            return activation;
+        }
+        scheduled_v3_fee_settlement_activation(V3_BLOCK_FEE_SETTLEMENT_SCHEDULE, || {
+            self.transaction_domain_hash()
+        })
+    }
+
+    /// Whether the activation reported by
+    /// [`Self::v3_fee_settlement_activation_height`] comes from a test or
+    /// harness override rather than the compiled schedule.
+    pub fn v3_fee_settlement_activation_overridden(&self) -> bool {
+        self.v3_fee_settlement_override.read().is_some()
+    }
+
+    /// Replace the compiled schedule for this process: `Some(height)`
+    /// activates block-level fee settlement from `height`, `None` disables
+    /// it. For tests and the feature-gated throughput harness only.
+    /// Production validators must rely on the compiled schedule, which every
+    /// node running the same binary shares. Install it before consensus
+    /// starts and never change it while blocks execute.
+    pub fn set_v3_fee_settlement_activation_override(&self, activation: Option<u64>) {
+        *self.v3_fee_settlement_override.write() = Some(activation);
+    }
+
+    /// Whether a protocol-v3 block executing at `height` credits transfer
+    /// fees to the treasury once, in its epilogue.
+    pub fn v3_fee_settlement_active_at(&self, height: u64) -> bool {
+        self.active_protocol_version().major == 3
+            && self
+                .v3_fee_settlement_activation_height()
+                .is_some_and(|activation| height >= activation)
+    }
+
+    /// How transfers in a block executing at `height` access the fee
+    /// treasury. Execution, partitioning, admission and the epilogue of one
+    /// block must all use this single answer.
+    pub fn v3_fee_access_at(&self, height: u64) -> block_stm::FeeTreasuryAccess {
+        if self.v3_fee_settlement_active_at(height) {
+            block_stm::FeeTreasuryAccess::BlockEpilogue
+        } else {
+            block_stm::FeeTreasuryAccess::PerTransaction
+        }
     }
 
     /// Reset the validator set to exactly the genesis validators at startup.
