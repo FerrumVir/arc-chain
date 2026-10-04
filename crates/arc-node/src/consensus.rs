@@ -6741,6 +6741,91 @@ mod tests {
     }
 
     #[test]
+    fn v3_selection_packs_disjoint_transfers_once_fee_settlement_is_active() {
+        let senders: Vec<_> = (0..502)
+            .map(|index| fixture_key(&format!("settled-selection-sender-{index}")))
+            .collect();
+        let funds: Vec<_> = senders.iter().map(|key| (key.address(), 1_000)).collect();
+        let (_directory, state) = recovered_v3_state("settled-selection", &funds);
+        state.set_v3_fee_settlement_activation_override(Some(state.height() + 1));
+        // 499 transfers to distinct recipients and three to one shared one:
+        // a full 500-transaction drain once the shared group yields one.
+        let shared = hash_bytes(b"settled-selection-shared-recipient");
+        let transfers: Vec<_> = senders
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let recipient = if index >= 499 {
+                    shared
+                } else {
+                    hash_bytes(format!("settled-selection-recipient-{index}").as_bytes())
+                };
+                recovered_transfer(&state, key, recipient, 0)
+            })
+            .collect();
+        let mut shared_group = hashes_of(&transfers[499..]);
+        shared_group.sort_by_key(|hash| hash.0);
+
+        let (proposal, deferred) = select_v3_proposal(&state, transfers);
+        assert_eq!(proposal.len(), 500, "every disjoint transfer is packed");
+        assert!(proposal.iter().any(|tx| tx.hash == shared_group[0]));
+        assert_eq!(
+            hashes_of(&deferred),
+            shared_group[1..].to_vec(),
+            "transfers to an already-credited recipient wait for a later block"
+        );
+        assert!(
+            proposal
+                .windows(2)
+                .all(|pair| pair[0].hash.0 < pair[1].hash.0),
+            "the proposal is in DagBlock (hash) order"
+        );
+
+        // The commit path admits the committed block unchanged.
+        let (admitted, omitted) = select_v3_block_transactions(&state, proposal);
+        assert_eq!(admitted.len(), 500);
+        assert!(omitted.is_empty());
+    }
+
+    #[test]
+    fn peer_dag_availability_relaxes_the_fee_treasury_only_when_scheduled() {
+        let senders: Vec<_> = (0..3)
+            .map(|index| fixture_key(&format!("scheduled-availability-sender-{index}")))
+            .collect();
+        let funds: Vec<_> = senders.iter().map(|key| (key.address(), 1_000)).collect();
+        let (_directory, state) = recovered_v3_state("scheduled-availability", &funds);
+        let disjoint = vec![
+            recovered_transfer(&state, &senders[0], hash_bytes(b"availability-a"), 0),
+            recovered_transfer(&state, &senders[1], hash_bytes(b"availability-b"), 0),
+        ];
+        let shared_recipient = hash_bytes(b"availability-shared");
+        let shared = vec![
+            recovered_transfer(&state, &senders[0], shared_recipient, 0),
+            recovered_transfer(&state, &senders[2], shared_recipient, 0),
+        ];
+        let available = |transactions: &[Transaction]| {
+            let mut hashes = hashes_of(transactions);
+            hashes.sort_by_key(|hash| hash.0);
+            verify_peer_dag_availability(&state, &hashes, transactions)
+        };
+        assert!(
+            available(&disjoint).is_err(),
+            "without a schedule the fee-treasury key still conflicts"
+        );
+
+        // A schedule relaxes peer availability at every height, so a node
+        // that lags behind the activation height keeps post-activation DAG
+        // parents instead of stalling catch-up.
+        state.set_v3_fee_settlement_activation_override(Some(state.height() + 1_000));
+        assert_eq!(available(&disjoint).unwrap().len(), 2);
+        assert!(available(&shared).is_err());
+        // Its own proposals keep the launch rule until the exact height.
+        let (proposal, deferred) = select_v3_proposal(&state, disjoint);
+        assert_eq!(proposal.len(), 1);
+        assert_eq!(deferred.len(), 1);
+    }
+
+    #[test]
     fn a_body_that_never_executed_is_kept_for_the_retention_window() {
         // The omitted finalize: named by a committed block, never executed.
         // A restarted peer re-running the selection needs it, and nothing but

@@ -17849,6 +17849,19 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
             .map(|context| format!("0x{}", context.domain_hash().to_hex())),
         "checkpoint_manifest_hash": recovery_manifest_hash
             .map(|hash| format!("0x{}", hash.to_hex())),
+        // Block-level v3 fee settlement: from this height a block credits the
+        // fee treasury once with its transfer fees. The compiled schedule is
+        // part of the binary, so every validator running the same release
+        // must report the same value; null keeps the launch rule.
+        "v3_fee_settlement_activation_height": node.state.v3_fee_settlement_activation_height(),
+        "v3_fee_settlement_active": node
+            .state
+            .v3_fee_settlement_active_at(height.saturating_add(1)),
+        "v3_fee_settlement_source": if node.state.v3_fee_settlement_activation_overridden() {
+            "test_override"
+        } else {
+            "compiled_schedule"
+        },
 
         // ── Liveness ──────────────────────────────────────────────────────
         "height": height,
@@ -26945,6 +26958,25 @@ mod tests {
             chain_advancing,
             Some(true),
             "a node with no readable block must never report the chain as advancing"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_info_reports_the_v3_fee_settlement_schedule() {
+        let node = fake_node_with_workers(Vec::new());
+        let Json(info) = network_info(AxumState(node.clone())).await;
+        assert!(info["v3_fee_settlement_activation_height"].is_null());
+        assert_eq!(info["v3_fee_settlement_active"], false);
+        assert_eq!(info["v3_fee_settlement_source"], "compiled_schedule");
+
+        node.state
+            .set_v3_fee_settlement_activation_override(Some(7));
+        let Json(info) = network_info(AxumState(node)).await;
+        assert_eq!(info["v3_fee_settlement_activation_height"], 7);
+        assert_eq!(info["v3_fee_settlement_source"], "test_override");
+        assert_eq!(
+            info["v3_fee_settlement_active"], false,
+            "a chain without recovery protocol v3 never settles fees per block"
         );
     }
 

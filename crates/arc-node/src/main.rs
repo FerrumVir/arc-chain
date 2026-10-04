@@ -305,6 +305,15 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     native_inference_test_executor: bool,
 
+    /// INTEGRATION TESTING ONLY: activate block-level protocol-v3 fee
+    /// settlement at this height, replacing the compiled schedule for this
+    /// process. Every validator of the test network must pass the same value.
+    /// Compiled in only with the `v3-fee-settlement-test-override` cargo
+    /// feature, so a default or release build cannot enable it.
+    #[cfg(feature = "v3-fee-settlement-test-override")]
+    #[arg(long, value_name = "HEIGHT")]
+    test_v3_fee_settlement_activation_height: Option<u64>,
+
     /// How many rounds of DAG history this node keeps below its commit cursor.
     ///
     /// Operator meaning: how far behind a validator may fall and still rejoin
@@ -7419,6 +7428,30 @@ async fn run_arc_node() -> Result<()> {
                 "Community reward v1 consensus activation is absent; tx 0x25 is disabled"
             ),
         }
+        // Installed before consensus or any DAG replay executes a block.
+        #[cfg(feature = "v3-fee-settlement-test-override")]
+        if let Some(height) = cli.test_v3_fee_settlement_activation_height {
+            db.set_v3_fee_settlement_activation_override(Some(height));
+            tracing::warn!(
+                height,
+                "TEST OVERRIDE: block-level v3 fee settlement activation replaces the compiled \
+                 schedule; for integration harnesses only"
+            );
+        }
+        match db.v3_fee_settlement_activation_height() {
+            Some(height) => tracing::info!(
+                height,
+                test_override = db.v3_fee_settlement_activation_overridden(),
+                active_at_next_block =
+                    db.v3_fee_settlement_active_at(db.height().saturating_add(1)),
+                "Block-level v3 fee settlement is scheduled: from this height a block credits \
+                 the fee treasury once with its transfer fees"
+            ),
+            None => tracing::info!(
+                "Block-level v3 fee settlement is not scheduled for this chain; every transfer \
+                 credits the fee treasury itself"
+            ),
+        }
         if let Some(context) = db.recovery_context() {
             let manifest_hash = db
                 .recovery_manifest_hash()
@@ -10818,6 +10851,38 @@ mod tests {
     #[test]
     fn default_cli_omits_benchmark_mutation_mode() {
         assert!(Cli::try_parse_from(["arc-node", "--benchmark"]).is_err());
+    }
+
+    #[cfg(not(feature = "v3-fee-settlement-test-override"))]
+    #[test]
+    fn default_cli_omits_the_v3_fee_settlement_test_override() {
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "--test-v3-fee-settlement-activation-height",
+                "5",
+            ])
+            .is_err(),
+            "only the compiled schedule may activate fee settlement in a default build"
+        );
+    }
+
+    #[cfg(feature = "v3-fee-settlement-test-override")]
+    #[test]
+    fn test_override_cli_parses_the_v3_fee_settlement_activation_height() {
+        let parsed = Cli::try_parse_from([
+            "arc-node",
+            "--test-v3-fee-settlement-activation-height",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(parsed.test_v3_fee_settlement_activation_height, Some(5));
+        assert_eq!(
+            Cli::try_parse_from(["arc-node"])
+                .unwrap()
+                .test_v3_fee_settlement_activation_height,
+            None
+        );
     }
 
     #[cfg(feature = "benchmark-tools")]
