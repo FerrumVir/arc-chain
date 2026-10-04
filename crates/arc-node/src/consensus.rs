@@ -830,6 +830,53 @@ fn retain_unreceipted(state: &StateDB, transactions: &mut Vec<arc_types::Transac
     before - transactions.len()
 }
 
+/// Deterministic protocol-v3 block selection over an ordered candidate list.
+///
+/// Each candidate is offered, in order, to one incremental
+/// [`arc_state::V3BlockAdmission`]. It is admitted exactly when the admitted
+/// prefix followed by it passes `validate_v3_block_admission`, which is what
+/// the quadratic greedy loops this replaces computed by re-validating the
+/// whole prefix, signatures included, for every candidate. Returns
+/// `(admitted, rejected)`, both in candidate order. Reads `state` only.
+fn select_v3_block_transactions(
+    state: &StateDB,
+    candidates: Vec<arc_types::Transaction>,
+) -> (Vec<arc_types::Transaction>, Vec<arc_types::Transaction>) {
+    let Ok(mut admission) = state.v3_block_admission() else {
+        return (Vec::new(), candidates);
+    };
+    let mut admitted = Vec::with_capacity(candidates.len());
+    let mut rejected = Vec::new();
+    for transaction in candidates {
+        if admission.try_push(&transaction).is_ok() {
+            admitted.push(transaction);
+        } else {
+            rejected.push(transaction);
+        }
+    }
+    (admitted, rejected)
+}
+
+/// Protocol-v3 proposal selection: never propose a transaction that would
+/// become a failed canonical history entry. Receipted or individually
+/// inadmissible envelopes are discarded. The rest are ordered as `DagBlock`
+/// commits them (lexicographically by hash, never the local FIFO attachment
+/// order peers are free to permute) and selected by
+/// [`select_v3_block_transactions`]. Returns `(proposal, deferred)`; deferred
+/// envelopes conflict only within this candidate and stay eligible for a
+/// later block.
+fn select_v3_proposal(
+    state: &StateDB,
+    mut candidates: Vec<arc_types::Transaction>,
+) -> (Vec<arc_types::Transaction>, Vec<arc_types::Transaction>) {
+    candidates.retain(|transaction| {
+        !state.receipts.contains_key(&transaction.hash.0)
+            && state.validate_v3_transaction_admission(transaction).is_ok()
+    });
+    candidates.sort_by_key(|transaction| transaction.hash.0);
+    select_v3_block_transactions(state, candidates)
+}
+
 fn verify_peer_dag_transactions_in_domain(
     committed_hashes: &[Hash256],
     transactions: &[arc_types::Transaction],
@@ -4126,35 +4173,16 @@ impl ConsensusManager {
                     // subset, defer candidate-local conflicts, and discard
                     // envelopes already stale against canonical state.
                     if state.active_protocol_version().major == 3 {
-                        transactions.retain(|transaction| {
-                            !state.receipts.contains_key(&transaction.hash.0)
-                                && state.validate_v3_transaction_admission(transaction).is_ok()
-                        });
-                        // DagBlock commits lexicographically sorted hashes.
-                        // Validate exactly that order, never the local FIFO
-                        // attachment order which peers are free to permute.
-                        transactions.sort_by_key(|transaction| transaction.hash.0);
-                        if state.validate_v3_block_admission(&transactions).is_err() {
-                            let mut admitted = Vec::with_capacity(transactions.len());
-                            let mut deferred = Vec::new();
-                            for transaction in transactions {
-                                let mut candidate = admitted.clone();
-                                candidate.push(transaction.clone());
-                                if state.validate_v3_block_admission(&candidate).is_ok() {
-                                    admitted.push(transaction);
-                                } else {
-                                    deferred.push(transaction);
-                                }
-                            }
-                            transactions = admitted;
-                            // Individually valid envelopes can conflict only
-                            // within this candidate (for example two spends of
-                            // one nonce). Keep the loser available until the
-                            // winning canonical state transition decides which
-                            // envelope became stale.
-                            for transaction in deferred {
-                                self.native_request_admission.insert(&mempool, transaction);
-                            }
+                        let (proposal, deferred) =
+                            select_v3_proposal(&state, std::mem::take(&mut transactions));
+                        transactions = proposal;
+                        // Individually valid envelopes can conflict only
+                        // within this candidate (for example two spends of
+                        // one nonce). Keep the loser available until the
+                        // winning canonical state transition decides which
+                        // envelope became stale.
+                        for transaction in deferred {
+                            self.native_request_admission.insert(&mempool, transaction);
                         }
                     }
                     let transaction_hashes: Vec<_> = transactions
@@ -4547,24 +4575,19 @@ impl ConsensusManager {
                     // deterministically omitted instead of becoming free failed
                     // receipts. The resulting subset is revalidated as one
                     // exact v3 state block before any mutation.
-                    if state.active_protocol_version().major == 3
-                        && state.validate_v3_block_admission(&committed_txs).is_err()
-                    {
-                        let original = committed_txs.len();
-                        let mut admitted = Vec::with_capacity(original);
-                        for transaction in committed_txs {
-                            let mut candidate = admitted.clone();
-                            candidate.push(transaction.clone());
-                            if state.validate_v3_block_admission(&candidate).is_ok() {
-                                admitted.push(transaction);
-                            }
-                        }
-                        committed_txs = admitted;
-                        warn!(
-                            block = %dag_block.hash,
-                            omitted = original.saturating_sub(committed_txs.len()),
-                            "Omitted state-stale v3 DAG envelopes without creating failed history"
+                    if state.active_protocol_version().major == 3 {
+                        let (admitted, omitted) = select_v3_block_transactions(
+                            &state,
+                            std::mem::take(&mut committed_txs),
                         );
+                        committed_txs = admitted;
+                        if !omitted.is_empty() {
+                            warn!(
+                                block = %dag_block.hash,
+                                omitted = omitted.len(),
+                                "Omitted state-stale v3 DAG envelopes without creating failed history"
+                            );
+                        }
                     }
 
                     // At most one native-inference transaction per canonical
@@ -6172,6 +6195,15 @@ mod tests {
                 .is_err(),
             "the native transition must still execute alone"
         );
+        // The incremental selection keeps a native transition alone in its
+        // block in either candidate order, exactly as re-validating the whole
+        // candidate block for every transaction did.
+        for (first, second) in [(&winner, &ordinary), (&ordinary, &winner)] {
+            let (admitted, rejected) =
+                select_v3_block_transactions(&state, vec![first.clone(), second.clone()]);
+            assert_eq!(hashes_of(&admitted), vec![first.hash]);
+            assert_eq!(hashes_of(&rejected), vec![second.hash]);
+        }
         // Reproduce the observed timing: one validator has a signed finalizer
         // DAG block before canonical finalization; another receives those
         // IDENTICAL bytes afterward. Both must retain the same consensus
@@ -6523,6 +6555,189 @@ mod tests {
             .is_empty()
         );
         assert!(mempool.is_empty());
+    }
+
+    fn hashes_of(transactions: &[Transaction]) -> Vec<Hash256> {
+        transactions
+            .iter()
+            .map(|transaction| transaction.hash)
+            .collect()
+    }
+
+    fn fixture_key(label: &str) -> KeyPair {
+        KeyPair::from_ed25519_secret_bytes(&hash_bytes(label.as_bytes()).0)
+    }
+
+    /// A real recovered-v3 state: a legacy source with a six-member validator
+    /// set exported to a five-of-six signed ARCCHKPT and imported, as the
+    /// migrated native selection test above does. `funds` are prefunded in
+    /// the legacy source and survive the transition.
+    fn recovered_v3_state(
+        label: &str,
+        funds: &[(arc_types::Address, u64)],
+    ) -> (tempfile::TempDir, StateDB) {
+        use arc_state::recovery::{
+            ArcCheckpoint, RecoveryExportSpec, RecoveryImport, RecoveryNetworkPolicy,
+            RecoveryValidator,
+        };
+        use arc_types::TxBody;
+        use arc_types::transaction::JoinValidatorBody;
+
+        let directory = tempfile::tempdir().unwrap();
+        let keys: Vec<_> = (0..6)
+            .map(|index| fixture_key(&format!("{label}-validator-{index}")))
+            .collect();
+        let genesis = hash_bytes(format!("{label}-genesis").as_bytes());
+        let validators: Vec<_> = keys
+            .iter()
+            .map(|key| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: 5_000_000,
+            })
+            .collect();
+        let mut source_funds = funds.to_vec();
+        source_funds.push((
+            arc_state::recovery::recovery_stake_reserve_address(),
+            60_000_000,
+        ));
+        source_funds.extend(keys.iter().map(|key| (key.address(), 5_000_000)));
+        let source = StateDB::with_genesis(&source_funds);
+        let joins: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, 0);
+                tx.tx_type = TxType::JoinValidator;
+                tx.body = TxBody::JoinValidator(JoinValidatorBody {
+                    pubkey: key.public_key_bytes().try_into().unwrap(),
+                    initial_stake: 5_000_000,
+                });
+                tx.sign(key).unwrap();
+                tx
+            })
+            .collect();
+        let (_, receipts) = source.execute_block(&joins, keys[0].address()).unwrap();
+        assert!(receipts.iter().all(|receipt| receipt.success));
+        for key in &keys {
+            let mut account = source.get_account(&key.address()).unwrap();
+            account.staked_balance = 0;
+            source.update_account(&key.address(), account);
+        }
+        source.execute_block(&[], keys[0].address()).unwrap();
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: label.into(),
+                genesis_hash: genesis,
+                source_consensus_round: 0,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let path = directory.path().join("approved.arcchkpt");
+        checkpoint.write_to(&path).unwrap();
+        let mut members: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator.address, validator.stake))
+            .collect();
+        members.sort_by_key(|member| member.0.0);
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            directory.path().join("state"),
+            RecoveryNetworkPolicy {
+                chain_id: label.into(),
+                genesis_hash: genesis,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: members,
+                community_rewards_v1_activation_height: None,
+            },
+            Some(RecoveryImport {
+                checkpoint_path: path,
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(state.active_protocol_version().major, 3);
+        (directory, state)
+    }
+
+    fn recovered_transfer(
+        state: &StateDB,
+        key: &KeyPair,
+        recipient: arc_types::Address,
+        nonce: u64,
+    ) -> Transaction {
+        let mut tx = Transaction::new_transfer(key.address(), recipient, 1, nonce);
+        tx.fee = arc_state::V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut tx, key).unwrap();
+        tx
+    }
+
+    #[test]
+    fn v3_selection_helpers_keep_one_launch_rule_transfer_and_discard_stale_envelopes() {
+        let senders: Vec<_> = (0..4)
+            .map(|index| fixture_key(&format!("launch-selection-sender-{index}")))
+            .collect();
+        let funds: Vec<_> = senders.iter().map(|key| (key.address(), 1_000)).collect();
+        let (_directory, state) = recovered_v3_state("launch-selection", &funds);
+        let shared = hash_bytes(b"launch-selection-shared-recipient");
+        let transfers: Vec<_> = senders
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let recipient = if index < 2 {
+                    shared
+                } else {
+                    hash_bytes(format!("launch-selection-recipient-{index}").as_bytes())
+                };
+                recovered_transfer(&state, key, recipient, 0)
+            })
+            .collect();
+        let mut ordered = hashes_of(&transfers);
+        ordered.sort_by_key(|hash| hash.0);
+
+        // Under the launch rule every transfer credits the fee treasury, so
+        // the proposal keeps the first in DagBlock (hash) order and defers the
+        // rest for later blocks.
+        let (proposal, deferred) = select_v3_proposal(&state, transfers.clone());
+        assert_eq!(hashes_of(&proposal), vec![ordered[0]]);
+        assert_eq!(hashes_of(&deferred), ordered[1..].to_vec());
+        state.validate_v3_block_admission(&proposal).unwrap();
+
+        // The commit path offers the committed order as is and omits the rest.
+        let mut committed = transfers.clone();
+        committed.sort_by_key(|transaction| transaction.hash.0);
+        let (admitted, omitted) = select_v3_block_transactions(&state, committed);
+        assert_eq!(hashes_of(&admitted), vec![ordered[0]]);
+        assert_eq!(omitted.len(), transfers.len() - 1);
+
+        // Receipted and individually inadmissible envelopes are discarded by
+        // the proposal path, never deferred back into the mempool.
+        let stale_nonce = recovered_transfer(&state, &senders[0], shared, 5);
+        let (stale_proposal, stale_deferred) = select_v3_proposal(&state, vec![stale_nonce]);
+        assert!(stale_proposal.is_empty());
+        assert!(stale_deferred.is_empty());
+        let (block, receipts) = state
+            .execute_block_adaptive_at_with_proof(
+                &proposal,
+                senders[0].address(),
+                state.get_block(state.height()).unwrap().header.timestamp + 1,
+                hash_bytes(b"launch-selection-decision"),
+            )
+            .unwrap();
+        assert_eq!(block.header.tx_count, 1);
+        assert!(receipts[0].success);
+        let (receipted, receipted_deferred) = select_v3_proposal(&state, proposal);
+        assert!(receipted.is_empty());
+        assert!(receipted_deferred.is_empty());
     }
 
     #[test]

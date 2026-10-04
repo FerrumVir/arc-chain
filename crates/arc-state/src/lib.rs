@@ -569,6 +569,113 @@ pub struct IndexerBatch {
     pub txs_per_sender: u64,
 }
 
+/// Incremental protocol-v3 block admission.
+///
+/// [`V3BlockAdmission::try_push`] admits a transaction exactly when
+/// [`StateDB::validate_v3_block_admission_at`] would accept the transactions
+/// admitted so far followed by it, and leaves the builder unchanged when it
+/// would not. Each transaction is therefore validated (including its
+/// signature) once, instead of re-validating the whole candidate block for
+/// every transaction as the greedy selection loops used to.
+///
+/// The builder reads the state it was created from on every push. Callers
+/// must not execute a block between creating it and the last push; the
+/// execution height is captured at creation.
+pub struct V3BlockAdmission<'a> {
+    state: &'a StateDB,
+    execution_height: u64,
+    admitted: usize,
+    /// A native transition was admitted; it must stay alone in its block.
+    native: bool,
+    hashes: HashSet<[u8; 32]>,
+    senders: HashMap<[u8; 32], usize>,
+    accessed: HashSet<[u8; 32]>,
+}
+
+impl V3BlockAdmission<'_> {
+    /// Height of the block this candidate would execute as.
+    pub fn execution_height(&self) -> u64 {
+        self.execution_height
+    }
+
+    /// Number of admitted transactions.
+    pub fn len(&self) -> usize {
+        self.admitted
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.admitted == 0
+    }
+
+    /// Admit `tx` after the transactions already admitted, or explain why the
+    /// extended block would be refused. On error nothing is recorded.
+    pub fn try_push(&mut self, tx: &Transaction) -> Result<(), StateError> {
+        if self.native || inference_contract_state::is_native_body(&tx.body) {
+            return self.try_push_native(tx);
+        }
+        if self.admitted >= V3_MAX_TRANSACTIONS_PER_BLOCK {
+            return Err(StateError::ExecutionError(format!(
+                "v3 block contains {} transactions; maximum is {V3_MAX_TRANSACTIONS_PER_BLOCK}",
+                self.admitted.saturating_add(1)
+            )));
+        }
+        if self.hashes.contains(&tx.hash.0) {
+            return Err(StateError::ExecutionError(
+                "v3 block contains a duplicate transaction hash".to_string(),
+            ));
+        }
+        let sender_count = self.senders.get(&tx.from.0).copied().unwrap_or_default();
+        if sender_count >= V3_MAX_TRANSACTIONS_PER_SENDER_PER_BLOCK {
+            return Err(StateError::ExecutionError(format!(
+                "v3 block exceeds per-sender transaction limit for {}",
+                tx.from.to_hex()
+            )));
+        }
+        self.state
+            .validate_v3_transaction_admission_at(tx, self.execution_height)?;
+        let access = crate::block_stm::tx_access_set(tx);
+        if access
+            .accounts
+            .iter()
+            .any(|account| self.accessed.contains(account))
+        {
+            return Err(StateError::ExecutionError(
+                "v3 block contains overlapping transaction state access".to_string(),
+            ));
+        }
+        self.hashes.insert(tx.hash.0);
+        self.senders
+            .insert(tx.from.0, sender_count.saturating_add(1));
+        self.accessed.extend(access.accounts);
+        self.admitted = self.admitted.saturating_add(1);
+        Ok(())
+    }
+
+    /// A native transition is admitted only as the first and only
+    /// transaction of its block, exactly as the native branch of
+    /// [`StateDB::validate_v3_block_admission_at`] requires.
+    fn try_push_native(&mut self, tx: &Transaction) -> Result<(), StateError> {
+        if self.state.active_protocol_version().major != 3 {
+            return Err(StateError::ExecutionError(
+                "native v3 block requires recovery protocol v3".into(),
+            ));
+        }
+        if self.admitted != 0 {
+            return Err(StateError::ExecutionError(
+                "native v3 blocks contain one native transition and cannot mix transaction families".into(),
+            ));
+        }
+        self.state.validate_v3_transaction_envelope(tx)?;
+        self.state.validate_native_inference_block_admission_at(
+            std::slice::from_ref(tx),
+            self.execution_height,
+        )?;
+        self.native = true;
+        self.admitted = 1;
+        Ok(())
+    }
+}
+
 /// In-memory state database with optional WAL persistence.
 /// Uses DashMap for lock-free concurrent reads across threads.
 pub struct StateDB {
@@ -2994,33 +3101,33 @@ impl StateDB {
                 transactions.len()
             )));
         }
-        let mut senders = HashMap::<[u8; 32], usize>::new();
-        let mut hashes = HashSet::with_capacity(transactions.len());
-        let mut accessed = HashSet::new();
+        let mut admission = self.v3_block_admission_at(execution_height);
         for tx in transactions {
-            if !hashes.insert(tx.hash.0) {
-                return Err(StateError::ExecutionError(
-                    "v3 block contains a duplicate transaction hash".to_string(),
-                ));
-            }
-            let sender_count = senders.entry(tx.from.0).or_default();
-            *sender_count += 1;
-            if *sender_count > V3_MAX_TRANSACTIONS_PER_SENDER_PER_BLOCK {
-                return Err(StateError::ExecutionError(format!(
-                    "v3 block exceeds per-sender transaction limit for {}",
-                    tx.from.to_hex()
-                )));
-            }
-            self.validate_v3_transaction_admission_at(tx, execution_height)?;
-            for account in crate::block_stm::tx_access_set(tx).accounts {
-                if !accessed.insert(account) {
-                    return Err(StateError::ExecutionError(
-                        "v3 block contains overlapping transaction state access".to_string(),
-                    ));
-                }
-            }
+            admission.try_push(tx)?;
         }
         Ok(())
+    }
+
+    /// Start incremental admission of the next block (current height + 1).
+    pub fn v3_block_admission(&self) -> Result<V3BlockAdmission<'_>, StateError> {
+        let execution_height = self.height().checked_add(1).ok_or_else(|| {
+            StateError::ExecutionError("prospective v3 block height overflow".to_string())
+        })?;
+        Ok(self.v3_block_admission_at(execution_height))
+    }
+
+    /// Start incremental admission of a candidate block that will execute at
+    /// exactly `execution_height`. See [`V3BlockAdmission`].
+    pub fn v3_block_admission_at(&self, execution_height: u64) -> V3BlockAdmission<'_> {
+        V3BlockAdmission {
+            state: self,
+            execution_height,
+            admitted: 0,
+            native: false,
+            hashes: HashSet::new(),
+            senders: HashMap::new(),
+            accessed: HashSet::new(),
+        }
     }
 
     /// Get current block height.

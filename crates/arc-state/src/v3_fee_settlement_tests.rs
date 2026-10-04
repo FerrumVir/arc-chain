@@ -388,3 +388,244 @@ fn reference_greedy_selection_keeps_one_launch_rule_transfer_per_block() {
         .validate_v3_block_admission(&admitted)
         .expect("the reference selection is a valid block");
 }
+
+/// Deterministic pseudo-random stream for differential candidates.
+struct FixtureRng {
+    seed: u64,
+    counter: u64,
+}
+
+impl FixtureRng {
+    fn new(seed: u64) -> Self {
+        Self { seed, counter: 0 }
+    }
+
+    fn draw(&mut self) -> u64 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-v3-fee-settlement-fixture-rng-v1");
+        hasher.update(&self.seed.to_le_bytes());
+        hasher.update(&self.counter.to_le_bytes());
+        self.counter += 1;
+        let digest = hasher.finalize();
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&digest.as_bytes()[..8]);
+        u64::from_le_bytes(word)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.draw() % bound as u64) as usize
+    }
+}
+
+/// Funded senders, the six-member recovery authority (faucet signers) and a
+/// funded faucet pool on a recovered-v3 state.
+struct DifferentialFixture {
+    state: StateDB,
+    senders: Vec<KeyPair>,
+    sender_addresses: Vec<Address>,
+    validators: Vec<KeyPair>,
+}
+
+fn differential_fixture() -> DifferentialFixture {
+    let senders: Vec<KeyPair> = (0..8)
+        .map(|index| fixture_key("differential-sender", index))
+        .collect();
+    let sender_addresses: Vec<Address> = senders.iter().map(KeyPair::address).collect();
+    let validators: Vec<KeyPair> = (0..6)
+        .map(|index| fixture_key("differential-validator", index))
+        .collect();
+    let validator_addresses: Vec<Address> = validators.iter().map(KeyPair::address).collect();
+    let mut prefunded: Vec<(Address, u64)> = sender_addresses
+        .iter()
+        .map(|address| (*address, 1_000_000))
+        .collect();
+    prefunded.extend(validator_addresses.iter().map(|address| (*address, 1_000)));
+    prefunded.push((
+        arc_types::transaction::faucet_pool_address(),
+        100 * arc_types::transaction::FAUCET_CLAIM_MAX,
+    ));
+    let state = v3_fixture_state(&prefunded);
+    state.seed_genesis_validators(
+        &validator_addresses
+            .iter()
+            .map(|address| (*address, 5_000_000))
+            .collect::<Vec<_>>(),
+    );
+    DifferentialFixture {
+        state,
+        senders,
+        sender_addresses,
+        validators,
+    }
+}
+
+/// A seeded candidate batch mixing admissible transfers and faucet claims
+/// with every kind of conflict and refusal the selection has to resolve.
+fn differential_candidates(
+    fixture: &DifferentialFixture,
+    seed: u64,
+    count: usize,
+) -> Vec<Transaction> {
+    let state = &fixture.state;
+    let mut rng = FixtureRng::new(seed);
+    let shared: Vec<Address> = (0..3)
+        .map(|index| fixture_address("differential-shared", seed * 16 + index))
+        .collect();
+    let mut candidates: Vec<Transaction> = Vec::with_capacity(count);
+    for index in 0..count {
+        let fresh = fixture_address("differential-fresh", seed * 10_000 + index as u64);
+        let roll = rng.below(100);
+        let transaction = if roll < 8 && !candidates.is_empty() {
+            let earlier = rng.below(candidates.len());
+            candidates[earlier].clone()
+        } else if roll < 20 {
+            let validator = &fixture.validators[rng.below(fixture.validators.len())];
+            let recipient = if rng.below(2) == 0 {
+                shared[rng.below(shared.len())]
+            } else {
+                fresh
+            };
+            let amount = 1 + rng.below(10) as u64;
+            let mut claim =
+                Transaction::new_faucet_claim(validator.address(), recipient, amount, 0);
+            state
+                .sign_transaction(&mut claim, validator)
+                .expect("fixture faucet claim signs");
+            claim
+        } else {
+            let sender = rng.below(fixture.senders.len());
+            let recipient = match rng.below(10) {
+                0..=4 => fresh,
+                5..=7 => shared[rng.below(shared.len())],
+                8 => fixture.sender_addresses[rng.below(fixture.sender_addresses.len())],
+                _ => v3_fee_treasury_address(),
+            };
+            let fee = rng.below(8) as u64;
+            let nonce = u64::from(rng.below(10) == 0);
+            let amount = 1 + rng.below(50) as u64;
+            signed_transfer(
+                state,
+                &fixture.senders[sender],
+                recipient,
+                amount,
+                fee,
+                nonce,
+            )
+        };
+        candidates.push(transaction);
+    }
+    candidates
+}
+
+fn hashes_of(transactions: &[Transaction]) -> Vec<Hash256> {
+    transactions
+        .iter()
+        .map(|transaction| transaction.hash)
+        .collect()
+}
+
+/// Offer `candidates` to one builder and to the reference greedy loop; both
+/// must admit and refuse exactly the same transactions in the same order.
+fn assert_builder_matches_reference(state: &StateDB, candidates: &[Transaction]) -> usize {
+    let (expected, expected_refused) = reference_greedy_selection(state, candidates);
+    let mut admission = state
+        .v3_block_admission()
+        .expect("next height is representable");
+    let mut admitted = Vec::new();
+    let mut refused = Vec::new();
+    for transaction in candidates {
+        match admission.try_push(transaction) {
+            Ok(()) => admitted.push(transaction.hash),
+            Err(_) => refused.push(transaction.hash),
+        }
+    }
+    assert_eq!(admitted, hashes_of(&expected), "admitted set differs");
+    assert_eq!(refused, hashes_of(&expected_refused), "refused set differs");
+    assert_eq!(admission.len(), admitted.len());
+    assert_eq!(admission.is_empty(), admitted.is_empty());
+    assert_eq!(admission.execution_height(), state.height() + 1);
+    state
+        .validate_v3_block_admission(&expected)
+        .expect("the selection is a valid block");
+    admitted.len()
+}
+
+#[test]
+fn v3_block_admission_builder_matches_reference_greedy() {
+    let fixture = differential_fixture();
+    let mut admitted = 0;
+    for seed in 1..=3 {
+        let mut candidates = differential_candidates(&fixture, seed, 24);
+        // The order a DagBlock commits, then an arbitrary other order.
+        candidates.sort_by_key(|transaction| transaction.hash.0);
+        admitted += assert_builder_matches_reference(&fixture.state, &candidates);
+        candidates.reverse();
+        assert_builder_matches_reference(&fixture.state, &candidates);
+    }
+    assert!(admitted >= 3, "every seeded batch admits something");
+}
+
+#[test]
+fn v3_block_admission_builder_refuses_without_recording() {
+    let fixture = differential_fixture();
+    let state = &fixture.state;
+    let first = signed_transfer(
+        state,
+        &fixture.senders[0],
+        fixture_address("refusal-recipient", 0),
+        5,
+        1,
+        0,
+    );
+    let mut admission = state.v3_block_admission().expect("next height");
+    assert!(admission.is_empty());
+    admission
+        .try_push(&first)
+        .expect("first transfer is admissible");
+    let refusals = [
+        first.clone(),
+        signed_transfer(
+            state,
+            &fixture.senders[0],
+            fixture_address("refusal-recipient", 1),
+            5,
+            1,
+            0,
+        ),
+        signed_transfer(
+            state,
+            &fixture.senders[1],
+            fixture_address("refusal-recipient", 0),
+            5,
+            1,
+            0,
+        ),
+        signed_transfer(
+            state,
+            &fixture.senders[2],
+            fixture_address("refusal-recipient", 2),
+            5,
+            0,
+            0,
+        ),
+    ];
+    for refused in &refusals {
+        assert!(admission.try_push(refused).is_err());
+        assert_eq!(admission.len(), 1, "a refusal must not be recorded");
+    }
+    let mut claim = Transaction::new_faucet_claim(
+        fixture.validators[0].address(),
+        fixture_address("refusal-faucet", 0),
+        1,
+        0,
+    );
+    state
+        .sign_transaction(&mut claim, &fixture.validators[0])
+        .expect("claim signs");
+    admission
+        .try_push(&claim)
+        .expect("a disjoint family still fits after refusals");
+    assert_eq!(admission.len(), 2);
+    state
+        .validate_v3_block_admission(&[first, claim])
+        .expect("the builder's block is valid");
+}
