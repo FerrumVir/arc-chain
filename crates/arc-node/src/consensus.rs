@@ -2343,6 +2343,27 @@ impl ConsensusManager {
                             block,
                             transactions,
                         } => {
+                            // Exact re-deliveries first. Validators re-send
+                            // their held proposals, bodies included, every
+                            // re-broadcast interval and on reconnect, even
+                            // while connected. The engine refuses a block whose
+                            // hash it already holds before looking at anything
+                            // else, and nothing on that path uses the attached
+                            // bodies, so recognise it before the availability
+                            // check. Re-verifying every attached body (two
+                            // Ed25519 checks each) of every re-delivery
+                            // dominated the consensus loop once blocks carried
+                            // hundreds of transfers.
+                            if self.engine.contains_block(&block.hash) {
+                                crate::consensus_diagnostics::bump(
+                                    &crate::consensus_diagnostics::DIAG.live_blocks_received,
+                                );
+                                crate::consensus_diagnostics::bump(
+                                    &crate::consensus_diagnostics::DIAG
+                                        .live_blocks_rejected_duplicate,
+                                );
+                                continue;
+                            }
                             // Verify peer-supplied envelopes locally before
                             // they can reach committed execution. The
                             // `sig_verified` bit is a process-local cache and
