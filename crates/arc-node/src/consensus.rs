@@ -2340,11 +2340,17 @@ impl ConsensusManager {
                             // vector can finalize a block whose transactions
                             // are unavailable (or populate pending state with
                             // transactions the author never committed to).
-                            let verified = match verify_peer_dag_availability(
+                            let availability_started = std::time::Instant::now();
+                            let availability = verify_peer_dag_availability(
                                 &state,
                                 &block.transactions,
                                 &transactions,
-                            ) {
+                            );
+                            crate::consensus_diagnostics::add_elapsed(
+                                &crate::consensus_diagnostics::DIAG.live_block_availability_us,
+                                availability_started,
+                            );
+                            let verified = match availability {
                                 Ok(verified) => verified,
                                 Err(error) => {
                                     warn!(
@@ -2632,6 +2638,10 @@ impl ConsensusManager {
                             );
                         }
                         InboundMessage::Transactions(txs) => {
+                            let gossip_started = std::time::Instant::now();
+                            crate::consensus_diagnostics::DIAG
+                                .gossip_transactions_received
+                                .fetch_add(txs.len() as u64, std::sync::atomic::Ordering::Relaxed);
                             let mut inserted = 0usize;
                             for tx_bytes in txs {
                                 if admit_gossiped_transaction(
@@ -2643,6 +2653,10 @@ impl ConsensusManager {
                                     inserted += 1;
                                 }
                             }
+                            crate::consensus_diagnostics::add_elapsed(
+                                &crate::consensus_diagnostics::DIAG.gossip_admit_us,
+                                gossip_started,
+                            );
                             if inserted > 0 {
                                 debug!(count = inserted, "Inserted gossiped txs into mempool");
                             }
@@ -4173,8 +4187,13 @@ impl ConsensusManager {
                     // subset, defer candidate-local conflicts, and discard
                     // envelopes already stale against canonical state.
                     if state.active_protocol_version().major == 3 {
+                        let selection_started = std::time::Instant::now();
                         let (proposal, deferred) =
                             select_v3_proposal(&state, std::mem::take(&mut transactions));
+                        crate::consensus_diagnostics::add_elapsed(
+                            &crate::consensus_diagnostics::DIAG.proposal_selection_us,
+                            selection_started,
+                        );
                         transactions = proposal;
                         // Individually valid envelopes can conflict only
                         // within this candidate (for example two spends of
@@ -4576,9 +4595,14 @@ impl ConsensusManager {
                     // receipts. The resulting subset is revalidated as one
                     // exact v3 state block before any mutation.
                     if state.active_protocol_version().major == 3 {
+                        let selection_started = std::time::Instant::now();
                         let (admitted, omitted) = select_v3_block_transactions(
                             &state,
                             std::mem::take(&mut committed_txs),
+                        );
+                        crate::consensus_diagnostics::add_elapsed(
+                            &crate::consensus_diagnostics::DIAG.commit_selection_us,
+                            selection_started,
                         );
                         committed_txs = admitted;
                         if !omitted.is_empty() {

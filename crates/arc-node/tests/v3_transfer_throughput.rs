@@ -12,13 +12,17 @@
 //! load through every validator's `/tx/submit_batch`.
 //!
 //! Measured per phase: transactions per second of canonical block time,
-//! `tx_count` per block, and `commit_execute_us` per committed block from
-//! `/consensus/diagnostics`. The JSON report is written to
-//! `ARC_V3_THROUGHPUT_REPORT`; node logs are copied to
-//! `ARC_V3_THROUGHPUT_LOG_DIR`. Runner numbers are only meaningful relative to
-//! each other.
+//! `tx_count` per block, `commit_execute_us` per committed block, and where a
+//! consensus round's time goes (every `/consensus/diagnostics` phase timer,
+//! per validator and per round) next to each process's CPU time. Two extra
+//! settlement phases separate harness effects from per-round cost: one fans
+//! every submission out to all six validators, one offers far less load.
+//! The JSON report is written to `ARC_V3_THROUGHPUT_REPORT`; node logs are
+//! copied to `ARC_V3_THROUGHPUT_LOG_DIR`. Runner numbers are only meaningful
+//! relative to each other.
 //!
 //! Tunables: `ARC_V3_THROUGHPUT_SENDERS` (default 800),
+//! `ARC_V3_THROUGHPUT_LOW_LOAD_SENDERS` (100),
 //! `ARC_V3_THROUGHPUT_WARMUP_SECONDS` (15) and
 //! `ARC_V3_THROUGHPUT_MEASURE_SECONDS` (60).
 #![cfg(all(unix, feature = "v3-fee-settlement-test-override"))]
@@ -46,6 +50,43 @@ const SUBMIT_BATCH: usize = 64;
 const WAVE_INTERVAL: Duration = Duration::from_millis(250);
 /// Resubmit an envelope that has not reached a canonical block by then.
 const RESUBMIT_AFTER: Duration = Duration::from_secs(10);
+/// Retry sooner when no validator has accepted the envelope yet (for example
+/// its target had not executed the sender's previous transfer).
+const RETRY_UNACCEPTED_AFTER: Duration = Duration::from_secs(1);
+/// `/proc/<pid>/stat` CPU times are in USER_HZ ticks, 100 per second on Linux.
+const USER_HZ: f64 = 100.0;
+/// Every phase timer `/consensus/diagnostics` exports, in microseconds.
+const TIMER_KEYS: &[&str] = &[
+    "loop_busy_us",
+    "phase_inbound_us",
+    "live_block_availability_us",
+    "live_block_validate_us",
+    "gossip_admit_us",
+    "phase_certificates_us",
+    "phase_history_us",
+    "phase_checkpoint_us",
+    "phase_absence_us",
+    "phase_propose_us",
+    "proposal_selection_us",
+    "phase_commit_us",
+    "commit_selection_us",
+    "commit_execute_us",
+    "dag_block_persist_us",
+    "signing_record_persist_us",
+    "state_snapshot_publish_us",
+];
+/// Event counters reported next to the timers.
+const COUNT_KEYS: &[&str] = &[
+    "rounds_advanced",
+    "canonical_blocks_produced",
+    "live_blocks_received",
+    "gossip_transactions_received",
+    "stale_transactions_dropped",
+    "loop_slow_iterations",
+    "outbound_dropped",
+    "history_requests_sent",
+    "pending_blocks_held",
+];
 /// Native migration activates this many blocks after the recovery transition.
 const NATIVE_ACTIVATION_OFFSET: u64 = 8;
 /// Phase B activates block-level fee settlement this many blocks after it.
@@ -362,11 +403,32 @@ impl Drop for NodeProcess {
     }
 }
 
+/// Where the driver submits each signed transfer.
+#[derive(Clone, Copy)]
+enum Submission {
+    /// To one validator per sender (`sender % 6`), as a wallet would.
+    OneValidator,
+    /// To all six validators, so every mempool holds every envelope.
+    AllValidators,
+}
+
+impl Submission {
+    fn describe(self) -> &'static str {
+        match self {
+            Submission::OneValidator => "one validator per sender",
+            Submission::AllValidators => "all six validators",
+        }
+    }
+}
+
 struct Phase {
     name: &'static str,
     rule: &'static str,
     /// Blocks after the recovery transition at which settlement activates.
     fee_settlement_offset: Option<u64>,
+    submission: Submission,
+    /// How many funded senders keep a transfer in flight.
+    senders: usize,
     rpc_base: u16,
     p2p_base: u16,
 }
@@ -449,14 +511,17 @@ struct InFlight {
     request: Value,
     last_submitted: Instant,
     first_submitted: Instant,
+    accepted_once: bool,
 }
 
-/// Keeps exactly one transfer in flight per funded sender (ingress accepts
-/// only the next nonce), with a fresh recipient for every transfer, fanned
-/// out to every validator's batch endpoint.
+/// Keeps exactly one transfer in flight per active sender (ingress accepts
+/// only the next nonce), with a fresh recipient for every transfer, posted to
+/// the validators' batch endpoints as the phase's `Submission` says.
 struct LoadDriver<'a> {
     network: &'a Network,
     ports: Vec<u16>,
+    submission: Submission,
+    active_senders: usize,
     public_keys: Vec<String>,
     next_nonce: Vec<u64>,
     busy: Vec<bool>,
@@ -471,11 +536,19 @@ struct LoadDriver<'a> {
 }
 
 impl<'a> LoadDriver<'a> {
-    fn new(network: &'a Network, ports: Vec<u16>, scanned_height: u64) -> Self {
+    fn new(
+        network: &'a Network,
+        ports: Vec<u16>,
+        scanned_height: u64,
+        submission: Submission,
+        active_senders: usize,
+    ) -> Self {
         let senders = network.senders.len();
         Self {
             network,
             ports,
+            submission,
+            active_senders: active_senders.min(senders),
             public_keys: network
                 .senders
                 .iter()
@@ -524,17 +597,26 @@ impl<'a> LoadDriver<'a> {
         (tx.hash, request)
     }
 
-    /// Sign a transfer for every idle sender, resubmit stale envelopes, and
-    /// post them in `SUBMIT_BATCH`-sized batches to every validator at once.
+    /// The validators a sender's envelopes go to.
+    fn targets(&self, sender: usize) -> Vec<usize> {
+        match self.submission {
+            Submission::OneValidator => vec![sender % self.ports.len()],
+            Submission::AllValidators => (0..self.ports.len()).collect(),
+        }
+    }
+
+    /// Sign a transfer for every idle active sender, resubmit stale
+    /// envelopes, and post each validator its share in `SUBMIT_BATCH`-sized
+    /// batches, all validators at once.
     fn submit_wave(&mut self) {
         let now = Instant::now();
-        let mut wave: Vec<Value> = Vec::new();
-        for sender in 0..self.network.senders.len() {
+        let mut outgoing: Vec<(Hash256, usize, Value)> = Vec::new();
+        for sender in 0..self.active_senders {
             if self.busy[sender] {
                 continue;
             }
             let (hash, request) = self.signed_request(sender);
-            wave.push(request.clone());
+            outgoing.push((hash, sender, request.clone()));
             self.busy[sender] = true;
             self.submitted += 1;
             self.in_flight.insert(
@@ -544,39 +626,58 @@ impl<'a> LoadDriver<'a> {
                     request,
                     last_submitted: now,
                     first_submitted: now,
+                    accepted_once: false,
                 },
             );
         }
-        for entry in self.in_flight.values_mut() {
+        for (hash, entry) in self.in_flight.iter_mut() {
             if now.duration_since(entry.last_submitted) >= RESUBMIT_AFTER {
-                wave.push(entry.request.clone());
+                outgoing.push((*hash, entry.sender, entry.request.clone()));
                 entry.last_submitted = now;
                 self.resubmitted += 1;
             }
         }
-        if wave.is_empty() {
+        if outgoing.is_empty() {
             return;
         }
-        let bodies: Vec<String> = wave
-            .chunks(SUBMIT_BATCH)
-            .map(|chunk| json!({ "transactions": chunk }).to_string())
+        let mut per_validator: Vec<Vec<Value>> = vec![Vec::new(); self.ports.len()];
+        for (_, sender, request) in &outgoing {
+            for target in self.targets(*sender) {
+                per_validator[target].push(request.clone());
+            }
+        }
+        let bodies: Vec<Vec<String>> = per_validator
+            .iter()
+            .map(|requests| {
+                requests
+                    .chunks(SUBMIT_BATCH)
+                    .map(|chunk| json!({ "transactions": chunk }).to_string())
+                    .collect()
+            })
             .collect();
-        let accepted: u64 = std::thread::scope(|scope| {
+        let accepted_hashes: Vec<String> = std::thread::scope(|scope| {
             let handles: Vec<_> = self
                 .ports
                 .iter()
-                .map(|port| {
-                    let bodies = &bodies;
+                .zip(&bodies)
+                .map(|(port, bodies)| {
                     let port = *port;
                     scope.spawn(move || {
-                        let mut accepted = 0;
+                        let mut accepted = Vec::new();
                         for body in bodies {
                             let (code, response) = post_json(port, "/tx/submit_batch", body);
-                            if code == 200 {
-                                accepted += serde_json::from_str::<Value>(&response)
-                                    .ok()
-                                    .and_then(|value| value["accepted"].as_u64())
-                                    .unwrap_or(0);
+                            if code != 200 {
+                                continue;
+                            }
+                            if let Some(hashes) = serde_json::from_str::<Value>(&response)
+                                .ok()
+                                .and_then(|value| value["tx_hashes"].as_array().cloned())
+                            {
+                                accepted.extend(
+                                    hashes
+                                        .iter()
+                                        .filter_map(|hash| hash.as_str().map(str::to_owned)),
+                                );
                             }
                         }
                         accepted
@@ -585,10 +686,24 @@ impl<'a> LoadDriver<'a> {
                 .collect();
             handles
                 .into_iter()
-                .map(|handle| handle.join().unwrap_or(0))
-                .sum()
+                .flat_map(|handle| handle.join().unwrap_or_default())
+                .collect()
         });
-        self.accepted += accepted;
+        self.accepted += accepted_hashes.len() as u64;
+        let accepted: std::collections::HashSet<String> = accepted_hashes.into_iter().collect();
+        for (hash, _, _) in &outgoing {
+            if let Some(entry) = self.in_flight.get_mut(hash) {
+                if accepted.contains(&hash.to_hex()) {
+                    entry.accepted_once = true;
+                } else if !entry.accepted_once {
+                    // Nobody took it yet: try again shortly, not after the
+                    // full resubmission interval.
+                    entry.last_submitted = now
+                        .checked_sub(RESUBMIT_AFTER - RETRY_UNACCEPTED_AFTER)
+                        .unwrap_or(now);
+                }
+            }
+        }
     }
 
     /// Read every new canonical block from the first validator and release
@@ -637,19 +752,79 @@ impl<'a> LoadDriver<'a> {
     }
 }
 
-fn diagnostics(ports: &[u16]) -> Vec<(u64, u64)> {
+fn diagnostics_snapshot(ports: &[u16]) -> Vec<Value> {
     ports
         .iter()
-        .map(|port| {
-            let diagnostics = get_json(*port, "/consensus/diagnostics").unwrap_or(Value::Null);
-            (
-                diagnostics["commit_execute_us"].as_u64().unwrap_or(0),
-                diagnostics["canonical_blocks_produced"]
-                    .as_u64()
-                    .unwrap_or(0),
-            )
-        })
+        .map(|port| get_json(*port, "/consensus/diagnostics").unwrap_or(Value::Null))
         .collect()
+}
+
+fn counter(snapshot: &Value, key: &str) -> u64 {
+    snapshot[key].as_u64().unwrap_or(0)
+}
+
+/// Per validator and on average: how much of each round every phase timer
+/// took, next to the event counts, over one measurement window.
+fn round_breakdown(start: &[Value], end: &[Value], wall_seconds: f64) -> Value {
+    let mut per_validator = Vec::new();
+    for (start, end) in start.iter().zip(end) {
+        let rounds =
+            counter(end, "rounds_advanced").saturating_sub(counter(start, "rounds_advanced"));
+        let mut timers = serde_json::Map::new();
+        for key in TIMER_KEYS {
+            let micros = counter(end, key).saturating_sub(counter(start, key)) as f64;
+            timers.insert(
+                (*key).to_string(),
+                json!({
+                    "total_ms": micros / 1_000.0,
+                    "per_round_ms": if rounds == 0 { 0.0 } else { micros / 1_000.0 / rounds as f64 },
+                    "share_of_wall": micros / 1_000_000.0 / wall_seconds,
+                }),
+            );
+        }
+        let mut counts = serde_json::Map::new();
+        for key in COUNT_KEYS {
+            counts.insert(
+                (*key).to_string(),
+                json!(counter(end, key).saturating_sub(counter(start, key))),
+            );
+        }
+        per_validator.push(json!({ "rounds": rounds, "timers": timers, "counts": counts }));
+    }
+    let validators = per_validator.len().max(1) as f64;
+    let mut mean_per_round_ms = serde_json::Map::new();
+    for key in TIMER_KEYS {
+        let total: f64 = per_validator
+            .iter()
+            .map(|validator| {
+                validator["timers"][*key]["per_round_ms"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+            })
+            .sum();
+        mean_per_round_ms.insert((*key).to_string(), json!(total / validators));
+    }
+    let mean_rounds: f64 = per_validator
+        .iter()
+        .map(|validator| validator["rounds"].as_u64().unwrap_or(0) as f64)
+        .sum::<f64>()
+        / validators;
+    json!({
+        "rounds_per_second": mean_rounds / wall_seconds,
+        "mean_per_round_ms": mean_per_round_ms,
+        "per_validator": per_validator,
+    })
+}
+
+/// User plus system CPU seconds a process has used, from `/proc` (Linux).
+fn cpu_seconds(pid: u32) -> Option<f64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // After the parenthesised command name: state is field 3, utime 14 and
+    // stime 15 (1-based), so utime and stime are the 12th and 13th here.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let utime: f64 = fields.get(11)?.parse().ok()?;
+    let stime: f64 = fields.get(12)?.parse().ok()?;
+    Some((utime + stime) / USER_HZ)
 }
 
 fn percentile(sorted: &[u64], fraction: f64) -> u64 {
@@ -689,6 +864,7 @@ fn run_phase(
         .map(|index| spawn_node(network, phase, index, activation, log_dir))
         .collect();
     let ports: Vec<u16> = nodes.iter().map(|node| node.port).collect();
+    let pids: Vec<u32> = nodes.iter().map(|node| node.child.id()).collect();
     eprintln!("[{}] waiting for six connected validators", phase.name);
     wait_for(
         Duration::from_secs(120),
@@ -720,11 +896,23 @@ fn run_phase(
     );
 
     let scan_from = height(ports[0]).expect("first validator height");
-    let mut driver = LoadDriver::new(network, ports.clone(), scan_from);
-    eprintln!("[{}] warm-up load for {warmup:?}", phase.name);
+    let mut driver = LoadDriver::new(
+        network,
+        ports.clone(),
+        scan_from,
+        phase.submission,
+        phase.senders,
+    );
+    eprintln!(
+        "[{}] warm-up load for {warmup:?}: {} senders, submitted to {}",
+        phase.name,
+        driver.active_senders,
+        phase.submission.describe()
+    );
     driver.run_until(Instant::now() + warmup);
     let start_height = driver.scanned_height;
-    let start_diagnostics = diagnostics(&ports);
+    let start_diagnostics = diagnostics_snapshot(&ports);
+    let start_cpu: Vec<Option<f64>> = pids.iter().map(|pid| cpu_seconds(*pid)).collect();
     let measure_start = Instant::now();
     eprintln!(
         "[{}] measuring for {measure:?} from height {start_height}",
@@ -732,7 +920,8 @@ fn run_phase(
     );
     driver.run_until(measure_start + measure);
     let wall_seconds = measure_start.elapsed().as_secs_f64();
-    let end_diagnostics = diagnostics(&ports);
+    let end_cpu: Vec<Option<f64>> = pids.iter().map(|pid| cpu_seconds(*pid)).collect();
+    let end_diagnostics = diagnostics_snapshot(&ports);
     let end_height = driver.scanned_height;
 
     // Every replica must agree on the measured history.
@@ -760,7 +949,7 @@ fn run_phase(
     let mut treasury: u64 = 0;
     let mut committed_transfers: u64 = 0;
     wait_for(
-        Duration::from_secs(60),
+        Duration::from_secs(90),
         "the fee treasury equals the fees of every committed transfer",
         || {
             driver.scan_blocks();
@@ -803,29 +992,50 @@ fn run_phase(
     let per_node_execute_us: Vec<f64> = start_diagnostics
         .iter()
         .zip(&end_diagnostics)
-        .map(|((start_us, start_blocks), (end_us, end_blocks))| {
-            let blocks = end_blocks.saturating_sub(*start_blocks);
+        .map(|(start, end)| {
+            let blocks = counter(end, "canonical_blocks_produced")
+                .saturating_sub(counter(start, "canonical_blocks_produced"));
+            let micros = counter(end, "commit_execute_us")
+                .saturating_sub(counter(start, "commit_execute_us"));
             if blocks == 0 {
                 0.0
             } else {
-                end_us.saturating_sub(*start_us) as f64 / blocks as f64
+                micros as f64 / blocks as f64
             }
         })
         .collect();
     let mean_execute_us =
         per_node_execute_us.iter().sum::<f64>() / per_node_execute_us.len().max(1) as f64;
+    let breakdown = round_breakdown(&start_diagnostics, &end_diagnostics, wall_seconds);
+    let rounds_per_second = breakdown["rounds_per_second"].as_f64().unwrap_or(0.0);
+    let cpu_per_validator: Vec<Option<f64>> = start_cpu
+        .iter()
+        .zip(&end_cpu)
+        .map(|(start, end)| start.zip(*end).map(|(start, end)| end - start))
+        .collect();
+    let cpu_total: f64 = cpu_per_validator.iter().flatten().sum();
+    let mean_rounds = rounds_per_second * wall_seconds;
+    let cpu_ms_per_round_per_validator = if mean_rounds > 0.0 {
+        cpu_total / cpu_per_validator.len().max(1) as f64 / mean_rounds * 1_000.0
+    } else {
+        0.0
+    };
     let max_tx_count = tx_counts.iter().copied().max().unwrap_or(0);
     let tps = transactions as f64 / block_seconds;
     eprintln!(
         "[{}] {} blocks, {transactions} transfers in {block_seconds:.1} s of block time: \
-         {tps:.1} TPS, max {max_tx_count} per block, {mean_execute_us:.0} us execute per block",
+         {tps:.1} TPS, max {max_tx_count} per block, {rounds_per_second:.2} rounds/s, \
+         {mean_execute_us:.0} us execute per block, {:.2} CPU-s per wall-s across validators",
         phase.name,
         measured.len(),
+        cpu_total / wall_seconds,
     );
     drop(nodes);
 
     json!({
         "rule": phase.rule,
+        "submission": phase.submission.describe(),
+        "active_senders": driver.active_senders,
         "fee_settlement_activation_height": activation,
         "measured_heights": [start_height, end_height],
         "blocks": measured.len(),
@@ -835,6 +1045,7 @@ fn run_phase(
         "tps": tps,
         "tps_wall_clock": transactions as f64 / wall_seconds,
         "blocks_per_second": measured.len() as f64 / block_seconds,
+        "rounds_per_second": rounds_per_second,
         "tx_count_per_block": distribution(&tx_counts),
         "tx_count_series": measured
             .iter()
@@ -844,8 +1055,16 @@ fn run_phase(
             "mean_over_validators": mean_execute_us,
             "per_validator": per_node_execute_us,
         },
+        "round_breakdown": breakdown,
+        "cpu": {
+            "per_validator_seconds": cpu_per_validator,
+            "cpu_seconds_per_wall_second": cpu_total / wall_seconds,
+            "ms_per_round_per_validator": cpu_ms_per_round_per_validator,
+            "available_parallelism": std::thread::available_parallelism()
+                .map(|cpus| cpus.get())
+                .unwrap_or(0),
+        },
         "driver": {
-            "senders": network.senders.len(),
             "signed": driver.submitted,
             "resubmitted": driver.resubmitted,
             "accepted_by_validators": driver.accepted,
@@ -860,37 +1079,68 @@ fn run_phase(
 #[test]
 fn v3_transfer_throughput_launch_rule_vs_block_settlement() {
     let senders = env_number("ARC_V3_THROUGHPUT_SENDERS", 800) as usize;
+    let low_load_senders = env_number("ARC_V3_THROUGHPUT_LOW_LOAD_SENDERS", 100) as usize;
     let warmup = Duration::from_secs(env_number("ARC_V3_THROUGHPUT_WARMUP_SECONDS", 15));
     let measure = Duration::from_secs(env_number("ARC_V3_THROUGHPUT_MEASURE_SECONDS", 60));
     let log_dir = std::env::var_os("ARC_V3_THROUGHPUT_LOG_DIR").map(PathBuf::from);
     if let Some(dir) = &log_dir {
         std::fs::create_dir_all(dir).unwrap();
     }
-    let network = Network::build(senders);
+    let network = Network::build(senders.max(low_load_senders));
+    let settlement = "block-level settlement via the harness override";
     let phases = [
         Phase {
             name: "phase-a",
             rule: "launch rule: every transfer credits the fee treasury itself",
             fee_settlement_offset: None,
+            submission: Submission::OneValidator,
+            senders,
             rpc_base: 9701,
             p2p_base: 9601,
         },
         Phase {
             name: "phase-b",
-            rule: "block-level settlement via the harness override",
+            rule: settlement,
             fee_settlement_offset: Some(FEE_SETTLEMENT_OFFSET),
+            submission: Submission::OneValidator,
+            senders,
             rpc_base: 9721,
             p2p_base: 9621,
+        },
+        Phase {
+            name: "phase-b-fanout",
+            rule: settlement,
+            fee_settlement_offset: Some(FEE_SETTLEMENT_OFFSET),
+            submission: Submission::AllValidators,
+            senders,
+            rpc_base: 9741,
+            p2p_base: 9641,
+        },
+        Phase {
+            name: "phase-b-low-load",
+            rule: settlement,
+            fee_settlement_offset: Some(FEE_SETTLEMENT_OFFSET),
+            submission: Submission::OneValidator,
+            senders: low_load_senders,
+            rpc_base: 9761,
+            p2p_base: 9661,
         },
     ];
     let results: Vec<Value> = phases
         .iter()
         .map(|phase| run_phase(&network, phase, warmup, measure, log_dir.as_deref()))
         .collect();
-    let (a, b) = (&results[0], &results[1]);
+    let (a, b, fanout, low_load) = (&results[0], &results[1], &results[2], &results[3]);
+    let ratio = |numerator: &Value, denominator: &Value, key: &str| {
+        numerator[key].as_f64().unwrap_or(0.0)
+            / denominator[key]
+                .as_f64()
+                .unwrap_or(0.0)
+                .max(f64::MIN_POSITIVE)
+    };
 
     let report = json!({
-        "schema": "arc.v3-transfer-throughput.v1",
+        "schema": "arc.v3-transfer-throughput.v2",
         "commit": std::env::var("GITHUB_SHA").ok(),
         "run_id": std::env::var("GITHUB_RUN_ID").ok(),
         "available_parallelism": std::thread::available_parallelism()
@@ -899,24 +1149,30 @@ fn v3_transfer_throughput_launch_rule_vs_block_settlement() {
         "config": {
             "validators": VALIDATORS,
             "senders": senders,
+            "low_load_senders": low_load_senders,
             "warmup_seconds": warmup.as_secs(),
             "measure_seconds": measure.as_secs(),
             "transfer_amount": TRANSFER_AMOUNT,
             "transfer_fee": TRANSFER_FEE,
-            "submission": "one in-flight transfer per sender, fresh recipient per transfer, \
-                           /tx/submit_batch (64) fanned out to all six validators",
+            "submission": "one in-flight transfer per active sender, fresh recipient per \
+                           transfer, /tx/submit_batch (64 per request)",
             "execution": "migrated recovered-v3 chain (native binding active, ingress closed): \
                           sequential executor",
         },
         "phase_a": a,
         "phase_b": b,
+        "variants": {
+            "phase_b_fanout": fanout,
+            "phase_b_low_load": low_load,
+        },
         "comparison": {
-            "tps_ratio_b_over_a": b["tps"].as_f64().unwrap_or(0.0)
-                / a["tps"].as_f64().unwrap_or(0.0).max(f64::MIN_POSITIVE),
+            "tps_ratio_b_over_a": ratio(b, a, "tps"),
+            "rounds_per_second_ratio_b_over_a": ratio(b, a, "rounds_per_second"),
             "max_tx_count_a": a["tx_count_per_block"]["max"],
             "max_tx_count_b": b["tx_count_per_block"]["max"],
         },
-        "note": "GitHub runner numbers are only meaningful relative to each other.",
+        "note": "GitHub runner numbers are only meaningful relative to each other; all six \
+                 validators share one runner's CPUs.",
     });
     let rendered = serde_json::to_string_pretty(&report).unwrap();
     println!("{rendered}");
@@ -929,14 +1185,17 @@ fn v3_transfer_throughput_launch_rule_vs_block_settlement() {
     }
 
     // Functional expectations, independent of runner speed.
-    assert!(
-        a["transactions"].as_u64().unwrap_or(0) > 0,
-        "phase A committed transfers"
-    );
-    assert!(
-        b["transactions"].as_u64().unwrap_or(0) > 0,
-        "phase B committed transfers"
-    );
+    for (label, phase) in [
+        ("phase A", a),
+        ("phase B", b),
+        ("phase B fan-out", fanout),
+        ("phase B low load", low_load),
+    ] {
+        assert!(
+            phase["transactions"].as_u64().unwrap_or(0) > 0,
+            "{label} committed transfers"
+        );
+    }
     assert!(
         a["tx_count_per_block"]["max"].as_u64().unwrap_or(u64::MAX) <= 1,
         "the launch rule keeps one transfer per canonical block"

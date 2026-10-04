@@ -87,6 +87,14 @@ counters!(
     phase_commit_us,
     commit_execute_us,
     state_snapshot_publish_us,
+    // where a protocol-v3 round's transaction work goes: peer DAG body
+    // availability checks, transaction gossip admission, and the proposal
+    // and commit block selection
+    live_block_availability_us,
+    gossip_transactions_received,
+    gossip_admit_us,
+    proposal_selection_us,
+    commit_selection_us,
     // already-receipted transactions refused re-proposal / re-admission
     stale_transactions_dropped,
     // protocol 4: committed transactions a canonical block could not carry

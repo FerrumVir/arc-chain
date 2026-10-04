@@ -110,20 +110,36 @@ jobs:
           import sys
 
           report = json.load(open(sys.argv[1], encoding="utf-8"))
+          phases = [("phase_a", report["phase_a"]), ("phase_b", report["phase_b"])]
+          phases += sorted(report.get("variants", {}).items())
           print("## v3 transfer throughput (relative, GitHub runner)")
           print()
-          print("| phase | rule | TPS | blocks/s | tx_count max | tx_count mean | commit_execute_us/block |")
-          print("|---|---|---|---|---|---|---|")
-          for key in ("phase_a", "phase_b"):
-              phase = report[key]
+          print("| phase | rule | submission | senders | TPS | blocks/s | rounds/s | tx/block max | tx/block mean | execute us/block | CPU-s per s |")
+          print("|---|---|---|---|---|---|---|---|---|---|---|")
+          for name, phase in phases:
               counts = phase["tx_count_per_block"]
-              execute = phase["commit_execute_us_per_block"]["mean_over_validators"]
               print(
-                  f"| {key} | {phase['rule']} | {phase['tps']:.1f} | "
-                  f"{phase['blocks_per_second']:.2f} | {counts['max']} | {counts['mean']:.1f} | {execute:.0f} |"
+                  f"| {name} | {phase['rule']} | {phase.get('submission', '')} | "
+                  f"{phase.get('active_senders', '')} | {phase['tps']:.1f} | "
+                  f"{phase['blocks_per_second']:.2f} | {phase.get('rounds_per_second', 0):.2f} | "
+                  f"{counts['max']} | {counts['mean']:.1f} | "
+                  f"{phase['commit_execute_us_per_block']['mean_over_validators']:.0f} | "
+                  f"{phase.get('cpu', {}).get('cpu_seconds_per_wall_second', 0):.2f} |"
               )
           print()
           print(f"TPS ratio B/A: {report['comparison']['tps_ratio_b_over_a']:.1f}")
+          print()
+          print("### Mean consensus-loop milliseconds per round")
+          print()
+          keys = list(report["phase_a"].get("round_breakdown", {}).get("mean_per_round_ms", {}))
+          print("| timer | " + " | ".join(name for name, _ in phases) + " |")
+          print("|---|" + "---|" * len(phases))
+          for key in keys:
+              cells = [
+                  f"{phase.get('round_breakdown', {}).get('mean_per_round_ms', {}).get(key, 0):.1f}"
+                  for _, phase in phases
+              ]
+              print(f"| {key} | " + " | ".join(cells) + " |")
           PYTHON
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
