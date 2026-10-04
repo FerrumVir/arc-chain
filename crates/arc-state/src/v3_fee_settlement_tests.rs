@@ -19,9 +19,32 @@ const FIXTURE_CHAIN_ID: &str = "0x415243";
 const FIXTURE_GENESIS: &[u8] = b"arc-v3-fee-settlement-fixture-genesis";
 const FIXTURE_TIMESTAMP_MS: u64 = 1_790_000_000_000;
 
-/// Launch-rule transcript recorded on unmodified `main` logic. See the module
+/// Launch-rule transcript recorded on unmodified `main` logic: printed by CI
+/// run 37232853669 (commit a76309a1, identical on ubuntu-latest and
+/// macos-15) before any fee-settlement code existed. See the module
 /// documentation; never edit these lines by hand to make a change pass.
-const V3_LAUNCH_RULE_GOLDENS: &[&str] = &[];
+const V3_LAUNCH_RULE_GOLDENS: &[&str] = &[
+    "h1 block=b3cf52a1ec680112eca34d2c69d3748640ac097cce75c97230aec6128f6ae311 root=37b02b247c092466e57fb82ef3ca2f4cf85d5aab400a47ff825bec3dc396c629 txs=1 ok=1",
+    "h2 block=f58dc06a33449d456b2e1a9fe3c85525bf99d398c82cd32637951374af46d43f root=37b02b247c092466e57fb82ef3ca2f4cf85d5aab400a47ff825bec3dc396c629 txs=0 ok=",
+    "h3 block=ca2f23736b51b5c887f472ff1a374dfe267917d9597ef3d93ba9ca7dafc7e9b6 root=dbac698695bff798df3aa1283ff4366132d9af226b949c65ee2e223cea6896f8 txs=1 ok=1",
+    "h4 block=d814b6eef245150d855dc4bfbe20671ab82dc37d40338abaf2898a6cb42e2793 root=4866a3ea9657751e5aceddcef3074f4a850173843639206fc786b498ba0ee867 txs=1 ok=1",
+    "h5 block=35afa6ef0939721764d58102e9338dc23373c4578ed01284448c1db94642fe7d root=554f3c8971afba630f5f853b6655fa3006a10f836d5a4a967768b42b1e781042 txs=1 ok=1",
+    "h6 block=a8cf21bd357ce72511d60a6550c2aa8ecbe19b40d6bb72d35a7faf23a9092437 root=554f3c8971afba630f5f853b6655fa3006a10f836d5a4a967768b42b1e781042 txs=0 ok=",
+    "h7 block=a41bfeb2ac7947974a8ec7f37d2c95bca4d66236f71a45a3d46842524bc82319 root=194879e12a875891d05e9b62b539bf433a378e2eb498180ad627fbe0eeb86abb txs=1 ok=1",
+    "treasury balance=111 history=5",
+    "sender0 balance=1000266 nonce=2",
+    "sender1 balance=999743 nonce=1",
+    "sender2 balance=999998 nonce=1",
+    "sender3 balance=999498 nonce=1",
+    "select 497979821be51b1dd22792e8b6a19fd1cf359b3d8d24a8684dbff6cc41f317f4",
+    "defer 506f4711754b68c3ed1c56f360ea8dc89ec2f185a5761d4ae9507c510e7d230b",
+    "defer 506f4711754b68c3ed1c56f360ea8dc89ec2f185a5761d4ae9507c510e7d230b",
+    "defer 60c15d7087d76671981254c2387032a839493e2489070409c1a85225e86ecd31",
+    "defer b0b10e71bf4e0efbc44fc8411f385ab08fec39b27c6cbcd256fdc4ef0c976560",
+    "defer dc1877c1fa875485e3daf3a43067697b6d2759c31b844dc9da8367710bf070a2",
+    "defer fc9cd8746f1c2bcfc1d93c09a770d20a4a0642f556ca7aee5f81f5e32ac2f8e2",
+    "wal=0fe3e6090190579f0df4296d8287447cea4cc3e3a1ec4ec1c04fc9bd10b2635b",
+];
 
 fn fixture_key(label: &str, index: u64) -> KeyPair {
     let mut hasher = blake3::Hasher::new_derive_key("ARC-v3-fee-settlement-fixture-key-v1");
