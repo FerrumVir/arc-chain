@@ -14,6 +14,8 @@ pub mod mmap_state;
 pub mod recovery;
 pub mod simd_parse;
 pub mod snapshot;
+#[cfg(test)]
+mod v3_fee_settlement_tests;
 pub mod wal;
 
 use arc_crypto::{Hash256, IncrementalMerkle, MerkleTree, hash_bytes, hash_pair};
