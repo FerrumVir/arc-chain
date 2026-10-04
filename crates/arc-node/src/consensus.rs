@@ -757,6 +757,28 @@ pub(crate) fn admit_gossiped_transaction(
     let Ok(mut tx) = bincode::deserialize::<arc_types::Transaction>(bytes) else {
         return false;
     };
+    // Cheap exits before any signature work. Every validator re-proposes and
+    // re-gossips the bodies it holds each round until one lands in a leader's
+    // block, so a pending body arrives from several peers every round. A copy
+    // whose hash is already resident here changes nothing: the mempool keeps
+    // the resident body, which was verified when it entered, and would refuse
+    // this one as a duplicate after verifying it. An executed body is history:
+    // re-admitting it is how a transaction circulated forever. Neither check
+    // can admit anything, so a forged hash can only get its own copy dropped.
+    // Checking both first spares two Ed25519 verifications and the native
+    // execution lock on the consensus loop for every redundant copy.
+    if state.receipts.contains_key(&tx.hash.0) {
+        crate::consensus_diagnostics::bump(
+            &crate::consensus_diagnostics::DIAG.stale_transactions_dropped,
+        );
+        return false;
+    }
+    if mempool.contains(&tx.hash) {
+        crate::consensus_diagnostics::bump(
+            &crate::consensus_diagnostics::DIAG.gossip_transactions_already_pending,
+        );
+        return false;
+    }
     // Gossip is an untrusted ingress boundary.
     // Verify before consuming bounded mempool
     // capacity and cache the result only in
@@ -799,14 +821,6 @@ pub(crate) fn admit_gossiped_transaction(
         // only native work, or native but
         // neither admissible now nor a bounded
         // future transaction of a funded sender.
-        return false;
-    }
-    // Already executed: re-admitting it is how
-    // a transaction circulated forever.
-    if state.receipts.contains_key(&tx.hash.0) {
-        crate::consensus_diagnostics::bump(
-            &crate::consensus_diagnostics::DIAG.stale_transactions_dropped,
-        );
         return false;
     }
     admission.insert(mempool, tx)
@@ -6847,6 +6861,63 @@ mod tests {
         let (proposal, deferred) = select_v3_proposal(&state, disjoint);
         assert_eq!(proposal.len(), 1);
         assert_eq!(deferred.len(), 1);
+    }
+
+    #[test]
+    fn gossip_skips_redundant_copies_but_keeps_retrying_drained_bodies() {
+        use crate::native_inference::NativeRequestAdmission;
+
+        let sender = fixture_key("gossip-dedup-sender");
+        let (_directory, state) = recovered_v3_state("gossip-dedup", &[(sender.address(), 1_000)]);
+        let mempool = Mempool::new(16);
+        let admission = NativeRequestAdmission::default();
+        let transfer =
+            recovered_transfer(&state, &sender, hash_bytes(b"gossip-dedup-recipient"), 0);
+        let gossip = |tx: &Transaction| {
+            admit_gossiped_transaction(
+                &state,
+                &mempool,
+                &admission,
+                &bincode::serialize(tx).unwrap(),
+            )
+        };
+        let before = crate::consensus_diagnostics::DIAG
+            .gossip_transactions_already_pending
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(gossip(&transfer), "a new valid body is admitted");
+
+        // A copy carrying the resident hash is dropped before any signature
+        // work, whatever its signature, and the verified body stays.
+        let mut forged = transfer.clone();
+        forged.signature = Signature::null();
+        assert!(!gossip(&forged));
+        assert!(!gossip(&transfer));
+        assert!(
+            crate::consensus_diagnostics::DIAG
+                .gossip_transactions_already_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= before + 2
+        );
+        let resident = mempool.drain(16);
+        assert_eq!(hashes_of(&resident), vec![transfer.hash]);
+        state.verify_transaction_signature(&resident[0]).unwrap();
+
+        // Draining it into a proposal is not execution: a peer's copy must
+        // make it proposal-eligible here again.
+        assert!(gossip(&transfer));
+        let proposal = mempool.drain(16);
+        let (_, receipts) = state
+            .execute_block_adaptive_at_with_proof(
+                &proposal,
+                sender.address(),
+                state.get_block(state.height()).unwrap().header.timestamp + 1,
+                hash_bytes(b"gossip-dedup-decision"),
+            )
+            .unwrap();
+        assert!(receipts[0].success);
+        // An executed body is never offered again.
+        assert!(!gossip(&transfer));
+        assert!(mempool.is_empty());
     }
 
     #[test]

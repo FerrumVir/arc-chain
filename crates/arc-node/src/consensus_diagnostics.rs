@@ -92,6 +92,7 @@ counters!(
     // and commit block selection
     live_block_availability_us,
     gossip_transactions_received,
+    gossip_transactions_already_pending,
     gossip_admit_us,
     proposal_selection_us,
     commit_selection_us,
