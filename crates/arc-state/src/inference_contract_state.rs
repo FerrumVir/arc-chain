@@ -5169,6 +5169,88 @@ mod tests {
         assert_eq!(state.native_inference_context(), Some(f.context.clone()));
     }
 
+    /// Block-level fee settlement changes how ordinary transfers reach the
+    /// fee treasury, never the native lane: with the rule active a native
+    /// request and its finalization still execute alone, take no epilogue and
+    /// leave the fee treasury untouched, while an ordinary transfer on the
+    /// same migrated chain settles its fee once.
+    #[test]
+    fn migrated_native_lane_is_unchanged_with_fee_settlement_active() {
+        let f = fixture("migration-fee-settlement");
+        let state = recovered_chain_at(&f, 4);
+        state.set_v3_fee_settlement_activation_override(Some(1));
+        state
+            .authorize_native_migration(migration_for(&f, 5), f.context.clone())
+            .unwrap();
+        state
+            .execute_block_adaptive_at(&[], f.validators[0].address(), 1_700_099)
+            .unwrap();
+        state.activate_native_inference(f.context.clone()).unwrap();
+        let treasury = crate::v3_fee_treasury_address();
+        assert!(state.v3_fee_settlement_active_at(state.height() + 1));
+
+        let req = request(&f, 0, 400);
+        let id = req.job.request_id();
+        let tx = native_request(state, &f.requester, req);
+        let (block, receipts) = state
+            .execute_block_adaptive_at(
+                std::slice::from_ref(&tx),
+                f.validators[0].address(),
+                1_700_200,
+            )
+            .unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(block.header.tx_count, 1);
+        assert_eq!(block.header.state_root, state.compute_state_root());
+        assert!(state.get_account(&treasury).is_none());
+
+        let terminal = native_finalize(state, &f.validators[0], 0, id, certificate(&f, id));
+        let mut transfer = arc_types::Transaction::new_transfer(
+            f.requester.address(),
+            hash_bytes(b"fee-settlement-native-lane-recipient"),
+            1,
+            state.get_account(&f.requester.address()).unwrap().nonce,
+        );
+        transfer.fee = 1;
+        state.sign_transaction(&mut transfer, &f.requester).unwrap();
+        state.validate_v3_transaction_admission(&transfer).unwrap();
+        // The native transition still refuses company, in either order and
+        // through the incremental builder as well.
+        for pair in [
+            [terminal.clone(), transfer.clone()],
+            [transfer.clone(), terminal.clone()],
+        ] {
+            assert!(state.validate_v3_block_admission(&pair).is_err());
+            let mut admission = state.v3_block_admission().unwrap();
+            admission.try_push(&pair[0]).unwrap();
+            assert!(admission.try_push(&pair[1]).is_err());
+        }
+        let (block, receipts) = state
+            .execute_block_adaptive_at(&[terminal], f.validators[0].address(), 1_700_300)
+            .unwrap();
+        assert!(receipts[0].success, "the certificate settles");
+        assert_eq!(block.header.state_root, state.compute_state_root());
+        assert!(state.get_account(&treasury).is_none());
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            990
+        );
+
+        let (block, receipts) = state
+            .execute_block_adaptive_at(&[transfer], f.validators[0].address(), 1_700_400)
+            .unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(block.header.state_root, state.compute_state_root());
+        assert_eq!(state.get_account(&treasury).unwrap().balance, 1);
+        assert_eq!(
+            state.get_account(&f.requester.address()).unwrap().balance,
+            988
+        );
+        let dir = f.dir.clone();
+        drop(f);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// WAL continuity across a mid-chain activation. The activation appends
     /// its own ops and checkpoint at the coordinated height, AFTER that
     /// block's own ops and checkpoint. Reopening the directory replays the

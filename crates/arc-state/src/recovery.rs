@@ -6011,6 +6011,177 @@ mod tests {
         fs::remove_dir_all(active_dir).unwrap();
     }
 
+    fn fee_settlement_transfer(
+        state: &StateDB,
+        sender: &KeyPair,
+        nonce: u64,
+        fee: u64,
+        tag: &[u8],
+    ) -> Transaction {
+        let mut transaction =
+            Transaction::new_transfer(sender.address(), hash_bytes(tag), 25, nonce);
+        transaction.fee = fee;
+        state.sign_transaction(&mut transaction, sender).unwrap();
+        transaction
+    }
+
+    #[test]
+    fn v3_fee_settlement_survives_wal_restart() {
+        let senders: Vec<_> = (0..3).map(|_| KeyPair::generate_ed25519()).collect();
+        let prefunded: Vec<_> = senders
+            .iter()
+            .map(|sender| (sender.address(), 10_000))
+            .collect();
+        let source = StateDB::with_genesis(&prefunded);
+        let (validator_keys, validators) = validators();
+        seed_source_validator_metadata(&source, &validators);
+        let genesis_hash = hash_bytes(b"fee-settlement-restart-genesis");
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash,
+                source_consensus_round: 100,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1_787_777_000_000,
+            },
+        )
+        .unwrap();
+        for key in validator_keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let policy = RecoveryNetworkPolicy {
+            chain_id: "0x415243".into(),
+            genesis_hash,
+            recovery_epoch: 1,
+            validator_set_id: 1,
+            validators: validators
+                .iter()
+                .map(|validator| (validator.address, validator.stake))
+                .collect(),
+            community_rewards_v1_activation_height: None,
+        };
+        let source_dir = temp_dir("fee-settlement-source");
+        let active_dir = temp_dir("fee-settlement-active");
+        let package = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&package).unwrap();
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy.clone(),
+            Some(RecoveryImport {
+                checkpoint_path: package,
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            }),
+        )
+        .unwrap();
+        let activation = state.height() + 2;
+        state.set_v3_fee_settlement_activation_override(Some(activation));
+        let treasury = crate::v3_fee_treasury_address();
+        let producer = validator_keys[0].address();
+
+        // Before activation a block carries one transfer, crediting its own fee.
+        let pair = [
+            fee_settlement_transfer(&state, &senders[0], 0, 3, b"pre-activation-a"),
+            fee_settlement_transfer(&state, &senders[1], 0, 3, b"pre-activation-b"),
+        ];
+        assert!(state.validate_v3_block_admission(&pair).is_err());
+        let (block, receipts) = state
+            .execute_block_adaptive_at_with_proof(
+                &pair[..1],
+                producer,
+                1_787_777_001_000,
+                hash_bytes(b"fee settlement decision before activation"),
+            )
+            .unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(block.header.height + 1, activation);
+        assert_eq!(state.get_account(&treasury).unwrap().balance, 3);
+
+        // From activation on, disjoint transfers share one block and the
+        // treasury is written once, in the block epilogue.
+        let batch = vec![
+            fee_settlement_transfer(&state, &senders[0], 1, 5, b"post-activation-a"),
+            pair[1].clone(),
+            fee_settlement_transfer(&state, &senders[2], 0, 11, b"post-activation-c"),
+        ];
+        let (block, receipts) = state
+            .execute_block_adaptive_at_with_proof(
+                &batch,
+                producer,
+                1_787_777_002_000,
+                hash_bytes(b"fee settlement decision at activation"),
+            )
+            .unwrap();
+        assert_eq!(block.header.height, activation);
+        assert_eq!(block.header.tx_count, 3);
+        assert!(receipts.iter().all(|receipt| receipt.success));
+        assert_eq!(
+            state.get_account(&treasury).unwrap().balance,
+            3 + 5 + 3 + 11
+        );
+        let root = block.header.state_root;
+        let height = block.header.height;
+        drop(state);
+
+        let wal_path = active_dir.join("state.wal");
+        let treasury_writes: Vec<u64> = read_repairable_wal_prefix(&wal_path)
+            .unwrap()
+            .entries
+            .iter()
+            .filter(
+                |entry| matches!(&entry.op, WalOp::SetAccount(address, _) if *address == treasury),
+            )
+            .map(|entry| entry.block_height)
+            .collect();
+        assert_eq!(
+            treasury_writes,
+            vec![activation - 1, activation],
+            "one treasury write per block under either rule"
+        );
+
+        // Replay restores the epilogue's write; the override is process
+        // configuration and is installed again before executing.
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .unwrap();
+        assert_eq!(restarted.height(), height);
+        assert_eq!(restarted.get_state_root(), root);
+        assert_eq!(restarted.get_account(&treasury).unwrap().balance, 22);
+        assert_eq!(
+            restarted.get_account(&senders[2].address()).unwrap().nonce,
+            1
+        );
+        restarted.set_v3_fee_settlement_activation_override(Some(activation));
+        let after_restart = [
+            fee_settlement_transfer(&restarted, &senders[1], 1, 7, b"after-restart-b"),
+            fee_settlement_transfer(&restarted, &senders[2], 1, 13, b"after-restart-c"),
+        ];
+        let (block, receipts) = restarted
+            .execute_block_adaptive_at_with_proof(
+                &after_restart,
+                producer,
+                1_787_777_003_000,
+                hash_bytes(b"fee settlement decision after restart"),
+            )
+            .unwrap();
+        assert!(receipts.iter().all(|receipt| receipt.success));
+        assert_eq!(restarted.get_account(&treasury).unwrap().balance, 42);
+        let root = block.header.state_root;
+        drop(restarted);
+        let reopened =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(reopened.get_state_root(), root);
+        assert_eq!(reopened.get_account(&treasury).unwrap().balance, 42);
+        drop(reopened);
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
     #[test]
     fn adaptive_h_plus_two_block_has_correct_wal_height_and_survives_restart() {
         let sender = KeyPair::generate_ed25519();

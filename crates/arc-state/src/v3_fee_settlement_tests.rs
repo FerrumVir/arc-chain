@@ -719,3 +719,675 @@ fn v3_fee_settlement_schedule_is_well_formed() {
         assert!(*height > 0, "{domain} activates at genesis");
     }
 }
+
+fn total_balance(state: &StateDB) -> u128 {
+    state
+        .accounts
+        .iter()
+        .map(|entry| u128::from(entry.value().balance) + u128::from(entry.value().staked_balance))
+        .sum()
+}
+
+fn treasury_balance(state: &StateDB) -> Option<u64> {
+    state
+        .get_account(&v3_fee_treasury_address())
+        .map(|treasury| treasury.balance)
+}
+
+#[test]
+fn v3_launch_rule_goldens_hold_until_activation() {
+    for activation in [None, Some(1_000)] {
+        let transcript = launch_rule_transcript(|state| {
+            state.set_v3_fee_settlement_activation_override(activation);
+        });
+        assert_matches_goldens(&transcript, V3_LAUNCH_RULE_GOLDENS);
+    }
+}
+
+#[test]
+fn v3_fee_settlement_pre_activation_replay_is_identical() {
+    let senders: Vec<KeyPair> = (0..6)
+        .map(|index| fixture_key("replay-sender", index))
+        .collect();
+    let prefunded: Vec<(Address, u64)> = senders
+        .iter()
+        .map(|sender| (sender.address(), 10_000))
+        .collect();
+    let producer = fixture_key("replay-producer", 0).address();
+    let replay = |activation: Option<Option<u64>>| {
+        let state = v3_fixture_state(&prefunded);
+        if let Some(activation) = activation {
+            state.set_v3_fee_settlement_activation_override(activation);
+        }
+        let mut history = Vec::new();
+        for (index, sender) in senders.iter().enumerate() {
+            let index = index as u64;
+            let transfer = signed_transfer(
+                &state,
+                sender,
+                fixture_address("replay-recipient", index),
+                25,
+                index + 1,
+                0,
+            );
+            let (block, _) = commit_adaptive(&state, std::slice::from_ref(&transfer), producer);
+            history.push((block.hash, block.header.state_root));
+            let (block, _) = commit_adaptive(&state, &[], producer);
+            history.push((block.hash, block.header.state_root));
+        }
+        (history, treasury_balance(&state))
+    };
+    let launch_rule = replay(None);
+    assert_eq!(launch_rule.1, Some(21));
+    assert_eq!(replay(Some(None)), launch_rule);
+    assert_eq!(
+        replay(Some(Some(1_000))),
+        launch_rule,
+        "an activation beyond the history changes nothing"
+    );
+    assert_eq!(
+        replay(Some(Some(5))),
+        launch_rule,
+        "single-transfer blocks settle to the same headers and roots under either rule"
+    );
+}
+
+#[test]
+fn v3_fee_settlement_admits_and_executes_1024_disjoint_transfers() {
+    let cap = V3_MAX_TRANSACTIONS_PER_BLOCK;
+    let directory = fixture_dir("max-block");
+    let senders: Vec<KeyPair> = (0..=cap as u64)
+        .map(|index| fixture_key("max-block-sender", index))
+        .collect();
+    let sender_addresses: Vec<Address> = senders.iter().map(KeyPair::address).collect();
+    let prefunded: Vec<(Address, u64)> = sender_addresses
+        .iter()
+        .map(|address| (*address, 5_000))
+        .collect();
+    let state =
+        StateDB::with_genesis_persistent(&prefunded, &directory, hash_bytes(FIXTURE_GENESIS))
+            .expect("fixture state opens");
+    bind_fixture_recovery_domain(&state);
+    state.set_v3_fee_settlement_activation_override(Some(1));
+    let producer = fixture_key("max-block-producer", 0).address();
+    let transactions: Vec<Transaction> = senders
+        .iter()
+        .enumerate()
+        .map(|(index, sender)| {
+            let index = index as u64;
+            let fee = if index < cap as u64 { index + 1 } else { 1 };
+            signed_transfer(
+                &state,
+                sender,
+                fixture_address("max-block-recipient", index),
+                7,
+                fee,
+                0,
+            )
+        })
+        .collect();
+    let (block_transactions, overflow) = transactions.split_at(cap);
+
+    // The builder admits exactly the cap and refuses the next transfer.
+    let mut admission = state.v3_block_admission().expect("next height");
+    for transaction in block_transactions {
+        admission
+            .try_push(transaction)
+            .expect("a disjoint transfer is admitted");
+    }
+    assert_eq!(admission.len(), cap);
+    let refusal = admission
+        .try_push(&overflow[0])
+        .expect_err("the 1,025th transfer is refused");
+    assert!(refusal.to_string().contains("maximum is 1024"), "{refusal}");
+    assert!(state.validate_v3_block_admission(&transactions).is_err());
+
+    let supply = total_balance(&state);
+    let (block, receipts) = commit_adaptive(&state, block_transactions, producer);
+    assert_eq!(block.header.tx_count as usize, cap);
+    assert!(receipts.iter().all(|receipt| receipt.success));
+    assert_eq!(treasury_balance(&state), Some(524_800));
+    assert_eq!(
+        total_balance(&state),
+        supply,
+        "transfers and fees conserve supply"
+    );
+    for (index, address) in sender_addresses.iter().enumerate().take(cap) {
+        let account = state.get_account(address).expect("sender exists");
+        assert_eq!(account.balance, 5_000 - 7 - (index as u64 + 1));
+        assert_eq!(account.nonce, 1);
+    }
+    assert_eq!(
+        state
+            .get_account(&fixture_address("max-block-recipient", 0))
+            .expect("recipient created")
+            .balance,
+        7
+    );
+    let untouched = state
+        .get_account(&sender_addresses[cap])
+        .expect("excluded sender exists");
+    assert_eq!((untouched.balance, untouched.nonce), (5_000, 0));
+
+    // The epilogue is the only treasury write: one WAL record at the block.
+    state.wal.sync().expect("fixture WAL syncs");
+    drop(state);
+    let treasury = v3_fee_treasury_address();
+    let treasury_writes: Vec<u64> = read_wal(directory.join("state.wal"))
+        .iter()
+        .filter(|entry| matches!(&entry.op, WalOp::SetAccount(address, _) if *address == treasury))
+        .map(|entry| entry.block_height)
+        .collect();
+    assert_eq!(treasury_writes, vec![1]);
+    std::fs::remove_dir_all(&directory).expect("fixture directory is removable");
+}
+
+/// What one execution engine produced, minus the wall-clock parts of a block.
+#[derive(Debug, PartialEq, Eq)]
+struct EngineOutcome {
+    state_root: Hash256,
+    receipts: Vec<(Hash256, u32, bool, u64)>,
+    treasury: Option<u64>,
+}
+
+fn engine_outcome(state: &StateDB, executed: (Block, Vec<TxReceipt>)) -> EngineOutcome {
+    let (block, receipts) = executed;
+    assert_eq!(block.header.state_root, state.get_state_root());
+    assert_eq!(block.header.height, 1);
+    EngineOutcome {
+        state_root: block.header.state_root,
+        receipts: receipts
+            .iter()
+            .map(|receipt| {
+                (
+                    receipt.tx_hash,
+                    receipt.index,
+                    receipt.success,
+                    receipt.gas_used,
+                )
+            })
+            .collect(),
+        treasury: treasury_balance(state),
+    }
+}
+
+#[test]
+fn v3_fee_settlement_engines_agree() {
+    let count = 128;
+    let senders: Vec<KeyPair> = (0..count)
+        .map(|index| fixture_key("engine-sender", index))
+        .collect();
+    let prefunded: Vec<(Address, u64)> = senders
+        .iter()
+        .map(|sender| (sender.address(), 10_000))
+        .collect();
+    let fresh_state = || {
+        let state = v3_fixture_state(&prefunded);
+        state.set_v3_fee_settlement_activation_override(Some(1));
+        state
+    };
+    let signer = fresh_state();
+    let transactions: Vec<Transaction> = senders
+        .iter()
+        .enumerate()
+        .map(|(index, sender)| {
+            let index = index as u64;
+            signed_transfer(
+                &signer,
+                sender,
+                fixture_address("engine-recipient", index),
+                10,
+                index + 1,
+                0,
+            )
+        })
+        .collect();
+    let producer = fixture_key("engine-producer", 0).address();
+
+    let mut outcomes = Vec::new();
+    let state = fresh_state();
+    outcomes.push((
+        "partitioned execute_block",
+        engine_outcome(
+            &state,
+            state
+                .execute_block(&transactions, producer)
+                .expect("executes"),
+        ),
+    ));
+    let state = fresh_state();
+    assert_eq!(
+        state.execution_mode(&transactions),
+        block_stm::AdaptiveMode::BlockSTM,
+        "128 transfers to distinct recipients select BlockSTM"
+    );
+    outcomes.push((
+        "adaptive BlockSTM",
+        engine_outcome(&state, commit_adaptive(&state, &transactions, producer)),
+    ));
+    let state = fresh_state();
+    outcomes.push((
+        "sequential verified",
+        engine_outcome(&state, commit_verified(&state, &transactions, producer)),
+    ));
+    let state = fresh_state();
+    outcomes.push((
+        "batch-verified",
+        engine_outcome(
+            &state,
+            state
+                .execute_block_gpu_verified(&transactions, producer)
+                .expect("executes"),
+        ),
+    ));
+    let state = fresh_state();
+    outcomes.push((
+        "sender-sharded parallel",
+        engine_outcome(
+            &state,
+            state
+                .execute_block_parallel(&transactions, producer)
+                .expect("executes"),
+        ),
+    ));
+    let state = fresh_state();
+    outcomes.push((
+        "partitioned execute_block_stm",
+        engine_outcome(
+            &state,
+            state
+                .execute_block_stm(&transactions, producer)
+                .expect("executes"),
+        ),
+    ));
+
+    let (_, reference) = &outcomes[0];
+    assert_eq!(reference.treasury, Some((1..=count).sum::<u64>()));
+    assert!(reference.receipts.iter().all(|receipt| receipt.2));
+    for (engine, outcome) in &outcomes {
+        assert_eq!(outcome, reference, "{engine} diverged");
+    }
+}
+
+#[test]
+fn v3_fee_settlement_keeps_other_conflicts() {
+    let keys: Vec<KeyPair> = (0..3)
+        .map(|index| fixture_key("conflict-sender", index))
+        .collect();
+    let addresses: Vec<Address> = keys.iter().map(KeyPair::address).collect();
+    let state = v3_fixture_state(
+        &addresses
+            .iter()
+            .map(|address| (*address, 1_000))
+            .collect::<Vec<_>>(),
+    );
+    state.set_v3_fee_settlement_activation_override(Some(1));
+    let fresh = |index| fixture_address("conflict-recipient", index);
+    let transfer = |from: usize, to: Address| signed_transfer(&state, &keys[from], to, 5, 1, 0);
+
+    let disjoint = [transfer(0, fresh(0)), transfer(1, fresh(1))];
+    state
+        .validate_v3_block_admission(&disjoint)
+        .expect("disjoint transfers share a block");
+    state
+        .validate_v3_dag_availability(&disjoint)
+        .expect("disjoint transfers are available together");
+
+    let conflicts = [
+        (
+            "shared recipient",
+            [transfer(0, fresh(2)), transfer(1, fresh(2))],
+        ),
+        (
+            "chained A to B to C",
+            [transfer(0, addresses[1]), transfer(1, fresh(3))],
+        ),
+        (
+            "recipient also sends",
+            [transfer(1, fresh(4)), transfer(0, addresses[1])],
+        ),
+        (
+            "one nonce spent twice",
+            [transfer(0, fresh(5)), transfer(0, fresh(6))],
+        ),
+    ];
+    for (label, pair) in &conflicts {
+        assert!(state.validate_v3_block_admission(pair).is_err(), "{label}");
+        assert!(state.validate_v3_dag_availability(pair).is_err(), "{label}");
+        let mut admission = state.v3_block_admission().expect("next height");
+        admission.try_push(&pair[0]).expect(label);
+        assert!(admission.try_push(&pair[1]).is_err(), "{label}");
+        assert_eq!(admission.len(), 1, "{label}");
+    }
+
+    // The fee treasury is never a party to a transfer, in either direction.
+    let treasury = v3_fee_treasury_address();
+    let to_treasury = transfer(2, treasury);
+    assert!(
+        state
+            .validate_v3_transaction_admission(&to_treasury)
+            .is_err()
+    );
+    let mut admission = state.v3_block_admission().expect("next height");
+    assert!(admission.try_push(&to_treasury).is_err());
+    let mut from_treasury = Transaction::new_transfer(treasury, fresh(7), 1, 0);
+    from_treasury.fee = 1;
+    state
+        .sign_transaction(&mut from_treasury, &keys[2])
+        .expect("signs");
+    assert!(admission.try_push(&from_treasury).is_err());
+    assert!(admission.is_empty());
+}
+
+#[test]
+fn settle_v3_block_fees_counts_only_successful_transfers() {
+    use block_stm::FeeTreasuryAccess::{BlockEpilogue, PerTransaction};
+
+    let keys: Vec<KeyPair> = (0..3)
+        .map(|index| fixture_key("settle-sender", index))
+        .collect();
+    let treasury = v3_fee_treasury_address();
+    let mut prefunded: Vec<(Address, u64)> =
+        keys.iter().map(|key| (key.address(), 1_000)).collect();
+    prefunded.push((treasury, 40));
+    let state = v3_fixture_state(&prefunded);
+    let mut fee_bearing_claim = Transaction::new_faucet_claim(
+        keys[0].address(),
+        fixture_address("settle-recipient", 9),
+        1,
+        0,
+    );
+    fee_bearing_claim.fee = 13;
+    let transactions = vec![
+        signed_transfer(
+            &state,
+            &keys[0],
+            fixture_address("settle-recipient", 0),
+            5,
+            5,
+            0,
+        ),
+        signed_transfer(
+            &state,
+            &keys[1],
+            fixture_address("settle-recipient", 1),
+            5,
+            7,
+            0,
+        ),
+        signed_transfer(
+            &state,
+            &keys[2],
+            fixture_address("settle-recipient", 2),
+            5,
+            11,
+            0,
+        ),
+        fee_bearing_claim,
+    ];
+    let receipts_with = |outcomes: [bool; 4]| -> Vec<TxReceipt> {
+        transactions
+            .iter()
+            .zip(outcomes)
+            .enumerate()
+            .map(|(index, (transaction, success))| TxReceipt {
+                tx_hash: transaction.hash,
+                block_height: 1,
+                block_hash: Hash256::ZERO,
+                index: index as u32,
+                success,
+                gas_used: 0,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: vec![],
+            })
+            .collect()
+    };
+    let receipts = receipts_with([true, false, true, true]);
+
+    // Under the launch rule each transfer already credited its own fee.
+    state
+        .settle_v3_block_fees(1, PerTransaction, &transactions, &receipts)
+        .expect("no-op");
+    assert_eq!(treasury_balance(&state), Some(40));
+    // A receipt list that does not match the block is refused unwritten.
+    assert!(
+        state
+            .settle_v3_block_fees(1, BlockEpilogue, &transactions, &receipts[..3])
+            .is_err()
+    );
+    assert_eq!(treasury_balance(&state), Some(40));
+    // Only successful transfers count: 5 + 11, not the failed 7 and not the
+    // fee field of another family.
+    state
+        .settle_v3_block_fees(1, BlockEpilogue, &transactions, &receipts)
+        .expect("settles");
+    assert_eq!(treasury_balance(&state), Some(56));
+
+    // Nothing to settle writes nothing, not even an absent treasury account.
+    let empty = v3_fixture_state(&[]);
+    empty
+        .settle_v3_block_fees(
+            1,
+            BlockEpilogue,
+            &transactions,
+            &receipts_with([false, false, false, true]),
+        )
+        .expect("nothing to settle");
+    assert_eq!(treasury_balance(&empty), None);
+
+    // A credit that would overflow the treasury is refused atomically.
+    let full = v3_fixture_state(&[(treasury, u64::MAX - 10)]);
+    assert!(
+        full.settle_v3_block_fees(1, BlockEpilogue, &transactions, &receipts)
+            .is_err()
+    );
+    assert_eq!(treasury_balance(&full), Some(u64::MAX - 10));
+}
+
+#[test]
+fn empty_faucet_reward_blocks_do_not_touch_treasury() {
+    let fixture = differential_fixture();
+    let state = &fixture.state;
+    state.set_v3_fee_settlement_activation_override(Some(1));
+    let producer = fixture.validators[0].address();
+
+    commit_adaptive(state, &[], producer);
+    assert_eq!(
+        treasury_balance(state),
+        None,
+        "an empty block settles nothing"
+    );
+
+    let mut claim = Transaction::new_faucet_claim(
+        fixture.validators[1].address(),
+        fixture_address("treasury-faucet-recipient", 0),
+        3,
+        0,
+    );
+    state
+        .sign_transaction(&mut claim, &fixture.validators[1])
+        .expect("claim signs");
+    let (_, receipts) = commit_adaptive(state, std::slice::from_ref(&claim), producer);
+    assert!(receipts[0].success);
+    assert_eq!(treasury_balance(state), None, "a faucet claim pays no fee");
+
+    // A faucet claim and a transfer share a block; only the transfer's fee
+    // reaches the treasury.
+    let mut second_claim = Transaction::new_faucet_claim(
+        fixture.validators[2].address(),
+        fixture_address("treasury-faucet-recipient", 1),
+        3,
+        0,
+    );
+    state
+        .sign_transaction(&mut second_claim, &fixture.validators[2])
+        .expect("claim signs");
+    let transfer = signed_transfer(
+        state,
+        &fixture.senders[0],
+        fixture_address("treasury-transfer-recipient", 0),
+        5,
+        4,
+        0,
+    );
+    let (block, receipts) = commit_adaptive(state, &[second_claim, transfer], producer);
+    assert_eq!(block.header.tx_count, 2);
+    assert!(receipts.iter().all(|receipt| receipt.success));
+    assert_eq!(treasury_balance(state), Some(4));
+}
+
+#[test]
+fn v3_block_admission_rejects_fee_sum_overflow() {
+    let keys: Vec<KeyPair> = (0..3)
+        .map(|index| fixture_key("overflow-sender", index))
+        .collect();
+    let treasury = v3_fee_treasury_address();
+    let mut prefunded: Vec<(Address, u64)> =
+        keys.iter().map(|key| (key.address(), 1_000)).collect();
+    prefunded.push((treasury, u64::MAX - 10));
+    let state = v3_fixture_state(&prefunded);
+    state.set_v3_fee_settlement_activation_override(Some(1));
+    let transfer = |index: usize, fee: u64| {
+        signed_transfer(
+            &state,
+            &keys[index],
+            fixture_address("overflow-recipient", index as u64),
+            1,
+            fee,
+            0,
+        )
+    };
+    let (first, second, third) = (transfer(0, 6), transfer(1, 6), transfer(2, 4));
+    for single in [&first, &second, &third] {
+        state
+            .validate_v3_block_admission(std::slice::from_ref(single))
+            .expect("each fee fits the treasury alone");
+    }
+    let error = state
+        .validate_v3_block_admission(&[first.clone(), second.clone()])
+        .expect_err("6 + 6 exceeds the remaining 10");
+    assert!(
+        error.to_string().contains("overflow the fee treasury"),
+        "{error}"
+    );
+    let mut admission = state.v3_block_admission().expect("next height");
+    admission.try_push(&first).expect("first fits");
+    assert!(admission.try_push(&second).is_err());
+    admission
+        .try_push(&third)
+        .expect("a refused fee leaves the running sum unchanged");
+    assert_eq!(admission.len(), 2);
+
+    let (_, receipts) = commit_adaptive(
+        &state,
+        &[first, third],
+        fixture_key("overflow-producer", 0).address(),
+    );
+    assert!(receipts.iter().all(|receipt| receipt.success));
+    assert_eq!(treasury_balance(&state), Some(u64::MAX));
+
+    // The running fee sum itself is checked too.
+    let rich: Vec<KeyPair> = (0..2)
+        .map(|index| fixture_key("overflow-rich", index))
+        .collect();
+    let rich_state = v3_fixture_state(
+        &rich
+            .iter()
+            .map(|key| (key.address(), u64::MAX))
+            .collect::<Vec<_>>(),
+    );
+    rich_state.set_v3_fee_settlement_activation_override(Some(1));
+    let huge: Vec<Transaction> = rich
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            signed_transfer(
+                &rich_state,
+                key,
+                fixture_address("overflow-rich-recipient", index as u64),
+                1,
+                u64::MAX - 1,
+                0,
+            )
+        })
+        .collect();
+    rich_state
+        .validate_v3_block_admission(&huge[..1])
+        .expect("one huge fee fits an empty treasury");
+    let error = rich_state
+        .validate_v3_block_admission(&huge)
+        .expect_err("two huge fees overflow u64");
+    assert!(error.to_string().contains("overflow"), "{error}");
+}
+
+#[test]
+fn v3_block_admission_builder_matches_reference_greedy_under_block_settlement() {
+    let fixture = differential_fixture();
+    fixture
+        .state
+        .set_v3_fee_settlement_activation_override(Some(1));
+    let mut most_admitted = 0;
+    for seed in 11..=13 {
+        let mut candidates = differential_candidates(&fixture, seed, 24);
+        candidates.sort_by_key(|transaction| transaction.hash.0);
+        most_admitted = most_admitted.max(assert_builder_matches_reference(
+            &fixture.state,
+            &candidates,
+        ));
+        candidates.reverse();
+        assert_builder_matches_reference(&fixture.state, &candidates);
+    }
+    assert!(
+        most_admitted >= 2,
+        "block-level settlement must admit several transfers in one block"
+    );
+}
+
+#[test]
+fn dag_availability_relaxes_treasury_only_when_scheduled() {
+    let keys: Vec<KeyPair> = (0..3)
+        .map(|index| fixture_key("availability-sender", index))
+        .collect();
+    let state = v3_fixture_state(
+        &keys
+            .iter()
+            .map(|key| (key.address(), 1_000))
+            .collect::<Vec<_>>(),
+    );
+    let fresh = |index| fixture_address("availability-recipient", index);
+    let pair = [
+        signed_transfer(&state, &keys[0], fresh(0), 1, 1, 0),
+        signed_transfer(&state, &keys[1], fresh(1), 1, 1, 0),
+    ];
+    let shared = [
+        signed_transfer(&state, &keys[0], fresh(2), 1, 1, 0),
+        signed_transfer(&state, &keys[2], fresh(2), 1, 1, 0),
+    ];
+    assert!(
+        state.validate_v3_dag_availability(&pair).is_err(),
+        "without a schedule the fee-treasury key still conflicts"
+    );
+
+    // A schedule relaxes availability at every height, long before it
+    // activates, so a lagging node keeps post-activation DAG parents ...
+    state.set_v3_fee_settlement_activation_override(Some(1_000_000));
+    state
+        .validate_v3_dag_availability(&pair)
+        .expect("availability is never height-gated");
+    assert!(state.validate_v3_dag_availability(&shared).is_err());
+    // ... while execution keeps the launch rule until the exact height.
+    assert!(state.validate_v3_block_admission(&pair).is_err());
+    assert!(
+        state
+            .validate_v3_block_admission_at(&pair, 999_999)
+            .is_err()
+    );
+    state
+        .validate_v3_block_admission_at(&pair, 1_000_000)
+        .expect("admitted from the activation height on");
+
+    // An explicitly disabled schedule restores the launch rule everywhere.
+    state.set_v3_fee_settlement_activation_override(None);
+    assert!(state.validate_v3_dag_availability(&pair).is_err());
+}

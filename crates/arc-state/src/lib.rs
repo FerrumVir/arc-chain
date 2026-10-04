@@ -612,10 +612,16 @@ pub struct IndexerBatch {
 ///
 /// The builder reads the state it was created from on every push. Callers
 /// must not execute a block between creating it and the last push; the
-/// execution height is captured at creation.
+/// execution height, the block's fee-treasury access mode and (under
+/// block-level fee settlement) the treasury balance are captured at creation.
 pub struct V3BlockAdmission<'a> {
     state: &'a StateDB,
     execution_height: u64,
+    fee_access: block_stm::FeeTreasuryAccess,
+    /// Fee treasury balance before the block (block-level settlement only).
+    treasury_balance: u64,
+    /// Fees of the admitted transfers (block-level settlement only).
+    transfer_fees: u64,
     admitted: usize,
     /// A native transition was admitted; it must stay alone in its block.
     native: bool,
@@ -665,7 +671,7 @@ impl V3BlockAdmission<'_> {
         }
         self.state
             .validate_v3_transaction_admission_at(tx, self.execution_height)?;
-        let access = crate::block_stm::tx_access_set(tx);
+        let access = crate::block_stm::tx_access_set_with(tx, self.fee_access);
         if access
             .accounts
             .iter()
@@ -675,12 +681,36 @@ impl V3BlockAdmission<'_> {
                 "v3 block contains overlapping transaction state access".to_string(),
             ));
         }
+        let transfer_fees = self.transfer_fees_with(tx)?;
         self.hashes.insert(tx.hash.0);
         self.senders
             .insert(tx.from.0, sender_count.saturating_add(1));
         self.accessed.extend(access.accounts);
+        self.transfer_fees = transfer_fees;
         self.admitted = self.admitted.saturating_add(1);
         Ok(())
+    }
+
+    /// Under block-level settlement the epilogue credits the fees of every
+    /// admitted transfer to the treasury at once. Per-transaction admission
+    /// checks each fee against the treasury alone, so the block must also
+    /// prove that their sum fits. Under the launch rule each transfer's own
+    /// admission already proves its credit, and transfers cannot share a block.
+    fn transfer_fees_with(&self, tx: &Transaction) -> Result<u64, StateError> {
+        if self.fee_access != block_stm::FeeTreasuryAccess::BlockEpilogue
+            || !matches!(tx.body, TxBody::Transfer(_))
+        {
+            return Ok(self.transfer_fees);
+        }
+        let transfer_fees = self.transfer_fees.checked_add(tx.fee).ok_or_else(|| {
+            StateError::ExecutionError("v3 block transfer fee total overflow".to_string())
+        })?;
+        if self.treasury_balance.checked_add(transfer_fees).is_none() {
+            return Err(StateError::ExecutionError(
+                "v3 block transfer fees would overflow the fee treasury".to_string(),
+            ));
+        }
+        Ok(transfer_fees)
     }
 
     /// A native transition is admitted only as the first and only
@@ -3113,6 +3143,17 @@ impl StateDB {
                 transactions.len()
             )));
         }
+        // A fee-settlement schedule relaxes the fee-treasury key at every
+        // height, never only from its activation height. A node catching up
+        // through DAG history checks availability against its own older
+        // height, so a height-gated rule would refuse post-activation parents
+        // it must retain and stop catch-up. Execution enforces the exact
+        // activation height: before it, the commit path keeps one transfer.
+        let fee_access = if self.v3_fee_settlement_activation_height().is_some() {
+            crate::block_stm::FeeTreasuryAccess::BlockEpilogue
+        } else {
+            crate::block_stm::FeeTreasuryAccess::PerTransaction
+        };
         let mut senders = HashMap::<[u8; 32], usize>::new();
         let mut hashes = HashSet::new();
         let mut accessed = HashSet::new();
@@ -3133,7 +3174,7 @@ impl StateDB {
             // Native access is checked by its single-transition planner at
             // execution; ordinary blocks retain the existing static isolation.
             if !contains_native {
-                for account in crate::block_stm::tx_access_set(tx).accounts {
+                for account in crate::block_stm::tx_access_set_with(tx, fee_access).accounts {
                     if !accessed.insert(account) {
                         return Err(StateError::ExecutionError(
                             "v3 block contains overlapping transaction state access".into(),
@@ -3210,9 +3251,20 @@ impl StateDB {
     /// Start incremental admission of a candidate block that will execute at
     /// exactly `execution_height`. See [`V3BlockAdmission`].
     pub fn v3_block_admission_at(&self, execution_height: u64) -> V3BlockAdmission<'_> {
+        let fee_access = self.v3_fee_access_at(execution_height);
+        let treasury_balance = match fee_access {
+            block_stm::FeeTreasuryAccess::BlockEpilogue => self
+                .get_account(&v3_fee_treasury_address())
+                .map(|treasury| treasury.balance)
+                .unwrap_or_default(),
+            block_stm::FeeTreasuryAccess::PerTransaction => 0,
+        };
         V3BlockAdmission {
             state: self,
             execution_height,
+            fee_access,
+            treasury_balance,
+            transfer_fees: 0,
             admitted: 0,
             native: false,
             hashes: HashSet::new(),
@@ -3345,6 +3397,10 @@ impl StateDB {
             *h
         };
 
+        // One answer per block for how transfers reach the fee treasury:
+        // execution, partitioning and the epilogue below all use it.
+        let fee_access = self.v3_fee_access_at(height);
+
         let parent = self
             .blocks
             .get(&(height - 1))
@@ -3354,7 +3410,7 @@ impl StateDB {
         // Execute transactions - use Block-STM parallel batches when beneficial
         if transactions.len() >= 16 {
             // Block-STM: partition into conflict-free batches for parallel execution
-            let batches = block_stm::partition_batches(transactions);
+            let batches = block_stm::partition_batches_with(transactions, fee_access);
             tracing::info!(
                 block_height = height,
                 tx_count = transactions.len(),
@@ -3396,7 +3452,8 @@ impl StateDB {
                 let results: Vec<(usize, bool, u64)> = batch_indices
                     .par_iter()
                     .map(|&idx| {
-                        let result = self.execute_tx(&transactions[idx]);
+                        let result =
+                            self.execute_tx_with_fee_access(&transactions[idx], fee_access);
                         let (success, gas_used) = match result {
                             Ok(gas) => (true, gas),
                             Err(_) => (false, Self::gas_cost_for_tx(&transactions[idx])),
@@ -3424,7 +3481,7 @@ impl StateDB {
             // Sequential fallback for small batches (< 16 txs)
             for (i, tx) in transactions.iter().enumerate() {
                 self.mark_tx_accounts_dirty(tx);
-                let result = self.execute_tx(tx);
+                let result = self.execute_tx_with_fee_access(tx, fee_access);
                 let (success, gas_used) = match result {
                     Ok(gas) => (true, gas),
                     Err(_) => (false, Self::gas_cost_for_tx(tx)),
@@ -3457,6 +3514,11 @@ impl StateDB {
         }
 
         // Build Merkle tree from transaction hashes
+        // Block-level v3 fee settlement: credit the fee treasury once with
+        // the fees of this block's successful transfers, after every
+        // transaction and before the state root. A no-op under the launch
+        // rule, where each transfer already credited its own fee.
+        self.settle_v3_block_fees(height, fee_access, transactions, &receipts)?;
         // Refund matured, unchallenged Tier 2 attestation bonds at this height
         // BEFORE the state root is computed so refunds land in this block.
         // Bounded, deterministic, and a no-op when nothing has matured (always
@@ -3643,20 +3705,24 @@ impl StateDB {
         self.validate_next_protocol_block_admission(transactions)?;
         use rayon::prelude::*;
 
-        // The transaction slice is already in canonical block/DAG order.
-        // Re-sorting by sender used to reverse cross-sender conflicts (shared
-        // treasury, reward marker, challenge escrow, etc.) while merely moving
-        // receipts back to their original slots. Partition that canonical
-        // sequence directly; partition_batches preserves every conflict edge.
-        let batches = crate::block_stm::partition_batches(transactions);
-        let mut receipts = vec![None; transactions.len()];
-        let mut tx_hashes = vec![Hash256::ZERO; transactions.len()];
-
         let height = {
             let mut h = self.height.write();
             *h += 1;
             *h
         };
+        // One answer per block for how transfers reach the fee treasury:
+        // execution, partitioning and the epilogue below all use it, so the
+        // partition follows the height increment.
+        let fee_access = self.v3_fee_access_at(height);
+
+        // The transaction slice is already in canonical block/DAG order.
+        // Re-sorting by sender used to reverse cross-sender conflicts (shared
+        // treasury, reward marker, challenge escrow, etc.) while merely moving
+        // receipts back to their original slots. Partition that canonical
+        // sequence directly; partition_batches preserves every conflict edge.
+        let batches = crate::block_stm::partition_batches_with(transactions, fee_access);
+        let mut receipts = vec![None; transactions.len()];
+        let mut tx_hashes = vec![Hash256::ZERO; transactions.len()];
 
         let parent = self
             .blocks
@@ -3674,13 +3740,14 @@ impl StateDB {
                     let tx = &transactions[idx];
                     self.mark_tx_accounts_dirty(tx);
                     let result = if tx.sig_verified {
-                        self.execute_tx(tx) // Pre-verified (faucet/RPC) - skip sig check
+                        // Pre-verified (faucet/RPC) - skip sig check
+                        self.execute_tx_with_fee_access(tx, fee_access)
                     } else if tx.is_unsigned() {
                         Err(StateError::ExecutionError("unsigned transaction".into()))
                     } else if self.verify_transaction_signature(tx).is_err() {
                         Err(StateError::ExecutionError("invalid signature".into()))
                     } else {
-                        self.execute_tx(tx)
+                        self.execute_tx_with_fee_access(tx, fee_access)
                     };
                     let (success, gas_used) = match result {
                         Ok(gas) => (true, gas),
@@ -3726,6 +3793,11 @@ impl StateDB {
             .collect();
 
         // Build block (same as sequential path)
+        // Block-level v3 fee settlement: credit the fee treasury once with
+        // the fees of this block's successful transfers, after every
+        // transaction and before the state root. A no-op under the launch
+        // rule, where each transfer already credited its own fee.
+        self.settle_v3_block_fees(height, fee_access, transactions, &receipts)?;
         // Refund matured, unchallenged Tier 2 attestation bonds at this height
         // BEFORE the state root is computed so refunds land in this block.
         // Bounded, deterministic, and a no-op when nothing has matured (always
@@ -3847,6 +3919,10 @@ impl StateDB {
             *h
         };
 
+        // One answer per block for how transfers reach the fee treasury:
+        // execution, partitioning and the epilogue below all use it.
+        let fee_access = self.v3_fee_access_at(height);
+
         let parent = self
             .blocks
             .get(&(height - 1))
@@ -3937,20 +4013,20 @@ impl StateDB {
             self.mark_tx_accounts_dirty(tx);
             let result = if tx.sig_verified {
                 // Pre-verified (faucet/RPC) - skip sig check
-                self.execute_tx(tx)
+                self.execute_tx_with_fee_access(tx, fee_access)
             } else if tx.is_unsigned() {
                 Err(StateError::ExecutionError("unsigned transaction".into()))
             } else if let Some(valid) = batch_sig_valid[i] {
                 // Batch-verified above
                 if valid {
-                    self.execute_tx(tx)
+                    self.execute_tx_with_fee_access(tx, fee_access)
                 } else {
                     Err(StateError::ExecutionError("invalid signature".into()))
                 }
             } else if self.verify_transaction_signature(tx).is_err() {
                 Err(StateError::ExecutionError("invalid signature".into()))
             } else {
-                self.execute_tx(tx)
+                self.execute_tx_with_fee_access(tx, fee_access)
             };
             let (success, gas_used) = match result {
                 Ok(gas) => (true, gas),
@@ -3973,6 +4049,11 @@ impl StateDB {
         }
 
         // Build Merkle tree from transaction hashes
+        // Block-level v3 fee settlement: credit the fee treasury once with
+        // the fees of this block's successful transfers, after every
+        // transaction and before the state root. A no-op under the launch
+        // rule, where each transfer already credited its own fee.
+        self.settle_v3_block_fees(height, fee_access, transactions, &receipts)?;
         // Refund matured, unchallenged Tier 2 attestation bonds at this height
         // BEFORE the state root is computed so refunds land in this block.
         // Bounded, deterministic, and a no-op when nothing has matured (always
@@ -4068,6 +4149,10 @@ impl StateDB {
             *h
         };
 
+        // One answer per block for how transfers reach the fee treasury:
+        // execution, partitioning and the epilogue below all use it.
+        let fee_access = self.v3_fee_access_at(height);
+
         let parent = self
             .blocks
             .get(&(height - 1))
@@ -4144,7 +4229,7 @@ impl StateDB {
 
         if transactions.len() >= 16 {
             // Block-STM parallel path for large batches
-            let batches = block_stm::partition_batches(transactions);
+            let batches = block_stm::partition_batches_with(transactions, fee_access);
 
             receipts.resize(
                 transactions.len(),
@@ -4176,7 +4261,8 @@ impl StateDB {
                         if !sig_valid[idx] {
                             return (idx, false, Self::gas_cost_for_tx(&transactions[idx]));
                         }
-                        let result = self.execute_tx(&transactions[idx]);
+                        let result =
+                            self.execute_tx_with_fee_access(&transactions[idx], fee_access);
                         let (success, gas_used) = match result {
                             Ok(gas) => (true, gas),
                             Err(_) => (false, Self::gas_cost_for_tx(&transactions[idx])),
@@ -4206,7 +4292,7 @@ impl StateDB {
                 let result = if !sig_valid[i] {
                     Err(StateError::ExecutionError("invalid signature".into()))
                 } else {
-                    self.execute_tx(tx)
+                    self.execute_tx_with_fee_access(tx, fee_access)
                 };
                 let (success, gas_used) = match result {
                     Ok(gas) => (true, gas),
@@ -4239,6 +4325,11 @@ impl StateDB {
             );
         }
 
+        // Block-level v3 fee settlement: credit the fee treasury once with
+        // the fees of this block's successful transfers, after every
+        // transaction and before the state root. A no-op under the launch
+        // rule, where each transfer already credited its own fee.
+        self.settle_v3_block_fees(height, fee_access, transactions, &receipts)?;
         // Refund matured, unchallenged Tier 2 attestation bonds at this height
         // BEFORE the state root is computed so refunds land in this block.
         // Bounded, deterministic, and a no-op when nothing has matured (always
@@ -4322,12 +4413,24 @@ impl StateDB {
             *h
         };
 
+        // One answer per block for how transfers reach the fee treasury:
+        // execution, partitioning and the epilogue below all use it.
+        let fee_access = self.v3_fee_access_at(height);
+
         let parent = self
             .blocks
             .get(&(height - 1))
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
+        // Sharding by sender alone is safe for protocol v3 only because the
+        // admission above proves every transaction's static access set
+        // pairwise disjoint, and no transfer writes the shared fee treasury
+        // while shards run: under the launch rule a block admits at most one
+        // transfer (they all share the treasury key), and under block-level
+        // settlement the epilogue credits the treasury once after every shard
+        // has finished. No two shards can then write the same account. Legacy
+        // blocks carry no such proof; there this engine is a benchmark path.
         let mut shards: HashMap<[u8; 32], Vec<(usize, &Transaction)>> = HashMap::new();
         for (i, tx) in transactions.iter().enumerate() {
             self.mark_tx_accounts_dirty(tx);
@@ -4339,7 +4442,8 @@ impl StateDB {
             .map(|(_sender, txs)| {
                 let mut results = Vec::with_capacity(txs.len());
                 for (idx, tx) in txs {
-                    let (success, gas_used) = match self.execute_tx(tx) {
+                    let (success, gas_used) = match self.execute_tx_with_fee_access(tx, fee_access)
+                    {
                         Ok(gas) => (true, gas),
                         Err(_) => (false, Self::gas_cost_for_tx(tx)),
                     };
@@ -4375,6 +4479,11 @@ impl StateDB {
             })
             .collect();
 
+        // Block-level v3 fee settlement: credit the fee treasury once with
+        // the fees of this block's successful transfers, after every
+        // transaction and before the state root. A no-op under the launch
+        // rule, where each transfer already credited its own fee.
+        self.settle_v3_block_fees(height, fee_access, transactions, &receipts)?;
         // Refund matured, unchallenged Tier 2 attestation bonds at this height
         // BEFORE the state root is computed so refunds land in this block.
         // Bounded, deterministic, and a no-op when nothing has matured (always
@@ -4460,6 +4569,10 @@ impl StateDB {
             *h
         };
 
+        // One answer per block for how transfers reach the fee treasury:
+        // execution, partitioning and the epilogue below all use it.
+        let fee_access = self.v3_fee_access_at(height);
+
         let parent = self
             .blocks
             .get(&(height - 1))
@@ -4472,7 +4585,7 @@ impl StateDB {
         }
 
         // Partition into conflict-free batches.
-        let batches = block_stm::partition_batches(transactions);
+        let batches = block_stm::partition_batches_with(transactions, fee_access);
 
         // Execute batches: within each batch, txs run in parallel;
         // batches themselves run sequentially to respect dependencies.
@@ -4483,7 +4596,7 @@ impl StateDB {
             if batch.len() == 1 {
                 // Single tx -- no rayon overhead
                 let idx = batch[0];
-                match self.execute_tx(&transactions[idx]) {
+                match self.execute_tx_with_fee_access(&transactions[idx], fee_access) {
                     Ok(gas) => {
                         receipt_success[idx] = true;
                         receipt_gas[idx] = gas;
@@ -4496,9 +4609,11 @@ impl StateDB {
                 // Parallel execution within the batch
                 let results: Vec<(usize, bool, u64)> = batch
                     .par_iter()
-                    .map(|&idx| match self.execute_tx(&transactions[idx]) {
-                        Ok(gas) => (idx, true, gas),
-                        Err(_) => (idx, false, Self::gas_cost_for_tx(&transactions[idx])),
+                    .map(|&idx| {
+                        match self.execute_tx_with_fee_access(&transactions[idx], fee_access) {
+                            Ok(gas) => (idx, true, gas),
+                            Err(_) => (idx, false, Self::gas_cost_for_tx(&transactions[idx])),
+                        }
                     })
                     .collect();
                 for (idx, ok, gas) in results {
@@ -4526,6 +4641,11 @@ impl StateDB {
             })
             .collect();
 
+        // Block-level v3 fee settlement: credit the fee treasury once with
+        // the fees of this block's successful transfers, after every
+        // transaction and before the state root. A no-op under the launch
+        // rule, where each transfer already credited its own fee.
+        self.settle_v3_block_fees(height, fee_access, transactions, &receipts)?;
         // Refund matured, unchallenged Tier 2 attestation bonds at this height
         // BEFORE the state root is computed so refunds land in this block.
         // Bounded, deterministic, and a no-op when nothing has matured (always
@@ -5405,7 +5525,72 @@ impl StateDB {
         )
     }
 
+    /// Protocol-v3 transfer under block-level fee settlement: debit amount
+    /// plus fee from the sender and credit the amount to the recipient. The
+    /// fee stays with the block until `settle_v3_block_fees` credits the
+    /// treasury once, so the transaction writes exactly its own two accounts.
+    /// Same checked arithmetic and atomicity as the launch-rule branch:
+    /// both candidates are complete before any account, JMT leaf or WAL
+    /// record is written. The caller has already run
+    /// `validate_v3_transfer_admission`, which rejects `from == to`.
+    fn apply_v3_transfer_deferring_fee(
+        &self,
+        tx: &Transaction,
+        body: &TransferBody,
+    ) -> Result<(), StateError> {
+        let total_debit = body.amount.checked_add(tx.fee).ok_or_else(|| {
+            StateError::ExecutionError("transfer amount plus fee overflow".to_string())
+        })?;
+        let mut sender = self.get_account(&tx.from).ok_or_else(|| {
+            StateError::ExecutionError("v3 transfer sender disappeared after preflight".to_string())
+        })?;
+        let mut receiver = self
+            .get_account(&body.to)
+            .unwrap_or_else(|| Account::new(body.to, 0));
+        sender.balance = sender.balance.checked_sub(total_debit).ok_or_else(|| {
+            StateError::ExecutionError("transfer sender balance underflow".to_string())
+        })?;
+        sender.nonce = sender
+            .nonce
+            .checked_add(1)
+            .ok_or_else(|| StateError::ExecutionError("transfer nonce overflow".to_string()))?;
+        receiver.balance = receiver.balance.checked_add(body.amount).ok_or_else(|| {
+            StateError::ExecutionError("transfer recipient balance overflow".to_string())
+        })?;
+
+        self.accounts.insert(tx.from.0, sender.clone());
+        self.accounts.insert(body.to.0, receiver.clone());
+        if self.use_jmt {
+            let mut jmt = self.jmt.lock();
+            for (address, account) in [(tx.from, &sender), (body.to, &receiver)] {
+                let value = hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                jmt.update_leaf(address.0, value);
+            }
+        }
+        if self.wal.is_active() {
+            let height = self.height();
+            self.wal.append(WalOp::SetAccount(tx.from, sender), height);
+            self.wal
+                .append(WalOp::SetAccount(body.to, receiver), height);
+        }
+        Ok(())
+    }
+
     fn execute_tx(&self, tx: &Transaction) -> Result<u64, StateError> {
+        self.execute_tx_with_fee_access(tx, block_stm::FeeTreasuryAccess::PerTransaction)
+    }
+
+    /// Execute one transaction of a block whose transfers reach the fee
+    /// treasury as `fee_access` says. Only the canonical block paths, which
+    /// all run `settle_v3_block_fees` before taking the state root, pass
+    /// [`block_stm::FeeTreasuryAccess::BlockEpilogue`]. Every other caller
+    /// goes through `execute_tx` and keeps the launch rule, so no path can
+    /// debit a transfer fee that nothing credits.
+    fn execute_tx_with_fee_access(
+        &self,
+        tx: &Transaction,
+        fee_access: block_stm::FeeTreasuryAccess,
+    ) -> Result<u64, StateError> {
         if tx.tx_type != tx.body.tx_type() {
             return Err(StateError::ExecutionError(format!(
                 "transaction type/body mismatch: envelope {:?}, body {:?}",
@@ -5434,6 +5619,10 @@ impl StateDB {
             TxBody::Transfer(body) => {
                 if self.active_protocol_version().major == 3 {
                     self.validate_v3_transfer_admission(tx, body)?;
+                    if fee_access == block_stm::FeeTreasuryAccess::BlockEpilogue {
+                        self.apply_v3_transfer_deferring_fee(tx, body)?;
+                        return Ok(gas.consumed);
+                    }
                     let fee_treasury_addr = v3_fee_treasury_address();
                     let total_debit = body.amount.checked_add(tx.fee).ok_or_else(|| {
                         StateError::ExecutionError("transfer amount plus fee overflow".to_string())
@@ -8926,6 +9115,64 @@ impl StateDB {
         }
 
         Ok((block, receipts))
+    }
+
+    /// Epilogue of block-level protocol-v3 fee settlement: credit the shared
+    /// fee treasury once with the fees of the block's successful transfers,
+    /// after every transaction and before the state root is taken.
+    ///
+    /// A no-op under the launch rule (`fee_access` is `PerTransaction`, where
+    /// every transfer already credited its own fee) and when no transfer
+    /// succeeded, so empty, faucet, reward and native blocks never touch the
+    /// treasury. Fees are summed with checked arithmetic in canonical order.
+    /// Admission refuses any block whose transfer fees could overflow the
+    /// treasury, so an error here means the block must not be committed.
+    fn settle_v3_block_fees(
+        &self,
+        height: u64,
+        fee_access: block_stm::FeeTreasuryAccess,
+        transactions: &[Transaction],
+        receipts: &[TxReceipt],
+    ) -> Result<(), StateError> {
+        if fee_access != block_stm::FeeTreasuryAccess::BlockEpilogue {
+            return Ok(());
+        }
+        if transactions.len() != receipts.len() {
+            return Err(StateError::ExecutionError(format!(
+                "v3 fee settlement has {} receipts for {} transactions",
+                receipts.len(),
+                transactions.len()
+            )));
+        }
+        let mut total: u64 = 0;
+        for (tx, receipt) in transactions.iter().zip(receipts) {
+            if receipt.success && matches!(tx.body, TxBody::Transfer(_)) {
+                total = total.checked_add(tx.fee).ok_or_else(|| {
+                    StateError::ExecutionError("v3 block transfer fee total overflow".to_string())
+                })?;
+            }
+        }
+        if total == 0 {
+            return Ok(());
+        }
+        let treasury_address = v3_fee_treasury_address();
+        let mut treasury = self
+            .get_account(&treasury_address)
+            .unwrap_or_else(|| Account::new(treasury_address, 0));
+        treasury.balance = treasury.balance.checked_add(total).ok_or_else(|| {
+            StateError::ExecutionError("transfer fee treasury balance overflow".to_string())
+        })?;
+        self.accounts.insert(treasury_address.0, treasury.clone());
+        self.dirty_accounts.insert(treasury_address.0);
+        if self.use_jmt {
+            let value = hash_bytes(&bincode::serialize(&treasury).unwrap_or_default());
+            self.jmt.lock().update_leaf(treasury_address.0, value);
+        }
+        if self.wal.is_active() {
+            self.wal
+                .append(WalOp::SetAccount(treasury_address, treasury), height);
+        }
+        Ok(())
     }
 
     /// Refund matured, unchallenged Tier 2 attestation bonds to their original
@@ -14529,6 +14776,89 @@ mod tests {
             V3_MIN_TRANSFER_FEE
         );
 
+        // Past a block-level fee settlement activation, transfers that
+        // overlapped only on the fee treasury share a block, every other
+        // check above still applies, and the treasury moves once.
+        let mut settled = make_channel_tx(
+            sender.address(),
+            1,
+            TxBody::Transfer(TransferBody {
+                to: hash_bytes(b"v3-transfer-settled-recipient"),
+                amount: 5,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        settled.fee = 2;
+        state.sign_transaction(&mut settled, &sender).unwrap();
+        let mut second = make_channel_tx(
+            second_sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: second_receiver.address(),
+                amount: 3,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        second.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut second, &second_sender).unwrap();
+        let settled_block = vec![settled, second];
+        assert!(
+            state
+                .validate_v3_block_admission(&settled_block)
+                .unwrap_err()
+                .to_string()
+                .contains("overlapping")
+        );
+        state.set_v3_fee_settlement_activation_override(Some(state.height() + 1));
+        state.validate_v3_block_admission(&settled_block).unwrap();
+        let mut zero_fee_after = make_channel_tx(
+            second_sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: second_receiver.address(),
+                amount: 3,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        state
+            .sign_transaction(&mut zero_fee_after, &second_sender)
+            .unwrap();
+        assert!(
+            state
+                .validate_v3_transaction_admission(&zero_fee_after)
+                .unwrap_err()
+                .to_string()
+                .contains("below minimum")
+        );
+        let (block, receipts) = state
+            .execute_block_verified_at(&settled_block, sender.address(), 1_787_857_623_003)
+            .unwrap();
+        assert_eq!(block.header.height, 2);
+        assert!(receipts.iter().all(|receipt| receipt.success));
+        assert_eq!(state.get_account(&sender.address()).unwrap().balance, 52);
+        assert_eq!(state.get_account(&sender.address()).unwrap().nonce, 2);
+        assert_eq!(
+            state.get_account(&second_sender.address()).unwrap().balance,
+            96
+        );
+        assert_eq!(
+            state
+                .get_account(&second_receiver.address())
+                .unwrap()
+                .balance,
+            3
+        );
+        assert_eq!(
+            state
+                .get_account(&v3_fee_treasury_address())
+                .unwrap()
+                .balance,
+            2 * V3_MIN_TRANSFER_FEE + 2
+        );
+
         drop(state);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -16560,6 +16890,107 @@ mod tests {
         );
         assert_eq!(
             restarted.get_account(&treasury).unwrap().balance,
+            3 * REWARD
+        );
+
+        drop(restarted);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_v3_reward_and_block_settled_transfers_restart_identically() {
+        let directory = persistent_test_dir("v3-reward-settled-transfers");
+        let genesis_hash = hash_bytes(b"v3-reward-settled-transfers-genesis");
+        let context = crate::recovery::RecoveryContext::new("0x415243", genesis_hash, 9, 12);
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let senders: Vec<_> = (0..3)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let reward_treasury = arc_types::transaction::inference_reward_treasury_address();
+        let fee_treasury = v3_fee_treasury_address();
+        let mut prefunded = vec![(reward_treasury, 4 * REWARD)];
+        prefunded.extend(validators.iter().map(|validator| (validator.address(), 0)));
+        prefunded.extend(senders.iter().map(|sender| (sender.address(), 1_000)));
+        let validator_set: Vec<_> = validators
+            .iter()
+            .enumerate()
+            .map(|(index, validator)| {
+                (
+                    validator.address(),
+                    if index < 4 { 6_666_667 } else { 6_666_666 },
+                )
+            })
+            .collect();
+
+        let state = StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        state.seed_genesis_validators(&validator_set);
+        state.staking_pool.store(40_000_000, Ordering::Release);
+        state.set_community_rewards_v1_activation_height(Some(0));
+        *state.recovery_context.write() = Some(context.clone());
+        state.set_v3_fee_settlement_activation_override(Some(1));
+        let supply = sum_all_balances(&state);
+        let transfer = |state: &StateDB, sender: &arc_crypto::KeyPair, tag: &[u8], fee: u64| {
+            let mut transfer = Transaction::new_transfer(sender.address(), hash_bytes(tag), 10, 0);
+            transfer.fee = fee;
+            state.sign_transaction(&mut transfer, sender).unwrap();
+            transfer
+        };
+
+        // A reward and a transfer share a block. The reward pays from its own
+        // treasury, so only the transfer fee reaches the fee treasury.
+        let reward = make_recovery_signed_community_reward(
+            &state,
+            &validators[0],
+            &worker,
+            &validators,
+            0,
+            b"settled-transfers-job",
+        );
+        let first = transfer(&state, &senders[0], b"settled-recipient-0", 2);
+        let (_, receipts) = state
+            .execute_block_verified_at(&[reward, first], validators[0].address(), 1_787_857_623_020)
+            .unwrap();
+        assert!(receipts.iter().all(|receipt| receipt.success));
+        assert_eq!(state.get_account(&fee_treasury).unwrap().balance, 2);
+
+        // Two more disjoint transfers settle their fees once.
+        let batch = vec![
+            transfer(&state, &senders[1], b"settled-recipient-1", 3),
+            transfer(&state, &senders[2], b"settled-recipient-2", 4),
+        ];
+        let (block, receipts) = state
+            .execute_block_verified_at(&batch, validators[0].address(), 1_787_857_623_021)
+            .unwrap();
+        assert!(receipts.iter().all(|receipt| receipt.success));
+        assert_eq!(state.get_account(&fee_treasury).unwrap().balance, 9);
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(sum_all_balances(&state), supply, "supply is conserved");
+        state.wal.sync().unwrap();
+        let rooted_state = state.get_state_root();
+        assert_eq!(block.header.state_root, rooted_state);
+        let block_hash = block.hash;
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        restarted.set_community_rewards_v1_activation_height(Some(0));
+        *restarted.recovery_context.write() = Some(context);
+        assert_eq!(restarted.height(), 2);
+        assert_eq!(restarted.get_state_root(), rooted_state);
+        assert_eq!(restarted.get_block(2).unwrap().hash, block_hash);
+        assert_eq!(restarted.get_account(&fee_treasury).unwrap().balance, 9);
+        assert_eq!(
+            restarted.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(
+            restarted.get_account(&reward_treasury).unwrap().balance,
             3 * REWARD
         );
 
