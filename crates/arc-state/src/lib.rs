@@ -2176,6 +2176,29 @@ impl StateDB {
     /// starts and never change it while blocks execute.
     pub fn set_v3_fee_settlement_activation_override(&self, activation: Option<u64>) {
         *self.v3_fee_settlement_override.write() = Some(activation);
+        self.retain_launch_rule_fee_treasury_history();
+    }
+
+    /// Keep the fee treasury's `account_txs` history consistent with the
+    /// activation in force. Startup rebuilds the index before a test or
+    /// harness override can be installed, so it indexes every replayed
+    /// transfer under the treasury; drop the ones whose block settled its fees
+    /// in the epilogue. A hash without a retained receipt is kept.
+    fn retain_launch_rule_fee_treasury_history(&self) {
+        let treasury = v3_fee_treasury_address();
+        let Some(history) = self.account_txs.get(&treasury.0).map(|entry| entry.clone()) else {
+            return;
+        };
+        let retained: Vec<Hash256> = history
+            .into_iter()
+            .filter(|hash| {
+                self.receipts.get(&hash.0).is_none_or(|receipt| {
+                    self.v3_fee_access_at(receipt.block_height)
+                        == block_stm::FeeTreasuryAccess::PerTransaction
+                })
+            })
+            .collect();
+        self.account_txs.insert(treasury.0, retained);
     }
 
     /// Whether a protocol-v3 block executing at `height` credits transfer
@@ -3568,7 +3591,7 @@ impl StateDB {
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
-            self.index_account_tx(tx);
+            self.index_account_tx_with(tx, fee_access);
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
@@ -3841,7 +3864,7 @@ impl StateDB {
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, final_receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
-            self.index_account_tx(tx);
+            self.index_account_tx_with(tx, fee_access);
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
@@ -4100,7 +4123,7 @@ impl StateDB {
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
-            self.index_account_tx(tx);
+            self.index_account_tx_with(tx, fee_access);
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
@@ -4375,7 +4398,7 @@ impl StateDB {
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
-            self.index_account_tx(tx);
+            self.index_account_tx_with(tx, fee_access);
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
@@ -4530,7 +4553,7 @@ impl StateDB {
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
-            self.index_account_tx(tx);
+            self.index_account_tx_with(tx, fee_access);
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
@@ -4692,7 +4715,7 @@ impl StateDB {
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
-            self.index_account_tx(tx);
+            self.index_account_tx_with(tx, fee_access);
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
@@ -9638,6 +9661,15 @@ impl StateDB {
     /// Index a transaction's sender and recipient addresses for `account_txs` lookups.
     /// Caps per-account history at 10K entries to prevent unbounded memory growth.
     fn index_account_tx(&self, tx: &Transaction) {
+        self.index_account_tx_with(tx, block_stm::FeeTreasuryAccess::PerTransaction);
+    }
+
+    /// [`Self::index_account_tx`] for a transaction of a block whose transfers
+    /// reached the fee treasury as `fee_access` says. Under block-level fee
+    /// settlement a transfer never touches the treasury, so it is not indexed
+    /// there: the treasury's history would otherwise grow by one hash per
+    /// transfer, without bound, and be cloned on every history request.
+    fn index_account_tx_with(&self, tx: &Transaction, fee_access: block_stm::FeeTreasuryAccess) {
         const MAX_TX_HISTORY: usize = 10_000;
         // Index the sender first and DROP the DashMap entry guard before
         // touching any other account. Holding a shard guard while calling
@@ -9658,7 +9690,9 @@ impl StateDB {
         match &tx.body {
             TxBody::Transfer(body) => {
                 self.account_txs.entry(body.to.0).or_default().push(tx.hash);
-                if self.active_protocol_version().major == 3 {
+                if self.active_protocol_version().major == 3
+                    && fee_access == block_stm::FeeTreasuryAccess::PerTransaction
+                {
                     self.account_txs
                         .entry(v3_fee_treasury_address().0)
                         .or_default()

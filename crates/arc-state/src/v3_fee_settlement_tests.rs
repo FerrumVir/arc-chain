@@ -1391,3 +1391,52 @@ fn dag_availability_relaxes_treasury_only_when_scheduled() {
     state.set_v3_fee_settlement_activation_override(None);
     assert!(state.validate_v3_dag_availability(&pair).is_err());
 }
+
+#[test]
+fn settled_transfers_are_not_indexed_under_the_fee_treasury() {
+    let senders: Vec<KeyPair> = (0..4)
+        .map(|index| fixture_key("history-sender", index))
+        .collect();
+    let state = v3_fixture_state(
+        &senders
+            .iter()
+            .map(|sender| (sender.address(), 1_000))
+            .collect::<Vec<_>>(),
+    );
+    state.set_v3_fee_settlement_activation_override(Some(3));
+    let treasury = v3_fee_treasury_address();
+    let producer = fixture_key("history-producer", 0).address();
+    let recipient = |index| fixture_address("history-recipient", index);
+
+    // Under the launch rule every transfer is part of the treasury history.
+    let first = signed_transfer(&state, &senders[0], recipient(0), 1, 1, 0);
+    commit_adaptive(&state, std::slice::from_ref(&first), producer);
+    let second = signed_transfer(&state, &senders[1], recipient(1), 1, 1, 0);
+    commit_adaptive(&state, std::slice::from_ref(&second), producer);
+    assert_eq!(
+        state.get_account_txs(&treasury.0),
+        vec![first.hash, second.hash]
+    );
+
+    // Settled transfers touch only their own accounts and are indexed there.
+    let settled = [
+        signed_transfer(&state, &senders[2], recipient(2), 1, 1, 0),
+        signed_transfer(&state, &senders[3], recipient(3), 1, 1, 0),
+    ];
+    let (block, receipts) = commit_adaptive(&state, &settled, producer);
+    assert_eq!(block.header.height, 3);
+    assert!(receipts.iter().all(|receipt| receipt.success));
+    assert_eq!(treasury_balance(&state), Some(4));
+    assert_eq!(
+        state.get_account_txs(&treasury.0),
+        vec![first.hash, second.hash],
+        "settled transfers must not grow the treasury history"
+    );
+    for transfer in &settled {
+        let TxBody::Transfer(body) = &transfer.body else {
+            unreachable!("fixture transfers are transfers");
+        };
+        assert_eq!(state.get_account_txs(&transfer.from.0), vec![transfer.hash]);
+        assert_eq!(state.get_account_txs(&body.to.0), vec![transfer.hash]);
+    }
+}

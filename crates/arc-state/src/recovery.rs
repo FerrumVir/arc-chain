@@ -3545,7 +3545,17 @@ impl StateDB {
                 .unwrap_or((u64::MAX, u32::MAX))
         });
         for transaction in transactions {
-            self.index_account_tx(&transaction);
+            // A transfer that executed under block-level fee settlement never
+            // touched the fee treasury; index it exactly as it was live.
+            let fee_access = self
+                .receipts
+                .get(&transaction.hash.0)
+                .map(|receipt| receipt.block_height)
+                .map_or(
+                    crate::block_stm::FeeTreasuryAccess::PerTransaction,
+                    |height| self.v3_fee_access_at(height),
+                );
+            self.index_account_tx_with(&transaction, fee_access);
         }
     }
 
@@ -6123,6 +6133,13 @@ mod tests {
             state.get_account(&treasury).unwrap().balance,
             3 + 5 + 3 + 11
         );
+        // Settled transfers are not indexed under the treasury.
+        let treasury_history = state.get_account_txs(&treasury.0);
+        assert_eq!(treasury_history, vec![pair[0].hash]);
+        let sender_histories: Vec<_> = senders
+            .iter()
+            .map(|sender| state.get_account_txs(&sender.address().0))
+            .collect();
         let root = block.header.state_root;
         let height = block.header.height;
         drop(state);
@@ -6156,6 +6173,12 @@ mod tests {
             1
         );
         restarted.set_v3_fee_settlement_activation_override(Some(activation));
+        // Startup rebuilt the history index before the override existed;
+        // installing it leaves exactly the history the live node had.
+        assert_eq!(restarted.get_account_txs(&treasury.0), treasury_history);
+        for (sender, history) in senders.iter().zip(&sender_histories) {
+            assert_eq!(&restarted.get_account_txs(&sender.address().0), history);
+        }
         let after_restart = [
             fee_settlement_transfer(&restarted, &senders[1], 1, 7, b"after-restart-b"),
             fee_settlement_transfer(&restarted, &senders[2], 1, 13, b"after-restart-c"),
