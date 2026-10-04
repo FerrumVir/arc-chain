@@ -17,6 +17,10 @@ default = []
 # exist in a default build; evidence produced with it is protocol coverage and
 # qualifies no model.
 native-test-executor = []
+# Integration-only override of the compiled block-level v3 fee-settlement
+# schedule (`--test-v3-fee-settlement-activation-height`), for the throughput
+# harness. Behind a feature so a default or release build cannot enable it.
+v3-fee-settlement-test-override = []
 benchmark-tools = ["arc-crypto/benchmark-tools", "arc-state/benchmark-tools"]
 candle = ["arc-inference/candle"]
 stwo-prover = ["arc-crypto/stwo-prover", "arc-state/stwo-prover"]

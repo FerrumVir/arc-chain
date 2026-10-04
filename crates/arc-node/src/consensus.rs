@@ -757,6 +757,28 @@ pub(crate) fn admit_gossiped_transaction(
     let Ok(mut tx) = bincode::deserialize::<arc_types::Transaction>(bytes) else {
         return false;
     };
+    // Cheap exits before any signature work. Every validator re-proposes and
+    // re-gossips the bodies it holds each round until one lands in a leader's
+    // block, so a pending body arrives from several peers every round. A copy
+    // whose hash is already resident here changes nothing: the mempool keeps
+    // the resident body, which was verified when it entered, and would refuse
+    // this one as a duplicate after verifying it. An executed body is history:
+    // re-admitting it is how a transaction circulated forever. Neither check
+    // can admit anything, so a forged hash can only get its own copy dropped.
+    // Checking both first spares two Ed25519 verifications and the native
+    // execution lock on the consensus loop for every redundant copy.
+    if state.receipts.contains_key(&tx.hash.0) {
+        crate::consensus_diagnostics::bump(
+            &crate::consensus_diagnostics::DIAG.stale_transactions_dropped,
+        );
+        return false;
+    }
+    if mempool.contains(&tx.hash) {
+        crate::consensus_diagnostics::bump(
+            &crate::consensus_diagnostics::DIAG.gossip_transactions_already_pending,
+        );
+        return false;
+    }
     // Gossip is an untrusted ingress boundary.
     // Verify before consuming bounded mempool
     // capacity and cache the result only in
@@ -801,14 +823,6 @@ pub(crate) fn admit_gossiped_transaction(
         // future transaction of a funded sender.
         return false;
     }
-    // Already executed: re-admitting it is how
-    // a transaction circulated forever.
-    if state.receipts.contains_key(&tx.hash.0) {
-        crate::consensus_diagnostics::bump(
-            &crate::consensus_diagnostics::DIAG.stale_transactions_dropped,
-        );
-        return false;
-    }
     admission.insert(mempool, tx)
 }
 
@@ -828,6 +842,53 @@ fn retain_unreceipted(state: &StateDB, transactions: &mut Vec<arc_types::Transac
     let before = transactions.len();
     transactions.retain(|transaction| !state.receipts.contains_key(&transaction.hash.0));
     before - transactions.len()
+}
+
+/// Deterministic protocol-v3 block selection over an ordered candidate list.
+///
+/// Each candidate is offered, in order, to one incremental
+/// [`arc_state::V3BlockAdmission`]. It is admitted exactly when the admitted
+/// prefix followed by it passes `validate_v3_block_admission`, which is what
+/// the quadratic greedy loops this replaces computed by re-validating the
+/// whole prefix, signatures included, for every candidate. Returns
+/// `(admitted, rejected)`, both in candidate order. Reads `state` only.
+fn select_v3_block_transactions(
+    state: &StateDB,
+    candidates: Vec<arc_types::Transaction>,
+) -> (Vec<arc_types::Transaction>, Vec<arc_types::Transaction>) {
+    let Ok(mut admission) = state.v3_block_admission() else {
+        return (Vec::new(), candidates);
+    };
+    let mut admitted = Vec::with_capacity(candidates.len());
+    let mut rejected = Vec::new();
+    for transaction in candidates {
+        if admission.try_push(&transaction).is_ok() {
+            admitted.push(transaction);
+        } else {
+            rejected.push(transaction);
+        }
+    }
+    (admitted, rejected)
+}
+
+/// Protocol-v3 proposal selection: never propose a transaction that would
+/// become a failed canonical history entry. Receipted or individually
+/// inadmissible envelopes are discarded. The rest are ordered as `DagBlock`
+/// commits them (lexicographically by hash, never the local FIFO attachment
+/// order peers are free to permute) and selected by
+/// [`select_v3_block_transactions`]. Returns `(proposal, deferred)`; deferred
+/// envelopes conflict only within this candidate and stay eligible for a
+/// later block.
+fn select_v3_proposal(
+    state: &StateDB,
+    mut candidates: Vec<arc_types::Transaction>,
+) -> (Vec<arc_types::Transaction>, Vec<arc_types::Transaction>) {
+    candidates.retain(|transaction| {
+        !state.receipts.contains_key(&transaction.hash.0)
+            && state.validate_v3_transaction_admission(transaction).is_ok()
+    });
+    candidates.sort_by_key(|transaction| transaction.hash.0);
+    select_v3_block_transactions(state, candidates)
 }
 
 fn verify_peer_dag_transactions_in_domain(
@@ -2282,6 +2343,27 @@ impl ConsensusManager {
                             block,
                             transactions,
                         } => {
+                            // Exact re-deliveries first. Validators re-send
+                            // their held proposals, bodies included, every
+                            // re-broadcast interval and on reconnect, even
+                            // while connected. The engine refuses a block whose
+                            // hash it already holds before looking at anything
+                            // else, and nothing on that path uses the attached
+                            // bodies, so recognise it before the availability
+                            // check. Re-verifying every attached body (two
+                            // Ed25519 checks each) of every re-delivery
+                            // dominated the consensus loop once blocks carried
+                            // hundreds of transfers.
+                            if self.engine.contains_block(&block.hash) {
+                                crate::consensus_diagnostics::bump(
+                                    &crate::consensus_diagnostics::DIAG.live_blocks_received,
+                                );
+                                crate::consensus_diagnostics::bump(
+                                    &crate::consensus_diagnostics::DIAG
+                                        .live_blocks_rejected_duplicate,
+                                );
+                                continue;
+                            }
                             // Verify peer-supplied envelopes locally before
                             // they can reach committed execution. The
                             // `sig_verified` bit is a process-local cache and
@@ -2293,11 +2375,17 @@ impl ConsensusManager {
                             // vector can finalize a block whose transactions
                             // are unavailable (or populate pending state with
                             // transactions the author never committed to).
-                            let verified = match verify_peer_dag_availability(
+                            let availability_started = std::time::Instant::now();
+                            let availability = verify_peer_dag_availability(
                                 &state,
                                 &block.transactions,
                                 &transactions,
-                            ) {
+                            );
+                            crate::consensus_diagnostics::add_elapsed(
+                                &crate::consensus_diagnostics::DIAG.live_block_availability_us,
+                                availability_started,
+                            );
+                            let verified = match availability {
                                 Ok(verified) => verified,
                                 Err(error) => {
                                     warn!(
@@ -2585,6 +2673,10 @@ impl ConsensusManager {
                             );
                         }
                         InboundMessage::Transactions(txs) => {
+                            let gossip_started = std::time::Instant::now();
+                            crate::consensus_diagnostics::DIAG
+                                .gossip_transactions_received
+                                .fetch_add(txs.len() as u64, std::sync::atomic::Ordering::Relaxed);
                             let mut inserted = 0usize;
                             for tx_bytes in txs {
                                 if admit_gossiped_transaction(
@@ -2596,6 +2688,10 @@ impl ConsensusManager {
                                     inserted += 1;
                                 }
                             }
+                            crate::consensus_diagnostics::add_elapsed(
+                                &crate::consensus_diagnostics::DIAG.gossip_admit_us,
+                                gossip_started,
+                            );
                             if inserted > 0 {
                                 debug!(count = inserted, "Inserted gossiped txs into mempool");
                             }
@@ -4126,35 +4222,21 @@ impl ConsensusManager {
                     // subset, defer candidate-local conflicts, and discard
                     // envelopes already stale against canonical state.
                     if state.active_protocol_version().major == 3 {
-                        transactions.retain(|transaction| {
-                            !state.receipts.contains_key(&transaction.hash.0)
-                                && state.validate_v3_transaction_admission(transaction).is_ok()
-                        });
-                        // DagBlock commits lexicographically sorted hashes.
-                        // Validate exactly that order, never the local FIFO
-                        // attachment order which peers are free to permute.
-                        transactions.sort_by_key(|transaction| transaction.hash.0);
-                        if state.validate_v3_block_admission(&transactions).is_err() {
-                            let mut admitted = Vec::with_capacity(transactions.len());
-                            let mut deferred = Vec::new();
-                            for transaction in transactions {
-                                let mut candidate = admitted.clone();
-                                candidate.push(transaction.clone());
-                                if state.validate_v3_block_admission(&candidate).is_ok() {
-                                    admitted.push(transaction);
-                                } else {
-                                    deferred.push(transaction);
-                                }
-                            }
-                            transactions = admitted;
-                            // Individually valid envelopes can conflict only
-                            // within this candidate (for example two spends of
-                            // one nonce). Keep the loser available until the
-                            // winning canonical state transition decides which
-                            // envelope became stale.
-                            for transaction in deferred {
-                                self.native_request_admission.insert(&mempool, transaction);
-                            }
+                        let selection_started = std::time::Instant::now();
+                        let (proposal, deferred) =
+                            select_v3_proposal(&state, std::mem::take(&mut transactions));
+                        crate::consensus_diagnostics::add_elapsed(
+                            &crate::consensus_diagnostics::DIAG.proposal_selection_us,
+                            selection_started,
+                        );
+                        transactions = proposal;
+                        // Individually valid envelopes can conflict only
+                        // within this candidate (for example two spends of
+                        // one nonce). Keep the loser available until the
+                        // winning canonical state transition decides which
+                        // envelope became stale.
+                        for transaction in deferred {
+                            self.native_request_admission.insert(&mempool, transaction);
                         }
                     }
                     let transaction_hashes: Vec<_> = transactions
@@ -4547,24 +4629,24 @@ impl ConsensusManager {
                     // deterministically omitted instead of becoming free failed
                     // receipts. The resulting subset is revalidated as one
                     // exact v3 state block before any mutation.
-                    if state.active_protocol_version().major == 3
-                        && state.validate_v3_block_admission(&committed_txs).is_err()
-                    {
-                        let original = committed_txs.len();
-                        let mut admitted = Vec::with_capacity(original);
-                        for transaction in committed_txs {
-                            let mut candidate = admitted.clone();
-                            candidate.push(transaction.clone());
-                            if state.validate_v3_block_admission(&candidate).is_ok() {
-                                admitted.push(transaction);
-                            }
-                        }
-                        committed_txs = admitted;
-                        warn!(
-                            block = %dag_block.hash,
-                            omitted = original.saturating_sub(committed_txs.len()),
-                            "Omitted state-stale v3 DAG envelopes without creating failed history"
+                    if state.active_protocol_version().major == 3 {
+                        let selection_started = std::time::Instant::now();
+                        let (admitted, omitted) = select_v3_block_transactions(
+                            &state,
+                            std::mem::take(&mut committed_txs),
                         );
+                        crate::consensus_diagnostics::add_elapsed(
+                            &crate::consensus_diagnostics::DIAG.commit_selection_us,
+                            selection_started,
+                        );
+                        committed_txs = admitted;
+                        if !omitted.is_empty() {
+                            warn!(
+                                block = %dag_block.hash,
+                                omitted = omitted.len(),
+                                "Omitted state-stale v3 DAG envelopes without creating failed history"
+                            );
+                        }
                     }
 
                     // At most one native-inference transaction per canonical
@@ -6172,6 +6254,15 @@ mod tests {
                 .is_err(),
             "the native transition must still execute alone"
         );
+        // The incremental selection keeps a native transition alone in its
+        // block in either candidate order, exactly as re-validating the whole
+        // candidate block for every transaction did.
+        for (first, second) in [(&winner, &ordinary), (&ordinary, &winner)] {
+            let (admitted, rejected) =
+                select_v3_block_transactions(&state, vec![first.clone(), second.clone()]);
+            assert_eq!(hashes_of(&admitted), vec![first.hash]);
+            assert_eq!(hashes_of(&rejected), vec![second.hash]);
+        }
         // Reproduce the observed timing: one validator has a signed finalizer
         // DAG block before canonical finalization; another receives those
         // IDENTICAL bytes afterward. Both must retain the same consensus
@@ -6522,6 +6613,331 @@ mod tests {
             )
             .is_empty()
         );
+        assert!(mempool.is_empty());
+    }
+
+    fn hashes_of(transactions: &[Transaction]) -> Vec<Hash256> {
+        transactions
+            .iter()
+            .map(|transaction| transaction.hash)
+            .collect()
+    }
+
+    fn fixture_key(label: &str) -> KeyPair {
+        KeyPair::from_ed25519_secret_bytes(&hash_bytes(label.as_bytes()).0)
+    }
+
+    /// A real recovered-v3 state: a legacy source with a six-member validator
+    /// set exported to a five-of-six signed ARCCHKPT and imported, as the
+    /// migrated native selection test above does. `funds` are prefunded in
+    /// the legacy source and survive the transition.
+    fn recovered_v3_state(
+        label: &str,
+        funds: &[(arc_types::Address, u64)],
+    ) -> (tempfile::TempDir, StateDB) {
+        use arc_state::recovery::{
+            ArcCheckpoint, RecoveryExportSpec, RecoveryImport, RecoveryNetworkPolicy,
+            RecoveryValidator,
+        };
+        use arc_types::TxBody;
+        use arc_types::transaction::JoinValidatorBody;
+
+        let directory = tempfile::tempdir().unwrap();
+        let keys: Vec<_> = (0..6)
+            .map(|index| fixture_key(&format!("{label}-validator-{index}")))
+            .collect();
+        let genesis = hash_bytes(format!("{label}-genesis").as_bytes());
+        let validators: Vec<_> = keys
+            .iter()
+            .map(|key| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: 5_000_000,
+            })
+            .collect();
+        let mut source_funds = funds.to_vec();
+        source_funds.push((
+            arc_state::recovery::recovery_stake_reserve_address(),
+            60_000_000,
+        ));
+        source_funds.extend(keys.iter().map(|key| (key.address(), 5_000_000)));
+        let source = StateDB::with_genesis(&source_funds);
+        let joins: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, 0);
+                tx.tx_type = TxType::JoinValidator;
+                tx.body = TxBody::JoinValidator(JoinValidatorBody {
+                    pubkey: key.public_key_bytes().try_into().unwrap(),
+                    initial_stake: 5_000_000,
+                });
+                tx.sign(key).unwrap();
+                tx
+            })
+            .collect();
+        let (_, receipts) = source.execute_block(&joins, keys[0].address()).unwrap();
+        assert!(receipts.iter().all(|receipt| receipt.success));
+        for key in &keys {
+            let mut account = source.get_account(&key.address()).unwrap();
+            account.staked_balance = 0;
+            source.update_account(&key.address(), account);
+        }
+        source.execute_block(&[], keys[0].address()).unwrap();
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: label.into(),
+                genesis_hash: genesis,
+                source_consensus_round: 0,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let path = directory.path().join("approved.arcchkpt");
+        checkpoint.write_to(&path).unwrap();
+        let mut members: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator.address, validator.stake))
+            .collect();
+        members.sort_by_key(|member| member.0.0);
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            directory.path().join("state"),
+            RecoveryNetworkPolicy {
+                chain_id: label.into(),
+                genesis_hash: genesis,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: members,
+                community_rewards_v1_activation_height: None,
+            },
+            Some(RecoveryImport {
+                checkpoint_path: path,
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(state.active_protocol_version().major, 3);
+        (directory, state)
+    }
+
+    fn recovered_transfer(
+        state: &StateDB,
+        key: &KeyPair,
+        recipient: arc_types::Address,
+        nonce: u64,
+    ) -> Transaction {
+        let mut tx = Transaction::new_transfer(key.address(), recipient, 1, nonce);
+        tx.fee = arc_state::V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut tx, key).unwrap();
+        tx
+    }
+
+    #[test]
+    fn v3_selection_helpers_keep_one_launch_rule_transfer_and_discard_stale_envelopes() {
+        let senders: Vec<_> = (0..4)
+            .map(|index| fixture_key(&format!("launch-selection-sender-{index}")))
+            .collect();
+        let funds: Vec<_> = senders.iter().map(|key| (key.address(), 1_000)).collect();
+        let (_directory, state) = recovered_v3_state("launch-selection", &funds);
+        let shared = hash_bytes(b"launch-selection-shared-recipient");
+        let transfers: Vec<_> = senders
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let recipient = if index < 2 {
+                    shared
+                } else {
+                    hash_bytes(format!("launch-selection-recipient-{index}").as_bytes())
+                };
+                recovered_transfer(&state, key, recipient, 0)
+            })
+            .collect();
+        let mut ordered = hashes_of(&transfers);
+        ordered.sort_by_key(|hash| hash.0);
+
+        // Under the launch rule every transfer credits the fee treasury, so
+        // the proposal keeps the first in DagBlock (hash) order and defers the
+        // rest for later blocks.
+        let (proposal, deferred) = select_v3_proposal(&state, transfers.clone());
+        assert_eq!(hashes_of(&proposal), vec![ordered[0]]);
+        assert_eq!(hashes_of(&deferred), ordered[1..].to_vec());
+        state.validate_v3_block_admission(&proposal).unwrap();
+
+        // The commit path offers the committed order as is and omits the rest.
+        let mut committed = transfers.clone();
+        committed.sort_by_key(|transaction| transaction.hash.0);
+        let (admitted, omitted) = select_v3_block_transactions(&state, committed);
+        assert_eq!(hashes_of(&admitted), vec![ordered[0]]);
+        assert_eq!(omitted.len(), transfers.len() - 1);
+
+        // Receipted and individually inadmissible envelopes are discarded by
+        // the proposal path, never deferred back into the mempool.
+        let stale_nonce = recovered_transfer(&state, &senders[0], shared, 5);
+        let (stale_proposal, stale_deferred) = select_v3_proposal(&state, vec![stale_nonce]);
+        assert!(stale_proposal.is_empty());
+        assert!(stale_deferred.is_empty());
+        let (block, receipts) = state
+            .execute_block_adaptive_at_with_proof(
+                &proposal,
+                senders[0].address(),
+                state.get_block(state.height()).unwrap().header.timestamp + 1,
+                hash_bytes(b"launch-selection-decision"),
+            )
+            .unwrap();
+        assert_eq!(block.header.tx_count, 1);
+        assert!(receipts[0].success);
+        let (receipted, receipted_deferred) = select_v3_proposal(&state, proposal);
+        assert!(receipted.is_empty());
+        assert!(receipted_deferred.is_empty());
+    }
+
+    #[test]
+    fn v3_selection_packs_disjoint_transfers_once_fee_settlement_is_active() {
+        let senders: Vec<_> = (0..502)
+            .map(|index| fixture_key(&format!("settled-selection-sender-{index}")))
+            .collect();
+        let funds: Vec<_> = senders.iter().map(|key| (key.address(), 1_000)).collect();
+        let (_directory, state) = recovered_v3_state("settled-selection", &funds);
+        state.set_v3_fee_settlement_activation_override(Some(state.height() + 1));
+        // 499 transfers to distinct recipients and three to one shared one:
+        // a full 500-transaction drain once the shared group yields one.
+        let shared = hash_bytes(b"settled-selection-shared-recipient");
+        let transfers: Vec<_> = senders
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let recipient = if index >= 499 {
+                    shared
+                } else {
+                    hash_bytes(format!("settled-selection-recipient-{index}").as_bytes())
+                };
+                recovered_transfer(&state, key, recipient, 0)
+            })
+            .collect();
+        let mut shared_group = hashes_of(&transfers[499..]);
+        shared_group.sort_by_key(|hash| hash.0);
+
+        let (proposal, deferred) = select_v3_proposal(&state, transfers);
+        assert_eq!(proposal.len(), 500, "every disjoint transfer is packed");
+        assert!(proposal.iter().any(|tx| tx.hash == shared_group[0]));
+        assert_eq!(
+            hashes_of(&deferred),
+            shared_group[1..].to_vec(),
+            "transfers to an already-credited recipient wait for a later block"
+        );
+        assert!(
+            proposal
+                .windows(2)
+                .all(|pair| pair[0].hash.0 < pair[1].hash.0),
+            "the proposal is in DagBlock (hash) order"
+        );
+
+        // The commit path admits the committed block unchanged.
+        let (admitted, omitted) = select_v3_block_transactions(&state, proposal);
+        assert_eq!(admitted.len(), 500);
+        assert!(omitted.is_empty());
+    }
+
+    #[test]
+    fn peer_dag_availability_relaxes_the_fee_treasury_only_when_scheduled() {
+        let senders: Vec<_> = (0..3)
+            .map(|index| fixture_key(&format!("scheduled-availability-sender-{index}")))
+            .collect();
+        let funds: Vec<_> = senders.iter().map(|key| (key.address(), 1_000)).collect();
+        let (_directory, state) = recovered_v3_state("scheduled-availability", &funds);
+        let disjoint = vec![
+            recovered_transfer(&state, &senders[0], hash_bytes(b"availability-a"), 0),
+            recovered_transfer(&state, &senders[1], hash_bytes(b"availability-b"), 0),
+        ];
+        let shared_recipient = hash_bytes(b"availability-shared");
+        let shared = vec![
+            recovered_transfer(&state, &senders[0], shared_recipient, 0),
+            recovered_transfer(&state, &senders[2], shared_recipient, 0),
+        ];
+        let available = |transactions: &[Transaction]| {
+            let mut hashes = hashes_of(transactions);
+            hashes.sort_by_key(|hash| hash.0);
+            verify_peer_dag_availability(&state, &hashes, transactions)
+        };
+        assert!(
+            available(&disjoint).is_err(),
+            "without a schedule the fee-treasury key still conflicts"
+        );
+
+        // A schedule relaxes peer availability at every height, so a node
+        // that lags behind the activation height keeps post-activation DAG
+        // parents instead of stalling catch-up.
+        state.set_v3_fee_settlement_activation_override(Some(state.height() + 1_000));
+        assert_eq!(available(&disjoint).unwrap().len(), 2);
+        assert!(available(&shared).is_err());
+        // Its own proposals keep the launch rule until the exact height.
+        let (proposal, deferred) = select_v3_proposal(&state, disjoint);
+        assert_eq!(proposal.len(), 1);
+        assert_eq!(deferred.len(), 1);
+    }
+
+    #[test]
+    fn gossip_skips_redundant_copies_but_keeps_retrying_drained_bodies() {
+        use crate::native_inference::NativeRequestAdmission;
+
+        let sender = fixture_key("gossip-dedup-sender");
+        let (_directory, state) = recovered_v3_state("gossip-dedup", &[(sender.address(), 1_000)]);
+        let mempool = Mempool::new(16);
+        let admission = NativeRequestAdmission::default();
+        let transfer =
+            recovered_transfer(&state, &sender, hash_bytes(b"gossip-dedup-recipient"), 0);
+        let gossip = |tx: &Transaction| {
+            admit_gossiped_transaction(
+                &state,
+                &mempool,
+                &admission,
+                &bincode::serialize(tx).unwrap(),
+            )
+        };
+        let before = crate::consensus_diagnostics::DIAG
+            .gossip_transactions_already_pending
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(gossip(&transfer), "a new valid body is admitted");
+
+        // A copy carrying the resident hash is dropped before any signature
+        // work, whatever its signature, and the verified body stays.
+        let mut forged = transfer.clone();
+        forged.signature = Signature::null();
+        assert!(!gossip(&forged));
+        assert!(!gossip(&transfer));
+        assert!(
+            crate::consensus_diagnostics::DIAG
+                .gossip_transactions_already_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= before + 2
+        );
+        let resident = mempool.drain(16);
+        assert_eq!(hashes_of(&resident), vec![transfer.hash]);
+        state.verify_transaction_signature(&resident[0]).unwrap();
+
+        // Draining it into a proposal is not execution: a peer's copy must
+        // make it proposal-eligible here again.
+        assert!(gossip(&transfer));
+        let proposal = mempool.drain(16);
+        let (_, receipts) = state
+            .execute_block_adaptive_at_with_proof(
+                &proposal,
+                sender.address(),
+                state.get_block(state.height()).unwrap().header.timestamp + 1,
+                hash_bytes(b"gossip-dedup-decision"),
+            )
+            .unwrap();
+        assert!(receipts[0].success);
+        // An executed body is never offered again.
+        assert!(!gossip(&transfer));
         assert!(mempool.is_empty());
     }
 

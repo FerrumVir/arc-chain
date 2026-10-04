@@ -1610,6 +1610,13 @@ impl ConsensusEngine {
         self.dag.get(hash).map(|r| r.value().clone())
     }
 
+    /// Whether the DAG already holds a block with this hash: exactly the
+    /// check that makes [`Self::receive_block`] refuse a `DuplicateBlock`
+    /// before it looks at anything else, without cloning the block.
+    pub fn contains_block(&self, hash: &Hash256) -> bool {
+        self.dag.contains_key(hash)
+    }
+
     /// Get all block hashes for a given round.
     pub fn blocks_in_round(&self, round: u64) -> Vec<Hash256> {
         self.rounds
@@ -4695,7 +4702,9 @@ mod tests {
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
         let block = make_block(test_addr(1), 0, vec![], vec![], 1000);
+        assert!(!engine.contains_block(&block.hash));
         engine.receive_block(&block).expect("first receive ok");
+        assert!(engine.contains_block(&block.hash));
 
         let result = engine.receive_block(&block);
         assert_eq!(result.unwrap_err(), ConsensusError::DuplicateBlock);

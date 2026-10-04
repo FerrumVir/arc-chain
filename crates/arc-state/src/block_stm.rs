@@ -27,23 +27,49 @@ fn validator_set_access_key() -> [u8; 32] {
     arc_crypto::hash_bytes(b"arc-block-stm-validator-set-v1").0
 }
 
-/// Compute the access set for a single transaction.
+/// How transfers in a block access the shared protocol-v3 fee treasury.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeeTreasuryAccess {
+    /// Launch rule: every transfer reads and writes the fee treasury itself,
+    /// so any two transfers conflict. Always used outside an active
+    /// block-level settlement, including on legacy chains.
+    PerTransaction,
+    /// Block-level settlement: transfers leave the treasury alone and the
+    /// block credits it once, after every transaction, in a deterministic
+    /// epilogue. Transfers then conflict only on their own accounts.
+    BlockEpilogue,
+}
+
+/// Compute the access set for a single transaction under the launch rule
+/// ([`FeeTreasuryAccess::PerTransaction`]).
 ///
 /// This is a *static* prediction based on the transaction body - no execution
 /// required.  It is conservative: every account that *might* be touched is
 /// included.  False positives (extra accounts) are safe; false negatives would
 /// cause silent conflicts.
 pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
+    tx_access_set_with(tx, FeeTreasuryAccess::PerTransaction)
+}
+
+/// Compute the access set for a single transaction when its block accesses
+/// the fee treasury as `fee_access` says. Only transfers differ between the
+/// two modes.
+pub fn tx_access_set_with(tx: &Transaction, fee_access: FeeTreasuryAccess) -> TxAccessSet {
     let mut accounts = HashSet::new();
     accounts.insert(tx.from.0);
 
     match &tx.body {
         TxBody::Transfer(body) => {
             accounts.insert(body.to.0);
-            // Protocol-v3 transfers all credit the fixed fee treasury. This
-            // conservative key is also safe for legacy transfers and prevents
-            // parallel lost updates when a v3 mixed block selects BlockSTM.
-            accounts.insert(crate::v3_fee_treasury_address().0);
+            // Under the launch rule protocol-v3 transfers all credit the fixed
+            // fee treasury. This conservative key is also safe for legacy
+            // transfers and prevents parallel lost updates when a v3 mixed
+            // block selects BlockSTM. With block-level settlement no
+            // transaction touches the treasury: the block epilogue credits it
+            // once, after every transaction has executed.
+            if fee_access == FeeTreasuryAccess::PerTransaction {
+                accounts.insert(crate::v3_fee_treasury_address().0);
+            }
         }
         TxBody::Settle(body) => {
             accounts.insert(body.agent_id.0);
@@ -275,12 +301,29 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
 /// **Nonce ordering constraint**: transactions from the same sender must execute
 /// in nonce order.  This is enforced by always placing same-sender txs in
 /// sequential batches (they share the sender account, so they conflict).
+///
+/// Uses the launch-rule access sets; see [`partition_batches_with`].
 pub fn partition_batches(transactions: &[Transaction]) -> Vec<Vec<usize>> {
+    partition_batches_with(transactions, FeeTreasuryAccess::PerTransaction)
+}
+
+/// [`partition_batches`] for a block whose transfers access the fee treasury
+/// as `fee_access` says. The executor must use the same mode for the
+/// transactions themselves: partitioning with
+/// [`FeeTreasuryAccess::BlockEpilogue`] while transfers still write the
+/// treasury would run conflicting writes in parallel.
+pub fn partition_batches_with(
+    transactions: &[Transaction],
+    fee_access: FeeTreasuryAccess,
+) -> Vec<Vec<usize>> {
     if transactions.is_empty() {
         return vec![];
     }
 
-    let access_sets: Vec<TxAccessSet> = transactions.iter().map(tx_access_set).collect();
+    let access_sets: Vec<TxAccessSet> = transactions
+        .iter()
+        .map(|tx| tx_access_set_with(tx, fee_access))
+        .collect();
 
     // Assign each transaction to the first wave *after* every earlier
     // transaction that touches one of the same accounts. This is deliberately
@@ -533,6 +576,73 @@ mod tests {
         assert!(tx_access_set(&first).accounts.contains(&escrow));
         assert!(tx_access_set(&second).accounts.contains(&escrow));
         assert_eq!(partition_batches(&[first, second]).len(), 2);
+    }
+
+    #[test]
+    fn block_epilogue_access_drops_only_the_fee_treasury_key() {
+        let treasury = crate::v3_fee_treasury_address().0;
+        let transfer = make_transfer(addr(1), addr(2), 0);
+        let launch = tx_access_set_with(&transfer, FeeTreasuryAccess::PerTransaction);
+        let epilogue = tx_access_set_with(&transfer, FeeTreasuryAccess::BlockEpilogue);
+        assert!(launch.accounts.contains(&treasury));
+        assert!(!epilogue.accounts.contains(&treasury));
+        let mut expected = launch.accounts.clone();
+        expected.remove(&treasury);
+        assert_eq!(epilogue.accounts, expected);
+        assert_eq!(epilogue.accounts.len(), 2, "sender and recipient remain");
+        assert_eq!(tx_access_set(&transfer).accounts, launch.accounts);
+
+        // Every other family keeps its exact access set.
+        for other in [
+            make_attestation(addr(10), 0, 1),
+            make_challenge(addr(20), hash_bytes(b"attestation")),
+            make_community_reward(addr(9), addr(10), 1),
+        ] {
+            assert_eq!(
+                tx_access_set_with(&other, FeeTreasuryAccess::BlockEpilogue).accounts,
+                tx_access_set(&other).accounts
+            );
+        }
+    }
+
+    #[test]
+    fn block_epilogue_partitions_disjoint_transfers_into_one_batch() {
+        let txs = vec![
+            make_transfer(addr(1), addr(2), 0),
+            make_transfer(addr(3), addr(4), 0),
+            make_transfer(addr(5), addr(6), 0),
+        ];
+        assert_eq!(
+            partition_batches_with(&txs, FeeTreasuryAccess::BlockEpilogue),
+            vec![vec![0, 1, 2]]
+        );
+        assert_eq!(
+            partition_batches_with(&txs, FeeTreasuryAccess::PerTransaction),
+            partition_batches(&txs)
+        );
+        assert_eq!(partition_batches(&txs).len(), 3);
+        assert!(partition_batches_with(&[], FeeTreasuryAccess::BlockEpilogue).is_empty());
+    }
+
+    #[test]
+    fn block_epilogue_partitions_keep_account_conflicts_in_canonical_order() {
+        // A->B, C->B (shared recipient), B->D (chained through B), A->E (same
+        // sender) and an unrelated F->G.
+        let txs = vec![
+            make_transfer(addr(1), addr(2), 0),
+            make_transfer(addr(3), addr(2), 0),
+            make_transfer(addr(2), addr(4), 0),
+            make_transfer(addr(1), addr(5), 1),
+            make_transfer(addr(6), addr(7), 0),
+        ];
+        assert_eq!(
+            partition_batches_with(&txs, FeeTreasuryAccess::BlockEpilogue),
+            vec![vec![0, 4], vec![1, 3], vec![2]]
+        );
+        assert!(
+            partition_batches(&txs).iter().all(|batch| batch.len() == 1),
+            "the launch rule still serializes every transfer"
+        );
     }
 }
 
