@@ -126,10 +126,12 @@ jobs:
           "$RUNNER_TEMP/actionlint" -color
 
   # ----------------------------------------------- static web contracts ----
-  # Dashboard CSS is compiled and committed so production never executes the
-  # Tailwind development CDN. Its verifier regenerates CSS and rejects drift;
-  # the contract validates JavaScript syntax, sources, safe rendering, and
-  # honest liveness semantics. Explorer remains dependency-free static HTML.
+  # Dashboard CSS is a reviewed static file, committed so production never
+  # executes the Tailwind development CDN; the dashboard has no npm
+  # dependencies. Its verifier pins the reviewed bytes and checks local fonts
+  # and tokens; the contract validates JavaScript syntax, sources, safe
+  # rendering, and honest liveness semantics. Explorer remains
+  # dependency-free static HTML.
   dashboard-contract:
     name: dashboard build + contract
     runs-on: ubuntu-latest
