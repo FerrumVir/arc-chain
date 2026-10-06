@@ -519,6 +519,15 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_community: bool,
 
+    /// Keep this computer from idle-sleeping while the community worker
+    /// computes a job, so an assignment is not lost halfway (macOS
+    /// `caffeinate`, Linux `systemd-inhibit`, Windows
+    /// `SetThreadExecutionState`). The computer can still sleep between jobs
+    /// and when its lid closes. Off by default; the desktop app passes it
+    /// only when the user turns on "Keep awake while a job runs".
+    #[arg(long, default_value_t = false)]
+    prevent_sleep_during_jobs: bool,
+
     /// Ask a seed to assign this node a layer range at boot (POST /shards/join).
     ///
     /// OFF by default, and it used to be implicit for any staked node with a
@@ -5031,6 +5040,28 @@ fn public_node_name(cli: &Cli) -> String {
     format!("arc-{}", &hex::encode(digest.0)[..8])
 }
 
+/// The label this community worker registers under on every coordinator's
+/// public scoreboard, plus why a `--node-name` nickname was not used.
+///
+/// Never derived from the hostname, user name, data directory, or any other
+/// machine metadata: see [`rpc::community_public_name`].
+fn community_registration_name(
+    worker_id: &str,
+    requested: Option<&str>,
+) -> (String, Option<&'static str>) {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (rpc::community_default_public_name(worker_id), None);
+    };
+    let public_name = rpc::community_public_name(worker_id, requested);
+    if public_name == requested {
+        return (public_name, None);
+    }
+    let reason = rpc::validate_community_nickname(requested)
+        .err()
+        .unwrap_or("nickname has the shape of another worker's default label");
+    (public_name, Some(reason))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ValidatorHttpAudience {
     target_validator: Hash256,
@@ -5347,6 +5378,19 @@ async fn post_signed_community<T: serde::Serialize>(
         .with_context(|| format!("POST authenticated community mutation to {rpc_base}{path}"))
 }
 
+/// What one coordinator answered to a community claim long-poll.
+enum ClaimPoll {
+    /// An assignment for this worker.
+    Work(String, serde_json::Value),
+    /// The long-poll ended normally without work (`no_work`).
+    Idle,
+    /// The coordinator does not know this worker: it restarted, or pruned
+    /// the registration while this machine slept.
+    NotRegistered,
+    /// No usable answer: network error, timeout, or an unexpected status.
+    Unreachable,
+}
+
 async fn decline_community_assignment(
     client: reqwest::Client,
     coordinator: String,
@@ -5412,6 +5456,8 @@ async fn decline_community_assignment(
     }
 }
 
+/// Heartbeat interval for community presence; every fourth round registers.
+const COMMUNITY_PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const COMMUNITY_SUBMIT_LATE_GRACE_SECS: u64 = 5 * 60;
 const COMMUNITY_ASSIGNMENT_CLOCK_SKEW_SECS: u64 = 60;
 const COMMUNITY_SUBMIT_BACKOFF_BASE_MS: u64 = 250;
@@ -8744,14 +8790,24 @@ async fn run_arc_node() -> Result<()> {
     }
 
     if community_networking {
-        let public_node_name_c = public_node_name(&cli);
         let worker_id = format!("0x{}", hex::encode(validator_address.0));
-        let hostname = std::process::Command::new("hostname")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Every validator serves this label on its public scoreboard. It is a
+        // validated `--node-name` nickname or `node-<short public-key hash>`,
+        // never the hostname: default computer names usually carry the
+        // owner's first name.
+        let (public_worker_name, rejected_nickname) =
+            community_registration_name(&worker_id, cli.node_name.as_deref());
+        if let Some(reason) = rejected_nickname {
+            tracing::warn!(
+                public_name = %public_worker_name,
+                reason,
+                "--node-name is not used on public community scoreboards"
+            );
+        }
+        tracing::info!(
+            public_name = %public_worker_name,
+            "community worker public name (choose a nickname with --node-name)"
+        );
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let worker_model = inference_model.as_ref().and_then(|m| {
             if !m.has_all_transformer_layers() || !m.has_canonical_i8_profile() {
@@ -8775,7 +8831,6 @@ async fn run_arc_node() -> Result<()> {
         let community_rpc_targets = community_rpc_bases.clone();
 
         let worker_id_c = worker_id.clone();
-        let hostname_c = hostname.clone();
         let platform_c = platform.clone();
         let model_name_c = worker_model.as_ref().map(|(name, _, _)| name.clone());
         let model_id_c = worker_model
@@ -8787,6 +8842,20 @@ async fn run_arc_node() -> Result<()> {
         let community_rpc_targets_c = community_rpc_targets.clone();
         let registration_keypair = validator_keypair.clone();
         let mut registration_shutdown = Some(background_admission_shutdown_rx.clone());
+        // Local status for the desktop app (GET /community/worker/status),
+        // and a wake-up the claim loop uses when a coordinator answers that
+        // it no longer knows this worker.
+        let worker_status = arc_node::community_worker::install(Arc::new(
+            arc_node::community_worker::CommunityWorkerStatus::new(
+                worker_id.clone(),
+                public_worker_name.clone(),
+                community_rpc_targets.len(),
+                cli.prevent_sleep_during_jobs,
+            ),
+        ));
+        let reregister = Arc::new(tokio::sync::Notify::new());
+        let registration_status = worker_status.clone();
+        let registration_wakeup = reregister.clone();
 
         runtime_tasks.push(tokio::spawn(async move {
             // Settle before first POST
@@ -8823,7 +8892,7 @@ async fn run_arc_node() -> Result<()> {
             };
             let register_payload = rpc::CommunityRegisterRequest {
                 worker_id: worker_id_c.clone(),
-                name: format!("{} ({})", public_node_name_c, hostname_c),
+                name: public_worker_name,
                 capabilities,
                 model: model_name_c,
                 model_id: model_id_c,
@@ -8844,9 +8913,32 @@ async fn run_arc_node() -> Result<()> {
             // Seeds are contacted CONCURRENTLY. Serially, one unreachable
             // seed's 5 s timeout delayed every seed after it, and with six
             // seeds a full round could exceed the 15 s tick.
+            //
+            // Coordinators keep the registry in memory and prune a worker
+            // after 90 s without a heartbeat, so a coordinator restart or a
+            // sleeping laptop used to leave this worker unknown (every claim
+            // answered 404) until the next registration tick, up to a minute
+            // later. Register again immediately when a heartbeat gets 404,
+            // when the claim loop reports a 404, or when the wall clock shows
+            // the machine slept.
             let mut ticks: u64 = 0;
+            let mut force_register = false;
+            let mut previous_round = std::time::SystemTime::now();
             loop {
-                let register_tick = ticks.is_multiple_of(4);
+                let now = std::time::SystemTime::now();
+                let woke_from_sleep = arc_node::community_worker::wall_clock_gap_suggests_sleep(
+                    previous_round,
+                    now,
+                    COMMUNITY_PRESENCE_INTERVAL,
+                );
+                previous_round = now;
+                if woke_from_sleep {
+                    tracing::info!(
+                        "wall clock jumped (sleep or suspend); registering again with every coordinator"
+                    );
+                }
+                let register_tick = ticks.is_multiple_of(4) || force_register || woke_from_sleep;
+                force_register = false;
                 let mut set = tokio::task::JoinSet::new();
                 for addr in &community_rpc_targets_c {
                     let client = client.clone();
@@ -8855,12 +8947,12 @@ async fn run_arc_node() -> Result<()> {
                     let heartbeat_payload = heartbeat_payload.clone();
                     let keypair = registration_keypair.clone();
                     set.spawn(async move {
-                        let response = if register_tick {
+                        let mut response = if register_tick {
                             post_signed_community(
                                 &client,
                                 &addr,
                                 rpc::COMMUNITY_REGISTER_PATH,
-                                register_payload,
+                                register_payload.clone(),
                                 &keypair,
                                 std::time::Duration::from_secs(5),
                             )
@@ -8876,30 +8968,55 @@ async fn run_arc_node() -> Result<()> {
                             )
                             .await
                         };
+                        if !register_tick
+                            && response.as_ref().is_ok_and(|response| {
+                                response.status() == reqwest::StatusCode::NOT_FOUND
+                            })
+                        {
+                            tracing::info!(
+                                seed = %addr,
+                                "coordinator no longer knows this worker; registering again"
+                            );
+                            response = post_signed_community(
+                                &client,
+                                &addr,
+                                rpc::COMMUNITY_REGISTER_PATH,
+                                register_payload,
+                                &keypair,
+                                std::time::Duration::from_secs(5),
+                            )
+                            .await;
+                        }
                         match response {
-                            Ok(response) if response.status().is_success() => {}
+                            Ok(response) if response.status().is_success() => true,
                             Ok(response) => {
                                 tracing::warn!(
                                     seed = %addr,
                                     status = %response.status(),
                                     "coordinator rejected authenticated community presence"
                                 );
+                                false
                             }
                             Err(error) => {
                                 tracing::debug!(seed = %addr, %error, "community presence POST failed");
+                                false
                             }
                         }
                     });
                 }
-                while set.join_next().await.is_some() {}
+                let mut accepted = 0usize;
+                while let Some(result) = set.join_next().await {
+                    if matches!(result, Ok(true)) {
+                        accepted += 1;
+                    }
+                }
+                registration_status.record_registration_round(accepted);
                 ticks += 1;
-                if sleep_or_runtime_shutdown(
-                    &mut registration_shutdown,
-                    std::time::Duration::from_secs(15),
-                )
-                .await
-                {
-                    return;
+                tokio::select! {
+                    biased;
+                    () = wait_for_optional_runtime_shutdown(&mut registration_shutdown) => return,
+                    () = registration_wakeup.notified() => force_register = true,
+                    () = tokio::time::sleep(COMMUNITY_PRESENCE_INTERVAL) => {}
                 }
             }
         }));
@@ -8934,8 +9051,13 @@ async fn run_arc_node() -> Result<()> {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let worker_execution_gate = native_request_admission.worker_execution_gate();
             let mut worker_shutdown = Some(background_admission_shutdown_rx.clone());
+            let status_w = worker_status.clone();
+            let reregister_w = reregister.clone();
+            let prevent_sleep_during_jobs = cli.prevent_sleep_during_jobs;
 
             runtime_tasks.push(tokio::spawn(async move {
+                use arc_node::community_worker::{JobOutcome, KeepAwake, WorkerState};
+
                 if sleep_or_runtime_shutdown(
                     &mut worker_shutdown,
                     std::time::Duration::from_secs(10),
@@ -8957,6 +9079,7 @@ async fn run_arc_node() -> Result<()> {
                     "Community inference worker started - polling for jobs"
                 );
                 let mut decline_tasks = tokio::task::JoinSet::new();
+                let mut failed_claim_rounds: u32 = 0;
                 loop {
                     while let Some(result) = decline_tasks.try_join_next() {
                         if let Err(error) = result {
@@ -9004,7 +9127,7 @@ async fn run_arc_node() -> Result<()> {
                         let target = addr.clone();
                         let keypair = worker_keypair.clone();
                         claims.spawn(async move {
-                            let response = post_signed_community(
+                            let Ok(response) = post_signed_community(
                                 &client,
                                 &target,
                                 rpc::COMMUNITY_CLAIM_WORK_PATH,
@@ -9013,25 +9136,45 @@ async fn run_arc_node() -> Result<()> {
                                 std::time::Duration::from_secs(35),
                             )
                             .await
-                            .ok()?;
-                            if !response.status().is_success() {
-                                return None;
+                            else {
+                                return ClaimPoll::Unreachable;
+                            };
+                            let status = response.status();
+                            if status == reqwest::StatusCode::NOT_FOUND {
+                                return ClaimPoll::NotRegistered;
                             }
-                            let job: serde_json::Value = response.json().await.ok()?;
+                            if !status.is_success() {
+                                return ClaimPoll::Unreachable;
+                            }
+                            let Ok(job) = response.json::<serde_json::Value>().await else {
+                                return ClaimPoll::Unreachable;
+                            };
                             if job.get("status").and_then(|s| s.as_str()) == Some("work") {
-                                Some((target, job))
+                                ClaimPoll::Work(target, job)
                             } else {
-                                None
+                                ClaimPoll::Idle
                             }
                         });
                     }
 
                     let mut claimed: Option<(String, serde_json::Value)> = None;
+                    let mut answered = false;
+                    let mut unregistered = false;
                     while let Some(res) = claims.join_next().await {
-                        if let Ok(Some(hit)) = res {
-                            claimed = Some(hit);
-                            break;
+                        match res {
+                            Ok(ClaimPoll::Work(target, job)) => {
+                                claimed = Some((target, job));
+                                break;
+                            }
+                            Ok(ClaimPoll::Idle) => answered = true,
+                            Ok(ClaimPoll::NotRegistered) => unregistered = true,
+                            Ok(ClaimPoll::Unreachable) | Err(_) => {}
                         }
+                    }
+                    if unregistered {
+                        // The registration task re-registers now instead of
+                        // at its next one-minute registration tick.
+                        reregister_w.notify_one();
                     }
                     // A request can already have consumed a remote queue item
                     // by the time its future is canceled. Keep the remaining
@@ -9044,7 +9187,7 @@ async fn run_arc_node() -> Result<()> {
                         let decline_keypair = worker_keypair.clone();
                         decline_tasks.spawn(async move {
                             while let Some(result) = claims.join_next().await {
-                                let Ok(Some((coordinator, job))) = result else {
+                                let Ok(ClaimPoll::Work(coordinator, job)) = result else {
                                     continue;
                                 };
                                 decline_community_assignment(
@@ -9083,9 +9226,34 @@ async fn run_arc_node() -> Result<()> {
 
                     {
                         let Some((winner, job)) = claimed else {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            // Long-polls that ended normally re-poll at once;
+                            // a round in which no coordinator answered backs
+                            // off instead of re-sending signed claims every
+                            // 500 ms to coordinators that are down or
+                            // unreachable (offline laptop, captive portal).
+                            failed_claim_rounds = if answered {
+                                0
+                            } else {
+                                failed_claim_rounds.saturating_add(1)
+                            };
+                            status_w.set_state(if answered {
+                                WorkerState::Polling
+                            } else {
+                                WorkerState::Reconnecting
+                            });
+                            if sleep_or_runtime_shutdown(
+                                &mut worker_shutdown,
+                                arc_node::community_worker::claim_retry_delay(failed_claim_rounds),
+                            )
+                            .await
+                            {
+                                break;
+                            }
                             continue;
                         };
+                        failed_claim_rounds = 0;
+                        status_w.set_state(WorkerState::Polling);
+                        status_w.record_claim();
                         let Some(worker_execution_permit) = worker_execution_gate.try_enter() else {
                             decline_community_assignment(
                                 client.clone(),
@@ -9096,6 +9264,7 @@ async fn run_arc_node() -> Result<()> {
                                 "worker is quiescing for desktop update",
                             )
                             .await;
+                            status_w.record_outcome(JobOutcome::Declined);
                             continue;
                         };
 
@@ -9119,6 +9288,7 @@ async fn run_arc_node() -> Result<()> {
                                 seed = %winner,
                                 "coordinator returned a community assignment without a job_id"
                             );
+                            status_w.record_outcome(JobOutcome::Declined);
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue;
                         }
@@ -9247,6 +9417,7 @@ async fn run_arc_node() -> Result<()> {
                                 std::time::Duration::from_secs(10),
                             )
                             .await;
+                            status_w.record_outcome(JobOutcome::Declined);
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue;
                         }
@@ -9323,11 +9494,17 @@ async fn run_arc_node() -> Result<()> {
                                 submission_deadline,
                             )
                             .await;
+                            status_w.record_outcome(JobOutcome::Declined);
                             continue;
                         }
                         let worker_execution_for_compute = worker_execution_permit.clone();
+                        status_w.set_state(WorkerState::Computing);
                         let inference = tokio::task::spawn_blocking(move || {
                             let _worker_execution_permit = worker_execution_for_compute;
+                            // Created and dropped on this compute thread (the
+                            // Windows request is per thread). Inert unless
+                            // --prevent-sleep-during-jobs was given.
+                            let _keep_awake = KeepAwake::begin(prevent_sleep_during_jobs);
                             // The fallible model API is authoritative at this
                             // untrusted boundary. It performs checked context
                             // admission immediately before allocating KV state;
@@ -9353,6 +9530,7 @@ async fn run_arc_node() -> Result<()> {
                             Ok::<_, String>((generated, hash, output_text))
                         })
                         .await;
+                        status_w.set_state(WorkerState::Polling);
                         let (generated, hash, output_text) = match inference {
                             Ok(Ok(result)) => result,
                             Ok(Err(error)) => {
@@ -9384,6 +9562,7 @@ async fn run_arc_node() -> Result<()> {
                                     submission_deadline,
                                 )
                                 .await;
+                                status_w.record_outcome(JobOutcome::Failed);
                                 continue;
                             }
                             Err(error) => {
@@ -9415,6 +9594,7 @@ async fn run_arc_node() -> Result<()> {
                                     submission_deadline,
                                 )
                                 .await;
+                                status_w.record_outcome(JobOutcome::Failed);
                                 continue;
                             }
                         };
@@ -9521,6 +9701,17 @@ async fn run_arc_node() -> Result<()> {
                             submission_deadline,
                         )
                         .await;
+                        status_w.record_outcome(match &submit_outcome {
+                            CommunitySubmitOutcome::Accepted { body } => JobOutcome::Completed {
+                                verified:
+                                    arc_node::community_worker::submit_response_is_quorum_verified(
+                                        body,
+                                    ),
+                            },
+                            CommunitySubmitOutcome::Rejected { .. }
+                            | CommunitySubmitOutcome::DeadlineExceeded
+                            | CommunitySubmitOutcome::LocalError => JobOutcome::Failed,
+                        });
 
                         // If a terminal response reports invalid_nonce, force
                         // a chain re-query before building the next immutable
@@ -9707,6 +9898,61 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn community_registration_name_is_a_nickname_or_public_key_hash_never_a_hostname() {
+        let keypair = arc_crypto::KeyPair::generate_ed25519();
+        let worker_id = format!("0x{}", keypair.address().to_hex());
+        let default_name = format!("node-{}", &keypair.address().to_hex()[..8]);
+
+        // No --node-name: the default is `node-` plus a short hash of the
+        // worker public key (its address), with no machine metadata at all.
+        assert_eq!(
+            community_registration_name(&worker_id, None),
+            (default_name.clone(), None)
+        );
+        assert_eq!(
+            community_registration_name(&worker_id, Some("   ")),
+            (default_name.clone(), None)
+        );
+
+        // A valid nickname is used verbatim (trimmed).
+        assert_eq!(
+            community_registration_name(&worker_id, Some(" basement rig 2 ")),
+            ("basement rig 2".to_string(), None)
+        );
+        assert_eq!(
+            community_registration_name(
+                &worker_id,
+                Some("github-linux-x86_64-community-verification")
+            ),
+            (
+                "github-linux-x86_64-community-verification".to_string(),
+                None
+            )
+        );
+
+        // Hostname-shaped or unsafe nicknames fall back with a stated reason.
+        for rejected in [
+            "Adas-MacBook-Pro.local",
+            "Adas-MacBook-Pro",
+            "DESKTOP-1A2B3C4",
+            "ada (Adas-MacBook-Pro.local)",
+            "<b>ada</b>",
+            "node-00000000",
+        ] {
+            let (name, reason) = community_registration_name(&worker_id, Some(rejected));
+            assert_eq!(name, default_name, "{rejected} must not be published");
+            assert!(
+                reason.is_some(),
+                "{rejected} must explain why it was refused"
+            );
+        }
+
+        // The worker's own default label is accepted as an explicit nickname.
+        let explicit_default = community_registration_name(&worker_id, Some(&*default_name));
+        assert_eq!(explicit_default, (default_name, None));
+    }
 
     #[test]
     fn community_audience_accepts_live_0x_prefixed_network_info() {

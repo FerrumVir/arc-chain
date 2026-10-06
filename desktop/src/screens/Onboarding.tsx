@@ -14,6 +14,7 @@ import {
 import clsx from "clsx";
 import { useAppStore } from "../lib/store";
 import { api, isTauri } from "../lib/tauri";
+import { modelDownloadStatus } from "../lib/format";
 import { LogoMark, Tagline } from "../components/Logo";
 import {
   DEFAULT_NODE_CONFIG,
@@ -174,10 +175,13 @@ export function Onboarding() {
       //    role + modelPath set makes the node eligible to advertise an exact,
       //    fully loaded artifact. It does not promise assignment or payment.
       //    No model means observer/router mode with no local model execution.
+      //    Choosing the model here is the user's explicit consent to run ARC
+      //    jobs on this computer; choosing observer mode is an explicit no.
       const config: NodeConfig = {
         ...DEFAULT_NODE_CONFIG,
         role: modelPath ? "worker" : "observer",
         modelPath,
+        computeConsent: modelPath !== null,
       };
       setStoreConfig(config);
 
@@ -789,18 +793,9 @@ export function Onboarding() {
                       ? "We'll download the node binary and start an observer/router without local model execution. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards."
                       : "We'll fetch the selected model, download the node binary, and start the process. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards.")}
                   {launching && launchStage === "model" && modelProgress && (
-                    <>
-                      {formatBytes(modelProgress.downloadedBytes)} of{" "}
-                      {formatBytes(modelProgress.totalBytes)} (
-                      {modelProgress.totalBytes > 0
-                        ? Math.floor(
-                            (modelProgress.downloadedBytes /
-                              modelProgress.totalBytes) *
-                              100,
-                          )
-                        : 0}
-                      %) — Hugging Face is fast, this is the bulk of the wait.
-                    </>
+                    <span data-testid="model-download-status">
+                      {modelDownloadStatus(modelProgress)}
+                    </span>
                   )}
                   {launching &&
                     launchStage === "model" &&

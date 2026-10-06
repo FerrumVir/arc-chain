@@ -2,6 +2,7 @@ mod auto_update;
 mod commands;
 mod hardware;
 mod identity;
+mod legacy_upgrade;
 mod native_paid;
 mod node_manager;
 mod paths;
@@ -293,6 +294,7 @@ pub fn run() {
                 Ok(None) => loaded_store.protect_legacy_v07_data(),
                 Err(error) => Err(error),
             };
+            let migration_created_notice = matches!(migration_result, Ok(Some(_)));
             let (
                 migration_allows_autostart,
                 migration_failure_reason,
@@ -335,6 +337,35 @@ pub fn run() {
                     )
                 }
             };
+            // A v0.7 install that reached this build (normally through the
+            // v0.7 legacy bridge release) is asked once whether to keep
+            // contributing compute. Until it answers, it auto-starts as an
+            // observer without a model: no compute without consent.
+            let v07_origin = legacy_upgrade::detect_v07_origin(
+                migration_created_notice,
+                &paths::home_dir(),
+            );
+            if let Some(config) = loaded_store.config.as_mut() {
+                match legacy_upgrade::hold_until_answered(
+                    config,
+                    &resolved,
+                    v07_origin,
+                    legacy_upgrade::now_unix_ms(),
+                ) {
+                    Ok(true) => {
+                        tracing::warn!(
+                            "upgraded from v0.7: compute contribution is held until the user answers the first-launch question"
+                        );
+                        if let Err(error) = loaded_store.save_to(&resolved) {
+                            tracing::error!(%error, "could not persist the held observer config");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "could not record the v0.7 upgrade compute question");
+                    }
+                }
+            }
             let autostart_desired = loaded_store
                 .config
                 .as_ref()
@@ -611,6 +642,12 @@ pub fn run() {
                     match outcome {
                         Ok(()) => {
                             tracing::info!("auto-started arc-node on launch");
+                            // A user who opted in to contributing compute but
+                            // is not a worker yet (an interrupted model
+                            // download, or consent given while offline) is
+                            // finished here, so the install takes jobs without
+                            // another click. No-op without consent.
+                            commands::promote_consented_install_on_startup(&handle, &state).await;
                             break;
                         }
                         Err(error) if error.is_transient() => {
@@ -676,6 +713,8 @@ pub fn run() {
             commands::load_config,
             commands::load_data_migration_notice,
             commands::dismiss_data_migration_notice,
+            legacy_upgrade::load_legacy_compute_question,
+            legacy_upgrade::answer_legacy_compute_question,
             commands::start_node,
             commands::stop_node,
             commands::prepare_update_relaunch,
@@ -692,6 +731,10 @@ pub fn run() {
             commands::fetch_reward_economics,
             commands::fetch_earnings_projection,
             commands::fetch_node_contribution,
+            commands::fetch_worker_status,
+            commands::set_compute_contribution,
+            commands::promote_consented_install,
+            commands::set_prevent_sleep_during_jobs,
             commands::fetch_network_overview,
             commands::fetch_recent_blocks,
             commands::fetch_block_txs,

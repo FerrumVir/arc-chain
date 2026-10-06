@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Loader2, Sparkles, X } from "lucide-react";
 import { api, isTauri } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
+import { modelDownloadStatus } from "../lib/format";
 import type {
   ModelDownloadProgress,
   ModelTierInfo,
@@ -100,10 +101,14 @@ export function ObserverUpgradeBanner() {
       const existing = await api.existingModelForTier(selectedTier);
       const modelPath = existing ?? (await api.downloadModel(selectedTier));
 
+      // Clicking "Download & enable worker mode" is the user's explicit
+      // consent to contribute compute; record it so later launches finish
+      // or keep worker mode without asking again.
       const updated: NodeConfig = {
         ...config,
         role: "worker",
         modelPath,
+        computeConsent: true,
       };
       await api.saveConfig(updated);
       setStoreConfig(updated);
@@ -344,7 +349,7 @@ export function ObserverUpgradeBanner() {
                   }}
                 >
                   {stage === "downloading" && progress
-                    ? `${formatBytes(progress.downloadedBytes)} of ${formatBytes(progress.totalBytes)} (${progress.totalBytes > 0 ? Math.floor((progress.downloadedBytes / progress.totalBytes) * 100) : 0}%)`
+                    ? modelDownloadStatus(progress)
                     : stage === "downloading"
                       ? "Connecting to Hugging Face..."
                       : "arc-node is reloading with --model and --community-mode."}

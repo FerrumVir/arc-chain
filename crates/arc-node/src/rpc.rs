@@ -730,7 +730,9 @@ pub struct ShardInfo {
 pub struct CommunityWorker {
     /// Self-chosen worker ID (hex of validator pubkey or a uuid).
     pub worker_id: String,
-    /// Operator-friendly name (hostname, city, whatever).
+    /// Public display label, as produced by [`community_public_name`]: a
+    /// validated operator-chosen nickname, otherwise `node-` plus a short hash
+    /// of the worker's public key. Never a hostname or other machine metadata.
     pub name: String,
     /// What this worker can do. For now: just "inference".
     pub capabilities: Vec<String>,
@@ -780,6 +782,135 @@ const COMMUNITY_WORKER_PLATFORM_MAX_BYTES: usize = 64;
 const COMMUNITY_WORKER_MODEL_MAX_BYTES: usize = 128;
 const COMMUNITY_WORKER_CAPABILITIES_MAX: usize = 16;
 const COMMUNITY_WORKER_CAPABILITY_MAX_BYTES: usize = 32;
+
+/// Longest operator-chosen nickname shown on public worker scoreboards.
+pub const COMMUNITY_NICKNAME_MAX_BYTES: usize = 48;
+
+/// Hex characters of the worker address shown in the default public label.
+const COMMUNITY_DEFAULT_NAME_HEX_CHARS: usize = 8;
+
+/// The privacy-safe default public label for a community worker: `node-`
+/// plus the first eight hex characters of its address. A worker's address is
+/// the BLAKE3 hash of its public key, so the label is a short hash of the
+/// public key, stable for the life of the key, and lets an operator find
+/// their own row by address prefix. It is never derived from the hostname,
+/// user name, data directory, or any other machine metadata.
+pub fn community_default_public_name(worker_id: &str) -> String {
+    let trimmed = worker_id.trim();
+    let bare = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    let digest_hex = match Hash256::from_hex(bare) {
+        Ok(address) => address.to_hex(),
+        // Non-address IDs only exist in legacy or test registrations. Hash
+        // them so the label still reveals nothing beyond the ID itself.
+        Err(_) => arc_crypto::hash_bytes(trimmed.as_bytes()).to_hex(),
+    };
+    format!("node-{}", &digest_hex[..COMMUNITY_DEFAULT_NAME_HEX_CHARS])
+}
+
+/// Accept an operator-chosen nickname for public display, or say why not.
+///
+/// A nickname is 1-48 ASCII letters, digits, spaces, `-` or `_`, starting and
+/// ending with a letter or digit. The narrow alphabet keeps markup, control,
+/// bidi-override, and look-alike characters off every validator's public
+/// scoreboard, and excludes the `.` and `(` of the legacy `name (hostname)`
+/// registrations. Names shaped like an operating system's default computer
+/// name are refused as well, because a person's first name is usually part
+/// of one ("Ada's MacBook Pro" becomes `Adas-MacBook-Pro`).
+pub fn validate_community_nickname(nickname: &str) -> Result<(), &'static str> {
+    if nickname.is_empty() {
+        return Err("nickname is empty");
+    }
+    if nickname.len() > COMMUNITY_NICKNAME_MAX_BYTES {
+        return Err("nickname is longer than 48 characters");
+    }
+    let bytes = nickname.as_bytes();
+    if !bytes
+        .iter()
+        .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_'))
+    {
+        return Err("nickname may contain only ASCII letters, digits, spaces, '-' and '_'");
+    }
+    if !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err("nickname must start and end with a letter or digit");
+    }
+    if looks_like_default_computer_name(nickname) {
+        return Err("nickname looks like a computer's default hostname");
+    }
+    Ok(())
+}
+
+/// Default computer names that operating systems derive from the owner's
+/// name or that identify a specific machine: Apple's `<Name>s-MacBook-Pro`,
+/// `<Name>s-MBP`, `<Name>s-iMac`, `<Name>s-Mac-mini`; Windows' random
+/// `DESKTOP-XXXXXXX` / `LAPTOP-XXXXXXXX` and the older `<NAME>-PC`.
+fn looks_like_default_computer_name(nickname: &str) -> bool {
+    const DEVICE_TOKENS: &[&str] = &[
+        "macbook",
+        "macbookpro",
+        "macbookair",
+        "imac",
+        "imacpro",
+        "macmini",
+        "macstudio",
+        "macpro",
+        "mbp",
+        "mba",
+        "localhost",
+    ];
+    let lower = nickname.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.iter().any(|token| DEVICE_TOKENS.contains(token)) {
+        return true;
+    }
+    if tokens
+        .windows(2)
+        .any(|pair| pair[0] == "mac" && matches!(pair[1], "mini" | "studio" | "pro"))
+    {
+        return true;
+    }
+    if tokens.len() == 2
+        && matches!(tokens[0], "desktop" | "laptop")
+        && (7..=8).contains(&tokens[1].len())
+    {
+        return true;
+    }
+    tokens.len() >= 2 && tokens.last() == Some(&"pc")
+}
+
+/// The label a community worker is shown under on every public surface.
+///
+/// Returns the requested nickname when [`validate_community_nickname`]
+/// accepts it, and the worker's [`community_default_public_name`] otherwise.
+/// A nickname shaped like a default label (`node-` plus eight hex characters)
+/// is kept only when it is this worker's own default, so one worker cannot
+/// impersonate another's row.
+///
+/// Validators apply this when a worker registers and again whenever the
+/// registry is served, so a name stored before this rule existed (for example
+/// `arc-1a2b3c4d (Adas-MacBook-Pro.local)`) is never published.
+pub fn community_public_name(worker_id: &str, requested: &str) -> String {
+    let default_name = community_default_public_name(worker_id);
+    let nickname = requested.trim();
+    if validate_community_nickname(nickname).is_err() {
+        return default_name;
+    }
+    let reserved_shape = nickname.strip_prefix("node-").is_some_and(|suffix| {
+        suffix.len() == COMMUNITY_DEFAULT_NAME_HEX_CHARS
+            && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    if reserved_shape && !nickname.eq_ignore_ascii_case(&default_name) {
+        return default_name;
+    }
+    nickname.to_string()
+}
 
 /// Time a shard registry entry is considered fresh. Entries older than this
 /// are dropped at read time. Must be greater than the shard announcement
@@ -2342,6 +2473,12 @@ pub async fn serve(
                 .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
         )
         .route("/community/list", get(community_list))
+        // This node's own community worker: state and job counters for the
+        // desktop app. Validators run no worker and answer 404.
+        .route(
+            crate::community_worker::COMMUNITY_WORKER_STATUS_PATH,
+            get(community_worker_status),
+        )
         // Community inference work dispatch (long-poll claim + submit)
         .route(
             COMMUNITY_CLAIM_WORK_PATH,
@@ -8246,7 +8383,9 @@ async fn workers_scoreboard(
         };
         rows.push(WorkerScore {
             worker_id: w.worker_id.clone(),
-            name: w.name.clone(),
+            // Re-derived on every read: a label stored before this rule (a
+            // legacy `name (hostname)` registration) must never be served.
+            name: community_public_name(&w.worker_id, &w.name),
             platform: w.platform.clone(),
             capabilities: w.capabilities.clone(),
             model: w.model.clone(),
@@ -13180,7 +13319,9 @@ async fn community_register(
 
     let worker = CommunityWorker {
         worker_id: req.worker_id.clone(),
-        name: req.name,
+        // Older workers append the machine hostname, which usually carries the
+        // owner's first name. Store only the privacy-safe public label.
+        name: community_public_name(&req.worker_id, &req.name),
         capabilities,
         model,
         model_id,
@@ -13249,6 +13390,21 @@ async fn community_heartbeat(
     }
 }
 
+/// GET /community/worker/status
+/// This node's own community worker: whether it is polling or computing, how
+/// many coordinators accepted its last registration, and the jobs it claimed,
+/// completed, and had quorum-verified since the process started. Local
+/// observations for the desktop app, not chain or reward evidence.
+async fn community_worker_status()
+-> Result<Json<crate::community_worker::CommunityWorkerSnapshot>, (StatusCode, String)> {
+    crate::community_worker::installed()
+        .map(|status| Json(status.snapshot()))
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "this node is not running a community worker".to_string(),
+        ))
+}
+
 /// GET /community/list
 /// Returns all fresh community workers. Entries older than
 /// COMMUNITY_WORKER_TTL_SECS are pruned at read time. The dashboard
@@ -13262,7 +13418,9 @@ async fn community_list(AxumState(node): AxumState<NodeState>) -> Json<serde_jso
     for entry in node.community_workers.iter() {
         let (w, ts) = entry.value();
         if now.duration_since(*ts) <= ttl {
-            live.push(w.clone());
+            let mut public = w.clone();
+            public.name = community_public_name(&w.worker_id, &w.name);
+            live.push(public);
         } else {
             expired.push(entry.key().clone());
         }
@@ -22030,6 +22188,200 @@ mod tests {
             "peer connectivity must never masquerade as worker registration"
         );
         assert!(!node.community_workers.contains_key("expired-worker"));
+    }
+
+    #[test]
+    fn community_default_public_name_is_a_short_public_key_hash() {
+        let keypair = arc_crypto::KeyPair::generate_ed25519();
+        let address_hex = keypair.address().to_hex();
+        let worker_id = format!("0x{address_hex}");
+        assert_eq!(
+            community_default_public_name(&worker_id),
+            format!("node-{}", &address_hex[..8])
+        );
+        // Stable for the key, whatever the case or prefix of the ID.
+        assert_eq!(
+            community_default_public_name(&address_hex.to_ascii_uppercase()),
+            community_default_public_name(&worker_id)
+        );
+        // Non-address legacy IDs still get an opaque, well-formed label.
+        let legacy = community_default_public_name("fast_reliable");
+        assert_eq!(legacy.len(), "node-".len() + 8, "{legacy}");
+        assert!(legacy.starts_with("node-"));
+        assert!(legacy[5..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn community_public_name_redacts_legacy_hostname_registrations() {
+        let worker_id = format!("0x{}", "c4".repeat(32));
+        // v0.8.10 and earlier registered `<label> (<hostname>)`.
+        for legacy in [
+            "arc-1a2b3c4d (Adas-MacBook-Pro.local)",
+            "arc-1a2b3c4d (DESKTOP-1A2B3C4)",
+            "arc-1a2b3c4d (ada-ThinkPad-X1-Carbon)",
+            "github-linux-x86_64-community-verification (fv-az123-456)",
+            "LAX (vultr-lax-1)",
+        ] {
+            assert_eq!(
+                community_public_name(&worker_id, legacy),
+                "node-c4c4c4c4",
+                "{legacy} must not be published"
+            );
+        }
+    }
+
+    #[test]
+    fn community_nicknames_keep_safe_labels_and_refuse_the_rest() {
+        let worker_id = format!("0x{}", "5e".repeat(32));
+        let longest = "n".repeat(COMMUNITY_NICKNAME_MAX_BYTES);
+        let too_long = "n".repeat(COMMUNITY_NICKNAME_MAX_BYTES + 1);
+        for accepted in [
+            "basement rig 2",
+            "A",
+            "rig_01",
+            "github-linux-x86_64-community-verification",
+            // Its own default label is not an impersonation.
+            "node-5e5e5e5e",
+            longest.as_str(),
+        ] {
+            assert_eq!(
+                community_public_name(&worker_id, accepted),
+                accepted,
+                "{accepted} is a safe nickname"
+            );
+        }
+        assert_eq!(community_public_name(&worker_id, "  rig 7  "), "rig 7");
+        for refused in [
+            "",
+            "   ",
+            "-rig",
+            "rig-",
+            "rig.local",
+            "ada@home",
+            "ada's rig",
+            "<b>rig</b>",
+            "rig\u{202e}gnp",
+            "r\u{00e9}seau",
+            "tab\there",
+            "line\nbreak",
+            too_long.as_str(),
+            "Adas-MacBook-Pro",
+            "adas-mbp",
+            "Adas MacBook Air",
+            "adas-imac",
+            "adas mac mini",
+            "DESKTOP-1A2B3C4",
+            "LAPTOP-ABCD1234",
+            "ADA-PC",
+            "localhost",
+            // Another worker's default label.
+            "node-deadbeef",
+        ] {
+            assert_eq!(
+                community_public_name(&worker_id, refused),
+                "node-5e5e5e5e",
+                "{refused:?} must fall back to the default label"
+            );
+        }
+        assert!(
+            validate_community_nickname("Adas-MacBook-Pro")
+                .unwrap_err()
+                .contains("hostname")
+        );
+    }
+
+    #[tokio::test]
+    async fn community_register_stores_only_a_privacy_safe_public_name() {
+        let keypair = arc_crypto::KeyPair::generate_ed25519();
+        let mut legacy = community_register_payload(&keypair);
+        legacy.name = "arc-1a2b3c4d (Adas-MacBook-Pro.local)".to_string();
+        let worker_id = legacy.worker_id.clone();
+        let node = fake_node_with_workers(Vec::new());
+
+        let signed = sign_community_request(COMMUNITY_REGISTER_PATH, legacy, &keypair).unwrap();
+        let response = community_register_signed(AxumState(node.clone()), Json(signed))
+            .await
+            .expect("a legacy name is redacted, not rejected");
+        assert_eq!(response.0["worker_id"], worker_id);
+        let stored = node
+            .community_workers
+            .get(&worker_id)
+            .unwrap()
+            .0
+            .name
+            .clone();
+        assert_eq!(stored, format!("node-{}", &keypair.address().to_hex()[..8]));
+
+        let mut renamed = community_register_payload(&keypair);
+        renamed.name = "basement rig".to_string();
+        let signed = sign_community_request(COMMUNITY_REGISTER_PATH, renamed, &keypair).unwrap();
+        let response = community_register_signed(AxumState(node.clone()), Json(signed))
+            .await
+            .expect("a valid nickname re-registers");
+        assert_eq!(response.0["worker_id"], worker_id);
+        let stored = node
+            .community_workers
+            .get(&worker_id)
+            .unwrap()
+            .0
+            .name
+            .clone();
+        assert_eq!(stored, "basement rig");
+    }
+
+    #[tokio::test]
+    async fn scoreboard_and_list_never_serve_hostnames_stored_before_the_upgrade() {
+        let now = std::time::Instant::now();
+        let legacy_id = format!("0x{}", "7a".repeat(32));
+        let mut legacy = worker(&legacy_id, &["inference"]);
+        legacy.name = "arc-1a2b3c4d (Adas-MacBook-Pro.local)".to_string();
+        let mut nicknamed = worker("nicknamed-worker", &["inference"]);
+        nicknamed.name = "basement rig".to_string();
+        let node = fake_node_with_workers(vec![(legacy, now), (nicknamed, now)]);
+
+        let board = workers_scoreboard(AxumState(node.clone()), Query(HashMap::new()))
+            .await
+            .0;
+        let listed = community_list(AxumState(node.clone())).await.0;
+        for rows in [&board["workers"], &listed["workers"]] {
+            let names: HashMap<&str, &str> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row["worker_id"].as_str().unwrap(),
+                        row["name"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(names.len(), 2);
+            assert_eq!(names[legacy_id.as_str()], "node-7a7a7a7a");
+            assert_eq!(names["nicknamed-worker"], "basement rig");
+        }
+        let served = format!("{board}{listed}");
+        assert!(!served.contains("MacBook") && !served.contains("Adas"));
+    }
+
+    #[tokio::test]
+    async fn worker_status_route_serves_this_process_worker() {
+        // The only test in this binary that installs the process-wide status.
+        let status = crate::community_worker::install(Arc::new(
+            crate::community_worker::CommunityWorkerStatus::new(
+                "0xworker",
+                "node-worker",
+                6,
+                false,
+            ),
+        ));
+        status.record_claim();
+        status.record_outcome(crate::community_worker::JobOutcome::Completed { verified: true });
+
+        let Json(served) = community_worker_status()
+            .await
+            .expect("an installed worker is served");
+        assert_eq!(served, status.snapshot());
+        assert!(served.jobs_completed >= 1 && served.jobs_verified >= 1);
     }
 
     #[test]

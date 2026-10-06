@@ -399,6 +399,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-legacy-bridge"
+version = "0.7.12"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "arc-mempool"
 version = "0.8.10"
 dependencies = [
