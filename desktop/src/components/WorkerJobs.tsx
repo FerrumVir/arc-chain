@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { Card, CardHeader } from "./Card";
 import { Skeleton } from "./Skeleton";
 import { api } from "../lib/tauri";
@@ -32,12 +33,33 @@ function count(value: number | null): string {
  */
 export function WorkerJobsCard() {
   const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
   const contributing = computeContributionEnabled(config);
   const { data: status } = useQuery({
     queryKey: ["worker-status"],
     queryFn: api.fetchWorkerStatus,
     refetchInterval: 5000,
   });
+
+  // The app can finish enabling contribution in the background (after an
+  // interrupted download, at launch). When the node reports a worker this
+  // screen does not know about yet, reload the saved config so the observer
+  // banner and Settings catch up.
+  const workerUnknownToUi =
+    status?.running === true && !(config?.role === "worker" && config.modelPath);
+  useEffect(() => {
+    if (!workerUnknownToUi) return;
+    let active = true;
+    api
+      .loadConfig()
+      .then((saved) => {
+        if (active && saved) setConfig(saved);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [workerUnknownToUi, setConfig]);
 
   return (
     <Card style={{ marginBottom: "var(--space-6)" }} data-testid="worker-jobs">
