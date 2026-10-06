@@ -2167,6 +2167,21 @@ impl NodeManager {
                 cmd.arg("--community-rpc-url").arg(origin);
             }
         }
+        if keep_awake_during_jobs_requested(config) {
+            // Probed like --threads: an unknown flag is a hard clap failure,
+            // and a node that will not start is worse than one that may sleep.
+            if binary_supports_flag(&binary, "--prevent-sleep-during-jobs") {
+                cmd.arg("--prevent-sleep-during-jobs");
+            } else {
+                push_log(
+                    &self.logs,
+                    "warn",
+                    "this arc-node cannot keep the computer awake during jobs; update arc-node to use that setting"
+                        .to_string(),
+                )
+                .await;
+            }
+        }
 
         if let Some(model) = &config.model_path {
             cmd.arg("--model").arg(model);
@@ -3095,6 +3110,14 @@ fn request_graceful_stop(
     _shutdown_control: Option<&DesktopShutdownControl>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("this platform exposes no supported graceful process signal")
+}
+
+/// Whether to start the node with `--prevent-sleep-during-jobs`: only a
+/// worker computes jobs, and only a user who turned the setting on.
+fn keep_awake_during_jobs_requested(config: &NodeConfig) -> bool {
+    config.role == "worker"
+        && config.model_path.is_some()
+        && config.prevent_sleep_during_jobs == Some(true)
 }
 
 async fn push_log(logs: &Arc<Mutex<VecDeque<LogEntry>>>, level: &str, message: String) {
@@ -6828,5 +6851,38 @@ mod tests {
         }
         let _ = unrelated.wait();
         result.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod keep_awake_flag_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_worker_whose_user_turned_it_on_keeps_the_computer_awake() {
+        let worker = NodeConfig {
+            role: "worker".into(),
+            model_path: Some("/m.gguf".into()),
+            ..NodeConfig::default()
+        };
+        assert!(
+            !keep_awake_during_jobs_requested(&worker),
+            "off unless the user turned it on"
+        );
+        let on = NodeConfig {
+            prevent_sleep_during_jobs: Some(true),
+            ..worker
+        };
+        assert!(keep_awake_during_jobs_requested(&on));
+        let observer = NodeConfig {
+            role: "observer".into(),
+            ..on.clone()
+        };
+        assert!(!keep_awake_during_jobs_requested(&observer));
+        let no_model = NodeConfig {
+            model_path: None,
+            ..on
+        };
+        assert!(!keep_awake_during_jobs_requested(&no_model));
     }
 }
