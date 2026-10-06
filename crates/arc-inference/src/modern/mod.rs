@@ -21,6 +21,7 @@ pub mod convert;
 pub mod model;
 pub mod package;
 pub mod safetensors;
+pub mod serving;
 pub mod tables;
 
 /// Arithmetic profile implemented by this module.
