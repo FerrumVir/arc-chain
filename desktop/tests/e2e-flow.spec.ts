@@ -253,6 +253,21 @@ test.describe("Gatekeeper + first-run docs are shipped", () => {
     expect(text).toMatch(/smartscreen/i);
     expect(text).toMatch(/linux/i);
   });
+
+  test("both macOS guides use Open Anyway for macOS 15, where right-click → Open is gone", () => {
+    const guides = [
+      path.resolve(REPO_DESKTOP, "FIRST-RUN.md"),
+      path.resolve(REPO_DESKTOP, "..", "docs", "GETTING_STARTED.md"),
+    ];
+    for (const guide of guides) {
+      const text = fs.readFileSync(guide, "utf8");
+      expect(text, guide).toMatch(/macOS 15 Sequoia/);
+      expect(text, guide).toMatch(/System Settings\*\* → \*\*Privacy &\s+Security/);
+      expect(text, guide).toMatch(/\*\*Open Anyway\*\*/);
+      // Right-click → Open is described only as the macOS 14-and-earlier path.
+      expect(text, guide).toMatch(/macOS 14 Sonoma and earlier/);
+    }
+  });
 });
 
 test.describe("Bundled testnet resources", () => {

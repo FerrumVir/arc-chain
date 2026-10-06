@@ -24,17 +24,24 @@ earned token. Reading time: ~5 minutes. Hands-on time: ~3 minutes.
 2. Drag **ARC Node** into your Applications folder.
 3. Eject the `.dmg`.
 4. Open **Applications → ARC Node** for the first time.
-5. macOS will say *"ARC Node can't be opened because it is from an unidentified developer."* That's normal for early releases.
-   - **Right-click** ARC Node in Applications.
-   - Choose **Open** from the context menu.
-   - Click **Open** in the dialog that appears.
-   - You only do this once. After the first launch, double-clicking works normally.
+5. macOS blocks the first launch because early releases are not notarized by
+   Apple. Approve it once; after that, double-clicking works normally.
+   - **macOS 15 Sequoia and later:** macOS says *"ARC Node" Not Opened*. Click
+     **Done**, then open Apple menu → **System Settings** → **Privacy &
+     Security**, scroll to **Security**, and click **Open Anyway** next to
+     *"ARC Node" was blocked to protect your Mac*. Enter your login password,
+     then click **Open Anyway** in the dialog that follows. The button appears
+     for about an hour after the blocked launch; if it is missing, double-click
+     ARC Node again first. The right-click → **Open** shortcut no longer works
+     on macOS 15.
+   - **macOS 14 Sonoma and earlier:** right-click (or Control-click) ARC Node in
+     Applications, choose **Open**, then click **Open** in the dialog.
 
 > **Got *"ARC Node is damaged and can't be opened. You should move it to the Trash"* instead?**
-> That's the same Gatekeeper rejection in disguise — it isn't actually damaged. macOS just refuses to verify a signature that doesn't exist on early builds. Two fixes:
+> That's the same Gatekeeper rejection in disguise — it isn't actually damaged, provided the `.dmg` matched the release's `SHA256SUMS`. macOS just refuses to verify a signature that doesn't exist on early builds, and usually offers no **Open Anyway** button for this message. Two fixes:
 >
 > - **Easy:** open Terminal and run `xattr -cr "/Applications/ARC Node.app"`, then double-click ARC Node again. The command strips the quarantine flag macOS adds to anything downloaded from a browser.
-> - **Or:** delete the .app, re-download the .dmg, and use the right-click → Open flow above *before* double-clicking.
+> - **Or:** delete the .app, re-download the .dmg, check it against `SHA256SUMS`, and repeat steps 1–5 for your macOS version.
 >
 > Permanent fix is on the roadmap — once the project is signed + notarized with an Apple Developer ID, this dialog goes away for everyone.
 
