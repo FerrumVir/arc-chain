@@ -19,6 +19,11 @@
     "ts-jest": "^29.1",
     "typescript": "^5.4"
   },
+  "overrides": {
+    "js-yaml": {
+      "argparse": "^2.0.1"
+    }
+  },
   "jest": {
     "preset": "ts-jest",
     "testEnvironment": "node",
