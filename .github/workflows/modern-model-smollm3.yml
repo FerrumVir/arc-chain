@@ -35,8 +35,10 @@ on:
 permissions:
   contents: read
 
+# One group per commit: a new push does not cancel the evidence of the previous
+# one (macOS runners are scarce and their queued legs would restart).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 env:
@@ -412,21 +414,26 @@ jobs:
         run: cargo build --release --locked -p arc-inference --bin arc-modern
       - name: Fetch SmolLM3-3B BF16 (pinned revision, SHA-256 verified)
         run: python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR"
-      - name: Tokenise the public-domain text once (shared by both models)
-        run: |
-          python scripts/arc_modern/hf_checks.py tokenize-text --model-dir "$MODEL_DIR" \
-            --text scripts/arc_modern/data/alice_ch1.txt --max-tokens 1024 --out "$EVIDENCE/ppl-tokens.json"
-      - name: Integer engine perplexity, then the BF16 reference (transformers, CPU)
+      - name: Perplexity on two public-domain texts, integer engine then BF16 reference
         run: |
           set -euo pipefail
           ./target/release/arc-modern convert --source-dir "$MODEL_DIR" \
             --source-manifest "$SOURCE_MANIFEST" --out "$MODEL_DIR/smollm3-3b.arcipkg" > "$EVIDENCE/convert.json"
-          ./target/release/arc-modern ppl --package "$MODEL_DIR/smollm3-3b.arcipkg" \
-            --tokens "$EVIDENCE/ppl-tokens.json" --window 512 --kernel simd --out "$EVIDENCE/ppl-integer.json"
-          python scripts/arc_modern/hf_checks.py bf16-ppl --model-dir "$MODEL_DIR" \
-            --tokens "$EVIDENCE/ppl-tokens.json" --rust "$EVIDENCE/ppl-integer.json" --window 512 \
-            --threads "$(nproc)" --text-label "Alice in Wonderland ch. 1 (public domain), first 1024 tokens" \
-            --out "$EVIDENCE/quality.json"
+          run_text() {
+            local key="$1" file="$2" label="$3"
+            python scripts/arc_modern/hf_checks.py tokenize-text --model-dir "$MODEL_DIR" \
+              --text "$file" --max-tokens 1024 --out "$EVIDENCE/ppl-tokens-$key.json"
+            ./target/release/arc-modern ppl --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+              --tokens "$EVIDENCE/ppl-tokens-$key.json" --window 512 --kernel simd \
+              --out "$EVIDENCE/ppl-integer-$key.json"
+            python scripts/arc_modern/hf_checks.py bf16-ppl --model-dir "$MODEL_DIR" \
+              --tokens "$EVIDENCE/ppl-tokens-$key.json" --rust "$EVIDENCE/ppl-integer-$key.json" \
+              --window 512 --threads "$(nproc)" --text-label "$label" --out "$EVIDENCE/quality-$key.json"
+          }
+          run_text federal-register scripts/arc_modern/data/fr_2026-20493_supplementary.txt \
+            "Federal Register 2026-20493 (public domain, published after the model's data cutoff), first 1024 tokens"
+          run_text alice scripts/arc_modern/data/alice_ch1.txt \
+            "Alice in Wonderland ch. 1 (public domain, likely memorised), first 1024 tokens"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -496,20 +503,17 @@ jobs:
           print()
           PY
           fi
-          if [ -f "$all/evidence-quality/quality.json" ]; then
-            python - "$all/evidence-quality/quality.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          if compgen -G "$all/evidence-quality/quality-*.json" > /dev/null; then
+            python - "$all"/evidence-quality/quality-*.json >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import json, sys
-          q = json.load(open(sys.argv[1]))
           print("### Perplexity vs BF16 (CPU, CI runner)")
           print()
-          print(f"Text: {q['text']}; window {q['window']}; scored tokens {q['scored_tokens']}.")
-          print()
-          print(f"| model | perplexity |")
-          print(f"|---|---|")
-          print(f"| BF16 reference (transformers, torch {q['bf16_reference']['torch']}) | {q['bf16_reference']['ppl']:.4f} |")
-          print(f"| ARC integer engine ({q['integer_engine']['profile']}) | {q['integer_engine']['ppl']:.4f} |")
-          print()
-          print(f"Delta: **{q['ppl_delta_percent']:+.2f}%**; top-1 agreement {100 * q['top1_agreement']:.1f}%.")
+          print("| text | scored tokens | BF16 (transformers) | ARC integer | delta | top-1 agreement |")
+          print("|---|---|---|---|---|---|")
+          for path in sys.argv[1:]:
+              q = json.load(open(path))
+              print(f"| {q['text']} | {q['scored_tokens']} | {q['bf16_reference']['ppl']:.4f} | "
+                    f"{q['integer_engine']['ppl']:.4f} | {q['ppl_delta_percent']:+.3f}% | {100 * q['top1_agreement']:.1f}% |")
           PY
           fi
           exit "$status"
