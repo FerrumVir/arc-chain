@@ -38,10 +38,11 @@ on:
 permissions:
   contents: read
 
-# One run per commit: the push and pull_request events of the same commit
-# share a group, so only one of them runs.
+# One run per commit and event. Push and pull_request runs of the same commit
+# use separate groups, so opening a PR never cancels a branch push's
+# real-model run that is still in progress.
 concurrency:
-  group: gpu-portable-${{ github.event.pull_request.head.sha || github.sha }}
+  group: gpu-portable-${{ github.event_name }}-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: true
 
 env:
@@ -293,6 +294,28 @@ jobs:
             --tokenizer "$MODEL_DIR/tokenizer.json" --cases "$CASES" --golden "$CPU_GOLDEN" \
             --out "$EVIDENCE/smollm3-gpu-check.json" --run-out "$EVIDENCE/smollm3-gpu-run.json" \
             --self-test-rounds 8 --trace-forwards 2
+      - name: Batched prefill (16 tokens per pass) on the first golden case
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$CASES" "$EVIDENCE/smollm3-first-case.json" <<'PY'
+          import json, sys
+          cases = json.load(open(sys.argv[1]))
+          cases["cases"] = cases["cases"][:1]
+          json.dump(cases, open(sys.argv[2], "w"))
+          PY
+          ./target/release/arc-modern golden --gpu --gpu-batch 16 \
+            --package "$MODEL_DIR/smollm3-3b.arcipkg" --tokenizer "$MODEL_DIR/tokenizer.json" \
+            --cases "$EVIDENCE/smollm3-first-case.json" --out "$EVIDENCE/smollm3-gpu-batch16.json"
+          python - "$EVIDENCE/smollm3-gpu-batch16.json" "$CPU_GOLDEN" <<'PY'
+          import json, sys
+          got = json.load(open(sys.argv[1]))["cases"][0]
+          want = json.load(open(sys.argv[2]))["cases"][0]
+          print(f"case {got['id']}: batched logits_digest {got['logits_digest']}, CPU golden {want['logits_digest']}")
+          assert got["id"] == want["id"]
+          assert got["logits_hashes"] == want["logits_hashes"], "batched prefill differs from the CPU golden"
+          assert got["tokens"] == want["tokens"]
+          PY
       - name: Summary
         if: always()
         shell: bash

@@ -15,9 +15,10 @@ pub mod kat;
 use std::time::Instant;
 
 use arc_gpu::modern::{
-    DyadicRef, EngineOptions, GpuEngine, GpuEngineBuilder, GpuModernError, LayerRef, ModelShape,
-    TraceEntry,
+    AdapterReport, DyadicRef, EngineOptions, GpuEngine, GpuEngineBuilder, GpuModernError, LayerRef,
+    ModelShape, TraceEntry,
 };
+use serde_json::{Value, json};
 
 use super::ModernError;
 use super::arith::{self, DyadicMatrix, HeadCache};
@@ -32,6 +33,24 @@ pub fn gpu_error(error: GpuModernError) -> ModernError {
         GpuModernError::Invalid(message) => ModernError::Invalid(message),
         other => ModernError::Invalid(format!("GPU: {other}")),
     }
+}
+
+/// The adapter as the Proof Kit's `runs[].adapter` reports it
+/// (`arc.proof-result.v1`): `{vendor, device, backend, driver}` with the
+/// vendor and backend in lower case (`vulkan`, `metal`, `dx12`, `gl`).
+pub fn adapter_json(report: &AdapterReport) -> Value {
+    let driver = [report.driver.as_str(), report.driver_info.as_str()]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    json!({
+        "vendor": report.vendor.to_lowercase(),
+        "device": report.name,
+        "backend": report.backend.to_lowercase(),
+        "driver": driver,
+    })
 }
 
 /// The GPU engine's view of a model configuration.
@@ -499,6 +518,31 @@ mod tests {
             .map(|&t| model.forward(t, &mut cache).unwrap())
             .collect();
         (logits, cache.digest())
+    }
+
+    #[test]
+    fn adapter_json_has_the_proof_kit_shape() {
+        let report = AdapterReport {
+            index: 0,
+            name: "llvmpipe (LLVM 20.1.2, 256 bits)".into(),
+            vendor_id: 0x10005,
+            vendor: "Mesa".into(),
+            device_id: 0,
+            device_type: "Cpu".into(),
+            backend: "Vulkan".into(),
+            driver: "llvmpipe".into(),
+            driver_info: "Mesa 25.2.8".into(),
+            software: true,
+        };
+        assert_eq!(
+            adapter_json(&report),
+            json!({
+                "vendor": "mesa",
+                "device": "llvmpipe (LLVM 20.1.2, 256 bits)",
+                "backend": "vulkan",
+                "driver": "llvmpipe Mesa 25.2.8",
+            })
+        );
     }
 
     #[test]
