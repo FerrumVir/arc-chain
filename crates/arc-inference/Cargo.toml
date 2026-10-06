@@ -37,6 +37,10 @@ sha2.workspace = true
 # The Llama-3/SmolLM3 tokenizer split pattern needs a negative lookahead.
 # Already locked through candle-transformers; no new crate enters the graph.
 fancy-regex = "0.13"
+# Memory-mapped stage packages (`modern::mla`): a 16 GB MoE package is read
+# through the page cache instead of the heap. Already locked (0.9.11) through
+# the shipped Wasmer runtime; no new crate enters the graph.
+memmap2 = "0.9"
 
 # Optional: real INT4/GGUF inference via Hugging Face candle
 candle-core = { version = "0.8", optional = true }
@@ -50,6 +54,12 @@ rand.workspace = true
 [[bin]]
 name = "arc-modern"
 path = "src/bin/arc_modern.rs"
+
+# MLA + MoE CLI (Moonlight-16B-A3B, the Kimi K2 text architecture): convert
+# any layer range, verify, golden, stage replay, ppl, tokenize.
+[[bin]]
+name = "arc-mla"
+path = "src/bin/arc_mla.rs"
 
 # Examples that load GGUF models or run inference benchmarks against candle-
 # backed tensors pull in candle-core/candle-nn/candle-transformers. Declare

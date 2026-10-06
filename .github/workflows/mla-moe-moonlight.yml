@@ -1,0 +1,83 @@
+name: MLA + MoE model (Moonlight-16B-A3B, Kimi-K2 architecture)
+
+# Evidence for the integer profile arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1
+# (docs/protocol/integer-profile-mla-moe-dyadic-v1.md): multi-head latent
+# attention, mixture-of-experts routing and pipeline stages on ARC's
+# deterministic integer engine. Nothing here changes the network's canonical
+# model or any consensus or native-inference binding.
+#
+#   rust       rustfmt, clippy (deny warnings), unit tests of the profile.
+#
+# The push trigger covers only the development branch, so iterating does not
+# start the repository-wide workflows (and their macOS legs); it is removed
+# before the pull request leaves draft.
+
+on:
+  push:
+    branches: [kimi-arch-integer]
+    paths:
+      - 'crates/arc-inference/**'
+      - 'scripts/arc_conformance/mla_moe_reference.py'
+      - 'scripts/arc_conformance/tests/test_mla_moe_reference.py'
+      - 'scripts/arc_mla/**'
+      - 'docs/protocol/integer-profile-mla-moe-dyadic-v1.md'
+      - 'docs/protocol/packages/moonlight-16b-a3b*'
+      - '.github/workflows/mla-moe-moonlight.yml'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'crates/arc-inference/src/modern/mla/**'
+      - 'crates/arc-inference/src/modern/tiktoken.rs'
+      - 'crates/arc-inference/src/bin/arc_mla.rs'
+      - 'scripts/arc_conformance/mla_moe_reference.py'
+      - 'scripts/arc_conformance/tests/test_mla_moe_reference.py'
+      - 'scripts/arc_mla/**'
+      - 'docs/protocol/integer-profile-mla-moe-dyadic-v1.md'
+      - 'docs/protocol/packages/moonlight-16b-a3b*'
+      - '.github/workflows/mla-moe-moonlight.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+
+jobs:
+  rust:
+    name: rust (fmt, clippy, unit tests)
+    if: github.event_name == 'push' || github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - name: rustfmt (the profile's files)
+        run: |
+          rustfmt --check --edition 2024 \
+            crates/arc-inference/src/modern/mla/*.rs \
+            crates/arc-inference/src/modern/tiktoken.rs \
+            crates/arc-inference/src/modern/mod.rs \
+            crates/arc-inference/src/bin/arc_mla.rs
+      - name: Clippy (arc-inference with candle, all targets, deny warnings)
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+      - name: Unit tests (MLA + MoE profile, stages, tokenizer)
+        run: |
+          cargo test -p arc-inference --lib --locked modern::mla -- --nocapture
+          cargo test -p arc-inference --lib --locked modern::tiktoken -- --nocapture
