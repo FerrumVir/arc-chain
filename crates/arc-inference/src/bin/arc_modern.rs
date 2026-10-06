@@ -376,12 +376,12 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
     let rate = |count: f64, seconds: f64| if seconds > 0.0 { count / seconds } else { 0.0 };
     let prefill_tok_s = rate(prompt_total as f64, prefill_total);
     let decode_tok_s = rate(forwards_total as f64, decode_total);
+    // The run names one semantics family; each case's `selection` is
+    // authoritative (the Python reference uses the same convention).
     let generation = if selections.iter().all(|s| *s == "argmax") {
         Selection::Argmax.semantics()
-    } else if selections.iter().all(|s| *s == "rp64-argmax") {
-        Selection::Rp64Argmax.semantics()
     } else {
-        "mixed"
+        Selection::Rp64Argmax.semantics()
     };
     let run = json!({
         "schema": "arc.modern-run.v1",
