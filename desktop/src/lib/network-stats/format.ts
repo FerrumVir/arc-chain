@@ -1,15 +1,14 @@
 // How the live numbers are written on screen. The arc.ai counter uses the same
 // rules (docs/network-stats-contract.md, "Display rules").
 
-import type { VersionCountV1 } from "./contract";
+import type { VersionCountV1, WindowStatusV1 } from "./contract";
 
-/** A per-second rate: two decimals under 10, one under 100, whole numbers above. */
+/** A per-second rate: one decimal under 10 ("4.4"), whole numbers from 10 up ("169"), as on arc.ai. */
 export function formatRate(value: number): string {
-  const digits = value < 10 ? 2 : value < 100 ? 1 : 0;
-  return value.toLocaleString("en-US", {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  });
+  if (value < 10) {
+    return value.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  }
+  return Math.round(value).toLocaleString("en-US");
 }
 
 /**
@@ -37,7 +36,15 @@ export function shouldAnimateCounter(from: number, to: number, reducedMotion: bo
   return !reducedMotion && Number.isFinite(from) && Number.isFinite(to) && from !== to;
 }
 
-/** "16:05:12" in the viewer's local time, for "as of" lines. */
+/**
+ * The title dot pulses only while real data shows a live chain. Fixture data
+ * (the browser preview) never pulses, whatever it says.
+ */
+export function shouldPulse(status: WindowStatusV1, syntheticPreview: boolean): boolean {
+  return !syntheticPreview && status === "live";
+}
+
+/** "16:05:12" in the viewer's local time. */
 export function formatClock(unixMs: number): string {
   return new Date(unixMs).toLocaleTimeString("en-US", {
     hour: "2-digit",
@@ -45,4 +52,14 @@ export function formatClock(unixMs: number): string {
     second: "2-digit",
     hourCycle: "h23",
   });
+}
+
+/** "Updated just now", "Updated 3 s ago", "Updated 2 min ago", then "Updated at 16:05:12". */
+export function formatUpdatedAgo(asOfUnixMs: number, nowUnixMs: number): string {
+  const seconds = Math.max(0, Math.floor((nowUnixMs - asOfUnixMs) / 1000));
+  if (seconds < 1) return "Updated just now";
+  if (seconds < 60) return `Updated ${seconds} s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `Updated ${minutes} min ago`;
+  return `Updated at ${formatClock(asOfUnixMs)}`;
 }

@@ -14,8 +14,10 @@ import {
 import {
   formatMatchRate,
   formatRate,
+  formatUpdatedAgo,
   formatVersions,
   shouldAnimateCounter,
+  shouldPulse,
 } from "../src/lib/network-stats/format";
 import { mockBlockTimestamp, mockNetworkRead, mockTipHeight } from "../src/lib/network-stats/mock-chain";
 import {
@@ -540,7 +542,16 @@ test.describe("network stats: display", () => {
     expect(formatMatchRate(0.995)).toBe("99.5%");
     expect(formatMatchRate(1)).toBe("100%");
     expect(formatMatchRate(0)).toBe("0.0%");
-    expect([0, 2, 4.404, 12.345, 168.6].map(formatRate)).toEqual(["0.00", "2.00", "4.40", "12.3", "169"]);
+    // One decimal under 10, whole numbers from 10 up, as on arc.ai.
+    expect([0, 2, 4.404, 4.483, 12.345, 168.6, 1_234.5].map(formatRate)).toEqual([
+      "0.0",
+      "2.0",
+      "4.4",
+      "4.5",
+      "12",
+      "169",
+      "1,235",
+    ]);
     expect(formatVersions([{ version: "0.8.10", count: 6 }], 6)).toBe("v0.8.10 on all 6");
     expect(
       formatVersions(
@@ -559,6 +570,18 @@ test.describe("network stats: display", () => {
     expect(shouldAnimateCounter(2, 2, false)).toBe(false);
     expect(shouldAnimateCounter(1, 2, true)).toBe(false);
     expect(shouldAnimateCounter(Number.NaN, 2, false)).toBe(false);
+    // The title dot pulses only over real data showing a live chain.
+    expect(shouldPulse("live", false)).toBe(true);
+    expect(shouldPulse("live", true)).toBe(false);
+    expect(shouldPulse("stalled", false)).toBe(false);
+    expect(shouldPulse("measuring", false)).toBe(false);
+    // "Updated 3 s ago", ticking.
+    const read = Date.UTC(2026, 9, 6, 17, 25, 27);
+    expect(formatUpdatedAgo(read, read + 400)).toBe("Updated just now");
+    expect(formatUpdatedAgo(read, read + 3_200)).toBe("Updated 3 s ago");
+    expect(formatUpdatedAgo(read, read + 125_000)).toBe("Updated 2 min ago");
+    expect(formatUpdatedAgo(read, read - 5_000)).toBe("Updated just now");
+    expect(formatUpdatedAgo(read, read + 2 * 3_600_000)).toMatch(/^Updated at \d{2}:\d{2}:\d{2}$/);
   });
 });
 
@@ -566,11 +589,15 @@ test.describe("measured records", () => {
   test("every record has a date, its pull requests and a public CI receipt", () => {
     const raw = JSON.parse(
       readFileSync(new URL("../src/lib/network-stats/measured-records.json", import.meta.url), "utf8"),
-    ) as { records: Array<{ setting: string; headline: string; receipts: Array<{ url: string }> }> };
+    ) as {
+      records: Array<{ setting: string; headline: string; summary: string; method: string; receipts: Array<{ url: string }> }>;
+    };
     expect(measuredRecordsProblems(raw)).toEqual([]);
     for (const record of raw.records) {
       expect(["lab", "ci"]).toContain(record.setting);
       expect(record.headline.toLowerCase()).not.toContain("live");
+      if (record.setting === "lab") expect(record.headline).toMatch(/\blab\b/);
+      expect(`${record.headline} ${record.summary} ${record.method}`).not.toContain("byte-identical");
       for (const receipt of record.receipts) {
         expect(receipt.url).toMatch(/^https:\/\/github\.com\/FerrumVir\/arc-chain\/actions\/runs\/\d+$/);
       }
@@ -584,8 +611,9 @@ test.describe("measured records", () => {
     // Ready for future model-speed records. A test fixture, not a claim.
     const fixture = {
       id: "fixture-model-speed",
-      headline: "Fixture model at 12.5 tokens per second per answer",
-      detail: "Test fixture only.",
+      headline: "Fixture model at 12.5 tokens a second per answer, on the public testnet",
+      summary: "Test fixture only.",
+      method: "Test fixture only.",
       setting: "testnet",
       measured_on: "2026-12-01",
       prs: [1],
@@ -608,6 +636,12 @@ test.describe("measured records", () => {
       }).join("\n");
     expect(check({})).toBe("");
     expect(check({ setting: "projection" })).toContain("a projection is not a record");
+    expect(check({ headline: "Fixture model at 12.5 tokens a second per answer" })).toContain(
+      'must say "testnet" in its headline',
+    );
+    expect(check({ setting: "lab" })).toContain('must say "lab" in its headline');
+    expect(check({ summary: "first line\nsecond line" })).toContain("summary must be one line");
+    expect(check({ method: "" })).toContain("method is missing");
     expect(check({ unit: undefined })).toContain("unit is missing");
     expect(check({ hardware: undefined })).toContain("must name the exact model and the hardware");
     expect(

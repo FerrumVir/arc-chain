@@ -44,22 +44,30 @@ test.describe("Live network panel", () => {
     const panel = panelOf(page);
     await expect(panel).toBeVisible();
     await expect(panel.getByTestId("live-value-validators")).toHaveText("6 of 6");
+    await expect(panel.getByTestId("live-note-validators")).toContainText("run by the Arc team today");
     await expect(panel.getByTestId("live-note-validators")).toContainText("v0.8.10 on all 6");
     await expect(panel.getByTestId("live-counter-height")).toHaveText(/^\d{1,3}(,\d{3})+$/);
-    await expect(panel.getByTestId("live-counter-blocks-per-second")).toHaveText("4.00");
-    await expect(panel.getByTestId("live-note-blocks-per-second")).toHaveText(
-      "240 finalized blocks in the last 60 s",
-    );
-    await expect(panel.getByTestId("live-counter-tps")).toHaveText("2.00");
-    await expect(panel.getByTestId("live-note-tps")).toHaveText("120 finalized in the last 60 s");
+    // One decimal for rates, as on arc.ai.
+    await expect(panel.getByTestId("live-counter-blocks-per-second")).toHaveText("4.0");
+    await expect(panel.getByTestId("live-note-blocks-per-second")).toHaveText("240 in the last minute");
+    await expect(panel.getByTestId("live-counter-tps")).toHaveText("2.0");
+    await expect(panel.getByTestId("live-note-tps")).toHaveText("120 in the last minute");
     await expect(panel.getByTestId("live-counter-community")).toHaveText("3");
-    await expect(panel.getByTestId("live-network-window")).toContainText("60 s ending at block");
-    // Fixture data is never called live.
+    await expect(panel.getByTestId("live-note-community")).toHaveText("ready for AI work");
+    for (const label of ["Validators online", "Chain height", "Blocks a second", "Transactions a second", "Community nodes ready"]) {
+      await expect(panel.getByText(label, { exact: true })).toBeVisible();
+    }
+    // One plain line under the numbers; the detail is behind the explainer.
+    await expect(panel.getByTestId("live-network-window")).toHaveText(
+      "Counted from the last minute of finalized blocks.",
+    );
+    await expect(panel.getByTestId("live-network-updated")).toHaveText(/^Updated (just now|\d+ s ago)$/);
+    // Fixture data is never called live, and the title dot does not pulse over it.
     await expect(panel).toContainText("Synthetic preview");
     await expect(panel).not.toContainText(/\bLive\b/);
+    await expect(panel.getByTestId("live-network-dot")).toHaveAttribute("data-pulsing", "false");
     // Twin figures stay hidden until a validator serves them (v0.8.11).
-    await expect(panel.getByTestId("live-stat-verified-tokens")).toHaveCount(0);
-    await expect(panel.getByTestId("live-stat-twin-match")).toHaveCount(0);
+    await expect(panel.getByTestId("live-twin")).toHaveCount(0);
     // Not contributing compute: no contribution line, no zeros.
     await expect(page.getByTestId("live-contribution")).toHaveCount(0);
     await testInfo.attach("live-network-panel", {
@@ -86,15 +94,16 @@ test.describe("Live network panel", () => {
     await seedNetwork(page, { twinStats: { 0: twinStats(98, 1, 7_200), 1: twinStats(99, 0, 3_600) } });
     await page.goto("/");
     const panel = panelOf(page);
-    await expect(panel.getByTestId("live-counter-verified-tokens")).toHaveText("3.00", {
+    const band = panel.getByRole("region", { name: "AI work, checked by twins" });
+    await expect(band.getByTestId("live-counter-verified-tokens")).toHaveText("3.0", {
       timeout: 15_000,
     });
-    await expect(panel.getByTestId("live-note-verified-tokens")).toHaveText(
+    await expect(band.getByTestId("live-note-verified-tokens")).toHaveText(
       "average over the last hour · 2 of 6 coordinators",
     );
     // 197 of 198 is 99.49%: shown as 99.4%, never rounded up.
-    await expect(panel.getByTestId("live-value-twin-match")).toHaveText("99.4%");
-    await expect(panel.getByTestId("live-note-twin-match")).toHaveText(
+    await expect(band.getByTestId("live-value-twin-match")).toHaveText("99.4%");
+    await expect(band.getByTestId("live-note-twin-match")).toHaveText(
       "197 of 198 twin pairs gave the same answer",
     );
     await testInfo.attach("live-network-panel-with-twin", {
@@ -115,7 +124,8 @@ test.describe("Live network panel", () => {
     await expect(panel.getByTestId("live-network-window")).toContainText(
       "does not serve /finality/latest (HTTP 404)",
     );
-    await expect(panel).not.toContainText("0.00");
+    await expect(panel).not.toContainText("0.0 ");
+    await expect(panel.getByTestId("live-counter-tps")).toHaveCount(0);
   });
 
   test("shows this computer's jobs next to the network", async ({ page }) => {
@@ -152,13 +162,24 @@ test.describe("Live network panel", () => {
     await expect(records).toBeVisible();
     await expect(records.getByTestId("measured-records-not-live")).toHaveText("Not live");
     await expect(panelOf(page).getByTestId("measured-records")).toHaveCount(0);
+    // A plain headline and one line; a lab figure says so in its headline.
     const lab = records.getByTestId("measured-record-lab-payments-per-second");
-    await expect(lab).toContainText("168.6 payments per second");
-    await expect(lab).toContainText("not active on the live network");
+    await expect(lab.getByText("169 payments a second, in our test lab", { exact: true })).toBeVisible();
+    await expect(lab).toContainText("not on the live network yet");
+    await expect(records).not.toContainText("byte-identical");
+    await expect(records.getByTestId("measured-record-same-answer-bit-for-bit")).toContainText(
+      "the same output",
+    );
     await expect(records.getByTestId("measured-record-date")).toHaveText([
-      "Measured 4 Oct 2026",
       "Measured 6 Oct 2026",
+      "Measured 4 Oct 2026",
     ]);
+    // The method is behind a collapsed "How we measured".
+    const method = lab.getByTestId("measured-record-method");
+    await expect(method.getByText(/168\.6 transfers a second/)).toBeHidden();
+    await method.getByText("How we measured", { exact: true }).click();
+    await expect(method.getByText(/168\.6 transfers a second/)).toBeVisible();
+    await expect(method.getByTestId("measured-record-hardware")).toContainText("4-vCPU");
     const receipts = records.getByTestId("measured-record-receipt");
     await expect(receipts).toHaveCount(4);
     const urls = await receipts.evaluateAll((elements) =>
@@ -209,6 +230,8 @@ test.describe("Live network panel", () => {
     const explainer = page.getByRole("dialog", { name: "How these numbers are measured" });
     await expect(explainer).toContainText("arc.network-stats.v1");
     await expect(explainer).toContainText("never a sum");
+    await expect(explainer).toContainText("linked to the one before by hash");
+    await expect(explainer.getByTestId("live-network-window-detail")).toContainText("60 s ending at block");
     await page.keyboard.press("Escape");
     await expect(explainer).toHaveCount(0);
     await expect(panel.getByRole("list", { name: "Validators" }).getByRole("listitem")).toHaveCount(6);

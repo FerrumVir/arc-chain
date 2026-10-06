@@ -187,7 +187,6 @@ export function summarizeValidators(
     const sample = samples[index] ?? null;
     return {
       validator: validator.label,
-      origin: validator.origin,
       online: sample ? sample.online : null,
       version: sample ? sample.version : null,
       height: sample ? sample.height : null,

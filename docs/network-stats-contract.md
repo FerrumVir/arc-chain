@@ -96,8 +96,8 @@ Keys are snake_case. Times are unix milliseconds. Rates are per second.
     "checked": 6,                   // validators checked at least once
     "versions": [{ "version": "0.8.10", "count": 6 }],   // among online validators, most common first
     "per_validator": [
-      { "validator": "NYC", "origin": "https://149.28.32.76", "online": true,
-        "version": "0.8.10", "height": 6105063, "checked_at_unix_ms": 1791302040000, "reason": null }
+      { "validator": "NYC", "online": true, "version": "0.8.10", "height": 6105063,
+        "checked_at_unix_ms": 1791302040000, "reason": null }   // labels only: no addresses in the document
     ],
     "source": "GET /health on each public validator"
   },
@@ -164,7 +164,8 @@ Keys are snake_case. Times are unix milliseconds. Rates are per second.
 A validator is online when its latest `GET /health` answered HTTP 200 with
 `status: "ok"`. Anything else (unreachable, timeout, another status code, a
 different `status`) is offline, with the observed reason. `versions` counts
-`version` among online validators only.
+`version` among online validators only. `per_validator` names validators by
+label only; the document carries no addresses.
 
 ### Chain height
 
@@ -296,36 +297,54 @@ The fields above stay the same.
 
 ## Display rules
 
-| Figure | Label | Format |
-|---|---|---|
-| validators | "Validators online" | `6 of 6`, then "v0.8.10 on all 6" or "v0.8.10 on 5 · v0.8.11 on 1" |
-| chain.height | "Chain height" | whole number with separators |
-| window.blocks_per_second | "Blocks per second" | 2 decimals under 10, 1 under 100, whole above; note the block count "in the last 60 s" |
-| window.tps | "Transactions per second" | same; note `finalized_tx` "finalized in the last 60 s" |
-| community.ready_workers | "Community nodes ready" | whole number; "online, idle and running the network model" |
-| twin.verified_tokens_per_second | "Verified tokens per second" | rate format; "average over the last hour" |
-| twin.match_rate | "Twin match rate" | percentage with one decimal, **truncated, never rounded up**: 1,999 of 2,000 is 99.9%, not 100.0%; 100% only when nothing mismatched |
-| models[].served_tokens_per_second | "Served tokens per second" (per model) | rate format, with the window: "average over the last hour" |
-| models[].verified_share | "Verified" (per model) | like the match rate: truncated, never rounded up |
-| models[].median_answer_tokens_per_second | "Median tokens per second per answer" | rate format, with `answer_samples`: "median of 412 answers" |
+Shared by the desktop panel and arc.ai. Labels are sentence case and short
+enough not to wrap.
 
+| Figure | Label | Format and note |
+|---|---|---|
+| validators | "Validators online" | `6 of 6`; notes: "run by the Arc team today" (the honesty line, also on arc.ai) and "v0.8.10 on all 6" or "v0.8.10 on 5 · v0.8.11 on 1" |
+| chain.height | "Chain height" | whole number with separators |
+| window.blocks_per_second | "Blocks a second" | rate format; note: `blocks` "in the last minute" |
+| window.tps | "Transactions a second" | rate format; note: `finalized_tx` "in the last minute" |
+| community.ready_workers | "Community nodes ready" | whole number; note: "ready for AI work" |
+| twin.verified_tokens_per_second | "Verified tokens a second" | rate format; note: "average over the last hour" |
+| twin.match_rate | "Twin match rate" | percentage with one decimal, **truncated, never rounded up**: 1,999 of 2,000 is 99.9%, not 100.0%; 100% only when nothing mismatched |
+| models[].served_tokens_per_second | "Served tokens a second" (per model) | rate format, with the window: "average over the last hour" |
+| models[].verified_share | "Verified" (per model) | like the match rate: truncated, never rounded up |
+| models[].median_answer_tokens_per_second | "Median tokens a second per answer" | rate format, with `answer_samples`: "median of 412 answers" |
+
+- **Rate format:** one decimal under 10 (`4.4`), whole numbers from 10 up
+  (`169`), with separators.
+- **Under the numbers**, one plain line while the window is live: "Counted from
+  the last minute of finalized blocks." The detail (the end block, the counts,
+  the hash links, the validators read) sits behind the explainer. Any other
+  window status shows its reason instead.
+- **Freshness:** "Updated just now", "Updated 3 s ago", "Updated 2 min ago",
+  ticking once a second, with the exact time on hover.
+- **Twin figures** sit in their own band, "AI work, checked by twins", and the
+  band is absent until `twin.available`.
 - A null figure is a dash with its reason, never 0.
 - Counters move only when a value changes, and not at all when the viewer
-  asks for reduced motion (`prefers-reduced-motion: reduce`).
+  asks for reduced motion (`prefers-reduced-motion: reduce`). The live dot by
+  the title pulses only while real data shows a live chain, and not with
+  reduced motion.
 - Never call a fixture or a preview "live". The desktop's browser preview says
-  "Synthetic preview" in place of "Live".
+  "Synthetic preview" in place of "Live", and its dot does not pulse.
 
 ## Measured records: `arc.measured-records.v1`
 
 A separate, static list (`desktop/src/lib/network-stats/measured-records.json`)
-of one-time measurements, shown apart from the live numbers and labelled "not
-live". Each record carries:
+of one-time measurements, shown apart from the live numbers in a dashed card
+labelled "Not live". Each record is a plain headline and one line, with the
+method collapsed behind "How we measured". Write "the same output", not
+"byte-identical". Each record carries:
 
 | Field | Meaning |
 |---|---|
 | `id` | stable identifier |
-| `headline` | the figure or claim in plain words |
-| `detail` | what exactly was measured, where, and what it does not cover |
+| `headline` | the figure or claim in plain words. A lab or testnet record says so here: "169 payments a second, in our test lab" |
+| `summary` | one plain line under the headline (at most 160 characters) |
+| `method` | how it was measured, where, and what it does not cover; shown behind a collapsed "How we measured" |
 | `setting` | `lab` (a staged test, such as several validators on one machine), `ci` (public CI runners), or `testnet` (measured once on the public testnet, on the stated date). A projection is never a record |
 | `measured_on` | `YYYY-MM-DD` |
 | `prs` | the pull requests it came from |

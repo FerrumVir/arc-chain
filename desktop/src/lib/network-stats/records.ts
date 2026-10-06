@@ -3,12 +3,14 @@
 // (measured-records.json, schema `arc.measured-records.v1`) so it can be
 // reviewed line by line and reused by the arc.ai website.
 //
-// Every record carries a date, the pull requests it came from, where it was
-// measured, and at least one receipt: a public CI run in this repository, or
-// an evidence file pinned to a commit. A model-speed record (for example a
-// Kimi-class model at some tokens per second) also names the exact model, the
-// hardware, the metric, the measured value and its unit. Projections are not
-// records.
+// Every record has a plain headline and one line under it; the method sits
+// behind a collapsed "How we measured". It carries a date, the pull requests
+// it came from, where it was measured, and at least one receipt: a public CI
+// run in this repository, or an evidence file pinned to a commit. A lab or
+// testnet record says so in its headline ("169 payments a second, in our test
+// lab"). A model-speed record (for example a Kimi-class model at some tokens
+// per second) also names the exact model, the hardware, the metric, the
+// measured value and its unit. Projections are not records.
 
 export const MEASURED_RECORDS_SCHEMA = "arc.measured-records.v1";
 
@@ -55,10 +57,12 @@ export interface MeasuredReceipt {
 
 export interface MeasuredRecord {
   id: string;
-  /** The figure or claim, in plain words. */
+  /** The figure or claim in plain words; a lab or testnet record says so here. */
   headline: string;
-  /** What exactly was measured, where, and what it does not cover. */
-  detail: string;
+  /** One plain line under the headline. */
+  summary: string;
+  /** How it was measured, where, and what it does not cover (shown collapsed). */
+  method: string;
   setting: RecordSetting;
   /** ISO date, YYYY-MM-DD. */
   measured_on: string;
@@ -100,7 +104,16 @@ export function measuredRecordsProblems(raw: unknown): string[] {
     else if (ids.has(r.id)) problems.push(`${where}: id is repeated`);
     else ids.add(r.id);
     if (!isText(r.headline)) problems.push(`${where}: headline is missing`);
-    if (!isText(r.detail)) problems.push(`${where}: detail is missing`);
+    if (!isText(r.summary) || /\n/.test(r.summary) || r.summary.length > 160) {
+      problems.push(`${where}: summary must be one line of at most 160 characters`);
+    }
+    if (!isText(r.method)) problems.push(`${where}: method is missing`);
+    if (r.setting === "lab" && isText(r.headline) && !/\blab\b/i.test(r.headline)) {
+      problems.push(`${where}: a lab record must say "lab" in its headline`);
+    }
+    if (r.setting === "testnet" && isText(r.headline) && !/\btestnet\b/i.test(r.headline)) {
+      problems.push(`${where}: a testnet record must say "testnet" in its headline`);
+    }
     if (!RECORD_SETTINGS.includes(r.setting as RecordSetting)) {
       problems.push(`${where}: setting must be one of ${RECORD_SETTINGS.join(", ")} (a projection is not a record)`);
     }

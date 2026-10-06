@@ -2,9 +2,9 @@
    Live network panel and measured records (components/LiveNetworkPanel.tsx).
    Built from the app's tokens only, so both themes follow: on the engraved
    default that is white line on Arc blue #002dde, Marcellus for the title,
-   Hanken Grotesk for text and figures, JetBrains Mono for validator labels.
-   Nothing here animates on its own; counters move only when a value changes
-   (and not at all with "reduce motion", see reset.css).
+   Hanken Grotesk for text, JetBrains Mono for the live figures and the
+   validator labels. Counters move only when a value changes; the title dot
+   pulses only over real live data; with "reduce motion" nothing moves.
    ───────────────────────────────────────────────────────────────────── */
 
 .live-network {
@@ -45,42 +45,96 @@
   font-size: var(--text-sm);
 }
 
-/* Columns divided by hairlines, as on an engraved plate. A second row (the
-   v0.8.11 twin figures) keeps the same column widths as the first. */
+/* The live signal: a small dot by the title. */
+.live-dot {
+  position: relative;
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: var(--radius-full);
+  background: var(--text-faint);
+}
+.live-dot.state-live {
+  background: var(--success);
+}
+.live-dot.state-stalled {
+  background: var(--warning);
+}
+.live-dot.state-down {
+  background: var(--danger);
+}
+.live-dot.pulsing::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: inherit;
+  animation: live-dot-pulse 2.4s var(--ease-out) infinite;
+}
+@keyframes live-dot-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(3);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-dot.pulsing::after {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+/* Five columns divided by hairlines, as on an engraved plate. Each tile is as
+   wide as its content, so the row holds all five whenever they fit, with the
+   values on one baseline; on narrow windows the tiles wrap. */
 .live-network-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   row-gap: var(--space-5);
 }
 
 .live-stat {
+  flex: 1 1 auto;
   min-width: 0;
-  padding: 2px var(--space-4);
+  padding: 2px 10px 2px 12px;
   border-left: 1px solid var(--border);
 }
 
-/* Every label takes two lines, so the values line up across a row whether
-   or not a label wraps. */
-.live-stat .stat-label {
-  display: flex;
-  align-items: flex-end;
-  min-height: 2.8em;
+/* Sentence case, one line: labels never wrap, so values line up. */
+.live-label {
+  margin-bottom: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   line-height: 1.4;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
-.live-stat-value {
-  font-size: var(--text-2xl);
-  line-height: 1.15;
+.live-network .live-stat-value {
+  font-family: var(--font-mono);
+  font-size: clamp(28px, 3vw, 36px);
+  font-weight: var(--weight-medium);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .live-stat-note {
-  margin-top: var(--space-1);
+  margin-top: var(--space-2);
+  max-width: 18ch;
   font-size: var(--text-xs);
   line-height: 1.5;
   color: var(--text-muted);
+}
+
+.live-note-line {
+  display: block;
 }
 
 .live-counter {
@@ -128,6 +182,29 @@
   background: var(--danger);
 }
 
+/* v0.8.11: the twin figures get their own full-width band. */
+.live-twin {
+  margin-top: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.live-twin-title {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+}
+
+.live-twin-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.live-twin .live-stat-note {
+  max-width: 48ch;
+}
+
 .live-network-window {
   margin: var(--space-5) 0 0;
   max-width: 90ch;
@@ -148,12 +225,13 @@
   color: var(--text-secondary);
 }
 
-.live-network-you .stat-label {
+.live-network-you .live-label {
   margin: 0;
 }
 
 .live-network-you strong {
   color: var(--text);
+  font-family: var(--font-mono);
   font-weight: var(--weight-semibold);
   font-variant-numeric: tabular-nums;
 }
@@ -215,8 +293,8 @@
   color: var(--text);
 }
 
-.measured-record-detail {
-  margin: var(--space-2) 0 var(--space-3);
+.measured-record-summary {
+  margin: var(--space-1) 0 var(--space-3);
   max-width: 80ch;
   font-size: var(--text-sm);
   line-height: 1.6;
@@ -232,20 +310,37 @@
   color: var(--text-muted);
 }
 
-.measured-record-setting {
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-wider);
-  text-transform: uppercase;
+.measured-record-method {
+  margin-top: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.measured-record-method summary {
+  width: fit-content;
+  cursor: pointer;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.measured-record-method summary:hover {
+  color: var(--text);
+}
+
+.measured-record-method p {
+  margin: var(--space-2) 0 0;
+  max-width: 80ch;
+  line-height: 1.6;
 }
 
 @media (max-width: 768px) {
   .live-network-title {
     font-size: var(--text-xl);
   }
-  .live-network-grid {
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-  }
-  .live-stat-value {
-    font-size: var(--text-xl);
+  .live-twin-grid {
+    grid-template-columns: 1fr;
+    row-gap: var(--space-4);
   }
 }

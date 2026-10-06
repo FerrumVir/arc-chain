@@ -37,9 +37,8 @@ export const SOURCES = {
 } as const;
 
 export interface ValidatorHealthV1 {
-  /** City label, e.g. "LAX". */
+  /** City label, e.g. "LAX". Addresses are not published in the document. */
   validator: string;
-  origin: string;
   /** Answered GET /health with HTTP 200 and `status: "ok"` at its latest check. `null`: not checked yet. */
   online: boolean | null;
   version: string | null;
