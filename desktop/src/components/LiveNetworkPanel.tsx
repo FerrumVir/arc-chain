@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { ArrowDown, ArrowUpRight } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Card } from "./Card";
 import { InfoPopover } from "./InfoPopover";
 import { Skeleton } from "./Skeleton";
@@ -466,42 +466,51 @@ function LiveCounter({
   value: number;
   format: (value: number) => string;
 }) {
-  const [shown, setShown] = useState(value);
-  const shownRef = useRef(value);
+  // The in-between value while the counter moves; null at rest, when the
+  // counter shows `value` itself. With "reduce motion" it is never set, so a
+  // new value is on screen in the same render that receives it.
+  const [frame, setFrame] = useState<number | null>(null);
+  const onScreen = useRef(value);
 
-  useEffect(() => {
-    const from = shownRef.current;
+  // A layout effect runs before the browser paints, so a moving counter
+  // never flashes its new value first.
+  useLayoutEffect(() => {
+    const from = onScreen.current;
     if (!shouldAnimateCounter(from, value, prefersReducedMotion())) {
-      shownRef.current = value;
-      setShown(value);
+      onScreen.current = value;
+      setFrame(null);
       return;
     }
-    let frame = 0;
+    let raf = 0;
     const start = performance.now();
+    setFrame(from);
     const step = (time: number) => {
       // A frame's timestamp can precede `start`; never move backwards.
       const progress = Math.max(0, Math.min(1, (time - start) / COUNTER_MS));
-      const eased = 1 - (1 - progress) ** 3;
-      const next = progress >= 1 ? value : from + (value - from) * eased;
-      shownRef.current = next;
-      setShown(next);
-      if (progress < 1) frame = requestAnimationFrame(step);
+      if (progress >= 1) {
+        onScreen.current = value;
+        setFrame(null);
+        return;
+      }
+      const next = from + (value - from) * (1 - (1 - progress) ** 3);
+      onScreen.current = next;
+      setFrame(next);
+      raf = requestAnimationFrame(step);
     };
-    frame = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(frame);
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
   }, [value]);
 
-  const moving = shown !== value;
   return (
     <span
       className="live-counter"
       data-testid={`live-counter-${id}`}
       data-value={value}
-      data-animating={moving ? "true" : "false"}
+      data-animating={frame !== null ? "true" : "false"}
     >
-      {moving ? (
+      {frame !== null ? (
         <>
-          <span aria-hidden="true">{format(shown)}</span>
+          <span aria-hidden="true">{format(frame)}</span>
           <span className="sr-only">{format(value)}</span>
         </>
       ) : (
