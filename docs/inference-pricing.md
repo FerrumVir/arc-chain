@@ -85,7 +85,7 @@ reported but never count as capacity.
 
 **Why "not long-polling here" counts as busy.** Each idle worker long-polls all six coordinators at
 once. Once it wins a job from any of them, it opens no new polls until the job is done
-(`main.rs:8990-9065`). So V − I counts it as busy wherever its job came from, and every coordinator sees
+(`main.rs:8985-9060`). So V − I counts it as busy wherever its job came from, and every coordinator sees
 nearly the same network-wide utilization without any new messages between them.
 
 The proxy has known errors in both directions:
@@ -288,9 +288,9 @@ Sources are listed in section 12. Values marked [ASSUMPTION] were not measured.
 | Faster CPU kernels | 7.2 tok/s, at 40 W [ASSUMPTION] | `README.md:552` |
 | Batched fleet [ASSUMPTION: GPU determinism proven] | 30% RTX 4090-class nodes at 3,000 tok/s and 550 W; 70% M4 Max-class at 248 tok/s and 80 W | Batched benchmarks; the M4 Max figure is an estimate |
 | Twin execution | 2 paid executions; validators recompute 5% of jobs on 3 replicas | PR #139 |
-| Sampled audits | Replay costs 0.6 of the original (published range 0.4-0.8) | Published replay costs |
+| Sampled audits | Replay costs 0.6 of the original [ASSUMPTION] | A deterministic replay is one prefill pass. Our estimate is 0.4-0.8 of the original GPU time for chat and prompt-heavy traffic; SYNTHETIC-2 measured 1/25 on decode-heavy traces. |
 | Cheaper model [ASSUMPTION] | 0.4× the bytes moved per token | |
-| Demand at the floor price [ASSUMPTION] | 30% average utilization, a daily cycle of ±30-50% | Comparable networks report 16-30% |
+| Demand at the floor price [ASSUMPTION] | 30% average utilization, a daily cycle of ±30-50% | One live consumer-Mac network reports 16% utilization. 30% is a planning assumption. |
 | Demand bursts [ASSUMPTION] | 3 nodes: a daily 2 h demo burst at 4×. 100 nodes: 1 h at 2×. | |
 | Price elasticity of demand [ASSUMPTION] | 0.5 | |
 | Controller | Target 50%, step 12.5%, 10-minute epochs | Defaults |
@@ -497,8 +497,8 @@ moves. The capped 2.5 testnet ARC promotional reward is separate and unchanged.
   - vLLM batched benchmarks of RTX GPUs (CloudRift, 2025-10);
   - the M4 Max batched figure is an estimate from llama.cpp batched-bench ratios.
 - Verification cost:
-  - the replay of a deterministic job is one prefill pass, about 0.4-0.8 of the original GPU time
-    depending on the traffic mix;
+  - the replay of a deterministic job is one prefill pass, which we estimate at about 0.4-0.8 of the
+    original GPU time depending on the traffic mix (an estimate, not a measurement);
   - TOPLOC (arXiv 2505.07291) and Prime Intellect's SYNTHETIC-2 report about 1% overhead and "25×
     cheaper than re-doing the original inference".
 - Settlement designs: Filecoin payment channels (cumulative vouchers), and the x402 `upto` and

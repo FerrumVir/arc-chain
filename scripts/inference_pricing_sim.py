@@ -112,8 +112,10 @@ ENGINES = {
     ),
     "gpu_batched": Engine(
         "Batched GPU/Max-Mac fleet [ASSUMPTION: GPU determinism proven]",
-        # 30% RTX 4090-class nodes at 3,000 tok/s and 550 W, 70% M4 Max-class
-        # at 248 tok/s and 80 W (research-2 section 6d); capacity-weighted.
+        # 30% RTX 4090-class nodes at 3,000 tok/s and 550 W (batched vLLM
+        # benchmarks), 70% M4 Max-class at 248 tok/s and 80 W (an estimate from
+        # llama.cpp batched-bench ratios); capacity-weighted. Wall power is
+        # assumed, not measured.
         0.3 * 3_000 + 0.7 * 248, 0.3 * 550 + 0.7 * 80,
         "30% RTX 4090 (3,000 tok/s, 550 W) + 70% M4 Max (248 tok/s, 80 W), batched",
     ),
@@ -147,8 +149,8 @@ VERIFICATION = {
     # check (each recompute runs every range on 3 replicas = 3 executions).
     "twin": Verification("twin execution, 5% validator spot checks", 2,
                          0.05 * 3, 1_000, 700),
-    # research-4: replay is one prefill pass, 0.4-0.8 of the original GPU
-    # time (0.6 used here), at audit rate p.
+    # A deterministic replay is one prefill pass, estimated at 0.4-0.8 of the
+    # original GPU time (0.6 used here [ASSUMPTION]), at audit rate p.
     "audit_p5": Verification("sampled audits, p = 5%", 1, 0.05 * 0.6, 1_000, 300),
     "audit_p1": Verification("sampled audits, p = 1%", 1, 0.01 * 0.6, 1_000, 100),
 }
