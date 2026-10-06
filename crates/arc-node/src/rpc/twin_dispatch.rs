@@ -1754,12 +1754,21 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
         (None, Some(status)) => Some(Err(status)),
         (None, None) => None,
     };
-    let classification = twin::classify(
+    let mut classification = twin::classify(
         &outputs,
         comparison,
         reference_output.as_ref(),
         recompute_outcome,
     );
+    // The reward recomputation ran because `reward_leg` qualified (certificate
+    // and issuance capacity). When validators found that leg valid, serve and
+    // settle it, rather than whichever valid leg comes first, which may lack a
+    // certificate or issuance capacity. Valid legs carry identical outputs.
+    if let Some(index) = reward_leg
+        && classification.leg_valid.get(index).copied().flatten() == Some(true)
+    {
+        classification.chosen_leg = Some(index);
+    }
 
     let settlement = match classification.chosen_leg {
         Some(index) if input.source.reward_eligible() => match input.legs.get(index) {
