@@ -1,0 +1,299 @@
+name: Proof Kit
+
+# The volunteer Proof Kit (docs/proof-kit.md): `arc-modern proof`, the
+# anti-faking challenge, the arc.proof-result.v1 checks and the wrapper
+# scripts.
+#
+#   checks     rustfmt, clippy, unit tests (Rust and the independent Python
+#              reference), shellcheck, PowerShell parse, actionlint and the
+#              secret scan. Linux.
+#   e2e-linux  the kit end to end, the way a volunteer runs it, in --dry-run
+#              mode: scripts/proof-kit/run.sh builds arc-modern from the
+#              checkout, downloads SmolLM3-3B from Hugging Face (pinned,
+#              SHA-256 checked), converts it, verifies it against the pinned
+#              manifest and runs the golden prompts and the test challenge on
+#              the scalar and SIMD kernels. The payload must validate and
+#              MATCH. Then the challenge derivation is compared between Rust
+#              and Python, and --submit is exercised against a local mock Hash
+#              Wall on 127.0.0.1 (consent typed on a pseudo-terminal), both
+#              accepted and declined. Nothing is sent to any real endpoint.
+#   matrix     only with the `proof-kit-matrix` label: the same dry run on
+#              macOS arm64, macOS x86-64, Windows x86-64 and Linux arm64. Do
+#              not add the label while macOS runners are reserved for the
+#              release sequence.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'crates/arc-inference/src/bin/arc_modern.rs'
+      - 'crates/arc-inference/src/bin/proof_kit/**'
+      - 'crates/arc-inference/src/modern/proof.rs'
+      - 'docs/proof-kit.md'
+      - 'docs/protocol/proof-kit/**'
+      - 'scripts/proof-kit/**'
+      - 'scripts/arc_conformance/proof_kit_reference.py'
+      - 'scripts/arc_conformance/tests/test_proof_kit_reference.py'
+      - '.github/workflows/proof-kit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'labeled' && 'label' || 'code' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Release optimisation without fat LTO (as in the SmolLM3 workflow).
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  PY_BLAKE3: blake3==1.0.10
+
+jobs:
+  checks:
+    name: checks (fmt, clippy, unit tests, scripts)
+    if: github.event.action != 'labeled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check "$PY_BLAKE3"
+      - name: Python reference (challenge derivation and result checks)
+        working-directory: scripts
+        run: python -m unittest arc_conformance.tests.test_proof_kit_reference -v
+      - name: Wrapper scripts (bash -n, shellcheck, Python syntax)
+        run: |
+          set -euo pipefail
+          bash -n scripts/proof-kit/run.sh
+          shellcheck -S warning scripts/proof-kit/run.sh
+          python -m py_compile scripts/proof-kit/mock_hash_wall.py scripts/proof-kit/pty_answer.py
+      - name: run.ps1 parses (PowerShell parser)
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/scripts/proof-kit/run.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_.ToString() }; exit 1 }
+          'run.ps1 parses'
+      - name: Workflow syntax (pinned actionlint, as in CI)
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            > "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color .github/workflows/proof-kit.yml
+      - name: Secret scan (current tree, as in CI)
+        run: bash tests/release/current_tree_secret_scan.sh
+      # Install every component rust-toolchain.toml lists up front.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - name: rustfmt
+        run: cargo fmt -p arc-inference -- --check
+      - name: Unit tests (modern profile incl. the Proof Kit library)
+        run: cargo test -p arc-inference --lib --locked modern -- --nocapture
+      - name: Unit tests (arc-modern binary incl. the kit's host and network helpers)
+        run: cargo test -p arc-inference --bin arc-modern --locked
+      # Same feature set as the shipped node (arc-node enables candle).
+      - name: Clippy (arc-inference with candle, all targets, deny warnings)
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+
+  e2e-linux:
+    name: end to end, dry run and mock submission (ubuntu)
+    if: github.event.action != 'labeled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check "$PY_BLAKE3"
+      - name: Kit directory with room for 9.3 GB
+        run: |
+          set -euo pipefail
+          # Use whichever of / and /mnt has more free space.
+          if [ "$(df --output=avail -B1 /mnt | tail -1)" -gt "$(df --output=avail -B1 / | tail -1)" ]; then
+            sudo mkdir -p /mnt/arc-proof-kit
+            sudo chown "$(id -u):$(id -g)" /mnt/arc-proof-kit
+            dir=/mnt/arc-proof-kit
+          else
+            dir="$HOME/arc-proof-kit"
+            mkdir -p "$dir"
+          fi
+          mkdir -p "$RUNNER_TEMP/evidence"
+          echo "KIT_DIR=$dir" >> "$GITHUB_ENV"
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+          { lscpu | grep -E 'Model name|^CPU\(s\)' || true; free -h || true; df -h "$dir" || true; } \
+            | tee "$EVIDENCE/runner.txt"
+      - name: Proof Kit dry run, as a volunteer runs it (build, download, convert, verify, run)
+        run: |
+          set -euo pipefail
+          scripts/proof-kit/run.sh --dry-run --dir "$KIT_DIR" --out "$EVIDENCE/dry-run" \
+            > "$EVIDENCE/dry-run-stdout.json"
+          cmp "$EVIDENCE/dry-run-stdout.json" "$EVIDENCE/dry-run/proof-result.json"
+      - name: The dry-run payload validates, MATCHes and carries the challenge fields
+        working-directory: scripts
+        run: |
+          set -euo pipefail
+          payload="$EVIDENCE/dry-run/proof-result.json"
+          python -m arc_conformance.proof_kit_reference validate "$payload" --expect-verdict MATCH
+          python - "$payload" <<'PY'
+          import json, sys
+          from arc_conformance import proof_kit_reference as ref
+          p = json.load(open(sys.argv[1]))
+          ch = p["challenge"]
+          assert ch["challenge_id"] == ref.TEST_CHALLENGE["challenge_id"], ch
+          assert ch["seed"] == ref.TEST_CHALLENGE["seed"], ch
+          assert ch["prompt_sha256"] == ref.sha256_hex(ref.challenge_prompt(ch["seed"])), ch
+          backends = [r["backend"] for r in p["runs"]]
+          assert backends == ["cpu-scalar", "cpu-simd"], backends
+          digests = {r["challenge_digest"] for r in p["runs"]}
+          assert digests == {ch["digest"]}, "the challenge digest differs between kernels"
+          assert all(r["golden_digest"] == ref.PUBLISHED_GOLDEN_DIGEST for r in p["runs"])
+          simd = p["runs"][1]["vector_projections"]
+          assert simd["attempted"] > 0 and simd["accepted"] == simd["attempted"], simd
+          assert p["runs"][0]["vector_projections"] == {"attempted": 0, "accepted": 0}
+          assert p["island"] is not None and p["island"]["memory_class_gb"] is not None
+          print("golden", p["golden"]["digest"])
+          print("test challenge digest", ch["digest"], "on", ", ".join(backends))
+          print("speeds", [(r["backend"], r["prefill_tok_s"], r["decode_tok_s"]) for r in p["runs"]])
+          print("device", json.dumps(p["device"]), "island", json.dumps(p["island"]))
+          PY
+      - name: Challenge derivation is identical in Rust and Python (256 random seeds)
+        working-directory: scripts
+        run: |
+          set -euo pipefail
+          python -c 'import secrets; print("\n".join(secrets.token_hex(32) for _ in range(256)))' \
+            > "$EVIDENCE/seeds.txt"
+          ../target/release/arc-modern challenge-prompt --seeds "$EVIDENCE/seeds.txt" > "$EVIDENCE/rust-prompts.jsonl"
+          python -m arc_conformance.proof_kit_reference derive --seeds-file "$EVIDENCE/seeds.txt" --json \
+            > "$EVIDENCE/python-prompts.jsonl"
+          python - "$EVIDENCE/rust-prompts.jsonl" "$EVIDENCE/python-prompts.jsonl" <<'PY'
+          import json, sys
+          rust = [json.loads(line) for line in open(sys.argv[1])]
+          python = [json.loads(line) for line in open(sys.argv[2])]
+          assert len(rust) == len(python) == 256, (len(rust), len(python))
+          assert rust == python, next((r, p) for r, p in zip(rust, python) if r != p)
+          print("256 of 256 seeds derive the identical prompt in Rust and Python")
+          PY
+      - name: Submit to a local mock Hash Wall, confirmed with "yes" on a terminal
+        run: |
+          set -euo pipefail
+          python scripts/proof-kit/mock_hash_wall.py --port 8787 --store "$EVIDENCE/mock" \
+            2> "$EVIDENCE/mock.log" &
+          echo "MOCK_PID=$!" >> "$GITHUB_ENV"
+          sleep 2
+          python scripts/proof-kit/pty_answer.py --answer yes -- \
+            ./target/release/arc-modern proof --submit --endpoint http://127.0.0.1:8787 \
+            --dir "$KIT_DIR" --backends cpu-simd --out "$EVIDENCE/submit-yes" \
+            | tee "$EVIDENCE/submit-yes.log"
+          test "$(find "$EVIDENCE/mock" -name 'submission-*.json' | wc -l)" -eq 1
+          grep -q 'HTTP 202' "$EVIDENCE/submit-yes.log"
+          cd scripts
+          python -m arc_conformance.proof_kit_reference validate "$EVIDENCE/mock/submission-0.json" \
+            --expect-verdict MATCH
+          cmp "$EVIDENCE/mock/submission-0.json" "$EVIDENCE/submit-yes/proof-result.json"
+      - name: A declined submission sends nothing
+        run: |
+          set -euo pipefail
+          python scripts/proof-kit/pty_answer.py --answer no -- \
+            ./target/release/arc-modern proof --submit --endpoint http://127.0.0.1:8787 \
+            --dir "$KIT_DIR" --backends cpu-simd --out "$EVIDENCE/submit-no" \
+            | tee "$EVIDENCE/submit-no.log"
+          grep -q 'Not sent' "$EVIDENCE/submit-no.log"
+          test "$(find "$EVIDENCE/mock" -name 'submission-*.json' | wc -l)" -eq 1
+          kill "$MOCK_PID" || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: proof-kit-e2e-linux
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  matrix:
+    name: dry run (${{ matrix.os }})
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'proof-kit-matrix') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'proof-kit-matrix')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, windows-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        shell: bash
+        run: python -m pip install --disable-pip-version-check "$PY_BLAKE3"
+      - name: Kit directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            # RUNNER_TEMP is on D:, which has far more room than C:.
+            Windows) dir="$RUNNER_TEMP/arc-proof-kit" ;;
+            *) dir="$HOME/arc-proof-kit" ;;
+          esac
+          mkdir -p "$dir" "$RUNNER_TEMP/evidence"
+          echo "KIT_DIR=$dir" >> "$GITHUB_ENV"
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+      - name: Proof Kit dry run (run.sh)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: scripts/proof-kit/run.sh --dry-run --dir "$KIT_DIR" --out "$EVIDENCE/dry-run" > /dev/null
+      - name: Proof Kit dry run (run.ps1, Windows PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\proof-kit\run.ps1 --dry-run --dir "$env:KIT_DIR" --out "$env:EVIDENCE\dry-run" | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: The payload validates and MATCHes
+        shell: bash
+        working-directory: scripts
+        run: |
+          python -m arc_conformance.proof_kit_reference validate "$EVIDENCE/dry-run/proof-result.json" \
+            --expect-verdict MATCH
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: proof-kit-${{ matrix.os }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
