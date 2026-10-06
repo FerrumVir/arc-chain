@@ -5031,6 +5031,28 @@ fn public_node_name(cli: &Cli) -> String {
     format!("arc-{}", &hex::encode(digest.0)[..8])
 }
 
+/// The label this community worker registers under on every coordinator's
+/// public scoreboard, plus why a `--node-name` nickname was not used.
+///
+/// Never derived from the hostname, user name, data directory, or any other
+/// machine metadata: see [`rpc::community_public_name`].
+fn community_registration_name(
+    worker_id: &str,
+    requested: Option<&str>,
+) -> (String, Option<&'static str>) {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (rpc::community_default_public_name(worker_id), None);
+    };
+    let public_name = rpc::community_public_name(worker_id, requested);
+    if public_name == requested {
+        return (public_name, None);
+    }
+    let reason = rpc::validate_community_nickname(requested)
+        .err()
+        .unwrap_or("nickname has the shape of another worker's default label");
+    (public_name, Some(reason))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ValidatorHttpAudience {
     target_validator: Hash256,
@@ -8744,14 +8766,24 @@ async fn run_arc_node() -> Result<()> {
     }
 
     if community_networking {
-        let public_node_name_c = public_node_name(&cli);
         let worker_id = format!("0x{}", hex::encode(validator_address.0));
-        let hostname = std::process::Command::new("hostname")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Every validator serves this label on its public scoreboard. It is a
+        // validated `--node-name` nickname or `node-<short public-key hash>`,
+        // never the hostname: default computer names usually carry the
+        // owner's first name.
+        let (public_worker_name, rejected_nickname) =
+            community_registration_name(&worker_id, cli.node_name.as_deref());
+        if let Some(reason) = rejected_nickname {
+            tracing::warn!(
+                public_name = %public_worker_name,
+                reason,
+                "--node-name is not used on public community scoreboards"
+            );
+        }
+        tracing::info!(
+            public_name = %public_worker_name,
+            "community worker public name (choose a nickname with --node-name)"
+        );
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let worker_model = inference_model.as_ref().and_then(|m| {
             if !m.has_all_transformer_layers() || !m.has_canonical_i8_profile() {
@@ -8775,7 +8807,6 @@ async fn run_arc_node() -> Result<()> {
         let community_rpc_targets = community_rpc_bases.clone();
 
         let worker_id_c = worker_id.clone();
-        let hostname_c = hostname.clone();
         let platform_c = platform.clone();
         let model_name_c = worker_model.as_ref().map(|(name, _, _)| name.clone());
         let model_id_c = worker_model
@@ -8823,7 +8854,7 @@ async fn run_arc_node() -> Result<()> {
             };
             let register_payload = rpc::CommunityRegisterRequest {
                 worker_id: worker_id_c.clone(),
-                name: format!("{} ({})", public_node_name_c, hostname_c),
+                name: public_worker_name,
                 capabilities,
                 model: model_name_c,
                 model_id: model_id_c,
@@ -9707,6 +9738,61 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn community_registration_name_is_a_nickname_or_public_key_hash_never_a_hostname() {
+        let keypair = arc_crypto::KeyPair::generate_ed25519();
+        let worker_id = format!("0x{}", keypair.address().to_hex());
+        let default_name = format!("node-{}", &keypair.address().to_hex()[..8]);
+
+        // No --node-name: the default is `node-` plus a short hash of the
+        // worker public key (its address), with no machine metadata at all.
+        assert_eq!(
+            community_registration_name(&worker_id, None),
+            (default_name.clone(), None)
+        );
+        assert_eq!(
+            community_registration_name(&worker_id, Some("   ")),
+            (default_name.clone(), None)
+        );
+
+        // A valid nickname is used verbatim (trimmed).
+        assert_eq!(
+            community_registration_name(&worker_id, Some(" basement rig 2 ")),
+            ("basement rig 2".to_string(), None)
+        );
+        assert_eq!(
+            community_registration_name(
+                &worker_id,
+                Some("github-linux-x86_64-community-verification")
+            ),
+            (
+                "github-linux-x86_64-community-verification".to_string(),
+                None
+            )
+        );
+
+        // Hostname-shaped or unsafe nicknames fall back with a stated reason.
+        for rejected in [
+            "Adas-MacBook-Pro.local",
+            "Adas-MacBook-Pro",
+            "DESKTOP-1A2B3C4",
+            "ada (Adas-MacBook-Pro.local)",
+            "<b>ada</b>",
+            "node-00000000",
+        ] {
+            let (name, reason) = community_registration_name(&worker_id, Some(rejected));
+            assert_eq!(name, default_name, "{rejected} must not be published");
+            assert!(
+                reason.is_some(),
+                "{rejected} must explain why it was refused"
+            );
+        }
+
+        // The worker's own default label is accepted as an explicit nickname.
+        let explicit_default = community_registration_name(&worker_id, Some(&*default_name));
+        assert_eq!(explicit_default, (default_name, None));
+    }
 
     #[test]
     fn community_audience_accepts_live_0x_prefixed_network_info() {
