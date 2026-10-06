@@ -1,12 +1,57 @@
 use crate::types::HardwareInfo;
 use sysinfo::System;
 
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Product floor for running the canonical 7B worker, in marketed gigabytes
+/// (what the machine's spec sheet says: a "16 GB" laptop).
+pub const WORKER_MIN_NOMINAL_RAM_GB: u64 = 16;
+
+/// Memory capacities machines are sold with, in GiB.
+const MARKETED_RAM_SIZES_GB: &[u64] = &[
+    2, 3, 4, 6, 8, 12, 16, 18, 20, 24, 32, 36, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
+    1536, 2048,
+];
+
+/// Largest share of a marketed size that firmware, integrated graphics, and
+/// the kernel are allowed to reserve before the OS reports its total (at
+/// least 1 GiB). 15% of 16 GiB is 2.4 GiB, which covers an AMD APU's 2 GiB
+/// UMA frame buffer.
+const MAX_RESERVED_PERCENT: u64 = 15;
+
+/// The marketed capacity ("16 GB") behind the memory the OS reports.
+///
+/// The OS total excludes memory reserved before the OS sees it. macOS
+/// (`hw.memsize`) reports exactly 16 GiB on a 16 GB Mac, but Windows
+/// (`GlobalMemoryStatusEx`) typically reports 15.7–15.9 GiB, Linux
+/// (`/proc/meminfo` `MemTotal`) 15.2–15.6 GiB, and a 16 GB AMD APU with a
+/// 2 GiB frame buffer about 13.9 GiB. Flooring those to whole GiB read
+/// "15 GB" and sent 16 GB Windows and Linux machines to observer mode.
+///
+/// The visible total maps to the smallest marketed size at or above it when
+/// the shortfall is within [`MAX_RESERVED_PERCENT`]; otherwise (a VM with an
+/// unusual size, say) it stays at whole GiB, rounded down.
+pub fn nominal_ram_gb(visible_bytes: u64) -> u64 {
+    for &size_gb in MARKETED_RAM_SIZES_GB {
+        let size_bytes = size_gb * GIB;
+        if visible_bytes > size_bytes {
+            continue;
+        }
+        let tolerance = (size_bytes / 100 * MAX_RESERVED_PERCENT).max(GIB);
+        if size_bytes - visible_bytes <= tolerance {
+            return size_gb;
+        }
+        break;
+    }
+    visible_bytes / GIB
+}
+
 pub fn detect() -> HardwareInfo {
     let mut sys = System::new_all();
     sys.refresh_all();
 
     let total_ram_bytes = sys.total_memory();
-    let ram_gb = total_ram_bytes / 1024 / 1024 / 1024;
+    let ram_gb = nominal_ram_gb(total_ram_bytes);
     let cpu_cores = sys.cpus().len() as u32;
     let cpu_model = sys
         .cpus()
@@ -56,7 +101,9 @@ pub fn detect() -> HardwareInfo {
 
 fn recommend(ram_gb: u64, _gpu_gb: Option<u64>) -> (&'static str, &'static str) {
     match ram_gb {
-        r if r >= 16 => ("Llama-2-7B Q4_K_M (3.8 GB, ARC compatible)", "worker"),
+        r if r >= WORKER_MIN_NOMINAL_RAM_GB => {
+            ("Llama-2-7B Q4_K_M (3.8 GB, ARC compatible)", "worker")
+        }
         _ => (
             "Observer/router (16 GB RAM required for ARC 7B work)",
             "verifier",
@@ -86,7 +133,7 @@ fn detect_gpu() -> (Option<String>, Option<u64>) {
             // On Apple Silicon, VRAM == unified memory
             let mut sys = sysinfo::System::new_all();
             sys.refresh_memory();
-            let unified_gb = sys.total_memory() / 1024 / 1024 / 1024;
+            let unified_gb = nominal_ram_gb(sys.total_memory());
             (name, Some(unified_gb))
         }
         _ => (None, None),
@@ -216,4 +263,74 @@ fn detect_gpu() -> (Option<String>, Option<u64>) {
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn detect_gpu() -> (Option<String>, Option<u64>) {
     (None, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `tenths` of a GiB, so the fixtures read like the OS dialogs do.
+    fn gib_tenths(tenths: u64) -> u64 {
+        tenths * GIB / 10
+    }
+
+    #[test]
+    fn sixteen_gb_machines_count_as_sixteen_gb_on_every_os() {
+        // macOS: `hw.memsize` reports the full installed amount.
+        assert_eq!(nominal_ram_gb(16 * GIB), 16);
+        // Windows: GlobalMemoryStatusEx excludes firmware and iGPU memory.
+        for visible in [159, 158, 157, 154] {
+            assert_eq!(nominal_ram_gb(gib_tenths(visible)), 16, "{visible}/10 GiB");
+        }
+        // Linux: MemTotal also excludes kernel and crash-kernel reservations.
+        for visible in [156, 152, 149] {
+            assert_eq!(nominal_ram_gb(gib_tenths(visible)), 16, "{visible}/10 GiB");
+        }
+        // A 16 GB AMD APU with a 2 GiB UMA frame buffer.
+        assert_eq!(nominal_ram_gb(gib_tenths(139)), 16);
+        // Exactly what the old floor-to-GiB arithmetic turned into "15 GB".
+        assert_eq!(nominal_ram_gb(16 * GIB - 1), 16);
+        assert_eq!((16 * GIB - 1) / GIB, 15);
+    }
+
+    #[test]
+    fn sixteen_gb_machines_are_recommended_the_worker_role() {
+        for visible in [16 * GIB, gib_tenths(158), gib_tenths(152), gib_tenths(139)] {
+            let (_, role) = recommend(nominal_ram_gb(visible), None);
+            assert_eq!(role, "worker", "{visible} visible bytes");
+        }
+    }
+
+    #[test]
+    fn smaller_machines_keep_their_own_size_and_stay_observers() {
+        // 8 GB and 12 GB machines.
+        assert_eq!(nominal_ram_gb(gib_tenths(77)), 8);
+        assert_eq!(nominal_ram_gb(gib_tenths(116)), 12);
+        // A 12.5 GiB VM is too far below 16 GB to be a reserved 16 GB machine.
+        assert_eq!(nominal_ram_gb(gib_tenths(125)), 12);
+        // 13.5 GiB is more than 15% below 16 GB.
+        assert_eq!(nominal_ram_gb(gib_tenths(135)), 13);
+        // Failed detection never rounds up into eligibility.
+        assert_eq!(nominal_ram_gb(0), 0);
+        for visible in [
+            0,
+            gib_tenths(77),
+            gib_tenths(116),
+            gib_tenths(125),
+            gib_tenths(135),
+        ] {
+            let (_, role) = recommend(nominal_ram_gb(visible), None);
+            assert_eq!(role, "verifier", "{visible} visible bytes");
+        }
+    }
+
+    #[test]
+    fn larger_machines_keep_their_marketed_size() {
+        assert_eq!(nominal_ram_gb(18 * GIB), 18);
+        assert_eq!(nominal_ram_gb(gib_tenths(235)), 24);
+        assert_eq!(nominal_ram_gb(gib_tenths(313)), 32);
+        assert_eq!(nominal_ram_gb(gib_tenths(628)), 64);
+        // Beyond the table, whole GiB rounded down.
+        assert_eq!(nominal_ram_gb(4096 * GIB), 4096);
+    }
 }
