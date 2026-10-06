@@ -41,6 +41,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
   # Release optimisation without fat LTO: the same kernels, a much shorter
   # build. Integer results cannot depend on optimisation settings.
   CARGO_PROFILE_RELEASE_LTO: 'off'
@@ -54,6 +55,9 @@ env:
 jobs:
   unit:
     name: unit + tiny Rust/Python cross-check
+    # Adding an unrelated label must not re-run anything (pattern shared with
+    # determinism-proof.yml).
+    if: github.event.action != 'labeled' || github.event.label.name == 'smollm3-proof'
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -131,6 +135,7 @@ jobs:
 
   matrix:
     name: matrix (${{ matrix.os }})
+    if: github.event.action != 'labeled' || github.event.label.name == 'smollm3-proof'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     strategy:
@@ -169,13 +174,25 @@ jobs:
                 dir="$HOME/arc-model"
               fi
               ;;
-            Windows) dir="C:/arc-model" ;;
+            # Windows: RUNNER_TEMP is on D:, which has far more room than C:.
             *) dir="$RUNNER_TEMP/arc-model" ;;
           esac
           mkdir -p "$dir" "$RUNNER_TEMP/evidence"
           echo "MODEL_DIR=$dir" >> "$GITHUB_ENV"
           echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
           df -h "$dir" "$RUNNER_TEMP" || true
+      - name: Record runner facts (CPU, memory, disk) for the tok/s labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            case "$RUNNER_OS" in
+              macOS) sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize ;;
+              Linux) { lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | cut -c1-400; free -b; } || true ;;
+              Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory" ;;
+            esac
+          } 2>&1 | tee "$EVIDENCE/runner.txt"
       - name: Build arc-modern
         shell: bash
         run: cargo build --release --locked -p arc-inference --bin arc-modern
@@ -231,7 +248,9 @@ jobs:
 
   reference:
     name: SmolLM3-3B independent Python reference
-    if: contains(github.event.pull_request.labels.*.name, 'smollm3-proof')
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'smollm3-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'smollm3-proof')
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -312,7 +331,9 @@ jobs:
 
   quality:
     name: SmolLM3-3B perplexity vs BF16
-    if: contains(github.event.pull_request.labels.*.name, 'smollm3-proof')
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'smollm3-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'smollm3-proof')
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
