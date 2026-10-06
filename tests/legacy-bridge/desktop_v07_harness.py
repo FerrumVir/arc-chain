@@ -313,13 +313,28 @@ def pid_alive(pid: int) -> bool:
     return Path(f"/proc/{pid}").exists()
 
 
-def assert_no_seed(paths: list[Path], extra: str) -> None:
+def assert_no_seed(paths: list[Path], extra: str) -> list[str]:
+    """Search everything the bridge wrote for the v0.7 seed phrase.
+
+    Windows refuses reads of files the running node holds open exclusively
+    (its own WAL and locks, which it created after the bridge exec'd it and
+    which never saw the seed). Those are listed, not silently passed.
+    """
     needle = SEED_PHRASE.encode("utf-8")
     assert SEED_PHRASE not in extra, "the seed phrase reached the bridged node's command line"
+    unreadable: list[str] = []
     for root in paths:
         for path in [root] if root.is_file() else root.rglob("*"):
-            if path.is_file() and needle in path.read_bytes():
+            if not path.is_file():
+                continue
+            try:
+                payload = path.read_bytes()
+            except PermissionError:
+                unreadable.append(str(path))
+                continue
+            if needle in payload:
                 raise AssertionError(f"the seed phrase leaked into {path}")
+    return unreadable
 
 
 # -------------------------------------------------------------- scenario --
@@ -349,7 +364,8 @@ def run(args: argparse.Namespace) -> None:
     threading.Thread(target=github.serve_forever, daemon=True).start()
     github.releases["v0.7.7"] = {asset: args.legacy_node.read_bytes()}
     github.releases["v0.7.11"] = {"latest.json": b"{}"}  # desktop-only, like the real one
-    github.releases["v0.7.12"] = {asset: args.bridge.read_bytes()}
+    bridge_tag = "v" + pins["bridge_version"]
+    github.releases[bridge_tag] = {asset: args.bridge.read_bytes()}
     config = {"rpc_port": 9944, "p2p_port": 9945, "data_dir": "~/.arc", "role": "worker", "model_path": None}
     node = DesktopNode(home, resources, evidence / "desktop-node.log")
 
@@ -377,7 +393,7 @@ def run(args: argparse.Namespace) -> None:
     snapshot_tree.write_json(evidence / "v07-data.before.json", {"entries": snapshot_tree.snapshot(arc, True)})
 
     print("== the bridge is Latest: the next start installs it and the node joins as v0.8 stake 0")
-    github.latest = "v0.7.12"
+    github.latest = bridge_tag
     started = time.time()
     argv = start_node(node, github.base, "0.7.11", config)
     report["spawn_argv"] = [arg if arg != SEED_PHRASE else "<seed phrase>" for arg in argv]
@@ -414,7 +430,15 @@ def run(args: argparse.Namespace) -> None:
     before = json.loads((evidence / "v07-data.before.json").read_text(encoding="utf-8"))["entries"]
     after = json.loads((evidence / "v07-data.after.json").read_text(encoding="utf-8"))["entries"]
     assert before == after and "state.wal" in before, "the v0.7 data changed"
-    assert_no_seed([bridge_root], cmdline)
+    locked = assert_no_seed([bridge_root], cmdline)
+    report["seed_scan_locked_by_running_node"] = locked
+    bridge_outputs = [
+        path
+        for path in locked
+        if Path(path).name in ("bridge.log", "bridge-state.json")
+        or Path(path).name.startswith("v0.7-data-archive")
+    ]
+    assert not bridge_outputs, f"bridge outputs could not be scanned: {bridge_outputs}"
 
     print("== stop and start again: the launcher is fetched again, the verified cache is reused")
     node_pid = int(running["pid"])
