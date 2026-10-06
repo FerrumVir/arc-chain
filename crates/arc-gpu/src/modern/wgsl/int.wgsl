@@ -134,22 +134,30 @@ fn mul_u32_i32(w: u32, v: i32) -> vec2<u32> {
     return select(m, i64_neg(m), v < 0);
 }
 
-// floor(n / d) for an unsigned 64-bit n and 0 < d <= 2^31. The remainder stays
-// below d, so doubling it never leaves u32.
-fn div64_u32(n: vec2<u32>, d: u32) -> vec2<u32> {
-    var q = vec2<u32>(0u, 0u);
-    var rem = 0u;
-    for (var i = 0u; i < 64u; i = i + 1u) {
-        let bi = 63u - i;
-        let limb = bi >> 5u;
-        let bit = (n[limb] >> (bi & 31u)) & 1u;
-        rem = (rem << 1u) | bit;
+// One 32-bit word of a long division: (rem * 2^32 + word) / d for rem < d and
+// 0 < d <= 2^31, so doubling the remainder never leaves u32. Returns
+// (quotient word, remainder). Only scalars are written: dynamically indexed
+// local vectors or arrays on the left of an assignment are not portable (FXC
+// rejects them inside loops).
+fn div_word(rem_in: u32, word: u32, d: u32) -> vec2<u32> {
+    var rem = rem_in;
+    var q = 0u;
+    for (var i = 0u; i < 32u; i = i + 1u) {
+        rem = (rem << 1u) | ((word >> (31u - i)) & 1u);
+        q = q << 1u;
         if (rem >= d) {
             rem = rem - d;
-            q[limb] = q[limb] | (1u << (bi & 31u));
+            q = q | 1u;
         }
     }
-    return q;
+    return vec2<u32>(q, rem);
+}
+
+// floor(n / d) for an unsigned 64-bit n and 0 < d <= 2^31.
+fn div64_u32(n: vec2<u32>, d: u32) -> vec2<u32> {
+    let hi = div_word(0u, n.y, d);
+    let lo = div_word(hi.y, n.x, d);
+    return vec2<u32>(lo.x, hi.x);
 }
 
 // Truncating division of an i64 by 0 < d <= 2^31 (Rust `/`).
@@ -377,35 +385,29 @@ fn signed_from_mag(lo: vec4<u32>, neg: bool) -> vec4<u32> {
 
 // floor(n / d) for unsigned 128-bit n and 0 < d <= 2^31.
 fn div128_u32(n: vec4<u32>, d: u32) -> vec4<u32> {
-    var q = vec4<u32>(0u);
-    var rem = 0u;
-    for (var i = 0u; i < 128u; i = i + 1u) {
-        let bi = 127u - i;
-        let limb = bi >> 5u;
-        let bit = (n[limb] >> (bi & 31u)) & 1u;
-        rem = (rem << 1u) | bit;
-        if (rem >= d) {
-            rem = rem - d;
-            q[limb] = q[limb] | (1u << (bi & 31u));
-        }
-    }
-    return q;
+    let w = div_word(0u, n.w, d);
+    let z = div_word(w.y, n.z, d);
+    let y = div_word(z.y, n.y, d);
+    let x = div_word(y.y, n.x, d);
+    return vec4<u32>(x.x, y.x, z.x, w.x);
 }
 
-// floor(2^92 / d) for 1 <= d <= 2^92 (restoring division; the remainder stays
-// below d, so doubling it stays below 2^93).
+// floor(2^92 / d) for 1 <= d <= 2^92 (restoring division over the 93 bits of
+// the dividend, of which only the top one is set; the remainder stays below
+// d, so doubling it stays below 2^93). The quotient is shifted in from the
+// low end, so only constant components are written.
 fn div_2pow92(d: vec4<u32>) -> vec4<u32> {
     var q = vec4<u32>(0u);
     var rem = vec4<u32>(0u);
     for (var i = 0u; i < 93u; i = i + 1u) {
-        let bi = 92u - i;
         rem = shl128_1(rem);
         if (i == 0u) {
             rem.x = rem.x | 1u;
         }
+        q = shl128_1(q);
         if (!u128_lt(rem, d)) {
             rem = sub128(rem, d);
-            q[bi >> 5u] = q[bi >> 5u] | (1u << (bi & 31u));
+            q.x = q.x | 1u;
         }
     }
     return q;
