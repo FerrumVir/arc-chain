@@ -516,20 +516,23 @@ mod tests {
 
     #[test]
     fn keep_awake_helpers_exit_with_the_node_and_are_inert_when_disabled() {
-        let pid = 4242;
-        match keep_awake_helper_command(pid) {
-            Some((program, args)) if cfg!(target_os = "macos") => {
-                assert_eq!(program, "/usr/bin/caffeinate");
-                assert_eq!(args, ["-i", "-w", "4242"]);
-            }
-            Some((program, args)) if cfg!(target_os = "linux") => {
-                assert_eq!(program, "systemd-inhibit");
-                assert!(args.iter().any(|arg| arg == "--what=idle:sleep"));
-                assert!(args.iter().any(|arg| arg == "--pid=4242"));
-            }
-            Some((program, _)) => panic!("unexpected keep-awake helper {program}"),
-            None => assert!(!cfg!(any(target_os = "macos", target_os = "linux"))),
+        let command = keep_awake_helper_command(4242);
+        #[cfg(target_os = "macos")]
+        {
+            let (program, args) = command.expect("macOS keeps awake with caffeinate");
+            assert_eq!(program, "/usr/bin/caffeinate");
+            assert_eq!(args, ["-i", "-w", "4242"]);
         }
+        #[cfg(target_os = "linux")]
+        {
+            let (program, args) = command.expect("Linux keeps awake with systemd-inhibit");
+            assert_eq!(program, "systemd-inhibit");
+            assert!(args.iter().any(|arg| arg == "--what=idle:sleep"));
+            assert!(args.iter().any(|arg| arg == "--pid=4242"));
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        assert!(command.is_none());
+
         let guard = KeepAwake::begin(false);
         assert!(!guard.is_active());
     }
