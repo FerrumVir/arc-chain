@@ -148,11 +148,13 @@ jobs:
             dir="$HOME/arc-proof-kit"
             mkdir -p "$dir"
           fi
-          mkdir -p "$RUNNER_TEMP/evidence"
+          evidence="$RUNNER_TEMP/evidence"
+          mkdir -p "$evidence"
           echo "KIT_DIR=$dir" >> "$GITHUB_ENV"
-          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+          echo "EVIDENCE=$evidence" >> "$GITHUB_ENV"
           { lscpu | grep -E 'Model name|^CPU\(s\)' || true; free -h || true; df -h "$dir" || true; } \
-            | tee "$EVIDENCE/runner.txt"
+            > "$evidence/runner.txt"
+          cat "$evidence/runner.txt"
       - name: Proof Kit dry run, as a volunteer runs it (build, download, convert, verify, run)
         run: |
           set -euo pipefail

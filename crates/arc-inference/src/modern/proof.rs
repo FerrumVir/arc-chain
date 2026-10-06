@@ -1791,7 +1791,8 @@ mod tests {
     fn tampered_results_are_rejected() {
         let runs = [sample_run("cpu-scalar", None)];
         let good = sample_result(&runs);
-        let mutations: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+        type Mutation = Box<dyn Fn(&mut Value)>;
+        let mutations: Vec<(&str, Mutation)> = vec![
             (
                 "extra field",
                 Box::new(|v: &mut Value| v["hostname"] = json!("alice-laptop")),
