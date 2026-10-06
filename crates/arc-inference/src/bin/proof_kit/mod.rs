@@ -868,6 +868,16 @@ fn print_summary(runs: &[BackendRun], prepared: &Prepared) {
         result["challenge"]["digest"].as_str().unwrap_or("?"),
         result["challenge"]["challenge_id"].as_str().unwrap_or("?")
     );
+    if result["challenge"]["challenge_id"] == proof::TEST_CHALLENGE_ID {
+        if result["challenge"]["digest"] == proof::TEST_CHALLENGE_DIGEST {
+            eprintln!("  {pad} same as the published test-challenge digest");
+        } else {
+            eprintln!(
+                "  {pad} DIFFERS from the published test-challenge digest {}; please report it",
+                proof::TEST_CHALLENGE_DIGEST
+            );
+        }
+    }
     eprintln!();
     eprintln!(
         "Speed ({}): the five golden prompts, one request at a time on all {} threads; prefill",

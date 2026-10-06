@@ -180,6 +180,7 @@ jobs:
           digests = {r["challenge_digest"] for r in p["runs"]}
           assert digests == {ch["digest"]}, "the challenge digest differs between kernels"
           assert all(r["golden_digest"] == ref.PUBLISHED_GOLDEN_DIGEST for r in p["runs"])
+          assert ch["digest"] == ref.TEST_CHALLENGE_DIGEST, ("test challenge digest", ch["digest"])
           simd = p["runs"][1]["vector_projections"]
           assert simd["attempted"] > 0 and simd["accepted"] == simd["attempted"], simd
           assert p["runs"][0]["vector_projections"] == {"attempted": 0, "accepted": 0}
@@ -287,12 +288,14 @@ jobs:
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File scripts\proof-kit\run.ps1 --dry-run --dir "$env:KIT_DIR" --out "$env:EVIDENCE\dry-run" | Out-Null
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: The payload validates and MATCHes
+      - name: The payload validates, MATCHes and reproduces the test-challenge digest
         shell: bash
         working-directory: scripts
         run: |
-          python -m arc_conformance.proof_kit_reference validate "$EVIDENCE/dry-run/proof-result.json" \
-            --expect-verdict MATCH
+          set -euo pipefail
+          payload="$EVIDENCE/dry-run/proof-result.json"
+          python -m arc_conformance.proof_kit_reference validate "$payload" --expect-verdict MATCH
+          python -c 'import json, sys; from arc_conformance import proof_kit_reference as ref; d = json.load(open(sys.argv[1]))["challenge"]["digest"]; assert d == ref.TEST_CHALLENGE_DIGEST, d; print("test challenge digest", d)' "$payload"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

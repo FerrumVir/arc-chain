@@ -46,10 +46,10 @@ newer Apple chips, AVX-512 PCs, Windows on ARM, other Linux distributions.
 7. **Shares nothing** unless you run it with `--submit` and type `yes` after
    reading the exact data it would send.
 
-On GitHub's 4-core cloud machines the five golden prompts take about 6 minutes
-on the scalar path and 2.5 minutes on the vector path; conversion takes 15 s
-to 3 minutes. Your computer will differ. The model needs about 3 GB of memory
-while it runs.
+On GitHub's 4-core cloud machines the download took about a minute, the
+conversion 15 s to 3 minutes, and the five golden prompts 6 to 7 minutes on
+the scalar path and 2.5 minutes on the vector path. Your computer will differ.
+The model needs about 3 GB of memory while it runs.
 
 ## Run it
 
@@ -148,7 +148,8 @@ the model's 128,256 scores at every step of every prompt, so equal digests
 mean bit-identical computation, not just the same final words. The published
 digest was produced identically in 28 of 28 CI runs on Linux, Windows and
 macOS (Intel and Apple Silicon), on five processor models, and by an
-independent Python implementation written from the specification.
+independent Python implementation written from the specification. The kit's
+own CI dry run reproduced it on a sixth, an AMD EPYC 9V74, on both kernels.
 
 It also means your computer converted the public weights into exactly the
 published package (the conversion check runs first).
@@ -261,7 +262,12 @@ it): `challenge_id` `test-challenge-v1`, seed
 `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f`,
 `expires_at` `2099-12-31T23:59:59Z`, `signature` `unsigned-test-challenge`.
 Its prompt: "Write one short sentence that mentions frogs, kayaks, buttons and
-teapots."
+teapots." In the kit's CI dry run (Proof Kit run 37507415675, an AMD EPYC
+9V74 GitHub runner) both CPU kernels answered "The frog leaped gracefully into
+the kayak, causing a button to pop off and land in its teapot." with challenge
+digest `fad7f4483e2092bd21f669fad7bc70e6f203792a81ddce440026917ffaba4f6c`.
+Every computer should reproduce that digest; local and dry runs print whether
+they did.
 
 ### Digests
 
@@ -325,6 +331,133 @@ lists on one line, and shows exactly those bytes before sending.
 | `island.gpu_vram_class_gb` | Largest of 1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 192 not above the GPU's own memory (5% allowance), or `null` (none found, or unified memory) |
 | `island.thunderbolt5` | Mac only: `true` if macOS reports a Thunderbolt port of 80 Gb/s or more, `false` if only slower ports, `null` elsewhere |
 | `island.download_mbps_class` | Largest of 1, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000 Mb/s not above the measured model download speed, or `null` (no download in this run) |
+
+### Example: a real dry run
+
+This is the exact output of `scripts/proof-kit/run.sh --dry-run` in the kit's
+CI (Proof Kit run 37507415675, GitHub `ubuntu-latest`, AMD EPYC 9V74, 4
+vCPU): 4,680 bytes. Both kernels matched the published golden digest, and
+both produced the same test-challenge digest. The model download (6.15 GB in
+58 s) gave the `download_mbps_class` of 500. The speeds are that cloud
+machine's, not a benchmark.
+
+```json
+{
+  "arc_version": "0.8.10",
+  "challenge": {
+    "case": {
+      "id": "challenge",
+      "logits_digest": "b17675fd936c02067c11510fb1e27bf85fb2ab8bf4dd32f4c6fa6e84125a897d",
+      "output_hash": "fc071265009a51e9620f5b3b987385615d3638f83c9d61ad1adcffa8c6e3facb",
+      "tokens": [791, 60981, 514, 10395, 79599, 1139, 279, 88078, 11, 14718, 264, 3215, 311, 2477, 1022, 323, 4363, 304, 1202, 1028, 91001, 13, 128012]
+    },
+    "challenge_id": "test-challenge-v1",
+    "digest": "fad7f4483e2092bd21f669fad7bc70e6f203792a81ddce440026917ffaba4f6c",
+    "expires_at": "2099-12-31T23:59:59Z",
+    "prompt_sha256": "5fc6b7fa32ea6642a8ae0992164040418cd151ca5f854f1f998259d69dcc8748",
+    "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "signature": "unsigned-test-challenge"
+  },
+  "device": {
+    "arch": "x86_64",
+    "cpu_features": ["avx2", "fma"],
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "gpu_model": null,
+    "logical_cpus": 4,
+    "os": "linux",
+    "os_version": "ubuntu 24.04"
+  },
+  "golden": {
+    "cases": [
+      {
+        "id": "capital",
+        "logits_digest": "380651493c7a67fb85c17d2ffb08672c5be2a38eefe1e51988bd783a96659242",
+        "output_hash": "9ab86a7a11c164c14e4101cd9b624deb335df356f5f0ca7c5a5d1ae5ad3a5eea",
+        "tokens": [791, 6864, 315, 9822, 374, 12366, 13, 128012]
+      },
+      {
+        "id": "haiku",
+        "logits_digest": "99e04500cdbe893686f61171bc068c10e4dbe65ceb1ab60742c9602b22e9550b",
+        "output_hash": "8e7aaab19309868ee06fd7d4c75c559d3de4c66452a8bff5a9a46f37a7597ff6",
+        "tokens": [28671, 306, 24811, 11, 2355, 2123, 596, 26348, 304, 279, 3805, 2345, 198, 9219, 770, 287, 16058, 13, 128012]
+      },
+      {
+        "id": "integers",
+        "logits_digest": "ab9ffa0042e0417065bc75630c9647a1427936321f6f58546446cf6c4a6b9a05",
+        "output_hash": "230e4460a67d831e847ca4688cd6bae68a101a8061c55dae71709c07def94b77",
+        "tokens": [3570, 35884, 374, 53823, 79385, 4028, 2204, 19002, 1606, 279, 3135, 315, 7698, 7677, 527, 11075, 21742, 555, 872, 8026, 44713, 323, 8521, 2766]
+      },
+      {
+        "id": "primes",
+        "logits_digest": "63bb9d89aee90b35a1ab5c0ae330de52a58a46d3de21ea05f1320c455f62ff69",
+        "output_hash": "fc4fa66506fc0dd722bb8417b1f884111444b54bc2d06b70787db7341f343c0e",
+        "tokens": [8586, 527, 2380, 10461, 5219, 7191, 1109, 220, 1041, 1473, 16, 13, 3146, 4645, 96618, 1115, 374, 264, 1664, 22015, 10461, 1396, 11, 323]
+      },
+      {
+        "id": "product-greedy",
+        "logits_digest": "9a2a06a1c7b1d8b1b5ad676b9704432ab3d5f1517cecff30fb6b6a7019c41cae",
+        "output_hash": "6f40e1ddca6a30489d73600fb2dca92bd5d9d8529eb555a423f2ce99e570e78c",
+        "tokens": [1271, 1505, 279, 2027, 315, 220, 1114, 323, 220, 1419, 11, 584, 649, 2804, 279, 47544]
+      }
+    ],
+    "digest": "3e43f342c00cf3e3be3072e654e9d1c43f547a73b8a4fc6e906b7119e5cb49f2",
+    "published_digest": "3e43f342c00cf3e3be3072e654e9d1c43f547a73b8a4fc6e906b7119e5cb49f2"
+  },
+  "island": {
+    "download_mbps_class": 500,
+    "gpu_vram_class_gb": null,
+    "memory_class_gb": 16,
+    "thunderbolt5": null,
+    "unified_memory": false
+  },
+  "kit_version": "0.1.0",
+  "model": {
+    "manifest_blake3": "af388d01c3578c5f97238fd74aaa3d0d8194d29fc6fbd99f3aae226064659fa2",
+    "package_sha256": "19c67496ee23fe5da0e12eb1f22cb17f6386c560071587b5b8dfa68731c0aa91",
+    "profile": "arc.hf-llama.i8-dyadic-row.q16.v1",
+    "repo": "HuggingFaceTB/SmolLM3-3B",
+    "revision": "a07cc9a04f16550a088caea529712d1d335b0ac1"
+  },
+  "nonce": "bf4b33f80398b9520a45d13522c2cf9b",
+  "runs": [
+    {
+      "adapter": null,
+      "backend": "cpu-scalar",
+      "challenge_digest": "fad7f4483e2092bd21f669fad7bc70e6f203792a81ddce440026917ffaba4f6c",
+      "decode_tok_s": 1.145,
+      "divergence": null,
+      "golden_digest": "3e43f342c00cf3e3be3072e654e9d1c43f547a73b8a4fc6e906b7119e5cb49f2",
+      "isa": null,
+      "prefill_tok_s": 1.163,
+      "threads": 4,
+      "vector_projections": {
+        "accepted": 0,
+        "attempted": 0
+      },
+      "verdict": "MATCH"
+    },
+    {
+      "adapter": null,
+      "backend": "cpu-simd",
+      "challenge_digest": "fad7f4483e2092bd21f669fad7bc70e6f203792a81ddce440026917ffaba4f6c",
+      "decode_tok_s": 3.2,
+      "divergence": null,
+      "golden_digest": "3e43f342c00cf3e3be3072e654e9d1c43f547a73b8a4fc6e906b7119e5cb49f2",
+      "isa": "avx2",
+      "prefill_tok_s": 3.238,
+      "threads": 4,
+      "vector_projections": {
+        "accepted": 121187,
+        "attempted": 121187
+      },
+      "verdict": "MATCH"
+    }
+  ],
+  "schema": "arc.proof-result.v1",
+  "speed_method": "arc.proof-speed.v1",
+  "verdict": "MATCH"
+}
+```
 
 ### Validation rules
 

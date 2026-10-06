@@ -74,6 +74,11 @@ pub const TEST_CHALLENGE_SEED: &str =
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 pub const TEST_CHALLENGE_EXPIRES_AT: &str = "2099-12-31T23:59:59Z";
 pub const TEST_CHALLENGE_SIGNATURE: &str = "unsigned-test-challenge";
+/// The test challenge's digest, as the kit's own CI dry run produced it on
+/// both CPU kernels (Proof Kit CI run 37507415675, ubuntu-latest). Every
+/// computer should reproduce it; local and dry runs print the comparison.
+pub const TEST_CHALLENGE_DIGEST: &str =
+    "fad7f4483e2092bd21f669fad7bc70e6f203792a81ddce440026917ffaba4f6c";
 
 /// Run backends. GPU runs (`gpu-wgpu`) join when the portable GPU engine lands.
 pub const BACKENDS: [&str; 3] = ["cpu-scalar", "cpu-simd", "gpu-wgpu"];

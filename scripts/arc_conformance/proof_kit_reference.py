@@ -62,6 +62,9 @@ TEST_CHALLENGE = {
     "expires_at": "2099-12-31T23:59:59Z",
     "signature": "unsigned-test-challenge",
 }
+# The test challenge's digest from the kit's own CI dry run (both CPU kernels,
+# Proof Kit CI run 37507415675); every computer should reproduce it.
+TEST_CHALLENGE_DIGEST = "fad7f4483e2092bd21f669fad7bc70e6f203792a81ddce440026917ffaba4f6c"
 
 # --- the pinned workload ----------------------------------------------------
 
