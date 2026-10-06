@@ -73,8 +73,10 @@ jobs:
           python-version: '3.12'
       - name: Python dependencies
         run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
-      - name: Clippy (arc-inference, all targets, deny warnings)
-        run: cargo clippy -p arc-inference --all-targets --locked -- -D warnings
+      # Same feature set as the shipped node (arc-node enables candle); without
+      # it, candle-only helpers in existing code are reported as dead.
+      - name: Clippy (arc-inference with candle, all targets, deny warnings)
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
       - name: Unit tests (modern profile, tables, operators, tokenizer, package)
         run: cargo test -p arc-inference --lib --locked modern -- --nocapture
       - name: Python reference unit tests
