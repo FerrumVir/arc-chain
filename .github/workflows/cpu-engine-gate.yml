@@ -1,0 +1,183 @@
+name: CPU engine gate (SmolLM3-3B)
+
+# Gate and speed evidence for the exact CPU kernels and the fast engine of the
+# dyadic profile arc.hf-llama.i8-dyadic-row.q16.v1
+# (crates/arc-inference/src/modern/{kernels,engine,bench}.rs).
+#
+#   lint-test  clippy (deny warnings) and the kernel/engine unit tests, which
+#              compare every kernel this CPU supports with the scalar kernel.
+#   gate       the real SmolLM3-3B, converted on the runner; every forward pass
+#              and kernel the runner supports is forced in turn and each run's
+#              479 logits hashes must equal the independent Python executor's
+#              golden (scripts/arc_modern/golden/smollm3-3b.python-golden.json,
+#              byte-identical to the evidence-reference artifact of run
+#              37473148757). A speedup that changes one digest fails here.
+#              Then `arc-modern bench` measures tok/s on this runner.
+#
+# Linux only (x86-64 AVX2 and ARM64 NEON): macOS runners are reserved for the
+# release sequence. Numbers are CI-runner measurements, labelled as such.
+
+on:
+  push:
+    branches: [cpu-engine-optimize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Release optimisation without fat LTO: the same kernels, a shorter build.
+  # Integer results cannot depend on optimisation settings.
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  SOURCE_MANIFEST: docs/protocol/packages/smollm3-3b.source.json
+  PINNED_MANIFEST: docs/protocol/packages/smollm3-3b.integer-package.json
+  CASES: scripts/arc_modern/smollm3_cases.json
+  GOLDEN: scripts/arc_modern/golden/smollm3-3b.python-golden.json
+
+jobs:
+  lint-test:
+    name: clippy + kernel tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - name: rustfmt (arc-inference)
+        run: cargo fmt -p arc-inference -- --check
+      - name: Clippy (arc-inference, all targets, deny warnings)
+        run: cargo clippy -p arc-inference --all-targets --locked -- -D warnings
+      - name: Kernel, engine and modern-profile unit tests
+        run: cargo test -p arc-inference --lib --locked modern -- --nocapture
+      - name: Legacy limb-kernel and golden known-answer tests (unchanged paths)
+        run: |
+          cargo test -p arc-inference --lib --locked canonical_simd
+          cargo test -p arc-inference --lib --locked golden
+      - name: Kernel tests with optimisations (the code the gate times)
+        run: cargo test -p arc-inference --lib --release --locked modern::kernels
+
+  gate:
+    name: golden + speed (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            specs: scalar fast:scalar legacy ref:auto simd
+            bench: scalar,legacy,ref:auto,simd
+          - os: ubuntu-24.04-arm
+            specs: scalar fast:scalar legacy ref:auto simd
+            bench: scalar,legacy,ref:auto,simd
+          - os: windows-latest
+            specs: scalar legacy simd
+            bench: legacy,ref:auto,simd
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Choose a model directory with room for 9.3 GB
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux)
+              if [ -d /mnt ] && [ "$(df --output=avail -B1 /mnt | tail -1)" -gt "$(df --output=avail -B1 "$HOME" | tail -1)" ]; then
+                sudo mkdir -p /mnt/arc-model
+                sudo chown "$(id -u):$(id -g)" /mnt/arc-model
+                dir=/mnt/arc-model
+              else
+                dir="$HOME/arc-model"
+              fi
+              ;;
+            *) dir="$RUNNER_TEMP/arc-model" ;;
+          esac
+          mkdir -p "$dir" "$RUNNER_TEMP/evidence"
+          echo "MODEL_DIR=$dir" >> "$GITHUB_ENV"
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+          df -h "$dir" || true
+      - name: Record runner facts (CPU, memory) for the tok/s labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            case "$RUNNER_OS" in
+              Linux) { lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|L2|L3|Flags' | cut -c1-600; free -b; } || true ;;
+              Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors,L2CacheSize,L3CacheSize; Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory" ;;
+            esac
+          } 2>&1 | tee "$EVIDENCE/runner.txt"
+      - name: Build arc-modern
+        shell: bash
+        run: cargo build --release --locked -p arc-inference --bin arc-modern
+      - name: Fetch SmolLM3-3B BF16 (pinned revision, SHA-256 verified)
+        shell: bash
+        run: python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR"
+      - name: Convert on this runner and verify the pinned package hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/arc-modern convert --source-dir "$MODEL_DIR" \
+            --source-manifest "$SOURCE_MANIFEST" --out "$MODEL_DIR/smollm3-3b.arcipkg" \
+            > "$EVIDENCE/convert.json"
+          rm -f "$MODEL_DIR"/model-*.safetensors
+          ./target/release/arc-modern verify --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --manifest "$PINNED_MANIFEST" | tee "$EVIDENCE/verify-pinned.json"
+      - name: Golden prompts with every forced kernel vs the Python golden
+        shell: bash
+        env:
+          SPECS: ${{ matrix.specs }}
+        run: |
+          set -euo pipefail
+          read -ra specs <<< "$SPECS"
+          runs=()
+          for spec in "${specs[@]}"; do
+            file="$EVIDENCE/golden-${spec//:/-}.json"
+            echo "::group::golden --kernel $spec"
+            ./target/release/arc-modern golden --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+              --tokenizer "$MODEL_DIR/tokenizer.json" --cases "$CASES" --kernel "$spec" --out "$file"
+            echo "::endgroup::"
+            runs+=("$file")
+          done
+          python scripts/arc_modern/engine_gate.py check --golden "$GOLDEN" \
+            --label "${{ matrix.os }}" --fail-on-refusal --summary-md "$GITHUB_STEP_SUMMARY" "${runs[@]}"
+      - name: Speed (CI runner) - decode by spec, thread scaling, profile, kernels, bandwidth
+        shell: bash
+        env:
+          BENCH_SPECS: ${{ matrix.bench }}
+        run: |
+          set -euo pipefail
+          ./target/release/arc-modern bench --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --specs "$BENCH_SPECS" --scaling 1,2 --contexts 80,1024 --decode 16 \
+            --tokens-from "$GOLDEN" --profile --micro --bandwidth \
+            --out "$EVIDENCE/bench.json"
+          python scripts/arc_modern/engine_gate.py report --summary-md "$GITHUB_STEP_SUMMARY" \
+            "${{ matrix.os }}=$EVIDENCE/bench.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: cpu-engine-evidence-${{ matrix.os }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
