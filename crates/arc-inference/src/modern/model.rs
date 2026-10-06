@@ -274,6 +274,21 @@ pub trait TokenForward {
     ///
     /// On error the sequence is unusable and must be restarted.
     fn forward_token(&mut self, token: u32) -> Result<&[i64], ModernError>;
+    /// Feed `tokens` in order and pass every position's logits to `each`, in
+    /// order. The same logits as calling [`TokenForward::forward_token`] for
+    /// each token; an implementation may process several positions together
+    /// (batched prefill). On error the sequence must be restarted.
+    fn forward_tokens(
+        &mut self,
+        tokens: &[u32],
+        each: &mut dyn FnMut(&[i64]) -> Result<(), ModernError>,
+    ) -> Result<(), ModernError> {
+        for &token in tokens {
+            let logits = self.forward_token(token)?;
+            each(logits)?;
+        }
+        Ok(())
+    }
     /// The KV cache of the current sequence.
     fn kv_cache(&self) -> &KvCache;
     /// Continue from `cache` (a snapshot of the same model's KV cache).
@@ -356,13 +371,15 @@ pub fn generate_with<F: TokenForward + ?Sized>(
     // top of the decode loop.
     let prefill_start = Instant::now();
     let mut next = 0u32;
-    for (index, &token) in request.prompt.iter().enumerate() {
-        let logits = forward.forward_token(token)?;
+    let mut seen = 0usize;
+    forward.forward_tokens(request.prompt, &mut |logits| {
         hashes.push(arith::logits_hash(logits));
-        if index + 1 == request.prompt.len() {
+        seen += 1;
+        if seen == request.prompt.len() {
             next = arith::select_into(logits, &tokens, request.selection, &mut scratch)?;
         }
-    }
+        Ok(())
+    })?;
     let prefill_seconds = prefill_start.elapsed().as_secs_f64();
     let decode_start = Instant::now();
     loop {

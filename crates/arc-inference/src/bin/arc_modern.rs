@@ -18,7 +18,7 @@ use arc_inference::modern::bpe::ByteLevelBpe;
 use arc_inference::modern::chat::{ChatPrompt, render};
 use arc_inference::modern::convert::{self, SourceManifest};
 use arc_inference::modern::engine::Spec;
-use arc_inference::modern::kernels::Kernel;
+use arc_inference::modern::kernels::{self, Kernel, Tiling};
 use arc_inference::modern::model::{GenerationRequest, ModernModel, TokenForward, generate_with};
 use arc_inference::modern::package;
 use arc_inference::modern::{ModernError, PROFILE, hex_lower};
@@ -41,6 +41,7 @@ const USAGE: &str = "usage: arc-modern <command> [options]
   bench     --package PKG --out BENCH.json [--specs SPEC,...] [--threads N]
             [--scaling N,...] [--contexts N,...] [--decode N]
             [--tokens-from GOLDEN.json] [--profile] [--micro] [--bandwidth]
+            [--tilings rows4,stream]
   tokenize  --tokenizer tokenizer.json --input IN.jsonl --out OUT.jsonl
   render    --user TEXT [--system TEXT] [--today DATE] [--think]
 
@@ -48,7 +49,9 @@ const USAGE: &str = "usage: arc-modern <command> [options]
   logits. scalar: reference forward, scalar kernel (the default). simd: fast
   engine, fastest SIMD kernel on this CPU. legacy: reference forward, the
   earlier limb kernel. ref:KERNEL or fast:KERNEL with KERNEL one of scalar,
-  avx2, neon, auto. ARC_MODERN_KERNEL=SPEC changes the default.";
+  avx2, neon, auto. ARC_MODERN_KERNEL=SPEC changes the default.
+  --tiling rows4|stream (or ARC_MODERN_TILING) picks the row order of the
+  SIMD kernels: a speed setting that cannot change a value.";
 
 const DEFAULT_TODAY: &str = "06 October 2026";
 
@@ -125,7 +128,24 @@ fn configure_kernel(args: &Args) -> Result<(String, Spec), ModernError> {
     let spec = Spec::parse(&name)?;
     spec.apply();
     Spec::start_census();
+    configure_tiling(args)?;
     Ok((name, spec))
+}
+
+/// `--tiling rows4|stream` (default rows4, or `ARC_MODERN_TILING`): the row
+/// order of the SIMD kernels, a speed setting that cannot change a value.
+fn configure_tiling(args: &Args) -> Result<Tiling, ModernError> {
+    let name = args.value("--tiling").or_else(|| {
+        std::env::var("ARC_MODERN_TILING")
+            .ok()
+            .filter(|v| !v.is_empty())
+    });
+    let tiling = match name {
+        Some(name) => Tiling::parse(&name)?,
+        None => Tiling::default(),
+    };
+    kernels::set_tiling(tiling);
+    Ok(tiling)
 }
 
 fn platform() -> Value {
@@ -406,6 +426,7 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
         "spec": spec.name(),
         "engine": spec.engine_name(),
         "kernel_path": spec.kernel_name(),
+        "tiling": kernels::tiling().name(),
         "threads": threads,
         "platform": platform(),
         "cases": records,
@@ -505,14 +526,16 @@ fn cmd_ppl(args: &Args) -> Result<(), ModernError> {
             continue;
         }
         runner.begin(chunk.len());
-        for (position, &token) in chunk.iter().enumerate().take(chunk.len() - 1) {
-            let logits = runner.forward_token(token)?;
+        let mut position = 0usize;
+        runner.forward_tokens(&chunk[..chunk.len() - 1], &mut |logits| {
             forwards += 1;
             hashes.push(arith::logits_hash(logits));
             nll_sum += nll(logits, chunk[position + 1] as usize);
             argmax_ids.push(arith::argmax(logits) as u32);
             scored += 1;
-        }
+            position += 1;
+            Ok(())
+        })?;
     }
     let seconds = start.elapsed().as_secs_f64();
     let out = json!({
@@ -568,6 +591,7 @@ fn bench_tokens(value: &Value) -> Result<Vec<u32>, ModernError> {
 
 fn cmd_bench(args: &Args) -> Result<(), ModernError> {
     configure_threads(args)?;
+    configure_tiling(args)?;
     let package_path = args.path("--package")?;
     let digest = package::digest_file(&package_path)?;
     let (model, load_seconds) = load(&package_path)?;
@@ -596,6 +620,13 @@ fn cmd_bench(args: &Args) -> Result<(), ModernError> {
         profile: args.flag("--profile"),
         kernel_micro: args.flag("--micro"),
         bandwidth: args.flag("--bandwidth"),
+        tilings: args
+            .value("--tilings")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| Tiling::parse(s.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
     };
     let mut result = bench::run(&model, &options)?;
     result["package"] = digest.to_json();
@@ -605,9 +636,10 @@ fn cmd_bench(args: &Args) -> Result<(), ModernError> {
     for context in result["contexts"].as_array().into_iter().flatten() {
         for run in context["decode"].as_array().into_iter().flatten() {
             println!(
-                "context {} | {} | {} threads | {:.2} tok/s | digest {}",
+                "context {} | {} ({}) | {} threads | {:.2} tok/s | digest {}",
                 context["context"],
                 run["spec"].as_str().unwrap_or_default(),
+                run["tiling"].as_str().unwrap_or_default(),
                 run["threads"],
                 run["tok_s"].as_f64().unwrap_or(0.0),
                 run["logits_digest"].as_str().unwrap_or_default()
