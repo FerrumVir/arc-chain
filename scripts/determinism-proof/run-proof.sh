@@ -14,7 +14,7 @@
 #
 # Needs rustup (the repository pins its toolchain), curl, about 5 GB of disk
 # for the model and about 8 GB of free memory; less memory works, slowly,
-# through swap. A laptop takes roughly 20 to 90 minutes for the default run.
+# through swap. docs/determinism-proof.md lists measured CI run times.
 set -Eeuo pipefail
 
 readonly MODEL_URL="https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf"

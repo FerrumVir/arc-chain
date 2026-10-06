@@ -73,10 +73,11 @@ once it is on the default branch.
 
 ## Run it yourself
 
-You need about 5 GB of disk for the model, about 8 GB of free memory (less
-works, slowly, through swap) and the Rust toolchain manager `rustup`. The
-repository pins its toolchain, so the first build installs it. Expect 20 to 90
-minutes on a laptop CPU.
+You need about 5 GB of disk for the model, about 8 GB of free memory (the
+process peaked at 8.2 GB on Linux; less works, slowly, through swap) and the
+Rust toolchain manager `rustup`. The repository pins its toolchain, so the
+first build installs it. Run times on the CI runners are listed under Results;
+a personal computer will differ.
 
 macOS or Linux:
 
@@ -119,11 +120,12 @@ computer.
   untested. The SIMD kernel is NEON dotprod on arm64 and AVX2 on x86_64; on
   arm64 the attention dot product also uses an exact NEON path in both jobs.
 - **Load-time floating point.** The engine's arithmetic is integer-only, but
-  model loading uses floating point twice: dequantizing GGUF blocks and
-  requantizing rows use only exactly rounded IEEE operations, while the RoPE
-  tables use the platform's `powf`, `sin` and `cos`. The transcript records
-  digests of both results, so a platform difference would show up and be
-  located; it does not prove that other math libraries round identically.
+  model loading uses floating point. Dequantizing GGUF blocks, requantizing
+  rows to INT8 and converting embeddings and norms to Q16 use only exactly
+  rounded IEEE operations. The RoPE tables use the platform's `powf`, `sin` and
+  `cos`. The transcript records digests of all of these results, so a platform
+  difference would show up and be located; it does not prove that other math
+  libraries round identically.
 - **Determinism is not quality.** Identical output says nothing about whether
   the output is good.
 - **Timings are CI-runner measurements.** GitHub-hosted runners are shared

@@ -347,6 +347,36 @@ def main() -> int:
     if run_url:
         lines.append(f"- Workflow run: {run_url}")
     lines.append(f"- Compared at {now}.")
+    reference_pair = (
+        next((p for p in pairs if p["combined_sha256"] == reference), None) if reference else None
+    )
+    reference_results = (
+        groups.get((reference_pair["runner"], reference_pair["kernel"]), [])
+        if reference_pair
+        else []
+    )
+
+    def shard_index(item: dict) -> int:
+        try:
+            return int(str(item.get("shard", "0/1")).partition("/")[0])
+        except ValueError:
+            return 0
+
+    answers = []
+    for result in sorted(reference_results, key=shard_index):
+        for prompt in ((result.get("run") or {}).get("prompts")) or []:
+            text = " ".join(str(prompt.get("text", "")).split()).replace("```", "'''")
+            answers.append(f"{prompt.get('id')}: {text}")
+    if answers:
+        lines += [
+            "",
+            "Generated answers (decoded from the reference run's token IDs, which every "
+            "identical run shares; each ends at end-of-sequence or at the token budget):",
+            "",
+            "```text",
+            *answers,
+            "```",
+        ]
     for pair in pairs:
         if pair["problems"] or not pair["identical"]:
             lines.append("")

@@ -161,6 +161,30 @@ def main() -> int:
         if transcript is not None and written != transcript["bytes"]:
             problems.append("transcript size differs from what the driver wrote")
 
+    host = {
+        "cpu_model": cpu_model(),
+        "memory_bytes": memory_bytes(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "python": platform.python_version(),
+    }
+    timing = (run or {}).get("timing") or {}
+    whole = args.shard in ("", "0/1")
+    summary = {
+        "os": os.environ.get("RUNNER_OS") or platform.system(),
+        "os_version": host["platform"],
+        "cpu_model": host["cpu_model"],
+        "kernel_requested": args.kernel,
+        "kernel_path": ((run or {}).get("kernel") or {}).get("effective"),
+        "decode_tokens_per_second_ci_runner": timing.get("decode_tokens_per_second"),
+        "prefill_tokens_per_second_ci_runner": timing.get("prefill_tokens_per_second"),
+        "tokens_per_second_note": (
+            "GitHub-hosted CI runner measurement (shared virtual machine), forward "
+            "passes only; not a product benchmark"
+        ),
+        "combined_sha256": transcript["sha256"] if transcript and whole else None,
+        "shard_transcript_sha256": transcript["sha256"] if transcript and not whole else None,
+    }
     result = {
         "schema": SCHEMA,
         "status": "complete" if not problems else "failed",
@@ -168,14 +192,9 @@ def main() -> int:
         "runner_label": args.runner_label,
         "kernel": args.kernel,
         "shard": args.shard,
+        "summary": summary,
         "transcript": transcript,
-        "host": {
-            "cpu_model": cpu_model(),
-            "memory_bytes": memory_bytes(),
-            "platform": platform.platform(),
-            "machine": platform.machine(),
-            "python": platform.python_version(),
-        },
+        "host": host,
         "github": {key: os.environ.get(key) for key in GITHUB_KEYS},
         "run": run,
     }

@@ -12,7 +12,7 @@ docs/determinism-proof.md (also in expected-sha256.txt). CPU only.
 Needs rustup with the MSVC build tools (the repository pins its toolchain),
 curl.exe (built into Windows 10 1803 and later), about 5 GB of disk for the
 model and about 8 GB of free memory; less memory works, slowly, through the
-page file. A laptop takes roughly 20 to 90 minutes for the default run.
+page file. docs/determinism-proof.md lists measured CI run times.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File scripts\determinism-proof\run-proof.ps1 -Kernel scalar
