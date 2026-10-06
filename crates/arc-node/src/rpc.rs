@@ -902,11 +902,15 @@ pub fn community_public_name(worker_id: &str, requested: &str) -> String {
     if validate_community_nickname(nickname).is_err() {
         return default_name;
     }
-    let reserved_shape = nickname.strip_prefix("node-").is_some_and(|suffix| {
+    // Compare case-folded, with `_` and spaces read as `-`, so look-alikes
+    // such as `Node-DeadBeef` or `node_deadbeef` cannot pass for another
+    // worker's default label either.
+    let folded = nickname.to_ascii_lowercase().replace(['_', ' '], "-");
+    let reserved_shape = folded.strip_prefix("node-").is_some_and(|suffix| {
         suffix.len() == COMMUNITY_DEFAULT_NAME_HEX_CHARS
             && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
     });
-    if reserved_shape && !nickname.eq_ignore_ascii_case(&default_name) {
+    if reserved_shape && !folded.eq_ignore_ascii_case(&default_name) {
         return default_name;
     }
     nickname.to_string()
@@ -22253,8 +22257,12 @@ mod tests {
             "LAPTOP-ABCD1234",
             "ADA-PC",
             "localhost",
-            // Another worker's default label.
+            // Another worker's default label, and look-alikes of it.
             "node-deadbeef",
+            "Node-DeadBeef",
+            "NODE-DEADBEEF",
+            "node_deadbeef",
+            "node deadbeef",
         ] {
             assert_eq!(
                 community_public_name(&worker_id, refused),
