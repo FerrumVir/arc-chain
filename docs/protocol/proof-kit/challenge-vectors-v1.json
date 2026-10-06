@@ -1,0 +1,75 @@
+{
+  "schema": "arc.proof-challenge-vectors.v1",
+  "scheme": "arc.proof-challenge.v1",
+  "words_sha256": "4eda9812f9ae77ed55b5e73f10506e8f3cf3f294dc1f086c77884be95917ad60",
+  "template": "Write one short sentence that mentions {0}, {1}, {2} and {3}.",
+  "domain_hex": "6172632e70726f6f662d6368616c6c656e67652e763100",
+  "vectors": [
+    {
+      "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "word_indices": [84, 103, 31, 222],
+      "prompt": "Write one short sentence that mentions frogs, kayaks, buttons and teapots.",
+      "prompt_sha256": "5fc6b7fa32ea6642a8ae0992164040418cd151ca5f854f1f998259d69dcc8748"
+    },
+    {
+      "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+      "word_indices": [40, 18, 223, 3],
+      "prompt": "Write one short sentence that mentions castles, biscuits, telescopes and ants.",
+      "prompt_sha256": "5f117ebad2ca7af509b03d439cb7e8b6269754b5d9395092b9d7d168b2ed64f4"
+    },
+    {
+      "seed": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "word_indices": [11, 35, 187, 124],
+      "prompt": "Write one short sentence that mentions baskets, cameras, robots and marbles.",
+      "prompt_sha256": "2220a79077ed36a451a43b5daa096e6dc7fc891e3cbf0736920bbf15f7772f14"
+    },
+    {
+      "seed": "d6da283fa7563cdddbf5d43acb8eb8ea280ba75be82a997d2b6622464a65cb00",
+      "word_indices": [121, 101, 77, 55],
+      "prompt": "Write one short sentence that mentions magnets, islands, fields and crackers.",
+      "prompt_sha256": "314fd4e4c06220c64710f91c925653555c840461b58ca9dd50b5e869a9839fea"
+    },
+    {
+      "seed": "d2adbe05e6ef951f73e388dfdc2079fab2cc063e27ef9f50b097da90bdd07604",
+      "word_indices": [30, 130, 84, 110],
+      "prompt": "Write one short sentence that mentions buckets, mittens, frogs and lakes.",
+      "prompt_sha256": "94be88a327389dfd3b15de866cacb57dff682bebc7edcb86612fff868cfe5946"
+    },
+    {
+      "seed": "d09c3151ca8dea416d9cf29d4b204d59da3fada545ab7da69dd85e2047980b60",
+      "word_indices": [254, 229, 197, 83],
+      "prompt": "Write one short sentence that mentions windows, towers, shells and foxes.",
+      "prompt_sha256": "c9825c2c9d3c0f0bd92334dd7e703e725c928181892981bbbffdaa747ef50ade"
+    },
+    {
+      "seed": "ff65060f7d733afb0f45911984860a02b4e2489ef718615950dfb153ff682531",
+      "word_indices": [99, 91, 89, 22],
+      "prompt": "Write one short sentence that mentions hills, guitars, goats and books.",
+      "prompt_sha256": "0d8c0ee43ff624bc0d35e65c229cc1d28dc47dea4369b711054f6c02401a2b50"
+    },
+    {
+      "seed": "52341e58e86b5567bfcf3b5ee901325194324d4b637cb597ec610d655f831b8c",
+      "word_indices": [38, 92, 17, 119],
+      "prompt": "Write one short sentence that mentions canyons, hammers, bicycles and limes.",
+      "prompt_sha256": "10632ed2af21345fc520b0120d808df044e476a8a06caba3a5d10a60bd3d2707"
+    },
+    {
+      "seed": "4ba793a9a2a8a1caf5518c0ba5e9523202cb6ae373eb3f000b26abc7c3f4a9ec",
+      "word_indices": [36, 169, 248, 167],
+      "prompt": "Write one short sentence that mentions candles, plates, waterfalls and pizzas.",
+      "prompt_sha256": "e6418371ec9892ea40ef32abb3dd89fc4321107822a6bd4917996deb81e25438"
+    },
+    {
+      "seed": "122ce6aa8417939a38523f078042797c5f84bad349db462916a94459366e810d",
+      "word_indices": [16, 20, 145, 82],
+      "prompt": "Write one short sentence that mentions bells, blueberries, owls and forks.",
+      "prompt_sha256": "f13ae195a19ad96695f7c7b9d228c4d71e1700fc25becd9d4fdb9ab67986ba5c"
+    },
+    {
+      "seed": "e3a0e082e9c8f41bfe8c4a0b1fb106077206d90b532a90a70a9cd509f6202984",
+      "word_indices": [105, 20, 156, 108],
+      "prompt": "Write one short sentence that mentions kites, blueberries, peas and koalas.",
+      "prompt_sha256": "a28f08e2f7defa87a32ad786ad73148d2bcb498e680244202e0166d516c6a974"
+    }
+  ]
+}
