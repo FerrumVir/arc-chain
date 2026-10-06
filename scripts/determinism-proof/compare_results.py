@@ -245,6 +245,11 @@ def main() -> int:
             if run.get("engine_crosscheck_ok") is not True:
                 problems.append("engine API cross-check failed")
         crosschecks = [run["engine_crosscheck"] for run in runs if run.get("engine_crosscheck")]
+        if runs and not any(
+            check.get("tokens_match") is True and check.get("output_hash_match") is True
+            for check in crosschecks
+        ):
+            problems.append("no job for this pair ran a passing engine API cross-check")
         host = (group[0].get("host") if group else None) or {}
         effective = sorted({(run.get("kernel") or {}).get("effective", "?") for run in runs})
         pairs.append(

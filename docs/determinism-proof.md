@@ -49,19 +49,25 @@ the recorded loop is the engine's own generation loop.
 ## How CI runs it
 
 [`.github/workflows/determinism-proof.yml`](../.github/workflows/determinism-proof.yml)
-runs eight jobs (four platforms by two kernels). Each job downloads the model
-from the pinned URL, checks its size and SHA-256, builds the driver in release
-mode and runs it through the same script a developer would use (bash on macOS
-and Linux, PowerShell on Windows). A final job collects every transcript and
-is green only if:
+runs both kernels on all four platforms: eight platform/kernel pairs. Each job
+downloads the model from the pinned URL, checks its size and SHA-256, builds
+the driver in release mode and runs it through the same script a developer
+would use (bash on macOS and Linux, PowerShell on Windows). The Apple Silicon
+runner has less memory than the resident model and swaps (about 57 seconds
+per forward pass, against about one second on the x86 runners), so each of its
+kernels runs as six parallel jobs, each over a sixth of the prompts. Every
+prompt starts from an empty K/V cache, and the final job joins the six shard
+transcripts into exactly the bytes a single run writes. The final job is green
+only if:
 
-- all eight jobs completed;
-- all eight combined hashes are identical;
+- every job completed;
+- all eight platform/kernel combined hashes are identical;
 - in every SIMD job, the vectorised kernel accepted every projection it was
   offered (none fell back to the scalar kernel), and in every scalar job it was
   offered none;
-- every job loaded the pinned model bytes and passed the engine API
-  cross-check.
+- every job loaded the pinned model bytes, and the engine API cross-check
+  (run by the job that holds the first prompt) passed for every platform and
+  kernel.
 
 The final job writes the hash matrix to the job summary and uploads the
 evidence: every transcript, every per-runner JSON and a combined
@@ -79,11 +85,17 @@ Rust toolchain manager `rustup`. The repository pins its toolchain, so the
 first build installs it. Run times on the CI runners are listed under Results;
 a personal computer will differ.
 
+Fetch one exact commit: the measured commit listed under Results, or any
+later commit that contains this page. Then run the script for your platform.
+
 macOS or Linux:
 
 ```bash
-git clone https://github.com/FerrumVir/arc-chain.git
-cd arc-chain
+ARC_SOURCE_REV=<commit>
+git init arc-chain && cd arc-chain
+git remote add origin https://github.com/FerrumVir/arc-chain.git
+git fetch --depth 1 origin "$ARC_SOURCE_REV"
+git checkout --detach FETCH_HEAD
 scripts/determinism-proof/run-proof.sh            # default scalar kernel
 scripts/determinism-proof/run-proof.sh --kernel simd
 ```
@@ -91,8 +103,11 @@ scripts/determinism-proof/run-proof.sh --kernel simd
 Windows (PowerShell, with the MSVC build tools installed):
 
 ```powershell
-git clone https://github.com/FerrumVir/arc-chain.git
-cd arc-chain
+$ArcSourceRev = '<commit>'
+git init arc-chain; Set-Location arc-chain
+git remote add origin https://github.com/FerrumVir/arc-chain.git
+git fetch --depth 1 origin $ArcSourceRev
+git checkout --detach FETCH_HEAD
 powershell -ExecutionPolicy Bypass -File scripts\determinism-proof\run-proof.ps1
 powershell -ExecutionPolicy Bypass -File scripts\determinism-proof\run-proof.ps1 -Kernel simd
 ```

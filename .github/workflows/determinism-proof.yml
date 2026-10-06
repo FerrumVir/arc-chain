@@ -66,19 +66,26 @@ jobs:
       fail-fast: false
       matrix:
         # macos-15 is Apple Silicon with 7 GB of RAM, less than the ~7.3 GiB
-        # resident INT8 model, so it swaps: each kernel's prompts are split
-        # into three shards that run in parallel. Every prompt starts from an
-        # empty KV cache, and the compare job joins the shard transcripts into
-        # the exact bytes a single run writes. The driver checks its deadline
-        # between prompts, so the deadline leaves a 30-minute margin inside the
-        # run step's timeout for the last prompt.
+        # resident INT8 model, so it swaps: the smoke run measured ~57 s per
+        # forward there, against ~1 s on the x86 runners. Each of its kernels
+        # therefore runs as six parallel prompt shards (at most ~155 forwards,
+        # ~2.5 h each). Every prompt starts from an empty KV cache, and the
+        # compare job joins the shard transcripts into the exact bytes a single
+        # run writes. The driver checks its deadline between prompts, so the
+        # deadline leaves a 30-minute margin inside the run step's timeout.
         include:
-          - {runner: macos-15, kernel: scalar, shard: "0/3", shard_tag: 1of3, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: scalar, shard: "1/3", shard_tag: 2of3, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: scalar, shard: "2/3", shard_tag: 3of3, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: simd, shard: "0/3", shard_tag: 1of3, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: simd, shard: "1/3", shard_tag: 2of3, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: simd, shard: "2/3", shard_tag: 3of3, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "0/6", shard_tag: 1of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "1/6", shard_tag: 2of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "2/6", shard_tag: 3of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "3/6", shard_tag: 4of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "4/6", shard_tag: 5of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "5/6", shard_tag: 6of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "0/6", shard_tag: 1of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "1/6", shard_tag: 2of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "2/6", shard_tag: 3of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "3/6", shard_tag: 4of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "4/6", shard_tag: 5of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "5/6", shard_tag: 6of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
           - {runner: macos-15-intel, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
           - {runner: macos-15-intel, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
           - {runner: ubuntu-24.04, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
