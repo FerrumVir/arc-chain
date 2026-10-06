@@ -792,6 +792,33 @@ async fn persist_config(state: &AppState, mut config: NodeConfig) -> Result<Node
     Ok(config)
 }
 
+/// Record a finished promotion (worker mode with the verified model) only if
+/// the user still consents. The consent check and the write happen under one
+/// store lock, so a "turn it off" saved while the model downloaded is never
+/// overwritten with "on". Returns `None`, writing nothing, when consent was
+/// withdrawn.
+async fn persist_promotion_if_still_consented(
+    state: &AppState,
+    model_path: String,
+) -> Result<Option<NodeConfig>, String> {
+    let mut store = state.store.lock().await;
+    let latest = store.config.clone().unwrap_or_default();
+    if !compute_contribution_enabled(&latest) {
+        return Ok(None);
+    }
+    let mut promoted = NodeConfig {
+        role: "worker".into(),
+        model_path: Some(model_path),
+        compute_consent: Some(true),
+        ..latest
+    };
+    preserve_authoritative_data_dir(&mut promoted, store.config.as_ref());
+    store.config = Some(promoted.clone());
+    let dir = state.data_dir.lock().await.clone();
+    store.save_to(&dir).map_err(map_err)?;
+    Ok(Some(promoted))
+}
+
 /// Record a "no" to contributing compute: observer mode with no model path.
 ///
 /// The model file stays on disk, but the node is no longer started with
@@ -864,20 +891,9 @@ pub(crate) async fn promote_consented_install_inner(
         None => download_model(app.clone(), tier.to_string()).await?,
     };
     // The download can take an hour. Honour a "turn it off" made meanwhile.
-    let latest = current_config(state).await;
-    if !compute_contribution_enabled(&latest) {
-        return Ok(latest);
-    }
-    let promoted = persist_config(
-        state,
-        NodeConfig {
-            role: "worker".into(),
-            model_path: Some(model_path),
-            compute_consent: Some(true),
-            ..latest
-        },
-    )
-    .await?;
+    let Some(promoted) = persist_promotion_if_still_consented(state, model_path).await? else {
+        return Ok(current_config(state).await);
+    };
     // Apply it to a running node. A node the user stopped stays stopped and
     // starts as a worker next time.
     let running = state.node.lock().await.is_running();
