@@ -37,6 +37,12 @@ verified network capacity grows and rise only when that capacity is congested.
 - **If every lever works, the floor could fall to about $0.005 to $0.012 per 1M tokens**, below today's
   API prices. None of those levers is proven yet. Even then the floor covers electricity only, not
   hardware, bandwidth or anyone's margin.
+- **Kimi-class models** (projection, section 5.5). $0.60 or less per 1M output tokens, with island owners
+  and verifiers paid, is reachable in two cases:
+  - on batched islands whose owners already have the hardware, at $0.27-0.47;
+  - on dense GPU rigs that pay their hardware back, at 58% utilization or more over 5 years.
+
+  That is 76-94% below the $2.45-4.60 API range, but at only 7-24 tok/s per user.
 - **Testnet ARC has no monetary value.** Nothing here promises income to anyone.
 
 ## 2. What exists today
@@ -365,6 +371,109 @@ Within four hours of 10-minute epochs, the extra capacity has removed the whole 
   congestion price at all.
 - **A 70% target** raises the price less often, but leaves less headroom for bursts.
 
+### 5.5 [PROJECTION] Kimi-class island tier
+
+Everything in this subsection is a **projection** from published measurements and arithmetic. None of it
+has been measured on ARC.
+
+**The setting.**
+
+- Kimi K2 and K2.6 have about 1T parameters, or about 582 GB with INT4 experts. That does not fit one
+  consumer device, so the model would run on an **island**: machines that one operator links over
+  Thunderbolt or a LAN.
+- Islands are checked by **sampled stage audits**. A verifier re-runs one pipeline stage from its
+  committed input, at 5% of jobs, with a replay costing about 0.6 of the original. That is 3% of compute.
+- The split is therefore 87% to the island owner, 3% to the verifier pool and 10% to the treasury.
+
+**Fair price** is the price per 1M output tokens that pays the island owner its electricity (and, where
+stated, its hardware back) with the verifier pool and treasury on top. It is the floor rule of
+section 3.4 with one paid execution.
+
+**Verifiers are paid at about cost.** At the fair price the verifier pool is 3.4% of the owner's cost,
+against audits that use 3% of compute. That leaves about 15% headroom, provided a verifier's cost per
+unit of compute matches the owner's.
+
+**Inputs.**
+
+| Island | Source |
+|---|---|
+| 2× Mac Studio M3 Ultra 512 GB over Thunderbolt 5: 23 tok/s on one stream, about 70 tok/s across 8 streams, 560 W, $11,699 each | A model calibrated to Kimi K2 at about 30 tok/s on 4 Mac Studios (exo, Dec 2025) and DeepSeek-R1 671B at 20.2 tok/s on one M3 Ultra |
+| 22× RTX 5090 pipeline on one LAN: 576, 1,514 or 2,139 tok/s at 16, 64 or 300 streams (36, 23.7 or 7.1 tok/s per stream) | The same batching model. Power of 10 kW and about $55,000 of hardware, including hosts and switch, are assumptions. |
+| Prices | US residential power at 18.31 ¢/kWh. A low-cost case at 7.6 ¢/kWh (the China and India average). Hardware paid back straight-line over 5 or 3 years. |
+| API benchmark | Kimi K2.6 output on OpenRouter providers: $2.45 to $4.60 per 1M output tokens (read 4-6 Oct 2026; the lowest listing seen on 2026-10-05 was $2.40) |
+| Goal | $0.60 or less per 1M output tokens, owner payouts included (✓ marks it) |
+
+**[PROJECTION] Hardware already owned: electricity only, US residential power**
+
+| Island | Per-stream tok/s | Aggregate tok/s | Power | Hardware | Owner electricity, $/1M out | Fair price, $/1M out | vs API |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 2x Mac Studio M3 Ultra 512 GB, 1 stream | 23 | 23 | 560 W | $23,398 | $1.24 | $1.42 | 42%-69% below |
+| 2x Mac Studio M3 Ultra 512 GB, 8 streams | 8 | 70 | 560 W | $23,398 | $0.407 | $0.467 ✓ | 81%-90% below |
+| 22x RTX 5090 LAN rig, 16 streams | 36 | 576 | 10,000 W | $55,000 | $0.883 | $1.01 | 59%-78% below |
+| 22x RTX 5090 LAN rig, 64 streams | 23.7 | 1,514 | 10,000 W | $55,000 | $0.336 | $0.386 ✓ | 84%-92% below |
+| 22x RTX 5090 LAN rig, 300 streams (batch tier) | 7.1 | 2,139 | 10,000 W | $55,000 | $0.238 | $0.273 ✓ | 89%-94% below |
+
+**[PROJECTION] Hardware paid back: fair price by utilization**
+
+| Island | Power, $/kWh | Payback | 16% busy | 30% busy | 60% busy | 90% busy |
+|---|---:|---|---:|---:|---:|---:|
+| 2x Mac Studio M3 Ultra 512 GB, 1 stream | 0.183 | 5 years | $47.77 (above every API price) | $26.14 (above every API price) | $13.78 (above every API price) | $9.66 (above every API price) |
+| 2x Mac Studio M3 Ultra 512 GB, 1 stream | 0.183 | 3 years | $78.67 (above every API price) | $42.62 (above every API price) | $22.02 (above every API price) | $15.16 (above every API price) |
+| 2x Mac Studio M3 Ultra 512 GB, 8 streams | 0.183 | 5 years | $15.70 (above every API price) | $8.59 (above every API price) | $4.53 (up to 2% below) | $3.17 (up to 31% below) |
+| 2x Mac Studio M3 Ultra 512 GB, 8 streams | 0.183 | 3 years | $25.85 (above every API price) | $14.00 (above every API price) | $7.24 (above every API price) | $4.98 (above every API price) |
+| 22x RTX 5090 LAN rig, 16 streams | 0.183 | 5 years | $5.36 (above every API price) | $3.33 (up to 28% below) | $2.17 (11%-53% below) | $1.79 (27%-61% below) |
+| 22x RTX 5090 LAN rig, 16 streams | 0.183 | 3 years | $8.26 (above every API price) | $4.88 (above every API price) | $2.95 (up to 36% below) | $2.30 (6%-50% below) |
+| 22x RTX 5090 LAN rig, 64 streams | 0.183 | 5 years | $2.04 (17%-56% below) | $1.27 (48%-72% below) | $0.827 (66%-82% below) | $0.680 (72%-85% below) |
+| 22x RTX 5090 LAN rig, 64 streams | 0.183 | 3 years | $3.14 (up to 32% below) | $1.86 (24%-60% below) | $1.12 (54%-76% below) | $0.876 (64%-81% below) |
+| 22x RTX 5090 LAN rig, 300 streams (batch tier) | 0.183 | 5 years | $1.44 (41%-69% below) | $0.898 (63%-80% below) | $0.586 ✓ (76%-87% below) | $0.481 ✓ (80%-90% below) |
+| 22x RTX 5090 LAN rig, 300 streams (batch tier) | 0.183 | 3 years | $2.23 (9%-52% below) | $1.31 (46%-71% below) | $0.794 (68%-83% below) | $0.620 (75%-87% below) |
+| 22x RTX 5090 LAN rig, 64 streams | 0.076 | 5 years | $1.82 (26%-61% below) | $1.04 (57%-77% below) | $0.602 (75%-87% below) | $0.455 ✓ (81%-90% below) |
+| 22x RTX 5090 LAN rig, 64 streams | 0.076 | 3 years | $2.92 (up to 37% below) | $1.63 (33%-65% below) | $0.896 (63%-81% below) | $0.651 (73%-86% below) |
+| 22x RTX 5090 LAN rig, 300 streams (batch tier) | 0.076 | 5 years | $1.28 (48%-72% below) | $0.738 (70%-84% below) | $0.426 ✓ (83%-91% below) | $0.322 ✓ (87%-93% below) |
+| 22x RTX 5090 LAN rig, 300 streams (batch tier) | 0.076 | 3 years | $2.07 (16%-55% below) | $1.15 (53%-75% below) | $0.634 (74%-86% below) | $0.461 ✓ (81%-90% below) |
+
+**[PROJECTION] Utilization an island needs for $0.60 per 1M output tokens**
+
+| Island | Power, $/kWh | Hardware already owned | 5-year payback | 3-year payback |
+|---|---:|---|---|---|
+| 2x Mac Studio M3 Ultra 512 GB, 1 stream | 0.183 | never: electricity alone is too high | never: electricity alone is too high | never: electricity alone is too high |
+| 2x Mac Studio M3 Ultra 512 GB, 8 streams | 0.183 | any | not reachable (needs 1838.0%) | not reachable (needs 3063.4%) |
+| 22x RTX 5090 LAN rig, 16 streams | 0.183 | never: electricity alone is too high | never: electricity alone is too high | never: electricity alone is too high |
+| 22x RTX 5090 LAN rig, 64 streams | 0.183 | any | not reachable (needs 123.7%) | not reachable (needs 206.2%) |
+| 22x RTX 5090 LAN rig, 300 streams (batch tier) | 0.183 | any | at least 58% | at least 96% |
+| 22x RTX 5090 LAN rig, 64 streams | 0.076 | any | at least 61% | not reachable (needs 100.4%) |
+| 22x RTX 5090 LAN rig, 300 streams (batch tier) | 0.076 | any | at least 39% | at least 65% |
+
+**Reading** (all projections):
+
+- **With hardware the owners already have, batched islands meet the goal.**
+  - 2× M3 Ultra at 8 streams: $0.47.
+  - 22× RTX 5090 at 64 streams: $0.39.
+  - The 300-stream batch tier: $0.27.
+  - That is 81-94% below the API range. The owner then recovers electricity only.
+- **With hardware paid back at US residential power, only the GPU rig's batch tier gets there**, at about
+  7 tok/s per user: 58% utilization or more with a 5-year payback.
+  - At 64 streams, about 24 tok/s per user, the best case is $0.68 at 90% busy.
+  - Mac islands never fall below about $3.17 once their hardware is paid back.
+- **Cheaper power changes the picture.** At 7.6 ¢/kWh, the 64-stream rig reaches the goal at 61%
+  utilization or more with a 5-year payback.
+- **Price and speed pull against each other.** No configuration that reaches $0.60 gives one user more
+  than about 24 tok/s, against about 59 tok/s from Chutes, a production provider, today. Reaching both
+  goals needs faster kernels, speculative decoding (about 1.3-1.4× on a LAN pipeline), or both.
+- **Most paid tokens are input.** On a GPU rig, prefill costs the owner about $0.24 per 1M input tokens
+  at 30% use with a 3-year payback (about $0.28 as a fair price). That is below the $0.465-1.09 API
+  input range. Mac islands prefill slowly: about 24 s for a 6,000-token prompt.
+- **Utilization drives the payback columns.** One consumer-Mac network reports 16%. At 16% the hardware
+  part of every payback cell is 1.9 times what it is at 30%.
+
+**How the mechanism uses this.**
+
+- A coordinator serving the Kimi tier sets its own worker floor: the owner cost per 1M output tokens it
+  guarantees.
+- It sets `input_weight_bps` to the prefill-to-decode cost ratio, about 1,500 basis points on a GPU rig.
+- The base fee then rests at that floor and rises only when the island tier's verified capacity is
+  congested.
+
 ## 6. Guardrails
 
 **No promise of profit.**
@@ -463,6 +572,7 @@ moves. The capped 2.5 testnet ARC promotional reward is separate and unchanged.
 | Split | Workers 83% (41.5% each twin), verifier pool 7%, treasury 10% | A larger treasury share raises the floor for everyone | Use these with twin execution. Move to 87-89% / 1-3% / 10% when audits replace twins. |
 | Epoch length | 10 minutes | Shorter: tracks peaks, and quotes stay valid for less time. Longer: smoother, but it misses peaks. The 13.8 h reward epoch never reacts. | 10 minutes |
 | Step and ceiling | 12.5% per epoch, 1,000× the floor | A larger step reacts faster and swings more | Keep the EIP-1559 step |
+| What a Kimi-tier owner payout covers (section 5.5, projection) | Not set | Electricity only (the owner already has the hardware): a $0.27-0.47 fair price meets the $0.60 goal, at 7-24 tok/s per user. Hardware payback too: $0.60 is met only on dense GPU rigs at 58% utilization or more (US power, 5 years), or 61% at 7.6 ¢/kWh. | Decide this first. It, not the mechanism, decides whether $0.60 is reachable. |
 
 ## 11. Rollout
 
@@ -505,3 +615,12 @@ moves. The capped 2.5 testnet ARC promotional reward is separate and unchanged.
   `batch-settlement` schemes.
 - Today's speed: a live on-chain receipt of 16 tokens at 716 ms/token, from a community Apple Silicon
   MacBook Pro (`/inference/attestations` on the Singapore validator, block 5,406,627, read 2026-10-05).
+- Kimi-class islands (section 5.5, projections):
+  - Kimi K2 Thinking at about 30 tok/s on 4 Mac Studio M3 Ultras over Thunderbolt 5 RDMA (exo 1.0,
+    jeffgeerling.com, Dec 2025);
+  - DeepSeek-R1 671B Q4 at 20.21 tok/s on one M3 Ultra 512 GB at 290 W (geerlingguy/beowulf-ai-cluster,
+    issue 17);
+  - Kimi K2.6 prices: OpenRouter endpoints API (output $2.40-4.60 per 1M on 2026-10-05; input
+    $0.465-1.09);
+  - Mac Studio prices, 22-GPU rig aggregate throughput and rig power are calculated or assumed, as
+    labelled in the tables.

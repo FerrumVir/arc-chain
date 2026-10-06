@@ -403,6 +403,147 @@ def sensitivity_table() -> None:
     print()
 
 
+# ---------------------------------------------------------------------------
+# Kimi-class island tier [PROJECTION]. A 1T-parameter MoE model (Kimi K2 /
+# K2.6 class, about 582 GB with INT4 experts) does not fit one consumer
+# device, so it runs on an "island" of fast-linked machines owned by one
+# operator. Every figure here is a projection from published measurements
+# and arithmetic. None of it has been measured on ARC.
+# ---------------------------------------------------------------------------
+
+LOW_COST_USD_PER_KWH = 0.076  # China / India average residential rate
+SECONDS_PER_YEAR = 3_600 * 24 * 365
+# Kimi K2.6 output price on OpenRouter providers, $ per 1M output tokens,
+# read 4-6 Oct 2026 (the lowest listing seen on 2026-10-05 was $2.40).
+KIMI_API_OUTPUT = (2.45, 4.60)
+KIMI_PRICE_GOAL = 0.60  # per 1M output tokens, owner payouts included
+KIMI_UTILIZATION = (0.16, 0.30, 0.60, 0.90)
+# Islands are checked by sampled stage audits: a verifier re-runs one
+# pipeline stage from its committed input. Audit rate 5% x replay cost 0.6
+# = 3% of compute, so the verifier pool gets 3% and the owner 87%.
+KIMI_VERIFICATION = Verification("sampled stage audits, p = 5%", 1, 0.05 * 0.6, 1_000, 300)
+
+
+@dataclass(frozen=True)
+class Island:
+    name: str
+    per_stream_tok_s: float  # decode speed one user sees
+    aggregate_tok_s: float  # output tokens per second across all streams
+    watts: float
+    capex_usd: float
+
+    def electricity_per_mtok(self, usd_per_kwh: float) -> float:
+        return self.watts / self.aggregate_tok_s * 1e6 / 3.6e6 * usd_per_kwh
+
+    def hardware_per_mtok(self, years: float, utilization: float) -> float:
+        mtok_per_year = self.aggregate_tok_s * SECONDS_PER_YEAR * utilization / 1e6
+        return self.capex_usd / years / mtok_per_year
+
+
+# Throughput and power: 2x M3 Ultra over Thunderbolt 5 (23 tok/s single
+# stream; ~70 tok/s at 8 streams; 560 W) and a 22x RTX 5090 pipeline on one
+# LAN (aggregate by concurrency; 10 kW assumed). Mac price $11,699 each
+# (512 GB); the GPU rig is ~$55,000 including hosts and switch [UNVERIFIED].
+ISLANDS = [
+    Island("2x Mac Studio M3 Ultra 512 GB, 1 stream", 23.0, 23.0, 560, 2 * 11_699),
+    Island("2x Mac Studio M3 Ultra 512 GB, 8 streams", 8.0, 70.0, 560, 2 * 11_699),
+    Island("22x RTX 5090 LAN rig, 16 streams", 36.0, 576.0, 10_000, 55_000),
+    Island("22x RTX 5090 LAN rig, 64 streams", 23.7, 1_514.0, 10_000, 55_000),
+    Island("22x RTX 5090 LAN rig, 300 streams (batch tier)", 7.1, 2_139.0, 10_000, 55_000),
+]
+
+
+def kimi_fair_price(island: Island, usd_per_kwh: float, years: float | None,
+                    utilization: float) -> float:
+    """Price per 1M output tokens that pays the island owner its electricity
+    and, when `years` is set, its hardware back over that many years, with
+    the verifier pool and treasury on top. Same rule as `floor_usd`: owner
+    cost divided by the owner's share of the price."""
+    cost = island.electricity_per_mtok(usd_per_kwh)
+    if years:
+        cost += island.hardware_per_mtok(years, utilization)
+    return cost / (KIMI_VERIFICATION.worker_pool_bps / BPS)
+
+
+def kimi_discount(price: float) -> str:
+    vs_cheapest = 1 - price / KIMI_API_OUTPUT[0]
+    vs_dearest = 1 - price / KIMI_API_OUTPUT[1]
+    if vs_dearest <= 0:
+        return "above every API price"
+    if vs_cheapest <= 0:
+        return f"up to {vs_dearest:.0%} below"
+    return f"{vs_cheapest:.0%}-{vs_dearest:.0%} below"
+
+
+def kimi_cell(price: float) -> str:
+    mark = " ✓" if price <= KIMI_PRICE_GOAL else ""
+    return f"{fmt_usd(price)}{mark}"
+
+
+def kimi_utilization_needed(island: Island, usd_per_kwh: float, years: float | None) -> str:
+    pool = KIMI_VERIFICATION.worker_pool_bps / BPS
+    headroom = KIMI_PRICE_GOAL * pool - island.electricity_per_mtok(usd_per_kwh)
+    if headroom <= 0:
+        return "never: electricity alone is too high"
+    if not years:
+        return "any"
+    full_year_mtok = island.aggregate_tok_s * SECONDS_PER_YEAR / 1e6
+    needed = island.capex_usd / years / (full_year_mtok * headroom)
+    if needed > 1:
+        return f"not reachable (needs {needed:.1%})"
+    # Round up: a requirement of 60.2% is not met at 60%.
+    return f"at least {math.ceil(needed * 100)}%"
+
+
+def kimi_island_tables() -> None:
+    api = f"${KIMI_API_OUTPUT[0]:.2f}-{KIMI_API_OUTPUT[1]:.2f}"
+    goal = f"${KIMI_PRICE_GOAL:.2f}"
+    print("## [PROJECTION] Kimi-class island tier: price per 1M output tokens\n")
+    print(f"Every figure in this section is a projection, not a measurement on ARC. "
+          f"Fair price = the island owner's cost (electricity, plus hardware paid back "
+          f"when stated) divided by the owner's 87% share; the verifier pool (3%) and "
+          f"treasury (10%) come on top. API range for Kimi K2.6 output: {api}. "
+          f"Goal: {goal} or less with owner payouts included (✓ marks it).\n")
+
+    print("### [PROJECTION] Hardware already owned: electricity only, US residential power\n")
+    print("| Island | Per-stream tok/s | Aggregate tok/s | Power | Hardware | Owner electricity, "
+          "$/1M out | Fair price, $/1M out | vs API |")
+    print("|---|---:|---:|---:|---:|---:|---:|---|")
+    for island in ISLANDS:
+        price = kimi_fair_price(island, US_RESIDENTIAL_USD_PER_KWH, None, 1.0)
+        print(f"| {island.name} | {island.per_stream_tok_s:g} | {island.aggregate_tok_s:,.0f} "
+              f"| {island.watts:,.0f} W | ${island.capex_usd:,.0f} "
+              f"| {fmt_usd(island.electricity_per_mtok(US_RESIDENTIAL_USD_PER_KWH))} "
+              f"| {kimi_cell(price)} | {kimi_discount(price)} |")
+    print()
+
+    print("### [PROJECTION] Hardware paid back: fair price by utilization\n")
+    header = " | ".join(f"{u:.0%} busy" for u in KIMI_UTILIZATION)
+    print(f"| Island | Power, $/kWh | Payback | {header} |")
+    print("|---|---:|---|" + "---:|" * len(KIMI_UTILIZATION))
+    rows = [(island, US_RESIDENTIAL_USD_PER_KWH) for island in ISLANDS]
+    rows += [(ISLANDS[3], LOW_COST_USD_PER_KWH), (ISLANDS[4], LOW_COST_USD_PER_KWH)]
+    for island, power in rows:
+        for years in (5, 3):
+            cells = " | ".join(
+                f"{kimi_cell(kimi_fair_price(island, power, years, u))} "
+                f"({kimi_discount(kimi_fair_price(island, power, years, u))})"
+                for u in KIMI_UTILIZATION
+            )
+            print(f"| {island.name} | {power:.3f} | {years} years | {cells} |")
+    print()
+
+    print(f"### [PROJECTION] Utilization an island needs for {goal} per 1M output tokens\n")
+    print("| Island | Power, $/kWh | Hardware already owned | 5-year payback | 3-year payback |")
+    print("|---|---:|---|---|---|")
+    for island, power in rows:
+        print(f"| {island.name} | {power:.3f} "
+              f"| {kimi_utilization_needed(island, power, None)} "
+              f"| {kimi_utilization_needed(island, power, 5)} "
+              f"| {kimi_utilization_needed(island, power, 3)} |")
+    print()
+
+
 def parity_vector() -> None:
     print("## Parity vector (Rust test base_fee_matches_python_parity_vector)\n")
     # None = an epoch with no verified capacity (the fee holds). The run of
@@ -426,6 +567,7 @@ def main() -> None:
     lever_table()
     capacity_step_table()
     sensitivity_table()
+    kimi_island_tables()
     parity_vector()
 
 
