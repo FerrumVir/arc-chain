@@ -189,6 +189,7 @@ fn cmd_convert(args: &Args) -> Result<(), ModernError> {
         "package": report.digest.to_json(),
         "manifest_blake3": report.manifest.get("manifest_blake3"),
         "seconds": report.seconds,
+        "scale_stats": report.scale_stats.to_json(),
         "platform": platform(),
     });
     println!(
