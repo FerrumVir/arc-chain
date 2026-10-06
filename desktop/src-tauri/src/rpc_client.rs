@@ -2510,6 +2510,58 @@ pub async fn fetch_earnings_projection(
     }
 }
 
+/// Local path of the community worker status served by arc-node.
+pub(crate) const WORKER_STATUS_PATH: &str = "/community/worker/status";
+
+/// This machine's community worker, read from the LOCAL node only.
+///
+/// A 404 means the node runs no worker (observer mode, no model loaded, or an
+/// arc-node older than this endpoint); any other failure is reported as the
+/// observed fact rather than shown as zero jobs.
+pub async fn fetch_worker_status(
+    http: &reqwest::Client,
+    local_url: &str,
+) -> crate::types::WorkerStatus {
+    match get_detailed(http, &format!("{local_url}{WORKER_STATUS_PATH}")).await {
+        Fetched::Ok(value) => worker_status_from_json(&value),
+        Fetched::NotFound => crate::types::WorkerStatus {
+            unavailable: Some(
+                "This node is not running a community worker (observer mode, or no model loaded yet)."
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+        other => crate::types::WorkerStatus {
+            unavailable: Some(unavailable_reason(local_url, WORKER_STATUS_PATH, &other)),
+            ..Default::default()
+        },
+    }
+}
+
+pub(crate) fn worker_status_from_json(value: &Value) -> crate::types::WorkerStatus {
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    let count = |key: &str| value.get(key).and_then(Value::as_u64);
+    let small = |key: &str| count(key).and_then(|n| u32::try_from(n).ok());
+    crate::types::WorkerStatus {
+        running: true,
+        unavailable: None,
+        state: text("state"),
+        public_name: text("public_name"),
+        coordinators_registered: small("coordinators_registered"),
+        coordinators_total: small("coordinators_total"),
+        jobs_claimed: count("jobs_claimed"),
+        jobs_completed: count("jobs_completed"),
+        jobs_verified: count("jobs_verified"),
+        jobs_failed: count("jobs_failed"),
+        jobs_declined: count("jobs_declined"),
+        last_job_completed_unix_ms: count("last_job_completed_unix_ms"),
+        started_unix_ms: count("started_unix_ms"),
+        prevent_sleep_during_jobs: value
+            .get("prevent_sleep_during_jobs")
+            .and_then(Value::as_bool),
+    }
+}
+
 /// What the LOCAL node is contributing.
 ///
 /// Prefers `GET /node/contribution`. Where that is absent it composes the same
@@ -4499,5 +4551,59 @@ mod chain_read_tests {
             assert_eq!(result.success, Some(success));
             assert_eq!(result.block_height, Some(42));
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_status_tests {
+    use super::*;
+
+    #[test]
+    fn worker_status_reads_the_local_node_counters() {
+        let status = worker_status_from_json(&serde_json::json!({
+            "schema": "arc.community.worker-status.v1",
+            "worker_id": "0xabc",
+            "public_name": "node-abc",
+            "state": "computing",
+            "coordinators_total": 6,
+            "coordinators_registered": 5,
+            "jobs_claimed": 9,
+            "jobs_completed": 7,
+            "jobs_verified": 6,
+            "jobs_failed": 1,
+            "jobs_declined": 1,
+            "last_job_completed_unix_ms": 1_760_000_000_000u64,
+            "last_registration_unix_ms": null,
+            "started_unix_ms": 1_759_990_000_000u64,
+            "prevent_sleep_during_jobs": true
+        }));
+        assert!(status.running);
+        assert_eq!(status.unavailable, None);
+        assert_eq!(status.state.as_deref(), Some("computing"));
+        assert_eq!(status.public_name.as_deref(), Some("node-abc"));
+        assert_eq!(
+            (status.coordinators_registered, status.coordinators_total),
+            (Some(5), Some(6))
+        );
+        assert_eq!(
+            (status.jobs_completed, status.jobs_verified),
+            (Some(7), Some(6))
+        );
+        assert_eq!(status.last_job_completed_unix_ms, Some(1_760_000_000_000));
+        assert_eq!(status.prevent_sleep_during_jobs, Some(true));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_node_is_reported_not_shown_as_zero_jobs() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let status =
+            fetch_worker_status(&reqwest::Client::new(), &format!("http://127.0.0.1:{port}")).await;
+
+        assert!(!status.running);
+        assert!(status.unavailable.is_some());
+        assert_eq!(status.jobs_completed, None);
     }
 }

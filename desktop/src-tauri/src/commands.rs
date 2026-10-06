@@ -229,6 +229,7 @@ pub async fn save_config(
         // history. A future data-move feature needs its own verified native
         // transaction instead of widening this IPC surface.
         preserve_authoritative_data_dir(&mut config, store.config.as_ref());
+        preserve_unsent_contribution_choices(&mut config, store.config.as_ref());
         auto_start = config.auto_start;
         store.config = Some(config);
         let dir = state.data_dir.lock().await.clone();
@@ -651,8 +652,12 @@ pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> 
 
 #[tauri::command]
 pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    restart_node_inner(&app, &state).await
+}
+
+pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     state.cancel_startup_retry();
-    require_data_migration_ready(&state).await?;
+    require_data_migration_ready(state).await?;
     let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
         let cfg = store.config.clone().unwrap_or_default();
@@ -699,13 +704,212 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
 
     // A restart is a good moment to pick up a newer arc-node, since the user
     // is already paying the restart cost. Now safe: nothing holds the file.
-    ensure_binary_inner(&app).await?;
+    ensure_binary_inner(app).await?;
 
-    let resources = resolve_testnet_resources(&app);
+    let resources = resolve_testnet_resources(app);
     let mut node = state.node.lock().await;
     node.start(&cfg, &validator_keyfile, &resources, lifecycle_lock)
         .await
         .map_err(map_err)
+}
+
+// ── Compute contribution (explicit opt-in) ─────────────────────────────────
+//
+// An install contributes compute only after its user says yes: onboarding's
+// model choice, the observer banner, or the Settings switch. Nothing here
+// downloads a model or switches to worker mode without that answer, and
+// turning the switch off returns the node to observer mode at once.
+
+/// Shown when the app is asked to promote an install whose user never opted in.
+pub(crate) const COMPUTE_CONSENT_REQUIRED: &str =
+    "Compute contribution is off. Turn it on in Settings to download the model and take ARC jobs on this computer.";
+
+/// Shown when the machine is below the worker memory floor.
+pub(crate) const COMPUTE_INELIGIBLE: &str =
+    "This computer has less than 16 GB of memory, so it cannot run the ARC model. It stays an observer, which still relays and verifies.";
+
+/// Whether the user agreed to contribute compute. An explicit answer is
+/// authoritative. Installs from before the question existed count as opted
+/// in only if their user had already chosen worker mode with a model.
+pub(crate) fn compute_contribution_enabled(config: &NodeConfig) -> bool {
+    config
+        .compute_consent
+        .unwrap_or(config.role == "worker" && config.model_path.is_some())
+}
+
+/// What a consented install still needs before it can take jobs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PromotionNeed {
+    /// The user has not opted in; never touch the machine.
+    NoConsent,
+    /// Below the memory floor; stays an observer.
+    Ineligible,
+    /// Already a worker with a model; nothing to do.
+    Ready,
+    /// Download (or reuse) the model, switch to worker mode, restart.
+    Promote,
+}
+
+pub(crate) fn promotion_need(config: &NodeConfig, ram_gb: u64) -> PromotionNeed {
+    if !compute_contribution_enabled(config) {
+        PromotionNeed::NoConsent
+    } else if config.role == "worker" && config.model_path.is_some() {
+        PromotionNeed::Ready
+    } else if tier_for_ram_gb(ram_gb) == "none" {
+        PromotionNeed::Ineligible
+    } else {
+        PromotionNeed::Promote
+    }
+}
+
+/// Contribution choices are changed by their own commands. A WebView save
+/// that does not carry them (a screen built before they existed) keeps the
+/// stored answers instead of silently erasing the user's consent.
+fn preserve_unsent_contribution_choices(config: &mut NodeConfig, persisted: Option<&NodeConfig>) {
+    if let Some(persisted) = persisted {
+        if config.compute_consent.is_none() {
+            config.compute_consent = persisted.compute_consent;
+        }
+        if config.prevent_sleep_during_jobs.is_none() {
+            config.prevent_sleep_during_jobs = persisted.prevent_sleep_during_jobs;
+        }
+    }
+}
+
+async fn current_config(state: &AppState) -> NodeConfig {
+    state.store.lock().await.config.clone().unwrap_or_default()
+}
+
+async fn persist_config(state: &AppState, mut config: NodeConfig) -> Result<NodeConfig, String> {
+    let mut store = state.store.lock().await;
+    preserve_authoritative_data_dir(&mut config, store.config.as_ref());
+    store.config = Some(config.clone());
+    let dir = state.data_dir.lock().await.clone();
+    store.save_to(&dir).map_err(map_err)?;
+    Ok(config)
+}
+
+/// Turn compute contribution on or off.
+///
+/// On: record the consent, then download the model if needed (resumable,
+/// with progress on `model-download-progress`), switch to worker mode, and
+/// restart the node so it registers and starts taking jobs. Off: record the
+/// refusal and return to observer mode now; the model stays on disk.
+#[tauri::command]
+pub async fn set_compute_contribution(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> CmdResult<NodeConfig> {
+    let mut config = current_config(&state).await;
+    config.compute_consent = Some(enabled);
+    if !enabled {
+        config.role = "observer".into();
+        let config = persist_config(&state, config).await?;
+        let running = state.node.lock().await.is_running();
+        if running {
+            restart_node_inner(&app, &state).await?;
+        }
+        return Ok(config);
+    }
+    persist_config(&state, config).await?;
+    promote_consented_install_inner(&app, &state).await
+}
+
+/// Finish promoting an install whose user opted in: the model download may
+/// have been interrupted, or the user agreed on a machine that was offline.
+#[tauri::command]
+pub async fn promote_consented_install(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<NodeConfig> {
+    promote_consented_install_inner(&app, &state).await
+}
+
+pub(crate) async fn promote_consented_install_inner(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<NodeConfig, String> {
+    let config = current_config(state).await;
+    // The first hardware read can block for seconds (system_profiler).
+    let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
+        .await
+        .map_err(map_err)?;
+    let tier = tier_for_ram_gb(ram_gb);
+    match promotion_need(&config, ram_gb) {
+        PromotionNeed::NoConsent => return Err(COMPUTE_CONSENT_REQUIRED.to_string()),
+        PromotionNeed::Ineligible => return Err(COMPUTE_INELIGIBLE.to_string()),
+        PromotionNeed::Ready => return Ok(config),
+        PromotionNeed::Promote => {}
+    }
+    let model_path = match existing_model_for_tier(tier.to_string()).await? {
+        Some(path) => path,
+        None => download_model(app.clone(), tier.to_string()).await?,
+    };
+    // The download can take an hour. Honour a "turn it off" made meanwhile.
+    let latest = current_config(state).await;
+    if !compute_contribution_enabled(&latest) {
+        return Ok(latest);
+    }
+    let promoted = persist_config(
+        state,
+        NodeConfig {
+            role: "worker".into(),
+            model_path: Some(model_path),
+            compute_consent: Some(true),
+            ..latest
+        },
+    )
+    .await?;
+    // Apply it to a running node. A node the user stopped stays stopped and
+    // starts as a worker next time.
+    let running = state.node.lock().await.is_running();
+    if running {
+        restart_node_inner(app, state).await?;
+    }
+    Ok(promoted)
+}
+
+/// Startup hook: once the node is up, finish enabling contribution for a
+/// consented install that is not a worker yet. Silent when there is nothing
+/// to do; a failure is logged and retried on the next launch or toggle.
+pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state: &AppState) {
+    let config = current_config(state).await;
+    let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
+        .await
+        .unwrap_or(0);
+    if promotion_need(&config, ram_gb) != PromotionNeed::Promote {
+        return;
+    }
+    match promote_consented_install_inner(app, state).await {
+        Ok(_) => tracing::info!("compute contribution enabled: worker mode with a verified model"),
+        Err(error) => {
+            tracing::warn!(%error, "could not finish enabling compute contribution; will retry")
+        }
+    }
+}
+
+/// Keep the computer awake while a job runs. Takes effect the next time the
+/// node starts, so an in-flight job is not interrupted by a restart.
+#[tauri::command]
+pub async fn set_prevent_sleep_during_jobs(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> CmdResult<NodeConfig> {
+    let mut config = current_config(&state).await;
+    config.prevent_sleep_during_jobs = Some(enabled);
+    persist_config(&state, config).await
+}
+
+/// This machine's community worker: state and job counters, read from the
+/// local node only.
+#[tauri::command]
+pub async fn fetch_worker_status(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::types::WorkerStatus> {
+    let port = state.node.lock().await.rpc_port;
+    let local = paths::local_host(port);
+    Ok(rpc_client::fetch_worker_status(&state.http, &local).await)
 }
 
 /// Stops the node, wipes the cached peer dial list (`known_peers.json` in
@@ -6062,5 +6266,104 @@ mod release_binary_tests {
         std::fs::write(&path, b"evil").unwrap();
         assert!(!verify_model_file(&path, &spec).unwrap());
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod compute_contribution_tests {
+    use super::*;
+
+    fn config(role: &str, model: Option<&str>, consent: Option<bool>) -> NodeConfig {
+        NodeConfig {
+            role: role.into(),
+            model_path: model.map(str::to_string),
+            compute_consent: consent,
+            ..NodeConfig::default()
+        }
+    }
+
+    #[test]
+    fn nothing_is_downloaded_or_promoted_without_consent() {
+        // Never asked: an observer stays an observer.
+        assert_eq!(
+            promotion_need(&config("observer", None, None), 16),
+            PromotionNeed::NoConsent
+        );
+        // An explicit no wins even with a model already on disk.
+        assert_eq!(
+            promotion_need(&config("observer", Some("/m.gguf"), Some(false)), 64),
+            PromotionNeed::NoConsent
+        );
+        // The default config's "worker" role without a model is not consent.
+        assert!(!compute_contribution_enabled(&NodeConfig::default()));
+        assert_eq!(
+            promotion_need(&NodeConfig::default(), 64),
+            PromotionNeed::NoConsent
+        );
+    }
+
+    #[test]
+    fn consented_observers_are_promoted_only_when_eligible() {
+        assert_eq!(
+            promotion_need(&config("observer", None, Some(true)), 16),
+            PromotionNeed::Promote
+        );
+        assert_eq!(
+            promotion_need(&config("observer", None, Some(true)), 12),
+            PromotionNeed::Ineligible
+        );
+        assert_eq!(
+            promotion_need(&config("worker", Some("/m.gguf"), Some(true)), 16),
+            PromotionNeed::Ready
+        );
+    }
+
+    #[test]
+    fn workers_from_before_the_question_keep_contributing() {
+        let legacy = config("worker", Some("/m.gguf"), None);
+        assert!(compute_contribution_enabled(&legacy));
+        assert_eq!(promotion_need(&legacy, 16), PromotionNeed::Ready);
+    }
+
+    #[test]
+    fn a_save_that_omits_the_choices_keeps_the_stored_answers() {
+        let persisted = NodeConfig {
+            compute_consent: Some(true),
+            prevent_sleep_during_jobs: Some(true),
+            ..NodeConfig::default()
+        };
+        let mut stale_webview = NodeConfig {
+            rpc_port: 10_001,
+            ..NodeConfig::default()
+        };
+        preserve_unsent_contribution_choices(&mut stale_webview, Some(&persisted));
+        assert_eq!(stale_webview.compute_consent, Some(true));
+        assert_eq!(stale_webview.prevent_sleep_during_jobs, Some(true));
+
+        let mut explicit = NodeConfig {
+            compute_consent: Some(false),
+            prevent_sleep_during_jobs: Some(false),
+            ..NodeConfig::default()
+        };
+        preserve_unsent_contribution_choices(&mut explicit, Some(&persisted));
+        assert_eq!(explicit.compute_consent, Some(false));
+        assert_eq!(explicit.prevent_sleep_during_jobs, Some(false));
+    }
+
+    #[test]
+    fn a_store_written_before_the_question_still_loads() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "role": "worker",
+            "modelPath": "/m.gguf",
+            "rpcPort": 9090,
+            "p2pPort": 9091,
+            "autoStart": true,
+            "autoUpdate": true,
+            "dataDir": "~/.arc/data-v3"
+        }))
+        .unwrap();
+        assert_eq!(config.compute_consent, None);
+        assert_eq!(config.prevent_sleep_during_jobs, None);
+        assert!(compute_contribution_enabled(&config));
     }
 }

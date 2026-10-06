@@ -175,10 +175,13 @@ export function Onboarding() {
       //    role + modelPath set makes the node eligible to advertise an exact,
       //    fully loaded artifact. It does not promise assignment or payment.
       //    No model means observer/router mode with no local model execution.
+      //    Choosing the model here is the user's explicit consent to run ARC
+      //    jobs on this computer; choosing observer mode is an explicit no.
       const config: NodeConfig = {
         ...DEFAULT_NODE_CONFIG,
         role: modelPath ? "worker" : "observer",
         modelPath,
+        computeConsent: modelPath !== null,
       };
       setStoreConfig(config);
 

@@ -101,10 +101,14 @@ export function ObserverUpgradeBanner() {
       const existing = await api.existingModelForTier(selectedTier);
       const modelPath = existing ?? (await api.downloadModel(selectedTier));
 
+      // Clicking "Download & enable worker mode" is the user's explicit
+      // consent to contribute compute; record it so later launches finish
+      // or keep worker mode without asking again.
       const updated: NodeConfig = {
         ...config,
         role: "worker",
         modelPath,
+        computeConsent: true,
       };
       await api.saveConfig(updated);
       setStoreConfig(updated);
