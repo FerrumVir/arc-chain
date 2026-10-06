@@ -745,4 +745,14 @@ export interface ModelDownloadProgress {
   downloadedBytes: number;
   totalBytes: number;
   done: boolean;
+  /** `connecting`, `downloading`, `retrying`, `verifying`, or `done`. Absent from older backends. */
+  stage?: string;
+  /** Bytes saved by an earlier attempt or app run when this attempt started. */
+  resumedFromBytes?: number;
+  /** 1-based attempt number within this download. */
+  attempt?: number;
+  /** Seconds until the next attempt while retrying. */
+  retryInSecs?: number | null;
+  /** Why the previous attempt stopped, while retrying. */
+  message?: string | null;
 }

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Loader2, Sparkles, X } from "lucide-react";
 import { api, isTauri } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
+import { modelDownloadStatus } from "../lib/format";
 import type {
   ModelDownloadProgress,
   ModelTierInfo,
@@ -344,7 +345,7 @@ export function ObserverUpgradeBanner() {
                   }}
                 >
                   {stage === "downloading" && progress
-                    ? `${formatBytes(progress.downloadedBytes)} of ${formatBytes(progress.totalBytes)} (${progress.totalBytes > 0 ? Math.floor((progress.downloadedBytes / progress.totalBytes) * 100) : 0}%)`
+                    ? modelDownloadStatus(progress)
                     : stage === "downloading"
                       ? "Connecting to Hugging Face..."
                       : "arc-node is reloading with --model and --community-mode."}
