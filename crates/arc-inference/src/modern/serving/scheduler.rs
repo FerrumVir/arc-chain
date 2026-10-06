@@ -55,7 +55,11 @@ pub struct SchedulerConfig {
     /// cache, whose hits skip those positions. Off, only the last prompt
     /// position runs the LM head.
     pub all_logits: bool,
-    /// Drafted tokens verified per decode step; 0 turns speculation off.
+    /// Most drafted tokens verified per decode step; 0 turns speculation off.
+    /// Each request adapts its own draft length below this bound: it doubles
+    /// after a step whose drafts were all accepted and drops to the accepted
+    /// length plus one after a rejection. Outputs cannot change; only the
+    /// number of rows verified does.
     pub draft_tokens: usize,
     /// The prefix cache, if any.
     pub prefix: Option<PrefixConfig>,
@@ -153,9 +157,13 @@ struct Active {
     drafted: usize,
     accepted: usize,
     decode_steps: usize,
+    draft_window: usize,
     finished: bool,
     error: Option<String>,
 }
+
+/// Draft length a request starts with.
+const FIRST_DRAFT_WINDOW: usize = 2;
 
 impl Active {
     fn prefilling(&self) -> bool {
@@ -278,6 +286,11 @@ impl<'m, M: BatchModel> Scheduler<'m, M> {
         self.prefix.as_ref().map(PrefixCache::stats)
     }
 
+    /// The prefix cache itself, if it is on (inspection and audits).
+    pub fn prefix_cache_mut(&mut self) -> Option<&mut PrefixCache> {
+        self.prefix.as_mut()
+    }
+
     /// Every step so far.
     pub fn steps(&self) -> &[StepStats] {
         &self.steps
@@ -338,6 +351,7 @@ impl<'m, M: BatchModel> Scheduler<'m, M> {
                 drafted: 0,
                 accepted: 0,
                 decode_steps: 0,
+                draft_window: FIRST_DRAFT_WINDOW,
                 finished: false,
                 error: None,
             });
@@ -371,6 +385,7 @@ impl<'m, M: BatchModel> Scheduler<'m, M> {
             let k = self
                 .config
                 .draft_tokens
+                .min(active.draft_window)
                 .min(remaining.saturating_sub(1))
                 .min(room)
                 .min(budget - 1);
@@ -446,6 +461,7 @@ impl<'m, M: BatchModel> Scheduler<'m, M> {
             mut errors,
         } = output;
         let all_logits = self.config.all_logits;
+        let max_draft = self.config.draft_tokens.max(1);
         let mut emitted = 0usize;
         for plan in plans {
             let active = &mut self.running[plan.seq];
@@ -515,8 +531,16 @@ impl<'m, M: BatchModel> Scheduler<'m, M> {
                                 active.hashes.push(arith::logits_hash(values));
                             }
                             active.kv.rollback(before + verified.rows_used);
+                            let accepted = verified.rows_used - 1;
+                            if !drafts.is_empty() {
+                                active.draft_window = if accepted == drafts.len() {
+                                    (active.draft_window * 2).min(max_draft)
+                                } else {
+                                    accepted + 1
+                                };
+                            }
                             active.drafted += drafts.len();
-                            active.accepted += verified.rows_used - 1;
+                            active.accepted += accepted;
                             active.decode_steps += 1;
                             emitted += verified.emitted.len();
                             active.generated.extend(verified.emitted);
