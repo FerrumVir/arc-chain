@@ -60,7 +60,10 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: legacy-bridge-unit-${{ matrix.os }}
+      # Windows checkouts use CRLF; rustfmt.toml pins Unix newlines, so the
+      # format gate runs on Linux only (as in ci.yml).
       - name: rustfmt
+        if: runner.os == 'Linux'
         run: cargo fmt -p arc-legacy-bridge -- --check
       - name: clippy (deny warnings)
         run: cargo clippy -p arc-legacy-bridge --all-targets --locked -- -D warnings
@@ -263,10 +266,16 @@ jobs:
           $ips = $env:LIVE_NETWORK_IPS -split ' '
           New-NetFirewallRule -DisplayName 'arc-live-network-block' -Direction Outbound -Action Block -RemoteAddress $ips | Out-Null
           Set-NetFirewallProfile -All -Enabled True
+          # A blocked connect fails fast ("access forbidden") or times out.
           $client = New-Object System.Net.Sockets.TcpClient
-          $attempt = $client.ConnectAsync('149.28.32.76', 443)
-          if ($attempt.Wait(5000) -and $client.Connected) { throw 'the live network is still reachable' }
+          $reachable = $false
+          try {
+            $reachable = $client.ConnectAsync('149.28.32.76', 443).Wait(5000) -and $client.Connected
+          } catch {
+            Write-Host "blocked as intended: $($_.Exception.InnerException.Message)"
+          }
           $client.Dispose()
+          if ($reachable) { throw 'the live network is still reachable' }
       - name: Released v0.7 inputs (v0.7.11 app resources, pinned v0.7.7 node)
         shell: bash
         run: |

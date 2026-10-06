@@ -298,6 +298,18 @@ sudo systemctl restart arc-node
 wait_health http://127.0.0.1:9944 60 || fail "v0.7.7 did not start after rollback"
 [ "$(readlink "/proc/$(main_pid)/exe")" = "$arc_dir/bin/arc-node" ]
 /usr/bin/curl -sf http://127.0.0.1:9944/health > "$evidence/health.after-rollback.json"
+# The restored v0.7 node owns its data again and may write to it. Observe
+# whether it does, so the archive expectation below matches what happened.
+v07_wrote=false
+for _ in $(seq 1 90); do
+    python3 "$here/snapshot_tree.py" snapshot --root "$arc_dir/data" --out "$evidence/v07-data.after-rollback.json"
+    if ! python3 "$here/snapshot_tree.py" compare "$pre_bridge" "$evidence/v07-data.after-rollback.json" >/dev/null; then
+        v07_wrote=true
+        break
+    fi
+    sleep 1
+done
+printf 'restored v0.7 node wrote to its data after rollback: %s\n' "$v07_wrote"
 kept="$arc_dir/legacy-bridge/arc-node-bridge-0.7.12"
 [ "$(sha "$kept")" = "$bridge_sha" ] || fail "rollback did not keep the bridge launcher"
 # The running v0.7.7 binary is busy; stage and rename, as the updater does.
@@ -307,7 +319,15 @@ sudo systemctl restart arc-node
 wait_health http://127.0.0.1:9944 60 || fail "the node did not come back after reinstall"
 [ "$(sha "$(readlink "/proc/$(main_pid)/exe")")" = "$node_sha256" ]
 [ "$(jq -r .node_address "$state_json")" = "$address" ] || fail "reinstall changed the node identity"
-jq -e '.archive_generation == 2' "$state_json" >/dev/null \
-    || fail "the bridge did not record that v0.7 ran again after the rollback"
+expected_generation=1
+if [ "$v07_wrote" = true ]; then
+    expected_generation=2
+fi
+jq -e --argjson g "$expected_generation" '.archive_generation == $g' "$state_json" >/dev/null \
+    || fail "archive generation $(jq -r .archive_generation "$state_json") does not reflect the v0.7 run after rollback (expected $expected_generation)"
+if [ "$expected_generation" = 2 ]; then
+    grep -q 'the v0.7 data changed since archive record 1' "$arc_dir/legacy-bridge/bridge.log" \
+        || fail "the bridge did not log that v0.7 changed its data after the rollback"
+fi
 
 log "PASS: v0.7.11 headless install bridged to $node_tag at stake 0; v0.7 data untouched"
