@@ -520,6 +520,58 @@ pub struct ConversionReport {
     pub manifest: Value,
     pub config: ModernConfig,
     pub seconds: f64,
+    /// What Q16 row scales would have cost on these rows (measurement only).
+    pub scale_stats: ScaleStats,
+}
+
+/// Measured gain error a v1 Q16 row scale `round(absmax * 2^16 / 127)` would
+/// carry on each converted row, next to the dyadic scale actually used
+/// (relative error at most 2^-31 by construction). Measurement only: nothing
+/// here feeds the package bytes.
+#[derive(Debug, Clone, Default)]
+pub struct ScaleStats {
+    pub rows: u64,
+    pub q16_relative_error_max: f64,
+    pub q16_relative_error_sum: f64,
+    pub q16_rows_over_one_percent: u64,
+}
+
+impl ScaleStats {
+    /// Add every nonzero row of `matrix`.
+    pub fn add(&mut self, matrix: &DyadicMatrix) {
+        for (&mu, &k) in matrix.mu.iter().zip(&matrix.k) {
+            if mu == 0 {
+                continue;
+            }
+            // mu * 2^(16 - k) is the exact Q16 scale to within 2^-31.
+            let exact = f64::from(mu) * 2f64.powi(16 - i32::from(k));
+            let q16 = exact.round().max(1.0);
+            let error = (q16 - exact).abs() / exact;
+            self.rows += 1;
+            self.q16_relative_error_sum += error;
+            if error > self.q16_relative_error_max {
+                self.q16_relative_error_max = error;
+            }
+            if error > 0.01 {
+                self.q16_rows_over_one_percent += 1;
+            }
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mean = if self.rows > 0 {
+            self.q16_relative_error_sum / self.rows as f64
+        } else {
+            0.0
+        };
+        json!({
+            "rows": self.rows,
+            "q16_scale_relative_error_max": self.q16_relative_error_max,
+            "q16_scale_relative_error_mean": mean,
+            "q16_rows_over_one_percent": self.q16_rows_over_one_percent,
+            "dyadic_scale_relative_error_bound": 2f64.powi(-31),
+        })
+    }
 }
 
 /// Convert the pinned BF16 source in `dir` to the package at `out`.
@@ -564,6 +616,8 @@ pub fn convert(
         config.vocab_size,
         config.d_model,
     )?;
+    let mut scale_stats = ScaleStats::default();
+    scale_stats.add(&embed);
     package::write_matrix(&mut writer, "embed", &embed)?;
     drop(embed);
     writer.write_tensor(
@@ -596,6 +650,7 @@ pub fn convert(
                 _ => (config.d_model, config.d_ff),
             };
             let m = matrix(&source_name, rows, cols)?;
+            scale_stats.add(&m);
             package::write_matrix(&mut writer, &format!("{p}.{name}"), &m)?;
         }
     }
@@ -621,6 +676,7 @@ pub fn convert(
         manifest,
         config,
         seconds: start.elapsed().as_secs_f64(),
+        scale_stats,
     })
 }
 
