@@ -21,6 +21,10 @@ pub mod llama_spm_tokenizer;
 pub mod low_residency;
 pub mod model_artifact;
 pub mod model_package;
+/// Modern Llama-family models (SmolLM3-3B) on the integer engine: an
+/// additional profile with its own package format and CLI (`arc-modern`).
+/// Nothing in consensus or native inference refers to it.
+pub mod modern;
 pub mod q4_engine;
 #[cfg(unix)]
 pub mod row_service;

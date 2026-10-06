@@ -660,6 +660,78 @@ pub(crate) fn matmul_i8_canonical_rows_fast_view(
     }
 }
 
+/// Exact unscaled row dot products with the limb kernel.
+///
+/// Writes `acc[i] = sum_j data[i * n_cols + j] * input[j]` for every row of a
+/// row-major INT8 matrix. No scale is applied: the caller owns the epilogue
+/// (the dyadic profile in `crate::modern` applies `(acc * mu) >> k`). Returns
+/// `false` without writing `acc` when it refuses, exactly like
+/// [`matmul_i8_canonical_rows_fast`]; the caller then computes the same values
+/// with its scalar kernel. The dot itself is exact inside the accepted domain
+/// (see the module docs), so no scale-overflow check is needed here.
+pub(crate) fn exact_row_dots_fast(
+    data: &[i8],
+    n_rows: usize,
+    n_cols: usize,
+    input: &[i64],
+    acc: &mut [i64],
+) -> bool {
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = (data, n_rows, n_cols, input, acc);
+        record_attempt();
+        record_refusal(Refusal::Unavailable)
+    }
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        record_attempt();
+        if !dotprod_available() {
+            return record_refusal(Refusal::Unavailable);
+        }
+        if n_cols == 0
+            || n_rows == 0
+            || input.len() != n_cols
+            || data.len() != n_rows.saturating_mul(n_cols)
+            || acc.len() != n_rows
+        {
+            return record_refusal(Refusal::Shape);
+        }
+        if n_cols > MAX_COLS_FOR_I32 {
+            return record_refusal(Refusal::InnerDimAboveI32Bound);
+        }
+        LIMB_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            if scratch.len() < LIMB_COUNT * n_cols {
+                scratch.resize(LIMB_COUNT * n_cols, 0);
+            }
+            let Some(used) = split_limbs(input, &mut scratch[..LIMB_COUNT * n_cols]) else {
+                return record_refusal(Refusal::ActivationOutOfDomain);
+            };
+            let limbs = &scratch[..LIMB_COUNT * n_cols];
+            // Small chunks: the dyadic models have 512-row K/V projections,
+            // which 256-row chunks would split across only two workers.
+            acc.par_chunks_mut(64)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let start = chunk_idx * 64;
+                    for (local_i, out) in chunk.iter_mut().enumerate() {
+                        let i = start + local_i;
+                        // SAFETY: `data` holds n_rows * n_cols bytes (checked
+                        // above) and `i < n_rows`, so `i * n_cols` is in bounds
+                        // for `n_cols` reads; `limbs` holds LIMB_COUNT * n_cols
+                        // digits; `n_cols <= MAX_COLS_FOR_I32`; the vector
+                        // feature was checked by `dotprod_available`.
+                        *out = unsafe {
+                            dot_limbs_dotprod(data.as_ptr().add(i * n_cols), limbs, n_cols, used)
+                        };
+                    }
+                });
+            record_accept();
+            true
+        })
+    }
+}
+
 /// Batched form of [`matmul_i8_canonical_rows_fast`]: `n_tokens` activations
 /// against the same weight matrix.
 ///
