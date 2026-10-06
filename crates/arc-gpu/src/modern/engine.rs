@@ -545,6 +545,7 @@ impl GpuEngineBuilder {
             uploaded_bytes: self.uploaded_bytes,
             positions: 0,
             poisoned: false,
+            lost: false,
             ctx: self.ctx,
         })
     }
@@ -856,6 +857,9 @@ pub struct GpuEngine {
     uploaded_bytes: u64,
     positions: usize,
     poisoned: bool,
+    /// Set when a read-back failed: its staging buffers may still be mapping,
+    /// so the engine cannot be reused (rebuild it).
+    lost: bool,
 }
 
 impl GpuEngine {
@@ -944,6 +948,11 @@ impl GpuEngine {
         tokens: &[u32],
         trace: bool,
     ) -> Result<(Vec<Vec<i64>>, Vec<TraceEntry>), GpuModernError> {
+        if self.lost {
+            return Err(GpuModernError::Execution(
+                "an earlier read-back failed; build a new engine".into(),
+            ));
+        }
         if self.poisoned {
             return Err(GpuModernError::Invalid(
                 "a previous forward pass failed; reset() before reusing the engine".into(),
@@ -1024,6 +1033,7 @@ impl GpuEngine {
             Ok(data) => data,
             Err(error) => {
                 self.poisoned = true;
+                self.lost = true;
                 return Err(error);
             }
         };

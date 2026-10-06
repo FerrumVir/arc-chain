@@ -256,6 +256,36 @@ pub(crate) fn staging(ctx: &GpuContext, label: &str, bytes: u64) -> wgpu::Buffer
     })
 }
 
+/// Seconds a forward pass may take before it is reported as stuck
+/// (`ARC_GPU_WAIT_SECONDS`, default one hour). wgpu-core's own wait gives up
+/// after 60 s, which a software adapter (WARP) can exceed on a 3B model, so
+/// the wait is repeated until this limit.
+fn wait_limit_seconds() -> u64 {
+    std::env::var("ARC_GPU_WAIT_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(3600)
+}
+
+/// Block until every submitted command buffer has finished.
+fn wait_idle(ctx: &GpuContext) -> Result<(), GpuModernError> {
+    let limit = wait_limit_seconds();
+    let start = std::time::Instant::now();
+    loop {
+        match ctx.device.poll(wgpu::PollType::wait()) {
+            Ok(_) => return Ok(()),
+            Err(wgpu::PollError::Timeout) if start.elapsed().as_secs() < limit => continue,
+            Err(e) => {
+                return Err(GpuModernError::Execution(format!(
+                    "device poll after {} s: {e}",
+                    start.elapsed().as_secs()
+                )));
+            }
+        }
+    }
+}
+
 /// Map the first `bytes[i]` bytes of each staging buffer, after the queue has
 /// finished all submitted work, and copy them out.
 pub(crate) fn read_staging(
@@ -272,9 +302,7 @@ pub(crate) fn read_staging(
             });
         receivers.push(receiver);
     }
-    ctx.device
-        .poll(wgpu::PollType::wait())
-        .map_err(|e| GpuModernError::Execution(format!("device poll: {e}")))?;
+    wait_idle(ctx)?;
     let mut out = Vec::with_capacity(buffers.len());
     for ((buffer, bytes), receiver) in buffers.iter().zip(receivers) {
         receiver

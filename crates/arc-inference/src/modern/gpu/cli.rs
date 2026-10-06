@@ -16,7 +16,7 @@ use arc_gpu::modern::{self as gpu, EngineOptions, GpuEngine, OpLab};
 use serde_json::{Value, json};
 
 use super::{Divergence, engine_from, generate_gpu, gpu_error, kat, localize};
-use crate::modern::arith::Selection;
+use crate::modern::arith::{self, Selection};
 use crate::modern::bpe::ByteLevelBpe;
 use crate::modern::chat::{ChatPrompt, render};
 use crate::modern::model::{GenerationRequest, ModernConfig};
@@ -33,7 +33,10 @@ pub const USAGE: &str =
   gpu-check --package PKG --tokenizer tokenizer.json --cases CASES.json
             --golden GOLDEN.json --out RESULT.json [--run-out RUN.json]
             [--gpu-adapter N|NAME] [--gpu-batch N] [--gpu-max-positions N]
-            [--self-test-rounds N] [--trace-forwards N]
+            [--self-test-rounds N] [--trace-forwards N] [--prefix-forwards N]
+  --prefix-forwards N checks only the first N forward passes of golden case 0
+  (teacher-forced, every logits hash exact), for adapters too slow for the full
+  run. ARC_GPU_WAIT_SECONDS raises the per-pass wait (default 3600).
   ARC_GPU_ADAPTER selects the adapter too; WGPU_BACKEND=vulkan|dx12|metal
   restricts the backends.";
 
@@ -438,6 +441,160 @@ fn divergence_json(divergence: Option<&Divergence>, case_id: &str, compared: usi
     }
 }
 
+/// What the golden comparison found: a JSON section, the timing section,
+/// whether everything matched, and where to start localising a mismatch
+/// (golden case index, forward index; `usize::MAX` = the whole case).
+struct Comparison {
+    golden: Value,
+    timing: Value,
+    matched: bool,
+    first: Option<(usize, usize)>,
+}
+
+/// The five golden prompts on the GPU, compared with the pinned CPU golden.
+fn full_comparison(
+    args: &Args<'_>,
+    engine: &mut GpuEngine,
+    config: &ModernConfig,
+    golden_doc: &Value,
+    golden_cases: &[Value],
+    run_facts: (&PackageDigest, f64, Value),
+) -> Result<Comparison, ModernError> {
+    let (digest, load_seconds, gpu_facts) = run_facts;
+    let cases = read_json(&args.path("--cases")?)?;
+    let tokenizer = load_tokenizer(args.value("--tokenizer"))?;
+    let mut runs = Vec::new();
+    let mut failure: Option<(usize, String)> = None;
+    for (index, case) in case_list(&cases)?.iter().enumerate() {
+        match run_case(engine, config, case, tokenizer.as_ref()) {
+            Ok(run) => {
+                eprintln!(
+                    "case {}: {} tokens, logits_digest {}",
+                    run.record["id"], run.record["tokens"], run.record["logits_digest"]
+                );
+                runs.push(run);
+            }
+            Err(error) => {
+                eprintln!("case {index}: GPU run failed: {error}");
+                failure = Some((index, error.to_string()));
+                break;
+            }
+        }
+    }
+    let document = run_document(digest, &runs, load_seconds, gpu_facts)?;
+    if let Some(path) = args.value("--run-out") {
+        write_json(Path::new(path), &document)?;
+    }
+    let expected_digest = golden_doc["matrix_digest"].as_str().unwrap_or_default();
+    let actual_digest = document["matrix_digest"].as_str().unwrap_or_default();
+    let matched =
+        failure.is_none() && !expected_digest.is_empty() && expected_digest == actual_digest;
+    let mut per_case = Vec::new();
+    let mut first = failure.as_ref().map(|(index, _)| (*index, usize::MAX));
+    for (index, expected) in golden_cases.iter().enumerate() {
+        let actual = document["cases"].get(index);
+        let divergent = match actual {
+            Some(actual) => first_divergent_forward(expected, actual),
+            None => Some(0),
+        };
+        if let (Some(forward), None) = (divergent, first)
+            && actual.is_some()
+        {
+            first = Some((index, forward));
+        }
+        per_case.push(json!({
+            "id": expected["id"],
+            "match": actual.is_some() && divergent.is_none(),
+            "first_divergent_forward": divergent,
+        }));
+    }
+    Ok(Comparison {
+        golden: json!({
+            "mode": "full",
+            "expected_matrix_digest": expected_digest,
+            "matrix_digest": actual_digest,
+            "match": matched,
+            "cases": per_case,
+            "run_error": failure.map(|(index, message)| json!({"case_index": index, "error": message})),
+        }),
+        timing: document["timing"].clone(),
+        matched,
+        first,
+    })
+}
+
+/// The first `forwards` forward passes of golden case 0, teacher-forced with
+/// the golden's tokens, each logits hash compared with the CPU golden's. For
+/// adapters too slow for the full golden run (software rasterizers).
+fn prefix_comparison(
+    engine: &mut GpuEngine,
+    golden_doc: &Value,
+    golden_cases: &[Value],
+    forwards: usize,
+) -> Result<Comparison, ModernError> {
+    let expected = golden_cases
+        .first()
+        .ok_or_else(|| ModernError::Invalid("the golden file has no cases".into()))?;
+    let tokens = forwarded_tokens(expected)?;
+    let hashes = hash_list(expected);
+    let depth = forwards.min(tokens.len()).min(hashes.len());
+    engine.reset();
+    let mut seconds = Vec::with_capacity(depth);
+    let mut divergent = None;
+    let mut error = Value::Null;
+    for (index, &token) in tokens.iter().take(depth).enumerate() {
+        let start = Instant::now();
+        let logits = match engine.forward(token) {
+            Ok(logits) => logits,
+            Err(e) => {
+                eprintln!("forward {index}: GPU failed: {e}");
+                error = Value::from(e.to_string());
+                divergent = Some(index);
+                break;
+            }
+        };
+        let elapsed = start.elapsed().as_secs_f64();
+        seconds.push(elapsed);
+        let equal = hex_lower(&arith::logits_hash(&logits)) == hashes[index];
+        eprintln!(
+            "forward {index}: {elapsed:.1} s, logits {}",
+            if equal {
+                "equal to the CPU golden"
+            } else {
+                "DIFFER from the CPU golden"
+            }
+        );
+        if !equal {
+            divergent = Some(index);
+            break;
+        }
+    }
+    let matched = depth > 0 && divergent.is_none();
+    let total: f64 = seconds.iter().sum();
+    Ok(Comparison {
+        golden: json!({
+            "mode": "prefix",
+            "expected_matrix_digest": golden_doc["matrix_digest"],
+            "matrix_digest": Value::Null,
+            "match": matched,
+            "prefix": {
+                "case": expected["id"],
+                "forwards": depth,
+                "matched_forwards": divergent.unwrap_or(depth),
+                "first_divergent_forward": divergent,
+                "error": error,
+            },
+        }),
+        timing: json!({
+            "forward_seconds": seconds,
+            "prefill_tok_s": rate(seconds.len() as f64, total),
+            "decode_tok_s": Value::Null,
+        }),
+        matched,
+        first: divergent.map(|forward| (0, forward)),
+    })
+}
+
 /// `arc-modern gpu-check`: the Proof Kit's GPU mode.
 pub fn check(items: &[String]) -> Result<(), ModernError> {
     let args = Args { items };
@@ -447,9 +604,8 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
     let golden_cases = case_list(&golden_doc)?.clone();
     let rounds = args.number("--self-test-rounds", 8)?;
     let trace_forwards = args.number("--trace-forwards", 0)?;
+    let prefix_forwards = args.number("--prefix-forwards", 0)?;
     let package_path = args.path("--package")?;
-    let cases = read_json(&args.path("--cases")?)?;
-    let tokenizer = load_tokenizer(args.value("--tokenizer"))?;
 
     // 1. Every kernel against the CPU operators on this adapter and driver.
     let self_test = {
@@ -469,71 +625,32 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
         })
     };
 
-    // 2. The golden prompts on the GPU, case by case.
+    // 2. The golden prompts (or a prefix of the first) on the GPU.
     let digest = package::digest_file(&package_path)?;
     let (mut engine, config, load_seconds, upload_seconds) = load_engine(&package_path, &options)?;
-    let mut runs = Vec::new();
-    let mut failure: Option<(usize, String)> = None;
-    for (index, case) in case_list(&cases)?.iter().enumerate() {
-        match run_case(&mut engine, &config, case, tokenizer.as_ref()) {
-            Ok(run) => {
-                eprintln!(
-                    "case {}: {} tokens, logits_digest {}",
-                    run.record["id"], run.record["tokens"], run.record["logits_digest"]
-                );
-                runs.push(run);
-            }
-            Err(error) => {
-                eprintln!("case {index}: GPU run failed: {error}");
-                failure = Some((index, error.to_string()));
-                break;
-            }
-        }
-    }
     let gpu_facts = gpu_section(&engine, upload_seconds);
-    let document = run_document(&digest, &runs, load_seconds, gpu_facts.clone())?;
-    if let Some(path) = args.value("--run-out") {
-        write_json(Path::new(path), &document)?;
-    }
+    let comparison = if prefix_forwards > 0 {
+        prefix_comparison(&mut engine, &golden_doc, &golden_cases, prefix_forwards)?
+    } else {
+        full_comparison(
+            &args,
+            &mut engine,
+            &config,
+            &golden_doc,
+            &golden_cases,
+            (&digest, load_seconds, gpu_facts.clone()),
+        )?
+    };
 
-    // 3. Compare with the pinned CPU golden.
-    let expected_digest = golden_doc["matrix_digest"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let actual_digest = document["matrix_digest"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let digest_match =
-        failure.is_none() && !expected_digest.is_empty() && expected_digest == actual_digest;
-    let mut per_case = Vec::new();
-    let mut first: Option<(usize, usize)> = failure.as_ref().map(|(index, _)| (*index, usize::MAX));
-    for (index, expected) in golden_cases.iter().enumerate() {
-        let actual = document["cases"].get(index);
-        let divergent = match actual {
-            Some(actual) => first_divergent_forward(expected, actual),
-            None => Some(0),
-        };
-        if let (Some(forward), None) = (divergent, first)
-            && actual.is_some()
-        {
-            first = Some((index, forward));
-        }
-        per_case.push(json!({
-            "id": expected["id"],
-            "match": actual.is_some() && divergent.is_none(),
-            "first_divergent_forward": divergent,
-        }));
-    }
-
-    // 4. Name the first divergent layer/op (traced CPU and GPU replay of the
+    // 3. Name the first divergent layer/op (traced CPU and GPU replay of the
     //    golden token sequence), and the optional always-on trace check.
     let mut first_divergence = Value::Null;
     let mut trace_check = Value::Null;
-    if (!digest_match && first.is_some()) || trace_forwards > 0 {
+    if (!comparison.matched && comparison.first.is_some()) || trace_forwards > 0 {
         let model = package::load_package(&package_path)?;
-        if !digest_match && let Some((case_index, forward)) = first {
+        if !comparison.matched
+            && let Some((case_index, forward)) = comparison.first
+        {
             let expected = &golden_cases[case_index];
             let tokens = forwarded_tokens(expected)?;
             let depth = if forward == usize::MAX {
@@ -541,26 +658,36 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
             } else {
                 forward + 1
             };
-            let (divergence, compared) = localize(&model, &mut engine, &tokens, depth)?;
             let id = expected["id"].as_str().unwrap_or_default();
-            first_divergence = divergence_json(divergence.as_ref(), id, compared);
+            first_divergence = match localize(&model, &mut engine, &tokens, depth) {
+                Ok((divergence, compared)) => divergence_json(divergence.as_ref(), id, compared),
+                Err(error) => json!({"case": id, "error": error.to_string()}),
+            };
         }
         if trace_forwards > 0 && !golden_cases.is_empty() {
             let expected = &golden_cases[0];
             let tokens = forwarded_tokens(expected)?;
             let depth = trace_forwards.min(tokens.len());
-            let (divergence, compared) = localize(&model, &mut engine, &tokens, depth)?;
             let id = expected["id"].as_str().unwrap_or_default();
-            trace_check = json!({
-                "forwards": depth,
-                "all_equal": divergence.is_none(),
-                "detail": divergence_json(divergence.as_ref(), id, compared),
-            });
+            trace_check = match localize(&model, &mut engine, &tokens, depth) {
+                Ok((divergence, compared)) => json!({
+                    "forwards": depth,
+                    "all_equal": divergence.is_none(),
+                    "detail": divergence_json(divergence.as_ref(), id, compared),
+                }),
+                Err(error) => json!({
+                    "forwards": depth,
+                    "all_equal": false,
+                    "error": error.to_string(),
+                }),
+            };
         }
     }
     let trace_ok = trace_check.is_null() || trace_check["all_equal"].as_bool() == Some(true);
     let self_test_ok = self_test["pass"].as_bool() == Some(true);
-    let pass = digest_match && self_test_ok && trace_ok;
+    let pass = comparison.matched && self_test_ok && trace_ok;
+    let mut timing = comparison.timing;
+    timing["load_seconds"] = json!(load_seconds);
     let result = json!({
         "schema": "arc.gpu-proof.v1",
         "profile": PROFILE,
@@ -570,26 +697,27 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
         "gpu": gpu_facts,
         "adapters_available": gpu::list_adapters(),
         "self_test": self_test,
-        "golden": {
-            "expected_matrix_digest": expected_digest,
-            "matrix_digest": actual_digest,
-            "match": digest_match,
-            "cases": per_case,
-            "run_error": failure.map(|(index, message)| json!({"case_index": index, "error": message})),
-        },
+        "golden": comparison.golden,
         "first_divergence": first_divergence,
         "trace_check": trace_check,
-        "timing": document["timing"],
+        "timing": timing,
         "platform": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH},
     });
     write_json(&out_path, &result)?;
     println!(
-        "gpu-check: {} | {} | golden {actual_digest} (expected {expected_digest}) | self-test {} | decode {:.3} tok/s | prefill {:.3} tok/s",
+        "gpu-check: {} | {} | {} | golden {} (expected {}) | self-test {} | prefill {:.3} tok/s | decode {}",
         if pass { "PASS" } else { "FAIL" },
         engine.report().name,
+        result["golden"]["mode"].as_str().unwrap_or_default(),
+        result["golden"]["matrix_digest"].as_str().unwrap_or("-"),
+        result["golden"]["expected_matrix_digest"]
+            .as_str()
+            .unwrap_or_default(),
         if self_test_ok { "pass" } else { "FAIL" },
-        document["timing"]["decode_tok_s"].as_f64().unwrap_or(0.0),
-        document["timing"]["prefill_tok_s"].as_f64().unwrap_or(0.0)
+        result["timing"]["prefill_tok_s"].as_f64().unwrap_or(0.0),
+        result["timing"]["decode_tok_s"]
+            .as_f64()
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.3} tok/s"))
     );
     if pass {
         Ok(())

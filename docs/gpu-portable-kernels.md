@@ -29,11 +29,28 @@ timings say nothing about GPU speed.
 | [37508127774](https://github.com/FerrumVir/arc-chain/actions/runs/37508127774), commit `d83d6334d` | lavapipe: `llvmpipe (LLVM 20.1.2, 256 bits)`, Mesa 25.2.8, Vulkan 1.4.318, on an AMD EPYC 7763 (4 vCPU) | The five SmolLM3-3B golden prompts (393 prompt tokens, 479 forward passes); package `19c67496…aa91` converted on the runner and checked against the pinned manifest | Matrix digest `3e43f342…49f2`, **identical to the CPU golden**, with all 5 cases matching. Self-test: 56 kernel cases, 0 mismatches. Per-layer trace: 1,050 operation hashes over 2 forwards, all equal. 0.238 tok/s (software) |
 | same run | lavapipe | Operator known-answer tests (300 rounds) | 2,100 cases, 1,091 of them refused by both CPU and GPU (out-of-domain inputs), 0 mismatches |
 | same run | lavapipe | Tiny SmolLM3-shaped model | CPU = GPU = GPU with 3 tokens per pass = `98cc9928…0918`; gpu-check passes; 488 operation hashes equal over 8 forwards |
+| [37522544179](https://github.com/FerrumVir/arc-chain/actions/runs/37522544179), commit `97b74a277` | WARP: `Microsoft Basic Render Driver`, DX12, driver 10.0.26100.33438, Windows runner (4 vCPU) | Operator known-answer tests (150 rounds) | 1,050 cases, 548 refused on both sides, 0 mismatches |
+| same run | WARP | Tiny SmolLM3-shaped model | CPU = GPU = GPU with 3 tokens per pass = `98cc9928…0918`; gpu-check passes; 488 operation hashes equal over 8 forwards |
+| same run | WARP | SmolLM3-3B: the gpu-check self-test on WARP before the model run | 56 kernel cases, 0 mismatches |
 
-WARP (DX12) results are added by the next run; see the PR for the current
-status. The first WARP run showed that FXC (the DX12 shader compiler wgpu uses
-by default) rejects dynamically indexed local arrays inside loops; §5 covers the
-rewrite.
+The first WARP run (commit `d83d6334d`) showed that FXC, the DX12 shader
+compiler wgpu uses by default, rejects dynamically indexed local arrays inside
+loops. §5 covers the rewrite.
+
+**WARP and the real model.** One forward pass of the 3B model takes WARP more
+than 60 seconds on the 4-vCPU runner. That exceeded wgpu-core's built-in
+60-second wait; the engine now keeps waiting, up to `ARC_GPU_WAIT_SECONDS`
+(default one hour).
+
+At that speed the full golden run (479 passes) cannot finish within a 6-hour CI
+job. CI therefore checks WARP with `gpu-check --prefix-forwards`: the first
+passes of the first golden case, teacher-forced with the golden tokens, each
+logits hash compared exactly, plus a traced pass compared operation by
+operation.
+
+On Windows runners, FXC also takes about a minute to compile the nine kernels
+each time an engine is built. WARP compiles each kernel on its first dispatch,
+which inflates the first pass's time. Neither affects any value.
 
 ## 2. Why the GPU computes the same integers
 
@@ -146,8 +163,14 @@ arc-modern gpu-check --package smollm3-3b.arcipkg --tokenizer tokenizer.json \
   --cases scripts/arc_modern/smollm3_cases.json \
   --golden scripts/arc_modern/golden/smollm3-3b.cpu-golden.json \
   --out gpu-result.json [--run-out gpu-run.json] [--gpu-adapter N|NAME] \
-  [--self-test-rounds 8] [--trace-forwards 2]
+  [--self-test-rounds 8] [--trace-forwards 2] [--prefix-forwards N]
 ```
+
+`--prefix-forwards N` is the quick mode for adapters too slow for the full run
+(for example software rasterizers). It checks only the first N forward passes
+of the first golden case, teacher-forced with the golden tokens, and still
+compares every logits hash exactly. A pass may take up to
+`ARC_GPU_WAIT_SECONDS` (default 3600 s) before it is reported as stuck.
 
 It does four things:
 
@@ -348,7 +371,7 @@ python scripts/arc_modern/fetch_source.py --manifest docs/protocol/packages/smol
 
 | OS | GPU and driver | Notes |
 |---|---|---|
-| Windows 10/11 | Any DX12 GPU (NVIDIA, AMD, Intel) with a current vendor driver; Vulkan also works (`WGPU_BACKEND=vulkan`) | Without a GPU, wgpu falls back to WARP (software): exact, but slow. DX12 uses FXC in wgpu 25 |
+| Windows 10/11 | Any DX12 GPU (NVIDIA, AMD, Intel) with a current vendor driver; Vulkan also works (`WGPU_BACKEND=vulkan`) | Without a GPU, wgpu falls back to WARP (software): exact, but too slow for the full run (use `--prefix-forwards`). DX12 compiles the kernels with FXC at start, about a minute on a 4-core machine |
 | Linux | Vulkan: NVIDIA proprietary driver, or Mesa RADV (AMD) / ANV (Intel). `vulkaninfo --summary` must list the GPU | Mesa lavapipe (`mesa-vulkan-drivers`) is the software reference used in CI. Hardware GPUs are picked before software adapters automatically |
 | macOS 13 or later | Metal on Apple Silicon, or AMD GPUs in Intel Macs | Unified memory: about 3.1 GB for the weights plus the system's working-set limit. 8 GB Macs are tight |
 
@@ -361,7 +384,11 @@ restricts the backends.
 - the lint job;
 - the lavapipe and WARP jobs (operator tests, the tiny model, gpu-check);
 - on pushes to `gpu-portable-*` branches or with the `gpu-proof` label, the
-  real SmolLM3-3B golden prompts on both software adapters.
+  real SmolLM3-3B package:
+  - on lavapipe: all five golden prompts, plus the first case with 16
+    tokens per pass;
+  - on WARP: the first forward passes and a traced pass, because WARP is too
+    slow for the full run within a CI job.
 
 There are no macOS jobs: macOS runners are reserved for releases. Apple GPUs
 are covered by volunteers and later by a self-hosted Metal runner.
