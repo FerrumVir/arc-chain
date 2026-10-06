@@ -15,6 +15,14 @@ v0.7 data stays where it is, unchanged.
 Nothing here publishes anything. Publication is a separate owner action, in
 stages, described in [Rollout](#rollout).
 
+Why it matters: these returning machines are the start of the community
+test lab and verifier fleet that ARC's verified-inference plan relies on.
+Once their owners consent, they hold the pinned model, take community jobs,
+and re-check answers through the twin execution in PR #139. Proof Kit
+fingerprint reports can be added later through the same consent. The bridge
+holds four rules: a fresh data directory, stake 0, compute off until
+consent, and no publication without TJ's go.
+
 ## What released v0.7 updaters actually do
 
 All citations are to tag `v0.7.11` unless marked otherwise.
@@ -22,8 +30,8 @@ All citations are to tag `v0.7.11` unless marked otherwise.
 | Updater | When it runs | What it fetches | Verification | What it runs afterwards |
 |---|---|---|---|---|
 | Desktop app update (Tauri) | Only when the user clicks Settings > Check for updates, then Install (`desktop/src/screens/Settings.tsx:22-52`). `config.autoUpdate` is stored but never acted on. | `releases/latest/download/latest.json` (`desktop/src-tauri/tauri.conf.json:58-66`) and the bundle URL it names | minisign signature of the bundle, key `9A970CAACE56473B` (same key in every desktop from v0.5.4 through v0.7.11 and in v0.8.10) | Replaces the app (`.app.tar.gz`, NSIS `-setup.exe`, AppImage) and relaunches |
-| Desktop node binary (`ensure_binary`) | **Automatically, before every node start and restart** (`desktop/src-tauri/src/commands.rs:110`, `:140`), in every desktop from v0.6.0 on | `releases/latest/download/arc-node-{macos-arm64,macos-x86_64,windows-x86_64.exe,linux-x86_64}` whenever `~/.arc/bin/arc-node --version`'s second token differs from the app version (`commands.rs:974-1075`, `:1097-1128`) | None | Spawns it as `--rpc 127.0.0.1:<p> --p2p-port <q> --data-dir ~/.arc --validator-seed <phrase> --eth-rpc-port 0 --seeds-file … --genesis … [--community-mode] [--model …]` and never `--stake` (`desktop/src-tauri/src/node_manager.rs:126-211`) |
-| Headless daily updater (`arc-auto-update.sh`, written by `scripts/install-community-node.sh:218-283`) | Daily at 04:17 local: launchd `StartCalendarInterval` (`:362-366`) or the systemd timer, which has `Persistent=true` (`:436-446`) | `api.github.com/repos/FerrumVir/arc-chain/releases/latest`, `tag_name` taken with `grep -m1 '"tag_name"' \| sed` that requires a bare `vX.Y.Z` (`:237-239`), then `releases/download/v<X.Y.Z>/arc-node-{macos-arm64,macos-x86_64,linux-x86_64,linux-aarch64}` (`:247`) | None. Any tag different from `version.txt` is installed (`:241-245`) | Copies the old binary to `arc-node.prev`, moves the new one into `bin/arc-node`, writes `version.txt`, restarts the service (`:249-261`), then rolls back if neither `localhost:9944/health` nor `:9090/health` answers within 30 s (`:262-281`). The service runs `--rpc 0.0.0.0:9944 --p2p-port 9945 --seeds-file … --genesis … --validator-seed <seed> --stake 0 --min-stake 0 --eth-rpc-port 0 --data-dir ~/.arc/data [--model …] --community-mode` (`:306-341`, `:389-421`) |
+| Desktop node binary (`ensure_binary`) | **Automatically, before every node start and restart** (`desktop/src-tauri/src/commands.rs:110`, `:140`), in every desktop from v0.6.0 on | `releases/latest/download/arc-node-{macos-arm64,macos-x86_64,windows-x86_64.exe,linux-x86_64}` whenever `~/.arc/bin/arc-node --version`'s second token differs from the app version (`commands.rs:974-1075`, `:1097-1128`) | None | Spawns it with `--rpc 127.0.0.1:<p> --p2p-port <q> --data-dir ~/.arc`, the wallet's recovery phrase as its identity seed argument, and `--eth-rpc-port 0 --seeds-file … --genesis … [--community-mode] [--model …]`. It never passes `--stake` (`desktop/src-tauri/src/node_manager.rs:126-211`) |
+| Headless daily updater (`arc-auto-update.sh`, written by `scripts/install-community-node.sh:218-283`) | Daily at 04:17 local: launchd `StartCalendarInterval` (`:362-366`) or the systemd timer, which has `Persistent=true` (`:436-446`) | `api.github.com/repos/FerrumVir/arc-chain/releases/latest`, `tag_name` taken with `grep -m1 '"tag_name"' \| sed` that requires a bare `vX.Y.Z` (`:237-239`), then `releases/download/v<X.Y.Z>/arc-node-{macos-arm64,macos-x86_64,linux-x86_64,linux-aarch64}` (`:247`) | None. Any tag different from `version.txt` is installed (`:241-245`) | Copies the old binary to `arc-node.prev`, moves the new one into `bin/arc-node`, writes `version.txt`, restarts the service (`:249-261`), then rolls back if neither `localhost:9944/health` nor `:9090/health` answers within 30 s (`:262-281`). The service runs `--rpc 0.0.0.0:9944 --p2p-port 9945 --seeds-file … --genesis …`, the installer's seed as the identity seed argument, and `--stake 0 --min-stake 0 --eth-rpc-port 0 --data-dir ~/.arc/data [--model …] --community-mode` (`:306-341`, `:389-421`) |
 | Older daemon (`scripts/auto-update.sh`) | Every 600 s while someone keeps it running (`:20`) | Same `releases/latest` parse; `releases/download/v<ver>/arc-node-<platform>` (`:73-101`) when the version is newer (`:180`) | None | Kills the matching `arc-node` process and restarts the new binary with the same arguments (`:103-157`) |
 
 What a "Latest" release must therefore contain:
@@ -41,7 +49,7 @@ Three facts make "just mark v0.8 Latest" unsafe:
    and so on) plus a `latest.json` signed with the same key. Marking it Latest
    would hot-swap a raw v0.8 binary into every v0.7 supervisor, which then
    starts it with the v0.7 arguments and the v0.7 data directory. v0.8.10
-   refuses `--validator-seed` without `--insecure-dev-validator-seed`
+   refuses a seed-derived identity outside its insecure development mode
    (`crates/arc-node/src/main.rs:5908` at `v0.8.10`). So those nodes would
    crash-loop and roll back daily rather than join anything.
 2. The v0.7 desktop never passes `--stake`, and v0.7.11's default stake was
@@ -99,7 +107,7 @@ line. The launcher sits in that slot permanently and on every start:
 1. **Recognizes the invocation** (`src/argv.rs`). It accepts exactly the v0.7
    desktop and headless command lines above. Anything else exits 64 without
    touching the machine. An explicit `--stake` other than 0 is a validator
-   and exits 78. The `--validator-seed` value is consumed and dropped, never
+   and exits 78. The v0.7 identity seed argument is consumed and dropped, never
    stored, logged, transformed or forwarded.
 2. **Resolves the layout** (`src/layout.rs`). The launcher must be
    `<ARC dir>/bin/arc-node`. A headless data directory must be
@@ -109,7 +117,7 @@ line. The launcher sits in that slot permanently and on every start:
    writable by others.
 3. **Refuses to run beside v0.7.** On Linux and macOS it refuses (exit 75,
    retried by the supervisor) while any v0.7 `arc-node` with
-   `--validator-seed` still runs on that data directory.
+   a seed argument still runs on that data directory.
 4. **Archives in place** (`src/archive.rs`). It records a stat-only manifest
    (path, type, size, mtime; links recorded, never followed) of the v0.7 data
    directory as `v0.7-data-archive-0001.json`. It writes a new generation only
@@ -247,8 +255,10 @@ None is automated.
 
 1. Merge PRs #134 (privacy-safe worker names), #135, #138 (consent switch)
    and this PR.
-2. Cut the next v0.8 release (for example v0.8.11) through the normal
-   `release.yml` pipeline. It stays non-latest automatically.
+2. Cut the next v0.8 release (the release captain's v0.8.11 or v0.8.12,
+   carrying the privacy, joining, compute, and twin-verification fixes)
+   through the normal `release.yml` pipeline. It stays non-latest
+   automatically.
 3. Re-pin the bridge to it, in a reviewed PR:
    `python3 scripts/legacy-bridge/pin-release.py --tag v0.8.11 --write`.
    The generator refuses unless the release is immutable, bot-published and
@@ -358,6 +368,11 @@ bridge.
 - **Linux headless nodes without passwordless sudo:** the v0.7 updater cannot
   restart the service (`sudo systemctl restart` fails quietly), so the bridge
   takes effect at the next service restart or reboot.
+- **v0.7 app crash or force-quit:** if the v0.7 app crashes or is force-quit
+  while the bridged node runs, the node keeps running in the background, as a
+  v0.7 node did. The app's next start then reports that the node's data
+  directory is locked. The tray's "Quit ARC Node" stops the node cleanly
+  (`tray.rs:53-63`); otherwise, restart the computer.
 - **Custom layouts are refused (exit 64 or 78), not guessed:** source builds
   driven by the old daemon, custom data directories, and explicit stakes.
 - **`arc-node-linux-aarch64`:** this asset was never published for v0.7, so
