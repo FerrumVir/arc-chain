@@ -545,7 +545,8 @@ function ComputeConsent() {
         <span>Let ARC run inference jobs on this computer</span>
       </label>
       <span className="field-hint">
-        Off unless you turn it on. When on, the app downloads the ARC model once
+        Off unless you turn it on here or chose the ARC model during setup.
+        When on, the app downloads the ARC model once
         (3.80 GB, checked against its pinned SHA-256), switches your node to
         worker mode, and takes jobs from the network while the app is open.
         Turning it off returns the node to observer mode right away.
