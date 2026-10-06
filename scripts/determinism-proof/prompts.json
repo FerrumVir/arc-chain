@@ -1,0 +1,22 @@
+{
+  "schema": "arc-determinism-proof-prompts-v1",
+  "note": "Fixed, public, harmless prompts in the Llama-2 chat [INST] form. The driver tokenizes them with the GGUF SPM tokenizer and records the token IDs in the transcript. Changing anything here changes the expected hash.",
+  "prompts": [
+    {"id": "capital-france", "text": "[INST] What is the capital of France? [/INST]"},
+    {"id": "photosynthesis", "text": "[INST] Explain photosynthesis in one sentence. [/INST]"},
+    {"id": "haiku-ocean", "text": "[INST] Write a haiku about the ocean. [/INST]"},
+    {"id": "study-tips", "text": "[INST] List three tips for staying focused while studying. [/INST]"},
+    {"id": "twelve-squared", "text": "[INST] What is 12 multiplied by 12? [/INST]"},
+    {"id": "good-morning", "text": "[INST] How do you say good morning in Spanish and in French? [/INST]"},
+    {"id": "sky-blue", "text": "[INST] Why is the sky blue? [/INST]"},
+    {"id": "scrambled-eggs", "text": "[INST] Give me a short recipe for scrambled eggs. [/INST]"},
+    {"id": "states-of-matter", "text": "[INST] What are the three common states of matter? [/INST]"},
+    {"id": "robot-name", "text": "[INST] Suggest a name for a friendly robot. [/INST]"},
+    {"id": "cinderella", "text": "[INST] Summarize the story of Cinderella in two sentences. [/INST]"},
+    {"id": "leap-year", "text": "[INST] How many days are in a leap year? [/INST]"},
+    {"id": "learning-to-code", "text": "[INST] Write one sentence of encouragement for someone learning to code. [/INST]"},
+    {"id": "librarian", "text": "[INST] What does a librarian do? [/INST]"},
+    {"id": "planets", "text": "[INST] Name four planets in our solar system. [/INST]"},
+    {"id": "thank-you-japanese", "text": "[INST] How do you say thank you in Japanese? [/INST]"}
+  ]
+}

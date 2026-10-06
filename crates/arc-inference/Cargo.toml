@@ -78,6 +78,9 @@ required-features = ["candle"]
 name = "cross_platform_7b"
 required-features = ["candle"]
 [[example]]
+name = "determinism_proof"
+required-features = ["candle"]
+[[example]]
 name = "debug_7b"
 required-features = ["candle"]
 [[example]]
