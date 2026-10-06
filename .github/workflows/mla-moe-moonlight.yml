@@ -7,6 +7,13 @@ name: MLA + MoE model (Moonlight-16B-A3B, Kimi-K2 architecture)
 # model or any consensus or native-inference binding.
 #
 #   rust       rustfmt, clippy (deny warnings), unit tests of the profile.
+#   tiny       two tiny DeepSeek-V3-shaped models (Moonlight-like and Kimi-like
+#              options): Rust converter vs the independent Python preparer
+#              (byte-identical stage packages), Rust scalar/SIMD generation vs
+#              Python generation and verification, and the same sequences
+#              through 1, 2 and 4 pipeline stages run as separate processes
+#              that exchange only boundary files, each stage also replayed by
+#              the Python executor.
 #
 # The push trigger covers only the development branch, so iterating does not
 # start the repository-wide workflows (and their macOS legs); it is removed
@@ -49,6 +56,8 @@ env:
   CARGO_INCREMENTAL: '0'
   CARGO_PROFILE_RELEASE_LTO: 'off'
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  PY_NUMPY: numpy==2.5.3
+  PY_BLAKE3: blake3==1.0.10
 
 jobs:
   rust:
@@ -81,3 +90,40 @@ jobs:
         run: |
           cargo test -p arc-inference --lib --locked modern::mla -- --nocapture
           cargo test -p arc-inference --lib --locked modern::tiktoken -- --nocapture
+
+  tiny:
+    name: tiny models (Rust vs Python, layouts, replay)
+    if: github.event_name == 'push' || github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
+      - name: Python reference unit tests
+        working-directory: scripts
+        run: python -m unittest arc_conformance.tests.test_mla_moe_reference -v
+      - name: Build arc-mla
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: Tiny models through every check
+        shell: bash
+        run: bash scripts/arc_mla/tiny_checks.sh ./target/release/arc-mla "$RUNNER_TEMP/tiny" "$RUNNER_TEMP/tiny-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-arch-tiny-ubuntu
+          path: ${{ runner.temp }}/tiny-evidence/
+          if-no-files-found: warn

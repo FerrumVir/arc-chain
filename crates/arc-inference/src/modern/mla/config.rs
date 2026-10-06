@@ -136,11 +136,7 @@ impl MlaConfig {
             self.vocab_size,
             self.max_seq,
         ];
-        let group_size = if self.n_group > 0 {
-            self.n_routed_experts / self.n_group
-        } else {
-            0
-        };
+        let group_size = self.n_routed_experts.checked_div(self.n_group).unwrap_or(0);
         let ok = !self.architecture.is_empty()
             && positive.iter().all(|&v| v > 0)
             && self.qk_rope_dim.is_multiple_of(2)
