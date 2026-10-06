@@ -249,6 +249,52 @@ jobs:
           path: ${{ runner.temp }}/evidence/
           if-no-files-found: warn
 
+  tokenizer:
+    name: tokenizer and chat template vs Hugging Face
+    if: github.event.action != 'labeled' || github.event.label.name == 'smollm3-proof'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Install every component rust-toolchain.toml lists up front; letting
+      # cargo auto-install them hit a rustup component conflict on runners.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies (Hugging Face tokenizers and transformers, no torch)
+        run: |
+          python -m pip install --disable-pip-version-check 'tokenizers==0.22.2' \
+            'transformers==4.57.6' 'jinja2==3.1.6'
+      - name: Build arc-modern
+        run: cargo build --release --locked -p arc-inference --bin arc-modern
+      - name: Fetch the pinned tokenizer files (no weights)
+        run: |
+          mkdir -p "$RUNNER_TEMP/tok" "$RUNNER_TEMP/evidence"
+          python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$RUNNER_TEMP/tok" --only tokenizer
+      - name: Byte-level BPE ids and rendered chat prompts must equal Hugging Face
+        run: |
+          set -euo pipefail
+          ev="$RUNNER_TEMP/evidence"
+          python scripts/arc_modern/hf_checks.py corpus --out "$ev/tokenizer-corpus.jsonl" \
+            scripts/arc_conformance/data/tokenizer_corpus.jsonl scripts/arc_modern/tokenizer_extra.jsonl
+          ./target/release/arc-modern tokenize --tokenizer "$RUNNER_TEMP/tok/tokenizer.json" \
+            --input "$ev/tokenizer-corpus.jsonl" --out "$ev/tokenizer-rust.jsonl"
+          python scripts/arc_modern/hf_checks.py compare-tokens --model-dir "$RUNNER_TEMP/tok" \
+            --corpus "$ev/tokenizer-corpus.jsonl" --rust "$ev/tokenizer-rust.jsonl" \
+            --out "$ev/tokenizer-check.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: evidence-tokenizer
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
   reference:
     name: SmolLM3-3B independent Python reference
     if: >-
@@ -269,10 +315,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
-      - name: Python dependencies (reference executor and Hugging Face tokenizer)
-        run: |
-          python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3" \
-            'tokenizers==0.22.2' 'transformers==4.57.6' 'jinja2==3.1.6'
+      - name: Python dependencies (reference executor)
+        run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
       - name: Model directory (the larger of / and /mnt)
         run: |
           set -euo pipefail
@@ -292,16 +336,6 @@ jobs:
         run: cargo build --release --locked -p arc-inference --bin arc-modern
       - name: Fetch SmolLM3-3B BF16 (pinned revision, SHA-256 verified)
         run: python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR"
-      - name: Tokenizer and chat template vs Hugging Face
-        run: |
-          set -euo pipefail
-          python scripts/arc_modern/hf_checks.py corpus --out "$EVIDENCE/tokenizer-corpus.jsonl" \
-            scripts/arc_conformance/data/tokenizer_corpus.jsonl scripts/arc_modern/tokenizer_extra.jsonl
-          ./target/release/arc-modern tokenize --tokenizer "$MODEL_DIR/tokenizer.json" \
-            --input "$EVIDENCE/tokenizer-corpus.jsonl" --out "$EVIDENCE/tokenizer-rust.jsonl"
-          python scripts/arc_modern/hf_checks.py compare-tokens --model-dir "$MODEL_DIR" \
-            --corpus "$EVIDENCE/tokenizer-corpus.jsonl" --rust "$EVIDENCE/tokenizer-rust.jsonl" \
-            --out "$EVIDENCE/tokenizer-check.json"
       - name: Rust converter and independent Python preparer produce the same bytes
         run: |
           set -euo pipefail
@@ -402,7 +436,7 @@ jobs:
 
   report:
     name: report
-    needs: [unit, matrix, reference, quality]
+    needs: [unit, tokenizer, matrix, reference, quality]
     if: always() && needs.matrix.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -451,6 +485,16 @@ jobs:
               $golden --label "SmolLM3-3B (real model)" --out "$RUNNER_TEMP/smollm3-report.json" \
               --summary-md "$RUNNER_TEMP/smollm3-report.md" || status=1
             cat "$RUNNER_TEMP/smollm3-report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f "$all/evidence-tokenizer/tokenizer-check.json" ]; then
+            python - "$all/evidence-tokenizer/tokenizer-check.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          t = json.load(open(sys.argv[1]))
+          print("### Tokenizer and chat template vs Hugging Face")
+          print()
+          print(f"{t['rows'] - t['failures']}/{t['rows']} corpus rows identical ({t['chat_rows']} rendered chat prompts).")
+          print()
+          PY
           fi
           if [ -f "$all/evidence-quality/quality.json" ]; then
             python - "$all/evidence-quality/quality.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
