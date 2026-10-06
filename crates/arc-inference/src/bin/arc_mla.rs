@@ -36,14 +36,16 @@ const USAGE: &str = "usage: arc-mla <command> [options]
   golden    --package PKG --cases CASES.json --out RUN.json
             [--tokenizer-dir DIR] [--special-tokens N] [--kernel scalar|simd] [--threads N]
   stage     --package PKG (--run RUN.json | --input BOUNDARY.bin) --out BOUNDARY.bin
-            --report STAGE.json [--manifest MANIFEST.json] [--kernel scalar|simd] [--threads N]
+            --report STAGE.json [--layers A:B] [--manifest MANIFEST.json]
+            [--kernel scalar|simd] [--threads N]
   ppl       --package PKG --tokens TOKENS.json --out OUT.json
             [--window N] [--max-tokens N] [--kernel scalar|simd] [--threads N]
   tokenize  --tokenizer-dir DIR --input IN.jsonl --out OUT.jsonl [--special-tokens N]
   render    --user TEXT [--system TEXT]
 
 A package holds a layer range [A, B) of the model (the whole model when
-converted without --layers). The tokenizer directory holds tiktoken.model and
+converted without --layers); `stage --layers` executes a sub-range of it,
+reading only those tensors. The tokenizer directory holds tiktoken.model and
 tokenizer_config.json.";
 
 struct Args {
@@ -485,10 +487,16 @@ fn sequences_from_run(run: &Value) -> Result<Vec<BoundarySequence>, ModernError>
 fn cmd_stage(args: &Args) -> Result<(), ModernError> {
     let threads = configure_threads(args)?;
     let kernel = configure_kernel(args)?;
-    let (model, load_seconds) = open_model(args)?;
+    let load_start = Instant::now();
+    let layers = args
+        .value("--layers")
+        .map(|s| StageSpec::parse(&s))
+        .transpose()?;
+    let model = StageModel::open_range(&args.path("--package")?, layers)?;
+    let load_seconds = load_start.elapsed().as_secs_f64();
     let c = model.config().clone();
     let stage = model.stage();
-    let segments = package::segment_digests(model.bytes(), &model.header);
+    let segments = model.segments();
     let (mut sequences, model_root, input) = match (args.value("--run"), args.value("--input")) {
         (Some(run_path), None) => {
             if stage.first_layer != 0 {
