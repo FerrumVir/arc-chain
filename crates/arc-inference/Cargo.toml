@@ -31,6 +31,12 @@ dashmap.workspace = true
 hex.workspace = true
 rayon.workspace = true
 libc = "0.2"
+# SHA-256 identities of pinned Hugging Face sources and integer packages
+# (`modern`). Already in the shipped graph through arc-crypto.
+sha2.workspace = true
+# The Llama-3/SmolLM3 tokenizer split pattern needs a negative lookahead.
+# Already locked through candle-transformers; no new crate enters the graph.
+fancy-regex = "0.13"
 
 # Optional: real INT4/GGUF inference via Hugging Face candle
 candle-core = { version = "0.8", optional = true }
@@ -39,6 +45,11 @@ candle-transformers = { version = "0.8", optional = true }
 
 [dev-dependencies]
 rand.workspace = true
+
+# Modern-model CLI (SmolLM3-3B): convert, verify, generate, golden, ppl.
+[[bin]]
+name = "arc-modern"
+path = "src/bin/arc_modern.rs"
 
 # Examples that load GGUF models or run inference benchmarks against candle-
 # backed tensors pull in candle-core/candle-nn/candle-transformers. Declare
