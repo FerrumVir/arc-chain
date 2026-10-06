@@ -1,0 +1,107 @@
+{
+ "chat_template": {
+  "bytes": 5598,
+  "name": "chat_template.jinja",
+  "rendering": "single user turn, no tools, add_generation_prompt, explicit today date, default /no_think",
+  "sha256": "3e0e275a527f249670056e0078e474eadbdd007c134b4fdfae5a7b3089702814"
+ },
+ "contract": "docs/protocol/integer-profile-hf-llama-dyadic-v1.md",
+ "generation": {
+  "bos_forwarded": false,
+  "diagnostic_semantics": "arc.hf-chat.no-bos.argmax.le-u32.v1",
+  "eos": [
+   128012
+  ],
+  "max_seq": 4096,
+  "semantics": "arc.hf-chat.no-bos.rp64-argmax.le-u32.v1",
+  "semantics_blake3": "f267f6818464cfaed9afe66eec8b29efd59e7208dde72b711487e73756450fdb"
+ },
+ "manifest_blake3": "af388d01c3578c5f97238fd74aaa3d0d8194d29fc6fbd99f3aae226064659fa2",
+ "model": {
+  "architecture": "smollm3",
+  "d_ff": 11008,
+  "d_head": 128,
+  "d_model": 2048,
+  "max_seq": 4096,
+  "n_heads": 16,
+  "n_kv_heads": 4,
+  "n_layers": 36,
+  "rms_eps_q32": 4295,
+  "rope_layers": [
+   1,
+   1,
+   1,
+   0,
+   1,
+   1,
+   1,
+   0,
+   1,
+   1,
+   1,
+   0,
+   1,
+   1,
+   1,
+   0,
+   1,
+   1,
+   1,
+   0,
+   1,
+   1,
+   1,
+   0,
+   1,
+   1,
+   1,
+   0,
+   1,
+   1,
+   1,
+   0,
+   1,
+   1,
+   1,
+   0
+  ],
+  "rope_theta": 5000000,
+  "tied_embeddings": true,
+  "vocab_size": 128256
+ },
+ "package": {
+  "blake3": "3929d6f728660abbdb189a4c4e6ee9c5106c958e2b4c165a37d48ada30378516",
+  "bytes": 3084214016,
+  "sha256": "19c67496ee23fe5da0e12eb1f22cb17f6386c560071587b5b8dfa68731c0aa91"
+ },
+ "profile": "arc.hf-llama.i8-dyadic-row.q16.v1",
+ "profile_blake3": "3eb41a4fe376be020e2b93ff4ca10d55977d113278546ba2ee74622c3db1fa48",
+ "schema": "arc.integer-package-manifest.v1",
+ "source": {
+  "files": [
+   {
+    "bytes": 1915,
+    "name": "config.json",
+    "sha256": "c72b1031274ff4626e434d0019e88e95a767460135db9ee492eb80652b786af1"
+   },
+   {
+    "bytes": 4966315264,
+    "name": "model-00001-of-00002.safetensors",
+    "sha256": "e5eed4113a925264c33e3cdf76cd9f547c06a207ef2270914a7274a2bf685ffd"
+   },
+   {
+    "bytes": 1183919744,
+    "name": "model-00002-of-00002.safetensors",
+    "sha256": "6c3ad90646457295723e4da5ee8afac47006e20407b122df5174693dd8d68a43"
+   }
+  ],
+  "repo": "HuggingFaceTB/SmolLM3-3B",
+  "revision": "a07cc9a04f16550a088caea529712d1d335b0ac1"
+ },
+ "tokenizer": {
+  "bytes": 17208819,
+  "identity": "arc.hf-tokenizers.bytelevel-bpe.v1",
+  "name": "tokenizer.json",
+  "sha256": "7b6a500b662a34eb3f0374db856ba4ad7de4c81040571d78dc0d357238930005"
+ }
+}
