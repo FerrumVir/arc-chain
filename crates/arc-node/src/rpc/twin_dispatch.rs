@@ -435,6 +435,28 @@ impl CommunityTwinState {
         }
     }
 
+    /// Return a declined leg to the queue while its group still has
+    /// collection time. A declining worker never started computing (it won a
+    /// concurrent job elsewhere), so another independent worker can take it.
+    fn reopen_declined_leg(&self, job_id: &str, now: u64) -> Option<(WorkItem, Hash256, u64)> {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        let (group_id, leg_index) = inner.leg_to_group.get(job_id).cloned()?;
+        let group = inner.groups.get_mut(&group_id).filter(|group| {
+            group.state == GroupState::Collecting && now < group.collect_deadline_unix_ms
+        })?;
+        let leg = group.legs.get_mut(leg_index)?;
+        if leg.status != LegStatus::Claimed {
+            return None;
+        }
+        leg.worker = None;
+        leg.status = LegStatus::Unclaimed;
+        leg.enqueued_at_unix_ms = now;
+        let reopened = (leg.item.clone(), leg.assignment_epoch, leg.job_nonce);
+        inner.counters.legs_requeued += 1;
+        Some(reopened)
+    }
+
     /// Record a leg's terminal submission. Returns the group id and whether
     /// every leg is now terminal, or `None` for a leg whose group already
     /// resolved.
@@ -827,6 +849,42 @@ pub(super) fn requeue_item(node: &NodeState, item: WorkItem) {
     }
 }
 
+/// Re-insert a reopened leg's pending record and put it back on the queue.
+fn requeue_twin_leg(
+    node: &NodeState,
+    item: WorkItem,
+    assignment_epoch: Hash256,
+    job_nonce: u64,
+) -> bool {
+    let (Some(tx), Some(results)) = (
+        node.community_work_tx.as_ref(),
+        node.community_work_results.as_ref(),
+    ) else {
+        return false;
+    };
+    match results.entry(item.job_id.clone()) {
+        Entry::Occupied(_) => return false,
+        Entry::Vacant(entry) => {
+            let (leg_sender, _unused_receiver) =
+                tokio::sync::oneshot::channel::<CommunityDispatchOutcome>();
+            entry.insert(PendingCommunityWork {
+                item: item.clone(),
+                assignment_epoch,
+                job_nonce,
+                assigned_worker: None,
+                submitting: false,
+                sender: leg_sender,
+            });
+        }
+    }
+    let job_id = item.job_id.clone();
+    if tx.try_send(item).is_err() {
+        results.remove(&job_id);
+        return false;
+    }
+    true
+}
+
 /// Record a twin leg's authenticated submission. The comparison and any
 /// validator recomputation run in a node-owned task, so the worker's HTTP
 /// request is not held open and a dropped connection cannot cancel them.
@@ -851,6 +909,20 @@ pub(super) fn submit_twin_leg(
     };
     if let Some(mut entry) = node.community_workers.get_mut(&result.worker_id) {
         entry.value_mut().1 = std::time::Instant::now();
+    }
+    if result.declined
+        && let Some((item, assignment_epoch, job_nonce)) = node
+            .community_twin
+            .reopen_declined_leg(&job_id, now_unix_ms())
+        && requeue_twin_leg(node, item, assignment_epoch, job_nonce)
+    {
+        return Ok(Json(json!({
+            "ok": true,
+            "job_id": job_id,
+            "twin": {
+                "status": "requeued",
+            },
+        })));
     }
     let status = if result.success {
         LegStatus::Submitted
@@ -2154,6 +2226,24 @@ mod tests {
         }
     }
 
+    /// A failed (`declined = false`) or declined (`declined = true`) result.
+    fn failed(job_id: &str, worker_id: &str, declined: bool) -> WorkResult {
+        WorkResult {
+            job_id: job_id.to_string(),
+            worker_id: worker_id.to_string(),
+            success: false,
+            declined,
+            output: String::new(),
+            output_hash: String::new(),
+            tokens_generated: 0,
+            total_ms: 0,
+            ms_per_token: 0,
+            engine: String::new(),
+            error: (!declined).then(|| "local inference task failed".to_string()),
+            signed_attestation_hex: None,
+        }
+    }
+
     async fn submit(node: &NodeState, result: WorkResult) -> Value {
         let Json(response) = community_submit_work(AxumState(node.clone()), Json(result))
             .await
@@ -2294,15 +2384,7 @@ mod tests {
         let first = job_of(&claim(&node, "w1").await);
         let second = job_of(&claim(&node, "w2").await);
         submit(&node, result(&first, "w1", "four")).await;
-        let mut declined = result(&second, "w2", "");
-        declined.success = false;
-        declined.declined = true;
-        declined.output_hash = String::new();
-        declined.tokens_generated = 0;
-        declined.total_ms = 0;
-        declined.ms_per_token = 0;
-        declined.engine = String::new();
-        submit(&node, declined).await;
+        submit(&node, failed(&second, "w2", false)).await;
 
         let outcome = outcome_of(dispatcher).await;
         assert_eq!(
@@ -2311,11 +2393,54 @@ mod tests {
         );
         assert_eq!(outcome.receipt.validator_recompute.reason, None);
         assert_eq!(outcome.receipt.verdict, Verdict::Unverified);
-        assert_eq!(outcome.receipt.legs[1].status, LegStatus::Declined);
+        assert_eq!(outcome.receipt.legs[1].status, LegStatus::Failed);
+        // A worker-reported failure counts against that worker, as today.
+        assert_eq!(
+            node.community_workers
+                .get("w2")
+                .unwrap()
+                .value()
+                .0
+                .failure_count,
+            1
+        );
         let counters = node.community_twin.inner.lock().counters.clone();
         assert_eq!(counters.groups_incomplete, 1);
         assert_eq!(counters.recompute_fallback, 0);
         assert_eq!(counters.recompute_unavailable, 0);
+    }
+
+    #[tokio::test]
+    async fn declined_twin_leg_is_requeued_for_another_independent_worker() {
+        let node = twin_node(&["w1", "w2", "w3"], enabled());
+        let dispatcher = spawn_dispatch(&node, DemandSource::PumpDemo);
+        wait_for_pending(&node, 2).await;
+        let first = job_of(&claim(&node, "w1").await);
+        let second = job_of(&claim(&node, "w2").await);
+        // w2 won a concurrent job elsewhere and declines without computing.
+        let requeued = submit(&node, failed(&second, "w2", true)).await;
+        assert_eq!(requeued["twin"]["status"], "requeued");
+        let again = job_of(&claim(&node, "w3").await);
+        assert_eq!(again, second);
+        submit(&node, result(&first, "w1", "green")).await;
+        submit(&node, result(&second, "w3", "green")).await;
+
+        let outcome = outcome_of(dispatcher).await;
+        assert_eq!(outcome.receipt.verdict, Verdict::Verified);
+        assert_eq!(outcome.receipt.legs[1].worker_id.as_deref(), Some("w3"));
+        let counters = node.community_twin.inner.lock().counters.clone();
+        assert_eq!(counters.legs_requeued, 1);
+        assert_eq!(counters.groups_matched, 1);
+        // Declining is not a failure.
+        assert_eq!(
+            node.community_workers
+                .get("w2")
+                .unwrap()
+                .value()
+                .0
+                .failure_count,
+            0
+        );
     }
 
     #[tokio::test]

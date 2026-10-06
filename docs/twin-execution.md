@@ -98,7 +98,8 @@ Spot-check selection is `BLAKE3-keyed(coordinator secret, group_id) mod 1000 < p
 | Queue full when enqueueing | First leg: safe local fallback, as today. Second leg: the caller gets a timeout and the orphaned leg settles as an ordinary job |
 | Sibling never claimed | Resolve 30 s after the first leg finishes. The unclaimed leg's pending record is removed, so a late dequeue expires it |
 | Sibling claimed but late | Marked `abandoned`. A later submit is recognized (up to 1,024 resolved legs are remembered) and recorded as `late_after_resolution`, never re-verified or settled as an ordinary job |
-| Worker declines or fails | The leg is terminal, so the group resolves on what it has |
+| Worker declines (it won a concurrent job on another coordinator and never started) | The leg goes back on the queue for another independent worker while collection time remains (`legs_requeued`); after that it is terminal |
+| Worker reports a failure | The leg is terminal and counts as that worker's failure, as today; the group resolves on what it has |
 | Coordinator restarts | Open groups and receipts are in memory and are lost, like the scoreboard. Rewards in flight keep today's crash-durable settlement journal |
 | Validator recomputation unavailable | Unverified; no output, no penalty (same rule as today's `Unavailable`) |
 | Shutdown | Watchdogs, resolutions and the pump stop on the lifecycle signal |
@@ -379,7 +380,7 @@ Say this only after steps 1–2 above, with numbers read from `twin_stats` and r
 |---|---|---|
 | `--community-twin-execution` | off | coordinator: twin dispatch |
 | `--community-twin-spot-check-per-mille N` | 50 | coordinator: share of matched groups recomputed; hard cap 6 per hour |
-| `--community-demand-pump` | off | coordinator: generated demand |
+| `--community-demand-pump` | off | coordinator: generated demand. Requires `--community-twin-execution`: replays only reuse answers that twins verified |
 | `--community-demand-dry-run` | off | coordinator: plan and log only |
 | `--community-demand-interval-secs N` | 120 | coordinator: tick (minimum 30) |
 | `--community-region-probe` | off | worker: opt-in region report |

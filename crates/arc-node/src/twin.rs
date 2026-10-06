@@ -1098,6 +1098,7 @@ pub struct TwinCounters {
     pub worker_compute_tokens: u64,
     pub rejected_legs: u64,
     pub late_legs: u64,
+    pub legs_requeued: u64,
     pub recompute_spot_check: u64,
     pub recompute_mismatch: u64,
     pub recompute_fallback: u64,
