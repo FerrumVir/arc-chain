@@ -1,0 +1,69 @@
+SUPPLEMENTARY INFORMATION:
+
+I. Background
+
+NTIA and NHTSA are eliminating the regulations at 47 CFR part 400, which pertain to the 911 Grant Program jointly administered by NTIA and NHTSA. The 911 Grant Program was originally established under the Ensuring Needed Help Arrives Near Callers Employing 911 (ENHANCE 911) Act of 2004, codified at 47 U.S.C. 942. Through a final rule published on August 3, 2018 (83 FR 38059), the agencies revised the program's implementing regulations as required by the Next Generation 911 Advancement Act of 2012, which was part of the Middle Class Tax Relief and Job Creation Act of 2012 (Pub. L. 112-96) and modernized the program to support the nationwide transition from legacy 911 systems to Next Generation 911 (NG911) services. The 2018 final rule updated the program's structure and broadened the eligible uses for grant funds to include NG911 technologies. As of 2026, the 911 Grant Program is no longer active. Authorization for the program expired on October 1, 2022 (47 U.S.C. 942(d)(2)), and the Public Safety Trust Fund that funded the program was not extended past fiscal year 2022 (47 U.S.C. 1457(a)(2)). All projects funded by the program have been closed out and no open grants or applications exist.
+
+II. Description of Regulatory Sections
+
+Part 400 consists of eleven sections: Sec. Sec. 400.1-400.11. Section 400.1 establishes the purpose of part 400. Section 400.2 provides definitions for various terms used throughout part 400. Section 400.3 addresses who may apply for a grant under part 400. Section 400.4 sets forth the application requirements. Section 400.5 addresses the review and approval of applications. Section 400.6 sets forth the framework for the distribution of grant funds. Section 400.7 establishes restrictions on how grant funds may be used. Section 400.8 sets forth continuing compliance requirements. Section 400.9 sets forth financial and administrative requirements, including reporting requirements related to performance and finances. Section 400.10 establishes the applicable closeout procedures. Section 400.11 addresses the authority of the 911 Implementation Coordination Office to waive the provisions of part 400 in extraordinary circumstances.
+
+III. Discussion
+
+NTIA and NHTSA are eliminating 47 CFR part 400 in its entirety. The ENHANCE 911 Act of 2004, as amended by the Next Generation 911 Advancement Act of 2012, appropriated a limited amount of funding for the 911 Grant Program, and all those funds have been allocated and awarded. No new appropriations have been made to revive or extend the program. Indeed, as stated on the program's website (https://www.911.gov/projects/federal-funding/), ``[t]here are currently no 911 Grants open for application.'' Because the program is now obsolete, and all the language in part 400 is now functionally irrelevant, NTIA and NHTSA are removing and reserving part 400. The elimination of part 400 will remove obsolete language, simplify the Code of Federal Regulations, and reduce the possibility of confusion regarding the availability of 911 Grant Program funds. NTIA and NHTSA will remain ready to promulgate new regulations in the event that the 911 Grant Program is revived or extended by Congress.
+
+IV. Waiver of Notice and Comment
+
+Administrative Procedure Act
+
+NTIA and NHTSA find good cause to issue, without notice and comment, and to make effective immediately, this elimination of the 911 Grant Program regulations in their entirety, in accordance with 5 U.S.C. 553(b)(B) and 5 U.S.C. 553(d)(3). The Administrative Procedure Act provides that when an agency, for good cause, finds that notice and comment are impracticable, unnecessary, or contrary to the public interest, the agency may issue a final rule without providing prior notice and an opportunity for public comment (5 U.S.C. 553(b)(B)). In addition, a substantive rule will be made effective at least 30 days after its publication unless an agency finds good cause to make the rule effective prior to that date. See 5 U.S.C. 553(d)(3). The 911 Grant Program, which is the subject of the regulations eliminated by this action, is no longer active. Both the authorization and trust fund that provide funding for the 911 Grant Program expired at the end of fiscal year 2022. No funds have been appropriated for the 911 Grant Program since 2022. With these considerations in mind, NTIA and NHTSA find it unnecessary to provide prior notice and opportunity for public comment on this elimination of regulatory language related to the expired 911 Grant Program. For these same reasons, the agencies find good cause to make this amendment effective immediately.
+
+V. Regulatory Analyses and Notices
+
+A. Executive Order 12866 (Regulatory Planning and Review)
+
+The Office of Management and Budget (OMB) has determined this rule to be significant for purposes of Executive Order (E.O.) 12866.
+
+B. Executive Order 14192 (Unleashing Prosperity Through Deregulation)
+
+This rule is an E.O. 14192 deregulatory action.
+
+[[Page 63501]]
+
+C. Regulatory Flexibility Act
+
+The Regulatory Flexibility Act (RFA) of 1980 (5 U.S.C. 601, et seq.) requires agencies to evaluate the potential effects of their proposed and final rules on small businesses, small organizations, and small governmental jurisdictions. Section 605 of the RFA allows agencies to certify a rule, in lieu of preparing an analysis, if the proposed rulemaking is not expected to have a significant economic impact on a substantial number of small entities. The Small Business Regulatory Enforcement Fairness Act of 1996 (Pub. L. 104-21, 110 Stat. 857) amended the RFA to require Federal agencies to provide a statement of the factual basis for certifying that an action would not have a significant economic impact on a substantial number of small entities. Because a notice of proposed rulemaking and an opportunity for public participation are not required to be given for this rule by 5 U.S.C. 553(b)(B), the analytical requirements of the Regulatory Flexibility Act (5 U.S.C. 601, et seq.) are not applicable. See Or. Trollers Ass'n v. Gutierrez, 452 F.3d 1104, 1123-24 (9th Cir. 2006) (noting that the RFA does not apply when an agency validly invokes an exception to the public comment requirements of 5 U.S.C. 553).
+
+D. Executive Order 13132 (Federalism)
+
+This rule does not contain policies having federalism implications as the term is defined in E.O. 13132.
+
+E. Executive Order 12988 (Civil Justice Reform)
+
+This rulemaking meets applicable standards to minimize litigation, eliminate ambiguity, and reduce burden as set forth in sections 3(a) and 3(b)(2) of E.O. 12988 (February 5, 1996).
+
+F. Paperwork Reduction Act
+
+Under the procedures established by the Paperwork Reduction Act of 1995 (PRA) (44 U.S.C. 3501, et seq.), Federal agencies must obtain approval from OMB for each collection of information they conduct, sponsor, or require through regulations. The OMB Control Number for the information collection was 0660-0041; the information collection expired June 30, 2023. This rule contains no new information collection requirements under the Paperwork Reduction Act of 1995.
+
+G. Unfunded Mandates Reform Act
+
+The changes set forth in this rulemaking do not involve a Federal intergovernmental mandate that will result in the expenditure by State, local, and tribal governments, in the aggregate, of $100 million (as adjusted) or more in any one year, or a Federal private sector mandate that will result in the expenditure by the private sector of $100 million (as adjusted) or more in any one year, and will not significantly or uniquely affect small governments. Therefore, no actions are necessary under the provisions of the Unfunded Mandates Reform Act of 1995. See 2 U.S.C. 1501 et seq.
+
+H. National Environmental Policy Act
+
+NHTSA has analyzed the environmental impacts of this final rule pursuant to the National Environmental Policy Act of 1969 (NEPA) (42 U.S.C. 4321, et seq.). NHTSA has determined that this rule is categorically excluded pursuant to 23 CFR 771.118(c)(4). Categorical exclusions are categories of actions that the agency has determined normally do not significantly affect the quality of the human environment and therefore do not require either an environmental assessment (EA) or environmental impact statement (EIS). See DOT Order 5610.1D Sec. 9. In analyzing the applicability of a categorical exclusion (CE), the agency must also consider whether extraordinary circumstances are present that would warrant the preparation of an EA or EIS. Id. Sec. 9(b). Each DOT Operating Administration (OA) may apply a CE established in another OA's procedures. Id. Sec. 9(f). To do so, the OA ``must evaluate the action for extraordinary circumstances identified in the OA procedures in which the CE is established to determine if a normally excluded action may have a significant impact and coordinate with the originating OA to ensure that the CE is being applied correctly.'' Id. This rulemaking eliminates regulatory provisions related to the 911 Grant Program, which is no longer operational, and is categorically excluded pursuant to 23 CFR 771.118(c)(4), ``Planning and administrative activities not involving or leading directly to construction, such as: Training, technical assistance and research; promulgation of rules, regulations, directives, or program guidance; approval of project concepts; engineering; and operating assistance to transit authorities to continue existing service or increase service to meet routine demand.'' NHTSA has coordinated with the Federal Transit Administration to ensure that this CE is being applied correctly. NHTSA does not anticipate any environmental impacts, and there are no extraordinary circumstances present in connection with this rulemaking. NTIA has analyzed the environmental impacts of this final rule pursuant to the National Environmental Policy Act of 1969 (NEPA) (42 U.S.C. 4321, et seq.) and in accordance with its Guidance on NTIA National Environmental Policy Act Compliance to determine the potential environmental impacts of this rulemaking. NTIA has determined that this Proposed Action, which is a rulemaking to eliminate regulatory provisions for an obsolete grant program, qualifies for NTIA CE A-1, ``Personnel, fiscal, management, and administrative activities, including recruiting, processing, paying, recordkeeping, budgeting, personnel actions, contract administration, and travel.'' This action has no potential for extraordinary circumstances because the elimination of obsolete regulatory provisions would not result in any activities or follow-on actions and has no potential to impact the human environment.
+
+I. Executive Order 13175 (Consultation and Coordination With Indian Tribes)
+
+E.O. 13175 (65 FR 67249, Nov. 9, 2000) requires Federal agencies to consult and coordinate with Tribes on a government-to-government basis on policies that have Tribal implications, including regulations, legislative comments or proposed legislation, and other policy statements or actions that have substantial direct effects on one or more Indian Tribes, on the relationship between the Federal Government and Indian Tribes, or on the distribution of power and responsibilities between the Federal Government and Indian Tribes. NTIA and NHTSA has assessed the impact of this rule on Indian tribes and determined that this action would not have Tribal implications that require consultation under E.O. 13175.
+
+J. Congressional Review Act
+
+The Congressional Review Act, 5 U.S.C. 801, et seq., as added by the Small Business Regulatory Enforcement Fairness Act of 1996, generally provides that before a rule may take effect, the agency promulgating the rule must submit a rule report, which includes a copy of the rule to each House of the Congress and to the Comptroller General of the United States. NTIA and NHTSA will submit a report containing this rule and other required information to the U.S. Senate, the U.S. House of Representatives, and the Comptroller General of the United States prior to publication of this rule in the Federal Register. Because this rule does not meet the criteria in 5 U.S.C. 804(2) for a major rule, it will be effective upon publication in the Federal Register.
+
+[[Page 63502]]
+
+L. Privacy Act
+
+Anyone is able to search the electronic form of all comments received into any of our dockets by the name of the individual submitting the comment (or signing the comment, if submitted on behalf of an association, business, labor union, etc.). For information on DOT's compliance with the Privacy Act, please visit https://www.transportation.gov/privacy.
