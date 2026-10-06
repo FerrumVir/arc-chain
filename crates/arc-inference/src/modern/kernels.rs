@@ -791,6 +791,139 @@ pub fn project_swiglu_many(
         })
 }
 
+// --------------------------------------------------------------- batches --
+
+/// Most inputs (tokens) one batched call takes.
+pub const MAX_BATCH: usize = 16;
+/// Rows a batched call computes for every input before moving on: small
+/// enough that the rows stay in the core's cache while every input reads them.
+const BATCH_TILE_ROWS: usize = 4;
+
+fn check_batch(inputs: &[PreparedInput]) -> Result<usize, ModernError> {
+    if inputs.is_empty() || inputs.len() > MAX_BATCH {
+        return Err(ModernError::Invalid(format!(
+            "a batch takes 1 to {MAX_BATCH} inputs, not {}",
+            inputs.len()
+        )));
+    }
+    Ok(inputs.len())
+}
+
+/// Rows `row0 .. row0 + acc.len() / inputs.len()` of `m` for every input:
+/// `acc[i * inputs.len() + t]`. Each tile of rows is read from memory once
+/// and then from cache by every input; the arithmetic is [`row_dots`]'s.
+fn row_dots_batch(
+    m: MatrixRows<'_>,
+    row0: usize,
+    inputs: &[PreparedInput],
+    acc: &mut [i64],
+) -> Result<(), ModernError> {
+    let tokens = inputs.len();
+    let rows = acc.len() / tokens;
+    let mut tile = [0i64; BATCH_TILE_ROWS];
+    let mut i = 0usize;
+    while i < rows {
+        let n = (rows - i).min(BATCH_TILE_ROWS);
+        for (t, input) in inputs.iter().enumerate() {
+            row_dots(m, row0 + i, input, &mut tile[..n])?;
+            for (r, &value) in tile[..n].iter().enumerate() {
+                acc[(i + r) * tokens + t] = value;
+            }
+        }
+        i += n;
+    }
+    Ok(())
+}
+
+/// [`project_many`] for several tokens that read the same matrices (prompt
+/// prefill, batched verification): `out[row * inputs.len() + t]` is row
+/// `row` of the concatenated parts for token `t`. Weight traffic falls by the
+/// number of tokens; every value is the single-token value.
+pub fn project_batch(
+    parts: &[MatrixRows<'_>],
+    inputs: &[PreparedInput],
+    out: &mut [i64],
+) -> Result<(), ModernError> {
+    let tokens = check_batch(inputs)?;
+    let mut total = 0usize;
+    for m in parts {
+        for input in inputs {
+            m.check(input.len())?;
+        }
+        total += m.rows;
+    }
+    if total.checked_mul(tokens) != Some(out.len()) {
+        return Err(ModernError::Invalid(format!(
+            "batched projection output: {} values for {total} rows x {tokens} inputs",
+            out.len()
+        )));
+    }
+    out.par_chunks_mut(TASK_ROWS * tokens)
+        .enumerate()
+        .try_for_each(|(chunk_index, chunk)| {
+            let mut first = chunk_index * TASK_ROWS;
+            let mut rest = chunk;
+            let mut part_start = 0usize;
+            for &m in parts {
+                let part_end = part_start + m.rows;
+                if !rest.is_empty() && first < part_end {
+                    let local = first - part_start;
+                    let take = (part_end - first).min(rest.len() / tokens);
+                    let (head, tail) = std::mem::take(&mut rest).split_at_mut(take * tokens);
+                    row_dots_batch(m, local, inputs, head)?;
+                    for (offset, row_out) in head.chunks_exact_mut(tokens).enumerate() {
+                        let row = local + offset;
+                        for slot in row_out {
+                            *slot = arith::dyadic_epilogue(*slot, m.mu[row], m.k[row])?;
+                        }
+                    }
+                    rest = tail;
+                    first += take;
+                }
+                part_start = part_end;
+            }
+            Ok(())
+        })
+}
+
+/// [`project_swiglu`] for several tokens: `out[row * inputs.len() + t]`.
+pub fn project_swiglu_batch(
+    gate: MatrixRows<'_>,
+    up: MatrixRows<'_>,
+    inputs: &[PreparedInput],
+    out: &mut [i64],
+) -> Result<(), ModernError> {
+    let tokens = check_batch(inputs)?;
+    for input in inputs {
+        gate.check(input.len())?;
+        up.check(input.len())?;
+    }
+    if gate.rows != up.rows || gate.rows.checked_mul(tokens) != Some(out.len()) {
+        return Err(ModernError::Invalid(format!(
+            "batched SwiGLU: gate {} rows, up {} rows, output {} for {tokens} inputs",
+            gate.rows,
+            up.rows,
+            out.len()
+        )));
+    }
+    out.par_chunks_mut(TASK_ROWS * tokens)
+        .enumerate()
+        .try_for_each(|(chunk_index, chunk)| {
+            let row0 = chunk_index * TASK_ROWS;
+            let mut up_acc = [0i64; TASK_ROWS * MAX_BATCH];
+            let up_chunk = &mut up_acc[..chunk.len()];
+            row_dots_batch(gate, row0, inputs, chunk)?;
+            row_dots_batch(up, row0, inputs, up_chunk)?;
+            for (index, (g, &u)) in chunk.iter_mut().zip(up_chunk.iter()).enumerate() {
+                let row = row0 + index / tokens;
+                let g_out = arith::dyadic_epilogue(*g, gate.mu[row], gate.k[row])?;
+                let u_out = arith::dyadic_epilogue(u, up.mu[row], up.k[row])?;
+                *g = arith::gated_silu(g_out, u_out)?;
+            }
+            Ok(())
+        })
+}
+
 // ------------------------------------------------------------- attention --
 
 /// A kernel whose CPU support has been checked, for the attention loops.
@@ -862,6 +995,65 @@ impl Isa {
     }
 }
 
+// ---------------------------------------------------------------- tiling --
+
+/// How the SIMD kernels walk the rows of a projection. Both orders compute
+/// the same integers; they differ only in memory access pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tiling {
+    /// Four rows per register tile: each digit vector is loaded once and
+    /// used for four rows (four short row streams per thread).
+    #[default]
+    Rows4,
+    /// One row at a time, several column blocks per step: each thread reads
+    /// its rows as one sequential stream.
+    Stream,
+}
+
+impl Tiling {
+    /// Every tiling, in a fixed order.
+    pub const ALL: [Tiling; 2] = [Tiling::Rows4, Tiling::Stream];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tiling::Rows4 => "rows4",
+            Tiling::Stream => "stream",
+        }
+    }
+
+    pub fn parse(name: &str) -> Result<Self, ModernError> {
+        match name {
+            "rows4" => Ok(Tiling::Rows4),
+            "stream" => Ok(Tiling::Stream),
+            other => Err(ModernError::Invalid(format!(
+                "unknown tiling {other} (expected rows4 or stream)"
+            ))),
+        }
+    }
+}
+
+static TILING: AtomicU8 = AtomicU8::new(0);
+
+/// Select the row order of the SIMD kernels process-wide (a speed setting;
+/// it cannot change a value).
+pub fn set_tiling(tiling: Tiling) {
+    TILING.store(
+        match tiling {
+            Tiling::Rows4 => 0,
+            Tiling::Stream => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// The row order of the SIMD kernels (see [`set_tiling`]).
+pub fn tiling() -> Tiling {
+    match TILING.load(Ordering::Relaxed) {
+        1 => Tiling::Stream,
+        _ => Tiling::Rows4,
+    }
+}
+
 // ------------------------------------------------- reference-path switch --
 
 static REFERENCE_KERNEL: AtomicU8 = AtomicU8::new(0);
@@ -911,7 +1103,7 @@ pub(crate) fn project_reference(
 mod x86 {
     use std::arch::x86_64::*;
 
-    use super::{MatrixRows, ModernError, PreparedInput, combine};
+    use super::{MatrixRows, ModernError, PreparedInput, Tiling, combine, tiling};
 
     /// Columns per i32 accumulation block: 128 `vpmaddwd` steps of at most
     /// 2^23 per lane, so a lane stays below 2^30 before it is widened.
@@ -958,6 +1150,18 @@ mod x86 {
         let planes = input.planes16.as_ptr();
         let stride = input.stride;
         let base = m.q.as_ptr();
+        if tiling() == Tiling::Stream {
+            for (offset, slot) in acc.iter_mut().enumerate() {
+                let row = row0 + offset;
+                // SAFETY: row < m.rows, so its `cols >= vector_cols` weights
+                // lie in m.q; the planes hold L * stride digits with
+                // vector_cols <= stride.
+                let sums =
+                    unsafe { stream::<L>(base.add(row * cols), planes, stride, vector_cols) };
+                *slot = combine(&sums, 16, m.row(row), &input.x, vector_cols)?;
+            }
+            return Ok(());
+        }
         let mut i = 0usize;
         while i < acc.len() {
             if acc.len() - i >= R {
@@ -1024,6 +1228,61 @@ mod x86 {
                     for l in 0..L {
                         total[r][l] += hsum_epi32(acc[r][l]);
                     }
+                }
+            }
+            total
+        }
+    }
+
+    /// One row against `L` digit planes over the first `vector_cols`
+    /// columns (a multiple of 16), two 16-column blocks per step (`2L`
+    /// accumulators), so each thread reads its rows as one sequential stream.
+    /// Each accumulator takes at most 65 `vpmaddwd` steps per 2,048-column
+    /// block, so its lanes stay below 2^30 before they are widened.
+    ///
+    /// # Safety
+    /// AVX2; `row` valid for `vector_cols` reads; `planes` valid for
+    /// `L * stride` reads with `vector_cols <= stride`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::needless_range_loop)]
+    unsafe fn stream<const L: usize>(
+        row: *const i8,
+        planes: *const i16,
+        stride: usize,
+        vector_cols: usize,
+    ) -> [i64; L] {
+        // SAFETY: every load stays inside the bounds stated above.
+        unsafe {
+            let mut total = [0i64; L];
+            let mut c = 0usize;
+            while c < vector_cols {
+                let block_end = vector_cols.min(c + FLUSH_COLS);
+                let mut even = [_mm256_setzero_si256(); L];
+                let mut odd = [_mm256_setzero_si256(); L];
+                while c + 32 <= block_end {
+                    let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(row.add(c).cast()));
+                    let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(row.add(c + 16).cast()));
+                    for l in 0..L {
+                        let plane = planes.add(l * stride + c);
+                        let d0 = _mm256_loadu_si256(plane.cast());
+                        let d1 = _mm256_loadu_si256(plane.add(16).cast());
+                        even[l] = _mm256_add_epi32(even[l], _mm256_madd_epi16(w0, d0));
+                        odd[l] = _mm256_add_epi32(odd[l], _mm256_madd_epi16(w1, d1));
+                    }
+                    c += 32;
+                }
+                if c < block_end {
+                    // One 16-column block is left (vector_cols is a multiple
+                    // of 16 and FLUSH_COLS a multiple of 32).
+                    let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(row.add(c).cast()));
+                    for l in 0..L {
+                        let d0 = _mm256_loadu_si256(planes.add(l * stride + c).cast());
+                        even[l] = _mm256_add_epi32(even[l], _mm256_madd_epi16(w0, d0));
+                    }
+                    c += 16;
+                }
+                for l in 0..L {
+                    total[l] += hsum_epi32(even[l]) + hsum_epi32(odd[l]);
                 }
             }
             total
@@ -1111,7 +1370,7 @@ mod x86 {
 mod arm {
     use std::arch::aarch64::*;
 
-    use super::{MatrixRows, ModernError, PreparedInput, combine};
+    use super::{MatrixRows, ModernError, PreparedInput, Tiling, combine, tiling};
 
     /// `SDOT Vd.4S, Vn.16B, Vm.16B`: four exact 4-way i8 dot products added
     /// to i32 lanes. Inline assembly, because the intrinsic is still behind
@@ -1177,6 +1436,18 @@ mod arm {
         let planes = input.planes8.as_ptr();
         let stride = input.stride;
         let base = m.q.as_ptr();
+        if tiling() == Tiling::Stream {
+            for (offset, slot) in acc.iter_mut().enumerate() {
+                let row = row0 + offset;
+                // SAFETY: row < m.rows, so its `cols >= vector_cols` weights
+                // lie in m.q; the planes hold L * stride digits with
+                // vector_cols <= stride <= ... and vector_cols <= I8_MAX_COLS.
+                let sums =
+                    unsafe { stream::<L>(base.add(row * cols), planes, stride, vector_cols) };
+                *slot = combine(&sums, 8, m.row(row), &input.x, vector_cols)?;
+            }
+            return Ok(());
+        }
         let mut i = 0usize;
         while i < acc.len() {
             if acc.len() - i >= R {
@@ -1240,6 +1511,54 @@ mod arm {
             for r in 0..R {
                 for l in 0..L {
                     total[r][l] = i64::from(vaddvq_s32(acc[r][l]));
+                }
+            }
+            total
+        }
+    }
+
+    /// One row against `L` digit planes over the first `vector_cols`
+    /// columns (a multiple of 16), four 16-column blocks per step (`4L`
+    /// independent `sdot` chains), so each thread reads its rows as one
+    /// sequential stream.
+    ///
+    /// # Safety
+    /// dotprod; `row` valid for `vector_cols` reads; `planes` valid for
+    /// `L * stride` reads with `vector_cols <= stride` and
+    /// `vector_cols <= I8_MAX_COLS` (no i32 lane can overflow).
+    #[target_feature(enable = "neon,dotprod")]
+    #[allow(clippy::needless_range_loop)]
+    unsafe fn stream<const L: usize>(
+        row: *const i8,
+        planes: *const i8,
+        stride: usize,
+        vector_cols: usize,
+    ) -> [i64; L] {
+        // SAFETY: every load stays inside the bounds stated above.
+        unsafe {
+            let mut acc = [[vdupq_n_s32(0); L]; 4];
+            let mut c = 0usize;
+            while c + 64 <= vector_cols {
+                for b in 0..4 {
+                    let w = vld1q_s8(row.add(c + 16 * b));
+                    for l in 0..L {
+                        let d = vld1q_s8(planes.add(l * stride + c + 16 * b));
+                        acc[b][l] = sdot(acc[b][l], w, d);
+                    }
+                }
+                c += 64;
+            }
+            while c < vector_cols {
+                let w = vld1q_s8(row.add(c));
+                for l in 0..L {
+                    acc[0][l] = sdot(acc[0][l], w, vld1q_s8(planes.add(l * stride + c)));
+                }
+                c += 16;
+            }
+            let mut total = [0i64; L];
+            for l in 0..L {
+                for b in 0..4 {
+                    total[l] += i64::from(vaddvq_s32(acc[b][l]));
                 }
             }
             total
@@ -1444,11 +1763,50 @@ mod tests {
     }
 
     #[test]
+    fn both_tilings_compute_the_same_integers() {
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let mut rng = Rng(0x7111_4e55);
+        for kernel in Kernel::available_kernels() {
+            for &cols in &[16usize, 33, 64, 2048, 2080, 4111, 11_008] {
+                let rows = 9;
+                let m = matrix(&mut rng, rows, cols, 127);
+                for magnitude in [1i64 << 12, 1 << 20, 3 << 29, 1 << 40] {
+                    let bound = magnitude.min(magnitude_cap(cols));
+                    let x: Vec<i64> = (0..cols).map(|_| rng.signed(bound)).collect();
+                    let mut input = PreparedInput::new();
+                    input.prepare(&x, kernel).unwrap();
+                    let expected = reference(&m, &x);
+                    for tiling in Tiling::ALL {
+                        set_tiling(tiling);
+                        let mut out = vec![0i64; rows];
+                        project(MatrixRows::of(&m), &input, &mut out).unwrap();
+                        assert_eq!(
+                            out,
+                            expected,
+                            "{} {} cols {cols} magnitude {magnitude}",
+                            kernel.name(),
+                            tiling.name()
+                        );
+                    }
+                }
+            }
+        }
+        set_tiling(Tiling::default());
+        assert_eq!(Tiling::parse("stream").unwrap(), Tiling::Stream);
+        assert!(Tiling::parse("rows8").is_err());
+    }
+
+    #[test]
     fn extreme_digits_and_weights_cannot_overflow_a_lane() {
         // Weight -128 (outside the profile, inside every kernel's bound) times
         // the most negative digit in every column maximises every lane; 4,111
-        // columns cross two i32 flush blocks and leave a tail.
-        for kernel in Kernel::available_kernels() {
+        // columns cross two i32 flush blocks and leave a tail. Both tilings.
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        for (kernel, tiling) in Kernel::available_kernels()
+            .into_iter()
+            .flat_map(|k| Tiling::ALL.map(|t| (k, t)))
+        {
+            set_tiling(tiling);
             let (bits, most) = match kernel {
                 Kernel::Avx2 => (16, I16_MAX_LIMBS),
                 Kernel::Neon => (8, I8_MAX_LIMBS),
@@ -1471,10 +1829,17 @@ mod tests {
                     input.prepare(&x, kernel).unwrap();
                     let mut out = vec![0i64; m.rows];
                     project(MatrixRows::of(&m), &input, &mut out).unwrap();
-                    assert_eq!(out, reference(&m, &x), "{} {limbs} {fill}", kernel.name());
+                    assert_eq!(
+                        out,
+                        reference(&m, &x),
+                        "{} {} {limbs} {fill}",
+                        kernel.name(),
+                        tiling.name()
+                    );
                 }
             }
         }
+        set_tiling(Tiling::default());
     }
 
     #[test]
@@ -1562,6 +1927,66 @@ mod tests {
             project_swiglu_many(&parts, &input, &mut out).unwrap();
             assert_eq!(out, expected, "{}", kernel.name());
         }
+    }
+
+    #[test]
+    fn batched_calls_match_one_token_at_a_time() {
+        let mut rng = Rng(0xba7c4);
+        let cols = 70;
+        let wq = matrix(&mut rng, 37, cols, 127);
+        let wk = matrix(&mut rng, 29, cols, 127);
+        let gate = matrix(&mut rng, 75, cols, 127);
+        let up = matrix(&mut rng, 75, cols, 127);
+        for kernel in Kernel::available_kernels() {
+            for tokens in [1usize, 2, 5, MAX_BATCH] {
+                // Mixed magnitudes, so the inputs use different digit counts
+                // (and the scalar fallback) inside one batch.
+                let inputs: Vec<PreparedInput> = (0..tokens)
+                    .map(|t| {
+                        let bound =
+                            [1i64 << 10, 1 << 20, 1 << 33, 1 << 50][t % 4].min(magnitude_cap(cols));
+                        let x: Vec<i64> = (0..cols).map(|_| rng.signed(bound)).collect();
+                        let mut input = PreparedInput::new();
+                        input.prepare(&x, kernel).unwrap();
+                        input
+                    })
+                    .collect();
+                let rows = wq.rows + wk.rows;
+                let mut batched = vec![0i64; rows * tokens];
+                project_batch(
+                    &[MatrixRows::of(&wq), MatrixRows::of(&wk)],
+                    &inputs,
+                    &mut batched,
+                )
+                .unwrap();
+                let mut swiglu = vec![0i64; gate.rows * tokens];
+                project_swiglu_batch(
+                    MatrixRows::of(&gate),
+                    MatrixRows::of(&up),
+                    &inputs,
+                    &mut swiglu,
+                )
+                .unwrap();
+                for (t, input) in inputs.iter().enumerate() {
+                    let mut single = vec![0i64; rows];
+                    project_many(
+                        &[(MatrixRows::of(&wq), input), (MatrixRows::of(&wk), input)],
+                        &mut single,
+                    )
+                    .unwrap();
+                    let column: Vec<i64> = (0..rows).map(|r| batched[r * tokens + t]).collect();
+                    assert_eq!(column, single, "{} tokens {tokens} t {t}", kernel.name());
+                    let mut silu = vec![0i64; gate.rows];
+                    project_swiglu(MatrixRows::of(&gate), MatrixRows::of(&up), input, &mut silu)
+                        .unwrap();
+                    let column: Vec<i64> = (0..gate.rows).map(|r| swiglu[r * tokens + t]).collect();
+                    assert_eq!(column, silu, "{} tokens {tokens} t {t}", kernel.name());
+                }
+            }
+        }
+        let too_many: Vec<PreparedInput> = (0..=MAX_BATCH).map(|_| PreparedInput::new()).collect();
+        let mut out = vec![0i64; wq.rows * too_many.len()];
+        assert!(project_batch(&[MatrixRows::of(&wq)], &too_many, &mut out).is_err());
     }
 
     #[test]

@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use super::ModernError;
 use super::arith;
 use super::engine::{Engine, Spec};
-use super::kernels::{self, Kernel, MatrixRows, PreparedInput};
+use super::kernels::{self, Kernel, MatrixRows, PreparedInput, Tiling};
 use super::model::{KvCache, ModernModel, TokenForward};
 
 /// What [`run`] measures.
@@ -49,6 +49,9 @@ pub struct BenchOptions {
     pub kernel_micro: bool,
     /// Measure read bandwidth over the weights.
     pub bandwidth: bool,
+    /// Row orders of the SIMD kernels to compare (the first is used for
+    /// every other measurement; empty = the current setting only).
+    pub tilings: Vec<Tiling>,
 }
 
 fn pool(threads: usize) -> Result<rayon::ThreadPool, ModernError> {
@@ -86,12 +89,14 @@ fn prefill(
     runner.begin(room);
     let start = Instant::now();
     let mut last = Vec::new();
-    for (index, &token) in tokens.iter().enumerate() {
-        let logits = runner.forward_token(token)?;
-        if index + 1 == tokens.len() {
+    let mut seen = 0usize;
+    runner.forward_tokens(tokens, &mut |logits| {
+        seen += 1;
+        if seen == tokens.len() {
             last = logits.to_vec();
         }
-    }
+        Ok(())
+    })?;
     let seconds = start.elapsed().as_secs_f64();
     Ok((runner.kv_cache().clone(), last, seconds))
 }
@@ -168,7 +173,7 @@ fn read_bandwidth(model: &ModernModel, threads: usize) -> Result<f64, ModernErro
 
 /// Each available kernel on the model's own matrices: seconds per call and
 /// GB/s of weights streamed, with the default thread pool.
-fn kernel_micro(model: &ModernModel) -> Result<Vec<Value>, ModernError> {
+fn kernel_micro(model: &ModernModel, tilings: &[Tiling]) -> Result<Vec<Value>, ModernError> {
     let layer = &model.layers[0];
     let matrices = [
         ("q_proj", &layer.wq),
@@ -179,7 +184,16 @@ fn kernel_micro(model: &ModernModel) -> Result<Vec<Value>, ModernError> {
         ("lm_head", &model.embed),
     ];
     let mut rows = Vec::new();
-    for kernel in Kernel::available_kernels() {
+    let pairs = Kernel::available_kernels().into_iter().flat_map(|kernel| {
+        let orders: Vec<Tiling> = if kernel == Kernel::Scalar {
+            vec![tilings[0]]
+        } else {
+            tilings.to_vec()
+        };
+        orders.into_iter().map(move |tiling| (kernel, tiling))
+    });
+    for (kernel, tiling) in pairs {
+        kernels::set_tiling(tiling);
         for (name, m) in matrices {
             // A deterministic input with RMS-normalised magnitudes (|x| up to
             // 8.0 in Q16), the common case for projection inputs.
@@ -200,6 +214,7 @@ fn kernel_micro(model: &ModernModel) -> Result<Vec<Value>, ModernError> {
             let weights = (m.rows * m.cols) as f64;
             rows.push(json!({
                 "kernel": kernel.name(),
+                "tiling": tiling.name(),
                 "matrix": name,
                 "rows": m.rows,
                 "cols": m.cols,
@@ -210,6 +225,7 @@ fn kernel_micro(model: &ModernModel) -> Result<Vec<Value>, ModernError> {
             }));
         }
     }
+    kernels::set_tiling(tilings[0]);
     Ok(rows)
 }
 
@@ -236,6 +252,12 @@ pub fn run(model: &ModernModel, options: &BenchOptions) -> Result<Value, ModernE
         options.threads
     };
     let main_pool = pool(threads)?;
+    let tilings: Vec<Tiling> = if options.tilings.is_empty() {
+        vec![kernels::tiling()]
+    } else {
+        options.tilings.clone()
+    };
+    kernels::set_tiling(tilings[0]);
     let mut bandwidth = Vec::new();
     if options.bandwidth {
         let mut counts = options.scaling.clone();
@@ -271,18 +293,21 @@ pub fn run(model: &ModernModel, options: &BenchOptions) -> Result<Value, ModernE
             weight_bytes(model) + kv_bytes(model, context + options.decode_tokens / 2);
         let mut runs = Vec::new();
         let mut digests = Vec::new();
-        let mut measure = |spec: Spec, count: usize| -> Result<(), ModernError> {
+        let mut measure = |spec: Spec, count: usize, tiling: Tiling| -> Result<(), ModernError> {
             let run_pool = pool(count)?;
+            kernels::set_tiling(tiling);
             let (seconds, digest, tokens) = run_pool.install(|| {
                 spec.apply();
                 Spec::start_census();
                 let mut runner = spec.runner(model);
                 decode(runner.as_mut(), model, &cache, &last, options.decode_tokens)
             })?;
+            kernels::set_tiling(tilings[0]);
             let tok_s = rate(options.decode_tokens as f64, seconds);
             digests.push(digest.clone());
             runs.push(json!({
                 "spec": spec.name(),
+                "tiling": tiling.name(),
                 "threads": count,
                 "tokens": options.decode_tokens,
                 "seconds": seconds,
@@ -296,11 +321,16 @@ pub fn run(model: &ModernModel, options: &BenchOptions) -> Result<Value, ModernE
             Ok(())
         };
         for &spec in &options.specs {
-            measure(spec, threads)?;
+            measure(spec, threads, tilings[0])?;
         }
         for &count in &options.scaling {
             if count != threads {
-                measure(lead, count)?;
+                measure(lead, count, tilings[0])?;
+            }
+        }
+        if matches!(lead, Spec::Fast(_)) {
+            for &tiling in &tilings[1..] {
+                measure(lead, threads, tiling)?;
             }
         }
         let digests_equal = digests.windows(2).all(|w| w[0] == w[1]);
@@ -360,7 +390,7 @@ pub fn run(model: &ModernModel, options: &BenchOptions) -> Result<Value, ModernE
         }));
     }
     let micro = if options.kernel_micro {
-        main_pool.install(|| kernel_micro(model))?
+        main_pool.install(|| kernel_micro(model, &tilings))?
     } else {
         Vec::new()
     };
@@ -383,6 +413,8 @@ pub fn run(model: &ModernModel, options: &BenchOptions) -> Result<Value, ModernE
             "kv_bytes_per_position": c.kv_bytes_per_position(),
         },
         "threads": threads,
+        "tiling": tilings[0].name(),
+        "tilings": tilings.iter().map(|t| t.name()).collect::<Vec<_>>(),
         "bandwidth": bandwidth,
         "contexts": contexts,
         "kernel_micro": micro,
