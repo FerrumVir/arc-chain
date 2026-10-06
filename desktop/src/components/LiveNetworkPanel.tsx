@@ -133,7 +133,7 @@ export function LiveNetworkPanel() {
           loading={firstLoad}
           note={
             chain.height_validator
-              ? `newest block, as ${chain.height_validator} reports it`
+              ? `newest block, reported by ${chain.height_validator}`
               : "no validator reported a height"
           }
         >

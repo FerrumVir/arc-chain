@@ -45,18 +45,27 @@
   font-size: var(--text-sm);
 }
 
-/* Columns divided by hairlines, as on an engraved plate. */
+/* Columns divided by hairlines, as on an engraved plate. A second row (the
+   v0.8.11 twin figures) keeps the same column widths as the first. */
 .live-network-grid {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
   row-gap: var(--space-5);
 }
 
 .live-stat {
-  flex: 1 1 168px;
   min-width: 0;
   padding: 2px var(--space-4);
   border-left: 1px solid var(--border);
+}
+
+/* Every label takes two lines, so the values line up across a row whether
+   or not a label wraps. */
+.live-stat .stat-label {
+  display: flex;
+  align-items: flex-end;
+  min-height: 2.8em;
+  line-height: 1.4;
 }
 
 .live-stat-value {
@@ -233,8 +242,8 @@
   .live-network-title {
     font-size: var(--text-xl);
   }
-  .live-stat {
-    flex-basis: 140px;
+  .live-network-grid {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   }
   .live-stat-value {
     font-size: var(--text-xl);
