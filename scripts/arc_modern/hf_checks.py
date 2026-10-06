@@ -24,7 +24,9 @@ from pathlib import Path
 
 
 def read_jsonl(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # Split on "\n" only: str.splitlines() also breaks at U+2028, U+0085 and
+    # other characters that legitimately occur inside the corpus strings.
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
 
 
 def today_string() -> str:
@@ -42,7 +44,7 @@ def cmd_corpus(args: argparse.Namespace) -> int:
                 chat["today"] = today_string()
                 row["chat"] = chat
             rows.append(row)
-    Path(args.out).write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    Path(args.out).write_text("".join(json.dumps(r, ensure_ascii=True) + "\n" for r in rows), encoding="utf-8")
     print(f"{len(rows)} corpus rows")
     return 0
 
