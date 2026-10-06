@@ -106,6 +106,43 @@ jobs:
         run: |
           cargo test -p arc-inference --lib --locked modern::
 
+  kernel:
+    name: kernel (${{ matrix.os }})
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: serving-bench-${{ matrix.os }}
+          save-if: false
+      - name: Batched projection vs one row at a time (synthetic matrices, no model)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread' || true
+          cargo build --release --locked -p arc-inference --bin arc-serve-bench
+          ./target/release/arc-serve-bench gemm --kernel simd \
+            --out "$RUNNER_TEMP/evidence/gemm.json" --summary "$RUNNER_TEMP/evidence/gemm.md"
+          cat "$RUNNER_TEMP/evidence/gemm.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: gemm-${{ matrix.os }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
   bench:
     name: bench (${{ matrix.os }})
     needs: gate

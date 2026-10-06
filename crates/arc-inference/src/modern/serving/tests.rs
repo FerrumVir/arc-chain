@@ -447,6 +447,130 @@ fn prefix_keys_commit_to_the_model_and_the_whole_prefix() {
     assert!(miss.is_empty());
 }
 
+/// Generated-prefix reuse (an agent's next turn re-sends the conversation) and
+/// the KV-cache invariant of Vosti (arXiv 2609.38981): every block the cache
+/// can serve equals recomputing its token prefix without the cache, with an
+/// unbounded cache and with one small enough to evict.
+#[test]
+fn generated_prefixes_are_reused_and_every_cached_block_equals_recomputation() {
+    let model = model_with(3, 128, 131);
+    let dense = DenseModel::new(&model, [131; 32]);
+    let first = Request {
+        id: 0,
+        prompt: (0..23u32).map(|i| (i * 7) % VOCAB).collect(),
+        max_tokens: 12,
+        eos: Vec::new(),
+        selection: Selection::Argmax,
+    };
+    for capacity_bytes in [usize::MAX, 6_000] {
+        let settings = SchedulerConfig {
+            prefix: Some(PrefixConfig {
+                block: 4,
+                capacity_bytes,
+            }),
+            ..config(1)
+        };
+        let mut scheduler = Scheduler::new(&dense, settings);
+        scheduler.submit(first.clone()).unwrap();
+        let turn1 = scheduler.run().pop().unwrap();
+        let out1 = turn1.result.unwrap().tokens;
+        let mut prompt2 = first.prompt.clone();
+        prompt2.extend_from_slice(&out1);
+        prompt2.extend_from_slice(&[3, 1, 4, 1, 5]);
+        let second = Request {
+            id: 1,
+            prompt: prompt2,
+            max_tokens: 10,
+            eos: Vec::new(),
+            selection: Selection::Rp64Argmax,
+        };
+        scheduler.submit(second.clone()).unwrap();
+        let turn2 = scheduler.run().pop().unwrap();
+        assert_matches_reference(&model, &second, &turn2, false);
+        let out2 = turn2.result.as_ref().unwrap();
+        if capacity_bytes == usize::MAX {
+            // Everything turn 1 computed (its prompt and every generated token
+            // but the last) is reusable, in whole 4-position blocks.
+            let reusable = first.prompt.len() + out1.len() - 1;
+            assert_eq!(out2.cached_tokens, reusable / 4 * 4);
+        }
+        let cache = scheduler.prefix_cache_mut().unwrap();
+        for (prompt, tokens) in [(&first.prompt, &out1), (&second.prompt, &out2.tokens)] {
+            let sequence: Vec<u32> = prompt
+                .iter()
+                .chain(&tokens[..tokens.len() - 1])
+                .copied()
+                .collect();
+            let mut served = dense.new_kv();
+            let hit = cache.lookup_into(&sequence, sequence.len(), &mut served);
+            if capacity_bytes == usize::MAX {
+                assert_eq!(hit, sequence.len() / 4 * 4);
+            }
+            let mut recomputed = model.new_cache();
+            for &t in &sequence[..hit] {
+                model.forward(t, &mut recomputed).unwrap();
+            }
+            assert_eq!(served.len(), hit);
+            assert_eq!(served.digest(), recomputed.digest());
+        }
+    }
+}
+
+/// A request that loses its cache mid-generation (preemption, a device
+/// leaving an island) is rebuilt by prefilling its prompt and the tokens it
+/// already generated. The rebuilt cache, the next logits and the next token
+/// are the uninterrupted ones, whatever the chunking.
+#[test]
+fn recomputing_a_preempted_request_is_byte_identical() {
+    let model = model_with(3, 96, 141);
+    let dense = DenseModel::new(&model, [141; 32]);
+    let request = Request {
+        id: 0,
+        prompt: (0..29u32).map(|i| (i * 13 + 5) % VOCAB).collect(),
+        max_tokens: 20,
+        eos: Vec::new(),
+        selection: Selection::Rp64Argmax,
+    };
+    let (tokens, hashes) = reference(&model, &request);
+    let p = request.prompt.len();
+    for generated in [1usize, 7, tokens.len() - 1] {
+        let sequence: Vec<u32> = request
+            .prompt
+            .iter()
+            .chain(&tokens[..generated])
+            .copied()
+            .collect();
+        for chunk in [sequence.len(), 5, 1] {
+            let mut kv = dense.new_kv();
+            let mut last = None;
+            for start in (0..sequence.len()).step_by(chunk) {
+                let end = (start + chunk).min(sequence.len());
+                let rows: Vec<Row> = (start..end)
+                    .map(|q| Row {
+                        seq: 0,
+                        token: sequence[q],
+                        position: q,
+                        logits: q + 1 == sequence.len(),
+                    })
+                    .collect();
+                let out = dense.forward_rows(&rows, &mut [&mut kv]);
+                assert!(out.errors[0].is_none());
+                if let Some(Some(values)) = out.logits.last() {
+                    last = Some(values.clone());
+                }
+            }
+            let values = last.unwrap();
+            assert_eq!(arith::logits_hash(&values), hashes[p + generated - 1]);
+            let next = arith::select(&values, &tokens[..generated], request.selection).unwrap();
+            assert_eq!(next, tokens[generated]);
+            assert_eq!(
+                kv.digest(),
+                replay_digest(&model, &request.prompt, &tokens[..generated + 1])
+            );
+        }
+    }
+}
+
 #[test]
 fn speculative_decoding_emits_exactly_the_plain_greedy_tokens() {
     let model = model_with(3, 128, 57);

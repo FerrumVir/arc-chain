@@ -24,12 +24,12 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use arc_inference::canonical_simd;
-use arc_inference::modern::arith::{self, Selection};
+use arc_inference::modern::arith::{self, DyadicMatrix, Selection};
 use arc_inference::modern::bpe::ByteLevelBpe;
 use arc_inference::modern::chat::{ChatPrompt, render};
 use arc_inference::modern::model::ModernModel;
 use arc_inference::modern::serving::dense::DenseModel;
-use arc_inference::modern::serving::gemm::digit_kernel_enabled;
+use arc_inference::modern::serving::gemm::{digit_kernel_enabled, exact_sums, project_rows};
 use arc_inference::modern::serving::prefix::PrefixConfig;
 use arc_inference::modern::serving::scheduler::{
     Completion, Generated, Request, Scheduler, SchedulerConfig, StepStats,
@@ -42,7 +42,9 @@ const USAGE: &str = "usage: arc-serve-bench <golden|batching|prefix|speculative|
 --package PKG --tokenizer tokenizer.json --out REPORT.json
   [--summary REPORT.md] [--cases CASES.json] [--expect DIGEST] [--workload WORKLOAD.json]
   [--kernel scalar|simd] [--threads N] [--concurrency 1,2,4,8,16,32] [--gen N]
-  [--prefix-gen N] [--spec-gen N] [--draft N]";
+  [--prefix-gen N] [--spec-gen N] [--draft N]
+       arc-serve-bench gemm --out REPORT.json [--summary REPORT.md] [--kernel scalar|simd]
+  [--threads N] [--widths 1,2,4,...] [--repeats N]   (synthetic matrices, no model)";
 
 const DEFAULT_TODAY: &str = "06 October 2026";
 /// `<|im_end|>`, SmolLM3's end of turn.
@@ -533,6 +535,7 @@ fn bench_speculative(
     for (set, prompts) in &sets {
         // Per arm: decode tokens, decode seconds, drafted, accepted, passes.
         let mut totals = [(0usize, 0f64, 0usize, 0usize, 0usize); 2];
+        let mut records = Vec::new();
         for (index, prompt) in prompts.iter().enumerate() {
             let mut plain_tokens = Vec::new();
             for (arm, k) in [0usize, draft].into_iter().enumerate() {
@@ -557,6 +560,14 @@ fn bench_speculative(
                     plain_tokens = out.tokens.clone();
                 } else {
                     identical &= plain_tokens == out.tokens;
+                    records.push(json!({
+                        "prompt_tokens": prompt.len(),
+                        "generated": out.tokens.len(),
+                        "drafted": out.drafted,
+                        "accepted": out.accepted,
+                        "passes": out.decode_steps,
+                        "text": bench.tokenizer.decode(&out.tokens, true),
+                    }));
                 }
             }
         }
@@ -583,6 +594,7 @@ fn bench_speculative(
             "prompts": prompts.len(),
             "arms": arms,
             "speedup": ratio(spec, plain),
+            "requests": records,
         }));
     }
     Ok(json!({
@@ -593,6 +605,128 @@ fn bench_speculative(
         "outputs_identical": identical,
         "pass": identical,
     }))
+}
+
+/// Batched projection against one-row-at-a-time projection on synthetic
+/// matrices shaped like SmolLM3's (`d_model` 2048, `d_ff` 11008): time per row
+/// and weights per second at each width, and the outputs compared. Needs no
+/// model, so it gives kernel feedback in minutes.
+fn bench_gemm(widths: &[usize], repeats: usize) -> Result<Value, ModernError> {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let top = widths.iter().copied().max().unwrap_or(1);
+    let mut shapes = Vec::new();
+    let mut identical = true;
+    for (rows, cols) in [(2048usize, 2048usize), (2048, 11008)] {
+        let m = DyadicMatrix {
+            rows,
+            cols,
+            q: (0..rows * cols)
+                .map(|_| ((next() % 255) as i64 - 127) as i8)
+                .collect(),
+            mu: (0..rows)
+                .map(|_| ((1u64 << 30) + next() % (1 << 30)) as i32)
+                .collect(),
+            k: (0..rows).map(|_| 40 + (next() % 3) as u8).collect(),
+        };
+        // Activations like normalised Q16 inputs: |x| below 4.0.
+        let all: Vec<i64> = (0..top * cols)
+            .map(|_| (next() % (1 << 19)) as i64 - (1 << 18))
+            .collect();
+        let mut points = Vec::new();
+        for &width in widths {
+            let xs = &all[..width * cols];
+            let mut gemv = vec![0i64; width * rows];
+            let mut gemv_seconds = f64::MAX;
+            for _ in 0..repeats {
+                let started = Instant::now();
+                for (x, y) in xs.chunks(cols).zip(gemv.chunks_mut(rows)) {
+                    arith::project(&m, x, y)?;
+                }
+                gemv_seconds = gemv_seconds.min(started.elapsed().as_secs_f64());
+            }
+            let mut gemm = vec![0i64; width * rows];
+            let mut gemm_seconds = f64::MAX;
+            for _ in 0..repeats {
+                let mut errors: Vec<Option<ModernError>> = (0..width).map(|_| None).collect();
+                let started = Instant::now();
+                project_rows(&m, xs, &mut gemm, &mut errors);
+                gemm_seconds = gemm_seconds.min(started.elapsed().as_secs_f64());
+                if let Some(error) = errors.into_iter().flatten().next() {
+                    return Err(error);
+                }
+            }
+            // The digit kernel alone (raw sums, no epilogue), also at width 1,
+            // where project_rows uses the single-row path instead.
+            let live: Vec<usize> = (0..width).collect();
+            let mut sums_seconds = f64::MAX;
+            for _ in 0..repeats {
+                let started = Instant::now();
+                let sums = exact_sums(&m, xs, &live);
+                sums_seconds = sums_seconds.min(started.elapsed().as_secs_f64());
+                identical &= sums.len() == rows * width;
+            }
+            identical &= gemv == gemm;
+            let weights = (rows * cols * width) as f64;
+            let per_row = |seconds: f64| 1e3 * seconds / width as f64;
+            points.push(json!({
+                "width": width,
+                "gemv_ms_per_row": per_row(gemv_seconds),
+                "gemm_ms_per_row": per_row(gemm_seconds),
+                "kernel_ms_per_row": per_row(sums_seconds),
+                "gemv_gweights_s": weights / gemv_seconds / 1e9,
+                "gemm_gweights_s": weights / gemm_seconds / 1e9,
+                "gemm_speedup_per_row": ratio(gemv_seconds, gemm_seconds),
+            }));
+        }
+        shapes.push(json!({"rows": rows, "cols": cols, "points": points}));
+    }
+    Ok(json!({
+        "repeats": repeats,
+        "shapes": shapes,
+        "outputs_identical": identical,
+        "pass": identical,
+    }))
+}
+
+fn gemm_summary(report: &Value) -> String {
+    let p = &report["platform"];
+    let g = &report["gemm"];
+    let mut md = format!(
+        "### Batched projection vs one row at a time (synthetic, {} {}, {} threads, kernel {}; outputs identical: {})\n\n",
+        p["os"].as_str().unwrap_or("?"),
+        p["cpu"]
+            .as_str()
+            .or_else(|| p["arch"].as_str())
+            .unwrap_or("?"),
+        p["rayon_threads"],
+        report["kernel"].as_str().unwrap_or("?"),
+        yes(&g["outputs_identical"]),
+    );
+    for shape in g["shapes"].as_array().into_iter().flatten() {
+        md += &format!(
+            "**{} x {} matrix**\n\n| rows in the step | one row at a time (ms/row) | batched (ms/row) | digit kernel only (ms/row) | batched Gweights/s | speedup per row |\n|---|---|---|---|---|---|\n",
+            shape["rows"], shape["cols"]
+        );
+        for point in shape["points"].as_array().into_iter().flatten() {
+            md += &format!(
+                "| {} | {} | {} | {} | {} | {}x |\n",
+                point["width"],
+                fmt(&point["gemv_ms_per_row"], 3),
+                fmt(&point["gemm_ms_per_row"], 3),
+                fmt(&point["kernel_ms_per_row"], 3),
+                fmt(&point["gemm_gweights_s"], 2),
+                fmt(&point["gemm_speedup_per_row"], 2),
+            );
+        }
+        md += "\n";
+    }
+    md
 }
 
 fn configure(args: &Args) -> Result<(usize, String), ModernError> {
@@ -741,11 +875,34 @@ fn summary(report: &Value) -> String {
 fn execute(command: &str, args: &Args) -> Result<bool, ModernError> {
     if !matches!(
         command,
-        "golden" | "batching" | "prefix" | "speculative" | "all"
+        "golden" | "batching" | "prefix" | "speculative" | "all" | "gemm"
     ) {
         return Err(ModernError::Invalid(USAGE.into()));
     }
     let (threads, kernel) = configure(args)?;
+    let platform = json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "cpu": cpu_model(),
+        "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "rayon_threads": threads,
+        "simd_available": canonical_simd::dotprod_available(),
+        "batched_digit_kernel": digit_kernel_enabled(),
+    });
+    if command == "gemm" {
+        let widths = parse_list(args.value("--widths"), &[1, 2, 4, 8, 16, 32, 64, 128, 256])?;
+        let result = bench_gemm(&widths, args.number("--repeats", 3)?)?;
+        let pass = result["pass"].as_bool() == Some(true);
+        let report = json!({
+            "schema": "arc.serving-gemm-bench.v1",
+            "kernel": kernel,
+            "platform": platform,
+            "gemm": result,
+            "pass": pass,
+        });
+        write_report(args, &report, gemm_summary(&report))?;
+        return Ok(pass);
+    }
     let package_path = args.path("--package")?;
     let digest = package::digest_file(&package_path)?;
     let started = Instant::now();
@@ -783,18 +940,7 @@ fn execute(command: &str, args: &Args) -> Result<bool, ModernError> {
     report.insert("package".into(), digest.to_json());
     report.insert("kernel".into(), json!(kernel));
     report.insert("load_seconds".into(), json!(load_seconds));
-    report.insert(
-        "platform".into(),
-        json!({
-            "os": std::env::consts::OS,
-            "arch": std::env::consts::ARCH,
-            "cpu": cpu_model(),
-            "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
-            "rayon_threads": threads,
-            "simd_available": canonical_simd::dotprod_available(),
-            "batched_digit_kernel": digit_kernel_enabled(),
-        }),
-    );
+    report.insert("platform".into(), platform);
     let all = command == "all";
     let need_workload = || {
         workload
@@ -813,14 +959,7 @@ fn execute(command: &str, args: &Args) -> Result<bool, ModernError> {
         report.insert("golden".into(), result);
     }
     if all || command == "batching" {
-        let levels = match args.value("--concurrency") {
-            Some(list) => list
-                .split(',')
-                .map(|s| s.trim().parse::<usize>())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| ModernError::Invalid("bad --concurrency list".into()))?,
-            None => vec![1, 2, 4, 8, 16, 32],
-        };
+        let levels = parse_list(args.value("--concurrency"), &[1, 2, 4, 8, 16, 32])?;
         let result = bench_batching(&bench, need_workload()?, &levels, args.number("--gen", 16)?)?;
         eprintln!("batching: {}", result["points"]);
         pass &= result["pass"].as_bool() == Some(true);
@@ -846,16 +985,33 @@ fn execute(command: &str, args: &Args) -> Result<bool, ModernError> {
     }
     report.insert("pass".into(), json!(pass));
     let report = Value::Object(report);
+    write_report(args, &report, summary(&report))?;
+    Ok(pass)
+}
+
+/// A comma-separated list of counts, or `default`.
+fn parse_list(text: Option<String>, default: &[usize]) -> Result<Vec<usize>, ModernError> {
+    match text {
+        None => Ok(default.to_vec()),
+        Some(list) => list
+            .split(',')
+            .map(|item| item.trim().parse::<usize>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ModernError::Invalid(format!("bad list {list}"))),
+    }
+}
+
+/// Write the JSON report to `--out` and the Markdown summary to `--summary`.
+fn write_report(args: &Args, report: &Value, markdown: String) -> Result<(), ModernError> {
     let out = args.path("--out")?;
-    let text = serde_json::to_string_pretty(&report)
+    let text = serde_json::to_string_pretty(report)
         .map_err(|e| ModernError::Invalid(format!("JSON: {e}")))?;
     std::fs::write(&out, text + "\n")
         .map_err(|e| ModernError::Io(format!("{}: {e}", out.display())))?;
     if let Some(path) = args.value("--summary") {
-        std::fs::write(&path, summary(&report))
-            .map_err(|e| ModernError::Io(format!("{path}: {e}")))?;
+        std::fs::write(&path, markdown).map_err(|e| ModernError::Io(format!("{path}: {e}")))?;
     }
-    Ok(pass)
+    Ok(())
 }
 
 fn main() -> ExitCode {

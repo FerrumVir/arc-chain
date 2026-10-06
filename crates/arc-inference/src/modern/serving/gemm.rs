@@ -27,8 +27,9 @@ use crate::modern::arith::{
     self, DyadicMatrix, check_projection_input, dot_i8_i64, dyadic_epilogue,
 };
 
-/// Weight rows per parallel task.
-const ROW_BLOCK: usize = 16;
+/// Weight rows per parallel task. With a column chunk of [`simd`]'s `CHUNK`
+/// width, a block's weights and one group of digit planes fit in L1 together.
+const ROW_BLOCK: usize = 8;
 
 /// Largest inner dimension the digit kernels accept. With `|w|, |d| <= 128`
 /// every `i32` partial sum of an ARM digit plane stays below `2^31`; the x86
@@ -195,66 +196,85 @@ struct Planes {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl Planes {
     fn split(xs: &[i64], cols: usize, live: &[usize]) -> Self {
+        let rows: Vec<_> = live
+            .par_iter()
+            .map(|&r| split_row(&xs[r * cols..(r + 1) * cols]))
+            .collect();
         let mut planes = Planes {
             cols,
             digits: Vec::new(),
             owners: Vec::new(),
             scalar: Vec::new(),
         };
-        let mut split = vec![[0i64; simd::MAX_DIGITS]; cols];
-        for (t, &r) in live.iter().enumerate() {
-            let mut used = 0usize;
-            let mut inside = true;
-            for (slot, &value) in split.iter_mut().zip(&xs[r * cols..(r + 1) * cols]) {
-                let Some(digits) = split_digits(value) else {
-                    inside = false;
-                    break;
-                };
-                *slot = digits;
-                if let Some(top) = digits.iter().rposition(|&d| d != 0) {
-                    used = used.max(top + 1);
+        for (t, row) in rows.into_iter().enumerate() {
+            match row {
+                Some((used, digits)) => {
+                    planes
+                        .owners
+                        .extend((0..used).map(|level| (t, simd::DIGIT_BITS * level as u32)));
+                    planes.digits.extend_from_slice(&digits);
                 }
-            }
-            if !inside {
-                planes.scalar.push(t);
-                continue;
-            }
-            for level in 0..used {
-                planes.owners.push((t, simd::DIGIT_BITS * level as u32));
-                planes
-                    .digits
-                    .extend(split.iter().map(|digits| digits[level] as simd::Digit));
+                None => planes.scalar.push(t),
             }
         }
         planes
     }
 
     /// Add each weight row's exact dot product with every plane into the
-    /// plane owner's slot of that row's output (`width` slots per row). Plane
-    /// groups are the outer loop, so a group stays in cache across all the
-    /// weight rows of the block.
+    /// plane owner's slot of that row's output (`width` slots per row).
+    ///
+    /// Loop order: column chunks, then groups of planes, then weight rows. A
+    /// chunk of one plane group and of the block's weight rows stay in L1
+    /// while every pair is multiplied. Partial sums of chunks add up exactly.
     fn accumulate(&self, rows: &[&[i8]], out: &mut [i64], width: usize) {
         let count = self.owners.len();
-        let mut start = 0usize;
-        while start < count {
-            let take = (count - start).min(simd::GROUP);
-            let group: [&[simd::Digit]; simd::GROUP] = std::array::from_fn(|q| {
-                let p = start + q.min(take - 1);
-                &self.digits[p * self.cols..(p + 1) * self.cols]
-            });
-            for (row, slots) in rows.iter().zip(out.chunks_mut(width)) {
-                // SAFETY: `digit_kernel_enabled` checked the CPU feature, every
-                // plane holds `self.cols == row.len()` digits, and
-                // `row.len() <= MAX_SIMD_COLS`.
-                let sums = unsafe { simd::dot_planes(row, &group) };
-                for (q, &sum) in sums.iter().enumerate().take(take) {
-                    let (t, shift) = self.owners[start + q];
-                    slots[t] += sum * (1i64 << shift);
+        let cols = self.cols;
+        let mut c0 = 0usize;
+        while c0 < cols {
+            let c1 = (c0 + simd::CHUNK).min(cols);
+            let mut start = 0usize;
+            while start < count {
+                let take = (count - start).min(simd::GROUP);
+                let group: [&[simd::Digit]; simd::GROUP] = std::array::from_fn(|q| {
+                    let p = start + q.min(take - 1);
+                    &self.digits[p * cols + c0..p * cols + c1]
+                });
+                for (row, slots) in rows.iter().zip(out.chunks_mut(width)) {
+                    // SAFETY: `digit_kernel_enabled` checked the CPU feature,
+                    // every plane chunk holds `c1 - c0` digits like the row
+                    // chunk, and `c1 - c0 <= CHUNK <= MAX_SIMD_COLS`.
+                    let sums = unsafe { simd::dot_planes(&row[c0..c1], &group) };
+                    for (q, &sum) in sums.iter().enumerate().take(take) {
+                        let (t, shift) = self.owners[start + q];
+                        slots[t] += sum * (1i64 << shift);
+                    }
                 }
+                start += take;
             }
-            start += take;
+            c0 = c1;
         }
     }
+}
+
+/// One activation row's digit planes, least significant first (`used` planes
+/// of `x.len()` digits each), or `None` when a value is outside the digit
+/// domain.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn split_row(x: &[i64]) -> Option<(usize, Vec<simd::Digit>)> {
+    let mut split = Vec::with_capacity(x.len());
+    let mut used = 0usize;
+    for &value in x {
+        let digits = split_digits(value)?;
+        if let Some(top) = digits.iter().rposition(|&d| d != 0) {
+            used = used.max(top + 1);
+        }
+        split.push(digits);
+    }
+    let mut planes = Vec::with_capacity(used * x.len());
+    for level in 0..used {
+        planes.extend(split.iter().map(|digits| digits[level] as simd::Digit));
+    }
+    Some((used, planes))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -264,7 +284,9 @@ mod simd {
     //!
     //! With `|w| <= 128` and `|d| <= 2^15`, one `vpmaddwd` lane gains at most
     //! `2 * 128 * 2^15 = 2^23` per 16 columns. Flushing the `i32` lanes to
-    //! `i64` every [`FLUSH`] iterations keeps each lane below `2^30`.
+    //! `i64` every [`FLUSH`] iterations keeps each lane below `2^30`. The eight
+    //! accumulators are named variables so they stay in registers: each weight
+    //! vector is loaded and widened once and feeds eight `vpmaddwd`.
 
     use std::arch::x86_64::{
         _mm_loadu_si128, _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
@@ -279,6 +301,9 @@ mod simd {
     pub(super) const MAX_DIGITS: usize = 2;
     /// Planes multiplied per pass over a weight row.
     pub(super) const GROUP: usize = 8;
+    /// Columns per call: eight 2 KiB plane chunks and eight 1 KiB weight
+    /// chunks (24 KiB) fit in a 32 KiB L1.
+    pub(super) const CHUNK: usize = 1024;
     /// 16-column iterations between flushes: `128 * 2^23 = 2^30`.
     const FLUSH: usize = 128;
 
@@ -295,6 +320,8 @@ mod simd {
     pub(super) unsafe fn dot_planes(row: &[i8], planes: &[&[Digit]; GROUP]) -> [i64; GROUP] {
         let len = row.len();
         let full = len - len % 16;
+        let w = row.as_ptr();
+        let [p0, p1, p2, p3, p4, p5, p6, p7] = planes.map(|plane| plane.as_ptr());
         let mut total = [0i64; GROUP];
         let mut start = 0usize;
         while start < full {
@@ -304,19 +331,33 @@ mod simd {
             // `row` and 16 digits (32 bytes) from each plane, which holds at
             // least `len` digits.
             let lanes = unsafe {
-                let mut acc = [_mm256_setzero_si256(); GROUP];
+                let zero = _mm256_setzero_si256();
+                let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+                let (mut a4, mut a5, mut a6, mut a7) = (zero, zero, zero, zero);
                 let mut j = start;
                 while j < stop {
-                    let w = _mm256_cvtepi8_epi16(_mm_loadu_si128(row.as_ptr().add(j).cast()));
-                    for (slot, plane) in acc.iter_mut().zip(planes) {
-                        let d = _mm256_loadu_si256(plane.as_ptr().add(j).cast());
-                        *slot = _mm256_add_epi32(*slot, _mm256_madd_epi16(w, d));
-                    }
+                    let x = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(j).cast()));
+                    let d0 = _mm256_loadu_si256(p0.add(j).cast());
+                    let d1 = _mm256_loadu_si256(p1.add(j).cast());
+                    let d2 = _mm256_loadu_si256(p2.add(j).cast());
+                    let d3 = _mm256_loadu_si256(p3.add(j).cast());
+                    a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(x, d0));
+                    a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(x, d1));
+                    a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(x, d2));
+                    a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(x, d3));
+                    let d4 = _mm256_loadu_si256(p4.add(j).cast());
+                    let d5 = _mm256_loadu_si256(p5.add(j).cast());
+                    let d6 = _mm256_loadu_si256(p6.add(j).cast());
+                    let d7 = _mm256_loadu_si256(p7.add(j).cast());
+                    a4 = _mm256_add_epi32(a4, _mm256_madd_epi16(x, d4));
+                    a5 = _mm256_add_epi32(a5, _mm256_madd_epi16(x, d5));
+                    a6 = _mm256_add_epi32(a6, _mm256_madd_epi16(x, d6));
+                    a7 = _mm256_add_epi32(a7, _mm256_madd_epi16(x, d7));
                     j += 16;
                 }
                 let mut lanes = [[0i32; 8]; GROUP];
-                for (out, value) in lanes.iter_mut().zip(&acc) {
-                    _mm256_storeu_si256(out.as_mut_ptr().cast(), *value);
+                for (out, value) in lanes.iter_mut().zip([a0, a1, a2, a3, a4, a5, a6, a7]) {
+                    _mm256_storeu_si256(out.as_mut_ptr().cast(), value);
                 }
                 lanes
             };
@@ -340,10 +381,13 @@ mod simd {
     //! ARM: balanced base-2^8 digits multiplied with `sdot`, four exact `i8`
     //! products into each `i32` lane.
     //!
-    //! With `|w|, |d| <= 128` every product is at most `2^14`, so the whole
-    //! plane sum is at most `cols * 2^14 < 2^31` for `cols <= 131_071`.
+    //! With `|w|, |d| <= 128` every product is at most `2^14`, so a plane's
+    //! whole sum (the four lanes added) is at most `cols * 2^14 < 2^31` for
+    //! `cols <= 131_071`. The eight accumulators are named variables so they
+    //! stay in registers: each weight vector is loaded once and feeds eight
+    //! independent `sdot` chains.
 
-    use std::arch::aarch64::{int8x16_t, int32x4_t, vaddq_s32, vaddvq_s32, vdupq_n_s32, vld1q_s8};
+    use std::arch::aarch64::{int8x16_t, int32x4_t, vaddvq_s32, vdupq_n_s32, vld1q_s8};
 
     /// Digit type of a plane.
     pub(super) type Digit = i8;
@@ -352,7 +396,10 @@ mod simd {
     /// Digits that cover any accepted activation.
     pub(super) const MAX_DIGITS: usize = 4;
     /// Planes multiplied per pass over a weight row.
-    pub(super) const GROUP: usize = 4;
+    pub(super) const GROUP: usize = 8;
+    /// Columns per call: eight 2 KiB plane chunks and eight 2 KiB weight
+    /// chunks (32 KiB) stay in a 64 KiB L1.
+    pub(super) const CHUNK: usize = 2048;
 
     pub(super) fn available() -> bool {
         std::arch::is_aarch64_feature_detected!("dotprod")
@@ -389,29 +436,39 @@ mod simd {
     #[target_feature(enable = "neon,dotprod")]
     pub(super) unsafe fn dot_planes(row: &[i8], planes: &[&[Digit]; GROUP]) -> [i64; GROUP] {
         let len = row.len();
-        let full = len - len % 32;
+        let full = len - len % 16;
+        let w = row.as_ptr();
+        let [p0, p1, p2, p3, p4, p5, p6, p7] = planes.map(|plane| plane.as_ptr());
         // SAFETY: `dotprod` is available (caller contract). Every load starts
-        // at a column `j` with `j + 32 <= full <= len`, inside `row` and inside
+        // at a column `j` with `j + 16 <= full <= len`, inside `row` and inside
         // every plane, which holds at least `len` digits.
         let mut total = unsafe {
-            let mut low = [vdupq_n_s32(0); GROUP];
-            let mut high = [vdupq_n_s32(0); GROUP];
+            let zero = vdupq_n_s32(0);
+            let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+            let (mut a4, mut a5, mut a6, mut a7) = (zero, zero, zero, zero);
             let mut j = 0usize;
             while j < full {
-                let w0 = vld1q_s8(row.as_ptr().add(j));
-                let w1 = vld1q_s8(row.as_ptr().add(j + 16));
-                for ((a, b), plane) in low.iter_mut().zip(high.iter_mut()).zip(planes) {
-                    let p = plane.as_ptr().add(j);
-                    *a = sdot(*a, w0, vld1q_s8(p));
-                    *b = sdot(*b, w1, vld1q_s8(p.add(16)));
-                }
-                j += 32;
+                let x = vld1q_s8(w.add(j));
+                a0 = sdot(a0, x, vld1q_s8(p0.add(j)));
+                a1 = sdot(a1, x, vld1q_s8(p1.add(j)));
+                a2 = sdot(a2, x, vld1q_s8(p2.add(j)));
+                a3 = sdot(a3, x, vld1q_s8(p3.add(j)));
+                a4 = sdot(a4, x, vld1q_s8(p4.add(j)));
+                a5 = sdot(a5, x, vld1q_s8(p5.add(j)));
+                a6 = sdot(a6, x, vld1q_s8(p6.add(j)));
+                a7 = sdot(a7, x, vld1q_s8(p7.add(j)));
+                j += 16;
             }
-            let mut total = [0i64; GROUP];
-            for ((sum, a), b) in total.iter_mut().zip(&low).zip(&high) {
-                *sum = i64::from(vaddvq_s32(vaddq_s32(*a, *b)));
-            }
-            total
+            [
+                i64::from(vaddvq_s32(a0)),
+                i64::from(vaddvq_s32(a1)),
+                i64::from(vaddvq_s32(a2)),
+                i64::from(vaddvq_s32(a3)),
+                i64::from(vaddvq_s32(a4)),
+                i64::from(vaddvq_s32(a5)),
+                i64::from(vaddvq_s32(a6)),
+                i64::from(vaddvq_s32(a7)),
+            ]
         };
         for (c, &weight) in row.iter().enumerate().skip(full) {
             let weight = i64::from(weight);
