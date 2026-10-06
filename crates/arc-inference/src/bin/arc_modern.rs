@@ -5,7 +5,10 @@
 //! native inference, and it does not change the network's canonical model.
 //!
 //! Subcommands (run with no arguments for usage):
-//! convert, verify, inspect, generate, golden, ppl, tokenize, render.
+//! convert, verify, inspect, generate, golden, ppl, tokenize, render, and the
+//! volunteer Proof Kit: proof, challenge-prompt (docs/proof-kit.md).
+
+mod proof_kit;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,7 +39,11 @@ const USAGE: &str = "usage: arc-modern <command> [options]
   ppl       --package PKG --tokens TOKENS.json --out OUT.json
             [--window N] [--max-tokens N] [--kernel scalar|simd] [--threads N]
   tokenize  --tokenizer tokenizer.json --input IN.jsonl --out OUT.jsonl
-  render    --user TEXT [--system TEXT] [--today DATE] [--think]";
+  render    --user TEXT [--system TEXT] [--today DATE] [--think]
+  proof     [--dry-run | --submit --endpoint URL] [--dir DIR] [--out DIR]
+            [--backends cpu-scalar,cpu-simd] [--threads N] [--keep-source]
+            [--no-island] [--force] [--gpu]
+  challenge-prompt --seed HEX | --seeds FILE";
 
 const DEFAULT_TODAY: &str = "06 October 2026";
 
@@ -594,6 +601,8 @@ fn main() -> ExitCode {
         "ppl" => cmd_ppl(&args),
         "tokenize" => cmd_tokenize(&args),
         "render" => cmd_render(&args),
+        "proof" => return proof_kit::run(&args),
+        "challenge-prompt" => proof_kit::cmd_challenge_prompt(&args),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
