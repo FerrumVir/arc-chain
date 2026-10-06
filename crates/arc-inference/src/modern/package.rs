@@ -769,6 +769,62 @@ mod tests {
     }
 
     #[test]
+    fn the_pinned_smollm3_manifest_is_self_consistent() {
+        // Produced byte-identically by `arc-modern convert` on ubuntu x86-64,
+        // windows x86-64, macOS arm64 and macOS x86-64 CI runners.
+        let text =
+            include_str!("../../../../docs/protocol/packages/smollm3-3b.integer-package.json");
+        let manifest: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(manifest["schema"], MANIFEST_SCHEMA);
+        assert_eq!(manifest["profile"], PROFILE);
+        assert_eq!(manifest["profile_blake3"], identity_blake3(PROFILE));
+        let recorded = manifest["manifest_blake3"].as_str().unwrap();
+        assert_eq!(
+            crate::model_package::manifest_body_blake3(&manifest).unwrap(),
+            recorded
+        );
+        assert_eq!(
+            recorded,
+            "af388d01c3578c5f97238fd74aaa3d0d8194d29fc6fbd99f3aae226064659fa2"
+        );
+        assert_eq!(
+            manifest["package"]["sha256"],
+            "19c67496ee23fe5da0e12eb1f22cb17f6386c560071587b5b8dfa68731c0aa91"
+        );
+        assert_eq!(manifest["package"]["bytes"], 3_084_214_016u64);
+        // The source it was converted from is exactly the pinned source.
+        let source = super::super::convert::SourceManifest::parse(include_bytes!(
+            "../../../../docs/protocol/packages/smollm3-3b.source.json"
+        ))
+        .unwrap();
+        assert_eq!(manifest["source"], source.header_json());
+        // The shape the converter derived: GQA 16:4, NoPE on every 4th layer.
+        let config = config_from_json(&manifest["model"]).unwrap();
+        assert_eq!(
+            (
+                config.n_layers,
+                config.d_model,
+                config.n_heads,
+                config.n_kv_heads
+            ),
+            (36, 2048, 16, 4)
+        );
+        assert_eq!(
+            (config.d_ff, config.vocab_size, config.max_seq),
+            (11_008, 128_256, 4096)
+        );
+        assert_eq!((config.rms_eps_q32, config.rope_theta), (4295, 5_000_000));
+        for (layer, &rope) in config.rope_layers.iter().enumerate() {
+            assert_eq!(rope, !(layer + 1).is_multiple_of(4), "layer {layer}");
+        }
+        assert_eq!(manifest["generation"]["eos"], json!([128_012]));
+        assert_eq!(
+            manifest["generation"]["bos_forwarded"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn a_header_round_trips_through_the_canonical_encoding() {
         let config = tiny_config();
         let entries = layout(&config);
