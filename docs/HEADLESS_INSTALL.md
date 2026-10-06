@@ -46,6 +46,11 @@ v0.7 updaters remain deployed. Those unsigned updaters are not a migration
 path: the first v0.7-to-v0.8 upgrade must use the exact protected tag and
 verified installer below.
 
+Installs whose released v0.7 updater still runs unattended can instead be
+moved by the owner-published legacy bridge release. It starts the pinned,
+signature-verified v0.8 node at stake 0 in a fresh data directory and never
+writes v0.7 data. See [LEGACY-BRIDGE.md](LEGACY-BRIDGE.md).
+
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.11/install.sh
 ARC_INSTALL_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
