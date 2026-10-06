@@ -91,8 +91,11 @@ jobs:
         run: |
           "$RUNNER_TEMP/actionlint" -color .github/workflows/gpu-portable.yml
           shellcheck scripts/arc_modern/gpu_tiny_check.sh
-      - name: Clippy (arc-gpu, arc-inference; all targets; deny warnings)
-        run: cargo clippy -p arc-gpu -p arc-inference --all-targets --locked -- -D warnings
+      # Same feature set as the shipped node (arc-node enables candle); without
+      # it, candle-only helpers in existing arc-inference code are reported as
+      # dead (the pattern of modern-model-smollm3.yml).
+      - name: Clippy (arc-gpu, arc-inference with candle; all targets; deny warnings)
+        run: cargo clippy -p arc-gpu -p arc-inference --all-targets --features arc-inference/candle --locked -- -D warnings
       - name: CPU-side unit tests (module sources, adapter selection, CLI parsing, CPU trace)
         run: |
           cargo test -p arc-gpu --lib --locked modern -- --nocapture

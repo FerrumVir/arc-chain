@@ -31,6 +31,21 @@ const MAX_DIGITS: u32 = 8u;
 var<workgroup> mass: array<vec3<u32>, 256>;
 var<workgroup> used: array<u32, 256>;
 
+fn load_or_zero(index: u32, end: u32) -> vec2<u32> {
+    if (index < end) {
+        return x[index];
+    }
+    return vec2<u32>(0u, 0u);
+}
+
+// The value left after removing the balanced digit whose byte is `low`:
+// (u - digit) >> 8 with digit = low read as a signed byte, in two's
+// complement u64 with a logical shift, exactly as the CPU does.
+fn after_digit(u: vec2<u32>, low: u32) -> vec2<u32> {
+    let v = select(sub64(u, vec2<u32>(low, 0u)), add64(u, vec2<u32>(256u - low, 0u)), low > 127u);
+    return vec2<u32>((v.x >> 8u) | (v.y << 24u), v.y >> 8u);
+}
+
 @compute @workgroup_size(256)
 fn split(
     @builtin(local_invocation_index) lid: u32,
@@ -38,39 +53,33 @@ fn split(
 ) {
     let t = wid.x;
     let xbase = t * params.n;
+    let xend = xbase + params.n;
     let dbase = t * MAX_DIGITS * params.words;
     var m = vec3<u32>(0u);
     var top = 1u;
     for (var w = lid; w < params.words; w = w + SPLIT_WG) {
-        // Explicit initializer: naga re-runs it on every iteration (a bare
-        // `var` would be hoisted and keep the previous word's bytes).
-        var planes = array<u32, 8>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
-        for (var b = 0u; b < 4u; b = b + 1u) {
-            let j = w * 4u + b;
-            var v = vec2<u32>(0u, 0u);
-            if (j < params.n) {
-                v = x[xbase + j];
-            }
-            m = add96(m, i64_abs(v));
-            // Two's complement walk: digit = low byte read as signed, then
-            // u = (u - digit) >> 8 (logical), exactly as the CPU does in u64.
-            var u = v;
-            for (var d = 0u; d < MAX_DIGITS; d = d + 1u) {
-                let low = u.x & 255u;
-                planes[d] = planes[d] | (low << (b * 8u));
-                if (low != 0u) {
-                    top = max(top, d + 1u);
-                }
-                if (low > 127u) {
-                    u = add64(u, vec2<u32>(256u - low, 0u));
-                } else {
-                    u = sub64(u, vec2<u32>(low, 0u));
-                }
-                u = vec2<u32>((u.x >> 8u) | (u.y << 24u), u.y >> 8u);
-            }
-        }
+        // Four activations walk their digits in lockstep; plane d's word holds
+        // digit d of each, low byte first. Only scalars and storage are
+        // written (no dynamically indexed local arrays).
+        let j = xbase + w * 4u;
+        var u0 = load_or_zero(j, xend);
+        var u1 = load_or_zero(j + 1u, xend);
+        var u2 = load_or_zero(j + 2u, xend);
+        var u3 = load_or_zero(j + 3u, xend);
+        m = add96(add96(add96(add96(m, i64_abs(u0)), i64_abs(u1)), i64_abs(u2)), i64_abs(u3));
         for (var d = 0u; d < MAX_DIGITS; d = d + 1u) {
-            digits[dbase + d * params.words + w] = planes[d];
+            let l0 = u0.x & 255u;
+            let l1 = u1.x & 255u;
+            let l2 = u2.x & 255u;
+            let l3 = u3.x & 255u;
+            if ((l0 | l1 | l2 | l3) != 0u) {
+                top = max(top, d + 1u);
+            }
+            digits[dbase + d * params.words + w] = l0 | (l1 << 8u) | (l2 << 16u) | (l3 << 24u);
+            u0 = after_digit(u0, l0);
+            u1 = after_digit(u1, l1);
+            u2 = after_digit(u2, l2);
+            u3 = after_digit(u3, l3);
         }
     }
     mass[lid] = m;
