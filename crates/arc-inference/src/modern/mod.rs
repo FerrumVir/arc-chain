@@ -13,6 +13,8 @@
 //!   embedding, i32 KV cache) and generation;
 //! * [`arith`] and [`tables`]: the operators and their exact tables;
 //! * [`bpe`] and [`chat`]: the byte-level BPE tokenizer and the chat prompt.
+//! * [`proof`]: the Proof Kit's challenge, golden reference and result
+//!   schema (`arc-modern proof`, docs/proof-kit.md).
 
 pub mod arith;
 pub mod bpe;
@@ -20,6 +22,7 @@ pub mod chat;
 pub mod convert;
 pub mod model;
 pub mod package;
+pub mod proof;
 pub mod safetensors;
 pub mod tables;
 

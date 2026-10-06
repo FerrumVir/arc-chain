@@ -37,14 +37,14 @@ sha2.workspace = true
 # The Llama-3/SmolLM3 tokenizer split pattern needs a negative lookahead.
 # Already locked through candle-transformers; no new crate enters the graph.
 fancy-regex = "0.13"
+# Proof Kit submission nonces (OS randomness). Already locked as this
+# crate's dev-dependency, so the lock file does not change.
+rand.workspace = true
 
 # Optional: real INT4/GGUF inference via Hugging Face candle
 candle-core = { version = "0.8", optional = true }
 candle-nn = { version = "0.8", optional = true }
 candle-transformers = { version = "0.8", optional = true }
-
-[dev-dependencies]
-rand.workspace = true
 
 # Modern-model CLI (SmolLM3-3B): convert, verify, generate, golden, ppl.
 [[bin]]
