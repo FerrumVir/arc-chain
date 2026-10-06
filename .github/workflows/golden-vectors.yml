@@ -26,7 +26,12 @@ permissions:
 jobs:
   golden:
     name: golden vectors (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # The Apple Silicon leg runs on ARC's own Mac Studio only when the
+    # ARC_MACOS_ARM_RUNNER repository variable is set and the branch belongs to
+    # this repository; otherwise it runs on GitHub's macos-15 as before. The
+    # matrix value, and so the check name, never changes. See
+    # docs/self-hosted-runner.md.
+    runs-on: ${{ matrix.os == 'macos-15' && startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -35,6 +40,29 @@ jobs:
         # Mac artifact that community members reported as broken.
         os: [ubuntu-latest, macos-15, macos-15-intel, windows-latest]
     steps:
+      # Self-hosted runner only (docs/self-hosted-runner.md): start from an
+      # empty workspace and keep the Rust toolchain in the runner's own home.
+      - name: Prepare self-hosted runner
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          case " $(id -Gn) " in
+            *" admin "*) echo "::error::The runner account must not be an administrator."; exit 1 ;;
+          esac
+          case "${HOME:?}" in /Users/?*) ;; *) echo "::error::Unexpected HOME: $HOME"; exit 1 ;; esac
+          case "${GITHUB_WORKSPACE:?}" in
+            */_work/*) ;;
+            *) echo "::error::Unexpected workspace: $GITHUB_WORKSPACE"; exit 1 ;;
+          esac
+          chmod -R u+rwX -- "$GITHUB_WORKSPACE"
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          {
+            echo "CARGO_HOME=$HOME/.cargo"
+            echo "RUSTUP_HOME=$HOME/.rustup"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+          } >> "$GITHUB_ENV"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -76,8 +104,23 @@ jobs:
           cleanup
           trap - EXIT HUP INT TERM
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # A self-hosted run neither restores nor saves the shared Actions cache.
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        if: runner.environment != 'self-hosted'
         with:
           shared-key: golden-${{ matrix.os }}
       - name: Run golden known-answer vectors
         run: cargo test -p arc-inference --lib --locked golden -- --nocapture
+      - name: Clean up self-hosted runner
+        if: always() && runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set +e
+          case "${GITHUB_WORKSPACE:-}" in
+            */_work/*)
+              chmod -R u+rwX -- "$GITHUB_WORKSPACE" 2>/dev/null
+              find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + ||
+                echo "::warning::Workspace not fully removed; the next job's preparation retries."
+              ;;
+          esac
+          exit 0

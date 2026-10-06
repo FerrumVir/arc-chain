@@ -256,7 +256,12 @@ jobs:
   # machine. See .github/workflows/golden-vectors.yml for the missing half.
   test:
     name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # The Apple Silicon leg runs on ARC's own Mac Studio only when the
+    # ARC_MACOS_ARM_RUNNER repository variable is set and the branch belongs to
+    # this repository; otherwise it runs on GitHub's macos-15 as before. The
+    # matrix value, and so the check name, never changes. See
+    # docs/self-hosted-runner.md.
+    runs-on: ${{ matrix.os == 'macos-15' && startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || matrix.os }}
     # The Windows all-targets + library leg reached the former 45-minute
     # ceiling and GitHub cancelled an otherwise progressing required check.
     # Keep one bounded ceiling for the matrix, but leave enough headroom for a
@@ -270,13 +275,38 @@ jobs:
         # merge; a green Linux leg cannot mask a broken Mac or Windows binary.
         os: [ubuntu-latest, macos-15, windows-latest]
     steps:
+      # Self-hosted runner only (docs/self-hosted-runner.md): start from an
+      # empty workspace and keep the Rust toolchain in the runner's own home.
+      - name: Prepare self-hosted runner
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          case " $(id -Gn) " in
+            *" admin "*) echo "::error::The runner account must not be an administrator."; exit 1 ;;
+          esac
+          case "${HOME:?}" in /Users/?*) ;; *) echo "::error::Unexpected HOME: $HOME"; exit 1 ;; esac
+          case "${GITHUB_WORKSPACE:?}" in
+            */_work/*) ;;
+            *) echo "::error::Unexpected workspace: $GITHUB_WORKSPACE"; exit 1 ;;
+          esac
+          chmod -R u+rwX -- "$GITHUB_WORKSPACE"
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          {
+            echo "CARGO_HOME=$HOME/.cargo"
+            echo "RUSTUP_HOME=$HOME/.rustup"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+          } >> "$GITHUB_ENV"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: nightly-2026-03-16
+      # A self-hosted run neither restores nor saves the shared Actions cache.
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        if: runner.environment != 'self-hosted'
         with:
           shared-key: test-${{ matrix.os }}
       # Keep the native Windows namespace/durability cases ahead of every
@@ -370,6 +400,19 @@ jobs:
         run: cargo test -p arc-node --bin arc-node --locked -- --test-threads=1
       - name: Desktop-managed node graceful shutdown integration
         run: cargo test -p arc-node --test desktop_shutdown_lifecycle --locked -- --test-threads=1
+      - name: Clean up self-hosted runner
+        if: always() && runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set +e
+          case "${GITHUB_WORKSPACE:-}" in
+            */_work/*)
+              chmod -R u+rwX -- "$GITHUB_WORKSPACE" 2>/dev/null
+              find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + ||
+                echo "::warning::Workspace not fully removed; the next job's preparation retries."
+              ;;
+          esac
+          exit 0
 
   # -------------------------------------------------------- integration ----
   # Separate job so a slow multi-node run neither serializes behind nor
@@ -429,7 +472,10 @@ jobs:
   # platform-specific supervisor/updater branch before a tag is created.
   desktop-tauri-test:
     name: desktop Tauri Rust tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # Same routing as `test`: only the Apple Silicon leg can move to ARC's own
+    # Mac Studio; macos-15-intel always stays on GitHub. See
+    # docs/self-hosted-runner.md.
+    runs-on: ${{ matrix.os == 'macos-15' && startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || matrix.os }}
     timeout-minutes: 45
     env:
       # The repository root pins nightly for Stwo. `--manifest-path` does not
@@ -443,6 +489,29 @@ jobs:
         # that regressed for community users and is still released.
         os: [ubuntu-latest, macos-15, macos-15-intel, windows-latest]
     steps:
+      # Self-hosted runner only (docs/self-hosted-runner.md): start from an
+      # empty workspace and keep the Rust toolchain in the runner's own home.
+      - name: Prepare self-hosted runner
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          case " $(id -Gn) " in
+            *" admin "*) echo "::error::The runner account must not be an administrator."; exit 1 ;;
+          esac
+          case "${HOME:?}" in /Users/?*) ;; *) echo "::error::Unexpected HOME: $HOME"; exit 1 ;; esac
+          case "${GITHUB_WORKSPACE:?}" in
+            */_work/*) ;;
+            *) echo "::error::Unexpected workspace: $GITHUB_WORKSPACE"; exit 1 ;;
+          esac
+          chmod -R u+rwX -- "$GITHUB_WORKSPACE"
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+          {
+            echo "CARGO_HOME=$HOME/.cargo"
+            echo "RUSTUP_HOME=$HOME/.rustup"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+          } >> "$GITHUB_ENV"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -505,10 +574,11 @@ jobs:
           wait "$probe_pid" 2>/dev/null || true
           probe_pid=''
           trap - EXIT HUP INT TERM
+      # A self-hosted run neither restores nor saves the shared Actions cache.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24.20.0
-          cache: npm
+          cache: ${{ runner.environment != 'self-hosted' && 'npm' || '' }}
           cache-dependency-path: desktop/package-lock.json
       - name: Build desktop frontend required by Tauri context
         working-directory: desktop
@@ -560,6 +630,7 @@ jobs:
             patchelf libfuse2
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        if: runner.environment != 'self-hosted'
         with:
           workspaces: desktop/src-tauri
           shared-key: desktop-tauri-${{ matrix.os }}
@@ -596,6 +667,19 @@ jobs:
             -- --exact --test-threads=1 --nocapture
           exit "$failed"
       - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked
+      - name: Clean up self-hosted runner
+        if: always() && runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set +e
+          case "${GITHUB_WORKSPACE:-}" in
+            */_work/*)
+              chmod -R u+rwX -- "$GITHUB_WORKSPACE" 2>/dev/null
+              find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + ||
+                echo "::warning::Workspace not fully removed; the next job's preparation retries."
+              ;;
+          esac
+          exit 0
 
   # -------------------------------------------------------- desktop e2e ----
   # playwright.config.ts drives the mock Tauri backend, so no arc-node binary
