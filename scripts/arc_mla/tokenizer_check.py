@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import json
 import sys
 from pathlib import Path
@@ -31,7 +32,9 @@ MAX_RUN_CHARS = 25_000
 
 
 def read_jsonl(path: Path) -> list:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # Split on "\n" only: str.splitlines() also breaks at U+2028, U+0085 and
+    # other separators that may appear raw inside JSON strings of the corpus.
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
 
 
 def wrapper_pattern(model_dir: Path) -> str:
@@ -48,11 +51,25 @@ def wrapper_pattern(model_dir: Path) -> str:
     raise SystemExit("pat_str not found in tokenization_moonshot.py")
 
 
+def load_ranks(path: Path) -> dict:
+    """tiktoken's mergeable ranks: one `base64(token) rank` line per token.
+
+    This is what tiktoken.load.load_tiktoken_bpe returns after reading the
+    file; reading it here avoids that function's blobfile dependency for local
+    paths (tiktoken 0.9).
+    """
+    ranks = {}
+    for line in path.read_bytes().splitlines():
+        if line.strip():
+            token, rank = line.split()
+            ranks[base64.b64decode(token)] = int(rank)
+    return ranks
+
+
 def reference_encoder(model_dir: Path):
     import tiktoken
-    from tiktoken.load import load_tiktoken_bpe
 
-    ranks = load_tiktoken_bpe(str(model_dir / "tiktoken.model"))
+    ranks = load_ranks(model_dir / "tiktoken.model")
     config = json.loads((model_dir / "tokenizer_config.json").read_text(encoding="utf-8"))
     names = {int(k): v["content"] for k, v in config.get("added_tokens_decoder", {}).items()}
     n_base = len(ranks)

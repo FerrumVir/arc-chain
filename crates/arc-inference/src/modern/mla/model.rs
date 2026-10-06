@@ -607,21 +607,22 @@ impl StageModel {
         };
         let (nope, dqk, lambda) = (c.qk_nope_dim, c.d_qk(), c.attention_lambda);
         let mut heads = vec![0i64; c.d_attn_out()];
-        heads
-            .par_chunks_mut(c.v_head_dim)
-            .enumerate()
-            .try_for_each(|(j, out)| -> Result<(), ModernError> {
-                let base = j * dqk;
-                let mut qp = q[base + nope..base + dqk].to_vec();
-                rope_interleaved(&mut qp, cos, sin)?;
-                let mut qa = vec![0i64; rank];
-                w.wk_b
-                    .view(data, j)
-                    .project(&q[base..base + nope], &mut qa)?;
-                let mut u = vec![0i64; rank];
-                mla_attend(&qa, &qp, view, lambda, &mut u)?;
-                w.wv_b.view(data, j).project(&u, out)
-            })?;
+        // Heads run one after another: each projection is already parallel
+        // over its rows, and the opt-in limb kernel keeps per-thread scratch
+        // that a projection nested inside another rayon task could re-enter
+        // through work stealing.
+        for (j, out) in heads.chunks_mut(c.v_head_dim).enumerate() {
+            let base = j * dqk;
+            let mut qp = q[base + nope..base + dqk].to_vec();
+            rope_interleaved(&mut qp, cos, sin)?;
+            let mut qa = vec![0i64; rank];
+            w.wk_b
+                .view(data, j)
+                .project(&q[base..base + nope], &mut qa)?;
+            let mut u = vec![0i64; rank];
+            mla_attend(&qa, &qp, view, lambda, &mut u)?;
+            w.wv_b.view(data, j).project(&u, out)?;
+        }
         let mut y = vec![0i64; c.d_model];
         w.wo.view(data, 0).project(&heads, &mut y)?;
         add_residual(h, &y)?;
@@ -647,8 +648,10 @@ impl StageModel {
         let chosen_sigma: Vec<i64> = chosen.iter().map(|&e| sigma[e]).collect();
         let weights = routing_weights(&chosen_sigma, c.routed_scaling_q32, c.norm_topk_prob);
         let [gate, up, down] = &m.experts;
+        // Experts run one after another for the same reason as heads: their
+        // projections are parallel over rows.
         let outputs = chosen
-            .par_iter()
+            .iter()
             .map(|&e| gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x))
             .collect::<Result<Vec<_>, _>>()?;
         let [s_gate, s_up, s_down] = &m.shared;
