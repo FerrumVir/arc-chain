@@ -22278,9 +22278,10 @@ mod tests {
         let node = fake_node_with_workers(Vec::new());
 
         let signed = sign_community_request(COMMUNITY_REGISTER_PATH, legacy, &keypair).unwrap();
-        community_register_signed(AxumState(node.clone()), Json(signed))
+        let response = community_register_signed(AxumState(node.clone()), Json(signed))
             .await
             .expect("a legacy name is redacted, not rejected");
+        assert_eq!(response.0["worker_id"], worker_id);
         let stored = node
             .community_workers
             .get(&worker_id)
@@ -22293,9 +22294,10 @@ mod tests {
         let mut renamed = community_register_payload(&keypair);
         renamed.name = "basement rig".to_string();
         let signed = sign_community_request(COMMUNITY_REGISTER_PATH, renamed, &keypair).unwrap();
-        community_register_signed(AxumState(node.clone()), Json(signed))
+        let response = community_register_signed(AxumState(node.clone()), Json(signed))
             .await
             .expect("a valid nickname re-registers");
+        assert_eq!(response.0["worker_id"], worker_id);
         let stored = node
             .community_workers
             .get(&worker_id)
