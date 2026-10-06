@@ -116,7 +116,7 @@ jobs:
           file dist/arc-node-linux-x86_64 | tee dist/file.txt
           grep -Eq 'statically linked|static-pie linked' dist/file.txt
           dist/arc-node-linux-x86_64 --version | tee dist/version.txt
-          grep -q '^arc-node 0\.7\.12 ' dist/version.txt
+          grep -qF "arc-node $(jq -er .bridge_version crates/arc-legacy-bridge/pins/active.json) " dist/version.txt
           (cd dist && sha256sum arc-node-linux-x86_64 | tee SHA256SUMS)
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -259,7 +259,7 @@ jobs:
           mkdir -p dist
           cp target/release/arc-legacy-bridge.exe dist/arc-node-windows-x86_64.exe
           dist/arc-node-windows-x86_64.exe --version | tee dist/version.txt
-          grep -q '^arc-node 0\.7\.12 ' dist/version.txt
+          grep -qF "arc-node $(jq -er .bridge_version crates/arc-legacy-bridge/pins/active.json) " dist/version.txt
       - name: Isolate the runner from every live-network address
         shell: pwsh
         run: |

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Acceptance: a real v0.7.11 headless community install consumes the v0.7.12
-# bridge through its own, unmodified updater and systemd units.
+# Acceptance: a real v0.7.11 headless community install consumes the bridge
+# release (tag v<bridge_version> from the pins) through its own, unmodified
+# updater and systemd units.
 #
 #   1. The unmodified v0.7.11 scripts/install-community-node.sh installs the
 #      pinned v0.7.7 release binary (the last v0.7 release that shipped
 #      headless binaries) as a systemd service, exactly as in the field.
 #      The v0.7 node runs and writes genuine v0.7 state.
-#   2. The fake-github curl shim makes "Latest" the v0.7.12 bridge release.
+#   2. The fake-github curl shim makes "Latest" the bridge release (v0.7.12).
 #      The installer-generated arc-auto-update.sh then runs as the real
 #      arc-updater.service: it downloads the bridge, keeps arc-node.prev,
 #      restarts arc-node.service, and applies its own 30-second health check.
@@ -32,12 +33,13 @@ here="$repo_root/tests/legacy-bridge"
 legacy_tag=v0.7.11
 legacy_node_tag=v0.7.7
 legacy_node_sha256=1cfc3039786d023cde24ad0b452f35735b39f9e83aaf293e6ed0bf623a11b20c
-bridge_tag=v0.7.12
 asset=arc-node-linux-x86_64
 live_ips=(149.28.32.76 140.82.16.112 136.244.109.1 104.238.171.11 202.182.107.41 149.28.153.31)
 
 pins="$repo_root/crates/arc-legacy-bridge/pins/active.json"
 node_tag="$(jq -er '.node_release.tag' "$pins")"
+bridge_version="$(jq -er '.bridge_version' "$pins")"
+bridge_tag="v$bridge_version"
 node_version="$(jq -er '.node_release.version' "$pins")"
 node_sha256="$(jq -er --arg a "$asset" '.node_release.assets[$a].sha256' "$pins")"
 
@@ -183,14 +185,14 @@ started=$(date +%s)
 sudo systemctl start arc-updater.service
 printf 'updater finished after %ss\n' "$(( $(date +%s) - started ))"
 cp "$arc_dir/auto-update.log" "$evidence/auto-update.after-bridge.log"
-grep -q 'new version available: 0.7.7 → 0.7.12' "$arc_dir/auto-update.log" \
+grep -qF "new version available: 0.7.7 → $bridge_version" "$arc_dir/auto-update.log" \
     || fail "the v0.7 updater did not see the bridge release"
-grep -q 'binary updated to v0.7.12' "$arc_dir/auto-update.log" || fail "the v0.7 updater did not install the bridge"
+grep -qF "binary updated to v$bridge_version" "$arc_dir/auto-update.log" || fail "the v0.7 updater did not install the bridge"
 if grep -q 'ROLLED BACK' "$arc_dir/auto-update.log"; then
     fail "the v0.7 updater's 30-second health check rolled the bridge back"
 fi
 grep -q 'auto-update complete' "$arc_dir/auto-update.log"
-[ "$(cat "$arc_dir/version.txt")" = 0.7.12 ]
+[ "$(cat "$arc_dir/version.txt")" = "$bridge_version" ]
 [ "$(sha "$arc_dir/bin/arc-node")" = "$bridge_sha" ] || fail "bin/arc-node is not the bridge launcher"
 [ "$(sha "$arc_dir/bin/arc-node.prev")" = "$legacy_node_sha256" ] || fail "arc-node.prev is not v0.7.7"
 
@@ -260,7 +262,7 @@ grep -Eq '^  stake: +0$' "$evidence/status.txt" || fail "status does not report 
 log "Idempotent: the updater sees nothing new; a restart reuses the verified cache"
 address="$(jq -r .node_address "$state_json")"
 sudo systemctl start arc-updater.service
-tail -n 3 "$arc_dir/auto-update.log" | grep -q 'up to date (0.7.12)' || fail "the second updater run was not a no-op"
+tail -n 3 "$arc_dir/auto-update.log" | grep -qF "up to date ($bridge_version)" || fail "the second updater run was not a no-op"
 sudo systemctl restart arc-node
 wait_health http://127.0.0.1:9944 60 || fail "the node did not come back after a restart"
 grep -q "reusing the verified $node_tag release cache" "$arc_dir/legacy-bridge/bridge.log"
@@ -310,7 +312,7 @@ for _ in $(seq 1 90); do
     sleep 1
 done
 printf 'restored v0.7 node wrote to its data after rollback: %s\n' "$v07_wrote"
-kept="$arc_dir/legacy-bridge/arc-node-bridge-0.7.12"
+kept="$arc_dir/legacy-bridge/arc-node-bridge-$bridge_version"
 [ "$(sha "$kept")" = "$bridge_sha" ] || fail "rollback did not keep the bridge launcher"
 # The running v0.7.7 binary is busy; stage and rename, as the updater does.
 cp "$kept" "$arc_dir/bin/arc-node.new"
