@@ -51,9 +51,12 @@ of Llama-2-7B. Each step needs an owner and an explicit go decision.
    (`desktop/src-tauri/src/commands.rs`, `desktop/src/lib/tauri.ts`) with the
    source manifest:
    - download the two pinned BF16 shards and `config.json` (6.15 GB), resumable;
+     on CI runners this took 60–80 s;
    - verify each file's SHA-256;
-   - run the converter (minutes, about 1.5 GB peak RAM);
-   - verify the package hash, then delete the BF16 files (3.1 GB kept).
+   - run the converter: 13–26 s on 4-vCPU CI runners, including the SHA-256
+     of the source;
+   - verify the package hash, then delete the BF16 files. The package is
+     3,084,214,016 bytes.
 
    Show progress for conversion as well as download.
 7. **Admission KAT.** On join and after every update, each node runs a short

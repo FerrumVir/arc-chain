@@ -417,13 +417,23 @@ jobs:
       - name: Perplexity on two public-domain texts, integer engine then BF16 reference
         run: |
           set -euo pipefail
-          ./target/release/arc-modern convert --source-dir "$MODEL_DIR" \
+          # Peak resident memory of conversion and serving (GNU time, if installed).
+          timed() {
+            local name="$1"
+            shift
+            if [ -x /usr/bin/time ]; then
+              /usr/bin/time -v -o "$EVIDENCE/time-$name.txt" "$@"
+            else
+              "$@"
+            fi
+          }
+          timed convert ./target/release/arc-modern convert --source-dir "$MODEL_DIR" \
             --source-manifest "$SOURCE_MANIFEST" --out "$MODEL_DIR/smollm3-3b.arcipkg" > "$EVIDENCE/convert.json"
           run_text() {
             local key="$1" file="$2" label="$3"
             python scripts/arc_modern/hf_checks.py tokenize-text --model-dir "$MODEL_DIR" \
               --text "$file" --max-tokens 1024 --out "$EVIDENCE/ppl-tokens-$key.json"
-            ./target/release/arc-modern ppl --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            timed "ppl-$key" ./target/release/arc-modern ppl --package "$MODEL_DIR/smollm3-3b.arcipkg" \
               --tokens "$EVIDENCE/ppl-tokens-$key.json" --window 512 --kernel simd \
               --out "$EVIDENCE/ppl-integer-$key.json"
             python scripts/arc_modern/hf_checks.py bf16-ppl --model-dir "$MODEL_DIR" \
