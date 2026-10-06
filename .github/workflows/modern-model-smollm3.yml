@@ -17,14 +17,22 @@ name: Modern model (SmolLM3-3B)
 #   report     one table of package hashes, matrix digests and CI tok/s.
 #
 # workflow_dispatch only works from the default branch, so the pull request is
-# the trigger: paths below, plus the label for the multi-gigabyte jobs.
+# the trigger: paths below, plus the label for the multi-gigabyte jobs. The
+# paths are the modern profile and the two modules it calls (canonical_simd,
+# model_package), not all of arc-inference: the matrix job takes two of the
+# account's scarce macOS runners, and ci.yml's test job already runs the modern
+# unit tests (cargo test --workspace --lib) on Linux, Windows and Apple Silicon.
 
 on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled]
     paths:
-      - 'crates/arc-inference/**'
+      - 'crates/arc-inference/Cargo.toml'
+      - 'crates/arc-inference/src/modern/**'
+      - 'crates/arc-inference/src/bin/arc_modern.rs'
+      - 'crates/arc-inference/src/canonical_simd.rs'
+      - 'crates/arc-inference/src/model_package.rs'
       - 'scripts/arc_conformance/modern_reference.py'
       - 'scripts/arc_conformance/tests/test_modern_reference.py'
       - 'scripts/arc_modern/**'
