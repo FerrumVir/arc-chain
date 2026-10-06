@@ -244,7 +244,7 @@ impl CommunityTwinState {
         let now = now_unix_ms();
         Self {
             config: config.normalized(),
-            secret: rand::random::<[u8; 32]>(),
+            secret: random_secret(),
             started_at_unix_ms: now,
             inner: parking_lot::Mutex::new(TwinInner {
                 groups: HashMap::new(),
@@ -678,7 +678,7 @@ impl CommunityTwinState {
     ) -> Result<PlannedDemand, &'static str> {
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
-        let roll = rand::random::<u16>() % 1_000;
+        let roll = (random_u64() % 1_000) as u16;
         let kind = twin::plan_demand(
             idle_workers.len(),
             self.config.twin_execution,
@@ -697,7 +697,7 @@ impl CommunityTwinState {
             DemandKind::Replay => {
                 let reference = inner
                     .references
-                    .pick(rand::random::<u64>(), model_id)
+                    .pick(random_u64(), model_id)
                     .cloned()
                     .ok_or("no verified reference is available")?;
                 if idle_workers
@@ -1222,6 +1222,7 @@ pub(super) fn spawn_community_demand_pump(node: &NodeState) {
     tracing::info!(
         interval_secs = node.community_twin.config.demand_interval_secs,
         twin_execution = node.community_twin.config.twin_execution,
+        dry_run = node.community_twin.config.demand_dry_run,
         "community demand pump enabled: public demo and replay jobs for idle workers"
     );
     let pump_node = node.clone();
@@ -1337,6 +1338,7 @@ pub(super) async fn community_twin_stats(AxumState(node): AxumState<NodeState>) 
         "config": {
             "twin_execution": config.twin_execution,
             "demand_pump": config.demand_pump,
+            "demand_dry_run": config.demand_dry_run,
             "spot_check_per_mille": config.spot_check_per_mille,
             "spot_checks_per_hour_max": TWIN_SPOT_CHECKS_PER_HOUR,
             "demand_interval_secs": config.demand_interval_secs,
@@ -1963,15 +1965,26 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
 
 // ─── Demand ─────────────────────────────────────────────────────────────────
 
+/// Process-local randomness from the OS CSPRNG through UUIDv4, the same
+/// source the signed community request nonces use. Six of the 128 bits are
+/// fixed by the UUID format; folding both halves keeps the result mixed.
+fn random_u64() -> u64 {
+    let value = uuid::Uuid::new_v4().as_u128();
+    (value as u64) ^ ((value >> 64) as u64)
+}
+
+/// 244 random bits for the per-process spot-check key.
+fn random_secret() -> [u8; 32] {
+    let mut secret = [0u8; 32];
+    secret[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    secret[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    secret
+}
+
 fn jittered_interval(base_secs: u64) -> Duration {
-    use rand::Rng;
     let base_ms = base_secs.saturating_mul(1_000);
     let jitter = base_ms / 5;
-    let offset = if jitter == 0 {
-        0
-    } else {
-        rand::thread_rng().gen_range(0..=jitter.saturating_mul(2))
-    };
+    let offset = random_u64() % jitter.saturating_mul(2).saturating_add(1);
     Duration::from_millis(base_ms.saturating_sub(jitter).saturating_add(offset))
 }
 
@@ -2007,6 +2020,20 @@ async fn run_demand_tick(node: &NodeState) -> Result<(), &'static str> {
     let _running = PumpRunningGuard(&state.pump_running);
     let idle = idle_eligible_workers(node);
     let planned = state.plan_tick(&idle, &model_id, now_unix_ms())?;
+    if state.config.demand_dry_run {
+        let (kind, prompt_index) = match &planned {
+            PlannedDemand::Twin { prompt_index, .. } => ("twin_demo", *prompt_index),
+            PlannedDemand::Replay(reference) => ("replay", reference.prompt_index),
+        };
+        state.inner.lock().counters.demand_dry_run_ticks += 1;
+        tracing::info!(
+            kind,
+            prompt_index,
+            idle_workers = idle.len(),
+            "community demand pump dry run: would dispatch this job"
+        );
+        return Ok(());
+    }
     let model_id_hint = Some(format!("0x{}", model_id.to_hex()));
     let request = match planned {
         PlannedDemand::Twin {
@@ -2058,6 +2085,7 @@ mod tests {
         TwinConfig {
             twin_execution: true,
             demand_pump: false,
+            demand_dry_run: false,
             spot_check_per_mille: 0,
             demand_interval_secs: twin::DEFAULT_DEMAND_INTERVAL_SECS,
         }
@@ -2446,7 +2474,11 @@ mod tests {
 
         let Json(stats) = community_twin_stats(AxumState(node.clone())).await;
         assert_eq!(stats["schema"], twin::TWIN_STATS_SCHEMA);
-        assert_eq!(stats["twin_match_rate"], 1.0);
+        assert!(
+            stats["twin_match_rate"]
+                .as_f64()
+                .is_some_and(|rate| (rate - 1.0).abs() < 1e-9)
+        );
         assert_eq!(stats["throughput_last_hour"]["verified_jobs"], 1);
         assert_eq!(stats["validator_recompute"]["avoided"], 1);
         assert_eq!(stats["config"]["twin_execution"], true);
@@ -2470,6 +2502,44 @@ mod tests {
         let summary = scoreboard_summary(&node).unwrap();
         assert_eq!(summary["groups_matched"], 1);
         assert_eq!(summary["verified_tokens_last_hour"], 2);
+    }
+
+    #[tokio::test]
+    async fn demand_pump_dry_run_plans_without_dispatching_and_yields_to_callers() {
+        let node = twin_node(
+            &["w1", "w2"],
+            TwinConfig {
+                demand_pump: true,
+                demand_dry_run: true,
+                ..enabled()
+            },
+        );
+        assert_eq!(
+            run_demand_tick(&node).await.unwrap_err(),
+            "no idle eligible worker is polling this coordinator"
+        );
+        for id in ["w1", "w2"] {
+            node.community_active_jobs
+                .insert(id.to_string(), String::new());
+        }
+        run_demand_tick(&node)
+            .await
+            .expect("a dry-run tick plans a job");
+        assert!(node.community_work_results.as_ref().unwrap().is_empty());
+        let counters = node.community_twin.inner.lock().counters.clone();
+        assert_eq!(counters.demand_dry_run_ticks, 1);
+        assert_eq!(counters.groups_started, 0);
+        assert!(!node.community_twin.pump_running.load(Ordering::Acquire));
+
+        let _caller = node
+            .public_inference_permits
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        assert_eq!(
+            run_demand_tick(&node).await.unwrap_err(),
+            "caller inference is in flight"
+        );
     }
 
     #[test]

@@ -511,6 +511,11 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     community_demand_pump: bool,
 
+    /// Run the demand pump in dry-run mode: plan and log every tick without
+    /// dispatching a job. Use this before enabling the pump for real.
+    #[arg(long, default_value_t = false)]
+    community_demand_dry_run: bool,
+
     /// Seconds between demand-pump ticks on this coordinator (minimum 30).
     #[arg(long, default_value_t = arc_node::twin::DEFAULT_DEMAND_INTERVAL_SECS)]
     community_demand_interval_secs: u64,
@@ -9783,6 +9788,7 @@ async fn run_arc_node() -> Result<()> {
         arc_node::twin::TwinConfig {
             twin_execution: cli.community_twin_execution,
             demand_pump: cli.community_demand_pump,
+            demand_dry_run: cli.community_demand_dry_run,
             spot_check_per_mille: cli.community_twin_spot_check_per_mille,
             demand_interval_secs: cli.community_demand_interval_secs,
         },

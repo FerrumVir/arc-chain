@@ -153,6 +153,9 @@ pub struct TwinConfig {
     pub twin_execution: bool,
     /// Generate rate-limited public demo and replay jobs for idle workers.
     pub demand_pump: bool,
+    /// Plan and log every demand tick without dispatching anything, so an
+    /// operator can review what the pump would do before enabling it.
+    pub demand_dry_run: bool,
     /// Share of twin-matched jobs without a reward that validators still
     /// recompute, in parts per thousand.
     pub spot_check_per_mille: u16,
@@ -165,6 +168,7 @@ impl Default for TwinConfig {
         Self {
             twin_execution: false,
             demand_pump: false,
+            demand_dry_run: false,
             spot_check_per_mille: DEFAULT_SPOT_CHECK_PER_MILLE,
             demand_interval_secs: DEFAULT_DEMAND_INTERVAL_SECS,
         }
@@ -1107,6 +1111,7 @@ pub struct TwinCounters {
     pub demand_public_demo: u64,
     pub demand_pump_demo: u64,
     pub demand_pump_replay: u64,
+    pub demand_dry_run_ticks: u64,
     pub public_demo_rate_limited: u64,
     pub public_demo_rejected: u64,
     pub pairing_refused: u64,
@@ -1409,13 +1414,14 @@ mod tests {
         let clamped = TwinConfig {
             twin_execution: true,
             demand_pump: true,
+            demand_dry_run: true,
             spot_check_per_mille: 5_000,
             demand_interval_secs: 1,
         }
         .normalized();
         assert_eq!(clamped.spot_check_per_mille, 1_000);
         assert_eq!(clamped.demand_interval_secs, MIN_DEMAND_INTERVAL_SECS);
-        assert!(clamped.twin_execution && clamped.demand_pump);
+        assert!(clamped.twin_execution && clamped.demand_pump && clamped.demand_dry_run);
     }
 
     #[test]
@@ -2046,7 +2052,11 @@ mod tests {
         assert_eq!(counters.twin_match_rate(), None);
         counters.groups_matched = 3;
         counters.groups_mismatched = 1;
-        assert_eq!(counters.twin_match_rate(), Some(0.75));
+        assert!(
+            counters
+                .twin_match_rate()
+                .is_some_and(|rate| (rate - 0.75).abs() < 1e-9)
+        );
         counters.count_demand(DemandSource::PumpReplay);
         counters.count_demand(DemandSource::PublicDemo);
         assert_eq!(counters.demand_pump_replay, 1);
