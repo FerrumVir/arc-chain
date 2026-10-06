@@ -97,10 +97,10 @@ jobs:
           mkdir -p "$out"
           python scripts/arc_modern/make_tiny_model.py "$tiny"
           ./target/release/arc-modern convert --source-dir "$tiny" \
-            --source-manifest "$tiny/source.json" --out "$out/tiny-rust.arcipkg" \
+            --source-manifest "$tiny/tiny-smollm3.source.json" --out "$out/tiny-rust.arcipkg" \
             --manifest-out "$out/tiny-manifest.json" | tee "$out/convert.json"
           (cd scripts && python -m arc_conformance.modern_reference prepare \
-            --source-dir "$tiny" --source-manifest "$tiny/source.json" \
+            --source-dir "$tiny" --source-manifest "$tiny/tiny-smollm3.source.json" \
             --out "$out/tiny-python.arcipkg" --json-out "$out/prepare.json")
           rust_sha="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["package"]["sha256"])' "$out/convert.json")"
           py_sha="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$out/prepare.json")"
@@ -109,13 +109,13 @@ jobs:
           test "$rust_sha" = "$py_sha"
           ./target/release/arc-modern verify --package "$out/tiny-rust.arcipkg" --manifest "$out/tiny-manifest.json"
           ./target/release/arc-modern golden --package "$out/tiny-rust.arcipkg" \
-            --cases "$tiny/cases.json" --kernel scalar --out "$out/run-scalar.json"
+            --cases "$tiny/tiny-smollm3.cases.json" --kernel scalar --out "$out/run-scalar.json"
           ./target/release/arc-modern golden --package "$out/tiny-rust.arcipkg" \
-            --cases "$tiny/cases.json" --kernel simd --out "$out/run-simd.json"
+            --cases "$tiny/tiny-smollm3.cases.json" --kernel simd --out "$out/run-simd.json"
           (cd scripts && python -m arc_conformance.modern_reference verify-run \
             --package "$out/tiny-python.arcipkg" --run "$out/run-scalar.json" --out "$out/golden-verify.json")
           (cd scripts && python -m arc_conformance.modern_reference generate \
-            --package "$out/tiny-python.arcipkg" --cases "$tiny/cases.json" --out "$out/run-python.json")
+            --package "$out/tiny-python.arcipkg" --cases "$tiny/tiny-smollm3.cases.json" --out "$out/run-python.json")
           python - "$out" <<'PY'
           import json, sys
           from pathlib import Path
@@ -203,11 +203,11 @@ jobs:
           tiny="$RUNNER_TEMP/tiny"
           python scripts/arc_modern/make_tiny_model.py "$tiny"
           ./target/release/arc-modern convert --source-dir "$tiny" \
-            --source-manifest "$tiny/source.json" --out "$tiny/tiny.arcipkg" \
+            --source-manifest "$tiny/tiny-smollm3.source.json" --out "$tiny/tiny.arcipkg" \
             --manifest-out "$EVIDENCE/tiny-manifest.json"
           for kernel in scalar simd; do
             ./target/release/arc-modern golden --package "$tiny/tiny.arcipkg" \
-              --cases "$tiny/cases.json" --kernel "$kernel" --out "$EVIDENCE/tiny-run-$kernel.json"
+              --cases "$tiny/tiny-smollm3.cases.json" --kernel "$kernel" --out "$EVIDENCE/tiny-run-$kernel.json"
           done
       - name: Fetch SmolLM3-3B BF16 from Hugging Face (pinned revision, SHA-256 verified)
         if: env.PROOF == 'true'

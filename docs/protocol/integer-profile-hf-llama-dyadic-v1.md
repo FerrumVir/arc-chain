@@ -350,7 +350,8 @@ Residual additions are exact; every resulting element must satisfy
 * **rp64-argmax (default):** for each of the 64 most recent generated tokens,
   newest first, once per occurrence, `ℓ = tdiv(5ℓ, 6)` if `ℓ > 0`, else
   `ℓ = tdiv(6ℓ, 5)`; then argmax. Prompt tokens are not penalised. (This is
-  the selection rule of the GGUF profile's generation v2.)
+  the selection rule of the GGUF profile's generation v2.) A penalised logit
+  beyond `2^62` in magnitude is out of the domain (§9).
 
 ### 6.2 Semantics `arc.hf-chat.no-bos.*.le-u32.v1`
 
@@ -416,7 +417,8 @@ not on the verification path: requests and receipts carry token ids.
 An implementation refuses when any of these fails:
 
 * projection input: `127 · Σ|x_j| < 2^63`; output `|y| ≤ 2^62`;
-* residual and every stored activation: `|v| ≤ 2^62`;
+* residual and every stored activation (embedding rows, norm, projection,
+  RoPE, SiLU and residual outputs, penalised logits): `|v| ≤ 2^62`;
 * RMS: `v ≤ 2^92`; products `|x·r·g| < 2^127`;
 * KV entries within i32;
 * token ids `< vocab_size`; positions `< max_seq`.
