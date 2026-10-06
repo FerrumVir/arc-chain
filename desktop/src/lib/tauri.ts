@@ -2985,7 +2985,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             role: "worker",
             modelPath: config.modelPath ?? "/mock/.arc/models/standard.gguf",
           }
-        : { ...config, computeConsent: false, role: "observer" };
+        : { ...config, computeConsent: false, role: "observer", modelPath: null };
       return mockConfig as T;
     }
     case "promote_consented_install": {
