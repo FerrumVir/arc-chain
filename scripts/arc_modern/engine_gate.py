@@ -165,16 +165,21 @@ def report_one(bench: dict, label: str) -> list[str]:
         ) + ".")
         out.append("")
     best = best_kernel(bench)
+    default_tiling = bench.get("tiling")
+    ladder_specs = [k.format(best=best) for k, _ in LADDER]
     for ctx in bench.get("contexts", []):
         runs = ctx.get("decode", [])
         threads = bench.get("threads")
-        main = [r for r in runs if r.get("threads") == threads]
+        main = [
+            r for r in runs
+            if r.get("threads") == threads and r.get("tiling", default_tiling) == default_tiling
+        ]
         by_spec = {r["spec"]: r for r in main}
         out.append(f"#### Context {ctx['context']} positions, {ctx['decode_tokens']} decoded tokens")
         out.append("")
         pre = ctx.get("prefill", {})
         out.append(
-            f"Prefill ({pre.get('spec')}, token at a time): {fmt(pre.get('tok_s', 0))} tok/s. "
+            f"Prefill of the context (`{pre.get('spec')}`): {fmt(pre.get('tok_s', 0))} tok/s. "
             f"All specs produced identical logits: **{ctx.get('digests_equal')}**."
         )
         out.append("")
@@ -196,16 +201,16 @@ def report_one(bench: dict, label: str) -> list[str]:
                 f"{fmt(100 * util, 0) + '%' if util else '—'} |"
             )
             prev = tok_s
-        others = [r for r in runs if r not in main or r["spec"] not in [k.format(best=best) for k, _ in LADDER]]
+        others = [r for r in runs if r not in main or r["spec"] not in ladder_specs]
         if others:
             out.append("")
-            out.append("| other runs | threads | decode tok/s | effective GB/s | of measured bandwidth at those threads |")
-            out.append("|---|---|---|---|---|")
+            out.append("| other runs | tiling | threads | decode tok/s | effective GB/s | of measured bandwidth at those threads |")
+            out.append("|---|---|---|---|---|---|")
             for r in others:
                 util = r["effective_gb_s"] / bw[r["threads"]] if bw.get(r["threads"]) else None
                 out.append(
-                    f"| `{r['spec']}` | {r['threads']} | {fmt(r['tok_s'])} | {fmt(r['effective_gb_s'], 1)} | "
-                    f"{fmt(100 * util, 0) + '%' if util else '—'} |"
+                    f"| `{r['spec']}` | {r.get('tiling', '—')} | {r['threads']} | {fmt(r['tok_s'])} | "
+                    f"{fmt(r['effective_gb_s'], 1)} | {fmt(100 * util, 0) + '%' if util else '—'} |"
                 )
         prof = ctx.get("profile")
         if prof:
@@ -223,12 +228,14 @@ def report_one(bench: dict, label: str) -> list[str]:
     if micro:
         out.append("#### Kernel throughput on the model's matrices (all threads)")
         out.append("")
-        out.append("| kernel | matrix | rows × cols | digit planes | ms/call | GB/s of weights |")
-        out.append("|---|---|---|---|---|---|")
+        out.append("Small matrices stay in the last-level cache between calls, so their rate shows the kernel's compute ceiling; the LM head (262 MB) streams from memory.")
+        out.append("")
+        out.append("| kernel | tiling | matrix | rows × cols | digit planes | ms/call | GB/s of weights |")
+        out.append("|---|---|---|---|---|---|---|")
         for m in micro:
             out.append(
-                f"| {m['kernel']} | {m['matrix']} | {m['rows']} × {m['cols']} | {m['limbs']} | "
-                f"{fmt(1000 * m['seconds_per_call'], 3)} | {fmt(m['gb_s'], 1)} |"
+                f"| {m['kernel']} | {m.get('tiling', '—')} | {m['matrix']} | {m['rows']} × {m['cols']} | "
+                f"{m['limbs']} | {fmt(1000 * m['seconds_per_call'], 3)} | {fmt(m['gb_s'], 1)} |"
             )
         out.append("")
     return out
@@ -244,10 +251,12 @@ def projections(bench: dict) -> list[str]:
     kv = model.get("kv_bytes_per_position", 0)
     rows = []
     for ctx in bench.get("contexts", []):
-        run = next(
-            (r for r in ctx.get("decode", []) if r["spec"] == f"fast:{best}" and r["threads"] == threads),
-            None,
-        )
+        candidates = [
+            r for r in ctx.get("decode", [])
+            if r["spec"] == f"fast:{best}" and r["threads"] == threads
+        ]
+        # The fastest measured tiling of the fast engine at full threads.
+        run = max(candidates, key=lambda r: r["tok_s"], default=None)
         if not run or not bw.get(threads):
             continue
         util = run["effective_gb_s"] / bw[threads]
@@ -296,6 +305,10 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str]) -> int:
+    # Tables use characters outside cp1252 (Windows consoles); always emit UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("check", help="compare golden runs with the pinned digests")
