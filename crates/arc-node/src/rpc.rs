@@ -1934,6 +1934,9 @@ pub async fn serve(
     // Local issuance half of the two-part rollout gate. Consensus activation
     // comes from canonical genesis and is enforced independently by StateDB.
     community_rewards_v1_enabled: bool,
+    // inference_pricing: capacity-aware advisory quotes
+    //   (docs/inference-pricing.md). Off by default; moves no ARC.
+    inference_pricing: crate::inference_pricing::PricingConfig,
     // native_serving: what this node's protocol-4 native worker executes,
     //   when it runs one (context/tokenize endpoints only).
     native_serving: Option<Arc<crate::native_inference::NativeServing>>,
@@ -2378,6 +2381,16 @@ pub async fn serve(
         // accessible; community mutations independently require signed PoP.
         .layer(CorsLayer::permissive())
         .with_state(node.clone());
+
+    // Capacity-aware inference pricing v0 (docs/inference-pricing.md). Off by
+    // default: when off, no route is mounted and no sampler runs.
+    let app = match crate::inference_pricing::mount(&node, inference_pricing, shutdown.clone()) {
+        Some(pricing) => {
+            spawn_node_runtime_task(&node, pricing.sampler.run());
+            app.merge(pricing.router)
+        }
+        None => app,
+    };
 
     // into_make_service_with_connect_info lets handlers extract
     // RpcPeerAddr. announce_shard uses the real TCP peer to override stub
@@ -6332,7 +6345,7 @@ const COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED: usize = 2;
 /// 30-second claim window. Contexts that cannot finish inside the reviewed
 /// public budget are rejected before enqueue, allowing a safe local/sharded
 /// fallback instead of creating work guaranteed to time out.
-fn community_dispatch_timeout_secs(required_positions: usize) -> Result<u64, String> {
+pub(crate) fn community_dispatch_timeout_secs(required_positions: usize) -> Result<u64, String> {
     let per_token_ms: u64 = 3300;
     let positions = u64::try_from(required_positions)
         .map_err(|_| "community generation position count overflow".to_string())?;
@@ -26255,6 +26268,7 @@ mod tests {
                     0,
                     None,
                     false,
+                    crate::inference_pricing::PricingConfig::default(),
                     None,
                     Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
@@ -26341,6 +26355,7 @@ mod tests {
                 0,
                 None,
                 false,
+                crate::inference_pricing::PricingConfig::default(),
                 None,
                 Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                 Some(shutdown_rx),

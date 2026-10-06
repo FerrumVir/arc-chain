@@ -10,6 +10,9 @@ pub mod coalesce;
 pub mod config;
 pub mod consensus;
 pub mod consensus_diagnostics;
+/// Capacity-aware inference pricing v0: advisory, off by default
+/// (see docs/inference-pricing.md).
+pub mod inference_pricing;
 pub mod inference_validator;
 pub mod legacy_archive;
 pub mod native_inference;
