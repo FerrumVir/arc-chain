@@ -311,9 +311,12 @@ pub enum StageInput<'a> {
     Hidden(&'a [i64]),
 }
 
-/// A loaded stage package.
+/// A loaded stage package, executing the package's layer range or a
+/// sub-range of it.
 pub struct StageModel {
     pub header: StageHeader,
+    /// The executed layer range (the package's own range unless narrowed).
+    stage: StageSpec,
     bytes: PackageBytes,
     rope_cos: Vec<i32>,
     rope_sin: Vec<i32>,
@@ -354,6 +357,14 @@ pub struct SequenceRun {
 impl StageModel {
     /// Memory-map and validate a stage package.
     pub fn open(path: &Path) -> Result<Self, ModernError> {
+        Self::open_range(path, None)
+    }
+
+    /// Memory-map a stage package and load only layers `range` (which must
+    /// lie inside the package's range); `None` loads the package's range.
+    /// Only the tensors of the executed range are read and validated, so a
+    /// process holding a whole-model file can act as any single stage.
+    pub fn open_range(path: &Path, range: Option<StageSpec>) -> Result<Self, ModernError> {
         let context = path.display().to_string();
         let file = File::open(path).map_err(|e| ModernError::io(&context, e))?;
         // SAFETY: the map is read-only. A package changed on disk while it is
@@ -361,19 +372,32 @@ impl StageModel {
         // pinned manifest); it can change values, never memory safety of the
         // integer code, which only reads bytes.
         let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| ModernError::io(&context, e))?;
-        Self::from_bytes(PackageBytes::Mapped(map))
+        Self::from_bytes(PackageBytes::Mapped(map), range)
     }
 
     /// Validate a stage package held in memory.
     pub fn from_owned(bytes: Vec<u8>) -> Result<Self, ModernError> {
-        Self::from_bytes(PackageBytes::Owned(bytes))
+        Self::from_bytes(PackageBytes::Owned(bytes), None)
     }
 
-    fn from_bytes(bytes: PackageBytes) -> Result<Self, ModernError> {
-        let (header, rope_cos, rope_sin, embed, layers, head) = {
+    fn from_bytes(bytes: PackageBytes, range: Option<StageSpec>) -> Result<Self, ModernError> {
+        let (header, stage, rope_cos, rope_sin, embed, layers, head) = {
             let data = bytes.as_slice();
             let header = package::parse_header(data, data.len() as u64)?;
             package::check_padding(data, &header)?;
+            let stage = range.unwrap_or(header.stage);
+            stage.validate(&header.config)?;
+            if stage.first_layer < header.stage.first_layer
+                || stage.end_layer > header.stage.end_layer
+            {
+                return Err(invalid(format!(
+                    "layers [{}, {}) are not inside the package's [{}, {})",
+                    stage.first_layer,
+                    stage.end_layer,
+                    header.stage.first_layer,
+                    header.stage.end_layer
+                )));
+            }
             let loader = Loader {
                 data,
                 header: &header,
@@ -381,17 +405,16 @@ impl StageModel {
             let c = &header.config;
             let rope_cos = loader.i32s("rope.cos")?;
             let rope_sin = loader.i32s("rope.sin")?;
-            let embed = if header.stage.has_embed() {
+            let embed = if stage.has_embed() {
                 Some(loader.mat("embed", 1, c.vocab_size, c.d_model)?)
             } else {
                 None
             };
-            let layers = header
-                .stage
+            let layers = stage
                 .layers()
                 .map(|layer| loader.layer(c, layer))
                 .collect::<Result<Vec<_>, _>>()?;
-            let head = if header.stage.has_head(c) {
+            let head = if stage.has_head(c) {
                 Some(HeadWeights {
                     final_norm: loader.i64s("final_norm")?,
                     lm_head: loader.mat("lm_head", 1, c.vocab_size, c.d_model)?,
@@ -399,10 +422,11 @@ impl StageModel {
             } else {
                 None
             };
-            (header, rope_cos, rope_sin, embed, layers, head)
+            (header, stage, rope_cos, rope_sin, embed, layers, head)
         };
         Ok(Self {
             header,
+            stage,
             bytes,
             rope_cos,
             rope_sin,
@@ -416,8 +440,9 @@ impl StageModel {
         &self.header.config
     }
 
+    /// The executed layer range.
     pub fn stage(&self) -> StageSpec {
-        self.header.stage
+        self.stage
     }
 
     /// The package bytes (for segment digests).
@@ -425,12 +450,31 @@ impl StageModel {
         self.bytes.as_slice()
     }
 
-    /// INT8 weights held by this stage.
+    /// Whether a segment belongs to the executed range (spec §4.7).
+    pub fn executes_segment(&self, segment: &str) -> bool {
+        let c = self.config();
+        match segment {
+            "tables" => true,
+            "embed" => self.stage.has_embed(),
+            "head" => self.stage.has_head(c),
+            other => other
+                .strip_prefix("layer.")
+                .and_then(|l| l.parse::<usize>().ok())
+                .is_some_and(|l| self.stage.layers().contains(&l)),
+        }
+    }
+
+    /// Digests of the segments this stage executes (spec §4.7).
+    pub fn segments(&self) -> Vec<package::SegmentDigest> {
+        package::segment_digests_where(self.bytes(), &self.header, |s| self.executes_segment(s))
+    }
+
+    /// INT8 weights this stage executes.
     pub fn weight_count(&self) -> usize {
         self.header
             .entries
             .iter()
-            .filter(|e| e.dtype == package::Dtype::I8)
+            .filter(|e| e.dtype == package::Dtype::I8 && self.executes_segment(&e.segment))
             .map(|e| e.bytes as usize)
             .sum()
     }
@@ -1100,6 +1144,51 @@ pub(crate) mod tests {
             .map(|j| (((device_a[j] + device_b[j]) >> 32) + i128::from(shared[j])) as i64)
             .collect();
         assert_eq!(single, expert_parallel);
+    }
+
+    #[test]
+    fn a_sub_range_of_a_larger_package_is_the_same_stage() {
+        let c = tiny_config(true);
+        let path =
+            std::env::temp_dir().join(format!("arc-mla-range-{}.arcspkg", std::process::id()));
+        std::fs::write(&path, tiny_package(&c, StageSpec::full(&c))).unwrap();
+        let narrowed = StageModel::open_range(
+            &path,
+            Some(StageSpec {
+                first_layer: 1,
+                end_layer: 3,
+            }),
+        )
+        .unwrap();
+        let separate = StageModel::from_owned(tiny_package(
+            &c,
+            StageSpec {
+                first_layer: 1,
+                end_layer: 3,
+            },
+        ))
+        .unwrap();
+        assert_eq!(narrowed.segments(), separate.segments());
+        assert_eq!(narrowed.weight_count(), separate.weight_count());
+        let inputs: Vec<i64> = (0..3 * c.d_model as i64).map(|i| (i - 40) * 1013).collect();
+        let a = narrowed
+            .run_sequence(&[4, 9, 2], Some(&inputs), 1, Selection::Argmax)
+            .unwrap();
+        let b = separate
+            .run_sequence(&[4, 9, 2], Some(&inputs), 1, Selection::Argmax)
+            .unwrap();
+        assert_eq!(a.hidden, b.hidden);
+        assert!(
+            StageModel::open_range(
+                &path,
+                Some(StageSpec {
+                    first_layer: 3,
+                    end_layer: 5,
+                }),
+            )
+            .is_err()
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

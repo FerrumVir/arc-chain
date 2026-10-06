@@ -1,0 +1,177 @@
+{
+  "schema": "arc.hf-source.v1",
+  "repo": "moonshotai/Moonlight-16B-A3B-Instruct",
+  "revision": "4e735b07a89f73647dfab71ab91b840f362ede5b",
+  "license": "mit",
+  "url_template": "https://huggingface.co/{repo}/resolve/{revision}/{name}",
+  "max_seq": 4096,
+  "files": [
+    {
+      "name": "config.json",
+      "bytes": 1375,
+      "sha256": "6827d4b5327a446d6a80716a6e5cec695f279b282110ef7dae09241656430302"
+    },
+    {
+      "name": "model-1-of-27.safetensors",
+      "bytes": 837036512,
+      "sha256": "0dceee366b9c6b6c8ad3dc7c214337f72ee9af0b0677f6f2e2cfc0599b646555"
+    },
+    {
+      "name": "model-2-of-27.safetensors",
+      "bytes": 1169721008,
+      "sha256": "7a917ac61aded48450f52f13c02747adb81b7820e01f908db42db88b4e389b25"
+    },
+    {
+      "name": "model-3-of-27.safetensors",
+      "bytes": 1169721008,
+      "sha256": "d66f4dced6006dabfb2bbd202f4dde691886dfe70e40324e7102d9167900eabb"
+    },
+    {
+      "name": "model-4-of-27.safetensors",
+      "bytes": 1169721008,
+      "sha256": "1cb810044152c84e245774437840a76bb764b62b3fa2d0c3ef05caed1eb7fdf8"
+    },
+    {
+      "name": "model-5-of-27.safetensors",
+      "bytes": 1169721008,
+      "sha256": "252bb6e360a23538b5f6ee7fe51d5c7d4ffe1c7f441a92501241e2ebd171426b"
+    },
+    {
+      "name": "model-6-of-27.safetensors",
+      "bytes": 1169721008,
+      "sha256": "53ba366873cfacb0643eb2067c45c4f338c7468c447e8f353562e4e85399d82d"
+    },
+    {
+      "name": "model-7-of-27.safetensors",
+      "bytes": 1169721008,
+      "sha256": "59645c041235dcab6bddbcb4ade760c97aa240595ccdc99ea108fc268317e6fc"
+    },
+    {
+      "name": "model-8-of-27.safetensors",
+      "bytes": 1169721008,
+      "sha256": "0ec3674945cccbbece2a4416cca19dc95e13a3da2ab8ac0eee9f0e5e7c5ee9eb"
+    },
+    {
+      "name": "model-9-of-27.safetensors",
+      "bytes": 1169721008,
+      "sha256": "13073db9b73d39ff91297dc76a81605524ea749c39554bf6265cab6dad6e35ce"
+    },
+    {
+      "name": "model-10-of-27.safetensors",
+      "bytes": 1169721008,
+      "sha256": "55327131f99ad49dd37dfd652e55354ad088641faddca632b596e69fdb7088e1"
+    },
+    {
+      "name": "model-11-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "58affbc0f89b5f54318535db520b2b85f933dd1d16d98ebfd6c96914ddd41070"
+    },
+    {
+      "name": "model-12-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "ac37dabc936fea02655743fcf25408f9974c76430befece30a9f0cfa013c85c3"
+    },
+    {
+      "name": "model-13-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "00cf971ccd61d137faa5cc10c51d485915d6afb8bb8e544017fde818acd4fa5a"
+    },
+    {
+      "name": "model-14-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "47bb07f8e887b7ddb4bf11b8fe7fe5a4428006a5e3b83762e6d2dd9350b96431"
+    },
+    {
+      "name": "model-15-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "aeb67d81a46a1c58de95f8ac7d814217d7d877478cd90f6cf773ebe61cc84d12"
+    },
+    {
+      "name": "model-16-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "4f7d2658f2f52a5d15720cf9e351ebedd7b1aa08e685b16b207f79f74625c948"
+    },
+    {
+      "name": "model-17-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "5daa7403aae7c1d264999fbe061cde6ad875120e15a4a2ccc83ee37ed66327d5"
+    },
+    {
+      "name": "model-18-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "59963d4316e317ef201f9d410135803e6ca4457c11f868eebe8c72f09c878086"
+    },
+    {
+      "name": "model-19-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "b4d04095f25e67566206a95e91641f36bd523a95514a55694abf1f47c688bd74"
+    },
+    {
+      "name": "model-20-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "87e6c4444e675d1eaf32f2d176d9c089cf57d6131a0234a460055831ec680e12"
+    },
+    {
+      "name": "model-21-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "8f67c412d45d6cf122a24f4795e4a2171d600a9fe928ddc5d0d2b57b77925bc9"
+    },
+    {
+      "name": "model-22-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "63e68239ecccace921b6263d849577b7edf023a3ba9c261f66dc165917a66008"
+    },
+    {
+      "name": "model-23-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "f5cdddcca5fb46485d81c1b0a9f0921166198172c28cf404ca9a0d88284e41bb"
+    },
+    {
+      "name": "model-24-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "983a6cb98453a45a8000e6e2ada366dd2a8d9b920b4d147e0fd1ac1296570030"
+    },
+    {
+      "name": "model-25-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "8bfd793f95b07cc151670b69c29d0f4f962c1b4921431fb876c6e2e4f23cd2c5"
+    },
+    {
+      "name": "model-26-of-27.safetensors",
+      "bytes": 1169721216,
+      "sha256": "354b94860ad04422fa497b3182ed30ccf6743d2d364a120dcaf7a64d117919de"
+    },
+    {
+      "name": "model-27-of-27.safetensors",
+      "bytes": 1840814416,
+      "sha256": "9e1421875fb5eb7255c6d3b656297a98cfa236125d0cecdd46989f544f51b0bd"
+    }
+  ],
+  "tokenizer": {
+    "name": "tiktoken.model",
+    "bytes": 2795286,
+    "sha256": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103"
+  },
+  "chat_template": {
+    "name": "tokenizer_config.json",
+    "bytes": 2659,
+    "sha256": "566eff6d3b862587c620edb402dc76417c582605c79e2c9a4bca333a73f44fcb"
+  },
+  "reference_files": [
+    {
+      "name": "model.safetensors.index.json",
+      "bytes": 445693,
+      "sha256": "8289ce9bfff0d8e4c457eebdc10299f90d7cbb8933b1d6d2b09a7a43401f1018"
+    },
+    {
+      "name": "tokenization_moonshot.py",
+      "bytes": 11129,
+      "sha256": "11b6c72b07381146bbde5e987e927b134a5a1a7e22741693024237b53dd23557"
+    },
+    {
+      "name": "generation_config.json",
+      "bytes": 61,
+      "sha256": "0294fc712bd5c3a568d113f1faaec2a2dbe4a29d490eeb841b4fb485532690af"
+    }
+  ]
+}

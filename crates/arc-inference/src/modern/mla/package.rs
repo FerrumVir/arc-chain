@@ -672,9 +672,18 @@ pub fn check_padding(bytes: &[u8], header: &StageHeader) -> Result<(), ModernErr
 
 /// Segment digests of a stage package's bytes (spec §4.7).
 pub fn segment_digests(bytes: &[u8], header: &StageHeader) -> Vec<SegmentDigest> {
+    segment_digests_where(bytes, header, |_| true)
+}
+
+/// Digests of the segments for which `keep` holds, in layout order.
+pub fn segment_digests_where(
+    bytes: &[u8],
+    header: &StageHeader,
+    keep: impl Fn(&str) -> bool,
+) -> Vec<SegmentDigest> {
     let mut out: Vec<SegmentDigest> = Vec::new();
     let mut current: Option<(String, blake3::Hasher, u64)> = None;
-    for e in &header.entries {
+    for e in header.entries.iter().filter(|e| keep(&e.segment)) {
         if current.as_ref().map(|c| c.0.as_str()) != Some(e.segment.as_str()) {
             if let Some((name, hasher, count)) = current.take() {
                 out.push(SegmentDigest {
