@@ -5,7 +5,8 @@
 //! native inference, and it does not change the network's canonical model.
 //!
 //! Subcommands (run with no arguments for usage):
-//! convert, verify, inspect, generate, golden, ppl, tokenize, render.
+//! convert, verify, inspect, generate, golden, ppl, tokenize, render, and
+//! the GPU path (`golden --gpu`, `gpu-info`, `gpu-check`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -581,7 +582,7 @@ fn cmd_render(args: &Args) -> Result<(), ModernError> {
 fn main() -> ExitCode {
     let items: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = items.first().cloned() else {
-        eprintln!("{USAGE}");
+        eprintln!("{USAGE}\n\n{}", arc_inference::modern::gpu::cli::USAGE);
         return ExitCode::from(2);
     };
     let args = Args { items };
@@ -590,12 +591,15 @@ fn main() -> ExitCode {
         "verify" => cmd_verify(&args),
         "inspect" => cmd_inspect(&args),
         "generate" => cmd_generate(&args),
+        "golden" if args.flag("--gpu") => arc_inference::modern::gpu::cli::golden(&args.items),
         "golden" => cmd_golden(&args),
         "ppl" => cmd_ppl(&args),
         "tokenize" => cmd_tokenize(&args),
         "render" => cmd_render(&args),
+        "gpu-info" => arc_inference::modern::gpu::cli::info(&args.items),
+        "gpu-check" => arc_inference::modern::gpu::cli::check(&args.items),
         _ => {
-            eprintln!("{USAGE}");
+            eprintln!("{USAGE}\n\n{}", arc_inference::modern::gpu::cli::USAGE);
             return ExitCode::from(2);
         }
     };
