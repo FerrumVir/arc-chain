@@ -254,61 +254,136 @@ impl ModernModel {
         Ok(logits)
     }
 
-    /// Generation `arc.hf-chat.no-bos.*.le-u32.v1` (spec §6.2).
+    /// Generation `arc.hf-chat.no-bos.*.le-u32.v1` (spec §6.2) with the
+    /// reference forward pass.
     pub fn generate(
         &self,
         request: &GenerationRequest<'_>,
     ) -> Result<GenerationOutput, ModernError> {
-        let c = &self.config;
-        if request.prompt.is_empty() || request.max_tokens == 0 {
-            return Err(ModernError::Invalid(
-                "generation needs a non-empty prompt and max_tokens >= 1".into(),
-            ));
-        }
-        if request.prompt.len() + request.max_tokens > c.max_seq {
-            return Err(ModernError::Domain(format!(
-                "{} prompt tokens + {} generated tokens exceed the {}-position context",
-                request.prompt.len(),
-                request.max_tokens,
-                c.max_seq
-            )));
-        }
-        if let Some(&bad) = request.prompt.iter().find(|&&t| t as usize >= c.vocab_size) {
-            return Err(ModernError::Domain(format!(
-                "prompt token {bad} is outside the vocabulary"
-            )));
-        }
-        let mut cache = self.new_cache();
-        let mut hashes = Vec::with_capacity(request.prompt.len() + request.max_tokens);
-        let prefill_start = Instant::now();
-        let mut logits = Vec::new();
-        for &token in request.prompt {
-            logits = self.forward(token, &mut cache)?;
-            hashes.push(arith::logits_hash(&logits));
-        }
-        let prefill_seconds = prefill_start.elapsed().as_secs_f64();
-        let decode_start = Instant::now();
-        let mut tokens: Vec<u32> = Vec::new();
-        loop {
-            let next = arith::select(&logits, &tokens, request.selection)?;
-            tokens.push(next);
-            if request.eos.contains(&next) || tokens.len() == request.max_tokens {
-                break;
-            }
-            logits = self.forward(next, &mut cache)?;
-            hashes.push(arith::logits_hash(&logits));
-        }
-        let decode_seconds = decode_start.elapsed().as_secs_f64();
-        Ok(GenerationOutput {
-            output_hash: arith::tokens_hash(&tokens),
-            logits_digest: arith::logits_digest(&hashes),
-            decode_forwards: tokens.len() - 1,
-            tokens,
-            logits_hashes: hashes,
-            prefill_seconds,
-            decode_seconds,
-        })
+        generate_with(&mut ReferenceRun::new(self), &self.config, request)
     }
+}
+
+/// Anything that computes the dyadic profile's logits one token at a time:
+/// the reference [`ModernModel::forward`] ([`ReferenceRun`]) or the fast
+/// engine (`super::engine::Engine`). Both compute the same function.
+pub trait TokenForward {
+    /// Start a new sequence (empty KV cache) with room for `positions`.
+    fn begin(&mut self, positions: usize);
+    /// Feed `token` at the next position and return that position's logits.
+    ///
+    /// On error the sequence is unusable and must be restarted.
+    fn forward_token(&mut self, token: u32) -> Result<&[i64], ModernError>;
+    /// The KV cache of the current sequence.
+    fn kv_cache(&self) -> &KvCache;
+    /// Continue from `cache` (a snapshot of the same model's KV cache).
+    fn set_kv_cache(&mut self, cache: KvCache);
+}
+
+/// The reference forward pass as a [`TokenForward`].
+pub struct ReferenceRun<'m> {
+    model: &'m ModernModel,
+    cache: KvCache,
+    logits: Vec<i64>,
+}
+
+impl<'m> ReferenceRun<'m> {
+    pub fn new(model: &'m ModernModel) -> Self {
+        Self {
+            model,
+            cache: model.new_cache(),
+            logits: Vec::new(),
+        }
+    }
+}
+
+impl TokenForward for ReferenceRun<'_> {
+    fn begin(&mut self, positions: usize) {
+        self.cache = self.model.new_cache();
+        self.cache.reserve(positions, self.model.config.d_kv());
+    }
+
+    fn forward_token(&mut self, token: u32) -> Result<&[i64], ModernError> {
+        self.logits = self.model.forward(token, &mut self.cache)?;
+        Ok(&self.logits)
+    }
+
+    fn kv_cache(&self) -> &KvCache {
+        &self.cache
+    }
+
+    fn set_kv_cache(&mut self, cache: KvCache) {
+        self.cache = cache;
+    }
+}
+
+/// Generation `arc.hf-chat.no-bos.*.le-u32.v1` (spec §6.2) with any forward
+/// pass: the prompt is forwarded without a BOS, then each selected token is
+/// forwarded until EOS or `max_tokens`; the last token is never forwarded.
+pub fn generate_with<F: TokenForward + ?Sized>(
+    forward: &mut F,
+    config: &ModernConfig,
+    request: &GenerationRequest<'_>,
+) -> Result<GenerationOutput, ModernError> {
+    if request.prompt.is_empty() || request.max_tokens == 0 {
+        return Err(ModernError::Invalid(
+            "generation needs a non-empty prompt and max_tokens >= 1".into(),
+        ));
+    }
+    if request.prompt.len() + request.max_tokens > config.max_seq {
+        return Err(ModernError::Domain(format!(
+            "{} prompt tokens + {} generated tokens exceed the {}-position context",
+            request.prompt.len(),
+            request.max_tokens,
+            config.max_seq
+        )));
+    }
+    if let Some(&bad) = request
+        .prompt
+        .iter()
+        .find(|&&t| t as usize >= config.vocab_size)
+    {
+        return Err(ModernError::Domain(format!(
+            "prompt token {bad} is outside the vocabulary"
+        )));
+    }
+    forward.begin(request.prompt.len() + request.max_tokens);
+    let mut hashes = Vec::with_capacity(request.prompt.len() + request.max_tokens);
+    let mut scratch = Vec::new();
+    let mut tokens: Vec<u32> = Vec::with_capacity(request.max_tokens);
+    // The selection after each forward call is made while its logits are
+    // borrowed; it is the same rule, on the same logits, as selecting at the
+    // top of the decode loop.
+    let prefill_start = Instant::now();
+    let mut next = 0u32;
+    for (index, &token) in request.prompt.iter().enumerate() {
+        let logits = forward.forward_token(token)?;
+        hashes.push(arith::logits_hash(logits));
+        if index + 1 == request.prompt.len() {
+            next = arith::select_into(logits, &tokens, request.selection, &mut scratch)?;
+        }
+    }
+    let prefill_seconds = prefill_start.elapsed().as_secs_f64();
+    let decode_start = Instant::now();
+    loop {
+        tokens.push(next);
+        if request.eos.contains(&next) || tokens.len() == request.max_tokens {
+            break;
+        }
+        let logits = forward.forward_token(next)?;
+        hashes.push(arith::logits_hash(logits));
+        next = arith::select_into(logits, &tokens, request.selection, &mut scratch)?;
+    }
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
+    Ok(GenerationOutput {
+        output_hash: arith::tokens_hash(&tokens),
+        logits_digest: arith::logits_digest(&hashes),
+        decode_forwards: tokens.len() - 1,
+        tokens,
+        logits_hashes: hashes,
+        prefill_seconds,
+        decode_seconds,
+    })
 }
 
 /// i32 KV cache: post-RoPE keys and raw values per layer.
@@ -325,16 +400,41 @@ impl KvCache {
         self.positions
     }
 
-    fn push(&mut self, layer: usize, k: &[i64], v: &[i64]) -> Result<(), ModernError> {
-        let narrow = |x: &i64| {
-            i32::try_from(*x)
-                .map_err(|_| ModernError::Domain("KV value outside i32 (|v| >= 2^31)".into()))
-        };
-        let k32 = k.iter().map(narrow).collect::<Result<Vec<i32>, _>>()?;
-        let v32 = v.iter().map(narrow).collect::<Result<Vec<i32>, _>>()?;
-        self.keys[layer].extend_from_slice(&k32);
-        self.values[layer].extend_from_slice(&v32);
+    /// Append one position's keys and values to `layer`, refusing (and
+    /// appending nothing) if any value is outside i32.
+    pub(crate) fn push(&mut self, layer: usize, k: &[i64], v: &[i64]) -> Result<(), ModernError> {
+        if k.iter().chain(v).any(|&x| i32::try_from(x).is_err()) {
+            return Err(ModernError::Domain(
+                "KV value outside i32 (|v| >= 2^31)".into(),
+            ));
+        }
+        self.keys[layer].extend(k.iter().map(|&x| x as i32));
+        self.values[layer].extend(v.iter().map(|&x| x as i32));
         Ok(())
+    }
+
+    /// Keys and values of `layer`, `positions * d_kv` values each.
+    pub(crate) fn layer(&self, layer: usize) -> (&[i32], &[i32]) {
+        (&self.keys[layer], &self.values[layer])
+    }
+
+    /// Whether the cache has `n_layers` layers (belongs to such a model).
+    pub(crate) fn has_layers(&self, n_layers: usize) -> bool {
+        self.keys.len() == n_layers && self.values.len() == n_layers
+    }
+
+    /// Mark one more position as complete.
+    pub(crate) fn advance(&mut self) {
+        self.positions += 1;
+    }
+
+    /// Reserve room for `positions` positions of `d_kv` values per layer, so
+    /// appending never reallocates (and copies) the cache mid-sequence.
+    pub fn reserve(&mut self, positions: usize, d_kv: usize) {
+        let wanted = positions.saturating_mul(d_kv);
+        for cache in self.keys.iter_mut().chain(self.values.iter_mut()) {
+            cache.reserve(wanted.saturating_sub(cache.len()));
+        }
     }
 
     /// BLAKE3 over every cached key then value, layer by layer, as LE i32.
