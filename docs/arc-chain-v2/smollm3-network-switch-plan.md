@@ -37,7 +37,8 @@ of Llama-2-7B. Each step needs an owner and an explicit go decision.
    (`load_qualified`): load the verified package, admit
    `prompt + max_tokens <= 4096`, run generation `arc.hf-chat.no-bos.rp64-argmax.le-u32.v1`.
    The KV cache is 147,456 bytes per position (604 MB at 4,096 positions), so
-   the `--native-kv-budget-bytes` default fits.
+   the `--native-kv-budget-bytes` default fits. Serving peaked at 2.95 GiB
+   resident on CI (1,022 forwards).
 4. **Validators.** Re-execution needs the same engine, either whole-model or
    with row-partitioned projections. The dyadic epilogue is per row, so row
    partitioning stays exact. The `tensor_parallel` / `row_service` paths
@@ -53,8 +54,9 @@ of Llama-2-7B. Each step needs an owner and an explicit go decision.
    - download the two pinned BF16 shards and `config.json` (6.15 GB), resumable;
      on CI runners this took 60–80 s;
    - verify each file's SHA-256;
-   - run the converter: 13–26 s on 4-vCPU CI runners, including the SHA-256
-     of the source;
+   - run the converter: 13–26 s on 4-vCPU CI runners (71 s on the macOS arm64
+     runner, 177 s on the macOS x86-64 one), including the SHA-256 of the
+     source, with a 0.99 GiB peak resident set;
    - verify the package hash, then delete the BF16 files. The package is
      3,084,214,016 bytes.
 
@@ -75,7 +77,7 @@ of Llama-2-7B. Each step needs an owner and an explicit go decision.
 | Independent reference | Python executor re-derives every golden logits vector |
 | Device classes that will serve | the same digests on M1–M4, AVX2-only and AVX-512 x86, and Windows-on-ARM if admitted (self-hosted or volunteer runs) |
 | Quality | perplexity delta vs BF16 within the threshold agreed before the run; task spot checks |
-| Memory | conversion and serving fit 8 GB Macs with the node running |
+| Memory | conversion (0.99 GiB peak on CI) and serving (2.95 GiB peak) fit 8 GB Macs with the node running, measured on real 8 GB devices |
 | Rollback | the Llama-2 identity is untouched; switching back is a coordinator routing change |
 
 ## Open decisions
