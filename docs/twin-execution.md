@@ -284,7 +284,7 @@ Derived per recomputation [CALC]:
 - **CPU per validator** is at most about P × 0.55 s, so 30 s or less for a pump job.
 - **KV per validator** is about P MiB, so about 55 MiB for a pump job and 258 MiB at the maximum.
 
-Today every community job costs at least 1 recomputation, and 6 when rewarded. For example, 60 jobs an hour would need 60 recomputations an hour: about 30 CPU-minutes per validator per hour (about half a core) and 2–3 recomputations in flight continuously.
+Today every community job costs at least 1 recomputation, and 6 when rewarded. For example, 60 jobs an hour would need 60 recomputations an hour: about 30 CPU-minutes per validator per hour (about half a core) and 1–2.3 recomputations in flight continuously.
 
 Twin v0 at the recommended settings: twin on, pump on two coordinators at 120 s, 25% replays, 5% spot checks.
 
