@@ -652,6 +652,9 @@ pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> 
 
 #[tauri::command]
 pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    // The same migration fence as Start, checked before anything stops the
+    // node; restart_node_inner checks it again for its other callers.
+    require_data_migration_ready(&state).await?;
     restart_node_inner(&app, &state).await
 }
 
