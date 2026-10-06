@@ -3,6 +3,7 @@ import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { DataMigrationBanner } from "./components/DataMigrationBanner";
+import { LegacyUpgradeDialog } from "./components/LegacyUpgradeDialog";
 import { Onboarding } from "./screens/Onboarding";
 import { Dashboard } from "./screens/Dashboard";
 import { Earnings } from "./screens/Earnings";
@@ -20,7 +21,7 @@ import {
 import { appUpdater } from "./lib/updater";
 import { dismissBootSplash } from "./lib/boot";
 import { EASE_OUT } from "./lib/motion";
-import type { DataMigrationNotice } from "./lib/types";
+import type { DataMigrationNotice, LegacyComputeQuestion } from "./lib/types";
 
 // If the native store never answers, stop waiting and show what the local state says.
 const BOOT_TIMEOUT_MS = 4_000;
@@ -83,6 +84,8 @@ export function App() {
   const [bootTimedOut, setBootTimedOut] = useState(false);
   const [dataMigration, setDataMigration] =
     useState<DataMigrationNotice | null>(null);
+  const [legacyQuestion, setLegacyQuestion] =
+    useState<LegacyComputeQuestion | null>(null);
   const mainRef = useRef<HTMLElement>(null);
 
   // The launch screen (index.html) stays up until the saved identity and config have loaded. Deciding between the
@@ -104,15 +107,18 @@ export function App() {
   useEffect(() => {
     let active = true;
     (async () => {
-      const [loadedIdentity, loadedConfig, loadedMigration] = await Promise.all([
-        api.loadIdentity().catch(() => null),
-        api.loadConfig().catch(() => null),
-        api.loadDataMigrationNotice().catch(() => null),
-      ]);
+      const [loadedIdentity, loadedConfig, loadedMigration, loadedQuestion] =
+        await Promise.all([
+          api.loadIdentity().catch(() => null),
+          api.loadConfig().catch(() => null),
+          api.loadDataMigrationNotice().catch(() => null),
+          api.loadLegacyComputeQuestion().catch(() => null),
+        ]);
       if (loadedIdentity) setIdentity(loadedIdentity);
       if (loadedConfig) setConfig(loadedConfig);
       if (loadedIdentity && loadedConfig) setOnboarded(true);
       if (active) setDataMigration(loadedMigration);
+      if (active) setLegacyQuestion(loadedQuestion);
       if (active) setConfigHydrated(true);
     })();
     return () => {
@@ -178,6 +184,12 @@ export function App() {
             >
               <Titlebar />
               <Sidebar />
+              {legacyQuestion && (
+                <LegacyUpgradeDialog
+                  question={legacyQuestion}
+                  onAnswered={() => setLegacyQuestion(null)}
+                />
+              )}
               <main className="main" data-testid="main" ref={mainRef}>
                 {dataMigration && (
                   <DataMigrationBanner
