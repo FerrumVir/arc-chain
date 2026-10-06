@@ -95,7 +95,7 @@ struct MoeWeights {
 }
 
 enum FfnWeights {
-    Dense([MatRef; 3]),
+    Dense(Box<[MatRef; 3]>),
     Moe(Box<MoeWeights>),
 }
 
@@ -244,11 +244,11 @@ impl Loader<'_> {
                 ],
             }))
         } else {
-            FfnWeights::Dense([
+            FfnWeights::Dense(Box::new([
                 self.mat(&format!("{p}.w_gate"), 1, c.d_ff, d)?,
                 self.mat(&format!("{p}.w_up"), 1, c.d_ff, d)?,
                 self.mat(&format!("{p}.w_down"), 1, d, c.d_ff)?,
-            ])
+            ]))
         };
         Ok(LayerWeights {
             attn_norm: self.i64s(&format!("{p}.attn_norm"))?,
@@ -584,7 +584,8 @@ impl StageModel {
         // Dense FFN or mixture of experts (spec §5.3–§5.6).
         let x = rms_norm(h, &w.ffn_norm, eps)?;
         let out = match &w.ffn {
-            FfnWeights::Dense([gate, up, down]) => {
+            FfnWeights::Dense(dense) => {
+                let [gate, up, down] = &**dense;
                 gated_ffn(gate.view(data, 0), up.view(data, 0), down.view(data, 0), &x)?
             }
             FfnWeights::Moe(moe) => self.moe_forward(moe, &x)?,
@@ -869,6 +870,9 @@ pub(crate) mod tests {
         bytes
     }
 
+    /// Per-sequence boundary digests, logits hashes and re-derived tokens.
+    type Reference = (Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<u32>);
+
     fn sequences() -> Vec<(Vec<u32>, usize)> {
         vec![
             (vec![3, 17, 5, 49, 0, 22, 8], 3),
@@ -918,7 +922,7 @@ pub(crate) mod tests {
             let c = tiny_config(lora);
             let full = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
             // Reference: per-boundary digests from the single-stage generation path.
-            let reference: Vec<(Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<u32>)> = sequences()
+            let reference: Vec<Reference> = sequences()
                 .into_iter()
                 .map(|(tokens, prompt_len)| {
                     let mut cache = full.new_cache();
