@@ -792,12 +792,26 @@ async fn persist_config(state: &AppState, mut config: NodeConfig) -> Result<Node
     Ok(config)
 }
 
+/// Record a "no" to contributing compute: observer mode with no model path.
+///
+/// The model file stays on disk, but the node is no longer started with
+/// `--model`: an observer given a model still loads it (the Q4 engine holds
+/// about 4 GB of RAM) although it takes no jobs, which is not what someone
+/// who switched contribution off expects. Turning it back on reuses the file
+/// after re-checking its pinned SHA-256 (`existing_model_for_tier`).
+fn withdraw_compute_consent(config: &mut NodeConfig) {
+    config.compute_consent = Some(false);
+    config.role = "observer".into();
+    config.model_path = None;
+}
+
 /// Turn compute contribution on or off.
 ///
 /// On: record the consent, then download the model if needed (resumable,
 /// with progress on `model-download-progress`), switch to worker mode, and
 /// restart the node so it registers and starts taking jobs. Off: record the
-/// refusal and return to observer mode now; the model stays on disk.
+/// refusal and return to observer mode now, without loading the model; the
+/// file stays on disk for a later "on".
 #[tauri::command]
 pub async fn set_compute_contribution(
     app: AppHandle,
@@ -807,7 +821,7 @@ pub async fn set_compute_contribution(
     let mut config = current_config(&state).await;
     config.compute_consent = Some(enabled);
     if !enabled {
-        config.role = "observer".into();
+        withdraw_compute_consent(&mut config);
         let config = persist_config(&state, config).await?;
         let running = state.node.lock().await.is_running();
         if running {
@@ -6326,6 +6340,22 @@ mod compute_contribution_tests {
         let legacy = config("worker", Some("/m.gguf"), None);
         assert!(compute_contribution_enabled(&legacy));
         assert_eq!(promotion_need(&legacy, 16), PromotionNeed::Ready);
+    }
+
+    #[test]
+    fn switching_contribution_off_stops_loading_the_model() {
+        let mut worker = config("worker", Some("/m.gguf"), Some(true));
+        withdraw_compute_consent(&mut worker);
+        assert_eq!(worker.compute_consent, Some(false));
+        assert_eq!(worker.role, "observer");
+        // No --model for an observer that said no: it would still hold the
+        // model in memory without taking jobs.
+        assert_eq!(worker.model_path, None);
+        assert_eq!(promotion_need(&worker, 64), PromotionNeed::NoConsent);
+
+        // Turning it back on promotes again (reusing the verified file).
+        worker.compute_consent = Some(true);
+        assert_eq!(promotion_need(&worker, 16), PromotionNeed::Promote);
     }
 
     #[test]
