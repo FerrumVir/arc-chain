@@ -261,7 +261,7 @@ jobs:
     # this repository; otherwise it runs on GitHub's macos-15 as before. The
     # matrix value, and so the check name, never changes. See
     # docs/self-hosted-runner.md.
-    runs-on: ${{ matrix.os == 'macos-15' && startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-15' && startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || matrix.os }}
     # The Windows all-targets + library leg reached the former 45-minute
     # ceiling and GitHub cancelled an otherwise progressing required check.
     # Keep one bounded ceiling for the matrix, but leave enough headroom for a
@@ -475,7 +475,7 @@ jobs:
     # Same routing as `test`: only the Apple Silicon leg can move to ARC's own
     # Mac Studio; macos-15-intel always stays on GitHub. See
     # docs/self-hosted-runner.md.
-    runs-on: ${{ matrix.os == 'macos-15' && startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || matrix.os }}
+    runs-on: ${{ matrix.os == 'macos-15' && startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || matrix.os }}
     timeout-minutes: 45
     env:
       # The repository root pins nightly for Stwo. `--manifest-path` does not

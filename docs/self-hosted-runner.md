@@ -32,15 +32,17 @@ Each routed job computes `runs-on` from the repository variable
 `ARC_MACOS_ARM_RUNNER`:
 
 ```yaml
-runs-on: ${{ matrix.os == 'macos-15' && startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || matrix.os }}
+runs-on: ${{ matrix.os == 'macos-15' && startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || matrix.os }}
 ```
 
 A job goes to the Mac Studio only when all three hold:
 
 1. it is the Apple Silicon leg (`macos-15`; Intel legs never move);
 2. the variable holds a JSON array of runner labels (it starts with `[`);
-3. the run is not a pull request from a fork. Pushes, schedules, manual runs
-   and pull requests whose branch is in this repository qualify.
+3. the run is not a pull request from a fork or from Dependabot. Pushes,
+   schedules, manual runs and pull requests whose branch is in this
+   repository qualify, except Dependabot's, whose new dependency versions'
+   install and build scripts stay on GitHub-hosted machines.
 
 Otherwise the job runs on `macos-15` as before. A value that does not start
 with `[` is ignored rather than breaking CI. A malformed array stops the routed
@@ -102,7 +104,8 @@ secrets away from it.
 **Fork pull requests never run on the Studio.**
 
 - Every routed `runs-on` contains the same-repository condition above. The
-  Metal job's `if:` requires a branch in this repository, or a manual run.
+  Metal job's `if:` requires a branch in this repository that Dependabot did
+  not open, or a manual run.
 - The repository requires approval before workflows run for pull requests from
   any outside contributor (`approval_policy: all_external_contributors`).
 - For `pull_request` events, GitHub runs the workflow files from the pull
@@ -115,12 +118,12 @@ secrets away from it.
   workflow. Its same-repository condition is written for `pull_request`.
 
 **Who can run code on the Studio:** everyone with write access to this
-repository (any branch they push), Dependabot (its pull requests are branches
-in this repository, so new dependency versions' install and build scripts run
-there), and anyone who can start workflows manually. To keep Dependabot pull
-requests on GitHub-hosted machines, extend the pull-request part of the
-condition to
-`(github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')`.
+repository (any branch they push) and anyone who can start workflows manually.
+Dependabot pull requests are branches in this repository, but the routed
+conditions exclude them (`github.event.pull_request.user.login !=
+'dependabot[bot]'`), so new dependency versions' install and build scripts run
+only on GitHub-hosted machines and never reach the toolchains and caches that
+persist on the Studio.
 
 **What a job can reach:**
 

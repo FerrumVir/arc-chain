@@ -166,7 +166,7 @@ jobs:
     # Runs on ARC's own Mac Studio only when the ARC_MACOS_ARM_RUNNER
     # repository variable is set and the branch belongs to this repository;
     # otherwise on GitHub's macos-15 as before. See docs/self-hosted-runner.md.
-    runs-on: ${{ startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || 'macos-15' }}
+    runs-on: ${{ startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || 'macos-15' }}
     timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: stable
