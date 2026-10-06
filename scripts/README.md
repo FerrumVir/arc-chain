@@ -77,20 +77,20 @@ asset, and verifies all downloads with that release's `SHA256SUMS`. It does not
 walk backward through old tags: an incomplete release fails closed.
 
 Public v0.7.10 and v0.7.11 were desktop-only releases. The protected v0.8.0
-tag has no published assets; v0.8.10 is the current release target. The
+tag has no published assets; v0.8.11 is the current release target. The
 commands below are release-shape examples, not a claim that GitHub's current
 `latest` release can install every platform today.
 
 ```bash
-# Example only after the v0.8.10 release is explicitly approved and published:
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.10/install.sh
+# Example only after the v0.8.11 release is explicitly approved and published:
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.11/install.sh
 ARC_INSTALL_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.10
+bash install.sh --version 0.8.11
 ```
 
 The candidate service launches with `--stake 0 --min-stake 0 --community-mode`.
@@ -180,15 +180,15 @@ ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
 
 **I want to join the network as a community node:**
 ```bash
-# Only after v0.8.10 is explicitly approved and published:
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.10/install.sh
+# Only after v0.8.11 is explicitly approved and published:
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.11/install.sh
 ARC_INSTALL_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.10
+bash install.sh --version 0.8.11
 ```
 
 **I want to reproduce the factual benchmark:**

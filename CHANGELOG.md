@@ -18,6 +18,10 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.11 - Release-preparation snapshot (2026-10-06)
+
+<!-- v0.8.11 changelog body: filled in by the release captain after the merge sequence -->
+
 ## v0.8.10 - Release-preparation snapshot (2026-09-30)
 
 > **Candidate note:** This entry records the v0.8.10 release-preparation
