@@ -570,6 +570,9 @@ export function Onboarding() {
                   Machines with at least 16 GB RAM pre-select it; smaller
                   machines stay useful as observer/routers. A model creates
                   eligibility, not guaranteed assignments or rewards.
+                  Continuing with the model lets ARC run inference jobs on
+                  this computer while the app is open; choose Skip to keep it
+                  an observer. You can change this any time in Settings.
                 </p>
                 <p
                   style={{
