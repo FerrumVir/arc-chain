@@ -207,14 +207,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # lavapipe runs all five golden prompts (about 0.24 tok/s).
           - name: lavapipe
             os: ubuntu-latest
             backend: vulkan
             adapter: llvmpipe
+            check_args: --trace-forwards 2
+            batched: true
+          # WARP needs more than a minute per forward pass of the 3B model, so
+          # the full run (479 passes) cannot fit a 6-hour job: it checks the
+          # first passes of the first golden case exactly, plus a traced pass.
           - name: WARP
             os: windows-latest
             backend: dx12
             adapter: basic render
+            check_args: --prefix-forwards 4 --trace-forwards 1
+            batched: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 340
     env:
@@ -289,12 +297,17 @@ jobs:
             --manifest "$PINNED_MANIFEST" | tee "$EVIDENCE/smollm3-verify-pinned.json"
       - name: Proof Kit GPU mode on the golden prompts (self-test, digest, traces, tok/s)
         shell: bash
+        env:
+          CHECK_ARGS: ${{ matrix.check_args }}
         run: |
+          set -euo pipefail
+          read -r -a extra <<< "$CHECK_ARGS"
           ./target/release/arc-modern gpu-check --package "$MODEL_DIR/smollm3-3b.arcipkg" \
             --tokenizer "$MODEL_DIR/tokenizer.json" --cases "$CASES" --golden "$CPU_GOLDEN" \
             --out "$EVIDENCE/smollm3-gpu-check.json" --run-out "$EVIDENCE/smollm3-gpu-run.json" \
-            --self-test-rounds 8 --trace-forwards 2
+            --self-test-rounds 8 "${extra[@]}"
       - name: Batched prefill (16 tokens per pass) on the first golden case
+        if: matrix.batched
         shell: bash
         run: |
           set -euo pipefail
@@ -331,13 +344,17 @@ jobs:
           a = r["gpu"]["adapter"]
           print(f"### SmolLM3-3B on {a['name']} ({a['backend']}, {a['driver']} {a['driver_info']})")
           print()
-          print(f"- pass: **{r['pass']}**")
-          print(f"- golden matrix digest: `{r['golden']['matrix_digest']}` (CPU golden `{r['golden']['expected_matrix_digest']}`, match: {r['golden']['match']})")
+          g = r["golden"]
+          print(f"- pass: **{r['pass']}** (mode: {g['mode']})")
+          if g["mode"] == "full":
+              print(f"- golden matrix digest: `{g['matrix_digest']}` (CPU golden `{g['expected_matrix_digest']}`, match: {g['match']})")
+          else:
+              print(f"- prefix of case {g['prefix']['case']}: {g['prefix']['matched_forwards']}/{g['prefix']['forwards']} forward passes with logits identical to the CPU golden")
           print(f"- self-test: {r['self_test']['report']['cases']} kernel cases, {r['self_test']['report']['mismatch_count']} mismatches")
           print(f"- per-layer trace check: {json.dumps(r['trace_check'])}")
           print(f"- first divergence: {json.dumps(r['first_divergence'])}")
           t = r["timing"]
-          print(f"- prefill {t['prefill_tok_s']:.4f} tok/s, decode {t['decode_tok_s']:.4f} tok/s ({r['gpu']['speed_label']})")
+          print(f"- timing ({r['gpu']['speed_label']}): {json.dumps(t)}")
           PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
