@@ -1,0 +1,242 @@
+/* ─────────────────────────────────────────────────────────────────────
+   Live network panel and measured records (components/LiveNetworkPanel.tsx).
+   Built from the app's tokens only, so both themes follow: on the engraved
+   default that is white line on Arc blue #002dde, Marcellus for the title,
+   Hanken Grotesk for text and figures, JetBrains Mono for validator labels.
+   Nothing here animates on its own; counters move only when a value changes
+   (and not at all with "reduce motion", see reset.css).
+   ───────────────────────────────────────────────────────────────────── */
+
+.live-network {
+  margin-bottom: var(--space-6);
+}
+
+.live-network-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.live-network-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.live-network-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-regular);
+  letter-spacing: 0.005em;
+  line-height: 1.1;
+}
+
+.live-network-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+/* Columns divided by hairlines, as on an engraved plate. */
+.live-network-grid {
+  display: flex;
+  flex-wrap: wrap;
+  row-gap: var(--space-5);
+}
+
+.live-stat {
+  flex: 1 1 168px;
+  min-width: 0;
+  padding: 2px var(--space-4);
+  border-left: 1px solid var(--border);
+}
+
+.live-stat-value {
+  font-size: var(--text-2xl);
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.live-stat-note {
+  margin-top: var(--space-1);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.live-counter {
+  font-variant-numeric: tabular-nums;
+}
+
+.live-missing {
+  color: var(--text-muted);
+}
+
+.live-muted {
+  color: var(--text-muted);
+}
+
+.live-validators {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: var(--tracking-wide);
+}
+
+.live-validators li {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.live-validators .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--text-faint);
+}
+
+.live-validators .dot.online {
+  background: var(--success);
+}
+
+.live-validators .dot.offline {
+  background: var(--danger);
+}
+
+.live-network-window {
+  margin: var(--space-5) 0 0;
+  max-width: 90ch;
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.live-network-you {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-5);
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.live-network-you .stat-label {
+  margin: 0;
+}
+
+.live-network-you strong {
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A text button: receipts, PR links, the jump to measured records. */
+.live-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-secondary);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.live-link:hover {
+  color: var(--text);
+}
+
+/* Measured records: a dashed plate, set apart from the live figures. */
+.measured-records {
+  margin-top: var(--space-6);
+  border-style: dashed;
+}
+
+.measured-records-intro {
+  margin: 0 0 var(--space-4);
+  max-width: 80ch;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.measured-records-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.measured-record {
+  padding: var(--space-4) 0;
+  border-top: 1px solid var(--border);
+}
+
+.measured-record:last-child {
+  padding-bottom: 0;
+}
+
+.measured-record-headline {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  line-height: 1.3;
+  color: var(--text);
+}
+
+.measured-record-detail {
+  margin: var(--space-2) 0 var(--space-3);
+  max-width: 80ch;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.measured-record-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.measured-record-setting {
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+}
+
+@media (max-width: 768px) {
+  .live-network-title {
+    font-size: var(--text-xl);
+  }
+  .live-stat {
+    flex-basis: 140px;
+  }
+  .live-stat-value {
+    font-size: var(--text-xl);
+  }
+}
