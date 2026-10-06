@@ -7606,7 +7606,13 @@ async fn inference_run(
                 "public_demo cannot be combined with force_local or a recovery probe",
             ));
         }
-        if !twin_dispatch::twin_dispatch_ready(&node) {
+        if !node.community_twin.config.twin_execution {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the public demo is not enabled on this coordinator",
+            ));
+        }
+        if !twin_dispatch::twin_dispatch_ready(&node) || !readiness.community_dispatch_ready {
             return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the public demo runs every prompt on two independent community workers, and fewer than two are available on this coordinator now",
@@ -7800,6 +7806,14 @@ async fn inference_run(
                 );
             }
         }
+    }
+    // A public demo prompt only ever runs on two community workers; it never
+    // falls through to this coordinator's own model.
+    if public_demo {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the public demo could not be dispatched to two community workers",
+        ));
     }
 
     // Check if we have a loaded model (prefer candle float backend for quality)
