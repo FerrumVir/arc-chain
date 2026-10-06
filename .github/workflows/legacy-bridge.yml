@@ -309,7 +309,11 @@ jobs:
 
   desktop-macos:
     name: v0.7.11 desktop consumes the bridge (macOS, opt-in)
-    if: github.event_name == 'workflow_dispatch' && inputs.macos
+    # Opt-in: a manual dispatch with `macos`, or one pre-merge push whose
+    # head commit message contains "[macos-acceptance]".
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.macos) ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[macos-acceptance]'))
     runs-on: macos-15
     timeout-minutes: 45
     steps:

@@ -290,6 +290,14 @@ def process_tree(pid: int) -> list[dict[str, object]]:
             {"pid": row["ProcessId"], "exe": row["ExecutablePath"], "cmdline": row["CommandLine"] or ""}
             for row in rows
         ]
+    if sys.platform == "darwin":
+        # No /proc on macOS; after exec, `comm` is the node's own executable.
+        def ps(field: str) -> str:
+            return subprocess.run(
+                ["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True, check=True
+            ).stdout.strip()
+
+        return [{"pid": pid, "exe": ps("comm"), "cmdline": ps("command")}]
     exe = os.readlink(f"/proc/{pid}/exe")
     cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
     return [{"pid": pid, "exe": exe, "cmdline": cmdline}]
@@ -310,7 +318,13 @@ def pid_alive(pid: int) -> bool:
             text=True,
         ).stdout
         return bool(out.strip())
-    return Path(f"/proc/{pid}").exists()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def assert_no_seed(paths: list[Path], extra: str) -> list[str]:
