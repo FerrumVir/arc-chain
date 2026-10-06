@@ -1,0 +1,346 @@
+/* ─────────────────────────────────────────────────────────────────────
+   Live network panel and measured records (components/LiveNetworkPanel.tsx).
+   Built from the app's tokens only, so both themes follow: on the engraved
+   default that is white line on Arc blue #002dde, Marcellus for the title,
+   Hanken Grotesk for text, JetBrains Mono for the live figures and the
+   validator labels. Counters move only when a value changes; the title dot
+   pulses only over real live data; with "reduce motion" nothing moves.
+   ───────────────────────────────────────────────────────────────────── */
+
+.live-network {
+  margin-bottom: var(--space-6);
+}
+
+.live-network-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.live-network-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.live-network-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-regular);
+  letter-spacing: 0.005em;
+  line-height: 1.1;
+}
+
+.live-network-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+/* The live signal: a small dot by the title. */
+.live-dot {
+  position: relative;
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: var(--radius-full);
+  background: var(--text-faint);
+}
+.live-dot.state-live {
+  background: var(--success);
+}
+.live-dot.state-stalled {
+  background: var(--warning);
+}
+.live-dot.state-down {
+  background: var(--danger);
+}
+.live-dot.pulsing::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: inherit;
+  animation: live-dot-pulse 2.4s var(--ease-out) infinite;
+}
+@keyframes live-dot-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(3);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-dot.pulsing::after {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+/* Five columns divided by hairlines, as on an engraved plate. Each tile is as
+   wide as its content, so the row holds all five whenever they fit, with the
+   values on one baseline; on narrow windows the tiles wrap. */
+.live-network-grid {
+  display: flex;
+  flex-wrap: wrap;
+  row-gap: var(--space-5);
+}
+
+.live-stat {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 2px 10px 2px 12px;
+  border-left: 1px solid var(--border);
+}
+
+/* Sentence case, one line: labels never wrap, so values line up. */
+.live-label {
+  margin-bottom: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: 1.4;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.live-network .live-stat-value {
+  font-family: var(--font-mono);
+  font-size: clamp(28px, 3vw, 36px);
+  font-weight: var(--weight-medium);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.live-stat-note {
+  margin-top: var(--space-2);
+  max-width: 18ch;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.live-note-line {
+  display: block;
+}
+
+.live-counter {
+  font-variant-numeric: tabular-nums;
+}
+
+.live-missing {
+  color: var(--text-muted);
+}
+
+.live-muted {
+  color: var(--text-muted);
+}
+
+.live-validators {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: var(--tracking-wide);
+}
+
+.live-validators li {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.live-validators .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--text-faint);
+}
+
+.live-validators .dot.online {
+  background: var(--success);
+}
+
+.live-validators .dot.offline {
+  background: var(--danger);
+}
+
+/* v0.8.11: the twin figures get their own full-width band. */
+.live-twin {
+  margin-top: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.live-twin-title {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+}
+
+.live-twin-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.live-twin .live-stat-note {
+  max-width: 48ch;
+}
+
+.live-network-window {
+  margin: var(--space-5) 0 0;
+  max-width: 90ch;
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.live-network-you {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-5);
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.live-network-you .live-label {
+  margin: 0;
+}
+
+.live-network-you strong {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A text button: receipts, PR links, the jump to measured records. */
+.live-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-secondary);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.live-link:hover {
+  color: var(--text);
+}
+
+/* Measured records: a dashed plate, set apart from the live figures. */
+.measured-records {
+  margin-top: var(--space-6);
+  border-style: dashed;
+}
+
+.measured-records-intro {
+  margin: 0 0 var(--space-4);
+  max-width: 80ch;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.measured-records-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.measured-record {
+  padding: var(--space-4) 0;
+  border-top: 1px solid var(--border);
+}
+
+.measured-record:last-child {
+  padding-bottom: 0;
+}
+
+.measured-record-headline {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  line-height: 1.3;
+  color: var(--text);
+}
+
+.measured-record-summary {
+  margin: var(--space-1) 0 var(--space-3);
+  max-width: 80ch;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.measured-record-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.measured-record-method {
+  margin-top: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.measured-record-method summary {
+  width: fit-content;
+  cursor: pointer;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.measured-record-method summary:hover {
+  color: var(--text);
+}
+
+.measured-record-method p {
+  margin: var(--space-2) 0 0;
+  max-width: 80ch;
+  line-height: 1.6;
+}
+
+@media (max-width: 768px) {
+  .live-network-title {
+    font-size: var(--text-xl);
+  }
+  .live-twin-grid {
+    grid-template-columns: 1fr;
+    row-gap: var(--space-4);
+  }
+}

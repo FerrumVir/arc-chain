@@ -229,6 +229,7 @@ pub async fn save_config(
         // history. A future data-move feature needs its own verified native
         // transaction instead of widening this IPC surface.
         preserve_authoritative_data_dir(&mut config, store.config.as_ref());
+        preserve_unsent_contribution_choices(&mut config, store.config.as_ref());
         auto_start = config.auto_start;
         store.config = Some(config);
         let dir = state.data_dir.lock().await.clone();
@@ -651,8 +652,15 @@ pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> 
 
 #[tauri::command]
 pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
-    state.cancel_startup_retry();
+    // The same migration fence as Start, checked before anything stops the
+    // node; restart_node_inner checks it again for its other callers.
     require_data_migration_ready(&state).await?;
+    restart_node_inner(&app, &state).await
+}
+
+pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    state.cancel_startup_retry();
+    require_data_migration_ready(state).await?;
     let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
         let cfg = store.config.clone().unwrap_or_default();
@@ -699,13 +707,242 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
 
     // A restart is a good moment to pick up a newer arc-node, since the user
     // is already paying the restart cost. Now safe: nothing holds the file.
-    ensure_binary_inner(&app).await?;
+    ensure_binary_inner(app).await?;
 
-    let resources = resolve_testnet_resources(&app);
+    let resources = resolve_testnet_resources(app);
     let mut node = state.node.lock().await;
     node.start(&cfg, &validator_keyfile, &resources, lifecycle_lock)
         .await
         .map_err(map_err)
+}
+
+// ── Compute contribution (explicit opt-in) ─────────────────────────────────
+//
+// An install contributes compute only after its user says yes: onboarding's
+// model choice, the observer banner, or the Settings switch. Nothing here
+// downloads a model or switches to worker mode without that answer, and
+// turning the switch off returns the node to observer mode at once.
+
+/// Shown when the app is asked to promote an install whose user never opted in.
+pub(crate) const COMPUTE_CONSENT_REQUIRED: &str =
+    "Compute contribution is off. Turn it on in Settings to download the model and take ARC jobs on this computer.";
+
+/// Shown when the machine is below the worker memory floor.
+pub(crate) const COMPUTE_INELIGIBLE: &str =
+    "This computer has less than 16 GB of memory, so it cannot run the ARC model. It stays an observer, which still relays and verifies.";
+
+/// Whether the user agreed to contribute compute. An explicit answer is
+/// authoritative. Installs from before the question existed count as opted
+/// in only if their user had already chosen worker mode with a model.
+pub(crate) fn compute_contribution_enabled(config: &NodeConfig) -> bool {
+    config
+        .compute_consent
+        .unwrap_or(config.role == "worker" && config.model_path.is_some())
+}
+
+/// What a consented install still needs before it can take jobs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PromotionNeed {
+    /// The user has not opted in; never touch the machine.
+    NoConsent,
+    /// Below the memory floor; stays an observer.
+    Ineligible,
+    /// Already a worker with a model; nothing to do.
+    Ready,
+    /// Download (or reuse) the model, switch to worker mode, restart.
+    Promote,
+}
+
+pub(crate) fn promotion_need(config: &NodeConfig, ram_gb: u64) -> PromotionNeed {
+    if !compute_contribution_enabled(config) {
+        PromotionNeed::NoConsent
+    } else if config.role == "worker" && config.model_path.is_some() {
+        PromotionNeed::Ready
+    } else if tier_for_ram_gb(ram_gb) == "none" {
+        PromotionNeed::Ineligible
+    } else {
+        PromotionNeed::Promote
+    }
+}
+
+/// Contribution choices are changed by their own commands. A WebView save
+/// that does not carry them (a screen built before they existed) keeps the
+/// stored answers instead of silently erasing the user's consent.
+fn preserve_unsent_contribution_choices(config: &mut NodeConfig, persisted: Option<&NodeConfig>) {
+    if let Some(persisted) = persisted {
+        if config.compute_consent.is_none() {
+            config.compute_consent = persisted.compute_consent;
+        }
+        if config.prevent_sleep_during_jobs.is_none() {
+            config.prevent_sleep_during_jobs = persisted.prevent_sleep_during_jobs;
+        }
+    }
+}
+
+async fn current_config(state: &AppState) -> NodeConfig {
+    state.store.lock().await.config.clone().unwrap_or_default()
+}
+
+async fn persist_config(state: &AppState, mut config: NodeConfig) -> Result<NodeConfig, String> {
+    let mut store = state.store.lock().await;
+    preserve_authoritative_data_dir(&mut config, store.config.as_ref());
+    store.config = Some(config.clone());
+    let dir = state.data_dir.lock().await.clone();
+    store.save_to(&dir).map_err(map_err)?;
+    Ok(config)
+}
+
+/// Record a finished promotion (worker mode with the verified model) only if
+/// the user still consents. The consent check and the write happen under one
+/// store lock, so a "turn it off" saved while the model downloaded is never
+/// overwritten with "on". Returns `None`, writing nothing, when consent was
+/// withdrawn.
+async fn persist_promotion_if_still_consented(
+    state: &AppState,
+    model_path: String,
+) -> Result<Option<NodeConfig>, String> {
+    let mut store = state.store.lock().await;
+    let latest = store.config.clone().unwrap_or_default();
+    if !compute_contribution_enabled(&latest) {
+        return Ok(None);
+    }
+    let mut promoted = NodeConfig {
+        role: "worker".into(),
+        model_path: Some(model_path),
+        compute_consent: Some(true),
+        ..latest
+    };
+    preserve_authoritative_data_dir(&mut promoted, store.config.as_ref());
+    store.config = Some(promoted.clone());
+    let dir = state.data_dir.lock().await.clone();
+    store.save_to(&dir).map_err(map_err)?;
+    Ok(Some(promoted))
+}
+
+/// Record a "no" to contributing compute: observer mode with no model path.
+///
+/// The model file stays on disk, but the node is no longer started with
+/// `--model`: an observer given a model still loads it (the Q4 engine holds
+/// about 4 GB of RAM) although it takes no jobs, which is not what someone
+/// who switched contribution off expects. Turning it back on reuses the file
+/// after re-checking its pinned SHA-256 (`existing_model_for_tier`).
+fn withdraw_compute_consent(config: &mut NodeConfig) {
+    config.compute_consent = Some(false);
+    config.role = "observer".into();
+    config.model_path = None;
+}
+
+/// Turn compute contribution on or off.
+///
+/// On: record the consent, then download the model if needed (resumable,
+/// with progress on `model-download-progress`), switch to worker mode, and
+/// restart the node so it registers and starts taking jobs. Off: record the
+/// refusal and return to observer mode now, without loading the model; the
+/// file stays on disk for a later "on".
+#[tauri::command]
+pub async fn set_compute_contribution(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> CmdResult<NodeConfig> {
+    let mut config = current_config(&state).await;
+    config.compute_consent = Some(enabled);
+    if !enabled {
+        withdraw_compute_consent(&mut config);
+        let config = persist_config(&state, config).await?;
+        let running = state.node.lock().await.is_running();
+        if running {
+            restart_node_inner(&app, &state).await?;
+        }
+        return Ok(config);
+    }
+    persist_config(&state, config).await?;
+    promote_consented_install_inner(&app, &state).await
+}
+
+/// Finish promoting an install whose user opted in: the model download may
+/// have been interrupted, or the user agreed on a machine that was offline.
+#[tauri::command]
+pub async fn promote_consented_install(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<NodeConfig> {
+    promote_consented_install_inner(&app, &state).await
+}
+
+pub(crate) async fn promote_consented_install_inner(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<NodeConfig, String> {
+    let config = current_config(state).await;
+    // The first hardware read can block for seconds (system_profiler).
+    let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
+        .await
+        .map_err(map_err)?;
+    let tier = tier_for_ram_gb(ram_gb);
+    match promotion_need(&config, ram_gb) {
+        PromotionNeed::NoConsent => return Err(COMPUTE_CONSENT_REQUIRED.to_string()),
+        PromotionNeed::Ineligible => return Err(COMPUTE_INELIGIBLE.to_string()),
+        PromotionNeed::Ready => return Ok(config),
+        PromotionNeed::Promote => {}
+    }
+    let model_path = match existing_model_for_tier(tier.to_string()).await? {
+        Some(path) => path,
+        None => download_model(app.clone(), tier.to_string()).await?,
+    };
+    // The download can take an hour. Honour a "turn it off" made meanwhile.
+    let Some(promoted) = persist_promotion_if_still_consented(state, model_path).await? else {
+        return Ok(current_config(state).await);
+    };
+    // Apply it to a running node. A node the user stopped stays stopped and
+    // starts as a worker next time.
+    let running = state.node.lock().await.is_running();
+    if running {
+        restart_node_inner(app, state).await?;
+    }
+    Ok(promoted)
+}
+
+/// Startup hook: once the node is up, finish enabling contribution for a
+/// consented install that is not a worker yet. Silent when there is nothing
+/// to do; a failure is logged and retried on the next launch or toggle.
+pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state: &AppState) {
+    let config = current_config(state).await;
+    let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
+        .await
+        .unwrap_or(0);
+    if promotion_need(&config, ram_gb) != PromotionNeed::Promote {
+        return;
+    }
+    match promote_consented_install_inner(app, state).await {
+        Ok(_) => tracing::info!("compute contribution enabled: worker mode with a verified model"),
+        Err(error) => {
+            tracing::warn!(%error, "could not finish enabling compute contribution; will retry")
+        }
+    }
+}
+
+/// Keep the computer awake while a job runs. Takes effect the next time the
+/// node starts, so an in-flight job is not interrupted by a restart.
+#[tauri::command]
+pub async fn set_prevent_sleep_during_jobs(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> CmdResult<NodeConfig> {
+    let mut config = current_config(&state).await;
+    config.prevent_sleep_during_jobs = Some(enabled);
+    persist_config(&state, config).await
+}
+
+/// This machine's community worker: state and job counters, read from the
+/// local node only.
+#[tauri::command]
+pub async fn fetch_worker_status(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::types::WorkerStatus> {
+    let port = state.node.lock().await.rpc_port;
+    let local = paths::local_host(port);
+    Ok(rpc_client::fetch_worker_status(&state.http, &local).await)
 }
 
 /// Stops the node, wipes the cached peer dial list (`known_peers.json` in
@@ -4055,6 +4292,10 @@ fn model_path_for(tier: &str) -> PathBuf {
     models_dir().join(format!("{}.gguf", tier))
 }
 
+/// Sidecar naming used by builds before model downloads became resumable.
+/// Kept for tests that fabricate the leftovers `cleanup_model_download_sidecars`
+/// must still remove; production now resumes from [`model_partial_path`].
+#[cfg(test)]
 fn model_download_sidecar(target: &Path, nonce: u64) -> PathBuf {
     let suffix = format!("download-{}-{nonce:016x}", std::process::id());
     match target.extension().and_then(|extension| extension.to_str()) {
@@ -4063,6 +4304,7 @@ fn model_download_sidecar(target: &Path, nonce: u64) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 async fn create_model_download_sidecar(target: &Path) -> Result<PendingVerifiedDownload, String> {
     for _ in 0..32 {
         let path = model_download_sidecar(target, rand::random::<u64>());
@@ -4150,8 +4392,12 @@ pub async fn recommended_tier() -> CmdResult<String> {
 /// The model tier a machine with `ram_gb` of memory can run. The canonical
 /// 7B package needs about 7.8 GB resident plus its KV cache (M1 manifest),
 /// so anything under 16 GB is offered no model rather than a failing one.
+///
+/// `ram_gb` is the marketed size from [`hardware::nominal_ram_gb`], not the
+/// OS-visible total floored to whole GiB: a 16 GB Windows or Linux machine
+/// reports 15.x GiB and must still be offered the model.
 fn tier_for_ram_gb(ram_gb: u64) -> &'static str {
-    if ram_gb >= 16 { "standard" } else { "none" }
+    if ram_gb >= hardware::WORKER_MIN_NOMINAL_RAM_GB { "standard" } else { "none" }
 }
 
 /// Returns `Some(path)` only when the matching tier's GGUF is byte-for-byte
@@ -4170,14 +4416,609 @@ pub async fn existing_model_for_tier(tier: String) -> CmdResult<Option<String>> 
     Ok(valid.then(|| p.to_string_lossy().into_owned()))
 }
 
+/// Consecutive attempts without a single new byte before a model download
+/// gives up. Any attempt that saves data resets the count, so a connection
+/// that drops every few minutes still finishes, and whatever is saved stays
+/// on disk for the next start either way.
+const MODEL_DOWNLOAD_MAX_STALLED_ATTEMPTS: u32 = 8;
+/// Times the saved bytes may be discarded because a mirror cannot continue
+/// them, before the download stops instead of re-fetching gigabytes forever.
+const MODEL_DOWNLOAD_MAX_RESTARTS: u32 = 2;
+const MODEL_DOWNLOAD_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(2);
+const MODEL_DOWNLOAD_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// A request or read that delivers nothing for this long is treated as a
+/// dropped connection: Wi-Fi changes, residential NATs, and sleeping laptops
+/// leave sockets half-open rather than closed.
+const MODEL_DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const MODEL_DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Free space required beyond the bytes still to download, so completing
+/// the model never fills the disk.
+const MODEL_DOWNLOAD_DISK_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
+/// Emit progress at most every 250ms. Mirror chunks land in 8-64 KB units;
+/// emitting on every chunk would flood the IPC channel and pin the UI thread.
+const MODEL_PROGRESS_EMIT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug)]
+struct ModelDownloadPolicy {
+    max_stalled_attempts: u32,
+    retry_base: std::time::Duration,
+    retry_max: std::time::Duration,
+    idle_timeout: std::time::Duration,
+}
+
+impl ModelDownloadPolicy {
+    const PRODUCTION: Self = Self {
+        max_stalled_attempts: MODEL_DOWNLOAD_MAX_STALLED_ATTEMPTS,
+        retry_base: MODEL_DOWNLOAD_RETRY_BASE,
+        retry_max: MODEL_DOWNLOAD_RETRY_MAX,
+        idle_timeout: MODEL_DOWNLOAD_IDLE_TIMEOUT,
+    };
+
+    /// Exponential backoff for the `stalled`-th consecutive failure.
+    fn retry_delay(&self, stalled: u32) -> std::time::Duration {
+        let exponent = stalled.saturating_sub(1).min(16);
+        self.retry_base
+            .saturating_mul(1u32 << exponent)
+            .min(self.retry_max)
+    }
+}
+
+/// Why one HTTP attempt of a model download stopped.
+#[derive(Debug)]
+enum ModelAttemptFailure {
+    /// Network trouble: keep the saved bytes and retry from there.
+    Transient(String),
+    /// The saved bytes cannot be continued (the mirror ignored or misreported
+    /// the range): discard them and retry from byte 0.
+    Restart(String),
+    /// Retrying cannot help: the file is gone, the disk is full, or the
+    /// mirror serves an artifact of the wrong size.
+    Fatal(String),
+}
+
+/// How to use a response to `GET` with `Range: bytes=<offset>-`.
+#[derive(Debug, PartialEq, Eq)]
+enum ModelRangePlan {
+    /// Cut the partial file to this length, then append the body.
+    AppendFrom(u64),
+    /// The partial file already holds every byte.
+    Complete,
+}
+
+/// Parse `Content-Range: bytes <start>-<end>/<size|*>`.
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, size) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    let size = match size.trim() {
+        "*" => None,
+        size => Some(size.parse::<u64>().ok()?),
+    };
+    (start <= end).then_some((start, end, size))
+}
+
+fn plan_model_range_response(
+    status: u16,
+    content_range: Option<&str>,
+    content_length: Option<u64>,
+    offset: u64,
+    total: u64,
+) -> Result<ModelRangePlan, ModelAttemptFailure> {
+    match status {
+        200 => match content_length {
+            Some(length) if length != total => Err(ModelAttemptFailure::Fatal(format!(
+                "the model mirror is serving {length} bytes, but the pinned artifact is {total} bytes"
+            ))),
+            _ => Ok(ModelRangePlan::AppendFrom(0)),
+        },
+        206 => {
+            let Some((start, end, size)) = content_range.and_then(parse_content_range) else {
+                return Err(ModelAttemptFailure::Restart(
+                    "the model mirror sent a partial response without a valid Content-Range"
+                        .to_string(),
+                ));
+            };
+            if let Some(size) = size.filter(|size| *size != total) {
+                return Err(ModelAttemptFailure::Fatal(format!(
+                    "the model mirror is serving {size} bytes, but the pinned artifact is {total} bytes"
+                )));
+            }
+            if end >= total {
+                return Err(ModelAttemptFailure::Restart(format!(
+                    "the model mirror sent bytes past the pinned size of {total}"
+                )));
+            }
+            if start == offset || start == 0 {
+                Ok(ModelRangePlan::AppendFrom(start))
+            } else {
+                Err(ModelAttemptFailure::Restart(format!(
+                    "the model mirror resumed at byte {start} instead of {offset}"
+                )))
+            }
+        }
+        416 if offset >= total => Ok(ModelRangePlan::Complete),
+        416 => Err(ModelAttemptFailure::Restart(
+            "the model mirror could not resume the saved partial download".to_string(),
+        )),
+        408 | 425 | 429 | 500..=599 => Err(ModelAttemptFailure::Transient(format!(
+            "the model mirror returned HTTP {status}"
+        ))),
+        _ => Err(ModelAttemptFailure::Fatal(format!(
+            "the model mirror returned HTTP {status} for the pinned model URL"
+        ))),
+    }
+}
+
+fn describe_model_transport_error(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "the connection to the model mirror timed out".to_string()
+    } else if error.is_connect() {
+        "could not connect to the model mirror (check the internet connection)".to_string()
+    } else if error.is_body() || error.is_decode() {
+        "the connection dropped while downloading".to_string()
+    } else {
+        format!("network error: {error}")
+    }
+}
+
+fn model_write_failure(partial: &Path, error: std::io::Error) -> ModelAttemptFailure {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        ModelAttemptFailure::Fatal(format!(
+            "the disk is full while saving {}; free some space and retry (the bytes already saved are kept)",
+            partial.display()
+        ))
+    } else {
+        ModelAttemptFailure::Fatal(format!("write {}: {error}", partial.display()))
+    }
+}
+
+fn format_gb(bytes: u64) -> String {
+    format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// The partial file a model download resumes from. Its name carries the
+/// pinned digest, so bytes saved for one artifact are never continued as
+/// another after a pin changes.
+fn model_partial_path(target: &Path, spec: &ModelTierSpec) -> PathBuf {
+    let digest_prefix = &spec.sha256[..spec.sha256.len().min(16)];
+    target.with_extension(format!("{digest_prefix}.partial"))
+}
+
+/// Remove resumable partials for `target` other than `keep`.
+fn cleanup_model_partials(target: &Path, keep: Option<&Path>) -> Result<(), String> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    let stem = target
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "model filename is not UTF-8".to_string())?;
+    let prefix = format!("{stem}.");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read {}: {}", parent.display(), error)),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".partial") {
+            continue;
+        }
+        let path = entry.path();
+        if keep.is_some_and(|keep| keep == path.as_path()) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+/// Open (creating if needed) the partial download and return how many bytes
+/// it already holds. `restart`, or a partial longer than the artifact, cuts
+/// it back to empty.
+async fn prepare_model_partial(partial: &Path, total: u64, restart: bool) -> Result<u64, String> {
+    match tokio::fs::symlink_metadata(partial).await {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(format!(
+                "refusing a model partial download that is not a regular file: {}",
+                partial.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect {}: {}", partial.display(), error)),
+    }
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(partial)
+        .await
+        .map_err(|error| format!("open {}: {}", partial.display(), error))?;
+    let length = file
+        .metadata()
+        .await
+        .map_err(|error| format!("inspect {}: {}", partial.display(), error))?
+        .len();
+    if restart || length > total {
+        file.set_len(0)
+            .await
+            .map_err(|error| format!("reset {}: {}", partial.display(), error))?;
+        file.sync_all()
+            .await
+            .map_err(|error| format!("sync {}: {}", partial.display(), error))?;
+        return Ok(0);
+    }
+    Ok(length)
+}
+
+async fn model_partial_len(partial: &Path) -> u64 {
+    tokio::fs::metadata(partial)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn model_progress(
+    tier: &str,
+    stage: &str,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+) -> ModelDownloadProgress {
+    ModelDownloadProgress {
+        tier: tier.to_string(),
+        downloaded_bytes,
+        total_bytes,
+        done: stage == "done",
+        stage: stage.to_string(),
+        resumed_from_bytes: 0,
+        attempt: 0,
+        retry_in_secs: None,
+        message: None,
+    }
+}
+
+/// One HTTP attempt: request the bytes after `offset` and append them to the
+/// partial file. Returns once the partial holds all `total` bytes.
+#[allow(clippy::too_many_arguments)]
+async fn model_download_attempt<F>(
+    client: &reqwest::Client,
+    url: &str,
+    partial: &Path,
+    offset: u64,
+    total: u64,
+    tier: &str,
+    attempt: u32,
+    idle_timeout: std::time::Duration,
+    emit: &mut F,
+) -> Result<(), ModelAttemptFailure>
+where
+    F: FnMut(ModelDownloadProgress),
+{
+    use tokio::io::AsyncSeekExt as _;
+
+    let mut request = client.get(url);
+    if offset > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+    }
+    let mut response = match tokio::time::timeout(idle_timeout, request.send()).await {
+        Err(_) => {
+            return Err(ModelAttemptFailure::Transient(format!(
+                "the model mirror did not answer within {} s",
+                idle_timeout.as_secs()
+            )))
+        }
+        Ok(Err(error)) => {
+            return Err(ModelAttemptFailure::Transient(
+                describe_model_transport_error(&error),
+            ))
+        }
+        Ok(Ok(response)) => response,
+    };
+    let content_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let start = match plan_model_range_response(
+        response.status().as_u16(),
+        content_range.as_deref(),
+        response.content_length(),
+        offset,
+        total,
+    )? {
+        ModelRangePlan::Complete => return Ok(()),
+        ModelRangePlan::AppendFrom(start) => start,
+    };
+    // A plain write handle positioned at `start`: Windows append-only
+    // handles can neither truncate nor flush to disk.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(partial)
+        .await
+        .map_err(|error| model_write_failure(partial, error))?;
+    if start != offset {
+        // The mirror restarted from byte 0 instead of resuming.
+        file.set_len(start)
+            .await
+            .map_err(|error| model_write_failure(partial, error))?;
+    }
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|error| model_write_failure(partial, error))?;
+
+    let mut written = start;
+    emit(ModelDownloadProgress {
+        resumed_from_bytes: start,
+        attempt,
+        ..model_progress(tier, "downloading", written, total)
+    });
+    let mut last_emit = std::time::Instant::now();
+    let streamed: Result<(), ModelAttemptFailure> = async {
+        loop {
+            let chunk = match tokio::time::timeout(idle_timeout, response.chunk()).await {
+                Err(_) => {
+                    return Err(ModelAttemptFailure::Transient(format!(
+                        "no data from the model mirror for {} s",
+                        idle_timeout.as_secs()
+                    )))
+                }
+                Ok(Err(error)) => {
+                    return Err(ModelAttemptFailure::Transient(
+                        describe_model_transport_error(&error),
+                    ))
+                }
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Ok(Some(chunk))) => chunk,
+            };
+            let next = written.saturating_add(chunk.len() as u64);
+            if next > total {
+                return Err(ModelAttemptFailure::Restart(format!(
+                    "the model mirror sent more than the pinned {total} bytes"
+                )));
+            }
+            if let Err(error) = file.write_all(&chunk).await {
+                return Err(model_write_failure(partial, error));
+            }
+            written = next;
+            if last_emit.elapsed() >= MODEL_PROGRESS_EMIT_EVERY {
+                emit(ModelDownloadProgress {
+                    resumed_from_bytes: start,
+                    attempt,
+                    ..model_progress(tier, "downloading", written, total)
+                });
+                last_emit = std::time::Instant::now();
+            }
+        }
+    }
+    .await;
+    // Flush even after a failure: tokio completes writes in the background,
+    // and the next attempt must measure every byte already saved.
+    let flushed = file.flush().await;
+    streamed?;
+    flushed.map_err(|error| model_write_failure(partial, error))?;
+    file.sync_all()
+        .await
+        .map_err(|error| model_write_failure(partial, error))?;
+    if written < total {
+        return Err(ModelAttemptFailure::Transient(format!(
+            "the connection closed after {} of {}",
+            format_gb(written),
+            format_gb(total)
+        )));
+    }
+    emit(ModelDownloadProgress {
+        resumed_from_bytes: start,
+        attempt,
+        ..model_progress(tier, "downloading", written, total)
+    });
+    Ok(())
+}
+
+/// Fill `partial` with all `total` bytes from `url`, resuming with HTTP Range
+/// requests from whatever an earlier attempt or app run saved. Transient
+/// failures retry with exponential backoff; the partial is never deleted
+/// here, so the next call resumes even after this one gives up.
+async fn download_model_resumable<F>(
+    client: &reqwest::Client,
+    url: &str,
+    partial: &Path,
+    total: u64,
+    tier: &str,
+    policy: ModelDownloadPolicy,
+    emit: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
+    let mut attempt: u32 = 0;
+    let mut stalled: u32 = 0;
+    let mut restarts: u32 = 0;
+    let mut restart = false;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let offset = prepare_model_partial(partial, total, restart).await?;
+        restart = false;
+        if offset == total {
+            return Ok(());
+        }
+        emit(ModelDownloadProgress {
+            resumed_from_bytes: offset,
+            attempt,
+            ..model_progress(tier, "connecting", offset, total)
+        });
+        let failure = match model_download_attempt(
+            client,
+            url,
+            partial,
+            offset,
+            total,
+            tier,
+            attempt,
+            policy.idle_timeout,
+            emit,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(failure) => failure,
+        };
+        let saved = model_partial_len(partial).await;
+        let reason = match failure {
+            ModelAttemptFailure::Fatal(reason) => {
+                return Err(format!(
+                    "Model download stopped: {reason}. {} of {} is saved and the next download resumes from there.",
+                    format_gb(saved),
+                    format_gb(total)
+                ));
+            }
+            ModelAttemptFailure::Restart(reason) => {
+                restarts = restarts.saturating_add(1);
+                if restarts > MODEL_DOWNLOAD_MAX_RESTARTS {
+                    return Err(format!(
+                        "Model download stopped: {reason}, {restarts} times. The mirror is not serving the pinned file consistently; try again later."
+                    ));
+                }
+                restart = true;
+                reason
+            }
+            ModelAttemptFailure::Transient(reason) => reason,
+        };
+        // Only a resumable attempt that saved new bytes counts as progress.
+        stalled = if saved > offset && !restart {
+            1
+        } else {
+            stalled.saturating_add(1)
+        };
+        if stalled >= policy.max_stalled_attempts {
+            return Err(format!(
+                "Model download stopped after {stalled} attempts without progress: {reason}. {} of {} is saved; retry to resume from there.",
+                format_gb(saved),
+                format_gb(total)
+            ));
+        }
+        let delay = policy.retry_delay(stalled);
+        emit(ModelDownloadProgress {
+            resumed_from_bytes: offset,
+            attempt,
+            retry_in_secs: Some(delay.as_secs().max(1)),
+            message: Some(reason),
+            ..model_progress(tier, "retrying", saved, total)
+        });
+        tokio::time::sleep(delay).await;
+    }
+}
+
+async fn verify_model_file_blocking(
+    path: &Path,
+    spec: &'static ModelTierSpec,
+) -> Result<bool, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || verify_model_file(&path, spec))
+        .await
+        .map_err(map_err)?
+}
+
+/// Download, verify, and install `spec` at `target`. Callers hold the
+/// per-target download lock. Only bytes whose size and SHA-256 match the pin
+/// are ever renamed into place; a mismatching download is deleted.
+async fn download_verified_model<F>(
+    client: &reqwest::Client,
+    spec: &'static ModelTierSpec,
+    target: &Path,
+    policy: ModelDownloadPolicy,
+    mut emit: F,
+) -> Result<String, String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
+    let tier = spec.id;
+    // Already downloaded and hash-verified → done.
+    if verify_model_file_blocking(target, spec).await? {
+        emit(model_progress(
+            tier,
+            "done",
+            spec.size_bytes,
+            spec.size_bytes,
+        ));
+        return Ok(target.to_string_lossy().into_owned());
+    }
+
+    let partial = model_partial_path(target, spec);
+    cleanup_model_partials(target, Some(partial.as_path()))?;
+    if let Some(parent) = target.parent() {
+        let needed = spec
+            .size_bytes
+            .saturating_sub(model_partial_len(&partial).await)
+            .saturating_add(MODEL_DOWNLOAD_DISK_MARGIN_BYTES);
+        if let Ok(available) = fs2::available_space(parent) {
+            if available < needed {
+                return Err(format!(
+                    "Not enough free disk space for the model: {} is needed and {} is free in {}. Free some space and try again; anything already downloaded is kept.",
+                    format_gb(needed),
+                    format_gb(available),
+                    parent.display()
+                ));
+            }
+        }
+    }
+
+    download_model_resumable(
+        client,
+        spec.url,
+        &partial,
+        spec.size_bytes,
+        tier,
+        policy,
+        &mut emit,
+    )
+    .await?;
+
+    emit(model_progress(
+        tier,
+        "verifying",
+        spec.size_bytes,
+        spec.size_bytes,
+    ));
+    if !verify_model_file_blocking(&partial, spec).await? {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!(
+            "The downloaded model did not match its pinned SHA-256 ({}), so it was deleted. Try the download again; if this repeats, the mirror is serving different bytes.",
+            &spec.sha256[..spec.sha256.len().min(12)]
+        ));
+    }
+
+    // Atomic rename over any existing target. std::fs::rename uses
+    // MoveFileEx(REPLACE_EXISTING) on Windows since Rust 1.62, so this
+    // works cross-platform.
+    std::fs::rename(&partial, target)
+        .map_err(|e| format!("rename to {}: {}", target.display(), e))?;
+    sync_parent_best_effort(target);
+
+    emit(model_progress(
+        tier,
+        "done",
+        spec.size_bytes,
+        spec.size_bytes,
+    ));
+    Ok(target.to_string_lossy().into_owned())
+}
+
 /// Download the GGUF for `tier` to ~/.arc/models/<tier>.gguf, streaming
 /// progress events on the `model-download-progress` channel so the UI can
 /// render a real progress bar.
 ///
-/// Idempotent only for an exact pinned artifact. The stream is checked against
-/// both its exact LFS size and SHA-256 before an atomic rename from the
-/// `.download` sidecar, so a crash or mirror mutation cannot replace a known
-/// good model.
+/// Resumable: bytes are saved to `<tier>.<digest>.partial` and later
+/// attempts (including after an app restart or reboot) continue with an HTTP
+/// Range request instead of starting over. The finished file must match the
+/// pinned size and SHA-256 before an atomic rename, so a crash or mirror
+/// mutation cannot replace a known good model.
 #[tauri::command]
 pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     let spec = tier_spec(&tier).ok_or_else(|| format!("unknown model tier: {}", tier))?;
@@ -4189,156 +5030,26 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     // Onboarding and the existing-observer banner can request the same tier
     // concurrently. Hold one OS-backed per-target lock across recheck,
     // download, digest verification, fsync, and promotion; a waiter rechecks
-    // the completed target instead of opening/truncating the first stream.
+    // the completed target instead of writing the same partial file.
     let _download_guard = acquire_model_download_lock(&target).await?;
+    // Unique sidecars from earlier non-resumable builds are never resumed.
     cleanup_model_download_sidecars(&target)?;
 
-    // Already downloaded and hash-verified → done.
-    let verify_path = target.clone();
-    if tokio::task::spawn_blocking(move || verify_model_file(&verify_path, spec))
-        .await
-        .map_err(map_err)??
-    {
-        let _ = app.emit(
-            "model-download-progress",
-            ModelDownloadProgress {
-                tier: tier.clone(),
-                downloaded_bytes: spec.size_bytes,
-                total_bytes: spec.size_bytes,
-                done: true,
-            },
-        );
-        return Ok(target.to_string_lossy().into_owned());
-    }
-
-    // The production 7B artifact is ~4.1 GB; four hours keeps slow residential
-    // connections viable without allowing an unbounded request.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(4 * 60 * 60))
+        .connect_timeout(MODEL_DOWNLOAD_CONNECT_TIMEOUT)
         .build()
         .map_err(map_err)?;
-
-    let resp = client
-        .get(spec.url)
-        .send()
-        .await
-        .map_err(|e| format!("HF fetch failed: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "GGUF mirror returned HTTP {} for tier {}",
-            resp.status(),
-            tier
-        ));
-    }
-    if let Some(length) = resp.content_length() {
-        if length != spec.size_bytes {
-            return Err(format!(
-                "GGUF mirror reported {} bytes for tier {}, expected {}",
-                length, tier, spec.size_bytes
-            ));
-        }
-    }
-    let total_bytes = spec.size_bytes;
-
-    let mut pending = create_model_download_sidecar(&target).await?;
-
-    let mut stream = resp;
-    let mut downloaded: u64 = 0;
-    let mut hasher = Sha256::new();
-    let mut last_emit = std::time::Instant::now();
-    // Emit progress at most every 250ms. HF chunks tend to land in 8-64 KB
-    // units; emitting on every chunk would flood the IPC channel and pin
-    // the UI thread re-rendering progress.
-    let emit_every = std::time::Duration::from_millis(250);
-
-    loop {
-        let chunk = match stream.chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(error) => {
-                return Err(format!(
-                    "chunk read failed at {} bytes: {}",
-                    downloaded, error
-                ));
-            }
-        };
-        downloaded = downloaded.saturating_add(chunk.len() as u64);
-        if downloaded > spec.size_bytes {
-            return Err(format!(
-                "model tier {} exceeded its pinned size of {} bytes",
-                tier, spec.size_bytes
-            ));
-        }
-        hasher.update(&chunk);
-        if let Err(error) = pending.file_mut()?.write_all(&chunk).await {
-            return Err(format!("write to temp file: {}", error));
-        }
-
-        if last_emit.elapsed() >= emit_every {
-            let _ = app.emit(
-                "model-download-progress",
-                ModelDownloadProgress {
-                    tier: tier.clone(),
-                    downloaded_bytes: downloaded,
-                    total_bytes,
-                    done: false,
-                },
-            );
-            last_emit = std::time::Instant::now();
-        }
-    }
-
-    pending.file_mut()?.flush().await.map_err(map_err)?;
-    pending.file_mut()?.sync_all().await.map_err(map_err)?;
-    pending.close();
-
-    if downloaded != spec.size_bytes {
-        return Err(format!(
-            "model tier {} ended at {} bytes, expected {}",
-            tier, downloaded, spec.size_bytes
-        ));
-    }
-    let actual_sha256: [u8; 32] = hasher.finalize().into();
-    let expected_sha256 = model_digest(spec)?;
-    if actual_sha256 != expected_sha256 {
-        return Err(format!(
-            "SHA-256 verification failed for model tier {}",
-            tier
-        ));
-    }
-
-    // Re-read the fsynced unique sidecar and require the same exact
-    // size+digest contract before promotion. This catches disk faults and
-    // proves the file being renamed, not merely the received byte stream.
-    let verify_path = pending.path.clone();
-    if !tokio::task::spawn_blocking(move || verify_model_file(&verify_path, spec))
-        .await
-        .map_err(map_err)??
-    {
-        return Err(format!(
-            "durable model verification failed for tier {}",
-            tier
-        ));
-    }
-
-    // Atomic rename over any existing target. std::fs::rename uses
-    // MoveFileEx(REPLACE_EXISTING) on Windows since Rust 1.62, so this
-    // works cross-platform.
-    std::fs::rename(&pending.path, &target)
-        .map_err(|e| format!("rename to {}: {}", target.display(), e))?;
-    sync_parent_best_effort(&target);
-
-    let _ = app.emit(
-        "model-download-progress",
-        ModelDownloadProgress {
-            tier: tier.clone(),
-            downloaded_bytes: downloaded,
-            total_bytes,
-            done: true,
+    let emitter = app.clone();
+    download_verified_model(
+        &client,
+        spec,
+        &target,
+        ModelDownloadPolicy::PRODUCTION,
+        move |progress| {
+            let _ = emitter.emit("model-download-progress", progress);
         },
-    );
-
-    Ok(target.to_string_lossy().into_owned())
+    )
+    .await
 }
 
 /// Delete a previously-downloaded model. Frontend uses this when the user
@@ -4355,12 +5066,14 @@ pub async fn remove_model(tier: String) -> CmdResult<()> {
         std::fs::remove_file(&p).map_err(map_err)?;
     }
     // Also clean sidecars from both the legacy deterministic scheme and the
-    // unique create-new scheme after holding the same per-target lock.
+    // unique create-new scheme after holding the same per-target lock, plus
+    // any resumable partial download.
     let tmp = p.with_extension("download");
     if tmp.exists() {
         let _ = std::fs::remove_file(&tmp);
     }
     cleanup_model_download_sidecars(&p)?;
+    cleanup_model_partials(&p, None)?;
     Ok(())
 }
 
@@ -4404,6 +5117,436 @@ mod model_readiness_tests {
         assert_eq!(tier_for_ram_gb(15), "none");
         assert_eq!(tier_for_ram_gb(16), "standard");
         assert_eq!(tier_for_ram_gb(64), "standard");
+    }
+
+    #[test]
+    fn sixteen_gb_windows_and_linux_readings_are_offered_the_model() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // What the OS reports on 16 GB machines: macOS exact, Windows and
+        // Linux 15.x GiB, an AMD APU with a 2 GiB frame buffer ~13.9 GiB.
+        for visible in [16 * GIB, 159 * GIB / 10, 152 * GIB / 10, 139 * GIB / 10] {
+            assert_eq!(
+                tier_for_ram_gb(hardware::nominal_ram_gb(visible)),
+                "standard",
+                "{visible} visible bytes"
+            );
+        }
+        // 8 GB and 12 GB machines are still not offered a model they cannot run.
+        for visible in [77 * GIB / 10, 116 * GIB / 10] {
+            assert_eq!(
+                tier_for_ram_gb(hardware::nominal_ram_gb(visible)),
+                "none",
+                "{visible} visible bytes"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_download_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const FAST_RETRY: ModelDownloadPolicy = ModelDownloadPolicy {
+        max_stalled_attempts: 3,
+        retry_base: std::time::Duration::from_millis(5),
+        retry_max: std::time::Duration::from_millis(20),
+        idle_timeout: std::time::Duration::from_secs(10),
+    };
+
+    fn fixture_payload() -> Vec<u8> {
+        (0..256 * 1024u32)
+            .map(|index| (index.wrapping_mul(31).wrapping_add(7) % 251) as u8)
+            .collect()
+    }
+
+    fn leaked_spec(url: String, genuine: &[u8]) -> &'static ModelTierSpec {
+        Box::leak(Box::new(ModelTierSpec {
+            id: "standard",
+            display_name: "Fixture",
+            url: Box::leak(url.into_boxed_str()),
+            size_bytes: genuine.len() as u64,
+            sha256: Box::leak(hex::encode(Sha256::digest(genuine)).into_boxed_str()),
+        }))
+    }
+
+    /// One scripted response per accepted connection.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// 200 announcing the full length, then the socket closes after
+        /// `send` bytes: a lost connection mid-download.
+        FullThenDrop {
+            send: usize,
+        },
+        /// 200 with the whole payload, ignoring any Range header.
+        Full,
+        /// 206 from the requested offset to the end.
+        Partial,
+        NotFound,
+        Unavailable,
+    }
+
+    async fn read_head(stream: &mut tokio::net::TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.expect("read request");
+            if read == 0 {
+                break;
+            }
+            head.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    fn range_start(head: &str) -> Option<u64> {
+        head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.trim().eq_ignore_ascii_case("range") {
+                return None;
+            }
+            value
+                .trim()
+                .strip_prefix("bytes=")?
+                .strip_suffix('-')?
+                .parse()
+                .ok()
+        })
+    }
+
+    /// Serve `replies` in order, recording each request's Range start.
+    async fn spawn_mirror(
+        payload: Vec<u8>,
+        replies: Vec<Reply>,
+    ) -> (
+        String,
+        Arc<StdMutex<Vec<Option<u64>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/llama-2-7b-chat.Q4_K_M.gguf",
+            listener.local_addr().unwrap()
+        );
+        let ranges = Arc::new(StdMutex::new(Vec::new()));
+        let seen = ranges.clone();
+        let server = tokio::spawn(async move {
+            let total = payload.len();
+            for reply in replies {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let head = read_head(&mut stream).await;
+                let start = range_start(&head);
+                seen.lock().unwrap().push(start);
+                match reply {
+                    Reply::FullThenDrop { send } => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        );
+                        stream.write_all(header.as_bytes()).await.unwrap();
+                        stream.write_all(&payload[..send]).await.unwrap();
+                        stream.flush().await.unwrap();
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Reply::Full => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        );
+                        stream.write_all(header.as_bytes()).await.unwrap();
+                        stream.write_all(&payload).await.unwrap();
+                    }
+                    Reply::Partial => {
+                        let from = start.unwrap_or(0) as usize;
+                        let header = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{total}\r\nConnection: close\r\n\r\n",
+                            total - from,
+                            total - 1
+                        );
+                        stream.write_all(header.as_bytes()).await.unwrap();
+                        stream.write_all(&payload[from..]).await.unwrap();
+                    }
+                    Reply::NotFound => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    Reply::Unavailable => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+        (url, ranges, server)
+    }
+
+    #[test]
+    fn content_ranges_and_resume_plans_follow_the_http_range_rules() {
+        assert_eq!(
+            parse_content_range("bytes 100-199/200"),
+            Some((100, 199, Some(200)))
+        );
+        assert_eq!(parse_content_range("bytes 0-0/*"), Some((0, 0, None)));
+        assert_eq!(parse_content_range("bytes */200"), None);
+        assert_eq!(parse_content_range("items 1-2/3"), None);
+        assert_eq!(parse_content_range("bytes 9-1/10"), None);
+
+        let plan = |status, range: Option<&str>, length, offset| {
+            plan_model_range_response(status, range, length, offset, 200)
+        };
+        assert_eq!(
+            plan(206, Some("bytes 100-199/200"), Some(100), 100).unwrap(),
+            ModelRangePlan::AppendFrom(100)
+        );
+        // The mirror ignored Range or chose to start over.
+        assert_eq!(
+            plan(200, None, Some(200), 100).unwrap(),
+            ModelRangePlan::AppendFrom(0)
+        );
+        assert_eq!(
+            plan(206, Some("bytes 0-199/200"), Some(200), 100).unwrap(),
+            ModelRangePlan::AppendFrom(0)
+        );
+        assert_eq!(
+            plan(416, Some("bytes */200"), None, 200).unwrap(),
+            ModelRangePlan::Complete
+        );
+        assert!(matches!(
+            plan(416, None, None, 50),
+            Err(ModelAttemptFailure::Restart(_))
+        ));
+        assert!(matches!(
+            plan(206, Some("bytes 120-199/200"), None, 100),
+            Err(ModelAttemptFailure::Restart(_))
+        ));
+        assert!(matches!(
+            plan(206, None, None, 100),
+            Err(ModelAttemptFailure::Restart(_))
+        ));
+        // A different-size artifact can never become the pinned model.
+        assert!(matches!(
+            plan(206, Some("bytes 100-299/300"), None, 100),
+            Err(ModelAttemptFailure::Fatal(_))
+        ));
+        assert!(matches!(
+            plan(200, None, Some(300), 0),
+            Err(ModelAttemptFailure::Fatal(_))
+        ));
+        for status in [408, 429, 500, 502, 503] {
+            assert!(matches!(
+                plan(status, None, None, 0),
+                Err(ModelAttemptFailure::Transient(_))
+            ));
+        }
+        for status in [401, 403, 404, 410] {
+            assert!(matches!(
+                plan(status, None, None, 0),
+                Err(ModelAttemptFailure::Fatal(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn retries_back_off_exponentially_up_to_a_cap() {
+        let policy = ModelDownloadPolicy::PRODUCTION;
+        let secs = |stalled| policy.retry_delay(stalled).as_secs();
+        assert_eq!(
+            [secs(1), secs(2), secs(3), secs(5), secs(6), secs(40)],
+            [2, 4, 8, 32, 60, 60]
+        );
+    }
+
+    #[test]
+    fn partials_are_pinned_to_the_digest_and_survive_legacy_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("standard.gguf");
+        let spec = tier_spec("standard").unwrap();
+        let partial = model_partial_path(&target, spec);
+        assert_eq!(
+            partial.file_name().unwrap(),
+            "standard.08a5566d61d7cb6b.partial"
+        );
+        let other_pin = target.with_extension("0000000000000000.partial");
+        let legacy = model_download_sidecar(&target, 7);
+        for path in [&partial, &other_pin, &legacy] {
+            std::fs::write(path, b"saved bytes").unwrap();
+        }
+
+        cleanup_model_download_sidecars(&target).unwrap();
+        assert!(!legacy.exists(), "unresumable legacy sidecars are removed");
+        assert!(partial.exists() && other_pin.exists());
+
+        cleanup_model_partials(&target, Some(partial.as_path())).unwrap();
+        assert!(partial.exists(), "the current pin's partial is resumed");
+        assert!(!other_pin.exists(), "another pin's bytes are never resumed");
+
+        cleanup_model_partials(&target, None).unwrap();
+        assert!(!partial.exists(), "removing the model removes its partial");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_resumes_from_the_saved_bytes_and_verifies() {
+        let payload = fixture_payload();
+        let cut = 96 * 1024;
+        let (url, ranges, server) = spawn_mirror(
+            payload.clone(),
+            vec![Reply::FullThenDrop { send: cut }, Reply::Partial],
+        )
+        .await;
+        let spec = leaked_spec(url, &payload);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("standard.gguf");
+
+        let mut events = Vec::new();
+        let installed = download_verified_model(
+            &reqwest::Client::new(),
+            spec,
+            &target,
+            FAST_RETRY,
+            |event| events.push(event),
+        )
+        .await
+        .expect("the interrupted download resumes and completes");
+        server.await.unwrap();
+
+        assert_eq!(PathBuf::from(installed), target);
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert!(!model_partial_path(&target, spec).exists());
+        let ranges = ranges.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], None, "a fresh download sends no Range header");
+        let resumed = ranges[1].expect("the retry resumes with a Range request");
+        assert!(resumed > 0 && resumed <= cut as u64, "resumed at {resumed}");
+        assert!(events.iter().any(|event| event.stage == "retrying"
+            && event.retry_in_secs.is_some()
+            && event.message.is_some()));
+        assert!(events
+            .iter()
+            .any(|event| event.stage == "connecting" && event.resumed_from_bytes == resumed));
+        assert!(events.iter().any(|event| event.stage == "verifying"));
+        let last = events.last().unwrap();
+        assert!(last.done && last.stage == "done");
+        assert_eq!(last.downloaded_bytes, payload.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn bytes_saved_by_an_earlier_app_run_are_continued_not_refetched() {
+        let payload = fixture_payload();
+        let saved = 100_000;
+        let (url, ranges, server) = spawn_mirror(payload.clone(), vec![Reply::Partial]).await;
+        let spec = leaked_spec(url, &payload);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("standard.gguf");
+        std::fs::write(model_partial_path(&target, spec), &payload[..saved]).unwrap();
+
+        download_verified_model(&reqwest::Client::new(), spec, &target, FAST_RETRY, |_| {})
+            .await
+            .expect("a saved partial resumes after a restart");
+        server.await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert_eq!(*ranges.lock().unwrap(), vec![Some(saved as u64)]);
+    }
+
+    #[tokio::test]
+    async fn a_mirror_that_ignores_range_restarts_from_byte_zero() {
+        let payload = fixture_payload();
+        let (url, ranges, server) = spawn_mirror(payload.clone(), vec![Reply::Full]).await;
+        let spec = leaked_spec(url, &payload);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("standard.gguf");
+        std::fs::write(model_partial_path(&target, spec), &payload[..50_000]).unwrap();
+
+        download_verified_model(&reqwest::Client::new(), spec, &target, FAST_RETRY, |_| {})
+            .await
+            .expect("a full 200 response replaces the saved bytes");
+        server.await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert_eq!(*ranges.lock().unwrap(), vec![Some(50_000)]);
+    }
+
+    #[tokio::test]
+    async fn bytes_that_fail_the_pinned_digest_are_deleted_never_installed() {
+        let payload = fixture_payload();
+        let mut tampered = payload.clone();
+        tampered[1234] ^= 0xff;
+        let (url, _ranges, server) = spawn_mirror(tampered, vec![Reply::Full]).await;
+        let spec = leaked_spec(url, &payload);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("standard.gguf");
+
+        let error =
+            download_verified_model(&reqwest::Client::new(), spec, &target, FAST_RETRY, |_| {})
+                .await
+                .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.contains("SHA-256"), "{error}");
+        assert!(!target.exists());
+        assert!(
+            !model_partial_path(&target, spec).exists(),
+            "bytes that failed verification must not be resumed later"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_fails_once_with_its_http_status() {
+        let payload = fixture_payload();
+        let (url, ranges, server) = spawn_mirror(payload.clone(), vec![Reply::NotFound]).await;
+        let spec = leaked_spec(url, &payload);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("standard.gguf");
+
+        let error =
+            download_verified_model(&reqwest::Client::new(), spec, &target, FAST_RETRY, |_| {})
+                .await
+                .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.contains("HTTP 404"), "{error}");
+        assert_eq!(
+            ranges.lock().unwrap().len(),
+            1,
+            "permanent errors are not retried"
+        );
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn repeated_outages_stop_with_the_saved_bytes_kept_for_next_time() {
+        let payload = fixture_payload();
+        let saved = 10_000;
+        let (url, ranges, server) =
+            spawn_mirror(payload.clone(), vec![Reply::Unavailable; 3]).await;
+        let spec = leaked_spec(url, &payload);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("standard.gguf");
+        let partial = model_partial_path(&target, spec);
+        std::fs::write(&partial, &payload[..saved]).unwrap();
+
+        let error =
+            download_verified_model(&reqwest::Client::new(), spec, &target, FAST_RETRY, |_| {})
+                .await
+                .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.contains("3 attempts without progress"), "{error}");
+        assert!(error.contains("HTTP 503"), "{error}");
+        assert_eq!(
+            *ranges.lock().unwrap(),
+            vec![Some(saved as u64); 3],
+            "every retry resumes from the saved bytes"
+        );
+        assert_eq!(std::fs::read(&partial).unwrap(), &payload[..saved]);
     }
 }
 
@@ -5072,5 +6215,120 @@ mod release_binary_tests {
         std::fs::write(&path, b"evil").unwrap();
         assert!(!verify_model_file(&path, &spec).unwrap());
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod compute_contribution_tests {
+    use super::*;
+
+    fn config(role: &str, model: Option<&str>, consent: Option<bool>) -> NodeConfig {
+        NodeConfig {
+            role: role.into(),
+            model_path: model.map(str::to_string),
+            compute_consent: consent,
+            ..NodeConfig::default()
+        }
+    }
+
+    #[test]
+    fn nothing_is_downloaded_or_promoted_without_consent() {
+        // Never asked: an observer stays an observer.
+        assert_eq!(
+            promotion_need(&config("observer", None, None), 16),
+            PromotionNeed::NoConsent
+        );
+        // An explicit no wins even with a model already on disk.
+        assert_eq!(
+            promotion_need(&config("observer", Some("/m.gguf"), Some(false)), 64),
+            PromotionNeed::NoConsent
+        );
+        // The default config's "worker" role without a model is not consent.
+        assert!(!compute_contribution_enabled(&NodeConfig::default()));
+        assert_eq!(
+            promotion_need(&NodeConfig::default(), 64),
+            PromotionNeed::NoConsent
+        );
+    }
+
+    #[test]
+    fn consented_observers_are_promoted_only_when_eligible() {
+        assert_eq!(
+            promotion_need(&config("observer", None, Some(true)), 16),
+            PromotionNeed::Promote
+        );
+        assert_eq!(
+            promotion_need(&config("observer", None, Some(true)), 12),
+            PromotionNeed::Ineligible
+        );
+        assert_eq!(
+            promotion_need(&config("worker", Some("/m.gguf"), Some(true)), 16),
+            PromotionNeed::Ready
+        );
+    }
+
+    #[test]
+    fn workers_from_before_the_question_keep_contributing() {
+        let legacy = config("worker", Some("/m.gguf"), None);
+        assert!(compute_contribution_enabled(&legacy));
+        assert_eq!(promotion_need(&legacy, 16), PromotionNeed::Ready);
+    }
+
+    #[test]
+    fn switching_contribution_off_stops_loading_the_model() {
+        let mut worker = config("worker", Some("/m.gguf"), Some(true));
+        withdraw_compute_consent(&mut worker);
+        assert_eq!(worker.compute_consent, Some(false));
+        assert_eq!(worker.role, "observer");
+        // No --model for an observer that said no: it would still hold the
+        // model in memory without taking jobs.
+        assert_eq!(worker.model_path, None);
+        assert_eq!(promotion_need(&worker, 64), PromotionNeed::NoConsent);
+
+        // Turning it back on promotes again (reusing the verified file).
+        worker.compute_consent = Some(true);
+        assert_eq!(promotion_need(&worker, 16), PromotionNeed::Promote);
+    }
+
+    #[test]
+    fn a_save_that_omits_the_choices_keeps_the_stored_answers() {
+        let persisted = NodeConfig {
+            compute_consent: Some(true),
+            prevent_sleep_during_jobs: Some(true),
+            ..NodeConfig::default()
+        };
+        let mut stale_webview = NodeConfig {
+            rpc_port: 10_001,
+            ..NodeConfig::default()
+        };
+        preserve_unsent_contribution_choices(&mut stale_webview, Some(&persisted));
+        assert_eq!(stale_webview.compute_consent, Some(true));
+        assert_eq!(stale_webview.prevent_sleep_during_jobs, Some(true));
+
+        let mut explicit = NodeConfig {
+            compute_consent: Some(false),
+            prevent_sleep_during_jobs: Some(false),
+            ..NodeConfig::default()
+        };
+        preserve_unsent_contribution_choices(&mut explicit, Some(&persisted));
+        assert_eq!(explicit.compute_consent, Some(false));
+        assert_eq!(explicit.prevent_sleep_during_jobs, Some(false));
+    }
+
+    #[test]
+    fn a_store_written_before_the_question_still_loads() {
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "role": "worker",
+            "modelPath": "/m.gguf",
+            "rpcPort": 9090,
+            "p2pPort": 9091,
+            "autoStart": true,
+            "autoUpdate": true,
+            "dataDir": "~/.arc/data-v3"
+        }))
+        .unwrap();
+        assert_eq!(config.compute_consent, None);
+        assert_eq!(config.prevent_sleep_during_jobs, None);
+        assert!(compute_contribution_enabled(&config));
     }
 }

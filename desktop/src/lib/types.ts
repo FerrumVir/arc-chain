@@ -158,6 +158,28 @@ export interface NodeConfig {
   dataDir: string;
   /** Cores the node may use. null = every logical core. */
   workerThreads: number | null;
+  /**
+   * Answer to "contribute compute": true lets the app download the model and
+   * run as a worker, false keeps it an observer, null/absent = never asked.
+   */
+  computeConsent?: boolean | null;
+  /** Keep the computer awake while a job runs. Only true turns it on. */
+  preventSleepDuringJobs?: boolean | null;
+}
+
+/**
+ * Whether the user agreed to contribute compute. Mirrors
+ * `commands::compute_contribution_enabled`: an explicit answer wins, and
+ * configs from before the question count only if they already ran a worker
+ * with a model.
+ */
+export function computeContributionEnabled(
+  config: NodeConfig | null | undefined,
+): boolean {
+  if (!config) return false;
+  if (config.computeConsent === true) return true;
+  if (config.computeConsent === false) return false;
+  return config.role === "worker" && !!config.modelPath;
 }
 
 /**
@@ -745,4 +767,42 @@ export interface ModelDownloadProgress {
   downloadedBytes: number;
   totalBytes: number;
   done: boolean;
+  /** `connecting`, `downloading`, `retrying`, `verifying`, or `done`. Absent from older backends. */
+  stage?: string;
+  /** Bytes saved by an earlier attempt or app run when this attempt started. */
+  resumedFromBytes?: number;
+  /** 1-based attempt number within this download. */
+  attempt?: number;
+  /** Seconds until the next attempt while retrying. */
+  retryInSecs?: number | null;
+  /** Why the previous attempt stopped, while retrying. */
+  message?: string | null;
+}
+
+/**
+ * This machine's community worker, read from its own node
+ * (`GET /community/worker/status`). Counters cover the node process's
+ * lifetime: local observations, not reward evidence.
+ */
+export interface WorkerStatus {
+  /** The local node runs a community worker and answered. */
+  running: boolean;
+  /** Why there is no reading, when `running` is false. */
+  unavailable: string | null;
+  /** `polling`, `computing`, or `reconnecting`. */
+  state: string | null;
+  /** The label validators show for this worker. */
+  publicName: string | null;
+  coordinatorsRegistered: number | null;
+  coordinatorsTotal: number | null;
+  jobsClaimed: number | null;
+  /** Results a coordinator accepted. */
+  jobsCompleted: number | null;
+  /** Accepted results the coordinator reported as quorum-verified. */
+  jobsVerified: number | null;
+  jobsFailed: number | null;
+  jobsDeclined: number | null;
+  lastJobCompletedUnixMs: number | null;
+  startedUnixMs: number | null;
+  preventSleepDuringJobs: boolean | null;
 }

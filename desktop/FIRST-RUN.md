@@ -1,32 +1,53 @@
 # ARC Node - first run
 
-> **Release status:** v0.8.0 is an unreleased recovery candidate and is not
-> deployed to the public seeds. Use these steps only after the exact v0.8.0
-> release contains the complete normalized asset set and `SHA256SUMS`.
+> **Release status:** Use these steps only with a published v0.8 release whose
+> assets include the complete normalized set and `SHA256SUMS`. A release being
+> published does not by itself mean the public network is serving work.
 
-The candidate's updater payloads carry Tauri update signatures, but its macOS
+The release's updater payloads carry Tauri update signatures, but its macOS
 package is not Apple Developer ID signed/notarized and its Windows package is
 not Authenticode signed. Those are different trust systems. Verify the
 download against the exact release's `SHA256SUMS` before bypassing an operating
 system warning; never bypass a warning for an unverified or unexpected file.
 
-## macOS - "ARC Node cannot be opened because the developer cannot be verified"
+## macOS - "ARC Node" Not Opened / "the developer cannot be verified"
 
-Pick one of these, top-recommended first.
+Verify the DMG against the exact release's `SHA256SUMS` first, then follow the
+steps for your macOS version (Apple menu → **About This Mac**).
 
-### Option 1 - Right-click → Open (30 seconds)
-1. Right-click (or control-click) `ARC Node.app` in Applications.
+### macOS 15 Sequoia and later - Open Anyway in System Settings
+
+macOS 15 removed the right-click (Control-click) → **Open** override; that menu
+no longer opens an app macOS cannot verify. Approve it in System Settings:
+
+1. Double-click **ARC Node** in Applications. macOS says *"ARC Node" Not
+   Opened*: *Apple could not verify "ARC Node" is free of malware…*. Click
+   **Done** (not **Move to Trash**).
+2. Open Apple menu → **System Settings** → **Privacy & Security**.
+3. Scroll down to **Security**. Next to *"ARC Node" was blocked to protect your
+   Mac*, click **Open Anyway**. The button appears for about an hour after
+   step 1; if it is missing, repeat step 1.
+4. Enter your login password (or use Touch ID) when asked.
+5. In the dialog that follows, click **Open Anyway** again.
+6. macOS remembers this choice; double-clicking works normally from then on.
+
+### macOS 14 Sonoma and earlier - right-click → Open
+
+1. Right-click (or Control-click) **ARC Node** in Applications.
 2. Choose **Open** from the menu.
-3. The same warning appears but with an **Open** button. Click it.
-4. macOS remembers your choice; normal double-click works from then on.
+3. The same warning appears, now with an **Open** button. Click it.
+4. macOS remembers your choice; double-clicking works normally from then on.
 
-### Option 2 - Terminal (one command)
-If the right-click path doesn't give you an Open button on your macOS
-version, first verify the downloaded DMG against `SHA256SUMS`, then strip the
-quarantine flag from the installed app:
+### "ARC Node is damaged and can't be opened"
+
+If the DMG matched `SHA256SUMS`, this is Gatekeeper refusing a quarantined app
+it cannot verify, not a broken download, and **Open Anyway** is usually not
+offered for it. Strip the quarantine flag from the installed app, then open it
+normally:
 ```
 xattr -cr /Applications/ARC\ Node.app
 ```
+Never run this on an app whose download did not match `SHA256SUMS`.
 
 ## Windows - SmartScreen "Windows protected your PC"
 
@@ -35,8 +56,8 @@ xattr -cr /Applications/ARC\ Node.app
 
 ## Linux - `.AppImage` / `.deb`
 
-No Apple/Windows signing prompt applies. Use the normalized v0.8.0 filename;
-if the downloaded AppImage is not executable:
+No Apple/Windows signing prompt applies. Use the release's normalized
+filename; if the downloaded AppImage is not executable:
 ```
 chmod +x arc-desktop-linux-x86_64.AppImage
 ```
@@ -54,9 +75,15 @@ chmod +x arc-desktop-linux-x86_64.AppImage
    recovery phrase. The keyfile preserves the address you just saw; the app
    never places the phrase or secret key in node arguments, environment, or
    logs and reuses the same protected keyfile across restarts.
-4. **Attempts community-worker registration** (if you picked the Worker role).
-   Registration alone does not prove that the worker is eligible, reachable,
-   receiving jobs, or earning rewards; those states must be visible in the app.
+4. **Attempts community-worker registration** (if you picked the Worker role,
+   or later turn on **Settings → Contribute compute**). ARC never runs jobs on
+   your computer unless you choose one of those, and the same switch turns it
+   off. Registration alone does not prove that the worker is eligible,
+   reachable, receiving jobs, or earning rewards; those states must be visible
+   in the app. The Dashboard's **Jobs on this computer** card shows the jobs
+   this computer completed and the ones the network verified since the node
+   last started. **Keep this computer awake while a job runs** (Settings) holds
+   off idle sleep only while a job is computing.
 5. **Submits** a testnet faucet request when onboarding reaches that step. A
    submission is not a balance credit; only a successful mined receipt on the
    selected chain confirms it. The current public fleet is divergent, and the
@@ -66,6 +93,14 @@ chmod +x arc-desktop-linux-x86_64.AppImage
 
 - **"Couldn't start arc-node"** with a download error: GitHub releases
   may be rate-limiting. Wait a minute and click Retry.
+- **The model download stopped** (Wi-Fi dropped, the laptop slept, or the app
+  quit): the downloaded part stays in the `models` folder of the ARC data
+  directory, and the next attempt resumes from it instead of starting over.
+  Click Retry or reopen the app. The finished file is used only after it
+  matches the pinned SHA-256.
+- **"Not enough free disk space for the model"**: the model is a 3.80 GB
+  download and the app keeps 0.5 GB spare. Free that much space and retry; the
+  part already downloaded is kept.
 - **"port 9090 busy"**: another arc-node (or Jupyter) is using the port.
   The app will auto-fall back to 9100, 9110, ...; the warning in the logs
   tells you which port it ended up on.

@@ -212,6 +212,13 @@ curl -fsS "$ARC_RPC/community/reward_policy" \
          treasury_rewards_remaining,reward_program,earnings_evidence}'
 ```
 
+The `name` column is public on every validator. It is `node-` plus the first
+eight hex characters of this worker's address (a short hash of its public key),
+or a nickname the operator chose with `--node-name` (1–48 ASCII letters, digits,
+spaces, `-` or `_`). It is never derived from the machine's hostname, and
+validators replace any older `name (hostname)` registration with the `node-`
+label when they serve the scoreboard.
+
 Point to the actual platform, exact model identity, server-authoritative success
 and failure counts, and the separate reward-readiness response. A heartbeat
 cannot reset or inflate these counts. The read-only scoreboard must be queried

@@ -35,6 +35,7 @@ import type {
   TxLookup,
   UpdateInstallPolicy,
   WalletTxResult,
+  WorkerStatus,
 } from "./types";
 import type {
   NativeContextView,
@@ -49,6 +50,14 @@ import {
   nativeMockBalance,
   nativeMockEnabled,
 } from "./native-mock";
+import { DEFAULT_NODE_CONFIG } from "./types";
+import {
+  PUBLIC_VALIDATORS,
+  livePath,
+  type LiveReadRequest,
+  type LiveReadResult,
+} from "./network-stats/read";
+import { mockNetworkRead, type MockNetworkScenario } from "./network-stats/mock-chain";
 
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -2131,6 +2140,61 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (detailed.kind !== "ok") throw new Error("the receipt is unavailable");
       return { found: true, height: Number(health.height), receipt: detailed.body } as T;
     }
+    case "fetch_worker_status": {
+      const path = "/community/worker/status";
+      const detailed = await getDetailed(path);
+      const none: WorkerStatus = {
+        running: false,
+        unavailable: null,
+        state: null,
+        publicName: null,
+        coordinatorsRegistered: null,
+        coordinatorsTotal: null,
+        jobsClaimed: null,
+        jobsCompleted: null,
+        jobsVerified: null,
+        jobsFailed: null,
+        jobsDeclined: null,
+        lastJobCompletedUnixMs: null,
+        startedUnixMs: null,
+        preventSleepDuringJobs: null,
+      };
+      if (detailed.kind === "notFound") {
+        return {
+          ...none,
+          unavailable:
+            "This node is not running a community worker (observer mode, or no model loaded yet).",
+        } as T;
+      }
+      if (detailed.kind !== "ok") return { ...none, unavailable: reason(path, detailed) } as T;
+      const body = detailed.body;
+      const count = (key: string) => numOf(body, [key]);
+      return {
+        ...none,
+        running: true,
+        state: typeof body.state === "string" ? body.state : null,
+        publicName: typeof body.public_name === "string" ? body.public_name : null,
+        coordinatorsRegistered: count("coordinators_registered"),
+        coordinatorsTotal: count("coordinators_total"),
+        jobsClaimed: count("jobs_claimed"),
+        jobsCompleted: count("jobs_completed"),
+        jobsVerified: count("jobs_verified"),
+        jobsFailed: count("jobs_failed"),
+        jobsDeclined: count("jobs_declined"),
+        lastJobCompletedUnixMs: count("last_job_completed_unix_ms"),
+        startedUnixMs: count("started_unix_ms"),
+        preventSleepDuringJobs:
+          typeof body.prevent_sleep_during_jobs === "boolean"
+            ? body.prevent_sleep_during_jobs
+            : null,
+      } as T;
+    }
+    case "set_compute_contribution":
+    case "promote_consented_install":
+    case "set_prevent_sleep_during_jobs":
+      throw new Error(
+        "Compute contribution can only be changed in the ARC desktop app, which owns the node.",
+      );
     case "native_journal":
       return [] as T;
     case "native_prepare":
@@ -2140,6 +2204,26 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       throw new Error(
         "Native paid requests require the native desktop app so signing stays in Rust.",
       );
+    case "network_live_read": {
+      // The live harness talks to one local node over HTTP. The public
+      // validators are reached only by the native command, so say so rather
+      // than read them from a browser page.
+      const request = (args as { request: LiveReadRequest }).request;
+      const validator = PUBLIC_VALIDATORS[request.validator];
+      const result: LiveReadResult = {
+        validator: request.validator,
+        label: validator?.label ?? `validator ${request.validator}`,
+        origin: validator?.origin ?? "",
+        path: livePath(request),
+        outcome: "unreachable",
+        httpStatus: null,
+        body: null,
+        detail: "the browser live harness reads only the local node",
+        fetchedAtUnixMs: Date.now(),
+        elapsedMs: 0,
+      };
+      return result as T;
+    }
     default:
       throw new Error(`Unhandled live command: ${cmd}`);
   }
@@ -2148,6 +2232,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
 // Mock state - only used in browser preview. Tauri env always hits the real backend.
 let mockStartedAt: number | null = null;
 let mockWorkerThreads: number | null = null;
+let mockConfig: NodeConfig | null = null;
 const mockLogs: LogEntry[] = [];
 // Explicit browser-preview fixture for a hypothetical host whose candidate
 // receipt contract is ready. These are static layout values, never a claim
@@ -2441,6 +2526,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "load_identity":
       return null as T;
     case "save_config":
+      mockConfig = (args as { config?: NodeConfig } | undefined)?.config ?? mockConfig;
       return undefined as T;
     case "load_config":
       return null as T;
@@ -2876,6 +2962,78 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         path: "/mock/Downloads/arc-node-20260817-120000.log",
         lines: mockLogs.length,
       } as T;
+    case "fetch_worker_status": {
+      const config = mockConfig ?? DEFAULT_NODE_CONFIG;
+      const working =
+        mockStartedAt !== null && config.role === "worker" && !!config.modelPath;
+      if (!working) {
+        return {
+          running: false,
+          unavailable:
+            "This node is not running a community worker (observer mode, or no model loaded yet).",
+          state: null,
+          publicName: null,
+          coordinatorsRegistered: null,
+          coordinatorsTotal: null,
+          jobsClaimed: null,
+          jobsCompleted: null,
+          jobsVerified: null,
+          jobsFailed: null,
+          jobsDeclined: null,
+          lastJobCompletedUnixMs: null,
+          startedUnixMs: null,
+          preventSleepDuringJobs: null,
+        } as T;
+      }
+      return {
+        running: true,
+        unavailable: null,
+        state: "polling",
+        publicName: "node-99999999",
+        coordinatorsRegistered: 6,
+        coordinatorsTotal: 6,
+        jobsClaimed: 12,
+        jobsCompleted: 11,
+        jobsVerified: 10,
+        jobsFailed: 1,
+        jobsDeclined: 0,
+        lastJobCompletedUnixMs: Date.now() - 95_000,
+        startedUnixMs: mockStartedAt,
+        preventSleepDuringJobs: config.preventSleepDuringJobs === true,
+      } as T;
+    }
+    case "set_compute_contribution": {
+      const { enabled } = args as { enabled: boolean };
+      const config = mockConfig ?? DEFAULT_NODE_CONFIG;
+      mockConfig = enabled
+        ? {
+            ...config,
+            computeConsent: true,
+            role: "worker",
+            modelPath: config.modelPath ?? "/mock/.arc/models/standard.gguf",
+          }
+        : { ...config, computeConsent: false, role: "observer", modelPath: null };
+      return mockConfig as T;
+    }
+    case "promote_consented_install": {
+      const config = mockConfig ?? DEFAULT_NODE_CONFIG;
+      if (config.computeConsent !== true) {
+        throw new Error(
+          "Compute contribution is off. Turn it on in Settings to download the model and take ARC jobs on this computer.",
+        );
+      }
+      mockConfig = {
+        ...config,
+        role: "worker",
+        modelPath: config.modelPath ?? "/mock/.arc/models/standard.gguf",
+      };
+      return mockConfig as T;
+    }
+    case "set_prevent_sleep_during_jobs": {
+      const { enabled } = args as { enabled: boolean };
+      mockConfig = { ...(mockConfig ?? DEFAULT_NODE_CONFIG), preventSleepDuringJobs: enabled };
+      return mockConfig as T;
+    }
     case "set_worker_threads": {
       const { threads } = args as { threads: number };
       mockWorkerThreads = threads;
@@ -2926,6 +3084,14 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return "/mock/.arc/models/standard.gguf" as T;
     case "remove_model":
       return undefined as T;
+    case "network_live_read": {
+      // A synthetic chain (lib/network-stats/mock-chain.ts). Tests steer it
+      // through `window.__ARC_MOCK_NETWORK__`.
+      const request = (args as { request: LiveReadRequest }).request;
+      const scenario =
+        (globalThis as { __ARC_MOCK_NETWORK__?: MockNetworkScenario }).__ARC_MOCK_NETWORK__ ?? {};
+      return mockNetworkRead(request, Date.now(), scenario) as T;
+    }
     default:
       throw new Error(`Unmocked Tauri command: ${cmd}`);
   }
@@ -3119,6 +3285,26 @@ export const api = {
   /** Change how many cores the node contributes. */
   setWorkerThreads: (threads: number) =>
     invoke<ThreadsApplied>("set_worker_threads", { threads }),
+  /** This machine's community worker: state and job counters (local node only). */
+  fetchWorkerStatus: () => invoke<WorkerStatus>("fetch_worker_status"),
+  /**
+   * One read-only GET for the live network panel. Native code builds the path
+   * from the typed request (five allowlisted reads, never /community/list).
+   */
+  networkLiveRead: (request: LiveReadRequest) =>
+    invoke<LiveReadResult>("network_live_read", { request }),
+  /**
+   * Turn compute contribution on (download the model if needed, worker mode,
+   * restart) or off (observer mode). Returns the saved config.
+   */
+  setComputeContribution: (enabled: boolean) =>
+    invoke<NodeConfig>("set_compute_contribution", { enabled }),
+  /** Finish enabling contribution for a user who already opted in. */
+  promoteConsentedInstall: () =>
+    invoke<NodeConfig>("promote_consented_install"),
+  /** Keep the computer awake while a job runs (applies at the next node start). */
+  setPreventSleepDuringJobs: (enabled: boolean) =>
+    invoke<NodeConfig>("set_prevent_sleep_during_jobs", { enabled }),
   ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
   getAutostart: () => invoke<boolean>("get_autostart"),
   updateInstallPolicy: () =>

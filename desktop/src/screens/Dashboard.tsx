@@ -27,6 +27,8 @@ import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
 import { NumberTicker } from "../components/NumberTicker";
 import { ObserverUpgradeBanner } from "../components/ObserverUpgradeBanner";
+import { WorkerJobsCard } from "../components/WorkerJobs";
+import { LiveNetworkPanel, MeasuredRecordsCard } from "../components/LiveNetworkPanel";
 import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { StatusPill } from "../components/StatusPill";
 import { api } from "../lib/tauri";
@@ -566,6 +568,10 @@ export function Dashboard() {
 
       <ObserverUpgradeBanner />
 
+      <LiveNetworkPanel />
+
+      <WorkerJobsCard />
+
 
       <Card featured style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader
@@ -1087,6 +1093,8 @@ export function Dashboard() {
           </button>
         </Card>
       </div>
+
+      <MeasuredRecordsCard />
 
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>

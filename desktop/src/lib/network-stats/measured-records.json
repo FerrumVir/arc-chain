@@ -1,0 +1,47 @@
+{
+  "schema": "arc.measured-records.v1",
+  "records": [
+    {
+      "id": "same-answer-bit-for-bit",
+      "headline": "The same answer, bit for bit, on the computers we tested",
+      "summary": "Two AI models gave the same output on Linux, Windows and Mac computers.",
+      "method": "Llama-2-7B, 16 prompts × 32 tokens: the same output on Linux, Windows and Intel Mac, with both the scalar and the AVX2 kernel (6 of 6 runs). On a shorter test (2 prompts × 4 tokens), Apple Silicon matched too: 8 of 8 runs across the four platforms. SmolLM3-3B: the same output on Apple Silicon Mac, Intel Mac, Linux and Windows, with the scalar and the SIMD kernel (8 of 8 runs), and an independent Python reference agreed. The same output means the same tokens and the same digest of every internal score at every step. GitHub-hosted CPUs; GPUs not covered.",
+      "setting": "ci",
+      "measured_on": "2026-10-06",
+      "prs": [136, 137],
+      "receipts": [
+        {
+          "label": "PR #136 full run (Linux, Windows, Intel Mac)",
+          "url": "https://github.com/FerrumVir/arc-chain/actions/runs/37467005539"
+        },
+        {
+          "label": "PR #136 short run (all four platforms)",
+          "url": "https://github.com/FerrumVir/arc-chain/actions/runs/37458030569"
+        },
+        {
+          "label": "PR #137 eight-way run",
+          "url": "https://github.com/FerrumVir/arc-chain/actions/runs/37473148757"
+        }
+      ]
+    },
+    {
+      "id": "lab-payments-per-second",
+      "headline": "169 payments a second, in our test lab",
+      "summary": "Up from 3.4 a second on the same setup, with a fee change that is not on the live network yet.",
+      "method": "800 funded senders each kept one transfer in flight, measured over 60 seconds after a 15-second warm-up. With the once-per-block fee settlement from PR #133, the six validators completed 168.6 transfers a second; under today's rule they completed 3.4. Per the PR, only the before/after ratio is meaningful: absolute numbers depend on the hardware.",
+      "setting": "lab",
+      "measured_on": "2026-10-04",
+      "hardware": "one 4-vCPU ubuntu-24.04 GitHub runner hosting all six validators",
+      "metric": "transfers_per_second",
+      "value": 168.6,
+      "unit": "transfers/s",
+      "prs": [133],
+      "receipts": [
+        {
+          "label": "Throughput run 37238163514",
+          "url": "https://github.com/FerrumVir/arc-chain/actions/runs/37238163514"
+        }
+      ]
+    }
+  ]
+}

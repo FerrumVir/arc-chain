@@ -3,6 +3,7 @@ mod commands;
 mod hardware;
 mod identity;
 mod native_paid;
+mod network_live;
 mod node_manager;
 mod paths;
 mod production_acceptance;
@@ -611,6 +612,12 @@ pub fn run() {
                     match outcome {
                         Ok(()) => {
                             tracing::info!("auto-started arc-node on launch");
+                            // A user who opted in to contributing compute but
+                            // is not a worker yet (an interrupted model
+                            // download, or consent given while offline) is
+                            // finished here, so the install takes jobs without
+                            // another click. No-op without consent.
+                            commands::promote_consented_install_on_startup(&handle, &state).await;
                             break;
                         }
                         Err(error) if error.is_transient() => {
@@ -692,6 +699,11 @@ pub fn run() {
             commands::fetch_reward_economics,
             commands::fetch_earnings_projection,
             commands::fetch_node_contribution,
+            commands::fetch_worker_status,
+            network_live::network_live_read,
+            commands::set_compute_contribution,
+            commands::promote_consented_install,
+            commands::set_prevent_sleep_during_jobs,
             commands::fetch_network_overview,
             commands::fetch_recent_blocks,
             commands::fetch_block_txs,

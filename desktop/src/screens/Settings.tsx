@@ -5,10 +5,15 @@ import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { NotAvailable } from "../components/NotAvailable";
 import { StatusPill } from "../components/StatusPill";
-import { api } from "../lib/tauri";
-import { formatInt } from "../lib/format";
+import { api, isTauri } from "../lib/tauri";
+import { formatInt, modelDownloadStatus } from "../lib/format";
 import { useAppStore } from "../lib/store";
-import { DEFAULT_NODE_CONFIG, type NodeConfig } from "../lib/types";
+import {
+  computeContributionEnabled,
+  DEFAULT_NODE_CONFIG,
+  type ModelDownloadProgress,
+  type NodeConfig,
+} from "../lib/types";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import { setTheme, useTheme, type Theme } from "../lib/theme";
 
@@ -148,6 +153,8 @@ export function Settings() {
               independently of the RPC port.
             </span>
           </div>
+
+          <ComputeConsent />
 
           <ComputeContribution />
 
@@ -466,6 +473,146 @@ export function Settings() {
       </Card>
 
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
+/**
+ * The explicit opt-in for running ARC jobs on this computer.
+ *
+ * Nothing downloads a model or switches the node to worker mode without this
+ * switch (or the equivalent choice in onboarding or the observer banner).
+ * Turning it on downloads the model if needed (resumable, verified), switches
+ * to worker mode and restarts the node; turning it off returns to observer
+ * mode at once.
+ */
+function ComputeConsent() {
+  const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
+  const enabled = computeContributionEnabled(config);
+  const keepAwake = config?.preventSleepDuringJobs === true;
+  const { data: tier } = useQuery({
+    queryKey: ["recommended-tier"],
+    queryFn: api.recommendedTier,
+  });
+  const ineligible = tier === "none";
+  const [progress, setProgress] = useState<ModelDownloadProgress | null>(null);
+
+  const toggle = useMutation({
+    mutationFn: (next: boolean) => api.setComputeContribution(next),
+    onMutate: () => setProgress(null),
+    onSuccess: (saved) => setConfig(saved),
+  });
+  const awake = useMutation({
+    mutationFn: (next: boolean) => api.setPreventSleepDuringJobs(next),
+    onSuccess: (saved) => setConfig(saved),
+  });
+
+  useEffect(() => {
+    if (!isTauri || !toggle.isPending) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const handle = await listen<ModelDownloadProgress>(
+        "model-download-progress",
+        (event) => setProgress(event.payload),
+      );
+      if (cancelled) handle();
+      else unlisten = handle;
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [toggle.isPending]);
+
+  return (
+    <div className="field" data-testid="compute-consent">
+      <span className="field-label">Contribute compute</span>
+      <label
+        htmlFor="compute-consent-toggle"
+        style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", cursor: "pointer" }}
+      >
+        <input
+          id="compute-consent-toggle"
+          type="checkbox"
+          checked={enabled}
+          disabled={toggle.isPending || (!enabled && ineligible)}
+          onChange={(e) => toggle.mutate(e.target.checked)}
+          data-testid="compute-consent-toggle"
+        />
+        <span>Let ARC run inference jobs on this computer</span>
+      </label>
+      <span className="field-hint">
+        Off unless you turn it on here or chose the ARC model during setup.
+        When on, the app downloads the ARC model once
+        (3.80 GB, checked against its pinned SHA-256), switches your node to
+        worker mode, and takes jobs from the network while the app is open.
+        Turning it off returns the node to observer mode right away.
+      </span>
+      {ineligible && !enabled && (
+        <span className="field-hint" data-testid="compute-consent-ineligible">
+          This computer has less than 16 GB of memory, so it cannot run the ARC
+          model. It stays an observer, which still relays and verifies.
+        </span>
+      )}
+      {toggle.isPending && (
+        <p
+          style={{ marginTop: "var(--space-2)", fontSize: "var(--text-sm)", color: "var(--text-muted)" }}
+          data-testid="compute-consent-progress"
+        >
+          {progress
+            ? modelDownloadStatus(progress)
+            : enabled
+              ? "Switching to observer mode…"
+              : "Preparing worker mode…"}
+        </p>
+      )}
+      {toggle.error && (
+        <p
+          role="alert"
+          style={{ marginTop: "var(--space-2)", fontSize: "var(--text-sm)", color: "var(--danger)" }}
+          data-testid="compute-consent-error"
+        >
+          {String(toggle.error)}
+        </p>
+      )}
+
+      <label
+        htmlFor="prevent-sleep-toggle"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "var(--space-3)",
+          cursor: enabled ? "pointer" : "default",
+          marginTop: "var(--space-3)",
+        }}
+      >
+        <input
+          id="prevent-sleep-toggle"
+          type="checkbox"
+          checked={keepAwake}
+          disabled={!enabled || awake.isPending}
+          onChange={(e) => awake.mutate(e.target.checked)}
+          data-testid="prevent-sleep-toggle"
+        />
+        <span>Keep this computer awake while a job runs</span>
+      </label>
+      <span className="field-hint">
+        Holds off idle sleep only while a job is computing, so it is not lost
+        halfway. The computer still sleeps between jobs and when the lid
+        closes. Takes effect the next time the node starts.
+      </span>
+      {awake.error && (
+        <p
+          role="alert"
+          style={{ marginTop: "var(--space-2)", fontSize: "var(--text-sm)", color: "var(--danger)" }}
+          data-testid="prevent-sleep-error"
+        >
+          {String(awake.error)}
+        </p>
+      )}
     </div>
   );
 }
