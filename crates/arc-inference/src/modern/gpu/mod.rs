@@ -643,6 +643,30 @@ mod tests {
     }
 
     #[test]
+    fn localisation_names_the_first_divergent_operation() {
+        let model = tiny_model();
+        // Change one weight of layer 1's up projection in the GPU's copy only:
+        // every operation before layer1.up agrees, and layer1.up differs.
+        let mut altered = model.clone();
+        let weight = &mut altered.layers[1].w_up.q[0];
+        *weight = if *weight > 0 { -127 } else { 127 };
+        let Some(mut engine) = gpu_or_skip(&altered, 1) else {
+            return;
+        };
+        let tokens = [4u32, 4, 31];
+        let (divergence, compared) = localize(&model, &mut engine, &tokens, tokens.len()).unwrap();
+        assert_eq!(
+            divergence,
+            Some(Divergence {
+                forward: 0,
+                op: "layer1.up".into(),
+            })
+        );
+        // The whole first forward was compared (31 operations) before naming it.
+        assert_eq!(compared, 31);
+    }
+
+    #[test]
     fn gpu_trace_matches_cpu_trace() {
         let model = tiny_model();
         let Some(mut engine) = gpu_or_skip(&model, 1) else {
