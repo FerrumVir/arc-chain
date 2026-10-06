@@ -51,6 +51,13 @@ import {
   nativeMockEnabled,
 } from "./native-mock";
 import { DEFAULT_NODE_CONFIG } from "./types";
+import {
+  PUBLIC_VALIDATORS,
+  livePath,
+  type LiveReadRequest,
+  type LiveReadResult,
+} from "./network-stats/read";
+import { mockNetworkRead, type MockNetworkScenario } from "./network-stats/mock-chain";
 
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -2197,6 +2204,26 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       throw new Error(
         "Native paid requests require the native desktop app so signing stays in Rust.",
       );
+    case "network_live_read": {
+      // The live harness talks to one local node over HTTP. The public
+      // validators are reached only by the native command, so say so rather
+      // than read them from a browser page.
+      const request = (args as { request: LiveReadRequest }).request;
+      const validator = PUBLIC_VALIDATORS[request.validator];
+      const result: LiveReadResult = {
+        validator: request.validator,
+        label: validator?.label ?? `validator ${request.validator}`,
+        origin: validator?.origin ?? "",
+        path: livePath(request),
+        outcome: "unreachable",
+        httpStatus: null,
+        body: null,
+        detail: "the browser live harness reads only the local node",
+        fetchedAtUnixMs: Date.now(),
+        elapsedMs: 0,
+      };
+      return result as T;
+    }
     default:
       throw new Error(`Unhandled live command: ${cmd}`);
   }
@@ -3057,6 +3084,14 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return "/mock/.arc/models/standard.gguf" as T;
     case "remove_model":
       return undefined as T;
+    case "network_live_read": {
+      // A synthetic chain (lib/network-stats/mock-chain.ts). Tests steer it
+      // through `window.__ARC_MOCK_NETWORK__`.
+      const request = (args as { request: LiveReadRequest }).request;
+      const scenario =
+        (globalThis as { __ARC_MOCK_NETWORK__?: MockNetworkScenario }).__ARC_MOCK_NETWORK__ ?? {};
+      return mockNetworkRead(request, Date.now(), scenario) as T;
+    }
     default:
       throw new Error(`Unmocked Tauri command: ${cmd}`);
   }
@@ -3252,6 +3287,12 @@ export const api = {
     invoke<ThreadsApplied>("set_worker_threads", { threads }),
   /** This machine's community worker: state and job counters (local node only). */
   fetchWorkerStatus: () => invoke<WorkerStatus>("fetch_worker_status"),
+  /**
+   * One read-only GET for the live network panel. Native code builds the path
+   * from the typed request (five allowlisted reads, never /community/list).
+   */
+  networkLiveRead: (request: LiveReadRequest) =>
+    invoke<LiveReadResult>("network_live_read", { request }),
   /**
    * Turn compute contribution on (download the model if needed, worker mode,
    * restart) or off (observer mode). Returns the saved config.

@@ -547,11 +547,11 @@ factual_candidate_copy_matches_source_and_release_gates() {
     local desktop_spec_files playwright_inventory
     desktop_spec_files="$(find "$REPO_ROOT/desktop/tests" -maxdepth 1 -type f \
         -name '*.spec.ts' | wc -l | tr -d ' ')"
-    assert_equals 24 "$desktop_spec_files" \
+    assert_equals 25 "$desktop_spec_files" \
         'documented Playwright file inventory drifted from the current tree' || return 1
-    require_literal "$DESKTOP_README" '289 tests in' \
+    require_literal "$DESKTOP_README" '306 tests in' \
         'desktop README does not carry the audited Playwright test inventory' || return 1
-    require_literal "$DESKTOP_README" '24 files.' \
+    require_literal "$DESKTOP_README" '25 files.' \
         'desktop README does not carry the audited Playwright file inventory' || return 1
     if grep -Eq '176 tests|68[[:space:]]+native tests' "$DESKTOP_README"; then
         printf 'desktop README retains a stale hard-coded test inventory\n'
@@ -566,7 +566,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
             CI='' ./node_modules/.bin/playwright test --list 2>/dev/null \
                 | sed -n 's/^Total: //p' | tail -n 1
         )"
-        assert_equals '289 tests in 24 files' "$playwright_inventory" \
+        assert_equals '306 tests in 25 files' "$playwright_inventory" \
             'desktop README Playwright inventory differs from playwright --list' || return 1
     fi
 

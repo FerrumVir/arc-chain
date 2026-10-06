@@ -1,0 +1,123 @@
+{
+  "schema": "arc.network-stats.v1.window-vectors",
+  "window_length_ms": 60000,
+  "expansion": "Blocks start at first_height. The first block's timestamp is first_timestamp_ms; every later block's timestamp is the previous block's plus the interval_ms of the segment it belongs to. A block's tx_count is tx[i % tx.length], where i is its 0-based index inside its segment. Heights listed in omit_heights are then removed. Hashes do not affect these results; give each block any hash and set parent_hash to the previous height's hash.",
+  "vectors": [
+    {
+      "name": "steady chain: 4 blocks per second, 2 transactions in every fourth block",
+      "first_height": 1000,
+      "first_timestamp_ms": 1790000000000,
+      "segments": [{ "blocks": 300, "interval_ms": 250, "tx": [2, 0, 0, 0] }],
+      "omit_heights": [],
+      "expect": {
+        "complete": true,
+        "end_height": 1299,
+        "blocks": 240,
+        "finalized_tx": 120,
+        "blocks_per_second": 4,
+        "tps": 2
+      }
+    },
+    {
+      "name": "a block exactly 60 s before the end is outside the window",
+      "first_height": 1,
+      "first_timestamp_ms": 1790000000000,
+      "segments": [
+        { "blocks": 2, "interval_ms": 1, "tx": [5] },
+        { "blocks": 1, "interval_ms": 60000, "tx": [7] }
+      ],
+      "omit_heights": [],
+      "expect": {
+        "complete": true,
+        "end_height": 3,
+        "blocks": 1,
+        "finalized_tx": 7,
+        "blocks_per_second": 0.016666666666666666,
+        "tps": 0.11666666666666667
+      }
+    },
+    {
+      "name": "a block 1 ms inside the window is counted",
+      "first_height": 1,
+      "first_timestamp_ms": 1790000000000,
+      "segments": [
+        { "blocks": 2, "interval_ms": 2, "tx": [5] },
+        { "blocks": 1, "interval_ms": 59999, "tx": [7] }
+      ],
+      "omit_heights": [],
+      "expect": {
+        "complete": true,
+        "end_height": 3,
+        "blocks": 2,
+        "finalized_tx": 12,
+        "blocks_per_second": 0.03333333333333333,
+        "tps": 0.2
+      }
+    },
+    {
+      "name": "100 blocks spanning 24.75 s are not a full window: no rate",
+      "first_height": 500,
+      "first_timestamp_ms": 1790000000000,
+      "segments": [{ "blocks": 100, "interval_ms": 250, "tx": [1] }],
+      "omit_heights": [],
+      "expect": {
+        "complete": false,
+        "end_height": 599,
+        "blocks": null,
+        "finalized_tx": null,
+        "blocks_per_second": null,
+        "tps": null
+      }
+    },
+    {
+      "name": "a missing block makes the window incomplete",
+      "first_height": 1000,
+      "first_timestamp_ms": 1790000000000,
+      "segments": [{ "blocks": 300, "interval_ms": 250, "tx": [1] }],
+      "omit_heights": [1200],
+      "expect": {
+        "complete": false,
+        "end_height": null,
+        "blocks": null,
+        "finalized_tx": null,
+        "blocks_per_second": null,
+        "tps": null
+      }
+    },
+    {
+      "name": "the walk back stops at the first block at or before the window start",
+      "first_height": 1,
+      "first_timestamp_ms": 1790000000000,
+      "segments": [
+        { "blocks": 1, "interval_ms": 0, "tx": [1] },
+        { "blocks": 1, "interval_ms": 70000, "tx": [1] },
+        { "blocks": 1, "interval_ms": -69000, "tx": [1] },
+        { "blocks": 1, "interval_ms": 60000, "tx": [1] }
+      ],
+      "omit_heights": [],
+      "expect": {
+        "complete": true,
+        "end_height": 4,
+        "blocks": 1,
+        "finalized_tx": 1,
+        "blocks_per_second": 0.016666666666666666,
+        "tps": 0.016666666666666666
+      }
+    },
+    {
+      "name": "slow chain: one block every 10 s",
+      "first_height": 1,
+      "first_timestamp_ms": 1790000000000,
+      "segments": [{ "blocks": 10, "interval_ms": 10000, "tx": [3, 0] }],
+      "omit_heights": [],
+      "expect": {
+        "complete": true,
+        "end_height": 10,
+        "blocks": 6,
+        "finalized_tx": 9,
+        "blocks_per_second": 0.1,
+        "tps": 0.15
+      }
+    }
+  ]
+}

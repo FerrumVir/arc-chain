@@ -1,0 +1,41 @@
+{
+  "schema": "arc.measured-records.v1",
+  "records": [
+    {
+      "id": "lab-payments-per-second",
+      "headline": "168.6 payments per second",
+      "detail": "Lab test: all six validators ran on one 4-vCPU GitHub runner, with the once-per-block fee settlement from PR #133, which is not active on the live network. Per the PR, only the before/after ratio is meaningful; absolute numbers depend on the hardware.",
+      "setting": "lab",
+      "measured_on": "2026-10-04",
+      "prs": [133],
+      "receipts": [
+        {
+          "label": "Throughput run 37238163514",
+          "url": "https://github.com/FerrumVir/arc-chain/actions/runs/37238163514"
+        }
+      ]
+    },
+    {
+      "id": "same-answer-bit-for-bit",
+      "headline": "Same answer, bit for bit, on the computers we tested",
+      "detail": "Llama-2-7B gave byte-identical output on Linux, Windows and Intel Mac with the scalar and the AVX2 kernel (6 of 6 runs, 16 prompts × 32 tokens). On a shorter test (2 prompts × 4 tokens) Apple Silicon matched too: 8 of 8 runs identical across the four platforms. SmolLM3-3B matched on Apple Silicon Mac, Intel Mac, Linux and Windows, scalar and SIMD (8 of 8), and an independent Python reference agreed. GitHub-hosted CPUs; GPUs not covered.",
+      "setting": "ci",
+      "measured_on": "2026-10-06",
+      "prs": [136, 137],
+      "receipts": [
+        {
+          "label": "PR #136 full run (Linux, Windows, Intel Mac)",
+          "url": "https://github.com/FerrumVir/arc-chain/actions/runs/37467005539"
+        },
+        {
+          "label": "PR #136 short run (all four platforms)",
+          "url": "https://github.com/FerrumVir/arc-chain/actions/runs/37458030569"
+        },
+        {
+          "label": "PR #137 eight-way run",
+          "url": "https://github.com/FerrumVir/arc-chain/actions/runs/37473148757"
+        }
+      ]
+    }
+  ]
+}

@@ -3,6 +3,7 @@ mod commands;
 mod hardware;
 mod identity;
 mod native_paid;
+mod network_live;
 mod node_manager;
 mod paths;
 mod production_acceptance;
@@ -699,6 +700,7 @@ pub fn run() {
             commands::fetch_earnings_projection,
             commands::fetch_node_contribution,
             commands::fetch_worker_status,
+            network_live::network_live_read,
             commands::set_compute_contribution,
             commands::promote_consented_install,
             commands::set_prevent_sleep_during_jobs,
