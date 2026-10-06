@@ -3,9 +3,11 @@ import { readFileSync } from "node:fs";
 import {
   parseFinality,
   parseHealth,
+  parseModelStats,
   parseScoreboard,
   parseTwinStats,
   summarizeCommunity,
+  summarizeModels,
   summarizeTwin,
   summarizeValidators,
 } from "../src/lib/network-stats/aggregate";
@@ -305,6 +307,60 @@ test.describe("network stats: aggregation and missing endpoints", () => {
     expect(twin.as_of_unix_ms).toBe(20);
   });
 
+  test("keeps per-model stats empty until reported, then sums tokens and pools answers", () => {
+    const empty = summarizeModels([]);
+    expect(empty).toMatchObject({ available: false, window_ms: null, per_model: [] });
+    expect(empty.reason).toBe("No validator reports per-model serving stats yet.");
+
+    // Test fixtures for the proposed arc.community.model-stats.v1 source.
+    const body = (windowSecs: number, served: number, verified: number, rates: number[]) => ({
+      schema: "arc.community.model-stats.v1",
+      window_secs: windowSecs,
+      models: [
+        {
+          model_id: "0xAB",
+          model_name: "fixture-model",
+          answers: rates.length,
+          served_tokens: served,
+          verified_tokens: verified,
+          answer_tokens_per_second: rates,
+        },
+      ],
+    });
+    const read = (validator: number, payload: unknown) => {
+      const parsed = parseModelStats(result("modelStats", validator, "ok", payload));
+      if (parsed.kind !== "counts") throw new Error(`fixture did not parse: ${parsed.reason}`);
+      return parsed.reading;
+    };
+    const models = summarizeModels([read(0, body(3600, 7_200, 7_000, [10, 11, 12])), read(1, body(3600, 3_600, 3_600, [50])), null]);
+    expect(models.available).toBe(true);
+    expect(models.window_ms).toBe(3_600_000);
+    expect(models.per_model).toHaveLength(1);
+    const [model] = models.per_model;
+    expect(model).toMatchObject({
+      model_id: "0xab",
+      model_name: "fixture-model",
+      served_tokens: 10_800,
+      verified_tokens: 10_600,
+      answers: 4,
+      answer_samples: 4,
+      coordinators_reporting: 2,
+    });
+    expect(model.served_tokens_per_second).toBeCloseTo(3, 12);
+    expect(model.verified_share).toBeCloseTo(10_600 / 10_800, 12);
+    // The median of the pooled answers (10, 11, 12, 50) is 11.5; averaging the
+    // coordinators' medians (11 and 50) would claim 30.5.
+    expect(model.median_answer_tokens_per_second).toBe(11.5);
+
+    // Different windows are never combined.
+    const mixed = summarizeModels([read(0, body(3600, 1, 1, [5])), read(1, body(60, 1, 1, [5]))]);
+    expect(mixed.available).toBe(false);
+    expect(mixed.reason).toContain("different windows");
+    // A missing endpoint is absent, not zero; inconsistent counters are refused.
+    expect(parseModelStats(result("modelStats", 2, "notFound"))).toMatchObject({ kind: "absent" });
+    expect(parseModelStats(result("modelStats", 2, "ok", body(3600, 10, 11, [5])))).toMatchObject({ kind: "error" });
+  });
+
   test("states a missing endpoint instead of showing zero", async () => {
     expect(parseFinality(result("finality", 1, "notFound"))).toEqual({
       ok: false,
@@ -524,5 +580,38 @@ test.describe("measured records", () => {
     missing.records[0].receipts = [];
     expect(measuredRecordsProblems(missing).join("\n")).toContain("at least one receipt is required");
     expect(formatRecordDate("2026-10-06")).toBe("6 Oct 2026");
+
+    // Ready for future model-speed records. A test fixture, not a claim.
+    const fixture = {
+      id: "fixture-model-speed",
+      headline: "Fixture model at 12.5 tokens per second per answer",
+      detail: "Test fixture only.",
+      setting: "testnet",
+      measured_on: "2026-12-01",
+      prs: [1],
+      model: "fixture-model",
+      hardware: "fixture hardware",
+      metric: "answer_tokens_per_second",
+      value: 12.5,
+      unit: "tok/s",
+      receipts: [
+        {
+          label: "evidence file",
+          url: `https://github.com/FerrumVir/arc-chain/blob/${"a".repeat(40)}/docs/evidence.json`,
+        },
+      ],
+    };
+    const check = (patch: Record<string, unknown>) =>
+      measuredRecordsProblems({
+        schema: "arc.measured-records.v1",
+        records: [{ ...fixture, ...patch }],
+      }).join("\n");
+    expect(check({})).toBe("");
+    expect(check({ setting: "projection" })).toContain("a projection is not a record");
+    expect(check({ unit: undefined })).toContain("unit is missing");
+    expect(check({ hardware: undefined })).toContain("must name the exact model and the hardware");
+    expect(
+      check({ receipts: [{ label: "moving branch", url: "https://github.com/FerrumVir/arc-chain/blob/main/x.json" }] }),
+    ).toContain("commit-pinned");
   });
 });

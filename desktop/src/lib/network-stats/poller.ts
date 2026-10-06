@@ -49,6 +49,7 @@ import {
   parseScoreboard,
   parseTwinStats,
   summarizeCommunity,
+  summarizeModels,
   summarizeTwin,
   summarizeValidators,
   type HealthSample,
@@ -295,6 +296,9 @@ export function createNetworkStatsPoller(options: PollerOptions): NetworkStatsPo
       window: windowPart,
       community: communitySection,
       twin: twinSection,
+      // No validator reports per-model serving stats yet, so nothing is read
+      // for them; the section stays empty and unavailable until one does.
+      models: summarizeModels([]),
     };
     for (const listener of listeners) listener();
   }

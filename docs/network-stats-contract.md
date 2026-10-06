@@ -145,6 +145,14 @@ Keys are snake_case. Times are unix milliseconds. Rates are per second.
     "source": null,
     "as_of_unix_ms": null,
     "reason": "No validator serves /community/twin_stats yet; it arrives with v0.8.11 (PR #139)."
+  },
+  "models": {                       // per-model live stats: empty until a validator reports them
+    "available": false,
+    "window_ms": null,
+    "per_model": [],                // see "Per-model live stats" for each entry's fields
+    "source": null,
+    "as_of_unix_ms": null,
+    "reason": "No validator reports per-model serving stats yet."
   }
 }
 ```
@@ -239,6 +247,53 @@ restarts; `since_unix_ms` is the earliest start among those reporting. Until a
 validator serves either source, `available` is false and every figure is
 null. The desktop hides these figures entirely in that state.
 
+### Per-model live stats (defined now, reported later)
+
+These figures are defined now so that the desktop, the website and the
+validators agree on them before any validator reports them. Until then
+`models.available` is false, `per_model` is empty, and the desktop shows
+nothing for them. The fields are listed in this order:
+
+| Field | Definition |
+|---|---|
+| `model_id`, `model_name` | the exact model identity (0x-prefixed hash) and its name, as the source reports them |
+| `served_tokens` | output tokens of answers completed in the window, summed over coordinators |
+| `served_tokens_per_second` | `served_tokens` ÷ window seconds (a trailing average: label it with the window, e.g. "average over the last hour") |
+| `verified_tokens`, `verified_share` | output tokens of those answers that passed verification (twin match or validator recompute), and `verified_tokens ÷ served_tokens` (0..1; displayed like the match rate, truncated, never rounded up to 100%) |
+| `answers` | answers completed in the window |
+| `median_answer_tokens_per_second` | the median, over the **pooled** answers of every coordinator, of each answer's decode rate `(output tokens − 1) ÷ (last token time − first token time)`; answers with fewer than 2 output tokens have no rate |
+| `answer_samples` | how many per-answer rates were pooled (a source may report only its most recent answers) |
+| `coordinators_reporting`, `reason` | how many coordinators contributed; why a figure is null |
+
+Rules:
+
+- A median is never combined from medians. Averaging two coordinators'
+  medians of 11 and 50 tok/s would claim 30.5. The median of their pooled
+  answers (10, 11, 12, 50) is 11.5. `summarizeModels()` in `aggregate.ts`
+  implements this and a unit test pins it.
+- Counts over different windows are never combined.
+- The per-answer rate is a decode rate. It leaves out time to first token,
+  which gets its own figure once it is measured. Compare it only with the
+  same quantity for the same model, for example a hosted API's per-answer
+  output speed. Show such a comparison only as a dated, sourced reference,
+  never inside a live figure.
+
+**Proposed source (not built yet; the desktop does not request it).**
+`GET /community/model_stats`, schema `arc.community.model-stats.v1`, returned
+per coordinator:
+- `window_secs`;
+- per model: `model_id`, `model_name`, `answers`, `served_tokens`,
+  `verified_tokens` (≤ `served_tokens`), and `answer_tokens_per_second`, one
+  rate per answer, newest first, capped (for example at 1,000).
+
+`parseModelStats()` already reads this shape. When a validator serves it,
+three things are needed:
+1. add a sixth typed read to `src-tauri/src/network_live.rs` and to the poller;
+2. extend the gateway allowlist;
+3. show the section in the panel.
+
+The fields above stay the same.
+
 ## Display rules
 
 | Figure | Label | Format |
@@ -250,6 +305,9 @@ null. The desktop hides these figures entirely in that state.
 | community.ready_workers | "Community nodes ready" | whole number; "online, idle and running the network model" |
 | twin.verified_tokens_per_second | "Verified tokens per second" | rate format; "average over the last hour" |
 | twin.match_rate | "Twin match rate" | percentage with one decimal, **truncated, never rounded up**: 1,999 of 2,000 is 99.9%, not 100.0%; 100% only when nothing mismatched |
+| models[].served_tokens_per_second | "Served tokens per second" (per model) | rate format, with the window: "average over the last hour" |
+| models[].verified_share | "Verified" (per model) | like the match rate: truncated, never rounded up |
+| models[].median_answer_tokens_per_second | "Median tokens per second per answer" | rate format, with `answer_samples`: "median of 412 answers" |
 
 - A null figure is a dash with its reason, never 0.
 - Counters move only when a value changes, and not at all when the viewer
@@ -268,13 +326,28 @@ live". Each record carries:
 | `id` | stable identifier |
 | `headline` | the figure or claim in plain words |
 | `detail` | what exactly was measured, where, and what it does not cover |
-| `setting` | `lab` (a staged test) or `ci` (public CI machines); never the live network |
+| `setting` | `lab` (a staged test, such as several validators on one machine), `ci` (public CI runners), or `testnet` (measured once on the public testnet, on the stated date). A projection is never a record |
 | `measured_on` | `YYYY-MM-DD` |
 | `prs` | the pull requests it came from |
-| `receipts` | one or more `{ label, url }` links to public CI runs in this repository |
+| `receipts` | one or more `{ label, url }` links: a public CI run in this repository (optionally one job), or an evidence file pinned to a commit (`…/blob/<40-hex commit>/…`) |
+| `model` (optional) | the exact model, for model records |
+| `hardware` (optional) | the machines it ran on |
+| `metric`, `value`, `unit` (optional, all three together) | the measured figure: `metric` is one of `transfers_per_second`, `answer_tokens_per_second`, `served_tokens_per_second`, `time_to_first_token_seconds` |
 
 Add a record only with its receipt. `measuredRecordsProblems()` in
 `records.ts` checks the list, and a unit test runs it on every change.
+
+**Adding a model-speed record (for example, a Kimi-class model at X tok/s).**
+- Name the exact model and revision in `model`, for example the Hugging Face
+  repository and commit. "Kimi-class" may appear in the headline only next to
+  that exact name.
+- Describe the hardware in `hardware`: machine count, type, memory and
+  interconnect. A model-speed record without `model` and `hardware` is refused.
+- Use `answer_tokens_per_second` for a per-answer decode rate, or
+  `served_tokens_per_second` for aggregate throughput. The `value` must be the
+  number in the receipt, not an estimate or a projection.
+- Set `setting` to where it was measured, and set the date.
+- Link a receipt that contains the raw measurements.
 
 ## Versioning
 

@@ -19,6 +19,7 @@ import {
 } from "../lib/network-stats/format";
 import recordsJson from "../lib/network-stats/measured-records.json";
 import {
+  RECORD_SETTING_LABELS,
   formatRecordDate,
   pullRequestUrl,
   type MeasuredRecords,
@@ -292,11 +293,17 @@ export function MeasuredRecordsCard() {
             <p className="measured-record-detail">{record.detail}</p>
             <div className="measured-record-meta">
               <span className="measured-record-setting">
-                {record.setting === "lab" ? "Lab test" : "Test machines"}
+                {RECORD_SETTING_LABELS[record.setting] ?? record.setting}
               </span>
               <span data-testid="measured-record-date">
                 Measured {formatRecordDate(record.measured_on)}
               </span>
+              {record.model && (
+                <span data-testid="measured-record-model">Model: {record.model}</span>
+              )}
+              {record.hardware && (
+                <span data-testid="measured-record-hardware">On {record.hardware}</span>
+              )}
               {record.prs.map((pr) => (
                 <button
                   key={pr}

@@ -324,6 +324,159 @@ export function summarizeTwin(readings: ReadonlyArray<TwinSlotReading>): Network
   };
 }
 
+// ── per-model live stats (proposed source) ──────────────────────────────
+
+/**
+ * Proposed schema for a validator's per-model serving counters. No validator
+ * serves it yet; the desktop does not request it. It is defined so the
+ * figures in `models` have one meaning before the endpoint is built (see
+ * "Per-model live stats" in docs/network-stats-contract.md).
+ */
+export const MODEL_STATS_SCHEMA = "arc.community.model-stats.v1";
+
+export interface ModelCounts {
+  modelId: string;
+  modelName: string | null;
+  answers: number;
+  servedTokens: number;
+  verifiedTokens: number;
+  /** One decode rate per answer, as the coordinator reported them. */
+  answerRates: number[];
+}
+
+/** One coordinator's per-model counters over its trailing window. */
+export interface ModelStatsReading {
+  windowSecs: number;
+  models: ModelCounts[];
+  asOfUnixMs: number | null;
+}
+
+export type ModelStatsParse =
+  | { kind: "counts"; reading: ModelStatsReading }
+  | { kind: "absent"; reason: string }
+  | { kind: "error"; reason: string };
+
+export function parseModelStats(result: LiveReadResult): ModelStatsParse {
+  if (result.outcome === "notFound") return { kind: "absent", reason: readFailureReason(result) };
+  if (result.outcome !== "ok") return { kind: "error", reason: readFailureReason(result) };
+  const body = record(result.body);
+  const refuse = (what: string): ModelStatsParse => ({
+    kind: "error",
+    reason: `${result.label} answered with per-model stats that ${what}.`,
+  });
+  if (!body || body.schema !== MODEL_STATS_SCHEMA) return refuse(`lack the ${MODEL_STATS_SCHEMA} schema`);
+  const windowSecs = count(body.window_secs);
+  if (windowSecs === null || windowSecs === 0) return refuse("have no window");
+  if (!Array.isArray(body.models)) return refuse("have no models list");
+  const models: ModelCounts[] = [];
+  for (const raw of body.models as unknown[]) {
+    const model = record(raw);
+    const modelId = text(model?.model_id);
+    const answers = count(model?.answers);
+    const servedTokens = count(model?.served_tokens);
+    const verifiedTokens = count(model?.verified_tokens);
+    const rates = model?.answer_tokens_per_second;
+    if (
+      modelId === null ||
+      answers === null ||
+      servedTokens === null ||
+      verifiedTokens === null ||
+      verifiedTokens > servedTokens ||
+      !Array.isArray(rates) ||
+      !rates.every((r: unknown) => typeof r === "number" && Number.isFinite(r) && r > 0)
+    ) {
+      return refuse("are incomplete or inconsistent");
+    }
+    models.push({
+      modelId: modelId.toLowerCase(),
+      modelName: text(model?.model_name),
+      answers,
+      servedTokens,
+      verifiedTokens,
+      answerRates: rates as number[],
+    });
+  }
+  return { kind: "counts", reading: { windowSecs, models, asOfUnixMs: result.fetchedAtUnixMs } };
+}
+
+/** The median of a sample; null when empty. */
+export function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * Per-model figures across coordinators: token counts are summed (each answer
+ * is recorded by the one coordinator that served it), the median is taken over
+ * the pooled per-answer rates, and readings over different windows are never
+ * mixed.
+ */
+export function summarizeModels(
+  readings: ReadonlyArray<ModelStatsReading | null>,
+): NetworkStatsV1["models"] {
+  const present = readings.filter((r): r is ModelStatsReading => r !== null);
+  const none = {
+    available: false,
+    window_ms: null,
+    per_model: [],
+    source: null,
+    as_of_unix_ms: null,
+  };
+  if (present.length === 0) {
+    return { ...none, reason: "No validator reports per-model serving stats yet." };
+  }
+  const windowSecs = present[0].windowSecs;
+  if (present.some((r) => r.windowSecs !== windowSecs)) {
+    return {
+      ...none,
+      reason: "Coordinators report per-model stats over different windows, so they are not combined.",
+    };
+  }
+  const byModel = new Map<string, { name: string | null; counts: ModelCounts[] }>();
+  for (const reading of present) {
+    for (const model of reading.models) {
+      const entry = byModel.get(model.modelId) ?? { name: model.modelName, counts: [] };
+      entry.name ??= model.modelName;
+      entry.counts.push(model);
+      byModel.set(model.modelId, entry);
+    }
+  }
+  const perModel = [...byModel.entries()].map(([modelId, entry]) => {
+    const served = entry.counts.reduce((sum, c) => sum + c.servedTokens, 0);
+    const verified = entry.counts.reduce((sum, c) => sum + c.verifiedTokens, 0);
+    const answers = entry.counts.reduce((sum, c) => sum + c.answers, 0);
+    const rates = entry.counts.flatMap((c) => c.answerRates);
+    const middle = median(rates);
+    return {
+      model_id: modelId,
+      model_name: entry.name,
+      served_tokens: served,
+      served_tokens_per_second: served / windowSecs,
+      verified_tokens: verified,
+      verified_share: served > 0 ? verified / served : null,
+      answers,
+      median_answer_tokens_per_second: middle,
+      answer_samples: rates.length,
+      coordinators_reporting: entry.counts.length,
+      reason: middle === null ? "No per-answer rates were reported in this window." : null,
+    };
+  });
+  const asOf = present.reduce<number | null>(
+    (newest, r) => (r.asOfUnixMs === null ? newest : Math.max(newest ?? 0, r.asOfUnixMs)),
+    null,
+  );
+  return {
+    available: true,
+    window_ms: windowSecs * 1000,
+    per_model: perModel,
+    source: SOURCES.modelStats,
+    as_of_unix_ms: asOf,
+    reason: null,
+  };
+}
+
 /** An empty document: every figure unknown. */
 export function emptyNetworkStats(validators: ReadonlyArray<ValidatorRef>): NetworkStatsV1 {
   const { validators: v, chain } = summarizeValidators(validators, []);
@@ -351,5 +504,6 @@ export function emptyNetworkStats(validators: ReadonlyArray<ValidatorRef>): Netw
     },
     community: summarizeCommunity(validators, []),
     twin: summarizeTwin([]),
+    models: summarizeModels([]),
   };
 }

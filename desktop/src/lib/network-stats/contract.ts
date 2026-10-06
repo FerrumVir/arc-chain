@@ -33,6 +33,7 @@ export const SOURCES = {
   community: "GET /workers/scoreboard?limit=0 (eligible_inference_workers)",
   twinStats: "GET /community/twin_stats",
   twinScoreboard: "GET /workers/scoreboard (twin summary)",
+  modelStats: "GET /community/model_stats (proposed; no validator serves it yet)",
 } as const;
 
 export interface ValidatorHealthV1 {
@@ -63,6 +64,37 @@ export interface VersionCountV1 {
  * `unavailable`: the latest window read failed on every validator tried.
  */
 export type WindowStatusV1 = "waiting" | "measuring" | "live" | "stalled" | "unavailable";
+
+/**
+ * Live serving figures for one model, over the source's trailing window
+ * (`models.window_ms`). Defined now so the desktop, the website and the
+ * validators agree before any validator reports them; see "Per-model live
+ * stats" in docs/network-stats-contract.md.
+ */
+export interface ModelStatsV1 {
+  /** Exact model identity as the source reports it (0x-prefixed hash). */
+  model_id: string;
+  model_name: string | null;
+  /** Output tokens of answers completed in the window, summed over coordinators. */
+  served_tokens: number | null;
+  /** served_tokens / window seconds. */
+  served_tokens_per_second: number | null;
+  /** Output tokens of those answers that passed verification (twin match or validator recompute). */
+  verified_tokens: number | null;
+  /** verified_tokens / served_tokens, 0..1. */
+  verified_share: number | null;
+  /** Answers completed in the window. */
+  answers: number | null;
+  /**
+   * Median over the pooled per-answer decode rates, each (output tokens - 1)
+   * / (last token time - first token time). Never an average of medians.
+   */
+  median_answer_tokens_per_second: number | null;
+  /** Per-answer rates behind the median (sources may report only their most recent answers). */
+  answer_samples: number;
+  coordinators_reporting: number;
+  reason: string | null;
+}
 
 export interface NetworkStatsV1 {
   schema: typeof NETWORK_STATS_SCHEMA;
@@ -153,6 +185,20 @@ export interface NetworkStatsV1 {
     coordinators_reporting: number;
     /** Earliest coordinator start among those reporting (their counters reset on restart). */
     since_unix_ms: number | null;
+    source: string | null;
+    as_of_unix_ms: number | null;
+    reason: string | null;
+  };
+  /**
+   * Per-model live serving figures (served tokens per second, verified share,
+   * median per-answer tokens per second). `available` stays false, and
+   * `per_model` empty, until a validator reports them.
+   */
+  models: {
+    available: boolean;
+    /** The trailing window every per-model figure covers. */
+    window_ms: number | null;
+    per_model: ModelStatsV1[];
     source: string | null;
     as_of_unix_ms: number | null;
     reason: string | null;

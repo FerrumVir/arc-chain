@@ -7,6 +7,10 @@
       "detail": "Lab test: all six validators ran on one 4-vCPU GitHub runner, with the once-per-block fee settlement from PR #133, which is not active on the live network. Per the PR, only the before/after ratio is meaningful; absolute numbers depend on the hardware.",
       "setting": "lab",
       "measured_on": "2026-10-04",
+      "hardware": "one 4-vCPU ubuntu-24.04 GitHub runner hosting all six validators",
+      "metric": "transfers_per_second",
+      "value": 168.6,
+      "unit": "transfers/s",
       "prs": [133],
       "receipts": [
         {
