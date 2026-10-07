@@ -22,6 +22,7 @@ SOURCES = {
     "chat": ("OpenAssistant/oasst1", "fdf72ae0827c1cda404aff25b6603abec9e3399b", "2023-04-12_oasst_ready.messages.jsonl.gz", "286a6e9a5a413b3272ae9c0b5a20d327983dea1c24342ae28cb244a6da65185c", "chat.jsonl.gz", "Apache-2.0"),
 }
 TOKENIZER = "https://huggingface.co/HuggingFaceTB/SmolLM3-3B/resolve/a07cc9a04f16550a088caea529712d1d335b0ac1/tokenizer.json"
+BPE_SHA256 = "7b6a500b662a34eb3f0374db856ba4ad7de4c81040571d78dc0d357238930005"
 SEED = "ARC-70-public-v1:"
 
 
@@ -50,7 +51,7 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     for repo, revision, filename, digest, local, _ in SOURCES.values():
         fetch(f"https://huggingface.co/datasets/{repo}/resolve/{revision}/{filename}", args.cache / local, digest)
-    fetch(TOKENIZER, args.cache / "tokenizer.json", "7b6a500b662a34eb3f0374db856ba4ad7de4c81040571d78dc0d357238930005")
+    fetch(TOKENIZER, args.cache / "tokenizer.json", BPE_SHA256)
     for name, item in json.loads((OUT / "licenses/manifest.json").read_text()).items():
         fetch(item["url"], OUT / "licenses" / name, item["sha256"])
     tokenizer = Tokenizer.from_file(str(args.cache / "tokenizer.json"))
