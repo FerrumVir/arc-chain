@@ -18,6 +18,58 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.11 - Release-preparation snapshot (2026-10-06)
+
+> **Candidate note:** This entry records the v0.8.11 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.11.
+
+- Community workers no longer publish their computer's hostname. A worker
+  registers as `node-` plus the first eight hex characters of its address,
+  or under a validated `--node-name` nickname that cannot look like an
+  operating system's default computer name or another worker's label.
+  Validators redact names when a worker registers and again whenever
+  `/workers/scoreboard` or `/community/list` is served, so names stored by
+  older workers stop being published once validators run this release.
+- Windows and Linux machines that report slightly under 16 GB (within 15%,
+  or at least 1 GiB, of the marketed size) count as 16 GB for worker
+  eligibility.
+- Model downloads resume after an interruption, show progress, and are
+  checked against the pinned size and SHA-256 before the file is used.
+  A mirror that keeps restarting from byte 0 stops the download after a
+  bounded number of restarts instead of re-fetching the file indefinitely.
+- The macOS install steps follow macOS 15's Open Anyway flow.
+- Contributing compute is an explicit choice: a Settings switch, or choosing
+  the model during setup, which now says that it means running ARC jobs.
+  Once on, the app downloads the model if needed, switches to worker mode
+  and restarts the node. Turning it off returns the node to observer mode
+  without loading the model, and a refusal saved during a download is
+  never overwritten. Ordinary Settings saves never change this choice,
+  the role or the model path. Keeping the computer awake during a job is
+  a separate opt-in.
+- Community workers re-register with a coordinator that forgets them (at
+  most once per 15 seconds per coordinator), back off between failed claim
+  rounds, and report their job counters to the desktop
+  app over loopback (`/community/worker/status`), which shows them on a
+  Jobs card.
+- Coordinators can dispatch community jobs to two independent workers and
+  compare their outputs (twin execution), keep coarse region tags from
+  opt-in worker latency reports, and generate demo demand. Every switch is
+  off by default. With them off, dispatch, claims, submissions, rewards and
+  `/workers/scoreboard` behave as in v0.8.10, and no consensus or on-chain
+  rule changes.
+- SmolLM3-3B is available as an additional deterministic integer model
+  package with its own converter and `arc-modern` tool. The network's model
+  and every validator and worker inference path are unchanged.
+- The TypeScript SDK tests move to jest 30, and the lockfiles audited for
+  release builds no longer contain packages with published advisories:
+  braces and sprintf-js leave the TypeScript SDK test tree, desktop moves to
+  source-map-js 1.2.2, and the dashboard serves its compiled CSS as a
+  reviewed static file with no npm dependencies.
+- The Apple Silicon jobs of the required CI checks can run on a self-hosted
+  Mac Studio runner once a repository variable is set. Until then, and
+  always for fork and Dependabot pull requests and for the release
+  workflows, they run on GitHub-hosted runners.
+
 ## v0.8.10 - Release-preparation snapshot (2026-09-30)
 
 > **Candidate note:** This entry records the v0.8.10 release-preparation
