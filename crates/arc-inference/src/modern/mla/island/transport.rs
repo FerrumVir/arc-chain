@@ -819,6 +819,14 @@ mod tests {
             } else {
                 (client, server)
             };
+            // Winsock can accept a single large send beyond SO_SNDBUF.
+            // Disable its send buffering in this fixture so a blocking write
+            // must wait for the deliberately slow reader (not kernel queuing).
+            // https://learn.microsoft.com/windows/win32/winsock/tcp-ip-specific-issues-2
+            #[cfg(windows)]
+            socket2::SockRef::from(&stream)
+                .set_send_buffer_size(0)
+                .unwrap();
             let mut link = DeadlineTcpLink::new(stream, Duration::from_millis(150)).unwrap();
             let reader = std::thread::spawn(move || {
                 peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
