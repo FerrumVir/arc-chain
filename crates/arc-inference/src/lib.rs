@@ -28,6 +28,9 @@ pub mod modern;
 pub mod q4_engine;
 #[cfg(unix)]
 pub mod row_service;
+/// Stage-to-stage transport, exact activation codec, WAN simulation and
+/// placement for pipeline-sharded inference (ENG-9). Not wired into the node.
+pub mod stage_net;
 pub mod streaming;
 /// Private-cohort, within-query tensor row partitioning.  This deliberately
 /// has no dependency on validator RPC or the public layer-pipeline endpoint.
