@@ -5,7 +5,9 @@
 //! One store owns a private cache directory (do not share it between processes).
 //! Only verified objects are returned or served. `.part` files are untrusted
 //! resume state, never model inputs. Consumers must keep the cache private.
-//! ENG-10's manifest adapter and island-worker lifecycle are separate callers.
+//! The ENG-10 adapter and explicit local worker live in [`manifest`].
+
+pub mod manifest;
 
 use crate::config::SliceDistributionConfig;
 use futures_util::stream;

@@ -605,6 +605,29 @@ struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum OperatorCommand {
+    /// Acquire explicitly selected, pinned ENG-10 slices and serve verified
+    /// cache objects. Requires node config slice_distribution.host_slices=true.
+    /// This local worker does not join an island or enable inference.
+    SliceWorker {
+        #[arg(long)]
+        node_config: String,
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Trusted out-of-band digest; never obtain this from the same manifest.
+        #[arg(long)]
+        manifest_blake3: String,
+        #[arg(long = "slice", required = true)]
+        slices: Vec<String>,
+        #[arg(long)]
+        cache: PathBuf,
+        /// Directory URLs containing <blake3>.slice files.
+        #[arg(long = "mirror")]
+        mirrors: Vec<reqwest::Url>,
+        #[arg(long = "peer")]
+        peers: Vec<reqwest::Url>,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+    },
     /// Print the actual native assignment policy commitment without starting
     /// a node, connecting workers, reading chain state, or loading a model.
     NativeAssignmentPolicy {
@@ -4650,6 +4673,43 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
 
 async fn run_operator_command(command: OperatorCommand) -> Result<()> {
     match command {
+        OperatorCommand::SliceWorker {
+            node_config,
+            manifest,
+            manifest_blake3,
+            slices,
+            cache,
+            mirrors,
+            peers,
+            listen,
+        } => {
+            use arc_node::slice_distribution::manifest::{ManifestAssignment, SliceWorker};
+            let config = arc_node::config::load_config(&node_config)?;
+            // Bound the read before parsing, including files changed after stat.
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::new();
+            tokio::fs::File::open(manifest)
+                .await?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            let assignment = ManifestAssignment::parse(&bytes, &manifest_blake3, &slices)?;
+            let worker = SliceWorker::new(
+                assignment,
+                cache,
+                &config.slice_distribution,
+                mirrors,
+                peers,
+            )?;
+            worker
+                .run(listen, async {
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        tracing::error!(%error, "slice worker signal handler failed");
+                    }
+                })
+                .await?;
+            Ok(())
+        }
         OperatorCommand::NativeAssignmentPolicy {
             row_workers,
             low_residency,
