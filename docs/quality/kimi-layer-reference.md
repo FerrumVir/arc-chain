@@ -15,6 +15,9 @@ report never produces certification or a PASS verdict.
   `moonshotai/Kimi-K2.6` revision `7eb5002f6aadc958aed6a9177b7ed26bb94011bb`,
   retained under `scripts/arc_quality/layer_probe/reference/` with Apache-2.0
   notice, config, hashes and provenance. `NOTICE.md` documents AST selection.
+  The secret scanner exempts only the exact official docstring import line at
+  this path (a generic-key false positive); adjacent credential-shaped input
+  remains detected. The official file is not edited to suppress the scanner.
   This executes PyTorch, not formula-only vectors or fabricated ARC records.
 - Reference compute: torch 2.9.1, CPU, one thread, eager attention, source BF16
   weights decoded to FP32, deterministic algorithms, no cache. ARC uses its
