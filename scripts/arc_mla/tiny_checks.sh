@@ -4,7 +4,8 @@
 #
 #   bash scripts/arc_mla/tiny_checks.sh ARC_MLA_BINARY WORKDIR EVIDENCE_DIR
 #
-# For the Moonlight-like and the Kimi-like tiny model:
+# For the Moonlight-like and the Kimi-like tiny model, each with INT8 dyadic
+# experts and with INT4 group-32 experts (spec section 13):
 #   1. the Rust converter and the independent Python preparer produce the same
 #      bytes for the whole model and for every stage of the 2- and 4-stage
 #      layouts; every stage package verifies against the whole-model manifest;
@@ -31,37 +32,40 @@ field() { python -c 'import json,sys; d=json.load(open(sys.argv[1]))
 for k in sys.argv[2:]: d=d[k]
 print(d)' "$@"; }
 
-for variant in moonlight kimi; do
+for combo in moonlight:i8 kimi:i8 moonlight:i4g32 kimi:i4g32; do
+  variant="${combo%%:*}"
+  fmt="${combo##*:}"
   src="$WORK/$variant"
-  out="$EV/$variant"
+  out="$EV/$variant-$fmt"
+  pkgs="$WORK/$variant-$fmt"
   mkdir -p "$out"
   python "$ROOT/scripts/arc_mla/make_tiny_mla_model.py" "$src" --variant "$variant" > "$out/generator.txt"
   manifest="$src/tiny-mla.source.json"
   cases="$src/tiny-mla.cases.json"
-  full="$WORK/$variant-0-4.arcspkg"
-  echo "== $variant: packages (Rust converter vs Python preparer)"
-  "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --out "$full" \
+  full="$pkgs-0-4.arcspkg"
+  echo "== $variant ($fmt experts): packages (Rust converter vs Python preparer)"
+  "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --experts "$fmt" --out "$full" \
     --manifest-out "$out/manifest.json" --report "$out/convert-0-4.json" > /dev/null
   for layers in 0:4 0:2 2:4 0:1 1:2 2:3 3:4; do
     tag="${layers/:/-}"
     if [ "$tag" != "0-4" ]; then
-      "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --layers "$layers" \
-        --out "$WORK/$variant-$tag.arcspkg" --report "$out/convert-$tag.json" > /dev/null
+      "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --layers "$layers" --experts "$fmt" \
+        --out "$pkgs-$tag.arcspkg" --report "$out/convert-$tag.json" > /dev/null
     fi
-    py_ref prepare --source-dir "$src" --source-manifest "$manifest" --layers "$layers" --hash-only \
-      --json-out "$out/prepare-$tag.json" > /dev/null
+    py_ref prepare --source-dir "$src" --source-manifest "$manifest" --layers "$layers" --experts "$fmt" \
+      --hash-only --json-out "$out/prepare-$tag.json" > /dev/null
     rust="$(field "$out/convert-$tag.json" package sha256)"
     python_sha="$(field "$out/prepare-$tag.json" sha256)"
     if [ "$rust" != "$python_sha" ]; then
-      echo "$variant [$layers]: Rust package $rust != Python package $python_sha" >&2
+      echo "$variant $fmt [$layers]: Rust package $rust != Python package $python_sha" >&2
       exit 1
     fi
-    "$BIN" verify --package "$WORK/$variant-$tag.arcspkg" --manifest "$out/manifest.json" \
+    "$BIN" verify --package "$pkgs-$tag.arcspkg" --manifest "$out/manifest.json" \
       --full-digest > "$out/verify-$tag.json"
-    echo "$variant [$layers]: sha256 $rust (Rust = Python; segments verified against the manifest)"
+    echo "$variant $fmt [$layers]: sha256 $rust (Rust = Python; segments verified against the manifest)"
   done
 
-  echo "== $variant: generation (Rust scalar, Rust SIMD, Python)"
+  echo "== $variant ($fmt experts): generation (Rust scalar, Rust SIMD, Python)"
   for kernel in scalar simd; do
     "$BIN" golden --package "$full" --cases "$cases" --kernel "$kernel" --out "$out/run-$kernel.json" > /dev/null
   done
@@ -81,14 +85,14 @@ assert golden["checks"]["all_match"], "Python teacher-forced verification found 
 print("python verify-run: all logits hashes, boundary digests and tokens match")
 PY
 
-  echo "== $variant: 1, 2 and 4 stages as separate processes"
+  echo "== $variant ($fmt experts): 1, 2 and 4 stages as separate processes"
   run="$out/run-scalar.json"
-  "$BIN" stage --package "$full" --run "$run" --out "$WORK/$variant-one-b4.bin" \
+  "$BIN" stage --package "$full" --run "$run" --out "$pkgs-one-b4.bin" \
     --report "$out/one-0-4.json" --manifest "$out/manifest.json" --kernel simd > /dev/null
-  "$BIN" stage --package "$WORK/$variant-0-2.arcspkg" --run "$run" --out "$WORK/$variant-two-b2.bin" \
+  "$BIN" stage --package "$pkgs-0-2.arcspkg" --run "$run" --out "$pkgs-two-b2.bin" \
     --report "$out/two-0-2.json" --manifest "$out/manifest.json" --kernel scalar > /dev/null
-  "$BIN" stage --package "$WORK/$variant-2-4.arcspkg" --input "$WORK/$variant-two-b2.bin" \
-    --out "$WORK/$variant-two-b4.bin" --report "$out/two-2-4.json" --manifest "$out/manifest.json" \
+  "$BIN" stage --package "$pkgs-2-4.arcspkg" --input "$pkgs-two-b2.bin" \
+    --out "$pkgs-two-b4.bin" --report "$out/two-2-4.json" --manifest "$out/manifest.json" \
     --kernel simd > /dev/null
   previous=""
   kernel=scalar
@@ -100,19 +104,19 @@ PY
     else
       input=(--input "$previous")
     fi
-    "$BIN" stage --package "$WORK/$variant-$tag.arcspkg" "${input[@]}" --out "$WORK/$variant-four-b$end.bin" \
+    "$BIN" stage --package "$pkgs-$tag.arcspkg" "${input[@]}" --out "$pkgs-four-b$end.bin" \
       --report "$out/four-$tag.json" --manifest "$out/manifest.json" --kernel "$kernel" > /dev/null
     if [ -z "$previous" ]; then
-      py_ref stage-replay --package "$WORK/$variant-$tag.arcspkg" --run "$run" --report "$out/py-replay-$tag.json" > /dev/null
+      py_ref stage-replay --package "$pkgs-$tag.arcspkg" --run "$run" --report "$out/py-replay-$tag.json" > /dev/null
     else
-      py_ref stage-replay --package "$WORK/$variant-$tag.arcspkg" --input "$previous" \
+      py_ref stage-replay --package "$pkgs-$tag.arcspkg" --input "$previous" \
         --report "$out/py-replay-$tag.json" > /dev/null
     fi
-    previous="$WORK/$variant-four-b$end.bin"
+    previous="$pkgs-four-b$end.bin"
     four_reports="${four_reports:+$four_reports,}$out/four-$tag.json"
     if [ "$kernel" = scalar ]; then kernel=simd; else kernel=scalar; fi
   done
-  python "$ROOT/scripts/arc_mla/layout_check.py" --run "$run" --label "tiny $variant" \
+  python "$ROOT/scripts/arc_mla/layout_check.py" --run "$run" --label "tiny $variant, $fmt experts" \
     --layout "one=$out/one-0-4.json" \
     --layout "two=$out/two-0-2.json,$out/two-2-4.json" \
     --layout "four=$four_reports" \

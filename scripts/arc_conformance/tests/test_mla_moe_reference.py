@@ -32,6 +32,8 @@ def _load_generator():
 
 
 GEN = _load_generator()
+# Both tiny shapes with INT8 dyadic experts and with INT4 group-32 experts.
+CASES = [("moonlight", "i8"), ("kimi", "i8"), ("moonlight", "i4g32"), ("kimi", "i4g32")]
 _TMP: tempfile.TemporaryDirectory = None
 ROOT: Path = None
 
@@ -59,6 +61,7 @@ def _f32(value: float) -> int:
 class IdentityAndConstants(unittest.TestCase):
     def test_profile_identity(self):
         self.assertEqual(dy.blake3_hex(mm.PROFILE_ID.encode()), mm.PROFILE_BLAKE3)
+        self.assertEqual(dy.blake3_hex(mm.PROFILE_ID_I4G32.encode()), mm.PROFILE_I4G32_BLAKE3)
 
     def test_attention_lambda(self):
         self.assertEqual(mm.attention_lambda(192), 77_490_641)
@@ -125,6 +128,34 @@ class RouterAndRouting(unittest.TestCase):
         self.assertEqual(mm.combine_int([1 << 31, 1 << 30], [[4, -4], [8, 1]], [1, 1]), [5, -1])
         self.assertEqual(mm.combine_int([1 << 31] * 3, [[1], [1], [1]], [0]), [1])
 
+    def test_int4_quantiser_matches_the_literal_rule(self):
+        rng = random.Random(11)
+        groups = []
+        for _ in range(300):
+            top = rng.randint(100, 126)
+            g = [(rng.getrandbits(1) << 15) | (rng.randint(max(1, top - 12), top) << 7) | rng.getrandbits(7)
+                 for _ in range(32)]
+            g[rng.randrange(32)] = 0x8000
+            g[rng.randrange(32)] = 0x0001
+            groups.append(g)
+        groups.append([0] * 32)
+        packed, scales = mm.quantize_q4_rows(np.array(groups, dtype=np.uint16))
+        values = mm.unpack_q4(packed)
+        for i, g in enumerate(groups):
+            scale, q = mm.quantize_q4_group_exact(g)
+            self.assertEqual(int(scales[i][0]), scale, i)
+            self.assertEqual(values[i].tolist(), q, i)
+
+    def test_int4_spec_examples(self):
+        row = [_bf16(1.0), _bf16(-0.5), _bf16(0.25)] + [0] * 29
+        scale, q = mm.quantize_q4_group_exact(row)
+        self.assertEqual(scale, (124 << 7) | 18)
+        self.assertEqual(q[:3], [7, -4, 2])
+        values = [[1] * 32 + [-2] * 32]
+        self.assertEqual(mm.q4_project_int(list(range(1, 65)), values, [[_bf16(0.5), _bf16(0.25)]]), [-512])
+        self.assertEqual(mm.q4_project_int([-1] + [0] * 31, [[1] + [0] * 31], [[_bf16(0.75)]]), [-1])
+        self.assertEqual(mm.unpack_q4(mm.pack_q4(np.array([list(range(-8, 8))]))).tolist(), [list(range(-8, 8))])
+
     def test_rope_pairs(self):
         self.assertEqual(mm.rope_pairs_int([1 << 16, 3, -(1 << 16), 5], [0, 0], [1 << 16, 1 << 16]),
                          [-3, 1 << 16, -5, -(1 << 16)])
@@ -132,25 +163,25 @@ class RouterAndRouting(unittest.TestCase):
 
 
 class TinyModels(unittest.TestCase):
-    def _prepare(self, variant: str, layers=None, name="full"):
+    def _prepare(self, variant: str, layers=None, name="full", fmt="i8"):
         src = ROOT / variant
-        out = ROOT / f"{variant}-{name}.arcspkg"
+        out = ROOT / f"{variant}-{fmt}-{name}.arcspkg"
         first, end = (None, None) if layers is None else layers
-        ident = mm.prepare_stage(src, src / "tiny-mla.source.json", first, end, out)
+        ident = mm.prepare_stage(src, src / "tiny-mla.source.json", first, end, out, fmt)
         return out, ident
 
     def test_stage_packages_share_segments_with_the_whole_model(self):
-        for variant in ("moonlight", "kimi"):
-            full, ident = self._prepare(variant)
+        for variant, fmt in CASES:
+            full, ident = self._prepare(variant, fmt=fmt)
             self.assertIn("model_root", ident)
             by_name = {s["name"]: s for s in ident["segments"]}
             for cut in ((0, 2), (2, 4), (1, 3)):
-                _, part = self._prepare(variant, cut, f"{cut[0]}-{cut[1]}")
+                _, part = self._prepare(variant, cut, f"{cut[0]}-{cut[1]}", fmt)
                 for seg in part["segments"]:
                     self.assertEqual(seg, by_name[seg["name"]], (variant, cut, seg["name"]))
             # Digest-only preparation agrees with the written file.
             src = ROOT / variant
-            again = mm.prepare_stage(src, src / "tiny-mla.source.json", None, None, None)
+            again = mm.prepare_stage(src, src / "tiny-mla.source.json", None, None, None, fmt)
             self.assertEqual(again["sha256"], ident["sha256"])
             pkg = mm.StagePackage(full)
             self.assertEqual(pkg.segment_digests(), ident["segments"])
@@ -168,8 +199,8 @@ class TinyModels(unittest.TestCase):
             mm.prepare_stage(lone, src / "tiny-mla.source.json", 0, 2, None)
 
     def test_fast_engine_equals_slow_engine(self):
-        for variant in ("moonlight", "kimi"):
-            path, _ = self._prepare(variant, None, "engines")
+        for variant, fmt in CASES:
+            path, _ = self._prepare(variant, None, "engines", fmt)
             pkg = mm.StagePackage(path)
             seqs = [[1, 99, 123, 7, 64], [256, 256, 256], [5]]
             fast = mm.FastEngine(pkg)
@@ -180,12 +211,12 @@ class TinyModels(unittest.TestCase):
                 slow.reset()
                 for t in seq:
                     _, lg = slow.forward(token=t)
-                    self.assertEqual(lg, logits[row].tolist(), (variant, seq, t))
+                    self.assertEqual(lg, logits[row].tolist(), (variant, fmt, seq, t))
                     row += 1
 
     def test_pipeline_layouts_are_byte_identical(self):
-        for variant in ("moonlight", "kimi"):
-            full_path, ident = self._prepare(variant, None, "layout")
+        for variant, fmt in CASES:
+            full_path, ident = self._prepare(variant, None, "layout", fmt)
             root = ident["model_root"]
             seqs = [[1, 99, 123, 7, 64, 3], [256, 2]]
             meta = [{"id": f"s{i}", "tokens": s, "prompt_len": 2, "selection": "rp64-argmax", "eos": [7],
@@ -199,7 +230,7 @@ class TinyModels(unittest.TestCase):
             for cuts in ([0, 4], [0, 2, 4], [0, 1, 2, 3, 4]):
                 data = None
                 for a, b in zip(cuts, cuts[1:]):
-                    path, _ = self._prepare(variant, (a, b), f"{a}-{b}")
+                    path, _ = self._prepare(variant, (a, b), f"{a}-{b}", fmt)
                     pkg = mm.StagePackage(path)
                     inputs = None if data is None else [s["values"] for s in mm.read_boundary(data)["sequences"]]
                     h, logits = mm.FastEngine(pkg).run(seqs, inputs)
@@ -209,7 +240,7 @@ class TinyModels(unittest.TestCase):
                         n = len(s["tokens"])
                         out.append(dict(s, values=h[start:start + n]))
                         start += n
-                    data, _ = mm.write_boundary(None, b, pkg.model["d_model"], root, out)
+                    data, _ = mm.write_boundary(None, b, pkg.model["d_model"], root, out, pkg.profile)
                     if b == 4:
                         np.testing.assert_array_equal(logits, ref_logits)
 
@@ -226,13 +257,13 @@ class TinyModels(unittest.TestCase):
             mm.read_boundary(bytes(flipped))
 
     def test_generation_and_verification_agree(self):
-        for variant in ("moonlight", "kimi"):
-            path, _ = self._prepare(variant, None, "gen")
+        for variant, fmt in CASES:
+            path, _ = self._prepare(variant, None, "gen", fmt)
             run = mm.generate_run(path, ROOT / variant / "tiny-mla.cases.json")
-            run_path = ROOT / f"{variant}-run.json"
+            run_path = ROOT / f"{variant}-{fmt}-run.json"
             run_path.write_text(json.dumps(run))
             golden, problems = mm.verify_run(path, run_path)
-            self.assertEqual(problems, [], variant)
+            self.assertEqual(problems, [], (variant, fmt))
             self.assertEqual(golden["matrix_digest"], run["matrix_digest"])
 
 

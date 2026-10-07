@@ -9,7 +9,8 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::{BOUNDARY_MAGIC, BOUNDARY_SCHEMA, PROFILE};
+use super::config::ExpertFormat;
+use super::{BOUNDARY_MAGIC, BOUNDARY_SCHEMA};
 use crate::modern::arith::{ACTIVATION_LIMIT, Selection};
 use crate::modern::{ModernError, hex_lower};
 
@@ -58,6 +59,9 @@ impl BoundarySequence {
 /// A boundary file (spec §6.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Boundary {
+    /// The arithmetic profile that produced the values (one of the MLA + MoE
+    /// profiles).
+    pub profile: String,
     /// The boundary index `l` (0 = embedding output, L = last layer output).
     pub layer: usize,
     pub d_model: usize,
@@ -94,7 +98,7 @@ impl Boundary {
             .collect();
         json!({
             "schema": BOUNDARY_SCHEMA,
-            "profile": PROFILE,
+            "profile": self.profile,
             "model_root": self.model_root,
             "layer": self.layer,
             "d_model": self.d_model,
@@ -105,6 +109,12 @@ impl Boundary {
     fn check(&self) -> Result<(), ModernError> {
         if self.d_model == 0 {
             return Err(invalid("boundary d_model must be positive"));
+        }
+        if ExpertFormat::from_profile(&self.profile).is_none() {
+            return Err(invalid(format!(
+                "boundary profile {} is not an MLA + MoE profile",
+                self.profile
+            )));
         }
         for s in &self.sequences {
             if s.tokens.is_empty() || s.values.len() != s.tokens.len() * self.d_model {
@@ -186,9 +196,13 @@ impl Boundary {
         {
             return Err(invalid(format!("boundary header fields {keys:?}")));
         }
-        if header["schema"] != BOUNDARY_SCHEMA || header["profile"] != PROFILE {
-            return Err(invalid("boundary schema or profile mismatch"));
+        if header["schema"] != BOUNDARY_SCHEMA {
+            return Err(invalid("boundary schema mismatch"));
         }
+        let profile = header["profile"]
+            .as_str()
+            .ok_or_else(|| invalid("boundary profile"))?
+            .to_string();
         let size = |v: &Value, what: &str| {
             v.as_u64()
                 .and_then(|n| usize::try_from(n).ok())
@@ -280,6 +294,7 @@ impl Boundary {
             return Err(invalid("boundary file has trailing bytes"));
         }
         let boundary = Self {
+            profile,
             layer,
             d_model,
             model_root,
@@ -322,6 +337,7 @@ mod tests {
 
     fn sample() -> Boundary {
         Boundary {
+            profile: super::super::PROFILE.into(),
             layer: 7,
             d_model: 3,
             model_root: "ab".repeat(32),

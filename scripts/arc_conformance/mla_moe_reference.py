@@ -48,6 +48,12 @@ from .modern_reference import (DomainError, PackageError, PreparationError, RunE
 
 PROFILE_ID = "arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1"
 PROFILE_BLAKE3 = "7b0bd25616bd29195da71bb0b02d3c436350e801811280def1bb29c22d75207e"
+PROFILE_ID_I4G32 = "arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.i4g32-experts.q16.v1"
+PROFILE_I4G32_BLAKE3 = "5e6d6392186d817e57806184b1193ea1648805bb82cf7749f9d563306237e71c"
+PROFILES = {"i8": PROFILE_ID, "i4g32": PROFILE_ID_I4G32}
+FORMATS = {v: k for k, v in PROFILES.items()}
+Q4_GROUP = 32
+Q4_SPAN = 40
 STAGE_SCHEMA = "arc.integer-stage-package.v1"
 STAGE_MANIFEST_SCHEMA = "arc.integer-stage-manifest.v1"
 BOUNDARY_SCHEMA = "arc.stage-boundary.v1"
@@ -61,7 +67,7 @@ ONE = 1 << 16
 LIM62 = 1 << 62
 I32_MIN, I32_MAX = -(1 << 31), (1 << 31) - 1
 
-DTYPES = {"i8": np.dtype("i1"), "u8": np.dtype("u1"), "i16": np.dtype("<i2"),
+DTYPES = {"i8": np.dtype("i1"), "u8": np.dtype("u1"), "i16": np.dtype("<i2"), "u16": np.dtype("<u2"),
           "i32": np.dtype("<i4"), "i64": np.dtype("<i8")}
 
 
@@ -224,13 +230,22 @@ def _dyadic(out: List[Dict[str, Any]], segment: str, name: str, dims: Sequence[i
                 "kind": kind + ".k", "source": source})
 
 
+def _int4(out: List[Dict[str, Any]], segment: str, name: str, dims: Sequence[int], source: Any) -> None:
+    """Spec 13.1: packed values u8 [n, r, c/2] and BF16 group scales u16 [n, r, c/32]."""
+    n, rows, cols = dims
+    out.append({"name": name + ".q4", "dtype": "u8", "shape": [n, rows, cols // 2], "segment": segment,
+                "kind": "stack4.q4", "source": source})
+    out.append({"name": name + ".s", "dtype": "u16", "shape": [n, rows, cols // Q4_GROUP], "segment": segment,
+                "kind": "stack4.s", "source": source})
+
+
 def _vector(out: List[Dict[str, Any]], segment: str, name: str, dtype: str, shape: Sequence[int],
             kind: str, source: Any) -> None:
     out.append({"name": name, "dtype": dtype, "shape": list(shape), "segment": segment,
                 "kind": kind, "source": source})
 
 
-def layer_layout(m: Dict[str, Any], layer: int) -> List[Dict[str, Any]]:
+def layer_layout(m: Dict[str, Any], layer: int, fmt: str = "i8") -> List[Dict[str, Any]]:
     """The tensors of one layer in spec 4.6 order, with their sources (spec 4.1)."""
     seg, p, hf = f"layer.{layer}", f"layers.{layer}", f"model.layers.{layer}"
     d, h = m["d_model"], m["n_heads"]
@@ -264,7 +279,10 @@ def layer_layout(m: Dict[str, Any], layer: int) -> List[Dict[str, Any]]:
         for short, proj, dims in (("w_gate", "gate_proj", [e, fm, d]), ("w_up", "up_proj", [e, fm, d]),
                                   ("w_down", "down_proj", [e, d, fm])):
             sources = [f"{hf}.mlp.experts.{x}.{proj}.weight" for x in range(e)]
-            _dyadic(out, seg, f"{p}.experts.{short}", dims, "stack", sources)
+            if fmt == "i4g32":
+                _int4(out, seg, f"{p}.experts.{short}", dims, sources)
+            else:
+                _dyadic(out, seg, f"{p}.experts.{short}", dims, "stack", sources)
     else:
         f = m["d_ff"]
         _dyadic(out, seg, f"{p}.w_gate", [f, d], "matrix", f"{hf}.mlp.gate_proj.weight")
@@ -273,7 +291,7 @@ def layer_layout(m: Dict[str, Any], layer: int) -> List[Dict[str, Any]]:
     return out
 
 
-def stage_layout(m: Dict[str, Any], first: int, end: int) -> List[Dict[str, Any]]:
+def stage_layout(m: Dict[str, Any], first: int, end: int, fmt: str = "i8") -> List[Dict[str, Any]]:
     """Every tensor of stage [first, end) in file order, with offsets and byte counts."""
     if not 0 <= first < end <= m["n_layers"]:
         raise PreparationError(f"stage [{first}, {end}) is not a layer range of a {m['n_layers']}-layer model")
@@ -283,8 +301,10 @@ def stage_layout(m: Dict[str, Any], first: int, end: int) -> List[Dict[str, Any]
     _vector(out, "tables", "rope.sin", "i32", [m["max_seq"], half], "rope", None)
     if first == 0:
         _dyadic(out, "embed", "embed", [m["vocab_size"], m["d_model"]], "matrix", "model.embed_tokens.weight")
+    if fmt == "i4g32" and (m["d_model"] % Q4_GROUP or m["moe_d_ff"] % Q4_GROUP):
+        raise PreparationError("INT4 experts need d_model and moe_d_ff divisible by 32")
     for layer in range(first, end):
-        out.extend(layer_layout(m, layer))
+        out.extend(layer_layout(m, layer, fmt))
     if end == m["n_layers"]:
         _vector(out, "head", "final_norm", "i64", [m["d_model"]], "norm", "model.norm.weight")
         _dyadic(out, "head", "lm_head", [m["vocab_size"], m["d_model"]], "matrix", "lm_head.weight")
@@ -301,19 +321,20 @@ def segment_names(m: Dict[str, Any]) -> List[str]:
 
 
 def build_header(m: Dict[str, Any], source: Dict[str, Any], first: int, end: int,
-                 layout: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    return {"schema": STAGE_SCHEMA, "profile": PROFILE_ID, "model": m, "source": source,
+                 layout: Sequence[Dict[str, Any]], fmt: str = "i8") -> Dict[str, Any]:
+    return {"schema": STAGE_SCHEMA, "profile": PROFILES[fmt], "model": m, "source": source,
             "stage": {"first_layer": first, "end_layer": end},
             "tensors": [{"name": e["name"], "dtype": e["dtype"], "shape": list(e["shape"]),
                          "offset": e["offset"], "bytes": e["bytes"]} for e in layout]}
 
 
-def model_root(m: Dict[str, Any], source: Dict[str, Any], segments: Sequence[Dict[str, Any]]) -> str:
+def model_root(m: Dict[str, Any], source: Dict[str, Any], segments: Sequence[Dict[str, Any]],
+               fmt: str = "i8") -> str:
     """Spec 4.7: BLAKE3 of the canonical JSON of model, profile, segment digests and source."""
     names = [s["name"] for s in segments]
     if names != segment_names(m):
         raise PackageError("the model root needs every segment, in canonical order")
-    return blake3_hex(canonical_json({"model": m, "profile": PROFILE_ID,
+    return blake3_hex(canonical_json({"model": m, "profile": PROFILES[fmt],
                                       "segments": [[s["name"], s["blake3"]] for s in segments],
                                       "source": source}))
 
@@ -378,6 +399,117 @@ def quantize_router_row_exact(bits: Sequence[int]) -> Tuple[List[int], int]:
             v = (2 * mant + (1 << c)) >> (c + 1)
         out.append(-v if s else v)
     return out, k
+
+
+def pack_q4(values: np.ndarray) -> np.ndarray:
+    """Spec 13.1: signed 4-bit values [rows, cols] -> bytes [rows, cols/2], low nibble first."""
+    v = np.asarray(values).astype(np.int64)
+    return ((v[:, 0::2] & 0x0F) | ((v[:, 1::2] & 0x0F) << 4)).astype(np.uint8)
+
+
+def unpack_q4(packed: np.ndarray) -> np.ndarray:
+    """Bytes [rows, cols/2] -> signed values [rows, cols] (int64)."""
+    b = np.asarray(packed).astype(np.int64)
+    lo, hi = b & 0x0F, b >> 4
+    out = np.empty((b.shape[0], 2 * b.shape[1]), dtype=np.int64)
+    out[:, 0::2] = np.where(lo > 7, lo - 16, lo)
+    out[:, 1::2] = np.where(hi > 7, hi - 16, hi)
+    return out
+
+
+def quantize_q4_rows(bits: np.ndarray, what: str = "experts") -> Tuple[np.ndarray, np.ndarray]:
+    """Spec 13.3, vectorised: BF16 [rows, cols] -> (packed u8 [rows, cols/2], scales u16 [rows, cols/32])."""
+    b = np.asarray(bits).astype(np.int64)
+    rows, cols = b.shape
+    if cols % Q4_GROUP:
+        raise PreparationError(f"{what}: {cols} inputs are not a multiple of 32")
+    if np.any((b & 0x7F80) == 0x7F80):
+        raise PreparationError(f"{what}: contains infinity or NaN")
+    g = b.reshape(rows, cols // Q4_GROUP, Q4_GROUP)
+    big_e, low = (g >> 7) & 0xFF, g & 0x7F
+    mant = np.where(big_e == 0, low, low + 128)
+    expo = np.where(big_e == 0, -133, big_e - 134)
+    mags = g & 0x7FFF
+    j_max = np.argmax(mags, axis=2)[..., None]
+    zero = np.take_along_axis(mags, j_max, 2)[..., 0] == 0
+    m_a = np.where(zero, 255, np.take_along_axis(mant, j_max, 2)[..., 0])
+    e_a = np.take_along_axis(expo, j_max, 2)[..., 0]
+    d = np.zeros_like(m_a)
+    for _ in range(11):
+        d = d + ((m_a << d) < 896)
+    f = e_a - d
+    m = (2 * (m_a << d) + 7) // 14
+    over = m == 256
+    m, f = np.where(over, 128, m), np.where(over, f + 1, f)
+    field = f + 134
+    bad = ~zero & ((field < 1) | (field > 254))
+    if np.any(bad):
+        raise PreparationError(f"{what}: an INT4 group scale exponent field is outside [1, 254]")
+    scales = np.where(zero, 0, (field << 7) | (m - 128))
+    shift = expo - f[..., None]
+    pos = shift >= 0
+    num = np.where(pos, mant << np.clip(shift, 0, 30), mant)
+    den = np.where(pos, m[..., None], m[..., None] << np.clip(-shift, 0, Q4_SPAN))
+    q = (2 * num + den) // (2 * den)
+    q = np.where((mant == 0) | (-shift > Q4_SPAN), 0, q)
+    q = np.where(((g >> 15) & 1) == 1, -q, q)
+    q = np.clip(q, -8, 7)
+    q[zero] = 0
+    return pack_q4(q.reshape(rows, cols)), scales.astype(np.uint16)
+
+
+def quantize_q4_group_exact(bits: Sequence[int]) -> Tuple[int, List[int]]:
+    """Spec 13.3 literally with rationals, one group of 32 (test oracle): (scale bits, values)."""
+    values = [dy.bf16_value(int(x)) for x in bits]
+    a = max(abs(v) for v in values)
+    if a == 0:
+        return 0, [0] * len(values)
+    target = a / 7
+    f = 0
+    while target / Fraction(2) ** f >= 256:
+        f += 1
+    while target / Fraction(2) ** f < 128:
+        f -= 1
+    ratio = target / Fraction(2) ** f
+    m = dy.rha_ratio(ratio.numerator, ratio.denominator)
+    if m == 256:
+        m, f = 128, f + 1
+    field = f + 134
+    if not 1 <= field <= 254:
+        raise PreparationError("INT4 group scale exponent field outside [1, 254]")
+    scale = Fraction(m) * Fraction(2) ** f
+    out = []
+    for v in values:
+        r = v / scale
+        if v == 0 or abs(r) < Fraction(1, 2 ** Q4_SPAN):
+            out.append(0)
+            continue
+        out.append(max(-8, min(7, dy.rha_ratio(r.numerator, r.denominator))))
+    return (field << 7) | (m - 128), out
+
+
+def q4_project_int(x: Sequence[int], values: Sequence[Sequence[int]], scales: Sequence[Sequence[int]],
+                   what: str = "int4 projection") -> List[int]:
+    """Spec 13.2 in Python ints: one exact scaled sum per row, one floor."""
+    if 8 * sum(abs(v) for v in x) >= 1 << 63:
+        raise DomainError(f"{what}: 8 * sum|x| >= 2^63")
+    out = []
+    for q, row_scales in zip(values, scales):
+        parts = [dy.bf16_parts(int(bits)) for bits in row_scales]
+        live = [e for _, mant, e in parts if mant > 0]
+        if not live:
+            out.append(0)
+            continue
+        top = max(live)
+        total = 0
+        for g, (_, mant, e) in enumerate(parts):
+            if mant == 0 or e < top - Q4_SPAN:
+                continue
+            acc = sum(q[j] * x[j] for j in range(g * Q4_GROUP, (g + 1) * Q4_GROUP))
+            total += (mant * acc) << (e - top + Q4_SPAN)
+        shift = top - Q4_SPAN
+        out.append(check62(total >> -shift if shift < 0 else total << shift, what))
+    return out
 
 
 def f32_parts(bits: int) -> Tuple[int, int, int]:
@@ -620,8 +752,10 @@ def _kv_b_blocks(bits: np.ndarray, m: Dict[str, Any]) -> Tuple[np.ndarray, np.nd
 
 
 def prepare_stage(source_dir: Path, manifest_path: Path, first: Optional[int], end: Optional[int],
-                  out_path: Optional[Path]) -> Dict[str, Any]:
+                  out_path: Optional[Path], experts: str = "i8") -> Dict[str, Any]:
     """Convert stage [first, end) (whole model when None) to a package; out_path None = digests only."""
+    if experts not in PROFILES:
+        raise PreparationError(f"unknown expert format {experts!r}")
     source_dir = Path(source_dir)
     manifest = dy.load_source_manifest(Path(manifest_path))
     config_entry = next(e for e in manifest["files"] if e["name"] == "config.json")
@@ -630,12 +764,12 @@ def prepare_stage(source_dir: Path, manifest_path: Path, first: Optional[int], e
     m = model_from_config(config, manifest["max_seq"])
     first = 0 if first is None else first
     end = m["n_layers"] if end is None else end
-    layout = stage_layout(m, first, end)
+    layout = stage_layout(m, first, end, experts)
     tensors = SourceTensors(source_dir, manifest, m)
     source = {"repo": manifest["repo"], "revision": manifest["revision"],
               "files": [{"name": e["name"], "bytes": e["bytes"], "sha256": e["sha256"]}
                         for e in manifest["files"]]}
-    header = build_header(m, source, first, end, layout)
+    header = build_header(m, source, first, end, layout, experts)
     header_bytes = canonical_json(header)
     tmp = None if out_path is None else Path(out_path).with_name(Path(out_path).name + ".partial")
     f = open(tmp, "wb") if tmp is not None else None
@@ -679,6 +813,18 @@ def prepare_stage(source_dir: Path, manifest_path: Path, first: Optional[int], e
                 w.write(pending.pop("mu").astype("<i4").tobytes(), seg)
             elif kind.endswith(".k") and kind != "router.k":
                 w.write(pending.pop("k").astype("u1").tobytes(), seg)
+            elif kind == "stack4.q4":
+                groups: List[np.ndarray] = []
+                for source_name in e["source"]:
+                    bits = tensors.bf16(source_name)
+                    step = _rows_chunk(bits.shape[1])
+                    for r0 in range(0, bits.shape[0], step):
+                        packed, scales = quantize_q4_rows(np.asarray(bits[r0:r0 + step]), what=source_name)
+                        w.write(packed.tobytes(), seg)
+                        groups.append(scales)
+                pending["s"] = np.concatenate(groups)
+            elif kind == "stack4.s":
+                w.write(pending.pop("s").astype("<u2").tobytes(), seg)
             elif kind == "router.q":
                 q, k = quantize_router_rows(np.asarray(tensors.bf16(e["source"])), what=e["name"])
                 w.write(q.astype("<i2").tobytes(), seg)
@@ -698,9 +844,10 @@ def prepare_stage(source_dir: Path, manifest_path: Path, first: Optional[int], e
             f.close()
     if tmp is not None:
         os.replace(tmp, out_path)
-    ident.update({"stage": {"first_layer": first, "end_layer": end}, "shards_read": tensors.shards_read})
+    ident.update({"stage": {"first_layer": first, "end_layer": end}, "shards_read": tensors.shards_read,
+                  "profile": PROFILES[experts]})
     if (first, end) == (0, m["n_layers"]):
-        ident["model_root"] = model_root(m, source, ident["segments"])
+        ident["model_root"] = model_root(m, source, ident["segments"], experts)
     return ident
 
 
@@ -728,15 +875,18 @@ class StagePackage:
             if not isinstance(header, dict) or sorted(header) != ["model", "profile", "schema", "source",
                                                                    "stage", "tensors"]:
                 raise PackageError("header has the wrong top-level fields")
-            if header["schema"] != STAGE_SCHEMA or header["profile"] != PROFILE_ID:
+            if header["schema"] != STAGE_SCHEMA or header["profile"] not in FORMATS:
                 raise PackageError("schema or profile mismatch")
+            self.fmt = FORMATS[header["profile"]]
+            self.profile = header["profile"]
             self.model = validate_model(header["model"])
             stage = header["stage"]
             if not isinstance(stage, dict) or sorted(stage) != ["end_layer", "first_layer"]:
                 raise PackageError("header 'stage' is malformed")
             self.first, self.end = stage["first_layer"], stage["end_layer"]
-            layout = stage_layout(self.model, self.first, self.end)
-            expected = build_header(self.model, header["source"], self.first, self.end, layout)["tensors"]
+            layout = stage_layout(self.model, self.first, self.end, self.fmt)
+            expected = build_header(self.model, header["source"], self.first, self.end, layout,
+                                    self.fmt)["tensors"]
             if header["tensors"] != expected:
                 raise PackageError("tensor table differs from the canonical layout")
             self.header = header
@@ -798,6 +948,10 @@ class StagePackage:
                 for row in np.nonzero(zero)[0].tolist():
                     if np.any(np.asarray(q2[row]) != 0):
                         raise PackageError(f"{base}: zero-scale row {row} has weights")
+            elif name.endswith(".s") and e["dtype"] == "u16":
+                sc = np.asarray(self.tensor(name)).astype(np.int64)
+                if np.any(sc >> 15 == 1) or np.any((sc >> 7) & 0xFF == 0xFF):
+                    raise PackageError(f"{name}: a group scale is negative, infinite or NaN")
             elif name.endswith("router.q"):
                 if np.any(np.asarray(self.tensor(name)) == -32768):
                     raise PackageError(f"{name} contains -32768")
@@ -955,6 +1109,12 @@ class SlowEngine:
         return len(self.latent[0]) if self.latent else 0
 
     def _project(self, x: Sequence[int], name: str, index: Optional[int] = None) -> List[int]:
+        if name + ".q4" in self.pkg.entries:
+            q4, sc = self.pkg.tensor(name + ".q4"), self.pkg.tensor(name + ".s")
+            if index is not None:
+                q4, sc = q4[index], sc[index]
+            values = unpack_q4(np.asarray(q4)).tolist()
+            return q4_project_int(x, values, np.asarray(sc).astype(np.int64).tolist(), name)
         q, mu, k = self.w.scaled(name, index)
         rows = np.asarray(q).astype(np.int64).tolist()
         return dy.project_int(x, rows, mu.tolist(), k.tolist(), name)
@@ -1057,7 +1217,59 @@ class FastEngine:
     def _note(self, what: str) -> None:
         self.fallbacks[what] = self.fallbacks.get(what, 0) + 1
 
+    def _project_q4(self, x: np.ndarray, name: str, index: Optional[int]) -> np.ndarray:
+        """Spec 13.2 for every row of x: float64 BLAS per group (exact below 2^53), int64 combine
+        with a proven bound, Python ints otherwise."""
+        q4, sc = self.pkg.tensor(name + ".q4"), self.pkg.tensor(name + ".s")
+        if index is not None:
+            q4, sc = q4[index], sc[index]
+        q = unpack_q4(np.asarray(q4))
+        s = np.asarray(sc).astype(np.int64)
+        rows, cols = q.shape
+        groups, t = cols // Q4_GROUP, x.shape[0]
+        est = dy._abs_sum_bound(x) * 8.0
+        for i in np.nonzero(est >= 2.0 ** 62)[0].tolist():
+            if 8 * sum(abs(v) for v in x[i].tolist()) >= 1 << 63:
+                raise DomainError(f"{name}: 8 * sum|x| >= 2^63")
+        try:
+            xg = x.reshape(t, groups, Q4_GROUP)
+            if t and float(dy._abs_sum_bound(xg).max()) * 8.0 >= 2.0 ** 53:
+                raise dy._NeedSlow("int4 group sum")
+            with np.errstate(all="ignore"):
+                acc_f = np.matmul(xg.transpose(1, 0, 2).astype(np.float64),
+                                  q.reshape(rows, groups, Q4_GROUP).transpose(1, 2, 0).astype(np.float64))
+            if acc_f.size and not (np.all(np.isfinite(acc_f)) and np.array_equal(acc_f, np.trunc(acc_f))):
+                raise RuntimeError("BLAS returned a non-integral product of integer operands")
+            acc = acc_f.astype(np.int64)  # [groups, t, rows]
+            big_e, low = (s >> 7) & 0xFF, s & 0x7F
+            mant = np.where(big_e == 0, low, low + 128)
+            expo = np.where(big_e == 0, -133, big_e - 134)
+            live = mant > 0
+            top = np.where(live, expo, -(1 << 20)).max(axis=1)
+            keep = live & (expo >= top[:, None] - Q4_SPAN)
+            empty = ~keep.any(axis=1)
+            e_min = np.where(keep, expo, 1 << 20).min(axis=1)
+            e_min = np.where(empty, 0, e_min)
+            if np.any(~empty & ((e_min >= 0) | (e_min <= -63))):
+                raise dy._NeedSlow("int4 scale outside the int64 shift range")
+            shift = np.where(keep, expo - e_min[:, None], 0)
+            coef = np.where(keep, mant, 0) << shift  # [rows, groups], below 2^49
+            weights = coef.astype(np.float64)
+            bound = np.einsum("gtr,rg->tr", np.abs(acc).astype(np.float64), weights) * (1.0 + 2.0 ** -30)
+            if bound.size and float(bound.max()) >= 2.0 ** 62:
+                raise dy._NeedSlow("int4 combine")
+            total = (acc.transpose(1, 2, 0) * coef[None, :, :]).sum(axis=2)  # [t, rows]
+            y = total >> np.where(empty, 0, -e_min)[None, :]
+            y[:, empty] = 0
+            return dy._check62_array(y, name)
+        except dy._NeedSlow:
+            self._note("int4 projection")
+            values, scales = q.tolist(), s.tolist()
+            return dy._to_int64([q4_project_int(r, values, scales, name) for r in x.tolist()])
+
     def _project(self, x: np.ndarray, name: str, index: Optional[int] = None) -> np.ndarray:
+        if name + ".q4" in self.pkg.entries:
+            return self._project_q4(x, name, index)
         q, mu, k = self.w.scaled(name, index)
         dy.FastEngine._check_projection_input(x, name)
         acc = dy._matmul_exact(x, b_float=np.asarray(q, dtype=np.float64).T, b_max=127, guard=False)
@@ -1255,7 +1467,7 @@ class FastEngine:
 # Boundary files (spec 6.3)
 
 def write_boundary(path: Optional[Path], layer: int, d_model: int, root: str,
-                   sequences: Sequence[Dict[str, Any]]) -> Tuple[bytes, str]:
+                   sequences: Sequence[Dict[str, Any]], profile: str = PROFILE_ID) -> Tuple[bytes, str]:
     """sequences: {id, tokens, prompt_len, selection, eos, max_tokens, values: int64 [P, D]}."""
     meta = []
     blobs = []
@@ -1267,7 +1479,9 @@ def write_boundary(path: Optional[Path], layer: int, d_model: int, root: str,
                      "selection": s["selection"], "eos": list(s["eos"]), "max_tokens": s["max_tokens"],
                      "digest": boundary_digest(values)})
         blobs.append(values.astype("<i8").tobytes())
-    header = canonical_json({"schema": BOUNDARY_SCHEMA, "profile": PROFILE_ID, "model_root": root,
+    if profile not in FORMATS:
+        raise RunError(f"{profile!r} is not an MLA + MoE profile")
+    header = canonical_json({"schema": BOUNDARY_SCHEMA, "profile": profile, "model_root": root,
                              "layer": layer, "d_model": d_model, "sequences": meta})
     data = BOUNDARY_MAGIC + struct.pack("<Q", len(header)) + header
     data += b"\x00" * (_align(len(data)) - len(data)) + b"".join(blobs)
@@ -1285,7 +1499,7 @@ def read_boundary(data: bytes) -> Dict[str, Any]:
     if canonical_json(header) != raw or sorted(header) != ["d_model", "layer", "model_root", "profile",
                                                             "schema", "sequences"]:
         raise PackageError("boundary header is not the canonical spec 6.3 object")
-    if header["schema"] != BOUNDARY_SCHEMA or header["profile"] != PROFILE_ID:
+    if header["schema"] != BOUNDARY_SCHEMA or header["profile"] not in FORMATS:
         raise PackageError("boundary schema or profile mismatch")
     d = header["d_model"]
     offset = _align(16 + hlen)
@@ -1306,7 +1520,8 @@ def read_boundary(data: bytes) -> Dict[str, Any]:
         sequences.append(dict(s, values=values))
     if offset != len(data):
         raise PackageError("boundary file has trailing bytes")
-    return {"layer": header["layer"], "d_model": d, "model_root": header["model_root"], "sequences": sequences}
+    return {"layer": header["layer"], "d_model": d, "model_root": header["model_root"],
+            "profile": header["profile"], "sequences": sequences}
 
 
 # --------------------------------------------------------------------------
@@ -1367,8 +1582,8 @@ def generate_run(pkg_path: Path, cases_path: Path) -> Dict[str, Any]:
                             logits_hashes=[h.hex() for h in hashes], logits_digest=dy.logits_digest(hashes),
                             boundary_digests=[b.hexdigest() for b in boundaries]))
     segments = pkg.segment_digests()
-    return {"schema": RUN_SCHEMA, "package": pkg.identity(), "profile": PROFILE_ID,
-            "model_root": model_root(m, pkg.source, segments), "kernel": "python-reference-int",
+    return {"schema": RUN_SCHEMA, "package": pkg.identity(), "profile": pkg.profile,
+            "model_root": model_root(m, pkg.source, segments, pkg.fmt), "kernel": "python-reference-int",
             "cases": results, "matrix_digest": dy.matrix_digest(results),
             "boundary_matrix_digest": blake3_hex(canonical_json([{"id": c["id"],
                                                                  "boundary_digests": c["boundary_digests"]}
@@ -1378,15 +1593,15 @@ def generate_run(pkg_path: Path, cases_path: Path) -> Dict[str, Any]:
 def verify_run(pkg_path: Path, run_path: Path) -> Tuple[Dict[str, Any], List[str]]:
     """Teacher-force every case of a Rust run with FastEngine; compare logits, boundaries and tokens."""
     run = json.loads(Path(run_path).read_bytes())
-    if run.get("schema") != RUN_SCHEMA or run.get("profile") != PROFILE_ID:
-        raise RunError(f"run must have schema {RUN_SCHEMA!r} and profile {PROFILE_ID!r}")
     pkg = StagePackage(pkg_path)
+    if run.get("schema") != RUN_SCHEMA or run.get("profile") != pkg.profile:
+        raise RunError(f"run must have schema {RUN_SCHEMA!r} and the package's profile {pkg.profile!r}")
     if not (pkg.has_embed and pkg.has_head):
         raise RunError("verify-run needs the whole-model package")
     m = pkg.model
     problems: List[str] = []
     segments = pkg.segment_digests()
-    root = model_root(m, pkg.source, segments)
+    root = model_root(m, pkg.source, segments, pkg.fmt)
     if run.get("model_root") != root:
         problems.append(f"run model_root {run.get('model_root')} != package model root {root}")
     cases = run["cases"]
@@ -1424,7 +1639,7 @@ def verify_run(pkg_path: Path, run_path: Path) -> Tuple[Dict[str, Any], List[str
     mdigest = dy.matrix_digest(golden)
     if run.get("matrix_digest") != mdigest:
         problems.append("matrix_digest differs")
-    return {"schema": "arc.mla-golden.v1", "profile": PROFILE_ID, "model_root": root,
+    return {"schema": "arc.mla-golden.v1", "profile": pkg.profile, "model_root": root,
             "verifier": "arc_conformance.mla_moe_reference FastEngine (independent Python)",
             "cases": golden, "matrix_digest": mdigest,
             "checks": {"fast_path_fallbacks": dict(engine.fallbacks), "all_match": not problems}}, problems
@@ -1450,6 +1665,8 @@ def stage_replay(pkg_path: Path, run_path: Optional[Path], input_path: Optional[
         boundary = read_boundary(data)
         if boundary["layer"] != pkg.first or boundary["d_model"] != m["d_model"]:
             raise RunError("boundary file does not start this stage")
+        if boundary["profile"] != pkg.profile:
+            raise RunError(f"boundary produced under {boundary['profile']}, stage runs {pkg.profile}")
         root = boundary["model_root"]
         sequences = boundary["sequences"]
         inputs = [s["values"] for s in sequences]
@@ -1471,8 +1688,8 @@ def stage_replay(pkg_path: Path, run_path: Optional[Path], input_path: Optional[
                          "logits_digest": dy.logits_digest([bytes.fromhex(x) for x in hashes]),
                          "derived_tokens": derived, "output_hash": dy.output_hash(derived)})
         start += n
-    data, file_b3 = write_boundary(out_path, pkg.end, m["d_model"], root, out_sequences)
-    return {"schema": STAGE_RUN_SCHEMA, "profile": PROFILE_ID, "model_root": root,
+    data, file_b3 = write_boundary(out_path, pkg.end, m["d_model"], root, out_sequences, pkg.profile)
+    return {"schema": STAGE_RUN_SCHEMA, "profile": pkg.profile, "model_root": root,
             "stage": {"first_layer": pkg.first, "end_layer": pkg.end}, "segments": pkg.segment_digests(),
             "input": input_desc,
             "output": {"layer": pkg.end, "file_bytes": len(data), "file_blake3": file_b3,
@@ -1506,6 +1723,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--layers", help="A:B (default: the whole model)")
     p.add_argument("--out", help="package path; omit with --hash-only")
     p.add_argument("--hash-only", action="store_true")
+    p.add_argument("--experts", choices=sorted(PROFILES), default="i8",
+                   help="routed experts as INT8 dyadic rows (default) or INT4 group-32 (spec 13)")
     p.add_argument("--json-out")
     g = sub.add_parser("generate", help="independent generation (SlowEngine, tiny models)")
     g.add_argument("--package", required=True)
@@ -1532,7 +1751,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 parser.error("give exactly one of --out and --hash-only")
             first, end = _parse_layers(args.layers)
             ident = prepare_stage(Path(args.source_dir), Path(args.source_manifest), first, end,
-                                  None if args.hash_only else Path(args.out))
+                                  None if args.hash_only else Path(args.out), args.experts)
             if args.json_out:
                 _write_json(Path(args.json_out), ident)
             print(json.dumps({k: ident[k] for k in ident if k != "segments"}, indent=1))

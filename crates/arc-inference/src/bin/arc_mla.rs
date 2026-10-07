@@ -16,10 +16,11 @@ use arc_inference::canonical_simd;
 use arc_inference::modern::arith::{self, Selection};
 use arc_inference::modern::convert::SourceManifest;
 use arc_inference::modern::mla::boundary::{Boundary, BoundarySequence, boundary_digest};
+use arc_inference::modern::mla::config::ExpertFormat;
 use arc_inference::modern::mla::convert::{self, blake3_hex};
 use arc_inference::modern::mla::model::{StageInput, StageModel};
 use arc_inference::modern::mla::package::{self, StageSpec};
-use arc_inference::modern::mla::{PROFILE, RUN_SCHEMA, STAGE_RUN_SCHEMA};
+use arc_inference::modern::mla::{RUN_SCHEMA, STAGE_RUN_SCHEMA};
 use arc_inference::modern::model::GenerationRequest;
 use arc_inference::modern::tiktoken::{
     MOONLIGHT_SPECIAL_TOKENS, TiktokenBpe, render_moonlight_chat,
@@ -29,8 +30,8 @@ use serde_json::{Value, json};
 
 const USAGE: &str = "usage: arc-mla <command> [options]
 
-  convert   --source-dir DIR --source-manifest SRC.json --out PKG
-            [--layers A:B] [--manifest-out MANIFEST.json] [--report OUT.json] [--threads N]
+  convert   --source-dir DIR --source-manifest SRC.json --out PKG [--layers A:B]
+            [--experts i8|i4g32] [--manifest-out MANIFEST.json] [--report OUT.json] [--threads N]
   verify    --package PKG --manifest MANIFEST.json [--full-digest]
   inspect   --package PKG
   golden    --package PKG --cases CASES.json --out RUN.json
@@ -44,8 +45,9 @@ const USAGE: &str = "usage: arc-mla <command> [options]
   render    --user TEXT [--system TEXT]
 
 A package holds a layer range [A, B) of the model (the whole model when
-converted without --layers); `stage --layers` executes a sub-range of it,
-reading only those tensors. The tokenizer directory holds tiktoken.model and
+converted without --layers). Its routed experts are INT8 dyadic rows, or with
+--experts i4g32 INT4 values with BF16 group-32 scales (spec section 13).
+`stage --layers` executes a sub-range of a package, reading only those tensors. The tokenizer directory holds tiktoken.model and
 tokenizer_config.json.";
 
 struct Args {
@@ -200,10 +202,12 @@ fn cmd_convert(args: &Args) -> Result<(), ModernError> {
         .value("--layers")
         .map(|s| StageSpec::parse(&s))
         .transpose()?;
+    let experts = ExpertFormat::parse(&args.value("--experts").unwrap_or_else(|| "i8".into()))?;
     let report = convert::convert_stage(
         &args.path("--source-dir")?,
         &source,
         stage,
+        experts,
         &args.path("--out")?,
     )?;
     if let Some(path) = args.value("--manifest-out") {
@@ -408,7 +412,7 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
     let run = json!({
         "schema": RUN_SCHEMA,
         "package": digest.to_json(),
-        "profile": PROFILE,
+        "profile": c.profile(),
         "model_root": model_root,
         "generation": generation,
         "kernel": kernel,
@@ -518,6 +522,13 @@ fn cmd_stage(args: &Args) -> Result<(), ModernError> {
             let bytes = std::fs::read(&input_path)
                 .map_err(|e| ModernError::Io(format!("{input_path}: {e}")))?;
             let boundary = Boundary::from_bytes(&bytes)?;
+            if boundary.profile != c.profile() {
+                return Err(ModernError::Invalid(format!(
+                    "boundary file was produced under {}; this stage runs {}",
+                    boundary.profile,
+                    c.profile()
+                )));
+            }
             if boundary.layer != stage.first_layer || boundary.d_model != c.d_model {
                 return Err(ModernError::Invalid(format!(
                     "boundary file is layer {} width {}; this stage starts at layer {} width {}",
@@ -588,6 +599,7 @@ fn cmd_stage(args: &Args) -> Result<(), ModernError> {
     }
     let seconds = start.elapsed().as_secs_f64();
     let output = Boundary {
+        profile: c.profile().to_string(),
         layer: stage.end_layer,
         d_model: c.d_model,
         model_root: model_root.clone(),
@@ -611,7 +623,7 @@ fn cmd_stage(args: &Args) -> Result<(), ModernError> {
         .collect();
     let report = json!({
         "schema": STAGE_RUN_SCHEMA,
-        "profile": PROFILE,
+        "profile": c.profile(),
         "model_root": model_root,
         "stage": stage.to_json(),
         "segments": segment_list,
@@ -697,7 +709,7 @@ fn cmd_ppl(args: &Args) -> Result<(), ModernError> {
     let seconds = start.elapsed().as_secs_f64();
     let out = json!({
         "schema": "arc.mla-ppl.v1",
-        "profile": PROFILE,
+        "profile": c.profile(),
         "kernel": kernel,
         "threads": threads,
         "window": window,

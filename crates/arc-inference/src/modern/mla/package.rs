@@ -15,8 +15,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::config::MlaConfig;
-use super::{PROFILE, STAGE_MAGIC, STAGE_MANIFEST_SCHEMA, STAGE_PACKAGE_SCHEMA};
+use super::config::{ExpertFormat, MlaConfig};
+use super::{STAGE_MAGIC, STAGE_MANIFEST_SCHEMA, STAGE_PACKAGE_SCHEMA};
 pub use crate::modern::package::PackageDigest;
 use crate::modern::{GENERATION_ARGMAX, GENERATION_RP64, ModernError, hex_lower, identity_blake3};
 
@@ -33,6 +33,7 @@ pub enum Dtype {
     I8,
     U8,
     I16,
+    U16,
     I32,
     I64,
 }
@@ -43,6 +44,7 @@ impl Dtype {
             Dtype::I8 => "i8",
             Dtype::U8 => "u8",
             Dtype::I16 => "i16",
+            Dtype::U16 => "u16",
             Dtype::I32 => "i32",
             Dtype::I64 => "i64",
         }
@@ -51,7 +53,7 @@ impl Dtype {
     pub fn width(self) -> u64 {
         match self {
             Dtype::I8 | Dtype::U8 => 1,
-            Dtype::I16 => 2,
+            Dtype::I16 | Dtype::U16 => 2,
             Dtype::I32 => 4,
             Dtype::I64 => 8,
         }
@@ -175,6 +177,25 @@ fn dyadic(specs: &mut Vec<Spec>, segment: &str, name: &str, dims: &[usize]) {
     vector(specs, segment, &format!("{name}.k"), Dtype::U8, rows);
 }
 
+/// The two tensors of an INT4 group-32 stack `[n, rows, cols]` (spec §13.1).
+fn int4_stack(specs: &mut Vec<Spec>, segment: &str, name: &str, dims: &[usize]) {
+    let (n, rows, cols) = (dims[0], dims[1], dims[2]);
+    vector(
+        specs,
+        segment,
+        &format!("{name}.q4"),
+        Dtype::U8,
+        &[n, rows, cols / 2],
+    );
+    vector(
+        specs,
+        segment,
+        &format!("{name}.s"),
+        Dtype::U16,
+        &[n, rows, cols / 32],
+    );
+}
+
 /// Segment name of layer `l`.
 pub fn layer_segment(layer: usize) -> String {
     format!("layer.{layer}")
@@ -214,9 +235,13 @@ fn layer_specs(c: &MlaConfig, layer: usize, specs: &mut Vec<Spec>) {
         dyadic(specs, s, &format!("{p}.shared.w_gate"), &[sf, d]);
         dyadic(specs, s, &format!("{p}.shared.w_up"), &[sf, d]);
         dyadic(specs, s, &format!("{p}.shared.w_down"), &[d, sf]);
-        dyadic(specs, s, &format!("{p}.experts.w_gate"), &[e, fm, d]);
-        dyadic(specs, s, &format!("{p}.experts.w_up"), &[e, fm, d]);
-        dyadic(specs, s, &format!("{p}.experts.w_down"), &[e, d, fm]);
+        let stack = match c.expert_format {
+            ExpertFormat::Int8Dyadic => dyadic,
+            ExpertFormat::Int4G32 => int4_stack,
+        };
+        stack(specs, s, &format!("{p}.experts.w_gate"), &[e, fm, d]);
+        stack(specs, s, &format!("{p}.experts.w_up"), &[e, fm, d]);
+        stack(specs, s, &format!("{p}.experts.w_down"), &[e, d, fm]);
     } else {
         dyadic(specs, s, &format!("{p}.w_gate"), &[c.d_ff, d]);
         dyadic(specs, s, &format!("{p}.w_up"), &[c.d_ff, d]);
@@ -296,7 +321,7 @@ pub fn header_json(c: &MlaConfig, source: &Value, stage: StageSpec, entries: &[E
         .collect();
     json!({
         "schema": STAGE_PACKAGE_SCHEMA,
-        "profile": PROFILE,
+        "profile": c.profile(),
         "model": c.to_json(),
         "source": source,
         "stage": stage.to_json(),
@@ -512,6 +537,11 @@ pub fn i16_bytes(values: &[i16]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+/// Little-endian bytes of a u16 slice.
+pub fn u16_bytes(values: &[u16]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
 /// The parsed header of a stage package.
 #[derive(Debug, Clone)]
 pub struct StageHeader {
@@ -585,12 +615,19 @@ pub fn parse_header(prefix: &[u8], file_len: u64) -> Result<StageHeader, ModernE
             "stage package schema is not {STAGE_PACKAGE_SCHEMA}"
         )));
     }
-    if value.get("profile").and_then(Value::as_str) != Some(PROFILE) {
-        return Err(ModernError::Invalid(format!(
-            "stage package profile is not {PROFILE}"
-        )));
-    }
-    let config = MlaConfig::from_json(&value["model"])?;
+    let format = value
+        .get("profile")
+        .and_then(Value::as_str)
+        .and_then(ExpertFormat::from_profile)
+        .ok_or_else(|| {
+            ModernError::Invalid(format!(
+                "stage package profile {} is not an MLA + MoE profile",
+                value["profile"]
+            ))
+        })?;
+    let mut config = MlaConfig::from_json(&value["model"])?;
+    config.expert_format = format;
+    config.validate()?;
     let stage = StageSpec::from_json(&value["stage"])?;
     stage.validate(&config)?;
     let source = value["source"].clone();
@@ -725,7 +762,7 @@ pub fn model_root(
     let list: Vec<Value> = segments.iter().map(|s| json!([s.name, s.blake3])).collect();
     let body = json!({
         "model": c.to_json(),
-        "profile": PROFILE,
+        "profile": c.profile(),
         "segments": list,
         "source": source,
     });
@@ -747,8 +784,8 @@ pub fn build_manifest(
     let segment_list: Vec<Value> = segments.iter().map(SegmentDigest::to_json).collect();
     let mut manifest = json!({
         "schema": STAGE_MANIFEST_SCHEMA,
-        "profile": PROFILE,
-        "profile_blake3": identity_blake3(PROFILE),
+        "profile": c.profile(),
+        "profile_blake3": identity_blake3(c.profile()),
         "contract": CONTRACT,
         "model": c.to_json(),
         "source": source,
@@ -781,7 +818,7 @@ pub fn verify_against_manifest(
     let manifest: Value = serde_json::from_slice(manifest_bytes)
         .map_err(|e| ModernError::Invalid(format!("stage manifest JSON: {e}")))?;
     if manifest.get("schema").and_then(Value::as_str) != Some(STAGE_MANIFEST_SCHEMA)
-        || manifest.get("profile").and_then(Value::as_str) != Some(PROFILE)
+        || manifest.get("profile").and_then(Value::as_str) != Some(header.config.profile())
     {
         return Err(ModernError::Invalid(
             "stage manifest schema or profile mismatch".into(),
@@ -850,7 +887,7 @@ pub fn digest_file(path: &Path) -> Result<PackageDigest, ModernError> {
 #[cfg(test)]
 mod tests {
     use super::super::config::tests::MOONLIGHT_CONFIG;
-    use super::super::config::{MlaConfig, parse_hf_config};
+    use super::super::config::{ExpertFormat, MlaConfig, parse_hf_config};
     use super::*;
 
     fn moonlight() -> MlaConfig {
@@ -924,6 +961,46 @@ mod tests {
                 end_layer: 27
             }
         );
+    }
+
+    #[test]
+    fn int4_experts_replace_the_dyadic_stacks() {
+        let mut c = moonlight();
+        c.expert_format = ExpertFormat::Int4G32;
+        c.validate().unwrap();
+        let entries = layout(
+            &c,
+            StageSpec {
+                first_layer: 1,
+                end_layer: 2,
+            },
+        );
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"layers.1.experts.w_gate.q4"));
+        assert!(names.contains(&"layers.1.experts.w_down.s"));
+        assert!(!names.contains(&"layers.1.experts.w_gate.q"));
+        // The shared experts stay INT8 dyadic.
+        assert!(names.contains(&"layers.1.shared.w_gate.q"));
+        let q4 = entries
+            .iter()
+            .find(|e| e.name == "layers.1.experts.w_up.q4")
+            .unwrap();
+        assert_eq!(q4.shape, vec![64, 1408, 1024]);
+        let scales = entries
+            .iter()
+            .find(|e| e.name == "layers.1.experts.w_down.s")
+            .unwrap();
+        assert_eq!(
+            (scales.dtype, scales.shape.clone()),
+            (Dtype::U16, vec![64, 2048, 44])
+        );
+        let full = layout(&c, StageSpec::full(&c));
+        let header = header_json(&c, &json!({}), StageSpec::full(&c), &full);
+        assert_eq!(header["profile"], super::super::PROFILE_I4G32);
+        // Routed experts at 0.5 + 2/32 bytes per weight (8.10 GB) plus the
+        // INT8 rest: about 9.66 GB instead of 15.96 GB.
+        let bytes: u64 = full.iter().map(|e| e.bytes).sum();
+        assert!((9_600_000_000..9_750_000_000).contains(&bytes), "{bytes}");
     }
 
     #[test]
