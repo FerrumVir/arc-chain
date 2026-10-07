@@ -127,10 +127,11 @@ storing them (`--discard`).
   matrix and its 1.18 GB INT8 form at a time: about 3.6 GB [CALC, not
   measured].
 - **Time.** Conversion is about 45–55 s per MoE shard on a 4-vCPU CI runner.
-  The download is the bound: 7–10 MB/s per stream from Hugging Face in these
-  runs. A projection for all 62 text shards from these figures: about one
-  hour of conversion. The downloads would take about 17–24 h on one such
-  stream [CALC]; shards are independent, so they parallelise across machines.
+  The download is the bound: 7.6–10.5 MB/s per stream from Hugging Face in
+  these runs (9.8 GB in 938–1,352 s). A projection for all 62 text shards
+  from these figures: about one hour of conversion. The downloads would take
+  about 16–22 h on one such stream [CALC]; shards are independent, so they
+  parallelise across machines.
 
 ## 5. Expert placement
 
