@@ -803,11 +803,13 @@ pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
         unused_eligible: outcome.unused.len(),
         needed_gb,
         largest_region,
+        // `+ 0.0`: an empty float sum is -0.0.
         aggregate_tok_s: rows
             .iter()
             .map(|r| r.projection.batch.aggregate_tok_s)
-            .sum(),
-        tokens_per_day: rows.iter().map(|r| r.tokens_per_day).sum(),
+            .sum::<f64>()
+            + 0.0,
+        tokens_per_day: rows.iter().map(|r| r.tokens_per_day).sum::<f64>() + 0.0,
         churn: churn(&outcome, &devices, model, &mut rng),
         rows,
         scenario: scenario.clone(),
@@ -905,8 +907,10 @@ fn fmt_big(x: f64) -> String {
         format!("{:.2} B", x / 1e9)
     } else if x >= 1e6 {
         format!("{:.1} M", x / 1e6)
-    } else if x >= 1e3 {
+    } else if x >= 1e5 {
         format!("{:.0} k", x / 1e3)
+    } else if x >= 1e3 {
+        format!("{:.1} k", x / 1e3)
     } else {
         format!("{x:.0}")
     }
