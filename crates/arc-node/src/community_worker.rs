@@ -8,9 +8,10 @@
 //! jobs it completed and had verified. Counters cover this process's
 //! lifetime; they are local observations, not chain or reward evidence.
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Route on the node's own RPC that serves [`CommunityWorkerStatus::snapshot`].
 pub const COMMUNITY_WORKER_STATUS_PATH: &str = "/community/worker/status";
@@ -266,6 +267,114 @@ pub fn wall_clock_gap_suggests_sleep(
         .is_ok_and(|gap| gap > interval.saturating_mul(3))
 }
 
+/// Pause before a coordinator that answered a claim with 404 is registered
+/// with again at the claim loop's request, after the immediate first try.
+pub const REREGISTER_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// Spread repeated re-registrations across workers by up to this much, so a
+/// coordinator that restarted is not hit by every worker on the same tick.
+pub const REREGISTER_JITTER_MAX: Duration = Duration::from_secs(5);
+
+/// Coordinators whose claim long-poll answered 404 ("unknown worker"),
+/// waiting for the registration task to register with them again.
+///
+/// The first report for a coordinator wakes the registration task at once:
+/// a coordinator that restarted knows no workers, and waiting for the next
+/// one-minute registration tick would leave this worker idle there. Later
+/// reports for the same coordinator within [`REREGISTER_COOLDOWN`] plus a
+/// jitter are coalesced, so a coordinator that keeps answering 404 costs one
+/// signed registration per cooldown instead of one per 500 ms claim round,
+/// and only the reported coordinators are registered with again; the others
+/// keep their 15 s heartbeat cadence.
+pub struct ReregistrationQueue {
+    state: Mutex<ReregistrationState>,
+    wakeup: tokio::sync::Notify,
+    cooldown: Duration,
+    jitter_max: Duration,
+}
+
+#[derive(Default)]
+struct ReregistrationState {
+    /// Coordinators to register with at the next wakeup, in a stable order.
+    pending: BTreeSet<String>,
+    /// The earliest instant each coordinator may be queued again.
+    next_allowed: HashMap<String, Instant>,
+}
+
+impl Default for ReregistrationQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReregistrationQueue {
+    pub fn new() -> Self {
+        Self::with_cooldown(REREGISTER_COOLDOWN, REREGISTER_JITTER_MAX)
+    }
+
+    pub fn with_cooldown(cooldown: Duration, jitter_max: Duration) -> Self {
+        Self {
+            state: Mutex::new(ReregistrationState::default()),
+            wakeup: tokio::sync::Notify::new(),
+            cooldown,
+            jitter_max,
+        }
+    }
+
+    /// Queue `coordinator` for registration and wake the registration task.
+    /// Returns `false`, waking nothing, when the coordinator was queued less
+    /// than a cooldown ago: that request stands, or has just been served.
+    pub fn request(&self, coordinator: &str) -> bool {
+        self.request_at(coordinator, Instant::now())
+    }
+
+    /// [`Self::request`] at a given instant, for tests.
+    pub fn request_at(&self, coordinator: &str, now: Instant) -> bool {
+        let jitter = self.jitter();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state
+            .next_allowed
+            .get(coordinator)
+            .is_some_and(|allowed| *allowed > now)
+        {
+            return false;
+        }
+        state
+            .next_allowed
+            .insert(coordinator.to_string(), now + self.cooldown + jitter);
+        state.pending.insert(coordinator.to_string());
+        drop(state);
+        self.wakeup.notify_one();
+        true
+    }
+
+    /// The coordinators queued since the last call.
+    pub fn take_pending(&self) -> Vec<String> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut state.pending).into_iter().collect()
+    }
+
+    /// Resolves once a coordinator has been queued. A request made while
+    /// nobody waits is remembered until the next call, like
+    /// [`tokio::sync::Notify::notify_one`].
+    pub async fn notified(&self) {
+        self.wakeup.notified().await;
+    }
+
+    fn jitter(&self) -> Duration {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        let max_ms = u64::try_from(self.jitter_max.as_millis()).unwrap_or(u64::MAX);
+        if max_ms == 0 {
+            return Duration::ZERO;
+        }
+        // Fresh random keys on every call; the node crate has no rand.
+        let roll = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        Duration::from_millis(roll % max_ms.saturating_add(1))
+    }
+}
+
 /// Keeps the computer from idle-sleeping while a community job computes,
 /// when the operator enabled `--prevent-sleep-during-jobs`. Dropping the
 /// guard releases it. The machine may still sleep when the lid closes or
@@ -512,6 +621,70 @@ mod tests {
             before - Duration::from_secs(600),
             interval
         ));
+    }
+
+    #[test]
+    fn a_coordinator_that_keeps_answering_404_is_re_registered_alone_once_per_cooldown() {
+        let queue = ReregistrationQueue::with_cooldown(Duration::from_secs(15), Duration::ZERO);
+        let start = Instant::now();
+        let failing = "https://a.example";
+        // The first 404 is recovered at once, with that coordinator alone.
+        assert!(queue.request_at(failing, start));
+        assert_eq!(queue.take_pending(), vec![failing.to_string()]);
+        // Another coordinator answers idle, so the claim loop re-polls every
+        // 500 ms and the failing one keeps answering 404: every report
+        // within the cooldown is coalesced, and the idle coordinator is
+        // never queued because it never asked.
+        for round in 1..30u64 {
+            assert!(!queue.request_at(failing, start + Duration::from_millis(500 * round)));
+        }
+        assert!(queue.take_pending().is_empty());
+        // After the cooldown, one more registration, and the cycle repeats.
+        assert!(queue.request_at(failing, start + Duration::from_secs(15)));
+        assert_eq!(queue.take_pending(), vec![failing.to_string()]);
+        assert!(!queue.request_at(failing, start + Duration::from_secs(29)));
+        assert!(queue.request_at(failing, start + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn coordinators_cool_down_independently_and_the_jitter_is_bounded() {
+        let queue =
+            ReregistrationQueue::with_cooldown(Duration::from_secs(15), Duration::from_secs(5));
+        let start = Instant::now();
+        assert!(queue.request_at("https://a.example", start));
+        // A second coordinator's first 404 is not held back by the first's
+        // cooldown.
+        assert!(queue.request_at("https://b.example", start + Duration::from_secs(7)));
+        assert_eq!(
+            queue.take_pending(),
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
+        // Within the cooldown a report is coalesced whatever the jitter; a
+        // cooldown plus the whole jitter later it is accepted.
+        assert!(!queue.request_at("https://a.example", start + Duration::from_millis(14_999)));
+        assert!(queue.request_at("https://a.example", start + Duration::from_secs(20)));
+        assert!(!queue.request_at("https://b.example", start + Duration::from_millis(21_999)));
+        assert!(queue.request_at("https://b.example", start + Duration::from_secs(27)));
+    }
+
+    #[tokio::test]
+    async fn a_queued_coordinator_wakes_the_registration_task_once() {
+        let queue = ReregistrationQueue::with_cooldown(Duration::from_secs(15), Duration::ZERO);
+        assert!(queue.request("https://a.example"));
+        tokio::time::timeout(Duration::from_millis(200), queue.notified())
+            .await
+            .expect("the first report wakes the registration task");
+        assert_eq!(queue.take_pending(), vec!["https://a.example".to_string()]);
+        assert!(!queue.request("https://a.example"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), queue.notified())
+                .await
+                .is_err(),
+            "a coalesced report does not wake it again"
+        );
     }
 
     #[test]

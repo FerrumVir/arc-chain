@@ -5519,9 +5519,9 @@ enum ClaimPoll {
     Work(String, serde_json::Value),
     /// The long-poll ended normally without work (`no_work`).
     Idle,
-    /// The coordinator does not know this worker: it restarted, or pruned
-    /// the registration while this machine slept.
-    NotRegistered,
+    /// The coordinator (by RPC base) does not know this worker: it
+    /// restarted, or pruned the registration while this machine slept.
+    NotRegistered(String),
     /// No usable answer: network error, timeout, or an unexpected status.
     Unreachable,
 }
@@ -8978,8 +8978,9 @@ async fn run_arc_node() -> Result<()> {
         let registration_keypair = validator_keypair.clone();
         let mut registration_shutdown = Some(background_admission_shutdown_rx.clone());
         // Local status for the desktop app (GET /community/worker/status),
-        // and a wake-up the claim loop uses when a coordinator answers that
-        // it no longer knows this worker.
+        // and the queue of coordinators the claim loop reports as no longer
+        // knowing this worker (registered with again, each at most once per
+        // cooldown).
         let worker_status = arc_node::community_worker::install(Arc::new(
             arc_node::community_worker::CommunityWorkerStatus::new(
                 worker_id.clone(),
@@ -8988,7 +8989,7 @@ async fn run_arc_node() -> Result<()> {
                 cli.prevent_sleep_during_jobs,
             ),
         ));
-        let reregister = Arc::new(tokio::sync::Notify::new());
+        let reregister = Arc::new(arc_node::community_worker::ReregistrationQueue::new());
         let registration_status = worker_status.clone();
         let registration_wakeup = reregister.clone();
 
@@ -9055,9 +9056,21 @@ async fn run_arc_node() -> Result<()> {
             // answered 404) until the next registration tick, up to a minute
             // later. Register again immediately when a heartbeat gets 404,
             // when the claim loop reports a 404, or when the wall clock shows
-            // the machine slept.
+            // the machine slept. A claim 404 names its coordinator, and that
+            // coordinator alone is registered with again, outside the 15 s
+            // schedule: at once the first time, then at most once per
+            // `REREGISTER_COOLDOWN` (the queue coalesces the rest).
+            enum Round {
+                // The schedule: heartbeat everyone, register every fourth
+                // round.
+                Scheduled,
+                // The claim loop reported these coordinators as not knowing
+                // this worker: register with them alone.
+                Requested(Vec<String>),
+            }
             let mut ticks: u64 = 0;
-            let mut force_register = false;
+            let mut round = Round::Scheduled;
+            let mut next_scheduled = tokio::time::Instant::now();
             let mut previous_round = std::time::SystemTime::now();
             loop {
                 let now = std::time::SystemTime::now();
@@ -9072,10 +9085,27 @@ async fn run_arc_node() -> Result<()> {
                         "wall clock jumped (sleep or suspend); registering again with every coordinator"
                     );
                 }
-                let register_tick = ticks.is_multiple_of(4) || force_register || woke_from_sleep;
-                force_register = false;
+                // A requested round leaves the schedule alone; after a sleep
+                // every coordinator has to be registered with anyway.
+                let (targets, register_tick, scheduled) =
+                    match std::mem::replace(&mut round, Round::Scheduled) {
+                        Round::Requested(requested)
+                            if !requested.is_empty() && !woke_from_sleep =>
+                        {
+                            tracing::info!(
+                                coordinators = ?requested,
+                                "registering again with coordinators that no longer know this worker"
+                            );
+                            (requested, true, false)
+                        }
+                        _ => (
+                            community_rpc_targets_c.clone(),
+                            ticks.is_multiple_of(4) || woke_from_sleep,
+                            true,
+                        ),
+                    };
                 let mut set = tokio::task::JoinSet::new();
-                for addr in &community_rpc_targets_c {
+                for addr in &targets {
                     let client = client.clone();
                     let addr = addr.clone();
                     let register_payload = register_payload.clone();
@@ -9145,13 +9175,20 @@ async fn run_arc_node() -> Result<()> {
                         accepted += 1;
                     }
                 }
-                registration_status.record_registration_round(accepted);
-                ticks += 1;
+                if scheduled {
+                    // A requested round covers a subset; only a full round
+                    // says how many coordinators know this worker.
+                    registration_status.record_registration_round(accepted);
+                    ticks += 1;
+                    next_scheduled = tokio::time::Instant::now() + COMMUNITY_PRESENCE_INTERVAL;
+                }
                 tokio::select! {
                     biased;
                     () = wait_for_optional_runtime_shutdown(&mut registration_shutdown) => return,
-                    () = registration_wakeup.notified() => force_register = true,
-                    () = tokio::time::sleep(COMMUNITY_PRESENCE_INTERVAL) => {}
+                    () = registration_wakeup.notified() => {
+                        round = Round::Requested(registration_wakeup.take_pending());
+                    }
+                    () = tokio::time::sleep_until(next_scheduled) => round = Round::Scheduled,
                 }
             }
         }));
@@ -9286,7 +9323,7 @@ async fn run_arc_node() -> Result<()> {
                             };
                             let status = response.status();
                             if status == reqwest::StatusCode::NOT_FOUND {
-                                return ClaimPoll::NotRegistered;
+                                return ClaimPoll::NotRegistered(target);
                             }
                             if !status.is_success() {
                                 return ClaimPoll::Unreachable;
@@ -9304,7 +9341,7 @@ async fn run_arc_node() -> Result<()> {
 
                     let mut claimed: Option<(String, serde_json::Value)> = None;
                     let mut answered = false;
-                    let mut unregistered = false;
+                    let mut unregistered: Vec<String> = Vec::new();
                     while let Some(res) = claims.join_next().await {
                         match res {
                             Ok(ClaimPoll::Work(target, job)) => {
@@ -9312,14 +9349,19 @@ async fn run_arc_node() -> Result<()> {
                                 break;
                             }
                             Ok(ClaimPoll::Idle) => answered = true,
-                            Ok(ClaimPoll::NotRegistered) => unregistered = true,
+                            Ok(ClaimPoll::NotRegistered(coordinator)) => {
+                                unregistered.push(coordinator)
+                            }
                             Ok(ClaimPoll::Unreachable) | Err(_) => {}
                         }
                     }
-                    if unregistered {
-                        // The registration task re-registers now instead of
-                        // at its next one-minute registration tick.
-                        reregister_w.notify_one();
+                    for coordinator in unregistered {
+                        // The registration task registers with this
+                        // coordinator now instead of at its next one-minute
+                        // registration tick. Repeats within the cooldown are
+                        // coalesced, and the other coordinators are left
+                        // alone.
+                        reregister_w.request(&coordinator);
                     }
                     // A request can already have consumed a remote queue item
                     // by the time its future is canceled. Keep the remaining
