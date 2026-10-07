@@ -50,14 +50,15 @@ pub struct V07Signals {
     pub fenced_v07_root_earlier: bool,
 }
 
-/// Fenced v0.7 chain data (on this launch or, still undismissed, an earlier
-/// one), the bridge's record of having run under the v0.7 app, or a saved
+/// Fenced v0.7 chain data (on this launch, or kept from an earlier one), the
+/// bridge's record of having run under the v0.7 app, or a saved
 /// configuration that still uses the v0.7 data layout marks an install that
 /// came from v0.7. The layout covers v0.7.10/v0.7.11 desktops whose node
 /// never started, because their updater returned 404: they have no WAL to
 /// fence and may have no bridge record, but their owner has still never been
-/// asked. The earlier notice covers a v0.7 install whose first v0.8 launch
-/// was a build without this question.
+/// asked. The earlier notice and the WAL kept at the `~/.arc` root cover a v0.7
+/// install whose first v0.8 launch was a build without this question; the
+/// WAL outlives the notice, which the user can dismiss.
 pub fn detect_v07_origin(signals: V07Signals, home: &Path) -> Option<&'static str> {
     if signals.fenced_this_launch {
         Some("v0.7 chain data was fenced on this launch")
@@ -67,6 +68,8 @@ pub fn detect_v07_origin(signals: V07Signals, home: &Path) -> Option<&'static st
         Some("the saved configuration still uses the v0.7 data layout")
     } else if signals.fenced_v07_root_earlier {
         Some("v0.7 chain data was fenced on an earlier launch")
+    } else if v07_wal_kept_at_root(home) {
+        Some("v0.7 chain data is still kept at the ~/.arc root")
     } else {
         None
     }
@@ -88,6 +91,34 @@ pub fn config_uses_v07_layout(config: &NodeConfig, home: &Path) -> bool {
 /// malformed v0.8 `data-v3*` directory.
 pub fn notice_fenced_v07_root(notice: Option<&DataMigrationNotice>, home: &Path) -> bool {
     notice.is_some_and(|notice| Path::new(&notice.legacy_data_dir) == v07_root(home))
+}
+
+/// Whether the `~/.arc` root still holds a v0.7 WAL: `state.wal` or `dag-wal`
+/// without a valid `genesis.network-hash`. The fence keeps those bytes in
+/// place and only moves the pointer, so they outlive a dismissed notice. A v0.8
+/// install never writes there (its default is a `data-v3*` child), and a v0.8
+/// node that did run at the root wrote a valid hash beside its WAL.
+pub fn v07_wal_kept_at_root(home: &Path) -> bool {
+    let root = v07_root(home);
+    let has_wal = ["state.wal", "dag-wal"]
+        .iter()
+        .any(|name| fs::symlink_metadata(root.join(name)).is_ok());
+    has_wal && !has_valid_network_hash(&root.join("genesis.network-hash"))
+}
+
+/// The same syntactic check the WAL fence applies to `genesis.network-hash`.
+fn has_valid_network_hash(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 1024 => {
+            fs::read(path).ok().is_some_and(|bytes| {
+                std::str::from_utf8(&bytes).ok().is_some_and(|value| {
+                    let value = value.trim();
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            })
+        }
+        _ => false,
+    }
 }
 
 fn v07_root(home: &Path) -> PathBuf {
@@ -509,6 +540,64 @@ mod tests {
             load(&machine.app_data()).unwrap().detected_by,
             "v0.7 chain data was fenced on an earlier launch"
         );
+    }
+
+    #[test]
+    fn a_v07_install_whose_earlier_notice_was_dismissed_is_still_held() {
+        // As above, then the owner dismissed that build's migration notice
+        // (`dismiss_data_migration_notice`). The v0.7 WAL the fence kept at
+        // the ~/.arc root still marks the install.
+        let machine = Machine::new();
+        machine.install_store(&v07_store("onboarding-worker"));
+        machine.v07_node_ran();
+        let mut store = Store::load_from(&machine.app_data());
+        store
+            .protect_legacy_v07_data_at(&machine.arc_root())
+            .unwrap()
+            .unwrap();
+        store.data_migration_notice = None;
+        store.save_to(&machine.app_data()).unwrap();
+        let (store, outcome) = machine.launch(1);
+        assert!(outcome.hold.held);
+        assert_held(&store, &machine);
+        assert_eq!(
+            load(&machine.app_data()).unwrap().detected_by,
+            "v0.7 chain data is still kept at the ~/.arc root"
+        );
+        // And on every launch after that.
+        let (store, _) = machine.launch(2);
+        assert_held(&store, &machine);
+    }
+
+    #[test]
+    fn only_a_v07_wal_at_the_root_counts() {
+        let machine = Machine::new();
+        let root = machine.arc_root();
+        fs::create_dir_all(&root).unwrap();
+        assert!(!v07_wal_kept_at_root(&machine.home()));
+        // Binaries, models and a fresh v0.8 data-v3 child are not chain data.
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("models")).unwrap();
+        fs::create_dir_all(root.join("data-v3")).unwrap();
+        fs::write(root.join("data-v3").join("state.wal"), b"v3").unwrap();
+        assert!(!v07_wal_kept_at_root(&machine.home()));
+        for wal in ["state.wal", "dag-wal"] {
+            let machine = Machine::new();
+            let root = machine.arc_root();
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join(wal), b"v0.7").unwrap();
+            assert!(v07_wal_kept_at_root(&machine.home()), "{wal}");
+            // A malformed hash is not a v0.8 binding.
+            fs::write(root.join("genesis.network-hash"), b"not a hash").unwrap();
+            assert!(v07_wal_kept_at_root(&machine.home()), "{wal}");
+            // A v0.8 node that ran at the root bound its WAL to the network.
+            fs::write(
+                root.join("genesis.network-hash"),
+                format!("{}\n", "ab".repeat(32)),
+            )
+            .unwrap();
+            assert!(!v07_wal_kept_at_root(&machine.home()), "{wal}");
+        }
     }
 
     #[test]

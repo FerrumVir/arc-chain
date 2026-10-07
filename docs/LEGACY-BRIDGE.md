@@ -204,7 +204,11 @@ reports `chain_participation_enabled: false` and `/node/info` reports
      desktop wrote and no v0.8 build writes (the node never ran, because
      the v0.7.10/v0.7.11 updater returned 404);
    - an undismissed migration notice fenced the `~/.arc` root on an earlier
-     launch (the first v0.8 build to open it had no question).
+     launch (the first v0.8 build to open it had no question);
+   - the `~/.arc` root still holds a v0.7 WAL (`state.wal` or `dag-wal`
+     without a valid `genesis.network-hash`). The fence keeps those bytes in
+     place, so this outlives a dismissed notice; no v0.8 install writes
+     there.
 
    The hold is applied before the question is written, and the held
    observer config is persisted even when the question cannot be, so a
@@ -226,7 +230,7 @@ match every released tag from v0.6.0 to v0.7.11.
 | Desktop app updated, node already ran | held: observer, no model | `legacy_upgrade.rs` `a_v07_node_that_already_ran_is_fenced_and_held` |
 | Desktop app updated, node never ran | held | `a_v07_node_that_never_ran_is_held` |
 | Desktop app updated after the bridge ran | held | `a_desktop_the_bridge_ran_under_is_held` |
-| Desktop opened first by a v0.8 build without the question | held | `a_v07_install_first_opened_by_a_build_without_the_question_is_still_held` |
+| Desktop opened first by a v0.8 build without the question, notice kept or dismissed | held | `a_v07_install_first_opened_by_a_build_without_the_question_is_still_held`, `a_v07_install_whose_earlier_notice_was_dismissed_is_still_held`, `only_a_v07_wal_at_the_root_counts` |
 | Every v0.6.0..v0.7.11 desktop store (worker, observer, custom ports; ran or not) | held | `every_released_v07_desktop_store_is_held_until_its_owner_answers` |
 | Relaunch before answering | still held | `relaunching_before_answering_keeps_the_hold` |
 | Question cannot be written, or its record is unreadable | still held | `an_unrecordable_question_still_holds_the_node`, `an_unreadable_question_record_is_still_pending` |
