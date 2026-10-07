@@ -1,0 +1,12 @@
+{
+  "schema": "arc.tree-traffic.v1",
+  "provenance": "Original representative prompts authored for ENG-8; no production logs or private transcripts. Equal cases per category; deliberately includes repetition-friendly edits and non-repetitive open generation.",
+  "cases": [
+    {"id":"coding-edit","traffic":"coding","max_tokens":48,"user":"Change the timeout from 30 to 60 and return the complete function, with no explanation:\n```python\ndef fetch_record(client, record_id):\n    response = client.get(f'/records/{record_id}', timeout=30)\n    response.raise_for_status()\n    return response.json()\n```"},
+    {"id":"coding-new","traffic":"coding","max_tokens":48,"user":"Write a Python function unique_in_order(values) that removes duplicates while preserving the order of first occurrence. The input elements are hashable. Include one assert test."},
+    {"id":"agent-patch","traffic":"agent","max_tokens":48,"user":"Continue this coding-agent transcript with the next action and a concise explanation.\nUser: Fix the retry bug.\nAssistant: I will inspect the loop and run the regression test.\nTool read_file: def retry(fn, attempts):\n    for attempt in range(attempts):\n        try: return fn()\n        except TimeoutError: pass\n    return None\nTool pytest: FAILED test_retry_raises_last_error: expected TimeoutError, got None\nUser: Preserve successful returns and raise the last timeout after retries are exhausted."},
+    {"id":"agent-summary","traffic":"agent","max_tokens":48,"user":"Summarize this agent's tool results for the user and state the next step. Do not invent results.\nUser: Find why the build failed.\nAssistant: Checking compiler and test output.\nTool build: error E0308: expected usize, found u32 at src/parser.rs:42\nTool read_file: let size: usize = header.length; // header.length is u32\nTool test: skipped because build failed\nAssistant:"},
+    {"id":"chat-explain","traffic":"chat","max_tokens":48,"user":"Why does bread become stale? Explain in two sentences for someone who does not know chemistry."},
+    {"id":"chat-plan","traffic":"chat","max_tokens":48,"user":"I have twenty minutes and want a quiet break from working at a computer. Suggest three simple activities that do not involve a screen."}
+  ]
+}

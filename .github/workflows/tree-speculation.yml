@@ -1,0 +1,73 @@
+name: Tree speculation (SmolLM3)
+
+# One CPU job, no self-hosted runners or ARC nodes. The normal CI matrix runs
+# the small exactness tests; this job measures acceptance on pinned real weights.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/arc-inference/src/modern/serving/tree.rs'
+      - 'crates/arc-inference/src/modern/serving/tree/**'
+      - 'crates/arc-inference/examples/tree_speculation.rs'
+      - 'crates/arc-inference/tests/fixtures/tree_traffic.json'
+      - '.github/workflows/tree-speculation.yml'
+permissions:
+  contents: read
+concurrency:
+  group: tree-speculation-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  CARGO_INCREMENTAL: '0'
+jobs:
+  acceptance:
+    name: SmolLM3 tree acceptance + exactness
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: tree-speculation
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Build measurement and converter
+        run: cargo build --locked --release -p arc-inference --example tree_speculation --bin arc-modern
+      - name: Fetch pinned public SmolLM3 weights (hash checked)
+        run: python scripts/arc_modern/fetch_source.py --manifest docs/protocol/packages/smollm3-3b.source.json --dir "$RUNNER_TEMP/tree-model"
+      - name: Convert and verify integer package identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tree-evidence"
+          ./target/release/arc-modern convert --source-dir "$RUNNER_TEMP/tree-model" \
+            --source-manifest docs/protocol/packages/smollm3-3b.source.json \
+            --out "$RUNNER_TEMP/tree-model/model.arcipkg" --threads 4 \
+            > "$RUNNER_TEMP/tree-evidence/convert.json"
+          ./target/release/arc-modern verify --package "$RUNNER_TEMP/tree-model/model.arcipkg" \
+            --manifest docs/protocol/packages/smollm3-3b.integer-package.json
+      - name: Measure acceptance and prove greedy byte identity on each case
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/examples/tree_speculation \
+            --package "$RUNNER_TEMP/tree-model/model.arcipkg" \
+            --tokenizer "$RUNNER_TEMP/tree-model/tokenizer.json" \
+            --cases crates/arc-inference/tests/fixtures/tree_traffic.json \
+            --out "$RUNNER_TEMP/tree-evidence/results.json" \
+            --summary "$RUNNER_TEMP/tree-evidence/summary.md"
+          cat "$RUNNER_TEMP/tree-evidence/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: tree-speculation-evidence
+          path: ${{ runner.temp }}/tree-evidence/
+          if-no-files-found: warn

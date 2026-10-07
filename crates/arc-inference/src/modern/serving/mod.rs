@@ -32,6 +32,7 @@ pub mod gemm;
 pub mod prefix;
 pub mod scheduler;
 pub mod spec;
+pub mod tree;
 
 #[cfg(test)]
 mod tests;

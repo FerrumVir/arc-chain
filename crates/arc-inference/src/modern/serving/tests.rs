@@ -1675,3 +1675,30 @@ fn prompt_rows_without_logits_run_the_same_head_checks_as_generate() {
         }
     }
 }
+
+#[test]
+fn tree_generation_survives_pipeline_partition_and_microbatch_boundaries() {
+    use super::tree::{LookupTree, generate_tree};
+    let model = model_with(4, 96, 113);
+    let dense = DenseModel::new(&model, [113; 32]);
+    let pipeline = Pipeline {
+        model: &model,
+        cut: 2,
+    };
+    for req in random_requests(8, 47) {
+        let request = GenerationRequest {
+            prompt: &req.prompt,
+            max_tokens: req.max_tokens,
+            eos: &req.eos,
+            selection: req.selection,
+        };
+        let whole = generate_tree(&dense, &request, &LookupTree::default(), 8).unwrap();
+        let split = generate_tree(&pipeline, &request, &LookupTree::default(), 8).unwrap();
+        let plain = model.generate(&request).unwrap();
+        assert_eq!(split.tokens, plain.tokens);
+        assert_eq!(split.logits_hashes, plain.logits_hashes);
+        assert_eq!(split.tokens, whole.tokens);
+        assert_eq!(split.kv_digest, whole.kv_digest);
+        assert_eq!(split.verification_passes, whole.verification_passes);
+    }
+}
