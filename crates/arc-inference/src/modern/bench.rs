@@ -171,6 +171,16 @@ fn read_bandwidth(model: &ModernModel, threads: usize) -> Result<f64, ModernErro
     Ok(rate(bytes as f64, best) / 1e9)
 }
 
+/// The concrete row order `spec`'s kernel runs with under `tiling` for a
+/// single-input or batched call; null for the scalar and legacy kernels,
+/// which have no row order.
+fn row_order(spec: Spec, tiling: Tiling, batched: bool) -> Value {
+    match spec.kernel() {
+        Some(kernel) if kernel != Kernel::Scalar => json!(tiling.resolve(kernel, batched).name()),
+        _ => Value::Null,
+    }
+}
+
 /// Each available kernel on the model's own matrices: seconds per call and
 /// GB/s of weights streamed, with the default thread pool.
 fn kernel_micro(model: &ModernModel, tilings: &[Tiling]) -> Result<Vec<Value>, ModernError> {
@@ -185,11 +195,19 @@ fn kernel_micro(model: &ModernModel, tilings: &[Tiling]) -> Result<Vec<Value>, M
     ];
     let mut rows = Vec::new();
     let pairs = Kernel::available_kernels().into_iter().flat_map(|kernel| {
-        let orders: Vec<Tiling> = if kernel == Kernel::Scalar {
-            vec![tilings[0]]
-        } else {
-            tilings.to_vec()
-        };
+        // Concrete orders only (`auto` would repeat one of them); the scalar
+        // kernel has no row order and is measured once.
+        let mut orders: Vec<Tiling> = tilings
+            .iter()
+            .copied()
+            .filter(|t| *t != Tiling::Auto)
+            .collect();
+        if orders.is_empty() {
+            orders.push(tilings[0].resolve(kernel, false));
+        }
+        if kernel == Kernel::Scalar {
+            orders.truncate(1);
+        }
         orders.into_iter().map(move |tiling| (kernel, tiling))
     });
     for (kernel, tiling) in pairs {
@@ -308,6 +326,7 @@ pub fn run(model: &ModernModel, options: &BenchOptions) -> Result<Value, ModernE
             runs.push(json!({
                 "spec": spec.name(),
                 "tiling": tiling.name(),
+                "row_order": row_order(spec, tiling, false),
                 "threads": count,
                 "tokens": options.decode_tokens,
                 "seconds": seconds,
@@ -379,6 +398,8 @@ pub fn run(model: &ModernModel, options: &BenchOptions) -> Result<Value, ModernE
             "decode_tokens": options.decode_tokens,
             "prefill": {
                 "spec": lead.name(),
+                "tiling": tilings[0].name(),
+                "row_order": row_order(lead, tilings[0], true),
                 "threads": threads,
                 "tokens": context,
                 "seconds": prefill_seconds,
@@ -414,6 +435,10 @@ pub fn run(model: &ModernModel, options: &BenchOptions) -> Result<Value, ModernE
         },
         "threads": threads,
         "tiling": tilings[0].name(),
+        "row_orders": {
+            "single": row_order(lead, tilings[0], false),
+            "batched": row_order(lead, tilings[0], true),
+        },
         "tilings": tilings.iter().map(|t| t.name()).collect::<Vec<_>>(),
         "bandwidth": bandwidth,
         "contexts": contexts,

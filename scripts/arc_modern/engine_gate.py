@@ -166,6 +166,14 @@ def report_one(bench: dict, label: str) -> list[str]:
         out.append("")
     best = best_kernel(bench)
     default_tiling = bench.get("tiling")
+    orders = bench.get("row_orders") or {}
+    if orders.get("single") or orders.get("batched"):
+        out.append(
+            f"Row order of the SIMD kernels (`--tiling {default_tiling}`): "
+            f"{orders.get('single')} for single-token calls (decode), "
+            f"{orders.get('batched')} for batched calls (prefill)."
+        )
+        out.append("")
     ladder_specs = [k.format(best=best) for k, _ in LADDER]
     for ctx in bench.get("contexts", []):
         runs = ctx.get("decode", [])
@@ -178,8 +186,9 @@ def report_one(bench: dict, label: str) -> list[str]:
         out.append(f"#### Context {ctx['context']} positions, {ctx['decode_tokens']} decoded tokens")
         out.append("")
         pre = ctx.get("prefill", {})
+        pre_order = f", {pre['row_order']}" if pre.get("row_order") else ""
         out.append(
-            f"Prefill of the context (`{pre.get('spec')}`): {fmt(pre.get('tok_s', 0))} tok/s. "
+            f"Prefill of the context (`{pre.get('spec')}`{pre_order}): {fmt(pre.get('tok_s', 0))} tok/s. "
             f"All specs produced identical logits: **{ctx.get('digests_equal')}**."
         )
         out.append("")
@@ -208,8 +217,11 @@ def report_one(bench: dict, label: str) -> list[str]:
             out.append("|---|---|---|---|---|---|")
             for r in others:
                 util = r["effective_gb_s"] / bw[r["threads"]] if bw.get(r["threads"]) else None
+                tiling = r.get("tiling", "—")
+                if r.get("row_order") and r["row_order"] != tiling:
+                    tiling = f"{tiling} ({r['row_order']})"
                 out.append(
-                    f"| `{r['spec']}` | {r.get('tiling', '—')} | {r['threads']} | {fmt(r['tok_s'])} | "
+                    f"| `{r['spec']}` | {tiling} | {r['threads']} | {fmt(r['tok_s'])} | "
                     f"{fmt(r['effective_gb_s'], 1)} | {fmt(100 * util, 0) + '%' if util else '—'} |"
                 )
         prof = ctx.get("profile")

@@ -812,6 +812,15 @@ impl Spec {
         }
     }
 
+    /// The exact kernel of [`super::kernels`] this spec uses (`None` for the
+    /// legacy limb kernel).
+    pub fn kernel(self) -> Option<Kernel> {
+        match self {
+            Spec::Reference(ReferenceKernel::Legacy) => None,
+            Spec::Reference(ReferenceKernel::Exact(kernel)) | Spec::Fast(kernel) => Some(kernel),
+        }
+    }
+
     fn check_available(self) -> Result<(), ModernError> {
         let available = match self {
             Spec::Reference(ReferenceKernel::Legacy) => canonical_simd::dotprod_available(),
