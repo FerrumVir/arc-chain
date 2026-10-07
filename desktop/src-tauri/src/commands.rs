@@ -4184,8 +4184,9 @@ pub async fn existing_model_for_tier(tier: String) -> CmdResult<Option<String>> 
 /// that drops every few minutes still finishes, and whatever is saved stays
 /// on disk for the next start either way.
 const MODEL_DOWNLOAD_MAX_STALLED_ATTEMPTS: u32 = 8;
-/// Times the saved bytes may be discarded because a mirror cannot continue
-/// them, before the download stops instead of re-fetching gigabytes forever.
+/// Times the saved bytes may be discarded, because a mirror cannot continue
+/// them (a `Restart`) or answered from byte 0 instead of resuming (a rewind),
+/// before the download stops instead of re-fetching gigabytes forever.
 const MODEL_DOWNLOAD_MAX_RESTARTS: u32 = 2;
 const MODEL_DOWNLOAD_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(2);
 const MODEL_DOWNLOAD_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
@@ -4242,7 +4243,9 @@ enum ModelAttemptFailure {
 /// How to use a response to `GET` with `Range: bytes=<offset>-`.
 #[derive(Debug, PartialEq, Eq)]
 enum ModelRangePlan {
-    /// Cut the partial file to this length, then append the body.
+    /// Cut the partial file to this length, then append the body. A length
+    /// below the saved bytes is a rewind (the mirror ignored or rejected the
+    /// Range), which the retry loop counts against the restart budget.
     AppendFrom(u64),
     /// The partial file already holds every byte.
     Complete,
@@ -4447,7 +4450,10 @@ fn model_progress(
 }
 
 /// One HTTP attempt: request the bytes after `offset` and append them to the
-/// partial file. Returns once the partial holds all `total` bytes.
+/// partial file. Returns once the partial holds all `total` bytes. When the
+/// mirror answers from an earlier byte than `offset`, the saved bytes from
+/// there are discarded and re-fetched, and `rewound_to` records that start
+/// so the caller can count the rewind whether or not the stream then fails.
 #[allow(clippy::too_many_arguments)]
 async fn model_download_attempt<F>(
     client: &reqwest::Client,
@@ -4458,6 +4464,7 @@ async fn model_download_attempt<F>(
     tier: &str,
     attempt: u32,
     idle_timeout: std::time::Duration,
+    rewound_to: &mut Option<u64>,
     emit: &mut F,
 ) -> Result<(), ModelAttemptFailure>
 where
@@ -4507,7 +4514,11 @@ where
         .await
         .map_err(|error| model_write_failure(partial, error))?;
     if start != offset {
-        // The mirror restarted from byte 0 instead of resuming.
+        // The mirror restarted from byte 0 instead of resuming. The saved
+        // bytes past `start` are discarded and fetched again; report that so
+        // the caller counts it against the restart budget whatever happens
+        // to this stream next.
+        *rewound_to = Some(start);
         file.set_len(start)
             .await
             .map_err(|error| model_write_failure(partial, error))?;
@@ -4616,6 +4627,7 @@ where
             attempt,
             ..model_progress(tier, "connecting", offset, total)
         });
+        let mut rewound_to = None;
         let failure = match model_download_attempt(
             client,
             url,
@@ -4625,6 +4637,7 @@ where
             tier,
             attempt,
             policy.idle_timeout,
+            &mut rewound_to,
             emit,
         )
         .await
@@ -4642,19 +4655,33 @@ where
                 ));
             }
             ModelAttemptFailure::Restart(reason) => {
-                restarts = restarts.saturating_add(1);
-                if restarts > MODEL_DOWNLOAD_MAX_RESTARTS {
-                    return Err(format!(
-                        "Model download stopped: {reason}, {restarts} times. The mirror is not serving the pinned file consistently; try again later."
-                    ));
-                }
                 restart = true;
                 reason
             }
             ModelAttemptFailure::Transient(reason) => reason,
         };
+        let reason = match rewound_to {
+            Some(start) => format!(
+                "the model mirror restarted from byte {start} instead of resuming at byte {offset} ({reason})"
+            ),
+            None => reason,
+        };
+        // A `Restart` discards the saved bytes before the next attempt; a
+        // response that rewound has already discarded and re-fetched them.
+        // Both count against the same budget. Otherwise a mirror that ignores
+        // Range and keeps dropping the connection would re-fetch the file
+        // forever: each slightly longer partial would look like progress
+        // below, and nothing would ever report a `Restart`.
+        if restart || rewound_to.is_some() {
+            restarts = restarts.saturating_add(1);
+            if restarts > MODEL_DOWNLOAD_MAX_RESTARTS {
+                return Err(format!(
+                    "Model download stopped: {reason}, {restarts} times. The mirror is not serving the pinned file consistently; try again later."
+                ));
+            }
+        }
         // Only a resumable attempt that saved new bytes counts as progress.
-        stalled = if saved > offset && !restart {
+        stalled = if saved > offset && !restart && rewound_to.is_none() {
             1
         } else {
             stalled.saturating_add(1)
@@ -5310,6 +5337,63 @@ mod model_download_tests {
             "every retry resumes from the saved bytes"
         );
         assert_eq!(std::fs::read(&partial).unwrap(), &payload[..saved]);
+    }
+
+    #[tokio::test]
+    async fn a_mirror_that_ignores_range_and_keeps_dropping_stops_within_the_restart_budget() {
+        // ARC-48 F5: every reply ignores Range, answers 200 from byte 0 and
+        // drops the connection one byte further than the saved partial. The
+        // partial grew 101, 102, ... bytes, each attempt looked like
+        // progress, and nothing reported a `Restart`, so the loop re-fetched
+        // the file indefinitely. A rewind now spends the restart budget.
+        let payload = fixture_payload();
+        let saved = 100usize;
+        let drops = (1..=10)
+            .map(|extra| Reply::FullThenDrop {
+                send: saved + extra,
+            })
+            .collect();
+        let (url, ranges, server) = spawn_mirror(payload.clone(), drops).await;
+        let spec = leaked_spec(url, &payload);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("standard.gguf");
+        let partial = model_partial_path(&target, spec);
+        std::fs::write(&partial, &payload[..saved]).unwrap();
+        // More stall budget than rewinds, so only the restart budget can
+        // stop this download.
+        let policy = ModelDownloadPolicy {
+            max_stalled_attempts: MODEL_DOWNLOAD_MAX_STALLED_ATTEMPTS,
+            ..FAST_RETRY
+        };
+
+        let error = download_verified_model(&reqwest::Client::new(), spec, &target, policy, |_| {})
+            .await
+            .unwrap_err();
+        // Ten replies were scripted; the download must stop long before.
+        server.abort();
+
+        assert!(error.contains("restarted from byte 0"), "{error}");
+        assert!(error.contains("3 times"), "{error}");
+        let ranges = ranges.lock().unwrap().clone();
+        assert_eq!(
+            ranges.len(),
+            3,
+            "two rewinds are tolerated and the third stops the download: {ranges:?}"
+        );
+        assert_eq!(ranges[0], Some(saved as u64));
+        assert!(
+            ranges.windows(2).all(|pair| pair[0] <= pair[1]),
+            "every attempt resumed from the saved bytes: {ranges:?}"
+        );
+        // Whatever the last response saved is kept for the next run.
+        let kept = std::fs::read(&partial).unwrap();
+        assert!(
+            kept.len() >= saved && kept.len() <= saved + 3,
+            "kept {}",
+            kept.len()
+        );
+        assert_eq!(kept, &payload[..kept.len()]);
+        assert!(!target.exists());
     }
 }
 
