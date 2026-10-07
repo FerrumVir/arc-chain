@@ -58,6 +58,7 @@ on:
       - 'crates/arc-inference/src/modern/mla/config.rs'
       - 'scripts/arc_conformance/mla_moe_reference.py'
       - 'scripts/arc_mla/stream_slices.py'
+      - 'scripts/arc_mla/tests/**'
       - 'scripts/arc_mla/slice_checks.sh'
       - 'scripts/arc_mla/make_tiny_kimi_packed.py'
       - 'scripts/arc_mla/ct_unpack_check.py'
@@ -139,6 +140,9 @@ jobs:
       - name: Build arc-mla
         shell: bash
         run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: Streaming driver keeps at most one step's shards (no downloads)
+        shell: bash
+        run: python -m unittest scripts/arc_mla/tests/test_stream_slices.py -v
       - name: Slice checks
         shell: bash
         run: |

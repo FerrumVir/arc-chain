@@ -140,6 +140,17 @@ def main(argv: list) -> int:
     run([args.arc_mla, "slice-plan", *common, *select, "--out", str(plan_path)])
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
 
+    def release(step: dict) -> list:
+        """Delete the shards no later step reads (unless --keep-source)."""
+        released = []
+        if not args.keep_source:
+            for name in step["release"]:
+                path = work / name
+                if path.exists():
+                    path.unlink()
+                    released.append(name)
+        return released
+
     steps = []
     peak_disk = 0
     start_all = time.time()
@@ -147,7 +158,11 @@ def main(argv: list) -> int:
         record = {"step": i, "units": step["units"], "shards": step["shards"]}
         done = all((out / "units" / f"{u}.json").exists() for u in step["units"])
         if args.resume and done:
+            # A run interrupted after converting this step but before deleting
+            # its shards left them on disk; delete them now, before the next
+            # step downloads anything, so at most one step's shards are held.
             record["skipped"] = "unit records exist"
+            record["deleted"] = release(step)
             steps.append(record)
             continue
         download_seconds, download_bytes = 0.0, 0
@@ -166,11 +181,7 @@ def main(argv: list) -> int:
         report = json.loads(stdout)
         disk = tree_bytes(work) + tree_bytes(out)
         peak_disk = max(peak_disk, disk)
-        released = []
-        if not args.keep_source:
-            for name in step["release"]:
-                (work / name).unlink()
-                released.append(name)
+        released = release(step)
         record.update({
             "download_seconds": round(download_seconds, 3),
             "downloaded_bytes": download_bytes,

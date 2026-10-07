@@ -127,10 +127,11 @@ storing them (`--discard`).
   matrix and its 1.18 GB INT8 form at a time: about 3.6 GB [CALC, not
   measured].
 - **Time.** Conversion is about 45–55 s per MoE shard on a 4-vCPU CI runner.
-  The download is the bound: 7.6–10.5 MB/s per stream from Hugging Face in
-  these runs (9.8 GB in 938–1,352 s). A projection for all 62 text shards
-  from these figures: about one hour of conversion. The downloads would take
-  about 16–22 h on one such stream [CALC]; shards are independent, so they
+  The download is the bound: 7.26–10.46 MB/s per stream from Hugging Face in
+  these runs (shard 2, 9,809,047,464 B in 1,351.96 s on CI x86-64 and 937.8 s
+  on CI arm64). A projection for all 62 text shards (594.2 GB) from these
+  figures: about one hour of conversion [CALC]. The downloads would take
+  about 16–23 h on one such stream [CALC]; shards are independent, so they
   parallelise across machines.
 
 ## 5. Expert placement
@@ -188,7 +189,10 @@ Also exists (spec §14):
   `83347a71…`) is identical on linux x86-64, linux arm64 (CI) and macOS arm64
   (Studio lab), on 1 thread and on all threads, and in the independent Python
   preparer. Compressed-tensors' own unpacker gives the same INT4 values and
-  scales for 8 sampled experts × 3 projections.
+  scales for 8 sampled experts × 3 projections. The pinned file was added
+  after CI run 37622036049 (copied from the Studio-lab run of the same
+  shards) and checked byte for byte against that run's artifacts; the run
+  itself had no pin to compare with.
 
 Does not exist: the YaRN preparation (§2), so no K2.6 stage package, model
 root or forward pass; slices of layers 2–60 and of the embedding and head

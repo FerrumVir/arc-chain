@@ -865,6 +865,9 @@ only, not of the thread count, the shard order or the machine.
   rules (and §14.2), writes the slices and one record per unit, and deletes
   the shards no later step needs. The segment digests are computed in the
   same pass, in layout order. They are the digests a stage manifest pins.
+  A resumed run that skips an already converted step still deletes that
+  step's shards before the next download, so an interruption between
+  conversion and deletion cannot leave two steps' shards on disk.
 - **Check.** A node holding any slice checks its length and BLAKE3 against
   the manifest. A node holding every slice of a segment can also re-hash the
   segment in layout order. A node holding only expert group `g` of every
@@ -925,5 +928,10 @@ dividing 48 (2, 3, 4, 6, 8, 12, 16, 24, 48) composes from whole groups.
   - checked against the Python preparer;
   - sampled experts checked against compressed-tensors' own
     `unpack_from_int32`;
-  - compared across linux x86-64 and linux arm64, and against the manifest
-    pinned in `docs/protocol/packages/kimi-k26.slices-layers-0-1.json`.
+  - compared across linux x86-64 and linux arm64.
+  - The manifest in `docs/protocol/packages/kimi-k26.slices-layers-0-1.json`
+    was pinned after that run (CI run 37622036049): it is byte-identical
+    (SHA-256 `6750bbc6…`) to the run's x86-64, arm64 and one-thread
+    manifests, checked against the run's artifacts. The run itself had no pin
+    to compare with. Later runs of the real-shard job compare their manifest
+    with the pin.
