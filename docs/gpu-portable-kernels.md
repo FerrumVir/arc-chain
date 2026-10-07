@@ -27,8 +27,9 @@ Every row comes from run
 [37525693372](https://github.com/FerrumVir/arc-chain/actions/runs/37525693372)
 on commit `1a28b26d0`, the last commit that changed a kernel or the engine; all
 five jobs of that run passed. The adapter column is what wgpu reported
-(`gpu.adapter` in the result files, kept as run artifacts). No hardware GPU has
-run these kernels yet; see "Not yet shown" below.
+(`gpu.adapter` in the result files, kept as run artifacts). One hardware GPU
+has run these kernels so far, an Apple M2 Ultra through Metal; its results and
+the defect it found follow the table.
 
 | Job (duration) | Adapter, as reported by wgpu | What ran | Result |
 |---|---|---|---|
@@ -46,15 +47,54 @@ is uploaded in row chunks that fit one storage binding, with one GEMV dispatch
 per chunk; an adapter with a smaller maximum binding size issues more
 dispatches (707 on lavapipe, 706 on WARP). The values do not depend on it.
 
-**Not yet shown.** No hardware GPU has run these kernels. The two adapters above
-are software rasterizers for two APIs (Vulkan and DX12), on two operating
-systems, through two shader compilers (naga to SPIR-V for lavapipe; naga to
-HLSL, then FXC, for WARP), and they agree with the CPU bit for bit. Metal waits
-for the self-hosted Mac Studio runner, which is not installed yet; NVIDIA and
-AMD GPUs wait for a runner with a GPU or for volunteers' `gpu-check` results
-(§7). Other teams verify across NVIDIA generations or on one GPU type; the
-same bits across vendors is the target of this path and is not demonstrated
-yet.
+**On a hardware GPU: Apple M2 Ultra through Metal, 7 October 2026.** TJ's Mac
+Studio (Mac14,14, Apple M2 Ultra, 64 GB unified memory, macOS 14.6.1) ran
+`ex13-hw-run-macos.sh` at commit `b2f90797b` on the wgpu Metal backend. wgpu
+reported the adapter as `Apple M2 Ultra`, `IntegratedGpu`, Metal, with an empty
+driver string. Lab numbers: one stream, token selection on the CPU, logits read
+back after every forward pass.
+
+| What ran | Result |
+|---|---|
+| The five SmolLM3-3B golden prompts, 479 forward passes; package `19c67496…aa91` converted on the Mac and checked against the pinned manifest; 3,086,602,240 bytes uploaded in 1.53 s | Matrix digest `3e43f342c00cf3e3be3072e654e9d1c43f547a73b8a4fc6e906b7119e5cb49f2`, **identical to the CPU golden**; 5 of 5 cases, every logits hash and every token; self-test (8 rounds) 56 cases, 0 mismatches; per-layer trace 1,050 hashes over 2 passes, all equal; `first_divergence` null; 706 dispatches per pass. Prefill 393 tokens in 18.49 s (21.26 tok/s); decode 86 passes in 3.99 s (21.56 tok/s) |
+| Batched prefill, 16 tokens per pass, all five prompts | Matrix digest identical; prefill 8.96 s (43.86 tok/s), decode 21.50 tok/s |
+| Prefix run: 4 passes of case `capital`, 1 traced pass | 4 of 4 identical; 525 trace hashes equal; 0.26 s for the first pass (shader compilation), then 0.044 to 0.048 s per pass |
+| Tiny SmolLM3-shaped model | CPU = GPU = GPU with 3 tokens per pass = `98cc9928…0918` |
+| Operator known-answer tests, 300 rounds | 2,100 cases, 1,091 refused on both sides, **9 mismatches, all in `gated_silu`**. The tiny model's gpu-check self-test (20 rounds) showed the same defect: 140 cases, 2 mismatches |
+
+The defect, from the Studio's result files: every mismatching element had a
+positive gate `g` of 55 to 59 bits (high word roughly in [2^22, 2^27)), and the
+GPU's value equalled the CPU's product multiplied by exactly 2^15 + 1 before
+the floor shift, as if sigma had been 0x80010000 instead of 65536. For
+g = 81162991232727707 and u = -1 the GPU gave -40582734065326756 where the CPU
+gives -1238448962902; the other seven cases were refusals of values the CPU
+accepts, for the same reason. Gates below 2^54, the 63-bit edge values and
+every negative gate agreed. The real model never produces such gates, which
+is why the golden runs passed. The inputs were recovered by replaying the
+self-test's SplitMix64 generator (seed `0x00A2C0DE`) in Python; the CPU
+values matched the Studio's report to the digit.
+
+The gated-SiLU kernel was the only one that divided with the native `/`
+operator (two divisions by a per-thread divisor; naga routes integer division
+through a helper function, and Apple GPUs lower it in software), and every
+other kernel, including the ones that share its wide-multiply helpers, agreed
+with the CPU on that adapter. The commit after `b2f90797b` on this branch
+computes sigma with the shift-subtract divider of int.wgsl instead,
+branch-free, and adds the recovered pairs plus an edge sweep over both
+operands to the self-test as fixed cases, so lavapipe, WARP and every
+volunteer adapter exercise the same inputs (self-test counts become 2,242
+cases at 300 rounds and 198 at 8 rounds). Whether this removes the Metal
+mismatch is decided by the re-run on the Studio, not by this text.
+
+**Not yet shown.** The two CI adapters above are software rasterizers for two
+APIs (Vulkan and DX12), on two operating systems, through two shader
+compilers (naga to SPIR-V for lavapipe; naga to HLSL, then FXC, for WARP); the
+Apple GPU adds a third compiler (naga to MSL). NVIDIA, AMD and Intel GPUs wait
+for the gaming PC's run (`ex13-hw-run-windows.ps1`, DX12 and Vulkan) or for
+volunteers' `gpu-check` results (§7). Other teams verify across NVIDIA
+generations or on one GPU type; the same bits across GPU vendors is the target
+of this path, and so far it holds for the CPU, two software adapters and one
+Apple GPU on the real model.
 
 **Earlier runs.** Run
 [37508127774](https://github.com/FerrumVir/arc-chain/actions/runs/37508127774)
@@ -248,7 +288,7 @@ already reserves `--gpu`, the backend name `gpu-wgpu` and
 - **Driver and compiler bugs.** Integer code paths are exercised much less
   than float paths. The self-test runs before every Proof Kit GPU run. A
   mismatch is reported with the failing operator or the first divergent layer,
-  and that adapter is not trusted. Two compiler hazards have already been
+  and that adapter is not trusted. Three compiler hazards have already been
   found and designed around:
   - **naga** hoists a WGSL `var` declared without an initializer to the
     function entry, so inside a loop it would keep the previous iteration's
@@ -258,6 +298,14 @@ already reserves `--gpu`, the backend name `gpu-wgpu` and
     indexed local vector or array inside a loop it cannot unroll. Long
     division therefore produces one 32-bit quotient word at a time as a
     scalar, and the digit split writes each plane word straight to storage.
+  - **Metal** (Apple M2 Ultra, macOS 14.6.1, wgpu 25, commit `b2f90797b`): the
+    gated-SiLU kernel returned products multiplied by exactly 2^15 + 1 for
+    positive gates of 55 to 59 bits, while every other kernel agreed with the
+    CPU (§1). Its two `u32` divisions by a per-thread divisor were the only
+    native integer divisions in the kernels. Sigma is now computed with the
+    same shift-subtract divider as every other quotient, branch-free, and the
+    failing inputs are fixed cases of the self-test. The Studio's re-run
+    decides whether that was the cause.
 - **Overflow bounds.** Every bound in §2–§3 is either proved in the comments
   of the WGSL or enforced by the host at build time (shape limits) or at run
   time (the status word). Out-of-domain inputs are refused, never wrapped.
