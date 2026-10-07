@@ -966,7 +966,7 @@ pub(crate) mod tests {
             } else if e.name.ends_with(".s") {
                 // Positive BF16 group scales near 2^-11.
                 let values: Vec<u16> = (0..count)
-                    .map(|_| ((114 + rng.next() % 3) << 7 | rng.next() % 128) as u16)
+                    .map(|_| (((114 + rng.next() % 3) << 7) | (rng.next() % 128)) as u16)
                     .collect();
                 super::super::package::u16_bytes(&values)
             } else if e.name.ends_with(".q") && e.dtype == package::Dtype::I8 {

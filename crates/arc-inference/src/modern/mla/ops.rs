@@ -142,7 +142,11 @@ const Q4_SCALE_SPAN: i32 = 40;
 #[inline]
 pub fn q4_value(packed: &[u8], j: usize) -> i64 {
     let byte = packed[j / 2];
-    let nibble = if j % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+    let nibble = if j.is_multiple_of(2) {
+        byte & 0x0F
+    } else {
+        byte >> 4
+    };
     i64::from(((nibble << 4) as i8) >> 4)
 }
 
@@ -190,9 +194,10 @@ impl Q4View<'_> {
                 continue;
             }
             // |q| <= 8 and 8 * sum |x| < 2^63 bound every partial sum.
+            let first = g * Q4_GROUP;
             let mut acc = 0i64;
-            for j in g * Q4_GROUP..(g + 1) * Q4_GROUP {
-                acc += q4_value(packed, j) * x[j];
+            for (offset, &xj) in x[first..first + Q4_GROUP].iter().enumerate() {
+                acc += q4_value(packed, first + offset) * xj;
             }
             total += (i128::from(m) * i128::from(acc)) << (e - top + Q4_SCALE_SPAN);
         }
