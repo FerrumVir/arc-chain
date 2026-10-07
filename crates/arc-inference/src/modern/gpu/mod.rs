@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod cli;
 pub mod kat;
+pub mod proof_run;
 
 use std::time::Instant;
 

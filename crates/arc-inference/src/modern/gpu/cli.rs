@@ -15,6 +15,7 @@ use std::time::Instant;
 use arc_gpu::modern::{self as gpu, EngineOptions, GpuEngine, OpLab};
 use serde_json::{Value, json};
 
+use super::proof_run::{self, GpuProofRun, ProofDivergence};
 use super::{Divergence, engine_from, generate_gpu, gpu_error, kat, localize};
 use crate::modern::arith::{self, Selection};
 use crate::modern::bpe::ByteLevelBpe;
@@ -34,6 +35,11 @@ pub const USAGE: &str =
             --golden GOLDEN.json --out RESULT.json [--run-out RUN.json]
             [--gpu-adapter N|NAME] [--gpu-batch N] [--gpu-max-positions N]
             [--self-test-rounds N] [--trace-forwards N] [--prefix-forwards N]
+            [--challenge-cases CHALLENGE.json --reference-challenge-digest HEX
+             --proof-run-out RUN-ENTRY.json]
+  --proof-run-out writes the Proof Kit's GPU run entry (arc.proof-result.v1
+  runs[]): the full golden run plus the challenge case on the GPU, compared
+  with the reference (CPU) run's challenge digest.
   --prefix-forwards N checks only the first N forward passes of golden case 0
   (teacher-forced, every logits hash exact), for adapters too slow for the full
   run. ARC_GPU_WAIT_SECONDS raises the per-pass wait (default 3600).
@@ -260,6 +266,16 @@ fn gpu_section(engine: &GpuEngine, upload_seconds: f64) -> Value {
     })
 }
 
+/// BLAKE3 of the canonical JSON list of the cases' digest entries: the
+/// golden digest for the golden cases, the Proof Kit's challenge digest for
+/// the challenge case.
+fn matrix_digest(cases: &[CaseRun]) -> Result<String, ModernError> {
+    let entries: Vec<Value> = cases.iter().map(|c| c.entry.clone()).collect();
+    let matrix_text = crate::model_package::canonical_json(&Value::from(entries))
+        .map_err(|e| ModernError::Invalid(format!("canonical JSON: {e}")))?;
+    Ok(blake3::hash(matrix_text.as_bytes()).to_hex().to_string())
+}
+
 /// The run document (`arc.modern-run.v1`) from finished cases.
 fn run_document(
     digest: &PackageDigest,
@@ -267,10 +283,7 @@ fn run_document(
     load_seconds: f64,
     gpu_facts: Value,
 ) -> Result<Value, ModernError> {
-    let entries: Vec<Value> = cases.iter().map(|c| c.entry.clone()).collect();
-    let matrix_text = crate::model_package::canonical_json(&Value::from(entries))
-        .map_err(|e| ModernError::Invalid(format!("canonical JSON: {e}")))?;
-    let matrix_digest = blake3::hash(matrix_text.as_bytes()).to_hex().to_string();
+    let matrix_digest = matrix_digest(cases)?;
     let all_argmax = cases
         .iter()
         .all(|c| c.record["selection"].as_str() == Some("argmax"));
@@ -595,6 +608,71 @@ fn prefix_comparison(
     })
 }
 
+/// Run the challenge case(s) on the GPU and build the Proof Kit run entry
+/// from the full golden comparison. The entry must pass the Proof Kit's
+/// `runs[]` rules ([`proof_run::check_run_entry`]).
+fn proof_run_entry(
+    args: &Args<'_>,
+    engine: &mut GpuEngine,
+    config: &ModernConfig,
+    comparison: &Comparison,
+    first_divergence: &Value,
+) -> Result<Value, ModernError> {
+    let challenge_cases = read_json(&args.path("--challenge-cases")?)?;
+    let tokenizer = load_tokenizer(args.value("--tokenizer"))?;
+    let mut runs = Vec::new();
+    for case in case_list(&challenge_cases)? {
+        runs.push(run_case(engine, config, case, tokenizer.as_ref())?);
+    }
+    let challenge_digest = matrix_digest(&runs)?;
+    let reference = args.required("--reference-challenge-digest")?.to_string();
+    eprintln!(
+        "challenge: digest {challenge_digest} (reference {reference}){}",
+        if challenge_digest == reference {
+            ""
+        } else {
+            " DIFFERS"
+        }
+    );
+    let divergence = if !comparison.matched {
+        Some(match first_divergence["op"].as_str() {
+            Some(op) => ProofDivergence::from_trace(
+                first_divergence["case"].as_str().unwrap_or_default(),
+                first_divergence["forward"].as_u64().unwrap_or_default() as usize,
+                op,
+            ),
+            None => ProofDivergence::unlocated(),
+        })
+    } else if challenge_digest != reference {
+        Some(ProofDivergence {
+            case: Some("challenge".into()),
+            ..ProofDivergence::unlocated()
+        })
+    } else {
+        None
+    };
+    let entry = proof_run::gpu_run_entry(&GpuProofRun {
+        adapter: engine.report(),
+        golden_digest: comparison.golden["matrix_digest"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        challenge_digest,
+        reference_challenge_digest: reference,
+        prefill_tok_s: comparison.timing["prefill_tok_s"].as_f64().unwrap_or(0.0),
+        decode_tok_s: comparison.timing["decode_tok_s"].as_f64().unwrap_or(0.0),
+        divergence,
+    });
+    let problems = proof_run::check_run_entry(&entry);
+    if !problems.is_empty() {
+        return Err(ModernError::Invalid(format!(
+            "the GPU run entry breaks arc.proof-result.v1: {}",
+            problems.join("; ")
+        )));
+    }
+    Ok(entry)
+}
+
 /// `arc-modern gpu-check`: the Proof Kit's GPU mode.
 pub fn check(items: &[String]) -> Result<(), ModernError> {
     let args = Args { items };
@@ -606,6 +684,16 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
     let trace_forwards = args.number("--trace-forwards", 0)?;
     let prefix_forwards = args.number("--prefix-forwards", 0)?;
     let package_path = args.path("--package")?;
+    let proof_run_out = args.value("--proof-run-out").map(PathBuf::from);
+    if proof_run_out.is_some() {
+        if prefix_forwards > 0 {
+            return Err(ModernError::Invalid(
+                "--proof-run-out needs the full golden run, not --prefix-forwards".into(),
+            ));
+        }
+        args.required("--challenge-cases")?;
+        args.required("--reference-challenge-digest")?;
+    }
 
     // 1. Every kernel against the CPU operators on this adapter and driver.
     let self_test = {
@@ -683,6 +771,16 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
             };
         }
     }
+    // 4. The Proof Kit's GPU run entry: the challenge case on the GPU too.
+    let proof_run = match &proof_run_out {
+        None => Value::Null,
+        Some(path) => {
+            let entry =
+                proof_run_entry(&args, &mut engine, &config, &comparison, &first_divergence)?;
+            write_json(path, &entry)?;
+            entry
+        }
+    };
     let trace_ok = trace_check.is_null() || trace_check["all_equal"].as_bool() == Some(true);
     let self_test_ok = self_test["pass"].as_bool() == Some(true);
     let pass = comparison.matched && self_test_ok && trace_ok;
@@ -700,6 +798,7 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
         "golden": comparison.golden,
         "first_divergence": first_divergence,
         "trace_check": trace_check,
+        "proof_run": proof_run,
         "timing": timing,
         "platform": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH},
     });

@@ -1,9 +1,17 @@
-//! Backend selection for a worker that serves the dyadic profile: the GPU is
-//! used only after it reproduces the CPU golden bit for bit, on this adapter
-//! and driver, in this process. Otherwise the worker stays on the CPU and
-//! says why.
+//! GPU backend selection for the dyadic profile
+//! (`arc.hf-llama.i8-dyadic-row.q16.v1`, SmolLM3): a GPU may run this profile
+//! only after it reproduces the CPU golden bit for bit, on this adapter and
+//! driver, in this process. Otherwise the CPU runs it, and the decision says
+//! why.
 //!
-//! The gate ([`select`]), off unless a worker opts in:
+//! Scope: the community worker's network jobs use the canonical INT8 reward
+//! profile (`CachedIntegerModel`), for which no GPU kernels exist. The worker
+//! runs this gate when `--gpu-inference` is given and reports the result
+//! locally, but its jobs stay on the CPU. [`ModernBackend`] is the serving
+//! path for dyadic-profile generation; no worker job calls it yet. See
+//! `docs/gpu-worker-backend.md`.
+//!
+//! The gate ([`select`]), off unless enabled:
 //!
 //! 1. The CPU runs the self-test workload (a deterministic model built in
 //!    process, fixed prompts, both selection rules) and its digest must equal
@@ -12,16 +20,16 @@
 //! 2. The selected adapter runs the operator known-answer test ([`kat`]):
 //!    every kernel against the CPU operator, refusals included.
 //! 3. The adapter runs the same self-test workload through the engine options
-//!    the worker serves with. Its digest must equal the CPU golden exactly.
+//!    used for serving. Its digest must equal the CPU golden exactly.
 //!
-//! Any failure, error or difference selects the CPU, with the reason. A model
-//! the worker then serves ([`ModernBackend::for_model`]) is uploaded to the
-//! same adapter and spot-checked against the CPU forward pass before the
+//! Any failure, error or difference keeps the dyadic profile on the CPU, with
+//! the reason. [`ModernBackend::for_model`] uploads a model to the adapter
+//! that passed and spot-checks it against the CPU forward pass before the
 //! first request (large matrices are chunked to the adapter's binding limit,
 //! which the small self-test model never reaches). While serving, a GPU
-//! execution failure, or a GPU refusal of an input the CPU accepts, moves the
-//! worker to the CPU for good and the request is answered by the CPU.
-//! Nothing here changes a digest: the GPU's results are the CPU's results.
+//! execution failure, or a GPU refusal of an input the CPU accepts, moves
+//! generation to the CPU for good, and the CPU answers the request. Nothing
+//! here changes a digest: the GPU's results are the CPU's results.
 
 use std::time::Instant;
 
@@ -255,11 +263,12 @@ fn same_adapter(a: &AdapterReport, b: &AdapterReport) -> bool {
     a.index == b.index && a.name == b.name && a.backend == b.backend && a.driver == b.driver
 }
 
-/// Which backend serves, and why.
+/// Which backend may run the dyadic profile, and why.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct BackendDecision {
-    /// [`PROOF_BACKEND`] (`gpu-wgpu`) or [`CPU_BACKEND`] (`cpu`).
-    pub backend: &'static str,
+    /// [`PROOF_BACKEND`] (`gpu-wgpu`: the GPU passed the gate) or
+    /// [`CPU_BACKEND`] (`cpu`), for the dyadic profile only.
+    pub dyadic_backend: &'static str,
     /// One sentence: why this backend.
     pub reason: String,
     /// The pinned CPU golden of the self-test.
@@ -273,13 +282,14 @@ pub struct BackendDecision {
 }
 
 impl BackendDecision {
-    pub fn uses_gpu(&self) -> bool {
-        self.backend == PROOF_BACKEND
+    /// Whether a GPU passed the gate (and may run the dyadic profile).
+    pub fn gpu_eligible(&self) -> bool {
+        self.dyadic_backend == PROOF_BACKEND
     }
 
     fn cpu(reason: impl Into<String>) -> Self {
         Self {
-            backend: CPU_BACKEND,
+            dyadic_backend: CPU_BACKEND,
             reason: reason.into(),
             expected_digest: SELF_TEST_GOLDEN.to_string(),
             cpu_digest: None,
@@ -288,22 +298,24 @@ impl BackendDecision {
         }
     }
 
-    /// The adapter that serves, when the GPU serves.
+    /// The adapter that passed the gate, if one did.
     pub fn adapter(&self) -> Option<&AdapterReport> {
         self.gpu
             .as_ref()
-            .filter(|_| self.uses_gpu())
+            .filter(|_| self.gpu_eligible())
             .map(|g| &g.adapter)
     }
 
-    /// The decision as JSON: the backend, the reason, the self-test digests
-    /// and the adapter twice, as the Proof Kit's `runs[].adapter`
-    /// (`proof_adapter`) and as wgpu reported it (`adapter`).
+    /// The decision as JSON: the dyadic-profile backend, the reason, the
+    /// self-test digests and the adapter twice, as the Proof Kit's
+    /// `runs[].adapter` (`proof_adapter`) and as wgpu reported it (`adapter`).
     pub fn to_json(&self) -> Value {
         let tested = self.gpu.as_ref();
         json!({
             "schema": DECISION_SCHEMA,
-            "backend": self.backend,
+            "profile": crate::modern::PROFILE,
+            "dyadic_backend": self.dyadic_backend,
+            "gpu_self_test_passed": self.gpu_eligible(),
             "reason": self.reason,
             "self_test": {
                 "expected_digest": self.expected_digest,
@@ -321,7 +333,7 @@ impl BackendDecision {
 }
 
 /// The gate's rule, given the CPU's self-test digest and what the adapter
-/// produced. The GPU serves only when the CPU reproduces the pinned golden,
+/// produced. The GPU becomes eligible only when the CPU reproduces the pinned golden,
 /// the adapter's operator test has no mismatch, and the adapter's self-test
 /// digest equals the golden exactly.
 pub fn decide(
@@ -336,7 +348,8 @@ pub fn decide(
     let cpu_digest = match cpu_digest {
         Ok(digest) => digest,
         Err(error) => {
-            decision.reason = format!("the CPU self-test failed ({error}); serving on the CPU");
+            decision.reason =
+                format!("the CPU self-test failed ({error}); the dyadic profile runs on the CPU");
             return decision;
         }
     };
@@ -344,14 +357,16 @@ pub fn decide(
     if cpu_digest != expected {
         decision.reason = format!(
             "the CPU self-test digest {cpu_digest} differs from the pinned golden {expected}, \
-             so it cannot vouch for a GPU; serving on the CPU"
+             so it cannot vouch for a GPU; the dyadic profile runs on the CPU"
         );
         return decision;
     }
     let gpu = match gpu {
         Ok(gpu) => gpu,
         Err(error) => {
-            decision.reason = format!("no GPU passed the self-test ({error}); serving on the CPU");
+            decision.reason = format!(
+                "no GPU passed the self-test ({error}); the dyadic profile runs on the CPU"
+            );
             return decision;
         }
     };
@@ -359,7 +374,7 @@ pub fn decide(
     let reason = if !gpu.kat.passed() {
         Some(format!(
             "{name}: the operator self-test found {} mismatches in {} cases (first: {}); \
-             serving on the CPU",
+             the dyadic profile runs on the CPU",
             gpu.kat.mismatch_count,
             gpu.kat.cases,
             gpu.kat.mismatches.first().map_or("-", String::as_str)
@@ -367,7 +382,7 @@ pub fn decide(
     } else if gpu.digest != expected {
         Some(format!(
             "{name}: the GPU self-test digest {} differs from the CPU golden {expected}; \
-             serving on the CPU",
+             the dyadic profile runs on the CPU",
             gpu.digest
         ))
     } else {
@@ -376,10 +391,10 @@ pub fn decide(
     match reason {
         Some(reason) => decision.reason = reason,
         None => {
-            decision.backend = PROOF_BACKEND;
+            decision.dyadic_backend = PROOF_BACKEND;
             decision.reason = format!(
                 "{name} ({}) reproduced the CPU golden {expected} bit for bit and passed the \
-                 operator self-test ({} cases); serving on the GPU",
+                 operator self-test ({} cases); it may run the dyadic profile",
                 gpu.adapter.backend, gpu.kat.cases
             );
         }
@@ -388,11 +403,13 @@ pub fn decide(
     decision
 }
 
-/// The gate. `config.enabled == false` (the default) selects the CPU without
-/// touching a GPU.
+/// The gate. `config.enabled == false` (the default) decides for the CPU
+/// without touching a GPU.
 pub fn select(config: &GpuBackendConfig) -> BackendDecision {
     if !config.enabled {
-        return BackendDecision::cpu("the GPU backend is off (the default); serving on the CPU");
+        return BackendDecision::cpu(
+            "the GPU backend is off (the default); the dyadic profile runs on the CPU",
+        );
     }
     let start = Instant::now();
     let mut decision = decide(
@@ -404,10 +421,13 @@ pub fn select(config: &GpuBackendConfig) -> BackendDecision {
     decision
 }
 
-/// A served model and the backend that runs it.
+/// A dyadic-profile model being served and the backend that runs it.
 pub struct ModernBackend {
     decision: BackendDecision,
     engine: Option<GpuEngine>,
+    /// Tests: the error the next GPU forward pass returns instead of running.
+    #[cfg(test)]
+    fault: Option<GpuModernError>,
 }
 
 impl ModernBackend {
@@ -429,6 +449,8 @@ impl ModernBackend {
             return Self {
                 decision,
                 engine: None,
+                #[cfg(test)]
+                fault: None,
             };
         };
         let engine = engine_for(model, &config.engine_options()).and_then(|mut engine| {
@@ -446,16 +468,20 @@ impl ModernBackend {
             Ok(engine) => Self {
                 decision,
                 engine: Some(engine),
+                #[cfg(test)]
+                fault: None,
             },
             Err(error) => {
-                decision.backend = CPU_BACKEND;
+                decision.dyadic_backend = CPU_BACKEND;
                 decision.reason = format!(
-                    "{}: the served model failed its GPU check ({error}); serving on the CPU",
+                    "{}: the served model failed its GPU check ({error}); the dyadic profile runs on the CPU",
                     tested.name
                 );
                 Self {
                     decision,
                     engine: None,
+                    #[cfg(test)]
+                    fault: None,
                 }
             }
         }
@@ -465,9 +491,14 @@ impl ModernBackend {
         &self.decision
     }
 
+    /// Whether requests currently run on the GPU.
+    pub fn on_gpu(&self) -> bool {
+        self.engine.is_some()
+    }
+
     fn fall_back(&mut self, reason: String) {
         self.engine = None;
-        self.decision.backend = CPU_BACKEND;
+        self.decision.dyadic_backend = CPU_BACKEND;
         self.decision.reason = reason;
     }
 
@@ -487,9 +518,17 @@ impl ModernBackend {
         }
         engine.reset();
         let batch = engine.batch();
+        #[cfg(test)]
+        let mut injected = self.fault.take();
+        #[cfg(not(test))]
+        let mut injected: Option<GpuModernError> = None;
         let mut gpu_failure: Option<GpuModernError> = None;
         let result = generate_with(&model.config, request, batch, |tokens| {
-            engine.forward_batch(tokens).map_err(|error| match error {
+            let outcome = match injected.take() {
+                Some(error) => Err(error),
+                None => engine.forward_batch(tokens),
+            };
+            outcome.map_err(|error| match error {
                 GpuModernError::Domain(message) => ModernError::Domain(message),
                 other => {
                     let message = other.to_string();
@@ -501,7 +540,7 @@ impl ModernBackend {
         if let Some(error) = gpu_failure {
             let name = engine.report().name.clone();
             self.fall_back(format!(
-                "{name}: GPU execution failed while serving ({error}); serving on the CPU"
+                "{name}: GPU execution failed while serving ({error}); the dyadic profile runs on the CPU"
             ));
             return model.generate(request);
         }
@@ -514,7 +553,7 @@ impl ModernBackend {
                     let name = engine.report().name.clone();
                     self.fall_back(format!(
                         "{name}: the GPU refused an input the CPU accepts ({gpu_refusal}); \
-                         serving on the CPU"
+                         the dyadic profile runs on the CPU"
                     ));
                 }
                 cpu
@@ -604,8 +643,8 @@ mod tests {
     #[test]
     fn the_gpu_serves_only_on_an_exact_match() {
         let gpu = decide(GOLDEN, Ok(GOLDEN.into()), Ok(fake_gpu(GOLDEN, 0)));
-        assert!(gpu.uses_gpu(), "{}", gpu.reason);
-        assert_eq!(gpu.backend, PROOF_BACKEND);
+        assert!(gpu.gpu_eligible(), "{}", gpu.reason);
+        assert_eq!(gpu.dyadic_backend, PROOF_BACKEND);
         assert_eq!(gpu.adapter().unwrap().name, "Test GPU");
         assert!(gpu.reason.contains("bit for bit"));
     }
@@ -613,8 +652,8 @@ mod tests {
     #[test]
     fn a_digest_mismatch_falls_back_to_the_cpu() {
         let decision = decide(GOLDEN, Ok(GOLDEN.into()), Ok(fake_gpu("ab", 0)));
-        assert!(!decision.uses_gpu());
-        assert_eq!(decision.backend, CPU_BACKEND);
+        assert!(!decision.gpu_eligible());
+        assert_eq!(decision.dyadic_backend, CPU_BACKEND);
         assert!(decision.adapter().is_none());
         assert!(
             decision.reason.contains("GPU self-test digest ab differs"),
@@ -624,16 +663,16 @@ mod tests {
         // The evidence is kept for the log and the status page.
         assert_eq!(decision.gpu.as_ref().unwrap().digest, "ab");
         assert_eq!(decision.to_json()["self_test"]["gpu_digest"], "ab");
-        assert_eq!(decision.to_json()["backend"], "cpu");
+        assert_eq!(decision.to_json()["dyadic_backend"], "cpu");
     }
 
     #[test]
     fn every_other_failure_falls_back_to_the_cpu() {
         let kat = decide(GOLDEN, Ok(GOLDEN.into()), Ok(fake_gpu(GOLDEN, 3)));
-        assert!(!kat.uses_gpu());
+        assert!(!kat.gpu_eligible());
         assert!(kat.reason.contains("3 mismatches"), "{}", kat.reason);
         let drifted_cpu = decide(GOLDEN, Ok("ab".into()), Ok(fake_gpu("ab", 0)));
-        assert!(!drifted_cpu.uses_gpu());
+        assert!(!drifted_cpu.gpu_eligible());
         assert!(drifted_cpu.reason.contains("cannot vouch"));
         assert!(drifted_cpu.gpu.is_none());
         let cpu_error = decide(
@@ -641,13 +680,13 @@ mod tests {
             Err(ModernError::Domain("x".into())),
             Ok(fake_gpu(GOLDEN, 0)),
         );
-        assert!(!cpu_error.uses_gpu());
+        assert!(!cpu_error.gpu_eligible());
         let no_gpu = decide(
             GOLDEN,
             Ok(GOLDEN.into()),
             Err(gpu_error(GpuModernError::NoAdapter("none".into()))),
         );
-        assert!(!no_gpu.uses_gpu());
+        assert!(!no_gpu.gpu_eligible());
         assert!(no_gpu.reason.contains("no usable GPU adapter"));
     }
 
@@ -656,7 +695,7 @@ mod tests {
         let config = GpuBackendConfig::default();
         assert!(!config.enabled);
         let decision = select(&config);
-        assert!(!decision.uses_gpu());
+        assert!(!decision.gpu_eligible());
         assert!(decision.reason.contains("off (the default)"));
         let mut backend = ModernBackend::with_decision(&self_test_model(), &config, decision);
         let model = self_test_model();
@@ -701,7 +740,7 @@ mod tests {
         };
         let decision = select(&config);
         eprintln!("decision: {}", decision.to_json());
-        assert!(decision.uses_gpu(), "{}", decision.reason);
+        assert!(decision.gpu_eligible(), "{}", decision.reason);
         assert_eq!(
             decision.gpu.as_ref().unwrap().digest,
             SELF_TEST_GOLDEN,
@@ -710,7 +749,7 @@ mod tests {
         let model = self_test_model();
         let mut backend = ModernBackend::with_decision(&model, &config, decision);
         assert!(
-            backend.decision().uses_gpu(),
+            backend.decision().gpu_eligible(),
             "{}",
             backend.decision().reason
         );
@@ -727,7 +766,7 @@ mod tests {
             assert_eq!(served.logits_hashes, cpu.logits_hashes);
             assert_eq!(served.output_hash, cpu.output_hash);
         }
-        assert!(backend.decision().uses_gpu());
+        assert!(backend.decision().gpu_eligible());
         // A request beyond the context: the same refusal as the CPU, and the
         // GPU keeps serving.
         let too_long = GenerationRequest {
@@ -740,7 +779,7 @@ mod tests {
             backend.generate(&model, &too_long),
             Err(ModernError::Domain(_))
         ));
-        assert!(backend.decision().uses_gpu());
+        assert!(backend.decision().gpu_eligible());
     }
 
     #[test]
@@ -757,7 +796,7 @@ mod tests {
         assert!(gpu.kat.passed(), "{:#?}", gpu.kat.mismatches);
         assert_ne!(gpu.digest, SELF_TEST_GOLDEN);
         let decision = decide(SELF_TEST_GOLDEN, cpu_self_test_digest(), Ok(gpu));
-        assert!(!decision.uses_gpu());
+        assert!(!decision.gpu_eligible());
         assert!(
             decision.reason.contains("differs from the CPU golden"),
             "{}",
@@ -770,13 +809,93 @@ mod tests {
             cpu_self_test_digest(),
             gpu_self_test(&config),
         );
-        assert!(passed.uses_gpu(), "{}", passed.reason);
+        assert!(passed.gpu_eligible(), "{}", passed.reason);
         let model = self_test_model();
         let mut engine = engine_for(&altered, &config.engine_options()).unwrap();
         let error = spot_check(&model, &mut engine).unwrap_err();
         assert!(
             error.to_string().contains("differ from CPU logits"),
             "{error}"
+        );
+    }
+
+    /// A backend generating the self-test model on the CI adapter's GPU.
+    fn backend_on_gpu(config: &GpuBackendConfig) -> (ModernModel, ModernBackend) {
+        let model = self_test_model();
+        let backend = ModernBackend::for_model(&model, config);
+        assert!(backend.on_gpu(), "{}", backend.decision().reason);
+        (model, backend)
+    }
+
+    const FAULT_PROMPT: [u32; 5] = [5, 9, 2, 33, 7];
+
+    fn fault_request() -> GenerationRequest<'static> {
+        GenerationRequest {
+            prompt: &FAULT_PROMPT,
+            max_tokens: 8,
+            eos: &[],
+            selection: Selection::Rp64Argmax,
+        }
+    }
+
+    /// Inject `fault` into the next GPU forward pass: the request is answered
+    /// by the CPU with the CPU's exact output, the GPU is dropped, and a later
+    /// request never reaches it again (a fault armed for it stays unused).
+    fn assert_fault_moves_generation_to_the_cpu(fault: GpuModernError, reason: &str) {
+        let Some(config) = gpu_config_or_skip() else {
+            return;
+        };
+        let (model, mut backend) = backend_on_gpu(&config);
+        let request = fault_request();
+        let cpu = model.generate(&request).unwrap();
+        // Before the fault, the GPU serves the CPU's output.
+        let healthy = backend.generate(&model, &request).unwrap();
+        assert_eq!(healthy.logits_hashes, cpu.logits_hashes);
+        assert!(backend.on_gpu());
+
+        backend.fault = Some(fault);
+        let served = backend.generate(&model, &request).unwrap();
+        assert_eq!(served.tokens, cpu.tokens);
+        assert_eq!(served.logits_hashes, cpu.logits_hashes);
+        assert_eq!(served.output_hash, cpu.output_hash);
+        assert!(
+            backend.fault.is_none(),
+            "the injected fault was consumed by the GPU path"
+        );
+        assert!(!backend.on_gpu());
+        assert!(!backend.decision().gpu_eligible());
+        assert_eq!(backend.decision().to_json()["dyadic_backend"], "cpu");
+        assert!(
+            backend.decision().reason.contains(reason),
+            "{}",
+            backend.decision().reason
+        );
+
+        // Persistent: the next request runs on the CPU without touching the GPU.
+        backend.fault = Some(GpuModernError::Execution("must never be consumed".into()));
+        let again = backend.generate(&model, &request).unwrap();
+        assert_eq!(again.output_hash, cpu.output_hash);
+        assert_eq!(again.logits_hashes, cpu.logits_hashes);
+        assert!(
+            backend.fault.is_some(),
+            "the GPU path ran after the fallback"
+        );
+        assert!(!backend.on_gpu());
+    }
+
+    #[test]
+    fn a_gpu_execution_failure_moves_generation_to_the_cpu_for_good() {
+        assert_fault_moves_generation_to_the_cpu(
+            GpuModernError::Execution("injected: device lost".into()),
+            "GPU execution failed while serving (GPU execution: injected: device lost)",
+        );
+    }
+
+    #[test]
+    fn a_gpu_refusal_of_a_cpu_valid_input_moves_generation_to_the_cpu_for_good() {
+        assert_fault_moves_generation_to_the_cpu(
+            GpuModernError::Domain("injected: projection output beyond 2^62".into()),
+            "the GPU refused an input the CPU accepts (injected: projection output beyond 2^62)",
         );
     }
 }
