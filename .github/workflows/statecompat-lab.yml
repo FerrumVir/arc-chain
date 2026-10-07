@@ -33,7 +33,7 @@ env:
 
 jobs:
   guard:
-    name: lab commit is SOURCE plus lab files only; offline self-tests
+    name: lab tree is SOURCE plus lab files only; offline self-tests
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -42,14 +42,16 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - name: Bind the lab commit to the exact SOURCE and allow only lab files on top
+      - name: Bind the lab tree to the exact SOURCE tree plus exactly the four lab files
         shell: bash
         run: |
           set -Eeuo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git rev-parse 'HEAD^')" = "$SOURCE_SHA"
+          # The lab branch may carry several commits; what matters is the TREE: SOURCE plus four added files.
+          git fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          test "$(git rev-parse "$SOURCE_SHA")" = "$SOURCE_SHA"
           test "$(git rev-parse "$SOURCE_SHA^{tree}")" = "$SOURCE_TREE"
-          git diff --name-status HEAD^ HEAD | sort > "$RUNNER_TEMP/lab-diff.txt"
+          git diff --name-status "$SOURCE_SHA" HEAD | sort > "$RUNNER_TEMP/lab-diff.txt"
           cat "$RUNNER_TEMP/lab-diff.txt"
           expected="$(printf '%s\n' \
             'A	.github/workflows/statecompat-lab.yml' \
@@ -57,10 +59,10 @@ jobs:
             'A	lab/statecompat/statecompat_lab.py' \
             'A	lab/statecompat/test_statecompat_lab.py' | sort)"
           if [ "$(cat "$RUNNER_TEMP/lab-diff.txt")" != "$expected" ]; then
-            echo "::error::the lab commit must add exactly the four lab files on top of the SOURCE commit" >&2
+            echo "::error::the lab tree must be the SOURCE tree plus exactly the four lab files" >&2
             exit 1
           fi
-          echo "Lab commit $GITHUB_SHA = SOURCE $SOURCE_SHA + four added lab files." >> "$GITHUB_STEP_SUMMARY"
+          echo "Lab commit $GITHUB_SHA: tree = SOURCE $SOURCE_SHA (tree $SOURCE_TREE) + four added lab files." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Offline self-tests of the lab driver (fake harness and fake node; no network)
         shell: bash
