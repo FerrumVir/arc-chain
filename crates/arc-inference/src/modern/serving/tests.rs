@@ -10,16 +10,20 @@
 use std::collections::HashMap;
 
 use super::dense::{
-    DenseFfn, DenseModel, FeedForward, dense_kv_widths, embed_rows, failed_step, final_logits,
-    finish_step, forward_layers, layered_forward, silu_rows,
+    DenseFfn, DenseModel, FeedForward, TreeView, attention_head_tree, dense_kv_widths, embed_rows,
+    failed_step, final_logits, finish_step, forward_layers, forward_tree_layers, layered_forward,
+    silu_rows,
 };
 use super::gemm::project_rows;
 use super::prefix::{PrefixCache, PrefixConfig};
 use super::scheduler::{Completion, Request, Scheduler, SchedulerConfig};
 use super::spec::{Drafter, PromptLookup, accept};
+use super::tree::{DraftTree, Node, TreeOutput, TreePlan, forward_tree_by_paths, verify_tree};
 use super::{BatchModel, Failure, Row, SeqKv, StepOutput, check_rows};
 use crate::modern::ModernError;
-use crate::modern::arith::{self, DyadicMatrix, ONE, Selection, exp_q16};
+use crate::modern::arith::{
+    self, DyadicMatrix, HeadCache, ONE, Selection, attention_head, exp_q16,
+};
 use crate::modern::model::tests::{lcg_matrix, tiny_model};
 use crate::modern::model::{GenerationRequest, ModernConfig, ModernLayer, ModernModel};
 use crate::modern::tables::rope_tables;
@@ -1212,6 +1216,40 @@ impl BatchModel for Pipeline<'_> {
         let logits = final_logits(self.model, rows, &hidden, &mut errors);
         finish_step(rows, kvs, &base, errors, logits)
     }
+
+    /// A token tree crosses the cut once, as one batch of node hidden states;
+    /// each stage masks attention per node over its own KV planes.
+    fn forward_tree(&self, tree: &DraftTree, kv: &mut SeqKv) -> TreeOutput {
+        let plan = TreePlan::new(tree, kv.len());
+        let ffn = DenseFfn(self.model);
+        let mut errors: Vec<Option<ModernError>> = plan.rows.iter().map(|_| None).collect();
+        let mut hidden = embed_rows(self.model, &plan.rows, &mut errors);
+        forward_tree_layers(
+            self.model,
+            0..self.cut,
+            &plan.rows,
+            kv,
+            plan.prefix,
+            &plan.tails,
+            &mut hidden,
+            &mut errors,
+            &ffn,
+        );
+        let mut stage_two = hidden.clone();
+        forward_tree_layers(
+            self.model,
+            self.cut..self.model.config.n_layers,
+            &plan.rows,
+            kv,
+            plan.prefix,
+            &plan.tails,
+            &mut stage_two,
+            &mut errors,
+            &ffn,
+        );
+        let logits = final_logits(self.model, &plan.rows, &stage_two, &mut errors);
+        TreeOutput::in_place(tree, kv, plan.prefix, logits, errors)
+    }
 }
 
 #[test]
@@ -1678,7 +1716,7 @@ fn prompt_rows_without_logits_run_the_same_head_checks_as_generate() {
 
 #[test]
 fn tree_generation_survives_pipeline_partition_and_microbatch_boundaries() {
-    use super::tree::{LookupTree, generate_tree};
+    use super::tree::{LookupTree, RecycleTree, generate_tree};
     let model = model_with(4, 96, 113);
     let dense = DenseModel::new(&model, [113; 32]);
     let pipeline = Pipeline {
@@ -1692,13 +1730,307 @@ fn tree_generation_survives_pipeline_partition_and_microbatch_boundaries() {
             eos: &req.eos,
             selection: req.selection,
         };
-        let whole = generate_tree(&dense, &request, &LookupTree::default(), 8).unwrap();
-        let split = generate_tree(&pipeline, &request, &LookupTree::default(), 8).unwrap();
+        let whole = generate_tree(&dense, &request, &mut LookupTree::default(), 8).unwrap();
+        let split = generate_tree(&pipeline, &request, &mut LookupTree::default(), 8).unwrap();
         let plain = model.generate(&request).unwrap();
         assert_eq!(split.tokens, plain.tokens);
         assert_eq!(split.logits_hashes, plain.logits_hashes);
         assert_eq!(split.tokens, whole.tokens);
         assert_eq!(split.kv_digest, whole.kv_digest);
         assert_eq!(split.verification_passes, whole.verification_passes);
+        let mut recycle = RecycleTree::new(4, 32, Some(LookupTree::default()));
+        let split = generate_tree(&pipeline, &request, &mut recycle, 6).unwrap();
+        assert_eq!(split.tokens, plain.tokens);
+        assert_eq!(split.logits_hashes, plain.logits_hashes);
+        assert_eq!(split.kv_digest, whole.kv_digest);
+        assert_eq!(
+            split.verified_rows, split.logical_nodes,
+            "each node computed once"
+        );
     }
+}
+
+// ENG-8: shared-node tree verification.
+
+/// A random tree of at most `nodes` nodes and `depth` levels.
+fn random_tree(state: &mut u64, root: u32, nodes: usize, depth: usize) -> DraftTree {
+    let mut list = vec![Node {
+        parent: None,
+        token: root,
+    }];
+    let mut depths = vec![0usize];
+    for _ in 0..nodes * 8 {
+        if list.len() == nodes {
+            break;
+        }
+        let parent = lcg(state) as usize % list.len();
+        let t = token(state);
+        if depths[parent] >= depth
+            || list
+                .iter()
+                .any(|n| n.parent == Some(parent) && n.token == t)
+        {
+            continue;
+        }
+        list.push(Node {
+            parent: Some(parent),
+            token: t,
+        });
+        depths.push(depths[parent] + 1);
+    }
+    DraftTree::new(list).unwrap()
+}
+
+/// Every node of a tree computed once, with per-node attention masks, equals
+/// (1) the path-lowering fallback and (2) the single-token reference fed the
+/// node's whole path; committing ANY node's path leaves exactly the cache the
+/// reference holds after that path; discarding restores the cache.
+#[test]
+fn every_tree_node_equals_its_path_alone_and_any_path_commits_exactly() {
+    let _guard = crate::canonical_simd::kernel_switch_guard();
+    for fast in [false, true] {
+        crate::canonical_simd::set_fast_canonical_kernel(fast);
+        for seed in 0..6u64 {
+            let model = model_with(4, 96, 200 + seed);
+            let dense = DenseModel::new(&model, [seed as u8; 32]);
+            let mut state = 900 + seed;
+            let prompt: Vec<u32> = (0..1 + lcg(&mut state) as usize % 30)
+                .map(|_| token(&mut state))
+                .collect();
+            let mut kv = dense.new_kv();
+            let rows: Vec<Row> = prompt
+                .iter()
+                .enumerate()
+                .map(|(position, &token)| Row {
+                    seq: 0,
+                    token,
+                    position,
+                    logits: false,
+                })
+                .collect();
+            assert!(dense.forward_rows(&rows, &mut [&mut kv]).errors[0].is_none());
+            let mut reference = model.new_cache();
+            for &t in &prompt {
+                model.forward(t, &mut reference).unwrap();
+            }
+            for (nodes, depth) in [(1, 0), (6, 1), (12, 5), (24, 8), (40, 3)] {
+                let root = token(&mut state);
+                let tree = random_tree(&mut state, root, nodes, depth);
+                let before = kv.clone();
+                let mut shared_kv = kv.clone();
+                let shared = dense.forward_tree(&tree, &mut shared_kv);
+                assert_eq!(shared.physical_rows, tree.nodes().len());
+                let mut paths_kv = kv.clone();
+                let lowered = forward_tree_by_paths(&dense, &tree, &mut paths_kv);
+                assert_eq!(paths_kv, before, "the fallback leaves the cache alone");
+                assert_eq!(lowered.physical_rows, tree.expanded_rows());
+                for node in 0..tree.nodes().len() {
+                    let mut alone = reference.clone();
+                    let mut logits = Vec::new();
+                    for step in tree.path_to(node) {
+                        logits = model.forward(tree.nodes()[step].token, &mut alone).unwrap();
+                    }
+                    assert_eq!(shared.logits[node].as_ref(), Some(&logits), "node {node}");
+                    assert_eq!(lowered.logits[node].as_ref(), Some(&logits), "node {node}");
+                }
+                for node in [0, tree.nodes().len() / 2, tree.nodes().len() - 1] {
+                    let mut alone = reference.clone();
+                    for step in tree.path_to(node) {
+                        model.forward(tree.nodes()[step].token, &mut alone).unwrap();
+                    }
+                    let mut committed = kv.clone();
+                    let out = dense.forward_tree(&tree, &mut committed);
+                    out.commit(&tree, node, &mut committed).unwrap();
+                    assert_eq!(committed.digest(), alone.digest(), "node {node}");
+                    assert_eq!(committed.len(), prompt.len() + tree.path_to(node).len());
+                    let mut committed = kv.clone();
+                    let out = forward_tree_by_paths(&dense, &tree, &mut committed);
+                    out.commit(&tree, node, &mut committed).unwrap();
+                    assert_eq!(committed.digest(), alone.digest(), "fallback node {node}");
+                }
+                shared.discard(&mut shared_kv);
+                assert_eq!(shared_kv, before, "discard restores the cache");
+            }
+        }
+    }
+    crate::canonical_simd::set_fast_canonical_kernel(false);
+}
+
+/// The tree attention visits the prefix then the listed positions and is the
+/// profile's attention on those keys laid out contiguously, including the
+/// wide (`i128`) dot-product branch.
+#[test]
+fn tree_attention_equals_attention_on_the_gathered_positions() {
+    let mut state = 77u64;
+    let (width, stride, offset) = (8usize, 24usize, 8usize);
+    for case in 0..200 {
+        let stored = 1 + lcg(&mut state) as usize % 40;
+        let keys: Vec<i32> = (0..stored * stride)
+            .map(|_| (lcg(&mut state) as i64 - (1 << 30)) as i32 >> (lcg(&mut state) % 20))
+            .collect();
+        let values: Vec<i32> = (0..stored * stride)
+            .map(|_| (lcg(&mut state) as i64 - (1 << 30)) as i32 >> (lcg(&mut state) % 20))
+            .collect();
+        let prefix = lcg(&mut state) as usize % (stored + 1);
+        let mut tail: Vec<usize> = (prefix..stored)
+            .filter(|_| lcg(&mut state).is_multiple_of(2))
+            .collect();
+        if prefix == 0 && tail.is_empty() {
+            tail.push(stored - 1);
+        }
+        let shift = if case % 3 == 0 { 40 } else { 8 };
+        let q: Vec<i64> = (0..width)
+            .map(|_| ((lcg(&mut state) as i64) - (1 << 30)) << (lcg(&mut state) % shift))
+            .collect();
+        let order: Vec<usize> = (0..prefix).chain(tail.iter().copied()).collect();
+        let gather = |source: &[i32]| -> Vec<i32> {
+            order
+                .iter()
+                .flat_map(|&p| source[p * stride..(p + 1) * stride].to_vec())
+                .collect()
+        };
+        let (gk, gv) = (gather(&keys), gather(&values));
+        let lambda = crate::modern::tables::attention_lambda(width);
+        let mut want = vec![0i64; width];
+        let expected = attention_head(
+            &q,
+            HeadCache {
+                keys: &gk,
+                values: &gv,
+                positions: order.len(),
+                stride,
+                offset,
+            },
+            lambda,
+            &mut want,
+        );
+        let mut got = vec![0i64; width];
+        let result = attention_head_tree(
+            &q,
+            TreeView {
+                keys: &keys,
+                values: &values,
+                stride,
+                offset,
+                prefix,
+                tail: &tail,
+            },
+            lambda,
+            &mut got,
+        );
+        assert_eq!(
+            result.as_ref().map_err(ToString::to_string),
+            expected.as_ref().map_err(ToString::to_string),
+            "case {case}"
+        );
+        assert_eq!(got, want, "case {case}");
+    }
+}
+
+/// In-place tree verification is transactional: a rejected sibling outside
+/// the domain is harmless, and a node greedy would forward fails exactly as
+/// `forward` does, leaving the cache untouched.
+#[test]
+fn in_place_tree_failures_stay_with_their_node() {
+    let model = two_token_model([1, 0, 0, 1], [ONE; 2], true);
+    let expected = model
+        .forward(1, &mut model.new_cache())
+        .expect_err("token 1 leaves the domain")
+        .to_string();
+    let dense = DenseModel::new(&model, [0x5a; 32]);
+    let mut kv = dense.new_kv();
+    let mut reference = model.new_cache();
+    let first = model.forward(0, &mut reference).unwrap();
+    let rows = [Row {
+        seq: 0,
+        token: 0,
+        position: 0,
+        logits: false,
+    }];
+    assert!(dense.forward_rows(&rows, &mut [&mut kv]).errors[0].is_none());
+    assert_eq!(arith::select(&first, &[0], Selection::Argmax).unwrap(), 0);
+    // root 0 -> {1 (bad) -> 0, 0 -> 0}
+    let tree = DraftTree::new(vec![
+        Node {
+            parent: None,
+            token: 0,
+        },
+        Node {
+            parent: Some(0),
+            token: 1,
+        },
+        Node {
+            parent: Some(1),
+            token: 0,
+        },
+        Node {
+            parent: Some(0),
+            token: 0,
+        },
+        Node {
+            parent: Some(3),
+            token: 0,
+        },
+    ])
+    .unwrap();
+    let mut committed = kv.clone();
+    let out = verify_tree(
+        &dense,
+        &tree,
+        &mut committed,
+        &[0],
+        Selection::Argmax,
+        &[],
+        8,
+    )
+    .unwrap();
+    assert_eq!(out.emitted, vec![0, 0, 0]);
+    assert_eq!(out.verified_rows, 5);
+    let mut plain = reference.clone();
+    for _ in 0..3 {
+        model.forward(0, &mut plain).unwrap();
+    }
+    assert_eq!(committed.digest(), plain.digest());
+    // A root greedy would forward that leaves the domain.
+    let bad_root = DraftTree::new(vec![
+        Node {
+            parent: None,
+            token: 1,
+        },
+        Node {
+            parent: Some(0),
+            token: 0,
+        },
+    ])
+    .unwrap();
+    let before = kv.clone();
+    let error = verify_tree(
+        &dense,
+        &bad_root,
+        &mut kv,
+        &[0, 1],
+        Selection::Argmax,
+        &[],
+        8,
+    )
+    .expect_err("greedy would forward token 1");
+    assert_eq!(error.to_string(), expected);
+    assert_eq!(kv, before);
+}
+
+#[test]
+fn keep_path_moves_exactly_the_accepted_positions() {
+    let mut kv = SeqKv::new(vec![2, 1]);
+    for p in 0..7i32 {
+        kv.extend_plane(0, &[10 * p, 10 * p + 1]);
+        kv.extend_plane(1, &[100 + p]);
+    }
+    kv.commit(7).unwrap();
+    let mut path = kv.clone();
+    path.keep_path(2, &[0, 2, 4]).unwrap();
+    assert_eq!(path.len(), 5);
+    assert_eq!(path.plane(0), &[0, 1, 10, 11, 20, 21, 40, 41, 60, 61]);
+    assert_eq!(path.plane(1), &[100, 101, 102, 104, 106]);
+    assert!(kv.clone().keep_path(2, &[0, 5]).is_err());
+    assert!(kv.clone().keep_path(2, &[2, 1]).is_err());
 }

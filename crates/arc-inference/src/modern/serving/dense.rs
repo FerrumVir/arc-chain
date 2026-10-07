@@ -26,10 +26,12 @@ use std::ops::Range;
 use rayon::prelude::*;
 
 use super::gemm::project_rows;
+use super::tree::{DraftTree, TreeOutput, TreePlan};
 use super::{BatchModel, Failure, Row, SeqKv, StepOutput, check_rows};
 use crate::modern::ModernError;
 use crate::modern::arith::{
-    HeadCache, add_residual, attention_head, embed_row, gated_silu, rms_norm, rope_split_half,
+    HeadCache, add_residual, attention_head, embed_row, exp_q16, gated_silu, rms_norm,
+    rope_split_half, to_activation,
 };
 use crate::modern::model::ModernModel;
 use crate::modern::tables::attention_lambda;
@@ -111,6 +113,10 @@ impl BatchModel for DenseModel<'_> {
     fn forward_rows(&self, rows: &[Row], kvs: &mut [&mut SeqKv]) -> StepOutput {
         layered_forward(self.model, rows, kvs, &DenseFfn(self.model))
     }
+
+    fn forward_tree(&self, tree: &DraftTree, kv: &mut SeqKv) -> TreeOutput {
+        layered_forward_tree(self.model, tree, kv, &DenseFfn(self.model))
+    }
 }
 
 /// Plane widths of a dense model's cache: keys then values for each layer.
@@ -143,6 +149,112 @@ pub fn layered_forward(
     );
     let logits = final_logits(model, rows, &hidden, &mut errors);
     finish_step(rows, kvs, &base, errors, logits)
+}
+
+/// A token tree verified in one step with each node computed once (ENG-8):
+/// embeddings, [`forward_tree_layers`] over every layer, logits for every node.
+/// The cache keeps every node in node order until [`TreeOutput::commit`].
+pub fn layered_forward_tree(
+    model: &ModernModel,
+    tree: &DraftTree,
+    kv: &mut SeqKv,
+    ffn: &dyn FeedForward,
+) -> TreeOutput {
+    let plan = TreePlan::new(tree, kv.len());
+    let mut errors: Vec<Option<ModernError>> = plan.rows.iter().map(|_| None).collect();
+    let mut hidden = embed_rows(model, &plan.rows, &mut errors);
+    forward_tree_layers(
+        model,
+        0..model.config.n_layers,
+        &plan.rows,
+        kv,
+        plan.prefix,
+        &plan.tails,
+        &mut hidden,
+        &mut errors,
+        ffn,
+    );
+    let logits = final_logits(model, &plan.rows, &hidden, &mut errors);
+    TreeOutput::in_place(tree, kv, plan.prefix, logits, errors)
+}
+
+/// The cache view of one query head of a tree node: the committed positions
+/// `0..prefix`, then the stored positions in `tail`.
+pub struct TreeView<'a> {
+    pub keys: &'a [i32],
+    pub values: &'a [i32],
+    pub stride: usize,
+    pub offset: usize,
+    pub prefix: usize,
+    pub tail: &'a [usize],
+}
+
+/// [`attention_head`] over the positions of a [`TreeView`], in that order.
+/// The arithmetic is the profile's two-pass attention, operation for
+/// operation; only the positions visited differ. A test pins it to
+/// [`attention_head`] on the same keys laid out contiguously.
+pub fn attention_head_tree(
+    q: &[i64],
+    view: TreeView<'_>,
+    lambda: i64,
+    out: &mut [i64],
+) -> Result<(), ModernError> {
+    let width = q.len();
+    let last = view.tail.last().copied().or(view.prefix.checked_sub(1));
+    let end = last
+        .and_then(|p| p.checked_mul(view.stride))
+        .and_then(|base| base.checked_add(view.offset + width));
+    let ordered = view.tail.windows(2).all(|w| w[0] < w[1])
+        && view.tail.first().is_none_or(|&t| t >= view.prefix);
+    if out.len() != width
+        || !ordered
+        || end.is_none_or(|end| end > view.keys.len() || end > view.values.len())
+    {
+        return Err(ModernError::Invalid("attention cache shape".into()));
+    }
+    let positions = || (0..view.prefix).chain(view.tail.iter().copied());
+    let q_mass: u128 = q.iter().map(|v| u128::from(v.unsigned_abs())).sum();
+    let narrow = q_mass < (1u128 << 32);
+    let mut scores = Vec::with_capacity(view.prefix + view.tail.len());
+    for position in positions() {
+        let base = position * view.stride + view.offset;
+        let key = &view.keys[base..base + width];
+        let dot: i128 = if narrow {
+            let mut sum = 0i64;
+            for (&a, &b) in q.iter().zip(key) {
+                sum += a * i64::from(b);
+            }
+            i128::from(sum)
+        } else {
+            let mut sum = 0i128;
+            for (&a, &b) in q.iter().zip(key) {
+                sum += i128::from(a) * i128::from(b);
+            }
+            sum
+        };
+        let scaled = dot
+            .checked_mul(i128::from(lambda))
+            .ok_or_else(|| ModernError::Domain("attention score product beyond 2^127".into()))?;
+        scores.push(to_activation(scaled >> 46, "attention score beyond 2^62")?);
+    }
+    let max_score = scores.iter().copied().max().unwrap_or(0);
+    let mut total: i64 = 0;
+    let mut weighted = vec![0i64; width];
+    for (position, &score) in positions().zip(&scores) {
+        let weight = exp_q16(score - max_score);
+        if weight == 0 {
+            continue;
+        }
+        total += weight;
+        let base = position * view.stride + view.offset;
+        for (acc, &v) in weighted.iter_mut().zip(&view.values[base..base + width]) {
+            *acc += weight * i64::from(v);
+        }
+    }
+    for (slot, &acc) in out.iter_mut().zip(&weighted) {
+        *slot = acc / total;
+    }
+    Ok(())
 }
 
 /// A step that failed its contract check: every sequence gets the error and
@@ -199,6 +311,76 @@ pub fn forward_layers(
     hidden: &mut [i64],
     errors: &mut [Option<ModernError>],
     ffn: &dyn FeedForward,
+) {
+    layers_with(
+        model,
+        layers,
+        rows,
+        kvs,
+        hidden,
+        errors,
+        ffn,
+        Attend::Causal,
+    );
+}
+
+/// The cached positions a row attends to.
+#[derive(Clone, Copy)]
+enum Attend<'a> {
+    /// Positions `0..=position` of the row's own sequence.
+    Causal,
+    /// A token tree in one sequence (ENG-8): the committed positions
+    /// `0..prefix`, then the stored positions `tails[r]` (the row's ancestors
+    /// and itself, in increasing order).
+    Tree {
+        prefix: usize,
+        tails: &'a [Vec<usize>],
+    },
+}
+
+/// [`forward_layers`] for the nodes of a token tree over one sequence
+/// (ENG-8). Row `r` is node `r`: it sits at position `prefix + depth(r)`,
+/// appends its KV at stored position `prefix + r`, and attends to the
+/// committed positions `0..prefix` followed by `tails[r]`, the stored
+/// positions of its ancestors and itself in increasing order. Those are the
+/// keys and values the reference holds for that token alone, in the same
+/// order, so each node computes exactly the greedy forward pass of its own
+/// path. Pipeline stages call this for their layer range like
+/// [`forward_layers`].
+#[allow(clippy::too_many_arguments)]
+pub fn forward_tree_layers(
+    model: &ModernModel,
+    layers: Range<usize>,
+    rows: &[Row],
+    kv: &mut SeqKv,
+    prefix: usize,
+    tails: &[Vec<usize>],
+    hidden: &mut [i64],
+    errors: &mut [Option<ModernError>],
+    ffn: &dyn FeedForward,
+) {
+    layers_with(
+        model,
+        layers,
+        rows,
+        &mut [kv],
+        hidden,
+        errors,
+        ffn,
+        Attend::Tree { prefix, tails },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layers_with(
+    model: &ModernModel,
+    layers: Range<usize>,
+    rows: &[Row],
+    kvs: &mut [&mut SeqKv],
+    hidden: &mut [i64],
+    errors: &mut [Option<ModernError>],
+    ffn: &dyn FeedForward,
+    attend: Attend<'_>,
 ) {
     let c = &model.config;
     let n = rows.len();
@@ -266,15 +448,32 @@ pub fn forward_layers(
                 }
                 let row = rows[r];
                 let cache = &caches[row.seq];
-                let view = HeadCache {
-                    keys: cache.plane(2 * l),
-                    values: cache.plane(2 * l + 1),
-                    positions: row.position + 1,
-                    stride: dkv,
-                    offset: (head / group) * dh,
-                };
                 let start = r * dq + head * dh;
-                attention_head(&q[start..start + dh], view, lambda, out)
+                match attend {
+                    Attend::Causal => {
+                        let view = HeadCache {
+                            keys: cache.plane(2 * l),
+                            values: cache.plane(2 * l + 1),
+                            positions: row.position + 1,
+                            stride: dkv,
+                            offset: (head / group) * dh,
+                        };
+                        attention_head(&q[start..start + dh], view, lambda, out)
+                    }
+                    Attend::Tree { prefix, tails } => attention_head_tree(
+                        &q[start..start + dh],
+                        TreeView {
+                            keys: cache.plane(2 * l),
+                            values: cache.plane(2 * l + 1),
+                            stride: dkv,
+                            offset: (head / group) * dh,
+                            prefix,
+                            tail: &tails[r],
+                        },
+                        lambda,
+                        out,
+                    ),
+                }
             })
             .collect();
         for (index, result) in results.into_iter().enumerate() {

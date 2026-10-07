@@ -34,7 +34,7 @@ struct KnownHeads {
     wrong_first: bool,
 }
 impl TreeDrafter for KnownHeads {
-    fn propose(&self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError> {
+    fn propose(&mut self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError> {
         let at = context.len() - self.prompt;
         let heads: Vec<_> = self
             .output
@@ -87,14 +87,20 @@ fn exact_tokens_logits_and_committed_kv_across_trees_kernels_and_stops() {
                         {
                             model.forward(t, &mut reference_kv).unwrap();
                         }
-                        let known = KnownHeads {
-                            prompt: prompt.len(),
-                            output: reference.tokens.clone(),
-                            wrong_first: true,
-                        };
                         for depth in [0, 1, 4, 12] {
-                            for drafter in [&known as &dyn TreeDrafter, &LookupTree::default()] {
-                                let out = generate_tree(&dense, &req, drafter, depth).unwrap();
+                            let mut drafters: Vec<Box<dyn TreeDrafter>> = vec![
+                                Box::new(KnownHeads {
+                                    prompt: prompt.len(),
+                                    output: reference.tokens.clone(),
+                                    wrong_first: true,
+                                }),
+                                Box::new(LookupTree::default()),
+                                Box::new(RecycleTree::new(3, 24, None)),
+                                Box::new(RecycleTree::new(4, 40, Some(LookupTree::default()))),
+                            ];
+                            for drafter in &mut drafters {
+                                let out =
+                                    generate_tree(&dense, &req, drafter.as_mut(), depth).unwrap();
                                 assert_eq!(out.tokens, baseline.tokens);
                                 assert_eq!(arith::tokens_hash(&out.tokens), baseline.output_hash);
                                 assert_eq!(out.logits_hashes, baseline.logits_hashes);
@@ -170,7 +176,26 @@ fn deep_branch_verification_is_one_batch_and_rejected_invalid_sibling_is_harmles
     assert_eq!(count.calls.load(Ordering::Relaxed), 1);
     assert_eq!(out.emitted, baseline.tokens[1..]);
     assert_eq!(out.logits_hashes, baseline.logits_hashes[3..]);
-    assert!(out.verified_rows > out.logical_nodes); // ancestor duplication visible
+    // `Counting` has no tree kernel, so it takes the path-lowering fallback,
+    // which duplicates ancestors; the dense model computes each node once.
+    assert!(out.verified_rows > out.logical_nodes);
+    assert_eq!(out.expanded_rows, out.verified_rows);
+    let mut shared_kv = dense.new_kv();
+    dense.forward_rows(&rows, &mut [&mut shared_kv]);
+    let shared = verify_tree(
+        &dense,
+        &tree,
+        &mut shared_kv,
+        &baseline.tokens[..1],
+        request.selection,
+        &[],
+        8,
+    )
+    .unwrap();
+    assert_eq!(shared.emitted, out.emitted);
+    assert_eq!(shared.logits_hashes, out.logits_hashes);
+    assert_eq!(shared.verified_rows, tree.nodes().len());
+    assert_eq!(shared_kv, kv);
     let mut plain = model.new_cache();
     for &t in request.prompt.iter().chain(&baseline.tokens[..7]) {
         model.forward(t, &mut plain).unwrap();
@@ -332,7 +357,7 @@ fn malformed_trees_context_limits_and_projection_inputs_refuse() {
             eos: &[],
             selection: Selection::Argmax,
         };
-        assert!(generate_tree(&dense, &request, &LookupTree::default(), 8).is_err());
+        assert!(generate_tree(&dense, &request, &mut LookupTree::default(), 8).is_err());
     }
     assert!((projected_tokens_per_second(8.0, 8, 10.0, 20.0).unwrap() - 80.0).abs() < 1e-12);
     for (tokens, hops, hop_ms, compute) in [
@@ -347,7 +372,7 @@ fn malformed_trees_context_limits_and_projection_inputs_refuse() {
 
 #[test]
 fn lookup_forks_matches_and_local_draft_keeps_target_bytes() {
-    let lookup = LookupTree::default();
+    let mut lookup = LookupTree::default();
     let tree = lookup.propose(&[1, 2, 7, 8, 1, 2, 9, 10, 1, 2], 2).unwrap();
     assert!(
         tree.nodes
@@ -361,7 +386,7 @@ fn lookup_forks_matches_and_local_draft_keeps_target_bytes() {
     );
     let model = tiny_model();
     let dense = DenseModel::new(&model, [0; 32]);
-    let draft = LocalModelTree {
+    let mut draft = LocalModelTree {
         model: &dense,
         top_k: 2,
         max_nodes: 32,
@@ -372,9 +397,70 @@ fn lookup_forks_matches_and_local_draft_keeps_target_bytes() {
         eos: &[],
         selection: Selection::Argmax,
     };
-    let out = generate_tree(&dense, &request, &draft, 5).unwrap();
+    let out = generate_tree(&dense, &request, &mut draft, 5).unwrap();
     let baseline = model.generate(&request).unwrap();
     assert_eq!(out.tokens, baseline.tokens);
     assert_eq!(out.logits_hashes, baseline.logits_hashes);
     assert!(out.verification_passes < 11);
+}
+
+#[test]
+fn top_k_ranks_by_logit_then_token_id() {
+    assert_eq!(top_k(&[5, 9, 9, -1, 7], 3), vec![1, 2, 4]);
+    assert_eq!(top_k(&[5, 9, 9, -1, 7], 9), vec![1, 2, 4, 0, 3]);
+    assert_eq!(top_k(&[3, 3, 3], 2), vec![0, 1]);
+    assert!(top_k(&[], 4).is_empty());
+}
+
+/// The recycler drafts only from candidates the target already returned,
+/// best-first by rank cost, within the node and depth budgets, merges lookup
+/// branches first, and is deterministic.
+#[test]
+fn recycle_tree_grows_best_first_from_observed_candidates() {
+    let mut recycle = RecycleTree::new(2, 6, None);
+    assert_eq!(recycle.propose(&[4], 8).unwrap(), DraftTree::root(4));
+    let logits = |best: u32, second: u32| {
+        let mut l = vec![0i64; 16];
+        l[best as usize] = 10;
+        l[second as usize] = 5;
+        l
+    };
+    recycle.observe(4, &logits(5, 9));
+    recycle.observe(5, &logits(6, 10));
+    recycle.observe(6, &logits(7, 11));
+    recycle.observe(9, &logits(12, 13));
+    assert_eq!(recycle.known_tokens(), 4);
+    let tree = recycle.propose(&[1, 4], 8).unwrap();
+    let tokens: Vec<_> = tree.nodes().iter().map(|n| (n.parent, n.token)).collect();
+    // cost 1: 4->5; cost 2: 4->9 (depth 1) before 5->6 (depth 2); cost 3 at
+    // depth 2 in insertion order: 5->10, 9->12; the budget of 6 stops there.
+    assert_eq!(
+        tokens,
+        vec![
+            (None, 4),
+            (Some(0), 5),
+            (Some(0), 9),
+            (Some(1), 6),
+            (Some(1), 10),
+            (Some(2), 12),
+        ]
+    );
+    assert_eq!(recycle.propose(&[1, 4], 8).unwrap(), tree);
+    let shallow = recycle.propose(&[1, 4], 1).unwrap();
+    assert!(shallow.depths().iter().all(|&d| d <= 1));
+    assert_eq!(shallow.nodes().len(), 3);
+    // Newer candidates replace older ones for the same token.
+    recycle.observe(4, &logits(9, 5));
+    assert_eq!(recycle.propose(&[4], 1).unwrap().nodes()[1].token, 9);
+    let mut hybrid = RecycleTree::new(2, 8, Some(LookupTree::default()));
+    hybrid.observe(4, &logits(5, 9));
+    let tree = hybrid.propose(&[4, 8, 3, 4], 4).unwrap();
+    assert_eq!(tree.nodes()[1].token, 8, "lookup branch first");
+    assert!(
+        tree.nodes()
+            .iter()
+            .any(|n| n.parent == Some(0) && n.token == 5)
+    );
+    hybrid.clear();
+    assert_eq!(hybrid.known_tokens(), 0);
 }

@@ -105,6 +105,19 @@ pub trait BatchModel: Sync {
     /// Run one batched step (see the trait contract).
     fn forward_rows(&self, rows: &[Row], kvs: &mut [&mut SeqKv]) -> StepOutput;
 
+    /// Verify a token tree for one sequence in one step (ENG-8). Node `i`
+    /// sits at position `kv.len() + depth(i)` and its logits must equal what
+    /// the model computes for that token alone after the committed cache and
+    /// the node's ancestors. Commit a path with [`tree::TreeOutput::commit`].
+    ///
+    /// The default lowers the tree to one sequence per root-to-leaf path
+    /// through a single [`Self::forward_rows`] call, which duplicates shared
+    /// ancestors. A model that can mask attention per node overrides it to
+    /// compute each node once ([`dense::DenseModel`] does).
+    fn forward_tree(&self, tree: &tree::DraftTree, kv: &mut SeqKv) -> tree::TreeOutput {
+        tree::forward_tree_by_paths(self, tree, kv)
+    }
+
     /// An empty cache for one sequence.
     fn new_kv(&self) -> SeqKv {
         SeqKv::new(self.kv_widths())
@@ -192,6 +205,33 @@ impl SeqKv {
             plane.truncate(len * width);
         }
         self.len = len;
+    }
+
+    /// Keep positions `0..start`, then move the committed positions
+    /// `start + offsets[j]` to `start + j` and drop everything after them:
+    /// the accepted path of a token tree whose nodes were stored in node
+    /// order. `offsets` must be strictly increasing.
+    pub fn keep_path(&mut self, start: usize, offsets: &[usize]) -> Result<(), ModernError> {
+        let increasing = offsets.windows(2).all(|w| w[0] < w[1]);
+        let inside = offsets
+            .last()
+            .is_none_or(|&last| start.checked_add(last).is_some_and(|end| end < self.len));
+        if start > self.len || !increasing || !inside {
+            return Err(ModernError::Invalid(
+                "tree path is outside the cache".into(),
+            ));
+        }
+        for (plane, &width) in self.planes.iter_mut().zip(&self.widths) {
+            for (j, &offset) in offsets.iter().enumerate() {
+                if offset != j {
+                    let from = (start + offset) * width;
+                    plane.copy_within(from..from + width, (start + j) * width);
+                }
+            }
+            plane.truncate((start + offsets.len()) * width);
+        }
+        self.len = start + offsets.len();
+        Ok(())
     }
 
     /// Copy committed positions `start..end` of every plane (a prefix block).

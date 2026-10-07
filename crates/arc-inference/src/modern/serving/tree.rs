@@ -1,18 +1,31 @@
 //! Exact tree speculation over ENG-1's [`BatchModel`].
 //!
-//! Compile a parent-indexed tree to root-to-leaf sequences, then send ALL
-//! sequences through ONE `forward_rows` call. A stage receives all rows at once;
-//! no target call occurs per depth. Each path sees only the committed prefix
-//! and its ancestors, in the reference attention order. This portable lowering
-//! duplicates shared ancestors and prefix KV; it is not a shared-node attention
-//! kernel. `verified_rows` exposes that cost rather than hiding it as speedup.
+//! A drafter proposes a tree of candidate continuations; the target verifies
+//! EVERY node in ONE [`BatchModel::forward_tree`] call, so a model split across
+//! devices traverses the network once per tree, not once per token. Node `i`
+//! sees the committed prefix and its own ancestors, in the reference attention
+//! order. [`dense::DenseModel`] computes each node once with per-node attention
+//! masks (shared ancestors are not duplicated); any other model falls back to
+//! one sequence per root-to-leaf path in one `forward_rows` call.
 //!
-//! Walk target argmax (or RP64) from the root, following a child only when its
-//! token equals the selected token. Inductively every visited row has exactly
-//! the greedy prefix, hence identical logits, tokens and KV. Rejected siblings
-//! and their failures never enter the committed cache. A failure on the chosen
-//! path is raised only if greedy would forward that token (not after EOS/limit).
+//! Walk the target's selection rule (argmax or RP64) from the root, following
+//! a child only when its token equals the selected token. Inductively every
+//! visited node has exactly the greedy prefix, hence identical logits, tokens
+//! and KV. Only the visited path's KV is committed. Rejected siblings and
+//! their failures never enter the cache. A failure on the chosen path is
+//! raised only if greedy would forward that token (not after EOS/limit).
 //! Drafts affect work and acceptance only, never the computed function.
+//!
+//! Drafters: [`LookupTree`] (n-gram/prompt lookup, for code and agent traffic),
+//! [`RecycleTree`] (token recycling: the target's own top-k candidates from
+//! earlier rows, no draft model, optionally merged with lookup), [`head_tree`]
+//! (Medusa/EAGLE-style ranked heads) and [`LocalModelTree`] (a small local
+//! model with the target's tokenizer).
+//!
+//! [`dense::DenseModel`]: super::dense::DenseModel
+
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 use super::{BatchModel, Row, SeqKv};
 use crate::modern::ModernError;
@@ -21,6 +34,7 @@ use crate::modern::model::GenerationRequest;
 
 const MAX_NODES: usize = 256;
 const MAX_DEPTH: usize = 64;
+/// Bound on the rows the path-lowering fallback materializes.
 const MAX_ROWS: usize = 1024;
 
 /// Node zero is the already emitted, not yet forwarded token. Every other
@@ -57,7 +71,7 @@ impl DraftTree {
             }
         }
         let tree = Self { nodes };
-        if tree.paths().iter().map(Vec::len).sum::<usize>() > MAX_ROWS {
+        if tree.expanded_rows() > MAX_ROWS {
             return Err(invalid("expanded tree exceeds 1024 verification rows"));
         }
         Ok(tree)
@@ -76,26 +90,291 @@ impl DraftTree {
         &self.nodes
     }
 
-    fn paths(&self) -> Vec<Vec<usize>> {
+    /// Depth of every node; the root is 0.
+    pub fn depths(&self) -> Vec<usize> {
+        let mut depths = vec![0; self.nodes.len()];
+        for (i, node) in self.nodes.iter().enumerate().skip(1) {
+            depths[i] = depths[node.parent.unwrap()] + 1;
+        }
+        depths
+    }
+
+    /// Nodes from the root to `node`, inclusive, in increasing order.
+    pub fn path_to(&self, node: usize) -> Vec<usize> {
+        let mut path = vec![node];
+        let mut at = node;
+        while let Some(parent) = self.nodes[at].parent {
+            path.push(parent);
+            at = parent;
+        }
+        path.reverse();
+        path
+    }
+
+    /// Root-to-leaf paths, the sequences of the path-lowering fallback.
+    pub fn paths(&self) -> Vec<Vec<usize>> {
         let mut has_child = vec![false; self.nodes.len()];
         for node in &self.nodes[1..] {
             has_child[node.parent.unwrap()] = true;
         }
-        has_child
-            .iter()
-            .enumerate()
-            .filter(|(_, child)| !**child)
-            .map(|(leaf, _)| {
-                let mut path = vec![leaf];
-                let mut at = leaf;
-                while let Some(parent) = self.nodes[at].parent {
-                    path.push(parent);
-                    at = parent;
-                }
-                path.reverse();
-                path
-            })
+        (0..self.nodes.len())
+            .filter(|&i| !has_child[i])
+            .map(|leaf| self.path_to(leaf))
             .collect()
+    }
+
+    /// Rows the path-lowering fallback sends: the sum of the path lengths.
+    pub fn expanded_rows(&self) -> usize {
+        self.paths().iter().map(Vec::len).sum()
+    }
+
+    fn child(&self, parent: usize, token: u32) -> Option<usize> {
+        self.nodes
+            .iter()
+            .position(|n| n.parent == Some(parent) && n.token == token)
+    }
+}
+
+/// Grows a tree while keeping the depth, leaf and expanded-row bookkeeping
+/// incremental, so drafters can bound nodes, depth and fallback rows cheaply.
+struct Builder {
+    tree: DraftTree,
+    depth: Vec<usize>,
+    has_child: Vec<bool>,
+    expanded: usize,
+    max_nodes: usize,
+}
+
+impl Builder {
+    fn new(root: u32, max_nodes: usize) -> Self {
+        Self {
+            tree: DraftTree::root(root),
+            depth: vec![0],
+            has_child: vec![false],
+            expanded: 1,
+            max_nodes: max_nodes.clamp(1, MAX_NODES),
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.tree.nodes.len() >= self.max_nodes
+    }
+
+    /// The existing child, or a new one if every bound allows it.
+    fn child(&mut self, parent: usize, token: u32) -> Option<usize> {
+        if let Some(i) = self.tree.child(parent, token) {
+            return Some(i);
+        }
+        let depth = self.depth[parent] + 1;
+        let added = if self.has_child[parent] { depth + 1 } else { 1 };
+        if self.full() || depth > MAX_DEPTH || self.expanded + added > MAX_ROWS {
+            return None;
+        }
+        self.tree.nodes.push(Node {
+            parent: Some(parent),
+            token,
+        });
+        self.depth.push(depth);
+        self.has_child.push(false);
+        self.has_child[parent] = true;
+        self.expanded += added;
+        Some(self.tree.nodes.len() - 1)
+    }
+}
+
+/// How a [`TreeOutput`]'s caches are laid out.
+#[derive(Debug)]
+enum Caches {
+    /// The caller's cache holds the committed prefix, then one position per
+    /// node in node order.
+    InPlace { prefix: usize },
+    /// One cache per root-to-leaf path; `at[node]` is (path, offset).
+    Paths {
+        caches: Vec<SeqKv>,
+        at: Vec<(usize, usize)>,
+    },
+}
+
+/// The result of [`BatchModel::forward_tree`].
+#[derive(Debug)]
+pub struct TreeOutput {
+    /// Per node: its logits, if it and every ancestor succeeded.
+    pub logits: Vec<Option<Vec<i64>>>,
+    /// Per node: its own error, when every ancestor succeeded and it failed
+    /// (the error the model raises for that token alone).
+    pub errors: Vec<Option<ModernError>>,
+    /// Rows the model computed for this tree.
+    pub physical_rows: usize,
+    caches: Caches,
+}
+
+impl TreeOutput {
+    /// Close an in-place tree step: `kv` holds the committed prefix plus one
+    /// appended position per node, in node order. A node's logits survive
+    /// only when it and every ancestor succeeded.
+    pub fn in_place(
+        tree: &DraftTree,
+        kv: &mut SeqKv,
+        prefix: usize,
+        mut logits: Vec<Option<Vec<i64>>>,
+        mut errors: Vec<Option<ModernError>>,
+    ) -> Self {
+        let n = tree.nodes.len();
+        if let Err(e) = kv.commit(prefix + n) {
+            kv.rollback(prefix);
+            let message = e.to_string();
+            errors = (0..n)
+                .map(|_| Some(ModernError::Invalid(message.clone())))
+                .collect();
+            logits = (0..n).map(|_| None).collect();
+            return Self {
+                logits,
+                errors,
+                physical_rows: n,
+                caches: Caches::InPlace { prefix },
+            };
+        }
+        let mut valid = vec![false; n];
+        for i in 0..n {
+            let parent_ok = tree.nodes[i].parent.is_none_or(|p| valid[p]);
+            valid[i] = parent_ok && errors[i].is_none();
+            if !parent_ok {
+                errors[i] = None;
+            }
+            if !valid[i] {
+                logits[i] = None;
+            }
+        }
+        Self {
+            logits,
+            errors,
+            physical_rows: n,
+            caches: Caches::InPlace { prefix },
+        }
+    }
+
+    /// Make the root-to-`node` path the committed continuation of `kv`, the
+    /// cache passed to [`BatchModel::forward_tree`].
+    pub fn commit(self, tree: &DraftTree, node: usize, kv: &mut SeqKv) -> Result<(), ModernError> {
+        let path = tree.path_to(node);
+        match self.caches {
+            Caches::InPlace { prefix } => kv.keep_path(prefix, &path),
+            Caches::Paths { mut caches, at } => {
+                let (seq, offset) = at[node];
+                let mut chosen = caches.swap_remove(seq);
+                if chosen.len() < kv.len() + offset + 1 {
+                    return Err(invalid("target omitted visited KV"));
+                }
+                chosen.rollback(kv.len() + offset + 1);
+                *kv = chosen;
+                Ok(())
+            }
+        }
+    }
+
+    /// Leave `kv` exactly as it was before the tree step.
+    pub fn discard(self, kv: &mut SeqKv) {
+        if let Caches::InPlace { prefix } = self.caches {
+            kv.rollback(prefix);
+        }
+    }
+}
+
+/// The rows of a tree step: node `i` at position `prefix + depth(i)`, and the
+/// stored positions it attends to after the prefix (`prefix + ancestor` for
+/// every ancestor, then `prefix + i`). Pipeline stages share one plan.
+pub struct TreePlan {
+    pub prefix: usize,
+    pub rows: Vec<Row>,
+    pub tails: Vec<Vec<usize>>,
+}
+
+impl TreePlan {
+    pub fn new(tree: &DraftTree, prefix: usize) -> Self {
+        let depths = tree.depths();
+        let rows = tree
+            .nodes
+            .iter()
+            .zip(&depths)
+            .map(|(node, depth)| Row {
+                seq: 0,
+                token: node.token,
+                position: prefix + depth,
+                logits: true,
+            })
+            .collect();
+        let tails = (0..tree.nodes.len())
+            .map(|i| tree.path_to(i).into_iter().map(|j| prefix + j).collect())
+            .collect();
+        Self {
+            prefix,
+            rows,
+            tails,
+        }
+    }
+}
+
+/// The portable [`BatchModel::forward_tree`]: one sequence per root-to-leaf
+/// path, all in one `forward_rows` call. Shared ancestors and the prefix KV
+/// are duplicated; `physical_rows` reports that cost.
+pub fn forward_tree_by_paths<M: BatchModel + ?Sized>(
+    model: &M,
+    tree: &DraftTree,
+    kv: &mut SeqKv,
+) -> TreeOutput {
+    let base = kv.len();
+    let paths = tree.paths();
+    let mut caches = vec![kv.clone(); paths.len()];
+    let mut rows = Vec::new();
+    let mut at = vec![(0, 0); tree.nodes.len()];
+    let mut row_of = vec![0; tree.nodes.len()];
+    for (seq, path) in paths.iter().enumerate() {
+        for (offset, &node) in path.iter().enumerate() {
+            at[node] = (seq, offset);
+            row_of[node] = rows.len();
+            rows.push(Row {
+                seq,
+                token: tree.nodes[node].token,
+                position: base + offset,
+                logits: true,
+            });
+        }
+    }
+    let mut refs: Vec<_> = caches.iter_mut().collect();
+    let mut step = model.forward_rows(&rows, &mut refs);
+    let n = tree.nodes.len();
+    let mut logits: Vec<Option<Vec<i64>>> = (0..n).map(|_| None).collect();
+    let mut errors: Vec<Option<ModernError>> = (0..n).map(|_| None).collect();
+    if step.logits.len() != rows.len() || step.errors.len() != paths.len() {
+        for error in &mut errors {
+            *error = Some(invalid("model returned malformed tree result"));
+        }
+    } else {
+        for node in 0..n {
+            let (seq, offset) = at[node];
+            match &step.errors[seq] {
+                Some(failure) if failure.kept == offset => {
+                    errors[node] = Some(ModernError::Invalid(String::new()));
+                }
+                Some(failure) if failure.kept < offset => {}
+                _ => logits[node] = step.logits[row_of[node]].take(),
+            }
+        }
+        // Move each failing node's real error out of its sequence's report.
+        for node in 0..n {
+            if errors[node].is_some() {
+                let (seq, _) = at[node];
+                if let Some(failure) = step.errors[seq].take() {
+                    errors[node] = Some(failure.error);
+                }
+            }
+        }
+    }
+    TreeOutput {
+        logits,
+        errors,
+        physical_rows: rows.len(),
+        caches: Caches::Paths { caches, at },
     }
 }
 
@@ -103,14 +382,23 @@ fn invalid(message: &str) -> ModernError {
     ModernError::Invalid(message.into())
 }
 
-/// Local drafts use only prompt + emitted output. The last context token is
-/// the root. Depth excludes the root. No target output may be peeked ahead.
+/// Local drafts use only prompt + emitted output, plus whatever the target
+/// already returned for earlier rows ([`Self::observe`]). The last context
+/// token is the root. Depth excludes the root. No target output may be
+/// peeked ahead.
 pub trait TreeDrafter {
-    fn propose(&self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError>;
+    fn propose(&mut self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError>;
+
+    /// The target's logits after feeding `token`, for every prompt position
+    /// and every verified node (accepted or not), in order. Drafters that
+    /// learn from the target's own candidates use this; it never changes
+    /// what the target computes.
+    fn observe(&mut self, _token: u32, _logits: &[i64]) {}
 }
 
 /// Multiple n-gram matches become branches; common continuations share nodes.
 /// Recent matches of the longest suffix are inserted first. No model needed.
+#[derive(Debug, Clone, Copy)]
 pub struct LookupTree {
     pub min_ngram: usize,
     pub max_ngram: usize,
@@ -127,13 +415,8 @@ impl Default for LookupTree {
     }
 }
 
-impl TreeDrafter for LookupTree {
-    fn propose(&self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError> {
-        let root = *context
-            .last()
-            .ok_or_else(|| invalid("empty draft context"))?;
-        let mut tree = DraftTree::root(root);
-        let limit = self.max_nodes.clamp(1, MAX_NODES);
+impl LookupTree {
+    fn grow(&self, builder: &mut Builder, context: &[u32], depth: usize) {
         for n in (self.min_ngram.max(1)..=self.max_ngram.min(context.len().saturating_sub(1))).rev()
         {
             let suffix = &context[context.len() - n..];
@@ -143,31 +426,152 @@ impl TreeDrafter for LookupTree {
                 }
                 let mut parent = 0;
                 for &token in context[start + n..].iter().take(depth.min(MAX_DEPTH)) {
-                    if let Some(i) = tree
-                        .nodes
-                        .iter()
-                        .position(|node| node.parent == Some(parent) && node.token == token)
-                    {
-                        parent = i;
-                    } else {
-                        if tree.nodes.len() == limit {
-                            break;
-                        }
-                        tree.nodes.push(Node {
-                            parent: Some(parent),
-                            token,
-                        });
-                        // Bound actual materialized work, not just logical nodes.
-                        if tree.paths().iter().map(Vec::len).sum::<usize>() > MAX_ROWS {
-                            tree.nodes.pop();
-                            break;
-                        }
-                        parent = tree.nodes.len() - 1;
+                    match builder.child(parent, token) {
+                        Some(i) => parent = i,
+                        None => break,
                     }
                 }
             }
         }
-        Ok(tree)
+    }
+}
+
+impl TreeDrafter for LookupTree {
+    fn propose(&mut self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError> {
+        let root = *context
+            .last()
+            .ok_or_else(|| invalid("empty draft context"))?;
+        let mut builder = Builder::new(root, self.max_nodes);
+        self.grow(&mut builder, context, depth);
+        Ok(builder.tree)
+    }
+}
+
+/// Token recycling: a draft tree built from the target's OWN top-k candidates.
+///
+/// Every time the target returns logits after a token (prompt rows and every
+/// verified node, accepted or rejected), the `top_k` highest-ranked next tokens
+/// are stored as that token's successors, replacing older ones. A proposal
+/// grows the tree best-first from the root along stored successors, a
+/// successor of rank `r` costing `rank_cost[r]` (default `r + 1`), until
+/// `max_nodes`. No draft model,
+/// no training and no extra target work: the candidates are by-products of
+/// rows the target computed anyway. For a sharded model the last stage only
+/// has to return `top_k` ids per row. With `lookup` set, n-gram branches are
+/// placed first and recycling fills the rest of the budget. Ties break by
+/// cost, then depth, then insertion order, so proposals are deterministic.
+///
+/// Token Recycling follows Luo et al., "Turning Trash into Treasure:
+/// Accelerating Inference of Large Language Models with Token Recycling"
+/// (arXiv 2408.08696); the tree shape here is a cost-ordered best-first
+/// search rather than the paper's static template.
+#[derive(Debug, Clone)]
+pub struct RecycleTree {
+    pub top_k: usize,
+    pub max_nodes: usize,
+    pub lookup: Option<LookupTree>,
+    /// Cost of a successor by rank (the last entry repeats); a path's cost is
+    /// the sum along it. Lower costs are drafted first.
+    pub rank_cost: Vec<usize>,
+    successors: HashMap<u32, Vec<u32>>,
+}
+
+impl RecycleTree {
+    pub fn new(top_k: usize, max_nodes: usize, lookup: Option<LookupTree>) -> Self {
+        Self {
+            top_k: top_k.clamp(1, 16),
+            max_nodes,
+            lookup,
+            rank_cost: (1..=16).collect(),
+            successors: HashMap::new(),
+        }
+    }
+
+    fn cost(&self, rank: usize) -> usize {
+        self.rank_cost
+            .get(rank)
+            .or(self.rank_cost.last())
+            .copied()
+            .unwrap_or(rank + 1)
+    }
+
+    /// Forget every stored successor (a cold start).
+    pub fn clear(&mut self) {
+        self.successors.clear();
+    }
+
+    /// Tokens with stored successors.
+    pub fn known_tokens(&self) -> usize {
+        self.successors.len()
+    }
+}
+
+/// The `k` highest logits' token ids, highest first, lower id first on ties.
+pub fn top_k(logits: &[i64], k: usize) -> Vec<u32> {
+    let mut best: Vec<(i64, u32)> = Vec::with_capacity(k + 1);
+    for (token, &value) in logits.iter().enumerate() {
+        if best.len() == k && best.last().is_some_and(|&(v, _)| value <= v) {
+            continue;
+        }
+        let at = best.partition_point(|&(v, _)| v >= value);
+        best.insert(at, (value, token as u32));
+        best.truncate(k);
+    }
+    best.into_iter().map(|(_, t)| t).collect()
+}
+
+impl TreeDrafter for RecycleTree {
+    fn propose(&mut self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError> {
+        let root = *context
+            .last()
+            .ok_or_else(|| invalid("empty draft context"))?;
+        let mut builder = Builder::new(root, self.max_nodes);
+        if let Some(lookup) = &self.lookup {
+            lookup.grow(&mut builder, context, depth);
+        }
+        let depth = depth.min(MAX_DEPTH);
+        // (cost, depth, order) -> (parent, token)
+        let mut heap = BinaryHeap::new();
+        let mut order = 0usize;
+        let this = &*self;
+        let mut seed = |heap: &mut BinaryHeap<_>, node: usize, cost: usize, builder: &Builder| {
+            if builder.depth[node] >= depth {
+                return;
+            }
+            if let Some(next) = this.successors.get(&builder.tree.nodes[node].token) {
+                for (rank, &token) in next.iter().enumerate() {
+                    let step = this.cost(rank);
+                    heap.push(Reverse((
+                        cost + step,
+                        builder.depth[node] + 1,
+                        order,
+                        node,
+                        token,
+                    )));
+                    order += 1;
+                }
+            }
+        };
+        for node in 0..builder.tree.nodes.len() {
+            seed(&mut heap, node, 0, &builder);
+        }
+        while !builder.full() {
+            let Some(Reverse((cost, _, _, parent, token))) = heap.pop() else {
+                break;
+            };
+            if builder.tree.child(parent, token).is_some() {
+                continue;
+            }
+            let Some(node) = builder.child(parent, token) else {
+                continue;
+            };
+            seed(&mut heap, node, cost, &builder);
+        }
+        Ok(builder.tree)
+    }
+
+    fn observe(&mut self, token: u32, logits: &[i64]) {
+        self.successors.insert(token, top_k(logits, self.top_k));
     }
 }
 
@@ -179,36 +583,24 @@ pub fn head_tree(
     heads: &[Vec<u32>],
     max_nodes: usize,
 ) -> Result<DraftTree, ModernError> {
-    let mut tree = DraftTree::root(root);
+    let mut builder = Builder::new(root, max_nodes);
     let mut frontier = vec![0];
     for head in heads.iter().take(MAX_DEPTH) {
         let mut next = Vec::new();
         for parent in frontier {
             for &token in head {
-                if tree.nodes.len() >= max_nodes.clamp(1, MAX_NODES) {
-                    return Ok(tree);
-                }
-                if tree
-                    .nodes
-                    .iter()
-                    .any(|n| n.parent == Some(parent) && n.token == token)
-                {
+                if builder.tree.child(parent, token).is_some() {
                     continue;
                 }
-                tree.nodes.push(Node {
-                    parent: Some(parent),
-                    token,
-                });
-                if tree.paths().iter().map(Vec::len).sum::<usize>() > MAX_ROWS {
-                    tree.nodes.pop();
-                    return Ok(tree);
+                match builder.child(parent, token) {
+                    Some(i) => next.push(i),
+                    None => return Ok(builder.tree),
                 }
-                next.push(tree.nodes.len() - 1);
             }
         }
         frontier = next;
     }
-    Ok(tree)
+    Ok(builder.tree)
 }
 
 /// Optional local draft model. Greedy rollout supplies top-k candidates at
@@ -222,7 +614,7 @@ pub struct LocalModelTree<'a> {
 }
 
 impl TreeDrafter for LocalModelTree<'_> {
-    fn propose(&self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError> {
+    fn propose(&mut self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError> {
         let root = *context
             .last()
             .ok_or_else(|| invalid("empty draft context"))?;
@@ -291,9 +683,11 @@ pub struct TreeStep {
     pub emitted: Vec<u32>,
     pub logits_hashes: Vec<[u8; 32]>,
     pub finished: bool,
-    /// Physical rows sent in the single target verification call.
+    /// Rows the target computed in the single verification call.
     pub verified_rows: usize,
     pub logical_nodes: usize,
+    /// Rows the path-lowering fallback would send for the same tree.
+    pub expanded_rows: usize,
 }
 
 /// Verify without mutating `kv` on any error. Commit only the greedy path.
@@ -307,6 +701,31 @@ pub fn verify_tree(
     eos: &[u32],
     max_tokens: usize,
 ) -> Result<TreeStep, ModernError> {
+    verify_tree_observed(
+        model,
+        tree,
+        kv,
+        generated,
+        selection,
+        eos,
+        max_tokens,
+        &mut |_, _| {},
+    )
+}
+
+/// [`verify_tree`], handing `observe` every node's token and logits in node
+/// order once the step succeeded (for [`TreeDrafter::observe`]).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_tree_observed(
+    model: &dyn BatchModel,
+    tree: &DraftTree,
+    kv: &mut SeqKv,
+    generated: &[u32],
+    selection: Selection,
+    eos: &[u32],
+    max_tokens: usize,
+    observe: &mut dyn FnMut(u32, &[i64]),
+) -> Result<TreeStep, ModernError> {
     if generated.last() != Some(&tree.nodes[0].token)
         || generated.len() >= max_tokens
         || generated.last().is_some_and(|t| eos.contains(t))
@@ -317,30 +736,17 @@ pub fn verify_tree(
         return Err(invalid("wrong cache shape"));
     }
     let base = kv.len();
-    let paths = tree.paths();
-    if paths.iter().any(|path| {
-        base.checked_add(path.len())
-            .is_none_or(|end| end > model.max_positions())
-    }) {
+    let deepest = tree.depths().into_iter().max().unwrap_or(0);
+    if base
+        .checked_add(deepest + 1)
+        .is_none_or(|end| end > model.max_positions())
+    {
         return Err(invalid("tree exceeds model context"));
     }
-    let mut caches = vec![kv.clone(); paths.len()];
-    let mut rows = Vec::new();
-    let mut locations = vec![(0, 0, 0); tree.nodes.len()];
-    for (seq, path) in paths.iter().enumerate() {
-        for (offset, &node) in path.iter().enumerate() {
-            locations[node] = (seq, offset, rows.len());
-            rows.push(Row {
-                seq,
-                token: tree.nodes[node].token,
-                position: base + offset,
-                logits: true,
-            });
-        }
-    }
-    let mut refs: Vec<_> = caches.iter_mut().collect();
-    let mut result = model.forward_rows(&rows, &mut refs);
-    if result.logits.len() != rows.len() || result.errors.len() != paths.len() {
+    let mut result = model.forward_tree(tree, kv);
+    let n = tree.nodes.len();
+    if result.logits.len() != n || result.errors.len() != n {
+        result.discard(kv);
         return Err(invalid("model returned malformed tree result"));
     }
     let mut history = generated.to_vec();
@@ -348,41 +754,46 @@ pub fn verify_tree(
     let mut hashes = Vec::new();
     let mut node = 0;
     loop {
-        let (seq, offset, row) = locations[node];
-        if result.errors[seq]
-            .as_ref()
-            .is_some_and(|e| e.kept <= offset)
-        {
-            return Err(result.errors[seq].take().unwrap().error);
+        if let Some(error) = result.errors[node].take() {
+            result.discard(kv);
+            return Err(error);
         }
-        let logits = result.logits[row]
-            .as_ref()
-            .ok_or_else(|| invalid("missing visited logits"))?;
-        if logits.len() != model.vocab_size() {
-            return Err(invalid("wrong target logits width"));
-        }
-        let next = arith::select(logits, &history, selection)?;
-        hashes.push(arith::logits_hash(logits));
+        let next = match result.logits[node].as_ref() {
+            None => Err(invalid("missing visited logits")),
+            Some(logits) if logits.len() != model.vocab_size() => {
+                Err(invalid("wrong target logits width"))
+            }
+            Some(logits) => {
+                hashes.push(arith::logits_hash(logits));
+                arith::select(logits, &history, selection)
+            }
+        };
+        let next = match next {
+            Ok(next) => next,
+            Err(e) => {
+                result.discard(kv);
+                return Err(e);
+            }
+        };
         emitted.push(next);
         history.push(next);
         let finished = history.len() == max_tokens || eos.contains(&next);
-        let child = tree
-            .nodes
-            .iter()
-            .position(|n| n.parent == Some(node) && n.token == next);
+        let child = tree.child(node, next);
         if finished || child.is_none() {
-            let mut chosen = caches.swap_remove(seq);
-            if chosen.len() < base + offset + 1 {
-                return Err(invalid("target omitted visited KV"));
+            for (i, logits) in result.logits.iter().enumerate() {
+                if let Some(logits) = logits {
+                    observe(tree.nodes[i].token, logits);
+                }
             }
-            chosen.rollback(base + offset + 1);
-            *kv = chosen;
+            let physical = result.physical_rows;
+            result.commit(tree, node, kv)?;
             return Ok(TreeStep {
                 emitted,
                 logits_hashes: hashes,
                 finished,
-                verified_rows: rows.len(),
-                logical_nodes: tree.nodes.len(),
+                verified_rows: physical,
+                logical_nodes: n,
+                expanded_rows: tree.expanded_rows(),
             });
         }
         node = child.unwrap();
@@ -398,12 +809,13 @@ pub struct TreeGeneration {
     pub verification_passes: usize,
     pub verified_rows: usize,
     pub logical_nodes: usize,
+    pub expanded_rows: usize,
 }
 
 pub fn generate_tree(
     model: &dyn BatchModel,
     request: &GenerationRequest<'_>,
-    drafter: &dyn TreeDrafter,
+    drafter: &mut dyn TreeDrafter,
     depth: usize,
 ) -> Result<TreeGeneration, ModernError> {
     if request.prompt.is_empty()
@@ -434,22 +846,21 @@ pub fn generate_tree(
     if let Some(failure) = step.errors[0].take() {
         return Err(failure.error);
     }
-    let mut hashes = step
-        .logits
-        .iter()
-        .map(|l| {
-            l.as_ref()
-                .map(|l| arith::logits_hash(l))
-                .ok_or_else(|| invalid("missing prefill logits"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut hashes = Vec::with_capacity(rows.len() + request.max_tokens);
+    for (row, logits) in rows.iter().zip(&step.logits) {
+        let logits = logits
+            .as_ref()
+            .ok_or_else(|| invalid("missing prefill logits"))?;
+        hashes.push(arith::logits_hash(logits));
+        drafter.observe(row.token, logits);
+    }
     let first = arith::select(
         step.logits.last().unwrap().as_ref().unwrap(),
         &[],
         request.selection,
     )?;
     let mut tokens = vec![first];
-    let (mut passes, mut physical, mut logical) = (0, 0, 0);
+    let (mut passes, mut physical, mut logical, mut expanded) = (0, 0, 0, 0);
     while tokens.len() < request.max_tokens && !request.eos.contains(tokens.last().unwrap()) {
         let context: Vec<_> = request.prompt.iter().chain(&tokens).copied().collect();
         let budget = depth
@@ -461,13 +872,13 @@ pub fn generate_tree(
             .propose(&context, budget)
             .unwrap_or_else(|_| DraftTree::root(*tokens.last().unwrap()));
         let tree = if proposed.nodes[0].token != *tokens.last().unwrap()
-            || proposed.paths().iter().any(|p| p.len() > budget + 1)
+            || proposed.depths().into_iter().any(|d| d > budget)
         {
             DraftTree::root(*tokens.last().unwrap())
         } else {
             proposed
         };
-        let verified = verify_tree(
+        let verified = verify_tree_observed(
             model,
             &tree,
             &mut kv,
@@ -475,10 +886,12 @@ pub fn generate_tree(
             request.selection,
             request.eos,
             request.max_tokens,
+            &mut |token, logits| drafter.observe(token, logits),
         )?;
         passes += 1;
         physical += verified.verified_rows;
         logical += verified.logical_nodes;
+        expanded += verified.expanded_rows;
         tokens.extend(verified.emitted);
         hashes.extend(verified.logits_hashes);
     }
@@ -489,6 +902,7 @@ pub fn generate_tree(
         verification_passes: passes,
         verified_rows: physical,
         logical_nodes: logical,
+        expanded_rows: expanded,
     })
 }
 

@@ -7,6 +7,8 @@ on:
     branches: [main]
     paths:
       - 'crates/arc-inference/src/modern/serving/tree.rs'
+      - 'crates/arc-inference/src/modern/serving/dense.rs'
+      - 'crates/arc-inference/src/modern/serving/mod.rs'
       - 'crates/arc-inference/src/modern/serving/tree/**'
       - 'crates/arc-inference/examples/tree_speculation.rs'
       - 'crates/arc-inference/tests/fixtures/tree_traffic.json'
