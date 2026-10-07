@@ -13,10 +13,13 @@ use std::time::Instant;
 
 use arc_inference::canonical_simd;
 use arc_inference::modern::arith::{self, Selection};
+use arc_inference::modern::bench::{self, BenchOptions};
 use arc_inference::modern::bpe::ByteLevelBpe;
 use arc_inference::modern::chat::{ChatPrompt, render};
 use arc_inference::modern::convert::{self, SourceManifest};
-use arc_inference::modern::model::{GenerationRequest, ModernModel};
+use arc_inference::modern::engine::{self, Spec};
+use arc_inference::modern::kernels::{self, Kernel, Tiling};
+use arc_inference::modern::model::{GenerationRequest, ModernModel, TokenForward, generate_with};
 use arc_inference::modern::package;
 use arc_inference::modern::{ModernError, PROFILE, hex_lower};
 use serde_json::{Value, json};
@@ -30,13 +33,27 @@ const USAGE: &str = "usage: arc-modern <command> [options]
   generate  --package PKG --tokenizer tokenizer.json --prompt TEXT
             [--system TEXT] [--today \"06 October 2026\"] [--think]
             [--max-tokens N] [--selection rp64-argmax|argmax] [--eos ID,...]
-            [--kernel scalar|simd] [--threads N] [--json-out OUT.json]
+            [--kernel SPEC] [--threads N] [--json-out OUT.json]
   golden    --package PKG --cases CASES.json --out RUN.json
-            [--tokenizer tokenizer.json] [--kernel scalar|simd] [--threads N]
+            [--tokenizer tokenizer.json] [--kernel SPEC] [--threads N]
   ppl       --package PKG --tokens TOKENS.json --out OUT.json
-            [--window N] [--max-tokens N] [--kernel scalar|simd] [--threads N]
+            [--window N] [--max-tokens N] [--kernel SPEC] [--threads N]
+  bench     --package PKG --out BENCH.json [--specs SPEC,...] [--threads N]
+            [--scaling N,...] [--contexts N,...] [--decode N]
+            [--tokens-from GOLDEN.json] [--profile] [--micro] [--bandwidth]
+            [--tilings auto,rows4,stream]
   tokenize  --tokenizer tokenizer.json --input IN.jsonl --out OUT.jsonl
-  render    --user TEXT [--system TEXT] [--today DATE] [--think]";
+  render    --user TEXT [--system TEXT] [--today DATE] [--think]
+
+  SPEC selects the forward pass and kernel; every spec computes the same
+  logits. scalar: reference forward, scalar kernel (the default). simd: fast
+  engine, fastest SIMD kernel on this CPU. legacy: reference forward, the
+  earlier limb kernel. ref:KERNEL or fast:KERNEL with KERNEL one of scalar,
+  avx2, neon, auto. ARC_MODERN_KERNEL=SPEC changes the default.
+  --tiling auto|rows4|stream (or ARC_MODERN_TILING) picks the row order of
+  the SIMD kernels, a speed setting that cannot change a value. auto (the
+  default) streams single-token AVX2 projections and tiles four rows for
+  batched prefill and for NEON.";
 
 const DEFAULT_TODAY: &str = "06 October 2026";
 
@@ -100,28 +117,81 @@ fn configure_threads(args: &Args) -> Result<usize, ModernError> {
     Ok(rayon::current_num_threads())
 }
 
-fn configure_kernel(args: &Args) -> Result<String, ModernError> {
-    let kernel = args
-        .value("--kernel")
-        .unwrap_or_else(|| "scalar".to_string());
-    // Read the ARC_FAST_CANONICAL_KERNEL default first, so the explicit
-    // choice below is the one that stays in force.
-    let _ = canonical_simd::fast_canonical_kernel_enabled();
-    match kernel.as_str() {
-        "scalar" => canonical_simd::set_fast_canonical_kernel(false),
-        "simd" => {
-            if !canonical_simd::dotprod_available() {
-                return Err(ModernError::Invalid(
-                    "--kernel simd needs NEON dotprod (arm64) or AVX2 (x86-64)".into(),
-                ));
-            }
-            canonical_simd::set_fast_canonical_kernel(true);
+/// The `--kernel` spec as given (default `scalar`, or `ARC_MODERN_KERNEL`),
+/// parsed and applied process-wide, with every kernel census counting.
+fn configure_kernel(args: &Args) -> Result<(String, Spec), ModernError> {
+    let name = match args.value("--kernel") {
+        Some(name) => name,
+        None => std::env::var("ARC_MODERN_KERNEL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "scalar".to_string()),
+    };
+    let spec = Spec::parse(&name)?;
+    spec.apply();
+    Spec::start_census();
+    configure_tiling(args)?;
+    Ok((name, spec))
+}
+
+/// `--tiling auto|rows4|stream` (default auto, or `ARC_MODERN_TILING`): the
+/// row order of the SIMD kernels, a speed setting that cannot change a value.
+fn configure_tiling(args: &Args) -> Result<Tiling, ModernError> {
+    let name = args.value("--tiling").or_else(|| {
+        std::env::var("ARC_MODERN_TILING")
+            .ok()
+            .filter(|v| !v.is_empty())
+    });
+    let tiling = match name {
+        Some(name) => Tiling::parse(&name)?,
+        None => Tiling::default(),
+    };
+    kernels::set_tiling(tiling);
+    Ok(tiling)
+}
+
+/// The concrete row orders the configured tiling resolves to for `spec`'s
+/// SIMD kernel: single-token calls (decode) and batched calls (prefill).
+/// Null for the scalar and legacy kernels, which have no row order.
+fn row_orders(spec: Spec) -> Value {
+    match spec.kernel() {
+        Some(kernel) if kernel != Kernel::Scalar => {
+            let tiling = kernels::tiling();
+            json!({
+                "single": tiling.resolve(kernel, false).name(),
+                "batched": tiling.resolve(kernel, true).name(),
+            })
         }
-        other => return Err(ModernError::Invalid(format!("unknown kernel {other}"))),
+        _ => Value::Null,
     }
-    canonical_simd::set_projection_census_enabled(true);
-    canonical_simd::reset_projection_census();
-    Ok(kernel)
+}
+
+/// Calibrate the `auto` row order on the loaded model
+/// ([`engine::calibrate_auto_tiling`]); the record goes into the run file.
+/// Null when the tiling is explicit or the CPU has no SIMD kernel.
+fn calibrate_tiling(model: &ModernModel) -> Result<Value, ModernError> {
+    let Some(c) = engine::calibrate_auto_tiling(model)? else {
+        return Ok(Value::Null);
+    };
+    eprintln!(
+        "tiling auto: {} single-token calls use {} (best of {} passes over {:.0} MB of weights: \
+         rows4 {:.1} ms, stream {:.1} ms); batched calls use {}",
+        c.kernel.name(),
+        c.chosen.name(),
+        c.passes,
+        c.weight_bytes as f64 / 1e6,
+        1e3 * c.rows4_seconds,
+        1e3 * c.stream_seconds,
+        Tiling::Auto.resolve(c.kernel, true).name()
+    );
+    Ok(json!({
+        "kernel": c.kernel.name(),
+        "rows4_seconds": c.rows4_seconds,
+        "stream_seconds": c.stream_seconds,
+        "weight_bytes": c.weight_bytes,
+        "passes": c.passes,
+        "chosen": c.chosen.name(),
+    }))
 }
 
 fn platform() -> Value {
@@ -131,11 +201,15 @@ fn platform() -> Value {
         "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
         "rayon_threads": rayon::current_num_threads(),
         "simd_available": canonical_simd::dotprod_available(),
+        "kernels_available": Kernel::available_kernels()
+            .iter()
+            .map(|k| k.name())
+            .collect::<Vec<_>>(),
     })
 }
 
-fn census() -> Value {
-    serde_json::to_value(canonical_simd::projection_census()).unwrap_or(Value::Null)
+fn census(spec: Spec) -> Value {
+    serde_json::to_value(spec.census()).unwrap_or(Value::Null)
 }
 
 fn load(path: &Path) -> Result<(ModernModel, f64), ModernError> {
@@ -241,6 +315,7 @@ struct CaseResult {
 
 fn run_case(
     model: &ModernModel,
+    runner: &mut dyn TokenForward,
     case: &Value,
     tokenizer: Option<&ByteLevelBpe>,
 ) -> Result<CaseResult, ModernError> {
@@ -282,12 +357,16 @@ fn run_case(
             .and_then(Value::as_str)
             .unwrap_or("rp64-argmax"),
     )?;
-    let out = model.generate(&GenerationRequest {
-        prompt: &prompt,
-        max_tokens,
-        eos: &eos,
-        selection,
-    })?;
+    let out = generate_with(
+        runner,
+        &model.config,
+        &GenerationRequest {
+            prompt: &prompt,
+            max_tokens,
+            eos: &eos,
+            selection,
+        },
+    )?;
     let output_hash = hex_lower(&out.output_hash);
     let logits_digest = hex_lower(&out.logits_digest);
     let hashes: Vec<String> = out.logits_hashes.iter().map(|h| hex_lower(h)).collect();
@@ -332,10 +411,12 @@ fn run_case(
 
 fn cmd_golden(args: &Args) -> Result<(), ModernError> {
     let threads = configure_threads(args)?;
-    let kernel = configure_kernel(args)?;
+    let (kernel, spec) = configure_kernel(args)?;
     let package_path = args.path("--package")?;
     let digest = package::digest_file(&package_path)?;
     let (model, load_seconds) = load(&package_path)?;
+    let calibration = calibrate_tiling(&model)?;
+    let mut runner = spec.runner(&model);
     let tokenizer = match args.value("--tokenizer") {
         Some(path) => {
             let bytes =
@@ -354,7 +435,7 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
     let (mut prompt_total, mut prefill_total, mut forwards_total, mut decode_total) =
         (0usize, 0f64, 0usize, 0f64);
     for case in list {
-        let result = run_case(&model, case, tokenizer.as_ref())?;
+        let result = run_case(&model, runner.as_mut(), case, tokenizer.as_ref())?;
         eprintln!(
             "case {}: {} tokens, output_hash {}",
             result.record["id"], result.record["tokens"], result.record["output_hash"]
@@ -389,11 +470,17 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
         "profile": PROFILE,
         "generation": generation,
         "kernel": kernel,
+        "spec": spec.name(),
+        "engine": spec.engine_name(),
+        "kernel_path": spec.kernel_name(),
+        "tiling": kernels::tiling().name(),
+        "row_orders": row_orders(spec),
+        "tiling_calibration": calibration,
         "threads": threads,
         "platform": platform(),
         "cases": records,
         "matrix_digest": matrix_digest,
-        "census": census(),
+        "census": census(spec),
         "timing": {
             "load_seconds": load_seconds,
             "prompt_tokens": prompt_total,
@@ -412,8 +499,10 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
 
 fn cmd_generate(args: &Args) -> Result<(), ModernError> {
     configure_threads(args)?;
-    let kernel = configure_kernel(args)?;
+    let (kernel, spec) = configure_kernel(args)?;
     let (model, load_seconds) = load(&args.path("--package")?)?;
+    let calibration = calibrate_tiling(&model)?;
+    let mut runner = spec.runner(&model);
     let tokenizer_path = args.required("--tokenizer")?;
     let tokenizer_bytes = std::fs::read(&tokenizer_path)
         .map_err(|e| ModernError::Io(format!("{tokenizer_path}: {e}")))?;
@@ -433,11 +522,15 @@ fn cmd_generate(args: &Args) -> Result<(), ModernError> {
         "eos": parse_eos(args.value("--eos"))?,
         "selection": args.value("--selection").unwrap_or_else(|| "rp64-argmax".to_string()),
     });
-    let result = run_case(&model, &case, Some(&tokenizer))?;
+    let result = run_case(&model, runner.as_mut(), &case, Some(&tokenizer))?;
     let mut record = result.record;
     record["load_seconds"] = Value::from(load_seconds);
     record["kernel"] = Value::from(kernel);
-    record["census"] = census();
+    record["spec"] = Value::from(spec.name());
+    record["census"] = census(spec);
+    record["tiling"] = Value::from(kernels::tiling().name());
+    record["row_orders"] = row_orders(spec);
+    record["tiling_calibration"] = calibration;
     record["platform"] = platform();
     if let Some(path) = args.value("--json-out") {
         write_json(Path::new(&path), &record)?;
@@ -462,8 +555,10 @@ fn nll(logits: &[i64], target: usize) -> f64 {
 
 fn cmd_ppl(args: &Args) -> Result<(), ModernError> {
     let threads = configure_threads(args)?;
-    let kernel = configure_kernel(args)?;
+    let (kernel, spec) = configure_kernel(args)?;
     let (model, _) = load(&args.path("--package")?)?;
+    let calibration = calibrate_tiling(&model)?;
+    let mut runner = spec.runner(&model);
     let tokens_json = read_json(&args.path("--tokens")?)?;
     let mut tokens = ids_from(tokens_json.get("tokens").or(Some(&tokens_json)))?;
     let limit = args.number("--max-tokens", tokens.len())?;
@@ -484,21 +579,27 @@ fn cmd_ppl(args: &Args) -> Result<(), ModernError> {
         if chunk.len() < 2 {
             continue;
         }
-        let mut cache = model.new_cache();
-        for (position, &token) in chunk.iter().enumerate().take(chunk.len() - 1) {
-            let logits = model.forward(token, &mut cache)?;
+        runner.begin(chunk.len());
+        let mut position = 0usize;
+        runner.forward_tokens(&chunk[..chunk.len() - 1], &mut |logits| {
             forwards += 1;
-            hashes.push(arith::logits_hash(&logits));
-            nll_sum += nll(&logits, chunk[position + 1] as usize);
-            argmax_ids.push(arith::argmax(&logits) as u32);
+            hashes.push(arith::logits_hash(logits));
+            nll_sum += nll(logits, chunk[position + 1] as usize);
+            argmax_ids.push(arith::argmax(logits) as u32);
             scored += 1;
-        }
+            position += 1;
+            Ok(())
+        })?;
     }
     let seconds = start.elapsed().as_secs_f64();
     let out = json!({
         "schema": "arc.modern-ppl.v1",
         "profile": PROFILE,
         "kernel": kernel,
+        "spec": spec.name(),
+        "tiling": kernels::tiling().name(),
+        "row_orders": row_orders(spec),
+        "tiling_calibration": calibration,
         "threads": threads,
         "window": window,
         "scored_tokens": scored,
@@ -509,7 +610,7 @@ fn cmd_ppl(args: &Args) -> Result<(), ModernError> {
         "logits_digest": hex_lower(&arith::logits_digest(&hashes)),
         "seconds": seconds,
         "tok_s": forwards as f64 / seconds.max(1e-9),
-        "census": census(),
+        "census": census(spec),
         "platform": platform(),
     });
     write_json(&args.path("--out")?, &out)?;
@@ -518,6 +619,108 @@ fn cmd_ppl(args: &Args) -> Result<(), ModernError> {
         (nll_sum / scored as f64).exp()
     );
     Ok(())
+}
+
+/// Comma-separated numbers.
+fn number_list(text: &str, name: &str) -> Result<Vec<usize>, ModernError> {
+    text.split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            s.trim()
+                .parse()
+                .map_err(|_| ModernError::Invalid(format!("{name}: bad number {s}")))
+        })
+        .collect()
+}
+
+/// Token ids for the bench: every case's prompt of a golden or run file, a
+/// `{"tokens": [...]}` file, or a plain list.
+fn bench_tokens(value: &Value) -> Result<Vec<u32>, ModernError> {
+    if let Some(cases) = value.get("cases").and_then(Value::as_array) {
+        let mut tokens = Vec::new();
+        for case in cases {
+            tokens.extend(ids_from(case.get("prompt_tokens"))?);
+        }
+        return Ok(tokens);
+    }
+    ids_from(value.get("tokens").or(Some(value)))
+}
+
+fn cmd_bench(args: &Args) -> Result<(), ModernError> {
+    configure_threads(args)?;
+    configure_tiling(args)?;
+    let package_path = args.path("--package")?;
+    let digest = package::digest_file(&package_path)?;
+    let (model, load_seconds) = load(&package_path)?;
+    let calibration = calibrate_tiling(&model)?;
+    let spec_names = args.value("--specs").unwrap_or_else(|| "simd".to_string());
+    let specs = spec_names
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| Spec::parse(s.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let source_tokens = match args.value("--tokens-from") {
+        Some(path) => bench_tokens(&read_json(Path::new(&path))?)?,
+        None => (0..4096u32)
+            .map(|i| (i.wrapping_mul(7919) + 13) % model.config.vocab_size as u32)
+            .collect(),
+    };
+    let options = BenchOptions {
+        specs,
+        threads: args.number("--threads", 0)?,
+        scaling: number_list(&args.value("--scaling").unwrap_or_default(), "--scaling")?,
+        contexts: number_list(
+            &args.value("--contexts").unwrap_or_else(|| "64".to_string()),
+            "--contexts",
+        )?,
+        decode_tokens: args.number("--decode", 16)?,
+        source_tokens,
+        profile: args.flag("--profile"),
+        kernel_micro: args.flag("--micro"),
+        bandwidth: args.flag("--bandwidth"),
+        tilings: args
+            .value("--tilings")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| Tiling::parse(s.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let mut result = bench::run(&model, &options)?;
+    result["package"] = digest.to_json();
+    result["load_seconds"] = json!(load_seconds);
+    result["specs_requested"] = json!(spec_names);
+    result["tiling_calibration"] = calibration;
+    write_json(&args.path("--out")?, &result)?;
+    for context in result["contexts"].as_array().into_iter().flatten() {
+        for run in context["decode"].as_array().into_iter().flatten() {
+            println!(
+                "context {} | {} ({}) | {} threads | {:.2} tok/s | digest {}",
+                context["context"],
+                run["spec"].as_str().unwrap_or_default(),
+                run["tiling"].as_str().unwrap_or_default(),
+                run["threads"],
+                run["tok_s"].as_f64().unwrap_or(0.0),
+                run["logits_digest"].as_str().unwrap_or_default()
+            );
+        }
+        println!(
+            "context {} | all specs agree: {}",
+            context["context"], context["digests_equal"]
+        );
+    }
+    let agree = result["contexts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .all(|c| c["digests_equal"].as_bool() == Some(true));
+    if agree {
+        Ok(())
+    } else {
+        Err(ModernError::Domain(
+            "bench: specs computed different logits".into(),
+        ))
+    }
 }
 
 fn cmd_tokenize(args: &Args) -> Result<(), ModernError> {
@@ -592,6 +795,7 @@ fn main() -> ExitCode {
         "generate" => cmd_generate(&args),
         "golden" => cmd_golden(&args),
         "ppl" => cmd_ppl(&args),
+        "bench" => cmd_bench(&args),
         "tokenize" => cmd_tokenize(&args),
         "render" => cmd_render(&args),
         _ => {
