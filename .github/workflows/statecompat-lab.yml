@@ -1,0 +1,526 @@
+name: StateCompat v0.8.11 old-binary reopen lab (throwaway branch)
+
+# THROWAWAY BRANCH ONLY. This workflow exists on `statecompat-v0811-lab` and is never merged: main stays frozen at
+# the v0.8.11 SOURCE commit until publication. It changes no product code and no existing workflow, publishes no
+# release, uses no environment, no secret and no deployment. The only token is the read-only job token.
+#
+# Question it answers (runbook section 2.6, STATECOMPAT): after the v0.8.11 candidate has executed on a recovered
+# protocol-v3 state written by v0.8.10, can the v0.8.10 binary reopen the state the candidate left behind?
+#
+# Everything runs on generated lab data (disposable validator keys, a freshly signed checkpoint, a fresh genesis):
+# never production state, hosts, addresses or keys. All third-party actions are pinned to the SHAs the repository's
+# own workflows already use (the repository enforces selected actions and SHA pinning).
+on:
+  push:
+    branches: [statecompat-v0811-lab]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: statecompat-v0811-lab
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: nightly-2026-03-16
+  SOURCE_SHA: cd2344138b32a46eea9192cf0fa7344db6481420
+  SOURCE_TREE: f002ed5d9c5e645a83820e31f944d509c1899eb5
+  BASELINE_SHA: fd4e8cd2f76b97d08221a622397f513ad04000ad
+  OLD_PROD_SHA256: 1fd253cd09520549534bb8b3be64b81022f4adcf66c24884967c621305097724
+  NEW_PROD_SHA256: 54d4d0708ae41d32958110cce9961851911c9b72ca269756cd49dfbc731e061b
+
+jobs:
+  guard:
+    name: lab commit is SOURCE plus lab files only; offline self-tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Bind the lab commit to the exact SOURCE and allow only lab files on top
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse 'HEAD^')" = "$SOURCE_SHA"
+          test "$(git rev-parse "$SOURCE_SHA^{tree}")" = "$SOURCE_TREE"
+          git diff --name-status HEAD^ HEAD | sort > "$RUNNER_TEMP/lab-diff.txt"
+          cat "$RUNNER_TEMP/lab-diff.txt"
+          expected="$(printf '%s\n' \
+            'A	.github/workflows/statecompat-lab.yml' \
+            'A	crates/arc-node/tests/old_binary_reopen_lab.rs' \
+            'A	lab/statecompat/statecompat_lab.py' \
+            'A	lab/statecompat/test_statecompat_lab.py' | sort)"
+          if [ "$(cat "$RUNNER_TEMP/lab-diff.txt")" != "$expected" ]; then
+            echo "::error::the lab commit must add exactly the four lab files on top of the SOURCE commit" >&2
+            exit 1
+          fi
+          echo "Lab commit $GITHUB_SHA = SOURCE $SOURCE_SHA + four added lab files." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Offline self-tests of the lab driver (fake harness and fake node; no network)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 --version
+          python3 -B lab/statecompat/statecompat_lab.py selftest
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lab-scripts
+          path: |
+            lab/statecompat/statecompat_lab.py
+            lab/statecompat/test_statecompat_lab.py
+          if-no-files-found: error
+          retention-days: 30
+
+  fetch-production:
+    name: the deployed v0.8.10 binary and the preflight-built v0.8.11 candidate, digest-bound
+    needs: guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-scripts
+          path: ${{ runner.temp }}/labscripts
+
+      - name: Fetch and verify both production binaries
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          python3 -B "$RUNNER_TEMP/labscripts/statecompat_lab.py" fetch-production --out "$RUNNER_TEMP/production"
+          ls -l "$RUNNER_TEMP/production/old" "$RUNNER_TEMP/production/new"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lab-production-binaries
+          path: |
+            ${{ runner.temp }}/production/old/arc-node-linux-x86_64
+            ${{ runner.temp }}/production/new/arc-node-linux-x86_64
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lab-production-record
+          path: ${{ runner.temp }}/production/prod-binaries.json
+          if-no-files-found: error
+          retention-days: 30
+
+  build-baseline:
+    name: build v0.8.10 (fd4e8cd2) twice - release flags and native-test-executor
+    needs: guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASELINE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the exact baseline commit
+        run: test "$(git rev-parse HEAD)" = "$BASELINE_SHA"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-scripts
+          path: ${{ runner.temp }}/labscripts
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: statecompat-baseline-x86_64-unknown-linux-gnu
+          workspaces: . -> target
+          cache-on-failure: true
+
+      - name: Build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          # The same command the pre-tag headless build runs for the deployed asset.
+          cargo build --release --locked -p arc-node --features candle --target x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/release/arc-node "$out/arc-node-release-flags"
+          # The lab's native tier: the repository's own deterministic test executor.
+          cargo build --release --locked -p arc-node --features native-test-executor --target x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/release/arc-node "$out/arc-node-native-te"
+          python3 -B "$RUNNER_TEMP/labscripts/statecompat_lab.py" build-record --label baseline \
+            --source-sha "$BASELINE_SHA" \
+            --binary release-flags="$out/arc-node-release-flags" \
+            --binary native-test-executor="$out/arc-node-native-te" \
+            --build-command 'cargo build --release --locked -p arc-node --features candle --target x86_64-unknown-linux-gnu' \
+            --build-command 'cargo build --release --locked -p arc-node --features native-test-executor --target x86_64-unknown-linux-gnu' \
+            --out "$RUNNER_TEMP/build-record-baseline.json"
+          cat "$RUNNER_TEMP/build-record-baseline.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lab-baseline-binaries
+          path: |
+            ${{ runner.temp }}/out/arc-node-release-flags
+            ${{ runner.temp }}/out/arc-node-native-te
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lab-baseline-record
+          path: ${{ runner.temp }}/build-record-baseline.json
+          if-no-files-found: error
+          retention-days: 30
+
+  build-candidate:
+    name: build v0.8.11 SOURCE (cd234413) twice - release flags and native-test-executor
+    needs: guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the exact SOURCE commit and tree
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-scripts
+          path: ${{ runner.temp }}/labscripts
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: pretag-headless-x86_64-unknown-linux-gnu
+          workspaces: . -> target
+          cache-on-failure: true
+
+      - name: Build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          cargo build --release --locked -p arc-node --features candle --target x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/release/arc-node "$out/arc-node-release-flags"
+          cargo build --release --locked -p arc-node --features native-test-executor --target x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/release/arc-node "$out/arc-node-native-te"
+          python3 -B "$RUNNER_TEMP/labscripts/statecompat_lab.py" build-record --label candidate \
+            --source-sha "$SOURCE_SHA" --source-tree "$SOURCE_TREE" \
+            --binary release-flags="$out/arc-node-release-flags" \
+            --binary native-test-executor="$out/arc-node-native-te" \
+            --build-command 'cargo build --release --locked -p arc-node --features candle --target x86_64-unknown-linux-gnu' \
+            --build-command 'cargo build --release --locked -p arc-node --features native-test-executor --target x86_64-unknown-linux-gnu' \
+            --out "$RUNNER_TEMP/build-record-candidate.json"
+          cat "$RUNNER_TEMP/build-record-candidate.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lab-candidate-binaries
+          path: |
+            ${{ runner.temp }}/out/arc-node-release-flags
+            ${{ runner.temp }}/out/arc-node-native-te
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lab-candidate-record
+          path: ${{ runner.temp }}/build-record-candidate.json
+          if-no-files-found: error
+          retention-days: 30
+
+  build-harness:
+    name: build the lab harness (SOURCE plus the lab test file)
+    needs: guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the exact lab commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: statecompat-lab-harness
+          workspaces: . -> target-lab
+          cache-on-failure: true
+
+      - name: Compile the lab harness
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target-lab
+        run: |
+          set -Eeuo pipefail
+          log="$RUNNER_TEMP/harness-compile.log"
+          cargo test --locked -p arc-node --features native-test-executor --test old_binary_reopen_lab --no-run \
+            --message-format=json-render-diagnostics >"$log" 2>&1 || {
+              cat "$log"
+              exit 1
+            }
+          python3 - "$log" "$RUNNER_TEMP/lab-harness" <<'PYTHON'
+          import json
+          import os
+          import shutil
+          import sys
+          from pathlib import Path
+
+          log_path, output_path = map(Path, sys.argv[1:])
+          executables = []
+          for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+              try:
+                  record = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              target = record.get("target", {})
+              if (
+                  record.get("reason") == "compiler-artifact"
+                  and target.get("name") == "old_binary_reopen_lab"
+                  and target.get("test") is True
+                  and record.get("executable")
+              ):
+                  executables.append(Path(record["executable"]))
+          if len(executables) != 1:
+              raise SystemExit(f"expected one compiled lab harness executable, found {len(executables)}")
+          executable = executables[0].resolve()
+          if not executable.is_file() or not os.access(executable, os.X_OK):
+              raise SystemExit(f"compiled lab harness is missing or not executable: {executable}")
+          shutil.copyfile(executable, output_path)
+          os.chmod(output_path, 0o755)
+          print(f"lab harness: {executable} -> {output_path}")
+          PYTHON
+          # The selector must resolve to exactly one test.
+          "$RUNNER_TEMP/lab-harness" lab_step --list --exact | tee "$RUNNER_TEMP/selector.log"
+          test "$(grep -Fxc 'lab_step: test' "$RUNNER_TEMP/selector.log")" = 1
+          sha256sum "$RUNNER_TEMP/lab-harness"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lab-harness
+          path: ${{ runner.temp }}/lab-harness
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  lab-prod:
+    name: tier prod - production bytes, production flag set
+    needs: [fetch-production, build-harness]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-scripts
+          path: ${{ runner.temp }}/labscripts
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-harness
+          path: ${{ runner.temp }}/harness
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-production-binaries
+          path: ${{ runner.temp }}/production
+
+      - name: Run tier prod
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          chmod +x "$RUNNER_TEMP/harness/lab-harness"
+          find "$RUNNER_TEMP/production" -type f -name arc-node-linux-x86_64 -exec chmod +x {} +
+          find "$RUNNER_TEMP/production" -type f
+          old="$(find "$RUNNER_TEMP/production" -type f -path '*/old/*' -name arc-node-linux-x86_64)"
+          new="$(find "$RUNNER_TEMP/production" -type f -path '*/new/*' -name arc-node-linux-x86_64)"
+          test -n "$old" && test -n "$new"
+          free -m
+          python3 -B "$RUNNER_TEMP/labscripts/statecompat_lab.py" run-tier --tier prod \
+            --harness "$RUNNER_TEMP/harness/lab-harness" \
+            --old-bin "$old" --new-bin "$new" \
+            --old-sha "$OLD_PROD_SHA256" --new-sha "$NEW_PROD_SHA256" \
+            --work "$RUNNER_TEMP/work" --out "$RUNNER_TEMP/evidence/tier-prod"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: lab-tier-prod
+          path: ${{ runner.temp }}/evidence/tier-prod
+          if-no-files-found: warn
+          retention-days: 30
+
+  lab-native:
+    name: tier native - lab builds of both sources with the deterministic test executor
+    needs: [build-baseline, build-candidate, build-harness]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-scripts
+          path: ${{ runner.temp }}/labscripts
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-harness
+          path: ${{ runner.temp }}/harness
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-baseline-binaries
+          path: ${{ runner.temp }}/baseline
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-baseline-record
+          path: ${{ runner.temp }}/baseline
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-candidate-binaries
+          path: ${{ runner.temp }}/candidate
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-candidate-record
+          path: ${{ runner.temp }}/candidate
+
+      - name: Run tier native
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          chmod +x "$RUNNER_TEMP/harness/lab-harness" "$RUNNER_TEMP"/baseline/arc-node-* "$RUNNER_TEMP"/candidate/arc-node-*
+          lab="$RUNNER_TEMP/labscripts/statecompat_lab.py"
+          old_sha="$(python3 -B "$lab" record-sha --record "$RUNNER_TEMP/baseline/build-record-baseline.json" --name native-test-executor)"
+          new_sha="$(python3 -B "$lab" record-sha --record "$RUNNER_TEMP/candidate/build-record-candidate.json" --name native-test-executor)"
+          test "$(sha256sum "$RUNNER_TEMP/baseline/arc-node-native-te" | cut -d' ' -f1)" = "$old_sha"
+          test "$(sha256sum "$RUNNER_TEMP/candidate/arc-node-native-te" | cut -d' ' -f1)" = "$new_sha"
+          free -m
+          python3 -B "$lab" run-tier --tier native \
+            --harness "$RUNNER_TEMP/harness/lab-harness" \
+            --old-bin "$RUNNER_TEMP/baseline/arc-node-native-te" --new-bin "$RUNNER_TEMP/candidate/arc-node-native-te" \
+            --old-sha "$old_sha" --new-sha "$new_sha" \
+            --work "$RUNNER_TEMP/work" --out "$RUNNER_TEMP/evidence/tier-native"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: lab-tier-native
+          path: ${{ runner.temp }}/evidence/tier-native
+          if-no-files-found: warn
+          retention-days: 30
+
+  assemble:
+    name: assemble the evidence summary
+    if: ${{ !cancelled() }}
+    needs: [guard, fetch-production, build-baseline, build-candidate, build-harness, lab-prod, lab-native]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lab-scripts
+          path: ${{ runner.temp }}/labscripts
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: lab-tier-prod
+          path: ${{ runner.temp }}/evidence/tier-prod
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: lab-tier-native
+          path: ${{ runner.temp }}/evidence/tier-native
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: lab-baseline-record
+          path: ${{ runner.temp }}/evidence/build-baseline
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: lab-candidate-record
+          path: ${{ runner.temp }}/evidence/build-candidate
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: lab-production-record
+          path: ${{ runner.temp }}/evidence/production
+
+      - name: Assemble
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ev="$RUNNER_TEMP/evidence"
+          find "$ev" -maxdepth 2 | sort
+          set +e
+          python3 -B "$RUNNER_TEMP/labscripts/statecompat_lab.py" assemble --out "$ev" \
+            --tier-dir "$ev/tier-prod" --tier-dir "$ev/tier-native" \
+            --build-record "$ev/build-baseline/build-record-baseline.json" \
+            --build-record "$ev/build-candidate/build-record-candidate.json" \
+            --prod-binaries "$ev/production/prod-binaries.json"
+          rc=$?
+          set -e
+          {
+            echo "### STATECOMPAT lab"
+            echo
+            echo "lab-summary.json sha256: \`$(cut -d' ' -f1 "$ev/lab-summary.sha256")\`"
+            python3 - "$ev/lab-summary.json" <<'PYTHON'
+          import json, sys
+          s = json.load(open(sys.argv[1]))
+          print("")
+          print("verdict: **%s**" % s["verdict"])
+          for tier, row in sorted(s["tiers"].items()):
+              print("- tier %s: %s %s" % (tier, row["verdict"], row["failing_checks"]))
+          for label, row in sorted(s.get("reproducibility", {}).items()):
+              print("- %s bit-identical to production: %s" % (label, row["bit_identical"]))
+          PYTHON
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: statecompat-evidence
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 60
