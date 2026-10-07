@@ -2499,6 +2499,12 @@ pub async fn serve(
                 .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
         )
         .route("/community/list", get(community_list))
+        // This node's own community worker: state and job counters for the
+        // desktop app. Validators run no worker and answer 404.
+        .route(
+            crate::community_worker::COMMUNITY_WORKER_STATUS_PATH,
+            get(community_worker_status),
+        )
         // Community inference work dispatch (long-poll claim + submit)
         .route(
             COMMUNITY_CLAIM_WORK_PATH,
@@ -13543,6 +13549,21 @@ async fn community_heartbeat(
     }
 }
 
+/// GET /community/worker/status
+/// This node's own community worker: whether it is polling or computing, how
+/// many coordinators accepted its last registration, and the jobs it claimed,
+/// completed, and had quorum-verified since the process started. Local
+/// observations for the desktop app, not chain or reward evidence.
+async fn community_worker_status()
+-> Result<Json<crate::community_worker::CommunityWorkerSnapshot>, (StatusCode, String)> {
+    crate::community_worker::installed()
+        .map(|status| Json(status.snapshot()))
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "this node is not running a community worker".to_string(),
+        ))
+}
+
 /// GET /community/list
 /// Returns all fresh community workers. Entries older than
 /// COMMUNITY_WORKER_TTL_SECS are pruned at read time. The dashboard
@@ -22575,6 +22596,27 @@ mod tests {
         }
         let served = format!("{board}{listed}");
         assert!(!served.contains("MacBook") && !served.contains("Adas"));
+    }
+
+    #[tokio::test]
+    async fn worker_status_route_serves_this_process_worker() {
+        // The only test in this binary that installs the process-wide status.
+        let status = crate::community_worker::install(Arc::new(
+            crate::community_worker::CommunityWorkerStatus::new(
+                "0xworker",
+                "node-worker",
+                6,
+                false,
+            ),
+        ));
+        status.record_claim();
+        status.record_outcome(crate::community_worker::JobOutcome::Completed { verified: true });
+
+        let Json(served) = community_worker_status()
+            .await
+            .expect("an installed worker is served");
+        assert_eq!(served, status.snapshot());
+        assert!(served.jobs_completed >= 1 && served.jobs_verified >= 1);
     }
 
     #[test]

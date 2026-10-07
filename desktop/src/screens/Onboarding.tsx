@@ -175,17 +175,23 @@ export function Onboarding() {
       //    role + modelPath set makes the node eligible to advertise an exact,
       //    fully loaded artifact. It does not promise assignment or payment.
       //    No model means observer/router mode with no local model execution.
+      //    Choosing the model here is the user's explicit consent to run ARC
+      //    jobs on this computer; choosing observer mode is an explicit no.
       const config: NodeConfig = {
         ...DEFAULT_NODE_CONFIG,
         role: modelPath ? "worker" : "observer",
         modelPath,
+        computeConsent: modelPath !== null,
       };
       setStoreConfig(config);
 
       // 3. Download the arc-node binary if it isn't already there.
       setLaunchStage("downloading");
       await api.ensureBinary();
-      await api.saveConfig(config);
+      // Onboarding's own save: it records the compute choice made above. A
+      // plain `saveConfig` keeps the stored contribution state once a config
+      // exists (commands.rs), so a re-run wizard has to go this way.
+      await api.completeOnboarding(config);
 
       // 4. Start the node + wait for either real peers OR a coordinator
       //    fallback (Lite mode survives residential UDP blocks).
@@ -567,6 +573,9 @@ export function Onboarding() {
                   Machines with at least 16 GB RAM pre-select it; smaller
                   machines stay useful as observer/routers. A model creates
                   eligibility, not guaranteed assignments or rewards.
+                  Continuing with the model lets ARC run inference jobs on
+                  this computer while the app is open; choose Skip to keep it
+                  an observer. You can change this any time in Settings.
                 </p>
                 <p
                   style={{

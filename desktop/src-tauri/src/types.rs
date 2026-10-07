@@ -75,6 +75,17 @@ pub struct NodeConfig {
     /// deserializes instead of resetting the whole config to defaults.
     #[serde(default)]
     pub worker_threads: Option<u32>,
+    /// The user's answer to "contribute compute to the ARC network":
+    /// `Some(true)` lets the app download the model and run as a worker,
+    /// `Some(false)` keeps it an observer, `None` means never asked. Stores
+    /// written before this field existed load as `None`; see
+    /// `commands::compute_contribution_enabled` for how that is read.
+    #[serde(default)]
+    pub compute_consent: Option<bool>,
+    /// Keep the computer from idle-sleeping while the node computes a job.
+    /// Only `Some(true)` turns it on; `None` means never set.
+    #[serde(default)]
+    pub prevent_sleep_during_jobs: Option<bool>,
 }
 
 impl Default for NodeConfig {
@@ -94,6 +105,8 @@ impl Default for NodeConfig {
             // and any v0.7 WAL that older desktop builds wrote in ~/.arc.
             data_dir: "~/.arc/data-v3".into(),
             worker_threads: None,
+            compute_consent: None,
+            prevent_sleep_during_jobs: None,
         }
     }
 }
@@ -890,4 +903,32 @@ pub struct BlockTxs {
     /// Total in the block, which can exceed `txs.len()` when paginated.
     pub tx_count: Option<u32>,
     pub txs: Vec<BlockTx>,
+}
+
+/// This machine's community worker as its own node reports it
+/// (`GET /community/worker/status` on 127.0.0.1). Counters cover the node
+/// process's lifetime: local observations, not reward evidence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerStatus {
+    /// The local node runs a community worker and answered.
+    pub running: bool,
+    /// Why there is no reading, when `running` is false.
+    pub unavailable: Option<String>,
+    /// `polling`, `computing`, or `reconnecting`.
+    pub state: Option<String>,
+    /// The label validators show for this worker.
+    pub public_name: Option<String>,
+    pub coordinators_registered: Option<u32>,
+    pub coordinators_total: Option<u32>,
+    pub jobs_claimed: Option<u64>,
+    /// Results a coordinator accepted.
+    pub jobs_completed: Option<u64>,
+    /// Accepted results the coordinator reported as quorum-verified.
+    pub jobs_verified: Option<u64>,
+    pub jobs_failed: Option<u64>,
+    pub jobs_declined: Option<u64>,
+    pub last_job_completed_unix_ms: Option<u64>,
+    pub started_unix_ms: Option<u64>,
+    pub prevent_sleep_during_jobs: Option<bool>,
 }
