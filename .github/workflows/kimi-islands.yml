@@ -1,0 +1,125 @@
+name: Kimi islands (arc-island)
+
+# Path-scoped gate for the dormant ARC-AC v0 crate: Kimi-class island and
+# regional swarm formation, lifecycle, admission, and the offline capacity
+# simulator. Linux only: the crate is pure Rust with no platform code, and
+# macOS runner minutes stay reserved for the release matrix in ci.yml. It runs
+# on pull requests that touch the crate and on demand, never on a schedule.
+# Nothing here contacts a node, a validator or any network service.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/arc-island/**'
+      - '.github/workflows/kimi-islands.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kimi-islands-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: arc-island rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Keep this dated toolchain aligned with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: rustfmt
+      - run: cargo fmt --package arc-island -- --check
+
+  dormant:
+    name: arc-island stays dormant
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No other crate depends on or imports arc-island
+        run: |
+          set -Eeuo pipefail
+          manifest_hits="$(grep -rl --include=Cargo.toml 'arc-island' . | grep -v '^\./crates/arc-island/' | grep -v '^\./Cargo.toml$' || true)"
+          source_hits="$(grep -rl --include='*.rs' 'arc_island' . | grep -v '^\./crates/arc-island/' || true)"
+          if [[ -n "$manifest_hits" || -n "$source_hits" ]]; then
+            echo "arc-island must stay a dormant library in this PR; found references:" >&2
+            printf '%s\n' "$manifest_hits" "$source_hits" >&2
+            exit 1
+          fi
+          echo "arc-island has no reverse dependencies and no importers outside crates/arc-island"
+
+  check:
+    name: arc-island clippy + rustdoc + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: kimi-islands-linux
+      # Default build: no simulator, no toy executor.
+      - run: cargo clippy -p arc-island --all-targets --locked -- -D warnings
+      - run: cargo clippy -p arc-island --all-targets --features simulator --locked -- -D warnings
+      - name: rustdoc (deny warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc -p arc-island --no-deps --locked
+          cargo doc -p arc-island --no-deps --features simulator --locked
+      - name: Unit tests, library only (trust root, evidence, consent, spares, recovery, admission)
+        run: cargo test -p arc-island --locked
+      - name: Unit tests with the simulator
+        run: cargo test -p arc-island --features simulator --locked
+
+  simulate:
+    name: arc-island capacity simulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: kimi-islands-linux-release
+      - name: Run the simulator (100 / 130 / 1,000 / 10,000 synthetic nodes)
+        run: |
+          set -Eeuo pipefail
+          mkdir -p sim-out
+          cargo run --release --locked -p arc-island --features simulator --bin arc-island-sim -- --seed 7 --out sim-out > /dev/null
+          # The report is a pure function of the seed: a second run must be byte-identical.
+          mkdir -p sim-out-2
+          cargo run --release --locked -p arc-island --features simulator --bin arc-island-sim -- --seed 7 --out sim-out-2 > /dev/null
+          cmp sim-out/kimi-island-capacity.md sim-out-2/kimi-island-capacity.md
+          cmp sim-out/kimi-island-capacity.json sim-out-2/kimi-island-capacity.json
+          {
+            echo "Commit ${GITHUB_SHA}, runner $(uname -m) $(nproc) vCPU."
+            echo
+            sed -n '/^## Summary/,/^## Every island/p' sim-out/kimi-island-capacity.md | sed '$d'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kimi-island-capacity
+          path: sim-out/
+          if-no-files-found: error

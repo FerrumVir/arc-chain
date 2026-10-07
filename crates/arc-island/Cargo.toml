@@ -1,0 +1,25 @@
+[package]
+name = "arc-island"
+description = "ARC-AC v0: Kimi-class island and regional swarm formation, lifecycle and a capacity simulator (library only; nothing is wired into the node)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[features]
+# The offline simulator and its synthetic toy executor. Off by default, so a
+# library build carries no code path that can produce a toy golden run.
+simulator = []
+
+[[bin]]
+name = "arc-island-sim"
+path = "src/bin/arc_island_sim.rs"
+required-features = ["simulator"]
+
+[lints]
+workspace = true

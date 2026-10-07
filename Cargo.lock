@@ -401,6 +401,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-island"
+version = "0.8.11"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "arc-mempool"
 version = "0.8.11"
 dependencies = [
