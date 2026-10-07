@@ -883,7 +883,7 @@ pub(crate) mod tests {
     use crate::modern::arith::ONE;
 
     /// Deterministic generator for tiny packages.
-    pub(crate) struct Lcg(u64);
+    pub(crate) struct Lcg(pub(crate) u64);
 
     impl Lcg {
         pub(crate) fn next(&mut self) -> u64 {

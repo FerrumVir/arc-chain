@@ -365,6 +365,38 @@ impl SegmentDigest {
     }
 }
 
+/// Receives a layout's tensors in order: a stage package ([`StageWriter`]) or
+/// the weight slices of one segment (`slices::SegmentSlicer`). The converter
+/// writes through this trait, so both get the same bytes.
+pub trait TensorSink {
+    /// Start the next tensor of the layout; its name must match.
+    fn begin(&mut self, name: &str) -> Result<(), ModernError>;
+    /// Append bytes to the open tensor.
+    fn chunk(&mut self, bytes: &[u8]) -> Result<(), ModernError>;
+    /// Close the open tensor; it must have exactly its layout size.
+    fn end(&mut self) -> Result<(), ModernError>;
+    /// Write a whole tensor.
+    fn write_tensor(&mut self, name: &str, bytes: &[u8]) -> Result<(), ModernError> {
+        self.begin(name)?;
+        self.chunk(bytes)?;
+        self.end()
+    }
+}
+
+impl TensorSink for StageWriter {
+    fn begin(&mut self, name: &str) -> Result<(), ModernError> {
+        StageWriter::begin(self, name)
+    }
+
+    fn chunk(&mut self, bytes: &[u8]) -> Result<(), ModernError> {
+        StageWriter::chunk(self, bytes)
+    }
+
+    fn end(&mut self) -> Result<(), ModernError> {
+        StageWriter::end(self)
+    }
+}
+
 /// Streams a stage package to disk in layout order, hashing the file
 /// (SHA-256, BLAKE3) and every segment (BLAKE3 of its tensor bytes).
 pub struct StageWriter {

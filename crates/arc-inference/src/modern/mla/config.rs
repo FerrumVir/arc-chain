@@ -476,11 +476,150 @@ pub fn unsupported_features(value: &Value) -> Vec<String> {
 pub fn parse_hf_config(bytes: &[u8], max_seq: usize) -> Result<HfMlaConfig, ModernError> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|e| ModernError::Invalid(format!("config.json: {e}")))?;
-    let bad = |what: &str| ModernError::Invalid(format!("config.json: {what}"));
     let missing = unsupported_features(&value);
     if !missing.is_empty() {
-        return Err(bad(&format!("not supported: {}", missing.join("; "))));
+        return Err(ModernError::Invalid(format!(
+            "config.json: not supported: {}",
+            missing.join("; ")
+        )));
     }
+    parse_text_config(&value, None, max_seq)
+}
+
+/// How a checkpoint stores the language model's weights (spec §14.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WeightsSource {
+    /// Prefix of every language-model tensor name: empty, or `language_model.`
+    /// in a multimodal checkpoint.
+    pub prefix: String,
+    /// The routed experts are stored pre-quantised as INT4 group-32 values
+    /// (compressed-tensors `pack-quantized`) and are repacked, not requantised.
+    pub packed_experts: bool,
+}
+
+/// A `config.json` read for its weights (spec §14): the model shape, how the
+/// tensors are stored, and the preparation features (RoPE scaling) that the
+/// profile does not define yet. Weights convert without those features;
+/// tables, the `model` object and the model root wait for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfWeightsConfig {
+    pub config: MlaConfig,
+    pub eos: Vec<u32>,
+    pub source: WeightsSource,
+    pub pending: Vec<String>,
+}
+
+/// The one compressed-tensors scheme the weights path reads (spec §14.2):
+/// 4-bit signed integers, symmetric, static, one scale per group of 32 inputs,
+/// packed eight to an int32 word. Returns why a configuration differs.
+fn packed_int4_scheme(q: &Value) -> Result<(), String> {
+    let field = |key: &str| q.get(key).and_then(Value::as_str).unwrap_or("?");
+    if field("quant_method") != "compressed-tensors" || field("format") != "pack-quantized" {
+        return Err(format!(
+            "{} with format {}",
+            field("quant_method"),
+            field("format")
+        ));
+    }
+    if !q.get("kv_cache_scheme").is_none_or(Value::is_null) {
+        return Err("a quantised KV cache".into());
+    }
+    let groups = q
+        .get("config_groups")
+        .and_then(Value::as_object)
+        .filter(|g| g.len() == 1)
+        .ok_or("config_groups other than a single group")?;
+    let group = groups.values().next().ok_or("an empty config_groups")?;
+    for key in ["input_activations", "output_activations"] {
+        if !group.get(key).is_none_or(Value::is_null) {
+            return Err(format!("quantised {key}"));
+        }
+    }
+    let w = group.get("weights").ok_or("a group without weights")?;
+    let want = [
+        ("num_bits", Value::from(4)),
+        ("type", Value::from("int")),
+        ("symmetric", Value::Bool(true)),
+        ("strategy", Value::from("group")),
+        ("group_size", Value::from(32)),
+        ("dynamic", Value::Bool(false)),
+    ];
+    for (key, value) in &want {
+        if w.get(key) != Some(value) {
+            return Err(format!("weights.{key} other than {value}"));
+        }
+    }
+    if !w.get("actorder").is_none_or(Value::is_null) {
+        return Err("activation-ordered groups".into());
+    }
+    Ok(())
+}
+
+/// Parse a `config.json` for weight conversion (spec §14). Beyond
+/// [`parse_hf_config`], this accepts a multimodal wrapper (the text model's
+/// tensors under `language_model.`), routed experts pre-quantised in the
+/// [`packed_int4_scheme`], and RoPE scaling, which it reports as pending.
+pub fn parse_hf_weights_config(
+    bytes: &[u8],
+    max_seq: usize,
+) -> Result<HfWeightsConfig, ModernError> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|e| ModernError::Invalid(format!("config.json: {e}")))?;
+    let (text, wrapped) = text_config(&value);
+    let quantization = text
+        .get("quantization_config")
+        .or_else(|| value.get("quantization_config"))
+        .filter(|q| !q.is_null());
+    let mut missing = Vec::new();
+    let mut pending = Vec::new();
+    for feature in unsupported_features(&value) {
+        if wrapped && feature.starts_with("a multimodal checkpoint") {
+            continue;
+        }
+        if feature.starts_with("pre-quantized weights") {
+            if let Some(q) = quantization
+                && let Err(why) = packed_int4_scheme(q)
+            {
+                missing.push(format!("pre-quantized weights ({why})"));
+            }
+            continue;
+        }
+        if feature.starts_with("rope_scaling") {
+            pending.push(feature);
+            continue;
+        }
+        missing.push(feature);
+    }
+    if !missing.is_empty() {
+        return Err(ModernError::Invalid(format!(
+            "config.json: not supported: {}",
+            missing.join("; ")
+        )));
+    }
+    let hf = parse_text_config(text, Some(&value), max_seq)?;
+    Ok(HfWeightsConfig {
+        config: hf.config,
+        eos: hf.eos,
+        source: WeightsSource {
+            prefix: if wrapped {
+                "language_model.".into()
+            } else {
+                String::new()
+            },
+            packed_experts: quantization.is_some(),
+        },
+        pending,
+    })
+}
+
+/// Read the model shape from the text model's configuration object `value`;
+/// `outer` is the wrapping configuration, consulted for the EOS ids only.
+fn parse_text_config(
+    value: &Value,
+    outer: Option<&Value>,
+    max_seq: usize,
+) -> Result<HfMlaConfig, ModernError> {
+    let bad = |what: &str| ModernError::Invalid(format!("config.json: {what}"));
     let size = |key: &str| -> Result<usize, ModernError> {
         value
             .get(key)
@@ -537,7 +676,10 @@ pub fn parse_hf_config(bytes: &[u8], max_seq: usize) -> Result<HfMlaConfig, Mode
     {
         return Err(bad("max_seq exceeds max_position_embeddings"));
     }
-    let eos = match value.get("eos_token_id") {
+    let eos_value = value
+        .get("eos_token_id")
+        .or_else(|| outer.and_then(|o| o.get("eos_token_id")));
+    let eos = match eos_value {
         Some(Value::Array(ids)) => ids
             .iter()
             .map(|v| v.as_u64().and_then(|id| u32::try_from(id).ok()))
@@ -738,6 +880,94 @@ pub(crate) mod tests {
         // Moonlight itself has nothing missing.
         let moonlight: Value = serde_json::from_str(MOONLIGHT_CONFIG).unwrap();
         assert!(unsupported_features(&moonlight).is_empty());
+    }
+
+    /// Kimi-K2.6's `config.json` (revision
+    /// 7eb5002f6aadc958aed6a9177b7ed26bb94011bb): every text-model key the
+    /// parser reads, the quantisation block without its `ignore` list, and
+    /// the wrapper's architecture and EOS.
+    const KIMI_K26_TEXT: &str = r#"{"architectures": ["KimiK25ForConditionalGeneration"], "eos_token_id": 163586, "model_type": "kimi_k25", "text_config": {"model_type": "kimi_k2", "hidden_act": "silu", "scoring_func": "sigmoid", "topk_method": "noaux_tc", "attention_bias": false, "moe_layer_freq": 1, "num_nextn_predict_layers": 0, "tie_word_embeddings": false, "rope_scaling": {"beta_fast": 32.0, "beta_slow": 1.0, "factor": 64.0, "mscale": 1.0, "mscale_all_dim": 1.0, "original_max_position_embeddings": 4096, "type": "yarn"}, "num_hidden_layers": 61, "hidden_size": 7168, "num_attention_heads": 64, "num_key_value_heads": 64, "q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128, "intermediate_size": 18432, "first_k_dense_replace": 1, "n_routed_experts": 384, "num_experts_per_tok": 8, "n_shared_experts": 1, "moe_intermediate_size": 2048, "n_group": 1, "topk_group": 1, "norm_topk_prob": true, "routed_scaling_factor": 2.827, "vocab_size": 163840, "max_position_embeddings": 262144, "rms_norm_eps": 1e-05, "rope_theta": 50000.0, "eos_token_id": 163586, "quantization_config": {"config_groups": {"group_0": {"input_activations": null, "output_activations": null, "targets": ["Linear"], "weights": {"actorder": null, "block_structure": null, "dynamic": false, "group_size": 32, "num_bits": 4, "observer": "minmax", "observer_kwargs": {}, "strategy": "group", "symmetric": true, "type": "int"}}}, "format": "pack-quantized", "kv_cache_scheme": null, "quant_method": "compressed-tensors", "quantization_status": "compressed"}}}"#;
+
+    #[test]
+    fn kimi_k26_weights_are_read_with_yarn_pending() {
+        // The stage-package path still refuses K2.6 ...
+        assert!(parse_hf_config(KIMI_K26_TEXT.as_bytes(), 4096).is_err());
+        // ... and the weights path reads it.
+        let hf = parse_hf_weights_config(KIMI_K26_TEXT.as_bytes(), 4096).unwrap();
+        assert_eq!(hf.source.prefix, "language_model.");
+        assert!(hf.source.packed_experts);
+        assert_eq!(hf.pending, ["rope_scaling yarn"]);
+        assert_eq!(hf.eos, vec![163_586]);
+        let c = &hf.config;
+        assert_eq!(c.architecture, "kimi_k2");
+        assert_eq!(
+            (
+                c.n_layers,
+                c.d_model,
+                c.n_heads,
+                c.q_lora_rank,
+                c.kv_lora_rank
+            ),
+            (61, 7168, 64, 1536, 512)
+        );
+        assert_eq!(
+            (
+                c.n_routed_experts,
+                c.n_experts_per_tok,
+                c.n_shared_experts,
+                c.moe_d_ff
+            ),
+            (384, 8, 1, 2048)
+        );
+        assert_eq!(c.routed_scaling_q32, 12_141_872_546);
+        // Moonlight has nothing pending and no wrapper.
+        let moonlight = parse_hf_weights_config(MOONLIGHT_CONFIG.as_bytes(), 4096).unwrap();
+        assert_eq!(moonlight.source, WeightsSource::default());
+        assert!(moonlight.pending.is_empty());
+        assert_eq!(
+            moonlight.config,
+            parse_hf_config(MOONLIGHT_CONFIG.as_bytes(), 4096)
+                .unwrap()
+                .config
+        );
+    }
+
+    #[test]
+    fn other_quantisation_schemes_are_refused() {
+        for (from, to) in [
+            ("\"num_bits\": 4", "\"num_bits\": 8"),
+            ("\"symmetric\": true", "\"symmetric\": false"),
+            ("\"strategy\": \"group\"", "\"strategy\": \"channel\""),
+            ("\"group_size\": 32", "\"group_size\": 128"),
+            ("\"dynamic\": false", "\"dynamic\": true"),
+            ("\"type\": \"int\"", "\"type\": \"float\""),
+            ("\"actorder\": null", "\"actorder\": \"group\""),
+            (
+                "\"input_activations\": null",
+                "\"input_activations\": {\"num_bits\": 8}",
+            ),
+            (
+                "\"kv_cache_scheme\": null",
+                "\"kv_cache_scheme\": {\"num_bits\": 8}",
+            ),
+            (
+                "\"format\": \"pack-quantized\"",
+                "\"format\": \"mxfp4-pack-quantized\"",
+            ),
+            (
+                "\"quant_method\": \"compressed-tensors\"",
+                "\"quant_method\": \"fp8\"",
+            ),
+            (
+                "\"model_type\": \"kimi_k2\"",
+                "\"model_type\": \"kimi_linear\"",
+            ),
+        ] {
+            let changed = KIMI_K26_TEXT.replace(from, to);
+            assert_ne!(changed, KIMI_K26_TEXT, "{from}");
+            let err = parse_hf_weights_config(changed.as_bytes(), 4096).unwrap_err();
+            assert!(err.to_string().contains("not supported"), "{to}: {err}");
+        }
     }
 
     #[test]

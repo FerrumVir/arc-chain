@@ -7,6 +7,12 @@
 //! are absent are not read, and any tensor the stage needs from them is
 //! reported missing. The package header still names the whole pinned source,
 //! so every stage of every layout descends from the same identity.
+//!
+//! A checkpoint stored as Kimi-K2.6 stores its weights (a multimodal wrapper,
+//! `language_model.` names, routed experts pre-quantised as compressed-tensors
+//! INT4) is read too (spec §14.1-§14.2); its experts are repacked into the §13
+//! layout, never requantised. The layer, embedding and head conversions write
+//! through [`TensorSink`], so [`super::slices`] produces the same bytes.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -17,12 +23,12 @@ use std::time::Instant;
 use rayon::prelude::*;
 use serde_json::{Value, json};
 
-use super::config::{ExpertFormat, MlaConfig, parse_hf_config};
+use super::config::{ExpertFormat, MlaConfig, WeightsSource, parse_hf_weights_config};
 use super::ops::{
     Q4_GROUP, bf16_to_q32, f32_to_q32, pack_q4, quantize_q4_group, quantize_router_row,
 };
 use super::package::{
-    self, PackageDigest, SegmentDigest, StageSpec, StageWriter, i16_bytes, u16_bytes,
+    self, PackageDigest, SegmentDigest, StageSpec, StageWriter, TensorSink, i16_bytes, u16_bytes,
 };
 use crate::modern::arith::DyadicMatrix;
 use crate::modern::convert::{SourceManifest, bf16_to_q16, quantize_matrix, verify_source_file};
@@ -39,6 +45,21 @@ pub enum SourceKind {
     Bf16,
     /// The routing correction bias: BF16 or F32 (spec §4.4).
     Bias,
+    /// INT4 values packed eight to a little-endian int32 word, offset by 8
+    /// (compressed-tensors `weight_packed`, spec §14.2).
+    Packed,
+    /// The `[rows, cols]` of a packed matrix (`weight_shape`, I32).
+    PackedShape,
+}
+
+impl SourceKind {
+    fn accepts(self, dtype: &str) -> bool {
+        match self {
+            SourceKind::Bf16 => dtype == "BF16",
+            SourceKind::Bias => dtype == "BF16" || dtype == "F32",
+            SourceKind::Packed | SourceKind::PackedShape => dtype == "I32",
+        }
+    }
 }
 
 fn add(
@@ -50,13 +71,52 @@ fn add(
     out.insert(name, (shape.to_vec(), kind));
 }
 
-fn layer_source_tensors(
+/// The source tensors of one routed expert projection `[rows, cols]` named
+/// `base` (`….experts.e.gate_proj`): BF16, or pre-quantised INT4 (spec §14.2).
+fn add_expert(
+    out: &mut BTreeMap<String, (Vec<usize>, SourceKind)>,
+    base: &str,
+    rows: usize,
+    cols: usize,
+    packed: bool,
+) {
+    if packed {
+        add(
+            out,
+            format!("{base}.weight_packed"),
+            &[rows, cols / 8],
+            SourceKind::Packed,
+        );
+        add(
+            out,
+            format!("{base}.weight_scale"),
+            &[rows, cols / Q4_GROUP],
+            SourceKind::Bf16,
+        );
+        add(
+            out,
+            format!("{base}.weight_shape"),
+            &[2],
+            SourceKind::PackedShape,
+        );
+    } else {
+        add(
+            out,
+            format!("{base}.weight"),
+            &[rows, cols],
+            SourceKind::Bf16,
+        );
+    }
+}
+
+pub(crate) fn layer_source_tensors(
     c: &MlaConfig,
+    src: &WeightsSource,
     layer: usize,
     out: &mut BTreeMap<String, (Vec<usize>, SourceKind)>,
 ) {
     use SourceKind::{Bf16, Bias};
-    let p = format!("model.layers.{layer}");
+    let p = format!("{}model.layers.{layer}", src.prefix);
     let d = c.d_model;
     add(out, format!("{p}.input_layernorm.weight"), &[d], Bf16);
     add(
@@ -141,9 +201,9 @@ fn layer_source_tensors(
         );
         for expert in 0..e {
             let q = format!("{p}.mlp.experts.{expert}");
-            add(out, format!("{q}.gate_proj.weight"), &[fm, d], Bf16);
-            add(out, format!("{q}.up_proj.weight"), &[fm, d], Bf16);
-            add(out, format!("{q}.down_proj.weight"), &[d, fm], Bf16);
+            add_expert(out, &format!("{q}.gate_proj"), fm, d, src.packed_experts);
+            add_expert(out, &format!("{q}.up_proj"), fm, d, src.packed_experts);
+            add_expert(out, &format!("{q}.down_proj"), d, fm, src.packed_experts);
         }
     } else {
         add(out, format!("{p}.mlp.gate_proj.weight"), &[c.d_ff, d], Bf16);
@@ -157,28 +217,39 @@ pub fn stage_source_tensors(
     c: &MlaConfig,
     stage: StageSpec,
 ) -> BTreeMap<String, (Vec<usize>, SourceKind)> {
+    stage_source_tensors_in(c, &WeightsSource::default(), stage)
+}
+
+/// [`stage_source_tensors`] for a checkpoint stored as `src` describes
+/// (spec §14.1).
+pub fn stage_source_tensors_in(
+    c: &MlaConfig,
+    src: &WeightsSource,
+    stage: StageSpec,
+) -> BTreeMap<String, (Vec<usize>, SourceKind)> {
     let mut out = BTreeMap::new();
+    let p = &src.prefix;
     if stage.has_embed() {
         add(
             &mut out,
-            "model.embed_tokens.weight".into(),
+            format!("{p}model.embed_tokens.weight"),
             &[c.vocab_size, c.d_model],
             SourceKind::Bf16,
         );
     }
     for layer in stage.layers() {
-        layer_source_tensors(c, layer, &mut out);
+        layer_source_tensors(c, src, layer, &mut out);
     }
     if stage.has_head(c) {
         add(
             &mut out,
-            "model.norm.weight".into(),
+            format!("{p}model.norm.weight"),
             &[c.d_model],
             SourceKind::Bf16,
         );
         add(
             &mut out,
-            "lm_head.weight".into(),
+            format!("{p}lm_head.weight"),
             &[c.vocab_size, c.d_model],
             SourceKind::Bf16,
         );
@@ -186,22 +257,29 @@ pub fn stage_source_tensors(
     out
 }
 
-/// Buffers the source carries that the profile ignores (spec §4.1).
-fn ignored(name: &str) -> bool {
-    name.starts_with("model.layers.") && name.ends_with(".self_attn.rotary_emb.inv_freq")
+/// Tensors the source carries that the profile ignores: rotary buffers
+/// (spec §4.1) and, in a multimodal checkpoint, the vision tower and its
+/// projector (spec §14.1).
+fn ignored(name: &str, src: &WeightsSource) -> bool {
+    let rest = name.strip_prefix(src.prefix.as_str()).unwrap_or(name);
+    (rest.starts_with("model.layers.") && rest.ends_with(".self_attn.rotary_emb.inv_freq"))
+        || (!src.prefix.is_empty()
+            && (name.starts_with("vision_tower.") || name.starts_with("mm_projector.")))
 }
 
 /// The tensors of the shards present on disk, by name.
-struct SourceTensors {
+pub(crate) struct SourceTensors {
     shards: Vec<SafetensorsFile>,
     index: BTreeMap<String, usize>,
     dtypes: BTreeMap<String, String>,
+    src: WeightsSource,
 }
 
 impl SourceTensors {
-    fn open(
+    pub(crate) fn open(
         paths: &[PathBuf],
         expected: &BTreeMap<String, (Vec<usize>, SourceKind)>,
+        src: &WeightsSource,
     ) -> Result<Self, ModernError> {
         let mut shards = Vec::new();
         let mut index = BTreeMap::new();
@@ -209,17 +287,13 @@ impl SourceTensors {
         for path in paths {
             let shard = SafetensorsFile::open(path)?;
             for (name, info) in &shard.tensors {
-                if ignored(name) {
+                if ignored(name, src) {
                     continue;
                 }
                 let (shape, kind) = expected.get(name).ok_or_else(|| {
                     ModernError::Invalid(format!("unexpected source tensor {name}"))
                 })?;
-                let dtype_ok = match kind {
-                    SourceKind::Bf16 => info.dtype == "BF16",
-                    SourceKind::Bias => info.dtype == "BF16" || info.dtype == "F32",
-                };
-                if !dtype_ok || info.shape != *shape {
+                if !kind.accepts(&info.dtype) || info.shape != *shape {
                     return Err(ModernError::Invalid(format!(
                         "source tensor {name} is {} {:?}; {:?} {shape:?} is required",
                         info.dtype, info.shape, kind
@@ -238,10 +312,19 @@ impl SourceTensors {
             shards,
             index,
             dtypes,
+            src: src.clone(),
         })
     }
 
-    fn require<'a>(&self, names: impl Iterator<Item = &'a String>) -> Result<(), ModernError> {
+    /// The source name of a language-model tensor (`model.…`, `lm_head.…`).
+    fn hf(&self, name: &str) -> String {
+        format!("{}{name}", self.src.prefix)
+    }
+
+    pub(crate) fn require<'a>(
+        &self,
+        names: impl Iterator<Item = &'a String>,
+    ) -> Result<(), ModernError> {
         for name in names {
             if !self.index.contains_key(name) {
                 return Err(ModernError::Invalid(format!(
@@ -300,7 +383,7 @@ impl SourceTensors {
     }
 }
 
-fn write_dyadic(w: &mut StageWriter, name: &str, m: &DyadicMatrix) -> Result<(), ModernError> {
+fn write_dyadic<W: TensorSink>(w: &mut W, name: &str, m: &DyadicMatrix) -> Result<(), ModernError> {
     w.write_tensor(&format!("{name}.q"), &i8_bytes(&m.q))?;
     w.write_tensor(&format!("{name}.mu"), &i32_bytes(&m.mu))?;
     w.write_tensor(&format!("{name}.k"), &m.k)
@@ -308,8 +391,8 @@ fn write_dyadic(w: &mut StageWriter, name: &str, m: &DyadicMatrix) -> Result<(),
 
 /// A stack of `count` matrices read one at a time and written as one
 /// `[count, rows, cols]` dyadic tensor (spec §4.1).
-fn write_stack(
-    w: &mut StageWriter,
+fn write_stack<W: TensorSink>(
+    w: &mut W,
     t: &SourceTensors,
     name: &str,
     sources: &[String],
@@ -332,8 +415,8 @@ fn write_stack(
 
 /// A stack of `count` matrices quantised to INT4 with BF16 group-32 scales
 /// (spec §13.3) and written as one `[count, rows, cols]` INT4 stack.
-fn write_stack_q4(
-    w: &mut StageWriter,
+fn write_stack_q4<W: TensorSink>(
+    w: &mut W,
     t: &SourceTensors,
     name: &str,
     sources: &[String],
@@ -374,13 +457,80 @@ fn write_stack_q4(
     w.write_tensor(&format!("{name}.s"), &u16_bytes(&scales))
 }
 
-fn convert_layer(
-    w: &mut StageWriter,
+/// A stack of `count` pre-quantised INT4 matrices (`base.weight_packed`,
+/// `.weight_scale`, `.weight_shape`) repacked losslessly into the §13 layout
+/// (spec §14.2): the values and scales are the checkpoint's own.
+fn write_stack_q4_packed<W: TensorSink>(
+    w: &mut W,
+    t: &SourceTensors,
+    name: &str,
+    bases: &[String],
+    rows: usize,
+    cols: usize,
+) -> Result<(), ModernError> {
+    if !cols.is_multiple_of(Q4_GROUP) {
+        return Err(ModernError::Invalid(format!(
+            "{name}: {cols} inputs are not a multiple of the INT4 group"
+        )));
+    }
+    w.begin(&format!("{name}.q4"))?;
+    for base in bases {
+        let shape = t.raw(&format!("{base}.weight_shape"))?;
+        let shape: Vec<i64> = shape
+            .chunks_exact(4)
+            .map(|c| i64::from(i32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+            .collect();
+        if shape != [rows as i64, cols as i64] {
+            return Err(ModernError::Invalid(format!(
+                "{base}.weight_shape is {shape:?}; [{rows}, {cols}] is required"
+            )));
+        }
+        let mut bytes = t.raw(&format!("{base}.weight_packed"))?;
+        repack_int4_words(&mut bytes);
+        w.chunk(&bytes)?;
+    }
+    w.end()?;
+    w.begin(&format!("{name}.s"))?;
+    for base in bases {
+        let scales = t.bf16(&format!("{base}.weight_scale"))?;
+        check_q4_scales(&scales, base)?;
+        w.chunk(&u16_bytes(&scales))?;
+    }
+    w.end()
+}
+
+/// compressed-tensors packs value `j` of a row into bits `4(j mod 8)` of
+/// little-endian int32 word `j / 8`, as the nibble `v + 8`. In the word's
+/// bytes that is value `j` in byte `j / 2`, low nibble for even `j`: the
+/// §13.1 order. The §13.1 nibble is `v` in two's complement, `(v + 8) XOR 8`,
+/// so every byte is XORed with 0x88 (spec §14.2).
+pub fn repack_int4_words(bytes: &mut [u8]) {
+    for b in bytes {
+        *b ^= 0x88;
+    }
+}
+
+/// A §13.1 group scale: a BF16 with the sign bit clear, finite.
+pub fn check_q4_scales(scales: &[u16], what: &str) -> Result<(), ModernError> {
+    match scales
+        .iter()
+        .find(|&&s| s >> 15 != 0 || (s >> 7) & 0xFF == 0xFF)
+    {
+        Some(bad) => Err(ModernError::Invalid(format!(
+            "{what}: group scale 0x{bad:04x} is negative, infinite or NaN"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Convert one layer's source tensors into its layout tensors (spec §4.1).
+pub(crate) fn convert_layer<W: TensorSink>(
+    w: &mut W,
     t: &SourceTensors,
     c: &MlaConfig,
     layer: usize,
 ) -> Result<(), ModernError> {
-    let hf = format!("model.layers.{layer}");
+    let hf = t.hf(&format!("model.layers.{layer}"));
     let p = format!("layers.{layer}");
     let d = c.d_model;
     w.write_tensor(
@@ -492,10 +642,20 @@ fn convert_layer(
             ("w_up", "up_proj", fm, d),
             ("w_down", "down_proj", d, fm),
         ] {
-            let sources: Vec<String> = (0..e)
-                .map(|expert| format!("{hf}.mlp.experts.{expert}.{hf_name}.weight"))
+            let bases: Vec<String> = (0..e)
+                .map(|expert| format!("{hf}.mlp.experts.{expert}.{hf_name}"))
                 .collect();
             let tensor = format!("{p}.experts.{name}");
+            if t.src.packed_experts {
+                if c.expert_format != ExpertFormat::Int4G32 {
+                    return Err(ModernError::Invalid(
+                        "pre-quantised INT4 experts are stored as i4g32, never requantised".into(),
+                    ));
+                }
+                write_stack_q4_packed(w, t, &tensor, &bases, rows, cols)?;
+                continue;
+            }
+            let sources: Vec<String> = bases.iter().map(|b| format!("{b}.weight")).collect();
             match c.expert_format {
                 ExpertFormat::Int8Dyadic => write_stack(w, t, &tensor, &sources, rows, cols)?,
                 ExpertFormat::Int4G32 => write_stack_q4(w, t, &tensor, &sources, rows, cols)?,
@@ -513,6 +673,51 @@ fn convert_layer(
         }
     }
     Ok(())
+}
+
+/// The `embed` segment (spec §4.1).
+pub(crate) fn convert_embed<W: TensorSink>(
+    w: &mut W,
+    t: &SourceTensors,
+    c: &MlaConfig,
+) -> Result<(), ModernError> {
+    let m = t.matrix(&t.hf("model.embed_tokens.weight"), c.vocab_size, c.d_model)?;
+    write_dyadic(w, "embed", &m)
+}
+
+/// The `head` segment (spec §4.1).
+pub(crate) fn convert_head<W: TensorSink>(
+    w: &mut W,
+    t: &SourceTensors,
+    c: &MlaConfig,
+) -> Result<(), ModernError> {
+    w.write_tensor(
+        "final_norm",
+        &i64_bytes(&t.norm(&t.hf("model.norm.weight"))?),
+    )?;
+    let m = t.matrix(&t.hf("lm_head.weight"), c.vocab_size, c.d_model)?;
+    write_dyadic(w, "lm_head", &m)
+}
+
+/// The pinned safetensors shards present in `dir`, each verified (length and
+/// SHA-256), in source-manifest order; returns their paths and names.
+pub(crate) fn present_shards(
+    dir: &Path,
+    source: &SourceManifest,
+) -> Result<(Vec<PathBuf>, Vec<String>), ModernError> {
+    let mut paths = Vec::new();
+    let mut names = Vec::new();
+    for file in source
+        .files
+        .iter()
+        .filter(|f| f.name.ends_with(".safetensors"))
+    {
+        if dir.join(&file.name).exists() {
+            paths.push(verify_source_file(dir, file)?);
+            names.push(file.name.clone());
+        }
+    }
+    Ok((paths, names))
 }
 
 /// The tokenizer files a source manifest pins, as recorded in manifests.
@@ -579,28 +784,23 @@ pub fn convert_stage(
     let config_path = verify_source_file(dir, config_entry)?;
     let config_bytes =
         std::fs::read(&config_path).map_err(|e| ModernError::io("config.json", e))?;
-    let hf = parse_hf_config(&config_bytes, source.max_seq)?;
+    let hf = parse_hf_weights_config(&config_bytes, source.max_seq)?;
+    if !hf.pending.is_empty() {
+        return Err(ModernError::Invalid(format!(
+            "config.json: not supported in a stage package: {} (arc-mla slice converts the weights)",
+            hf.pending.join("; ")
+        )));
+    }
     let mut c = hf.config.clone();
     c.expert_format = experts;
     c.validate()?;
     let full = StageSpec::full(&c);
     let stage = stage.unwrap_or(full);
     stage.validate(&c)?;
-    let mut paths = Vec::new();
-    let mut shards_read = Vec::new();
-    for file in source
-        .files
-        .iter()
-        .filter(|f| f.name.ends_with(".safetensors"))
-    {
-        if dir.join(&file.name).exists() {
-            paths.push(verify_source_file(dir, file)?);
-            shards_read.push(file.name.clone());
-        }
-    }
-    let expected = stage_source_tensors(&c, full);
-    let tensors = SourceTensors::open(&paths, &expected)?;
-    tensors.require(stage_source_tensors(&c, stage).keys())?;
+    let (paths, shards_read) = present_shards(dir, source)?;
+    let expected = stage_source_tensors_in(&c, &hf.source, full);
+    let tensors = SourceTensors::open(&paths, &expected, &hf.source)?;
+    tensors.require(stage_source_tensors_in(&c, &hf.source, stage).keys())?;
     let (cos, sin) = rope_tables(c.rope_theta, c.qk_rope_dim, c.max_seq)?;
     let source_json = source.header_json();
     let entries = package::layout(&c, stage);
@@ -609,19 +809,13 @@ pub fn convert_stage(
     w.write_tensor("rope.cos", &i32_bytes(&cos))?;
     w.write_tensor("rope.sin", &i32_bytes(&sin))?;
     if stage.has_embed() {
-        let m = tensors.matrix("model.embed_tokens.weight", c.vocab_size, c.d_model)?;
-        write_dyadic(&mut w, "embed", &m)?;
+        convert_embed(&mut w, &tensors, &c)?;
     }
     for layer in stage.layers() {
         convert_layer(&mut w, &tensors, &c, layer)?;
     }
     if stage.has_head(&c) {
-        w.write_tensor(
-            "final_norm",
-            &i64_bytes(&tensors.norm("model.norm.weight")?),
-        )?;
-        let m = tensors.matrix("lm_head.weight", c.vocab_size, c.d_model)?;
-        write_dyadic(&mut w, "lm_head", &m)?;
+        convert_head(&mut w, &tensors, &c)?;
     }
     let (digest, segments) = w.finish()?;
     let manifest = if stage == full {
