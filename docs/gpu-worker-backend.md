@@ -139,6 +139,11 @@ arc-modern gpu-check --package smollm3-3b.arcipkg --tokenizer tokenizer.json \
 - `check_run_entry` restates #149's `runs[]` rules, and `gpu-check` refuses
   to write an entry that breaks them.
 
+A present `--proof-run-out` requires a nonempty filename, not another option;
+malformed or duplicate flags fail argument validation before file reads or GPU
+work. Omission remains the valid no-proof mode. Paths starting with a dash can
+use a `./` prefix.
+
 When `--proof-run-out` is requested, the CLI's `pass` field, printed PASS and
 successful exit require the entry's `MATCH` verdict as well as the golden,
 operator self-test and trace checks. A challenge mismatch writes both the
@@ -147,7 +152,8 @@ exiting nonzero. Without proof output, the existing golden-check behavior is
 unchanged.
 
 The lavapipe job also runs `scripts/arc_modern/gpu_proof_check.py` on the tiny
-fixture: a matching challenge, a wrong reference digest, and a GPU challenge
+fixture: valid omission, a trailing proof flag, an option used as its value,
+a matching challenge, a wrong reference digest, and a GPU challenge
 execution error. The tiny fixture is not the published SmolLM3 golden, so
 both emitted entries must remain `MISMATCH`; these tests do not weaken that
 published-golden requirement. A CPU-only verdict regression separately uses

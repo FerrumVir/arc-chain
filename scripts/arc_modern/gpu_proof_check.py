@@ -86,6 +86,37 @@ def main():
     invalid_doc["cases"][0]["prompt_tokens"] = [4_294_967_295]
     write(invalid, invalid_doc)
     summary = []
+    # Exercise the actual CLI with fresh output paths. Only omission is the
+    # valid no-proof mode; malformed requests must fail before GPU work.
+    for name, extra, valid in [
+        ("omitted-proof-flag", [], True),
+        ("trailing-proof-flag", ["--proof-run-out"], False),
+        ("option-as-proof-value", ["--proof-run-out", "--trace-forwards", "0"], False),
+    ]:
+        result_path = out / f"{name}.result.json"
+        result = subprocess.run([
+            binary, "gpu-check", "--package", str(args.package),
+            "--cases", str(args.cases), "--golden", str(args.golden),
+            "--out", str(result_path), "--self-test-rounds", "1", *extra,
+        ], capture_output=True, text=True, check=False)
+        (out / f"{name}.stdout.txt").write_text(result.stdout, encoding="utf-8")
+        (out / f"{name}.stderr.txt").write_text(result.stderr, encoding="utf-8")
+        if valid:
+            assert result.returncode == 0, (name, result.stdout, result.stderr)
+            report = read(result_path)
+            assert report["pass"] is True and report["proof_run"] is None
+            assert report["golden"]["match"] is True
+            assert report["golden"]["matrix_digest"] == TINY_DIGEST
+            assert "gpu-check: PASS" in result.stdout
+        else:
+            assert result.returncode != 0, (name, result.stdout, result.stderr)
+            assert "argument --proof-run-out requires a filename value" in result.stderr
+            assert "gpu-check: PASS" not in result.stdout
+            assert "self-test:" not in result.stderr
+            assert not result_path.exists(), (name, read(result_path))
+        summary.append({"case": name, "exit_code": result.returncode,
+                        "result_written": result_path.exists(),
+                        "regression_passed": True})
     for name, cases, expected in [
         ("matching-challenge-unpublished-golden", challenge, reference),
         ("wrong-challenge-reference", challenge, wrong),

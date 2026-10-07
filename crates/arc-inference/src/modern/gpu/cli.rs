@@ -65,6 +65,33 @@ impl Args<'_> {
             .map(String::as_str)
     }
 
+    // An absent optional output is valid; a present but incomplete request is
+    // not. Validate every occurrence so duplicates cannot hide a trailing flag.
+    fn optional_path(&self, name: &str) -> Result<Option<PathBuf>, ModernError> {
+        let mut path = None;
+        for (index, arg) in self.items.iter().enumerate() {
+            if arg != name {
+                continue;
+            }
+            let value = self
+                .items
+                .get(index + 1)
+                .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                .ok_or_else(|| {
+                    ModernError::Invalid(format!(
+                        "argument {name} requires a filename value (not another option)"
+                    ))
+                })?;
+            if path.is_some() {
+                return Err(ModernError::Invalid(format!(
+                    "argument {name} may only be specified once"
+                )));
+            }
+            path = Some(PathBuf::from(value));
+        }
+        Ok(path)
+    }
+
     fn required(&self, name: &str) -> Result<&str, ModernError> {
         self.value(name)
             .ok_or_else(|| ModernError::Invalid(format!("missing {name}\n\n{USAGE}")))
@@ -697,6 +724,8 @@ fn check_pass(
 /// `arc-modern gpu-check`: the Proof Kit's GPU mode.
 pub fn check(items: &[String]) -> Result<(), ModernError> {
     let args = Args { items };
+    // Reject malformed proof requests before file reads or GPU work.
+    let proof_run_out = args.optional_path("--proof-run-out")?;
     let options = args.engine_options()?;
     let out_path = args.path("--out")?;
     let golden_doc = read_json(&args.path("--golden")?)?;
@@ -705,7 +734,6 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
     let trace_forwards = args.number("--trace-forwards", 0)?;
     let prefix_forwards = args.number("--prefix-forwards", 0)?;
     let package_path = args.path("--package")?;
-    let proof_run_out = args.value("--proof-run-out").map(PathBuf::from);
     if proof_run_out.is_some() {
         if prefix_forwards > 0 {
             return Err(ModernError::Invalid(
@@ -857,6 +885,38 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proof_output_requires_a_value_when_present() {
+        for args in [
+            vec!["--proof-run-out"],
+            vec!["--proof-run-out", "--out", "result.json"],
+            vec!["--proof-run-out", ""],
+            vec!["--proof-run-out", "entry.json", "--proof-run-out"],
+        ] {
+            let items = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            // No package or adapter is needed: validation must run first.
+            assert!(
+                check(&items)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("argument --proof-run-out requires a filename value")
+            );
+        }
+        assert_eq!(
+            Args { items: &[] }
+                .optional_path("--proof-run-out")
+                .unwrap(),
+            None
+        );
+        let items = vec!["--proof-run-out".into(), "entry.json".into()];
+        assert_eq!(
+            Args { items: &items }
+                .optional_path("--proof-run-out")
+                .unwrap(),
+            Some(PathBuf::from("entry.json"))
+        );
+    }
 
     #[test]
     fn matching_golden_with_wrong_challenge_cannot_pass() {
