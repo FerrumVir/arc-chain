@@ -10,3 +10,10 @@ publish = false
 arc-inference = { git = "https://github.com/FerrumVir/arc-chain.git", rev = "b0673684a8c16f83b318fe1a33ab6b33f3dc79df" }
 serde_json = "1"
 sha2 = "0.10"
+
+rayon = "1"
+memmap2 = "0.9"
+blake3 = "1"
+
+[build-dependencies]
+sha2 = "0.10"

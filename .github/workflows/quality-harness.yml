@@ -117,10 +117,12 @@ jobs:
           ARC_LAYER_FIXTURE: ${{ runner.temp }}/layer-fixture
           ARC_LAYER_DIAGNOSTIC: ${{ github.workspace }}/tools/quality-layer-probe/target/debug/arc-quality-layer-probe
         run: |
-          python -m arc_quality.layer_probe.run --engine-source reviewed-engine \
-            --arc-mla reviewed-engine/target/debug/arc-mla --diagnostic "$ARC_LAYER_DIAGNOSTIC" \
-            --out "$ARC_LAYER_FIXTURE"
-          python -m unittest arc_quality.layer_probe.test_comparison -v
+          for depth in 1 2 3; do
+            python -m arc_quality.layer_probe.run --engine-source reviewed-engine \
+              --arc-mla reviewed-engine/target/debug/arc-mla --diagnostic "$ARC_LAYER_DIAGNOSTIC" \
+              --layers "$depth" --out "$ARC_LAYER_FIXTURE/depth-$depth"
+            ARC_LAYER_FIXTURE="$ARC_LAYER_FIXTURE/depth-$depth" python -m unittest arc_quality.layer_probe.test_comparison -v
+          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

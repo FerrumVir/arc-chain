@@ -1,6 +1,6 @@
-"""Compare an already verified one-layer bundle with retained BF16 source shards.
+"""Compare a verified 1-3-layer synthetic bundle or one-layer real probe with retained sources.
 
-No downloads. The reference remains the declared dense layer-0 experiment.
+No downloads. The reference remains the explicitly declared graph; multi-layer real weights remain unsupported.
 """
 import argparse
 import json
@@ -29,7 +29,7 @@ def main():
     tokens = json.loads(Path(args.tokens).read_bytes())
     request = dict(engine_sha=ENGINE_SHA, model_root=manifest['model_root'],
                    scope=manifest['model']['preparation']['scope'],
-                   graph=dict(embedding='original', executed_layers=[0], head='original',
+                   graph=dict(embedding='original', executed_layers=list(range(manifest['model']['n_layers'])), head='original',
                               source_layer_count=original_cfg['num_hidden_layers']),
                    shape=dict(hidden_size=cfg['hidden_size'], vocab_size=cfg['vocab_size']),
                    token_ids=tokens, positions=list(range(len(tokens))), mask='causal_no_padding',
@@ -37,6 +37,8 @@ def main():
                    original_source_manifest_sha256=sha(original_pin.read_bytes()),
                    config_sha256=sha((source / 'config.json').read_bytes()),
                    package_sha256=sha_file(package), reference_sha256=REFERENCE_SHA)
+    if len(request['graph']['executed_layers'])>1:
+        request['moe']={k:cfg[k] for k in ['n_routed_experts','num_experts_per_tok','n_shared_experts','n_group','topk_group']}
     data = canonical(request)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)

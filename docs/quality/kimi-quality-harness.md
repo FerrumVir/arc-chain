@@ -9,7 +9,7 @@ items that stays inside a tolerance fixed *before* the run.
 **Status**
 - The harness is runnable today on SmolLM3-3B (CI, label `quality-proof`).
 - Full Kimi evaluation remains dependent on engine integration, admitted real
-  weights and a matching reference. The offline one-layer synthetic prerequisite
+  weights and a matching reference. The offline early-layer synthetic prerequisite
   now executes pinned ARC and official PyTorch code without model downloads or
   API calls; see [kimi-layer-reference.md](kimi-layer-reference.md). It does not
   establish real Kimi quality. No paid reference calls were made.
@@ -310,7 +310,7 @@ No endpoint was called to test these guards; regression tests mock transport.
 
 ## Offline original-layer prerequisite
 
-The executable synthetic one-layer comparison and retained official reference
+The executable synthetic one-, two- and three-layer comparison and retained official reference
 are documented in [kimi-layer-reference.md](kimi-layer-reference.md). It exports
 actual activations/logits from pinned ARC and PyTorch implementations, remains
 non-certifying, and requires no model download or API call. Real-weight execution

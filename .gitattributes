@@ -15,3 +15,5 @@ vendor/wasmer-compiler/** text eol=lf
 
 # Preserve immutable reference source/config hashes on all platforms.
 scripts/arc_quality/layer_probe/reference/* -text
+
+tools/quality-layer-probe/reference/model.rs -text

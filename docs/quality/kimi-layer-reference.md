@@ -1,48 +1,104 @@
 # Offline original-layer reference comparison
 
-This is an executed **synthetic, non-certifying** comparison, not a complete
-Kimi-K2.6 forward or quality/performance claim. It runs original embedding →
-original dense layer 0 → original final RMSNorm/head, omitting later layers.
-Tolerance policy remains **PROPOSED, not approved by TJ**. A numerical error
-report never produces certification or a PASS verdict.
+This executes **synthetic, non-certifying** original embedding → original early
+layers → original final RMSNorm/head graphs of depths 1, 2 and 3. Dense layer 0
+is followed by MoE layers. It is not full Kimi-K2.6 or a quality/performance claim.
+Tolerance policy remains **PROPOSED, not approved by TJ**. Numerical reports
+never produce certification or a tolerance PASS.
 
 ## Implementations and provenance
 
-- ARC engine: immutable `b0673684a8c16f83b318fe1a33ab6b33f3dc79df` (#168).
-  The isolated `tools/quality-layer-probe` crate pins it in its own Cargo.lock.
-  The production workspace lock and #156/#168/#166/#167 are unchanged.
-- Reference: actual unmodified dense decoder definitions from official
-  `moonshotai/Kimi-K2.6` revision `7eb5002f6aadc958aed6a9177b7ed26bb94011bb`,
-  retained under `scripts/arc_quality/layer_probe/reference/` with Apache-2.0
-  notice, config, hashes and provenance. `NOTICE.md` documents AST selection.
-  The secret scanner exempts only the exact official docstring import line at
-  this path (a generic-key false positive); adjacent credential-shaped input
-  remains detected. The official file is not edited to suppress the scanner.
-  This executes PyTorch, not formula-only vectors or fabricated ARC records.
-- Reference compute: torch 2.9.1, CPU, one thread, eager attention, source BF16
-  weights decoded to FP32, deterministic algorithms, no cache. ARC uses its
-  unchanged integer forward and cache. Both receive identical token IDs,
-  contiguous positions starting at zero and causal attention without padding.
-- The fixture starts with the reviewed four-layer synthetic source generator.
-  Only the declared depth changes to one. The source shard hashes prove that
-  embedding, layer 0 and original head are unchanged. No model fetch occurs.
-  The synthetic package has its own finalized fixture identity, not full/probe.
+ARC stays pinned to #168 `b0673684a8c16f83b318fe1a33ab6b33f3dc79df`, with an
+isolated diagnostic Cargo.lock. The production lock, engine and other PRs are
+unchanged. The reviewed four-layer fixture generator produces the original
+source; only declared experiment depth changes. Embedding, selected original
+layers and head retain their original shard bytes/hashes, including packed INT4
+experts. The one-layer ARC tensor hash remains
+`fd1309caa28fdc3e58f7b12f3f9ccff5d897100d1e9252061e3e3e97573f3596`.
 
-The diagnostic uses existing public `StageModel::forward`: the returned hidden
-vector is **after layer 0, before final RMSNorm**; logits follow final RMSNorm and
-original head. There is no added engine hook and no numerical/golden change.
-Raw ARC activations/logits are signed int64 Q16 (`real = integer / 65536`).
-Raw reference values are FP32, scale 1. Each sequence row maps to the corresponding
-position/token. JSON records include shape, model root, scope, graph, package,
-source, request and implementation hashes. The reference independently verifies
-its source config/index/shards, and executes without reading ARC output values.
+The official source/config retain revision
+`7eb5002f6aadc958aed6a9177b7ed26bb94011bb`, reference SHA-256
+`1fd8d198ff6ad69a5aec6fd85bf489d91ae2c432560b1e8ba7e34f710463c80a` and config SHA-256
+`85825ca6e18cbe539eb83ee09eedfb3f4222265929f06e9f535a6d9364f55899`.
+Apache-2.0 source/license/provenance are retained. AST extraction now includes
+unmodified `MoEGate` and `DeepseekV3MoE`, with torch functional and NumPy in their
+import environment. Execution uses torch 2.9.1 CPU FP32, one thread, eager
+attention, `ep_size=1`, no reference cache. Actual official gate, group top-k,
+routed/shared experts and combination execute; hooks only copy observations.
+The exact-line generic-key scanner exception remains limited to the official
+import-example false positive, with adjacent-credential controls retained.
+
+Reference weight adaptation is explicit: BF16 dense/shared/router weights and
+F32 correction bias become FP32. Compressed-tensors INT4 matrices are unpacked
+from little-endian I32 words, eight low-to-high nibbles per word. A nibble stores
+`q+8` (including -8); per-row/per-32-column BF16 scales produce `q*scale` in
+FP32. `weight_shape`, packed/scales dimensions, storage dtypes and finite
+nonnegative scales are checked. There is **no requantization** and no change to
+original shard bytes. Every consumed component is recorded with its source
+file hash, tensor name/shape/storage dtype. This is not a native INT4 GPU kernel
+or BF16 arithmetic reference; FP32 values may vary slightly by host.
+
+## Diagnostic observer isolation
+
+Public `StageModel::open_range` captures each layer's actual output and logits.
+The full pinned model runs alongside its one-layer stages: every stage output
+hash must equal the corresponding full-model trace hash and final logits must
+match exactly. The output boundary is after residual/FFN, before final norm.
+
+Routing is private in the engine. `tools/quality-layer-probe/reference/model.rs`
+is the unchanged pinned source (SHA-256
+`1d3da70c67a2735d15daa660804ccaaf770422041eea0b27ac65d7805dde663b`). `build.rs`
+verifies that hash and generates a diagnostic-only module: module imports are
+redirected to the pinned crate, its private I/O error helper is expanded with
+identical formatting, doc comments are adapted, upstream in-crate tests are
+omitted, and **one read-only observation is inserted after `combine`**. This
+copies chosen experts, Q32 weights, Q16 router input and shared-expert output
+into thread-local storage. No arithmetic, selection or accumulation is changed.
+Every observer stage output/logit must also equal the unmodified pinned stage.
+The observer is neither a production engine patch nor a new engine pin.
+
+## Alignment, routing and scales
+
+Both implementations receive IDs `[1,42,7,3]`, positions `[0,1,2,3]`, causal
+attention without padding and the exact declared graph/model/source/package
+identity. The reference verifies source config/index/shards independently and
+never reads ARC output values. Raw schema v2 adds ordered layer IDs and routing records; per-tensor SHA-256 binds
+raw captures; missing layers and reordered layer/row values are rejected.
+These consistency hashes are not third-party attestations or certification.
+
+ARC activation/logit/shared/input values are signed int64 Q16 (`/65536`);
+routing weights are Q32 (`/4294967296`). Reference values are FP32, scale 1.
+Routing reports preserve each implementation's native selected IDs/order and
+weights. Set disagreement, order disagreement and expert-weight L1 are separate
+from boundary/logit errors; shared-output and router-input errors are also
+reported. No common routing choice is imposed to improve apparent agreement.
+
+Studio ARM measurements, tiny synthetic fixtures:
+
+| Depth | Tensor | Max absolute error | Relative L2 |
+|---|---|---:|---:|
+| 1 | layer 0 | 0.030364275 | 0.012147774 |
+| 1 | logits | 0.050032556 | 0.014210289 |
+| 2 | layer 0 | 0.030364275 | 0.012147774 |
+| 2 | layer 1 | 1.240849495 | 0.221161113 |
+| 2 | logits | 1.452088594 | 0.243165966 |
+| 3 | layer 0 | 0.030364275 | 0.012147774 |
+| 3 | layer 1 | 1.240849495 | 0.221161113 |
+| 3 | layer 2 | 2.327426434 | 0.350162367 |
+| 3 | logits | 2.287083387 | 0.357204907 |
+
+At position 3, layer 1 selects ARC `[0,4,1]` vs reference `[0,7,6]`; layer 2
+selects ARC `[4,5,6]` vs reference `[4,5,2]`. Other positions' sets agree in this
+fixture. These are observed differences, not isolated causal attributions.
+Mean/RMSE/max-relative errors and all raw arrays are included in each report.
+Relative error denominator floor is 1e-8. FP32 reference results are labeled per
+host and **must never become golden-digest expectations**. Only integer ARC
+captures are compared for cross-platform exactness.
 
 ## Reproduce without model downloads
 
-Dependency/build setup may access package registries/GitHub; runtime inputs are
-local. Create a Python 3.12 environment and install the pinned requirements
-(`torch==2.9.1` CPU wheel on Linux). Use a clean checkout of the pinned engine.
-From this PR checkout:
+Dependency/build setup may access package registries/GitHub; execution uses only
+local inputs. Use Python 3.12 and a clean reviewed-engine checkout at the pin:
 
 ```sh
 python -m pip install -r scripts/arc_quality/layer_probe/requirements.txt
@@ -50,49 +106,27 @@ cargo build --locked --manifest-path ../reviewed-engine/Cargo.toml -p arc-infere
 cargo build --locked --manifest-path tools/quality-layer-probe/Cargo.toml
 export PYTHONPATH=scripts
 export ARC_LAYER_DIAGNOSTIC="$PWD/tools/quality-layer-probe/target/debug/arc-quality-layer-probe"
-export ARC_LAYER_FIXTURE="$PWD/fixture-comparison"
-python -m arc_quality.layer_probe.run --engine-source ../reviewed-engine \
-  --arc-mla ../reviewed-engine/target/debug/arc-mla \
-  --diagnostic "$ARC_LAYER_DIAGNOSTIC" --out "$ARC_LAYER_FIXTURE"
-python -m unittest arc_quality.layer_probe.test_comparison -v
+for depth in 1 2 3; do
+  python -m arc_quality.layer_probe.run --engine-source ../reviewed-engine \
+    --arc-mla ../reviewed-engine/target/debug/arc-mla --diagnostic "$ARC_LAYER_DIAGNOSTIC" \
+    --layers "$depth" --out "fixture-comparison/depth-$depth"
+  ARC_LAYER_FIXTURE="$PWD/fixture-comparison/depth-$depth" python -m unittest arc_quality.layer_probe.test_comparison -v
+done
 python -m unittest discover -s scripts/arc_quality/tests -t scripts -v
 ```
 
-Use fresh output directories; failures do not publish a comparison report.
-`run` preserves original/reduced source fixtures, verified slices and assembled
-package, command logs, request, raw ARC/reference tensors and comparison.json.
-The generic `capture` command runs the same comparison on an existing verified
-one-layer bundle, including an explicit real-weight probe identity when admitted.
-It never downloads weights. Windows binaries have the usual `.exe` suffix.
+Use fresh output directories. `capture` also supports existing verified 2/3-layer
+synthetic bundles; real-weight capture remains restricted to one layer. The CI
+CPU x86 job runs all depths and uploads raw artifacts. No labels are changed;
+ordinary pushes still cannot fetch weights. Existing Windows coverage remains.
 
-`quality-harness.yml` adds one CPU x86 fixture job and uploads all inputs/raw
-outputs. The old multi-gigabyte proof jobs now require an **explicit labeling
-event**; retaining the existing quality-proof label does not fetch weights on a
-push. Existing harness tests and proof job bodies remain intact.
-
-## Measurement and rejection
-
-Studio ARM, synthetic width 64/vocabulary 300, token IDs `[1,42,7,3]`, positions
-`[0,1,2,3]`; original fixture had four layers, experiment executes only layer 0:
-
-| Tensor | Values | Max absolute | Mean absolute | RMSE | Relative L2 | Max relative |
-|---|---:|---:|---:|---:|---:|---:|
-| post-layer 0 | 256 | 0.030364275 | 0.006815758 | 0.008613549 | 0.012147774 | 1.033166414 |
-| logits | 1200 | 0.050032556 | 0.010940573 | 0.013755598 | 0.014210289 | 33.363512212 |
-
-Relative component error uses `abs(ARC-reference)/max(abs(reference),1e-8)`;
-relative L2 uses the reference vector norm with the same floor. Large component
-relative error near zero is disclosed, not hidden by a tolerance or certification.
-Neither argmax agreement nor these errors establish quality equivalence.
-
-Ten integration tests (with mutation subcases) consume actual generated raw
-records: honest alignment and non-certification; model/input/scope/position/mask/
-graph mismatch; missing tensors/positions/width; nonfinite, boolean, fractional
-or overflowing Q16 values; scale/provenance mismatch; malformed request bytes;
-actual diagnostic CLI rejection without output; truncated packages and missing/altered reference source/config/index; and reexecution of official
-forward with identical original source tensors. Existing 62 harness tests retain
-missing-PPL, prompt mismatch, coverage/provenance, budget override and large-count
-McNemar regressions. The existing smoke report stays non-certifying.
+Sixteen targeted tests run for each graph: honest alignment, actual reference
+reexecution, native observer/full/stage equality, immutable one-layer integer
+control, three routed experts, nonzero shared outputs, official MoE combination
+with one **and two** shared experts, nibble -8/zero-scale decoding, model/input/
+scope/position/depth mismatches, missing/reordered layer/row/routing captures,
+nonfinite values, package/source corruption and no-output CLI rejection. The
+62 existing certification/budget/McNemar regressions remain unchanged.
 
 ## Real-weight follow-up: not admitted or executed
 
@@ -124,10 +158,10 @@ PYTHONPATH=scripts python -m arc_quality.layer_probe.capture \
 ```
 
 This command runs only the original dense layer 0 plus original head; the current
-reference adapter refuses later/MoE layers. It accepts the full original source
+reference adapter permits later/MoE layers only for synthetic fixtures. It accepts the full original source
 configuration, instantiates only layer 0, and records original depth 61 in the
 request. Real execution of this command remains unverified. No diagnostic hook
-is missing for this one-layer path. MoE/multi-layer, padded/arbitrary-position,
+is missing for this one-layer path. Real-weight MoE/multi-layer scaling, padded/arbitrary-position,
 cache/reference BF16 compute, tokenizer/chat, full model, quality certification
 and lab internet pipeline need separate work and evidence.
 

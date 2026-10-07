@@ -17,6 +17,7 @@ def main():
     p.add_argument('--arc-mla',required=True)
     p.add_argument('--diagnostic',required=True)
     p.add_argument('--out',required=True)
+    p.add_argument('--layers',type=int,choices=[1,2,3],default=1)
     args=p.parse_args()
     engine=Path(args.engine_source).resolve();binary=Path(args.arc_mla).resolve();diagnostic=Path(args.diagnostic).resolve()
     head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=engine,text=True).strip()
@@ -30,10 +31,10 @@ def main():
     original=out/'original';source=out/'source';slices=out/'slices';bundle=out/'bundle'
     command(sys.executable,engine/'scripts/arc_mla/make_tiny_kimi_packed.py',original,'--prepared')
     shutil.copytree(original,source)
-    cfg=json.loads((source/'config.json').read_text());cfg['text_config']['num_hidden_layers']=1
+    cfg=json.loads((source/'config.json').read_text());cfg['text_config']['num_hidden_layers']=args.layers
     (source/'config.json').write_bytes(canonical(cfg))
     pin=source/'tiny-kimi-packed.source.json';pin_doc=json.loads(pin.read_text())
-    pin_doc['repo']='arc-test/tiny-kimi-original-layer0-head'
+    pin_doc['repo']=('arc-test/tiny-kimi-original-layer0-head' if args.layers==1 else f'arc-test/tiny-kimi-original-layers{args.layers}-head')
     for item in pin_doc['files']:
         if item['name']=='config.json':item.update(bytes=(source/'config.json').stat().st_size,sha256=sha((source/'config.json').read_bytes()))
     pin.write_bytes(canonical(pin_doc))
@@ -44,12 +45,14 @@ def main():
             '--slices',slices,'--out-dir',bundle,'--fixture')
     final=json.loads((bundle/'manifest.json').read_text());package=bundle/'stage-0.arcspkg'
     request={'engine_sha':ENGINE_SHA,'model_root':final['model_root'],'scope':final['model']['preparation']['scope'],
-             'graph':{'embedding':'original','executed_layers':[0],'head':'original','source_layer_count':4},
+             'graph':{'embedding':'original','executed_layers':list(range(args.layers)),'head':'original','source_layer_count':4},
              'shape':{'hidden_size':cfg['text_config']['hidden_size'],'vocab_size':cfg['text_config']['vocab_size']},
              'token_ids':[1,42,7,3],'positions':[0,1,2,3],'mask':'causal_no_padding',
              'source_manifest_sha256':sha(pin.read_bytes()),'config_sha256':sha((source/'config.json').read_bytes()),
              'original_source_manifest_sha256':sha((original/'tiny-kimi-packed.source.json').read_bytes()),
              'package_sha256':sha_file(package),'reference_sha256':REFERENCE_SHA}
+    if args.layers>1:
+        request['moe']={k:cfg['text_config'][k] for k in ['n_routed_experts','num_experts_per_tok','n_shared_experts','n_group','topk_group']}
     request_bytes=canonical(request);(out/'request.json').write_bytes(request_bytes)
     command(diagnostic,package,bundle/'manifest.json',pin,out/'request.json',out/'arc.json')
     # Reference executes independently from ARC raw outputs; only the committed
@@ -59,7 +62,7 @@ def main():
     arc=json.loads((out/'arc.json').read_text())
     report=compare(arc,reference,request,request_bytes)
     report['setup']={'engine_checkout':head,'arc_mla_sha256':sha_file(binary),'diagnostic_sha256':sha_file(diagnostic),
-                     'reference_dtype':'source BF16 -> FP32 CPU','arc_dtype':'dyadic integer weights, Q16 activation/logits',
+                     'reference_dtype':'source BF16/F32 and packed INT4 group32 -> FP32 CPU','arc_dtype':'dyadic integer weights, Q16 activation/logits',
                      'original_head_preserved':True,'runtime_io':'local files; no downloader or API client invoked'}
     (out/'comparison.json').write_bytes(canonical(report))
     print(json.dumps(report,indent=2))

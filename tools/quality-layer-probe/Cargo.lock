@@ -105,6 +105,9 @@ name = "arc-quality-layer-probe"
 version = "0.1.0"
 dependencies = [
  "arc-inference",
+ "blake3",
+ "memmap2",
+ "rayon",
  "serde_json",
  "sha2",
 ]

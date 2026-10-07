@@ -9,8 +9,8 @@ layer execution. Current execution provenance is in each generated reference.jso
 listed in `NAMES` without rewriting any method body. It provides torch, typing,
 math, a SimpleNamespace configuration, the SiLU activation and eager attention
 class mapping that their original import context supplies. This executes the
-actual dense decoder forward, attention, YaRN, RMSNorm and MLP. The driver uses
+actual dense/MoE decoder forward, native gate/expert selection, attention, YaRN, RMSNorm and MLP. The driver uses
 PyTorch embedding and final linear projection, matching the reference model's
 original embedding -> layer -> final norm -> head graph. It deliberately excludes
-remote loaders, FlashAttention, Transformers wrappers, MoE and cache execution.
-The one-layer graph and fixture dimensions are experimental, not full K2.6.
+remote loaders, FlashAttention, Transformers wrappers, distributed expert parallelism and cache execution.
+The one-, two- and three-layer graphs and fixture dimensions are experimental, not full K2.6.

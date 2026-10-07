@@ -7,7 +7,7 @@ import subprocess
 import shutil
 import tempfile
 import unittest
-from .compare import canonical, compare
+from .compare import canonical, compare, sha
 from .official import execute
 
 
@@ -117,6 +117,79 @@ class ActualFixture(unittest.TestCase):
                 str(self.root/'request.json'),str(output)],capture_output=True,text=True)
             self.assertNotEqual(result.returncode,0)
             self.assertFalse(output.exists())
+
+    def test_missing_reordered_layer_captures(self):
+        for key in ('arc','ref'):
+            for fault in ('missing','layer_order','swapped_rows','swapped_layers'):
+                doc=copy.deepcopy(getattr(self,key))
+                if fault=='missing':doc['tensors'].pop('layer.0.output')
+                elif fault=='layer_order':doc['layer_order']=[99]+doc['layer_order'][1:]
+                elif fault=='swapped_rows':doc['tensors']['layer.0.output'].reverse()
+                elif len(doc['layer_order'])>1:
+                    doc['tensors']['layer.0.output'],doc['tensors']['layer.1.output']=doc['tensors']['layer.1.output'],doc['tensors']['layer.0.output']
+                else:continue
+                with self.subTest(engine=key,fault=fault),self.assertRaises(ValueError):self.check(**{key:doc})
+
+    def test_multiple_routes_and_shared_experts(self):
+        for doc in (self.arc,self.ref):
+            for layer,rows in doc['routing'].items():
+                self.assertEqual(len(rows),len(self.request['token_ids']))
+                for row in rows:
+                    self.assertEqual(len(set(row['experts'])),3)
+                    self.assertTrue(all(w>0 for w in row['weights']))
+                    self.assertTrue(any(x!=0 for x in row['shared']))
+        self.assertTrue(self.arc['observer']['verified_against_unmodified_engine'])
+        if len(self.arc['layer_order'])==1:
+            self.assertEqual(sha(canonical(self.arc['tensors'])),'fd1309caa28fdc3e58f7b12f3f9ccff5d897100d1e9252061e3e3e97573f3596')
+        else:
+            self.assertIn('layer.1',self.check()['routing_comparison'])
+            self.assertTrue(any(v['source_dtype']=='torch.int32' for v in self.ref['provenance']['weight_tensors'].values()))
+
+    def test_routing_missing_reordered_nonfinite(self):
+        if not self.arc['routing']:return
+        for key in ('arc','ref'):
+            for fault in ('missing','order','duplicate_expert','nonfinite'):
+                doc=copy.deepcopy(getattr(self,key));rows=doc['routing']['layer.1']
+                if fault=='missing':rows.pop()
+                elif fault=='order':rows.reverse()
+                elif fault=='duplicate_expert':rows[0]['experts'][0]=rows[0]['experts'][1]
+                else:rows[0]['weights'][0]=float('nan')
+                with self.subTest(engine=key,fault=fault),self.assertRaises(ValueError):self.check(**{key:doc})
+
+    def test_graph_depth_mismatch(self):
+        for layers in ([1], [0,2], [0,1,2,3]):
+            doc=copy.deepcopy(self.ref);doc['alignment']['graph']['executed_layers']=layers
+            with self.assertRaises(ValueError):self.check(ref=doc)
+
+    def test_official_moe_adds_shared_experts_to_multiple_routes(self):
+        import torch
+        import types
+        from .official import definitions
+        config=json.loads((self.root/'source/config.json').read_bytes())['text_config']
+        for shared_count in (1,2):
+            config['n_shared_experts']=shared_count
+            moe=definitions()['DeepseekV3MoE'](types.SimpleNamespace(**config)).eval()
+            with torch.no_grad():
+                for parameter in moe.parameters():parameter.fill_(0.1)
+                x=torch.ones((1,2,config['hidden_size']))
+                ids,weights=moe.gate(x)
+                self.assertEqual(ids.shape,(2,3))
+                routed=moe.moe_infer(x.view(-1,x.shape[-1]),ids,weights).view_as(x)
+                shared=moe.shared_experts(x)
+                self.assertTrue(torch.equal(moe(x),routed+shared))
+                self.assertFalse(torch.equal(moe(x),routed))
+                self.assertEqual(moe.shared_experts.gate_proj.out_features,shared_count*config['moe_intermediate_size'])
+
+    def test_packed_int4_offset_nibbles_and_zero_scale(self):
+        import torch
+        from .official import unpack_int4
+        # I32 packs low-to-high offset nibbles: 0 means -8, 8 means 0.
+        words=torch.tensor([[0x76543210,-19088744,0x76543210,-19088744]],dtype=torch.int32)
+        shape=torch.tensor([1,32],dtype=torch.int32)
+        actual=unpack_int4(words,torch.tensor([[0.5]],dtype=torch.bfloat16),shape)
+        self.assertEqual(actual.tolist(),[[x*0.5 for x in list(range(-8,8))*2]])
+        self.assertTrue((unpack_int4(words,torch.zeros((1,1),dtype=torch.bfloat16),shape)==0).all())
+        with self.assertRaises(ValueError):unpack_int4(words,torch.tensor([[float('nan')]],dtype=torch.bfloat16),shape)
 
     def test_reference_reexecutes_and_preserves_original_weights(self):
         doc=execute(self.root/'source',self.root/'source/tiny-kimi-packed.source.json',
