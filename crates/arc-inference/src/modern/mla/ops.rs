@@ -99,23 +99,227 @@ impl<'a> QView<'a> {
     }
 }
 
+/// A matrix that maps an input vector to output rows exactly: dyadic INT8
+/// rows ([`QView`]) or INT4 group-32 rows ([`Q4View`], spec §13).
+pub trait Project {
+    /// Number of output rows.
+    fn out_rows(&self) -> usize;
+    /// `out = W x`, exactly as the profile defines it.
+    fn project(&self, x: &[i64], out: &mut [i64]) -> Result<(), ModernError>;
+}
+
+impl Project for QView<'_> {
+    fn out_rows(&self) -> usize {
+        self.rows
+    }
+
+    fn project(&self, x: &[i64], out: &mut [i64]) -> Result<(), ModernError> {
+        QView::project(self, x, out)
+    }
+}
+
 /// `ffn(W, x) = W.down · gated_silu(W.gate x, W.up x)` (spec §5.6).
-pub fn gated_ffn(
-    gate: QView<'_>,
-    up: QView<'_>,
-    down: QView<'_>,
-    x: &[i64],
-) -> Result<Vec<i64>, ModernError> {
-    let mut g = vec![0i64; gate.rows];
+pub fn gated_ffn<P: Project>(gate: P, up: P, down: P, x: &[i64]) -> Result<Vec<i64>, ModernError> {
+    let mut g = vec![0i64; gate.out_rows()];
     gate.project(x, &mut g)?;
-    let mut u = vec![0i64; up.rows];
+    let mut u = vec![0i64; up.out_rows()];
     up.project(x, &mut u)?;
     for (gi, &ui) in g.iter_mut().zip(&u) {
         *gi = gated_silu(*gi, ui)?;
     }
-    let mut y = vec![0i64; down.rows];
+    let mut y = vec![0i64; down.out_rows()];
     down.project(&g, &mut y)?;
     Ok(y)
+}
+
+/// Inputs per INT4 scale group (spec §13).
+pub const Q4_GROUP: usize = 32;
+/// Groups whose scale is more than this many binades below the row's largest
+/// scale contribute nothing (spec §13.2).
+const Q4_SCALE_SPAN: i32 = 40;
+
+/// The signed 4-bit value `j` of a packed row (low nibble first, spec §13.1).
+#[inline]
+pub fn q4_value(packed: &[u8], j: usize) -> i64 {
+    let byte = packed[j / 2];
+    let nibble = if j % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+    i64::from(((nibble << 4) as i8) >> 4)
+}
+
+/// `floor(value * 2^-shift)` for any non-negative shift, without overflow.
+fn floor_shift(value: i128, shift: u32) -> i128 {
+    if shift >= 127 {
+        if value < 0 { -1 } else { 0 }
+    } else {
+        value >> shift
+    }
+}
+
+/// A borrowed stack element of INT4 group-32 rows with BF16 group scales
+/// (spec §13.1).
+#[derive(Debug, Clone, Copy)]
+pub struct Q4View<'a> {
+    pub rows: usize,
+    pub cols: usize,
+    /// `rows * cols / 2` bytes, two values per byte, low nibble first.
+    pub q4: &'a [u8],
+    /// `rows * cols / 32` BF16 bit patterns (non-negative, finite).
+    pub scales: &'a [u16],
+}
+
+impl Q4View<'_> {
+    fn row(&self, r: usize, x: &[i64]) -> Result<i64, ModernError> {
+        let groups = self.cols / Q4_GROUP;
+        let packed = &self.q4[r * self.cols / 2..(r + 1) * self.cols / 2];
+        let scales = &self.scales[r * groups..(r + 1) * groups];
+        let mut parts = Vec::with_capacity(groups);
+        let mut top: Option<i32> = None;
+        for &bits in scales {
+            let (_, m, e) = bf16_parts(bits)?;
+            if m > 0 {
+                top = Some(top.map_or(e, |t| t.max(e)));
+            }
+            parts.push((m, e));
+        }
+        let Some(top) = top else {
+            return Ok(0);
+        };
+        let mut total: i128 = 0;
+        for (g, &(m, e)) in parts.iter().enumerate() {
+            if m == 0 || e < top - Q4_SCALE_SPAN {
+                continue;
+            }
+            // |q| <= 8 and 8 * sum |x| < 2^63 bound every partial sum.
+            let mut acc = 0i64;
+            for j in g * Q4_GROUP..(g + 1) * Q4_GROUP {
+                acc += q4_value(packed, j) * x[j];
+            }
+            total += (i128::from(m) * i128::from(acc)) << (e - top + Q4_SCALE_SPAN);
+        }
+        let exponent = top - Q4_SCALE_SPAN;
+        let value = if exponent < 0 {
+            floor_shift(total, (-exponent) as u32)
+        } else if total == 0 {
+            0
+        } else if exponent > 62 {
+            return Err(domain("INT4 projection output beyond 2^62"));
+        } else {
+            total
+                .checked_mul(1i128 << exponent)
+                .ok_or_else(|| domain("INT4 projection output beyond 2^62"))?
+        };
+        to_activation(value, "INT4 projection output beyond 2^62")
+    }
+}
+
+impl Project for Q4View<'_> {
+    fn out_rows(&self) -> usize {
+        self.rows
+    }
+
+    /// `out = W x` with exact group scales and one floor (spec §13.2).
+    fn project(&self, x: &[i64], out: &mut [i64]) -> Result<(), ModernError> {
+        if self.rows == 0
+            || self.cols == 0
+            || !self.cols.is_multiple_of(Q4_GROUP)
+            || self.q4.len() != self.rows * self.cols / 2
+            || self.scales.len() != self.rows * self.cols / Q4_GROUP
+            || x.len() != self.cols
+            || out.len() != self.rows
+        {
+            return Err(invalid(format!(
+                "INT4 projection shape: matrix {}x{}, input {}, output {}",
+                self.rows,
+                self.cols,
+                x.len(),
+                out.len()
+            )));
+        }
+        let mass: u128 = x.iter().map(|v| u128::from(v.unsigned_abs())).sum();
+        if mass * 8 >= 1u128 << 63 {
+            return Err(domain(
+                "INT4 projection input magnitude (8 * sum |x| >= 2^63)",
+            ));
+        }
+        out.par_chunks_mut(16)
+            .enumerate()
+            .try_for_each(|(chunk_index, chunk)| {
+                for (offset, slot) in chunk.iter_mut().enumerate() {
+                    *slot = self.row(chunk_index * 16 + offset, x)?;
+                }
+                Ok(())
+            })
+    }
+}
+
+/// Quantise one group of 32 BF16 values to INT4 with a BF16 scale (spec
+/// §13.3). Returns the scale's bit pattern; `q` receives values in [-8, 7].
+pub fn quantize_q4_group(bits: &[u16], q: &mut [i8]) -> Result<u16, ModernError> {
+    if bits.len() != Q4_GROUP || q.len() != Q4_GROUP {
+        return Err(invalid("INT4 groups hold 32 values"));
+    }
+    let mut max_magnitude = 0u16;
+    for &b in bits {
+        if (b >> 7) & 0xFF == 0xFF {
+            return Err(invalid("BF16 infinity or NaN in an expert row"));
+        }
+        max_magnitude = max_magnitude.max(b & 0x7FFF);
+    }
+    if max_magnitude == 0 {
+        q.fill(0);
+        return Ok(0);
+    }
+    let (_, m_a, e_a) = bf16_parts(max_magnitude)?;
+    // 128 <= A / (7 * 2^f) < 256 with A = M_A * 2^e_A: shift M_A into [896, 1792).
+    let mut d = 0i32;
+    while (u64::from(m_a) << d) < 896 {
+        d += 1;
+    }
+    let mut f = e_a - d;
+    let mut m = (2 * (u64::from(m_a) << d) + 7) / 14;
+    if m == 256 {
+        m = 128;
+        f += 1;
+    }
+    let field = f + 134;
+    if !(1..=254).contains(&field) {
+        return Err(invalid(format!(
+            "INT4 group scale exponent field {field} is outside [1, 254]"
+        )));
+    }
+    let scale_bits = ((field as u16) << 7) | (m as u16 - 128);
+    for (slot, &b) in q.iter_mut().zip(bits) {
+        let (negative, m_j, e_j) = bf16_parts(b)?;
+        if m_j == 0 {
+            *slot = 0;
+            continue;
+        }
+        let shift = e_j - f;
+        let (num, den) = if shift >= 0 {
+            (u64::from(m_j) << shift.min(30), m)
+        } else if -shift > Q4_SCALE_SPAN {
+            *slot = 0;
+            continue;
+        } else {
+            (u64::from(m_j), m << (-shift))
+        };
+        let magnitude = ((2 * num + den) / (2 * den)) as i64;
+        let value = if negative { -magnitude } else { magnitude };
+        *slot = value.clamp(-8, 7) as i8;
+    }
+    Ok(scale_bits)
+}
+
+/// Pack signed 4-bit values two per byte, low nibble first (spec §13.1).
+pub fn pack_q4(values: &[i8]) -> Vec<u8> {
+    values
+        .chunks(2)
+        .map(|pair| {
+            let low = (pair[0] as u8) & 0x0F;
+            let high = pair.get(1).map_or(0, |&v| (v as u8) & 0x0F);
+            low | (high << 4)
+        })
+        .collect()
 }
 
 /// Interleaved RoPE on one vector at one position (spec §5.1): pairs
@@ -679,6 +883,84 @@ mod tests {
         let mut a = [0i64; 2];
         mla_attend(&big, &qp, cache, 1, &mut a).unwrap();
         assert!(a[0] > 0);
+    }
+
+    #[test]
+    fn int4_groups_quantise_with_bf16_scales() {
+        let mut row = [0u16; 32];
+        row[0] = bf16(1.0);
+        row[1] = bf16(-0.5);
+        row[2] = bf16(0.25);
+        let mut q = [0i8; 32];
+        let scale = quantize_q4_group(&row, &mut q).unwrap();
+        // A = 1.0: m = rha(1024 / 7) = 146 and f = -10, so s = 146 * 2^-10.
+        assert_eq!(scale, (124 << 7) | 18);
+        assert_eq!(&q[..3], &[7, -4, 2]);
+        assert!(q[3..].iter().all(|&v| v == 0));
+        // A zero group has a zero scale.
+        let mut q = [3i8; 32];
+        assert_eq!(quantize_q4_group(&[0u16; 32], &mut q).unwrap(), 0);
+        assert_eq!(q, [0i8; 32]);
+        // NaN is refused; groups hold exactly 32 values.
+        let mut bad = [0u16; 32];
+        bad[5] = 0x7FC0;
+        assert!(quantize_q4_group(&bad, &mut [0i8; 32]).is_err());
+        assert!(quantize_q4_group(&[0u16; 31], &mut [0i8; 31]).is_err());
+    }
+
+    #[test]
+    fn int4_values_pack_low_nibble_first() {
+        let values: Vec<i8> = (-8..8).collect();
+        let packed = pack_q4(&values);
+        assert_eq!(packed.len(), 8);
+        for (j, &v) in values.iter().enumerate() {
+            assert_eq!(q4_value(&packed, j), i64::from(v));
+        }
+        assert_eq!(pack_q4(&[1, -1]), vec![0xF1]);
+    }
+
+    #[test]
+    fn int4_projection_is_the_exact_scaled_sum_rounded_once() {
+        // Two groups: all +1 with scale 0.5, all -2 with scale 0.25; x_j = j + 1.
+        let mut values = vec![1i8; 32];
+        values.extend(vec![-2i8; 32]);
+        let packed = pack_q4(&values);
+        let scales = [bf16(0.5), bf16(0.25)];
+        let view = Q4View {
+            rows: 1,
+            cols: 64,
+            q4: &packed,
+            scales: &scales,
+        };
+        let x: Vec<i64> = (1..=64).collect();
+        let mut out = [0i64; 1];
+        view.project(&x, &mut out).unwrap();
+        // 0.5 * 528 + 0.25 * (-2 * 1552) = 264 - 776 = -512.
+        assert_eq!(out, [-512]);
+        // One floor at the end: 0.75 * (-1) = -0.75 -> -1.
+        let mut values = vec![0i8; 32];
+        values[0] = 1;
+        let packed = pack_q4(&values);
+        let scales = [bf16(0.75)];
+        let view = Q4View {
+            rows: 1,
+            cols: 32,
+            q4: &packed,
+            scales: &scales,
+        };
+        let mut x = vec![0i64; 32];
+        x[0] = -1;
+        view.project(&x, &mut out).unwrap();
+        assert_eq!(out, [-1]);
+        // A zero scale contributes nothing; shape errors are refused.
+        let zero = [0u16];
+        let view = Q4View {
+            scales: &zero,
+            ..view
+        };
+        view.project(&x, &mut out).unwrap();
+        assert_eq!(out, [0]);
+        assert!(view.project(&x[..31], &mut out).is_err());
     }
 
     #[test]

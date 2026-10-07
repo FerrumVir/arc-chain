@@ -20,7 +20,9 @@ options; "kimi" has Kimi K2's):
 | routed_scaling_factor   | 2.446     | 2.827 |
 
 Both: 4 layers (layer 0 dense), width 64, 4 heads, latent rank 32, RoPE
-width 8, 8 routed experts with 3 per token, vocabulary 300, max_seq 64.
+width 8, 8 routed experts of width 32 with 3 per token, vocabulary 300,
+max_seq 64. Widths are multiples of 32, so the experts also convert to the
+INT4 group-32 variant (spec section 13).
 
 Every value comes from a fixed 64-bit LCG turned directly into bit patterns
 (no floating point), so the files are identical on every OS. Edge cases:
@@ -49,7 +51,7 @@ N_HEADS = 4
 NOPE, ROPE, V_HEAD = 16, 8, 16
 KV_RANK = 32
 D_FF = 96
-MOE_FF = 24
+MOE_FF = 32
 N_EXPERTS = 8
 TOP_K = 3
 N_LAYERS = 4

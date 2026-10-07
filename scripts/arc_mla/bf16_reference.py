@@ -2,7 +2,7 @@
 """Streaming float reference for DeepSeek-V3-architecture BF16 checkpoints.
 
     python3 scripts/arc_mla/bf16_reference.py ppl --model-dir DIR --tokens TOKENS.json \
-        --rust INTEGER_PPL.json --window 512 --text-label LABEL --out QUALITY.json
+        --rust INTEGER_PPL.json [--rust INTEGER_PPL_2.json ...] --window 512 --text-label LABEL --out QUALITY.json
     python3 scripts/arc_mla/bf16_reference.py check-hf --model-dir TINY_DIR --out CHECK.json
 
 The perplexity baseline for the integer engine: the published BF16 weights,
@@ -162,21 +162,27 @@ def cmd_ppl(args: argparse.Namespace) -> int:
                                    "checked against transformers DeepseekV3ForCausalLM by check-hf)",
                  "torch": torch.__version__, "scored_tokens": scored, "nll_sum": nll_sum,
                  "ppl": math.exp(nll_sum / scored), "seconds": seconds}
-    rust = json.loads(Path(args.rust).read_text())
-    if rust["scored_tokens"] != scored or rust["window"] != args.window:
-        print(f"scored tokens differ: integer {rust['scored_tokens']} vs reference {scored}")
-        return 1
-    agree = sum(1 for a, b in zip(argmax, rust["argmax"]) if a == b)
+    variants = []
+    for path in args.rust:
+        rust = json.loads(Path(path).read_text())
+        if rust["scored_tokens"] != scored or rust["window"] != args.window:
+            print(f"{path}: scored tokens differ: integer {rust['scored_tokens']} vs reference {scored}")
+            return 1
+        agree = sum(1 for a, b in zip(argmax, rust["argmax"]) if a == b)
+        variants.append({"integer_engine": {"profile": rust["profile"], "kernel": rust["kernel"], "ppl": rust["ppl"],
+                                            "nll_sum": rust["nll_sum"], "logits_digest": rust["logits_digest"],
+                                            "tok_s": rust["tok_s"], "seconds": rust["seconds"]},
+                         "ppl_delta_percent": 100.0 * (rust["ppl"] / reference["ppl"] - 1.0),
+                         "top1_agreement": agree / scored})
+    # The first variant keeps the flat v1 fields; every variant is listed.
     report = {"schema": "arc.mla-quality.v1", "text": args.text_label, "window": args.window,
-              "scored_tokens": scored, "bf16_reference": reference,
-              "integer_engine": {"profile": rust["profile"], "kernel": rust["kernel"], "ppl": rust["ppl"],
-                                 "nll_sum": rust["nll_sum"], "logits_digest": rust["logits_digest"],
-                                 "tok_s": rust["tok_s"], "seconds": rust["seconds"]},
-              "ppl_delta_percent": 100.0 * (rust["ppl"] / reference["ppl"] - 1.0),
-              "top1_agreement": agree / scored}
+              "scored_tokens": scored, "bf16_reference": reference, **variants[0], "variants": variants}
     Path(args.out).write_text(json.dumps(report, indent=1) + "\n")
-    print(json.dumps({k: report[k] for k in ("text", "scored_tokens", "ppl_delta_percent", "top1_agreement")}, indent=1))
-    print(f"BF16 reference ppl {reference['ppl']:.4f}; integer ppl {rust['ppl']:.4f}")
+    print(json.dumps({"text": report["text"], "scored_tokens": scored,
+                      "variants": [{"profile": v["integer_engine"]["profile"], "ppl_delta_percent": v["ppl_delta_percent"],
+                                    "top1_agreement": v["top1_agreement"]} for v in variants]}, indent=1))
+    print(f"BF16 reference ppl {reference['ppl']:.4f}; integer ppl " +
+          ", ".join(f"{v['integer_engine']['ppl']:.4f}" for v in variants))
     return 0
 
 
@@ -226,7 +232,8 @@ def main(argv: list) -> int:
     p = sub.add_parser("ppl")
     p.add_argument("--model-dir", required=True)
     p.add_argument("--tokens", required=True)
-    p.add_argument("--rust", required=True)
+    p.add_argument("--rust", required=True, action="append",
+                   help="an integer-engine ppl report; repeat to compare several profiles to one BF16 pass")
     p.add_argument("--window", type=int, default=512)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--text-label", default="")

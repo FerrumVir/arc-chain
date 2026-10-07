@@ -6,7 +6,49 @@ use crate::modern::ModernError;
 use crate::modern::convert::eps_q32;
 use crate::modern::tables::attention_lambda;
 
-/// Model shape and profile constants: the `model` object of spec §2.2.
+/// How the routed experts are stored (spec §4.1 and the §13 variant).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExpertFormat {
+    /// INT8 rows with dyadic scales: `arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1`.
+    #[default]
+    Int8Dyadic,
+    /// INT4 values with BF16 scales per 32 inputs (spec §13):
+    /// `arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.i4g32-experts.q16.v1`.
+    Int4G32,
+}
+
+impl ExpertFormat {
+    /// The arithmetic profile identity of a package in this format.
+    pub fn profile(self) -> &'static str {
+        match self {
+            ExpertFormat::Int8Dyadic => super::PROFILE,
+            ExpertFormat::Int4G32 => super::PROFILE_I4G32,
+        }
+    }
+
+    /// The format a profile identity names, if any.
+    pub fn from_profile(profile: &str) -> Option<Self> {
+        match profile {
+            p if p == super::PROFILE => Some(ExpertFormat::Int8Dyadic),
+            p if p == super::PROFILE_I4G32 => Some(ExpertFormat::Int4G32),
+            _ => None,
+        }
+    }
+
+    /// Parse `i8` or `i4g32` (CLI option).
+    pub fn parse(text: &str) -> Result<Self, ModernError> {
+        match text {
+            "i8" => Ok(ExpertFormat::Int8Dyadic),
+            "i4g32" => Ok(ExpertFormat::Int4G32),
+            other => Err(ModernError::Invalid(format!(
+                "unknown expert format {other} (i8 or i4g32)"
+            ))),
+        }
+    }
+}
+
+/// Model shape and profile constants: the `model` object of spec §2.2. The
+/// expert format is not part of the object; the package's profile names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaConfig {
     /// `model_type` of the source (`deepseek_v3` or `kimi_k2`).
@@ -45,6 +87,8 @@ pub struct MlaConfig {
     pub rope_theta: u64,
     /// `floor(2^30 / sqrt(N + R))`.
     pub attention_lambda: i64,
+    /// Storage of the routed experts (named by the profile, not the object).
+    pub expert_format: ExpertFormat,
 }
 
 const MODEL_KEYS: [&str; 25] = [
@@ -163,7 +207,9 @@ impl MlaConfig {
             && self.n_routed_experts <= 1 << 16
             && self.n_shared_experts <= 1 << 8
             && self.vocab_size <= u32::MAX as usize
-            && self.max_seq <= 1 << 20;
+            && self.max_seq <= 1 << 20
+            && (self.expert_format == ExpertFormat::Int8Dyadic
+                || (self.d_model.is_multiple_of(32) && self.moe_d_ff.is_multiple_of(32)));
         if !ok {
             return Err(ModernError::Invalid(format!(
                 "unsupported MLA + MoE model shape: {self:?}"
@@ -264,9 +310,15 @@ impl MlaConfig {
                 .and_then(Value::as_u64)
                 .ok_or_else(|| bad("rope_theta"))?,
             attention_lambda: int("attention_lambda")?,
+            expert_format: ExpertFormat::Int8Dyadic,
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// The arithmetic profile identity of a package of this model.
+    pub fn profile(&self) -> &'static str {
+        self.expert_format.profile()
     }
 }
 
@@ -284,11 +336,151 @@ fn absent_or(value: &Value, key: &str, allowed: &Value) -> bool {
     }
 }
 
+/// The architecture families the engine recognises in a Hugging Face config
+/// (spec §2.1, §11). Only [`Architecture::DeepseekV3Mla`] has an integer
+/// profile; the others are recognised so that a refusal names everything that
+/// is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Architecture {
+    /// DeepSeek-V3 and Kimi K2.x: MLA in every layer, sigmoid-routed MoE with
+    /// shared experts.
+    DeepseekV3Mla,
+    /// Kimi Linear and Kimi K3: Kimi Delta Attention mixed with gated NoPE
+    /// MLA, latent MoE and attention residuals.
+    KimiLinear,
+}
+
+impl Architecture {
+    /// The family of a text model's `model_type`.
+    pub fn from_model_type(model_type: &str) -> Option<Self> {
+        match model_type {
+            "deepseek_v3" | "kimi_k2" => Some(Self::DeepseekV3Mla),
+            "kimi_linear" => Some(Self::KimiLinear),
+            _ => None,
+        }
+    }
+}
+
+/// The text model's configuration: the file itself, or its `text_config`
+/// object when the checkpoint is multimodal (Kimi K2.5, K2.6 and K3 wrap the
+/// language model this way).
+fn text_config(value: &Value) -> (&Value, bool) {
+    match value.get("text_config") {
+        Some(text @ Value::Object(_)) => (text, true),
+        _ => (value, false),
+    }
+}
+
+/// Every feature of a Hugging Face `config.json` that the integer engine does
+/// not implement; empty when the configuration is supported (spec §2.1, §11).
+pub fn unsupported_features(value: &Value) -> Vec<String> {
+    let (text, wrapped) = text_config(value);
+    let str_of = |key: &str| text.get(key).and_then(Value::as_str);
+    let mut missing = Vec::new();
+    if wrapped {
+        missing.push(
+            "a multimodal checkpoint: tensors under the language_model. prefix and a vision tower"
+                .to_string(),
+        );
+    }
+    if let Some(q) = text
+        .get("quantization_config")
+        .or_else(|| value.get("quantization_config"))
+        .filter(|q| !q.is_null())
+    {
+        let method = q.get("quant_method").and_then(Value::as_str).unwrap_or("?");
+        let format = q.get("format").and_then(Value::as_str).unwrap_or("?");
+        missing.push(format!(
+            "pre-quantized weights ({method}, {format}); the converter reads BF16"
+        ));
+    }
+    if let Some(scaling) = text.get("rope_scaling").filter(|r| !r.is_null()) {
+        let kind = scaling
+            .get("type")
+            .or_else(|| scaling.get("rope_type"))
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        missing.push(format!("rope_scaling {kind}"));
+    }
+    let model_type = str_of("model_type").unwrap_or("(none)");
+    match Architecture::from_model_type(model_type) {
+        None => missing.push(format!("model_type {model_type}")),
+        Some(Architecture::DeepseekV3Mla) => {
+            for (key, want) in [
+                ("hidden_act", "silu"),
+                ("scoring_func", "sigmoid"),
+                ("topk_method", "noaux_tc"),
+            ] {
+                if str_of(key) != Some(want) {
+                    missing.push(format!("{key} {}", str_of(key).unwrap_or("(none)")));
+                }
+            }
+            let checks = [
+                ("attention_bias", Value::Bool(false)),
+                ("moe_layer_freq", Value::from(1)),
+                ("num_nextn_predict_layers", Value::from(0)),
+                ("tie_word_embeddings", Value::Bool(false)),
+                ("rope_interleave", Value::Bool(true)),
+            ];
+            for (key, allowed) in &checks {
+                if !absent_or(text, key, allowed) {
+                    missing.push(format!("{key} other than {allowed}"));
+                }
+            }
+        }
+        Some(Architecture::KimiLinear) => {
+            let linear = text.get("linear_attn_config");
+            let count = |key: &str| {
+                linear
+                    .and_then(|l| l.get(key))
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len)
+            };
+            let layers = text
+                .get("num_hidden_layers")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            missing.push(format!(
+                "Kimi Delta Attention in {} of {layers} layers (gated delta rule, short convolutions, recurrent state)",
+                count("kda_layers")
+            ));
+            let flag = |key: &str| text.get(key).and_then(Value::as_bool) == Some(true);
+            if flag("mla_use_nope") || flag("mla_use_output_gate") {
+                missing.push(format!(
+                    "MLA without RoPE and with a sigmoid output gate in {} layers",
+                    count("full_attn_layers")
+                ));
+            }
+            if let Some(act) = str_of("hidden_act").filter(|&a| a != "silu") {
+                missing.push(format!("the {act} activation"));
+            }
+            if let Some(width) = text
+                .get("routed_expert_hidden_size")
+                .and_then(Value::as_u64)
+            {
+                missing.push(format!(
+                    "latent MoE: routed experts on a {width}-wide projection of the hidden state"
+                ));
+            }
+            if let Some(block) = text.get("attn_res_block_size").and_then(Value::as_u64) {
+                missing.push(format!(
+                    "attention residuals over blocks of {block} layers (the residual stream carries a block stack)"
+                ));
+            }
+        }
+    }
+    missing
+}
+
 /// Parse and check a Hugging Face `config.json` (spec §2.1).
 pub fn parse_hf_config(bytes: &[u8], max_seq: usize) -> Result<HfMlaConfig, ModernError> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|e| ModernError::Invalid(format!("config.json: {e}")))?;
     let bad = |what: &str| ModernError::Invalid(format!("config.json: {what}"));
+    let missing = unsupported_features(&value);
+    if !missing.is_empty() {
+        return Err(bad(&format!("not supported: {}", missing.join("; "))));
+    }
     let size = |key: &str| -> Result<usize, ModernError> {
         value
             .get(key)
@@ -296,33 +488,10 @@ pub fn parse_hf_config(bytes: &[u8], max_seq: usize) -> Result<HfMlaConfig, Mode
             .and_then(|v| usize::try_from(v).ok())
             .ok_or_else(|| bad(&format!("{key} must be a non-negative integer")))
     };
-    let text = |key: &str| value.get(key).and_then(Value::as_str);
-    let architecture = text("model_type").ok_or_else(|| bad("model_type"))?;
-    if !matches!(architecture, "deepseek_v3" | "kimi_k2") {
-        return Err(bad(&format!("model_type {architecture} is not supported")));
-    }
-    if text("hidden_act") != Some("silu") {
-        return Err(bad("hidden_act must be silu"));
-    }
-    if text("scoring_func") != Some("sigmoid") {
-        return Err(bad("scoring_func must be sigmoid"));
-    }
-    if text("topk_method") != Some("noaux_tc") {
-        return Err(bad("topk_method must be noaux_tc"));
-    }
-    let checks = [
-        ("attention_bias", Value::Bool(false)),
-        ("moe_layer_freq", Value::from(1)),
-        ("num_nextn_predict_layers", Value::from(0)),
-        ("rope_scaling", Value::Null),
-        ("tie_word_embeddings", Value::Bool(false)),
-        ("rope_interleave", Value::Bool(true)),
-    ];
-    for (key, allowed) in &checks {
-        if !absent_or(&value, key, allowed) {
-            return Err(bad(&format!("{key} must be absent or {allowed}")));
-        }
-    }
+    let architecture = value
+        .get("model_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("model_type"))?;
     let n_heads = size("num_attention_heads")?;
     if let Some(kv) = value.get("num_key_value_heads")
         && kv.as_u64() != Some(n_heads as u64)
@@ -408,6 +577,7 @@ pub fn parse_hf_config(bytes: &[u8], max_seq: usize) -> Result<HfMlaConfig, Mode
         rms_eps_q32: eps_q32(eps)?,
         rope_theta: theta as u64,
         attention_lambda: attention_lambda(qk_nope_dim + qk_rope_dim),
+        expert_format: ExpertFormat::Int8Dyadic,
     };
     config.validate()?;
     Ok(HfMlaConfig { config, eos })
@@ -520,6 +690,54 @@ pub(crate) mod tests {
                 .q_lora_rank,
             1536
         );
+    }
+
+    /// Keys of Kimi-K2.6's `config.json` (revision
+    /// 7eb5002f6aadc958aed6a9177b7ed26bb94011bb) that decide support; the
+    /// quantisation block is cut to its method and format.
+    const KIMI_K26_KEYS: &str = r#"{"architectures": ["KimiK25ForConditionalGeneration"], "model_type": "kimi_k25", "text_config": {"model_type": "kimi_k2", "hidden_act": "silu", "scoring_func": "sigmoid", "topk_method": "noaux_tc", "attention_bias": false, "moe_layer_freq": 1, "num_nextn_predict_layers": 0, "tie_word_embeddings": false, "rope_scaling": {"beta_fast": 32.0, "beta_slow": 1.0, "factor": 64.0, "mscale": 1.0, "mscale_all_dim": 1.0, "original_max_position_embeddings": 4096, "type": "yarn"}, "num_hidden_layers": 61, "quantization_config": {"format": "pack-quantized", "quant_method": "compressed-tensors"}}}"#;
+
+    /// Keys of Kimi-K3's `config.json` (revision
+    /// f831ab66814297da540d832a5235f8e904f29d06), cut the same way.
+    const KIMI_K3_KEYS: &str = r#"{"architectures": ["KimiK3ForConditionalGeneration"], "model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear", "hidden_act": "situ", "num_hidden_layers": 93, "linear_attn_config": {"full_attn_layers": [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 93], "gate_lower_bound": -5.0, "head_dim": 128, "kda_layers": [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26, 27, 29, 30, 31, 33, 34, 35, 37, 38, 39, 41, 42, 43, 45, 46, 47, 49, 50, 51, 53, 54, 55, 57, 58, 59, 61, 62, 63, 65, 66, 67, 69, 70, 71, 73, 74, 75, 77, 78, 79, 81, 82, 83, 85, 86, 87, 89, 90, 91], "num_heads": 96, "short_conv_kernel_size": 4, "use_full_rank_gate": true}, "mla_use_nope": true, "mla_use_output_gate": true, "routed_expert_hidden_size": 3584, "attn_res_block_size": 12, "quantization_config": {"format": "mxfp4-pack-quantized", "quant_method": "compressed-tensors"}}}"#;
+
+    #[test]
+    fn kimi_k26_and_k3_refusals_list_every_missing_feature() {
+        let k26: Value = serde_json::from_str(KIMI_K26_KEYS).unwrap();
+        assert_eq!(
+            unsupported_features(&k26),
+            [
+                "a multimodal checkpoint: tensors under the language_model. prefix and a vision tower",
+                "pre-quantized weights (compressed-tensors, pack-quantized); the converter reads BF16",
+                "rope_scaling yarn",
+            ]
+        );
+        let k3: Value = serde_json::from_str(KIMI_K3_KEYS).unwrap();
+        assert_eq!(
+            unsupported_features(&k3),
+            [
+                "a multimodal checkpoint: tensors under the language_model. prefix and a vision tower",
+                "pre-quantized weights (compressed-tensors, mxfp4-pack-quantized); the converter reads BF16",
+                "Kimi Delta Attention in 69 of 93 layers (gated delta rule, short convolutions, recurrent state)",
+                "MLA without RoPE and with a sigmoid output gate in 24 layers",
+                "the situ activation",
+                "latent MoE: routed experts on a 3584-wide projection of the hidden state",
+                "attention residuals over blocks of 12 layers (the residual stream carries a block stack)",
+            ]
+        );
+        let err = parse_hf_config(KIMI_K3_KEYS.as_bytes(), 4096).unwrap_err();
+        assert!(err.to_string().contains("Kimi Delta Attention"), "{err}");
+        assert_eq!(
+            Architecture::from_model_type("kimi_k2"),
+            Some(Architecture::DeepseekV3Mla)
+        );
+        assert_eq!(
+            Architecture::from_model_type("kimi_linear"),
+            Some(Architecture::KimiLinear)
+        );
+        // Moonlight itself has nothing missing.
+        let moonlight: Value = serde_json::from_str(MOONLIGHT_CONFIG).unwrap();
+        assert!(unsupported_features(&moonlight).is_empty());
     }
 
     #[test]

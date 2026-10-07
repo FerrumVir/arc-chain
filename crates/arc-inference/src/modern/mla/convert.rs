@@ -14,11 +14,16 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use serde_json::{Value, json};
 
-use super::config::{MlaConfig, parse_hf_config};
-use super::ops::{bf16_to_q32, f32_to_q32, quantize_router_row};
-use super::package::{self, PackageDigest, SegmentDigest, StageSpec, StageWriter, i16_bytes};
+use super::config::{ExpertFormat, MlaConfig, parse_hf_config};
+use super::ops::{
+    Q4_GROUP, bf16_to_q32, f32_to_q32, pack_q4, quantize_q4_group, quantize_router_row,
+};
+use super::package::{
+    self, PackageDigest, SegmentDigest, StageSpec, StageWriter, i16_bytes, u16_bytes,
+};
 use crate::modern::arith::DyadicMatrix;
 use crate::modern::convert::{SourceManifest, bf16_to_q16, quantize_matrix, verify_source_file};
 use crate::modern::package::{i8_bytes, i32_bytes, i64_bytes};
@@ -325,6 +330,50 @@ fn write_stack(
     w.write_tensor(&format!("{name}.k"), &k)
 }
 
+/// A stack of `count` matrices quantised to INT4 with BF16 group-32 scales
+/// (spec §13.3) and written as one `[count, rows, cols]` INT4 stack.
+fn write_stack_q4(
+    w: &mut StageWriter,
+    t: &SourceTensors,
+    name: &str,
+    sources: &[String],
+    rows: usize,
+    cols: usize,
+) -> Result<(), ModernError> {
+    if !cols.is_multiple_of(Q4_GROUP) {
+        return Err(ModernError::Invalid(format!(
+            "{name}: {cols} inputs are not a multiple of the INT4 group"
+        )));
+    }
+    w.begin(&format!("{name}.q4"))?;
+    let mut scales: Vec<u16> = Vec::with_capacity(sources.len() * rows * cols / Q4_GROUP);
+    for source in sources {
+        let bits = t.bf16(source)?;
+        if bits.len() != rows * cols {
+            return Err(ModernError::Invalid(format!("{source}: shape")));
+        }
+        let quantised = bits
+            .par_chunks(cols)
+            .map(|row| -> Result<(Vec<u16>, Vec<u8>), ModernError> {
+                let mut q = vec![0i8; cols];
+                let mut row_scales = Vec::with_capacity(cols / Q4_GROUP);
+                for (group, out) in row.chunks_exact(Q4_GROUP).zip(q.chunks_exact_mut(Q4_GROUP)) {
+                    row_scales.push(quantize_q4_group(group, out)?);
+                }
+                Ok((row_scales, pack_q4(&q)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut packed = Vec::with_capacity(rows * cols / 2);
+        for (row_scales, row_packed) in quantised {
+            scales.extend_from_slice(&row_scales);
+            packed.extend_from_slice(&row_packed);
+        }
+        w.chunk(&packed)?;
+    }
+    w.end()?;
+    w.write_tensor(&format!("{name}.s"), &u16_bytes(&scales))
+}
+
 fn convert_layer(
     w: &mut StageWriter,
     t: &SourceTensors,
@@ -446,7 +495,11 @@ fn convert_layer(
             let sources: Vec<String> = (0..e)
                 .map(|expert| format!("{hf}.mlp.experts.{expert}.{hf_name}.weight"))
                 .collect();
-            write_stack(w, t, &format!("{p}.experts.{name}"), &sources, rows, cols)?;
+            let tensor = format!("{p}.experts.{name}");
+            match c.expert_format {
+                ExpertFormat::Int8Dyadic => write_stack(w, t, &tensor, &sources, rows, cols)?,
+                ExpertFormat::Int4G32 => write_stack_q4(w, t, &tensor, &sources, rows, cols)?,
+            }
         }
     } else {
         let f = c.d_ff;
@@ -496,6 +549,7 @@ impl ConversionReport {
         let segments: Vec<Value> = self.segments.iter().map(SegmentDigest::to_json).collect();
         json!({
             "package": self.digest.to_json(),
+            "profile": self.config.profile(),
             "stage": self.stage.to_json(),
             "segments": segments,
             "model_root": self.manifest.as_ref().and_then(|m| m.get("model_root").cloned()),
@@ -507,11 +561,13 @@ impl ConversionReport {
 }
 
 /// Convert layer range `stage` (the whole model when `None`) of the pinned
-/// BF16 source in `dir` to the stage package `out`.
+/// BF16 source in `dir` to the stage package `out`, with the routed experts
+/// in `experts` format.
 pub fn convert_stage(
     dir: &Path,
     source: &SourceManifest,
     stage: Option<StageSpec>,
+    experts: ExpertFormat,
     out: &Path,
 ) -> Result<ConversionReport, ModernError> {
     let start = Instant::now();
@@ -524,7 +580,9 @@ pub fn convert_stage(
     let config_bytes =
         std::fs::read(&config_path).map_err(|e| ModernError::io("config.json", e))?;
     let hf = parse_hf_config(&config_bytes, source.max_seq)?;
-    let c = hf.config.clone();
+    let mut c = hf.config.clone();
+    c.expert_format = experts;
+    c.validate()?;
     let full = StageSpec::full(&c);
     let stage = stage.unwrap_or(full);
     stage.validate(&c)?;

@@ -15,10 +15,10 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use super::boundary::activation_hash;
-use super::config::MlaConfig;
+use super::config::{ExpertFormat, MlaConfig};
 use super::ops::{
-    LatentCache, QView, combine, gated_ffn, mla_attend, rope_interleaved, router_logits,
-    routing_weights, select_experts, selection_keys,
+    LatentCache, Q4_GROUP, Q4View, QView, combine, gated_ffn, mla_attend, rope_interleaved,
+    router_logits, routing_weights, select_experts, selection_keys,
 };
 use super::package::{self, StageHeader, StageSpec};
 use crate::modern::ModernError;
@@ -75,6 +75,36 @@ impl MatRef {
     }
 }
 
+/// A stack of INT4 group-32 matrices whose packed values stay in the
+/// package bytes (spec §13).
+#[derive(Debug, Clone)]
+struct Q4Ref {
+    rows: usize,
+    cols: usize,
+    q4: Range<usize>,
+    scales: Vec<u16>,
+}
+
+impl Q4Ref {
+    fn view<'a>(&'a self, bytes: &'a [u8], index: usize) -> Q4View<'a> {
+        let size = self.rows * self.cols / 2;
+        let groups = self.rows * self.cols / Q4_GROUP;
+        let start = self.q4.start + index * size;
+        Q4View {
+            rows: self.rows,
+            cols: self.cols,
+            q4: &bytes[start..start + size],
+            scales: &self.scales[index * groups..(index + 1) * groups],
+        }
+    }
+}
+
+/// gate, up and down stacks of the routed experts.
+enum ExpertStacks {
+    Int8([MatRef; 3]),
+    Int4([Q4Ref; 3]),
+}
+
 enum QueryProjection {
     Direct(MatRef),
     Lora {
@@ -91,7 +121,7 @@ struct MoeWeights {
     /// gate, up, down of the shared experts.
     shared: [MatRef; 3],
     /// gate, up, down stacks of the routed experts.
-    experts: [MatRef; 3],
+    experts: ExpertStacks,
 }
 
 enum FfnWeights {
@@ -149,6 +179,42 @@ impl Loader<'_> {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
+    }
+
+    fn u16s(&self, name: &str) -> Result<Vec<u16>, ModernError> {
+        Ok(self
+            .bytes(name)?
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect())
+    }
+
+    /// An INT4 group-32 stack; refuses negative, infinite or NaN scales
+    /// (spec §13.1).
+    fn q4(&self, name: &str, count: usize, rows: usize, cols: usize) -> Result<Q4Ref, ModernError> {
+        let entry = self.header.entry(&format!("{name}.q4"))?;
+        let q4 = self.header.range(entry);
+        let scales = self.u16s(&format!("{name}.s"))?;
+        if !cols.is_multiple_of(Q4_GROUP)
+            || q4.len() != count * rows * cols / 2
+            || scales.len() != count * rows * cols / Q4_GROUP
+        {
+            return Err(invalid(format!("{name}: inconsistent INT4 stack shape")));
+        }
+        if let Some(bad) = scales
+            .iter()
+            .find(|&&s| s >> 15 == 1 || (s >> 7) & 0xFF == 0xFF)
+        {
+            return Err(invalid(format!(
+                "{name}: group scale {bad:#06x} is negative, infinite or NaN"
+            )));
+        }
+        Ok(Q4Ref {
+            rows,
+            cols,
+            q4,
+            scales,
+        })
     }
 
     fn i16s(&self, name: &str) -> Result<Vec<i16>, ModernError> {
@@ -237,11 +303,18 @@ impl Loader<'_> {
                     self.mat(&format!("{p}.shared.w_up"), 1, sf, d)?,
                     self.mat(&format!("{p}.shared.w_down"), 1, d, sf)?,
                 ],
-                experts: [
-                    self.mat(&format!("{p}.experts.w_gate"), e, fm, d)?,
-                    self.mat(&format!("{p}.experts.w_up"), e, fm, d)?,
-                    self.mat(&format!("{p}.experts.w_down"), e, d, fm)?,
-                ],
+                experts: match c.expert_format {
+                    ExpertFormat::Int8Dyadic => ExpertStacks::Int8([
+                        self.mat(&format!("{p}.experts.w_gate"), e, fm, d)?,
+                        self.mat(&format!("{p}.experts.w_up"), e, fm, d)?,
+                        self.mat(&format!("{p}.experts.w_down"), e, d, fm)?,
+                    ]),
+                    ExpertFormat::Int4G32 => ExpertStacks::Int4([
+                        self.q4(&format!("{p}.experts.w_gate"), e, fm, d)?,
+                        self.q4(&format!("{p}.experts.w_up"), e, fm, d)?,
+                        self.q4(&format!("{p}.experts.w_down"), e, d, fm)?,
+                    ]),
+                },
             }))
         } else {
             FfnWeights::Dense(Box::new([
@@ -647,13 +720,18 @@ impl StageModel {
         let chosen = select_experts(&keys, c.n_experts_per_tok, c.n_group, c.topk_group)?;
         let chosen_sigma: Vec<i64> = chosen.iter().map(|&e| sigma[e]).collect();
         let weights = routing_weights(&chosen_sigma, c.routed_scaling_q32, c.norm_topk_prob);
-        let [gate, up, down] = &m.experts;
         // Experts run one after another for the same reason as heads: their
         // projections are parallel over rows.
-        let outputs = chosen
-            .iter()
-            .map(|&e| gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x))
-            .collect::<Result<Vec<_>, _>>()?;
+        let outputs = match &m.experts {
+            ExpertStacks::Int8([gate, up, down]) => chosen
+                .iter()
+                .map(|&e| gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x))
+                .collect::<Result<Vec<_>, _>>()?,
+            ExpertStacks::Int4([gate, up, down]) => chosen
+                .iter()
+                .map(|&e| gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         let [s_gate, s_up, s_down] = &m.shared;
         let shared = gated_ffn(
             s_gate.view(data, 0),
@@ -820,6 +898,11 @@ pub(crate) mod tests {
     /// A tiny configuration exercising query LoRA (when `lora`), group
     /// routing, a dense first layer and shared experts.
     pub(crate) fn tiny_config(lora: bool) -> MlaConfig {
+        tiny_config_with(lora, ExpertFormat::Int8Dyadic)
+    }
+
+    /// The tiny configuration with the routed experts in `format`.
+    pub(crate) fn tiny_config_with(lora: bool, format: ExpertFormat) -> MlaConfig {
         MlaConfig {
             architecture: "deepseek_v3".into(),
             n_layers: 4,
@@ -835,7 +918,7 @@ pub(crate) mod tests {
             n_routed_experts: 8,
             n_experts_per_tok: 3,
             n_shared_experts: 2,
-            moe_d_ff: 12,
+            moe_d_ff: 32,
             n_group: if lora { 4 } else { 1 },
             topk_group: if lora { 2 } else { 1 },
             norm_topk_prob: true,
@@ -845,6 +928,7 @@ pub(crate) mod tests {
             rms_eps_q32: 42_950,
             rope_theta: 50_000,
             attention_lambda: crate::modern::tables::attention_lambda(12),
+            expert_format: format,
         }
     }
 
@@ -876,6 +960,15 @@ pub(crate) mod tests {
                 crate::modern::package::i32_bytes(&cos)
             } else if e.name == "rope.sin" {
                 crate::modern::package::i32_bytes(&sin)
+            } else if e.name.ends_with(".q4") {
+                // Any nibble is a valid INT4 value.
+                (0..count).map(|_| rng.next() as u8).collect()
+            } else if e.name.ends_with(".s") {
+                // Positive BF16 group scales near 2^-11.
+                let values: Vec<u16> = (0..count)
+                    .map(|_| ((114 + rng.next() % 3) << 7 | rng.next() % 128) as u16)
+                    .collect();
+                super::super::package::u16_bytes(&values)
             } else if e.name.ends_with(".q") && e.dtype == package::Dtype::I8 {
                 (0..count)
                     .map(|_| ((rng.next() % 255) as i64 - 127) as i8 as u8)
@@ -920,6 +1013,14 @@ pub(crate) mod tests {
     /// Per-sequence boundary digests, logits hashes and re-derived tokens.
     type Reference = (Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<u32>);
 
+    /// Query LoRA off/on with INT8 and with INT4 group-32 experts.
+    const FORMATS: [(bool, ExpertFormat); 4] = [
+        (false, ExpertFormat::Int8Dyadic),
+        (true, ExpertFormat::Int8Dyadic),
+        (false, ExpertFormat::Int4G32),
+        (true, ExpertFormat::Int4G32),
+    ];
+
     fn sequences() -> Vec<(Vec<u32>, usize)> {
         vec![
             (vec![3, 17, 5, 49, 0, 22, 8], 3),
@@ -930,8 +1031,8 @@ pub(crate) mod tests {
 
     #[test]
     fn forward_is_identical_across_thread_counts_and_kernels() {
-        for lora in [false, true] {
-            let c = tiny_config(lora);
+        for (lora, format) in FORMATS {
+            let c = tiny_config_with(lora, format);
             let model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
             let run = |threads: usize| {
                 let pool = rayon::ThreadPoolBuilder::new()
@@ -956,7 +1057,7 @@ pub(crate) mod tests {
             crate::canonical_simd::set_fast_canonical_kernel(true);
             let simd = run(2);
             crate::canonical_simd::set_fast_canonical_kernel(false);
-            assert_eq!(one, simd, "lora = {lora}");
+            assert_eq!(one, simd, "lora = {lora}, {format:?}");
         }
     }
 
@@ -965,8 +1066,8 @@ pub(crate) mod tests {
     /// previous stage: identical boundaries, logits hashes and tokens.
     #[test]
     fn pipeline_layouts_are_byte_identical() {
-        for lora in [false, true] {
-            let c = tiny_config(lora);
+        for (lora, format) in FORMATS {
+            let c = tiny_config_with(lora, format);
             let full = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
             // Reference: per-boundary digests from the single-stage generation path.
             let reference: Vec<Reference> = sequences()
@@ -1009,6 +1110,7 @@ pub(crate) mod tests {
                     };
                     let model = StageModel::from_owned(tiny_package(&c, stage)).unwrap();
                     let mut next = Boundary {
+                        profile: c.profile().into(),
                         layer: pair[1],
                         d_model: c.d_model,
                         model_root: "00".repeat(32),
@@ -1120,7 +1222,9 @@ pub(crate) mod tests {
             c.routed_scaling_q32,
             c.norm_topk_prob,
         );
-        let [gate, up, down] = &moe.experts;
+        let ExpertStacks::Int8([gate, up, down]) = &moe.experts else {
+            panic!("the INT8 tiny model has INT8 experts");
+        };
         let device = |experts: &[(usize, i64)]| -> Vec<i128> {
             let mut partial = vec![0i128; c.d_model];
             for &(e, w) in experts {

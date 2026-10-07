@@ -34,6 +34,8 @@ pub mod package;
 
 /// Arithmetic profile implemented by this module.
 pub const PROFILE: &str = "arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1";
+/// The variant with INT4 group-32 routed experts (spec §13).
+pub const PROFILE_I4G32: &str = "arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.i4g32-experts.q16.v1";
 /// Stage package schema.
 pub const STAGE_PACKAGE_SCHEMA: &str = "arc.integer-stage-package.v1";
 /// Stage manifest schema.
@@ -59,6 +61,10 @@ mod tests {
         assert_eq!(
             identity_blake3(PROFILE),
             "7b0bd25616bd29195da71bb0b02d3c436350e801811280def1bb29c22d75207e"
+        );
+        assert_eq!(
+            identity_blake3(PROFILE_I4G32),
+            "5e6d6392186d817e57806184b1193ea1648805bb82cf7749f9d563306237e71c"
         );
         assert_eq!(
             identity_blake3(super::super::tiktoken::TOKENIZER_IDENTITY),

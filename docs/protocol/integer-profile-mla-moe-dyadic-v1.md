@@ -45,6 +45,7 @@ each other in CI:
 | Stage manifest schema | `arc.integer-stage-manifest.v1` | |
 | Boundary file schema | `arc.stage-boundary.v1` | |
 | Tokenizer | `arc.tiktoken-bpe.v1` + SHA-256 of `tiktoken.model` | `9506a8dc9c7806eae5eb7427be6056cb541ebbfcf1e9921915ce839e9d8a50c9` |
+| Variant: INT4 group-32 routed experts (§13) | `arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.i4g32-experts.q16.v1` | `5e6d6392186d817e57806184b1193ea1648805bb82cf7749f9d563306237e71c` |
 
 The generation semantics are the dyadic v1 ones unchanged. They define
 selection, stop rule and digests, and do not depend on the model.
@@ -94,6 +95,14 @@ The converter reads `config.json` and refuses anything outside the following:
 
 Other keys (dropout, auxiliary-loss settings, `ep_size`, `pretraining_tp`)
 do not affect inference and are ignored.
+
+The check is driven by the configuration. When the file wraps the language
+model in a `text_config` object (Kimi K2.5, K2.6 and K3 do), the converter reads
+that object. It recognises the family from the text model's `model_type`:
+DeepSeek-V3 MLA (`deepseek_v3`, `kimi_k2`) or Kimi Linear (`kimi_linear`, which
+Kimi K3 uses). It then refuses with the full list of unsupported features rather
+than the first one. Today the list for Kimi-K2.6 is the multimodal wrapper, the
+pre-quantised INT4 experts and YaRN. The list for Kimi K3 is in §11.2.
 
 ### 2.2 The `model` object
 
@@ -599,7 +608,9 @@ An implementation refuses (never wraps) when any of the following fails:
 - token ids are `< V`, positions are `< S`, and boundary files match their
   header digests and the stage's `model_root` and layer.
 
-## 11. Differences from Kimi K2.6 and what v1 does not cover
+## 11. Differences from Kimi K2.6 and K3, and what v1 does not cover
+
+### 11.1 Kimi K2.6
 
 | K2.6 feature | Status in v1 |
 |---|---|
@@ -607,9 +618,38 @@ An implementation refuses (never wraps) when any of the following fails:
 | 384 experts, top-8, 1 shared expert, group settings | General code paths. Tiny models exercise E = 8 / 16, k = 3 / 4, Es = 2 / 1, and G = 4 with Gk = 2. |
 | F32 correction bias | Implemented (§4.4) and tested on tiny models. |
 | YaRN RoPE (factor 64, β_fast 32, β_slow 1, mscale 1 / 1) | **Not in v1.** The converter refuses `rope_scaling`. YaRN changes only preparation: the frequencies `ω_i` and `λ` (by `mscale² = (0.1·ln 64 + 1)²`). The forward pass reads both from the package, so YaRN needs a new profile version, not new operators. |
-| Routed experts stored as INT4 group-32 symmetric (`weight_packed`, BF16 `weight_scale`) | **Not in v1** (BF16 sources only). Each INT4 value times its BF16 group scale is an exact dyadic rational, so a lossless integer form exists. It needs an INT4-group operator and a new identity. |
+| Routed experts stored as INT4 group-32 symmetric (`weight_packed`, BF16 `weight_scale`) | The **§13 variant** defines the exact integer form: INT4 values with their BF16 group scales, no requantisation. It is implemented with a quantiser for BF16 sources and checked on Moonlight. Reading K2.6's packed int32 words into the §13 layout is a lossless repacking that this PR does not implement. |
 | `language_model.` tensor prefix, MoonViT vision tower | Not handled. The vision tower is unused for text. |
 | `num_nextn_predict_layers = 0` | Same as Moonlight; MTP layers are refused. |
+
+### 11.2 Kimi K3 (Kimi Linear architecture)
+
+Kimi K3 was read from `moonshotai/Kimi-K3` at revision
+`f831ab66814297da540d832a5235f8e904f29d06`: its `config.json`,
+`modeling_kimi_linear.py` and its safetensors index. Its text model is
+`kimi_linear`, not DeepSeek-V3. The converter recognises it and refuses it,
+listing the features below. Supporting K3 needs a new profile with its own
+`model` object. The stage package container, the segment digests and model root,
+the boundary file (§6), the router (§5.5–§5.7) and the INT4 group format (§13)
+carry over unchanged.
+
+| K3 feature (config value) | What an integer profile needs |
+|---|---|
+| Kimi Delta Attention in 69 of 93 layers (`kda_layers`; the lists are 1-based) | A gated delta rule per head (96 heads of 128): a recurrent 128 × 128 state per head, L2-normalised q and k, a sigmoid β, a per-channel decay gate bounded below by `gate_lower_bound = −5`, 4-tap short convolutions on q, k and v, and a sigmoid-gated RMSNorm on the output. The recurrent order is the only one that is exactly reproducible, so it would be normative. Parallel prefill then comes from heads and channels, not from chunking time. |
+| MLA in the other 24 layers, without RoPE and with a sigmoid output gate (`mla_use_nope`, `mla_use_output_gate`) | The §5.3 attention with the 64 decoupled dimensions left unrotated, plus one projection and a sigmoid (exp table) per output. |
+| The `situ` activation: `β·tanh(g/β)·σ(g) · β′·tanh(u/β′)` with β = 4, β′ = 25 | Exact tanh and sigmoid tables over bounded domains, built like the exp table (§4.5). |
+| Latent MoE (`routed_expert_hidden_size = 3584`): the routed experts run on a down-projection of the hidden state, followed by RMSNorm and an up-projection | Two dyadic projections and one RMSNorm (existing operators). The router stays on the full hidden state. |
+| 896 routed experts, top-16, 2 shared, sigmoid router with correction bias, `n_group = 1` | Covered by §5.5–§5.7, with different key names in `config.json`. |
+| Attention residuals (`attn_res_block_size = 12`): each layer softmax-mixes a stack of earlier block outputs | An exact RMS-normalised score and softmax over at most 9 vectors per position (existing operators). Stage boundaries must carry the block stack, not one hidden vector: up to 9 × 7168 values per position instead of 7168. |
+| Routed experts as MXFP4 (E2M1 values, one power-of-two scale per 32) | Lossless: 2 × an E2M1 value is an integer in [−12, 12], and power-of-two scales make the §13 exact sum simpler. A reader for the packed format is needed. |
+| Multimodal wrapper and vision tower | The same as for K2.6: read the `language_model.` prefix; the vision tower is unused for text. |
+
+Sizes, from the safetensors index and the Hub's parameter count at that
+revision: 2,779,931,837,184 parameters, of which 2,722,740,830,208 are routed
+expert weights; 1,560,860,324,864 bytes on disk. Holding the experts at 4.25 bits
+(MXFP4 with its scales) and the other 57.2 billion weights at INT8 takes about
+1.50 TB. A KDA layer's state is a fixed 1,572,864 values per sequence, whatever
+the context length; only the 24 MLA layers keep a per-token cache.
 
 ## 12. Conformance evidence
 
@@ -626,11 +666,80 @@ An implementation refuses (never wraps) when any of the following fails:
   - the logits;
   - the boundary digests;
   - the re-derived tokens.
-- CI runs the hash matrix on ubuntu x86-64, windows x86-64, macOS arm64 and
-  macOS x86-64, with scalar and SIMD kernels:
-  - tiny models: the whole pipeline;
-  - Moonlight: a two-layer + LM-head stage slice, replayed from the boundary
-    committed by the Linux run.
-- Perplexity is measured against the BF16 weights on public-domain text.
+- CI runs the hash matrix with scalar and SIMD kernels on ubuntu x86-64,
+  ubuntu arm64 and windows x86-64. The macOS legs wait until macOS runners are
+  free again; the workflow has no macOS job yet.
+  - Tiny models run the whole pipeline.
+  - Moonlight runs a two-layer + LM-head stage slice, replayed from the
+    boundary committed by the Linux run.
+- The §13 INT4 variant gets the same checks:
+  - tiny models in both shapes run every check above;
+  - Moonlight gets the Rust–Python package equality, scalar = SIMD golden
+    generation, 1 and 4 stages, and a verifier slice replayed on every runner;
+  - the quantiser is checked against a literal rational implementation of
+    §13.3.
+- Perplexity is measured against the BF16 weights on public-domain text, for
+  both expert formats.
 - The tokenizer is checked against the `tiktoken` library with the pinned
   `tiktoken.model`, and the chat prompt against `jinja2`.
+
+## 13. Variant: INT4 group-32 routed experts
+
+This variant is identified by `arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.i4g32-experts.q16.v1`.
+Everything is as above except the routed experts. Their three stacked matrices
+are stored as signed 4-bit values with one BF16 scale per group of 32 inputs.
+That is the representation Kimi-K2.6 ships its experts in: 98.9% of its
+parameters, about 0.56 bytes per parameter, 582 GB in total instead of 1,028 GB.
+
+### 13.1 Format
+
+For each `layers.l.experts.{w_gate, w_up, w_down}` of shape `[E, r, c]` (where
+`c` is a multiple of 32), the stage package stores two tensors in place of
+`.q`, `.mu` and `.k`:
+
+| Tensor | Format | Contents |
+|---|---|---|
+| `X.q4` | u8 `[E, r, c/2]` | Value `j` of a row is the low nibble of byte `j/2` for even `j` and the high nibble for odd `j`. Each nibble is a two's-complement integer in `[−8, 7]`. |
+| `X.s` | u16 `[E, r, c/32]` | BF16 bit patterns of the group scales. The sign bit must be 0, and infinity and NaN are refused. |
+
+The weight is exactly `q · s` for its group's scale `s`. The other segments, the
+layout order and the container are unchanged. The `model` object is unchanged
+too; the header's `profile` names the variant.
+
+### 13.2 Projection
+
+For one row with values `q_j` and scales `s_g` (dyadic v1 §4.1 parts
+`(0, M_g, e_g)`), and input `x` (Q16):
+
+```text
+acc_g = Σ_{j in group g} q_j·x_j                     (exact)
+E     = max{e_g : M_g > 0}                          (y = 0 if every M_g = 0)
+S     = Σ_{g : M_g > 0, e_g ≥ E − 40} M_g·acc_g·2^(e_g − E + 40)   (exact)
+y     = ⌊S·2^(E − 40)⌋                               (arithmetic shift)
+```
+
+The precondition is `8·Σ|x| < 2^63`, and `|y| ≤ 2^62`.
+- This is the exact value `Σ_g s_g·acc_g`, rounded down once.
+- A group whose scale is more than 40 binades below the row's largest scale
+  contributes 0. This bound keeps the sum within 127 bits; real checkpoints
+  are nowhere near it.
+- Every term is exact, so splitting rows, groups or experts across threads or
+  devices cannot change `y`.
+
+### 13.3 Quantising BF16 experts (development models)
+
+For each group of 32 BF16 values `w_j`, with `A = max |w_j|`:
+1. **Zero group.** If `A = 0`, then `s = +0` and every `q_j = 0`.
+2. **Scale.** Otherwise `s` is `A/7` rounded to 8 significant bits, half away
+   from zero:
+   - choose the integer `f` with `128 ≤ A/(7·2^f) < 256`;
+   - `m = rha(A/(7·2^f))`;
+   - if `m = 256`, set `m = 128` and increase `f` by 1;
+   - `s = m·2^f`, encoded as a normal BF16 with exponent field `f + 134`. A
+     field outside `[1, 254]` is refused.
+3. **Values.** `q_j = clamp(rha(w_j / s), −8, 7)`, computed exactly from the
+   BF16 parts. When `w_j/s` is below `2^−40` in magnitude, `q_j = 0`.
+
+This gives `|q_j| ≤ 7`. The value −8 occurs only in checkpoints quantised
+elsewhere (such as Kimi-K2.6's `weight_packed`), which the format accepts as
+published.
