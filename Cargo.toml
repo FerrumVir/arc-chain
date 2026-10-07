@@ -19,6 +19,7 @@ members = [
     "crates/arc-channel",
     "crates/arc-inference",
     "crates/arc-olm",
+    "crates/arc-island",
     "agents",
     "relayer",
 ]
