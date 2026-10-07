@@ -9,6 +9,7 @@
 //! operator known-answer self-test ([`kat`]). [`cli`] implements the
 //! `arc-modern golden --gpu`, `gpu-info` and `gpu-check` commands.
 
+pub mod backend;
 pub mod cli;
 pub mod kat;
 
@@ -35,9 +36,40 @@ pub fn gpu_error(error: GpuModernError) -> ModernError {
     }
 }
 
+/// Graphics APIs the Proof Kit's `runs[].adapter.backend` accepts.
+pub const PROOF_GPU_APIS: [&str; 4] = ["vulkan", "metal", "dx12", "gl"];
+/// Longest Proof Kit label, and the punctuation it may hold besides letters
+/// and digits (`arc.proof-result.v1`).
+const PROOF_LABEL_MAX: usize = 64;
+const PROOF_LABEL_PUNCTUATION: &str = " ()@.,+/_-";
+
+/// A name reduced to a Proof Kit label: other characters become spaces,
+/// whitespace runs collapse, it starts with a letter or digit and holds at
+/// most 64 bytes; `null` when nothing is left.
+fn proof_label(raw: &str) -> Value {
+    let mapped: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || PROOF_LABEL_PUNCTUATION.contains(c) {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let joined = mapped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(start) = joined.find(|c: char| c.is_ascii_alphanumeric()) else {
+        return Value::Null;
+    };
+    let mut label = joined[start..].to_string();
+    label.truncate(PROOF_LABEL_MAX);
+    Value::from(label.trim_end())
+}
+
 /// The adapter as the Proof Kit's `runs[].adapter` reports it
-/// (`arc.proof-result.v1`): `{vendor, device, backend, driver}` with the
-/// vendor and backend in lower case (`vulkan`, `metal`, `dx12`, `gl`).
+/// (`arc.proof-result.v1`): `{vendor, device, backend, driver}`, each a
+/// label or `null`, with the vendor and backend in lower case and the backend
+/// one of [`PROOF_GPU_APIS`].
 pub fn adapter_json(report: &AdapterReport) -> Value {
     let driver = [report.driver.as_str(), report.driver_info.as_str()]
         .iter()
@@ -45,11 +77,16 @@ pub fn adapter_json(report: &AdapterReport) -> Value {
         .copied()
         .collect::<Vec<_>>()
         .join(" ");
+    let backend = report.backend.to_lowercase();
     json!({
-        "vendor": report.vendor.to_lowercase(),
-        "device": report.name,
-        "backend": report.backend.to_lowercase(),
-        "driver": driver,
+        "vendor": proof_label(&report.vendor.to_lowercase()),
+        "device": proof_label(&report.name),
+        "backend": if PROOF_GPU_APIS.contains(&backend.as_str()) {
+            Value::from(backend)
+        } else {
+            Value::Null
+        },
+        "driver": proof_label(&driver),
     })
 }
 
@@ -543,6 +580,31 @@ mod tests {
                 "driver": "llvmpipe Mesa 25.2.8",
             })
         );
+        // Metal reports no driver: `null`, never an empty label. Names keep
+        // only the Proof Kit's label characters; an API the kit does not
+        // list is `null`.
+        let metal = AdapterReport {
+            name: "Apple M2 Ultra".into(),
+            vendor: "Apple".into(),
+            backend: "Metal".into(),
+            driver: String::new(),
+            driver_info: String::new(),
+            ..report.clone()
+        };
+        assert_eq!(
+            adapter_json(&metal),
+            json!({"vendor": "apple", "device": "Apple M2 Ultra", "backend": "metal", "driver": null})
+        );
+        let odd = AdapterReport {
+            name: "  ~Radeon™ RX 7900 XTX\u{7}".into(),
+            backend: "BrowserWebGpu".into(),
+            driver: "x".repeat(80),
+            ..report
+        };
+        let value = adapter_json(&odd);
+        assert_eq!(value["device"], "Radeon RX 7900 XTX");
+        assert_eq!(value["backend"], Value::Null);
+        assert_eq!(value["driver"].as_str().unwrap().len(), 64);
     }
 
     #[test]
