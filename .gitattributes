@@ -12,3 +12,6 @@ vendor/third_party/glib-0.18.5/** text eol=lf
 vendor/third_party/glib-0.18.5/LICENSE whitespace=-blank-at-eof
 vendor/shared-buffer/** text eol=lf
 vendor/wasmer-compiler/** text eol=lf
+
+# Preserve immutable reference source/config hashes on all platforms.
+scripts/arc_quality/layer_probe/reference/* -text

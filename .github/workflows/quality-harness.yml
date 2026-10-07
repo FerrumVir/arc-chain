@@ -19,7 +19,8 @@ name: Quality harness (ARC vs reference)
 #
 # Nothing here changes an engine, a digest or any network binding. Only
 # ubuntu-latest runners are used (macOS runners are scarce and shared with
-# the release), and the multi-gigabyte jobs need the label.
+# the release). Multi-gigabyte jobs require an explicit quality-proof labeling
+# event; an already-present label does not fetch model weights on every push.
 
 on:
   pull_request:
@@ -27,6 +28,7 @@ on:
     types: [opened, synchronize, reopened, labeled]
     paths:
       - 'scripts/arc_quality/**'
+      - 'tools/quality-layer-probe/**'
       - 'docs/quality/**'
       - '.github/workflows/quality-harness.yml'
 
@@ -80,11 +82,55 @@ jobs:
           python -m arc_quality reference openai --base-url http://127.0.0.1:9 --model none \
             --items "$RUNNER_TEMP/full-items.jsonl" --price-in-per-mtok 0 --price-out-per-mtok 0 --dry-run
 
+  layer-fixture:
+    name: offline original-layer reference (CPU x86)
+    if: github.event.action != 'labeled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: b0673684a8c16f83b318fe1a33ab6b33f3dc79df
+          path: reviewed-engine
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Dependency setup only (no model downloads)
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.9.1'
+          python -m pip install 'numpy==2.2.6' 'safetensors==0.5.3' 'blake3==1.0.10'
+      - name: Build pinned engine and isolated diagnostic
+        run: |
+          cargo build --locked --manifest-path reviewed-engine/Cargo.toml -p arc-inference --bin arc-mla
+          cargo build --locked --manifest-path tools/quality-layer-probe/Cargo.toml
+      - name: Execute both paths, compare raw outputs and test rejection
+        env:
+          PYTHONPATH: scripts
+          ARC_LAYER_FIXTURE: ${{ runner.temp }}/layer-fixture
+          ARC_LAYER_DIAGNOSTIC: ${{ github.workspace }}/tools/quality-layer-probe/target/debug/arc-quality-layer-probe
+        run: |
+          python -m arc_quality.layer_probe.run --engine-source reviewed-engine \
+            --arc-mla reviewed-engine/target/debug/arc-mla --diagnostic "$ARC_LAYER_DIAGNOSTIC" \
+            --out "$ARC_LAYER_FIXTURE"
+          python -m unittest arc_quality.layer_probe.test_comparison -v
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: offline-original-layer-reference
+          path: ${{ runner.temp }}/layer-fixture/
+          if-no-files-found: error
+
   proof:
     name: SmolLM3-3B shard ${{ matrix.shard }} (ARC vs BF16)
     if: >-
-      contains(github.event.pull_request.labels.*.name, 'quality-proof') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'quality-proof')
+      github.event.action == 'labeled' && github.event.label.name == 'quality-proof'
     runs-on: ubuntu-latest
     timeout-minutes: 175
     strategy:
@@ -174,8 +220,7 @@ jobs:
   logit:
     name: SmolLM3-3B perplexity vs BF16 (logit track)
     if: >-
-      contains(github.event.pull_request.labels.*.name, 'quality-proof') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'quality-proof')
+      github.event.action == 'labeled' && github.event.label.name == 'quality-proof'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:

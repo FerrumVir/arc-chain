@@ -8,10 +8,11 @@ items that stays inside a tolerance fixed *before* the run.
 
 **Status**
 - The harness is runnable today on SmolLM3-3B (CI, label `quality-proof`).
-- It is ready for Kimi once ENG-5 (MLA + MoE engine, PR #156) and ENG-10
-  (K2.6 integer slices) land. A Kimi run also needs a reference, and every
-  Kimi reference option costs money (see "Kimi" below). Nothing has been
-  spent.
+- Full Kimi evaluation remains dependent on engine integration, admitted real
+  weights and a matching reference. The offline one-layer synthetic prerequisite
+  now executes pinned ARC and official PyTorch code without model downloads or
+  API calls; see [kimi-layer-reference.md](kimi-layer-reference.md). It does not
+  establish real Kimi quality. No paid reference calls were made.
 - The tolerance policy is a **proposal awaiting TJ's approval**
   (`scripts/arc_quality/policy.json`, `"status": "PROPOSED"`).
 
@@ -306,3 +307,11 @@ No endpoint was called to test these guards; regression tests mock transport.
 - **Few-shot or chain-of-thought MMLU-Pro** (the vendor protocol) was not
   used. Zero-shot letter answers keep each item to a few hundred tokens,
   which a CPU CI runner can afford.
+
+## Offline original-layer prerequisite
+
+The executable synthetic one-layer comparison and retained official reference
+are documented in [kimi-layer-reference.md](kimi-layer-reference.md). It exports
+actual activations/logits from pinned ARC and PyTorch implementations, remains
+non-certifying, and requires no model download or API call. Real-weight execution
+still requires disk/RAM admission and retained original source shards.
