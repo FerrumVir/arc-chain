@@ -1,0 +1,43 @@
+{
+  "schema": "arc.quality-datasets.v1",
+  "note": "Public benchmark files, pinned by Hugging Face dataset revision, byte length and SHA-256. fetch-data refuses any file that differs. ARC hosts nothing; the toolcall set is ARC-authored and lives in this directory.",
+  "url_template": "https://huggingface.co/datasets/{repo}/resolve/{revision}/{path}",
+  "datasets": {
+    "mmlu_pro": {
+      "repo": "TIGER-Lab/MMLU-Pro",
+      "revision": "b189ec765aa7ed75c8acfea42df31fdae71f97be",
+      "license": "MIT",
+      "path": "data/test-00000-of-00001.parquet",
+      "bytes": 4144185,
+      "sha256": "0e24a191921c2f453518a537a8b2117bd137e7714d4ef1565e9ba06c1ecb9ad8",
+      "rows": 12032
+    },
+    "gsm8k": {
+      "repo": "openai/gsm8k",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "license": "MIT",
+      "path": "main/test-00000-of-00001.parquet",
+      "bytes": 419088,
+      "sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59",
+      "rows": 1319
+    },
+    "humaneval": {
+      "repo": "openai/openai_humaneval",
+      "revision": "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544",
+      "license": "MIT",
+      "path": "openai_humaneval/test-00000-of-00001.parquet",
+      "bytes": 83920,
+      "sha256": "2f2871a15fbc95b6c683043359f4ed8e144c5a1c4f24f25f66bc51f598dfcfb6",
+      "rows": 164
+    },
+    "mbpp": {
+      "repo": "google-research-datasets/mbpp",
+      "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+      "license": "CC-BY-4.0 (Google Research, Austin et al. 2021)",
+      "path": "sanitized/test-00000-of-00001.parquet",
+      "bytes": 60864,
+      "sha256": "e9e9efa2c0d59ef5e55537a9d126b8f875d5ac010a8d75628d76824884e15850",
+      "rows": 257
+    }
+  }
+}

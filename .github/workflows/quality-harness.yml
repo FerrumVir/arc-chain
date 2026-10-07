@@ -1,0 +1,287 @@
+name: Quality harness (ARC vs reference)
+
+# ENG-12: does ARC's integer engine answer as well as the reference model?
+# The harness (scripts/arc_quality, docs/quality/kimi-quality-harness.md)
+# runs the same benchmark items through ARC and through a reference, grades
+# both the same way and judges the paired difference by a tolerance policy
+# (scripts/arc_quality/policy.json, PROPOSED until TJ approves it).
+#
+#   unit    harness unit tests; the pinned benchmark files are fetched and
+#           their SHA-256 checked; the CI subset is drawn.
+#   proof   (label `quality-proof`) SmolLM3-3B: ARC integer engine
+#           (`arc-modern golden`, SIMD kernel) and the BF16 model
+#           (transformers, CPU) on the same runner and the same prompt token
+#           ids, in 4 shards on ubuntu-latest.
+#   logit   (label) the existing SmolLM3 perplexity method (hf_checks.py
+#           bf16-ppl) on the post-cutoff Federal Register text.
+#   report  (label) one report: per-group paired deltas, 95% intervals,
+#           verdicts, token-level identity, the logit track.
+#
+# Nothing here changes an engine, a digest or any network binding. Only
+# ubuntu-latest runners are used (macOS runners are scarce and shared with
+# the release), and the multi-gigabyte jobs need the label.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'scripts/arc_quality/**'
+      - 'docs/quality/**'
+      - '.github/workflows/quality-harness.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  SOURCE_MANIFEST: docs/protocol/packages/smollm3-3b.source.json
+  PINNED_MANIFEST: docs/protocol/packages/smollm3-3b.integer-package.json
+  PROFILE: arc_quality/models/smollm3-3b.json
+  # The CI subset (76 items). Certification sizes are in policy.json.
+  CI_BENCHMARKS: mmlu_pro=24,gsm8k=16,humaneval=10,mbpp=10,toolcall=all
+  SHARDS: '4'
+  PY_PYARROW: pyarrow==21.0.0
+
+jobs:
+  unit:
+    name: harness unit tests + pinned data
+    if: github.event.action != 'labeled' || github.event.label.name == 'quality-proof'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Unit tests (standard library only)
+        working-directory: scripts
+        run: python -m unittest discover -s arc_quality/tests -t . -v
+      - name: Fetch the pinned benchmark files and draw the CI subset
+        working-directory: scripts
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "$PY_PYARROW"
+          python -m arc_quality fetch-data --dir "$RUNNER_TEMP/data"
+          python -m arc_quality prepare --profile "$PROFILE" --benchmarks "$CI_BENCHMARKS" \
+            --data-dir "$RUNNER_TEMP/data" --out-items "$RUNNER_TEMP/items.jsonl" --out-cases "$RUNNER_TEMP/cases.json"
+          python -m arc_quality prepare --profile "$PROFILE" \
+            --benchmarks mmlu_pro=2000,gsm8k=all,humaneval=all,mbpp=all,toolcall=all \
+            --data-dir "$RUNNER_TEMP/data" --out-items "$RUNNER_TEMP/full-items.jsonl" --out-cases "$RUNNER_TEMP/full-cases.json"
+          python -m arc_quality reference openai --base-url http://127.0.0.1:9 --model none \
+            --items "$RUNNER_TEMP/full-items.jsonl" --price-in-per-mtok 0 --price-out-per-mtok 0 --dry-run
+
+  proof:
+    name: SmolLM3-3B shard ${{ matrix.shard }} (ARC vs BF16)
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'quality-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'quality-proof')
+    runs-on: ubuntu-latest
+    timeout-minutes: 175
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies (CPU torch and transformers for the BF16 reference)
+        run: |
+          python -m pip install --disable-pip-version-check --index-url https://download.pytorch.org/whl/cpu 'torch==2.9.1'
+          python -m pip install --disable-pip-version-check 'tokenizers==0.22.2' 'transformers==4.57.6' \
+            'safetensors==0.7.0' 'jinja2==3.1.6' "$PY_PYARROW"
+      - name: Model directory (the larger of / and /mnt)
+        run: |
+          set -euo pipefail
+          if [ "$(df --output=avail -B1 /mnt | tail -1)" -gt "$(df --output=avail -B1 / | tail -1)" ]; then
+            sudo mkdir -p /mnt/arc-model
+            sudo chown "$(id -u):$(id -g)" /mnt/arc-model
+            dir=/mnt/arc-model
+          else
+            dir="$HOME/arc-model"
+            mkdir -p "$dir"
+          fi
+          mkdir -p "$RUNNER_TEMP/evidence"
+          echo "MODEL_DIR=$dir" >> "$GITHUB_ENV"
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+          { echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            lscpu | grep -E 'Model name|^CPU\(s\)' || true; free -b || true; } | tee "$RUNNER_TEMP/evidence/runner-${{ matrix.shard }}.txt"
+      - name: Build arc-modern
+        run: cargo build --release --locked -p arc-inference --bin arc-modern
+      - name: Fetch SmolLM3-3B BF16 (pinned revision, SHA-256 verified) and convert
+        run: |
+          set -euo pipefail
+          python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR"
+          ./target/release/arc-modern convert --source-dir "$MODEL_DIR" \
+            --source-manifest "$SOURCE_MANIFEST" --out "$MODEL_DIR/smollm3-3b.arcipkg" > "$EVIDENCE/convert-${{ matrix.shard }}.json"
+          ./target/release/arc-modern verify --package "$MODEL_DIR/smollm3-3b.arcipkg" --manifest "$PINNED_MANIFEST"
+      - name: Draw this shard's items
+        working-directory: scripts
+        run: |
+          set -euo pipefail
+          python -m arc_quality fetch-data --dir "$RUNNER_TEMP/data"
+          python -m arc_quality prepare --profile "$PROFILE" --benchmarks "$CI_BENCHMARKS" \
+            --data-dir "$RUNNER_TEMP/data" --shard "${{ matrix.shard }}/$SHARDS" \
+            --out-items "$EVIDENCE/items-${{ matrix.shard }}.jsonl" --out-cases "$EVIDENCE/cases-${{ matrix.shard }}.json"
+      - name: ARC integer engine (SIMD kernel, greedy)
+        run: |
+          ./target/release/arc-modern golden --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --tokenizer "$MODEL_DIR/tokenizer.json" --cases "$EVIDENCE/cases-${{ matrix.shard }}.json" \
+            --kernel simd --out "$EVIDENCE/arc-run-${{ matrix.shard }}.json"
+      - name: BF16 reference on the same prompt token ids (transformers, CPU, greedy)
+        working-directory: scripts
+        run: |
+          python -m arc_quality reference hf --model-dir "$MODEL_DIR" \
+            --items "$EVIDENCE/items-${{ matrix.shard }}.jsonl" \
+            --prompt-ids-from "$EVIDENCE/arc-run-${{ matrix.shard }}.json" --eos 128012 \
+            --dtype bfloat16 --threads "$(nproc)" --label "SmolLM3-3B BF16 (transformers 4.57.6, torch 2.9.1, CPU)" \
+            --out "$EVIDENCE/ref-run-${{ matrix.shard }}.json"
+      - name: Grade both runs (one decoder; model-written code runs on this disposable runner)
+        working-directory: scripts
+        run: |
+          set -euo pipefail
+          s=${{ matrix.shard }}
+          python -m arc_quality score --items "$EVIDENCE/items-$s.jsonl" --run "$EVIDENCE/arc-run-$s.json" \
+            --tokenizer "$MODEL_DIR/tokenizer.json" --allow-exec \
+            --label "ARC integer engine (arc.hf-llama.i8-dyadic-row.q16.v1, SIMD)" --out "$EVIDENCE/arc-scored-$s.json"
+          python -m arc_quality score --items "$EVIDENCE/items-$s.jsonl" --run "$EVIDENCE/ref-run-$s.json" \
+            --tokenizer "$MODEL_DIR/tokenizer.json" --allow-exec \
+            --label "SmolLM3-3B BF16 reference" --out "$EVIDENCE/ref-scored-$s.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: quality-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  logit:
+    name: SmolLM3-3B perplexity vs BF16 (logit track)
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'quality-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'quality-proof')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --index-url https://download.pytorch.org/whl/cpu 'torch==2.9.1'
+          python -m pip install --disable-pip-version-check 'tokenizers==0.22.2' 'transformers==4.57.6' \
+            'safetensors==0.7.0' 'jinja2==3.1.6'
+      - name: Model directory (the larger of / and /mnt)
+        run: |
+          set -euo pipefail
+          if [ "$(df --output=avail -B1 /mnt | tail -1)" -gt "$(df --output=avail -B1 / | tail -1)" ]; then
+            sudo mkdir -p /mnt/arc-model
+            sudo chown "$(id -u):$(id -g)" /mnt/arc-model
+            dir=/mnt/arc-model
+          else
+            dir="$HOME/arc-model"
+            mkdir -p "$dir"
+          fi
+          mkdir -p "$RUNNER_TEMP/evidence"
+          echo "MODEL_DIR=$dir" >> "$GITHUB_ENV"
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+      - name: Build arc-modern
+        run: cargo build --release --locked -p arc-inference --bin arc-modern
+      - name: Perplexity, integer engine then BF16 (the method of PR #137)
+        run: |
+          set -euo pipefail
+          python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR"
+          ./target/release/arc-modern convert --source-dir "$MODEL_DIR" \
+            --source-manifest "$SOURCE_MANIFEST" --out "$MODEL_DIR/smollm3-3b.arcipkg" > "$EVIDENCE/convert.json"
+          python scripts/arc_modern/hf_checks.py tokenize-text --model-dir "$MODEL_DIR" \
+            --text scripts/arc_modern/data/fr_2026-20493_supplementary.txt --max-tokens 1024 \
+            --out "$EVIDENCE/ppl-tokens.json"
+          ./target/release/arc-modern ppl --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --tokens "$EVIDENCE/ppl-tokens.json" --window 512 --kernel simd --out "$EVIDENCE/ppl-integer.json"
+          python scripts/arc_modern/hf_checks.py bf16-ppl --model-dir "$MODEL_DIR" \
+            --tokens "$EVIDENCE/ppl-tokens.json" --rust "$EVIDENCE/ppl-integer.json" \
+            --window 512 --threads "$(nproc)" \
+            --text-label "Federal Register 2026-20493 (public domain, after the model's data cutoff), first 1024 tokens" \
+            --out "$EVIDENCE/quality-federal-register.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: quality-logit
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  report:
+    name: report
+    needs: [proof, logit]
+    if: always() && needs.proof.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/all
+      - name: Paired comparison under the proposed tolerance policy
+        working-directory: scripts
+        run: |
+          set -euo pipefail
+          all="$RUNNER_TEMP/all"
+          args=()
+          for f in "$all"/quality-shard-*/items-*.jsonl; do args+=(--items "$f"); done
+          for f in "$all"/quality-shard-*/arc-scored-*.json; do args+=(--arc "$f"); done
+          for f in "$all"/quality-shard-*/ref-scored-*.json; do args+=(--reference "$f"); done
+          for f in "$all"/quality-logit/quality-*.json; do [ -f "$f" ] && args+=(--ppl "$f"); done
+          python -m arc_quality compare "${args[@]}" \
+            --label "SmolLM3-3B: ARC integer engine vs BF16 reference (CI runner, ubuntu-latest)" \
+            --out "$RUNNER_TEMP/quality-report.json" --summary-md "$RUNNER_TEMP/quality-report.md"
+          cat "$RUNNER_TEMP/quality-report.md" >> "$GITHUB_STEP_SUMMARY"
+          python - "$all" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          from pathlib import Path
+          rows = []
+          for path in sorted(Path(sys.argv[1]).glob("quality-shard-*/arc-run-*.json")):
+              run = json.loads(path.read_text())
+              t = run.get("timing", {})
+              rows.append(f"| {path.name} | {run.get('kernel')} | `{run.get('matrix_digest', '')[:16]}…` | "
+                          f"{t.get('prefill_tok_s', 0):.2f} | {t.get('decode_tok_s', 0):.2f} |")
+          print("\n#### ARC runs (CI runner, ubuntu-latest, single stream)\n")
+          print("| run | kernel | matrix digest | prefill tok/s | decode tok/s |")
+          print("|---|---|---|---|---|")
+          print("\n".join(rows))
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: quality-report
+          path: |
+            ${{ runner.temp }}/quality-report.json
+            ${{ runner.temp }}/quality-report.md
+          if-no-files-found: warn

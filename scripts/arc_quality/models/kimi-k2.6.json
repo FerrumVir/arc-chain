@@ -1,0 +1,19 @@
+{
+  "schema": "arc.quality-model.v1",
+  "name": "Kimi K2.6",
+  "status": "template: confirm every field when ENG-5 (MLA + MoE engine, PR #156) and ENG-10 (K2.6 slices) land",
+  "engine": {
+    "cli": "arc-mla golden (PR #156); the harness needs only its run file: cases[] with id, prompt_tokens, tokens",
+    "profile": "arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1 (PR #156); K2.6 expert format per ENG-10",
+    "source": "moonshotai/Kimi-K2.6 (Modified MIT), pinned revision to be set by ENG-10"
+  },
+  "cases": {"thinking": false, "eos": [163586], "selection": "argmax"},
+  "reference": {
+    "kind": "openai",
+    "options": [
+      "self-hosted vLLM or SGLang serving the official moonshotai/Kimi-K2.6 weights (native INT4 experts) with temperature 0: needs GPU hours, i.e. spend",
+      "Moonshot's API or another provider serving Kimi K2.6: paid per token, i.e. spend"
+    ],
+    "budget": "none approved; the harness refuses to call a priced endpoint without --budget-usd covering the worst case"
+  }
+}
