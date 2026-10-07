@@ -146,4 +146,30 @@ mod tests {
         };
         assert!(project_cost(huge, usize::MAX, 0, 1, 1.0, 0.0, 1.0).is_err());
     }
+
+    #[test]
+    fn fewer_tokens_never_lower_cost_per_million() {
+        // Same allocation and costs; egress scales with output, as when a
+        // higher RTT lowers throughput at a fixed batch and draft depth.
+        let a = CostAssumptions::default();
+        let bytes_per_token = 3.4e6;
+        for availability in [0.5, 0.95, 1.0] {
+            let mut last: Option<f64> = None;
+            for tokens in [5e7, 1e7, 3e6, 1e6, 1.0] {
+                let p = project_cost(a, 61, 3, 1, tokens, tokens * bytes_per_token, availability)
+                    .unwrap();
+                let usd = p.usd_per_million_tokens.unwrap();
+                if let Some(prev) = last {
+                    assert!(usd >= prev, "{tokens}: {usd} < {prev}");
+                }
+                last = Some(usd);
+            }
+            let zero = project_cost(a, 61, 3, 1, 0.0, 0.0, availability).unwrap();
+            assert_eq!(
+                zero.usd_per_million_tokens, None,
+                "zero output is undefined, not free"
+            );
+            assert!(zero.total_usd_per_day > 0.0);
+        }
+    }
 }

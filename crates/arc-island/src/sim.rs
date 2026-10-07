@@ -20,7 +20,7 @@ use crate::economics::{CostAssumptions, CostProjection, project_cost};
 use crate::form::{FormationOutcome, FormationPolicy, IslandPlan, RejectReason, Tier, form};
 use crate::lifecycle::{GoldenSource, Island, Recovery, State, TrustedCheckpoint};
 use crate::model::ModelSpec;
-use crate::perf::{NetAssumptions, Projection, project};
+use crate::perf::{FixedDepth, NetAssumptions, Projection, project, project_fixed};
 use crate::selftest::toy::ToyPipeline;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -624,10 +624,31 @@ pub enum InventoryProfile {
     },
 }
 
+/// How a scenario chooses batch and draft depth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BatchingPolicy {
+    /// Per-island search: the largest aggregate keeping per-stream speed at
+    /// least `min(floor_tok_s, half the island's own single-answer rate)`.
+    /// The floor follows the single-answer rate, which follows RTT, so the
+    /// selected workload changes with RTT: never use these rows to compare
+    /// RTTs.
+    Adaptive { floor_tok_s: f64 },
+    /// Depths held fixed for a controlled comparison: every swarm in the
+    /// scenario runs the plain batch at `plain` and the speculative batch
+    /// (and single-answer speculation) at `speculative`.
+    Fixed {
+        plain: FixedDepth,
+        speculative: FixedDepth,
+        /// How the depths were chosen.
+        chosen_from: String,
+    },
+}
+
 /// One simulator run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scenario {
     pub inventory: InventoryProfile,
+    pub batching: BatchingPolicy,
     pub costs: CostAssumptions,
     /// Reserved concurrent sequences; formation and batching share this budget.
     pub kv_sequences: u64,
@@ -725,6 +746,9 @@ pub struct IslandRow {
     pub max_pair_p95_ms: f64,
     pub mix: String,
     pub spare_mix: String,
+    /// SHA-256 over the member and spare device ids in stage order: equal
+    /// digests mean identical placement.
+    pub placement_digest: String,
     /// The lifecycle state qualification reached (always `Simulated`).
     pub state: State,
     pub projection: Projection,
@@ -809,6 +833,25 @@ pub struct ScenarioReport {
     pub cost_speculative: CostProjection,
     /// Each external input is an assumption; outputs are derived projections.
     pub input_basis: BTreeMap<String, String>,
+}
+
+fn placement_digest(plan: &IslandPlan, devices: &[DeviceDescriptor]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for (stage, &m) in plan.members.iter().enumerate() {
+        let layers = &plan.stages[stage].layers;
+        h.update(
+            format!(
+                "member {} {} {}\n",
+                devices[m].device_id, layers.start, layers.end
+            )
+            .as_bytes(),
+        );
+    }
+    for s in &plan.spares {
+        h.update(format!("spare {}\n", devices[s.device].device_id).as_bytes());
+    }
+    hex::encode(h.finalize())
 }
 
 fn mix_of(group: &[usize], inv: &Inventory, idx: &[usize]) -> String {
@@ -1042,15 +1085,29 @@ pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
                 GoldenSource::Simulation(&golden),
             )
             .unwrap_or_else(|_| island.state().clone());
-        let p = project(
-            plan,
-            &devices,
-            model,
-            &rtt,
-            &scenario.net,
-            CONTEXT_POSITIONS,
-            BATCH_FLOOR_TOK_S,
-        );
+        let p = match &scenario.batching {
+            BatchingPolicy::Adaptive { floor_tok_s } => project(
+                plan,
+                &devices,
+                model,
+                &rtt,
+                &scenario.net,
+                CONTEXT_POSITIONS,
+                *floor_tok_s,
+            ),
+            BatchingPolicy::Fixed {
+                plain, speculative, ..
+            } => project_fixed(
+                plan,
+                &devices,
+                model,
+                &rtt,
+                &scenario.net,
+                CONTEXT_POSITIONS,
+                *plain,
+                *speculative,
+            ),
+        };
         let hops = plan.hops();
         let spares: Vec<usize> = plan.spares.iter().map(|s| s.device).collect();
         rows.push(IslandRow {
@@ -1069,6 +1126,7 @@ pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
             max_pair_p95_ms: f64::from(plan.max_pair_p95_us) / 1000.0,
             mix: mix_of(&plan.members, &inv, &idx),
             spare_mix: mix_of(&spares, &inv, &idx),
+            placement_digest: placement_digest(plan, &devices),
             state,
             tokens_per_day: p.batch.aggregate_tok_s * 86_400.0,
             tokens_per_day_speculative: p.batch_speculative.aggregate_tok_s * 86_400.0,
@@ -1187,6 +1245,9 @@ pub fn standard_scenarios(seed: u64, node_counts: &[usize]) -> Vec<Scenario> {
         ] {
             out.push(Scenario {
                 inventory: InventoryProfile::ResearchMix,
+                batching: BatchingPolicy::Adaptive {
+                    floor_tok_s: BATCH_FLOOR_TOK_S,
+                },
                 costs: CostAssumptions::default(),
                 kv_sequences: kv_sequences(service),
                 nodes,
@@ -1225,6 +1286,9 @@ pub fn regional_scenarios(seed: u64, node_counts: &[usize]) -> Vec<Scenario> {
                         rtt_us,
                         nodes_per_region: 130,
                     },
+                    batching: BatchingPolicy::Adaptive {
+                        floor_tok_s: BATCH_FLOOR_TOK_S,
+                    },
                     costs: CostAssumptions::default(),
                     kv_sequences: 128,
                     nodes,
@@ -1247,6 +1311,223 @@ pub fn regional_scenarios(seed: u64, node_counts: &[usize]) -> Vec<Scenario> {
         out.push(dispersed);
     }
     out
+}
+
+/// RTT of the reference scenario whose adaptive optimum fixes the depths.
+pub const REFERENCE_RTT_US: u32 = 5_000;
+
+/// The modal (most common) plain and speculative depth across a report's
+/// swarms; ties go to the smaller concurrency, then the shallower draft.
+fn modal_depths(report: &ScenarioReport) -> Option<(FixedDepth, FixedDepth)> {
+    let modal = |pick: &dyn Fn(&IslandRow) -> FixedDepth| {
+        let mut counts: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+        for row in &report.rows {
+            let d = pick(row);
+            *counts.entry((d.concurrent, d.draft_tokens)).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&((b, k), n)| (n, Reverse(b), Reverse(k)))
+            .map(|((concurrent, draft_tokens), _)| FixedDepth {
+                concurrent,
+                draft_tokens,
+            })
+    };
+    let depth = |b: crate::perf::BatchPlan| FixedDepth {
+        concurrent: b.concurrent,
+        draft_tokens: b.draft_tokens,
+    };
+    Some((
+        modal(&|r| depth(r.projection.batch))?,
+        modal(&|r| depth(r.projection.batch_speculative))?,
+    ))
+}
+
+/// The default ordinary-node scenarios as a **controlled** comparison.
+///
+/// Within each matched group (same node count and uplink), the batch and
+/// draft depths are fixed once: the adaptive policy's choice in the group's
+/// reference scenario (RTT 5 ms, availability 0.7), taken as the modal value
+/// across its swarms. Those depths are then applied unchanged to RTT 5, 10
+/// and 20 ms and to the group's availability and dispersed sensitivities.
+/// Inventory, placement, compute, demand, downtime and cost inputs are the
+/// same within a group; only the RTT (or the named sensitivity) differs. A
+/// group whose reference forms no swarm has nothing to compare; it gets
+/// depth 1 / draft 0, which affects no row.
+pub fn controlled_regional_scenarios(
+    seed: u64,
+    node_counts: &[usize],
+    model: &ModelSpec,
+) -> Vec<Scenario> {
+    let adaptive = regional_scenarios(seed, node_counts);
+    let mut depths: BTreeMap<(usize, String), BatchingPolicy> = BTreeMap::new();
+    for s in &adaptive {
+        let reference = matches!(
+            s.inventory,
+            InventoryProfile::OrdinaryRegional {
+                rtt_us: REFERENCE_RTT_US,
+                ..
+            }
+        ) && s.availability_permille == 700;
+        if !reference {
+            continue;
+        }
+        let report = run(s, model);
+        let (plain, speculative, chosen_from) = match modal_depths(&report) {
+            Some((p, sp)) => (
+                p,
+                sp,
+                format!(
+                    "adaptive optimum at RTT {} ms, a = 0.7, same nodes and uplink (modal over {} swarm(s)); held fixed for every RTT and sensitivity in the group",
+                    REFERENCE_RTT_US / 1000,
+                    report.rows.len()
+                ),
+            ),
+            None => {
+                let none = FixedDepth {
+                    concurrent: 1,
+                    draft_tokens: 0,
+                };
+                (
+                    none,
+                    none,
+                    "no swarm forms in the reference scenario; the depth affects no row".into(),
+                )
+            }
+        };
+        depths.insert(
+            (s.nodes, s.transport.clone()),
+            BatchingPolicy::Fixed {
+                plain,
+                speculative,
+                chosen_from,
+            },
+        );
+    }
+    adaptive
+        .into_iter()
+        .map(|mut s| {
+            s.batching = depths[&(s.nodes, s.transport.clone())].clone();
+            s
+        })
+        .collect()
+}
+
+/// The adaptive-policy RTT rows, reported separately from the controlled
+/// comparison.
+pub fn adaptive_rtt_scenarios(seed: u64, node_counts: &[usize]) -> Vec<Scenario> {
+    regional_scenarios(seed, node_counts)
+        .into_iter()
+        .filter(|s| {
+            matches!(s.inventory, InventoryProfile::OrdinaryRegional { .. })
+                && s.availability_permille == 700
+        })
+        .collect()
+}
+
+/// The checks on one matched group of the controlled RTT comparison.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RttCheck {
+    pub nodes: usize,
+    pub transport: String,
+    pub rtts_ms: Vec<u32>,
+    pub plain: FixedDepth,
+    pub speculative: FixedDepth,
+    /// Every row ran the group's fixed depths.
+    pub same_depths: bool,
+    /// Identical swarm placement (members, stages, spares) at every RTT.
+    pub same_placement: bool,
+    /// Identical simulated lease availability at every RTT.
+    pub same_lease: bool,
+    /// Aggregate tok/s, plain and speculative, never rises with RTT.
+    pub aggregate_non_increasing: bool,
+    /// USD per million tokens, plain and speculative, never falls with RTT
+    /// (zero output counts as unbounded cost).
+    pub cost_non_decreasing: bool,
+    /// No swarm forms at any RTT (the comparison is vacuous).
+    pub zero_output: bool,
+}
+
+impl RttCheck {
+    pub fn holds(&self) -> bool {
+        self.same_depths
+            && self.same_placement
+            && self.same_lease
+            && self.aggregate_non_increasing
+            && self.cost_non_decreasing
+    }
+}
+
+/// Groups the controlled regional rows (a = 0.7) by node count and uplink,
+/// orders them by RTT, and checks the comparison is controlled and monotone.
+pub fn controlled_rtt_checks(reports: &[ScenarioReport]) -> Vec<RttCheck> {
+    let mut groups: BTreeMap<(usize, String), Vec<(u32, &ScenarioReport)>> = BTreeMap::new();
+    for r in reports {
+        if let (InventoryProfile::OrdinaryRegional { rtt_us, .. }, BatchingPolicy::Fixed { .. }) =
+            (&r.scenario.inventory, &r.scenario.batching)
+            && r.scenario.availability_permille == 700
+        {
+            groups
+                .entry((r.scenario.nodes, r.scenario.transport.clone()))
+                .or_default()
+                .push((*rtt_us, r));
+        }
+    }
+    let usd = |x: Option<f64>| x.unwrap_or(f64::INFINITY);
+    groups
+        .into_iter()
+        .filter(|(_, rows)| rows.len() > 1)
+        .map(|((nodes, transport), mut rows)| {
+            rows.sort_by_key(|(rtt, _)| *rtt);
+            let BatchingPolicy::Fixed {
+                plain, speculative, ..
+            } = rows[0].1.scenario.batching.clone()
+            else {
+                unreachable!("filtered to fixed rows")
+            };
+            let placement = |r: &ScenarioReport| {
+                r.rows
+                    .iter()
+                    .map(|x| x.placement_digest.clone())
+                    .collect::<Vec<_>>()
+            };
+            let same_depths = rows.iter().all(|(_, r)| {
+                r.scenario.batching == rows[0].1.scenario.batching
+                    && r.rows.iter().all(|x| {
+                        x.projection.batch.draft_tokens == 0
+                            && x.projection.batch_speculative.draft_tokens
+                                == speculative.draft_tokens
+                            && x.projection.speculative.draft_tokens == speculative.draft_tokens
+                    })
+            });
+            let pairs: Vec<(&ScenarioReport, &ScenarioReport)> =
+                rows.windows(2).map(|w| (w[0].1, w[1].1)).collect();
+            RttCheck {
+                nodes,
+                transport,
+                rtts_ms: rows.iter().map(|(rtt, _)| rtt / 1000).collect(),
+                plain,
+                speculative,
+                same_depths,
+                same_placement: rows
+                    .iter()
+                    .all(|(_, r)| placement(r) == placement(rows[0].1)),
+                // The lease fraction is derived from the churn record.
+                same_lease: rows.iter().all(|(_, r)| r.churn == rows[0].1.churn),
+                aggregate_non_increasing: pairs.iter().all(|(a, b)| {
+                    b.aggregate_tok_s <= a.aggregate_tok_s
+                        && b.aggregate_tok_s_speculative <= a.aggregate_tok_s_speculative
+                }),
+                cost_non_decreasing: pairs.iter().all(|(a, b)| {
+                    usd(b.cost_plain.usd_per_million_tokens)
+                        >= usd(a.cost_plain.usd_per_million_tokens)
+                        && usd(b.cost_speculative.usd_per_million_tokens)
+                            >= usd(a.cost_speculative.usd_per_million_tokens)
+                }),
+                zero_output: rows.iter().all(|(_, r)| r.rows.is_empty()),
+            }
+        })
+        .collect()
 }
 
 /// Every labelled input, for the report.
@@ -1274,8 +1555,8 @@ pub fn assumptions() -> Vec<(&'static str, String, &'static str)> {
         ("Pessimistic transport", format!("{} ms per hop, {} Mb/s home uplink, {} ms fixed per pass", f64::from(p.wan_hop_overhead_us) / 1000.0, p.wan_uplink_mbps, f64::from(p.fixed_pass_us) / 1000.0), "research-7 §2.1 defaults"),
         ("Optimized transport", format!("{} ms per hop, {} Mb/s uplink", f64::from(o.wan_hop_overhead_us) / 1000.0, o.wan_uplink_mbps), "ASSUMPTION (fibre homes, tuned streaming transport)"),
         ("Tensor parallel", format!("{} ms per collective on RDMA, 122 per token", f64::from(p.collective_us) / 1000.0), "research-6 §2.5"),
-        ("Speculation", format!("Default ordinary-node sweep: depth 0–64, alpha 0.9 ASSUMED; exact settings in scenario.net. No token-tree execution implemented (ENG-8). Legacy comparison: chain drafts from a separate drafter (K2.6 has no MTP head), acceptance α = {}, {} ms per draft token, depth 0–{} chosen per island, separately for a single answer and under batching", p.draft_acceptance, f64::from(p.draft_us_per_token) / 1000.0, p.max_draft_tokens), "ASSUMPTION (research-7 §2.2 planning values)"),
-        ("Batching", format!("Default ordinary-node scenarios reserve 128 sequences × 4096 positions, with both batch and draft depth optimized. Legacy comparison: KV for {} (interactive) / {} (batch) sequences × {} positions per island; depth = max aggregate keeping per-stream ≥ min({} tok/s, half the single-stream rate)", kv_sequences(Service::Interactive), kv_sequences(Service::Batch), CONTEXT_POSITIONS, BATCH_FLOOR_TOK_S), "research-6 §2.6 model"),
+        ("Speculation", format!("Ordinary-node rows: alpha 0.9 ASSUMED; controlled rows use the group's fixed draft depth (shown per group, the 5 ms adaptive optimum), adaptive rows search depth 0–64; exact settings in scenario.net and scenario.batching. No token-tree execution implemented (ENG-8). Legacy comparison: chain drafts from a separate drafter (K2.6 has no MTP head), acceptance α = {}, {} ms per draft token, depth 0–{} chosen per island, separately for a single answer and under batching", p.draft_acceptance, f64::from(p.draft_us_per_token) / 1000.0, p.max_draft_tokens), "ASSUMPTION (research-7 §2.2 planning values)"),
+        ("Batching", format!("Default ordinary-node rows are a controlled comparison: KV for 128 sequences × {CONTEXT_POSITIONS} positions per swarm, and within each matched group (same node count and uplink) one fixed plain batch depth and one fixed speculative batch/draft depth, applied unchanged at RTT 5, 10 and 20 ms and in the group's availability and dispersed sensitivities. The fixed depths are the adaptive optimum of the group's RTT {} ms, a = 0.7 scenario (modal across its swarms) and are printed per group. Adaptive-policy rows are reported separately: there each swarm searches batch 1, 2, 4, … 128 and draft 0–64 for the largest aggregate keeping per-stream speed ≥ min({BATCH_FLOOR_TOK_S} tok/s, half its own single-answer rate); that floor moves with RTT, so adaptive rows must not be compared across RTTs. Legacy comparison: adaptive, KV for {} (interactive) / {} (batch) sequences", REFERENCE_RTT_US / 1000, kv_sequences(Service::Interactive), kv_sequences(Service::Batch)), "research-6 §2.6 model; depth choice ASSUMED"),
         ("Compute model", "memory-bandwidth bound; distinct experts under uniform routing; FLOPs, prefill and queueing not modelled".into(), "CALC (research-6 §2.6)"),
         ("Tokens/day", "aggregate tok/s × 86,400: a fully loaded ceiling, excluding spare-shortfall and dissolved downtime, recovery stalls, prefill and audit; not a demand forecast".into(), "CALC"),
         ("Churn", format!("device MTBF {MTBF_H} h, lease {LEASE_H} h, exponential failures; a member loss promotes a spare, recovers from the ledger checkpoint and re-qualifies ({} s stall); lost spares are replaced from unused eligible devices after staging the largest stage at 1 Gb/s; spare-shortfall time counts only non-dissolved islands below policy, including time without an eligible replacement; dissolved time counts separately from dissolution to lease end", PROMOTION_STALL_MS / 1000), "research-6 §3.3 (Salad 92 h), §6.7"),
@@ -1343,7 +1624,172 @@ fn scenario_label(s: &Scenario) -> String {
         } else {
             " · **spares not required (comparison)**"
         }
-    )
+    ) + &match &s.batching {
+        BatchingPolicy::Adaptive { .. } => " · adaptive batching".to_string(),
+        BatchingPolicy::Fixed {
+            plain, speculative, ..
+        } => format!(
+            " · fixed B {} / spec B {} k {}",
+            plain.concurrent, speculative.concurrent, speculative.draft_tokens
+        ),
+    }
+}
+
+fn usd_cell(x: Option<f64>) -> String {
+    x.map_or_else(|| "undefined (zero output)".into(), |v| format!("{v:.2}"))
+}
+
+/// The controlled RTT comparison and, separately, the adaptive-policy rows.
+fn controlled_section(md: &mut String, reports: &[ScenarioReport]) {
+    let checks = controlled_rtt_checks(reports);
+    if !checks.is_empty() {
+        controlled_tables(md, reports, &checks);
+    }
+    adaptive_table(md, reports);
+}
+
+fn controlled_tables(md: &mut String, reports: &[ScenarioReport], checks: &[RttCheck]) {
+    let _ = writeln!(
+        md,
+        "#### Controlled RTT comparison (default)\n\nWithin each group (same node count and uplink) every row has the same inventory, placement, \
+         compute, demand, downtime and cost inputs **and the same batch and draft depth**; only the RTT differs. \
+         The fixed depths are the adaptive optimum of the group's RTT {} ms, a = 0.7 scenario (modal across its \
+         swarms), applied unchanged at every RTT. Plain batches never speculate. 130-node rows are conditional \
+         placement (130 registered nodes in one region), not today's unmeasured fleet.\n",
+        REFERENCE_RTT_US / 1000
+    );
+    let _ = writeln!(
+        md,
+        "| Nodes | Uplink | RTT ms | Fixed plain B | Fixed spec B / k | Swarms | Lease available | Per-answer tok/s, plain / spec (k) | Aggregate tok/s, plain / spec | Tokens/day ceiling, spec | Projected tokens/day, spec | USD / million tokens, plain / spec |\n|---|---|---|---|---|---|---|---|---|---|---|---|"
+    );
+    for c in checks {
+        let mut rows: Vec<(u32, &ScenarioReport)> = reports
+            .iter()
+            .filter_map(|r| match (&r.scenario.inventory, &r.scenario.batching) {
+                (
+                    InventoryProfile::OrdinaryRegional { rtt_us, .. },
+                    BatchingPolicy::Fixed { .. },
+                ) if r.scenario.nodes == c.nodes
+                    && r.scenario.transport == c.transport
+                    && r.scenario.availability_permille == 700 =>
+                {
+                    Some((*rtt_us, r))
+                }
+                _ => None,
+            })
+            .collect();
+        rows.sort_by_key(|(rtt, _)| *rtt);
+        for (rtt, r) in rows {
+            let mut single: Vec<f64> = r.rows.iter().map(|x| x.projection.single.tok_s).collect();
+            let mut spec: Vec<f64> = r
+                .rows
+                .iter()
+                .map(|x| x.projection.speculative.tok_s)
+                .collect();
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} | {} / {} | {} | {} | {} / {} ({}) | {} / {} | {} | {} | {} / {} |",
+                c.nodes,
+                c.transport,
+                rtt / 1000,
+                c.plain.concurrent,
+                c.speculative.concurrent,
+                c.speculative.draft_tokens,
+                r.rows.len(),
+                if r.rows.is_empty() {
+                    "–".into()
+                } else {
+                    format!("{:.4}", r.cost_plain.lease_available_fraction)
+                },
+                spread(&mut single),
+                spread(&mut spec),
+                c.speculative.draft_tokens,
+                fmt_big(r.aggregate_tok_s),
+                fmt_big(r.aggregate_tok_s_speculative),
+                fmt_big(r.tokens_per_day_speculative),
+                fmt_big(r.cost_speculative.projected_tokens_per_day),
+                usd_cell(r.cost_plain.usd_per_million_tokens),
+                usd_cell(r.cost_speculative.usd_per_million_tokens),
+            );
+        }
+    }
+    let mark = |ok: bool| if ok { "yes" } else { "**NO**" };
+    let _ = writeln!(
+        md,
+        "\nChecks per group, computed from the rows above (the simulator exits with an error if any fails):\n\n| Nodes | Uplink | RTTs ms | Same depths | Same placement | Same lease | Aggregate never rises with RTT | USD/M never falls with RTT | Zero output |\n|---|---|---|---|---|---|---|---|---|"
+    );
+    for c in checks {
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            c.nodes,
+            c.transport,
+            c.rtts_ms
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" / "),
+            mark(c.same_depths),
+            mark(c.same_placement),
+            mark(c.same_lease),
+            mark(c.aggregate_non_increasing),
+            mark(c.cost_non_decreasing),
+            if c.zero_output {
+                "yes (comparison vacuous)"
+            } else {
+                "no"
+            },
+        );
+    }
+    let _ = writeln!(md);
+}
+
+fn adaptive_table(md: &mut String, reports: &[ScenarioReport]) {
+    let mut adaptive: Vec<(usize, String, u32, &ScenarioReport)> = reports
+        .iter()
+        .filter_map(|r| match (&r.scenario.batching, &r.scenario.inventory) {
+            (
+                BatchingPolicy::Adaptive { .. },
+                InventoryProfile::OrdinaryRegional { rtt_us, .. },
+            ) => Some((r.scenario.nodes, r.scenario.transport.clone(), *rtt_us, r)),
+            _ => None,
+        })
+        .collect();
+    adaptive.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+    if adaptive.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        md,
+        "#### Adaptive batching policy (reported separately; not a controlled comparison)\n\nHere each swarm searches its own batch and draft depth, keeping per-stream speed at least min({BATCH_FLOOR_TOK_S} tok/s, half its own single-answer rate). A higher RTT lowers the single-answer rate, which lowers that floor and admits more concurrent streams, so the workload changes with RTT. These rows show what the search would pick; they must not be read as the effect of latency on throughput or cost.\n"
+    );
+    let _ = writeln!(
+        md,
+        "| Nodes | Uplink | RTT ms | Selected plain B (modal) | Selected spec B / k (modal) | Swarms | Aggregate tok/s, plain / spec | USD / million tokens, plain / spec |\n|---|---|---|---|---|---|---|---|"
+    );
+    for (_, _, rtt_us, r) in adaptive {
+        let (p, sp) = modal_depths(r).map_or(("–".into(), "–".into()), |(p, sp)| {
+            (
+                p.concurrent.to_string(),
+                format!("{} / {}", sp.concurrent, sp.draft_tokens),
+            )
+        });
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} | {} | {} | {} | {} / {} | {} / {} |",
+            r.scenario.nodes,
+            r.scenario.transport,
+            rtt_us / 1000,
+            p,
+            sp,
+            r.rows.len(),
+            fmt_big(r.aggregate_tok_s),
+            fmt_big(r.aggregate_tok_s_speculative),
+            usd_cell(r.cost_plain.usd_per_million_tokens),
+            usd_cell(r.cost_speculative.usd_per_million_tokens),
+        );
+    }
+    let _ = writeln!(md);
 }
 
 /// The markdown report.
@@ -1376,13 +1822,15 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
     let _ = writeln!(
         md,
         "\n## Summary\n\nPer-answer tok/s: median (min–max) over the islands formed, one answer at a time. \
-         \"With spec\" picks the best draft depth per island. Aggregates are at each island's planned \
-         batching depth, without and with speculation. Daily figures are fully loaded ceilings excluding both spare-shortfall and dissolved downtime, as well as recovery stalls, prefill and audit.\n\nBoth downtime shares use initially formed islands × the full 6 h lease as denominator. The categories are mutually exclusive; no islands means no denominator (shown as –). Other time is not measured serving uptime.\n"
+         \"With spec\" is single-answer speculation: at the fixed draft depth in controlled rows, at the best \
+         depth per island in adaptive and legacy rows. Aggregates use the scenario's batching policy, shown in \
+         its label: fixed depths (controlled rows) or the adaptive search (adaptive rows). Daily figures are fully loaded ceilings excluding both spare-shortfall and dissolved downtime, as well as recovery stalls, prefill and audit.\n\nBoth downtime shares use initially formed islands × the full 6 h lease as denominator. The categories are mutually exclusive; no islands means no denominator (shown as –). Other time is not measured serving uptime.\n"
     );
     let _ = writeln!(
         md,
         "### Ordinary-node capacity and cost [ASSUMED inputs → CALC outputs]\n\nThe ~130 node count comes from TJ; no measured current inventory or RTT matrix was supplied. Regional-density rows are conditional recruitment/placement scenarios, not a claim that today’s nodes are colocated. No large-memory host is required. Each swarm still contains complete layers/all experts; expert-group placement in the runtime remains ENG-6 work. Deep draft and batching columns are performance-model sweeps for ENG-8/ENG-1, not implementations or measured gains.\n"
     );
+    controlled_section(&mut md, reports);
     let _ = writeln!(
         md,
         "| Nodes | Scenario | Concurrent swarms | Stages (range) | Per-answer at speculative batch (range) | Aggregate speculative tok/s | Tokens/day ceiling | Projected tokens/day after demand + lease discount | Allocated cost USD/day | USD / million tokens, plain / spec |\n|---|---|---|---|---|---|---|---|---|---|"
@@ -1681,6 +2129,134 @@ mod tests {
         assert!(md.contains("Per-answer at speculative batch"));
         assert!(md.contains("not a measured limit of regional swarms"));
         serde_json::to_string(&reports).unwrap();
+    }
+
+    #[test]
+    fn controlled_rtt_comparison_holds_depths_placement_and_monotonicity() {
+        let model = ModelSpec::kimi_k26_int4();
+        let scenarios = controlled_regional_scenarios(7, &[100, 130], &model);
+        // Every row in a matched group carries the group's fixed depths.
+        for s in &scenarios {
+            let BatchingPolicy::Fixed { chosen_from, .. } = &s.batching else {
+                panic!("default rows are controlled: {s:?}");
+            };
+            assert!(!chosen_from.is_empty());
+            let twin = scenarios
+                .iter()
+                .find(|o| o.nodes == s.nodes && o.transport == s.transport)
+                .unwrap();
+            assert_eq!(twin.batching, s.batching);
+        }
+        let reports: Vec<_> = scenarios.iter().map(|s| run(s, &model)).collect();
+        let checks = controlled_rtt_checks(&reports);
+        // 100 and 130 nodes × 50 and 500 Mb/s.
+        assert_eq!(checks.len(), 4);
+        for c in &checks {
+            assert_eq!(c.rtts_ms, vec![5, 10, 20]);
+            assert!(c.holds(), "{c:?}");
+            assert_eq!(c.plain.draft_tokens, 0);
+        }
+        assert!(checks.iter().all(|c| !c.zero_output));
+        // Zero output: the same matched groups with too few opted-in nodes
+        // form no swarm at any RTT; cost per token stays undefined, and the
+        // vacuous comparison still holds.
+        let sparse: Vec<_> = scenarios
+            .iter()
+            .filter(|s| s.nodes == 130)
+            .map(|s| {
+                let mut s = s.clone();
+                s.opt_in_permille = 400;
+                run(&s, &model)
+            })
+            .collect();
+        let zero = controlled_rtt_checks(&sparse);
+        assert_eq!(zero.len(), 2);
+        for c in &zero {
+            assert!(c.zero_output && c.holds(), "{c:?}");
+        }
+        for r in &sparse {
+            assert!(r.rows.is_empty());
+            assert_eq!(r.cost_plain.usd_per_million_tokens, None);
+            assert_eq!(r.cost_speculative.usd_per_million_tokens, None);
+        }
+        // At 130 nodes the rates strictly fall from 5 to 20 ms.
+        for transport in ["50-Mbps", "500-Mbps"] {
+            let at = |rtt: u32| {
+                reports
+                    .iter()
+                    .find(|r| {
+                        r.scenario.nodes == 130
+                            && r.scenario.transport == transport
+                            && r.scenario.availability_permille == 700
+                            && matches!(r.scenario.inventory, InventoryProfile::OrdinaryRegional { rtt_us, .. } if rtt_us == rtt)
+                    })
+                    .unwrap()
+            };
+            let (fast, slow) = (at(5_000), at(20_000));
+            assert!(!fast.rows.is_empty());
+            assert!(slow.aggregate_tok_s < fast.aggregate_tok_s, "{transport}");
+            assert!(
+                slow.aggregate_tok_s_speculative < fast.aggregate_tok_s_speculative,
+                "{transport}"
+            );
+            assert!(
+                slow.cost_plain.usd_per_million_tokens.unwrap()
+                    > fast.cost_plain.usd_per_million_tokens.unwrap(),
+                "{transport}"
+            );
+            assert!(
+                slow.cost_speculative.usd_per_million_tokens.unwrap()
+                    > fast.cost_speculative.usd_per_million_tokens.unwrap(),
+                "{transport}"
+            );
+        }
+        let md = markdown(&reports, 7);
+        assert!(md.contains("Controlled RTT comparison (default)"));
+        assert!(!md.contains("**NO**"));
+    }
+
+    #[test]
+    fn rtt_checks_flag_an_uncontrolled_or_inverted_comparison() {
+        let model = ModelSpec::kimi_k26_int4();
+        let scenarios = controlled_regional_scenarios(7, &[130], &model);
+        let mut reports: Vec<_> = scenarios
+            .iter()
+            .filter(|s| {
+                s.transport == "50-Mbps"
+                    && matches!(s.inventory, InventoryProfile::OrdinaryRegional { .. })
+                    && s.availability_permille == 700
+            })
+            .map(|s| run(s, &model))
+            .collect();
+        assert_eq!(reports.len(), 3);
+        assert!(controlled_rtt_checks(&reports)[0].holds());
+        // Swapping the 5 ms and 20 ms results is an inversion the check catches.
+        let fast = reports[0].clone();
+        let slow = reports[2].clone();
+        reports[0].aggregate_tok_s = slow.aggregate_tok_s;
+        reports[2].aggregate_tok_s = fast.aggregate_tok_s;
+        let c = &controlled_rtt_checks(&reports)[0];
+        assert!(!c.aggregate_non_increasing && !c.holds());
+        // A row run at a different depth is not a controlled comparison.
+        let mut changed = scenarios
+            .iter()
+            .find(|s| {
+                s.transport == "50-Mbps"
+                    && matches!(
+                        s.inventory,
+                        InventoryProfile::OrdinaryRegional { rtt_us: 20_000, .. }
+                    )
+                    && s.availability_permille == 700
+            })
+            .unwrap()
+            .clone();
+        if let BatchingPolicy::Fixed { speculative, .. } = &mut changed.batching {
+            speculative.concurrent += 1;
+        }
+        reports[2] = run(&changed, &model);
+        reports[0] = fast;
+        let c = &controlled_rtt_checks(&reports)[0];
+        assert!(!c.same_depths && !c.holds());
     }
 
     #[test]

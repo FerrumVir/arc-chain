@@ -9,7 +9,10 @@
 //! network access, no node, no keys.
 
 use arc_island::model::ModelSpec;
-use arc_island::sim::{markdown, regional_scenarios, run, standard_scenarios};
+use arc_island::sim::{
+    adaptive_rtt_scenarios, controlled_regional_scenarios, controlled_rtt_checks, markdown, run,
+    standard_scenarios,
+};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -48,12 +51,20 @@ fn main() -> ExitCode {
     }
 
     let model = ModelSpec::kimi_k26_int4();
+    // Default: the controlled RTT comparison (fixed batch and draft depth per
+    // matched group), then the adaptive-policy rows, reported separately.
     let scenarios = if legacy {
         standard_scenarios(seed, &nodes)
     } else {
-        regional_scenarios(seed, &nodes)
+        let mut s = controlled_regional_scenarios(seed, &nodes, &model);
+        s.extend(adaptive_rtt_scenarios(seed, &nodes));
+        s
     };
     let reports: Vec<_> = scenarios.iter().map(|s| run(s, &model)).collect();
+    let failed: Vec<_> = controlled_rtt_checks(&reports)
+        .into_iter()
+        .filter(|c| !c.holds())
+        .collect();
     let md = markdown(&reports, seed);
     let json = match serde_json::to_string_pretty(&reports) {
         Ok(j) => j,
@@ -72,5 +83,9 @@ fn main() -> ExitCode {
         }
     }
     print!("{md}");
+    if !failed.is_empty() {
+        eprintln!("controlled RTT comparison failed its checks: {failed:?}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }

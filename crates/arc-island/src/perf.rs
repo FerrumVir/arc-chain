@@ -335,19 +335,8 @@ pub fn plan_batching(
     max_draft_tokens: u32,
 ) -> BatchPlan {
     let sh = shape(plan, devices, rtt, net);
-    let max_b = (plan.kv_positions / context_positions.max(1)).clamp(1, u64::from(u32::MAX)) as u32;
-    let at = |b: u32, k: u32| {
-        let (g, round) = batch_round(plan, model, &sh, net, b, k);
-        let t = tau(k, net.draft_acceptance);
-        BatchPlan {
-            concurrent: b,
-            micro_batches: g,
-            draft_tokens: k,
-            round_ms: round * 1e3,
-            per_stream_tok_s: t / round,
-            aggregate_tok_s: f64::from(b) * t / round,
-        }
-    };
+    let max_b = kv_sequence_budget(plan, context_positions);
+    let at = |b: u32, k: u32| evaluate(plan, model, &sh, net, b, k);
     let one = at(1, 0);
     let floor = floor_tok_s.min(one.per_stream_tok_s / 2.0);
     let mut best = one;
@@ -363,6 +352,98 @@ pub fn plan_batching(
         b = next;
     }
     best
+}
+
+/// Sequences the island's KV budget holds at `context_positions` each.
+fn kv_sequence_budget(plan: &IslandPlan, context_positions: u64) -> u32 {
+    (plan.kv_positions / context_positions.max(1)).clamp(1, u64::from(u32::MAX)) as u32
+}
+
+/// One batch/draft depth, evaluated with no search and no floor.
+fn evaluate(
+    plan: &IslandPlan,
+    model: &ModelSpec,
+    sh: &Shape,
+    net: &NetAssumptions,
+    b: u32,
+    k: u32,
+) -> BatchPlan {
+    let (g, round) = batch_round(plan, model, sh, net, b, k);
+    let t = tau(k, net.draft_acceptance);
+    BatchPlan {
+        concurrent: b,
+        micro_batches: g,
+        draft_tokens: k,
+        round_ms: round * 1e3,
+        per_stream_tok_s: t / round,
+        aggregate_tok_s: f64::from(b) * t / round,
+    }
+}
+
+/// A batch and draft depth held fixed, for controlled comparisons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixedDepth {
+    /// Concurrent sequences in flight.
+    pub concurrent: u32,
+    /// Draft tokens per sequence per pass (0 = no speculation).
+    pub draft_tokens: u32,
+}
+
+/// The batch at exactly `depth`: no search, no per-stream floor. The
+/// concurrency is clamped to the island's KV budget (`kv_positions /
+/// context_positions` sequences) and to at least 1. With every other input
+/// fixed, a higher RTT can only lengthen the round, so aggregate and
+/// per-stream rates cannot rise.
+#[allow(clippy::too_many_arguments)]
+pub fn batch_at(
+    plan: &IslandPlan,
+    devices: &[DeviceDescriptor],
+    model: &ModelSpec,
+    rtt: &dyn RttSource,
+    net: &NetAssumptions,
+    context_positions: u64,
+    depth: FixedDepth,
+) -> BatchPlan {
+    let sh = shape(plan, devices, rtt, net);
+    let b = depth
+        .concurrent
+        .clamp(1, kv_sequence_budget(plan, context_positions));
+    evaluate(plan, model, &sh, net, b, depth.draft_tokens)
+}
+
+/// A controlled projection: the plain batch at `plain` (its draft depth is
+/// forced to 0), the speculative batch at `speculative`, and the
+/// single-answer speculative rate at `speculative.draft_tokens`. Nothing is
+/// searched, so the compared workload is identical across RTTs.
+#[allow(clippy::too_many_arguments)]
+pub fn project_fixed(
+    plan: &IslandPlan,
+    devices: &[DeviceDescriptor],
+    model: &ModelSpec,
+    rtt: &dyn RttSource,
+    net: &NetAssumptions,
+    context_positions: u64,
+    plain: FixedDepth,
+    speculative: FixedDepth,
+) -> Projection {
+    let plain = FixedDepth {
+        draft_tokens: 0,
+        ..plain
+    };
+    Projection {
+        single: single_stream(plan, devices, model, rtt, net, 0),
+        speculative: single_stream(plan, devices, model, rtt, net, speculative.draft_tokens),
+        batch: batch_at(plan, devices, model, rtt, net, context_positions, plain),
+        batch_speculative: batch_at(
+            plan,
+            devices,
+            model,
+            rtt,
+            net,
+            context_positions,
+            speculative,
+        ),
+    }
 }
 
 /// Single stream, best speculation and batching for one island.
@@ -498,5 +579,135 @@ mod tests {
         assert!(b.concurrent > 1 && b.concurrent <= 8, "{b:?}");
         assert!(b.aggregate_tok_s > one.tok_s);
         assert!(b.per_stream_tok_s >= 5.0_f64.min(one.tok_s / 2.0));
+    }
+
+    /// One plan, re-evaluated at several RTTs with every other input fixed.
+    fn rtt_sweep(rtts_us: &[u32], net: &NetAssumptions, depth: FixedDepth) -> Vec<BatchPlan> {
+        let model = ModelSpec::uniform("u", 24, 1_000_000_000, 1_000);
+        let devices: Vec<_> = (0..9)
+            .map(|i| device(&format!("d{i}"), 8, false, None, "NYC"))
+            .collect();
+        let base = mesh(9, rtts_us[0], &[]);
+        let plan = form(
+            &devices,
+            &base,
+            &model,
+            &FormationPolicy::batch(16 * 4096),
+            0,
+        )
+        .islands[0]
+            .clone();
+        assert!(plan.members.len() > 1);
+        rtts_us
+            .iter()
+            .map(|&r| batch_at(&plan, &devices, &model, &mesh(9, r, &[]), net, 4096, depth))
+            .collect()
+    }
+
+    #[test]
+    fn fixed_depth_never_gains_from_higher_rtt() {
+        let rtts = [1_000, 5_000, 10_000, 20_000, 40_000, 80_000];
+        for net in [NetAssumptions::pessimistic(), NetAssumptions::optimized()] {
+            for depth in [
+                FixedDepth {
+                    concurrent: 1,
+                    draft_tokens: 0,
+                },
+                FixedDepth {
+                    concurrent: 8,
+                    draft_tokens: 0,
+                },
+                FixedDepth {
+                    concurrent: 8,
+                    draft_tokens: 3,
+                },
+                FixedDepth {
+                    concurrent: 16,
+                    draft_tokens: 7,
+                },
+            ] {
+                let sweep = rtt_sweep(&rtts, &net, depth);
+                for w in sweep.windows(2) {
+                    assert_eq!(
+                        (w[0].concurrent, w[0].draft_tokens),
+                        (w[1].concurrent, w[1].draft_tokens)
+                    );
+                    assert!(w[1].round_ms >= w[0].round_ms, "{net:?} {depth:?} {w:?}");
+                    assert!(
+                        w[1].aggregate_tok_s <= w[0].aggregate_tok_s,
+                        "{net:?} {depth:?} {w:?}"
+                    );
+                    assert!(w[1].per_stream_tok_s <= w[0].per_stream_tok_s);
+                }
+                assert!(sweep.last().unwrap().aggregate_tok_s < sweep[0].aggregate_tok_s);
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_depth_is_clamped_to_the_kv_budget() {
+        let net = NetAssumptions::pessimistic();
+        let p = rtt_sweep(
+            &[5_000],
+            &net,
+            FixedDepth {
+                concurrent: 1_000,
+                draft_tokens: 2,
+            },
+        )[0];
+        assert_eq!((p.concurrent, p.draft_tokens), (16, 2));
+        let p = rtt_sweep(
+            &[5_000],
+            &net,
+            FixedDepth {
+                concurrent: 0,
+                draft_tokens: 0,
+            },
+        )[0];
+        assert_eq!(p.concurrent, 1);
+    }
+
+    #[test]
+    fn the_adaptive_floor_moves_with_rtt_and_the_fixed_projection_does_not() {
+        // The adaptive policy's floor is min(5 tok/s, half the single-answer
+        // rate), so it changes with RTT; project_fixed keeps both depths.
+        let model = ModelSpec::kimi_k26_int4();
+        let net = NetAssumptions::pessimistic();
+        let (d, _, plan) = two_ultras(5_000, false, None);
+        let plain = FixedDepth {
+            concurrent: 4,
+            draft_tokens: 5,
+        };
+        let spec = FixedDepth {
+            concurrent: 4,
+            draft_tokens: 2,
+        };
+        let mut last: Option<Projection> = None;
+        for r in [5_000, 10_000, 20_000] {
+            let rtt = mesh(3, r, &[]);
+            let p = project_fixed(&plan, &d, &model, &rtt, &net, 4096, plain, spec);
+            assert_eq!(
+                (p.batch.concurrent, p.batch.draft_tokens),
+                (4, 0),
+                "plain is never speculative"
+            );
+            assert_eq!(
+                (
+                    p.batch_speculative.concurrent,
+                    p.batch_speculative.draft_tokens
+                ),
+                (4, 2)
+            );
+            assert_eq!(p.speculative.draft_tokens, 2);
+            if let Some(prev) = last {
+                assert!(p.batch.aggregate_tok_s <= prev.batch.aggregate_tok_s);
+                assert!(
+                    p.batch_speculative.aggregate_tok_s <= prev.batch_speculative.aggregate_tok_s
+                );
+                assert!(p.single.tok_s <= prev.single.tok_s);
+                assert!(p.speculative.tok_s <= prev.speculative.tok_s);
+            }
+            last = Some(p);
+        }
     }
 }
