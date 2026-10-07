@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
+use crate::paths;
 use crate::types::NodeConfig;
 use crate::AppState;
 
@@ -37,16 +38,34 @@ pub struct LegacyComputeQuestion {
     pub recorded_unix_ms: u64,
 }
 
-/// Fenced v0.7 chain data on this launch, or the bridge's record of having
-/// run under the v0.7 app, marks an install that came from v0.7.
-pub fn detect_v07_origin(created_migration_notice: bool, home: &Path) -> Option<&'static str> {
+/// Fenced v0.7 chain data on this launch, the bridge's record of having run
+/// under the v0.7 app, or a saved configuration that still uses the v0.7 data
+/// layout marks an install that came from v0.7. The third signal covers
+/// v0.7.10/v0.7.11 desktops whose node never started, because their updater
+/// returned 404: they have no WAL to fence and may have no bridge record, but
+/// their owner has still never been asked.
+pub fn detect_v07_origin(
+    created_migration_notice: bool,
+    config_uses_v07_layout: bool,
+    home: &Path,
+) -> Option<&'static str> {
     if created_migration_notice {
         Some("v0.7 chain data was fenced on this launch")
     } else if legacy_bridge_ran(home) {
         Some("the v0.7 legacy bridge release ran on this computer")
+    } else if config_uses_v07_layout {
+        Some("the saved configuration still uses the v0.7 data layout")
     } else {
         None
     }
+}
+
+/// Whether the saved configuration still uses the v0.7 desktop data layout:
+/// `dataDir` at the `~/.arc` root (v0.7.11 `types.rs` default `"~/.arc"`).
+/// Every v0.8 build defaults to a `data-v3*` child, and the WAL fence moves
+/// the pointer there, so this must be read before the fence runs.
+pub fn config_uses_v07_layout(config: &NodeConfig) -> bool {
+    paths::expand_tilde(&config.data_dir) == paths::arc_home()
 }
 
 /// The bridge writes `~/.arc/legacy-bridge/nodes/desktop-*/bridge-state.json`
@@ -247,17 +266,92 @@ mod tests {
     #[test]
     fn the_bridge_record_marks_a_v07_origin() {
         let home = temp_dir("bridge-home");
-        assert_eq!(detect_v07_origin(false, &home), None);
-        assert!(detect_v07_origin(true, &home).is_some());
+        assert_eq!(detect_v07_origin(false, false, &home), None);
+        assert!(detect_v07_origin(true, false, &home).is_some());
         let node = home
             .join(".arc")
             .join("legacy-bridge")
             .join("nodes")
             .join("desktop-0123456789ab");
         fs::create_dir_all(&node).unwrap();
-        assert_eq!(detect_v07_origin(false, &home), None);
+        assert_eq!(detect_v07_origin(false, false, &home), None);
         fs::write(node.join("bridge-state.json"), b"{}").unwrap();
-        assert!(detect_v07_origin(false, &home).is_some());
+        assert!(detect_v07_origin(false, false, &home).is_some());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_v0711_store_whose_node_never_ran_is_detected_and_held() {
+        // Exactly what v0.7.11 onboarding persisted for a worker: role and
+        // modelPath set, dataDir at the ~/.arc root, no consent field. On a
+        // machine whose node never started there is no WAL to fence and no
+        // bridge record, so the layout is the only signal left.
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "role": "worker",
+            "modelPath": "/Users/ada/.arc/models/standard.gguf",
+            "rpcPort": 9944,
+            "p2pPort": 9945,
+            "autoStart": true,
+            "autoUpdate": true,
+            "dataDir": "~/.arc"
+        }))
+        .unwrap();
+        assert_eq!(config.compute_consent, None);
+        assert!(config_uses_v07_layout(&config));
+        let home = temp_dir("v0711-never-ran-home");
+        let origin = detect_v07_origin(false, config_uses_v07_layout(&config), &home);
+        assert_eq!(
+            origin,
+            Some("the saved configuration still uses the v0.7 data layout")
+        );
+
+        let dir = temp_dir("v0711-never-ran-store");
+        let mut held = config.clone();
+        assert!(hold_until_answered(&mut held, &dir, origin, 11).unwrap());
+        assert_eq!(held.role, "observer");
+        assert_eq!(held.model_path, None);
+        // The startup promotion hook sees no consent, so nothing is promoted.
+        assert!(!crate::commands::compute_contribution_enabled(&held));
+        assert_eq!(
+            crate::commands::promotion_need(&held, 64),
+            crate::commands::PromotionNeed::NoConsent
+        );
+        let question = load(&dir).expect("question recorded");
+        assert_eq!(question.previous_role, "worker");
+        assert_eq!(
+            question.previous_model_path.as_deref(),
+            Some("/Users/ada/.arc/models/standard.gguf")
+        );
+        assert_eq!(
+            question.detected_by,
+            "the saved configuration still uses the v0.7 data layout"
+        );
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v08_layouts_are_not_mistaken_for_v07() {
+        let home = temp_dir("v08-layout-home");
+        // A fresh v0.8 install defaults to a data-v3 child and is never asked.
+        let fresh = NodeConfig::default();
+        assert!(!config_uses_v07_layout(&fresh));
+        assert_eq!(
+            detect_v07_origin(false, config_uses_v07_layout(&fresh), &home),
+            None
+        );
+        // A fenced v0.7 install already points at a data-v3* child.
+        let fenced = NodeConfig {
+            data_dir: "~/.arc/data-v3-1".to_string(),
+            ..NodeConfig::default()
+        };
+        assert!(!config_uses_v07_layout(&fenced));
+        // The absolute spelling of the v0.7 root counts as v0.7 too.
+        let absolute = NodeConfig {
+            data_dir: paths::arc_home().to_string_lossy().into_owned(),
+            ..NodeConfig::default()
+        };
+        assert!(config_uses_v07_layout(&absolute));
         fs::remove_dir_all(home).unwrap();
     }
 }
