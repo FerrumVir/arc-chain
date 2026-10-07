@@ -32,7 +32,7 @@ dependencies = [
 [[package]]
 name = "arc-bincode"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715#60c54bd8d1f72b333fe57de8059e9635cb8ff715"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5#962b640a6207f917289a10fd25c7e9e5129687d5"
 dependencies = [
  "cu-bincode",
  "serde",
@@ -67,7 +67,7 @@ dependencies = [
 [[package]]
 name = "arc-crypto"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715#60c54bd8d1f72b333fe57de8059e9635cb8ff715"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5#962b640a6207f917289a10fd25c7e9e5129687d5"
 dependencies = [
  "blake3",
  "blst",
@@ -114,10 +114,10 @@ dependencies = [
 [[package]]
 name = "arc-gpu"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715#60c54bd8d1f72b333fe57de8059e9635cb8ff715"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5#962b640a6207f917289a10fd25c7e9e5129687d5"
 dependencies = [
- "arc-crypto 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715)",
- "arc-types 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715)",
+ "arc-crypto 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5)",
+ "arc-types 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5)",
  "blake3",
  "bytemuck",
  "curve25519-dalek",
@@ -156,11 +156,11 @@ dependencies = [
 [[package]]
 name = "arc-inference"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715#60c54bd8d1f72b333fe57de8059e9635cb8ff715"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5#962b640a6207f917289a10fd25c7e9e5129687d5"
 dependencies = [
- "arc-crypto 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715)",
- "arc-gpu 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715)",
- "arc-types 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715)",
+ "arc-crypto 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5)",
+ "arc-gpu 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5)",
+ "arc-types 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5)",
  "blake3",
  "dashmap",
  "fancy-regex",
@@ -180,7 +180,7 @@ name = "arc-stage-eng6"
 version = "0.1.0"
 dependencies = [
  "arc-inference 0.8.11",
- "arc-inference 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715)",
+ "arc-inference 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5)",
 ]
 
 [[package]]
@@ -201,10 +201,10 @@ dependencies = [
 [[package]]
 name = "arc-types"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715#60c54bd8d1f72b333fe57de8059e9635cb8ff715"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5#962b640a6207f917289a10fd25c7e9e5129687d5"
 dependencies = [
- "arc-bincode 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715)",
- "arc-crypto 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=60c54bd8d1f72b333fe57de8059e9635cb8ff715)",
+ "arc-bincode 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5)",
+ "arc-crypto 0.8.11 (git+https://github.com/FerrumVir/arc-chain.git?rev=962b640a6207f917289a10fd25c7e9e5129687d5)",
  "blake3",
  "chrono",
  "hex",

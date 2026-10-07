@@ -31,7 +31,7 @@ The placement optimizer works in five steps:
 ## For ENG-6 (island runtime, ARC-68)
 
 `integrations/arc-stage-eng6` implements ARC-68's actual `Transport`,
-`Listener`, and `Link` interfaces from **60c54bd8d1f72b333fe57de8059e9635cb8ff715**.
+`Listener`, and `Link` interfaces from **962b640a6207f917289a10fd25c7e9e5129687d5**.
 The dependency is SHA-pinned in that standalone crate's manifest and lockfile;
 it does not alter the production workspace dependency graph or PR #167.
 Pass `arc_stage_eng6::TunedTransport::default()` to the island runtime.
@@ -43,6 +43,13 @@ or commitment bytes. `StageLink` also adapts a real ARC-68 `Link` to
 The integration test exchanges ARC-68 `Step`, `Close`, `Error`, and `Shutdown`
 frames with ARC-68's own `TcpTransport` in both directions, recomputes hidden
 commitments, and records received stage commitments in ARC-68's `Ledger`.
+The current native contract carries `logits` and `selected` on `StageCommit`,
+not `Item`. A two-position fixture checks per-position logits, selection only
+at the last position, exact Ledger records, boundary digests and stage roots.
+Changing logits, changing the selected token, or removing it must change the
+last-stage root while leaving activation digests unchanged. Ledger rejects
+head-only metadata on earlier stages and missing logits on the last stage.
+These are synthetic commitment fixtures, not token re-execution audits.
 It tests truncated/oversized frames, peer EOF, explicit close, and refusal to
 reuse a failed link. Run from the repository root:
 
@@ -63,8 +70,9 @@ whole experts. Routed bytes are the floor of the exact binary fraction times
 layer bytes; the remaining bytes are dense, and each equal expert is rounded
 up to a whole byte. Capacity reserves the first/last extras on the lead, and
 a final checked-integer pass verifies every member footprint without slack.
-The heuristic may conservatively reject a layout; it never certifies fractional
-expert storage as deployable memory.
+Candidate pruning, fixed memory-weighted expert apportionment and whole-byte
+rounding can conservatively reject feasible layouts; the search is not globally
+complete. It never certifies fractional expert storage as deployable memory.
 
 Compute time and uplink must be finite and positive; RTTs cannot be negative.
 Either direction being NaN or positive infinity leaves the link unknown.

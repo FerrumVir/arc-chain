@@ -192,23 +192,28 @@ mod tests {
         ] {
             let mut listener = server.listen("127.0.0.1:0").unwrap();
             let address = listener.address();
-            let mut item = Item::new(7, 0, 1, Selection::Argmax, vec![42]);
+            let mut item = Item::new(7, 0, 2, Selection::Argmax, vec![42, 43]);
             item.hidden = vec![i64::MIN, -1, 0, 127, 1 << 40, i64::MAX];
             let hash = activation_hash(&item.hidden);
             item.commits = vec![
                 StageCommit {
                     first_layer: 0,
                     end_layer: 1,
-                    hashes: vec![[1; 32], hash],
+                    hashes: vec![[1; 32], hash, [5; 32], hash],
+                    logits: vec![],
+                    selected: None,
                 },
                 StageCommit {
                     first_layer: 1,
                     end_layer: 2,
-                    hashes: vec![hash, [2; 32]],
+                    hashes: vec![hash, [2; 32], hash, [6; 32]],
+                    logits: vec![[3; 32], [4; 32]],
+                    selected: Some(19),
                 },
             ];
-            item.next = Some(19);
-            item.logits = vec![[3; 32]];
+            let mut expected_ledger = Ledger::new(2);
+            expected_ledger.record(0, 2, &item.commits);
+            assert!(expected_ledger.complete());
             let frames = vec![
                 Frame::Step {
                     id: 11,
@@ -246,9 +251,61 @@ mod tests {
                         hash
                     );
                     let mut ledger = Ledger::new(2);
-                    ledger.record(0, 1, &item.commits);
-                    assert!(ledger.link_faults.is_empty());
-                    assert!(ledger.malformed.is_empty());
+                    ledger.record(0, 2, &item.commits);
+                    assert!(ledger.complete());
+                    assert_eq!(item.tokens, vec![42, 43]);
+                    assert!(item.commits[0].logits.is_empty());
+                    assert_eq!(item.commits[0].selected, None);
+                    assert_eq!(item.commits[1].logits, vec![[3; 32], [4; 32]]);
+                    assert_eq!(item.commits[1].selected, Some(19));
+                    let head = ledger.stage_commits(1, 2).unwrap();
+                    assert_eq!(head[0].logits, Some([3; 32]));
+                    assert_eq!(head[0].selected, None);
+                    assert_eq!(head[1].logits, Some([4; 32]));
+                    assert_eq!(head[1].selected, Some(19));
+                    assert_eq!(
+                        ledger.boundary_digests(),
+                        expected_ledger.boundary_digests()
+                    );
+                    for (first, end) in [(0, 1), (1, 2)] {
+                        assert_eq!(
+                            ledger.stage_commits(first, end),
+                            expected_ledger.stage_commits(first, end)
+                        );
+                        assert_eq!(
+                            ledger.stage_root(7, first, end),
+                            expected_ledger.stage_root(7, first, end)
+                        );
+                    }
+                    // The last-stage root must bind both new fields, including
+                    // selected-token presence, even when all activations agree.
+                    for change in 0..3 {
+                        let mut altered = item.commits.clone();
+                        match change {
+                            0 => altered[1].logits[0][0] ^= 1,
+                            1 => altered[1].selected = Some(20),
+                            _ => altered[1].selected = None,
+                        }
+                        let mut changed = Ledger::new(2);
+                        changed.record(0, 2, &altered);
+                        assert!(changed.complete());
+                        assert_eq!(changed.boundary_digests(), ledger.boundary_digests());
+                        assert_ne!(changed.stage_root(7, 1, 2), ledger.stage_root(7, 1, 2));
+                    }
+                    // Native Ledger rejects logits/token metadata on a
+                    // non-head stage and missing logits at the head.
+                    for change in 0..3 {
+                        let mut malformed = item.commits.clone();
+                        match change {
+                            0 => malformed[0].logits = vec![[3; 32], [4; 32]],
+                            1 => malformed[0].selected = Some(19),
+                            _ => malformed[1].logits.clear(),
+                        }
+                        let mut rejected = Ledger::new(2);
+                        rejected.record(0, 2, &malformed);
+                        assert!(!rejected.complete());
+                        assert!(!rejected.malformed.is_empty());
+                    }
                 }
             }
             worker.join().unwrap();
