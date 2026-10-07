@@ -11,7 +11,10 @@ useDefault = true
 # The immutable official K2.6 reference contains this documentation import.
 # Generic-api-key mistakes the tokenizer/class names for a credential. Both
 # path and complete line must match; adjacent or edited lines remain scanned.
-[[allowlists]]
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
 description = "Pinned official K2.6 docstring import is not a credential"
 condition = "AND"
 paths = ['''(^|/)scripts/arc_quality/layer_probe/reference/modeling_deepseek\.py$''']
