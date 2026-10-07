@@ -5,8 +5,7 @@ same answer, byte for byte, on different computers. The test runs one real
 7-billion-parameter model on four CPU platforms and checks that every run
 produces an identical transcript.
 
-**Status:** pending the first full CI run. This section will record the
-workflow run, the date and the published hash.
+**Status:** measured 2026-10-06 in workflow run [37467005539](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539) on commit `be37100b2`. On the full 16 x 32 workload, every completed run produced the same transcript, SHA-256 `d2c8c82b3a82beb166559b78ad26a748cbd6395c2cf13e8f012b03f90fa92872`. That covers Linux, Windows and Intel macOS with both the scalar and the AVX2 kernel, and Apple Silicon with the scalar kernel. Apple Silicon's NEON kernel matched on the smaller smoke test and on 3 of the 16 full-workload prompts; its full-workload run was deferred to free shared CI runners.
 
 ## What is compared
 
@@ -45,6 +44,38 @@ kernel's acceptance counts go to a separate JSON file.
 The driver also replays the first prompt through the engine's public
 `try_generate_v2_greedy` API and fails if the tokens or output hash differ, so
 the recorded loop is the engine's own generation loop.
+
+## Results
+
+Full workload: 16 prompts x 32 new tokens, greedy, in
+[run 37467005539](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539), attempts 1-3 on
+2026-10-06, on commit `be37100b2`. The Apple Silicon legs ran as six prompt shards per kernel. Two
+scalar shards were re-run in later attempts of the same run: one lost its runner to a shutdown signal
+before producing output, and the other was stopped when the NEON shards were cancelled.
+
+| Platform (GitHub runner) | CPU reported by the runner | Kernel | Workload | Same transcript | Decode tok/s (CI runner) | SIMD projections accepted |
+| --- | --- | --- | --- | --- | --- | --- |
+| macOS 15, Apple Silicon (`macos-15`) | Apple M1 (Virtual) | scalar (`scalar-i8xi64`) | full, all 16 prompts | yes | 0.016 | not used |
+| macOS 15, Apple Silicon (`macos-15`) | Apple M1 (Virtual) | NEON (`neon-sdot-limb`) | smoke test; full-workload prompts 13-15 | yes | 0.015 | 9,000 of 9,000 (smoke); 32,850 of 32,850 (prompts 13-15) |
+| macOS 15, Intel (`macos-15-intel`) | Intel Core i7-8700B @ 3.20GHz | scalar (`scalar-i8xi64`) | full | yes | 0.65 | not used |
+| macOS 15, Intel (`macos-15-intel`) | Intel Core i7-8700B @ 3.20GHz | AVX2 (`avx2-limb`) | full | yes | 0.81 | 176,175 of 176,175 |
+| Linux, Ubuntu 24.04 (`ubuntu-24.04`) | AMD EPYC 9V74 | scalar (`scalar-i8xi64`) | full | yes | 0.77 | not used |
+| Linux, Ubuntu 24.04 (`ubuntu-24.04`) | AMD EPYC 7763 | AVX2 (`avx2-limb`) | full | yes | 1.55 | 176,175 of 176,175 |
+| Windows Server (`windows-latest`) | Intel Xeon Platinum 8573C | scalar (`scalar-i8xi64`) | full | yes | 0.93 | not used |
+| Windows Server (`windows-latest`) | AMD EPYC 9V74 | AVX2 (`avx2-limb`) | full | yes | 1.44 | 176,175 of 176,175 |
+
+- Every run loaded the same engine state: INT8 weights
+  `e43ae7d054493f318e119c2de07d09064fe822ca79cadb04f6d4f339d5e3e72d`, Q16 embeddings and norms
+  `d88be1b13dd355d67149a71f3e07ccae55f422a1693642a08126aa6af6f51230`, and RoPE tables
+  `9867f7d8d0cceb1a1cc3474f5449060038b3e75a25cb9b7a02048ef496263dd3`. The RoPE tables come
+  from each platform's math library, and they match on all four.
+- The engine API cross-check passed on every platform and kernel that ran the first prompt.
+- The run's compare job reports the Apple Silicon NEON pair as incomplete because its
+  full-workload shards were cancelled; every completed cell matches. The smoke test, 2 prompts x 4
+  tokens, matched on all eight cells: [run 37458030569](https://github.com/FerrumVir/arc-chain/actions/runs/37458030569).
+- Decode tokens per second are forward passes per second on GitHub-hosted runners. The Apple
+  Silicon runner has 7 GB of memory and swaps the ~7.3 GiB model, so its rate (about one token a
+  minute) measures swapping, not the chip.
 
 ## How CI runs it
 
