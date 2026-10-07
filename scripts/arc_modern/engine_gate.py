@@ -174,6 +174,14 @@ def report_one(bench: dict, label: str) -> list[str]:
             f"{orders.get('batched')} for batched calls (prefill)."
         )
         out.append("")
+    cal = bench.get("tiling_calibration") or {}
+    if cal.get("chosen"):
+        out.append(
+            f"Calibrated on this machine at model load (`{cal.get('kernel')}`, best of {cal.get('passes')} passes "
+            f"over {cal.get('weight_bytes', 0) / 1e6:.0f} MB of weights): rows4 {fmt(1000 * cal.get('rows4_seconds', 0), 1)} ms, "
+            f"stream {fmt(1000 * cal.get('stream_seconds', 0), 1)} ms, so single-token calls use {cal.get('chosen')}."
+        )
+        out.append("")
     ladder_specs = [k.format(best=best) for k, _ in LADDER]
     for ctx in bench.get("contexts", []):
         runs = ctx.get("decode", [])

@@ -51,6 +51,7 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -175,6 +176,11 @@ static LIMBS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// read it). Off by default, so timed runs do no counting unless asked.
 pub fn set_census_enabled(on: bool) {
     CENSUS_ON.store(on, Ordering::Relaxed);
+}
+
+/// Whether prepared inputs are being counted (see [`set_census_enabled`]).
+pub fn census_enabled() -> bool {
+    CENSUS_ON.load(Ordering::Relaxed)
 }
 
 /// Zero every census counter.
@@ -1020,12 +1026,10 @@ impl Isa {
 /// the same integers; they differ only in memory access pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tiling {
-    /// The order measured fastest for the kernel and the kind of call:
-    /// `stream` for single-input AVX2 calls (decode), `rows4` for batched
-    /// calls (prefill) and for NEON. On the CI runners of run 37522880513,
-    /// x86 decode ran 8.85 vs 7.85 tok/s (ubuntu) and 8.08 vs 7.88
-    /// (windows) with `stream`, x86 batched prefill 9.6 vs 11.7 tok/s, and
-    /// NEON decode 14.5 vs 16.2 tok/s. See [`Tiling::resolve`].
+    /// The order measured best for the kernel and the kind of call: batched
+    /// calls (prefill) tile four rows; single-input calls (decode) use the
+    /// order [`calibrate_auto`] measured on this machine, or until then
+    /// `stream` on AVX2 and `rows4` on NEON (see [`auto_order`]).
     #[default]
     Auto,
     /// Four rows per register tile: each digit vector is loaded once and
@@ -1060,12 +1064,28 @@ impl Tiling {
     }
 
     /// The concrete row order `kernel` runs with, for a single-input call
-    /// (`batched == false`) or a batched one. An explicit order is kept.
+    /// (`batched == false`) or a batched one. An explicit order is kept;
+    /// `auto` is [`auto_order`].
     pub fn resolve(self, kernel: Kernel, batched: bool) -> Tiling {
         match self {
-            Tiling::Auto if kernel == Kernel::Avx2 && !batched => Tiling::Stream,
-            Tiling::Auto => Tiling::Rows4,
+            Tiling::Auto => auto_order(kernel, batched),
             order => order,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Tiling::Auto => 0,
+            Tiling::Rows4 => 1,
+            Tiling::Stream => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Tiling::Rows4,
+            2 => Tiling::Stream,
+            _ => Tiling::Auto,
         }
     }
 }
@@ -1075,24 +1095,131 @@ static TILING: AtomicU8 = AtomicU8::new(0);
 /// Select the row order of the SIMD kernels process-wide (a speed setting;
 /// it cannot change a value). [`Tiling::Auto`] is the default.
 pub fn set_tiling(tiling: Tiling) {
-    TILING.store(
-        match tiling {
-            Tiling::Auto => 0,
-            Tiling::Rows4 => 1,
-            Tiling::Stream => 2,
-        },
-        Ordering::Relaxed,
-    );
+    TILING.store(tiling.code(), Ordering::Relaxed);
 }
 
 /// The configured tiling of the SIMD kernels (see [`set_tiling`]); the
 /// order a call runs with is [`Tiling::resolve`] of it.
 pub fn tiling() -> Tiling {
-    match TILING.load(Ordering::Relaxed) {
-        1 => Tiling::Rows4,
-        2 => Tiling::Stream,
-        _ => Tiling::Auto,
+    Tiling::from_code(TILING.load(Ordering::Relaxed))
+}
+
+/// Per kernel, the row order `auto` uses for single-input calls: the
+/// built-in default (code 0) until [`calibrate_auto`] measured this machine.
+static AUTO_SINGLE: [AtomicU8; 3] = [const { AtomicU8::new(0) }; 3];
+
+/// The row order [`Tiling::Auto`] resolves to for `kernel`.
+///
+/// Batched calls (prefill) tile four rows: on every CI runner that order
+/// read each weight tile once per block of tokens fastest. Single-input
+/// calls (decode) use the order [`calibrate_auto`] measured on this
+/// machine; until a calibration ran, `stream` on AVX2 (2-13% faster on AMD
+/// EPYC 9V74 and 7763 runners, 2% slower on an Intel Xeon 6973P-C runner)
+/// and `rows4` on NEON (15% faster on a Neoverse-N2 runner).
+pub fn auto_order(kernel: Kernel, batched: bool) -> Tiling {
+    if batched || kernel == Kernel::Scalar {
+        return Tiling::Rows4;
     }
+    match Tiling::from_code(AUTO_SINGLE[kernel.code() as usize].load(Ordering::Relaxed)) {
+        Tiling::Auto if kernel == Kernel::Avx2 => Tiling::Stream,
+        Tiling::Auto => Tiling::Rows4,
+        order => order,
+    }
+}
+
+/// Set the row order `auto` uses for single-input calls of `kernel`
+/// ([`Tiling::Auto`] restores the built-in default). A speed setting; it
+/// cannot change a value.
+pub fn set_auto_order(kernel: Kernel, order: Tiling) {
+    AUTO_SINGLE[kernel.code() as usize].store(order.code(), Ordering::Relaxed);
+}
+
+/// How this machine ran both row orders of one kernel ([`calibrate_auto`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Calibration {
+    pub kernel: Kernel,
+    /// Best pass over the matrices with `rows4`, seconds.
+    pub rows4_seconds: f64,
+    /// Best pass over the matrices with `stream`, seconds.
+    pub stream_seconds: f64,
+    /// Weight bytes one pass reads.
+    pub weight_bytes: usize,
+    /// Passes per order.
+    pub passes: usize,
+    /// The order `auto` now uses for single-input calls of the kernel.
+    pub chosen: Tiling,
+}
+
+/// Best pass over `matrices` with each order of [`Tiling::ALL`], in seconds,
+/// alternating the orders for `passes` rounds. Leaves the last order
+/// measured selected; the caller restores the tiling.
+fn time_orders(
+    matrices: &[MatrixRows<'_>],
+    input: &PreparedInput,
+    passes: usize,
+) -> Result<[f64; 2], ModernError> {
+    let widest = matrices.iter().map(|m| m.rows).max().unwrap_or(0);
+    let mut out = vec![0i64; widest];
+    let mut best = [f64::INFINITY; 2];
+    for _ in 0..passes {
+        for (slot, order) in Tiling::ALL.into_iter().enumerate() {
+            set_tiling(order);
+            let start = Instant::now();
+            for m in matrices {
+                project(*m, input, &mut out[..m.rows])?;
+            }
+            best[slot] = best[slot].min(start.elapsed().as_secs_f64());
+        }
+    }
+    Ok(best)
+}
+
+/// Measure both row orders of `kernel` on `matrices` with `input` and make
+/// the faster one the `auto` order for single-input calls of `kernel`.
+///
+/// Each pass projects every matrix once. Give matrices that together exceed
+/// the caches (one matrix of every layer, say), so a pass streams weights
+/// from memory the way a decoded token does. The orders alternate for
+/// `passes` rounds and each order's best pass counts; `stream` must win by
+/// more than 1% to replace `rows4`. The configured tiling is restored. The
+/// result changes speed only: every order computes the same integers.
+pub fn calibrate_auto(
+    kernel: Kernel,
+    matrices: &[MatrixRows<'_>],
+    input: &PreparedInput,
+    passes: usize,
+) -> Result<Calibration, ModernError> {
+    if kernel == Kernel::Scalar || matrices.is_empty() {
+        return Err(ModernError::Invalid(
+            "tiling calibration needs a SIMD kernel and at least one matrix".into(),
+        ));
+    }
+    if input.kernel() != kernel {
+        return Err(ModernError::Invalid(format!(
+            "tiling calibration input was prepared for {}, not {}",
+            input.kernel().name(),
+            kernel.name()
+        )));
+    }
+    let previous = tiling();
+    let passes = passes.max(1);
+    let timed = time_orders(matrices, input, passes);
+    set_tiling(previous);
+    let best = timed?;
+    let chosen = if best[1] < best[0] * 0.99 {
+        Tiling::Stream
+    } else {
+        Tiling::Rows4
+    };
+    set_auto_order(kernel, chosen);
+    Ok(Calibration {
+        kernel,
+        rows4_seconds: best[0],
+        stream_seconds: best[1],
+        weight_bytes: matrices.iter().map(|m| m.rows * m.cols).sum(),
+        passes,
+        chosen,
+    })
 }
 
 // ------------------------------------------------- reference-path switch --
@@ -1851,6 +1978,48 @@ mod tests {
         assert_eq!(Tiling::Auto.resolve(Kernel::Scalar, false), Tiling::Rows4);
         assert_eq!(Tiling::Stream.resolve(Kernel::Neon, true), Tiling::Stream);
         assert_eq!(Tiling::Rows4.resolve(Kernel::Avx2, false), Tiling::Rows4);
+    }
+
+    #[test]
+    fn calibration_picks_a_concrete_order_and_auto_follows_it() {
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let mut rng = Rng(0xca11_b8a7);
+        let cols = 2048;
+        let mats: Vec<DyadicMatrix> = (0..3).map(|_| matrix(&mut rng, 64, cols, 127)).collect();
+        let views: Vec<MatrixRows<'_>> = mats.iter().map(MatrixRows::of).collect();
+        let x: Vec<i64> = (0..cols).map(|_| rng.signed(8 << 16)).collect();
+        let before = tiling();
+        for kernel in Kernel::available_kernels() {
+            let mut input = PreparedInput::new();
+            input.prepare(&x, kernel).unwrap();
+            if kernel == Kernel::Scalar {
+                assert!(calibrate_auto(kernel, &views, &input, 1).is_err());
+                assert_eq!(Tiling::Auto.resolve(kernel, false), Tiling::Rows4);
+                continue;
+            }
+            let built_in = Tiling::Auto.resolve(kernel, false);
+            let c = calibrate_auto(kernel, &views, &input, 2).unwrap();
+            assert!(matches!(c.chosen, Tiling::Rows4 | Tiling::Stream), "{c:?}");
+            assert_eq!(c.kernel, kernel);
+            assert_eq!(c.weight_bytes, 3 * 64 * cols);
+            assert_eq!(c.passes, 2);
+            assert!(
+                c.rows4_seconds.is_finite() && c.stream_seconds.is_finite(),
+                "{c:?}"
+            );
+            // `auto` follows the measurement for single-input calls only; an
+            // explicit order and the configured tiling are untouched.
+            assert_eq!(Tiling::Auto.resolve(kernel, false), c.chosen);
+            assert_eq!(Tiling::Auto.resolve(kernel, true), Tiling::Rows4);
+            assert_eq!(Tiling::Stream.resolve(kernel, false), Tiling::Stream);
+            assert_eq!(tiling(), before);
+            // Whatever was chosen, the values are the reference's.
+            let mut out = vec![0i64; 64];
+            project(views[0], &input, &mut out).unwrap();
+            assert_eq!(out, reference(&mats[0], &x));
+            set_auto_order(kernel, Tiling::Auto);
+            assert_eq!(Tiling::Auto.resolve(kernel, false), built_in);
+        }
     }
 
     #[test]

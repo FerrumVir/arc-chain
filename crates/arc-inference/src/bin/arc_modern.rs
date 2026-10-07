@@ -17,7 +17,7 @@ use arc_inference::modern::bench::{self, BenchOptions};
 use arc_inference::modern::bpe::ByteLevelBpe;
 use arc_inference::modern::chat::{ChatPrompt, render};
 use arc_inference::modern::convert::{self, SourceManifest};
-use arc_inference::modern::engine::Spec;
+use arc_inference::modern::engine::{self, Spec};
 use arc_inference::modern::kernels::{self, Kernel, Tiling};
 use arc_inference::modern::model::{GenerationRequest, ModernModel, TokenForward, generate_with};
 use arc_inference::modern::package;
@@ -164,6 +164,34 @@ fn row_orders(spec: Spec) -> Value {
         }
         _ => Value::Null,
     }
+}
+
+/// Calibrate the `auto` row order on the loaded model
+/// ([`engine::calibrate_auto_tiling`]); the record goes into the run file.
+/// Null when the tiling is explicit or the CPU has no SIMD kernel.
+fn calibrate_tiling(model: &ModernModel) -> Result<Value, ModernError> {
+    let Some(c) = engine::calibrate_auto_tiling(model)? else {
+        return Ok(Value::Null);
+    };
+    eprintln!(
+        "tiling auto: {} single-token calls use {} (best of {} passes over {:.0} MB of weights: \
+         rows4 {:.1} ms, stream {:.1} ms); batched calls use {}",
+        c.kernel.name(),
+        c.chosen.name(),
+        c.passes,
+        c.weight_bytes as f64 / 1e6,
+        1e3 * c.rows4_seconds,
+        1e3 * c.stream_seconds,
+        Tiling::Auto.resolve(c.kernel, true).name()
+    );
+    Ok(json!({
+        "kernel": c.kernel.name(),
+        "rows4_seconds": c.rows4_seconds,
+        "stream_seconds": c.stream_seconds,
+        "weight_bytes": c.weight_bytes,
+        "passes": c.passes,
+        "chosen": c.chosen.name(),
+    }))
 }
 
 fn platform() -> Value {
@@ -387,6 +415,7 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
     let package_path = args.path("--package")?;
     let digest = package::digest_file(&package_path)?;
     let (model, load_seconds) = load(&package_path)?;
+    let calibration = calibrate_tiling(&model)?;
     let mut runner = spec.runner(&model);
     let tokenizer = match args.value("--tokenizer") {
         Some(path) => {
@@ -446,6 +475,7 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
         "kernel_path": spec.kernel_name(),
         "tiling": kernels::tiling().name(),
         "row_orders": row_orders(spec),
+        "tiling_calibration": calibration,
         "threads": threads,
         "platform": platform(),
         "cases": records,
@@ -471,6 +501,7 @@ fn cmd_generate(args: &Args) -> Result<(), ModernError> {
     configure_threads(args)?;
     let (kernel, spec) = configure_kernel(args)?;
     let (model, load_seconds) = load(&args.path("--package")?)?;
+    let calibration = calibrate_tiling(&model)?;
     let mut runner = spec.runner(&model);
     let tokenizer_path = args.required("--tokenizer")?;
     let tokenizer_bytes = std::fs::read(&tokenizer_path)
@@ -497,6 +528,9 @@ fn cmd_generate(args: &Args) -> Result<(), ModernError> {
     record["kernel"] = Value::from(kernel);
     record["spec"] = Value::from(spec.name());
     record["census"] = census(spec);
+    record["tiling"] = Value::from(kernels::tiling().name());
+    record["row_orders"] = row_orders(spec);
+    record["tiling_calibration"] = calibration;
     record["platform"] = platform();
     if let Some(path) = args.value("--json-out") {
         write_json(Path::new(&path), &record)?;
@@ -523,6 +557,7 @@ fn cmd_ppl(args: &Args) -> Result<(), ModernError> {
     let threads = configure_threads(args)?;
     let (kernel, spec) = configure_kernel(args)?;
     let (model, _) = load(&args.path("--package")?)?;
+    let calibration = calibrate_tiling(&model)?;
     let mut runner = spec.runner(&model);
     let tokens_json = read_json(&args.path("--tokens")?)?;
     let mut tokens = ids_from(tokens_json.get("tokens").or(Some(&tokens_json)))?;
@@ -562,6 +597,9 @@ fn cmd_ppl(args: &Args) -> Result<(), ModernError> {
         "profile": PROFILE,
         "kernel": kernel,
         "spec": spec.name(),
+        "tiling": kernels::tiling().name(),
+        "row_orders": row_orders(spec),
+        "tiling_calibration": calibration,
         "threads": threads,
         "window": window,
         "scored_tokens": scored,
@@ -614,6 +652,7 @@ fn cmd_bench(args: &Args) -> Result<(), ModernError> {
     let package_path = args.path("--package")?;
     let digest = package::digest_file(&package_path)?;
     let (model, load_seconds) = load(&package_path)?;
+    let calibration = calibrate_tiling(&model)?;
     let spec_names = args.value("--specs").unwrap_or_else(|| "simd".to_string());
     let specs = spec_names
         .split(',')
@@ -651,6 +690,7 @@ fn cmd_bench(args: &Args) -> Result<(), ModernError> {
     result["package"] = digest.to_json();
     result["load_seconds"] = json!(load_seconds);
     result["specs_requested"] = json!(spec_names);
+    result["tiling_calibration"] = calibration;
     write_json(&args.path("--out")?, &result)?;
     for context in result["contexts"].as_array().into_iter().flatten() {
         for run in context["decode"].as_array().into_iter().flatten() {

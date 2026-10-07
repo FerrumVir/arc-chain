@@ -28,7 +28,7 @@ use rayon::prelude::*;
 
 use super::ModernError;
 use super::arith::{self, HeadCache, add_residual, exp_q16, rope_split_half, to_activation};
-use super::kernels::{self, Isa, Kernel, MatrixRows, PreparedInput};
+use super::kernels::{self, Isa, Kernel, MatrixRows, PreparedInput, Tiling};
 use super::model::{KvCache, ModernConfig, ModernModel, ReferenceRun, TokenForward};
 use super::tables::attention_lambda;
 use crate::canonical_simd::{self, ProjectionCensus};
@@ -899,6 +899,45 @@ fn simd_kernel() -> Result<Kernel, ModernError> {
     }
 }
 
+/// Calibrate the `auto` row order of this CPU's fastest SIMD kernel on
+/// `model`: both orders project the gate matrix of every layer (one pass
+/// streams the weights from memory, as a decoded token does) and the faster
+/// one becomes the order of single-input calls ([`kernels::calibrate_auto`]).
+/// `None` when the configured tiling is not `auto` or the CPU has no SIMD
+/// kernel. Speed only: every order computes the same integers, and CI
+/// checks each order against the golden digests.
+pub fn calibrate_auto_tiling(
+    model: &ModernModel,
+) -> Result<Option<kernels::Calibration>, ModernError> {
+    if kernels::tiling() != Tiling::Auto {
+        return Ok(None);
+    }
+    let kernel = Kernel::best();
+    if kernel == Kernel::Scalar {
+        return Ok(None);
+    }
+    // RMS-normalised magnitudes (|x| < 8.0 in Q16), the common projection
+    // input: two digit planes on AVX2, three on NEON.
+    let x: Vec<i64> = (0..model.config.d_model)
+        .map(|j| ((j as i64 * 7919) % (16 << 16)) - (8 << 16))
+        .collect();
+    let matrices: Vec<MatrixRows<'_>> = model
+        .layers
+        .iter()
+        .map(|layer| MatrixRows::of(&layer.w_gate))
+        .collect();
+    // The calibration's own input and projections belong to no run, so
+    // they are kept out of the census.
+    let counting = kernels::census_enabled();
+    kernels::set_census_enabled(false);
+    let mut input = PreparedInput::new();
+    let calibrated = input
+        .prepare(&x, kernel)
+        .and_then(|()| kernels::calibrate_auto(kernel, &matrices, &input, 3));
+    kernels::set_census_enabled(counting);
+    calibrated.map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +946,41 @@ mod tests {
     use crate::modern::model::{GenerationRequest, generate_with};
 
     const TOKENS: [u32; 9] = [3, 17, 5, 39, 0, 12, 7, 7, 30];
+
+    #[test]
+    fn auto_tiling_is_calibrated_on_the_model_only_when_auto_and_simd() {
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let model = tiny_model();
+        let before = kernels::tiling();
+        kernels::set_tiling(Tiling::Auto);
+        Spec::start_census();
+        let calibration = calibrate_auto_tiling(&model).unwrap();
+        assert_eq!(
+            kernels::census().attempted,
+            0,
+            "calibration is no run's census"
+        );
+        assert!(kernels::census_enabled(), "the census switch is restored");
+        match Kernel::best() {
+            Kernel::Scalar => assert!(calibration.is_none()),
+            kernel => {
+                let c = calibration.expect("a SIMD kernel is calibrated");
+                assert_eq!(c.kernel, kernel);
+                assert_eq!(Tiling::Auto.resolve(kernel, false), c.chosen);
+                assert_eq!(
+                    c.weight_bytes,
+                    model.layers.len() * model.config.d_ff * model.config.d_model
+                );
+                kernels::set_auto_order(kernel, Tiling::Auto);
+            }
+        }
+        kernels::set_tiling(Tiling::Rows4);
+        assert!(
+            calibrate_auto_tiling(&model).unwrap().is_none(),
+            "an explicit order is kept"
+        );
+        kernels::set_tiling(before);
+    }
 
     /// Reference and engine logits for the same tokens, and both caches.
     type Trace = (Vec<Vec<i64>>, [u8; 32]);
