@@ -8,14 +8,17 @@ name: Serving speed (bit-exact)
 #
 #   gate   rustfmt, clippy (deny warnings), and every arc-inference unit test
 #          (serving proofs, golden vectors, modern profile) on Linux x86-64
-#          (AVX2) and Linux arm64 (NEON dotprod); the modern tests run again
-#          with the SIMD kernels forced on.
+#          (AVX2), Linux arm64 (NEON dotprod) and Windows x86-64 (AVX2); the
+#          modern tests run again with the SIMD kernels forced on.
+#   kernel the batched projection against one row at a time on synthetic
+#          matrices (Linux x86-64 and arm64).
 #   bench  the real SmolLM3-3B, downloaded at the pinned revision and converted
 #          on the runner: the golden digest through the serving engine, decode
 #          tok/s at concurrency 1..32, time to first token with and without the
 #          prefix cache, and the speculative speedup. CI-runner numbers.
 #
-# Linux only: macOS runners stay free for the release sequence.
+# Linux and Windows only: macOS runners stay free for the release sequence.
+# Documentation-only changes do not run it.
 
 on:
   pull_request:
@@ -23,7 +26,6 @@ on:
     paths:
       - 'crates/arc-inference/**'
       - 'scripts/arc_modern/**'
-      - 'docs/serving-optimizations.md'
       - '.github/workflows/serving-speed.yml'
 
 permissions:
@@ -57,7 +59,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,11 +73,11 @@ jobs:
         with:
           shared-key: serving-gate-${{ matrix.os }}
       - name: rustfmt (workspace packages)
-        if: runner.arch == 'X64'
+        if: matrix.os == 'ubuntu-latest'
         run: ./scripts/rustfmt-workspace.sh --check
       # Same feature set as the shipped node; CI's own clippy job runs on x86-64.
       - name: Clippy (arc-inference with candle, all targets, deny warnings)
-        if: runner.arch == 'X64'
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
       # The NEON kernels compile only on arm64. Repo CI has never run clippy
       # there, so pre-existing arm64-only findings must not block this job:
@@ -84,7 +86,7 @@ jobs:
         if: runner.arch == 'ARM64'
         continue-on-error: true
         run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
-      - name: Unit tests (every arc-inference test, including the serving proofs)
+      - name: Unit tests (every arc-inference test, including the serving proofs; Linux and Windows x86-64)
         if: runner.arch == 'X64'
         run: cargo test -p arc-inference --lib --locked
       - name: Unit tests on arm64 (modern profile, serving proofs, golden vectors)

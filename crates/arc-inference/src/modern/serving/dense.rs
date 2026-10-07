@@ -4,10 +4,13 @@
 //! A step's rows may mix sequences, prefill chunks and decode tokens. Each
 //! projection runs once over all rows ([`project_rows`]), so every weight row is
 //! read once per step instead of once per token. Everything else is per row:
-//! RMSNorm, RoPE at the row's own position, the KV append, and two-pass
-//! attention over the row's own sequence up to its own position. The
-//! arithmetic is the profile's ([`crate::modern::arith`]); only the loop order
-//! changes.
+//! RMSNorm, RoPE at the row's own position, the KV append, two-pass attention
+//! over the row's own sequence up to its own position, and the final norm and
+//! LM head, which run for every row so the reference's refusals are raised
+//! wherever it raises them. The arithmetic is the profile's
+//! ([`crate::modern::arith`]); only the loop order changes. A row that fails
+//! fails alone: [`finish_step`] keeps its sequence's rows before it and drops
+//! it and the rows after it.
 //!
 //! The pass is split into stages so a model can be cut between devices: an
 //! island pipeline runs [`embed_rows`], then [`forward_layers`] for its layer
@@ -23,7 +26,7 @@ use std::ops::Range;
 use rayon::prelude::*;
 
 use super::gemm::project_rows;
-use super::{BatchModel, Row, SeqKv, StepOutput, check_rows};
+use super::{BatchModel, Failure, Row, SeqKv, StepOutput, check_rows};
 use crate::modern::ModernError;
 use crate::modern::arith::{
     HeadCache, add_residual, attention_head, embed_row, gated_silu, rms_norm, rope_split_half,
@@ -142,13 +145,19 @@ pub fn layered_forward(
     finish_step(rows, kvs, &base, errors, logits)
 }
 
-/// A step that failed its contract check: every sequence gets the error.
+/// A step that failed its contract check: every sequence gets the error and
+/// keeps nothing.
 pub fn failed_step(rows: usize, sequences: usize, error: &ModernError) -> StepOutput {
     let message = error.to_string();
     StepOutput {
         logits: (0..rows).map(|_| None).collect(),
         errors: (0..sequences)
-            .map(|_| Some(ModernError::Invalid(message.clone())))
+            .map(|_| {
+                Some(Failure {
+                    kept: 0,
+                    error: ModernError::Invalid(message.clone()),
+                })
+            })
             .collect(),
     }
 }
@@ -284,31 +293,58 @@ pub fn forward_layers(
     }
 }
 
-/// Final RMSNorm and the tied LM head (spec §5.8) for rows that asked for
-/// logits. Rows that did not ask skip both, which is why a prefill chunk costs
-/// one LM head instead of one per token.
+/// Rows per LM-head pass over rows whose logits choose no token: their domain
+/// checks run like every other row's and their values are discarded, so the
+/// pass works on at most this many rows of `vocab` values at a time.
+const HEAD_CHECK_ROWS: usize = 64;
+
+/// Final RMSNorm and the tied LM head (spec §5.8) for every row without an
+/// error, as [`ModernModel::forward`] runs them for every token. Rows that
+/// asked for logits get them. The other rows keep only the outcome of the
+/// domain checks, so a refusal the reference raises at a prompt position whose
+/// logits choose no token is raised here too.
 pub fn final_logits(
     model: &ModernModel,
     rows: &[Row],
     hidden: &[i64],
     errors: &mut [Option<ModernError>],
 ) -> Vec<Option<Vec<i64>>> {
-    let c = &model.config;
-    let d = c.d_model;
-    let vocab = c.vocab_size;
     let mut logits: Vec<Option<Vec<i64>>> = rows.iter().map(|_| None).collect();
     let wanted: Vec<usize> = (0..rows.len())
         .filter(|&r| rows[r].logits && errors[r].is_none())
         .collect();
-    if wanted.is_empty() {
-        return logits;
+    head_pass(model, &wanted, hidden, errors, &mut logits, true);
+    let checked: Vec<usize> = (0..rows.len())
+        .filter(|&r| !rows[r].logits && errors[r].is_none())
+        .collect();
+    for chunk in checked.chunks(HEAD_CHECK_ROWS) {
+        head_pass(model, chunk, hidden, errors, &mut logits, false);
     }
-    let mut normed = vec![0i64; wanted.len() * d];
-    let mut wanted_errors: Vec<Option<ModernError>> = wanted.iter().map(|_| None).collect();
-    for ((&r, out), error) in wanted
+    logits
+}
+
+/// The final norm and the LM head for the rows `which`. A row's error lands
+/// in `errors`; its values land in `logits` when `keep` is set.
+fn head_pass(
+    model: &ModernModel,
+    which: &[usize],
+    hidden: &[i64],
+    errors: &mut [Option<ModernError>],
+    logits: &mut [Option<Vec<i64>>],
+    keep: bool,
+) {
+    if which.is_empty() {
+        return;
+    }
+    let c = &model.config;
+    let d = c.d_model;
+    let vocab = c.vocab_size;
+    let mut normed = vec![0i64; which.len() * d];
+    let mut pass_errors: Vec<Option<ModernError>> = which.iter().map(|_| None).collect();
+    for ((&r, out), error) in which
         .iter()
         .zip(normed.chunks_mut(d))
-        .zip(wanted_errors.iter_mut())
+        .zip(pass_errors.iter_mut())
     {
         match rms_norm(
             &hidden[r * d..(r + 1) * d],
@@ -319,19 +355,21 @@ pub fn final_logits(
             Err(e) => *error = Some(e),
         }
     }
-    let mut values = vec![0i64; wanted.len() * vocab];
-    project_rows(&model.embed, &normed, &mut values, &mut wanted_errors);
-    for ((&r, error), row_values) in wanted.iter().zip(wanted_errors).zip(values.chunks(vocab)) {
+    let mut values = vec![0i64; which.len() * vocab];
+    project_rows(&model.embed, &normed, &mut values, &mut pass_errors);
+    for ((&r, error), row_values) in which.iter().zip(pass_errors).zip(values.chunks(vocab)) {
         match error {
             Some(e) => errors[r] = Some(e),
-            None => logits[r] = Some(row_values.to_vec()),
+            None if keep => logits[r] = Some(row_values.to_vec()),
+            None => {}
         }
     }
-    logits
 }
 
-/// Close a step: each sequence commits its new positions, or rolls back to
-/// `base` and reports the first error among its rows.
+/// Close a step. Each sequence commits the positions of its rows up to its
+/// first failing row and drops that row and the rows after it, whose caches
+/// would include it; the failure is reported with the number of rows kept. A
+/// sequence without a failing row commits every row.
 pub fn finish_step(
     rows: &[Row],
     kvs: &mut [&mut SeqKv],
@@ -339,37 +377,52 @@ pub fn finish_step(
     errors: Vec<Option<ModernError>>,
     mut logits: Vec<Option<Vec<i64>>>,
 ) -> StepOutput {
-    let mut seq_errors: Vec<Option<ModernError>> = kvs.iter().map(|_| None).collect();
+    let mut failures: Vec<Option<Failure>> = kvs.iter().map(|_| None).collect();
     let mut grown = vec![0usize; kvs.len()];
+    let mut kept = vec![0usize; kvs.len()];
     for (row, error) in rows.iter().zip(errors) {
-        grown[row.seq] += 1;
-        if let Some(e) = error
-            && seq_errors[row.seq].is_none()
-        {
-            seq_errors[row.seq] = Some(e);
+        let seq = row.seq;
+        grown[seq] += 1;
+        if failures[seq].is_some() {
+            continue;
+        }
+        match error {
+            Some(e) => {
+                failures[seq] = Some(Failure {
+                    kept: kept[seq],
+                    error: e,
+                })
+            }
+            None => kept[seq] += 1,
         }
     }
     for (seq, kv) in kvs.iter_mut().enumerate() {
         if grown[seq] == 0 {
             continue;
         }
-        if seq_errors[seq].is_none()
-            && let Err(e) = kv.commit(base[seq] + grown[seq])
-        {
-            seq_errors[seq] = Some(e);
-        }
-        if seq_errors[seq].is_some() {
-            kv.rollback(base[seq]);
+        // Every plane holds the step's rows (zeros for a failed one): commit
+        // them all, then drop the rows from the first failure on.
+        match kv.commit(base[seq] + grown[seq]) {
+            Ok(()) => kv.rollback(base[seq] + kept[seq]),
+            Err(e) => {
+                kv.rollback(base[seq]);
+                kept[seq] = 0;
+                failures[seq] = Some(Failure { kept: 0, error: e });
+            }
         }
     }
+    let mut seen = vec![0usize; kvs.len()];
     for (row, slot) in rows.iter().zip(logits.iter_mut()) {
-        if seq_errors[row.seq].is_some() {
+        if let Some(failure) = &failures[row.seq]
+            && seen[row.seq] >= failure.kept
+        {
             *slot = None;
         }
+        seen[row.seq] += 1;
     }
     StepOutput {
         logits,
-        errors: seq_errors,
+        errors: failures,
     }
 }
 

@@ -665,12 +665,21 @@ fn bench_gemm(widths: &[usize], repeats: usize) -> Result<Value, ModernError> {
             // where project_rows uses the single-row path instead.
             let live: Vec<usize> = (0..width).collect();
             let mut sums_seconds = f64::MAX;
+            let mut sums = Vec::new();
             for _ in 0..repeats {
                 let started = Instant::now();
-                let sums = exact_sums(&m, xs, &live);
+                sums = exact_sums(&m, xs, &live);
                 sums_seconds = sums_seconds.min(started.elapsed().as_secs_f64());
-                identical &= sums.len() == rows * width;
             }
+            // Raw sums against independent scalar dot products, element by
+            // element; the projected outputs against one row at a time.
+            identical &= sums.len() == rows * width
+                && (0..rows).all(|i| {
+                    let row = &m.q[i * cols..(i + 1) * cols];
+                    (0..width).all(|t| {
+                        sums[i * width + t] == arith::dot_i8_i64(row, &xs[t * cols..(t + 1) * cols])
+                    })
+                });
             identical &= gemv == gemm;
             let weights = (rows * cols * width) as f64;
             let per_row = |seconds: f64| 1e3 * seconds / width as f64;
