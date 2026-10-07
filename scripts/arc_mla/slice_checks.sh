@@ -129,3 +129,6 @@ printf '\n}\n' >> "$summary"
 cat "$summary"
 python "$ROOT/scripts/arc_mla/check_slice_engine.py" "$BIN" "$WORK" "$EV"
 echo "slice checks: all passed"
+
+# Explicit versioned preparation: fresh synthetic fixture only, never weights.
+python "$ROOT/scripts/arc_mla/check_yarn_slices.py" "$BIN" "$WORK/prepared-yarn" "$EV/prepared-yarn"

@@ -1,0 +1,15 @@
+{
+  "schema": "arc.modern-cases.v1",
+  "cases": [
+    {
+      "id": "experimental-early-layer-head-token-probe",
+      "prompt_tokens": [
+        1,
+        42
+      ],
+      "max_tokens": 2,
+      "eos": [],
+      "selection": "argmax"
+    }
+  ]
+}

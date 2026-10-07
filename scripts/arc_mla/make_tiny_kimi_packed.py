@@ -136,7 +136,11 @@ def safetensors_bytes(items: list) -> bytes:
     return struct.pack("<Q", len(text)) + text + b"".join(blobs)
 
 
-def write(outdir: Path, yarn: bool = False, edge: bool = False) -> dict:
+def write(outdir: Path, yarn: bool = False, edge: bool = False, prepared: bool = False) -> dict:
+    previous_dims = tiny.NOPE, tiny.ROPE
+    if prepared:
+        tiny.NOPE, tiny.ROPE = 128, 64
+        yarn = True
     o = tiny.variant_options("kimi")
     first, second = tiny.shards(o)
     by_name = {name: (dtype, shape, values) for name, dtype, shape, values in first + second}
@@ -188,6 +192,7 @@ def write(outdir: Path, yarn: bool = False, edge: bool = False) -> dict:
     (outdir / "model.safetensors.index.json").write_bytes(index_bytes)
     tag = "-yarn" if yarn else ""
     tag += "-edge" if edge else ""
+    tag += "-prepared" if prepared else ""
     manifest = {
         "schema": "arc.hf-source.v1",
         "repo": f"arc-test/tiny-kimi-packed{tag}",
@@ -203,6 +208,7 @@ def write(outdir: Path, yarn: bool = False, edge: bool = False) -> dict:
     (outdir / "tiny-kimi-packed.source.json").write_bytes(tiny.json_bytes(manifest))
     (outdir / "tiny-kimi-packed.cases.json").write_bytes(
         tiny.json_bytes({"schema": "arc.modern-cases.v1", "cases": tiny.CASES}))
+    tiny.NOPE, tiny.ROPE = previous_dims
     return manifest
 
 
@@ -211,8 +217,9 @@ def main(argv: list) -> int:
     parser.add_argument("outdir")
     parser.add_argument("--yarn", action="store_true", help="add Kimi-K2.6's YaRN rope_scaling")
     parser.add_argument("--edge", action="store_true", help="a -8 value and a zero-scale group")
+    parser.add_argument("--prepared", action="store_true", help="distinct synthetic fixture with K2.6 YaRN head dimensions")
     args = parser.parse_args(argv)
-    manifest = write(Path(args.outdir), args.yarn, args.edge)
+    manifest = write(Path(args.outdir), args.yarn, args.edge, args.prepared)
     for entry in manifest["files"] + [manifest["index"]]:
         print(f"{entry['name']}: {entry['bytes']} bytes sha256 {entry['sha256']}")
     return 0

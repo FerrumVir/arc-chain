@@ -44,6 +44,9 @@ use crate::modern::tables::rope_tables;
 use crate::modern::{ModernError, hex_lower, identity_blake3};
 
 /// Slice manifest schema.
+mod prepared;
+pub use prepared::{assemble_yarn_bundle, prepare_yarn_manifest};
+
 pub const SLICE_MANIFEST_SCHEMA: &str = "arc.integer-slice-manifest.v1";
 /// Unit record schema (one file per converted unit, under `units/`).
 pub const SLICE_UNIT_SCHEMA: &str = "arc.integer-slice-unit.v1";
@@ -1315,6 +1318,7 @@ fn config_for_layout(shape: &Value, manifest: &Value) -> Result<MlaConfig, Moder
         rms_eps_q32: 1,
         rope_theta: 2,
         attention_lambda: 0,
+        preparation: None,
         expert_format: manifest
             .get("profile")
             .and_then(Value::as_str)
@@ -2065,6 +2069,7 @@ mod tests {
             rope_theta: 50_000,
             attention_lambda: crate::modern::tables::attention_lambda(192),
             expert_format: ExpertFormat::Int4G32,
+            preparation: None,
         };
         c.validate().unwrap();
         let bytes = |unit: Unit, experts: bool| -> u64 {

@@ -1,5 +1,15 @@
 # What a real Kimi-K2.6 checkpoint would need
 
+**Versioned preparation prerequisite:** [kimi-k26-yarn-v1.md](kimi-k26-yarn-v1.md)
+now defines pinned K2.6 YaRN tables/scaling, explicit full/probe/fixture
+identities, and finalization of declared pending weight commitments. The
+legacy converter still refuses the wrapped packed checkpoint. ARC-72's
+separate lossless loader must be integrated with this new preparation before
+real slice assembly/forward; no weights were fetched and no real forward was
+measured here. The legacy converter gaps below should be read with this
+separate entry point in mind.
+
+
 Status: **requirements**, 7 October 2026. Nothing in this repository has run
 Kimi-K2.6 weights, and this document makes no speed claim about Kimi. The
 engine work it builds on is the integer profile

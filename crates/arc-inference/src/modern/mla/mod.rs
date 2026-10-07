@@ -35,6 +35,8 @@ pub mod model;
 pub mod ops;
 pub mod package;
 pub mod slices;
+pub mod yarn;
+mod yarn_constants;
 
 /// Arithmetic profile implemented by this module.
 pub const PROFILE: &str = "arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1";

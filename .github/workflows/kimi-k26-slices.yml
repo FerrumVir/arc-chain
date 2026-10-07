@@ -18,7 +18,9 @@ name: Kimi-K2.6 weight slices (streamed per shard)
 #          Rust = the independent Python preparer, packed = the BF16 twin's
 #          i4g32 conversion, slices reassemble the converter's package,
 #          which executes through scalar/SIMD and 1/2/4 file-backed stages.
-#          YaRN and incompatible i8 conversion fail before package output.
+#          Legacy YaRN and incompatible i8 conversion fail before output.
+#          Explicit prepared YaRN bundles verify copied slices/segments and
+#          packages before publication; fixture 1/2/4-stage execution is exact.
 #
 # Real-shard jobs (label kimi-slices-proof on the pull request, or a push whose
 # head commit message contains [kimi-slices]):
@@ -45,6 +47,9 @@ on:
   push:
     branches: [agent/builder/ARC-72]
     paths:
+      - '.gitattributes'
+      - 'crates/arc-inference/src/modern/tables.rs'
+      - 'docs/protocol/reference/kimi-k26/**'
       - 'crates/arc-inference/src/modern/mla/**'
       - 'crates/arc-inference/src/bin/arc_mla.rs'
       - 'scripts/arc_conformance/mla_moe_reference.py'
@@ -55,7 +60,10 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, labeled]
     paths:
-      - 'crates/arc-inference/src/modern/mla/slices.rs'
+      - '.gitattributes'
+      - 'crates/arc-inference/src/modern/tables.rs'
+      - 'docs/protocol/reference/kimi-k26/**'
+      - 'crates/arc-inference/src/modern/mla/**'
       - 'crates/arc-inference/src/modern/mla/convert.rs'
       - 'crates/arc-inference/src/modern/mla/config.rs'
       - 'scripts/arc_conformance/mla_moe_reference.py'
@@ -63,6 +71,7 @@ on:
       - 'scripts/arc_mla/tests/**'
       - 'scripts/arc_mla/slice_checks.sh'
       - 'scripts/arc_mla/check_slice_engine.py'
+      - 'scripts/arc_mla/check_yarn_slices.py'
       - 'scripts/arc_mla/make_tiny_kimi_packed.py'
       - 'scripts/arc_mla/ct_unpack_check.py'
       - 'scripts/arc_mla/slice_report.py'
