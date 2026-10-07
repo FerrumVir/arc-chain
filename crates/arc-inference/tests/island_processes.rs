@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 
 use arc_inference::modern::arith::Selection;
 use arc_inference::modern::mla::config::MlaConfig;
-use arc_inference::modern::mla::island::commit::{Verdict, audit_all, audit_stage};
+use arc_inference::modern::mla::island::commit::{AuditContext, Verdict, audit_all, audit_stage};
 use arc_inference::modern::mla::island::coordinator::{Completion, Request, Schedule};
 use arc_inference::modern::mla::island::even_cuts;
 use arc_inference::modern::mla::island::process::ProcessIsland;
@@ -247,7 +247,13 @@ fn tampered_and_lying_stage_processes_are_rejected() {
             "a consistent lie passes the link check"
         );
         let revealed = island.coordinator.reveal(r.id).unwrap();
-        let verdicts = audit_all(&got.ledger, &revealed, &verifier_refs).unwrap();
+        let verdicts = audit_all(
+            &got.ledger,
+            &revealed,
+            &verifier_refs,
+            &AuditContext::new(r, &got.tokens),
+        )
+        .unwrap();
         for ((a, b), verdict) in verdicts {
             if r.id == victim && (a, b) == (1, 3) {
                 assert_eq!(
@@ -274,7 +280,8 @@ fn tampered_and_lying_stage_processes_are_rejected() {
             audit_stage(
                 &verifiers[2],
                 &forged,
-                got.ledger.stage_commits(3, 4).unwrap()
+                got.ledger.stage_commits(3, 4).unwrap(),
+                &AuditContext::new(r, &got.tokens)
             ),
             Verdict::InputMismatch { position: 1 }
         );
@@ -394,7 +401,14 @@ fn a_wrong_token_from_the_last_stage_process_is_rejected() {
     let verifier_refs: Vec<&StageModel> = verifiers.iter().collect();
     for (r, got) in reqs.iter().zip(&done) {
         let revealed = island.coordinator.reveal(r.id).unwrap();
-        for ((a, b), verdict) in audit_all(&got.ledger, &revealed, &verifier_refs).unwrap() {
+        for ((a, b), verdict) in audit_all(
+            &got.ledger,
+            &revealed,
+            &verifier_refs,
+            &AuditContext::new(r, &got.tokens),
+        )
+        .unwrap()
+        {
             if r.id == 7 && (a, b) == (2, 4) {
                 assert_eq!(
                     verdict,
@@ -508,4 +522,64 @@ fn regional_replicas_recover_lost_inflight_replies_with_heterogeneous_speeds() {
         child.finish().unwrap();
     }
     assert_eq!(c.n_layers, 4);
+}
+
+mod trusted_audit_cases {
+    use arc_inference as inference;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/audit_context_cases.rs"
+    ));
+}
+
+#[test]
+fn separate_process_metadata_attacks_require_trusted_context() {
+    use arc_inference::modern::mla::island::process::StageProcess;
+    use arc_inference::modern::mla::island::replica::{
+        ReplicaConnector, TransportConnector, stage_identity,
+    };
+    use arc_inference::modern::mla::island::transport::DeadlineTcpTransport;
+    use arc_inference::modern::mla::island::wire::Frame;
+    use std::sync::Arc;
+    use std::time::Duration;
+    let scratch = Scratch::new("trusted-audits");
+    let (path, _, _) = package(&scratch.0, "tiny-i4");
+    let mut children = Vec::new();
+    let mut sessions = Vec::new();
+    for (a, b) in [(0, 2), (2, 4)] {
+        let child = StageProcess::spawn_command(
+            Path::new(EXE),
+            "replica",
+            vec![
+                "--package".into(),
+                path.display().to_string(),
+                "--layers".into(),
+                format!("{a}:{b}"),
+                "--sessions".into(),
+                "1".into(),
+                "--threads".into(),
+                "1".into(),
+            ],
+            "127.0.0.1:0",
+        )
+        .unwrap();
+        let connector = TransportConnector {
+            transport: Arc::new(DeadlineTcpTransport {
+                timeout: Duration::from_secs(5),
+            }),
+            stage_id: stage_identity(&trusted_audit_cases::model(a, b)),
+        };
+        sessions.push(connector.connect(&child.address).unwrap());
+        children.push(child);
+    }
+    trusted_audit_cases::exercise(|s, frame| {
+        Frame::decode(&sessions[s].exchange(&frame.encode()).unwrap()).unwrap()
+    });
+    for session in &mut sessions {
+        session.exchange(&Frame::Shutdown.encode()).unwrap();
+    }
+    drop(sessions);
+    for child in children {
+        child.finish().unwrap();
+    }
 }

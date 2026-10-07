@@ -93,21 +93,30 @@ last stage committed to. The coordinator's `Ledger` per sequence:
   post per epoch (signing is not part of this change).
 
 **Audit** (`commit::audit_stage`). A verifier holding only layers `[a, b)`
-re-executes the stage from the inputs the stage reveals (its activation log,
-token ids and selection rule) and compares every committed hash. For the last
-stage it also recomputes every logits hash and re-applies the selection rule to
+requires an `AuditContext` captured from its original `Request` and accepted
+output transcript, independently of the reveal. It checks revealed sequence,
+prompt boundary, token history and selection against that context, re-executes
+the stage using the revealed activations and trusted tokens, and compares every
+committed hash. For the last stage it also recomputes every logits hash and
+re-applies the trusted selection rule and accepted history to
 every committed token (research-6 §4.2.2: the output tokens must equal the
 selection rule applied to the logits). Exact arithmetic makes the verdict
 decisive, with no thresholds:
 
 * `Valid`;
+* `RequestMismatch{field}`: revealed metadata differs from the trusted request;
 * `InputMismatch{position}`: the reveal does not hash to the committed input;
 * `Fault{position, boundary}`: the first boundary that differs;
 * `LogitsMismatch{position}`: the last stage's logits hash differs;
 * `WrongToken{position, committed, expected}`: the last stage emitted a token
   its selection rule does not give for these logits;
-* `ForwardMismatch{position}`: the committed token is not the token fed at the
-  next position (it was altered on its way back to the ring).
+* `ForwardMismatch{position}`: a forwarded or final emitted token differs from
+  the verifier's accepted transcript;
+* `Refused`: required trusted evidence is absent/inconsistent or shapes are invalid.
+
+`audit_all` also requires a complete, nonempty ledger and exactly one reveal
+for every committed stage. See [AUDIT-CONTEXT.md](AUDIT-CONTEXT.md) for the
+breaking API/wire change and consumer migration.
 
 Tests, on threads and on separate processes: a stage that alters an output and
 commits the altered hash keeps every link consistent and is blamed at that

@@ -239,6 +239,9 @@ fn cmd_relay(args: &Args) -> Result<(), ModernError> {
         .split(',')
         .map(str::to_string)
         .collect();
+    // Finite, non-compacting journal: at ~34 KB per position, 256 MiB holds
+    // roughly 190 decode steps at 40 streams (an estimate, not a quota).
+    // Exhaustion refuses work; see docs/island/REGIONAL-SWARM.md.
     let limit = args
         .number("--journal-mib", 256)?
         .checked_mul(1 << 20)

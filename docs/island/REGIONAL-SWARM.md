@@ -50,9 +50,17 @@ Current recovery limits: this is warm activation replay, not hot KV mirroring.
 The relay and its journal must survive. The journal is bounded and refuses work
 before overflow; it is not silently truncated. Relay/coordinator crash recovery,
 journal compaction and durable replicated logs are not implemented. The relay
+default of 256 MiB holds roughly 190 decode steps at 40 streams if each position
+costs about 34 KB (an estimate; actual capacity depends on frame sizes, batches
+and prior traffic). Admission must budget the full session, including prefill;
+closed sessions do not reclaim journal space. The relay
 adds request/response traffic; the direct-ring regional budget does not measure
 that extra RPC cost. TCP endpoints are a lab protocol, without public-internet
 authentication/encryption or abuse controls; deployment remains future work.
+The existing process tests drive `ReplicatedStage` directly. An end-to-end
+`serve_relay`/CLI test inside the coordinator ring remains deferred. TCP timeout
+limits currently apply per syscall; a peer trickling bytes can exceed that
+duration for a complete frame. Per-frame deadline hardening also remains deferred.
 
 ## Integration interfaces
 
@@ -61,12 +69,14 @@ authentication/encryption or abuse controls; deployment remains future work.
   or an earlier node as parent. Each stage forks the corresponding KV locally,
   returns per-node boundary/logits commitments and sampler selections, and drops
   temporary branches. The prefix is unchanged even on error. Accepted paths are
-  committed later through ordinary `Step` frames. Proposal/acceptance policy,
+  re-executed and committed later through ordinary `Step` frames. Proposal/acceptance policy,
   fused tree attention, prefix-cache sharing and tree memory admission belong to
   ENG-8; this initial implementation clones caches and caps trees at 4096 nodes.
   Use `Coordinator::forward_batch` to establish a live prefix,
   `Coordinator::verify_tree` to verify it and `close_sequences` to release it;
-  these synchronous calls require no other frames in flight.
+  these synchronous calls require an idle ring with no other frames in flight.
+  `await_frame` discards nonmatching frames, so tree calls cannot currently be
+  interleaved with batched streams.
 - **ENG-9:** `Transport`/`Listener`/`Link` remain the frame transport boundary.
   `ReplicaConnector`/`StageSession::exchange` expose recovery sessions for alternate
   transports. Every connect must yield empty KV. Relays occupy independent ring

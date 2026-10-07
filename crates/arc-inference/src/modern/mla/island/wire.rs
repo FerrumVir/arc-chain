@@ -10,7 +10,8 @@ use crate::modern::arith::Selection;
 
 const STEP: u8 = 1;
 const CLOSE: u8 = 2;
-const REVEAL: u8 = 3;
+// Tag 3 was the unbound v1 reveal; reject it instead of guessing its layout.
+const REVEAL: u8 = 8;
 const PING: u8 = 4;
 const SHUTDOWN: u8 = 5;
 const ERROR: u8 = 6;
@@ -378,6 +379,8 @@ impl Item {
 /// holding only this stage's weights can re-execute it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revealed {
+    /// Sequence named by the reveal envelope, checked against trusted request metadata.
+    pub seq: u64,
     pub first_layer: u32,
     pub end_layer: u32,
     pub prompt_len: u32,
@@ -456,6 +459,7 @@ impl Frame {
                 w.u64(*seq);
                 w.count(stages.len());
                 for s in stages {
+                    w.u64(s.seq);
                     w.u32(s.first_layer);
                     w.u32(s.end_layer);
                     w.u32(s.prompt_len);
@@ -520,6 +524,7 @@ impl Frame {
                 let stages = (0..n)
                     .map(|_| {
                         Ok(Revealed {
+                            seq: r.u64()?,
                             first_layer: r.u32()?,
                             end_layer: r.u32()?,
                             prompt_len: r.u32()?,
@@ -550,6 +555,18 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_unbound_reveal_tag_is_rejected() {
+        let frame = Frame::Reveal {
+            seq: 7,
+            stages: Vec::new(),
+        };
+        let mut old = frame.encode();
+        old[0] = 3;
+        assert!(Frame::decode(&old).is_err());
+        assert_eq!(Frame::decode(&frame.encode()).unwrap(), frame);
+    }
 
     #[test]
     fn frames_round_trip_and_activations_use_the_narrowest_exact_width() {
@@ -590,6 +607,7 @@ mod tests {
             Frame::Reveal {
                 seq: 7,
                 stages: vec![Revealed {
+                    seq: 7,
                     first_layer: 2,
                     end_layer: 4,
                     prompt_len: 2,

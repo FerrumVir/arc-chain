@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use super::coordinator::Request;
 use super::wire::{Revealed, StageCommit};
 use crate::modern::ModernError;
 use crate::modern::arith;
@@ -213,11 +214,81 @@ impl Ledger {
     }
 }
 
+/// Verifier-owned generation evidence, captured from the original request and
+/// the outputs accepted by the coordinator. Never construct this from a reveal
+/// or worker-supplied replacement request. Accepted tokens are the observed
+/// output transcript, not a claim they have already passed arithmetic audits.
+/// Every head selection is still independently re-executed below.
+#[derive(Debug, Clone)]
+pub struct AuditContext {
+    request: Request,
+    accepted_tokens: Vec<u32>,
+}
+
+impl AuditContext {
+    pub fn new(request: &Request, accepted_tokens: &[u32]) -> Self {
+        Self {
+            request: request.clone(),
+            accepted_tokens: accepted_tokens.to_vec(),
+        }
+    }
+
+    fn validate(&self, model: &StageModel, positions: usize) -> Result<(), String> {
+        let r = &self.request;
+        let c = model.config();
+        if r.prompt.is_empty()
+            || r.max_tokens == 0
+            || positions == 0
+            || r.prompt
+                .len()
+                .checked_add(r.max_tokens)
+                .is_none_or(|n| n > c.max_seq)
+            || r.prompt
+                .iter()
+                .chain(&self.accepted_tokens)
+                .any(|&t| t as usize >= c.vocab_size)
+            || self.accepted_tokens.len() > r.max_tokens
+        {
+            return Err("missing or invalid trusted request/history".into());
+        }
+        // A committed generation contains the whole prompt and one forwarded
+        // position for each accepted output except the final, unforwarded one.
+        // Incomplete prefill is also auditable, but cannot have emitted tokens.
+        let outputs = if positions < r.prompt.len() {
+            0
+        } else {
+            positions - r.prompt.len() + 1
+        };
+        if self.accepted_tokens.len() != outputs {
+            return Err("trusted output transcript does not cover committed positions".into());
+        }
+        if self
+            .accepted_tokens
+            .iter()
+            .take(outputs.saturating_sub(1))
+            .any(|t| r.eos.contains(t))
+        {
+            return Err("trusted history continues after EOS".into());
+        }
+        Ok(())
+    }
+
+    fn input_token(&self, position: usize) -> u32 {
+        if position < self.request.prompt.len() {
+            self.request.prompt[position]
+        } else {
+            self.accepted_tokens[position - self.request.prompt.len()]
+        }
+    }
+}
+
 /// The outcome of re-executing one stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Every committed hash was reproduced.
     Valid { positions: usize },
+    /// Reveal metadata attempts to redefine the verifier's request.
+    RequestMismatch { field: &'static str },
     /// The revealed input does not hash to the committed input (the stage
     /// withheld or altered its activation log).
     InputMismatch { position: usize },
@@ -246,11 +317,14 @@ pub enum Verdict {
 /// For the last stage it also recomputes every logits hash and re-applies
 /// the sequence's selection rule to every committed token (research-6
 /// §4.2.2: the output tokens must equal the selection rule applied to the
-/// logits). `committed` is what the ledger holds for that stage.
+/// logits). `committed` is what the verifier's ledger holds for that stage.
+/// `trusted` is mandatory; no self-consistency fallback accepts reveal-owned
+/// metadata or history. An absent/inconsistent transcript cannot return Valid.
 pub fn audit_stage(
     model: &StageModel,
     revealed: &Revealed,
     committed: &[PositionCommit],
+    trusted: &AuditContext,
 ) -> Verdict {
     let stage = model.stage();
     let c = model.config();
@@ -266,6 +340,33 @@ pub fn audit_stage(
             committed.len()
         ));
     }
+    if let Err(reason) = trusted.validate(model, positions) {
+        return Verdict::Refused(reason);
+    }
+    let request = &trusted.request;
+    for (differs, field) in [
+        (revealed.seq != request.id, "sequence"),
+        (
+            revealed.prompt_len as usize != request.prompt.len(),
+            "prompt boundary",
+        ),
+        (revealed.selection != request.selection, "selection"),
+    ] {
+        if differs {
+            return Verdict::RequestMismatch { field };
+        }
+    }
+    for (p, &token) in revealed.tokens.iter().enumerate() {
+        if token != trusted.input_token(p) {
+            return if p < request.prompt.len() {
+                Verdict::RequestMismatch {
+                    field: "prompt tokens",
+                }
+            } else {
+                Verdict::ForwardMismatch { position: p - 1 }
+            };
+        }
+    }
     let first = stage.has_embed();
     if (first && !revealed.inputs.is_empty())
         || (!first && revealed.inputs.len() != positions * c.d_model)
@@ -273,10 +374,11 @@ pub fn audit_stage(
         return Verdict::Refused("revealed inputs do not match the positions".into());
     }
     let head = stage.has_head(c);
-    let prompt_len = revealed.prompt_len as usize;
+    let prompt_len = request.prompt.len();
     let mut cache = model.new_cache();
     let mut trace = Vec::new();
-    for (p, &token) in revealed.tokens.iter().enumerate() {
+    for (p, position_commit) in committed.iter().enumerate() {
+        let token = trusted.input_token(p);
         let input = if first {
             StageInput::Token(token)
         } else {
@@ -289,7 +391,7 @@ pub fn audit_stage(
                 return Verdict::Refused(format!("re-execution failed at position {p}: {e}"));
             }
         };
-        let expected = &committed[p].hashes;
+        let expected = &position_commit.hashes;
         if expected.len() != trace.len() {
             return Verdict::Refused(format!("position {p}: commitment shape"));
         }
@@ -303,7 +405,7 @@ pub fn audit_stage(
             };
         }
         if !head {
-            if committed[p].logits.is_some() || committed[p].selected.is_some() {
+            if position_commit.logits.is_some() || position_commit.selected.is_some() {
                 return Verdict::Refused(format!("position {p}: logits from a middle stage"));
             }
             continue;
@@ -311,17 +413,19 @@ pub fn audit_stage(
         let Some(logits) = logits else {
             return Verdict::Refused("the last stage produced no logits".into());
         };
-        if committed[p].logits != Some(arith::logits_hash(&logits)) {
+        if position_commit.logits != Some(arith::logits_hash(&logits)) {
             return Verdict::LogitsMismatch { position: p };
         }
-        if let Some(emitted) = committed[p].selected {
-            if p + 1 < prompt_len {
-                return Verdict::Refused(format!(
-                    "position {p}: a token selected inside the prompt"
-                ));
-            }
-            let history = &revealed.tokens[prompt_len..=p];
-            let reselected = match arith::select(&logits, history, revealed.selection) {
+        let expects_output = p + 1 >= prompt_len;
+        if position_commit.selected.is_some() != expects_output {
+            return Verdict::Refused(format!(
+                "position {p}: missing or unexpected selected token"
+            ));
+        }
+        if let Some(emitted) = position_commit.selected {
+            let output_index = p + 1 - prompt_len;
+            let history = &trusted.accepted_tokens[..output_index];
+            let reselected = match arith::select(&logits, history, request.selection) {
                 Ok(t) => t,
                 Err(e) => return Verdict::Refused(format!("re-selection failed at {p}: {e}")),
             };
@@ -332,11 +436,8 @@ pub fn audit_stage(
                     expected: reselected,
                 };
             }
-            if revealed
-                .tokens
-                .get(p + 1)
-                .is_some_and(|&fed| fed != emitted)
-            {
+            // Includes the final emitted token, which has no next input row.
+            if trusted.accepted_tokens[output_index] != emitted {
                 return Verdict::ForwardMismatch { position: p };
             }
         }
@@ -353,7 +454,23 @@ pub fn audit_all(
     ledger: &Ledger,
     revealed: &[Revealed],
     models: &[&StageModel],
+    trusted: &AuditContext,
 ) -> Result<Vec<StageVerdict>, ModernError> {
+    if !ledger.complete() || ledger.positions() == 0 {
+        return Err(ModernError::Invalid(
+            "audit requires a complete, nonempty ledger".into(),
+        ));
+    }
+    let ranges = ledger.stage_ranges();
+    let supplied: std::collections::BTreeSet<_> = revealed
+        .iter()
+        .map(|r| (r.first_layer, r.end_layer))
+        .collect();
+    if supplied.len() != revealed.len() || supplied.into_iter().collect::<Vec<_>>() != ranges {
+        return Err(ModernError::Invalid(
+            "audit requires exactly one reveal for every committed stage".into(),
+        ));
+    }
     let mut verdicts = Vec::new();
     for r in revealed {
         let range = (r.first_layer, r.end_layer);
@@ -367,7 +484,7 @@ pub fn audit_all(
                 ModernError::Invalid(format!("no verifier holds [{}, {})", range.0, range.1))
             })?;
         let verdict = match ledger.stage_commits(range.0, range.1) {
-            Some(committed) => audit_stage(model, r, committed),
+            Some(committed) => audit_stage(model, r, committed, trusted),
             None => Verdict::Refused("the stage committed nothing".into()),
         };
         verdicts.push((range, verdict));

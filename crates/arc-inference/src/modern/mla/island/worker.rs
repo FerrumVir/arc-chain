@@ -192,6 +192,7 @@ impl StageWorker {
                 let s = self.model.stage();
                 if let Some(state) = self.seqs.get(&seq) {
                     stages.push(Revealed {
+                        seq,
                         first_layer: s.first_layer as u32,
                         end_layer: s.end_layer as u32,
                         prompt_len: state.prompt_len,

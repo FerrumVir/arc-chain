@@ -33,6 +33,7 @@ on:
       - 'crates/arc-inference/src/modern/mla/**'
       - 'crates/arc-inference/src/bin/arc_island.rs'
       - 'crates/arc-inference/tests/island_processes.rs'
+      - 'crates/arc-inference/tests/support/audit_context_cases.rs'
       - 'crates/arc-inference/Cargo.toml'
       - 'scripts/arc_island/**'
       - '.github/workflows/island-runtime.yml'
@@ -73,7 +74,8 @@ jobs:
             crates/arc-inference/src/modern/mla/*.rs \
             crates/arc-inference/src/modern/mla/island/*.rs \
             crates/arc-inference/src/bin/arc_island.rs \
-            crates/arc-inference/tests/island_processes.rs
+            crates/arc-inference/tests/island_processes.rs \
+            crates/arc-inference/tests/support/audit_context_cases.rs
       - name: Clippy (arc-inference with candle, all targets, deny warnings)
         run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
       - name: Unit tests (MLA + MoE profile and the island on threads)

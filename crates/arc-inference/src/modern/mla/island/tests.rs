@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use super::commit::{Verdict, audit_all, audit_stage};
+use super::commit::{AuditContext, Verdict, audit_all, audit_stage};
 use super::coordinator::{Completion, Coordinator, Request, Schedule};
 use super::even_cuts;
 use super::expert::{ExpertPlacement, RemoteExperts, serve_experts};
@@ -492,7 +492,13 @@ fn a_tampered_stage_is_rejected_by_re_execution() {
         assert!(got.ledger.complete(), "id {}", r.id);
         let revealed = island.coordinator.reveal(r.id).unwrap();
         assert_eq!(revealed.len(), 3);
-        let verdicts = audit_all(&got.ledger, &revealed, &verifier_refs).unwrap();
+        let verdicts = audit_all(
+            &got.ledger,
+            &revealed,
+            &verifier_refs,
+            &AuditContext::new(r, &got.tokens),
+        )
+        .unwrap();
         for ((a, b), verdict) in verdicts {
             if r.id == victim && (a, b) == (1, 3) {
                 assert_eq!(
@@ -526,7 +532,8 @@ fn a_tampered_stage_is_rejected_by_re_execution() {
             audit_stage(
                 &verifiers[2],
                 &forged,
-                got.ledger.stage_commits(3, 4).unwrap()
+                got.ledger.stage_commits(3, 4).unwrap(),
+                &AuditContext::new(r, &got.tokens)
             ),
             Verdict::InputMismatch { position: 1 }
         );
@@ -589,7 +596,14 @@ fn a_wrong_token_from_the_last_stage_is_rejected_by_re_selection() {
         .collect();
     let verifier_refs: Vec<&StageModel> = verifiers.iter().collect();
     let revealed = island.coordinator.reveal(victim).unwrap();
-    for ((a, b), verdict) in audit_all(&got.ledger, &revealed, &verifier_refs).unwrap() {
+    for ((a, b), verdict) in audit_all(
+        &got.ledger,
+        &revealed,
+        &verifier_refs,
+        &AuditContext::new(&reqs[0], &got.tokens),
+    )
+    .unwrap()
+    {
         if (a, b) == (3, 4) {
             assert_eq!(
                 verdict,
@@ -620,13 +634,23 @@ fn a_wrong_token_from_the_last_stage_is_rejected_by_re_selection() {
     let revealed = island.coordinator.reveal(2).unwrap();
     let commits = done[1].ledger.stage_commits(3, 4).unwrap();
     assert!(matches!(
-        audit_stage(&verifiers[2], &revealed[2], commits),
+        audit_stage(
+            &verifiers[2],
+            &revealed[2],
+            commits,
+            &AuditContext::new(&reqs[1], &done[1].tokens)
+        ),
         Verdict::Valid { .. }
     ));
     let mut forged = revealed[2].clone();
     forged.tokens[2] = (forged.tokens[2] + 1) % c.vocab_size as u32;
     assert_eq!(
-        audit_stage(&verifiers[2], &forged, commits),
+        audit_stage(
+            &verifiers[2],
+            &forged,
+            commits,
+            &AuditContext::new(&reqs[1], &done[1].tokens)
+        ),
         Verdict::ForwardMismatch { position: 1 }
     );
     island.stop();
@@ -664,7 +688,8 @@ fn a_lying_commitment_breaks_the_link_check() {
         audit_stage(
             &stage0,
             &revealed[0],
-            got.ledger.stage_commits(0, 2).unwrap()
+            got.ledger.stage_commits(0, 2).unwrap(),
+            &AuditContext::new(&reqs[0], &got.tokens)
         ),
         Verdict::Fault {
             position: 0,
@@ -1040,4 +1065,90 @@ fn replica_identity_and_transport_timeout_fail_closed() {
         }
         server.join().unwrap();
     }
+}
+
+mod trusted_audit_cases {
+    use crate as inference;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/audit_context_cases.rs"
+    ));
+
+    #[test]
+    fn native_worker_metadata_attacks_require_trusted_context() {
+        use super::{StageWorker, WorkerConfig};
+        let mut workers = [
+            StageWorker::new(model(0, 2), WorkerConfig::default()).unwrap(),
+            StageWorker::new(model(2, 4), WorkerConfig::default()).unwrap(),
+        ];
+        exercise(|s, frame| workers[s].process(frame).unwrap());
+    }
+}
+
+#[test]
+fn coordinator_rejects_substituted_return_metadata_without_harming_neighbour() {
+    use super::worker::Downstream;
+    let c = synthetic::tiny_config(true, ExpertFormat::Int4G32);
+    let reqs = vec![
+        Request {
+            id: 1,
+            prompt: vec![0, 17, 5],
+            max_tokens: 3,
+            eos: vec![],
+            selection: Selection::Rp64Argmax,
+        },
+        Request {
+            id: 2,
+            prompt: vec![0, 17, 5],
+            max_tokens: 3,
+            eos: vec![],
+            selection: Selection::Rp64Argmax,
+        },
+    ];
+    let whole = stage_model(&c, 0, 4, Router::Random);
+    let expected = reference(&whole, &reqs[1]);
+    let mem: Arc<dyn Transport> = Arc::new(MemTransport::new());
+    let mut listener = mem.listen("metadata-stage").unwrap();
+    let returns = mem.listen("metadata-coordinator").unwrap();
+    let transport = mem.clone();
+    let worker = std::thread::spawn(move || {
+        let mut stage = StageWorker::new(whole, WorkerConfig::default()).unwrap();
+        let mut link = listener.accept().unwrap();
+        let mut downstream = Downstream::new(transport, "metadata-coordinator".into());
+        loop {
+            let input = Frame::decode(&link.recv().unwrap()).unwrap();
+            let stop = matches!(input, Frame::Shutdown);
+            let mut output = stage.process(input).unwrap();
+            if let Frame::Step { items, .. } = &mut output {
+                for item in items.iter_mut().filter(|item| item.seq == 1) {
+                    item.selection = Selection::Argmax;
+                }
+            }
+            downstream.send(&output.encode()).unwrap();
+            if stop {
+                break;
+            }
+        }
+    });
+    let mut coordinator = Coordinator::new(mem, "metadata-stage".into(), returns, c);
+    let (done, _) = coordinator
+        .run(
+            &reqs,
+            &Schedule {
+                concurrency: 2,
+                ..Schedule::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        done[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("trusted request/input metadata")
+    );
+    assert!(done[0].tokens.is_empty());
+    assert_matches(&expected, &done[1], "honest neighbour");
+    coordinator.shutdown().unwrap();
+    worker.join().unwrap();
 }

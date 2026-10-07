@@ -333,6 +333,16 @@ impl Coordinator {
                                 ))
                             })?;
                         let comp = &mut completions[i];
+                        if item.start as usize != l.next_start
+                            || item.tokens != l.next_tokens
+                            || item.prompt_len as usize != r.prompt.len()
+                            || item.selection != r.selection
+                        {
+                            comp.error =
+                                Some("returned item changed trusted request/input metadata".into());
+                            finished.push(i);
+                            continue;
+                        }
                         let n = item.tokens.len();
                         if let Some(e) = item.error {
                             comp.error = Some(e);
@@ -453,8 +463,11 @@ impl Coordinator {
     }
 
     /// Verify drafted branches against a still-live prefix in one ring pass.
-    /// Call with no other frames in flight. ENG-8 owns draft proposal and path
-    /// acceptance; this API returns exact per-node logits/commitments only.
+    /// Requires an idle ring: `await_frame` discards nonmatching frames, so do
+    /// not interleave this with batched streams. Accepted paths are re-executed
+    /// through ordinary Step frames; this call does not advance the live KV.
+    /// ENG-8 owns draft proposal and path acceptance; this API returns exact
+    /// per-node logits/commitments only.
     pub fn verify_tree(
         &mut self,
         id: u64,
