@@ -115,6 +115,17 @@ class PureLogicTests(unittest.TestCase):
         self.assertEqual(L.new_signatures(later, scan), ["ERROR x: boom"])
         self.assertEqual(L.new_signatures(scan, None), sorted(set(scan["error_signatures"]) | set(scan["hard_signatures"])))
 
+    def test_anti_equivocation_info_line_is_not_damage_and_paths_do_not_matter(self):
+        a = "2026-10-07T10:51:12Z  INFO arc_node::consensus: Loaded consensus anti-equivocation record path=/home/runner/work/_temp/work/prod/d4-control-validator/node-0/consensus-signing-record.bin absences=1 finality=2"
+        b = a.replace("d4-control-validator", "d4-reopen-validator").replace("absences=1", "absences=7")
+        scan_a, scan_b = L.scan_log(a), L.scan_log(b)
+        self.assertEqual(scan_a["hard_signatures"], [])
+        self.assertEqual(scan_a["error_signatures"], [])
+        self.assertEqual(L.log_signature(a), L.log_signature(b))
+        real = L.scan_log("2026-10-07T10:51:12Z ERROR arc_consensus: EQUIVOCATION DETECTED - validator produced two blocks in the same round\n"
+                          "2026-10-07T10:51:13Z  WARN arc_consensus: Slash applied for DAG equivocation validator=ab")
+        self.assertEqual(len(real["hard_signatures"]), 2)
+
     def test_history_preserved(self):
         a = {"nodes": [node_obs(9980, 10), node_obs(9981, 10)]}
         b = {"nodes": [node_obs(9980, 15), node_obs(9981, 15)]}
@@ -250,6 +261,10 @@ STUB_NODE = textwrap.dedent('''
         if not signing.startswith(("NODE%d-" % index).encode()):
             sys.stderr.write("ERROR arc_node: signing record belongs to another validator\\n")
             sys.exit(4)
+    if stake > 0:
+        sys.stderr.write("2026-10-07T10:51:12Z  INFO arc_node::consensus: Loaded consensus anti-equivocation record path=%s absences=1 finality=2\\n"
+                         % os.path.join(data, "consensus-signing-record.bin"))
+        sys.stderr.flush()
     height = state["height"]
     sha = hashlib.sha256(open(sys.argv[0] if False else os.environ["STUB_SELF"], "rb").read()).hexdigest()
 
@@ -373,7 +388,7 @@ FAKE_HARNESS = textwrap.dedent('''
             (d / "generations" / "gen-2" / "state.bin").write_bytes(("state2-%d" % i).encode() * 40)
             (d / "consensus-signing-record.bin").write_bytes(sign_record(i, step))
             with open(str(d / "node.log"), "a") as stream:
-                stream.write("INFO started %s\\nWARN peer slow\\n" % step)
+                stream.write("INFO started %s\\nWARN peer slow\\nINFO arc_node::consensus: Loaded consensus anti-equivocation record path=%s absences=1 finality=2\\n" % (step, d / "consensus-signing-record.bin"))
             (d / "chain.json").write_text(json.dumps({"height": end_h, "records_sha256": hashlib.sha256(rec).hexdigest()}))
         report(step)
         observations.append({"label": "start", "nodes": [node(9980 + i, start_h, actual, version, features) for i in range(6)]})

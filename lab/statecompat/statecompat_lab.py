@@ -320,7 +320,7 @@ HARD = re.compile(
     r"panicked at|\bpanic\b|\bFATAL\b|corrupt|checksum|(?:digest|hash|state root) mismatch|"
     r"cannot (?:decode|deserialize|parse)|failed to (?:decode|deserialize|parse|load|read|open|replay)|"
     r"unsupported (?:format|version)|incompatible|invalid (?:magic|header|record|manifest|snapshot)|"
-    r"unknown (?:record|tag|variant|version)|EQUIVOCATION|equivocation detected|Slash applied",
+    r"unknown (?:record|tag|variant|version)|equivocation detected|slash applied",
     re.IGNORECASE,
 )
 
@@ -328,6 +328,7 @@ HARD = re.compile(
 def log_signature(line):
     text = ANSI.sub("", line)
     text = TIMESTAMP.sub("", text)
+    text = re.sub(r"(?:/[A-Za-z0-9_.@=+-]+){2,}", "<path>", text)
     text = re.sub(r"0x[0-9a-fA-F]{6,}|\b[0-9a-fA-F]{16,}\b", "<hex>", text)
     text = re.sub(r"\d+", "<n>", text)
     return text.strip()[:300]
@@ -963,7 +964,10 @@ class TierRunner:
         copy_tree(self.d3, d_post)
         before = self.keep_manifest(build_manifest(d_post, "d4-reopen-%s-before" % name))
         # control: the old binary on the OLD state. Its own log is the baseline of what normal looks like here.
+        ctl_before = self.keep_manifest(build_manifest(d_ctl, "d4-control-%s-before" % name))
         ctl_results, ctl_scans, _ = self.judged("control-" + name, d_ctl, mode, old_expected, self.old_sha, OLD_VERSION)
+        ctl_after = self.keep_manifest(build_manifest(d_ctl, "d4-control-%s-after" % name))
+        ctl_moved = manifest_delta(ctl_before, ctl_after)
         ctl_vs_old = judge_reopen(old_expected, ctl_results, self.old_sha, OLD_VERSION, mode == "observer", ctl_scans, ctl_scans)
         ctl_vs_new = judge_reopen(new_expected, ctl_results, self.old_sha, OLD_VERSION, mode == "observer", ctl_scans, ctl_scans)
         results, scans, verdict = self.judged("post-" + name, d_post, mode, new_expected, self.old_sha, OLD_VERSION,
@@ -971,6 +975,9 @@ class TierRunner:
         after = self.keep_manifest(build_manifest(d_post, "d4-reopen-%s-after" % name))
         moved = manifest_delta(before, after)
         signing_changed = [m["path"] for m in moved["modified"] if m["path"].endswith("consensus-signing-record.bin")]
+        ctl_kinds = set(kind_of(m["path"]) for m in ctl_moved["modified"]) | set(kind_of(p) for p in ctl_moved["added"])
+        touched = set(kind_of(m["path"]) for m in moved["modified"]) | set(kind_of(p) for p in moved["added"])
+        beyond_control = sorted(touched - ctl_kinds)
         control_hard = sorted(set(sig for scan in ctl_scans.values() for sig in scan["hard_signatures"]))
         control_errors = sorted(set(sig for scan in ctl_scans.values() for sig in scan["error_signatures"]))
         if control_hard:
@@ -982,6 +989,13 @@ class TierRunner:
             "control_vs_candidate_failed": failed_checks(ctl_vs_new),
             "control_error_signatures": control_errors, "control_hard_signatures": control_hard,
             "files_modified_by_reopen": moved["modified"], "files_added_by_reopen": moved["added"],
+            "control_files_modified": [m["path"] for m in ctl_moved["modified"]], "control_files_added": ctl_moved["added"],
+            "file_kinds_touched_beyond_the_control": beyond_control,
+            "reopened_heights": [((r.get("samples") or [{}])[-1].get("health") or {}).get("height") for r in results],
+            "candidate_observed_heights": [e["height"] for e in new_expected],
+            "blocks_compared_per_node": [len(e["chain"]) for e in new_expected],
+            "live_state_root_per_node": [norm_hex(((r.get("samples") or [{}])[-1].get("snapshot_info") or {}).get("state_root"))
+                                         for r in results],
             "signing_record_changed": signing_changed,
             "exit_codes": [r.get("exit_code") for r in results],
             "log_scans": {str(k): v for k, v in scans.items()},
@@ -998,6 +1012,8 @@ class TierRunner:
                         [p for p in moved["added"] if classify(p) == "state"]
         if mode == "observer" and state_changed:
             self.flag("the observer reopen modified or added state files (review): %s" % state_changed[:6])
+        if beyond_control:
+            self.flag("%s reopen touched file kinds the control reopen did not (review): %s" % (name, beyond_control[:6]))
         return run
 
     def s06_isolation(self):
@@ -1044,8 +1060,9 @@ class TierRunner:
         self.check("validator-argv reopen: the control FAILS the candidate-freshness expectation", run["control_fails_freshness"],
                    "control vs candidate failed: %s" % run["control_vs_candidate_failed"])
         self.check("validator-argv reopen: every node ran in a verified empty network namespace", isolated)
-        if run["signing_record_changed"]:
-            self.flag("the validator-argv reopen rewrote the signing record on: %s (a validator signs; informational)"
+        control_rewrote = [p for p in run["control_files_modified"] if p.endswith("consensus-signing-record.bin")]
+        if run["signing_record_changed"] and not control_rewrote:
+            self.flag("the validator-argv reopen rewrote the signing record on %s but the control reopen did not (review)"
                       % run["signing_record_changed"])
         ok = run["verdict"]["ok"] and run["control_vs_old_state_ok"] and run["control_fails_freshness"] and isolated
         return self.finish(rec, ok)
@@ -1053,30 +1070,42 @@ class TierRunner:
     def s09_inspectors(self):
         rec = self.begin("S09-inspectors")
         notes = {}
+        d_insp = self.root / "d7-inspectors-copy"
+        copy_tree(self.d3, d_insp)
         checkpoint = self.root / "fixture" / "approved.arcchkpt"
         run = subprocess.run([str(self.old_bin), "recovery", "inspect", "--checkpoint", str(checkpoint)],
                              capture_output=True, text=True, timeout=120)
         notes["recovery inspect --checkpoint (fixture checkpoint, old binary; informational)"] = {
             "exit_code": run.returncode, "stdout_head": run.stdout.strip()[:600], "stderr_head": run.stderr.strip()[:300]}
-        node0 = Path(self.d3) / "node-0"
-        legacy_files = [n for n in ("state.wal", "state.snapshot.lz4") if (node0 / n).exists()]
-        wal_dirs = [p for p in (node0 / "dag-wal",) if p.is_dir()]
+        node0 = Path(d_insp) / "node-0"
+        legacy_pair = [n for n in ("state.wal", "state.snapshot.lz4") if (node0 / n).exists()]
+        legacy_dag = node0 / "dag-wal"
+        recovered_dag = sorted(p for p in node0.glob("dag-wal-recovery-*") if p.is_dir())
         notes["layout (post-candidate copy, node-0)"] = directory_listing(node0, 150)
+        has_pair = len(legacy_pair) == 2
         notes["inspect-legacy-block"] = {
-            "applicable": bool(legacy_files),
-            "reason": ("legacy state.wal and/or state.snapshot.lz4 present" if legacy_files else
-                       "NOT APPLICABLE: the recovered-v3 layout has no legacy state.wal / state.snapshot.lz4 (listing above); "
-                       "the inspector reads only an exact, stopped legacy WAL/snapshot pair pinned by expected digests")}
-        if wal_dirs:
-            run = subprocess.run([str(self.old_bin), "recovery", "inspect-legacy-dag-round", "--dag-wal-dir", str(wal_dirs[0])],
+            "applicable": has_pair,
+            "reason": ("legacy state.wal and state.snapshot.lz4 present" if has_pair else
+                       "NOT APPLICABLE: the recovered-v3 layout has state.wal but no legacy state.snapshot.lz4 "
+                       "(it has state-snapshot.bin + state-snapshot.manifest); the inspector reads only an exact, stopped legacy "
+                       "WAL/snapshot pair pinned by expected digests, which this layout does not have (listing above)")}
+        if legacy_dag.is_dir():
+            target, why = legacy_dag, "a legacy dag-wal directory exists"
+        elif recovered_dag:
+            target, why = recovered_dag[0], ("informational probe only: the recovered layout has no legacy dag-wal; the inspector "
+                                             "is pointed at its dag-wal-recovery-<manifest> directory to record the exact answer")
+        else:
+            target, why = None, "no dag-wal directory of any kind"
+        if target is not None:
+            run = subprocess.run([str(self.old_bin), "recovery", "inspect-legacy-dag-round", "--dag-wal-dir", str(target)],
                                  capture_output=True, text=True, timeout=120)
             notes["inspect-legacy-dag-round"] = {
-                "applicable": "attempted: a dag-wal directory exists in the recovered layout", "exit_code": run.returncode,
-                "stdout_head": run.stdout.strip()[:600], "stderr_head": run.stderr.strip()[:300],
-                "interpretation": "informational only: the inspector is for the legacy segmented WAL; its answer on the "
-                                  "recovered layout's own dag-wal is not a state-compatibility result"}
+                "applicable": bool(legacy_dag.is_dir()), "why_run": why, "exit_code": run.returncode,
+                "stdout_head": run.stdout.strip()[:600], "stderr_head": run.stderr.strip()[:400],
+                "interpretation": "NOT a state-compatibility result unless a legacy dag-wal exists: the recovered layout's own "
+                                  "generation store has a different format (manifest.json + records.bin + checksummed active batches)"}
         else:
-            notes["inspect-legacy-dag-round"] = {"applicable": False, "reason": "no dag-wal directory in the recovered layout"}
+            notes["inspect-legacy-dag-round"] = {"applicable": False, "reason": why}
         write_json(self.out / "reopen" / "inspectors.json", notes)
         self.digests["inspectors"] = sha256_bytes(canonical(notes))
         return self.finish(rec, True, notes=notes)
@@ -1110,7 +1139,8 @@ class TierRunner:
                 theirs_path = Path(self.d3) / node_dir.name / "node.log"
                 theirs = scan_log(theirs_path.read_text(errors="replace")) if theirs_path.exists() else None
                 fresh[node_dir.name] = new_signatures(mine, theirs)
-                equivocation[node_dir.name] = [s for s in fresh[node_dir.name] if "equivocat" in s.lower() or "slash" in s.lower()]
+                equivocation[node_dir.name] = [s for s in fresh[node_dir.name]
+                                               if "equivocation detected" in s.lower() or "slash applied" in s.lower()]
             self.check("resume: no equivocation or slash message appeared in any log", not any(equivocation.values()),
                        json.dumps(equivocation, sort_keys=True))
             ok = ok and not any(equivocation.values())
@@ -1239,8 +1269,23 @@ class TierRunner:
         incomplete = [s["step"] for s in self.steps if s.get("status") in ("skipped", "running")]
         failed_steps = [s["step"] for s in self.steps if s.get("status") == "fail"]
         verdict = "pass" if not failing and not incomplete and not failed_steps else "fail"
+        numbers = {}
+        for step, key in (("old_run", "old_run"), ("new_run", "candidate_run"), ("resume", "resume")):
+            path = self.out / "observations" / (step + ".json")
+            if path.exists():
+                record = read_json(path)
+                for label in ("start", "after_import", "final"):
+                    try:
+                        obs = observation_by_label(record, label)
+                    except LabError:
+                        continue
+                    numbers["%s_%s_heights" % (key, label)] = [(n.get("health") or {}).get("height") for n in obs["nodes"]]
+                    numbers["%s_%s_blocks_served" % (key, label)] = [sum(1 for b in n.get("blocks", []) if not b.get("missing"))
+                                                                    for n in obs["nodes"]]
+                numbers["%s_workload" % key] = record.get("workload")
         result = {
             "schema": SCHEMA_TIER, "tier": self.tier, "verdict": verdict, "failing_checks": failing,
+            "summary_numbers": numbers,
             "failed_steps": failed_steps, "incomplete_steps": incomplete, "checks": self.checks, "flags": self.flags,
             "steps": self.steps, "digests": self.digests, "caveats": self.caveats,
             "not_reproduced": tier_not_reproduced(self.tier),
@@ -1459,7 +1504,10 @@ def cmd_assemble(args):
     summary["verdict"] = "pass" if verdicts and all(v == "pass" for v in verdicts) and len(verdicts) == 2 else (
         "fail" if "fail" in verdicts else "incomplete")
     files = {}
-    for root in [Path(p) for p in (args.tier_dir or [])] + [Path(p).parent for p in (args.build_record or []) if Path(p).exists()]:
+    roots = [Path(p) for p in (args.tier_dir or [])] + [Path(p).parent for p in (args.build_record or []) if Path(p).exists()]
+    if args.prod_binaries and Path(args.prod_binaries).exists():
+        roots.append(Path(args.prod_binaries).parent)
+    for root in roots:
         for path in sorted(root.rglob("*")):
             if path.is_file():
                 files[str(path.relative_to(root.parent))] = sha256_file(path)
