@@ -126,6 +126,24 @@ class PureLogicTests(unittest.TestCase):
                           "2026-10-07T10:51:13Z  WARN arc_consensus: Slash applied for DAG equivocation validator=ab")
         self.assertEqual(len(real["hard_signatures"]), 2)
 
+    def test_errors_during_an_orderly_shutdown_are_listed_apart(self):
+        text = "\n".join([
+            "2026-10-07T11:21:34Z  INFO arc_node: lifecycle signal handlers armed before node initialization",
+            "2026-10-07T11:21:35.458Z  INFO arc_node: SIGTERM received - stopping HTTP/background admission and draining active work",
+            "2026-10-07T11:21:35.460Z ERROR arc_node::consensus: Fatal recovery DAG pre-advance re-broadcast failure round=330 error=recovery DAG outbound transport channel is closed",
+            "2026-10-07T11:21:35.537Z  INFO arc_node: RPC handlers drained, node writers joined, WAL durability barrier completed, and the desktop receipt was acknowledged; shutdown is clean",
+            "2026-10-07T11:21:35.571Z  INFO arc_node: lifecycle signal handlers armed before node initialization",
+            "2026-10-07T11:21:40.000Z ERROR arc_node: a genuine error in the next life",
+        ])
+        scan = L.scan_log(text)
+        self.assertEqual(scan["error_signatures"], ["ERROR arc_node: a genuine error in the next life"])
+        self.assertEqual(len(scan["shutdown_error_signatures"]), 1)
+        self.assertIn("re-broadcast failure", scan["shutdown_error_signatures"][0])
+        self.assertEqual((scan["sigterms"], scan["clean_shutdowns"]), (1, 1))
+        # the shutdown-phase error is not "new damage" against a control that lacks it
+        control = L.scan_log("2026-10-07T11:00:00Z  INFO ok")
+        self.assertEqual(L.new_signatures(scan, control), ["ERROR arc_node: a genuine error in the next life"])
+
     def test_history_preserved(self):
         a = {"nodes": [node_obs(9980, 10), node_obs(9981, 10)]}
         b = {"nodes": [node_obs(9980, 15), node_obs(9981, 15)]}

@@ -335,21 +335,37 @@ def log_signature(line):
 
 
 def scan_log(text):
+    """Level counts and error/damage signatures of one log (which may hold several process lives).
+
+    Lines logged after "SIGTERM received" and before the next life's "lifecycle signal handlers armed" belong to an orderly
+    shutdown. Errors there (for example the DAG re-broadcast racing the closing P2P transport) are listed apart: they are
+    reported, not counted as damage, and an unclean shutdown shows up as a SIGTERM without its "shutdown is clean" line and
+    as a non-zero exit status."""
     levels = {}
     errors, hard = set(), set()
-    count = 0
+    shutdown_errors, shutdown_hard = set(), set()
+    count = sigterms = clean = 0
+    in_shutdown = False
     for raw in text.splitlines():
         count += 1
         line = ANSI.sub("", raw)
+        if "lifecycle signal handlers armed" in line:
+            in_shutdown = False
+        if "SIGTERM received" in line:
+            in_shutdown = True
+            sigterms += 1
+        if "shutdown is clean" in line:
+            clean += 1
         match = LEVEL.match(TIMESTAMP.sub("", line))
         level = match.group(1) if match else None
         if level:
             levels[level] = levels.get(level, 0) + 1
         if level == "ERROR":
-            errors.add(log_signature(line))
+            (shutdown_errors if in_shutdown else errors).add(log_signature(line))
         if HARD.search(line):
-            hard.add(log_signature(line))
-    return {"lines": count, "levels": levels, "error_signatures": sorted(errors), "hard_signatures": sorted(hard)}
+            (shutdown_hard if in_shutdown else hard).add(log_signature(line))
+    return {"lines": count, "levels": levels, "error_signatures": sorted(errors), "hard_signatures": sorted(hard),
+            "shutdown_error_signatures": sorted(shutdown_errors | shutdown_hard), "sigterms": sigterms, "clean_shutdowns": clean}
 
 
 def new_signatures(scan, control):
