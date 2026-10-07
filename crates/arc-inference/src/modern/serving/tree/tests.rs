@@ -334,10 +334,7 @@ fn malformed_trees_context_limits_and_projection_inputs_refuse() {
         };
         assert!(generate_tree(&dense, &request, &LookupTree::default(), 8).is_err());
     }
-    assert_eq!(
-        projected_tokens_per_second(8.0, 8, 10.0, 20.0).unwrap(),
-        80.0
-    );
+    assert!((projected_tokens_per_second(8.0, 8, 10.0, 20.0).unwrap() - 80.0).abs() < 1e-12);
     for (tokens, hops, hop_ms, compute) in [
         (f64::NAN, 8, 10.0, 0.0),
         (1.0, 0, 10.0, 0.0),
