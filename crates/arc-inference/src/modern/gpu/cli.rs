@@ -622,7 +622,14 @@ fn proof_run_entry(
     let tokenizer = load_tokenizer(args.value("--tokenizer"))?;
     let mut runs = Vec::new();
     for case in case_list(&challenge_cases)? {
-        runs.push(run_case(engine, config, case, tokenizer.as_ref())?);
+        runs.push(
+            run_case(engine, config, case, tokenizer.as_ref()).map_err(|error| {
+                ModernError::Domain(format!(
+                    "GPU challenge case {} failed: {error}",
+                    case["id"].as_str().unwrap_or("<unnamed>")
+                ))
+            })?,
+        );
     }
     let challenge_digest = matrix_digest(&runs)?;
     let reference = args.required("--reference-challenge-digest")?.to_string();
@@ -671,6 +678,20 @@ fn proof_run_entry(
         )));
     }
     Ok(entry)
+}
+
+/// The CLI's PASS, result flag and exit status share this decision. An
+/// omitted proof entry is allowed only when proof output was not requested.
+fn check_pass(
+    golden_matches: bool,
+    self_test_ok: bool,
+    trace_ok: bool,
+    proof_run: Option<&Value>,
+) -> bool {
+    golden_matches
+        && self_test_ok
+        && trace_ok
+        && proof_run.is_none_or(|entry| entry["verdict"] == "MATCH")
 }
 
 /// `arc-modern gpu-check`: the Proof Kit's GPU mode.
@@ -783,7 +804,12 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
     };
     let trace_ok = trace_check.is_null() || trace_check["all_equal"].as_bool() == Some(true);
     let self_test_ok = self_test["pass"].as_bool() == Some(true);
-    let pass = comparison.matched && self_test_ok && trace_ok;
+    let pass = check_pass(
+        comparison.matched,
+        self_test_ok,
+        trace_ok,
+        proof_run_out.as_ref().map(|_| &proof_run),
+    );
     let mut timing = comparison.timing;
     timing["load_seconds"] = json!(load_seconds);
     let result = json!({
@@ -822,7 +848,7 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
         Ok(())
     } else {
         Err(ModernError::Domain(format!(
-            "the GPU result differs from the CPU golden (see {})",
+            "GPU validation failed (golden, self-test, trace or proof challenge; see {})",
             out_path.display()
         )))
     }
@@ -831,6 +857,52 @@ pub fn check(items: &[String]) -> Result<(), ModernError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matching_golden_with_wrong_challenge_cannot_pass() {
+        let adapter = arc_gpu::modern::AdapterReport {
+            index: 0,
+            name: "fixture".into(),
+            vendor_id: 0,
+            vendor: "test".into(),
+            device_id: 0,
+            device_type: "Cpu".into(),
+            backend: "Vulkan".into(),
+            driver: String::new(),
+            driver_info: String::new(),
+            software: true,
+        };
+        let mut run = GpuProofRun {
+            adapter: &adapter,
+            golden_digest: proof_run::PUBLISHED_GOLDEN_DIGEST.into(),
+            challenge_digest: "ab".repeat(32),
+            reference_challenge_digest: "cd".repeat(32),
+            prefill_tok_s: 1.0,
+            decode_tok_s: 1.0,
+            divergence: Some(ProofDivergence {
+                case: Some("challenge".into()),
+                ..ProofDivergence::unlocated()
+            }),
+        };
+        let mismatch = proof_run::gpu_run_entry(&run);
+        assert!(proof_run::check_run_entry(&mismatch).is_empty());
+        assert_eq!(mismatch["verdict"], "MISMATCH");
+        assert_eq!(mismatch["divergence"]["case"], "challenge");
+        assert!(!check_pass(true, true, true, Some(&mismatch)));
+        run.reference_challenge_digest
+            .clone_from(&run.challenge_digest);
+        let matched = proof_run::gpu_run_entry(&run);
+        assert!(check_pass(true, true, true, Some(&matched)));
+        assert!(check_pass(true, true, true, None));
+        assert!(!check_pass(true, true, true, Some(&Value::Null)));
+        for (golden, operators, trace) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert!(!check_pass(golden, operators, trace, Some(&matched)));
+        }
+    }
 
     #[test]
     fn golden_comparison_finds_the_first_divergent_forward() {

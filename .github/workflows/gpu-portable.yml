@@ -35,6 +35,7 @@ on:
       - 'docs/gpu-worker-backend.md'
       - 'scripts/arc_modern/golden/**'
       - 'scripts/arc_modern/gpu_tiny_check.sh'
+      - 'scripts/arc_modern/gpu_proof_check.py'
       - 'docs/gpu-portable-kernels.md'
       - '.github/workflows/gpu-portable.yml'
 
@@ -147,6 +148,14 @@ jobs:
         run: ./target/release/arc-modern gpu-info --json-out "$RUNNER_TEMP/evidence/gpu-info.json"
       - name: Tiny model, CPU golden vs GPU golden vs Proof Kit gpu-check
         run: scripts/arc_modern/gpu_tiny_check.sh "$RUNNER_TEMP/tiny" "$RUNNER_TEMP/evidence"
+      - name: Proof entry, challenge mismatch and execution-error CLI regressions
+        run: |
+          python scripts/arc_modern/gpu_proof_check.py \
+            --binary ./target/release/arc-modern \
+            --package "$RUNNER_TEMP/tiny/tiny.arcipkg" \
+            --cases "$RUNNER_TEMP/tiny/tiny-smollm3.cases.json" \
+            --golden "$RUNNER_TEMP/evidence/tiny-cpu.json" \
+            --out-dir "$RUNNER_TEMP/evidence/proof-regressions"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

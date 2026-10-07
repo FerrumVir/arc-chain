@@ -139,6 +139,26 @@ arc-modern gpu-check --package smollm3-3b.arcipkg --tokenizer tokenizer.json \
 - `check_run_entry` restates #149's `runs[]` rules, and `gpu-check` refuses
   to write an entry that breaks them.
 
+When `--proof-run-out` is requested, the CLI's `pass` field, printed PASS and
+successful exit require the entry's `MATCH` verdict as well as the golden,
+operator self-test and trace checks. A challenge mismatch writes both the
+`MISMATCH` entry (including divergence evidence) and the failed result before
+exiting nonzero. Without proof output, the existing golden-check behavior is
+unchanged.
+
+The lavapipe job also runs `scripts/arc_modern/gpu_proof_check.py` on the tiny
+fixture: a matching challenge, a wrong reference digest, and a GPU challenge
+execution error. The tiny fixture is not the published SmolLM3 golden, so
+both emitted entries must remain `MISMATCH`; these tests do not weaken that
+published-golden requirement. A CPU-only verdict regression separately uses
+the published digest to isolate challenge mismatch from golden mismatch.
+
+**Remaining output limitation:** a challenge execution error is explicit on
+stderr and exits nonzero before either the result or run-entry file is written.
+The test preserves those logs. Use fresh output paths; the CLI does not remove
+pre-existing files on an early error. An assembled schema-valid entry/example
+is still not an integrated Proof Kit run.
+
 **Validated against #149 (93e4e368), Studio lab:** a `gpu-check` on Apple M2
 Ultra (Metal) gave this entry.
 - **Golden:** `3e43f342…49f2`, the published digest.

@@ -9038,8 +9038,8 @@ async fn run_arc_node() -> Result<()> {
             ),
         ));
         // ── Optional GPU backend (--gpu-inference, default OFF) ──────────
-        // The self-test runs off the async runtime; registration picks up the
-        // capabilities of a GPU that passed from the next round on.
+        // The dyadic self-test runs off the async runtime and is recorded
+        // locally. Canonical jobs remain on CPU; registration stays unchanged.
         worker_status.set_gpu_inference_requested(cli.gpu_inference);
         if cli.gpu_inference {
             if worker_model.is_some() {
