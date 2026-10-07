@@ -40,10 +40,36 @@
         ],
         "sampled_answers": 3,
         "cached_answers": 0,
-        "omitted_hop_samples": 0
+        "omitted_hop_samples": 0,
+        "untimed_answers_no_worker_timestamps": 0,
+        "short_answers": 0,
+        "zero_output_answers": 0,
+        "decode_missing_timestamps_answers": 0,
+        "ttft_missing_timestamps_answers": 0,
+        "invalid_decode_timing_answers": 0,
+        "speed_eligible_answers": 3,
+        "ttft_eligible_answers": 3,
+        "timing_coverage": {
+          "speed": {
+            "eligible_answers": 3,
+            "sampled_answers": 3,
+            "total_answers": 3,
+            "partial": false,
+            "reasons": []
+          },
+          "ttft": {
+            "eligible_answers": 3,
+            "sampled_answers": 3,
+            "total_answers": 3,
+            "partial": false,
+            "reasons": []
+          }
+        }
       }
     ],
-    "day_available": false
+    "day_available": false,
+    "day_window_start_unix_ms": null,
+    "day_window_end_unix_ms": 60000
   },
   {
     "schema": "arc.community.model-stats.v2",
@@ -82,9 +108,35 @@
         ],
         "sampled_answers": 1,
         "cached_answers": 0,
-        "omitted_hop_samples": 0
+        "omitted_hop_samples": 0,
+        "untimed_answers_no_worker_timestamps": 0,
+        "short_answers": 0,
+        "zero_output_answers": 0,
+        "decode_missing_timestamps_answers": 0,
+        "ttft_missing_timestamps_answers": 0,
+        "invalid_decode_timing_answers": 0,
+        "speed_eligible_answers": 1,
+        "ttft_eligible_answers": 1,
+        "timing_coverage": {
+          "speed": {
+            "eligible_answers": 1,
+            "sampled_answers": 1,
+            "total_answers": 1,
+            "partial": false,
+            "reasons": []
+          },
+          "ttft": {
+            "eligible_answers": 1,
+            "sampled_answers": 1,
+            "total_answers": 1,
+            "partial": false,
+            "reasons": []
+          }
+        }
       }
     ],
-    "day_available": false
+    "day_available": false,
+    "day_window_start_unix_ms": null,
+    "day_window_end_unix_ms": 60000
   }
 ]

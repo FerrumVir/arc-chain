@@ -9343,8 +9343,14 @@ fn serving_stats_routes() -> Router<NodeState> {
 
 // Read-only projections share one store: these routes are aliases, never
 // independent sources to sum. No registry maintenance or network IO on GET.
-async fn model_stats_v1(AxumState(node): AxumState<NodeState>) -> Json<Value> {
-    Json(node.serving_stats.lock().snapshot(true))
+async fn model_stats_v1(AxumState(node): AxumState<NodeState>) -> (StatusCode, Json<Value>) {
+    let snapshot = node.serving_stats.lock().snapshot(true);
+    let status = if snapshot["available"] == true {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(snapshot))
 }
 
 async fn model_stats_v2(AxumState(node): AxumState<NodeState>) -> Json<Value> {

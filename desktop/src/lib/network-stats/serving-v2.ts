@@ -23,7 +23,11 @@ export function percentiles(samples: readonly number[]) {
 }
 
 type Hop = { hop: number; start_layer: number; end_layer: number; positions: number; wall_ms: number; compute_ms: number };
-type Model = {
+const timingKeys = ["untimed_answers_no_worker_timestamps", "short_answers", "zero_output_answers",
+  "decode_missing_timestamps_answers", "ttft_missing_timestamps_answers", "invalid_decode_timing_answers",
+  "speed_eligible_answers", "ttft_eligible_answers"] as const;
+type TimingKey = typeof timingKeys[number];
+type Model = Record<TimingKey, number> & {
   model_id: string; answers: number; served_tokens: number; verified_tokens: number;
   input_tokens: number | null; input_tokens_last_day: number | null; output_tokens_last_day: number | null;
   answer_tokens_per_second: number[]; ttft_samples_ms: number[]; hop_samples: Hop[];
@@ -37,9 +41,13 @@ function parse(body: unknown, now: number): Source | null {
     || b.scope !== "completed_public_answers_on_this_coordinator" || b.window_secs !== 60
     || !count(b.window_start_unix_ms) || !count(b.window_end_unix_ms)
     || b.window_end_unix_ms - b.window_start_unix_ms !== 60000
-    || b.window_end_unix_ms % 1000 !== 0
-    || b.window_end_unix_ms > now || now - b.window_end_unix_ms > 30000
+    || b.window_end_unix_ms % 60000 !== 0
+    || b.window_end_unix_ms - now > 2000 || now - b.window_end_unix_ms > 62000
     || typeof b.day_available !== "boolean" || b.rejected_model_answers !== 0 || !Array.isArray(b.models) || b.models.length > 32) return null;
+  if (b.day_window_end_unix_ms !== b.window_end_unix_ms
+    || (b.day_available ? !count(b.day_window_start_unix_ms)
+      || b.day_window_start_unix_ms !== b.window_end_unix_ms - 86400000
+      : b.day_window_start_unix_ms !== null)) return null;
   const models: Model[] = [];
   const seen = new Set<string>();
   for (const raw of b.models) {
@@ -54,6 +62,15 @@ function parse(body: unknown, now: number): Source | null {
       || m.answer_tokens_per_second.length > m.sampled_answers || m.ttft_samples_ms.length > m.sampled_answers
       || !count(m.cached_answers) || m.cached_answers > m.answers || !count(m.omitted_hop_samples)
       || !Array.isArray(m.hop_samples) || m.hop_samples.length > 128) return null;
+    if (timingKeys.some(key => !count(m[key]) || (m[key] as number) > (m.answers as number))) return null;
+    const timing = Object.fromEntries(timingKeys.map(key => [key, m[key]])) as Record<TimingKey, number>;
+    if (m.cached_answers + timing.short_answers + timing.decode_missing_timestamps_answers
+        + timing.invalid_decode_timing_answers + timing.speed_eligible_answers !== m.answers
+      || m.cached_answers + timing.zero_output_answers + timing.ttft_missing_timestamps_answers
+        + timing.ttft_eligible_answers !== m.answers
+      || timing.zero_output_answers > timing.short_answers
+      || m.answer_tokens_per_second.length > timing.speed_eligible_answers
+      || m.ttft_samples_ms.length > timing.ttft_eligible_answers) return null;
     const hops: Hop[] = [];
     for (const rawHop of m.hop_samples) {
       const h = object(rawHop);
@@ -64,7 +81,7 @@ function parse(body: unknown, now: number): Source | null {
         positions: h.positions, wall_ms: h.wall_ms, compute_ms: h.compute_ms });
     }
     seen.add(m.model_id);
-    models.push({ model_id: m.model_id, answers: m.answers, served_tokens: m.served_tokens,
+    models.push({ ...timing, model_id: m.model_id, answers: m.answers, served_tokens: m.served_tokens,
       verified_tokens: m.verified_tokens, input_tokens: m.input_tokens,
       input_tokens_last_day: m.input_tokens_last_day, output_tokens_last_day: m.output_tokens_last_day,
       answer_tokens_per_second: m.answer_tokens_per_second, ttft_samples_ms: m.ttft_samples_ms,
@@ -98,7 +115,7 @@ export function summarizeServing(readings: readonly CoordinatorReading[], now = 
   }));
   const per_model = [...grouped].sort(([a], [b]) => a.localeCompare(b)).map(([model_id, entries]) => {
     const models = entries.map(e => e.model);
-    const sum = (key: "answers" | "served_tokens" | "verified_tokens" | "input_tokens" | "input_tokens_last_day" | "output_tokens_last_day" | "cached_answers") => {
+    const sum = (key: "answers" | "served_tokens" | "verified_tokens" | "input_tokens" | "input_tokens_last_day" | "output_tokens_last_day" | "cached_answers" | TimingKey | "sampled_answers") => {
       if ((key === "input_tokens_last_day" || key === "output_tokens_last_day") && !sources.every(s => s.dayComplete)) return null;
       let total = 0;
       for (const m of models) { if (m[key] === null) return null; total += m[key]; }
@@ -107,6 +124,23 @@ export function summarizeServing(readings: readonly CoordinatorReading[], now = 
     const output = sum("served_tokens"), input = sum("input_tokens"), verified = sum("verified_tokens");
     const speed = percentiles(models.flatMap(m => m.answer_tokens_per_second));
     const ttft = percentiles(models.flatMap(m => m.ttft_samples_ms));
+    const answers = sum("answers");
+    const coverage = (eligible: number | null, samples: number, exclusions: [string, number | null][]) => {
+      const reasons = exclusions.filter(([, n]) => n === null || n > 0).map(([reason]) => reason);
+      if (eligible === null) reasons.push("count_overflow");
+      else if (samples < eligible) reasons.push("sample_limit");
+      return { eligible_answers: eligible, sampled_answers: samples, total_answers: answers,
+        partial: answers === null || samples < answers, reasons };
+    };
+    const timingCoverage = {
+      speed: coverage(sum("speed_eligible_answers"), speed.samples, [
+        ["cached_answers", sum("cached_answers")], ["short_answers", sum("short_answers")],
+        ["missing_token_timestamps", sum("decode_missing_timestamps_answers")],
+        ["invalid_decode_interval", sum("invalid_decode_timing_answers")]]),
+      ttft: coverage(sum("ttft_eligible_answers"), ttft.samples, [
+        ["cached_answers", sum("cached_answers")], ["zero_output_answers", sum("zero_output_answers")],
+        ["missing_first_token_timestamp", sum("ttft_missing_timestamps_answers")]]),
+    };
     return { model_id, model_name: null, answers: sum("answers"), served_tokens: output,
       served_tokens_per_second: output === null ? null : output / 60,
       verified_tokens: verified, verified_share: output && verified !== null ? verified / output : null,
@@ -116,6 +150,8 @@ export function summarizeServing(readings: readonly CoordinatorReading[], now = 
       output_tokens_per_second: output === null ? null : output / 60,
       input_tokens_last_day: sum("input_tokens_last_day"), output_tokens_last_day: sum("output_tokens_last_day"),
       day_window_ms: 86400000, cached_answers: sum("cached_answers"),
+      ...Object.fromEntries(timingKeys.map(key => [key, sum(key)])) as Record<TimingKey, number | null>,
+      sampled_answers: sum("sampled_answers"), timing_coverage: timingCoverage,
       answer_tokens_per_second_percentiles: speed, time_to_first_token_ms: ttft,
       hop_latency: entries.flatMap(({ model, coordinator }) => model.hop_samples.map(h => ({
         coordinator_index: coordinator, ...h,
@@ -123,12 +159,18 @@ export function summarizeServing(readings: readonly CoordinatorReading[], now = 
         mean_compute_ms: h.positions ? h.compute_ms / h.positions : null,
       }))),
       hop_samples_truncated: models.some(m => m.omitted_hop_samples > 0),
-      reason: "Counts cover completed public answers. Timing is sampled; worker protocols without token timestamps and cached answers have no decode sample. Daily counts require a full day since every reporting coordinator started.",
+      reason: timingCoverage.speed.partial || timingCoverage.ttft.partial
+        ? "Timing covers only part of the answer population; see timing_coverage counts and reasons." : null,
+      day_reason: sources.every(s => s.dayComplete) ? null : "A coordinator lacks a complete day window.",
+      input_reason: input === null || sum("input_tokens_last_day") === null
+        ? "Input counts are unavailable where tokenization or day coverage is missing." : null,
     };
   });
   return { available: true, window_ms: 60000, per_model,
     window_start_unix_ms: sources[0].start, window_end_unix_ms: sources[0].end,
     source: "GET /community/model_stats/v2 (one alias per coordinator)",
+    day_window_start_unix_ms: sources.every(s => s.dayComplete) ? sources[0].end - 86400000 : null,
+    day_window_end_unix_ms: sources[0].end,
     as_of_unix_ms: sources[0].end, reason: null };
 }
 
