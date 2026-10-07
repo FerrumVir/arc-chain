@@ -9,6 +9,7 @@ use arc_vrf::bls_pop::{
 use arc_vrf::{
     BlsPopError, BlsPublicKey, BlsSecretKey, BlsSignature, EnrolledBlsKey, ProofOfPossession,
 };
+use blst::BLST_ERROR;
 use blst::min_pk::{AggregatePublicKey, PublicKey as RawPublicKey, SecretKey as RawSecretKey};
 use serde_json::Value;
 
@@ -151,13 +152,20 @@ fn ethereum_g1_deserialization_vectors_agree() {
     for case in cases {
         let decodes = case["output"].as_bool().unwrap();
         let bytes = hex_bytes(&case["input"]["pubkey"]);
-        // Pure decoding (what the vector specifies), straight from blst.
-        assert_eq!(
-            RawPublicKey::uncompress(&bytes).is_ok(),
-            decodes,
-            "{}",
-            case["name"]
-        );
+        // The vectors' notion of "deserializes" is the Ethereum one: the bytes
+        // decode to a point on the curve inside the G1 subgroup, with a
+        // well-formed infinity encoding counting as a success. blst splits that
+        // across `uncompress` (curve membership and flags) and `validate`
+        // (subgroup check, which also flags the identity), so the identity
+        // error is mapped back to "decodes".
+        let decodes_per_blst = match RawPublicKey::uncompress(&bytes) {
+            Ok(pk) => match pk.validate() {
+                Ok(()) | Err(BLST_ERROR::BLST_PK_IS_INFINITY) => true,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        assert_eq!(decodes_per_blst, decodes, "{}", case["name"]);
         // ARC's constructor additionally rejects the identity, so it accepts a
         // strict subset of what decodes.
         let arc_accepts = case["arc_from_bytes_ok"].as_bool().unwrap();
