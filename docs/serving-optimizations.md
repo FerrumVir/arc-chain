@@ -118,34 +118,34 @@ Decode first protects inter-token latency. Chunking bounds how long a long promp
 - **Tiling.** A rayon task owns 8 weight rows. Columns are walked in chunks (1,024 on x86-64, 2,048 on arm64) so one group of plane chunks and the block's weight chunks stay in L1 while every pair is multiplied; the partial sums of chunks add up exactly.
 - **Batch 1.** With a single live row the step calls `arith::project`, which is today's GEMV path. Single-token kernel work on the same base branch speeds that path up without touching this module.
 
-**Measured, kernel alone** (`arc-serve-bench gemm`, synthetic SmolLM3-shaped matrices, no model; the `kernel` CI job; commit `8d6ba36c4`, run 37523722150, 4 threads). Per-row time of the batched projection against one row at a time, outputs compared and identical. x86-64 ran on an AMD EPYC 9V45 (a different runner than the bench job below), arm64 on a Neoverse-N2.
+**Measured, kernel alone** (`arc-serve-bench gemm`, synthetic SmolLM3-shaped matrices, no model; the `kernel` CI job; commit `25ccd495f`, run 37555419649, 4 threads). Per-row time of the batched projection against one row at a time, outputs compared and identical. x86-64 ran on an AMD EPYC 7763 (a different runner than the bench job below), arm64 on a Neoverse-N2.
 
 | rows in the step | x86-64, 2048×2048 | x86-64, 2048×11008 | arm64, 2048×2048 | arm64, 2048×11008 |
 |---|---|---|---|---|
-| 1 | 0.97× | 1.01× | 1.05× | 1.10× |
-| 2 | 1.60× | 1.42× | 2.00× | 2.07× |
-| 4 | 2.20× | 2.76× | 2.28× | 2.16× |
-| 8 | 2.48× | 2.73× | 2.63× | 2.83× |
-| 16 | 2.67× | 2.69× | 3.01× | 2.91× |
-| 32 | 2.52× | 2.76× | 3.14× | 3.02× |
-| 64 | 2.79× | 2.80× | 3.15× | 2.97× |
-| 128 | 2.49× | 2.77× | 3.05× | 2.92× |
-| 256 | 2.59× | 2.54× | 2.91× | 2.78× |
+| 1 | 1.07× | 1.08× | 1.07× | 1.05× |
+| 2 | 2.28× | 2.19× | 1.97× | 1.91× |
+| 4 | 2.22× | 2.53× | 2.60× | 2.78× |
+| 8 | 2.35× | 2.51× | 2.62× | 2.89× |
+| 16 | 2.66× | 2.54× | 2.93× | 3.07× |
+| 32 | 2.47× | 2.59× | 2.98× | 3.09× |
+| 64 | 2.64× | 2.48× | 2.91× | 3.04× |
+| 128 | 2.44× | 2.25× | 2.84× | 2.93× |
+| 256 | 2.63× | 2.16× | 2.61× | 2.73× |
 
-In weights multiplied per second across all rows: x86-64 17–20 G at one row to 44–55 G batched; arm64 21–23 G to 60–68 G. These are from the run before the four- and two-plane kernels; the PR's CI summary carries the current values.
+In weights multiplied per second across all rows: x86-64 10–12 G at one row to 22–31 G batched; arm64 19–22 G to 55–65 G. One row is the GEMV path either way, so its ratio is noise around 1. In the run before the four- and two-plane kernels (37523722150) the two-row case was 1.42–1.60× on x86-64 and 2.00–2.07× on arm64; the x86-64 kernel job ran on a different CPU that time (EPYC 9V45), so only the arm64 pair is like for like, and there the two-row case did not move. On x86-64 two rows are exactly four base-2^16 planes, which the four-plane kernel fits; on arm64 two rows carry four to six base-2^8 planes, which it rarely fits exactly.
 
-**Measured, SmolLM3-3B, decode only** (`arc-serve-bench batching`, the `bench` CI job; commit `8d6ba36c4`, run 37523722150; x86-64 = AMD EPYC 7763, 2 cores / 4 threads; arm64 = Neoverse-N2, 4 cores; SIMD kernels). Every stream generates 16 tokens; the chat template's shared prefix is served from the prefix cache, so each stream prefills only its own question. **tok/s counts output (generated) tokens** over the forward-pass time of the steps that held only decode rows; prefill steps are excluded. Per-stream tok/s is one token per step, i.e. the inverse of the step time. The streams' tokens were identical at every concurrency.
+**Measured, SmolLM3-3B, decode only** (`arc-serve-bench batching`, the `bench` CI job; commit `25ccd495f`, run 37555419649; x86-64 = AMD EPYC 9V74, 2 cores / 4 threads; arm64 = Neoverse-N2, 4 cores; SIMD kernels). Every stream generates 16 tokens; the chat template's shared prefix is served from the prefix cache, so each stream prefills only its own question. **tok/s counts output (generated) tokens** over the forward-pass time of the steps that held only decode rows; prefill steps are excluded. Per-stream tok/s is one token per step, i.e. the inverse of the step time. The streams' tokens were identical at every concurrency.
 
 | concurrent streams | x86-64 aggregate tok/s | x86-64 per stream | x86-64 step (s) | arm64 aggregate tok/s | arm64 per stream | arm64 step (s) |
 |---|---|---|---|---|---|---|
-| 1 | 3.44 | 3.44 | 0.290 | 6.32 | 6.32 | 0.158 |
-| 2 | 5.15 | 2.58 | 0.388 | 11.94 | 5.97 | 0.168 |
-| 4 | 7.69 | 1.92 | 0.520 | 13.42 | 3.36 | 0.298 |
-| 8 | 8.10 | 1.01 | 0.987 | 17.31 | 2.16 | 0.462 |
-| 16 | 8.51 | 0.53 | 1.880 | 18.78 | 1.17 | 0.852 |
-| 32 | 8.35 | 0.28 | 3.618 | 19.68 | 0.65 | 1.534 |
+| 1 | 3.88 | 3.88 | 0.258 | 6.40 | 6.40 | 0.156 |
+| 2 | 7.44 | 3.72 | 0.269 | 11.87 | 5.94 | 0.168 |
+| 4 | 7.53 | 1.88 | 0.531 | 14.18 | 3.55 | 0.282 |
+| 8 | 8.10 | 1.01 | 0.988 | 17.28 | 2.16 | 0.463 |
+| 16 | 8.29 | 0.52 | 1.931 | 18.97 | 1.19 | 0.844 |
+| 32 | 9.54 | 0.32 | 3.165 | 19.61 | 0.65 | 1.540 |
 
-Reading it: 32 streams give 2.4× (x86-64) and 3.1× (arm64) the aggregate output of one stream on the same runner. The x86-64 runner is saturated from 8 streams; the arm64 runner is still gaining slowly at 32. A decode step's cost per row falls from 0.290 s (one row) to about 0.12 s (32 rows) on x86-64 and from 0.158 s to about 0.05 s on arm64, which is the kernel speedup above. Two CPU cores at full compute are the ceiling here, not memory bandwidth; GPUs move that ceiling (section 7).
+Reading it: 32 streams give 2.5× (x86-64) and 3.1× (arm64) the aggregate output of one stream on the same runner. Two streams cost 4% (x86-64) and 8% (arm64) more per step than one, so they produce 1.92× and 1.85× the output; the x86-64 runner is then near saturation from 4 streams, while the arm64 runner keeps gaining slowly to 32. A decode step's cost per row falls from 0.258 s (one row) to about 0.105 s (32 rows) on x86-64 and from 0.156 s to about 0.051 s on arm64, which is the kernel speedup above. Two to four CPU cores at full compute are the ceiling here, not memory bandwidth; GPUs move that ceiling (section 7).
 
 ## 3. Prefix and KV-cache reuse
 
@@ -172,10 +172,10 @@ Real traffic is prompt-heavy. DeepSeek's inference-system overview for V3/R1 (27
 
 | arm | prompt tokens from cache | x86-64 TTFT, request 1 (s) | x86-64 mean TTFT, requests 2–8 (s) | arm64 TTFT, request 1 (s) | arm64 mean TTFT, requests 2–8 (s) |
 |---|---|---|---|---|---|
-| no cache | 0 of 4,969 | 73.83 | 73.82 | 32.93 | 32.96 |
-| prefix cache | 4,144 of 4,969 (592 per later request) | 73.81 | 3.90 (3.0–4.8) | 32.78 | 1.67 (1.4–2.0) |
+| no cache | 0 of 4,969 | 64.62 | 65.74 | 32.81 | 32.98 |
+| prefix cache | 4,144 of 4,969 (592 per later request) | 66.19 | 3.49 (2.8–4.1) | 33.15 | 1.68 (1.4–2.0) |
 
-Outputs with and without the cache were identical on both runners. Mean TTFT of requests 2–8 fell 18.9× (x86-64) and 19.8× (arm64). The first request pays the full prefill: a 622-token prompt costs 74 s on the x86-64 runner and 33 s on arm64, about 8 and 19 processed prompt tokens per second, the same per-row cost as a wide decode step.
+Outputs with and without the cache were identical on both runners. Mean TTFT of requests 2–8 fell 18.8× (x86-64) and 19.6× (arm64). The first request pays the full prefill: a 622-token prompt costs 65 s on the x86-64 runner and 33 s on arm64, about 10 and 19 processed prompt tokens per second, the same per-row cost as a wide decode step.
 
 ## 4. Speculative decoding, provably exact
 
@@ -214,10 +214,10 @@ So the speculative output equals the greedy output for every drafter, including 
 
 | prompts | drafted / accepted | tokens per pass | x86-64 plain → speculative tok/s | arm64 plain → speculative tok/s |
 |---|---|---|---|---|
-| quotes-the-prompt (4 prompts, 336 output tokens: a checklist to repeat, a rename, a JSON edit, a spelling fix) | 163 / 91 (0.56) | 1.37 | 3.33 → 3.58 (1.08×) | 6.23 → 7.10 (1.14×) |
-| general chat (the 5 golden prompts, 252 output tokens) | 25 / 8 (0.32) | 1.03 | 3.40 → 3.39 (1.00×) | 6.37 → 6.40 (1.00×) |
+| quotes-the-prompt (4 prompts, 336 output tokens: a checklist to repeat, a rename, a JSON edit, a spelling fix) | 163 / 91 (0.56) | 1.37 | 3.74 → 4.11 (1.10×) | 6.14 → 7.09 (1.15×) |
+| general chat (the 5 golden prompts, 252 output tokens) | 25 / 8 (0.32) | 1.03 | 3.91 → 3.92 (1.00×) | 6.28 → 6.34 (1.01×) |
 
-Why the gain is small on a CPU: a verification pass over `1 + k` rows is not free. Two rows cost 1.3–1.5 single rows on these runners (kernel table above), so 1.37 tokens per pass buys about 10%. On general chat the adaptive window shrinks to one draft after the first rejections and the lookup mostly finds nothing, so speculation costs nothing. On hardware where extra rows in a step are nearly free, the same acceptance rate is worth more; that is a statement about the arithmetic, not a measurement.
+Why the gain is small on a CPU. On the quoting prompts the lookup proposed 163 drafts over 245 verification passes (many passes found no match and cost one row) and 91 were accepted, so a pass yielded 1.37 tokens on average. If drafted rows were free the speedup would be 1.37×; it was 1.10–1.15×, so each drafted row cost about 0.3–0.4 of a single-row step on these runners: the batched projection is cheaper per row than the GEMV, but attention, the LM head and the rejected rows are paid in full. On general chat the adaptive window shrinks to one draft after the first rejections and the lookup mostly finds nothing, so speculation costs nothing. On hardware where extra rows in a step are nearly free, the same acceptance rate is worth more; that is a statement about the arithmetic, not a measurement.
 
 **Where speculation does not help.** It is a latency-tier tool. When a node is already saturated with batched decoding, verification rows compete with other streams' rows.
 
@@ -230,7 +230,7 @@ On every bench run, each runner downloads SmolLM3-3B at the pinned revision, con
 
 The cases then run again through a warm prefix cache, and the tokens must not change.
 
-**Result** (commit `8d6ba36c4`, run 37523722150): both digests equal the pinned value on Linux x86-64 (AMD EPYC 7763) and Linux arm64 (Neoverse-N2), and the warm-cache tokens are identical. The same held in the first run (commit `ef724dcf2`, run 37506215624). The job fails if either digest differs.
+**Result** (commit `25ccd495f`, run 37555419649): both digests equal the pinned value on Linux x86-64 (AMD EPYC 9V74) and Linux arm64 (Neoverse-N2), and the warm-cache tokens are identical. The same held in the two earlier runs (commit `8d6ba36c4`, run 37523722150, on an EPYC 7763; commit `ef724dcf2`, run 37506215624). The job fails if either digest differs.
 
 ## 6. MoE and islands
 
@@ -273,13 +273,13 @@ The same arithmetic maps to GPU kernels; only the kernels change. Nothing in thi
 | Prefix cache | KV blocks copied into the request's cache | PagedAttention block tables pointing at shared, ref-counted blocks; the block id is the content hash | no copy is needed; the values are the same blocks |
 | Speculation | (k+1)-row step + accept rule on the host | the same (k+1)-row GEMM plus causal attention; accept rule on the host or in a small kernel | identical rows give identical logits |
 
-**What changes on a GPU.** SmolLM3-3B's integer package is 3,084,214,016 bytes, so a decode step at batch 1 reads about 3.1 GB of weights per token; on a device whose memory bandwidth is far above a CPU runner's, that single-stream floor moves first. On the CI runners above the batched kernel is compute-bound on two to four cores, which is why aggregate output flattens at 8–32 streams; a GPU's integer units move that ceiling by orders of magnitude, so the curve in section 2 should keep rising much further before it flattens. Prefill, which costs these runners 8–19 processed tokens per second, is the part that most needs tensor cores. All of this is arithmetic about the hardware, not a measurement.
+**What changes on a GPU.** SmolLM3-3B's integer package is 3,084,214,016 bytes, so a decode step at batch 1 reads about 3.1 GB of weights per token; on a device whose memory bandwidth is far above a CPU runner's, that single-stream floor moves first. On the CI runners above the batched kernel is compute-bound on two to four cores, which is why aggregate output flattens at 8–32 streams; a GPU's integer units move that ceiling by orders of magnitude, so the curve in section 2 should keep rising much further before it flattens. Prefill, which costs these runners 10–19 processed tokens per second, is the part that most needs tensor cores. All of this is arithmetic about the hardware, not a measurement.
 
 Every GPU kernel must reproduce the CPU's integers. The golden digest through the serving engine (section 5) is the test, unchanged.
 
 ## 8. What this does not do yet
 
-- **Time to first token on long prompts.** On these CPU runners a 622-token cold prompt takes 33–74 s. The prefix cache removes the shared part; it cannot make the first read of a long prompt fast. That needs GPU prefill.
+- **Time to first token on long prompts.** On these CPU runners a 622-token cold prompt takes 33–65 s. The prefix cache removes the shared part; it cannot make the first read of a long prompt fast. That needs GPU prefill.
 - **A real MoE or MLA model.** Only the test fixtures exercise those paths.
 - **Devices and transport.** The pipeline split is in-process; no network protocol between stages.
 - **Better drafters.** Prompt lookup is the only drafter shipped. A draft model or n-gram tables plug into `Drafter` without touching the accept rule.
