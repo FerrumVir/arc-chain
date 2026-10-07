@@ -18,6 +18,7 @@ anywhere in the gate: one differing bit in any logits vector fails it.
 | `arc-modern golden --gpu`, `gpu-info`, `gpu-check` | The command-line path; `gpu-check` is the Proof Kit's GPU mode |
 | `scripts/arc_modern/golden/smollm3-3b.cpu-golden.json` | Every logits hash of the five golden prompts from the CPU engine (CI run 37473148757) |
 | `.github/workflows/gpu-portable.yml` | The exactness gate on Mesa lavapipe (Linux) and WARP (Windows) |
+| `crates/arc-inference/src/modern/gpu/backend.rs`, `arc-node --gpu-inference` | The community worker's GPU backend: off by default, used only after a bit-exact self-test on the adapter ([gpu-worker-backend.md](gpu-worker-backend.md)) |
 
 ## 1. Results so far
 
