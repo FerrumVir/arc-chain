@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 
+/// Twin execution v0 orchestration (coordinator-side, off by default).
+mod twin_dispatch;
+
 /// Exact transport for the primary ARC HTTP API. Production validators use a
 /// Unix socket so a crashed origin cannot be replaced by a local TCP binder.
 #[derive(Clone, Debug)]
@@ -606,6 +609,9 @@ pub struct NodeState {
     /// seed-poll requests. Value is the assigned job id; an empty value means
     /// a claim long-poll currently holds the worker's reservation.
     pub community_active_jobs: Arc<dashmap::DashMap<String, String>>,
+    /// Twin execution, region tags and generated demand. Every switch in its
+    /// configuration defaults to off; see `docs/twin-execution.md`.
+    community_twin: Arc<twin_dispatch::CommunityTwinState>,
     /// Shared outbound HTTP client for ALL coordinator→shard traffic.
     /// Built once at boot so the keep-alive connection pool survives across
     /// requests. Previously every /inference/run_sharded and
@@ -1647,6 +1653,9 @@ pub fn build_node_state(
         community_work_queue: None,
         community_work_results: None,
         community_active_jobs: Arc::new(dashmap::DashMap::new()),
+        community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
+            crate::twin::TwinConfig::default(),
+        )),
         // One client, one connection pool, for the life of the process.
         // `pool_idle_timeout` is deliberately longer than the 15 s shard
         // announcement tick so an idle inter-seed connection survives between
@@ -2077,6 +2086,9 @@ pub async fn serve(
     // sends `true` and let Axum drain every active handler before returning.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
+    // Twin execution v0 and generated community demand
+    // (docs/twin-execution.md). Every switch defaults to off.
+    community_twin: crate::twin::TwinConfig,
 ) -> anyhow::Result<()> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
         anyhow::bail!(
@@ -2103,6 +2115,13 @@ pub async fn serve(
     node.native_serving = native_serving;
     node.native_request_admission = native_request_admission;
     node.consensus_engine = consensus_engine;
+    node.community_twin = Arc::new(twin_dispatch::CommunityTwinState::new(community_twin));
+    if node.community_twin.config.twin_execution {
+        tracing::info!(
+            spot_check_per_mille = node.community_twin.config.spot_check_per_mille,
+            "community twin execution enabled: each community job runs on two independent workers"
+        );
+    }
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
     }
@@ -2202,6 +2221,9 @@ pub async fn serve(
             }
         }
     });
+    // Rate-limited public demo and replay jobs for idle workers, when the
+    // operator enabled the demand pump.
+    twin_dispatch::spawn_community_demand_pump(&node);
 
     // ── Dedicated inference compute pool ────────────────────────────────
     if compute_threads > 0 {
@@ -2503,6 +2525,26 @@ pub async fn serve(
             get(community_reward_approval_status),
         )
         .route("/community/reward_policy", get(community_reward_policy))
+        // Twin execution v0 (docs/twin-execution.md): a worker's signed
+        // region report and read-only twin views. The sealed production
+        // gateway must allowlist these paths before they are public.
+        .route(
+            crate::twin::COMMUNITY_REGION_PATH,
+            post(twin_dispatch::community_region_signed)
+                .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/community/twin_stats",
+            get(twin_dispatch::community_twin_stats),
+        )
+        .route(
+            "/community/twin_receipts",
+            get(twin_dispatch::community_twin_receipts),
+        )
+        .route(
+            "/community/twin/{job_id}",
+            get(twin_dispatch::community_twin_receipt),
+        )
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -7551,11 +7593,106 @@ async fn inference_run(
             "sealed recovery probe coordinator cannot dispatch to the exact accepted canary worker",
         ));
     }
+    // Public demo: a caller-labelled public, testnet-only prompt that is
+    // always run by two independent community workers (twin execution).
+    let public_demo = req
+        .get("public_demo")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let max_tokens = if public_demo {
+        if force_local || recovery_probe_id.is_some() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "public_demo cannot be combined with force_local or a recovery probe",
+            ));
+        }
+        if !node.community_twin.config.twin_execution {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the public demo is not enabled on this coordinator",
+            ));
+        }
+        if !twin_dispatch::twin_dispatch_ready(&node) || !readiness.community_dispatch_ready {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the public demo runs every prompt on two independent community workers, and fewer than two are available on this coordinator now",
+            ));
+        }
+        twin_dispatch::admit_public_demo(&node, input_text)
+            .map_err(|(status, message)| api_error(status, message))?;
+        max_tokens.min(crate::twin::PUBLIC_DEMO_MAX_TOKENS)
+    } else {
+        max_tokens
+    };
     if !force_local && readiness.community_dispatch_ready {
         let dispatched_at = std::time::Instant::now();
         let assigned_model_id = node
             .model_artifact_id
             .map(|model_id| format!("0x{}", model_id.to_hex()));
+        if recovery_probe_id.is_none() && (public_demo || twin_dispatch::twin_dispatch_ready(&node))
+        {
+            let (source, community_input) = if public_demo {
+                (
+                    crate::twin::DemandSource::PublicDemo,
+                    node.inference_model
+                        .as_ref()
+                        .map(|model| model.apply_chat_template(input_text))
+                        .unwrap_or_else(|| input_text.to_string()),
+                )
+            } else {
+                (
+                    crate::twin::DemandSource::PublicRequest,
+                    input_text.to_string(),
+                )
+            };
+            match twin_dispatch::dispatch_twin(
+                &node,
+                twin_dispatch::TwinDispatchRequest {
+                    input: community_input,
+                    max_tokens,
+                    model_id_hint: assigned_model_id.clone(),
+                    source,
+                    public_prompt: None,
+                    reference: None,
+                },
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    let dispatch_ms =
+                        u64::try_from(dispatched_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    return Ok(Json(twin_dispatch::twin_inference_response(
+                        &node,
+                        input_text,
+                        outcome,
+                        live_workers,
+                        dispatch_ms,
+                        public_demo,
+                    )));
+                }
+                Err(error) if error.local_fallback_safe && !public_demo => {
+                    tracing::warn!(
+                        reason = %error.message,
+                        "twin dispatch could not be enqueued; trying single-worker dispatch"
+                    );
+                }
+                Err(error) if error.local_fallback_safe => {
+                    return Err(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("the public demo could not be dispatched: {}", error.message),
+                    ));
+                }
+                Err(error) => {
+                    return Err(api_error(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!(
+                            "Twin community inference did not complete within its verified dispatch budget: {}. The assignment may still resolve; query its twin receipt rather than starting duplicate work.",
+                            error.message
+                        ),
+                    ));
+                }
+            }
+        }
         match dispatch_to_community_worker_with_probe(
             &node,
             input_text.to_string(),
@@ -7669,6 +7806,14 @@ async fn inference_run(
                 );
             }
         }
+    }
+    // A public demo prompt only ever runs on two community workers; it never
+    // falls through to this coordinator's own model.
+    if public_demo {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the public demo could not be dispatched to two community workers",
+        ));
     }
 
     // Check if we have a loaded model (prefer candle float backend for quality)
@@ -8347,8 +8492,13 @@ async fn workers_scoreboard(
         avg_ms_per_job: f64,
         last_total_ms: u64,
         score: f64,
+        /// Twin execution tallies and the coarse region tag. Omitted while
+        /// twin execution and the demand pump are both off.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        twin: Option<twin_dispatch::WorkerTwinRow>,
     }
 
+    let twin_rows = twin_dispatch::worker_rows(&node);
     let mut rows: Vec<WorkerScore> = Vec::new();
     for entry in node.community_workers.iter() {
         let (w, ts) = entry.value();
@@ -8397,6 +8547,7 @@ async fn workers_scoreboard(
             avg_ms_per_job: avg_ms,
             last_total_ms: w.last_total_ms,
             score,
+            twin: twin_rows.get(&w.worker_id).cloned(),
         });
     }
 
@@ -8414,14 +8565,18 @@ async fn workers_scoreboard(
     let coordinator_model_id = coordinator_model.map(|(_, model_id)| model_id);
     let eligible_inference_workers = live_inference_worker_count(&node);
 
-    Json(json!({
+    let mut body = json!({
         "workers": rows,
         "count_visible": rows.len(),
         "count_total": node.community_workers.len(),
         "coordinator_model": coordinator_model_name,
         "coordinator_model_id": coordinator_model_id,
         "eligible_inference_workers": eligible_inference_workers,
-    }))
+    });
+    if let Some(summary) = twin_dispatch::scoreboard_summary(&node) {
+        body["twin"] = summary;
+    }
+    Json(body)
 }
 
 const INFERENCE_ACTIVITY_SCHEMA: &str = "arc.inference.activity.v1";
@@ -14073,6 +14228,40 @@ async fn verify_community_result_with_quorum(
     result: &WorkResult,
 ) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
     validate_community_reward_profile(result).map_err(CommunityResultVerificationError::Invalid)?;
+    let recomputed = recompute_community_output_with_quorum(node, work_item).await?;
+    let output_hash = compare_community_result_with_tokens(
+        result,
+        &recomputed.generated,
+        &recomputed.output_text,
+    )
+    .map_err(CommunityResultVerificationError::Invalid)?;
+
+    Ok(CommunityResultVerification {
+        output_hash,
+        tokens_generated: recomputed.generated.len(),
+        range_count: recomputed.range_count,
+        range_position_quorum_count: recomputed.range_position_quorum_count,
+    })
+}
+
+/// The validators' authenticated 2-of-3 recomputation of an assignment,
+/// independent of any worker's claim. Twin execution recomputes once and
+/// classifies both legs against this output.
+struct CommunityCanonicalRecompute {
+    generated: Vec<u32>,
+    output_text: String,
+    output_hash: Hash256,
+    range_count: usize,
+    range_position_quorum_count: usize,
+}
+
+/// Recompute an assignment through three authenticated, distinct
+/// active-validator replicas per layer range. Every failure is `Unavailable`:
+/// without a worker claim there is nothing for it to prove invalid.
+async fn recompute_community_output_with_quorum(
+    node: &NodeState,
+    work_item: &WorkItem,
+) -> Result<CommunityCanonicalRecompute, CommunityResultVerificationError> {
     let canonical = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE;
     if work_item.execution_profile != canonical {
         return Err(CommunityResultVerificationError::Unavailable(format!(
@@ -14198,13 +14387,16 @@ async fn verify_community_result_with_quorum(
         &active_validators,
     )
     .map_err(CommunityResultVerificationError::Unavailable)?;
-    let actual_output = model.decode(&run.generated);
-    let output_hash = compare_community_result_with_tokens(result, &run.generated, &actual_output)
-        .map_err(CommunityResultVerificationError::Invalid)?;
-
-    Ok(CommunityResultVerification {
-        output_hash,
-        tokens_generated: run.generated.len(),
+    let output_text = model.decode(&run.generated);
+    let output_bytes: Vec<u8> = run
+        .generated
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
+    Ok(CommunityCanonicalRecompute {
+        output_hash: arc_crypto::hash_bytes(&output_bytes),
+        generated: run.generated,
+        output_text,
         range_count: pipeline.len(),
         range_position_quorum_count,
     })
@@ -15848,6 +16040,18 @@ pub async fn community_claim_work(
                 ));
             }
 
+            // A twin leg must go to a worker independent of its sibling
+            // (crate::twin::decide_claim); a refused or briefly deferred leg
+            // goes back on the queue for another worker.
+            let twin_claim = twin_dispatch::claim_decision(&node, &item.job_id, &req.worker_id);
+            if let Some(reason) = twin_claim.and_then(twin_dispatch::refusal_reason) {
+                twin_dispatch::requeue_item(&node, item);
+                return Ok(Json(json!({
+                    "status": "no_work",
+                    "reason": reason,
+                })));
+            }
+
             // Bind this coordinator-issued job to the worker that actually
             // claimed it before returning the prompt. The pending record can
             // disappear here when the dispatcher timed out while the item was
@@ -15857,12 +16061,19 @@ pub async fn community_claim_work(
                 .as_ref()
                 .and_then(|pending| pending.get_mut(&item.job_id))
             else {
+                if twin_claim.is_some() {
+                    twin_dispatch::release_claim(&node, &item.job_id, &req.worker_id);
+                }
                 return Ok(Json(json!({
                     "status": "no_work",
                     "reason": "job_expired",
                 })));
             };
             if pending.assigned_worker.is_some() {
+                drop(pending);
+                if twin_claim.is_some() {
+                    twin_dispatch::release_claim(&node, &item.job_id, &req.worker_id);
+                }
                 return Ok(Json(json!({
                     "status": "no_work",
                     "reason": "job_already_claimed",
@@ -16205,6 +16416,17 @@ pub async fn community_submit_work(
     };
 
     let job_id = result.job_id.clone();
+    // A twin leg is compared with its sibling first; validators recompute
+    // only when the group needs them (see `twin_dispatch`).
+    if twin_dispatch::is_twin_leg(&node, &job_id) {
+        return twin_dispatch::submit_twin_leg(
+            &node,
+            submission_reservation,
+            assigned_worker,
+            result,
+            verified_attestation,
+        );
+    }
     let verification = if result.success {
         match verify_community_result_with_quorum(&node, &work_item, &result).await {
             Ok(verification) => Some(verification),
@@ -18323,7 +18545,7 @@ mod tests {
         directory
     }
 
-    fn canonical_profile() -> String {
+    pub(super) fn canonical_profile() -> String {
         arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string()
     }
 
@@ -20809,7 +21031,7 @@ mod tests {
     use std::sync::atomic::AtomicU32;
     use std::time::Instant;
 
-    fn test_model_id() -> String {
+    pub(super) fn test_model_id() -> String {
         format!(
             "0x{}",
             arc_crypto::hash_bytes(b"synthetic-model-artifact-exact-bytes").to_hex()
@@ -20953,7 +21175,9 @@ mod tests {
         Arc::new(model)
     }
 
-    fn fake_node_with_workers(workers: Vec<(CommunityWorker, std::time::Instant)>) -> NodeState {
+    pub(super) fn fake_node_with_workers(
+        workers: Vec<(CommunityWorker, std::time::Instant)>,
+    ) -> NodeState {
         // Build a minimal NodeState by hand. We can't call build_node_state
         // because it requires real Arc<StateDB> and Arc<Mempool>; we only
         // touch fields the router reads.
@@ -20983,6 +21207,9 @@ mod tests {
             community_work_queue: Some(Arc::new(tokio::sync::Mutex::new(rx))),
             community_work_results: Some(Arc::new(dashmap::DashMap::new())),
             community_active_jobs: Arc::new(dashmap::DashMap::new()),
+            community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
+                crate::twin::TwinConfig::default(),
+            )),
             attestation_nonce: Arc::new(AtomicU64::new(0)),
             latency_stats: Arc::new(dashmap::DashMap::new()),
 
@@ -21062,7 +21289,7 @@ mod tests {
         }
     }
 
-    fn worker(id: &str, caps: &[&str]) -> CommunityWorker {
+    pub(super) fn worker(id: &str, caps: &[&str]) -> CommunityWorker {
         CommunityWorker {
             worker_id: id.into(),
             name: format!("test-{}", id),
@@ -26577,6 +26804,7 @@ mod tests {
                     Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
+                    crate::twin::TwinConfig::default(),
                 )
                 .await
                 .unwrap();
@@ -26663,6 +26891,7 @@ mod tests {
                 Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                 Some(shutdown_rx),
                 Arc::new(arc_net::transport::TransportWirePolicy::default()),
+                crate::twin::TwinConfig::default(),
             )
             .await
         });

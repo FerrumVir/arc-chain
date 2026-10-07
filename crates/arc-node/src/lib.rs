@@ -21,6 +21,8 @@ pub mod row_cohort;
 pub mod row_residency;
 pub mod rpc;
 pub mod state_sync;
+/// Twin execution v0: pure rules (see docs/twin-execution.md).
+pub mod twin;
 #[cfg(unix)]
 mod unix_listener;
 pub mod validator_identity;

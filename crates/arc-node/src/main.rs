@@ -494,6 +494,39 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     enable_community_rewards_v1: bool,
 
+    /// Coordinator: dispatch each community inference job to two community
+    /// workers with distinct node keys and compare their outputs (twin
+    /// execution v0). Validators recompute only on a mismatch, a spot check,
+    /// a reward or a missing twin. Off by default; see docs/twin-execution.md.
+    #[arg(long, default_value_t = false)]
+    community_twin_execution: bool,
+
+    /// Share of twin-matched jobs without a reward that validators still
+    /// recompute, in parts per thousand (at most six an hour).
+    #[arg(long, default_value_t = arc_node::twin::DEFAULT_SPOT_CHECK_PER_MILLE)]
+    community_twin_spot_check_per_mille: u16,
+
+    /// Coordinator: generate rate-limited public demo and replay jobs for
+    /// idle community workers. Off by default; see docs/twin-execution.md.
+    #[arg(long, default_value_t = false)]
+    community_demand_pump: bool,
+
+    /// Run the demand pump in dry-run mode: plan and log every tick without
+    /// dispatching a job. Use this before enabling the pump for real.
+    #[arg(long, default_value_t = false)]
+    community_demand_dry_run: bool,
+
+    /// Seconds between demand-pump ticks on this coordinator (minimum 30).
+    #[arg(long, default_value_t = arc_node::twin::DEFAULT_DEMAND_INTERVAL_SECS)]
+    community_demand_interval_secs: u64,
+
+    /// Worker: every ten minutes, time the configured community RPC origins
+    /// and send the round trips, signed, so coordinators can pair twins in
+    /// different regions. Only a coarse region label is ever published.
+    /// Off by default.
+    #[arg(long, default_value_t = false)]
+    community_region_probe: bool,
+
     /// One-flag community-node setup. Equivalent to `--stake 0
     /// --community-mode` PLUS auto-discovery of a Llama-2-7B GGUF from
     /// standard paths (./llama2-7b.gguf, $HOME/.arc-models/, /opt/arc/).
@@ -5331,6 +5364,108 @@ fn community_audience_from_network_info(
     Ok((target_coordinator, transaction_domain))
 }
 
+/// Worker side of region tags v0. Every ten minutes, time `GET /health` on
+/// each configured community RPC origin (best of three, after a
+/// `/network/info` request has opened the connection) and send the round
+/// trips, signed, to every origin. Coordinators keep only the nearest
+/// validator's coarse region label; no IP or raw round trip is published.
+/// Coordinators without the endpoint answer 404, which is ignored.
+async fn run_community_region_probe_loop(
+    targets: Vec<String>,
+    keypair: arc_crypto::KeyPair,
+    worker_id: String,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    const FIRST_PROBE_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+    const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return;
+    };
+    let mut delay = FIRST_PROBE_DELAY;
+    loop {
+        if sleep_or_runtime_shutdown(&mut shutdown, delay).await {
+            return;
+        }
+        delay = PROBE_INTERVAL;
+        let mut samples = Vec::new();
+        for origin in &targets {
+            if let Some(sample) = measure_community_origin_rtt(&client, origin).await {
+                samples.push(sample);
+            }
+        }
+        if samples.is_empty() {
+            continue;
+        }
+        let report = arc_node::twin::CommunityRegionReport {
+            worker_id: worker_id.clone(),
+            samples,
+        };
+        for origin in &targets {
+            match post_signed_community(
+                &client,
+                origin,
+                arc_node::twin::COMMUNITY_REGION_PATH,
+                report.clone(),
+                &keypair,
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => tracing::debug!(
+                    seed = %origin,
+                    status = %response.status(),
+                    "coordinator did not accept the region report"
+                ),
+                Err(error) => tracing::debug!(seed = %origin, %error, "region report POST failed"),
+            }
+        }
+    }
+}
+
+/// Best of three `GET /health` round trips to one community RPC origin,
+/// labelled with the validator address that origin reports.
+async fn measure_community_origin_rtt(
+    client: &reqwest::Client,
+    origin: &str,
+) -> Option<arc_node::twin::CommunityRttSample> {
+    let info = client
+        .get(format!("{origin}/network/info"))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let (validator, _) = community_audience_from_network_info(&info).ok()?;
+    let mut best: Option<u128> = None;
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let healthy = client
+            .get(format!("{origin}/health"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        if healthy {
+            let elapsed = started.elapsed().as_millis();
+            best = Some(best.map_or(elapsed, |current| current.min(elapsed)));
+        }
+    }
+    let rtt_ms = u32::try_from(best?)
+        .unwrap_or(u32::MAX)
+        .min(arc_node::twin::MAX_REPORTED_RTT_MS);
+    Some(arc_node::twin::CommunityRttSample {
+        validator: format!("0x{}", validator.to_hex()),
+        rtt_ms,
+    })
+}
+
 async fn post_signed_community<T: serde::Serialize>(
     client: &reqwest::Client,
     rpc_base: &str,
@@ -8939,6 +9074,16 @@ async fn run_arc_node() -> Result<()> {
             worker_id
         );
 
+        // Region tags v0 (opt-in): coarse, measured-latency pairing labels.
+        if cli.community_region_probe && worker_model.is_some() {
+            runtime_tasks.push(tokio::spawn(run_community_region_probe_loop(
+                community_rpc_targets.clone(),
+                validator_keypair.clone(),
+                worker_id.clone(),
+                Some(background_admission_shutdown_rx.clone()),
+            )));
+        }
+
         // ── Community inference worker loop ──────────────────────────────
         // Continuously long-poll /community/claim_work on all seeds. When
         // a job arrives, run inference locally using the loaded model, then
@@ -9640,6 +9785,13 @@ async fn run_arc_node() -> Result<()> {
         native_request_admission,
         Some(shutdown_rx),
         transport_wire_policy,
+        arc_node::twin::TwinConfig {
+            twin_execution: cli.community_twin_execution,
+            demand_pump: cli.community_demand_pump,
+            demand_dry_run: cli.community_demand_dry_run,
+            spot_check_per_mille: cli.community_twin_spot_check_per_mille,
+            demand_interval_secs: cli.community_demand_interval_secs,
+        },
     )
     .await;
 
@@ -10795,6 +10947,7 @@ mod tests {
                     Arc::new(arc_node::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
+                    arc_node::twin::TwinConfig::default(),
                 )
                 .await
                 .unwrap();
