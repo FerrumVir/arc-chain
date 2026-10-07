@@ -6,17 +6,24 @@
 //! labelled \[UNVERIFIED\] there), apportioned exactly (largest remainder), so
 //! the counts are expected values, not samples. Every other input is listed
 //! in [`assumptions`] and printed with the report. Projections are \[CALC\].
+//!
+//! **Simulation never serves.** Every synthetic device and link carries
+//! synthetic evidence, formation runs with `allow_synthetic`, and islands
+//! are qualified against a synthetic toy reference, so they reach the
+//! `Simulated` state at most. The report counts them as simulated islands.
 
 use crate::device::{
-    Consent, DeviceDescriptor, IslandFacts, LinkStats, Location, Measured, RttSource,
+    Consent, DeviceDescriptor, Evidence, IslandFacts, LinkStats, Location, Measured, RdmaEvidence,
+    RttSource,
 };
 use crate::form::{FormationOutcome, FormationPolicy, IslandPlan, RejectReason, Tier, form};
-use crate::lifecycle::Island;
+use crate::lifecycle::{GoldenSource, Island, Recovery, State, TrustedCheckpoint};
 use crate::model::ModelSpec;
 use crate::perf::{NetAssumptions, Projection, project};
-use crate::selftest::ToyPipeline;
+use crate::selftest::toy::ToyPipeline;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fmt::Write as _;
 
 /// SplitMix64.
@@ -382,10 +389,17 @@ fn tilt(continent: &str, nodes: usize) -> f64 {
 }
 
 impl Inventory {
-    /// Builds `nodes` synthetic devices. Availability 70% (research-7 §4.1);
-    /// `opt_in_permille` of owners answer yes to both consent questions; all
-    /// pass the golden self-test \[ASSUMPTION\].
-    pub fn synthetic(nodes: usize, seed: u64, opt_in_permille: u32) -> Self {
+    /// Builds `nodes` synthetic devices, each online with probability
+    /// `availability_permille` (research-7 §4.1: 0.7, 0.5 sensitivity);
+    /// `opt_in_permille` of owners grant both consent answers for their own
+    /// device; all pass the golden self-test \[ASSUMPTION\]. All evidence
+    /// is synthetic.
+    pub fn synthetic(
+        nodes: usize,
+        seed: u64,
+        opt_in_permille: u32,
+        availability_permille: u16,
+    ) -> Self {
         let mut rng = Rng::new(seed);
         let weights: Vec<f64> = AREAS
             .iter()
@@ -432,7 +446,9 @@ impl Inventory {
                             zone: area.zone.into(),
                             metro: metro.into(),
                         },
-                        availability_permille: 700,
+                        availability_permille,
+                        evidence: Evidence::synthetic(0),
+                        rdma: None,
                     });
                 }
                 metro_members.push(members);
@@ -459,6 +475,15 @@ impl Inventory {
                 for &i in &members[cursor[m]..cursor[m] + 3] {
                     devices[i].site = Some(format!("site-{site_id:04}"));
                     devices[i].owner = owner.clone();
+                    // Thunderbolt 5 Macs on a site get a synthetic RDMA
+                    // result (research-6: < 50 µs, collectives 0.1–0.2 ms).
+                    if devices[i].thunderbolt5() {
+                        devices[i].rdma = Some(RdmaEvidence {
+                            rdma_up: true,
+                            collective_p99_us: 150,
+                            evidence: Evidence::synthetic(0),
+                        });
+                    }
                 }
                 cursor[m] += 3;
                 site_id += 1;
@@ -474,11 +499,14 @@ impl Inventory {
         let mut access_us = Vec::with_capacity(nodes);
         for d in &mut devices {
             d.consent = if rng.unit() * 1000.0 < f64::from(opt_in_permille) {
-                Consent::opted_in()
+                Consent::grant(&d.owner, &d.device_id, u64::MAX)
             } else {
                 Consent {
+                    owner: d.owner.clone(),
+                    device_id: d.device_id.clone(),
                     compute: Some(true),
                     island: None,
+                    expires_at_ms: u64::MAX,
                 }
             };
             online.push(rng.unit() * 1000.0 < f64::from(d.availability_permille));
@@ -501,6 +529,7 @@ impl Inventory {
         let rtt = SyntheticRtt {
             access_us: idx.iter().map(|&i| self.access_us[i]).collect(),
             devices: devices.clone(),
+            at_ms: 0,
         };
         (devices, idx, rtt)
     }
@@ -513,6 +542,8 @@ impl Inventory {
 pub struct SyntheticRtt {
     access_us: Vec<u32>,
     devices: Vec<DeviceDescriptor>,
+    /// Time stamped on every link (probes repeat every 5 min).
+    pub at_ms: u64,
 }
 
 impl RttSource for SyntheticRtt {
@@ -523,6 +554,7 @@ impl RttSource for SyntheticRtt {
             p99_us: p50 + p50 / 2,
             loss_permille: 0,
             samples: 200,
+            evidence: Evidence::synthetic(self.at_ms),
         };
         if a == b {
             return Some(stats(0));
@@ -567,9 +599,13 @@ pub struct Scenario {
     pub nodes: usize,
     pub seed: u64,
     pub opt_in_permille: u32,
+    pub availability_permille: u16,
     pub service: Service,
     pub transport: String,
     pub net: NetAssumptions,
+    /// The research-6 spare policy (the default); `false` only for the
+    /// comparison rows that explain what the requirement costs.
+    pub require_spares: bool,
 }
 
 /// Context length per sequence for KV budgets and batching.
@@ -587,9 +623,54 @@ pub const BATCH_FLOOR_TOK_S: f64 = 5.0;
 pub const MTBF_H: f64 = 92.0;
 /// Island lease (research-6 §6.4: 6 h).
 pub const LEASE_H: f64 = 6.0;
-/// Stall while a promoted spare re-qualifies (research-6 §6.7 target: ≤ 2 s
-/// GPU, ≤ 10 s Mac); the simulator uses 10 s.
+/// Stall while a promoted spare recovers and re-qualifies (research-6 §6.7
+/// target: ≤ 2 s GPU, ≤ 10 s Mac); the simulator uses 10 s.
 pub const PROMOTION_STALL_MS: u64 = 10_000;
+/// Link a replacement spare stages its shard over (1 Gb/s).
+pub const STAGING_BITS_PER_S: f64 = 1e9;
+/// Opt-in share in every scenario.
+pub const OPT_IN_PERMILLE: u32 = 900;
+
+/// Region adjacency for the neighbour level \[ASSUMPTION\]: regions that share
+/// a border or a short fibre corridor in the synthetic geography.
+pub const NEIGHBOURS: &[(&str, &str)] = &[
+    ("NA/US-East", "NA/US-Central"),
+    ("NA/US-East", "NA/Canada"),
+    ("NA/US-Central", "NA/US-West"),
+    ("NA/US-Central", "NA/Mexico"),
+    ("NA/US-West", "NA/Canada"),
+    ("EU/EU-NW", "EU/EU-C"),
+    ("EU/EU-NW", "EU/EU-S"),
+    ("EU/EU-C", "EU/EU-S"),
+    ("AS/South Asia", "AS/SE Asia"),
+    ("AS/SE Asia", "AS/East Asia"),
+    ("SA/South Cone", "SA/Andean"),
+    ("AF/East Africa", "AF/Southern Africa"),
+];
+
+/// [`NEIGHBOURS`] as a symmetric map.
+pub fn neighbour_map() -> BTreeMap<String, Vec<String>> {
+    let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for &(a, b) in NEIGHBOURS {
+        m.entry(a.into()).or_default().push(b.into());
+        m.entry(b.into()).or_default().push(a.into());
+    }
+    m
+}
+
+/// The formation policy a scenario uses: synthetic inputs allowed (so its
+/// islands can never serve), the neighbour table, and the spare policy.
+pub fn policy_for(s: &Scenario) -> FormationPolicy {
+    let kv_positions = kv_sequences(s.service) * CONTEXT_POSITIONS;
+    let mut policy = match s.service {
+        Service::Interactive => FormationPolicy::interactive(kv_positions),
+        Service::Batch => FormationPolicy::batch(kv_positions),
+    };
+    policy.allow_synthetic = true;
+    policy.require_spares = s.require_spares;
+    policy.neighbours = neighbour_map();
+    policy
+}
 
 /// One island in the report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -597,14 +678,19 @@ pub struct IslandRow {
     pub tier: Tier,
     pub cell: String,
     pub members: usize,
+    pub spares: usize,
+    pub required_spares: usize,
     pub hops: usize,
     pub ring_p50_ms: f64,
     pub mean_hop_rtt_ms: f64,
     pub max_pair_p95_ms: f64,
     pub mix: String,
-    pub spares: usize,
+    pub spare_mix: String,
+    /// The lifecycle state qualification reached (always `Simulated`).
+    pub state: State,
     pub projection: Projection,
     pub tokens_per_day: f64,
+    pub tokens_per_day_speculative: f64,
 }
 
 /// Churn over one lease.
@@ -614,8 +700,12 @@ pub struct ChurnReport {
     pub member_failures: usize,
     pub spare_failures: usize,
     pub promotions: usize,
+    pub replenished: usize,
     pub dissolved: usize,
     pub survived: usize,
+    /// Share of island-time with admission paused for a spare shortfall
+    /// (dissolved islands count as paused from dissolution).
+    pub paused_share: f64,
 }
 
 /// One scenario's results.
@@ -627,6 +717,9 @@ pub struct ScenarioReport {
     pub eligible_online: usize,
     pub rejected: BTreeMap<String, usize>,
     pub islands_by_tier: BTreeMap<String, usize>,
+    /// Islands that reached `Serving` (always 0: synthetic evidence).
+    pub serving_islands: usize,
+    pub simulated_islands: usize,
     pub machines_serving: usize,
     pub spares: usize,
     pub unused_eligible: usize,
@@ -637,19 +730,21 @@ pub struct ScenarioReport {
     pub largest_region: (String, f64),
     pub rows: Vec<IslandRow>,
     pub aggregate_tok_s: f64,
+    pub aggregate_tok_s_speculative: f64,
     pub tokens_per_day: f64,
+    pub tokens_per_day_speculative: f64,
     pub churn: ChurnReport,
 }
 
-fn mix(plan: &IslandPlan, inv: &Inventory, idx: &[usize]) -> String {
+fn mix_of(group: &[usize], inv: &Inventory, idx: &[usize]) -> String {
     let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
-    for &m in &plan.members {
+    for &m in group {
         *counts.entry(inv.class_of[idx[m]]).or_default() += 1;
     }
     let mut parts: Vec<(usize, usize)> = counts.into_iter().collect();
     parts.sort_by_key(|&(c, n)| {
         (
-            std::cmp::Reverse(
+            Reverse(
                 DEVICE_MIX[c].facts.memory_class_gb.unwrap_or(0) * 1000
                     + DEVICE_MIX[c].facts.gpu_vram_class_gb.unwrap_or(0),
             ),
@@ -663,53 +758,138 @@ fn mix(plan: &IslandPlan, inv: &Inventory, idx: &[usize]) -> String {
         .join(" + ")
 }
 
+/// Recovery in the simulator: the synthetic ledger's digest is restored.
+struct LedgerRecovery;
+
+impl Recovery for LedgerRecovery {
+    fn restore(&mut self, _: &IslandPlan, _: usize, checkpoint: &TrustedCheckpoint) -> String {
+        checkpoint.digest.clone()
+    }
+}
+
+const FAIL: u8 = 0;
+const READY: u8 = 1;
+
+/// Plays one lease of churn through the lifecycle: exponential failures;
+/// a lost member promotes a spare, recovers from the (synthetic) ledger
+/// checkpoint and re-qualifies; every lost or promoted spare is replaced from
+/// the unused eligible devices, warm after staging its largest stage at
+/// 1 Gb/s; admission is paused while spares are short.
 fn churn(
     outcome: &FormationOutcome,
     devices: &[DeviceDescriptor],
+    rtt: &mut SyntheticRtt,
     model: &ModelSpec,
+    policy: &FormationPolicy,
     rng: &mut Rng,
 ) -> ChurnReport {
-    let golden = ToyPipeline::golden(model.layers.len());
-    let lease_ms = LEASE_H * 3_600_000.0;
+    let golden = ToyPipeline::golden(&model.identity, model.layers.len());
+    let checkpoint = TrustedCheckpoint {
+        committed_tokens: 0,
+        digest: "synthetic-ledger-checkpoint".into(),
+    };
+    let lease_ms = (LEASE_H * 3_600_000.0) as u64;
     let mut r = ChurnReport {
         islands: outcome.islands.len(),
         ..ChurnReport::default()
     };
+    let mut live = devices.to_vec();
+    let mut pool: Vec<usize> = outcome.unused.clone();
+    let mut paused_ms = 0u64;
+    let draw = |rng: &mut Rng, from: u64| {
+        let t = from as f64 - MTBF_H * 3_600_000.0 * (1.0 - rng.unit()).ln();
+        (t < lease_ms as f64).then_some(t as u64)
+    };
     for plan in &outcome.islands {
-        let mut island = Island::new(plan.clone(), 0);
-        island.qualify(0, &mut ToyPipeline::default(), devices, &golden);
-        let spares: Vec<usize> = plan.spares.iter().map(|s| s.device).collect();
-        let mut failures: Vec<(u64, usize)> = island
-            .devices()
-            .into_iter()
-            .filter_map(|d| {
-                // Exponential time to failure.
-                let t = -MTBF_H * 3_600_000.0 * (1.0 - rng.unit()).ln();
-                (t < lease_ms).then_some((t as u64, d))
-            })
-            .collect();
-        failures.sort_unstable();
-        for (t, d) in failures {
+        rtt.at_ms = 0;
+        let mut island = Island::new(plan.clone(), devices, policy.freshness, 0);
+        let _ = island.qualify(
+            0,
+            &mut ToyPipeline::default(),
+            devices,
+            rtt,
+            GoldenSource::Simulation(&golden),
+        );
+        let mut heap: BinaryHeap<Reverse<(u64, u8, usize)>> = BinaryHeap::new();
+        for d in island.devices() {
+            if let Some(t) = draw(rng, 0) {
+                heap.push(Reverse((t, FAIL, d)));
+            }
+        }
+        let mut pending: BTreeSet<usize> = BTreeSet::new();
+        let mut last = 0u64;
+        while let Some(Reverse((t, kind, d))) = heap.pop() {
+            if island.spare_shortfall() > 0 || island.is_dissolved() {
+                paused_ms += t - last;
+            }
+            last = t;
             if island.is_dissolved() {
-                break;
+                continue;
             }
-            let was_member = island.plan.members.contains(&d);
-            if spares.contains(&d) && !was_member {
-                r.spare_failures += 1;
-            } else {
-                r.member_failures += 1;
+            rtt.at_ms = t;
+            match kind {
+                FAIL if pending.remove(&d) => {}
+                FAIL if island.devices().contains(&d) => {
+                    if island.plan.members.contains(&d) {
+                        r.member_failures += 1;
+                    } else {
+                        r.spare_failures += 1;
+                    }
+                    let before = island.generation;
+                    island.device_lost(d, t);
+                    if island.generation > before {
+                        r.promotions += 1;
+                        let at = t + PROMOTION_STALL_MS;
+                        island.recover(at, &checkpoint, &mut LedgerRecovery);
+                        let _ = island.qualify(
+                            at,
+                            &mut ToyPipeline::default(),
+                            devices,
+                            rtt,
+                            GoldenSource::Simulation(&golden),
+                        );
+                    }
+                }
+                READY if pending.remove(&d) => {
+                    // Probes and facts are refreshed every epoch.
+                    for &i in island.plan.members.iter().chain([&d]) {
+                        live[i].evidence.measured_at_ms = t;
+                    }
+                    if island.replenish_spare(t, d, &live, rtt).is_ok() {
+                        r.replenished += 1;
+                    }
+                }
+                _ => {}
             }
-            let before = island.generation;
-            island.device_lost(d, t);
-            if island.generation > before {
-                r.promotions += 1;
-                island.qualify(
-                    t + PROMOTION_STALL_MS,
-                    &mut ToyPipeline::default(),
-                    devices,
-                    &golden,
-                );
+            if island.is_dissolved() {
+                continue;
             }
+            // Reserve replacements for any shortfall.
+            let largest = island.plan.largest_stage_bytes();
+            while island.spare_shortfall() > pending.len() {
+                let found = pool.iter().position(|&c| {
+                    devices[c].pool().is_some_and(|p| p.usable_bytes >= largest)
+                        && island.plan.members.iter().all(|&m| {
+                            island
+                                .plan
+                                .link_rule
+                                .ok(rtt.link(c, m), t, &policy.freshness, true)
+                        })
+                });
+                let Some(k) = found else { break };
+                let c = pool.remove(k);
+                pending.insert(c);
+                let staging = (largest as f64 * 8.0 / STAGING_BITS_PER_S * 1000.0) as u64;
+                if t + staging < lease_ms {
+                    heap.push(Reverse((t + staging, READY, c)));
+                }
+                if let Some(f) = draw(rng, t) {
+                    heap.push(Reverse((f, FAIL, c)));
+                }
+            }
+        }
+        if island.spare_shortfall() > 0 || island.is_dissolved() {
+            paused_ms += lease_ms - last;
         }
         if island.is_dissolved() {
             r.dissolved += 1;
@@ -717,35 +897,55 @@ fn churn(
             r.survived += 1;
         }
     }
+    if r.islands > 0 {
+        r.paused_share = paused_ms as f64 / (r.islands as f64 * lease_ms as f64);
+    }
     r
+}
+
+fn reject_label(reason: RejectReason) -> &'static str {
+    match reason {
+        RejectReason::NoConsent => "no island consent",
+        RejectReason::NotQualified => "not golden-qualified",
+        RejectReason::NoMemoryFacts => "no memory facts",
+        RejectReason::StaleEvidence => "stale evidence",
+        RejectReason::UnmeasuredInputs => "unmeasured inputs",
+        RejectReason::LowAvailability => "low availability",
+        RejectReason::TooSmallForOneLayer => "too small for one layer",
+    }
 }
 
 /// Runs one scenario.
 pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
-    let inv = Inventory::synthetic(scenario.nodes, scenario.seed, scenario.opt_in_permille);
-    let (devices, idx, rtt) = inv.online_snapshot();
-    let kv_positions = kv_sequences(scenario.service) * CONTEXT_POSITIONS;
-    let policy = match scenario.service {
-        Service::Interactive => FormationPolicy::interactive(kv_positions),
-        Service::Batch => FormationPolicy::batch(kv_positions),
-    };
-    let outcome = form(&devices, &rtt, model, &policy);
+    let inv = Inventory::synthetic(
+        scenario.nodes,
+        scenario.seed,
+        scenario.opt_in_permille,
+        scenario.availability_permille,
+    );
+    let (devices, idx, mut rtt) = inv.online_snapshot();
+    let policy = policy_for(scenario);
+    let outcome = form(&devices, &rtt, model, &policy, 0);
+    let golden = ToyPipeline::golden(&model.identity, model.layers.len());
 
     let mut rejected: BTreeMap<String, usize> = BTreeMap::new();
     for r in &outcome.rejected {
-        let key = match r.reason {
-            RejectReason::NoConsent => "no island consent",
-            RejectReason::NotQualified => "not golden-qualified",
-            RejectReason::NoMemoryFacts => "no memory facts",
-            RejectReason::LowAvailability => "low availability",
-            RejectReason::TooSmallForOneLayer => "too small for one layer",
-        };
-        *rejected.entry(key.into()).or_default() += 1;
+        *rejected.entry(reject_label(r.reason).into()).or_default() += 1;
     }
     let mut islands_by_tier: BTreeMap<String, usize> = BTreeMap::new();
     let mut rows = Vec::new();
     for plan in &outcome.islands {
         *islands_by_tier.entry(plan.tier.label().into()).or_default() += 1;
+        let mut island = Island::new(plan.clone(), &devices, policy.freshness, 0);
+        let state = island
+            .qualify(
+                0,
+                &mut ToyPipeline::default(),
+                &devices,
+                &rtt,
+                GoldenSource::Simulation(&golden),
+            )
+            .unwrap_or_else(|_| island.state.clone());
         let p = project(
             plan,
             &devices,
@@ -756,10 +956,13 @@ pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
             BATCH_FLOOR_TOK_S,
         );
         let hops = plan.hops();
+        let spares: Vec<usize> = plan.spares.iter().map(|s| s.device).collect();
         rows.push(IslandRow {
             tier: plan.tier,
             cell: plan.cell.clone(),
             members: plan.members.len(),
+            spares: plan.spares.len(),
+            required_spares: plan.required_spares,
             hops,
             ring_p50_ms: plan.ring_p50_us as f64 / 1000.0,
             mean_hop_rtt_ms: if hops == 0 {
@@ -768,15 +971,16 @@ pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
                 plan.ring_p50_us as f64 / 1000.0 / hops as f64
             },
             max_pair_p95_ms: f64::from(plan.max_pair_p95_us) / 1000.0,
-            mix: mix(plan, &inv, &idx),
-            spares: plan.spares.len(),
+            mix: mix_of(&plan.members, &inv, &idx),
+            spare_mix: mix_of(&spares, &inv, &idx),
+            state,
             tokens_per_day: p.batch.aggregate_tok_s * 86_400.0,
+            tokens_per_day_speculative: p.batch_speculative.aggregate_tok_s * 86_400.0,
             projection: p,
         });
     }
-    let opted_in_online = devices.iter().filter(|d| d.consent.allows_island()).count();
-    let rejected_set: std::collections::BTreeSet<usize> =
-        outcome.rejected.iter().map(|r| r.device).collect();
+    let opted_in_online = devices.iter().filter(|d| d.consent.permits(d, 0)).count();
+    let rejected_set: BTreeSet<usize> = outcome.rejected.iter().map(|r| r.device).collect();
     let mut region_bytes: BTreeMap<String, u64> = BTreeMap::new();
     for (i, d) in devices.iter().enumerate() {
         if let (false, Some(p)) = (rejected_set.contains(&i), d.pool()) {
@@ -787,78 +991,62 @@ pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
     }
     let largest_region = region_bytes
         .iter()
-        .max_by_key(|&(k, v)| (*v, std::cmp::Reverse(k.clone())))
+        .max_by_key(|&(k, v)| (*v, Reverse(k.clone())))
         .map_or((String::new(), 0.0), |(k, v)| (k.clone(), *v as f64 / 1e9));
-    let need = model.weight_bytes() + model.kv_bytes_per_position() * kv_positions;
+    let need = model.weight_bytes() + model.kv_bytes_per_position() * policy.kv_positions;
     let needed_gb = (need + need * policy.capacity_headroom_permille / 1000) as f64 / 1e9;
     let mut rng = Rng::new(scenario.seed ^ 0xC0FFEE);
+    let sum = |f: &dyn Fn(&IslandRow) -> f64| rows.iter().map(f).sum::<f64>() + 0.0;
     ScenarioReport {
         online: devices.len(),
         opted_in_online,
         eligible_online: devices.len() - outcome.rejected.len(),
         rejected,
         islands_by_tier,
+        serving_islands: rows.iter().filter(|r| r.state == State::Serving).count(),
+        simulated_islands: rows.iter().filter(|r| r.state == State::Simulated).count(),
         machines_serving: outcome.islands.iter().map(|p| p.members.len()).sum(),
         spares: outcome.islands.iter().map(|p| p.spares.len()).sum(),
         unused_eligible: outcome.unused.len(),
         needed_gb,
         largest_region,
-        // `+ 0.0`: an empty float sum is -0.0.
-        aggregate_tok_s: rows
-            .iter()
-            .map(|r| r.projection.batch.aggregate_tok_s)
-            .sum::<f64>()
-            + 0.0,
-        tokens_per_day: rows.iter().map(|r| r.tokens_per_day).sum::<f64>() + 0.0,
-        churn: churn(&outcome, &devices, model, &mut rng),
+        aggregate_tok_s: sum(&|r| r.projection.batch.aggregate_tok_s),
+        aggregate_tok_s_speculative: sum(&|r| r.projection.batch_speculative.aggregate_tok_s),
+        tokens_per_day: sum(&|r| r.tokens_per_day),
+        tokens_per_day_speculative: sum(&|r| r.tokens_per_day_speculative),
+        churn: churn(&outcome, &devices, &mut rtt, model, &policy, &mut rng),
         rows,
         scenario: scenario.clone(),
     }
 }
 
-/// The scenarios the report covers.
+/// The scenarios the report covers: for each node count, batch and
+/// interactive service at a = 0.7, pessimistic and optimized transport;
+/// a = 0.5 for both services; and batch without the spare requirement, for
+/// comparison only. Opt-in 90% throughout.
 pub fn standard_scenarios(seed: u64, node_counts: &[usize]) -> Vec<Scenario> {
+    let p = || ("pessimistic", NetAssumptions::pessimistic());
+    let o = || ("optimized", NetAssumptions::optimized());
     let mut out = Vec::new();
     for &nodes in node_counts {
-        for (service, transport, net, opt_in) in [
-            (
-                Service::Batch,
-                "pessimistic",
-                NetAssumptions::pessimistic(),
-                1000,
-            ),
-            (
-                Service::Batch,
-                "optimized",
-                NetAssumptions::optimized(),
-                1000,
-            ),
-            (
-                Service::Interactive,
-                "pessimistic",
-                NetAssumptions::pessimistic(),
-                1000,
-            ),
-            (
-                Service::Interactive,
-                "optimized",
-                NetAssumptions::optimized(),
-                1000,
-            ),
-            (
-                Service::Batch,
-                "pessimistic",
-                NetAssumptions::pessimistic(),
-                500,
-            ),
+        for (service, (transport, net), availability, require_spares) in [
+            (Service::Batch, p(), 700, true),
+            (Service::Batch, o(), 700, true),
+            (Service::Interactive, p(), 700, true),
+            (Service::Interactive, o(), 700, true),
+            (Service::Batch, p(), 500, true),
+            (Service::Interactive, o(), 500, true),
+            (Service::Batch, p(), 700, false),
         ] {
             out.push(Scenario {
                 nodes,
                 seed,
-                opt_in_permille: opt_in,
+                opt_in_permille: OPT_IN_PERMILLE,
+                availability_permille: availability,
                 service,
                 transport: transport.into(),
                 net,
+                require_spares,
             });
         }
     }
@@ -871,24 +1059,28 @@ pub fn assumptions() -> Vec<(&'static str, String, &'static str)> {
     let o = NetAssumptions::optimized();
     vec![
         ("Model", "Kimi K2.6, INT4 g32 routed experts + INT8 elsewhere: 582.6 GB weights, 140,544 B KV per position, 56 KiB Q16 boundary per position, no MTP head".into(), "CALC from docs/protocol/kimi-k26-checkpoint.md (#156)"),
+        ("Evidence", "every synthetic device, link and RDMA result is marked synthetic; formation allows it, so every island is a simulated island and none can serve; no Kimi golden is pinned".into(), "by construction"),
         ("Inventory geography", "research-7 §4.1 shares (US/EU-skewed), Asia ×1.25/×1.55 and Africa ×1.2/×1.6 at 1,000/10,000; metros inside an area weighted by a fixed synthetic table".into(), "UNVERIFIED planning input (research-7) + ASSUMPTION"),
         ("Device mix", "8 GB GPU 10%, 12 GB 15%, 16 GB 15%, 24 GB 20%, 32 GB 8%, Mac 16–24 GB 10%, Mac 36–64 GB 12%, 128 GB Mac/Strix 6%, 256–512 GB Ultra 1%, CPU-only 3%; even splits inside each class".into(), "UNVERIFIED planning input (research-7 §4.1)"),
-        ("Online share", "70% of nodes online at formation (per-node availability a = 0.7)".into(), "UNVERIFIED (research-7 §4.1)"),
-        ("Consent", "100% of owners opted in to islands (upper bound); 50% sensitivity rows".into(), "ASSUMPTION; consent model from #138"),
-        ("Golden qualification", "every synthetic device passes the self-test".into(), "ASSUMPTION"),
+        ("Availability", "each node online at formation with probability 0.7 (base) or 0.5 (sensitivity)".into(), "UNVERIFIED (research-7 §4.1)"),
+        ("Consent", format!("{}% of owners grant both answers for their own device (no expiry inside the run); the rest answered the compute question only", OPT_IN_PERMILLE / 10), "ASSUMPTION; consent model from #138"),
+        ("Golden qualification", "every synthetic device passes its own Proof Kit self-test".into(), "ASSUMPTION"),
         ("Usable memory", "85% of GPU memory, 80% of unified/system memory".into(), "research-6 §2.2"),
         ("Bandwidth", "llama.cpp-class effective GB/s by class: GPU 8/12/16/24/32 GB = 250/300/450/680/1,108; Mac ≤24 GB 90, 36–192 GB 300, ≥256 GB 456; CPU 60. ARC's engine is not yet measured at these rates".into(), "CALC (research-6 §2.5, research-7 §2.6), UNVERIFIED for ARC"),
-        ("LAN sites", "3% / 5% / 8% of nodes at <1,000 / 1,000 / 10,000 on sites of 3 devices of one owner".into(), "UNVERIFIED (research-7 §4.1)"),
-        ("Home RTT", "access leg to the metro hub drawn from RIPE Atlas 0–100 km quantiles (p25 3.7, p50 5.5, p75 9.8, p90 22.1 ms); pair RTT = both legs + core (metro −1, zone +11, region +27, continent +45, world +181 ms); p95 = 1.25 × p50, p99 = 1.5 × p50, no loss".into(), "MEASURED quantiles (research-7 §1.6) + CALC + ASSUMPTION for jitter"),
+        ("Spare policy", "1 / 2 / 3 warm spares for 2–6 / 7–22 / 23+ stages; every spare holds the largest stage and meets the link rule with every member; the comparison rows drop the requirement".into(), "research-6 §6.4"),
+        ("LAN sites", "3% / 5% / 8% of nodes at <1,000 / 1,000 / 10,000 on sites of 3 devices of one owner; Thunderbolt 5 Macs there carry a synthetic RDMA result (collective p99 0.15 ms)".into(), "UNVERIFIED (research-7 §4.1) + ASSUMPTION"),
+        ("Home RTT", "access leg to the metro hub drawn from RIPE Atlas 0–100 km quantiles (p25 3.7, p50 5.5, p75 9.8, p90 22.1 ms); pair RTT = both legs + core (metro −1, zone +11, region +27, other region of the continent +45, world +181 ms); p95 = 1.25 × p50, p99 = 1.5 × p50, no loss".into(), "MEASURED quantiles (research-7 §1.6) + CALC + ASSUMPTION for jitter"),
+        ("Search levels", "metro 20 ms, zone 35 ms, region 60 ms, region + declared neighbours 75 ms (measured p95 between every pair); interactive stage caps 4 / 3 / 2 / 2, batch 30".into(), "research-7 §1.7, §6.2; 75 ms from the wide-region p75 (research-7 §1.6)"),
+        ("Neighbour table", NEIGHBOURS.iter().map(|(a, b)| format!("{a}–{b}")).collect::<Vec<_>>().join(", "), "ASSUMPTION"),
         ("LAN RTT", "0.3 ms p50 on one site, 0.04 ms when both machines have Thunderbolt 5".into(), "ASSUMPTION (research-6 §1.2: RDMA < 50 µs)"),
         ("Pessimistic transport", format!("{} ms per hop, {} Mb/s home uplink, {} ms fixed per pass", f64::from(p.wan_hop_overhead_us) / 1000.0, p.wan_uplink_mbps, f64::from(p.fixed_pass_us) / 1000.0), "research-7 §2.1 defaults"),
         ("Optimized transport", format!("{} ms per hop, {} Mb/s uplink", f64::from(o.wan_hop_overhead_us) / 1000.0, o.wan_uplink_mbps), "ASSUMPTION (fibre homes, tuned streaming transport)"),
-        ("Tensor parallel", format!("{} ms per collective on Thunderbolt-5 RDMA, 122 per token", f64::from(p.collective_us) / 1000.0), "research-6 §2.5"),
-        ("Speculation", format!("chain drafts from a separate drafter (K2.6 has no MTP head), acceptance α = {}, {} ms per draft token, depth 0–{} chosen per island", p.draft_acceptance, f64::from(p.draft_us_per_token) / 1000.0, p.max_draft_tokens), "ASSUMPTION (research-7 §2.2 planning values)"),
-        ("Batching", format!("KV for {} (interactive) / {} (batch) sequences × {} positions per island; depth = max aggregate keeping per-stream ≥ min({} tok/s, half the single-stream rate); speculation off when batching", kv_sequences(Service::Interactive), kv_sequences(Service::Batch), CONTEXT_POSITIONS, BATCH_FLOOR_TOK_S), "research-6 §2.6 model"),
+        ("Tensor parallel", format!("{} ms per collective on RDMA, 122 per token", f64::from(p.collective_us) / 1000.0), "research-6 §2.5"),
+        ("Speculation", format!("chain drafts from a separate drafter (K2.6 has no MTP head), acceptance α = {}, {} ms per draft token, depth 0–{} chosen per island, separately for a single answer and under batching", p.draft_acceptance, f64::from(p.draft_us_per_token) / 1000.0, p.max_draft_tokens), "ASSUMPTION (research-7 §2.2 planning values)"),
+        ("Batching", format!("KV for {} (interactive) / {} (batch) sequences × {} positions per island; depth = max aggregate keeping per-stream ≥ min({} tok/s, half the single-stream rate)", kv_sequences(Service::Interactive), kv_sequences(Service::Batch), CONTEXT_POSITIONS, BATCH_FLOOR_TOK_S), "research-6 §2.6 model"),
         ("Compute model", "memory-bandwidth bound; distinct experts under uniform routing; FLOPs, prefill and queueing not modelled".into(), "CALC (research-6 §2.6)"),
-        ("Tokens/day", "aggregate tok/s × 86,400: a capacity ceiling at 100% utilisation, not a demand forecast".into(), "CALC"),
-        ("Churn", format!("device MTBF {MTBF_H} h, lease {LEASE_H} h, exponential failures; a member loss promotes a covering spare (re-qualify) or dissolves the island"), "research-6 §3.3 (Salad 92 h)"),
+        ("Tokens/day", "aggregate tok/s × 86,400: a fully loaded ceiling, excluding repair, prefill and audit; not a demand forecast".into(), "CALC"),
+        ("Churn", format!("device MTBF {MTBF_H} h, lease {LEASE_H} h, exponential failures; a member loss promotes a spare, recovers from the ledger checkpoint and re-qualifies ({} s stall); lost spares are replaced from unused eligible devices after staging the largest stage at 1 Gb/s; admission is paused while spares are short", PROMOTION_STALL_MS / 1000), "research-6 §3.3 (Salad 92 h), §6.7"),
     ]
 }
 
@@ -932,13 +1124,19 @@ fn spread(values: &mut [f64]) -> String {
 
 fn scenario_label(s: &Scenario) -> String {
     format!(
-        "{} · {} · opt-in {}%",
+        "{} · {} · a = {} · opt-in {}%{}",
         match s.service {
             Service::Batch => "batch (S ≤ 30)",
-            Service::Interactive => "interactive (S ≤ 4/3/2)",
+            Service::Interactive => "interactive (S ≤ 4/3/2/2)",
         },
         s.transport,
-        s.opt_in_permille / 10
+        f64::from(s.availability_permille) / 1000.0,
+        s.opt_in_permille / 10,
+        if s.require_spares {
+            ""
+        } else {
+            " · **spares not required (comparison)**"
+        }
     )
 }
 
@@ -951,10 +1149,12 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
     );
     let _ = writeln!(
         md,
-        "Generated by `cargo run --release -p arc-island --bin arc-island-sim -- --seed {seed}` \
+        "Generated by `cargo run --release -p arc-island --features simulator --bin arc-island-sim -- --seed {seed}` \
          (crate `arc-island`, ARC-AC v0). **Every number below is a projection from the labelled \
          assumptions over a synthetic inventory. None is a measurement and none is a count of real \
-         community machines.** Real numbers replace these as ENG-6 measures them.\n"
+         community machines.** All inputs are synthetic, so every island here is a *simulated* island: \
+         the lifecycle stops it at `Simulated`, and none can serve. Real numbers replace these as ENG-6 \
+         measures them.\n"
     );
     let _ = writeln!(
         md,
@@ -966,12 +1166,13 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
 
     let _ = writeln!(
         md,
-        "\n## Summary\n\nPer-answer tok/s: median (min–max) over the islands formed, batch 1. \
-         \"With spec\" picks the best draft depth per island. Aggregate is at the planned batching depth.\n"
+        "\n## Summary\n\nPer-answer tok/s: median (min–max) over the islands formed, one answer at a time. \
+         \"With spec\" picks the best draft depth per island. Aggregates are at each island's planned \
+         batching depth, without and with speculation. Daily figures are fully loaded ceilings.\n"
     );
     let _ = writeln!(
         md,
-        "| Nodes | Scenario | Online | Eligible | Largest region, GB usable (one copy needs) | Islands (T0 / T1a / T1b) | Swarms (metro / zone / region) | Machines serving | Spares | Unused eligible | Hops per token | Per-answer tok/s | With spec | Aggregate tok/s | Tokens/day | Survive 6 h lease |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "| Nodes | Scenario | Online | Eligible | Largest region, GB (one copy needs) | Islands T0 / T1a / T1b | Swarms metro / zone / region / neighbour | Members + spares (required) | Unused eligible | Hops per token | Per-answer tok/s | With spec | Aggregate tok/s, plain / spec | Tokens/day, plain / spec | Survive 6 h lease | Admission paused | Serving / simulated |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     );
     for r in reports {
         let t = |tier: Tier| r.islands_by_tier.get(tier.label()).copied().unwrap_or(0);
@@ -982,14 +1183,18 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
             .map(|x| x.projection.speculative.tok_s)
             .collect();
         let mut hops: Vec<f64> = r.rows.iter().map(|x| x.hops as f64).collect();
-        let survive = if r.churn.islands == 0 {
-            "–".into()
+        let required: usize = r.rows.iter().map(|x| x.required_spares).sum();
+        let (survive, paused) = if r.churn.islands == 0 {
+            ("–".into(), "–".into())
         } else {
-            format!("{}/{}", r.churn.survived, r.churn.islands)
+            (
+                format!("{}/{}", r.churn.survived, r.churn.islands),
+                format!("{:.0}%", r.churn.paused_share * 100.0),
+            )
         };
         let _ = writeln!(
             md,
-            "| {} | {} | {} | {} | {} {:.0} ({:.0}) | {} / {} / {} | {} / {} / {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} {:.0} ({:.0}) | {} / {} / {} | {} / {} / {} / {} | {} + {} ({}) | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} | {} / {} |",
             r.scenario.nodes,
             scenario_label(&r.scenario),
             r.online,
@@ -998,13 +1203,15 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
             r.largest_region.1,
             r.needed_gb,
             t(Tier::T0Single),
-            t(Tier::T1aThunderbolt),
+            t(Tier::T1aRdma),
             t(Tier::T1bLan),
             t(Tier::T2Metro),
             t(Tier::T2Zone),
             t(Tier::T2Region),
+            t(Tier::T2Neighbour),
             r.machines_serving,
             r.spares,
+            required,
             r.unused_eligible,
             if hops.is_empty() {
                 "–".into()
@@ -1014,12 +1221,60 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
             spread(&mut single),
             spread(&mut spec),
             fmt_big(r.aggregate_tok_s),
+            fmt_big(r.aggregate_tok_s_speculative),
             fmt_big(r.tokens_per_day),
+            fmt_big(r.tokens_per_day_speculative),
             survive,
+            paused,
+            r.serving_islands,
+            r.simulated_islands,
         );
     }
 
-    let _ = writeln!(md, "\n## Islands and swarms by scenario\n");
+    let _ = writeln!(
+        md,
+        "\n## What the spare requirement changes\n\nSame inventory (batch, pessimistic transport, a = 0.7, opt-in 90%), with and without the research-6 spare policy:\n"
+    );
+    let _ = writeln!(
+        md,
+        "| Nodes | Spares | Swarms | Members | Spares held / required | Unused eligible | Aggregate tok/s | Survive 6 h lease | Admission paused |\n|---|---|---|---|---|---|---|---|---|"
+    );
+    for r in reports.iter().filter(|r| {
+        r.scenario.service == Service::Batch
+            && r.scenario.transport == "pessimistic"
+            && r.scenario.availability_permille == 700
+    }) {
+        let required: usize = r.rows.iter().map(|x| x.required_spares).sum();
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} | {} | {} / {} | {} | {} | {}/{} | {:.0}% |",
+            r.scenario.nodes,
+            if r.scenario.require_spares {
+                "required"
+            } else {
+                "not required"
+            },
+            r.rows.len(),
+            r.machines_serving,
+            r.spares,
+            required,
+            r.unused_eligible,
+            fmt_big(r.aggregate_tok_s),
+            r.churn.survived,
+            r.churn.islands,
+            r.churn.paused_share * 100.0,
+        );
+    }
+    let _ = writeln!(
+        md,
+        "\nEvery required spare must hold the island's largest stage, so the largest machines in a cell become \
+         the spares and every stage is capped at the smallest spare's memory. A swarm therefore needs more \
+         members and more large machines than the same swarm without spares, and fewer swarms form from the \
+         same inventory. In exchange, an island survives member loss by promotion and checkpoint recovery \
+         instead of dissolving, and admission pauses only while a replacement spare stages its shard.\n"
+    );
+
+    let _ = writeln!(md, "## Every island and swarm, by scenario\n");
     for r in reports {
         let _ = writeln!(
             md,
@@ -1034,7 +1289,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
             .collect();
         let _ = writeln!(
             md,
-            "Online {} · opted in {} · eligible {} · rejected: {} · churn over the lease: {} member failures, {} spare failures, {} promotions, {} dissolved.\n",
+            "Online {} · opted in {} · eligible {} · rejected: {} · churn over the lease: {} member failures, {} spare failures, {} promotions (each with checkpoint recovery and re-qualification), {} spares replenished, {} dissolved.\n",
             r.online,
             r.opted_in_online,
             r.eligible_online,
@@ -1046,6 +1301,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
             r.churn.member_failures,
             r.churn.spare_failures,
             r.churn.promotions,
+            r.churn.replenished,
             r.churn.dissolved,
         );
         if r.rows.is_empty() {
@@ -1054,7 +1310,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
         }
         let _ = writeln!(
             md,
-            "| Tier | Cell | Members | Hops | Mean hop RTT ms | Ring RTT ms | Max pair p95 ms | Spares | tok/s | With spec (k) | Batch B | Per-stream at B | Aggregate tok/s | Tokens/day | Members |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            "| Tier | Cell | Members | Spares | Hops | Mean hop RTT ms | Ring RTT ms | Max pair p95 ms | Per-answer tok/s | With spec (k) | Batch B / k | Per-stream at B | Aggregate tok/s | Spec batch B / k | Spec aggregate tok/s | Tokens/day, plain / spec | Members | Spare machines |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
         );
         let mut rows: Vec<&IslandRow> = r.rows.iter().collect();
         rows.sort_by(|a, b| {
@@ -1063,32 +1319,39 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
                 .aggregate_tok_s
                 .total_cmp(&a.projection.batch.aggregate_tok_s)
         });
-        const SHOWN: usize = 12;
-        for x in rows.iter().take(SHOWN) {
+        for x in rows {
             let p = &x.projection;
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} | {:.1} | {:.1} | {:.1} | {} | {} | {} ({}) | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {}/{} | {} | {:.1} | {:.1} | {:.1} | {} | {} ({}) | {} / {} | {} | {} | {} / {} | {} | {} / {} | {} | {} |",
                 x.tier.label(),
                 x.cell,
                 x.members,
+                x.spares,
+                x.required_spares,
                 x.hops,
                 x.mean_hop_rtt_ms,
                 x.ring_p50_ms,
                 x.max_pair_p95_ms,
-                x.spares,
                 fmt_rate(p.single.tok_s),
                 fmt_rate(p.speculative.tok_s),
                 p.speculative.draft_tokens,
                 p.batch.concurrent,
+                p.batch.draft_tokens,
                 fmt_rate(p.batch.per_stream_tok_s),
                 fmt_rate(p.batch.aggregate_tok_s),
+                p.batch_speculative.concurrent,
+                p.batch_speculative.draft_tokens,
+                fmt_rate(p.batch_speculative.aggregate_tok_s),
                 fmt_big(x.tokens_per_day),
+                fmt_big(x.tokens_per_day_speculative),
                 x.mix,
+                if x.spare_mix.is_empty() {
+                    "–"
+                } else {
+                    &x.spare_mix
+                },
             );
-        }
-        if rows.len() > SHOWN {
-            let _ = writeln!(md, "\n{} more in the JSON report.", rows.len() - SHOWN);
         }
         let _ = writeln!(md);
     }
@@ -1101,7 +1364,7 @@ mod tests {
 
     #[test]
     fn inventory_follows_the_apportioned_mix() {
-        let inv = Inventory::synthetic(1_000, 7, 1000);
+        let inv = Inventory::synthetic(1_000, 7, 900, 700);
         assert_eq!(inv.devices.len(), 1_000);
         let ultras = inv
             .class_of
@@ -1115,16 +1378,30 @@ mod tests {
             .filter(|d| d.location.region == "US-East")
             .count();
         assert!((120..=160).contains(&us_east), "{us_east}");
-        let sites: std::collections::BTreeSet<_> =
-            inv.devices.iter().filter_map(|d| d.site.clone()).collect();
+        let sites: BTreeSet<_> = inv.devices.iter().filter_map(|d| d.site.clone()).collect();
         assert_eq!(sites.len(), 17);
         let online = inv.online.iter().filter(|&&o| o).count();
         assert!((640..=760).contains(&online), "{online}");
+        let half = Inventory::synthetic(1_000, 7, 900, 500);
+        let online = half.online.iter().filter(|&&o| o).count();
+        assert!((440..=560).contains(&online), "{online}");
+        // Consent is bound to each device's own owner and id.
+        let opted = inv
+            .devices
+            .iter()
+            .filter(|d| d.consent.permits(d, 0))
+            .count();
+        assert!((860..=940).contains(&opted), "{opted}");
+        assert!(
+            inv.devices
+                .iter()
+                .all(|d| d.evidence.provenance == crate::device::Provenance::Synthetic)
+        );
     }
 
     #[test]
     fn synthetic_rtt_matches_the_planning_medians() {
-        let inv = Inventory::synthetic(1_000, 3, 1000);
+        let inv = Inventory::synthetic(1_000, 3, 900, 700);
         let (devices, _, rtt) = inv.online_snapshot();
         let mut metro = Vec::new();
         for a in 0..devices.len() {
@@ -1150,20 +1427,34 @@ mod tests {
     }
 
     #[test]
-    fn small_network_scenarios_run_and_are_deterministic() {
+    fn scenarios_run_deterministically_and_never_serve() {
         let model = ModelSpec::kimi_k26_int4();
-        let scenarios = standard_scenarios(7, &[130]);
+        let scenarios = standard_scenarios(7, &[130, 1_000]);
         let a: Vec<_> = scenarios.iter().map(|s| run(s, &model)).collect();
         let b: Vec<_> = scenarios.iter().map(|s| run(s, &model)).collect();
         assert_eq!(a, b);
+        let mut formed = 0;
         for r in &a {
+            assert_eq!(r.serving_islands, 0, "synthetic inputs must never serve");
+            assert_eq!(r.simulated_islands, r.rows.len());
             assert_eq!(r.churn.survived + r.churn.dissolved, r.churn.islands);
             for row in &r.rows {
+                formed += 1;
+                if r.scenario.require_spares {
+                    assert_eq!(row.spares, row.required_spares, "{row:?}");
+                    assert!(row.required_spares >= 1);
+                }
                 assert!(row.projection.single.tok_s > 0.0);
                 assert!(row.projection.speculative.tok_s >= row.projection.single.tok_s);
+                assert!(
+                    row.projection.batch_speculative.aggregate_tok_s
+                        >= row.projection.batch.aggregate_tok_s
+                );
             }
         }
+        assert!(formed > 0, "1,000 nodes form at least one swarm");
         let md = markdown(&a, 7);
         assert!(md.contains("| 130 |"));
+        assert!(md.contains("What the spare requirement changes"));
     }
 }

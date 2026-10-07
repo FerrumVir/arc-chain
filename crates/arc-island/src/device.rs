@@ -10,7 +10,15 @@
 //! Consent follows #138: `NodeConfig.compute_consent` is `None` until the
 //! owner answers, and only `Some(true)` counts. An island additionally needs
 //! its own explicit answer, because island members hold model shards and
-//! see activations for other people's requests.
+//! see activations for other people's requests. A grant is bound to one
+//! owner and one device and expires; the embedding application
+//! authenticates it (this library does not).
+//!
+//! Every device and link carries [`Evidence`]: whether it was measured or
+//! synthesised, and when. Formation may run on synthetic inputs (the
+//! simulator does), but an island built from them can never serve, and a
+//! serving island re-checks that its inputs are measured and fresh before
+//! every admission.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -133,28 +141,117 @@ impl ProofFacts {
     }
 }
 
-/// The owner's answers (#138). `None` means never asked, which is a no.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Whether an input was measured or synthesised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Provenance {
+    /// Measured on the real machine or link.
+    Measured,
+    /// Assumed, modelled or generated (simulation, class defaults).
+    Synthetic,
+}
+
+/// Provenance plus the time of measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Evidence {
+    pub provenance: Provenance,
+    pub measured_at_ms: u64,
+}
+
+impl Evidence {
+    pub fn measured(at_ms: u64) -> Self {
+        Self {
+            provenance: Provenance::Measured,
+            measured_at_ms: at_ms,
+        }
+    }
+
+    pub fn synthetic(at_ms: u64) -> Self {
+        Self {
+            provenance: Provenance::Synthetic,
+            measured_at_ms: at_ms,
+        }
+    }
+
+    /// Not from the future and no older than `ttl_ms`.
+    pub fn fresh(&self, now_ms: u64, ttl_ms: u64) -> bool {
+        now_ms >= self.measured_at_ms && now_ms - self.measured_at_ms <= ttl_ms
+    }
+
+    /// Fresh, and measured unless synthetic inputs are allowed.
+    pub fn acceptable(&self, now_ms: u64, ttl_ms: u64, allow_synthetic: bool) -> bool {
+        self.fresh(now_ms, ttl_ms) && (allow_synthetic || self.provenance == Provenance::Measured)
+    }
+}
+
+/// How old evidence may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Freshness {
+    /// Device facts, measured memory and bandwidth, consent re-read.
+    pub device_ttl_ms: u64,
+    /// Link probes.
+    pub link_ttl_ms: u64,
+}
+
+impl Default for Freshness {
+    /// Devices: one epoch (1 h, research-7 §6.2). Links: three probe periods
+    /// (15 min; research-7 probes every 5 min).
+    fn default() -> Self {
+        Self {
+            device_ttl_ms: 3_600_000,
+            link_ttl_ms: 900_000,
+        }
+    }
+}
+
+/// The owner's answers (#138), bound to one owner and device, with an
+/// expiry. `None` means never asked, which is a no.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Consent {
+    pub owner: String,
+    pub device_id: String,
     /// #138's `compute_consent`: "Let ARC run inference jobs on this computer".
     pub compute: Option<bool>,
     /// The island question: hold a model shard and serve with other machines.
     pub island: Option<bool>,
+    /// The grant lapses at this time; the owner must answer again.
+    pub expires_at_ms: u64,
 }
 
 impl Consent {
-    /// Both answers are an explicit yes.
-    pub fn allows_island(&self) -> bool {
-        self.compute == Some(true) && self.island == Some(true)
-    }
-
-    /// Opted in to both (tests and the simulator).
-    pub fn opted_in() -> Self {
+    /// A yes to both questions for `owner`'s `device_id` until `expires_at_ms`.
+    pub fn grant(owner: &str, device_id: &str, expires_at_ms: u64) -> Self {
         Self {
+            owner: owner.into(),
+            device_id: device_id.into(),
             compute: Some(true),
             island: Some(true),
+            expires_at_ms,
         }
     }
+
+    /// The owner withdrew the island answer.
+    pub fn withdraw(&mut self) {
+        self.island = Some(false);
+    }
+
+    /// Both answers are an explicit yes, the grant names this device and its
+    /// owner, and it has not expired.
+    pub fn permits(&self, device: &DeviceDescriptor, now_ms: u64) -> bool {
+        self.owner == device.owner
+            && self.device_id == device.device_id
+            && self.compute == Some(true)
+            && self.island == Some(true)
+            && now_ms < self.expires_at_ms
+    }
+}
+
+/// A measured RDMA and collective microbenchmark (research-6 §6.3: an
+/// all-reduce of 28 KiB × 122 iterations). T1a needs it on every member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RdmaEvidence {
+    pub rdma_up: bool,
+    pub collective_p99_us: u32,
+    pub evidence: Evidence,
 }
 
 /// Coarse location labels, used to name cells and to order the search
@@ -194,6 +291,10 @@ pub struct DeviceDescriptor {
     pub location: Location,
     /// Share of time online, from history (‰).
     pub availability_permille: u16,
+    /// Provenance of the facts and `measured` values.
+    pub evidence: Evidence,
+    /// Measured RDMA/collective result inside the device's LAN site.
+    pub rdma: Option<RdmaEvidence>,
 }
 
 /// Where a device's model memory lives.
@@ -277,6 +378,34 @@ impl DeviceDescriptor {
     pub fn thunderbolt5(&self) -> bool {
         self.facts.thunderbolt5 == Some(true)
     }
+
+    /// Inputs good enough for formation at `now_ms`: fresh, and either
+    /// measured (memory and bandwidth included) or synthetic inputs allowed.
+    pub fn inputs_acceptable(&self, now_ms: u64, fresh: &Freshness, allow_synthetic: bool) -> bool {
+        if !self
+            .evidence
+            .acceptable(now_ms, fresh.device_ttl_ms, allow_synthetic)
+        {
+            return false;
+        }
+        allow_synthetic
+            || self
+                .pool()
+                .is_some_and(|p| !p.memory_assumed && !p.bandwidth_assumed)
+    }
+
+    /// Effective provenance: synthetic if the facts are synthetic or memory
+    /// or bandwidth is a class assumption.
+    pub fn provenance(&self) -> Provenance {
+        let assumed = self
+            .pool()
+            .is_none_or(|p| p.memory_assumed || p.bandwidth_assumed);
+        if self.evidence.provenance == Provenance::Synthetic || assumed {
+            Provenance::Synthetic
+        } else {
+            Provenance::Measured
+        }
+    }
 }
 
 /// Summary of direct probes on one link (research-6 §6.3, research-7 §6.4).
@@ -288,12 +417,13 @@ pub struct LinkStats {
     /// Lost samples per thousand.
     pub loss_permille: u16,
     pub samples: u32,
+    pub evidence: Evidence,
 }
 
 impl LinkStats {
-    /// Summarises raw probe samples in microseconds; `None` is a lost probe.
-    /// Percentiles are nearest-rank on the received samples.
-    pub fn from_samples(samples: &[Option<u32>]) -> Option<Self> {
+    /// Summarises raw probe samples in microseconds taken at `at_ms`; `None`
+    /// is a lost probe. Percentiles are nearest-rank on the received samples.
+    pub fn from_samples(samples: &[Option<u32>], at_ms: u64) -> Option<Self> {
         let mut got: Vec<u32> = samples.iter().flatten().copied().collect();
         if got.is_empty() {
             return None;
@@ -307,6 +437,7 @@ impl LinkStats {
             p99_us: rank(99),
             loss_permille: (lost * 1000 / samples.len()) as u16,
             samples: samples.len() as u32,
+            evidence: Evidence::measured(at_ms),
         })
     }
 
@@ -347,6 +478,7 @@ impl RttSource for RttMatrix {
                 p99_us: 0,
                 loss_permille: 0,
                 samples: 0,
+                evidence: Evidence::measured(0),
             });
         }
         self.links.get(&(a.min(b), a.max(b))).copied()
@@ -403,32 +535,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn consent_needs_two_explicit_yes_answers() {
-        assert!(!Consent::default().allows_island());
-        assert!(
-            !Consent {
-                compute: Some(true),
-                island: None
-            }
-            .allows_island()
-        );
-        assert!(
-            !Consent {
-                compute: Some(false),
-                island: Some(true)
-            }
-            .allows_island()
-        );
-        assert!(Consent::opted_in().allows_island());
-    }
-
-    #[test]
-    fn pools_follow_the_usable_fractions() {
-        let mut d = DeviceDescriptor {
+    fn gpu_device() -> DeviceDescriptor {
+        DeviceDescriptor {
             device_id: "a".into(),
             owner: "o".into(),
-            consent: Consent::opted_in(),
+            consent: Consent::grant("o", "a", 10_000),
             facts: IslandFacts {
                 memory_class_gb: Some(64),
                 unified_memory: false,
@@ -441,7 +552,66 @@ mod tests {
             site: None,
             location: Location::default(),
             availability_permille: 1000,
-        };
+            evidence: Evidence::measured(0),
+            rdma: None,
+        }
+    }
+
+    #[test]
+    fn consent_needs_two_yes_answers_bound_to_owner_and_device_until_expiry() {
+        let d = gpu_device();
+        assert!(d.consent.permits(&d, 0));
+        assert!(!d.consent.permits(&d, 10_000), "expired at 10 s");
+        assert!(!Consent::default().permits(&d, 0), "never asked");
+        let mut c = Consent::grant("o", "a", 10_000);
+        c.island = None;
+        assert!(!c.permits(&d, 0));
+        let mut c = Consent::grant("o", "a", 10_000);
+        c.compute = Some(false);
+        assert!(!c.permits(&d, 0));
+        assert!(
+            !Consent::grant("someone-else", "a", 10_000).permits(&d, 0),
+            "other owner"
+        );
+        assert!(
+            !Consent::grant("o", "b", 10_000).permits(&d, 0),
+            "other device"
+        );
+        let mut c = Consent::grant("o", "a", 10_000);
+        c.withdraw();
+        assert!(!c.permits(&d, 0));
+    }
+
+    #[test]
+    fn provenance_and_freshness_gate_inputs() {
+        let mut d = gpu_device();
+        let fresh = Freshness::default();
+        // Class-assumed memory and bandwidth are synthetic even with
+        // measured facts.
+        assert_eq!(d.provenance(), Provenance::Synthetic);
+        assert!(!d.inputs_acceptable(0, &fresh, false));
+        assert!(d.inputs_acceptable(0, &fresh, true));
+        d.measured.usable_memory_bytes = Some(20_000_000_000);
+        d.measured.bandwidth_mb_s = Some(650_000);
+        assert_eq!(d.provenance(), Provenance::Measured);
+        assert!(d.inputs_acceptable(fresh.device_ttl_ms, &fresh, false));
+        assert!(
+            !d.inputs_acceptable(fresh.device_ttl_ms + 1, &fresh, false),
+            "stale"
+        );
+        d.evidence = Evidence::synthetic(0);
+        assert_eq!(d.provenance(), Provenance::Synthetic);
+        assert!(!d.inputs_acceptable(0, &fresh, false));
+        d.evidence = Evidence::measured(5_000);
+        assert!(
+            !d.inputs_acceptable(4_000, &fresh, false),
+            "from the future"
+        );
+    }
+
+    #[test]
+    fn pools_follow_the_usable_fractions() {
+        let mut d = gpu_device();
         let gpu = d.pool().unwrap();
         assert_eq!(gpu.kind, PoolKind::Gpu);
         assert_eq!(gpu.usable_bytes, 20_400_000_000);
@@ -457,23 +627,23 @@ mod tests {
     fn link_stats_from_samples() {
         let mut samples: Vec<Option<u32>> = (1..=200).map(Some).collect();
         samples[0] = None;
-        let s = LinkStats::from_samples(&samples).unwrap();
+        let s = LinkStats::from_samples(&samples, 0).unwrap();
         assert_eq!(s.p50_us, 101);
         assert_eq!(s.p99_us, 199);
         assert_eq!(s.loss_permille, 5);
         assert!(s.pipeline_qualified());
         let mut tail: Vec<Option<u32>> = vec![Some(10_000); 190];
         tail.extend([Some(25_000); 10]);
-        let s = LinkStats::from_samples(&tail).unwrap();
+        let s = LinkStats::from_samples(&tail, 0).unwrap();
         assert_eq!((s.p50_us, s.p95_us, s.p99_us), (10_000, 10_000, 25_000));
         assert!(!s.pipeline_qualified(), "p99 > 2 × p50 fails");
         samples[1] = None;
         assert!(
-            !LinkStats::from_samples(&samples)
+            !LinkStats::from_samples(&samples, 0)
                 .unwrap()
                 .pipeline_qualified(),
             "1% loss fails"
         );
-        assert!(LinkStats::from_samples(&[None, None]).is_none());
+        assert!(LinkStats::from_samples(&[None, None], 0).is_none());
     }
 }

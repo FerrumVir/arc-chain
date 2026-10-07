@@ -11,8 +11,10 @@
 //!
 //! Batching (research-6 §2.6): B sequences in G = min(S, B) micro-batches of
 //! b = ⌈B/G⌉; round time `T = max(G·max_s step_s(b), Σ_s step_s(b) + ring + fixed)`;
-//! per-stream `1/T`, aggregate `B/T`. Speculation is off under batching
-//! (research-7 §2.7: vLLM measured 1.4–1.8x slowdowns at high load).
+//! per-stream `1/T`, aggregate `B/T`. A second plan also searches the draft
+//! depth under batching: each sequence then sends k+1 positions per round
+//! and commits τ(k) tokens (research-7 §2.7 warns that speculation often
+//! stops paying at high load; the search keeps k = 0 when it does not pay).
 //!
 //! The speculation exactness rule (research-6 §2.7, research-7 §2.2): a
 //! draft token is accepted only if it equals what the seeded integer
@@ -98,6 +100,8 @@ pub struct StreamProjection {
 pub struct BatchPlan {
     pub concurrent: u32,
     pub micro_batches: u32,
+    /// Draft tokens per sequence per pass (0 = no speculation).
+    pub draft_tokens: u32,
     pub round_ms: f64,
     pub per_stream_tok_s: f64,
     pub aggregate_tok_s: f64,
@@ -109,7 +113,10 @@ pub struct Projection {
     pub single: StreamProjection,
     /// The best draft depth (may be 0 when speculation does not pay).
     pub speculative: StreamProjection,
+    /// Batching without speculation.
     pub batch: BatchPlan,
+    /// Batching with the best draft depth per sequence (may equal `batch`).
+    pub batch_speculative: BatchPlan,
 }
 
 struct Shape {
@@ -128,7 +135,7 @@ fn shape(
     rtt: &dyn RttSource,
     net: &NetAssumptions,
 ) -> Shape {
-    let lan = matches!(plan.tier, Tier::T1aThunderbolt | Tier::T1bLan);
+    let lan = matches!(plan.tier, Tier::T1aRdma | Tier::T1bLan);
     let pool = |m: usize| devices[m].pool();
     let bw = plan
         .members
@@ -272,36 +279,48 @@ fn batch_round(
     sh: &Shape,
     net: &NetAssumptions,
     concurrent: u32,
+    k: u32,
 ) -> (u32, f64) {
     let fixed = f64::from(net.fixed_pass_us) * 1e-6;
+    let draft = f64::from(k) * f64::from(net.draft_us_per_token) * 1e-6;
+    let positions = |seqs: u32| seqs * (k + 1);
     if sh.tensor {
-        return (1, tensor_compute(model, sh, net, concurrent) + fixed);
+        return (
+            1,
+            tensor_compute(model, sh, net, positions(concurrent)) + draft + fixed,
+        );
     }
     let s_count = plan.members.len();
     if s_count == 1 {
-        return (1, stage_compute(plan, model, sh, 0, concurrent) + fixed);
+        return (
+            1,
+            stage_compute(plan, model, sh, 0, positions(concurrent)) + draft + fixed,
+        );
     }
     let g = (s_count as u32).min(concurrent);
     let b = concurrent.div_ceil(g);
     let steps: Vec<f64> = (0..s_count)
         .map(|s| {
             let ser = if s + 1 < s_count {
-                serialisation(model, sh, s, b)
+                serialisation(model, sh, s, positions(b))
             } else {
                 0.0
             };
-            stage_compute(plan, model, sh, s, b) + ser
+            stage_compute(plan, model, sh, s, positions(b)) + ser
         })
         .collect();
     let slowest = steps.iter().copied().fold(0.0, f64::max);
-    let circuit = steps.iter().sum::<f64>() + sh.hops.iter().sum::<f64>() + fixed;
+    let circuit = steps.iter().sum::<f64>() + sh.hops.iter().sum::<f64>() + draft + fixed;
     (g, (f64::from(g) * slowest).max(circuit))
 }
 
-/// Picks the batching depth: the largest aggregate over B ∈ {1, 2, 4, …}
-/// up to the island's KV budget (`kv_positions / context_positions`
-/// sequences), keeping per-stream speed at least
-/// `min(floor_tok_s, single-stream / 2)`.
+/// Picks the batching depth (and, when `max_draft_tokens > 0`, the draft
+/// depth): the largest aggregate over B ∈ {1, 2, 4, …} up to the island's KV
+/// budget (`kv_positions / context_positions` sequences) and k ∈
+/// 0..=`max_draft_tokens`, keeping per-stream speed at least
+/// `min(floor_tok_s, single-stream / 2)`. Each sequence commits τ(k) tokens
+/// per round.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_batching(
     plan: &IslandPlan,
     devices: &[DeviceDescriptor],
@@ -310,27 +329,32 @@ pub fn plan_batching(
     net: &NetAssumptions,
     context_positions: u64,
     floor_tok_s: f64,
+    max_draft_tokens: u32,
 ) -> BatchPlan {
     let sh = shape(plan, devices, rtt, net);
     let max_b = (plan.kv_positions / context_positions.max(1)).clamp(1, u64::from(u32::MAX)) as u32;
-    let at = |b: u32| {
-        let (g, round) = batch_round(plan, model, &sh, net, b);
+    let at = |b: u32, k: u32| {
+        let (g, round) = batch_round(plan, model, &sh, net, b, k);
+        let t = tau(k, net.draft_acceptance);
         BatchPlan {
             concurrent: b,
             micro_batches: g,
+            draft_tokens: k,
             round_ms: round * 1e3,
-            per_stream_tok_s: 1.0 / round,
-            aggregate_tok_s: f64::from(b) / round,
+            per_stream_tok_s: t / round,
+            aggregate_tok_s: f64::from(b) * t / round,
         }
     };
-    let one = at(1);
+    let one = at(1, 0);
     let floor = floor_tok_s.min(one.per_stream_tok_s / 2.0);
     let mut best = one;
-    let mut b = 2u32;
+    let mut b = 1u32;
     while b <= max_b {
-        let p = at(b);
-        if p.per_stream_tok_s >= floor && p.aggregate_tok_s > best.aggregate_tok_s {
-            best = p;
+        for k in 0..=max_draft_tokens {
+            let p = at(b, k);
+            if p.per_stream_tok_s >= floor && p.aggregate_tok_s > best.aggregate_tok_s {
+                best = p;
+            }
         }
         b = b.saturating_mul(2);
     }
@@ -359,6 +383,17 @@ pub fn project(
             net,
             context_positions,
             floor_tok_s,
+            0,
+        ),
+        batch_speculative: plan_batching(
+            plan,
+            devices,
+            model,
+            rtt,
+            net,
+            context_positions,
+            floor_tok_s,
+            net.max_draft_tokens,
         ),
     }
 }
@@ -366,7 +401,7 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::form::tests::{device, mesh};
+    use crate::form::tests::{device, mesh, with_rdma};
     use crate::form::{FormationPolicy, form};
 
     const KV: u64 = 8 * 4096;
@@ -378,23 +413,30 @@ mod tests {
         assert!((tau(5, 0.8) - 3.689).abs() < 1e-3);
     }
 
+    /// Two 512 GB Macs serving plus a third as the required spare. `rdma`
+    /// adds measured RDMA evidence (T1a, tensor parallel).
     fn two_ultras(
         rtt_us: u32,
-        tb5: bool,
+        rdma: bool,
         site: Option<&str>,
     ) -> (Vec<DeviceDescriptor>, crate::device::RttMatrix, IslandPlan) {
-        let devices = vec![
-            device("a", 512, tb5, site, "NYC"),
-            device("b", 512, tb5, site, "NYC"),
-        ];
-        let rtt = mesh(2, rtt_us, &[]);
+        let devices: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|id| {
+                let d = device(id, 512, rdma, site, "NYC");
+                if rdma { with_rdma(d) } else { d }
+            })
+            .collect();
+        let rtt = mesh(3, rtt_us, &[]);
         let out = form(
             &devices,
             &rtt,
             &ModelSpec::kimi_k26_int4(),
             &FormationPolicy::interactive(KV),
+            0,
         );
         let plan = out.islands[0].clone();
+        assert_eq!(plan.members.len(), 2);
         (devices, rtt, plan)
     }
 
@@ -433,7 +475,20 @@ mod tests {
         let net = NetAssumptions::pessimistic();
         let (d, rtt, plan) = two_ultras(15_000, false, None);
         let one = single_stream(&plan, &d, &model, &rtt, &net, 0);
-        let b = plan_batching(&plan, &d, &model, &rtt, &net, 4096, 5.0);
+        let b = plan_batching(&plan, &d, &model, &rtt, &net, 4096, 5.0, 0);
+        assert_eq!(b.draft_tokens, 0);
+        let spec = plan_batching(
+            &plan,
+            &d,
+            &model,
+            &rtt,
+            &net,
+            4096,
+            5.0,
+            net.max_draft_tokens,
+        );
+        assert!(spec.aggregate_tok_s >= b.aggregate_tok_s);
+        assert!(spec.per_stream_tok_s >= 5.0_f64.min(one.tok_s / 2.0));
         assert!(b.concurrent > 1 && b.concurrent <= 8, "{b:?}");
         assert!(b.aggregate_tok_s > one.tok_s);
         assert!(b.per_stream_tok_s >= 5.0_f64.min(one.tok_s / 2.0));

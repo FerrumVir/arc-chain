@@ -15,16 +15,25 @@
 //!   Thunderbolt/LAN islands, then metro → zone → region swarms; warm spares.
 //! - [`perf`]: projected per-answer tok/s (with and without speculative
 //!   decoding), batching depth, aggregate tok/s.
-//! - [`lifecycle`]: form → qualify (golden digest) → serve → degrade/promote
-//!   spare → dissolve, driven by heartbeats and consent changes.
-//! - [`selftest`]: the deterministic qualification self-test.
-//! - [`admission`]: per-request admission control.
-//! - [`sim`]: the offline capacity simulator over a synthetic inventory.
+//! - [`lifecycle`]: form → qualify against a pinned golden → serve → member
+//!   lost → spare promoted → trusted-checkpoint recovery → re-qualify, or
+//!   dissolve; spare loss pauses admission until replenished.
+//! - [`selftest`]: the golden-reference trust root and the self-test
+//!   contract.
+//! - [`admission`]: per-request admission control, with a health check on
+//!   every request.
+//! - `sim` (feature `simulator`): the offline capacity simulator over a
+//!   synthetic inventory. Its islands reach at most the `Simulated` state.
 //!
 //! Sources: research-6 ("Auto-clustering consumer devices to serve 1T-class
 //! models", §2, §3, §6) and research-7 ("Adaptive hierarchical clustering",
 //! §2–§4). Model figures come from `docs/protocol/kimi-k26-checkpoint.md`
 //! (PR #156).
+//!
+//! **Trust.** Real serving needs a golden reference pinned in this crate for
+//! the exact model and integer profile, a measured executor, and measured,
+//! fresh device and link evidence. There is no pinned Kimi K2.6 reference
+//! yet, so a real Kimi island refuses to qualify (fail closed).
 //!
 //! **Determinism.** Formation, partitioning, spare choice and lifecycle use
 //! integers only (bytes, microseconds, MB/s), so anyone recomputing a
@@ -42,4 +51,5 @@ pub mod lifecycle;
 pub mod model;
 pub mod perf;
 pub mod selftest;
+#[cfg(feature = "simulator")]
 pub mod sim;

@@ -301,6 +301,7 @@ mod tests {
                         p99_us: us,
                         loss_permille: 0,
                         samples: 10,
+                        evidence: crate::device::Evidence::measured(0),
                     },
                 );
             }

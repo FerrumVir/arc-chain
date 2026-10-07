@@ -53,10 +53,20 @@ pub fn distinct_experts(experts: u32, top: u32, positions: u32) -> f64 {
     e * (1.0 - miss.powi(positions as i32))
 }
 
+/// The exact model and quantisation a golden reference is pinned to.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ModelIdentity {
+    /// Repository and revision of the source checkpoint.
+    pub checkpoint: String,
+    /// ARC integer profile identifier.
+    pub quant_profile: String,
+}
+
 /// A model as placement sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub name: String,
+    pub identity: ModelIdentity,
     pub layers: Vec<LayerSpec>,
     /// Bytes crossing a pipeline-stage boundary per position.
     pub boundary_bytes_per_position: u64,
@@ -152,6 +162,10 @@ impl ModelSpec {
         });
         Self {
             name: "kimi-k2.6-i4g32-experts".into(),
+            identity: ModelIdentity {
+                checkpoint: "moonshotai/Kimi-K2.6@7eb5002f6aadc958aed6a9177b7ed26bb94011bb".into(),
+                quant_profile: "arc.hf-deepseek-v3.mla-moe.i4g32-experts.q16.v1".into(),
+            },
             layers,
             boundary_bytes_per_position: HIDDEN * 8,
             collectives_per_token: 2 * 61,
@@ -179,6 +193,10 @@ impl ModelSpec {
             .collect();
         Self {
             name: name.into(),
+            identity: ModelIdentity {
+                checkpoint: format!("test/toy-units-{count}"),
+                quant_profile: "toy".into(),
+            },
             layers,
             boundary_bytes_per_position: 16 * 1024,
             collectives_per_token: 2 * count as u32,

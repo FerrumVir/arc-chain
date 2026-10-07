@@ -75,13 +75,19 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: kimi-islands-linux
+      # Default build: no simulator, no toy executor.
       - run: cargo clippy -p arc-island --all-targets --locked -- -D warnings
+      - run: cargo clippy -p arc-island --all-targets --features simulator --locked -- -D warnings
       - name: rustdoc (deny warnings)
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc -p arc-island --no-deps --locked
-      - name: Unit tests (fitting, partitioning, formation, consent, churn, spare promotion, self-test, admission, simulator)
+        run: |
+          cargo doc -p arc-island --no-deps --locked
+          cargo doc -p arc-island --no-deps --features simulator --locked
+      - name: Unit tests, library only (trust root, evidence, consent, spares, recovery, admission)
         run: cargo test -p arc-island --locked
+      - name: Unit tests with the simulator
+        run: cargo test -p arc-island --features simulator --locked
 
   simulate:
     name: arc-island capacity simulator
@@ -101,16 +107,16 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p sim-out
-          cargo run --release --locked -p arc-island --bin arc-island-sim -- --seed 7 --out sim-out > /dev/null
+          cargo run --release --locked -p arc-island --features simulator --bin arc-island-sim -- --seed 7 --out sim-out > /dev/null
           # The report is a pure function of the seed: a second run must be byte-identical.
           mkdir -p sim-out-2
-          cargo run --release --locked -p arc-island --bin arc-island-sim -- --seed 7 --out sim-out-2 > /dev/null
+          cargo run --release --locked -p arc-island --features simulator --bin arc-island-sim -- --seed 7 --out sim-out-2 > /dev/null
           cmp sim-out/kimi-island-capacity.md sim-out-2/kimi-island-capacity.md
           cmp sim-out/kimi-island-capacity.json sim-out-2/kimi-island-capacity.json
           {
             echo "Commit ${GITHUB_SHA}, runner $(uname -m) $(nproc) vCPU."
             echo
-            sed -n '/^## Summary/,/^## Islands and swarms/p' sim-out/kimi-island-capacity.md | sed '$d'
+            sed -n '/^## Summary/,/^## Every island/p' sim-out/kimi-island-capacity.md | sed '$d'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
