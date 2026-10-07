@@ -54,13 +54,24 @@ pub struct Row {
 /// What a batched step returns.
 #[derive(Debug, Default)]
 pub struct StepOutput {
-    /// Logits per row, for rows that asked for them and whose sequence
-    /// succeeded.
+    /// Logits per row, for rows that asked for them, succeeded, and precede
+    /// any failure of their sequence.
     pub logits: Vec<Option<Vec<i64>>>,
-    /// Per sequence, the first error one of its rows hit. A failed sequence's
-    /// cache is rolled back to its length before the step; other sequences
-    /// are unaffected.
-    pub errors: Vec<Option<ModernError>>,
+    /// Per sequence, its first failing row, if any. The rows before it are
+    /// kept: their logits are returned and their positions committed. It and
+    /// the rows after it, whose caches would include it, are dropped. Other
+    /// sequences are unaffected.
+    pub errors: Vec<Option<Failure>>,
+}
+
+/// The first failing row of one sequence in a step.
+#[derive(Debug)]
+pub struct Failure {
+    /// Rows of the sequence, in step order, that succeeded before this one
+    /// and whose positions stay committed.
+    pub kept: usize,
+    /// The row's error: the one the model raises for that token alone.
+    pub error: ModernError,
 }
 
 /// A model the serving layer can drive.
@@ -75,6 +86,12 @@ pub struct StepOutput {
 /// rows of the step, on how rows are grouped, or on the step's size.
 /// Mixture-of-experts routing must therefore be a function of the row alone:
 /// no expert capacity limit and no token dropping.
+///
+/// A row that fails fails alone, with the error the model raises for that
+/// token alone. Its sequence keeps the rows before it (logits returned,
+/// positions committed), drops it and the rows after it, and reports the
+/// failure with the number of rows kept ([`Failure`]). The scheduler decides
+/// whether plain decoding would have run the failing row at all.
 pub trait BatchModel: Sync {
     /// Token ids are below this.
     fn vocab_size(&self) -> usize;

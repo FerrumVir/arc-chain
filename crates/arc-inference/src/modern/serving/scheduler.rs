@@ -465,12 +465,15 @@ impl<'m, M: BatchModel> Scheduler<'m, M> {
         let mut emitted = 0usize;
         for plan in plans {
             let active = &mut self.running[plan.seq];
-            if let Some(error) = errors.get_mut(plan.seq).and_then(Option::take) {
-                active.fail(&error);
-                continue;
-            }
+            let failure = errors.get_mut(plan.seq).and_then(Option::take);
             match plan.kind {
                 Kind::Prefill { count } => {
+                    // A prompt token the model refuses is refused by
+                    // `generate` too, with the same error.
+                    if let Some(failure) = failure {
+                        active.fail(&failure.error);
+                        continue;
+                    }
                     let rows = &mut logits[plan.first_row..plan.first_row + count];
                     if all_logits {
                         for values in rows.iter().flatten() {
@@ -512,21 +515,42 @@ impl<'m, M: BatchModel> Scheduler<'m, M> {
                 }
                 Kind::Decode { drafts } => {
                     let width = 1 + drafts.len();
-                    let used: Vec<Vec<i64>> = logits[plan.first_row..plan.first_row + width]
+                    // The rows before the first failing one, if any, are the
+                    // passes plain decoding may run. The failing row matters
+                    // only if plain decoding would run it: when it is the
+                    // decode row itself, or when the accept rule reaches it.
+                    let valid = failure.as_ref().map_or(width, |f| f.kept);
+                    if valid == 0 {
+                        if let Some(failure) = failure {
+                            active.fail(&failure.error);
+                        }
+                        continue;
+                    }
+                    let used: Vec<Vec<i64>> = logits[plan.first_row..plan.first_row + valid]
                         .iter_mut()
                         .map(|slot| slot.take().unwrap_or_default())
                         .collect();
-                    let before = active.kv.len().saturating_sub(width);
+                    let before = active.kv.len().saturating_sub(valid);
                     let request = &active.request;
                     match accept(
                         &used,
-                        &drafts,
+                        &drafts[..valid - 1],
                         &active.generated,
                         request.selection,
                         &request.eos,
                         request.max_tokens,
                     ) {
                         Ok(verified) => {
+                            // Plain decoding would feed the failing row's token
+                            // next, and fail as that row did.
+                            if let Some(failure) = failure
+                                && verified.rows_used == valid
+                                && !verified.finished
+                                && verified.emitted.last() == drafts.get(valid - 1)
+                            {
+                                active.fail(&failure.error);
+                                continue;
+                            }
                             for values in &used[..verified.rows_used] {
                                 active.hashes.push(arith::logits_hash(values));
                             }

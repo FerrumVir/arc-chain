@@ -12,7 +12,7 @@ Code: `crates/arc-inference/src/modern/serving/`. Measurements: `arc-serve-bench
 
 **The rule.** A serving trick may change *when* something is computed and *how often* the weights and cached keys are read. It may never change *what* is computed. A speedup that changes a digest is a bug.
 
-**Numbers.** Every number below was measured on a GitHub-hosted CI runner by the job that produced it, and says which run, which commit and which CPU. They are CI-runner numbers, not device benchmarks, and they move between runs: the two x86-64 jobs of one run landed on different AMD EPYC models. "tok/s" always says which tokens it counts. Nothing here is projected unless it says so.
+**Numbers.** Every number below was measured on a GitHub-hosted CI runner by the job that produced it, and says which run, which commit and which CPU. They are CI-runner numbers, not device benchmarks, and they move between runs: the two x86-64 jobs of one run landed on different AMD EPYC models. "tok/s" always says which tokens it counts. Nothing here is projected unless it says so. The measured sections are from run 37555419649 (commit `25ccd495f`), before the review fixes of 7 October 2026 (section 1), which add the LM head's domain checks to every prompt row, about 8.5% more weight reads per prompt row, and change nothing in decode.
 
 ---
 
@@ -49,7 +49,7 @@ The serving layer only regroups rows, so batch invariance costs nothing.
 - how rows are grouped;
 - the size of the step.
 
-**Failure.** A failed sequence is rolled back to its length before the step and reported alone.
+**Failure.** A row that fails fails alone, with the error the model raises for that token alone. Its sequence keeps the rows before it (logits returned, positions committed), drops it and the rows after it, and reports how many rows it kept. Other sequences are unaffected.
 
 The scheduler, the prefix cache and speculation see a model only through this trait and the plane-structured `SeqKv`. Any model that keeps the contract plugs in unchanged (see "MoE and islands" below).
 
@@ -73,10 +73,10 @@ The scheduler, the prefix cache and speculation see a model only through this tr
 | A domain refusal fails the whole call | `arith::project` refuses a whole projection; `ModernModel::forward` fails the whole token | Checks are per row (`check_projection_input` and the epilogue per activation row). A row that leaves the domain fails alone, with the same error text it would get alone. The other rows' values are unaffected. |
 | A batch-wide kernel fallback | `canonical_simd::matmul_i8_batched_fast` refuses the whole batch if one token is out of range | The serving GEMM falls back per activation row. Values cannot differ anyway (both paths are exact), but one hostile request cannot slow every neighbour onto the scalar path. |
 | Shared scratch state | `canonical_simd`'s thread-local limb scratch stays borrowed across a rayon parallel loop | Calling `arith::project` from inside a parallel loop over requests could re-enter that scratch and panic, failing every request in the batch. The serving layer never nests projections: one projection per matrix per step, over all rows. Its own GEMM keeps no thread-local state. |
-| One failure aborts the step | Errors propagate with `?` | Errors are tracked per row and reported per sequence. A failed sequence's KV is rolled back to its pre-step length, and its rows append zeros meanwhile so its planes stay aligned. Every other sequence commits normally. |
+| One failure aborts the step | Errors propagate with `?` | Errors are tracked per row. A failing row appends zeros meanwhile so its sequence's planes stay aligned; when the step closes (`finish_step`), the sequence commits the rows before the failure and drops the failing row and the rows after it. Every other sequence commits normally. The scheduler then asks whether plain decoding would have run the failing row at all (section 4). |
 | Mixture-of-experts capacity limits | Common in MoE serving: an expert takes at most N tokens per batch and drops the rest | Forbidden by the contract. Routing is a function of the row alone: top-k by integer score, lowest index on ties. |
 
-**The proofs (CI, every run).** All of them are in `serving/tests.rs`. Every comparison is byte for byte against `ModernModel::forward` or `ModernModel::generate`, the single-token path the golden digests pin. Each one compares tokens, every logits hash and the KV digest. They run on Linux x86-64 and Linux arm64, with the scalar kernels and again with the SIMD kernels forced on.
+**The proofs (CI, every run).** All of them are in `serving/tests.rs`. Every comparison is byte for byte against `ModernModel::forward` or `ModernModel::generate`, the single-token path the golden digests pin. Each one compares tokens, every logits hash and the KV digest. They run on Linux x86-64, Linux arm64 and Windows x86-64, with the default kernels and again with the SIMD kernels forced on.
 
 - `every_request_is_byte_identical_at_batch_1_8_and_32`: 32 random requests at concurrency 1, 8 and 32. The step budgets go down to 7 rows (prefill chunked to 3), in forward and reversed arrival order.
 - `a_request_does_not_depend_on_its_neighbours`: one fixed request, alone and among 7 or 31 random other requests.
@@ -86,15 +86,17 @@ The scheduler, the prefix cache and speculation see a model only through this tr
   - activations at the digit-domain boundaries and past them;
   - one row outside the projection domain.
 - `recomputing_a_preempted_request_is_byte_identical`: a request that loses its cache mid-generation (preemption, a device leaving an island) is rebuilt by prefilling its prompt plus the tokens already generated, in one chunk, in chunks of 5 and token by token. The rebuilt cache, the next logits and the next token are the uninterrupted ones.
-- `a_failing_sequence_does_not_disturb_the_batch` and `a_failing_request_leaves_every_other_request_untouched`: failures stay with their request.
+- `a_failing_sequence_does_not_disturb_the_batch` and `a_failing_request_leaves_every_other_request_untouched`: failures stay with their request, and the rows of a sequence before its failing row are kept and equal single-token decoding.
 - `refusals_match_generate_and_stay_with_their_request`: a refused request gets the same error text as `generate`.
+- `a_prompt_token_outside_the_domain_is_refused_like_generate`: a prompt token whose forward pass leaves the domain (a value projection outside the KV `i32` range) is refused with `generate`'s error text, in whichever prefill chunk it falls, with the prefix cache off and on; the other requests of the batch are untouched.
+- `prompt_rows_without_logits_run_the_same_head_checks_as_generate`: the reference refuses at a prompt position whose logits choose no token (a huge final-norm gain); default serving refuses with the same text, as golden mode does.
 - `serving_reproduces_generate_on_the_tiny_model`: the module's pinned tiny model.
 
 These cover the four invariances named by Vosti et al. (arXiv 2609.38981): batch composition, chunked prefill, prefill versus decode, and prefix reuse (section 3), plus speculation (section 4), a pipeline split and preemption, which that work does not test.
 
 **On the real model (CI, every bench run).** Every stream's output hash at concurrency 2 to 32 is compared with the same prompt's hash at the first concurrency it ran. The golden digest through the serving engine is in section 5.
 
-**One deliberate difference from `generate`.** In serving mode, a prefill chunk runs the final norm and the LM head only for the last prompt position, the only one whose logits choose a token. Values are unchanged. But a pathological domain failure in a discarded logits vector is not raised. In golden mode (`all_logits`) every position runs the LM head, exactly as `generate` does.
+**Refusals are the reference's refusals.** `generate` runs the final norm and the LM head at every prompt position, and may refuse there even though those logits choose no token. The batched step does the same for every row: rows whose logits choose a token return them; the others run the same norm and head and keep only the domain result, 64 rows at a time so the discarded values stay small. A request the reference refuses is refused here with the same error, in the default mode as in golden mode (`all_logits`, which also records every prompt position's logits hash). The price is the LM head for every prompt row: 0.26 G of SmolLM3-3B's 3.08 G weights per row, about 8.5%. The batching, prefix and speculation numbers below were measured before this change.
 
 ## 2. Continuous batching
 
@@ -200,6 +202,8 @@ So the speculative output equals the greedy output for every drafter, including 
 
 **Draft length adapts per request.** A request starts by drafting 2 tokens. After a step whose drafts were all accepted it doubles its draft length, up to the configured bound; after a rejection it drops to the accepted length plus one. This decides how many rows are verified, never which tokens come out.
 
+**A draft that fails.** A drafted token can be in the vocabulary and still leave the profile's domain when it is fed (its value projection outside the KV `i32` range, say). Such a row fails alone: the step keeps the rows before it and drops it and the rows after it. The accept rule then runs over the rows kept. If it stops before the failing row, at a mismatch, EOS or `max_tokens`, the failure is irrelevant: plain decoding would never have computed that row. If it would continue into the failing row, that row is the pass plain decoding runs next, so the request fails with that row's error, exactly as plain decoding does. Tests: `a_rejected_draft_outside_the_domain_never_fails_the_request` (the counterexample of the ARC-54 review: a drafter that always proposes the out-of-domain token, at draft bounds 0, 1, 2 and 4, in default and golden mode, with the prefix cache off and on), `a_failing_draft_after_accepted_drafts_is_ignored`, and `a_draft_plain_decoding_would_feed_fails_exactly_like_plain_decoding` (the same error text as `generate`; an EOS or output-length decision taken before the failing row ends the request normally).
+
 **Proof in CI.**
 - `speculative_decoding_emits_exactly_the_plain_greedy_tokens` uses prompt lookup with draft bounds 1, 3 and 8 over 24 random requests.
 - `verification_is_exact_under_honest_corrupted_and_hostile_drafts` covers:
@@ -214,8 +218,8 @@ So the speculative output equals the greedy output for every drafter, including 
 
 | prompts | drafted / accepted | tokens per pass | x86-64 plain → speculative tok/s | arm64 plain → speculative tok/s |
 |---|---|---|---|---|
-| quotes-the-prompt (4 prompts, 336 output tokens: a checklist to repeat, a rename, a JSON edit, a spelling fix) | 163 / 91 (0.56) | 1.37 | 3.74 → 4.11 (1.10×) | 6.14 → 7.09 (1.15×) |
-| general chat (the 5 golden prompts, 252 output tokens) | 25 / 8 (0.32) | 1.03 | 3.91 → 3.92 (1.00×) | 6.28 → 6.34 (1.01×) |
+| quotes-the-prompt (4 prompts, 336 timed decode tokens, each prompt's first output token excluded: a checklist to repeat, a rename, a JSON edit, a spelling fix) | 163 / 91 (0.56) | 1.37 | 3.74 → 4.11 (1.10×) | 6.14 → 7.09 (1.15×) |
+| general chat (the 5 golden prompts, 252 timed decode tokens) | 25 / 8 (0.32) | 1.03 | 3.91 → 3.92 (1.00×) | 6.28 → 6.34 (1.01×) |
 
 Why the gain is small on a CPU. On the quoting prompts the lookup proposed 163 drafts over 245 verification passes (many passes found no match and cost one row) and 91 were accepted, so a pass yielded 1.37 tokens on average. If drafted rows were free the speedup would be 1.37×; it was 1.10–1.15×, so each drafted row cost about 0.3–0.4 of a single-row step on these runners: the batched projection is cheaper per row than the GEMV, but attention, the LM head and the rejected rows are paid in full. On general chat the adaptive window shrinks to one draft after the first rejections and the lookup mostly finds nothing, so speculation costs nothing. On hardware where extra rows in a step are nearly free, the same acceptance rate is worth more; that is a statement about the arithmetic, not a measurement.
 

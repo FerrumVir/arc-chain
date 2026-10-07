@@ -17,7 +17,7 @@ use super::gemm::project_rows;
 use super::prefix::{PrefixCache, PrefixConfig};
 use super::scheduler::{Completion, Request, Scheduler, SchedulerConfig};
 use super::spec::{Drafter, PromptLookup, accept};
-use super::{BatchModel, Row, SeqKv, StepOutput, check_rows};
+use super::{BatchModel, Failure, Row, SeqKv, StepOutput, check_rows};
 use crate::modern::ModernError;
 use crate::modern::arith::{self, DyadicMatrix, ONE, Selection, exp_q16};
 use crate::modern::model::tests::{lcg_matrix, tiny_model};
@@ -183,6 +183,7 @@ fn config(max_running: usize) -> SchedulerConfig {
 #[test]
 fn batched_projection_equals_one_row_at_a_time() {
     let _guard = crate::canonical_simd::kernel_switch_guard();
+    let was = crate::canonical_simd::fast_canonical_kernel_enabled();
     let mut seed = 0x9e37_79b9_u64;
     // Edge magnitudes: zero, small, digit boundaries on both ISAs, past them
     // (scalar fallback for that row only), and a last row outside the
@@ -235,12 +236,13 @@ fn batched_projection_equals_one_row_at_a_time() {
             );
         }
     }
-    crate::canonical_simd::set_fast_canonical_kernel(false);
+    crate::canonical_simd::set_fast_canonical_kernel(was);
 }
 
 #[test]
 fn a_prompt_gives_the_same_bytes_in_one_prefill_in_chunks_and_token_by_token() {
     let _guard = crate::canonical_simd::kernel_switch_guard();
+    let was = crate::canonical_simd::fast_canonical_kernel_enabled();
     let model = model_with(4, 96, 7);
     let dense = DenseModel::new(&model, [7; 32]);
     let mut state = 11u64;
@@ -278,7 +280,7 @@ fn a_prompt_gives_the_same_bytes_in_one_prefill_in_chunks_and_token_by_token() {
             assert_eq!(kv.digest(), reference_kv, "chunks {chunks:?} simd {simd}");
         }
     }
-    crate::canonical_simd::set_fast_canonical_kernel(false);
+    crate::canonical_simd::set_fast_canonical_kernel(was);
 }
 
 #[test]
@@ -791,8 +793,17 @@ fn a_failing_sequence_does_not_disturb_the_batch() {
         dense.forward_rows(&rows, &mut refs)
     };
     assert!(out.errors[0].is_none() && out.errors[2].is_none());
-    assert!(matches!(out.errors[1], Some(ModernError::Domain(_))));
-    assert_eq!(kvs[1].len(), 22, "the failed sequence is rolled back");
+    // Sequence 1 fails at its third row, position 24. The two rows before it
+    // are kept, exactly as plain decoding computes them; the failing row is
+    // dropped.
+    assert!(matches!(
+        &out.errors[1],
+        Some(Failure {
+            kept: 2,
+            error: ModernError::Domain(_)
+        })
+    ));
+    assert_eq!(kvs[1].len(), 24, "the rows before the failure stay");
     assert_eq!((kvs[0].len(), kvs[2].len()), (3, 2));
     let survivors: [(usize, &[u32], usize); 2] = [(0, &[3, 4, 5], 0), (2, &[7, 8], 6)];
     for (seq, tokens, first) in survivors {
@@ -806,7 +817,16 @@ fn a_failing_sequence_does_not_disturb_the_batch() {
         }
         assert_eq!(kvs[seq].digest(), cache.digest());
     }
-    assert!(out.logits[3..6].iter().all(Option::is_none));
+    let mut cache = model.new_cache();
+    for p in 0..22u32 {
+        model.forward(p, &mut cache).unwrap();
+    }
+    for (offset, &t) in [9u32, 9].iter().enumerate() {
+        let alone = model.forward(t, &mut cache).unwrap();
+        assert_eq!(out.logits[3 + offset].as_deref(), Some(alone.as_slice()));
+    }
+    assert_eq!(kvs[1].digest(), cache.digest());
+    assert!(out.logits[5].is_none());
 }
 
 /// Fails every sequence that feeds `poison`: a stand-in for a domain error
@@ -838,7 +858,10 @@ impl BatchModel for Poisoned<'_> {
         let mut out = self.inner.forward_rows(rows, kvs);
         for row in rows {
             if row.token == self.poison && out.errors[row.seq].is_none() {
-                out.errors[row.seq] = Some(ModernError::Domain("poisoned".into()));
+                out.errors[row.seq] = Some(Failure {
+                    kept: 0,
+                    error: ModernError::Domain("poisoned".into()),
+                });
                 kvs[row.seq].rollback(base[row.seq]);
             }
         }
@@ -1271,4 +1294,385 @@ fn refusals_match_generate_and_stay_with_their_request() {
     let completions = scheduler.run();
     assert_eq!(completions.len(), 1);
     assert_matches_reference(&model, &fine, &completions[0], false);
+}
+
+/// A dyadic matrix with one `mu` and one `k` for every row.
+fn plane_matrix(rows: usize, cols: usize, q: Vec<i8>, mu: i32, k: u8) -> DyadicMatrix {
+    DyadicMatrix {
+        rows,
+        cols,
+        q,
+        mu: vec![mu; rows],
+        k: vec![k; rows],
+    }
+}
+
+fn zero_matrix(rows: usize, cols: usize) -> DyadicMatrix {
+    plane_matrix(rows, cols, vec![0; rows * cols], 0, 16)
+}
+
+/// The two-token, two-dimensional model of the ARC-54 review (appendix A).
+/// `embed` holds the rows of token 0 and token 1, which are also the LM head;
+/// every other weight is zero, so a token's hidden state is its embedding.
+/// With `value_overflow`, the value projection reads axis 1 only, scaled so
+/// that a token with a non-zero axis-1 embedding leaves the KV `i32` domain
+/// while a token on axis 0 alone never does.
+fn two_token_model(embed: [i8; 4], final_norm: [i64; 2], value_overflow: bool) -> ModernModel {
+    let model = ModernModel {
+        config: ModernConfig {
+            architecture: "llama".into(),
+            n_layers: 1,
+            d_model: 2,
+            n_heads: 1,
+            n_kv_heads: 1,
+            d_head: 2,
+            d_ff: 2,
+            vocab_size: 2,
+            max_seq: 16,
+            rms_eps_q32: 4295,
+            rope_theta: 10_000,
+            rope_layers: vec![false],
+        },
+        embed: plane_matrix(2, 2, embed.to_vec(), 1 << 30, 30),
+        final_norm: final_norm.to_vec(),
+        rope_cos: vec![ONE as i32; 16],
+        rope_sin: vec![0; 16],
+        layers: vec![ModernLayer {
+            attn_norm: vec![ONE; 2],
+            wq: zero_matrix(2, 2),
+            wk: zero_matrix(2, 2),
+            wv: if value_overflow {
+                plane_matrix(2, 2, vec![0, 127, 0, 127], 1 << 30, 16)
+            } else {
+                zero_matrix(2, 2)
+            },
+            wo: zero_matrix(2, 2),
+            ffn_norm: vec![ONE; 2],
+            w_gate: zero_matrix(2, 2),
+            w_up: zero_matrix(2, 2),
+            w_down: zero_matrix(2, 2),
+        }],
+    };
+    model.validate().unwrap();
+    model
+}
+
+/// Proposes a fixed pattern, whatever the context.
+#[derive(Clone)]
+struct Pattern(Vec<u32>);
+
+impl Drafter for Pattern {
+    fn propose(&self, _: &[u32], max: usize) -> Vec<u32> {
+        self.0.iter().copied().take(max).collect()
+    }
+}
+
+/// The error `generate` returns for `request`, as text.
+fn reference_error(model: &ModernModel, request: &Request) -> String {
+    model
+        .generate(&GenerationRequest {
+            prompt: &request.prompt,
+            max_tokens: request.max_tokens,
+            eos: &request.eos,
+            selection: request.selection,
+        })
+        .err()
+        .expect("the reference refuses")
+        .to_string()
+}
+
+fn assert_fails_like_reference(model: &ModernModel, request: &Request, completion: &Completion) {
+    let expected = reference_error(model, request);
+    assert_eq!(
+        completion.result.as_ref().err().map(String::as_str),
+        Some(expected.as_str()),
+        "request {}",
+        request.id
+    );
+}
+
+fn serve_one<M: BatchModel>(
+    model: &M,
+    settings: SchedulerConfig,
+    drafter: Pattern,
+    request: &Request,
+) -> Completion {
+    let mut scheduler = Scheduler::new(model, settings).with_drafter(Box::new(drafter));
+    scheduler.submit(request.clone()).unwrap();
+    let mut completions = scheduler.run();
+    assert_eq!(completions.len(), 1);
+    completions.pop().unwrap()
+}
+
+/// ARC-54 finding 1: a drafted token in the vocabulary whose forward pass
+/// leaves the profile's domain used to fail the whole request, although plain
+/// decoding rejects that token and never computes it. The review's
+/// counterexample: a drafter that always proposes the bad token, at every
+/// draft bound, in default and golden mode, with the prefix cache off and on.
+#[test]
+fn a_rejected_draft_outside_the_domain_never_fails_the_request() {
+    let model = two_token_model([1, 0, 0, 1], [ONE; 2], true);
+    assert!(matches!(
+        model.forward(1, &mut model.new_cache()),
+        Err(ModernError::Domain(_))
+    ));
+    let dense = DenseModel::new(&model, [0xa5; 32]);
+    let request = Request {
+        id: 1,
+        prompt: vec![0, 0],
+        max_tokens: 4,
+        eos: Vec::new(),
+        selection: Selection::Argmax,
+    };
+    assert_eq!(reference(&model, &request).0, vec![0, 0, 0, 0]);
+    let caches = [
+        None,
+        Some(PrefixConfig {
+            block: 1,
+            capacity_bytes: usize::MAX,
+        }),
+    ];
+    for draft_tokens in [0usize, 1, 2, 4] {
+        for all_logits in [false, true] {
+            for prefix in caches {
+                let settings = SchedulerConfig {
+                    draft_tokens,
+                    all_logits,
+                    prefix,
+                    ..config(1)
+                };
+                let mut scheduler =
+                    Scheduler::new(&dense, settings).with_drafter(Box::new(Pattern(vec![1; 8])));
+                // Twice: the second run reuses the first's prompt block when
+                // the cache is on.
+                for round in 0..2 {
+                    scheduler.submit(request.clone()).unwrap();
+                    let completion = scheduler.run().pop().unwrap();
+                    assert_matches_reference(&model, &request, &completion, all_logits);
+                    let generated = completion.result.as_ref().unwrap();
+                    assert_eq!(generated.accepted, 0, "the bad token is never accepted");
+                    assert_eq!(
+                        generated.drafted > 0,
+                        draft_tokens > 0,
+                        "bound {draft_tokens}"
+                    );
+                    if prefix.is_some() && !all_logits && round == 1 {
+                        assert_eq!(generated.cached_tokens, 1, "the second run reuses a block");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A draft that fails after several accepted drafts is dropped together with
+/// the rows after it; the accepted rows stand and decoding continues.
+#[test]
+fn a_failing_draft_after_accepted_drafts_is_ignored() {
+    let model = two_token_model([1, 0, 0, 1], [ONE; 2], true);
+    let dense = DenseModel::new(&model, [0xa6; 32]);
+    let request = Request {
+        id: 2,
+        prompt: vec![0],
+        max_tokens: 8,
+        eos: Vec::new(),
+        selection: Selection::Argmax,
+    };
+    assert_eq!(reference(&model, &request).0, vec![0; 8]);
+    for all_logits in [false, true] {
+        let settings = SchedulerConfig {
+            draft_tokens: 8,
+            all_logits,
+            ..config(1)
+        };
+        let drafter = Pattern(vec![0, 0, 1, 1, 1, 1, 1, 1]);
+        let completion = serve_one(&dense, settings, drafter, &request);
+        assert_matches_reference(&model, &request, &completion, all_logits);
+        let generated = completion.result.as_ref().unwrap();
+        assert!(generated.accepted >= 4, "accepted {}", generated.accepted);
+        assert!(
+            generated.drafted > generated.accepted,
+            "a draft failed: drafted {} accepted {}",
+            generated.drafted,
+            generated.accepted
+        );
+    }
+}
+
+/// When plain decoding itself would feed the failing token next, the request
+/// fails with plain decoding's error. A decision taken before that row (EOS,
+/// the output length) ends the request normally, failing row or not.
+#[test]
+fn a_draft_plain_decoding_would_feed_fails_exactly_like_plain_decoding() {
+    // Token 0 predicts itself once; then the repetition penalty hands the
+    // argmax to token 1, whose value projection leaves the KV domain.
+    let model = two_token_model([21, 0, 20, 1], [ONE; 2], true);
+    let dense = DenseModel::new(&model, [0xa7; 32]);
+    let doomed = Request {
+        id: 3,
+        prompt: vec![0],
+        max_tokens: 4,
+        eos: Vec::new(),
+        selection: Selection::Rp64Argmax,
+    };
+    let expected = reference_error(&model, &doomed);
+    assert!(expected.contains("KV value outside i32"), "{expected}");
+    for draft_tokens in [0usize, 2] {
+        for all_logits in [false, true] {
+            let settings = SchedulerConfig {
+                draft_tokens,
+                all_logits,
+                ..config(1)
+            };
+            let completion = serve_one(&dense, settings, Pattern(vec![1; 8]), &doomed);
+            assert_fails_like_reference(&model, &doomed, &completion);
+        }
+    }
+    let saved = [
+        Request {
+            id: 4,
+            prompt: vec![0],
+            max_tokens: 4,
+            eos: vec![1],
+            selection: Selection::Rp64Argmax,
+        },
+        Request {
+            id: 5,
+            prompt: vec![0],
+            max_tokens: 2,
+            eos: Vec::new(),
+            selection: Selection::Rp64Argmax,
+        },
+    ];
+    for request in &saved {
+        assert_eq!(reference(&model, request).0, vec![0, 1]);
+        for draft_tokens in [0usize, 2] {
+            let settings = SchedulerConfig {
+                draft_tokens,
+                ..config(1)
+            };
+            let completion = serve_one(&dense, settings, Pattern(vec![1; 8]), request);
+            assert_matches_reference(&model, request, &completion, false);
+        }
+    }
+}
+
+/// A prompt token outside the domain is refused with `generate`'s error, in
+/// whichever prefill chunk it falls and whether or not a prefix is reused,
+/// and the other requests of the batch are untouched.
+#[test]
+fn a_prompt_token_outside_the_domain_is_refused_like_generate() {
+    let model = two_token_model([1, 0, 0, 1], [ONE; 2], true);
+    let dense = DenseModel::new(&model, [0xa8; 32]);
+    let refused: Vec<Request> = [vec![1u32], vec![0, 1, 0], vec![0, 0, 0, 1]]
+        .into_iter()
+        .enumerate()
+        .map(|(i, prompt)| Request {
+            id: 10 + i as u64,
+            prompt,
+            max_tokens: 3,
+            eos: Vec::new(),
+            selection: Selection::Argmax,
+        })
+        .collect();
+    let fine = Request {
+        id: 20,
+        prompt: vec![0, 0, 0],
+        max_tokens: 3,
+        eos: Vec::new(),
+        selection: Selection::Argmax,
+    };
+    let caches = [
+        None,
+        Some(PrefixConfig {
+            block: 1,
+            capacity_bytes: usize::MAX,
+        }),
+    ];
+    for prefill_chunk in [1usize, 2, 64] {
+        for all_logits in [false, true] {
+            for prefix in caches {
+                let settings = SchedulerConfig {
+                    prefill_chunk,
+                    all_logits,
+                    prefix,
+                    ..config(4)
+                };
+                let mut scheduler = Scheduler::new(&dense, settings);
+                // The fine request first, so its blocks are cached when the
+                // refused ones run again.
+                for round in 0..2 {
+                    scheduler.submit(fine.clone()).unwrap();
+                    for request in &refused {
+                        scheduler.submit(request.clone()).unwrap();
+                    }
+                    let completions: HashMap<u64, Completion> =
+                        scheduler.run().into_iter().map(|c| (c.id, c)).collect();
+                    for request in &refused {
+                        assert_fails_like_reference(&model, request, &completions[&request.id]);
+                    }
+                    assert_matches_reference(&model, &fine, &completions[&fine.id], all_logits);
+                    if round == 1 && prefix.is_some() && !all_logits {
+                        let reused = completions[&refused[2].id].result.is_err();
+                        assert!(reused, "the refused request still fails after a prefix hit");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// ARC-54 finding 2: `generate` runs the LM head at every prompt position, so
+/// a prompt position whose logits choose no token can still refuse. Serving
+/// runs the same head checks on those rows and refuses identically, in the
+/// default mode as in golden mode, with the prefix cache off and on.
+#[test]
+fn prompt_rows_without_logits_run_the_same_head_checks_as_generate() {
+    // A huge final-norm gain on axis 1: the LM head's input check fails at
+    // token 1's position, whose logits nobody reads, and nowhere else.
+    let model = two_token_model([1, 0, 0, 1], [ONE, 1 << 60], false);
+    let dense = DenseModel::new(&model, [0xa9; 32]);
+    let refused = Request {
+        id: 30,
+        prompt: vec![1, 0],
+        max_tokens: 1,
+        eos: Vec::new(),
+        selection: Selection::Argmax,
+    };
+    let expected = reference_error(&model, &refused);
+    assert!(
+        expected.contains("projection input magnitude"),
+        "{expected}"
+    );
+    let fine = Request {
+        id: 31,
+        prompt: vec![0, 0],
+        max_tokens: 1,
+        eos: Vec::new(),
+        selection: Selection::Argmax,
+    };
+    assert_eq!(reference(&model, &fine).0, vec![0]);
+    let caches = [
+        None,
+        Some(PrefixConfig {
+            block: 1,
+            capacity_bytes: usize::MAX,
+        }),
+    ];
+    for all_logits in [false, true] {
+        for prefix in caches {
+            let settings = SchedulerConfig {
+                all_logits,
+                prefix,
+                ..config(2)
+            };
+            let mut scheduler = Scheduler::new(&dense, settings);
+            scheduler.submit(refused.clone()).unwrap();
+            scheduler.submit(fine.clone()).unwrap();
+            let completions: HashMap<u64, Completion> =
+                scheduler.run().into_iter().map(|c| (c.id, c)).collect();
+            assert_fails_like_reference(&model, &refused, &completions[&refused.id]);
+            assert_matches_reference(&model, &fine, &completions[&fine.id], all_logits);
+        }
+    }
 }
