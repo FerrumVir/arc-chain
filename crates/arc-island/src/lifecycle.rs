@@ -136,18 +136,43 @@ pub enum Event {
     Dissolved(DissolveReason),
 }
 
-/// A running island.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A running island. Snapshots are diagnostic only: they cannot restore
+/// qualification. Construct a new, unqualified island from a plan instead.
+/// Lifecycle authority and the plan are read-only outside this module.
+///
+/// ```compile_fail,E0616
+/// use arc_island::lifecycle::{Island, State};
+/// fn bypass(island: &mut Island) { island.state = State::Serving; }
+/// ```
+/// ```compile_fail,E0616
+/// use arc_island::{lifecycle::Island, device::Provenance};
+/// fn bypass(island: &mut Island) { island.plan.provenance = Provenance::Measured; }
+/// ```
+/// ```compile_fail,E0594
+/// use arc_island::{lifecycle::Island, device::Provenance};
+/// fn bypass(island: &mut Island) { island.plan().provenance = Provenance::Measured; }
+/// ```
+/// ```compile_fail,E0594
+/// use arc_island::lifecycle::{Island, State};
+/// fn bypass(island: &mut Island) { *island.state() = State::Serving; }
+/// ```
+/// ```compile_fail,E0277
+/// use arc_island::lifecycle::Island;
+/// fn restore(snapshot: serde_json::Value) -> Island {
+///     serde_json::from_value(snapshot).unwrap()
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Island {
-    pub plan: IslandPlan,
-    pub state: State,
+    plan: IslandPlan,
+    state: State,
     /// Bumped on every membership change.
-    pub generation: u32,
+    generation: u32,
     last_seen: BTreeMap<usize, u64>,
     /// Device ids at the time each index joined, to catch a reused index.
     ids: BTreeMap<usize, String>,
     freshness: Freshness,
-    pub events: Vec<(u64, Event)>,
+    events: Vec<(u64, Event)>,
 }
 
 impl Island {
@@ -177,8 +202,26 @@ impl Island {
         }
     }
 
+    pub fn plan(&self) -> &IslandPlan {
+        &self.plan
+    }
+
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    pub fn events(&self) -> &[(u64, Event)] {
+        &self.events
+    }
+
     pub fn is_serving(&self) -> bool {
         self.state == State::Serving
+            && self.plan.provenance == Provenance::Measured
+            && GoldenReference::pinned(&self.plan.model).is_some()
     }
 
     pub fn is_dissolved(&self) -> bool {
@@ -246,8 +289,34 @@ impl Island {
         devices: &[DeviceDescriptor],
         rtt: &dyn RttSource,
     ) -> bool {
-        if self.is_dissolved() {
+        // Never interpret synthetic-plan validation as a real health gate,
+        // even if a future internal bug incorrectly sets its state to Serving.
+        if self.plan.provenance != Provenance::Measured {
             return false;
+        }
+        self.check_inputs(now_ms, devices, rtt);
+        self.admission_open()
+    }
+
+    /// Evaluate a simulation's health without granting serving authority.
+    /// This is deliberately separate from the real admission health gate.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn simulation_health_check(
+        &mut self,
+        now_ms: u64,
+        devices: &[DeviceDescriptor],
+        rtt: &dyn RttSource,
+    ) -> bool {
+        if self.state != State::Simulated {
+            return false;
+        }
+        self.check_inputs(now_ms, devices, rtt);
+        self.state == State::Simulated && self.spare_shortfall() == 0
+    }
+
+    fn check_inputs(&mut self, now_ms: u64, devices: &[DeviceDescriptor], rtt: &dyn RttSource) {
+        if self.is_dissolved() {
+            return;
         }
         let largest = self.plan.largest_stage_bytes();
         let spares: Vec<usize> = self.plan.spares.iter().map(|s| s.device).collect();
@@ -268,7 +337,7 @@ impl Island {
                 self.log(now_ms, Event::HealthCheckFailed { device: m });
                 self.device_lost(m, now_ms);
                 if self.is_dissolved() {
-                    return false;
+                    return;
                 }
             }
         }
@@ -277,11 +346,10 @@ impl Island {
             for &b in &members[k + 1..] {
                 if !self.link_ok(a, b, rtt, now_ms) {
                     self.dissolve(now_ms, DissolveReason::LinkFailed { a, b });
-                    return false;
+                    return;
                 }
             }
         }
-        self.admission_open()
     }
 
     /// Runs the golden self-test. Only [`GoldenSource::Pinned`] with a
@@ -575,6 +643,37 @@ pub(crate) mod tests {
         let (_, _, island) = serving(0);
         assert!(island.admission_open());
         assert_eq!(island.warm_spares(), 1);
+    }
+
+    #[test]
+    fn corrupted_synthetic_serving_state_fails_independent_gates() {
+        use crate::admission::{AdmissionPolicy, Load, Refusal, Request, admit};
+        let (devices, rtt, mut island) = serving(0);
+        // Only this module can simulate an internal state corruption. Even
+        // a test-pinned model with State::Serving must not trust a synthetic plan.
+        island.plan.provenance = Provenance::Synthetic;
+        assert_eq!(island.state, State::Serving);
+        assert!(!island.health_check(10, &devices, &rtt));
+        assert!(!island.is_serving());
+        assert_eq!(
+            admit(
+                &mut island,
+                10,
+                &devices,
+                &rtt,
+                &Load::default(),
+                &Request {
+                    prompt_tokens: 0,
+                    max_new_tokens: 0,
+                    min_tok_s: 0.0
+                },
+                &AdmissionPolicy {
+                    max_prefill_queue_ms: 1000
+                },
+                |_| 100.0
+            ),
+            Err(Refusal::NotServing)
+        );
     }
 
     #[test]

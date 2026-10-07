@@ -25,6 +25,12 @@ Design sources: research-6 §2, §3 and §6 (ARC-AC v0) and research-7 §2–§4
   including measured memory and bandwidth. A synthetic formation reaches at
   most the `Simulated` state. The island re-checks its health on every
   admission.
+- **Lifecycle authority.** `Island::new` always starts unqualified. Plan,
+  state, generation and events have read-only accessors; diagnostic snapshots
+  are serializable but cannot be deserialized into a running island. Import a
+  plan into a new island and qualify it again. Real admission and health gates
+  reject synthetic plans independently. With the simulator feature,
+  `simulation_health_check` evaluates simulated health without opening admission.
 - **Consent.** Owners answer two questions, compute and island (#138). The
   grant is bound to one owner and one device, and it expires. Withdrawal
   takes effect at the next check.
@@ -62,3 +68,11 @@ cargo run --release -p arc-island --features simulator --bin arc-island-sim -- -
 The simulator's numbers are projections from labelled assumptions over a
 synthetic inventory. They are not measurements and not community counts; the
 report lists every assumption.
+
+Lease accounting separates non-dissolved spare-shortfall time (including
+waiting for an eligible replacement) from time after dissolution. Both shares
+divide by initially formed islands × the full lease duration; the integer
+millisecond totals and remaining time are in JSON. Optional-spares scenarios
+have zero spare-shortfall time. Tokens/day are fully loaded ceilings excluding
+both downtimes, recovery stalls, prefill and audit. No projection in the seed-7
+report reaches 59 tok/s per answer.

@@ -7,7 +7,7 @@
 //! admitted meets the request's floor, and the prefill queue is short
 //! enough. Otherwise the router sends it elsewhere.
 
-use crate::device::{DeviceDescriptor, RttSource};
+use crate::device::{DeviceDescriptor, Provenance, RttSource};
 use crate::lifecycle::Island;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +69,9 @@ pub fn admit(
     policy: &AdmissionPolicy,
     per_stream_tok_s: impl Fn(u32) -> f64,
 ) -> Result<(), Refusal> {
+    if island.plan().provenance != Provenance::Measured {
+        return Err(Refusal::NotServing);
+    }
     island.health_check(now_ms, devices, rtt);
     if !island.is_serving() {
         return Err(Refusal::NotServing);
@@ -80,7 +83,7 @@ pub fn admit(
     }
     let need = req.prompt_tokens + req.max_new_tokens;
     let free = island
-        .plan
+        .plan()
         .kv_positions
         .saturating_sub(load.kv_positions_in_use);
     if need > free {
@@ -274,7 +277,7 @@ mod tests {
         let speed = |_: u32| 30.0;
         // A spare's owner withdraws: paused until replenished.
         let (mut devices, rtt, mut isl) = island(1, true);
-        let spare = isl.plan.spares[0].device;
+        let spare = isl.plan().spares[0].device;
         devices[spare].consent.withdraw();
         assert_eq!(
             admit(
@@ -307,7 +310,7 @@ mod tests {
         );
         // A member's evidence goes stale: the spare takes over and the island
         // must recover and re-qualify before admitting again.
-        let m = isl.plan.members[0];
+        let m = isl.plan().members[0];
         devices[m].evidence = Evidence::synthetic(0);
         assert_eq!(
             admit(
@@ -322,7 +325,7 @@ mod tests {
             ),
             Err(Refusal::NotServing)
         );
-        assert_eq!(isl.state, State::Recovering { stage: 0 });
+        assert_eq!(*isl.state(), State::Recovering { stage: 0 });
         // Expired links dissolve the island.
         let (devices, rtt, mut isl) = island(0, true);
         let late = Freshness::default().link_ttl_ms + 1;

@@ -697,15 +697,47 @@ pub struct IslandRow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ChurnReport {
     pub islands: usize,
+    pub lease_duration_ms: u64,
     pub member_failures: usize,
     pub spare_failures: usize,
     pub promotions: usize,
     pub replenished: usize,
     pub dissolved: usize,
     pub survived: usize,
-    /// Share of island-time with admission paused for a spare shortfall
-    /// (dissolved islands count as paused from dissolution).
-    pub paused_share: f64,
+    /// Denominator: initially formed islands × the full lease duration.
+    pub total_island_time_ms: u64,
+    /// Non-dissolved island-time below the required spare count, including
+    /// time with no eligible replacement (not just shard staging).
+    pub spare_shortfall_time_ms: u64,
+    /// Time from dissolution to lease end, disjoint from spare shortfall.
+    pub dissolved_time_ms: u64,
+    /// Remainder of the lease, not a measurement of serving uptime.
+    pub other_time_ms: u64,
+    /// spare_shortfall_time_ms / total_island_time_ms; 0 for no islands.
+    pub spare_shortfall_share: f64,
+    /// dissolved_time_ms / total_island_time_ms; 0 for no islands.
+    pub dissolved_share: f64,
+}
+
+impl ChurnReport {
+    fn account_interval(&mut self, island: &Island, duration_ms: u64) {
+        self.total_island_time_ms += duration_ms;
+        if island.is_dissolved() {
+            self.dissolved_time_ms += duration_ms;
+        } else if island.spare_shortfall() > 0 {
+            self.spare_shortfall_time_ms += duration_ms;
+        } else {
+            self.other_time_ms += duration_ms;
+        }
+    }
+
+    fn finish_accounting(&mut self) {
+        if self.total_island_time_ms > 0 {
+            self.spare_shortfall_share =
+                self.spare_shortfall_time_ms as f64 / self.total_island_time_ms as f64;
+            self.dissolved_share = self.dissolved_time_ms as f64 / self.total_island_time_ms as f64;
+        }
+    }
 }
 
 /// One scenario's results.
@@ -791,11 +823,11 @@ fn churn(
     let lease_ms = (LEASE_H * 3_600_000.0) as u64;
     let mut r = ChurnReport {
         islands: outcome.islands.len(),
+        lease_duration_ms: lease_ms,
         ..ChurnReport::default()
     };
     let mut live = devices.to_vec();
     let mut pool: Vec<usize> = outcome.unused.clone();
-    let mut paused_ms = 0u64;
     let draw = |rng: &mut Rng, from: u64| {
         let t = from as f64 - MTBF_H * 3_600_000.0 * (1.0 - rng.unit()).ln();
         (t < lease_ms as f64).then_some(t as u64)
@@ -819,9 +851,7 @@ fn churn(
         let mut pending: BTreeSet<usize> = BTreeSet::new();
         let mut last = 0u64;
         while let Some(Reverse((t, kind, d))) = heap.pop() {
-            if island.spare_shortfall() > 0 || island.is_dissolved() {
-                paused_ms += t - last;
-            }
+            r.account_interval(&island, t - last);
             last = t;
             if island.is_dissolved() {
                 continue;
@@ -830,14 +860,14 @@ fn churn(
             match kind {
                 FAIL if pending.remove(&d) => {}
                 FAIL if island.devices().contains(&d) => {
-                    if island.plan.members.contains(&d) {
+                    if island.plan().members.contains(&d) {
                         r.member_failures += 1;
                     } else {
                         r.spare_failures += 1;
                     }
-                    let before = island.generation;
+                    let before = island.generation();
                     island.device_lost(d, t);
-                    if island.generation > before {
+                    if island.generation() > before {
                         r.promotions += 1;
                         let at = t + PROMOTION_STALL_MS;
                         island.recover(at, &checkpoint, &mut LedgerRecovery);
@@ -852,7 +882,7 @@ fn churn(
                 }
                 READY if pending.remove(&d) => {
                     // Probes and facts are refreshed every epoch.
-                    for &i in island.plan.members.iter().chain([&d]) {
+                    for &i in island.plan().members.iter().chain([&d]) {
                         live[i].evidence.measured_at_ms = t;
                     }
                     if island.replenish_spare(t, d, &live, rtt).is_ok() {
@@ -865,13 +895,13 @@ fn churn(
                 continue;
             }
             // Reserve replacements for any shortfall.
-            let largest = island.plan.largest_stage_bytes();
+            let largest = island.plan().largest_stage_bytes();
             while island.spare_shortfall() > pending.len() {
                 let found = pool.iter().position(|&c| {
                     devices[c].pool().is_some_and(|p| p.usable_bytes >= largest)
-                        && island.plan.members.iter().all(|&m| {
+                        && island.plan().members.iter().all(|&m| {
                             island
-                                .plan
+                                .plan()
                                 .link_rule
                                 .ok(rtt.link(c, m), t, &policy.freshness, true)
                         })
@@ -888,18 +918,14 @@ fn churn(
                 }
             }
         }
-        if island.spare_shortfall() > 0 || island.is_dissolved() {
-            paused_ms += lease_ms - last;
-        }
+        r.account_interval(&island, lease_ms - last);
         if island.is_dissolved() {
             r.dissolved += 1;
         } else {
             r.survived += 1;
         }
     }
-    if r.islands > 0 {
-        r.paused_share = paused_ms as f64 / (r.islands as f64 * lease_ms as f64);
-    }
+    r.finish_accounting();
     r
 }
 
@@ -945,7 +971,7 @@ pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
                 &rtt,
                 GoldenSource::Simulation(&golden),
             )
-            .unwrap_or_else(|_| island.state.clone());
+            .unwrap_or_else(|_| island.state().clone());
         let p = project(
             plan,
             &devices,
@@ -1079,8 +1105,8 @@ pub fn assumptions() -> Vec<(&'static str, String, &'static str)> {
         ("Speculation", format!("chain drafts from a separate drafter (K2.6 has no MTP head), acceptance α = {}, {} ms per draft token, depth 0–{} chosen per island, separately for a single answer and under batching", p.draft_acceptance, f64::from(p.draft_us_per_token) / 1000.0, p.max_draft_tokens), "ASSUMPTION (research-7 §2.2 planning values)"),
         ("Batching", format!("KV for {} (interactive) / {} (batch) sequences × {} positions per island; depth = max aggregate keeping per-stream ≥ min({} tok/s, half the single-stream rate)", kv_sequences(Service::Interactive), kv_sequences(Service::Batch), CONTEXT_POSITIONS, BATCH_FLOOR_TOK_S), "research-6 §2.6 model"),
         ("Compute model", "memory-bandwidth bound; distinct experts under uniform routing; FLOPs, prefill and queueing not modelled".into(), "CALC (research-6 §2.6)"),
-        ("Tokens/day", "aggregate tok/s × 86,400: a fully loaded ceiling, excluding repair, prefill and audit; not a demand forecast".into(), "CALC"),
-        ("Churn", format!("device MTBF {MTBF_H} h, lease {LEASE_H} h, exponential failures; a member loss promotes a spare, recovers from the ledger checkpoint and re-qualifies ({} s stall); lost spares are replaced from unused eligible devices after staging the largest stage at 1 Gb/s; admission is paused while spares are short", PROMOTION_STALL_MS / 1000), "research-6 §3.3 (Salad 92 h), §6.7"),
+        ("Tokens/day", "aggregate tok/s × 86,400: a fully loaded ceiling, excluding spare-shortfall and dissolved downtime, recovery stalls, prefill and audit; not a demand forecast".into(), "CALC"),
+        ("Churn", format!("device MTBF {MTBF_H} h, lease {LEASE_H} h, exponential failures; a member loss promotes a spare, recovers from the ledger checkpoint and re-qualifies ({} s stall); lost spares are replaced from unused eligible devices after staging the largest stage at 1 Gb/s; spare-shortfall time counts only non-dissolved islands below policy, including time without an eligible replacement; dissolved time counts separately from dissolution to lease end", PROMOTION_STALL_MS / 1000), "research-6 §3.3 (Salad 92 h), §6.7"),
     ]
 }
 
@@ -1168,11 +1194,30 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
         md,
         "\n## Summary\n\nPer-answer tok/s: median (min–max) over the islands formed, one answer at a time. \
          \"With spec\" picks the best draft depth per island. Aggregates are at each island's planned \
-         batching depth, without and with speculation. Daily figures are fully loaded ceilings.\n"
+         batching depth, without and with speculation. Daily figures are fully loaded ceilings excluding both spare-shortfall and dissolved downtime, as well as recovery stalls, prefill and audit.\n\nBoth downtime shares use initially formed islands × the full 6 h lease as denominator. The categories are mutually exclusive; no islands means no denominator (shown as –). Other time is not measured serving uptime.\n"
+    );
+    let best = reports
+        .iter()
+        .flat_map(|r| &r.rows)
+        .map(|r| {
+            r.projection
+                .speculative
+                .tok_s
+                .max(r.projection.single.tok_s)
+        })
+        .fold(0.0, f64::max);
+    let _ = writeln!(
+        md,
+        "Best per-answer projection: {best:.1} tok/s. {}\n",
+        if best < 59.0 {
+            "No projection reaches 59 tok/s per answer."
+        } else {
+            "These are synthetic projections, not measured serving performance."
+        }
     );
     let _ = writeln!(
         md,
-        "| Nodes | Scenario | Online | Eligible | Largest region, GB (one copy needs) | Islands T0 / T1a / T1b | Swarms metro / zone / region / neighbour | Members + spares (required) | Unused eligible | Hops per token | Per-answer tok/s | With spec | Aggregate tok/s, plain / spec | Tokens/day, plain / spec | Survive 6 h lease | Admission paused | Serving / simulated |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "| Nodes | Scenario | Online | Eligible | Largest region, GB (one copy needs) | Islands T0 / T1a / T1b | Swarms metro / zone / region / neighbour | Members + spares (required) | Unused eligible | Hops per token | Per-answer tok/s | With spec | Aggregate tok/s, plain / spec | Tokens/day ceiling, plain / spec (excludes both downtimes) | Survive 6 h lease | Spare-shortfall / total lease | Dissolved / total lease | Serving / simulated |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     );
     for r in reports {
         let t = |tier: Tier| r.islands_by_tier.get(tier.label()).copied().unwrap_or(0);
@@ -1184,17 +1229,18 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
             .collect();
         let mut hops: Vec<f64> = r.rows.iter().map(|x| x.hops as f64).collect();
         let required: usize = r.rows.iter().map(|x| x.required_spares).sum();
-        let (survive, paused) = if r.churn.islands == 0 {
-            ("–".into(), "–".into())
+        let (survive, shortfall, dissolved) = if r.churn.islands == 0 {
+            ("–".into(), "–".into(), "–".into())
         } else {
             (
                 format!("{}/{}", r.churn.survived, r.churn.islands),
-                format!("{:.0}%", r.churn.paused_share * 100.0),
+                format!("{:.1}%", r.churn.spare_shortfall_share * 100.0),
+                format!("{:.1}%", r.churn.dissolved_share * 100.0),
             )
         };
         let _ = writeln!(
             md,
-            "| {} | {} | {} | {} | {} {:.0} ({:.0}) | {} / {} / {} | {} / {} / {} / {} | {} + {} ({}) | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} | {} / {} |",
+            "| {} | {} | {} | {} | {} {:.0} ({:.0}) | {} / {} / {} | {} / {} / {} / {} | {} + {} ({}) | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} | {} | {} / {} |",
             r.scenario.nodes,
             scenario_label(&r.scenario),
             r.online,
@@ -1225,7 +1271,8 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
             fmt_big(r.tokens_per_day),
             fmt_big(r.tokens_per_day_speculative),
             survive,
-            paused,
+            shortfall,
+            dissolved,
             r.serving_islands,
             r.simulated_islands,
         );
@@ -1237,7 +1284,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
     );
     let _ = writeln!(
         md,
-        "| Nodes | Spares | Swarms | Members | Spares held / required | Unused eligible | Aggregate tok/s | Survive 6 h lease | Admission paused |\n|---|---|---|---|---|---|---|---|---|"
+        "| Nodes | Spares | Swarms | Members | Spares held / required | Unused eligible | Aggregate tok/s | Survive 6 h lease | Spare-shortfall / total lease | Dissolved / total lease |\n|---|---|---|---|---|---|---|---|---|---|"
     );
     for r in reports.iter().filter(|r| {
         r.scenario.service == Service::Batch
@@ -1247,7 +1294,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
         let required: usize = r.rows.iter().map(|x| x.required_spares).sum();
         let _ = writeln!(
             md,
-            "| {} | {} | {} | {} | {} / {} | {} | {} | {}/{} | {:.0}% |",
+            "| {} | {} | {} | {} | {} / {} | {} | {} | {}/{} | {} | {} |",
             r.scenario.nodes,
             if r.scenario.require_spares {
                 "required"
@@ -1262,7 +1309,16 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
             fmt_big(r.aggregate_tok_s),
             r.churn.survived,
             r.churn.islands,
-            r.churn.paused_share * 100.0,
+            if r.churn.islands == 0 {
+                "–".into()
+            } else {
+                format!("{:.1}%", r.churn.spare_shortfall_share * 100.0)
+            },
+            if r.churn.islands == 0 {
+                "–".into()
+            } else {
+                format!("{:.1}%", r.churn.dissolved_share * 100.0)
+            },
         );
     }
     let _ = writeln!(
@@ -1271,7 +1327,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
          the spares and every stage is capped at the smallest spare's memory. A swarm therefore needs more \
          members and more large machines than the same swarm without spares, and fewer swarms form from the \
          same inventory. In exchange, an island survives member loss by promotion and checkpoint recovery \
-         instead of dissolving, and admission pauses only while a replacement spare stages its shard.\n"
+         when a suitable spare remains. Spare-shortfall pauses include waiting for an eligible replacement as well as shard staging. Once dissolved, all remaining lease time counts only as dissolved time; optional-spares rows have zero spare-shortfall pause.\n"
     );
 
     let _ = writeln!(md, "## Every island and swarm, by scenario\n");
@@ -1310,7 +1366,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
         }
         let _ = writeln!(
             md,
-            "| Tier | Cell | Members | Spares | Hops | Mean hop RTT ms | Ring RTT ms | Max pair p95 ms | Per-answer tok/s | With spec (k) | Batch B / k | Per-stream at B | Aggregate tok/s | Spec batch B / k | Spec aggregate tok/s | Tokens/day, plain / spec | Members | Spare machines |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            "| Tier | Cell | Members | Spares | Hops | Mean hop RTT ms | Ring RTT ms | Max pair p95 ms | Per-answer tok/s | With spec (k) | Batch B / k | Per-stream at B | Aggregate tok/s | Spec batch B / k | Spec aggregate tok/s | Tokens/day ceiling, plain / spec (excludes both downtimes) | Members | Spare machines |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
         );
         let mut rows: Vec<&IslandRow> = r.rows.iter().collect();
         rows.sort_by(|a, b| {
@@ -1438,6 +1494,20 @@ mod tests {
             assert_eq!(r.serving_islands, 0, "synthetic inputs must never serve");
             assert_eq!(r.simulated_islands, r.rows.len());
             assert_eq!(r.churn.survived + r.churn.dissolved, r.churn.islands);
+            let c = &r.churn;
+            assert_eq!(
+                c.total_island_time_ms,
+                c.islands as u64 * (LEASE_H * 3_600_000.0) as u64
+            );
+            assert_eq!(
+                c.spare_shortfall_time_ms + c.dissolved_time_ms + c.other_time_ms,
+                c.total_island_time_ms
+            );
+            assert!(c.spare_shortfall_share + c.dissolved_share <= 1.0);
+            if !r.scenario.require_spares {
+                assert_eq!(c.spare_shortfall_time_ms, 0);
+                assert_eq!(c.spare_shortfall_share.to_bits(), 0.0f64.to_bits());
+            }
             for row in &r.rows {
                 formed += 1;
                 if r.scenario.require_spares {
@@ -1456,5 +1526,54 @@ mod tests {
         let md = markdown(&a, 7);
         assert!(md.contains("| 130 |"));
         assert!(md.contains("What the spare requirement changes"));
+        assert!(md.contains("Spare-shortfall / total lease"));
+        assert!(md.contains("Dissolved / total lease"));
+        assert!(md.contains("excludes both downtimes"));
+    }
+
+    #[test]
+    fn lease_intervals_are_mutually_exclusive_even_when_dissolved_with_shortfall() {
+        let (_, _, mut island) = crate::lifecycle::tests::setup(0);
+        let mut report = ChurnReport::default();
+        report.account_interval(&island, 100);
+        island.device_lost(island.plan().spares[0].device, 100);
+        report.account_interval(&island, 200);
+        island.dissolve(300, crate::lifecycle::DissolveReason::Requested);
+        assert!(island.spare_shortfall() > 0);
+        report.account_interval(&island, 700);
+        report.finish_accounting();
+        assert_eq!(report.total_island_time_ms, 1000);
+        assert_eq!(report.other_time_ms, 100);
+        assert_eq!(report.spare_shortfall_time_ms, 200);
+        assert_eq!(report.dissolved_time_ms, 700);
+        assert!((report.spare_shortfall_share - 0.2).abs() < f64::EPSILON);
+        assert!((report.dissolved_share - 0.7).abs() < f64::EPSILON);
+        let mut empty = ChurnReport::default();
+        empty.finish_accounting();
+        assert_eq!(empty.spare_shortfall_share.to_bits(), 0.0f64.to_bits());
+        assert_eq!(empty.dissolved_share.to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn reviewed_optional_spare_scenarios_have_only_dissolved_downtime() {
+        for scenario in standard_scenarios(7, &[1_000, 10_000])
+            .into_iter()
+            .filter(|s| !s.require_spares)
+        {
+            let report = run(&scenario, &ModelSpec::kimi_k26_int4());
+            let c = report.churn;
+            assert!(c.islands > 0 && c.dissolved > 0);
+            assert_eq!(c.spare_shortfall_time_ms, 0);
+            assert_eq!(c.spare_shortfall_share.to_bits(), 0.0f64.to_bits());
+            assert!(c.dissolved_time_ms > 0);
+            assert_eq!(
+                c.total_island_time_ms,
+                c.islands as u64 * c.lease_duration_ms
+            );
+            assert_eq!(
+                c.dissolved_time_ms + c.other_time_ms,
+                c.total_island_time_ms
+            );
+        }
     }
 }
