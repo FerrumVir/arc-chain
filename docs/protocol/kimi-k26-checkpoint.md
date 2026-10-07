@@ -34,15 +34,15 @@ still to be checked.
 
 ## 2. What the engine is missing for it
 
-`parse_hf_config` already reads the wrapped configuration and refuses K2.6
-with exactly these three gaps (unit test
-`kimi_k26_and_k3_refusals_list_every_missing_feature`):
+`parse_hf_config` (stage packages) refuses K2.6 with three gaps (unit test
+`kimi_k26_and_k3_refusals_list_every_missing_feature`). The weight-slice path
+(spec §14) closes the first two:
 
-| Gap | Work needed |
+| Gap | Status |
 |---|---|
-| Multimodal wrapper: tensors under `language_model.`, a vision tower | Strip the prefix in the tensor mapping (spec §4.1); skip the vision tower and projector tensors. |
-| Pre-quantised experts (compressed-tensors `pack-quantized`) | A lossless repacker from `weight_packed` / `weight_scale` to the §13 `.q4` / `.s` layout. No requantisation: the §13 format is K2.6's own values and scales. |
-| `rope_scaling: yarn` | A new profile version whose preparation computes YaRN's `ω_i` and the attention scale `λ` (`mscale² = (0.1·ln 64 + 1)²`). The forward pass already reads both from the package, so no operator changes. |
+| Multimodal wrapper: tensors under `language_model.`, a vision tower | **Done for weights** (spec §14.1): `parse_hf_weights_config` reads `text_config`; the prefix is stripped and the vision tower and projector are skipped. |
+| Pre-quantised experts (compressed-tensors `pack-quantized`) | **Done** (spec §14.2): a lossless repack of `weight_packed` / `weight_scale` into the §13 `.q4` / `.s` layout (each byte XOR 0x88; scales copied). No requantisation. Pinned against compressed-tensors' own `unpack_from_int32` on a real K2.6 shard in CI. |
+| `rope_scaling: yarn` | **Open.** A new profile version whose preparation computes YaRN's `ω_i` and the attention scale `λ` (`mscale² = (0.1·ln 64 + 1)²`). The forward pass already reads both from the package, so no operator changes. Weights do not depend on it: the slice manifest lists it as pending, and its `model`, `tables` and `model_root` stay null until it is specified. |
 
 Everything else K2.6 uses (query LoRA, 384/8/1 experts, the F32 bias, group
 settings, MLA with the absorbed cache) is implemented and covered by the tiny
@@ -92,18 +92,45 @@ This is the Moonlight pipeline that CI runs today, with what K2.6 adds.
 
 | Step | Moonlight today | K2.6 adds |
 |---|---|---|
-| 1. Pin the source: revision + per-shard SHA-256 from the Hub's LFS ids | `packages/moonlight-16b-a3b-instruct.source.json` | A K2.6 source manifest (64 shards). |
-| 2. Read `config.json`, refuse anything unsupported | `parse_hf_config` | The three gaps of §2. |
-| 3. Plan each stage from `model.safetensors.index.json`; download only that stage's shards | `arc-mla convert --layers`; CI converts layers 25–26 + head from 2 of 27 shards | Same code; the index decides which of the 64 shards a stage needs. |
-| 4. Non-expert BF16 tensors → INT8 dyadic rows (§4.2); router → INT16 rows (§4.3); bias F32 → Q32 (§4.4) | Implemented | Unchanged. |
-| 5. Routed experts → §13 `.q4` / `.s` | Quantised from BF16 (§13.3) | Lossless repack of `weight_packed` / `weight_scale`. The nibble order and value offset of compressed-tensors' packing must be pinned against its own unpacker on a real shard before the repacker lands [UNVERIFIED]. Refuse negative, infinite or NaN scales (§13.1). |
-| 6. RoPE tables | Plain RoPE (§4.5) | YaRN tables, new profile version. |
-| 7. Write stage packages; segment digests and model root (§4.7) | Rust converter == independent Python preparer: same sha256 and model root on the whole model [CI] | Same check per stage. The model root does not depend on the stage split, so stages can be converted on different machines. |
+| 1. Pin the source: revision + per-shard SHA-256 from the Hub's LFS ids | `packages/moonlight-16b-a3b-instruct.source.json` | **Done:** `packages/kimi-k26.source.json` (config.json, 64 shards, and the index). |
+| 2. Read `config.json`, refuse anything unsupported | `parse_hf_config` | **Done for weights:** `parse_hf_weights_config` (§2 above); YaRN pending. |
+| 3. Plan from `model.safetensors.index.json`; download only the needed shards | `arc-mla convert --layers`; CI converts layers 25–26 + head from 2 of 27 shards | **Done:** `arc-mla slice-plan` and `scripts/arc_mla/stream_slices.py` (spec §14.4). Layer `l` is in shard `l + 1`, embedding, norm and LM head in shard 62, so each step holds one shard; shards 63–64 (vision) are never fetched. |
+| 4. Non-expert BF16 tensors → INT8 dyadic rows (§4.2); router → INT16 rows (§4.3); bias F32 → Q32 (§4.4) | Implemented | Unchanged; the same code writes slices. |
+| 5. Routed experts → §13 `.q4` / `.s` | Quantised from BF16 (§13.3) | **Done:** lossless repack (spec §14.2), checked against compressed-tensors' `unpack_from_int32` on shard 2 [CI]. Negative, infinite or NaN scales are refused. |
+| 6. RoPE tables | Plain RoPE (§4.5) | **Open:** YaRN tables, new profile version. |
+| 7. Write segments; digests and model root (§4.7) | Rust converter == independent Python preparer: same sha256 and model root on the whole model [CI] | **Done as slices** (spec §14): content-addressed per layer and per expert group, segment digests in the same pass, Rust == Python manifest. The model root follows once YaRN is specified, from the same slices. |
 | 8. Prove the package | scalar == SIMD golden generation; 1/2/4 stages as separate processes; Python re-derives every logits hash, boundary and token; verifier slice replayed on linux x86-64, linux arm64 and windows [CI] | Synthetic K2.6-shaped stages first (real widths, few layers), then the real stages. |
 
-Resources [CALC]: per stage, disk for its source shards (~595/S GB) and its
-package (~582/S GB). The Rust converter streams tensors; on Moonlight it peaked
-at 1.3 GiB RSS [CI, ubuntu-latest]. K2.6's peak has not been measured.
+### 4.1 Resources per shard (measured)
+
+`scripts/arc_mla/stream_slices.py` on the first two K2.6 shards, 48 expert
+groups. "Convert" includes the converter's own SHA-256 re-check of the shard.
+Peak RSS is the converter process's. CI runs are workflow
+`kimi-k26-slices.yml` run 37622036049. The arm64 leg hashes slices without
+storing them (`--discard`).
+
+| Shard (unit) | Source | Slices | Runner | Download | Convert | Peak RSS |
+|---|---|---|---|---|---|---|
+| 1 (layer 0, dense) | 0.93 GiB | 1 slice, 0.46 GiB | CI runner, linux x86-64 (AMD EPYC 9V74, 4 vCPU, 16 GB) | 24.7 s | 2.7 s | 0.68 GiB |
+| 1 | | | CI runner, linux arm64 (Neoverse-N2, 4 vCPU, 16 GB) | 29.2 s | 5.7 s | 0.68 GiB |
+| 1 | | | Studio lab (M2 Ultra, macOS arm64) | 23.2 s | 4.9 s | 1.37 GiB |
+| 2 (layer 1, MoE) | 9.14 GiB | 49 slices, 9.00 GiB | CI runner, linux x86-64 | 1,352.0 s | 54.7 s | 0.35 GiB |
+| 2 | | | CI runner, linux arm64 | 937.8 s | 46.5 s | 0.35 GiB |
+| 2 | | | Studio lab | 1,041.2 s | 44.0 s | 0.71 GiB |
+
+- **Disk.** The source shard being converted plus the slices kept. With
+  every step holding one shard, a machine that keeps all slices peaks at its
+  slices plus the largest shard (9.8 GB). A node that keeps only its own
+  slices needs those plus one shard.
+- **RAM.** Under 1.4 GiB measured on both layer shards. The shard-62 step
+  (embedding and LM head, 163,840 × 7,168 BF16 each) holds one 2.35 GB BF16
+  matrix and its 1.18 GB INT8 form at a time: about 3.6 GB [CALC, not
+  measured].
+- **Time.** Conversion is about 45–55 s per MoE shard on a 4-vCPU CI runner.
+  The download is the bound: 7–10 MB/s per stream from Hugging Face in these
+  runs. A projection for all 62 text shards from these figures: about one
+  hour of conversion. The downloads would take about 17–24 h on one such
+  stream [CALC]; shards are independent, so they parallelise across machines.
 
 ## 5. Expert placement
 
@@ -153,8 +180,18 @@ Exists:
   scalar == SIMD golden generation, stage replay across OSes, perplexity against
   BF16 [CI]. Those figures are Moonlight's, not Kimi's.
 
-Does not exist: the three §2 gaps, a K2.6 source manifest, synthetic
-K2.6-width stages, any run on K2.6 weights, any GPU kernel, and any measured
-Kimi speed. A plan with hardware options and projections was drafted on the
+Also exists (spec §14):
+- the K2.6 source manifest;
+- weight slices of real K2.6 layers 0 and 1. Their manifest
+  (`packages/kimi-k26.slices-layers-0-1.json`, `manifest_blake3`
+  `83347a71…`) is identical on linux x86-64, linux arm64 (CI) and macOS arm64
+  (Studio lab), on 1 thread and on all threads, and in the independent Python
+  preparer. Compressed-tensors' own unpacker gives the same INT4 values and
+  scales for 8 sampled experts × 3 projections.
+
+Does not exist: the YaRN preparation (§2), so no K2.6 stage package, model
+root or forward pass; slices of layers 2–60 and of the embedding and head
+(the same code, not yet run); synthetic K2.6-width stages; any GPU kernel; and
+any measured Kimi speed. A plan with hardware options and projections was drafted on the
 development branch `kimi-arch-integer`; it is not part of this change because
 nothing in it is measured on Kimi.
