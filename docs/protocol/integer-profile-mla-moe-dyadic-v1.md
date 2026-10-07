@@ -46,6 +46,7 @@ each other in CI:
 | Boundary file schema | `arc.stage-boundary.v1` | |
 | Tokenizer | `arc.tiktoken-bpe.v1` + SHA-256 of `tiktoken.model` | `9506a8dc9c7806eae5eb7427be6056cb541ebbfcf1e9921915ce839e9d8a50c9` |
 | Variant: INT4 group-32 routed experts (§13) | `arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.i4g32-experts.q16.v1` | `5e6d6392186d817e57806184b1193ea1648805bb82cf7749f9d563306237e71c` |
+| Slice manifest schema (§14) | `arc.integer-slice-manifest.v1` | |
 
 The generation semantics are the dyadic v1 ones unchanged. They define
 selection, stop rule and digests, and do not depend on the model.
@@ -617,9 +618,9 @@ An implementation refuses (never wraps) when any of the following fails:
 | Query LoRA (`q_lora_rank = 1536`, `q_a_layernorm`) | Implemented and tested on tiny models. Moonlight has no query LoRA. |
 | 384 experts, top-8, 1 shared expert, group settings | General code paths. Tiny models exercise E = 8 / 16, k = 3 / 4, Es = 2 / 1, and G = 4 with Gk = 2. |
 | F32 correction bias | Implemented (§4.4) and tested on tiny models. |
-| YaRN RoPE (factor 64, β_fast 32, β_slow 1, mscale 1 / 1) | **Not in v1.** The converter refuses `rope_scaling`. YaRN changes only preparation: the frequencies `ω_i` and `λ` (by `mscale² = (0.1·ln 64 + 1)²`). The forward pass reads both from the package, so YaRN needs a new profile version, not new operators. |
-| Routed experts stored as INT4 group-32 symmetric (`weight_packed`, BF16 `weight_scale`) | The **§13 variant** defines the exact integer form: INT4 values with their BF16 group scales, no requantisation. It is implemented with a quantiser for BF16 sources and checked on Moonlight. Reading K2.6's packed int32 words into the §13 layout is a lossless repacking that this PR does not implement. |
-| `language_model.` tensor prefix, MoonViT vision tower | Not handled. The vision tower is unused for text. |
+| YaRN RoPE (factor 64, β_fast 32, β_slow 1, mscale 1 / 1) | **Not in v1.** Stage packages refuse `rope_scaling`. YaRN changes only preparation: the frequencies `ω_i` and `λ` (by `mscale² = (0.1·ln 64 + 1)²`). The forward pass reads both from the package, so YaRN needs a new profile version, not new operators. The weights do not depend on it: §14 slices them, with the RoPE preparation listed as pending. |
+| Routed experts stored as INT4 group-32 symmetric (`weight_packed`, BF16 `weight_scale`) | The **§13 variant** defines the exact integer form: INT4 values with their BF16 group scales, no requantisation. §14.2 reads K2.6's packed int32 words into the §13 layout losslessly. |
+| `language_model.` tensor prefix, MoonViT vision tower | Read by §14.1: the prefix is stripped and the vision tower and projector are skipped (unused for text). |
 | `num_nextn_predict_layers = 0` | Same as Moonlight; MTP layers are refused. |
 
 ### 11.2 Kimi K3 (Kimi Linear architecture)
@@ -690,6 +691,7 @@ the context length; only the 24 MLA layers keep a per-token cache.
   both expert formats.
 - The tokenizer is checked against the `tiktoken` library with the pinned
   `tiktoken.model`, and the chat prompt against `jinja2`.
+- Weight slices (§14) have their own checks; see §14.6.
 
 ## 13. Variant: INT4 group-32 routed experts
 
@@ -751,3 +753,177 @@ For each group of 32 BF16 values `w_j`, with `A = max |w_j|`:
 This gives `|q_j| ≤ 7`. The value −8 occurs only in checkpoints quantised
 elsewhere (such as Kimi-K2.6's `weight_packed`), which the format accepts as
 published.
+
+## 14. Weight slices
+
+A checkpoint the size of Kimi-K2.6 (595 GB of source, 583 GB once converted)
+does not fit on one machine's disk next to its converted form. This section
+defines how its weights are converted **one source shard at a time** into
+**slices**: content-addressed files that hold exactly the bytes of the
+segments of §4.7, so that any node can fetch, check and assemble only the part
+of the model it serves or verifies.
+
+### 14.1 Units, slices and source naming
+
+A **unit** is one segment other than `tables`: `embed`, `layer.l` or `head`.
+A unit's bytes are those of its segment (§4.6 order, no padding). The slices
+of a unit are:
+
+| Unit | Slices |
+|---|---|
+| `embed`, `head`, a dense layer | one slice named like the unit, holding the whole segment |
+| an MoE layer `l` | `layer.l.core`: every tensor of the segment except the routed-expert stacks, in layout order; and `layer.l.experts.g` for `g < G`: for each routed-expert tensor `X` in layout order (`w_gate`, `w_up`, `w_down`, each with its `.q4`/`.s` or `.q`/`.mu`/`.k`), the rows of experts `[g·E/G, (g+1)·E/G)` |
+
+`G` (the expert groups) divides `E` and is recorded in the manifest. Changing
+`G` changes the slices, never the segments. A slice file holds its tensors'
+bytes back to back and is named `<BLAKE3 of the file>.slice`. The segment
+`layer.l` is the core slice followed, for each expert tensor in layout order,
+by that tensor's part of every expert-group slice in group order.
+
+**Source naming.** When `config.json` wraps the language model in a
+`text_config` object (a multimodal checkpoint such as Kimi-K2.6), the text
+model's configuration is read from that object, every §4.1 source tensor name
+is prefixed with `language_model.`, and tensors named `vision_tower.*` or
+`mm_projector.*` are ignored. Any other unexpected tensor is refused, as in
+§4.1. The EOS ids come from the text configuration, else from the wrapper.
+
+### 14.2 Pre-quantised INT4 experts
+
+A checkpoint may ship its routed experts already quantised by
+compressed-tensors with `quant_method = "compressed-tensors"`,
+`format = "pack-quantized"` and a single config group whose weights are
+`{num_bits: 4, type: int, symmetric: true, strategy: group, group_size: 32,
+dynamic: false, actorder: null}`, with no input, output or KV-cache
+quantisation. Any other quantisation block is refused. Each routed expert
+projection `[r, c]` named `B` (`….mlp.experts.e.gate_proj` and so on) is then
+stored as:
+
+| Source tensor | Type | Contents |
+|---|---|---|
+| `B.weight_packed` | I32 `[r, c/8]` | value `j` of a row in bits `4(j mod 8) … 4(j mod 8)+3` of little-endian word `j/8`, stored as `v + 8` (`v ∈ [−8, 7]`) |
+| `B.weight_scale` | BF16 `[r, c/32]` | the group scales |
+| `B.weight_shape` | I32 `[2]` | `[r, c]`; anything else is refused |
+
+Every other source tensor is BF16 (the correction bias BF16 or F32), as in
+§4.1. Only the §13 format can hold these experts; the profile never
+requantises them. The §13.1 tensors are, exactly:
+- `X.q4`: the bytes of `weight_packed`, each XORed with `0x88`. In the
+  word's bytes, value `j` lies in byte `j/2` (low nibble for even `j`), which
+  is the §13.1 order, and `(v + 8) XOR 8` is `v` in 4-bit two's complement.
+- `X.s`: the bits of `weight_scale` unchanged. A scale with the sign bit set,
+  or an infinity or NaN, is refused (§13.1). A zero scale is allowed.
+
+The value −8 is allowed (§13.3 never produces it; other quantisers do).
+
+### 14.3 The slice manifest (`arc.integer-slice-manifest.v1`)
+
+Canonical JSON (dyadic v1 §4.9) with these fields:
+
+```text
+schema          "arc.integer-slice-manifest.v1"
+profile         the §1 / §13 profile identity of the converted weights
+profile_blake3  BLAKE3 of profile
+contract        "docs/protocol/integer-profile-mla-moe-dyadic-v1.md"
+source          the §4.6 source object: {repo, revision, files}
+weights         {prefix: "" | "language_model.", packed_experts: bool}
+shape           the §2.2 fields that fix the weight layout: architecture, n_layers,
+                d_model, n_heads, q_lora_rank, kv_lora_rank, qk_nope_dim, qk_rope_dim,
+                v_head_dim, d_ff, first_k_dense, n_routed_experts, n_shared_experts,
+                moe_d_ff, vocab_size
+model           the §2.2 object, or null while preparation is pending
+pending         the configuration's preparation features this profile does not define
+                (for Kimi-K2.6: ["rope_scaling yarn"])
+expert_groups   G
+complete        whether every unit of the model is listed
+tables          the tables segment {name, bytes, blake3}, or null while pending
+segments        [{name, bytes, blake3}] of the listed units, canonical order (§4.7)
+slices          [{name, segment, blake3, bytes, experts: [a, b) | null,
+                  tensors: [{name, dtype, shape, offset, bytes}]}], canonical order
+model_root      §4.7, when complete and nothing is pending; else null
+manifest_blake3 BLAKE3 of the canonical JSON without manifest_blake3
+```
+
+A slice tensor's `shape` is its part: `[E/G, rows, cols']` for an expert part.
+Its `offset` is within the slice file. The weights depend on nothing in
+`pending`: when the RoPE preparation of a newer profile version is defined,
+`model`, `tables` and `model_root` follow from the same slices without
+converting the weights again. The same input always gives the same manifest:
+unit order, slice order and every byte are functions of the source and `G`
+only, not of the thread count, the shard order or the machine.
+
+### 14.4 Streaming, checking and assembling
+
+- **Plan.** The source manifest pins `model.safetensors.index.json` in an
+  `index` entry. Each unit needs the shards that hold its source tensors.
+  Units with the same shard set form one step. Steps run in the order of their
+  first shard in the source manifest, and each shard is deleted after the last
+  step that reads it. Kimi-K2.6 keeps layer `l` in shard `l + 1` and the
+  embedding, final norm and LM head in shard 62, so every step holds exactly
+  one shard. Shards 63 and 64 (the vision tower) are never downloaded.
+- **Convert.** Each step downloads its shards, refuses any whose length or
+  SHA-256 differs from the source manifest, converts its units with the §4
+  rules (and §14.2), writes the slices and one record per unit, and deletes
+  the shards no later step needs. The segment digests are computed in the
+  same pass, in layout order. They are the digests a stage manifest pins.
+- **Check.** A node holding any slice checks its length and BLAKE3 against
+  the manifest. A node holding every slice of a segment can also re-hash the
+  segment in layout order. A node holding only expert group `g` of every
+  layer (expert parallelism) needs only the core slices and its group slices.
+- **Assemble.** When `model` is not null, the stage package `[a, b)` is
+  rebuilt from slices: the tables are computed (§4.5), and every other tensor
+  is copied from its slice or slices. The result is byte-identical to the
+  stage package the §4 converter writes from the same source.
+
+| Command | What it does |
+|---|---|
+| `scripts/arc_mla/stream_slices.py` | the whole loop: fetch, `slice-plan`, per step `slice`, delete, `slice-manifest`; reports time, peak RSS and disk per step |
+| `arc-mla slice-plan` / `slice` / `slice-manifest` | plan; convert units to slices (or only hash them with `--discard`); collect the records |
+| `arc-mla slice-verify` | re-hash slice files, and with `--segments` their segments |
+| `arc-mla slice-assemble` | rebuild a stage package from slices |
+
+### 14.5 Kimi-K2.6 sizes
+
+From the layout (unit test `kimi_k26_slice_sizes`). The core and expert sizes
+are per MoE layer, and an expert-group slice holds `E/G` experts.
+
+| Unit | Bytes |
+|---|---|
+| `embed` | 1,175,224,320 |
+| `layer.0` (dense) | 498,147,648 |
+| `layer.l.core` (attention, norms, router, shared expert) | 151,170,752 |
+| one routed expert (3 × 7,168 × 2,048 INT4 + BF16 group-32 scales) | 24,772,608 |
+| `layer.l` routed experts (384) | 9,512,681,472 |
+| `head` | 1,175,281,664 |
+| whole model | 582,679,787,072 |
+
+With `G = 48` an expert-group slice holds 8 experts (198 MB). Any device count
+dividing 48 (2, 3, 4, 6, 8, 12, 16, 24, 48) composes from whole groups.
+
+### 14.6 Conformance evidence
+
+- Rust unit tests, on tiny checkpoints generated in the test in both storages
+  (BF16, and as Kimi-K2.6 stores its weights):
+  - the packed checkpoint's slices equal the §13.3 conversion of its BF16 twin;
+  - the stage package assembled from the slices (whole model and a 2-layer
+    stage) is byte-identical to the converter's package, and the model roots
+    are equal;
+  - 1, 2, 4 and 8 expert groups give the same segments;
+  - 1 and 3 threads give the same manifest;
+  - YaRN leaves `model`, `tables` and `model_root` null;
+  - changed slices and forged manifests are detected;
+  - negative scales and unpinned shards are refused;
+  - the plan holds one shard at a time;
+  - the repack matches a literal compressed-tensors packing that includes −8;
+  - three slice manifests are pinned as constants (`slice_manifests_are_pinned`).
+- `scripts/arc_mla/slice_checks.sh` (CI on linux x86-64, linux arm64 and
+  windows x86-64, workflow `kimi-k26-slices.yml`): the same checks on tiny
+  packed checkpoints written by `make_tiny_kimi_packed.py`. The independent
+  Python preparer (`mla_moe_reference.py slices`) must give the same
+  `manifest_blake3`.
+- Real Kimi-K2.6 shards 1 and 2 (layers 0 and 1), in the same workflow:
+  - streamed, measured, re-hashed, converted again on one thread;
+  - checked against the Python preparer;
+  - sampled experts checked against compressed-tensors' own
+    `unpack_from_int32`;
+  - compared across linux x86-64 and linux arm64, and against the manifest
+    pinned in `docs/protocol/packages/kimi-k26.slices-layers-0-1.json`.

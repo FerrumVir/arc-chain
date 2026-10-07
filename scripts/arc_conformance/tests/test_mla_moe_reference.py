@@ -303,3 +303,73 @@ class TinyModels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _load_packed_generator():
+    spec = importlib.util.spec_from_file_location("make_tiny_kimi_packed",
+                                                  SCRIPTS / "arc_mla" / "make_tiny_kimi_packed.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class WeightSlices(unittest.TestCase):
+    """Spec 14: Kimi-K2.6-style storage and weight slices."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gen = _load_packed_generator()
+        for name, yarn in (("packed", False), ("packed-yarn", True)):
+            cls.gen.write(ROOT / name, yarn=yarn)
+
+    def test_packed_words_unpack_in_the_compressed_tensors_order(self):
+        rng = np.random.default_rng(14)
+        values = rng.integers(-8, 8, size=(3, 64))
+        words = self.gen.pack_words(values)
+        # Value j of a row is nibble j mod 8 of word j / 8, stored as v + 8.
+        w = int(np.uint32(words[1, 2]))
+        self.assertEqual([((w >> (4 * i)) & 0xF) - 8 for i in range(8)], values[1, 16:24].tolist())
+        # Spec 14.2: the 13.1 bytes are the word bytes XOR 0x88.
+        xored = np.frombuffer(words.astype("<i4").tobytes(), dtype=np.uint8) ^ 0x88
+        self.assertEqual(xored.tolist(), mm.pack_q4(values).reshape(-1).tolist())
+
+    def test_weights_config_reads_the_wrapper_and_reports_yarn(self):
+        config = json.loads((ROOT / "packed-yarn" / "config.json").read_text())
+        m, prefix, packed, pending = mm.weights_from_config(config, 64)
+        self.assertEqual((prefix, packed, pending), ("language_model.", True, ["rope_scaling yarn"]))
+        self.assertEqual(m["n_routed_experts"], 8)
+        with self.assertRaises(dy.PreparationError):
+            mm.model_from_config(config["text_config"], 64)
+        bad = json.loads(json.dumps(config))
+        bad["text_config"]["quantization_config"]["config_groups"]["group_0"]["weights"]["num_bits"] = 8
+        with self.assertRaises(dy.PreparationError):
+            mm.weights_from_config(bad, 64)
+
+    def test_packed_slices_equal_the_bf16_twin_and_the_package(self):
+        src = ROOT / "packed"
+        manifest = src / "tiny-kimi-packed.source.json"
+        out = mm.prepare_slices(src, manifest, None, 4)
+        self.assertTrue(out["complete"])
+        twin = mm.prepare_stage(ROOT / "kimi", ROOT / "kimi" / "tiny-mla.source.json", None, None, None, "i4g32")
+        weights = [s for s in twin["segments"] if s["name"] != "tables"]
+        self.assertEqual(out["segments"], weights)
+        package = mm.prepare_stage(src, manifest, None, None, None, "i4g32")
+        self.assertEqual(out["model_root"], package["model_root"])
+        self.assertEqual(len(out["slices"]), 3 + 3 * (1 + 4))
+        group = next(s for s in out["slices"] if s["name"] == "layer.2.experts.3")
+        self.assertEqual(group["experts"], [6, 8])
+        # Expert groups change the slices, never the segments.
+        other = mm.prepare_slices(src, manifest, ["layer.2"], 2)
+        self.assertEqual(other["segments"], [s for s in out["segments"] if s["name"] == "layer.2"])
+        self.assertFalse(other["complete"])
+        self.assertIsNone(other["model_root"])
+
+    def test_yarn_slices_have_no_model_object(self):
+        src = ROOT / "packed-yarn"
+        out = mm.prepare_slices(src, src / "tiny-kimi-packed.source.json", None, 2)
+        self.assertEqual(out["pending"], ["rope_scaling yarn"])
+        self.assertIsNone(out["model"])
+        self.assertIsNone(out["tables"])
+        self.assertIsNone(out["model_root"])
+        with self.assertRaises(dy.PreparationError):
+            mm.prepare_stage(src, src / "tiny-kimi-packed.source.json", None, None, None, "i4g32")

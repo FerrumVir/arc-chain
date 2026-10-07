@@ -177,6 +177,43 @@ def model_from_config(config: Dict[str, Any], max_seq: int) -> Dict[str, Any]:
     return model
 
 
+PACKED_WEIGHTS = {"num_bits": 4, "type": "int", "symmetric": True, "strategy": "group",
+                  "group_size": 32, "dynamic": False}
+
+
+def weights_from_config(config: Dict[str, Any], max_seq: int) -> Tuple[Dict[str, Any], str, bool, List[str]]:
+    """Spec 14.1-14.2: (model object, tensor prefix, packed experts?, pending preparation features).
+
+    Accepts a multimodal wrapper (text model in text_config, tensors under language_model.),
+    routed experts pre-quantised by compressed-tensors pack-quantized INT4 group 32 symmetric,
+    and rope_scaling, reported as pending (the weights do not depend on it)."""
+    wrapped = isinstance(config.get("text_config"), dict)
+    text = dict(config["text_config"] if wrapped else config)
+    q = text.pop("quantization_config", None)
+    if q is None:
+        q = config.get("quantization_config")
+    if q is not None:
+        groups = q.get("config_groups") if isinstance(q, dict) else None
+        group = next(iter(groups.values())) if isinstance(groups, dict) and len(groups) == 1 else None
+        w = group.get("weights") if isinstance(group, dict) else None
+        ok = (q.get("quant_method") == "compressed-tensors" and q.get("format") == "pack-quantized"
+              and q.get("kv_cache_scheme") is None and isinstance(w, dict)
+              and group.get("input_activations") is None and group.get("output_activations") is None
+              and all(w.get(k) == v and type(w.get(k)) is type(v) for k, v in PACKED_WEIGHTS.items())
+              and w.get("actorder") is None)
+        if not ok:
+            raise PreparationError("unsupported config.json: pre-quantised weights other than "
+                                   "compressed-tensors pack-quantized INT4 group-32 symmetric")
+    pending: List[str] = []
+    scaling = text.get("rope_scaling")
+    if scaling is not None:
+        kind = scaling.get("type") or scaling.get("rope_type") or "?" if isinstance(scaling, dict) else "?"
+        pending.append(f"rope_scaling {kind}")
+        text["rope_scaling"] = None
+    m = model_from_config(text, max_seq)
+    return m, ("language_model." if wrapped else ""), q is not None, pending
+
+
 def validate_model(model: Any, error: type = PackageError) -> Dict[str, Any]:
     """Spec 2.1 constraints on a model object."""
     if not isinstance(model, dict) or sorted(model) != sorted(MODEL_KEYS):
@@ -572,12 +609,30 @@ class SourceShard:
                          shape=info["shape"])
 
 
-def _ignored(name: str) -> bool:
-    return name.startswith("model.layers.") and name.endswith(".self_attn.rotary_emb.inv_freq")
+def _ignored(name: str, prefix: str = "") -> bool:
+    """Rotary buffers (spec 4.1); in a wrapped checkpoint also the vision tower (spec 14.1)."""
+    rest = name[len(prefix):] if name.startswith(prefix) else name
+    if rest.startswith("model.layers.") and rest.endswith(".self_attn.rotary_emb.inv_freq"):
+        return True
+    return bool(prefix) and name.startswith(("vision_tower.", "mm_projector."))
 
 
-def expected_sources(m: Dict[str, Any]) -> Dict[str, Tuple[Tuple[int, ...], str]]:
-    """Every source tensor of the whole model (spec 4.1): name -> (shape, 'bf16' | 'bias')."""
+def expected_sources(m: Dict[str, Any], prefix: str = "",
+                     packed: bool = False) -> Dict[str, Tuple[Tuple[int, ...], str]]:
+    """Every source tensor of the whole model (spec 4.1, 14.1), without the prefix:
+    name -> (shape, 'bf16' | 'bias' | 'packed' | 'shape')."""
+    out = _expected_sources(m)
+    if packed:
+        for name in [n for n in out if ".mlp.experts." in n]:
+            (rows, cols), _ = out.pop(name)
+            base = name[: -len(".weight")]
+            out[base + ".weight_packed"] = ((rows, cols // 8), "packed")
+            out[base + ".weight_scale"] = ((rows, cols // Q4_GROUP), "bf16")
+            out[base + ".weight_shape"] = ((2,), "shape")
+    return out
+
+
+def _expected_sources(m: Dict[str, Any]) -> Dict[str, Tuple[Tuple[int, ...], str]]:
     d, h = m["d_model"], m["n_heads"]
     out: Dict[str, Tuple[Tuple[int, ...], str]] = {
         "model.embed_tokens.weight": ((m["vocab_size"], d), "bf16"),
@@ -623,8 +678,10 @@ def expected_sources(m: Dict[str, Any]) -> Dict[str, Tuple[Tuple[int, ...], str]
 class SourceTensors:
     """The verified shards present in a source directory (spec 4.8)."""
 
-    def __init__(self, source_dir: Path, manifest: Dict[str, Any], m: Dict[str, Any]):
-        expected = expected_sources(m)
+    def __init__(self, source_dir: Path, manifest: Dict[str, Any], m: Dict[str, Any],
+                 prefix: str = "", packed: bool = False):
+        expected = expected_sources(m, prefix, packed)
+        self.prefix, self.packed = prefix, packed
         self.found: Dict[str, SourceShard] = {}
         self.shards_read: List[str] = []
         for entry in manifest["files"]:
@@ -636,13 +693,17 @@ class SourceTensors:
             _verify_file(path, entry)
             shard = SourceShard(path)
             self.shards_read.append(entry["name"])
-            for name, info in shard.tensors.items():
-                if _ignored(name):
+            for full_name, info in shard.tensors.items():
+                if _ignored(full_name, prefix):
                     continue
-                if name not in expected:
-                    raise PreparationError(f"unexpected source tensor {name}")
+                if not full_name.startswith(prefix) or full_name[len(prefix):] not in expected:
+                    raise PreparationError(f"unexpected source tensor {full_name}")
+                name = full_name[len(prefix):]
                 shape, kind = expected[name]
-                ok = info["dtype"] == "BF16" or (kind == "bias" and info["dtype"] == "F32")
+                if kind in ("packed", "shape"):
+                    ok = info["dtype"] == "I32"
+                else:
+                    ok = info["dtype"] == "BF16" or (kind == "bias" and info["dtype"] == "F32")
                 if not ok or info["shape"] != shape:
                     raise PreparationError(f"{name}: {info['dtype']} {list(info['shape'])}, "
                                            f"need {kind} {list(shape)}")
@@ -650,18 +711,43 @@ class SourceTensors:
                     raise PreparationError(f"tensor {name} appears in two shards")
                 self.found[name] = shard
 
-    def bf16(self, name: str) -> np.ndarray:
+    def _shard(self, name: str) -> Tuple[SourceShard, str]:
         if name not in self.found:
-            raise PreparationError(f"source tensor {name} is not in any shard present")
-        return self.found[name].array(name, "<u2")
+            raise PreparationError(f"source tensor {self.prefix}{name} is not in any shard present")
+        return self.found[name], self.prefix + name
+
+    def bf16(self, name: str) -> np.ndarray:
+        shard, full = self._shard(name)
+        return shard.array(full, "<u2")
+
+    def i32(self, name: str) -> np.ndarray:
+        shard, full = self._shard(name)
+        return shard.array(full, "<u4").view(np.int32)
 
     def bias(self, name: str) -> List[int]:
-        if name not in self.found:
-            raise PreparationError(f"source tensor {name} is not in any shard present")
-        shard = self.found[name]
-        if shard.tensors[name]["dtype"] == "F32":
-            return [bias_q32(*f32_parts(int(x))) for x in np.asarray(shard.array(name, "<u4")).tolist()]
-        return [bias_q32(*dy.bf16_parts(int(x))) for x in np.asarray(shard.array(name, "<u2")).tolist()]
+        shard, full = self._shard(name)
+        if shard.tensors[full]["dtype"] == "F32":
+            return [bias_q32(*f32_parts(int(x))) for x in np.asarray(shard.array(full, "<u4")).tolist()]
+        return [bias_q32(*dy.bf16_parts(int(x))) for x in np.asarray(shard.array(full, "<u2")).tolist()]
+
+    def packed_values(self, base: str, rows: int, cols: int) -> np.ndarray:
+        """Spec 14.2: the INT4 values of a compressed-tensors matrix, value j of a row at
+        bits 4(j mod 8) of word j/8, stored as v + 8; int64 [rows, cols] in [-8, 7]."""
+        shape = [int(x) for x in np.asarray(self.i32(base + ".weight_shape")).tolist()]
+        if shape != [rows, cols]:
+            raise PreparationError(f"{base}.weight_shape is {shape}, need {[rows, cols]}")
+        words = np.asarray(self.i32(base + ".weight_packed")).astype(np.int64) & 0xFFFFFFFF
+        values = np.empty((rows, cols), dtype=np.int64)
+        for i in range(8):
+            values[:, i::8] = ((words >> (4 * i)) & 0xF) - 8
+        return values
+
+    def packed_scales(self, base: str) -> np.ndarray:
+        """Spec 13.1 / 14.2: BF16 group scales, sign bit clear, finite."""
+        scales = np.asarray(self.bf16(base + ".weight_scale")).astype(np.int64)
+        if np.any(scales >> 15) or np.any((scales & 0x7F80) == 0x7F80):
+            raise PreparationError(f"{base}: a group scale is negative, infinite or NaN")
+        return scales
 
 
 def _verify_file(path: Path, entry: Dict[str, Any]) -> None:
@@ -731,13 +817,13 @@ def _rows_chunk(cols: int) -> int:
     return max(1, (1 << 20) // max(1, cols))
 
 
-def _write_quantized(w: _StageWriter, bits: np.ndarray, segment: str, what: str,
+def _write_quantized(write: Callable[[bytes], None], bits: np.ndarray, what: str,
                      mus: List[np.ndarray], ks: List[np.ndarray]) -> None:
     rows, cols = bits.shape
     step = _rows_chunk(cols)
     for r0 in range(0, rows, step):
         q, mu, k = dy.quantize_rows(np.asarray(bits[r0:r0 + step]), what=what)
-        w.write(q.tobytes(), segment)
+        write(q.tobytes())
         mus.append(mu)
         ks.append(k)
 
@@ -751,6 +837,74 @@ def _kv_b_blocks(bits: np.ndarray, m: Dict[str, Any]) -> Tuple[np.ndarray, np.nd
     return key, value
 
 
+def _emit(e: Dict[str, Any], tensors: "SourceTensors", m: Dict[str, Any],
+          write: Callable[[bytes], None], state: Dict[str, Any]) -> None:
+    """Write the bytes of layout entry e (spec 4.1-4.5, 13, 14.2) in order through write."""
+    kind = e["kind"]
+    pending: Dict[str, np.ndarray] = state.setdefault("pending", {})
+    kv_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = state.setdefault("kv_cache", {})
+    if kind == "rope":
+        if state.get("rope") is None:
+            state["rope"] = dy.build_rope_tables(m["rope_theta"], m["qk_rope_dim"], m["max_seq"])
+        table = state["rope"][0] if e["name"] == "rope.cos" else state["rope"][1]
+        write(table.astype("<i4").tobytes())
+    elif kind == "norm":
+        gains = [dy.norm_gain(int(x)) for x in np.asarray(tensors.bf16(e["source"])).tolist()]
+        for g in gains:
+            check62(g, e["name"])
+        write(np.array(gains, dtype="<i8").tobytes())
+    elif kind in ("matrix.q", "stack.q", "wk_b.q", "wv_b.q"):
+        mus: List[np.ndarray] = []
+        ks: List[np.ndarray] = []
+        if kind == "matrix.q":
+            _write_quantized(write, tensors.bf16(e["source"]), e["name"], mus, ks)
+        elif kind == "stack.q":
+            for source_name in e["source"]:
+                _write_quantized(write, tensors.bf16(source_name), source_name, mus, ks)
+        else:
+            if e["source"] not in kv_cache:
+                kv_cache.clear()
+                kv_cache[e["source"]] = _kv_b_blocks(tensors.bf16(e["source"]), m)
+            block = kv_cache[e["source"]][0 if kind == "wk_b.q" else 1]
+            _write_quantized(write, block, e["name"], mus, ks)
+        pending["mu"] = np.concatenate(mus)
+        pending["k"] = np.concatenate(ks)
+    elif kind.endswith(".mu"):
+        write(pending.pop("mu").astype("<i4").tobytes())
+    elif kind.endswith(".k") and kind != "router.k":
+        write(pending.pop("k").astype("u1").tobytes())
+    elif kind == "stack4.q4" and tensors.packed:
+        # Spec 14.2: the checkpoint's own INT4 values, repacked into the 13.1 order.
+        rows, cols = e["shape"][1], 2 * e["shape"][2]
+        for source_name in e["source"]:
+            write(pack_q4(tensors.packed_values(source_name[: -len(".weight")], rows, cols)).tobytes())
+    elif kind == "stack4.s" and tensors.packed:
+        for source_name in e["source"]:
+            write(tensors.packed_scales(source_name[: -len(".weight")]).astype("<u2").tobytes())
+    elif kind == "stack4.q4":
+        groups: List[np.ndarray] = []
+        for source_name in e["source"]:
+            bits = tensors.bf16(source_name)
+            step = _rows_chunk(bits.shape[1])
+            for r0 in range(0, bits.shape[0], step):
+                packed, scales = quantize_q4_rows(np.asarray(bits[r0:r0 + step]), what=source_name)
+                write(packed.tobytes())
+                groups.append(scales)
+        pending["s"] = np.concatenate(groups)
+    elif kind == "stack4.s":
+        write(pending.pop("s").astype("<u2").tobytes())
+    elif kind == "router.q":
+        q, k = quantize_router_rows(np.asarray(tensors.bf16(e["source"])), what=e["name"])
+        write(q.astype("<i2").tobytes())
+        pending["router_k"] = k
+    elif kind == "router.k":
+        write(pending.pop("router_k").astype("u1").tobytes())
+    elif kind == "bias":
+        write(np.array(tensors.bias(e["source"]), dtype="<i8").tobytes())
+    else:  # pragma: no cover
+        raise AssertionError(kind)
+
+
 def prepare_stage(source_dir: Path, manifest_path: Path, first: Optional[int], end: Optional[int],
                   out_path: Optional[Path], experts: str = "i8") -> Dict[str, Any]:
     """Convert stage [first, end) (whole model when None) to a package; out_path None = digests only."""
@@ -761,11 +915,15 @@ def prepare_stage(source_dir: Path, manifest_path: Path, first: Optional[int], e
     config_entry = next(e for e in manifest["files"] if e["name"] == "config.json")
     _verify_file(source_dir / "config.json", config_entry)
     config = json.loads((source_dir / "config.json").read_bytes())
-    m = model_from_config(config, manifest["max_seq"])
+    m, prefix, packed, pending = weights_from_config(config, manifest["max_seq"])
+    if pending:
+        raise PreparationError(f"unsupported config.json: {'; '.join(pending)}")
+    if packed and experts != "i4g32":
+        raise PreparationError("pre-quantised INT4 experts are stored as i4g32, never requantised")
     first = 0 if first is None else first
     end = m["n_layers"] if end is None else end
     layout = stage_layout(m, first, end, experts)
-    tensors = SourceTensors(source_dir, manifest, m)
+    tensors = SourceTensors(source_dir, manifest, m, prefix, packed)
     source = {"repo": manifest["repo"], "revision": manifest["revision"],
               "files": [{"name": e["name"], "bytes": e["bytes"], "sha256": e["sha256"]}
                         for e in manifest["files"]]}
@@ -775,66 +933,12 @@ def prepare_stage(source_dir: Path, manifest_path: Path, first: Optional[int], e
     f = open(tmp, "wb") if tmp is not None else None
     try:
         w = _StageWriter(f, header_bytes)
-        pending: Dict[str, np.ndarray] = {}
-        rope: Optional[Tuple[np.ndarray, np.ndarray]] = None
-        kv_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        state: Dict[str, Any] = {}
         for e in layout:
             if w.size - w.data_start != e["offset"]:
                 raise AssertionError(f"layout drift at {e['name']}")
-            kind, seg = e["kind"], e["segment"]
             start = w.size
-            if kind == "rope":
-                if rope is None:
-                    rope = dy.build_rope_tables(m["rope_theta"], m["qk_rope_dim"], m["max_seq"])
-                table = rope[0] if e["name"] == "rope.cos" else rope[1]
-                w.write(table.astype("<i4").tobytes(), seg)
-            elif kind == "norm":
-                gains = [dy.norm_gain(int(x)) for x in np.asarray(tensors.bf16(e["source"])).tolist()]
-                for g in gains:
-                    check62(g, e["name"])
-                w.write(np.array(gains, dtype="<i8").tobytes(), seg)
-            elif kind in ("matrix.q", "stack.q", "wk_b.q", "wv_b.q"):
-                mus: List[np.ndarray] = []
-                ks: List[np.ndarray] = []
-                if kind == "matrix.q":
-                    _write_quantized(w, tensors.bf16(e["source"]), seg, e["name"], mus, ks)
-                elif kind == "stack.q":
-                    for source_name in e["source"]:
-                        _write_quantized(w, tensors.bf16(source_name), seg, source_name, mus, ks)
-                else:
-                    if e["source"] not in kv_cache:
-                        kv_cache.clear()
-                        kv_cache[e["source"]] = _kv_b_blocks(tensors.bf16(e["source"]), m)
-                    block = kv_cache[e["source"]][0 if kind == "wk_b.q" else 1]
-                    _write_quantized(w, block, seg, e["name"], mus, ks)
-                pending["mu"] = np.concatenate(mus)
-                pending["k"] = np.concatenate(ks)
-            elif kind.endswith(".mu"):
-                w.write(pending.pop("mu").astype("<i4").tobytes(), seg)
-            elif kind.endswith(".k") and kind != "router.k":
-                w.write(pending.pop("k").astype("u1").tobytes(), seg)
-            elif kind == "stack4.q4":
-                groups: List[np.ndarray] = []
-                for source_name in e["source"]:
-                    bits = tensors.bf16(source_name)
-                    step = _rows_chunk(bits.shape[1])
-                    for r0 in range(0, bits.shape[0], step):
-                        packed, scales = quantize_q4_rows(np.asarray(bits[r0:r0 + step]), what=source_name)
-                        w.write(packed.tobytes(), seg)
-                        groups.append(scales)
-                pending["s"] = np.concatenate(groups)
-            elif kind == "stack4.s":
-                w.write(pending.pop("s").astype("<u2").tobytes(), seg)
-            elif kind == "router.q":
-                q, k = quantize_router_rows(np.asarray(tensors.bf16(e["source"])), what=e["name"])
-                w.write(q.astype("<i2").tobytes(), seg)
-                pending["router_k"] = k
-            elif kind == "router.k":
-                w.write(pending.pop("router_k").astype("u1").tobytes(), seg)
-            elif kind == "bias":
-                w.write(np.array(tensors.bias(e["source"]), dtype="<i8").tobytes(), seg)
-            else:  # pragma: no cover
-                raise AssertionError(kind)
+            _emit(e, tensors, m, lambda data, seg=e["segment"]: w.write(data, seg), state)
             if w.size - start != e["bytes"]:
                 raise AssertionError(f"{e['name']}: wrote {w.size - start} bytes, layout needs {e['bytes']}")
             w.pad()
@@ -849,6 +953,132 @@ def prepare_stage(source_dir: Path, manifest_path: Path, first: Optional[int], e
     if (first, end) == (0, m["n_layers"]):
         ident["model_root"] = model_root(m, source, ident["segments"], experts)
     return ident
+
+
+# --------------------------------------------------------------------------
+# Weight slices (spec 14)
+
+SLICE_MANIFEST_SCHEMA = "arc.integer-slice-manifest.v1"
+CONTRACT = "docs/protocol/integer-profile-mla-moe-dyadic-v1.md"
+SHAPE_KEYS = ("architecture", "n_layers", "d_model", "n_heads", "q_lora_rank", "kv_lora_rank", "qk_nope_dim",
+              "qk_rope_dim", "v_head_dim", "d_ff", "first_k_dense", "n_routed_experts", "n_shared_experts",
+              "moe_d_ff", "vocab_size")
+
+
+def unit_layout(m: Dict[str, Any], unit: str, fmt: str) -> List[Dict[str, Any]]:
+    """The layout entries of one segment other than tables (spec 14.1)."""
+    if unit == "embed":
+        first = 0
+    elif unit == "head":
+        first = m["n_layers"] - 1
+    else:
+        first = int(unit.split(".")[1])
+    return [e for e in stage_layout(m, first, first + 1, fmt) if e["segment"] == unit]
+
+
+def slice_unit(m: Dict[str, Any], unit: str, fmt: str, groups: int, tensors: "SourceTensors") -> Dict[str, Any]:
+    """Spec 14.1: the segment digest and the slices (name, BLAKE3, bytes, experts, tensors) of a unit."""
+    entries = unit_layout(m, unit, fmt)
+    moe = unit.startswith("layer.") and is_moe(m, int(unit.split(".")[1]))
+    e_count = m["n_routed_experts"]
+    expert_prefix = f"layers.{unit.split('.')[1]}.experts." if moe else None
+    slices = [{"name": f"{unit}.core" if moe else unit, "experts": None}]
+    if moe:
+        slices += [{"name": f"{unit}.experts.{g}", "experts": [g * e_count // groups, (g + 1) * e_count // groups]}
+                   for g in range(groups)]
+    for sl in slices:
+        sl.update({"segment": unit, "hasher": dy._blake3_ctor()(), "bytes": 0, "tensors": []})
+    segment = dy._blake3_ctor()()
+    seg_bytes = 0
+    state: Dict[str, Any] = {}
+    for e in entries:
+        split = moe and e["name"].startswith(expert_prefix)
+        targets = slices[1:] if split else slices[:1]
+        part = e["bytes"] // len(targets)
+        for sl in targets:
+            shape = list(e["shape"])
+            if split:
+                shape[0] //= groups
+            sl["tensors"].append({"name": e["name"], "dtype": e["dtype"], "shape": shape,
+                                  "offset": sl["bytes"], "bytes": part})
+        written = [0]
+
+        def write(data: bytes, e=e, split=split, targets=targets, part=part, written=written) -> None:
+            nonlocal seg_bytes
+            segment.update(data)
+            seg_bytes += len(data)
+            view = memoryview(data)
+            while len(view):
+                pos = written[0]
+                g = pos // part if split else 0
+                take = min(len(view), (g + 1) * part - pos)
+                targets[g]["hasher"].update(view[:take])
+                targets[g]["bytes"] += take
+                written[0] += take
+                view = view[take:]
+
+        _emit(e, tensors, m, write, state)
+        if written[0] != e["bytes"]:
+            raise AssertionError(f"{e['name']}: wrote {written[0]} bytes, layout needs {e['bytes']}")
+    out = []
+    for sl in slices:
+        out.append({"name": sl["name"], "segment": unit, "blake3": sl["hasher"].hexdigest(), "bytes": sl["bytes"],
+                    "experts": sl["experts"], "tensors": sl["tensors"]})
+    return {"segment": {"name": unit, "bytes": seg_bytes, "blake3": segment.hexdigest()}, "slices": out}
+
+
+def prepare_slices(source_dir: Path, manifest_path: Path, units: Optional[Sequence[str]], groups: int,
+                   experts: Optional[str] = None) -> Dict[str, Any]:
+    """Spec 14.3: the slice manifest of `units` (every unit when None), computed without writing slices."""
+    source_dir = Path(source_dir)
+    manifest = dy.load_source_manifest(Path(manifest_path))
+    config_entry = next(e for e in manifest["files"] if e["name"] == "config.json")
+    _verify_file(source_dir / "config.json", config_entry)
+    config = json.loads((source_dir / "config.json").read_bytes())
+    m, prefix, packed, pending = weights_from_config(config, manifest["max_seq"])
+    fmt = experts or ("i4g32" if packed else "i8")
+    if packed and fmt != "i4g32":
+        raise PreparationError("pre-quantised INT4 experts are stored as i4g32, never requantised")
+    if groups < 1 or m["n_routed_experts"] % groups:
+        raise PreparationError(f"{groups} expert groups do not divide {m['n_routed_experts']} experts")
+    every = ["embed"] + [f"layer.{i}" for i in range(m["n_layers"])] + ["head"]
+    chosen = every if units is None else [u for u in every if u in set(units)]
+    if units is not None and len(chosen) != len(set(units)):
+        raise PreparationError(f"unknown units in {list(units)}")
+    tensors = SourceTensors(source_dir, manifest, m, prefix, packed)
+    records = [slice_unit(m, u, fmt, groups, tensors) for u in chosen]
+    source = {"repo": manifest["repo"], "revision": manifest["revision"],
+              "files": [{"name": e["name"], "bytes": e["bytes"], "sha256": e["sha256"]}
+                        for e in manifest["files"]]}
+    complete = len(chosen) == len(every)
+    tables = None
+    root = None
+    if not pending:
+        cos, sin = dy.build_rope_tables(m["rope_theta"], m["qk_rope_dim"], m["max_seq"])
+        data = cos.astype("<i4").tobytes() + sin.astype("<i4").tobytes()
+        tables = {"name": "tables", "bytes": len(data), "blake3": blake3_hex(data)}
+        if complete:
+            root = model_root(m, source, [tables] + [r["segment"] for r in records], fmt)
+    out = {
+        "schema": SLICE_MANIFEST_SCHEMA,
+        "profile": PROFILES[fmt],
+        "profile_blake3": blake3_hex(PROFILES[fmt].encode()),
+        "contract": CONTRACT,
+        "source": source,
+        "weights": {"prefix": prefix, "packed_experts": packed},
+        "shape": {k: m[k] for k in SHAPE_KEYS},
+        "model": None if pending else m,
+        "pending": pending,
+        "expert_groups": groups,
+        "complete": complete,
+        "tables": tables,
+        "segments": [r["segment"] for r in records],
+        "slices": [s for r in records for s in r["slices"]],
+        "model_root": root,
+    }
+    out["manifest_blake3"] = blake3_hex(canonical_json(out))
+    out["shards_read"] = tensors.shards_read
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1740,6 +1970,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     s.add_argument("--input")
     s.add_argument("--out")
     s.add_argument("--report", required=True)
+    sl = sub.add_parser("slices", help="weight slice manifest (spec 14), digests only")
+    sl.add_argument("--source-dir", required=True)
+    sl.add_argument("--source-manifest", required=True)
+    sl.add_argument("--units", help="comma-separated: embed, layer.N, head (default: every unit)")
+    sl.add_argument("--expert-groups", type=int, default=1)
+    sl.add_argument("--experts", choices=sorted(PROFILES))
+    sl.add_argument("--json-out", required=True)
     t = sub.add_parser("tables", help="RoPE table digest for (theta, rope width, max_seq)")
     t.add_argument("--theta", type=int, default=50000)
     t.add_argument("--rope-dim", type=int, default=64)
@@ -1776,6 +2013,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   Path(args.out) if args.out else None)
             _write_json(Path(args.report), report)
             print(json.dumps({"stage": report["stage"], "output": report["output"]}, indent=1))
+        elif args.cmd == "slices":
+            units = args.units.split(",") if args.units else None
+            out = prepare_slices(Path(args.source_dir), Path(args.source_manifest), units,
+                                 args.expert_groups, args.experts)
+            _write_json(Path(args.json_out), out)
+            print(json.dumps({"manifest_blake3": out["manifest_blake3"], "complete": out["complete"],
+                              "model_root": out["model_root"], "pending": out["pending"],
+                              "segments": len(out["segments"]), "slices": len(out["slices"])}, indent=1))
         elif args.cmd == "tables":
             cos, sin = dy.build_rope_tables(args.theta, args.rope_dim, args.max_seq)
             print(json.dumps({"theta": args.theta, "rope_dim": args.rope_dim, "max_seq": args.max_seq,
