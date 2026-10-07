@@ -471,6 +471,23 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(evidence["signing_record_changed"], [])
         self.assertTrue(result["test_override_used"])
 
+    def test_new_file_kinds_are_attributed_by_the_old_binary_lineage_control(self):
+        runner = self.runner("prod")
+        original = runner.s05_copy_post
+
+        def with_new_kind():
+            # the "candidate" creates a new file kind; the old lineage control will not -> attributable
+            outcome = original()
+            runner.delta["new_file_kinds"] = ["node-N/only-the-candidate.dat"]
+            return outcome
+
+        runner.s05_copy_post = with_new_kind
+        result = runner.run()
+        evidence = L.read_json(self.tmp / "out-prod" / "delta-pre-to-post-candidate.json")
+        self.assertEqual(evidence["new_file_kinds_attributable_to_candidate"], ["node-N/only-the-candidate.dat"])
+        self.assertTrue(any("old binary's own run" in f for f in result["flags"]), result["flags"])
+        self.assertTrue((self.tmp / "out-prod" / "delta-pre-to-old-binary-lineage-control.json").exists())
+
     def test_native_tier_requires_the_feature(self):
         runner = self.runner("native")
         result = runner.run()

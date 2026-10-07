@@ -892,13 +892,46 @@ class TierRunner:
         self.delta = delta
         self.check("post-candidate byte copy equals the stopped candidate directory, and the source is unchanged", ok,
                    "tree_sha256=%s" % copy["tree_sha256"])
-        if delta["new_file_kinds"]:
-            self.flag("the candidate created file kinds the old state did not have (review each): %s" % delta["new_file_kinds"])
-        if delta["vanished_file_kinds"]:
-            self.flag("file kinds present before the candidate ran are gone after it: %s" % delta["vanished_file_kinds"])
         return self.finish(rec, ok, tree_sha256=copy["tree_sha256"], files=copy["file_count"], bytes=copy["total_bytes"],
                            added=len(delta["added"]), modified=len(delta["modified"]),
                            new_file_kinds=delta["new_file_kinds"], vanished_file_kinds=delta["vanished_file_kinds"])
+
+    def s05b_lineage_control(self):
+        """The OLD binary extends the same pre-candidate state with the candidate's workload.
+
+        File kinds the candidate's run created are attributable to the candidate only if the old binary's own run on the
+        same state did not create them too (e.g. the recovered DAG WAL prunes generations on a later restart, in code
+        that is identical in both versions)."""
+        rec = self.begin("S05b-old-binary-lineage-control", binary=str(self.old_bin))
+        d_line = self.root / "d2b-old-lineage-control"
+        before, _, ok = self.copy_with_proof(self.d1, d_line, "d1-pre-candidate-copy-recheck-lineage", "d2b-old-lineage-before-run")
+        ok = ok and manifests_equal(before, self.m_pre)
+        old_json = self.out / "observations" / "old_run.json"
+        rc, record, complete = self.run_step("new_run", d_line, self.old_bin, self.old_sha, [old_json], "lineage_control_run")
+        ok = ok and rc == 0 and complete
+        reports = binary_reports_ok(record or {}, self.old_sha, "native-test-executor" if self.native else None)
+        self.check("lineage control: every node reported the old binary's digest", reports["ok"], json.dumps(reports))
+        after = self.keep_manifest(build_manifest(d_line, "d2b-old-lineage-after-run"))
+        line_delta = manifest_delta(self.m_pre, after)
+        write_json(self.out / "delta-pre-to-old-binary-lineage-control.json", line_delta)
+        candidate_new = set(self.delta["new_file_kinds"])
+        lineage_new = set(line_delta["new_file_kinds"])
+        attributable = sorted(candidate_new - lineage_new)
+        explained = sorted(candidate_new & lineage_new)
+        self.delta["new_file_kinds_attributable_to_candidate"] = attributable
+        self.delta["new_file_kinds_also_created_by_the_old_binary_lineage"] = explained
+        self.delta["old_lineage_control_new_file_kinds"] = sorted(lineage_new)
+        write_json(self.out / "delta-pre-to-post-candidate.json", self.delta)
+        if attributable:
+            self.flag("the candidate created file kinds the old binary's own run on the same state did not (review each): %s" % attributable)
+        if explained:
+            self.caveats.append("new file kinds %s appear after the candidate's run but the old binary's own run on the same pre-candidate "
+                                "state creates them too (restart-count behaviour of code identical in both versions)" % explained)
+        if self.delta["vanished_file_kinds"]:
+            self.flag("file kinds present before the candidate ran are gone after it: %s" % self.delta["vanished_file_kinds"])
+        return self.finish(rec, ok and reports["ok"], exit_code=rc, complete=complete, tree_sha256=after["tree_sha256"],
+                           candidate_new_file_kinds=sorted(candidate_new), old_lineage_new_file_kinds=sorted(lineage_new),
+                           attributable_to_candidate=attributable)
 
     # ----- reopen machinery
     def expected_nodes(self, record, label="final"):
@@ -1243,7 +1276,7 @@ class TierRunner:
 
     def run(self):
         foundation = [self.s00_binaries, self.s01_fixture, self.s02_old_run, self.s03_copy_pre, self.s04_candidate, self.s05_copy_post]
-        later = [self.s06_isolation, self.s07_reopen_observer, self.s08_reopen_validator, self.s09_inspectors,
+        later = [self.s05b_lineage_control, self.s06_isolation, self.s07_reopen_observer, self.s08_reopen_validator, self.s09_inspectors,
                  self.s10_resume, self.s11_negatives, self.s12_pristine]
         halted = None
         for step in foundation:
