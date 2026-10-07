@@ -285,6 +285,16 @@ pub fn run() {
                 }
                 _ => Ok(None),
             };
+            // A v0.7 desktop kept `dataDir` at the ~/.arc root itself (v0.7.11
+            // `types.rs` default "~/.arc"); every v0.8 build defaults to a
+            // `data-v3*` child. Read this before the fence below rewrites the
+            // pointer: a v0.7 install whose node never ran has no WAL to fence
+            // and no bridge record, yet must still be asked before it
+            // contributes compute.
+            let config_uses_v07_layout = loaded_store
+                .config
+                .as_ref()
+                .is_some_and(legacy_upgrade::config_uses_v07_layout);
             // A v0.7 desktop stored unbound chain state in the same ~/.arc
             // root as binaries and models. Fence that WAL before deriving the
             // auto-start config: old bytes stay untouched while only the
@@ -343,6 +353,7 @@ pub fn run() {
             // observer without a model: no compute without consent.
             let v07_origin = legacy_upgrade::detect_v07_origin(
                 migration_created_notice,
+                config_uses_v07_layout,
                 &paths::home_dir(),
             );
             if let Some(config) = loaded_store.config.as_mut() {
