@@ -30,7 +30,9 @@ from pathlib import Path
 
 
 def load(path: str) -> dict:
-    return json.loads(Path(path).read_text())
+    # Explicit UTF-8: the run file carries the cases' text (Chinese included), and
+    # Windows' default codec is cp1252.
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def check_stage(run: dict, report: dict, label: str, problems: list) -> dict:
@@ -95,7 +97,7 @@ def main(argv: list) -> int:
     result = {"schema": "arc.mla-layout-check.v1", "label": args.label, "run_matrix_digest": run["matrix_digest"],
               "run_boundary_matrix_digest": run.get("boundary_matrix_digest"), "layouts": layouts,
               "replays": replays, "problems": problems, "all_match": not problems}
-    Path(args.out).write_text(json.dumps(result, indent=1) + "\n")
+    Path(args.out).write_text(json.dumps(result, indent=1) + "\n", encoding="utf-8")
     lines = [f"### Pipeline layouts and stage replay{(' - ' + args.label) if args.label else ''}", "",
              "| layout | stage | kernel | OS / arch | output boundary = golden | logits + tokens = golden |",
              "|---|---|---|---|---|---|"]
@@ -110,7 +112,7 @@ def main(argv: list) -> int:
                      f"{row['os']}/{row['arch']} | {row['boundary_match']} | {head} |")
     lines += ["", f"All match: **{not problems}**."]
     lines += [f"- {p}" for p in problems]
-    Path(args.summary_md).write_text("\n".join(lines) + "\n")
+    Path(args.summary_md).write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))
     return 0 if not problems else 1
 
