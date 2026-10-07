@@ -182,6 +182,37 @@ def wan_section(b):
         rows)
 
 
+MEASURED_TARGETS = [25, 50, 100, 150, 200]
+PROJECTED_TARGETS = [50, 100, 200, 300, 400]
+
+
+def wan_targets_section(b):
+    """The measured curve read the other way: for each emulated link, the
+    smallest swept configuration (fewest concurrent sequences, then fewest
+    stages) that reached each aggregate, and its per-answer speed there."""
+    groups = {}
+    for r in b["wan"]:
+        groups.setdefault((r["one_way_ms"], r["uplink_mbit"]), []).append(r)
+    rows = []
+    for (ms, mbit), runs in sorted(groups.items()):
+        best_seen = max(r["aggregate_tok_s"] for r in runs)
+        for target in MEASURED_TARGETS:
+            hits = [r for r in runs if r["aggregate_tok_s"] >= target]
+            if hits:
+                r = min(hits, key=lambda r: (r["concurrency"], r["stages"]))
+                rows.append([ms, mbit, target, r["stages"], r["depth"], r["concurrency"],
+                             r["per_answer_decode_tok_s_mean"], r["aggregate_tok_s"]])
+            else:
+                rows.append([ms, mbit, target, "–", "–", "–", "–", f"not reached (best {fmt(best_seen, 0)})"])
+    if not rows:
+        return ""
+    return (f"**Curve, measured on the emulated WAN ({b['label']})**: the smallest swept configuration (2/4/8 stages × "
+            "depth 1/4/16, G = stages) whose aggregate reached each target, with Kimi-sized frames on the wire. "
+            "Synthetic model, so compute per stage is small; the network and the uplink set these numbers.\n\n" + table(
+                ["one-way ms", "uplink Mbit/s", "target tok/s", "stages", "depth", "concurrent", "per answer tok/s",
+                 "aggregate tok/s"], rows))
+
+
 def projection(benches):
     """Kimi K2 projections from measured hop overhead + research-6 math."""
     overheads = [(b["label"], hop_overhead_ms(b)) for b in benches if hop_overhead_ms(b) is not None]
@@ -241,6 +272,48 @@ def projection(benches):
     md.append(table(["devices", "stages", "one-way ms", "uplink Mbit/s", "depth", "concurrent", "per answer tok/s",
                      "aggregate tok/s", "uplink ceiling tok/s", "KV fits"], rows))
 
+    # The curve the other way: what it takes to reach an aggregate.
+    rows = []
+    out["curve"] = []
+    for device, stage_options in [("RTX 5090 32 GB", [26, 44]), ("Mac 64 GB (M4 Pro)", [12, 24])]:
+        for stages in stage_options:
+            for one_way_ms in [10, 30, 60]:
+                for mbit in [20, 100]:
+                    ceiling = mbit * 1e6 / (KIMI_WIRE_BYTES * 8)
+                    for target in PROJECTED_TARGETS:
+                        found = None
+                        for b in range(1, 257):
+                            fits, _, _ = kv_fit(device, stages, stages * b)
+                            if not fits:
+                                break
+                            serial = b * KIMI_WIRE_BYTES * 8 / (mbit * 1e6)
+                            step = kimi_step_seconds(b, stages, device)
+                            t = round_seconds(stages, stages, step, serial, one_way_ms / 1e3, o)
+                            if stages * b / t >= target:
+                                found = (b, 1 / t, stages * b / t)
+                                break
+                        if found:
+                            b, answer, agg = found
+                            rows.append([device, stages, one_way_ms, mbit, target, b, stages * b, answer, agg])
+                        else:
+                            why = (f"no: uplink ceiling {fmt(ceiling, 0)}" if target >= ceiling
+                                   else "no: KV memory runs out first")
+                            rows.append([device, stages, one_way_ms, mbit, target, "–", "–", "–", why])
+                        out["curve"].append({"device": device, "stages": stages, "one_way_ms": one_way_ms,
+                                             "uplink_mbit": mbit, "target_tok_s": target,
+                                             "depth": found[0] if found else None,
+                                             "concurrency": stages * found[0] if found else None,
+                                             "per_answer_tok_s": found[1] if found else None,
+                                             "aggregate_tok_s": found[2] if found else None})
+    md.append("**Curve: what one swarm pipeline needs to reach an aggregate, PROJECTION** — the smallest micro-batch "
+              "depth (G = stages micro-batches) whose projected aggregate reaches the target with the KV cache fitting "
+              f"({KV_CONTEXT} tokens of context), and the per-answer speed at that point. Two stage counts per device "
+              "class: the memory minimum (with KV headroom) and about twice that. More stages give more KV room, so "
+              "more sequences can be in flight, but each answer is slower and the uplink ceiling stays the same: every "
+              "stage's uplink carries every token.")
+    md.append(table(["devices", "stages", "one-way ms", "uplink Mbit/s", "target tok/s", "depth", "concurrent",
+                     "per answer tok/s", "aggregate tok/s"], rows))
+
     # Network scale: pipelines needed for a billion tokens a day.
     rows = []
     best = {}
@@ -277,6 +350,9 @@ def main(argv):
     for b in benches:
         md.append(measured_section(b))
         w = wan_section(b)
+        if w:
+            md.append(w)
+        w = wan_targets_section(b)
         if w:
             md.append(w)
     md.append("## Bit-exactness")
