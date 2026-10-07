@@ -21,26 +21,56 @@ anywhere in the gate: one differing bit in any logits vector fails it.
 
 ## 1. Results so far
 
-Measured in GitHub Actions. Software rasterizers prove exactness, but their
-timings say nothing about GPU speed.
+Measured in GitHub Actions on 6 October 2026 ("CI runner" numbers). Software
+rasterizers prove exactness, but their timings say nothing about GPU speed.
+Every row comes from run
+[37525693372](https://github.com/FerrumVir/arc-chain/actions/runs/37525693372)
+on commit `1a28b26d0`, the last commit that changed a kernel or the engine; all
+five jobs of that run passed. The adapter column is what wgpu reported
+(`gpu.adapter` in the result files, kept as run artifacts). No hardware GPU has
+run these kernels yet; see "Not yet shown" below.
 
-| Run | Adapter | What ran | Result |
+| Job (duration) | Adapter, as reported by wgpu | What ran | Result |
 |---|---|---|---|
-| [37508127774](https://github.com/FerrumVir/arc-chain/actions/runs/37508127774), commit `d83d6334d` | lavapipe: `llvmpipe (LLVM 20.1.2, 256 bits)`, Mesa 25.2.8, Vulkan 1.4.318, on an AMD EPYC 7763 (4 vCPU) | The five SmolLM3-3B golden prompts (393 prompt tokens, 479 forward passes); package `19c67496…aa91` converted on the runner and checked against the pinned manifest | Matrix digest `3e43f342…49f2`, **identical to the CPU golden**, with all 5 cases matching. Self-test: 56 kernel cases, 0 mismatches. Per-layer trace: 1,050 operation hashes over 2 forwards, all equal. 0.238 tok/s (software) |
-| same run | lavapipe | Operator known-answer tests (300 rounds) | 2,100 cases, 1,091 of them refused by both CPU and GPU (out-of-domain inputs), 0 mismatches |
-| same run | lavapipe | Tiny SmolLM3-shaped model | CPU = GPU = GPU with 3 tokens per pass = `98cc9928…0918`; gpu-check passes; 488 operation hashes equal over 8 forwards |
-| [37522544179](https://github.com/FerrumVir/arc-chain/actions/runs/37522544179), commit `97b74a277` | WARP: `Microsoft Basic Render Driver`, DX12, driver 10.0.26100.33438, Windows runner (4 vCPU) | Operator known-answer tests (150 rounds) | 1,050 cases, 548 refused on both sides, 0 mismatches |
-| same run | WARP | Tiny SmolLM3-shaped model | CPU = GPU = GPU with 3 tokens per pass = `98cc9928…0918`; gpu-check passes; 488 operation hashes equal over 8 forwards |
-| same run | WARP | SmolLM3-3B: the gpu-check self-test on WARP before the model run | 56 kernel cases, 0 mismatches |
+| SmolLM3-3B golden on lavapipe (43 min 49 s) | `llvmpipe (LLVM 20.1.2, 256 bits)`, Vulkan, driver `llvmpipe`, `Mesa 25.2.8-0ubuntu0.24.04.4 (LLVM 20.1.2)`, software adapter; AMD EPYC 7763, 4 vCPU; Ubuntu 24.04 runner image | The five SmolLM3-3B golden prompts: 393 prompt tokens, 86 decode passes, 479 forward passes in all. Package `19c67496…aa91` converted on the runner and checked against the pinned manifest; 3,086,602,240 bytes of weights uploaded in 2.6 s | Matrix digest `3e43f342c00cf3e3be3072e654e9d1c43f547a73b8a4fc6e906b7119e5cb49f2`, **identical to the CPU golden**; 5 of 5 cases match, no divergence. Self-test (8 rounds): 56 kernel cases, 30 refused on both sides, 0 mismatches. Per-layer trace: 1,050 operation hashes over 2 forward passes, all equal. 707 dispatches per forward pass. Prefill 1,642 s (0.239 tok/s), decode 360 s (0.239 tok/s): software, not a speed number |
+| same job | lavapipe, as above | Batched prefill, 16 tokens per pass, on golden case `capital` (80 prompt tokens, 7 decode passes) | Every logits hash and every token identical to the CPU golden's case `capital`; logits digest `38065149…9242` on both sides. Prefill 327 s (0.245 tok/s): software |
+| SmolLM3-3B golden on WARP (13 min 3 s) | `Microsoft Basic Render Driver`, DX12, driver `10.0.26100.33438`, software adapter; Intel Xeon Platinum 8370C, 2 cores, 4 logical processors; Windows Server 2025 runner image | `gpu-check --prefix-forwards 4 --trace-forwards 1`: the same package, converted on Windows and checked against the pinned manifest; 3,086,602,240 bytes uploaded in 71.1 s | 4 of 4 forward passes of case `capital` with logits identical to the CPU golden (80.0 s, 27.5 s, 27.7 s and 27.2 s per pass; the first includes WARP's shader compilation). Self-test (8 rounds): 56 kernel cases, 30 refused on both sides, 0 mismatches, in 59.0 s. Per-layer trace: 525 operation hashes over 1 forward pass, all equal. 706 dispatches per forward pass. 0.025 tok/s: software, not a speed number |
+| lavapipe (3 min 40 s) | lavapipe, as above | Operator known-answer tests (300 rounds) | 2,100 cases, 1,091 refused by both CPU and GPU (out-of-domain inputs), 0 mismatches |
+| same job | lavapipe | Tiny SmolLM3-shaped model | CPU = GPU = GPU with 3 tokens per pass = `98cc9928…0918`. gpu-check passes: self-test 140 cases, 71 refused on both sides, 0 mismatches; 488 operation hashes equal over 8 forward passes |
+| WARP (18 min 39 s) | WARP, as above | Operator known-answer tests (150 rounds) | 1,050 cases, 548 refused on both sides, 0 mismatches |
+| same job | WARP | Tiny SmolLM3-shaped model | CPU = GPU = GPU with 3 tokens per pass = `98cc9928…0918`. gpu-check passes: self-test 140 cases, 71 refused on both sides, 0 mismatches; 488 operation hashes equal over 8 forward passes |
+| fmt + clippy + actionlint (2 min 35 s) | none (CPU only) | rustfmt; clippy with `-D warnings` on arc-gpu and arc-inference (candle enabled); actionlint; shellcheck; the CPU-side unit tests | pass |
 
-The first WARP run (commit `d83d6334d`) showed that FXC, the DX12 shader
+The dispatch count differs between the two adapters because each weight matrix
+is uploaded in row chunks that fit one storage binding, with one GEMV dispatch
+per chunk; an adapter with a smaller maximum binding size issues more
+dispatches (707 on lavapipe, 706 on WARP). The values do not depend on it.
+
+**Not yet shown.** No hardware GPU has run these kernels. The two adapters above
+are software rasterizers for two APIs (Vulkan and DX12), on two operating
+systems, through two shader compilers (naga to SPIR-V for lavapipe; naga to
+HLSL, then FXC, for WARP), and they agree with the CPU bit for bit. Metal waits
+for the self-hosted Mac Studio runner, which is not installed yet; NVIDIA and
+AMD GPUs wait for a runner with a GPU or for volunteers' `gpu-check` results
+(§7). Other teams verify across NVIDIA generations or on one GPU type; the
+same bits across vendors is the target of this path and is not demonstrated
+yet.
+
+**Earlier runs.** Run
+[37508127774](https://github.com/FerrumVir/arc-chain/actions/runs/37508127774)
+(commit `d83d6334d`) produced the same lavapipe matrix digest
+`3e43f342…49f2` at 0.238 tok/s, and showed that FXC, the DX12 shader
 compiler wgpu uses by default, rejects dynamically indexed local arrays inside
-loops. §5 covers the rewrite.
+loops; §5 covers the rewrite. Run
+[37522544179](https://github.com/FerrumVir/arc-chain/actions/runs/37522544179)
+(commit `97b74a277`) passed the operator tests and the tiny model on WARP and
+showed that one forward pass of the 3B model on WARP exceeds wgpu-core's
+built-in 60-second wait.
 
-**WARP and the real model.** One forward pass of the 3B model takes WARP more
-than 60 seconds on the 4-vCPU runner. That exceeded wgpu-core's built-in
-60-second wait; the engine now keeps waiting, up to `ARC_GPU_WAIT_SECONDS`
-(default one hour).
+**WARP and the real model.** One forward pass of the 3B model takes WARP 27 to
+80 seconds on the runner above. That exceeded wgpu-core's built-in 60-second
+wait; the engine now keeps waiting, up to `ARC_GPU_WAIT_SECONDS` (default one
+hour).
 
 At that speed the full golden run (479 passes) cannot finish within a 6-hour CI
 job. CI therefore checks WARP with `gpu-check --prefix-forwards`: the first
@@ -49,8 +79,9 @@ logits hash compared exactly, plus a traced pass compared operation by
 operation.
 
 On Windows runners, FXC also takes about a minute to compile the nine kernels
-each time an engine is built. WARP compiles each kernel on its first dispatch,
-which inflates the first pass's time. Neither affects any value.
+each time an engine is built (the WARP self-test above took 59 s for that
+reason). WARP compiles each kernel on its first dispatch, which inflates the
+first pass's time. Neither affects any value.
 
 ## 2. Why the GPU computes the same integers
 
