@@ -9,4 +9,4 @@ publish = false
 
 [dependencies]
 arc-inference = { path = "../../crates/arc-inference" }
-arc-inference-eng6 = { package = "arc-inference", git = "https://github.com/FerrumVir/arc-chain.git", rev = "962b640a6207f917289a10fd25c7e9e5129687d5" }
+arc-inference-eng6 = { package = "arc-inference", git = "https://github.com/FerrumVir/arc-chain.git", rev = "d52d91966d217a8c9fbb819692b176df3d5bca62" }

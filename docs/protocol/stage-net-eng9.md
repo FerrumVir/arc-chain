@@ -31,7 +31,7 @@ The placement optimizer works in five steps:
 ## For ENG-6 (island runtime, ARC-68)
 
 `integrations/arc-stage-eng6` implements ARC-68's actual `Transport`,
-`Listener`, and `Link` interfaces from **962b640a6207f917289a10fd25c7e9e5129687d5**.
+`Listener`, and `Link` interfaces from **d52d91966d217a8c9fbb819692b176df3d5bca62**.
 The dependency is SHA-pinned in that standalone crate's manifest and lockfile;
 it does not alter the production workspace dependency graph or PR #167.
 Pass `arc_stage_eng6::TunedTransport::default()` to the island runtime.
@@ -49,8 +49,30 @@ at the last position, exact Ledger records, boundary digests and stage roots.
 Changing logits, changing the selected token, or removing it must change the
 last-stage root while leaving activation digests unchanged. Ledger rejects
 head-only metadata on earlier stages and missing logits on the last stage.
-These are synthetic commitment fixtures, not token re-execution audits.
-It tests truncated/oversized frames, peer EOF, explicit close, and refusal to
+The original hand-built commitment fixture remains; `tests/audit_interop.rs`
+adds real two-stage synthetic MLA/MoE generation, with native/tuned TCP peers
+in both directions. Argmax and Rp64Argmax results match whole-model generation
+and an all-native ring: exact tokens, logits hashes/digest, output hash, every
+Ledger record, boundary digest and stage root. This is correctness evidence,
+not a throughput measurement.
+
+Both peers use sequence-bound **Reveal tag 8** (`Revealed.seq`). Legacy tag 3
+is rejected, including its old layout without per-stage sequence IDs. Native
+decoding rejects trailing bytes and every truncated prefix after transport.
+`audit_all` and `audit_stage` require a fourth `&AuditContext` argument. Retain
+the original request, accepted output transcript and verifier Ledger together;
+construct `AuditContext::new(&original_request, &accepted_tokens)` from those
+records, never from received frames or worker-supplied replacement metadata.
+The tests audit generated tag-8 reveals, reject substituted sequence, selection,
+prompt boundary, prompt tokens and generated history on either stage, and
+retain an honest-stage control. Swapped contexts, absent/truncated transcripts,
+changed final emission, missing/duplicate reveals are also refused. Context
+binds caller-owned evidence; it does not authenticate callers replacing their
+own records or add automatic production auditing. Upgrade worker/verifier
+peers together; there is no legacy fallback. See ARC-68's pinned
+[`AUDIT-CONTEXT.md`](https://github.com/FerrumVir/arc-chain/blob/d52d91966d217a8c9fbb819692b176df3d5bca62/docs/island/AUDIT-CONTEXT.md).
+
+Existing tests retain truncated/oversized frames, peer EOF, explicit close, and refusal to
 reuse a failed link. Run from the repository root:
 
 ```sh
