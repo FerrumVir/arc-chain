@@ -84,6 +84,7 @@ pub struct ReplicatedStage {
     journal: Vec<(Vec<u8>, [u8; 32])>,
     journal_bytes: usize,
     journal_limit: usize,
+    failed: Option<String>,
     pub failovers: usize,
     pub replayed_frames: usize,
 }
@@ -107,6 +108,7 @@ impl ReplicatedStage {
             journal: Vec::new(),
             journal_bytes: 0,
             journal_limit,
+            failed: None,
             failovers: 0,
             replayed_frames: 0,
         })
@@ -147,6 +149,22 @@ impl ReplicatedStage {
     /// streams; ENG-8 supplies a Tree frame. A slow replica applies backpressure
     /// only to this stage relay; other stages can process other frames.
     pub fn process(&mut self, frame: Frame) -> Result<Frame, ModernError> {
+        if let Some(reason) = &self.failed {
+            return Err(ModernError::Invalid(format!(
+                "relay permanently refused: {reason}"
+            )));
+        }
+        let result = self.process_inner(frame);
+        if let Err(error) = &result {
+            // Never resume with a smaller frame after journal exhaustion, or
+            // with state advanced by a rejected/model-error response.
+            self.failed = Some(error.to_string());
+            self.session = None;
+        }
+        result
+    }
+
+    fn process_inner(&mut self, frame: Frame) -> Result<Frame, ModernError> {
         let input = frame.encode();
         // Refuse before executing anything, rather than silently lose replay
         // coverage. Production admission must budget this journal explicitly.

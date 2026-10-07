@@ -22,11 +22,21 @@ it connects the next replica, checks its pinned config/range/weight identity,
 replays accepted frames and checks every response byte, then resends the pending
 frame. A reply lost after computation is safe: the failed session has no route
 to forward duplicate outputs into the ring. A divergent replay is rejected;
-exhausted replicas fail closed. No digest is relaxed for churn or slow nodes.
+exhausted replicas fail closed. A terminal refusal (including journal exhaustion)
+permanently poisons that relay: a smaller subsequent frame or a fresh request
+cannot resume unchecked work. Reform the relay at a request boundary after such
+a failure. No digest is relaxed for churn or slow nodes.
 
-`DeadlineTcpTransport` bounds connection, read and write waits. Endpoints must
-be numeric addresses (discovery resolves DNS beforehand). Configure each
-relay's timeout for its stage's measured compute and RTT. Stages progress
+`DeadlineTcpTransport` retains a separate connection timeout and bounds each
+complete inbound/outbound frame with one absolute deadline, including its length
+prefix and payload. Every partial read/write or interrupted syscall receives
+only the remaining budget. The policy applies to connected and accepted links;
+a timed-out, truncated, oversized or otherwise failed link shuts down and cannot
+be reused. Endpoints must be numeric addresses (discovery resolves DNS
+beforehand). Configure each relay's timeout for its stage's measured compute
+and RTT; a replica exchange includes distinct send and receive frame budgets.
+These frame deadlines do not set an end-to-end generation deadline or a bound
+on listener acceptance, discovery, downstream reconnection or process startup. Stages progress
 independently and the existing micro-batch scheduler overlaps streams across
 them. Uneven cuts and arbitrary replica ordering allow heterogeneous nodes;
 placement and automatic deadline tuning belong to ENG-7/ENG-9.
@@ -57,10 +67,22 @@ closed sessions do not reclaim journal space. The relay
 adds request/response traffic; the direct-ring regional budget does not measure
 that extra RPC cost. TCP endpoints are a lab protocol, without public-internet
 authentication/encryption or abuse controls; deployment remains future work.
-The existing process tests drive `ReplicatedStage` directly. An end-to-end
-`serve_relay`/CLI test inside the coordinator ring remains deferred. TCP timeout
-limits currently apply per syscall; a peer trickling bytes can exceed that
-duration for a complete frame. Per-frame deadline hardening also remains deferred.
+`tests/support/relay_ring_cases.rs` now runs the actual `relay` CLI / `serve_relay`
+inside a two-stage coordinator ring, with replicas in separate local processes.
+The tests kill both primary sessions after two acknowledged frames, or lose
+both third replies after execution, then compare both neighbouring requests
+against whole-model generation and a non-failing relay control. Tokens, logits,
+every Ledger record, boundary digests and stage roots remain exact, and audits
+use verifier-owned `AuditContext`. Separate failure runs exhaust replicas and
+the finite journal, require a bounded coordinator error, then refuse small
+pings and fresh generation attempts. All owned children are reaped on success
+or failure. This proves stage-session recovery behind live relays; it does not
+prove relay/coordinator crash recovery.
+
+Transport regressions cover healthy fragmented frames, trickling headers and
+payloads, short/interrupted writes, a slow TCP reader, partial EOF, oversize
+input and refusal to reuse failed links. Scheduler allowances in these tests
+are correctness bounds, not measured serving latency or throughput.
 
 ## Integration interfaces
 

@@ -135,30 +135,181 @@ impl Transport for TcpTransport {
     }
 }
 
-/// TCP with bounded connection, read and write waits for replica failover.
-/// Endpoints are numeric socket addresses: DNS resolution must happen during
-/// discovery, outside the per-frame deadline.
+/// TCP with a connect timeout and one absolute budget per complete frame,
+/// including its length prefix. Partial progress never renews that budget.
+/// Endpoints are numeric socket addresses: DNS resolution happens in discovery.
 #[derive(Debug, Clone, Copy)]
 pub struct DeadlineTcpTransport {
     pub timeout: Duration,
 }
 
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "whole-frame deadline exceeded"))
+}
+
+fn write_until(
+    mut bytes: &[u8],
+    deadline: Instant,
+    mut write: impl FnMut(&[u8], Duration) -> io::Result<usize>,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match write(bytes, remaining(deadline)?) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    remaining(deadline).map(|_| ())
+}
+
+fn read_until(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        match stream.read(bytes) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => bytes = &mut bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    remaining(deadline).map(|_| ())
+}
+
+struct DeadlineTcpLink {
+    inner: TcpLink,
+    timeout: Duration,
+    closed: bool,
+}
+
+impl DeadlineTcpLink {
+    fn new(stream: TcpStream, timeout: Duration) -> io::Result<Self> {
+        validate_timeout(timeout)?;
+        Ok(Self {
+            inner: TcpLink::new(stream)?,
+            timeout,
+            closed: false,
+        })
+    }
+
+    fn deadline(&self) -> io::Result<Instant> {
+        if self.closed {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        Instant::now()
+            .checked_add(self.timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame deadline overflow"))
+    }
+
+    fn finish<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        if result.is_err() {
+            self.closed = true;
+            let _ = self.inner.stream.shutdown(std::net::Shutdown::Both);
+        }
+        result
+    }
+}
+
+fn validate_timeout(timeout: Duration) -> io::Result<()> {
+    if timeout.is_zero() || Instant::now().checked_add(timeout).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid frame timeout",
+        ));
+    }
+    Ok(())
+}
+
+impl Link for DeadlineTcpLink {
+    fn send(&mut self, frame: &[u8]) -> io::Result<()> {
+        let result = (|| {
+            let deadline = self.deadline()?;
+            if frame.len() > MAX_FRAME {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "frame too large",
+                ));
+            }
+            for bytes in [&(frame.len() as u32).to_le_bytes()[..], frame] {
+                write_until(bytes, deadline, |bytes, left| {
+                    self.inner.stream.set_write_timeout(Some(left))?;
+                    self.inner.stream.write(bytes)
+                })?;
+            }
+            Ok(())
+        })();
+        self.finish(result)
+    }
+
+    fn recv(&mut self) -> io::Result<Vec<u8>> {
+        let result = (|| {
+            let deadline = self.deadline()?;
+            let mut len = [0; 4];
+            read_until(&mut self.inner.stream, &mut len, deadline)?;
+            let len = u32::from_le_bytes(len) as usize;
+            if len > MAX_FRAME {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
+            }
+            let mut frame = vec![0; len];
+            read_until(&mut self.inner.stream, &mut frame, deadline)?;
+            Ok(frame)
+        })();
+        self.finish(result)
+    }
+
+    fn alive(&mut self) -> bool {
+        if !self.closed && !self.inner.alive() {
+            self.closed = true;
+            let _ = self.inner.stream.shutdown(std::net::Shutdown::Both);
+        }
+        !self.closed
+    }
+}
+
+struct DeadlineTcpListener {
+    inner: TcpListenerBox,
+    timeout: Duration,
+}
+
+impl Listener for DeadlineTcpListener {
+    fn accept(&mut self) -> io::Result<Box<dyn Link>> {
+        let (stream, _) = self.inner.listener.accept()?;
+        Ok(Box::new(DeadlineTcpLink::new(stream, self.timeout)?))
+    }
+    fn address(&self) -> String {
+        self.inner.address()
+    }
+}
+
 impl Transport for DeadlineTcpTransport {
     fn listen(&self, address: &str) -> io::Result<Box<dyn Listener>> {
-        TcpTransport.listen(address)
+        validate_timeout(self.timeout)?;
+        Ok(Box::new(DeadlineTcpListener {
+            inner: TcpListenerBox {
+                listener: TcpListener::bind(address)?,
+            },
+            timeout: self.timeout,
+        }))
     }
 
     fn connect(&self, address: &str) -> io::Result<Box<dyn Link>> {
+        validate_timeout(self.timeout)?;
         let address: SocketAddr = address.parse().map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("numeric endpoint: {e}"),
             )
         })?;
+        // Connect retains its independent timeout. Each send/recv starts a new
+        // frame budget; prefix and payload share it, including short syscalls.
         let stream = TcpStream::connect_timeout(&address, self.timeout)?;
-        stream.set_read_timeout(Some(self.timeout))?;
-        stream.set_write_timeout(Some(self.timeout))?;
-        Ok(Box::new(TcpLink::new(stream)?))
+        Ok(Box::new(DeadlineTcpLink::new(stream, self.timeout)?))
     }
 }
 
@@ -530,6 +681,174 @@ mod tests {
     fn tcp_and_memory_links_carry_frames_and_notice_a_dead_peer() {
         exchange(&TcpTransport, "127.0.0.1:0");
         exchange(&MemTransport::new(), "mem-a");
+    }
+
+    fn deadline_pair(accepted: bool, timeout: Duration) -> (Box<dyn Link>, TcpStream) {
+        let transport = DeadlineTcpTransport { timeout };
+        if accepted {
+            let mut listener = transport.listen("127.0.0.1:0").unwrap();
+            let peer = TcpStream::connect(listener.address()).unwrap();
+            (listener.accept().unwrap(), peer)
+        } else {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let link = transport
+                .connect(&listener.local_addr().unwrap().to_string())
+                .unwrap();
+            (link, listener.accept().unwrap().0)
+        }
+    }
+
+    fn assert_closed(link: &mut dyn Link) {
+        assert!(!link.alive());
+        assert_eq!(link.recv().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            link.send(b"later").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn deadline_links_accept_healthy_fragmented_frames_in_both_directions() {
+        exchange(
+            &DeadlineTcpTransport {
+                timeout: Duration::from_secs(5),
+            },
+            "127.0.0.1:0",
+        );
+        for accepted in [false, true] {
+            let (mut link, mut peer) = deadline_pair(accepted, Duration::from_secs(5));
+            peer.set_nodelay(true).unwrap();
+            let worker = std::thread::spawn(move || {
+                for byte in 257u32.to_le_bytes() {
+                    peer.write_all(&[byte]).unwrap();
+                }
+                for chunk in vec![42; 257].chunks(3) {
+                    peer.write_all(chunk).unwrap();
+                }
+                let mut prefix = [0; 4];
+                peer.read_exact(&mut prefix).unwrap();
+                assert_eq!(u32::from_le_bytes(prefix), 257);
+                let mut reply = vec![0; 257];
+                peer.read_exact(&mut reply).unwrap();
+                assert_eq!(reply, vec![42; 257]);
+            });
+            assert_eq!(link.recv().unwrap(), vec![42; 257]);
+            link.send(&vec![42; 257]).unwrap();
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn deadline_covers_trickling_prefix_and_payload_and_poisoned_links() {
+        for accepted in [false, true] {
+            for payload in [false, true] {
+                let (mut link, mut peer) = deadline_pair(accepted, Duration::from_millis(150));
+                peer.set_nodelay(true).unwrap();
+                let sender = std::thread::spawn(move || {
+                    let bytes = if payload {
+                        peer.write_all(&100u32.to_le_bytes()).unwrap();
+                        vec![42; 100]
+                    } else {
+                        100u32.to_le_bytes().to_vec()
+                    };
+                    for byte in bytes {
+                        // Every syscall makes progress sooner than 150 ms, but
+                        // the complete header/payload takes longer than it.
+                        std::thread::sleep(Duration::from_millis(60));
+                        if peer.write_all(&[byte]).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let start = Instant::now();
+                let error = link.recv().unwrap_err();
+                assert!(matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ));
+                // Broad scheduler allowance, not a throughput threshold.
+                assert!(start.elapsed() < Duration::from_secs(3));
+                assert_closed(&mut *link);
+                sender.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn short_writes_and_interruptions_share_one_absolute_budget() {
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let mut calls = 0;
+        let mut previous = Duration::MAX;
+        let error = write_until(&[0; 100], deadline, |_, left| {
+            assert!(left <= previous);
+            previous = left;
+            calls += 1;
+            std::thread::sleep(Duration::from_millis(25));
+            if calls % 2 == 0 {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(1)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(calls < 100);
+    }
+
+    #[test]
+    fn slow_tcp_reader_cannot_extend_outbound_deadline() {
+        for accepted in [false, true] {
+            let (mut link, mut peer) = deadline_pair(accepted, Duration::from_millis(150));
+            let reader = std::thread::spawn(move || {
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                // Consume a little, then keep the socket open past the sender's
+                // budget. The 32 MiB frame exceeds the loopback socket buffers.
+                let until = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < until {
+                    let mut byte = [0];
+                    if peer.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let start = Instant::now();
+            let error = link.send(&vec![0; 32 << 20]).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ));
+            assert!(start.elapsed() < Duration::from_secs(3));
+            assert_closed(&mut *link);
+            reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn partial_eof_oversize_and_invalid_deadline_fail_closed() {
+        for bytes in [
+            vec![1, 0],
+            vec![4, 0, 0, 0, 42],
+            ((MAX_FRAME + 1) as u32).to_le_bytes().to_vec(),
+        ] {
+            let (mut link, mut peer) = deadline_pair(true, Duration::from_secs(2));
+            peer.write_all(&bytes).unwrap();
+            peer.shutdown(std::net::Shutdown::Both).unwrap();
+            assert!(link.recv().is_err());
+            assert_closed(&mut *link);
+        }
+        let invalid = DeadlineTcpTransport {
+            timeout: Duration::ZERO,
+        };
+        assert!(invalid.listen("127.0.0.1:0").is_err());
+        assert!(invalid.connect("127.0.0.1:1").is_err());
+        assert!(
+            DeadlineTcpTransport {
+                timeout: Duration::from_secs(1)
+            }
+            .connect("localhost:1")
+            .is_err()
+        );
     }
 
     #[test]

@@ -583,3 +583,8 @@ fn separate_process_metadata_attacks_require_trusted_context() {
         child.finish().unwrap();
     }
 }
+
+mod relay_ring_cases {
+    use super::*;
+    include!("support/relay_ring_cases.rs");
+}
