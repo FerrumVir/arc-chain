@@ -12,14 +12,29 @@ name: CPU engine gate (SmolLM3-3B)
 #              golden (scripts/arc_modern/golden/smollm3-3b.python-golden.json,
 #              byte-identical to the evidence-reference artifact of run
 #              37473148757). A speedup that changes one digest fails here.
-#              Then `arc-modern bench` measures tok/s on this runner.
+#              The checker also requires dispatch evidence: a well-formed
+#              census showing the expected SIMD kernel (--expect-kernel) did
+#              the work, and for the fast engine an attention census.
+#              Then `arc-modern bench` measures tok/s on this runner: the
+#              PR #137 kernels (`scalar`, `legacy`) are the "before", the
+#              new exact kernels and engine (`ref:auto`, `simd`) the "after".
 #
-# Linux only (x86-64 AVX2 and ARM64 NEON): macOS runners are reserved for the
-# release sequence. Numbers are CI-runner measurements, labelled as such.
+# Every OS: Linux x86-64 (AVX2) and ARM64 (NEON), Windows x86-64 (AVX2),
+# macOS Apple Silicon (NEON) and Intel (AVX2). Runs on pull requests to main
+# that touch the engine, so the gate stays with the shared engine after
+# merge. Numbers are CI-runner measurements, labelled as such.
 
 on:
-  push:
-    branches: [cpu-engine-optimize]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/arc-inference/Cargo.toml'
+      - 'crates/arc-inference/src/modern/**'
+      - 'crates/arc-inference/src/bin/arc_modern.rs'
+      - 'crates/arc-inference/src/canonical_simd.rs'
+      - 'scripts/arc_modern/**'
+      - 'docs/protocol/packages/smollm3-3b.*'
+      - '.github/workflows/cpu-engine-gate.yml'
 
 permissions:
   contents: read
@@ -71,6 +86,8 @@ jobs:
           cargo test -p arc-inference --lib --locked golden
       - name: Kernel tests with optimisations (the code the gate times)
         run: cargo test -p arc-inference --lib --release --locked modern::kernels
+      - name: Gate checker tests (missing, zero or malformed evidence fails)
+        run: python3 scripts/arc_modern/test_engine_gate.py -v
 
   gate:
     name: golden + speed (${{ matrix.os }})
@@ -84,13 +101,26 @@ jobs:
           # it the default `auto` runs (stream for single-token AVX2 calls,
           # rows4 for batched calls and NEON), so every order is gated.
           - os: ubuntu-latest
+            kernel: avx2
             specs: scalar fast:scalar legacy ref:auto simd simd@rows4 simd@stream
             bench: scalar,legacy,ref:auto,simd
           - os: ubuntu-24.04-arm
+            kernel: neon
             specs: scalar fast:scalar legacy ref:auto simd simd@rows4 simd@stream
             bench: scalar,legacy,ref:auto,simd
           - os: windows-latest
-            specs: scalar legacy simd simd@rows4 simd@stream
+            kernel: avx2
+            specs: scalar legacy ref:auto simd simd@rows4 simd@stream
+            bench: legacy,ref:auto,simd
+          # macOS runners are scarce and shared with the release: the same
+          # golden specs, a shorter bench (no scalar ladder rung).
+          - os: macos-15
+            kernel: neon
+            specs: scalar legacy ref:auto simd simd@rows4 simd@stream
+            bench: legacy,ref:auto,simd
+          - os: macos-15-intel
+            kernel: avx2
+            specs: scalar legacy ref:auto simd simd@rows4 simd@stream
             bench: legacy,ref:auto,simd
     env:
       # Keep symbols so the kernel loops can be disassembled (diagnostic
@@ -136,6 +166,7 @@ jobs:
             case "$RUNNER_OS" in
               Linux) { lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|L2|L3|Flags' | cut -c1-600; free -b; } || true ;;
               Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors,L2CacheSize,L3CacheSize; Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory" ;;
+              macOS) sysctl machdep.cpu.brand_string hw.model hw.ncpu hw.physicalcpu hw.memsize hw.l2cachesize hw.l3cachesize hw.optional.arm.FEAT_DotProd hw.optional.avx2_0 2>/dev/null || true ;;
             esac
           } 2>&1 | tee "$EVIDENCE/runner.txt"
       - name: Build arc-modern
@@ -185,7 +216,8 @@ jobs:
             runs+=("$file")
           done
           python scripts/arc_modern/engine_gate.py check --golden "$GOLDEN" \
-            --label "${{ matrix.os }}" --fail-on-refusal --summary-md "$GITHUB_STEP_SUMMARY" "${runs[@]}"
+            --label "${{ matrix.os }}" --fail-on-refusal --expect-kernel "${{ matrix.kernel }}" \
+            --summary-md "$GITHUB_STEP_SUMMARY" "${runs[@]}"
       - name: Speed (CI runner) - decode by spec, thread scaling, profile, kernels, bandwidth
         shell: bash
         env:
