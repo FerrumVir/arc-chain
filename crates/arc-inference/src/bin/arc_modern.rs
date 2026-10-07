@@ -41,7 +41,7 @@ const USAGE: &str = "usage: arc-modern <command> [options]
   bench     --package PKG --out BENCH.json [--specs SPEC,...] [--threads N]
             [--scaling N,...] [--contexts N,...] [--decode N]
             [--tokens-from GOLDEN.json] [--profile] [--micro] [--bandwidth]
-            [--tilings rows4,stream]
+            [--tilings auto,rows4,stream]
   tokenize  --tokenizer tokenizer.json --input IN.jsonl --out OUT.jsonl
   render    --user TEXT [--system TEXT] [--today DATE] [--think]
 
@@ -50,8 +50,10 @@ const USAGE: &str = "usage: arc-modern <command> [options]
   engine, fastest SIMD kernel on this CPU. legacy: reference forward, the
   earlier limb kernel. ref:KERNEL or fast:KERNEL with KERNEL one of scalar,
   avx2, neon, auto. ARC_MODERN_KERNEL=SPEC changes the default.
-  --tiling rows4|stream (or ARC_MODERN_TILING) picks the row order of the
-  SIMD kernels: a speed setting that cannot change a value.";
+  --tiling auto|rows4|stream (or ARC_MODERN_TILING) picks the row order of
+  the SIMD kernels, a speed setting that cannot change a value. auto (the
+  default) streams single-token AVX2 projections and tiles four rows for
+  batched prefill and for NEON.";
 
 const DEFAULT_TODAY: &str = "06 October 2026";
 
@@ -132,8 +134,8 @@ fn configure_kernel(args: &Args) -> Result<(String, Spec), ModernError> {
     Ok((name, spec))
 }
 
-/// `--tiling rows4|stream` (default rows4, or `ARC_MODERN_TILING`): the row
-/// order of the SIMD kernels, a speed setting that cannot change a value.
+/// `--tiling auto|rows4|stream` (default auto, or `ARC_MODERN_TILING`): the
+/// row order of the SIMD kernels, a speed setting that cannot change a value.
 fn configure_tiling(args: &Args) -> Result<Tiling, ModernError> {
     let name = args.value("--tiling").or_else(|| {
         std::env::var("ARC_MODERN_TILING")
@@ -146,6 +148,22 @@ fn configure_tiling(args: &Args) -> Result<Tiling, ModernError> {
     };
     kernels::set_tiling(tiling);
     Ok(tiling)
+}
+
+/// The concrete row orders the configured tiling resolves to for `spec`'s
+/// SIMD kernel: single-token calls (decode) and batched calls (prefill).
+/// Null for the scalar and legacy kernels, which have no row order.
+fn row_orders(spec: Spec) -> Value {
+    match spec.kernel() {
+        Some(kernel) if kernel != Kernel::Scalar => {
+            let tiling = kernels::tiling();
+            json!({
+                "single": tiling.resolve(kernel, false).name(),
+                "batched": tiling.resolve(kernel, true).name(),
+            })
+        }
+        _ => Value::Null,
+    }
 }
 
 fn platform() -> Value {
@@ -427,6 +445,7 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
         "engine": spec.engine_name(),
         "kernel_path": spec.kernel_name(),
         "tiling": kernels::tiling().name(),
+        "row_orders": row_orders(spec),
         "threads": threads,
         "platform": platform(),
         "cases": records,

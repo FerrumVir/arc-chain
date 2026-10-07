@@ -633,7 +633,8 @@ impl<'a> MatrixRows<'a> {
 /// scheduling costs little next to streaming the rows.
 const TASK_ROWS: usize = 64;
 
-/// Exact accumulators of rows `row0 .. row0 + acc.len()` of `m`.
+/// Exact accumulators of rows `row0 .. row0 + acc.len()` of `m` for one
+/// input, in the configured row order for single-input calls.
 ///
 /// The caller has checked `m` against `input` and keeps the rows in range.
 fn row_dots(
@@ -641,6 +642,22 @@ fn row_dots(
     row0: usize,
     input: &PreparedInput,
     acc: &mut [i64],
+) -> Result<(), ModernError> {
+    row_dots_ordered(m, row0, input, acc, tiling().resolve(input.kernel(), false))
+}
+
+/// [`row_dots`] with the row order given (the batched path resolves it for
+/// batched calls). Every order computes the same integers.
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(unused_variables)
+)]
+fn row_dots_ordered(
+    m: MatrixRows<'_>,
+    row0: usize,
+    input: &PreparedInput,
+    acc: &mut [i64],
+    order: Tiling,
 ) -> Result<(), ModernError> {
     debug_assert!(row0 + acc.len() <= m.rows);
     match input.plan {
@@ -656,13 +673,13 @@ fn row_dots(
             // returned true and the planes were split with
             // `stride >= x.len() = m.cols`; the rows read lie inside `m.q`,
             // whose length `check` verified.
-            unsafe { x86::row_dots(m, row0, input, limbs, acc) }
+            unsafe { x86::row_dots(m, row0, input, limbs, order, acc) }
         }
         #[cfg(target_arch = "aarch64")]
         Plan::I8 { limbs } => {
             // SAFETY: as for `I16`, with `neon_available()` and
             // `m.cols <= I8_MAX_COLS` checked when the plan was made.
-            unsafe { arm::row_dots(m, row0, input, limbs, acc) }
+            unsafe { arm::row_dots(m, row0, input, limbs, order, acc) }
         }
     }
 }
@@ -820,12 +837,14 @@ fn row_dots_batch(
 ) -> Result<(), ModernError> {
     let tokens = inputs.len();
     let rows = acc.len() / tokens;
+    let order = tiling();
     let mut tile = [0i64; BATCH_TILE_ROWS];
     let mut i = 0usize;
     while i < rows {
         let n = (rows - i).min(BATCH_TILE_ROWS);
         for (t, input) in inputs.iter().enumerate() {
-            row_dots(m, row0 + i, input, &mut tile[..n])?;
+            let resolved = order.resolve(input.kernel(), true);
+            row_dots_ordered(m, row0 + i, input, &mut tile[..n], resolved)?;
             for (r, &value) in tile[..n].iter().enumerate() {
                 acc[(i + r) * tokens + t] = value;
             }
@@ -997,13 +1016,20 @@ impl Isa {
 
 // ---------------------------------------------------------------- tiling --
 
-/// How the SIMD kernels walk the rows of a projection. Both orders compute
+/// How the SIMD kernels walk the rows of a projection. Every order computes
 /// the same integers; they differ only in memory access pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tiling {
+    /// The order measured fastest for the kernel and the kind of call:
+    /// `stream` for single-input AVX2 calls (decode), `rows4` for batched
+    /// calls (prefill) and for NEON. On the CI runners of run 37522880513,
+    /// x86 decode ran 8.85 vs 7.85 tok/s (ubuntu) and 8.08 vs 7.88
+    /// (windows) with `stream`, x86 batched prefill 9.6 vs 11.7 tok/s, and
+    /// NEON decode 14.5 vs 16.2 tok/s. See [`Tiling::resolve`].
+    #[default]
+    Auto,
     /// Four rows per register tile: each digit vector is loaded once and
     /// used for four rows (four short row streams per thread).
-    #[default]
     Rows4,
     /// One row at a time, several column blocks per step: each thread reads
     /// its rows as one sequential stream.
@@ -1011,11 +1037,12 @@ pub enum Tiling {
 }
 
 impl Tiling {
-    /// Every tiling, in a fixed order.
+    /// Every concrete row order, in a fixed order.
     pub const ALL: [Tiling; 2] = [Tiling::Rows4, Tiling::Stream];
 
     pub fn name(self) -> &'static str {
         match self {
+            Tiling::Auto => "auto",
             Tiling::Rows4 => "rows4",
             Tiling::Stream => "stream",
         }
@@ -1023,11 +1050,22 @@ impl Tiling {
 
     pub fn parse(name: &str) -> Result<Self, ModernError> {
         match name {
+            "auto" => Ok(Tiling::Auto),
             "rows4" => Ok(Tiling::Rows4),
             "stream" => Ok(Tiling::Stream),
             other => Err(ModernError::Invalid(format!(
-                "unknown tiling {other} (expected rows4 or stream)"
+                "unknown tiling {other} (expected auto, rows4 or stream)"
             ))),
+        }
+    }
+
+    /// The concrete row order `kernel` runs with, for a single-input call
+    /// (`batched == false`) or a batched one. An explicit order is kept.
+    pub fn resolve(self, kernel: Kernel, batched: bool) -> Tiling {
+        match self {
+            Tiling::Auto if kernel == Kernel::Avx2 && !batched => Tiling::Stream,
+            Tiling::Auto => Tiling::Rows4,
+            order => order,
         }
     }
 }
@@ -1035,22 +1073,25 @@ impl Tiling {
 static TILING: AtomicU8 = AtomicU8::new(0);
 
 /// Select the row order of the SIMD kernels process-wide (a speed setting;
-/// it cannot change a value).
+/// it cannot change a value). [`Tiling::Auto`] is the default.
 pub fn set_tiling(tiling: Tiling) {
     TILING.store(
         match tiling {
-            Tiling::Rows4 => 0,
-            Tiling::Stream => 1,
+            Tiling::Auto => 0,
+            Tiling::Rows4 => 1,
+            Tiling::Stream => 2,
         },
         Ordering::Relaxed,
     );
 }
 
-/// The row order of the SIMD kernels (see [`set_tiling`]).
+/// The configured tiling of the SIMD kernels (see [`set_tiling`]); the
+/// order a call runs with is [`Tiling::resolve`] of it.
 pub fn tiling() -> Tiling {
     match TILING.load(Ordering::Relaxed) {
-        1 => Tiling::Stream,
-        _ => Tiling::Rows4,
+        1 => Tiling::Rows4,
+        2 => Tiling::Stream,
+        _ => Tiling::Auto,
     }
 }
 
@@ -1103,14 +1144,15 @@ pub(crate) fn project_reference(
 mod x86 {
     use std::arch::x86_64::*;
 
-    use super::{MatrixRows, ModernError, PreparedInput, Tiling, combine, tiling};
+    use super::{MatrixRows, ModernError, PreparedInput, Tiling, combine};
 
     /// Columns per i32 accumulation block: 128 `vpmaddwd` steps of at most
     /// 2^23 per lane, so a lane stays below 2^30 before it is widened.
     const FLUSH_COLS: usize = 2048;
     const _: () = assert!((FLUSH_COLS / 16) as i64 * (1i64 << 23) <= 1i64 << 30);
 
-    /// Exact accumulators of rows `row0 ..` with base-2^16 digit planes.
+    /// Exact accumulators of rows `row0 ..` with base-2^16 digit planes, in
+    /// row order `order` (a concrete one, see [`Tiling::resolve`]).
     ///
     /// # Safety
     /// AVX2 must be available; `input` must hold `limbs` planes of
@@ -1122,14 +1164,15 @@ mod x86 {
         row0: usize,
         input: &PreparedInput,
         limbs: usize,
+        order: Tiling,
         acc: &mut [i64],
     ) -> Result<(), ModernError> {
         // SAFETY: the caller's contract is forwarded unchanged.
         unsafe {
             match limbs {
-                1 => run::<1, 4>(m, row0, input, acc),
-                2 => run::<2, 4>(m, row0, input, acc),
-                _ => run::<3, 2>(m, row0, input, acc),
+                1 => run::<1, 4>(m, row0, input, order, acc),
+                2 => run::<2, 4>(m, row0, input, order, acc),
+                _ => run::<3, 2>(m, row0, input, order, acc),
             }
         }
     }
@@ -1143,6 +1186,7 @@ mod x86 {
         m: MatrixRows<'_>,
         row0: usize,
         input: &PreparedInput,
+        order: Tiling,
         acc: &mut [i64],
     ) -> Result<(), ModernError> {
         let cols = m.cols;
@@ -1150,7 +1194,7 @@ mod x86 {
         let planes = input.planes16.as_ptr();
         let stride = input.stride;
         let base = m.q.as_ptr();
-        if tiling() == Tiling::Stream {
+        if order == Tiling::Stream {
             for (offset, slot) in acc.iter_mut().enumerate() {
                 let row = row0 + offset;
                 // SAFETY: row < m.rows, so its `cols >= vector_cols` weights
@@ -1370,7 +1414,7 @@ mod x86 {
 mod arm {
     use std::arch::aarch64::*;
 
-    use super::{MatrixRows, ModernError, PreparedInput, Tiling, combine, tiling};
+    use super::{MatrixRows, ModernError, PreparedInput, Tiling, combine};
 
     /// `SDOT Vd.4S, Vn.16B, Vm.16B`: four exact 4-way i8 dot products added
     /// to i32 lanes. Inline assembly, because the intrinsic is still behind
@@ -1395,7 +1439,8 @@ mod arm {
         out
     }
 
-    /// Exact accumulators of rows `row0 ..` with base-256 digit planes.
+    /// Exact accumulators of rows `row0 ..` with base-256 digit planes, in
+    /// row order `order` (a concrete one, see [`Tiling::resolve`]).
     ///
     /// # Safety
     /// dotprod must be available; `input` must hold `limbs` planes of
@@ -1407,15 +1452,16 @@ mod arm {
         row0: usize,
         input: &PreparedInput,
         limbs: usize,
+        order: Tiling,
         acc: &mut [i64],
     ) -> Result<(), ModernError> {
         // SAFETY: the caller's contract is forwarded unchanged.
         unsafe {
             match limbs {
-                1 => run::<1, 4>(m, row0, input, acc),
-                2 => run::<2, 4>(m, row0, input, acc),
-                3 => run::<3, 4>(m, row0, input, acc),
-                _ => run::<4, 4>(m, row0, input, acc),
+                1 => run::<1, 4>(m, row0, input, order, acc),
+                2 => run::<2, 4>(m, row0, input, order, acc),
+                3 => run::<3, 4>(m, row0, input, order, acc),
+                _ => run::<4, 4>(m, row0, input, order, acc),
             }
         }
     }
@@ -1429,6 +1475,7 @@ mod arm {
         m: MatrixRows<'_>,
         row0: usize,
         input: &PreparedInput,
+        order: Tiling,
         acc: &mut [i64],
     ) -> Result<(), ModernError> {
         let cols = m.cols;
@@ -1436,7 +1483,7 @@ mod arm {
         let planes = input.planes8.as_ptr();
         let stride = input.stride;
         let base = m.q.as_ptr();
-        if tiling() == Tiling::Stream {
+        if order == Tiling::Stream {
             for (offset, slot) in acc.iter_mut().enumerate() {
                 let row = row0 + offset;
                 // SAFETY: row < m.rows, so its `cols >= vector_cols` weights
@@ -1792,8 +1839,18 @@ mod tests {
             }
         }
         set_tiling(Tiling::default());
+        assert_eq!(Tiling::default(), Tiling::Auto);
+        assert_eq!(Tiling::parse("auto").unwrap(), Tiling::Auto);
         assert_eq!(Tiling::parse("stream").unwrap(), Tiling::Stream);
         assert!(Tiling::parse("rows8").is_err());
+        // `auto` streams single-input AVX2 calls and tiles everything else;
+        // an explicit order is kept for every kernel and kind of call.
+        assert_eq!(Tiling::Auto.resolve(Kernel::Avx2, false), Tiling::Stream);
+        assert_eq!(Tiling::Auto.resolve(Kernel::Avx2, true), Tiling::Rows4);
+        assert_eq!(Tiling::Auto.resolve(Kernel::Neon, false), Tiling::Rows4);
+        assert_eq!(Tiling::Auto.resolve(Kernel::Scalar, false), Tiling::Rows4);
+        assert_eq!(Tiling::Stream.resolve(Kernel::Neon, true), Tiling::Stream);
+        assert_eq!(Tiling::Rows4.resolve(Kernel::Avx2, false), Tiling::Rows4);
     }
 
     #[test]

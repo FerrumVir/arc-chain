@@ -80,15 +80,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # SPEC@TILING forces the SIMD kernels' row order as well.
+          # SPEC@TILING forces the SIMD kernels' row order as well; without
+          # it the default `auto` runs (stream for single-token AVX2 calls,
+          # rows4 for batched calls and NEON), so every order is gated.
           - os: ubuntu-latest
-            specs: scalar fast:scalar legacy ref:auto simd simd@stream
+            specs: scalar fast:scalar legacy ref:auto simd simd@rows4 simd@stream
             bench: scalar,legacy,ref:auto,simd
           - os: ubuntu-24.04-arm
-            specs: scalar fast:scalar legacy ref:auto simd simd@stream
+            specs: scalar fast:scalar legacy ref:auto simd simd@rows4 simd@stream
             bench: scalar,legacy,ref:auto,simd
           - os: windows-latest
-            specs: scalar legacy simd simd@stream
+            specs: scalar legacy simd simd@rows4 simd@stream
             bench: legacy,ref:auto,simd
     env:
       # Keep symbols so the kernel loops can be disassembled (diagnostic
@@ -172,7 +174,7 @@ jobs:
           runs=()
           for entry in "${entries[@]}"; do
             spec="${entry%@*}"
-            tiling=rows4
+            tiling=auto
             if [[ "$entry" == *@* ]]; then tiling="${entry#*@}"; fi
             file="$EVIDENCE/golden-${spec//:/-}-$tiling.json"
             echo "::group::golden --kernel $spec --tiling $tiling"
@@ -192,7 +194,7 @@ jobs:
           set -euo pipefail
           ./target/release/arc-modern bench --package "$MODEL_DIR/smollm3-3b.arcipkg" \
             --specs "$BENCH_SPECS" --scaling 1,2 --contexts 80,1024 --decode 16 \
-            --tokens-from "$GOLDEN" --profile --micro --bandwidth --tilings rows4,stream \
+            --tokens-from "$GOLDEN" --profile --micro --bandwidth --tilings auto,rows4,stream \
             --out "$EVIDENCE/bench.json"
           python scripts/arc_modern/engine_gate.py report --summary-md "$GITHUB_STEP_SUMMARY" \
             "${{ matrix.os }}=$EVIDENCE/bench.json"
