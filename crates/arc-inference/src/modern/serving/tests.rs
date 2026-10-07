@@ -1376,8 +1376,7 @@ fn reference_error(model: &ModernModel, request: &Request) -> String {
             eos: &request.eos,
             selection: request.selection,
         })
-        .err()
-        .expect("the reference refuses")
+        .expect_err("the reference refuses")
         .to_string()
 }
 
