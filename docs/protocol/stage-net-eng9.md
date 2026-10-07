@@ -30,16 +30,49 @@ The placement optimizer works in five steps:
 
 ## For ENG-6 (island runtime, ARC-68)
 
-ENG-6 plugs in at two traits. `StageSink`/`StageSource` is the transport: a
-multi-process runtime connects each hop with `TcpStageSink::connect(addr, …)`
-and `TcpStageSource::accept(&listener, …)`, or with a future RDMA or
-Thunderbolt implementation. `StageCompute` is a stage's forward pass;
-`IntegerSlice` is the dense engine's, and the MoE/MLA engine adds its own.
-`run_stage` is the per-stage loop (reader, compute, sender, commitments). The
-benchmark runs stages as threads of one process over real loopback sockets;
-measuring separate processes and machines is ENG-6's acceptance test.
+`integrations/arc-stage-eng6` implements ARC-68's actual `Transport`,
+`Listener`, and `Link` interfaces from **60c54bd8d1f72b333fe57de8059e9635cb8ff715**.
+The dependency is SHA-pinned in that standalone crate's manifest and lockfile;
+it does not alter the production workspace dependency graph or PR #167.
+Pass `arc_stage_eng6::TunedTransport::default()` to the island runtime.
+It reuses ENG-9 socket tuning, keeps persistent connections and carries the
+island's original length-prefixed frames without changing token, activation,
+or commitment bytes. `StageLink` also adapts a real ARC-68 `Link` to
+`StageSink`/`StageSource` when carrying ENG-9 benchmark frames.
 
-## Results, Studio lab (Mac Studio M2 Ultra, 24 threads, 7 Oct 2026)
+The integration test exchanges ARC-68 `Step`, `Close`, `Error`, and `Shutdown`
+frames with ARC-68's own `TcpTransport` in both directions, recomputes hidden
+commitments, and records received stage commitments in ARC-68's `Ledger`.
+It tests truncated/oversized frames, peer EOF, explicit close, and refusal to
+reuse a failed link. Run from the repository root:
+
+```sh
+cargo test --locked --manifest-path integrations/arc-stage-eng6/Cargo.toml
+```
+
+`StageCompute` and the threaded dense benchmark remain independent of the
+island runtime's MLA/MoE compute. This proves local transport compatibility,
+not a full Kimi runtime performance result or a live deployment.
+
+## Placement validation (review revision)
+
+Expert counts are allocated with integer largest-remainder apportionment
+before capacity and compute scoring; those same contiguous ranges appear in
+the returned plan. Each member holds its replicated dense weights plus its
+whole experts. Routed bytes are the floor of the exact binary fraction times
+layer bytes; the remaining bytes are dense, and each equal expert is rounded
+up to a whole byte. Capacity reserves the first/last extras on the lead, and
+a final checked-integer pass verifies every member footprint without slack.
+The heuristic may conservatively reject a layout; it never certifies fractional
+expert storage as deployable memory.
+
+Compute time and uplink must be finite and positive; RTTs cannot be negative.
+Either direction being NaN or positive infinity leaves the link unknown.
+Fractions must be in [0,1], overheads finite and nonnegative, model dimensions
+nonzero, and total model memory representable in u64. Aggregate node memory
+uses u128. Invalid inputs are rejected before clustering or scoring.
+
+## Historical results at acdd849c, Studio lab (Mac Studio M2 Ultra, 24 threads, 7 Oct 2026)
 
 Command: `arc_wan_bench --label "Studio lab (Mac Studio M2 Ultra)" --model small`.
 Setup:
@@ -103,7 +136,7 @@ model activations have not been measured here (see *Not done*).
 
 ### What the numbers say
 
-- **The research-7 model holds.** With measured compute and codec cost, and the injected RTT and uplink, the model lands within 0.7 ms per hop of every measured pass.
+- **The simulator accounting agrees.** The calculation reuses same-run compute/codec measurements and the injected RTT/uplink formula, landing within 0.7 ms per hop. This is not independent validation of real-WAN behavior.
 - **The transport's own cost is small.** Measured per-hop overhead is o ≈ 0.23 ms (median, loopback), against research-7's 1 ms WAN default and 0.3 ms "optimized" figure. Serialize plus deserialize is about 0.05 ms for a 7,168-value frame.
 - **Network time is RTT and uplink.** On a WAN hop, what remains is RTT/2 and the uplink term, and only placement and fewer hops reduce those.
 - **Overlap matters once the ring is full.** At 16 sequences in flight on 4 stages, aggregate rose from 55.9 to 92.3 tok/s (+65%). With 1 sequence in flight it changes nothing.
@@ -126,7 +159,7 @@ Network inputs:
 Assumption:
 - Per-layer decode time assumes **0.6 of peak memory bandwidth**. ARC's integer engine does not reach this today.
 
-With the Studio-lab inputs:
+Historical projection at acdd849c with the original Studio-lab inputs (superseded by the revision evidence attached to ARC-76):
 
 | Scenario | Plan | Pass ms | Per-answer tok/s |
 |---|---|---|---|
@@ -153,7 +186,7 @@ the target, for example 8.63 ms measured against 8.9 ms injected.
 ## Not done, and why
 
 - **QUIC transport.** Not built. One persistent ordered stream per hop gains nothing from QUIC's stream multiplexing, and QUIC would pull a tokio runtime and TLS into the engine crate. The trait leaves room for it, or for RDMA.
-- **Separate processes and machines.** Stages here are threads joined by real loopback sockets. Multi-process and multi-host runs belong to the ENG-6 runtime, which plugs into these traits.
+- **Separate processes and machines.** Stages here are threads joined by real loopback sockets. The adapter tests use local sockets; multi-process and multi-host performance is still unmeasured here.
 - **Codec bits/value on real model weights.** Only synthetic activations were measured. The model files on the Studio sit in a node data directory, which the task rules keep off-limits.
 - **MoE/MLA compute.** The bench's stage compute is the dense integer engine. The optimizer models MoE islands, and the MoE/MLA engine (ENG-5) plugs in through `StageCompute`.
 - **Speculative decoding** is out of scope here. It is the lever the projection points to for 59 tok/s per answer.

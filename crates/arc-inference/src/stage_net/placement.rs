@@ -69,8 +69,34 @@ pub struct ModelShape {
 }
 
 impl ModelShape {
-    pub fn total_bytes(&self) -> u64 {
-        self.layer_bytes * self.n_layers as u64 + self.first_extra_bytes + self.last_extra_bytes
+    pub fn total_bytes(&self) -> Option<u64> {
+        self.layer_bytes
+            .checked_mul(self.n_layers as u64)?
+            .checked_add(self.first_extra_bytes)?
+            .checked_add(self.last_extra_bytes)
+    }
+
+    /// Conservative whole-byte footprint: replicate the dense bytes and round
+    /// each equal-sized expert up. Fraction multiplication uses the exact f64
+    /// binary value, avoiding loss of integer precision above 2^53 bytes.
+    fn member_layer_bytes(&self, experts: u32, split: bool) -> Option<u64> {
+        if !split {
+            return Some(self.layer_bytes);
+        }
+        let f = self.routed_bytes_fraction;
+        let bits = f.to_bits();
+        let exponent = ((bits >> 52) & 0x7ff) as u32;
+        let mantissa = (bits & ((1u64 << 52) - 1)) | if exponent == 0 { 0 } else { 1u64 << 52 };
+        let shift = if exponent == 0 { 1074 } else { 1075 - exponent };
+        let product = self.layer_bytes as u128 * mantissa as u128;
+        let routed = if shift >= 128 {
+            0
+        } else {
+            (product >> shift) as u64
+        };
+        let dense = self.layer_bytes.checked_sub(routed)?;
+        let expert = routed.div_ceil(self.experts_per_layer as u64);
+        dense.checked_add(expert.checked_mul(experts as u64)?)
     }
 }
 
@@ -143,6 +169,10 @@ pub struct Placement {
 pub enum PlacementError {
     #[error("RTT matrix is {got}×? but there are {nodes} nodes")]
     BadMatrix { got: usize, nodes: usize },
+    #[error("invalid placement input: {0}")]
+    InvalidInput(&'static str),
+    #[error("memory arithmetic overflow")]
+    MemoryOverflow,
     #[error("no set of at most {max_stages} stages can hold the model")]
     Infeasible { max_stages: usize },
 }
@@ -153,8 +183,11 @@ fn rtt(m: &[Vec<f64>], a: usize, b: usize) -> f64 {
         return 0.0;
     }
     let (x, y) = (m[a][b], m[b][a]);
-    let v = x.max(y);
-    if v.is_nan() { f64::INFINITY } else { v }
+    if !x.is_finite() || !y.is_finite() {
+        f64::INFINITY
+    } else {
+        x.max(y)
+    }
 }
 
 /// Complete-linkage agglomerative clustering of `members`, cut at `cut` ms:
@@ -214,7 +247,7 @@ pub fn complete_linkage(m: &[Vec<f64>], members: &[usize], cut: f64) -> Vec<Vec<
 #[derive(Clone, Debug)]
 struct Unit {
     members: Vec<usize>,
-    shares: Vec<f64>,
+    experts: Vec<Range<u32>>,
     ms_per_layer: f64,
     uplink_mbps: f64,
 }
@@ -226,24 +259,22 @@ impl Unit {
 
     /// Layers this unit can hold with `extra` bytes on its lead.
     fn capacity(&self, nodes: &[NodeSpec], model: &ModelShape, extra: u64) -> u32 {
-        let lb = model.layer_bytes as f64;
-        let f = if self.members.len() > 1 {
-            model.routed_bytes_fraction
-        } else {
-            0.0
-        };
-        let mut cap = u32::MAX;
-        for (k, (&node, &share)) in self.members.iter().zip(&self.shares).enumerate() {
-            let mem = nodes[node]
+        let mut cap = model.n_layers;
+        for (k, (&node, experts)) in self.members.iter().zip(&self.experts).enumerate() {
+            let Some(mem) = nodes[node]
                 .mem_bytes
-                .saturating_sub(if k == 0 { extra } else { 0 });
-            let per_layer = if self.members.len() > 1 {
-                lb * (1.0 - f) + lb * f * share
-            } else {
-                lb
+                .checked_sub(if k == 0 { extra } else { 0 })
+            else {
+                return 0;
             };
-            let c = (mem as f64 / per_layer.max(1.0)).floor();
-            cap = cap.min(c.min(u32::MAX as f64) as u32);
+            let Some(per_layer) =
+                model.member_layer_bytes(experts.end - experts.start, self.members.len() > 1)
+            else {
+                return 0;
+            };
+            if let Some(layers) = mem.checked_div(per_layer) {
+                cap = cap.min(layers.min(model.n_layers as u64) as u32);
+            }
         }
         cap.min(model.n_layers)
     }
@@ -260,7 +291,7 @@ fn make_units(
         .iter()
         .map(|&i| Unit {
             members: vec![i],
-            shares: vec![1.0],
+            experts: std::iter::once(0..model.experts_per_layer).collect(),
             ms_per_layer: nodes[i].ms_per_layer,
             uplink_mbps: nodes[i].uplink_mbps,
         })
@@ -273,22 +304,48 @@ fn make_units(
             // Largest memory first; the lead holds the embedding/LM head.
             island.sort_by(|&a, &b| nodes[b].mem_bytes.cmp(&nodes[a].mem_bytes).then(a.cmp(&b)));
             island.truncate(p.max_island_size.min(model.experts_per_layer as usize));
-            let total: f64 = island.iter().map(|&i| nodes[i].mem_bytes as f64).sum();
-            let shares: Vec<f64> = island
+            // Assign whole experts first, using integer largest-remainder memory shares.
+            // Reserve one expert per member, then apportion the remainder.
+            let total: u128 = island.iter().map(|&i| nodes[i].mem_bytes as u128).sum();
+            if total == 0 {
+                continue;
+            }
+            let remaining = model.experts_per_layer - island.len() as u32;
+            let weights: Vec<u128> = island
                 .iter()
-                .map(|&i| nodes[i].mem_bytes as f64 / total)
+                .map(|&i| nodes[i].mem_bytes as u128 * remaining as u128)
+                .collect();
+            let mut counts: Vec<u32> = weights.iter().map(|w| 1 + (w / total) as u32).collect();
+            let left = model.experts_per_layer - counts.iter().sum::<u32>();
+            let mut remainders: Vec<usize> = (0..island.len()).collect();
+            remainders.sort_by_key(|&k| (std::cmp::Reverse(weights[k] % total), k));
+            for &k in remainders.iter().take(left as usize) {
+                counts[k] += 1;
+            }
+            let mut at = 0;
+            let experts: Vec<Range<u32>> = counts
+                .into_iter()
+                .map(|count| {
+                    let range = at..at + count;
+                    at += count;
+                    range
+                })
                 .collect();
             let ft = model.routed_time_fraction;
             let ms = island
                 .iter()
-                .zip(&shares)
-                .map(|(&i, &s)| nodes[i].ms_per_layer * ((1.0 - ft) + ft * s))
+                .zip(&experts)
+                .map(|(&i, e)| {
+                    nodes[i].ms_per_layer
+                        * ((1.0 - ft)
+                            + ft * (e.end - e.start) as f64 / model.experts_per_layer as f64)
+                })
                 .fold(0.0f64, f64::max)
                 + p.island_exchange_ms_per_layer;
             units.push(Unit {
                 uplink_mbps: nodes[island[0]].uplink_mbps,
                 members: island,
-                shares,
+                experts,
                 ms_per_layer: ms,
             });
         }
@@ -524,6 +581,9 @@ fn score_order(
         .map(|i| layers[i] as f64 * order[i].ms_per_layer)
         .collect();
     let pass = cost::pass_ms(&compute, &hops);
+    if !pass.is_finite() || pass <= 0.0 || !(1000.0 / pass).is_finite() {
+        return None;
+    }
     let score = match p.objective {
         Objective::PerAnswer => (pass, 0.0),
         Objective::Aggregate { in_flight } => {
@@ -669,25 +729,13 @@ fn build(
     let mut stages = Vec::with_capacity(order.len());
     let mut compute = Vec::with_capacity(order.len());
     for (i, u) in order.iter().enumerate() {
-        let e = model.experts_per_layer;
-        let mut cum = 0.0;
         let members = u
             .members
             .iter()
-            .zip(&u.shares)
-            .enumerate()
-            .map(|(k, (&node, &share))| {
-                let lo = (cum * e as f64).floor() as u32;
-                cum += share;
-                let hi = if k + 1 == u.members.len() {
-                    e
-                } else {
-                    (cum * e as f64).floor() as u32
-                };
-                MemberSlice {
-                    node,
-                    experts: lo..hi,
-                }
+            .zip(&u.experts)
+            .map(|(&node, experts)| MemberSlice {
+                node,
+                experts: experts.clone(),
             })
             .collect();
         let c = sc.layers[i] as f64 * u.ms_per_layer;
@@ -718,6 +766,94 @@ fn build(
     }
 }
 
+fn validate_inputs(
+    nodes: &[NodeSpec],
+    m: &[Vec<f64>],
+    model: &ModelShape,
+    p: &PlacementParams,
+) -> Result<(), PlacementError> {
+    let nonnegative = |v: f64| v.is_finite() && v >= 0.0;
+    let positive = |v: f64| v.is_finite() && v > 0.0;
+    if nodes
+        .iter()
+        .any(|n| !positive(n.ms_per_layer) || !positive(n.uplink_mbps))
+    {
+        return Err(PlacementError::InvalidInput(
+            "compute and uplink must be finite and positive",
+        ));
+    }
+    // NaN and positive infinity mean unknown; negative RTT is never physical.
+    if m.iter().flatten().any(|&v| v < 0.0) {
+        return Err(PlacementError::InvalidInput("negative RTT"));
+    }
+    if model.n_layers == 0
+        || model.layer_bytes == 0
+        || !nonnegative(model.boundary_bytes)
+        || ![model.routed_bytes_fraction, model.routed_time_fraction]
+            .iter()
+            .all(|&f| f.is_finite() && (0.0..=1.0).contains(&f))
+        || (model.experts_per_layer == 0
+            && (model.routed_bytes_fraction != 0.0 || model.routed_time_fraction != 0.0))
+    {
+        return Err(PlacementError::InvalidInput(
+            "model shape or routed fractions",
+        ));
+    }
+    model.total_bytes().ok_or(PlacementError::MemoryOverflow)?;
+    if ![
+        p.hop_overhead_ms,
+        p.cluster_diameter_ms,
+        p.island_rtt_ms,
+        p.island_exchange_ms_per_layer,
+    ]
+    .iter()
+    .all(|&v| nonnegative(v))
+        || !(1..=8).contains(&p.max_stages)
+        || p.candidates == 0
+        || p.max_island_size == 0
+        || matches!(p.objective, Objective::Aggregate { in_flight: 0 })
+    {
+        return Err(PlacementError::InvalidInput("planning parameters"));
+    }
+    Ok(())
+}
+
+/// Defense in depth: check the exact slices returned to the caller, without
+/// fractional shares or an allowance for rounding beyond a node's memory.
+fn validate_footprints(
+    plan: Placement,
+    nodes: &[NodeSpec],
+    model: &ModelShape,
+) -> Result<Placement, PlacementError> {
+    for (i, stage) in plan.stages.iter().enumerate() {
+        for (k, member) in stage.members.iter().enumerate() {
+            let mut bytes = model
+                .member_layer_bytes(
+                    member.experts.end - member.experts.start,
+                    stage.members.len() > 1,
+                )
+                .and_then(|b| b.checked_mul((stage.layers.end - stage.layers.start) as u64))
+                .ok_or(PlacementError::MemoryOverflow)?;
+            if k == 0 {
+                if i == 0 {
+                    bytes = bytes
+                        .checked_add(model.first_extra_bytes)
+                        .ok_or(PlacementError::MemoryOverflow)?;
+                }
+                if i + 1 == plan.stages.len() {
+                    bytes = bytes
+                        .checked_add(model.last_extra_bytes)
+                        .ok_or(PlacementError::MemoryOverflow)?;
+                }
+            }
+            if bytes > nodes[member.node].mem_bytes {
+                return Err(PlacementError::InvalidInput("final member exceeds memory"));
+            }
+        }
+    }
+    Ok(plan)
+}
+
 /// Plan the best placement for `model` on `nodes` given the RTT matrix `m`
 /// (ms, `m[i][j]`; NaN or infinity = unmeasured).
 pub fn plan(
@@ -732,11 +868,12 @@ pub fn plan(
             nodes: nodes.len(),
         });
     }
+    validate_inputs(nodes, m, model, p)?;
     let all: Vec<usize> = (0..nodes.len()).collect();
     let mut best: Option<(Vec<Unit>, Scored, Vec<usize>)> = None;
     for cell in complete_linkage(m, &all, p.cluster_diameter_ms) {
-        let mem: u64 = cell.iter().map(|&i| nodes[i].mem_bytes).sum();
-        if mem < model.total_bytes() {
+        let mem: u128 = cell.iter().map(|&i| nodes[i].mem_bytes as u128).sum();
+        if mem < model.total_bytes().ok_or(PlacementError::MemoryOverflow)? as u128 {
             continue;
         }
         if let Some((units, sc)) = search_cell(nodes, m, &cell, model, p)
@@ -748,13 +885,13 @@ pub fn plan(
         }
     }
     if let Some((units, sc, cell)) = best {
-        return Ok(build(&units, &sc, m, cell, false, model, p));
+        return validate_footprints(build(&units, &sc, m, cell, false, model, p), nodes, model);
     }
     // No single cell can hold it: search everything and say so.
     let (units, sc) = search_cell(nodes, m, &all, model, p).ok_or(PlacementError::Infeasible {
         max_stages: p.max_stages,
     })?;
-    Ok(build(&units, &sc, m, all, true, model, p))
+    validate_footprints(build(&units, &sc, m, all, true, model, p), nodes, model)
 }
 
 #[cfg(test)]
@@ -818,16 +955,249 @@ mod tests {
                 if k == 0 && i + 1 == p.stages.len() {
                     need += model.last_extra_bytes as f64;
                 }
-                // Expert slices are floored, so allow one expert of slack.
-                let slack =
-                    model.layer_bytes as f64 * n_layers * f / model.experts_per_layer.max(1) as f64;
                 assert!(
-                    need <= nodes[mbr.node].mem_bytes as f64 + slack + 1.0,
+                    need <= nodes[mbr.node].mem_bytes as f64,
                     "stage {i} member {k} over memory"
                 );
             }
         }
         assert_eq!(at, model.n_layers);
+    }
+
+    fn byte_model() -> ModelShape {
+        ModelShape {
+            n_layers: 1,
+            layer_bytes: 300,
+            first_extra_bytes: 0,
+            last_extra_bytes: 0,
+            boundary_bytes: 24.0,
+            experts_per_layer: 3,
+            routed_bytes_fraction: 1.0,
+            routed_time_fraction: 1.0,
+        }
+    }
+
+    fn byte_nodes(mem: &[u64]) -> Vec<NodeSpec> {
+        mem.iter()
+            .enumerate()
+            .map(|(i, &mem_bytes)| NodeSpec {
+                id: i.to_string(),
+                region: "lab".into(),
+                mem_bytes,
+                ms_per_layer: 1.0,
+                uplink_mbps: 100.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn integer_experts_reject_200_bytes_on_150_byte_node() {
+        assert!(matches!(
+            plan(
+                &byte_nodes(&[150, 150]),
+                &matrix(2, |_, _| 0.2),
+                &byte_model(),
+                &PlacementParams::default()
+            ),
+            Err(PlacementError::Infeasible { .. })
+        ));
+    }
+
+    #[test]
+    fn uneven_expert_shares_drive_both_memory_and_compute() {
+        for memories in [&[200, 100][..], &[100, 200][..], &[201, 101][..]] {
+            let nodes = byte_nodes(memories);
+            let model = byte_model();
+            let result = plan(
+                &nodes,
+                &matrix(2, |_, _| 0.2),
+                &model,
+                &PlacementParams::default(),
+            )
+            .unwrap();
+            check_tiles(&result, &model, &nodes);
+            assert_eq!(result.stages[0].members[0].experts, 0..2);
+            assert_eq!(result.stages[0].members[1].experts, 2..3);
+            assert!((result.compute_ms - (2.0 / 3.0 + 0.05)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn dense_replication_and_both_boundary_extras_must_fit() {
+        let mut model = byte_model();
+        model.layer_bytes = 400;
+        model.routed_bytes_fraction = 0.75; // 100 dense + 100 per expert
+        model.first_extra_bytes = 7;
+        model.last_extra_bytes = 11;
+        let m = matrix(2, |_, _| 0.2);
+        assert!(
+            plan(
+                &byte_nodes(&[317, 200]),
+                &m,
+                &model,
+                &PlacementParams::default()
+            )
+            .is_err()
+        );
+        let nodes = byte_nodes(&[318, 200]);
+        let result = plan(&nodes, &m, &model, &PlacementParams::default()).unwrap();
+        check_tiles(&result, &model, &nodes);
+        assert!(
+            plan(
+                &byte_nodes(&[318, 199]),
+                &m,
+                &model,
+                &PlacementParams::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn expert_bytes_round_up_and_memory_arithmetic_is_checked() {
+        let mut model = byte_model();
+        model.layer_bytes = 301; // 101 bytes per indivisible equal expert
+        assert!(
+            plan(
+                &byte_nodes(&[201, 101]),
+                &matrix(2, |_, _| 0.2),
+                &model,
+                &PlacementParams::default()
+            )
+            .is_err()
+        );
+        let nodes = byte_nodes(&[202, 101]);
+        assert!(
+            plan(
+                &nodes,
+                &matrix(2, |_, _| 0.2),
+                &model,
+                &PlacementParams::default()
+            )
+            .is_ok()
+        );
+        model.layer_bytes = u64::MAX;
+        model.n_layers = 2;
+        assert_eq!(
+            plan(
+                &nodes,
+                &matrix(2, |_, _| 0.2),
+                &model,
+                &PlacementParams::default()
+            )
+            .unwrap_err(),
+            PlacementError::MemoryOverflow
+        );
+        model.n_layers = 1;
+        model.first_extra_bytes = 1;
+        assert_eq!(model.total_bytes(), None);
+        model.first_extra_bytes = 0;
+        model.routed_bytes_fraction = 0.5;
+        assert_eq!(
+            model.member_layer_bytes(1, true),
+            Some((1u64 << 63) + ((1u64 << 63) - 1).div_ceil(3))
+        );
+        // Aggregate node memory may exceed u64 even when the model does not.
+        let nodes = byte_nodes(&[u64::MAX, u64::MAX]);
+        assert!(
+            plan(
+                &nodes,
+                &matrix(2, |_, _| 0.2),
+                &byte_model(),
+                &PlacementParams::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn unknown_asymmetric_rtt_never_forms_a_measured_link() {
+        let nodes = byte_nodes(&[150, 150]);
+        let mut model = byte_model();
+        model.n_layers = 2;
+        model.layer_bytes = 150;
+        model.experts_per_layer = 0;
+        model.routed_bytes_fraction = 0.0;
+        model.routed_time_fraction = 0.0;
+        for unknown in [f64::NAN, f64::INFINITY] {
+            for m in [
+                vec![vec![0.0, unknown], vec![1.0, 0.0]],
+                vec![vec![0.0, 1.0], vec![unknown, 0.0]],
+            ] {
+                assert_eq!(complete_linkage(&m, &[0, 1], 60.0), vec![vec![0], vec![1]]);
+                assert!(plan(&nodes, &m, &model, &PlacementParams::default()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_numerical_domains_are_rejected_before_search() {
+        let m = matrix(1, |_, _| 0.0);
+        for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for speed in [true, false] {
+                let mut nodes = byte_nodes(&[1000]);
+                if speed {
+                    nodes[0].ms_per_layer = bad;
+                } else {
+                    nodes[0].uplink_mbps = bad;
+                }
+                assert!(matches!(
+                    plan(&nodes, &m, &byte_model(), &PlacementParams::default()),
+                    Err(PlacementError::InvalidInput(_))
+                ));
+            }
+        }
+        for bad in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            for bytes in [true, false] {
+                let mut model = byte_model();
+                if bytes {
+                    model.routed_bytes_fraction = bad;
+                } else {
+                    model.routed_time_fraction = bad;
+                }
+                assert!(
+                    plan(
+                        &byte_nodes(&[1000]),
+                        &m,
+                        &model,
+                        &PlacementParams::default()
+                    )
+                    .is_err()
+                );
+            }
+        }
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut model = byte_model();
+            model.boundary_bytes = bad;
+            assert!(
+                plan(
+                    &byte_nodes(&[1000]),
+                    &m,
+                    &model,
+                    &PlacementParams::default()
+                )
+                .is_err()
+            );
+            for field in 0..4 {
+                let mut p = PlacementParams::default();
+                match field {
+                    0 => p.hop_overhead_ms = bad,
+                    1 => p.cluster_diameter_ms = bad,
+                    2 => p.island_rtt_ms = bad,
+                    _ => p.island_exchange_ms_per_layer = bad,
+                }
+                assert!(plan(&byte_nodes(&[1000]), &m, &byte_model(), &p).is_err());
+            }
+        }
+        assert!(
+            plan(
+                &byte_nodes(&[1000, 1000]),
+                &matrix(2, |_, _| -1.0),
+                &byte_model(),
+                &PlacementParams::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -918,7 +1288,7 @@ mod tests {
         let units: Vec<Unit> = (0..5)
             .map(|i| Unit {
                 members: vec![i],
-                shares: vec![1.0],
+                experts: std::iter::once(0..model.experts_per_layer).collect(),
                 ms_per_layer: speeds[i],
                 uplink_mbps: 100.0,
             })

@@ -18,6 +18,7 @@ on:
     branches: [main]
     paths:
       - 'crates/arc-inference/src/stage_net/**'
+      - 'integrations/arc-stage-eng6/**'
       - 'crates/arc-inference/src/bin/arc_wan_bench.rs'
       - '.github/workflows/stage-net-bench.yml'
 
@@ -46,6 +47,10 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: stage-net-bench
+      - name: Placement and pinned ARC-68 transport regression tests
+        run: |
+          cargo test --locked -p arc-inference --lib stage_net
+          cargo test --locked --manifest-path integrations/arc-stage-eng6/Cargo.toml
       - name: Build
         run: cargo build --release --locked -p arc-inference --bin arc_wan_bench
       - name: Run

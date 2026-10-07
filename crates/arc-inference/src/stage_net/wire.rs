@@ -378,7 +378,8 @@ impl Default for TcpTuning {
     }
 }
 
-fn tune(stream: &TcpStream, tuning: &TcpTuning) -> io::Result<()> {
+/// Apply stage socket tuning to an existing TCP stream (also used by ARC-68 adapters).
+pub fn tune(stream: &TcpStream, tuning: &TcpTuning) -> io::Result<()> {
     stream.set_nodelay(tuning.nodelay)?;
     #[cfg(unix)]
     {

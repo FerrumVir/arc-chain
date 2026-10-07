@@ -30,8 +30,9 @@ pub struct HopCost {
 impl HopCost {
     pub fn serialization_ms(&self) -> f64 {
         match self.uplink_mbps {
-            Some(m) if m > 0.0 => self.bytes * 8.0 / (m * 1e3),
-            _ => 0.0,
+            Some(m) if m.is_finite() && m > 0.0 => self.bytes / m * 0.008,
+            Some(_) => f64::INFINITY,
+            None => 0.0,
         }
     }
 
@@ -72,6 +73,18 @@ mod tests {
             // in its tables (S=4, r=20 → 51.7 ms only matches that).
             bytes: 16_000.0,
         }
+    }
+
+    #[test]
+    fn invalid_uplink_is_not_free_transfer() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut h = hop(10.0);
+            h.uplink_mbps = Some(bad);
+            assert!(h.serialization_ms().is_infinite() && h.serialization_ms().is_sign_positive());
+        }
+        let mut h = hop(10.0);
+        h.uplink_mbps = None;
+        assert!(h.serialization_ms().abs() < f64::EPSILON);
     }
 
     #[test]

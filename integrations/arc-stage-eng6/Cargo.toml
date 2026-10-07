@@ -1,0 +1,12 @@
+[package]
+name = "arc-stage-eng6"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Isolate the pinned, in-review runtime from the production workspace graph.
+[workspace]
+
+[dependencies]
+arc-inference = { path = "../../crates/arc-inference" }
+arc-inference-eng6 = { package = "arc-inference", git = "https://github.com/FerrumVir/arc-chain.git", rev = "60c54bd8d1f72b333fe57de8059e9635cb8ff715" }

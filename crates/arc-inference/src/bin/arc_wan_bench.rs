@@ -822,6 +822,10 @@ fn render_md(
          \"Exact\" = tokens and every per-stage commitment equal a local transport-free reference, and tokens equal across splits.\n",
         args.model, args.jitter_ms, args.uplink_mbps, args.wire_dim, args.prompt, args.gen_tokens
     );
+    let _ = writeln!(
+        md,
+        "Simulator accounting only: the prediction reuses same-run compute/codec medians and the injected RTT/uplink formula. Agreement does not validate real-WAN Kimi performance. Rates use mean latency; pass columns report quantiles.\n"
+    );
     let _ = writeln!(md, "### A. Per-answer speed (1 sequence in flight)\n");
     let _ = writeln!(
         md,
