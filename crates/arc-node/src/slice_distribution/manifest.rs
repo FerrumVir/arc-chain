@@ -153,6 +153,16 @@ pub struct SliceWorker {
     peers: Vec<Url>,
 }
 
+// Also revoke if an embedding caller cancels the run future. The HTTP server
+// may already have connection tasks holding cloned router state.
+struct RevokeOnDrop(SliceConsent);
+
+impl Drop for RevokeOnDrop {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 impl SliceWorker {
     pub fn new(
         assignment: ManifestAssignment,
@@ -219,6 +229,7 @@ impl SliceWorker {
         shutdown: impl Future<Output = ()>,
     ) -> io::Result<()> {
         let mut permit = self.store.0.consent.permit()?;
+        let _revoke_on_cancel = RevokeOnDrop(self.consent());
         let result = permit
             .run(async {
                 let listener = tokio::net::TcpListener::bind(listen).await?;

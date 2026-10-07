@@ -49,3 +49,12 @@ an ENG-10 directory, verifies it again using the upstream assembler, and rejects
 pending profiles and incomplete stage/expert selections before writing output.
 Transport cache-to-package promotion and an authenticated island assignment
 caller remain integration work, not implicit behavior of this worker.
+
+`slice_distribution.max_concurrent_serves` bounds combined verification and
+serving (default 2, allowed 1–64). Every router clone and Range request shares
+the store's limit. Admission has no waiting queue: excess requests receive 503
+before file access. A slot remains held through response completion, error or
+cancellation. Full-file integrity verification is retained on each request;
+inode, length and modification time are not trusted as integrity evidence.
+Downloads remain serialized per store. No island fill-time or throughput
+claim is made; those require representative measurements.

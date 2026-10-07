@@ -336,3 +336,21 @@ async fn foreground_worker_startup_downloads_and_shutdown_revokes() {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     assert!(w.consent().permit().is_err());
 }
+
+#[tokio::test]
+async fn cancelling_worker_run_revokes_router_consent() {
+    let dir = TempDir::new().unwrap();
+    let (source, _, _) = mirror(0).await;
+    let w = worker(&dir, &config(), vec![source.url.clone()], vec![]);
+    let ready = tokio::sync::Notify::new();
+    let mut run = Box::pin(w.run("127.0.0.1:0".parse().unwrap(), async {
+        ready.notify_one();
+        std::future::pending::<()>().await;
+    }));
+    tokio::select! {
+        result = &mut run => panic!("worker unexpectedly exited: {result:?}"),
+        _ = ready.notified() => {},
+    }
+    drop(run);
+    assert!(w.consent().permit().is_err());
+}

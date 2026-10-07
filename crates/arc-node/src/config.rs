@@ -329,6 +329,9 @@ pub struct SliceDistributionConfig {
     pub download_bytes_per_second: u64,
     pub upload_bytes_per_second: u64,
     pub max_slice_bytes: u64,
+    /// Shared verification + response-body slots. Excess requests get 503,
+    /// with no waiting queue. Must be between 1 and 64.
+    pub max_concurrent_serves: usize,
 }
 
 impl Default for SliceDistributionConfig {
@@ -338,6 +341,7 @@ impl Default for SliceDistributionConfig {
             download_bytes_per_second: 8 * 1024 * 1024,
             upload_bytes_per_second: 1024 * 1024,
             max_slice_bytes: 64 * 1024 * 1024 * 1024,
+            max_concurrent_serves: 2,
         }
     }
 }

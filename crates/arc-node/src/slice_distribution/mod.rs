@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Semaphore, watch};
 use tokio::time::{Instant, sleep_until, timeout};
 
 const BLOCK: usize = 64 * 1024;
@@ -167,6 +167,7 @@ struct Inner {
     download: Bandwidth,
     upload: Bandwidth,
     downloading: Mutex<()>,
+    serving: Arc<Semaphore>,
     client: Client,
 }
 
@@ -181,6 +182,9 @@ impl SliceStore {
         assigned: Vec<SliceSpec>,
         config: &SliceDistributionConfig,
     ) -> io::Result<Self> {
+        if !(1..=64).contains(&config.max_concurrent_serves) {
+            return Err(invalid("max_concurrent_serves must be between 1 and 64"));
+        }
         let mut pins = BTreeMap::new();
         for spec in assigned {
             if spec.bytes == 0 || spec.bytes > config.max_slice_bytes {
@@ -206,6 +210,7 @@ impl SliceStore {
             download: Bandwidth::new(config.download_bytes_per_second),
             upload: Bandwidth::new(config.upload_bytes_per_second),
             downloading: Mutex::new(()),
+            serving: Arc::new(Semaphore::new(config.max_concurrent_serves)),
             client,
         })))
     }
@@ -493,15 +498,6 @@ async fn serve(
         .enabled()
         .map_err(|_| StatusCode::FORBIDDEN)?;
     let spec = store.spec(&key).map_err(|_| StatusCode::NOT_FOUND)?;
-    let mut file = regular(&store.0.root.join(&key), false)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-    if !verify(&mut file, spec, &mut permit)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?
-    {
-        return Err(StatusCode::NOT_FOUND);
-    }
     let start = match headers.get(header::RANGE) {
         None => 0,
         Some(value) => value
@@ -513,6 +509,26 @@ async fn serve(
             .filter(|v| *v < spec.bytes)
             .ok_or(StatusCode::RANGE_NOT_SATISFIABLE)?,
     };
+    // No admission queue: an untrusted peer cannot create arbitrarily many
+    // pending disk/hash jobs. Router clones and Range requests share this cap.
+    // The owned guard moves into the response body, releasing on EOF, error,
+    // request cancellation or body drop, not merely when headers are returned.
+    let admission = store
+        .0
+        .serving
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut file = regular(&store.0.root.join(&key), false)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    // Retain full verification: metadata is not a safe integrity cache key.
+    if !verify(&mut file, spec, &mut permit)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
     file.seek(io::SeekFrom::Start(start))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -534,8 +550,8 @@ async fn serve(
         );
     }
     let body = stream::try_unfold(
-        (file, remaining, store, permit),
-        |(mut file, remaining, store, mut permit)| async move {
+        (file, remaining, store, permit, admission),
+        |(mut file, remaining, store, mut permit, admission)| async move {
             if remaining == 0 {
                 return Ok::<_, io::Error>(None);
             }
@@ -544,7 +560,7 @@ async fn serve(
             permit.run(file.read_exact(&mut bytes)).await?;
             permit.check()?;
             let remaining = remaining - bytes.len() as u64;
-            Ok(Some((bytes, (file, remaining, store, permit))))
+            Ok(Some((bytes, (file, remaining, store, permit, admission))))
         },
     );
     response

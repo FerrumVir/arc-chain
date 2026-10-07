@@ -3,6 +3,7 @@ use axum::{Router, body::Body, response::Response, routing::get};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tower::ServiceExt;
 
 struct Server {
     url: Url,
@@ -68,6 +69,136 @@ async fn mirror(data: Vec<u8>) -> (Server, Arc<AtomicUsize>) {
     })))
     .await;
     (server, hits)
+}
+
+fn request(spec: &SliceSpec, range: bool) -> axum::http::Request<Body> {
+    let mut request = axum::http::Request::builder().uri(format!("/slices/{}", spec.digest.key()));
+    if range {
+        request = request.header(header::RANGE, "bytes=1-");
+    }
+    request.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn concurrent_get_and_range_requests_have_bounded_admission_through_body_drop() {
+    for range in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let spec = pin(b"bounded serving");
+        let node = store(&dir, &spec, &config());
+        seed(&node, &spec, b"bounded serving").await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let (router, barrier, spec) = (node.router(), barrier.clone(), spec.clone());
+            tasks.spawn(async move {
+                barrier.wait().await;
+                router.oneshot(request(&spec, range)).await.unwrap()
+            });
+        }
+        // Keep admitted bodies alive and unpolled: returning headers must not
+        // free verification/serving slots for another expensive request.
+        let mut admitted = Vec::new();
+        let mut rejected = 0;
+        while let Some(response) = tasks.join_next().await {
+            let response = response.unwrap();
+            if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                rejected += 1;
+            } else {
+                assert_eq!(
+                    response.status(),
+                    if range {
+                        StatusCode::PARTIAL_CONTENT
+                    } else {
+                        StatusCode::OK
+                    }
+                );
+                admitted.push(response);
+            }
+        }
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(rejected, 14);
+        assert_eq!(node.0.serving.available_permits(), 0);
+        drop(admitted.pop());
+        assert_eq!(node.0.serving.available_permits(), 1);
+        let replacement = node.router().oneshot(request(&spec, !range)).await.unwrap();
+        assert!(replacement.status().is_success());
+        assert_eq!(node.0.serving.available_permits(), 0);
+        axum::body::to_bytes(replacement.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(node.0.serving.available_permits(), 1);
+        drop(admitted);
+        assert_eq!(node.0.serving.available_permits(), 2);
+    }
+}
+
+#[tokio::test]
+async fn serving_slots_release_on_handler_cancel_body_cancel_revocation_and_integrity_errors() {
+    let dir = TempDir::new().unwrap();
+    let data = vec![7; BLOCK * 2];
+    let spec = pin(&data);
+    let mut cfg = config();
+    cfg.max_concurrent_serves = 1;
+    cfg.upload_bytes_per_second = 1;
+    let node = store(&dir, &spec, &cfg);
+    seed(&node, &spec, &data).await;
+
+    let mut handler = Box::pin(node.router().oneshot(request(&spec, true)));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(handler.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    assert_eq!(node.0.serving.available_permits(), 0);
+    drop(handler);
+    assert_eq!(node.0.serving.available_permits(), 1);
+
+    for revoke in [false, true] {
+        let response = node.router().oneshot(request(&spec, true)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let mut body = Box::pin(axum::body::to_bytes(response.into_body(), data.len()));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(body.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(node.0.serving.available_permits(), 0);
+        if revoke {
+            node.consent().set(false);
+            assert!(body.await.is_err());
+            node.consent().set(true);
+        } else {
+            drop(body);
+        }
+        assert_eq!(node.0.serving.available_permits(), 1);
+    }
+
+    // Preserve length and modification time while changing content. Neither
+    // full GET nor Range may trust previously verified metadata.
+    let path = node.0.root.join(spec.digest.key());
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, vec![8; data.len()]).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    for range in [false, true] {
+        assert_eq!(
+            node.router()
+                .oneshot(request(&spec, range))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(node.0.serving.available_permits(), 1);
+    }
+    for limit in [0, 65, usize::MAX] {
+        cfg.max_concurrent_serves = limit;
+        assert!(SliceStore::new(dir.path().join("unused"), vec![spec.clone()], &cfg).is_err());
+    }
 }
 
 #[tokio::test]
