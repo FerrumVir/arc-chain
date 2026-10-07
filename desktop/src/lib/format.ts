@@ -1,3 +1,5 @@
+import type { ModelDownloadProgress } from "./types";
+
 export function formatArc(n: number, digits = 2): string {
   return n.toLocaleString("en-US", {
     minimumFractionDigits: digits,
@@ -60,4 +62,35 @@ export function formatTps(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return n.toString();
+}
+
+/**
+ * One line describing a model download, for every stage the backend reports:
+ * connecting (or resuming), downloading, retrying after a dropped connection,
+ * verifying the pinned SHA-256, and done. Saved bytes are never discarded on a
+ * retry, so the copy says so instead of implying the download restarted.
+ */
+export function modelDownloadStatus(progress: ModelDownloadProgress): string {
+  const total = progress.totalBytes;
+  const saved = progress.downloadedBytes;
+  const percent = total > 0 ? Math.floor((saved / total) * 100) : 0;
+  const amount = `${formatBytes(saved)} of ${formatBytes(total)} (${percent}%)`;
+  const resumedFrom = progress.resumedFromBytes ?? 0;
+  switch (progress.stage) {
+    case "connecting":
+      return resumedFrom > 0
+        ? `Resuming from ${formatBytes(resumedFrom)} of ${formatBytes(total)}…`
+        : "Connecting to the model mirror…";
+    case "retrying": {
+      const wait = Math.max(1, progress.retryInSecs ?? 1);
+      const reason = progress.message ? ` (${progress.message})` : "";
+      return `Connection interrupted at ${amount}${reason}. Retrying in ${wait} s; the downloaded part is kept.`;
+    }
+    case "verifying":
+      return `Verifying all ${formatBytes(total)} against the pinned SHA-256…`;
+    case "done":
+      return `Downloaded and verified ${formatBytes(total)}.`;
+    default:
+      return resumedFrom > 0 ? `${amount} · resumed` : amount;
+  }
 }

@@ -545,7 +545,7 @@ pub struct ModelTierInfo {
 /// Streamed progress event for an in-flight model download. Frontend listens
 /// on the `model-download-progress` Tauri channel and renders a progress bar
 /// from `downloaded_bytes / total_bytes`. `done = true` is the terminal event
-/// (file fully written + atomically renamed into place).
+/// (file fully written, SHA-256 verified, and atomically renamed into place).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDownloadProgress {
@@ -553,6 +553,22 @@ pub struct ModelDownloadProgress {
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub done: bool,
+    /// `connecting`, `downloading`, `retrying`, `verifying`, or `done`.
+    #[serde(default)]
+    pub stage: String,
+    /// Bytes already saved by an earlier attempt (or an earlier app run) when
+    /// the current attempt started; 0 for a fresh download.
+    #[serde(default)]
+    pub resumed_from_bytes: u64,
+    /// 1-based attempt number within this download.
+    #[serde(default)]
+    pub attempt: u32,
+    /// Seconds until the next attempt while `stage` is `retrying`.
+    #[serde(default)]
+    pub retry_in_secs: Option<u64>,
+    /// Why the previous attempt stopped, while `stage` is `retrying`.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Result of `reset_peer_state` — wipes `<data_dir>/known_peers.json`
