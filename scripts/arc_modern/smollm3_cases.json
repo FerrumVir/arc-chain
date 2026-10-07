@@ -1,0 +1,11 @@
+{
+  "schema": "arc.modern-cases.v1",
+  "note": "Golden prompts for SmolLM3-3B. Text cases are rendered with the pinned chat template (single user turn, /no_think, fixed date) and tokenised by the CLI; the run records the prompt token ids.",
+  "cases": [
+    {"id": "capital", "user": "What is the capital of France? Answer in one sentence.", "today": "06 October 2026", "thinking": false, "max_tokens": 24, "eos": [128012], "selection": "rp64-argmax"},
+    {"id": "haiku", "user": "Write a haiku about computers that always agree.", "today": "06 October 2026", "thinking": false, "max_tokens": 24, "eos": [128012], "selection": "rp64-argmax"},
+    {"id": "integers", "user": "In one sentence, why is integer arithmetic reproducible across different computers?", "today": "06 October 2026", "thinking": false, "max_tokens": 24, "eos": [128012], "selection": "rp64-argmax"},
+    {"id": "primes", "user": "List three prime numbers greater than 100.", "today": "06 October 2026", "thinking": false, "max_tokens": 24, "eos": [128012], "selection": "rp64-argmax"},
+    {"id": "product-greedy", "user": "What is 17 times 23?", "today": "06 October 2026", "thinking": false, "max_tokens": 16, "eos": [128012], "selection": "argmax"}
+  ]
+}
