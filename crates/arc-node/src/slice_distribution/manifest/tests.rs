@@ -8,6 +8,13 @@ use tempfile::TempDir;
 const MANIFEST: &[u8] = include_bytes!("../../../tests/fixtures/eng10-tiny/manifest.json");
 const PIN: &str = include_str!("../../../tests/fixtures/eng10-tiny/trusted-manifest-blake3.txt");
 const NAME: &str = "layer.1.experts.0";
+const STAGE_NAMES: &[&str] = &[
+    "layer.1.core",
+    NAME,
+    "layer.1.experts.1",
+    "layer.1.experts.2",
+    "layer.1.experts.3",
+];
 
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/eng10-tiny")
@@ -42,6 +49,155 @@ fn worker(
         peers,
     )
     .unwrap()
+}
+
+async fn downloaded_stage(dir: &TempDir) -> SliceWorker {
+    let source = server(Router::new().route(
+        "/{file}",
+        get(|UrlPath(file): UrlPath<String>| async move {
+            let selected = assignment(STAGE_NAMES);
+            assert!(
+                selected
+                    .selected
+                    .values()
+                    .any(|r| file == format!("{}.slice", r.blake3))
+            );
+            fs::read(fixture().join(file)).await.unwrap()
+        }),
+    ))
+    .await;
+    let worker = SliceWorker::new(
+        assignment(STAGE_NAMES),
+        dir.path().join("cache"),
+        &config(),
+        vec![source.url.clone()],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(worker.download_selected().await.unwrap().len(), 5);
+    worker
+}
+
+#[tokio::test]
+async fn downloaded_cache_promotes_and_assembles_without_source_files() {
+    let dir = TempDir::new().unwrap();
+    let worker = downloaded_stage(&dir).await; // Mirror is stopped on return.
+    let stage = StageSpec {
+        first_layer: 1,
+        end_layer: 2,
+    };
+    let output = dir.path().join("downloaded.arcspkg");
+    let report = worker.assemble_cached_stage(stage, &output).unwrap();
+    assert!(output.is_file());
+    // Compare the result with the independently prepared fixture, but the
+    // promotion above receives only the transport cache, never this directory.
+    let expected = dir.path().join("expected.arcspkg");
+    let expected_report = assignment(STAGE_NAMES)
+        .assemble_stage(&fixture(), stage, &expected)
+        .unwrap();
+    assert_eq!(report, expected_report);
+    assert_eq!(
+        fs::read(&output).await.unwrap(),
+        fs::read(&expected).await.unwrap()
+    );
+    let saved = fs::read(&output).await.unwrap();
+    assert!(worker.assemble_cached_stage(stage, &output).is_err());
+    assert_eq!(fs::read(&output).await.unwrap(), saved);
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".arc-slice-assembly-")
+    }));
+}
+
+#[tokio::test]
+async fn cache_promotion_never_publishes_corrupt_partial_pending_or_failed_assembly() {
+    let dir = TempDir::new().unwrap();
+    let worker = downloaded_stage(&dir).await;
+    let stage = StageSpec {
+        first_layer: 1,
+        end_layer: 2,
+    };
+    let output = dir.path().join("must-not-exist.arcspkg");
+    let record = worker.assignment.record(NAME).unwrap();
+    let cache = worker
+        .store
+        .0
+        .root
+        .join(format!("blake3-{}", record.blake3));
+    let bytes = fs::read(&cache).await.unwrap();
+    for data in [vec![0; bytes.len()], bytes[..bytes.len() / 2].to_vec()] {
+        fs::write(&cache, data).await.unwrap();
+        assert!(worker.assemble_cached_stage(stage, &output).is_err());
+        assert!(!output.exists());
+    }
+    fs::rename(&cache, cache.with_extension("part"))
+        .await
+        .unwrap();
+    assert!(worker.assemble_cached_stage(stage, &output).is_err());
+    assert!(!output.exists());
+    fs::write(&cache, &bytes).await.unwrap();
+
+    let mut broken: serde_json::Value = serde_json::from_slice(MANIFEST).unwrap();
+    let segment = broken["segments"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["name"] == "layer.1")
+        .unwrap();
+    segment["blake3"] = "00".repeat(32).into();
+    let pin = arc_inference::model_package::manifest_body_blake3(&broken).unwrap();
+    broken["manifest_blake3"] = pin.clone().into();
+    let a = ManifestAssignment::parse(
+        &serde_json::to_vec(&broken).unwrap(),
+        &pin,
+        &STAGE_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let bad = SliceWorker::new(a, worker.store.0.root.clone(), &config(), vec![], vec![]).unwrap();
+    assert!(bad.assemble_cached_stage(stage, &output).is_err());
+    assert!(!output.exists()); // Even a failure after StageWriter creation.
+
+    let partial = SliceWorker::new(
+        assignment(&[NAME]),
+        worker.store.0.root.clone(),
+        &config(),
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    assert!(partial.assemble_cached_stage(stage, &output).is_err());
+    let pending = ManifestAssignment::parse(
+        include_bytes!("../../../tests/fixtures/eng10-tiny/pending-yarn-manifest.json"),
+        include_str!("../../../tests/fixtures/eng10-tiny/trusted-yarn-manifest-blake3.txt").trim(),
+        &STAGE_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let pending = SliceWorker::new(
+        pending,
+        worker.store.0.root.clone(),
+        &config(),
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    assert!(pending.assemble_cached_stage(stage, &output).is_err());
+    worker.consent().set(false);
+    assert!(worker.assemble_cached_stage(stage, &output).is_err());
+    assert!(!output.exists());
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".arc-slice-assembly-")
+    }));
 }
 struct Server {
     url: Url,

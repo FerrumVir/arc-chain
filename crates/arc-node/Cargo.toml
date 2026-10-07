@@ -97,13 +97,13 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 thiserror.workspace = true
 toml.workspace = true
 zeroize.workspace = true
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 rand = "0.8"
-tempfile = "3"
 
 [lints]
 workspace = true

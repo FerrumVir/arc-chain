@@ -7,6 +7,14 @@ the pending YaRN manifest is included without a second copy of the slices.
 The two `trusted-*-blake3.txt` files are independently fixed test trust inputs,
 not values that production callers should read from an untrusted manifest.
 
+**Executable consent is stop/restart only.** Revoke the running local worker
+by stopping its process (Ctrl-C/SIGINT gracefully closes transfers and the
+listener). Save `host_slices = false` to refuse its next startup. Editing that
+setting alone does not stop a running worker: there is **no live consent toggle,
+config watcher, RPC or desktop control**. Library consent handles are not
+controls exposed by the executable. On Unix, SIGTERM uses the OS default
+termination behavior; interrupted `.part` files remain untrusted resume state.
+
 From the repository root, with Python NumPy and BLAKE3 installed:
 
 ```sh
@@ -30,6 +38,7 @@ Run the targeted integration path:
 
 ```sh
 cargo test --locked -p arc-node --lib slice_distribution
+cargo test --locked -p arc-node --test slice_worker_cli
 ```
 
 The explicit local entry point is `arc-node slice-worker --node-config FILE
@@ -37,18 +46,39 @@ The explicit local entry point is `arc-node slice-worker --node-config FILE
 --mirror DIRECTORY_URL --listen 127.0.0.1:PORT`. Repeat `--slice`, `--mirror`,
 and `--peer` as needed. Node TOML must contain `[slice_distribution]` with
 `host_slices = true`; download/upload byte limits also come from this section.
-Omitting consent denies transfers and listener startup. Ctrl-C revokes the
-worker's consent and exits. Config changes take effect on restart; embedding
-callers can revoke the exposed consent handle immediately.
+Omitting consent denies transfers and listener startup. The CLI tests exercise
+the actual binary's startup, offline assembly and (on Unix) SIGINT shutdown,
+interrupted GET/Range bodies, closed port and disabled-consent restart.
 
 The operator explicitly supplies selection and sources. No ARC-68/69/71
 network assignment protocol is assumed, and this entry point never enables
 inference. Peer keys and verified cache objects use `blake3-<hex>`; the mirror
-adapter maps the pinned record to ENG-10 `<hex>.slice`. Offline assembly accepts
-an ENG-10 directory, verifies it again using the upstream assembler, and rejects
-pending profiles and incomplete stage/expert selections before writing output.
-Transport cache-to-package promotion and an authenticated island assignment
-caller remain integration work, not implicit behavior of this worker.
+adapter maps the pinned record to ENG-10 `<hex>.slice`.
+
+After downloading, explicitly promote a complete stage using the same trusted
+manifest and exact selected names:
+
+```sh
+arc-node slice-assemble --node-config node.toml --manifest manifest.json \
+  --manifest-blake3 TRUSTED_DIGEST --cache cache --stage 1:2 \
+  --slice layer.1.core --slice layer.1.experts.0 --slice layer.1.experts.1 \
+  --slice layer.1.experts.2 --slice layer.1.experts.3 --output stage.arcspkg
+```
+
+This offline command uses `SliceWorker::assemble_cached_stage`: it re-hashes
+and copies cached `blake3-<hex>` objects into a private temporary directory as
+`<hex>.slice`, runs the upstream assembler, and publishes the package only after
+all checks succeed. It does not hard-link mutable cache files or overwrite an
+existing output. The output's parent directory must exist. Corrupt/partial
+objects, pending profiles and incomplete stage/expert selections cannot publish
+an output package. A failure after the upstream writer starts also leaves no
+published package. Temporary copies are removed on ordinary return/error;
+abrupt process termination can leave private temporary directories, never a
+published partial output. Promotion requires temporary disk space for selected
+slices plus the package and runs synchronously as an explicit offline action.
+The command neither downloads nor activates inference. Authenticated island
+assignment, automatic peer discovery and inference activation remain separate
+integration work.
 
 `slice_distribution.max_concurrent_serves` bounds combined verification and
 serving (default 2, allowed 1–64). Every router clone and Range request shares

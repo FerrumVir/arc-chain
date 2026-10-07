@@ -188,6 +188,55 @@ impl SliceWorker {
         self.store.router()
     }
 
+    /// Explicit, synchronous offline promotion. Copies and re-hashes selected
+    /// cache objects into a private ENG-10 directory; never hard-links mutable
+    /// cache files. Only a successfully assembled package is published, using
+    /// create-only persistence. The output's parent must already exist.
+    pub fn assemble_cached_stage(
+        &self,
+        stage: StageSpec,
+        output: &Path,
+    ) -> io::Result<serde_json::Value> {
+        let permit = self.consent().permit()?;
+        self.assignment.validate_stage(stage)?;
+        if std::fs::symlink_metadata(&self.store.0.root)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(invalid("slice cache must not be a symlink"));
+        }
+        let parent = output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let staging = tempfile::Builder::new()
+            .prefix(".arc-slice-assembly-")
+            .tempdir_in(parent)?;
+        let mut copied = BTreeSet::new();
+        for record in self.assignment.selected.values() {
+            permit.check()?;
+            if !copied.insert(&record.blake3) {
+                continue;
+            }
+            copy_verified_cache(
+                &self.store.0.root.join(format!("blake3-{}", record.blake3)),
+                &record.path(staging.path()),
+                record,
+                &permit,
+            )?;
+        }
+        let package = tempfile::NamedTempFile::new_in(staging.path())?;
+        let report = self
+            .assignment
+            .assemble_stage(staging.path(), stage, package.path())?;
+        package.as_file().sync_all()?;
+        permit.check()?;
+        // No partial/corrupt package or failed assembler output reaches this
+        // name. Existing files and symlinks are never overwritten.
+        package.persist_noclobber(output).map_err(|e| e.error)?;
+        Ok(report)
+    }
+
     /// Return verified cache paths, not assembled models. Mirrors are directory
     /// URLs; peers expose the algorithm-qualified transport endpoint.
     pub async fn download_selected(&self) -> io::Result<Vec<PathBuf>> {
@@ -247,6 +296,59 @@ impl SliceWorker {
         self.consent().set(false);
         result
     }
+}
+
+fn copy_verified_cache(
+    source: &Path,
+    destination: &Path,
+    record: &SliceRecord,
+    permit: &Permit,
+) -> io::Result<()> {
+    use std::io::{Read, Write};
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let mut source = options.open(source)?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != record.bytes {
+        return Err(invalid("cache object is not a complete regular slice"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(invalid("cache object has multiple links"));
+        }
+    }
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut hash = blake3::Hasher::new();
+    let mut buffer = vec![0; BLOCK];
+    let mut remaining = record.bytes;
+    while remaining != 0 {
+        permit.check()?;
+        let count = remaining.min(BLOCK as u64) as usize;
+        source.read_exact(&mut buffer[..count])?;
+        hash.update(&buffer[..count]);
+        destination.write_all(&buffer[..count])?;
+        remaining -= count as u64;
+    }
+    if source.read(&mut [0])? != 0 || hash.finalize().as_bytes() != &decode_digest(&record.blake3)?
+    {
+        return Err(invalid("cache object failed full BLAKE3 verification"));
+    }
+    permit.check()
 }
 
 #[cfg(test)]
