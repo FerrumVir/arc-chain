@@ -418,6 +418,27 @@ fn matches_reference(done: &[Completion], reference: &[MlaGeneration]) -> bool {
         })
 }
 
+/// Aggregate decode rate while every sequence of the run is decoding at
+/// once: tokens that came back between the last sequence's first token and
+/// the first sequence's last token, over that window. It leaves out prefill
+/// and the pipeline's fill and drain, which the wall-clock aggregate keeps.
+fn steady_aggregate(done: &[Completion]) -> Option<f64> {
+    let start = done.iter().map(|c| c.first_token_at).fold(0.0, f64::max);
+    let end = done
+        .iter()
+        .map(|c| c.finished_at)
+        .fold(f64::INFINITY, f64::min);
+    if done.is_empty() || end <= start {
+        return None;
+    }
+    let tokens = done
+        .iter()
+        .flat_map(|c| &c.token_times)
+        .filter(|&&t| t > start && t <= end)
+        .count();
+    (tokens > 0).then(|| tokens as f64 / (end - start))
+}
+
 fn answer_rates(done: &[Completion]) -> (f64, f64) {
     let rates: Vec<f64> = done
         .iter()
@@ -651,7 +672,8 @@ fn cmd_bench(args: &Args) -> Result<(), ModernError> {
         let depths: Vec<usize> = args.list("--wan-depths", "1,4,16")?;
         let jitter_frac = args.float("--wan-jitter-frac", 0.1)?;
         let wire_bytes = args.number("--wan-wire-bytes", 7168 * 4)?;
-        let wan_tokens = args.number("--wan-max-tokens", 6)?;
+        // Long enough answers that the steady window dominates each run.
+        let wan_tokens = args.number("--wan-max-tokens", 32)?;
         let wan_prompt = args.number("--wan-prompt-len", 2)?;
         let max_b = wan_stages.iter().max().copied().unwrap_or(1)
             * depths.iter().max().copied().unwrap_or(1);
@@ -703,6 +725,7 @@ fn cmd_bench(args: &Args) -> Result<(), ModernError> {
                             ));
                         }
                         let (mean, median) = answer_rates(&done);
+                        let steady = steady_aggregate(&done);
                         let row = json!({
                             "stages": stages,
                             "one_way_ms": ms,
@@ -717,6 +740,11 @@ fn cmd_bench(args: &Args) -> Result<(), ModernError> {
                             "aggregate_tok_s": stats.generated_tokens as f64 / stats.seconds,
                             "per_answer_decode_tok_s_mean": mean,
                             "per_answer_decode_tok_s_median": median,
+                            "aggregate_steady_tok_s": steady,
+                            // The last stage returns commitments only: what a
+                            // position's commitments weigh by the last hop.
+                            "last_hop_bytes_per_position": stats.bytes_received as f64
+                                / stats.forwarded_positions.max(1) as f64,
                             "bit_exact_vs_single_process": exact,
                             "wan_timer_mode": timer,
                         });

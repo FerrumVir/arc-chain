@@ -70,7 +70,11 @@ partial sums add up exactly in any grouping.
 
 For every position, stage `[a, b)` commits `b − a + 1` hashes: the activation
 hash (`BLAKE3` of the Q16 values as LE `i64`, spec §6.2) of its input boundary,
-then of each layer's output. The coordinator's `Ledger` per sequence:
+then of each layer's output. The last stage (the one with the LM head) also
+commits every position's logits hash and the token it selected at each item's
+last position. The coordinator takes the generated token and the logits hashes
+from that commitment, so the token the run continues with is always one the
+last stage committed to. The coordinator's `Ledger` per sequence:
 
 * **Link check.** Stage `s+1`'s input hash is computed from the bytes it
   received; it must equal stage `s`'s committed output hash. A stage that sends
@@ -78,17 +82,32 @@ then of each layer's output. The coordinator's `Ledger` per sequence:
 * **Split invariance.** `Ledger::boundary_digests()` (per boundary, BLAKE3 over
   the positions' hashes) equals `generate`'s `boundary_digests` for every split.
 * **Stage record.** `Ledger::stage_root(seq, a, b)`: BLAKE3 over a domain tag,
-  the sequence, the range and every committed hash; the 32 bytes a stage would
-  sign and post per epoch (signing is not part of this change).
+  the sequence, the range and every committed hash (and, for the last stage,
+  every logits hash and selected token); the 32 bytes a stage would sign and
+  post per epoch (signing is not part of this change).
 
 **Audit** (`commit::audit_stage`). A verifier holding only layers `[a, b)`
-re-executes the stage from the inputs the stage reveals (its activation log)
-and compares every committed hash. Exact arithmetic makes the verdict decisive:
-`Valid`, `InputMismatch{position}` (the reveal does not hash to the committed
-input), or `Fault{position, boundary}` (the first boundary that differs). A
-stage that alters an output and commits the altered hash keeps every link
-consistent, and the audit blames exactly that stage at that position, with no
-thresholds (tests on threads and processes).
+re-executes the stage from the inputs the stage reveals (its activation log,
+token ids and selection rule) and compares every committed hash. For the last
+stage it also recomputes every logits hash and re-applies the selection rule to
+every committed token (research-6 §4.2.2: the output tokens must equal the
+selection rule applied to the logits). Exact arithmetic makes the verdict
+decisive, with no thresholds:
+
+* `Valid`;
+* `InputMismatch{position}`: the reveal does not hash to the committed input;
+* `Fault{position, boundary}`: the first boundary that differs;
+* `LogitsMismatch{position}`: the last stage's logits hash differs;
+* `WrongToken{position, committed, expected}`: the last stage emitted a token
+  its selection rule does not give for these logits;
+* `ForwardMismatch{position}`: the committed token is not the token fed at the
+  next position (it was altered on its way back to the ring).
+
+Tests, on threads and on separate processes: a stage that alters an output and
+commits the altered hash keeps every link consistent and is blamed at that
+position and boundary; a last stage that emits a wrong token (every hash
+honest) is blamed with `WrongToken` at that position; an altered reveal gives
+`InputMismatch`; a lying commitment breaks the link check.
 
 ## Recovery
 
@@ -98,13 +117,15 @@ hashes) and every close. A restarted stage replays the log to rebuild each open
 sequence's KV cache, checks that replay reproduces every hash it committed
 before the crash (else it refuses to start), drops a torn last record, and
 listens on the same address; the upstream stage notices the dead connection
-before sending and reconnects. Test: a stage process killed with SIGKILL in the
-middle of generation, restarted, and the run finishes byte-identically (stage 0,
-a middle stage and the last stage each tried).
+before sending and reconnects. Test: a stage process killed with SIGKILL
+between two decode steps of a generation (no frame in flight), restarted, and
+the run finishes byte-identically (stage 0, a middle stage and the last stage
+each tried).
 
-Limit: the restart happens at a quiescent point (no frame in flight). A crash
-with frames in flight needs the coordinator to resend them and stages to treat a
-repeated position as idempotent; not built yet.
+Limit: recovery covers a crash **between steps** only. A crash with a frame in
+flight loses that frame: the coordinator does not resend it and times out
+(300 s). In-flight recovery needs the coordinator to resend and stages to treat
+a repeated position as idempotent; not built yet.
 
 ## Running it
 

@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use super::wire::{Revealed, StageCommit};
 use crate::modern::ModernError;
+use crate::modern::arith;
 use crate::modern::mla::model::{StageInput, StageModel};
 
 /// Domain of a stage record root.
@@ -33,14 +34,26 @@ pub struct LinkFault {
     pub downstream: (u32, u32),
 }
 
+/// What one stage committed for one position.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PositionCommit {
+    /// Activation hashes at the stage's boundaries, input first.
+    pub hashes: Vec<[u8; 32]>,
+    /// The logits hash (the last stage only).
+    pub logits: Option<[u8; 32]>,
+    /// The token selected from these logits (the last stage, at positions
+    /// where a token was emitted).
+    pub selected: Option<u32>,
+}
+
 /// Everything committed for one sequence, by every stage.
 #[derive(Debug, Clone)]
 pub struct Ledger {
     n_layers: usize,
     /// Per position: the hash at every boundary `0 ..= L` once known.
     traces: Vec<Vec<Option<[u8; 32]>>>,
-    /// Per stage range: per position, the hashes that stage committed.
-    stages: BTreeMap<(u32, u32), Vec<Vec<[u8; 32]>>>,
+    /// Per stage range: per position, what that stage committed.
+    stages: BTreeMap<(u32, u32), Vec<PositionCommit>>,
     /// Link checks that failed.
     pub link_faults: Vec<LinkFault>,
     /// Shape violations (a stage committed the wrong number of hashes).
@@ -68,23 +81,41 @@ impl Ledger {
         let mut upstream: Option<(u32, u32)> = None;
         for commit in commits {
             let range = (commit.first_layer, commit.end_layer);
-            if commit.end_layer as usize > self.n_layers || commit.positions() != positions {
+            let head = commit.end_layer as usize == self.n_layers;
+            let head_shape = if head {
+                commit.logits.len() == positions
+            } else {
+                commit.logits.is_empty() && commit.selected.is_none()
+            };
+            if commit.end_layer as usize > self.n_layers
+                || commit.positions() != positions
+                || !head_shape
+            {
                 self.malformed.push(format!(
-                    "stage [{}, {}) committed {} hashes for {positions} positions",
+                    "stage [{}, {}) committed {} hashes and {} logits for {positions} positions",
                     range.0,
                     range.1,
-                    commit.hashes.len()
+                    commit.hashes.len(),
+                    commit.logits.len()
                 ));
                 continue;
             }
             let per_stage = self.stages.entry(range).or_default();
             if per_stage.len() < start + positions {
-                per_stage.resize(start + positions, Vec::new());
+                per_stage.resize(start + positions, PositionCommit::default());
             }
             for i in 0..positions {
                 let p = start + i;
                 let hashes = commit.position(i);
-                per_stage[p] = hashes.to_vec();
+                per_stage[p] = PositionCommit {
+                    hashes: hashes.to_vec(),
+                    logits: commit.logits.get(i).copied(),
+                    selected: if i + 1 == positions {
+                        commit.selected
+                    } else {
+                        None
+                    },
+                };
                 for (k, hash) in hashes.iter().enumerate() {
                     let boundary = commit.first_layer as usize + k;
                     let slot = &mut self.traces[p][boundary];
@@ -138,8 +169,8 @@ impl Ledger {
         )
     }
 
-    /// The hashes stage `[a, b)` committed, per position.
-    pub fn stage_commits(&self, first_layer: u32, end_layer: u32) -> Option<&[Vec<[u8; 32]>]> {
+    /// What stage `[a, b)` committed, per position.
+    pub fn stage_commits(&self, first_layer: u32, end_layer: u32) -> Option<&[PositionCommit]> {
         self.stages
             .get(&(first_layer, end_layer))
             .map(Vec::as_slice)
@@ -152,7 +183,8 @@ impl Ledger {
 
     /// The root a stage would sign for this sequence (research-6 §4.2):
     /// BLAKE3 over the domain, the sequence id, the range, then every
-    /// position's committed hashes in order.
+    /// position's committed hashes in order (with, for the last stage, the
+    /// logits hash and the selected token, if any).
     pub fn stage_root(&self, seq: u64, first_layer: u32, end_layer: u32) -> Option<[u8; 32]> {
         let commits = self.stage_commits(first_layer, end_layer)?;
         let mut h = blake3::Hasher::new();
@@ -161,8 +193,20 @@ impl Ledger {
         h.update(&first_layer.to_le_bytes());
         h.update(&end_layer.to_le_bytes());
         for position in commits {
-            for hash in position {
+            for hash in &position.hashes {
                 h.update(hash);
+            }
+            if let Some(logits) = &position.logits {
+                h.update(logits);
+            }
+            match position.selected {
+                Some(t) => {
+                    h.update(&[1]);
+                    h.update(&t.to_le_bytes());
+                }
+                None => {
+                    h.update(&[0]);
+                }
             }
         }
         Some(*h.finalize().as_bytes())
@@ -180,6 +224,18 @@ pub enum Verdict {
     /// The stage's committed hash at `boundary` differs from re-execution:
     /// the first faulty boundary of the first faulty position.
     Fault { position: usize, boundary: usize },
+    /// The last stage's committed logits hash differs from re-execution.
+    LogitsMismatch { position: usize },
+    /// The last stage committed (and emitted) a token its selection rule
+    /// does not give for these logits.
+    WrongToken {
+        position: usize,
+        committed: u32,
+        expected: u32,
+    },
+    /// The token committed at `position` is not the token the stage was
+    /// fed at `position + 1`: the emitted token was altered on its way back.
+    ForwardMismatch { position: usize },
     /// The reveal does not match the commitments' shape, or re-execution
     /// failed.
     Refused(String),
@@ -187,11 +243,14 @@ pub enum Verdict {
 
 /// Re-execute stage `model` (layers `[a, b)`, any package or sub-range that
 /// holds them) on the inputs it revealed and compare every committed hash.
-/// `committed` is what the ledger holds for that stage, per position.
+/// For the last stage it also recomputes every logits hash and re-applies
+/// the sequence's selection rule to every committed token (research-6
+/// §4.2.2: the output tokens must equal the selection rule applied to the
+/// logits). `committed` is what the ledger holds for that stage.
 pub fn audit_stage(
     model: &StageModel,
     revealed: &Revealed,
-    committed: &[Vec<[u8; 32]>],
+    committed: &[PositionCommit],
 ) -> Verdict {
     let stage = model.stage();
     let c = model.config();
@@ -213,6 +272,8 @@ pub fn audit_stage(
     {
         return Verdict::Refused("revealed inputs do not match the positions".into());
     }
+    let head = stage.has_head(c);
+    let prompt_len = revealed.prompt_len as usize;
     let mut cache = model.new_cache();
     let mut trace = Vec::new();
     for (p, &token) in revealed.tokens.iter().enumerate() {
@@ -222,10 +283,13 @@ pub fn audit_stage(
             StageInput::Hidden(&revealed.inputs[p * c.d_model..(p + 1) * c.d_model])
         };
         trace.clear();
-        if let Err(e) = model.forward(input, &mut cache, Some(&mut trace)) {
-            return Verdict::Refused(format!("re-execution failed at position {p}: {e}"));
-        }
-        let expected = &committed[p];
+        let logits = match model.forward(input, &mut cache, Some(&mut trace)) {
+            Ok((_, logits)) => logits,
+            Err(e) => {
+                return Verdict::Refused(format!("re-execution failed at position {p}: {e}"));
+            }
+        };
+        let expected = &committed[p].hashes;
         if expected.len() != trace.len() {
             return Verdict::Refused(format!("position {p}: commitment shape"));
         }
@@ -237,6 +301,44 @@ pub fn audit_stage(
                 position: p,
                 boundary: stage.first_layer + k,
             };
+        }
+        if !head {
+            if committed[p].logits.is_some() || committed[p].selected.is_some() {
+                return Verdict::Refused(format!("position {p}: logits from a middle stage"));
+            }
+            continue;
+        }
+        let Some(logits) = logits else {
+            return Verdict::Refused("the last stage produced no logits".into());
+        };
+        if committed[p].logits != Some(arith::logits_hash(&logits)) {
+            return Verdict::LogitsMismatch { position: p };
+        }
+        if let Some(emitted) = committed[p].selected {
+            if p + 1 < prompt_len {
+                return Verdict::Refused(format!(
+                    "position {p}: a token selected inside the prompt"
+                ));
+            }
+            let history = &revealed.tokens[prompt_len..=p];
+            let reselected = match arith::select(&logits, history, revealed.selection) {
+                Ok(t) => t,
+                Err(e) => return Verdict::Refused(format!("re-selection failed at {p}: {e}")),
+            };
+            if reselected != emitted {
+                return Verdict::WrongToken {
+                    position: p,
+                    committed: emitted,
+                    expected: reselected,
+                };
+            }
+            if revealed
+                .tokens
+                .get(p + 1)
+                .is_some_and(|&fed| fed != emitted)
+            {
+                return Verdict::ForwardMismatch { position: p };
+            }
         }
     }
     Verdict::Valid { positions }

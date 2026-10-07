@@ -45,6 +45,8 @@ pub struct Completion {
     /// Seconds from the start of the run.
     pub admitted_at: f64,
     pub first_token_at: f64,
+    /// When each generated token came back (seconds from the run's start).
+    pub token_times: Vec<f64>,
     pub finished_at: f64,
 }
 
@@ -225,6 +227,7 @@ impl Coordinator {
                 error: self.refusal(r),
                 admitted_at: 0.0,
                 first_token_at: 0.0,
+                token_times: Vec::new(),
                 finished_at: 0.0,
             })
             .collect();
@@ -337,13 +340,24 @@ impl Coordinator {
                             continue;
                         }
                         comp.ledger.record(item.start as usize, n, &item.commits);
-                        comp.logits_hashes.extend_from_slice(&item.logits);
+                        // The token and logits come from the last stage's
+                        // commitment, the record its audit checks.
+                        let head = item.commits.last().filter(|h| {
+                            h.end_layer as usize == self.config.n_layers && h.logits.len() == n
+                        });
+                        let Some(head) = head else {
+                            comp.error = Some("the last stage committed no logits".into());
+                            finished.push(i);
+                            continue;
+                        };
+                        comp.logits_hashes.extend_from_slice(&head.logits);
+                        let selected = head.selected;
                         l.next_start += n;
                         if l.next_start < r.prompt.len() {
                             l.next_tokens = chunk(r, l.next_start);
                             continue;
                         }
-                        let Some(token) = item.next else {
+                        let Some(token) = selected else {
                             comp.error = Some("the last stage returned no token".into());
                             finished.push(i);
                             continue;
@@ -352,6 +366,7 @@ impl Coordinator {
                             comp.first_token_at = now;
                         }
                         comp.tokens.push(token);
+                        comp.token_times.push(now);
                         stats.generated_tokens += 1;
                         if r.eos.contains(&token) || comp.tokens.len() == r.max_tokens {
                             finished.push(i);

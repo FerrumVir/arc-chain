@@ -1,64 +1,79 @@
-# Island runtime: measured results and the Kimi K2 projection
+# Island runtime: measured results and the Kimi K2 / K2.6 projection
 
 Measured on **Studio lab** (Mac Studio, Apple M2 Ultra, 24 cores, macOS; 7 Oct 2026)
-with `arc-island bench --kernel simd --threads 4 --stage-threads 4`; the CI runner
-numbers are produced on every pull-request run by `.github/workflows/island-runtime.yml`
-(job "bench", artifact `island-bench-ci`, also printed in the job summary); the copy in
-`data/ci-small.json` is from run 37621860068 (GitHub ubuntu-latest, 4 vCPU). Raw data:
-[`data/`](data/). Regenerate this report with
-`python3 scripts/arc_island/report.py docs/island/data/studio-kimi-mini.json docs/island/data/studio-small.json docs/island/data/ci-small.json`.
+with `arc-island bench --kernel simd --threads 4 --stage-threads 4` (32 tokens per answer
+on the emulated WAN). CI runner numbers are produced on every pull-request run by
+`.github/workflows/island-runtime.yml` (job "bench", artifact `island-bench-ci`, also in
+the job summary). Raw data: [`data/`](data/). Regenerate this report with
+`python3 scripts/arc_island/report.py docs/island/data/studio-kimi-mini.json docs/island/data/studio-small.json`.
 
-All numbers are from synthetic MLA + MoE models (the Kimi K2 text architecture at
-small width: `kimi-mini` 8 layers, d 512, 64 experts top-8, INT4 g32 experts; `small`
-8 layers, d 256). Every stage process on one host, joined by loopback TCP; the WAN rows
-emulate each hop in the sending process (delay line + bounded uplink). **No real Kimi
-weights, no real LAN, Thunderbolt or internet link was used.** Everything under
-"Projection" is arithmetic, not a measurement.
+All measurements use synthetic MLA + MoE models: the Kimi K2 text architecture at small
+width (`kimi-mini`: 8 layers, d 512, 64 experts top-8, INT4 g32 experts; `small`: 8
+layers, d 256). Every stage process runs on one host, joined by loopback TCP; the WAN
+rows emulate each hop in the sending process (delay line + bounded uplink). **No real
+Kimi weights and no real LAN, Thunderbolt or internet link were used.** Everything under
+"Projection" is arithmetic, not a measurement. Kimi K2.6 has the same text shapes as K2
+(`docs/protocol/kimi-k26-checkpoint.md` §1: 61 layers, hidden 7,168, 384 experts top-8,
+expert width 2,048), so the K2 arithmetic applies to K2.6.
 
 ## Reading
 
-1. **Bit-exact everywhere.** Every run (1, 2, 4 and 8 stage processes; 1 to 128
-   concurrent sequences; every WAN profile) produced the single process's tokens, every
-   logits hash and the hash at every layer boundary of every position.
-2. **Hop cost (Studio lab, loopback TCP): about 17–19 µs per hop** for a 28 KiB frame
-   (a Kimi K2 boundary at i32), about 13–14 µs for 2–14 KiB. Zero-byte pings read about
-   30 µs: they run first on a freshly started ring and include wake-up time. This is the
-   runtime's own software cost; a real NIC adds wire time and driver latency, which was
-   not measured. On the CI runner (4 vCPU) the same hop costs 36–39 µs; the projection uses
-   the larger.
-3. **The pipeline model holds.** Fed with the measured compute per position and hop cost,
-   research-6's round-time model predicts the emulated-WAN per-answer speed with a median
-   error of 3.9% over 54 runs (1.9% on the CI runner) (2/4/8 stages × 10/30/60 ms × 20/100 Mbit/s × depth 1/4/16).
-4. **The swarm tier is uplink-bound.** Exact boundaries are i32 (every boundary of both
-   synthetic models fits i32; none fits i16), so a Kimi K2 token puts 28 KiB on every
-   stage's uplink. A pipeline therefore cannot exceed about **87 tok/s aggregate at
-   20 Mbit/s uplinks or 436 tok/s at 100 Mbit/s**, whatever the schedule; per answer it
-   runs below 1 tok/s near those ceilings (projection table). Measured with Kimi-sized
-   frames on the emulated WAN: 8 stages, 10 ms, depth 16 (128 sequences) gave 54 tok/s
-   aggregate at 20 Mbit/s and 205 tok/s at 100 Mbit/s (prefill included).
-5. **One billion tokens a day on the swarm tier** (11.6k tok/s sustained) projects to about
-   1,000 RTX 5090-class devices on 100 Mbit/s uplinks, or 3,800 on 20 Mbit/s, at 100%
-   utilisation (decode only). ~130 community nodes would give a few hundred to ~1.5k tok/s
-   at best, if they had the GPUs. Lossless activation compression (or exact INT8
-   boundaries in a future profile) moves this ceiling directly.
-6. **Islands.** Pipeline parallelism does not speed up one answer: 2–4 M3 Ultras project to
-   about 20 tok/s per answer (memory-bound, as research-6 §2.5), with aggregate 74–147 tok/s
-   at 8 sequences per stage. A 26× RTX 5090 LAN pipeline projects to about 47 tok/s per answer, about
-   63 with one exact speculative draft, and 2.3k tok/s aggregate at depth 8. ≥59 tok/s per
-   answer needs either that GPU island with speculation or tensor/expert parallelism over
-   RDMA. Both assume kernels at research-6's calibrated memory bandwidths.
-7. **The curve, read the other way** (tables "Curve, measured" and "Curve: what one swarm
-   pipeline needs"). With 26 RTX 5090-class stages, 10 ms per hop and 100 Mbit/s uplinks, the
-   projection reaches 100 tok/s aggregate with 52 sequences in flight at 2.4 tok/s per answer,
-   200 tok/s with 130 at 1.6, and 300 tok/s with 416 at 0.7; 400 tok/s is not reachable before
-   the KV cache runs out. At 60 ms per hop the same pipeline needs 234 sequences for 100 tok/s
-   (0.46 tok/s per answer). At 20 Mbit/s nothing passes 87 tok/s. Doubling the stage count adds
-   KV room (more sequences in flight) but not throughput past the uplink ceiling, and every
-   answer gets slower.
-8. **The engine, not the network, is the gap.** ARC's integer engine reads its active weights
-   at 2.2–2.7 GB/s on the Studio (4 threads, SIMD kernel) against the 456 GB/s the M3 Ultra
-   projection assumes. The island runtime adds microseconds per hop; the per-token compute
-   is two orders of magnitude from the projection's assumption.
+1. **Bit-exact everywhere.** Every run produced the single process's tokens, every logits
+   hash and the hash at every layer boundary of every position. That covers 1, 2, 4 and 8
+   stage processes, 1 to 128 concurrent sequences, and every WAN profile.
+2. **Hop cost (Studio lab, loopback TCP).** About 16–18 µs per hop for a 28 KiB frame (a
+   Kimi K2 boundary at i32) in the `small` run, and up to 62 µs in the `kimi-mini` run on
+   the same host. The projection uses the larger. A real NIC, driver and GPU copies add
+   more; research-6's 0.3 ms streaming hop is shown as a sensitivity.
+3. **The pipeline model, checked on per answer and on aggregate.** Fed with the measured
+   compute per position and hop cost, research-6's round-time model was checked against 54
+   emulated-WAN runs (2/4/8 stages × 10/30/60 ms × 20/100 Mbit/s × depth 1/4/16, 32-token
+   answers). Measured minus predicted:
+   - **per answer:** median −3.0% (range −14.6% to −0.7%);
+   - **aggregate at steady state** (while every sequence decodes): median −3.1% (−14.2% to −0.5%);
+   - **aggregate over wall-clock time** (prefill and pipeline fill/drain included): median −7.7% (−19.3% to −4.2%).
+
+   The model never under-predicts, so every projected aggregate below is an **upper bound**.
+   An earlier version of this report quoted only the per-answer error. It also ran 6-token
+   answers, where fill/drain cost 16–35% of aggregate. And its emulator charged the
+   activation on the last hop, which in reality carries commitments only.
+4. **The swarm tier is uplink-bound.** Every exact boundary is i32 (none of 532 measured
+   vectors fits i16 or i8), so a Kimi token puts 28,672 B of activation on every stage's
+   uplink. Accumulated commitments add up to 32 B × (61 + stages); with 26 stages that is
+   +2,784 B. A 26-stage pipeline therefore cannot exceed about **79 tok/s aggregate at
+   20 Mbit/s or 397 tok/s at 100 Mbit/s**. Measured on the emulated WAN at 8 stages,
+   10 ms per hop and 128 sequences: 85 tok/s steady at 20 Mbit/s and 297 tok/s at 100 Mbit/s.
+5. **The curve** (tables "Curve, measured" and "Curve: what one swarm pipeline needs").
+   Projected for 26 RTX 5090-class stages at 100 Mbit/s and 4k context (an upper bound):
+
+   | Per hop | Target aggregate | Sequences in flight | Per answer |
+   |---|---|---|---|
+   | 10 ms | 100 tok/s | 52 | 2.4 tok/s |
+   | 10 ms | 200 tok/s | 130 | 1.6 tok/s |
+   | 10 ms | 300 tok/s | 494 | 0.6 tok/s |
+   | 60 ms | 100 tok/s | 234 | 0.45 tok/s |
+   | 60 ms | 200 tok/s | 702 | 0.29 tok/s |
+
+   - **Context matters.** At 8k context the 60 ms pipeline tops out at 153 tok/s; at 32k, at
+     56 tok/s ("Context sensitivity").
+   - **Per-sequence weight reads cost throughput.** This runtime reads each sequence's
+     weights separately, which cuts the depth-16 aggregate from 292 to 262 tok/s at
+     10 ms / 100 Mbit/s.
+6. **One billion tokens a day on the swarm tier** (11.6k tok/s sustained, decode only, 100%
+   utilisation) projects to at least about 1,040 RTX 5090-class devices on 100 Mbit/s
+   uplinks, or about 4,000 on 20 Mbit/s. These are lower bounds on devices.
+7. **Islands, per answer.** Pipeline parallelism does not speed up one answer.
+   - **2–4 M3 Ultras:** about 20 tok/s per answer.
+   - **26× RTX 5090 LAN pipeline:** 45.5 tok/s with the measured loopback hop, 35.5 tok/s
+     with research-6's 0.3 ms hop.
+   - **One exact speculative draft:** 56.9 tok/s for the 5090 island and 24.8 for 2× M3
+     Ultra. The model runs a 2-position verify pass at 1.85 tokens accepted per pass,
+     DeepSeek-V3's MTP rate. This is an assumption: Kimi has no MTP head, and the drafter's
+     acceptance and cost are not modelled.
+   - **No projected configuration here reaches ≥59 tok/s per answer.**
+8. **The engine, not the network, is the gap.** ARC's integer engine reads its active
+   weights at 1.1–2.8 GB/s on the Studio (4 threads, SIMD kernel). Every projection
+   assumes 456–1,108 GB/s.
 
 ## Measured
 
@@ -66,7 +81,7 @@ weights, no real LAN, Thunderbolt or internet link was used.** Everything under
 
 Model: synthetic MLA + MoE, 8 layers, d_model 512, 64 routed experts top-8, profile `arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.i4g32-experts.q16.v1`; package blake3 `b1bbd3fa1d524d46…`. WAN delay line: spin.
 
-Single process, no network: 144.19 tok/s decode (6.95 ms per position); engine effective weight bandwidth 2.178 GB/s (15.11 MB of active weights per token).
+Single process, no network: 71.95 tok/s decode (14.04 ms per position); engine effective weight bandwidth 1.087 GB/s (15.11 MB of active weights per token).
 
 Boundary activations on the wire (lossless width): {'i16': 0, 'i32': 420, 'i64': 0, 'i8': 0} over 420 vectors; mean 2,048 B per vector vs 4096 B as i64.
 
@@ -74,40 +89,40 @@ Boundary activations on the wire (lossless width): {'i16': 0, 'i32': 420, 'i64':
 
 | stages | payload B | hops | ring median ms | ring p90 ms | per hop µs |
 |---|---|---|---|---|---|
-| 1 | 0 | 2 | 0.09 | 0.11 | 43.31 |
-| 1 | 4,096 | 2 | 0.08 | 0.09 | 38.21 |
-| 1 | 14,336 | 2 | 0.03 | 0.06 | 13.83 |
-| 1 | 28,672 | 2 | 0.04 | 0.06 | 20.79 |
-| 1 | 57,344 | 2 | 0.06 | 0.09 | 31.31 |
-| 2 | 0 | 3 | 0.09 | 0.10 | 29.17 |
-| 2 | 4,096 | 3 | 0.04 | 0.09 | 13.36 |
-| 2 | 14,336 | 3 | 0.04 | 0.06 | 14.11 |
-| 2 | 28,672 | 3 | 0.06 | 0.07 | 18.58 |
-| 2 | 57,344 | 3 | 0.08 | 0.10 | 25.22 |
-| 4 | 0 | 5 | 0.15 | 0.16 | 29.28 |
-| 4 | 4,096 | 5 | 0.06 | 0.08 | 12.85 |
-| 4 | 14,336 | 5 | 0.07 | 0.08 | 13.58 |
-| 4 | 28,672 | 5 | 0.08 | 0.11 | 16.40 |
-| 4 | 57,344 | 5 | 0.13 | 0.15 | 26.12 |
+| 1 | 0 | 2 | 0.07 | 0.16 | 36.79 |
+| 1 | 4,096 | 2 | 0.06 | 0.12 | 30.15 |
+| 1 | 14,336 | 2 | 0.08 | 0.14 | 38.19 |
+| 1 | 28,672 | 2 | 0.04 | 0.05 | 20.96 |
+| 1 | 57,344 | 2 | 0.06 | 0.08 | 31.02 |
+| 2 | 0 | 3 | 0.19 | 0.23 | 61.82 |
+| 2 | 4,096 | 3 | 0.16 | 0.23 | 54.47 |
+| 2 | 14,336 | 3 | 0.17 | 0.24 | 57.96 |
+| 2 | 28,672 | 3 | 0.19 | 0.26 | 61.72 |
+| 2 | 57,344 | 3 | 0.22 | 0.30 | 73.64 |
+| 4 | 0 | 5 | 0.28 | 0.38 | 56.02 |
+| 4 | 4,096 | 5 | 0.29 | 0.38 | 58.52 |
+| 4 | 14,336 | 5 | 0.29 | 0.36 | 57.95 |
+| 4 | 28,672 | 5 | 0.31 | 0.39 | 62.03 |
+| 4 | 57,344 | 5 | 0.36 | 0.45 | 72.71 |
 
 **Throughput, stage processes on one host** (decode tok/s per answer, mean; aggregate = generated / wall time):
 
 | stages | G | B | tokens | per answer tok/s | aggregate tok/s | bit-exact |
 |---|---|---|---|---|---|---|
-| 1 | 1 | 1 | 96 | 133.02 | 107.10 | yes |
-| 1 | 2 | 8 | 96 | 18.00 | 120.58 | yes |
-| 2 | 1 | 1 | 96 | 152.87 | 122.26 | yes |
-| 2 | 2 | 2 | 96 | 101.93 | 165.51 | yes |
-| 2 | 2 | 8 | 96 | 25.54 | 161.24 | yes |
-| 4 | 1 | 1 | 96 | 144.83 | 116.21 | yes |
-| 4 | 4 | 4 | 96 | 62.16 | 201.51 | yes |
-| 4 | 4 | 8 | 96 | 31.25 | 201.54 | yes |
+| 1 | 1 | 1 | 96 | 78.68 | 61.79 | yes |
+| 1 | 2 | 8 | 96 | 8.74 | 58.71 | yes |
+| 2 | 1 | 1 | 96 | 48.37 | 38.84 | yes |
+| 2 | 2 | 2 | 96 | 37.08 | 59.27 | yes |
+| 2 | 2 | 8 | 96 | 9.44 | 58.79 | yes |
+| 4 | 1 | 1 | 96 | 46.82 | 37.74 | yes |
+| 4 | 4 | 4 | 96 | 27.27 | 86.52 | yes |
+| 4 | 4 | 8 | 96 | 13.98 | 86.81 | yes |
 
 ### Studio lab: macos aarch64, 24 logical CPUs
 
 Model: synthetic MLA + MoE, 8 layers, d_model 256, 16 routed experts top-4, profile `arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1`; package blake3 `59cccff13d80759a…`. WAN delay line: spin.
 
-Single process, no network: 472.81 tok/s decode (2.10 ms per position); engine effective weight bandwidth 2.661 GB/s (5.63 MB of active weights per token).
+Single process, no network: 495.86 tok/s decode (2.01 ms per position); engine effective weight bandwidth 2.791 GB/s (5.63 MB of active weights per token).
 
 Boundary activations on the wire (lossless width): {'i16': 0, 'i32': 532, 'i64': 0, 'i8': 0} over 532 vectors; mean 1,024 B per vector vs 2048 B as i64.
 
@@ -115,480 +130,371 @@ Boundary activations on the wire (lossless width): {'i16': 0, 'i32': 532, 'i64':
 
 | stages | payload B | hops | ring median ms | ring p90 ms | per hop µs |
 |---|---|---|---|---|---|
-| 1 | 0 | 2 | 0.06 | 0.08 | 28.62 |
-| 1 | 2,048 | 2 | 0.06 | 0.07 | 29.40 |
-| 1 | 14,336 | 2 | 0.03 | 0.04 | 13.85 |
-| 1 | 28,672 | 2 | 0.03 | 0.04 | 16.71 |
-| 1 | 57,344 | 2 | 0.05 | 0.07 | 25.65 |
-| 2 | 0 | 3 | 0.10 | 0.11 | 32.24 |
-| 2 | 2,048 | 3 | 0.04 | 0.10 | 13.90 |
+| 1 | 0 | 2 | 0.06 | 0.08 | 27.98 |
+| 1 | 2,048 | 2 | 0.06 | 0.06 | 28.23 |
+| 1 | 14,336 | 2 | 0.03 | 0.06 | 13.58 |
+| 1 | 28,672 | 2 | 0.03 | 0.04 | 16.44 |
+| 1 | 57,344 | 2 | 0.05 | 0.06 | 25.50 |
+| 2 | 0 | 3 | 0.09 | 0.11 | 31.62 |
+| 2 | 2,048 | 3 | 0.05 | 0.10 | 15.42 |
 | 2 | 14,336 | 3 | 0.04 | 0.05 | 13.79 |
-| 2 | 28,672 | 3 | 0.06 | 0.07 | 18.72 |
-| 2 | 57,344 | 3 | 0.08 | 0.10 | 27.44 |
-| 4 | 0 | 5 | 0.16 | 0.17 | 31.78 |
-| 4 | 2,048 | 5 | 0.06 | 0.07 | 12.79 |
-| 4 | 14,336 | 5 | 0.07 | 0.09 | 13.55 |
-| 4 | 28,672 | 5 | 0.09 | 0.11 | 17.84 |
-| 4 | 57,344 | 5 | 0.13 | 0.17 | 26.98 |
+| 2 | 28,672 | 3 | 0.05 | 0.07 | 17.86 |
+| 2 | 57,344 | 3 | 0.08 | 0.09 | 25.51 |
+| 4 | 0 | 5 | 0.15 | 0.17 | 30.82 |
+| 4 | 2,048 | 5 | 0.06 | 0.07 | 12.43 |
+| 4 | 14,336 | 5 | 0.07 | 0.08 | 13.67 |
+| 4 | 28,672 | 5 | 0.08 | 0.11 | 16.32 |
+| 4 | 57,344 | 5 | 0.13 | 0.15 | 25.91 |
 
 **Throughput, stage processes on one host** (decode tok/s per answer, mean; aggregate = generated / wall time):
 
 | stages | G | B | tokens | per answer tok/s | aggregate tok/s | bit-exact |
 |---|---|---|---|---|---|---|
-| 1 | 1 | 1 | 128 | 490.76 | 414.24 | yes |
-| 1 | 2 | 8 | 128 | 54.92 | 392.25 | yes |
-| 2 | 1 | 1 | 128 | 431.73 | 365.68 | yes |
-| 2 | 2 | 2 | 128 | 274.47 | 473.00 | yes |
-| 2 | 2 | 8 | 128 | 73.13 | 497.14 | yes |
-| 4 | 1 | 1 | 128 | 424.46 | 361.96 | yes |
-| 4 | 4 | 4 | 128 | 136.54 | 471.87 | yes |
-| 4 | 4 | 8 | 128 | 73.76 | 507.86 | yes |
+| 1 | 1 | 1 | 128 | 474.21 | 403.40 | yes |
+| 1 | 2 | 8 | 128 | 58.58 | 408.19 | yes |
+| 2 | 1 | 1 | 128 | 455.13 | 388.82 | yes |
+| 2 | 2 | 2 | 128 | 274.32 | 469.20 | yes |
+| 2 | 2 | 8 | 128 | 74.39 | 502.16 | yes |
+| 4 | 1 | 1 | 128 | 433.59 | 366.85 | yes |
+| 4 | 4 | 4 | 128 | 147.06 | 508.21 | yes |
+| 4 | 4 | 8 | 128 | 76.06 | 522.16 | yes |
 
-**Emulated WAN, Studio lab** (every stage's uplink shaped: one-way delay ± 10% jitter, bounded uplink; 28672 B per position on the wire = a Kimi K2 boundary at i32; G = stages micro-batches of `depth` sequences). Predicted = research-6 §2.6 round-time model fed with this run's measured compute per position and hop overhead. Median |error| per answer: 3.9%.
+**Emulated WAN, Studio lab** (every stage's uplink shaped: one-way delay ± 10% jitter, bounded uplink; 28672 B of activation per position on every hop but the last (a Kimi K2 boundary at i32; commitments ride on top); G = stages micro-batches of `depth` sequences; 32 tokens per answer). Predicted = research-6 §2.6 round-time model fed with this run's measured compute per position and hop overhead; it predicts steady state.
 
-| stages | one-way ms | uplink Mbit/s | depth | B | per answer tok/s | predicted | aggregate tok/s | predicted | bit-exact |
-|---|---|---|---|---|---|---|---|---|---|
-| 2 | 10.00 | 20.00 | 1 | 2 | 21.62 | 22.18 | 34.62 | 44.37 | yes |
-| 2 | 10.00 | 20.00 | 4 | 8 | 7.99 | 8.32 | 50.34 | 66.56 | yes |
-| 2 | 10.00 | 20.00 | 16 | 32 | 2.24 | 2.38 | 56.62 | 76.07 | yes |
-| 2 | 10.00 | 100.00 | 1 | 2 | 35.64 | 37.42 | 59.38 | 74.83 | yes |
-| 2 | 10.00 | 100.00 | 4 | 8 | 19.75 | 21.37 | 129.66 | 170.95 | yes |
-| 2 | 10.00 | 100.00 | 16 | 32 | 6.87 | 7.87 | 180.47 | 251.82 | yes |
-| 2 | 30.00 | 20.00 | 1 | 2 | 11.82 | 11.75 | 19.59 | 23.51 | yes |
-| 2 | 30.00 | 20.00 | 4 | 8 | 6.25 | 6.24 | 39.58 | 49.94 | yes |
-| 2 | 30.00 | 20.00 | 16 | 32 | 2.09 | 2.17 | 52.39 | 69.46 | yes |
-| 2 | 30.00 | 100.00 | 1 | 2 | 14.62 | 14.99 | 24.87 | 29.97 | yes |
-| 2 | 30.00 | 100.00 | 4 | 8 | 11.05 | 11.52 | 73.43 | 92.17 | yes |
-| 2 | 30.00 | 100.00 | 16 | 32 | 5.28 | 5.99 | 138.82 | 191.53 | yes |
-| 2 | 60.00 | 20.00 | 1 | 2 | 6.79 | 6.89 | 10.84 | 13.79 | yes |
-| 2 | 60.00 | 20.00 | 4 | 8 | 4.51 | 4.54 | 27.73 | 36.33 | yes |
-| 2 | 60.00 | 20.00 | 16 | 32 | 1.86 | 1.92 | 46.66 | 61.46 | yes |
-| 2 | 60.00 | 100.00 | 1 | 2 | 7.72 | 7.89 | 13.14 | 15.78 | yes |
-| 2 | 60.00 | 100.00 | 4 | 8 | 6.73 | 6.81 | 44.32 | 54.50 | yes |
-| 2 | 60.00 | 100.00 | 16 | 32 | 4.09 | 4.40 | 108.48 | 140.92 | yes |
-| 4 | 10.00 | 20.00 | 1 | 4 | 11.04 | 11.36 | 34.23 | 45.43 | yes |
-| 4 | 10.00 | 20.00 | 4 | 16 | 4.11 | 4.31 | 49.63 | 68.97 | yes |
-| 4 | 10.00 | 20.00 | 16 | 64 | 1.15 | 1.24 | 55.71 | 79.24 | yes |
-| 4 | 10.00 | 100.00 | 1 | 4 | 18.93 | 19.47 | 62.64 | 77.90 | yes |
-| 4 | 10.00 | 100.00 | 4 | 16 | 10.66 | 11.74 | 135.73 | 187.83 | yes |
-| 4 | 10.00 | 100.00 | 16 | 64 | 3.91 | 4.53 | 194.50 | 290.23 | yes |
-| 4 | 30.00 | 20.00 | 1 | 4 | 5.91 | 5.95 | 19.10 | 23.80 | yes |
-| 4 | 30.00 | 20.00 | 4 | 16 | 3.15 | 3.21 | 38.62 | 51.28 | yes |
-| 4 | 30.00 | 20.00 | 16 | 64 | 1.06 | 1.13 | 51.41 | 72.10 | yes |
-| 4 | 30.00 | 100.00 | 1 | 4 | 7.46 | 7.61 | 24.89 | 30.45 | yes |
-| 4 | 30.00 | 100.00 | 4 | 16 | 5.82 | 6.05 | 76.90 | 96.86 | yes |
-| 4 | 30.00 | 100.00 | 16 | 64 | 2.95 | 3.33 | 151.23 | 212.97 | yes |
-| 4 | 60.00 | 20.00 | 1 | 4 | 3.43 | 3.47 | 11.23 | 13.89 | yes |
-| 4 | 60.00 | 20.00 | 4 | 16 | 2.09 | 2.31 | 27.15 | 37.04 | yes |
-| 4 | 60.00 | 20.00 | 16 | 64 | 0.94 | 0.99 | 44.08 | 63.51 | yes |
-| 4 | 60.00 | 100.00 | 1 | 4 | 3.97 | 3.98 | 13.26 | 15.91 | yes |
-| 4 | 60.00 | 100.00 | 4 | 16 | 3.40 | 3.51 | 45.51 | 56.10 | yes |
-| 4 | 60.00 | 100.00 | 16 | 64 | 2.02 | 2.38 | 107.50 | 152.19 | yes |
-| 8 | 10.00 | 20.00 | 1 | 8 | 5.63 | 5.75 | 34.03 | 45.98 | yes |
-| 8 | 10.00 | 20.00 | 4 | 32 | 2.05 | 2.20 | 48.76 | 70.24 | yes |
-| 8 | 10.00 | 20.00 | 16 | 128 | 0.56 | 0.63 | 53.84 | 80.92 | yes |
-| 8 | 10.00 | 100.00 | 1 | 8 | 9.37 | 9.94 | 54.73 | 79.52 | yes |
-| 8 | 10.00 | 100.00 | 4 | 32 | 5.66 | 6.17 | 141.71 | 197.58 | yes |
-| 8 | 10.00 | 100.00 | 16 | 128 | 2.13 | 2.45 | 204.69 | 314.20 | yes |
-| 8 | 30.00 | 20.00 | 1 | 8 | 2.96 | 2.99 | 18.95 | 23.95 | yes |
-| 8 | 30.00 | 20.00 | 4 | 32 | 1.58 | 1.62 | 38.09 | 51.99 | yes |
-| 8 | 30.00 | 20.00 | 16 | 128 | 0.53 | 0.57 | 50.85 | 73.49 | yes |
-| 8 | 30.00 | 100.00 | 1 | 8 | 3.77 | 3.84 | 25.28 | 30.70 | yes |
-| 8 | 30.00 | 100.00 | 4 | 32 | 3.00 | 3.11 | 77.56 | 99.39 | yes |
-| 8 | 30.00 | 100.00 | 16 | 128 | 1.59 | 1.76 | 157.73 | 225.60 | yes |
-| 8 | 60.00 | 20.00 | 1 | 8 | 1.72 | 1.74 | 11.33 | 13.94 | yes |
-| 8 | 60.00 | 20.00 | 4 | 32 | 1.15 | 1.17 | 28.48 | 37.40 | yes |
-| 8 | 60.00 | 20.00 | 16 | 128 | 0.48 | 0.50 | 45.82 | 64.59 | yes |
-| 8 | 60.00 | 100.00 | 1 | 8 | 1.97 | 2.00 | 13.22 | 15.98 | yes |
-| 8 | 60.00 | 100.00 | 4 | 32 | 1.74 | 1.78 | 45.81 | 56.94 | yes |
-| 8 | 60.00 | 100.00 | 16 | 128 | 1.19 | 1.24 | 119.42 | 158.54 | yes |
+Model error (measured − predicted) ÷ predicted, over 54 runs:
+- per answer: median -3.0%, range -14.6% to -0.7%;
+- aggregate, steady state (tokens while every sequence decodes): median -3.1%, range -14.2% to -0.5%;
+- aggregate, wall clock (prefill and pipeline fill/drain included): median -7.7%, range -19.3% to -4.2%.
 
-**Curve, measured on the emulated WAN (Studio lab)**: the smallest swept configuration (2/4/8 stages × depth 1/4/16, G = stages) whose aggregate reached each target, with Kimi-sized frames on the wire. Synthetic model, so compute per stage is small; the network and the uplink set these numbers.
+| stages | one-way ms | uplink Mbit/s | depth | B | per answer tok/s | predicted | aggregate steady tok/s | aggregate wall tok/s | predicted aggregate | bit-exact |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2 | 10.00 | 20.00 | 1 | 2 | 28.79 | 29.84 | 57.73 | 54.77 | 59.68 | yes |
+| 2 | 10.00 | 20.00 | 4 | 8 | 10.75 | 10.90 | 86.73 | 82.43 | 87.19 | yes |
+| 2 | 10.00 | 20.00 | 16 | 32 | 2.69 | 2.72 | 86.67 | 83.23 | 87.19 | yes |
+| 2 | 10.00 | 100.00 | 1 | 2 | 39.88 | 41.09 | 79.11 | 76.69 | 82.19 | yes |
+| 2 | 10.00 | 100.00 | 4 | 8 | 23.83 | 26.85 | 190.16 | 183.00 | 214.84 | yes |
+| 2 | 10.00 | 100.00 | 16 | 32 | 9.64 | 11.26 | 309.59 | 294.61 | 360.17 | yes |
+| 2 | 30.00 | 20.00 | 1 | 2 | 13.35 | 13.60 | 26.59 | 25.54 | 27.21 | yes |
+| 2 | 30.00 | 20.00 | 4 | 8 | 8.46 | 8.78 | 67.83 | 64.56 | 70.21 | yes |
+| 2 | 30.00 | 20.00 | 16 | 32 | 2.69 | 2.72 | 86.67 | 82.68 | 87.19 | yes |
+| 2 | 30.00 | 100.00 | 1 | 2 | 15.40 | 15.54 | 30.47 | 29.77 | 31.09 | yes |
+| 2 | 30.00 | 100.00 | 4 | 8 | 12.51 | 12.95 | 99.33 | 96.07 | 103.58 | yes |
+| 2 | 30.00 | 100.00 | 16 | 32 | 6.99 | 7.76 | 224.49 | 213.40 | 248.36 | yes |
+| 2 | 60.00 | 20.00 | 1 | 2 | 7.40 | 7.49 | 14.64 | 14.30 | 14.98 | yes |
+| 2 | 60.00 | 20.00 | 4 | 8 | 5.56 | 5.75 | 44.49 | 42.48 | 45.99 | yes |
+| 2 | 60.00 | 20.00 | 16 | 32 | 2.69 | 2.72 | 86.74 | 81.93 | 87.19 | yes |
+| 2 | 60.00 | 100.00 | 1 | 2 | 7.94 | 8.04 | 15.66 | 15.34 | 16.09 | yes |
+| 2 | 60.00 | 100.00 | 4 | 8 | 7.07 | 7.29 | 56.14 | 54.27 | 58.29 | yes |
+| 2 | 60.00 | 100.00 | 16 | 32 | 4.96 | 5.30 | 157.32 | 152.96 | 169.45 | yes |
+| 4 | 10.00 | 20.00 | 1 | 4 | 12.72 | 13.08 | 51.03 | 48.13 | 52.30 | yes |
+| 4 | 10.00 | 20.00 | 4 | 16 | 5.16 | 5.38 | 83.47 | 77.59 | 86.15 | yes |
+| 4 | 10.00 | 20.00 | 16 | 64 | 1.33 | 1.36 | 86.09 | 80.52 | 87.19 | yes |
+| 4 | 10.00 | 100.00 | 1 | 4 | 19.50 | 20.43 | 77.22 | 74.74 | 81.70 | yes |
+| 4 | 10.00 | 100.00 | 4 | 16 | 11.64 | 13.22 | 186.35 | 176.55 | 211.58 | yes |
+| 4 | 10.00 | 100.00 | 16 | 64 | 4.76 | 5.49 | 306.54 | 287.59 | 351.11 | yes |
+| 4 | 30.00 | 20.00 | 1 | 4 | 6.29 | 6.39 | 24.88 | 24.11 | 25.56 | yes |
+| 4 | 30.00 | 20.00 | 4 | 16 | 3.66 | 3.76 | 58.70 | 55.08 | 60.21 | yes |
+| 4 | 30.00 | 20.00 | 16 | 64 | 1.33 | 1.36 | 86.10 | 80.02 | 87.19 | yes |
+| 4 | 30.00 | 100.00 | 1 | 4 | 7.67 | 7.75 | 30.14 | 29.53 | 31.02 | yes |
+| 4 | 30.00 | 100.00 | 4 | 16 | 6.24 | 6.43 | 98.62 | 95.53 | 102.81 | yes |
+| 4 | 30.00 | 100.00 | 16 | 64 | 3.36 | 3.81 | 215.01 | 205.12 | 244.01 | yes |
+| 4 | 60.00 | 20.00 | 1 | 4 | 3.57 | 3.62 | 14.12 | 13.67 | 14.47 | yes |
+| 4 | 60.00 | 20.00 | 4 | 16 | 2.54 | 2.59 | 40.69 | 38.75 | 41.48 | yes |
+| 4 | 60.00 | 20.00 | 16 | 64 | 1.17 | 1.22 | 75.57 | 70.53 | 77.79 | yes |
+| 4 | 60.00 | 100.00 | 1 | 4 | 3.97 | 4.02 | 15.62 | 15.31 | 16.07 | yes |
+| 4 | 60.00 | 100.00 | 4 | 16 | 3.56 | 3.63 | 56.03 | 54.72 | 58.05 | yes |
+| 4 | 60.00 | 100.00 | 16 | 64 | 2.47 | 2.62 | 157.35 | 150.99 | 167.42 | yes |
+| 8 | 10.00 | 20.00 | 1 | 8 | 6.00 | 6.16 | 48.11 | 45.16 | 49.25 | yes |
+| 8 | 10.00 | 20.00 | 4 | 32 | 2.34 | 2.44 | 75.56 | 70.09 | 78.18 | yes |
+| 8 | 10.00 | 20.00 | 16 | 128 | 0.66 | 0.68 | 85.40 | 78.86 | 87.19 | yes |
+| 8 | 10.00 | 100.00 | 1 | 8 | 9.84 | 10.18 | 77.53 | 75.15 | 81.47 | yes |
+| 8 | 10.00 | 100.00 | 4 | 32 | 6.01 | 6.56 | 192.84 | 182.55 | 209.99 | yes |
+| 8 | 10.00 | 100.00 | 16 | 128 | 2.31 | 2.71 | 297.43 | 279.92 | 346.74 | yes |
+| 8 | 30.00 | 20.00 | 1 | 8 | 3.07 | 3.10 | 24.34 | 23.31 | 24.81 | yes |
+| 8 | 30.00 | 20.00 | 4 | 32 | 1.70 | 1.76 | 54.53 | 51.16 | 56.21 | yes |
+| 8 | 30.00 | 20.00 | 16 | 128 | 0.61 | 0.64 | 79.39 | 73.51 | 82.22 | yes |
+| 8 | 30.00 | 100.00 | 1 | 8 | 3.78 | 3.87 | 29.79 | 29.14 | 30.98 | yes |
+| 8 | 30.00 | 100.00 | 4 | 32 | 3.10 | 3.20 | 99.16 | 94.90 | 102.44 | yes |
+| 8 | 30.00 | 100.00 | 16 | 128 | 1.69 | 1.89 | 216.37 | 205.44 | 241.90 | yes |
+| 8 | 60.00 | 20.00 | 1 | 8 | 1.76 | 1.78 | 13.88 | 13.49 | 14.22 | yes |
+| 8 | 60.00 | 20.00 | 4 | 32 | 1.22 | 1.24 | 38.89 | 36.76 | 39.54 | yes |
+| 8 | 60.00 | 20.00 | 16 | 128 | 0.54 | 0.56 | 69.29 | 64.44 | 71.24 | yes |
+| 8 | 60.00 | 100.00 | 1 | 8 | 1.99 | 2.01 | 15.68 | 15.32 | 16.06 | yes |
+| 8 | 60.00 | 100.00 | 4 | 32 | 1.78 | 1.81 | 56.17 | 54.40 | 57.93 | yes |
+| 8 | 60.00 | 100.00 | 16 | 128 | 1.19 | 1.30 | 151.75 | 145.04 | 166.42 | yes |
 
-| one-way ms | uplink Mbit/s | target tok/s | stages | depth | concurrent | per answer tok/s | aggregate tok/s |
-|---|---|---|---|---|---|---|---|
-| 10.00 | 20.00 | 25 | 2 | 1 | 2 | 21.62 | 34.62 |
-| 10.00 | 20.00 | 50 | 2 | 4 | 8 | 7.99 | 50.34 |
-| 10.00 | 20.00 | 100 | – | – | – | – | not reached (best 57) |
-| 10.00 | 20.00 | 150 | – | – | – | – | not reached (best 57) |
-| 10.00 | 20.00 | 200 | – | – | – | – | not reached (best 57) |
-| 10.00 | 100.00 | 25 | 2 | 1 | 2 | 35.64 | 59.38 |
-| 10.00 | 100.00 | 50 | 2 | 1 | 2 | 35.64 | 59.38 |
-| 10.00 | 100.00 | 100 | 2 | 4 | 8 | 19.75 | 129.66 |
-| 10.00 | 100.00 | 150 | 2 | 16 | 32 | 6.87 | 180.47 |
-| 10.00 | 100.00 | 200 | 8 | 16 | 128 | 2.13 | 204.69 |
-| 30.00 | 20.00 | 25 | 2 | 4 | 8 | 6.25 | 39.58 |
-| 30.00 | 20.00 | 50 | 2 | 16 | 32 | 2.09 | 52.39 |
-| 30.00 | 20.00 | 100 | – | – | – | – | not reached (best 52) |
-| 30.00 | 20.00 | 150 | – | – | – | – | not reached (best 52) |
-| 30.00 | 20.00 | 200 | – | – | – | – | not reached (best 52) |
-| 30.00 | 100.00 | 25 | 2 | 4 | 8 | 11.05 | 73.43 |
-| 30.00 | 100.00 | 50 | 2 | 4 | 8 | 11.05 | 73.43 |
-| 30.00 | 100.00 | 100 | 2 | 16 | 32 | 5.28 | 138.82 |
-| 30.00 | 100.00 | 150 | 4 | 16 | 64 | 2.95 | 151.23 |
-| 30.00 | 100.00 | 200 | – | – | – | – | not reached (best 158) |
-| 60.00 | 20.00 | 25 | 2 | 4 | 8 | 4.51 | 27.73 |
-| 60.00 | 20.00 | 50 | – | – | – | – | not reached (best 47) |
-| 60.00 | 20.00 | 100 | – | – | – | – | not reached (best 47) |
-| 60.00 | 20.00 | 150 | – | – | – | – | not reached (best 47) |
-| 60.00 | 20.00 | 200 | – | – | – | – | not reached (best 47) |
-| 60.00 | 100.00 | 25 | 2 | 4 | 8 | 6.73 | 44.32 |
-| 60.00 | 100.00 | 50 | 2 | 16 | 32 | 4.09 | 108.48 |
-| 60.00 | 100.00 | 100 | 2 | 16 | 32 | 4.09 | 108.48 |
-| 60.00 | 100.00 | 150 | – | – | – | – | not reached (best 119) |
-| 60.00 | 100.00 | 200 | – | – | – | – | not reached (best 119) |
-
-### CI runner (GitHub ubuntu-latest): linux x86_64, 4 logical CPUs
-
-Model: synthetic MLA + MoE, 8 layers, d_model 256, 16 routed experts top-4, profile `arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1`; package blake3 `59cccff13d80759a…`. WAN delay line: sleep.
-
-Single process, no network: 251.95 tok/s decode (3.94 ms per position); engine effective weight bandwidth 1.418 GB/s (5.63 MB of active weights per token).
-
-Boundary activations on the wire (lossless width): {'i16': 0, 'i32': 532, 'i64': 0, 'i8': 0} over 532 vectors; mean 1,024 B per vector vs 2048 B as i64.
-
-**Hop latency** (ring round trip of a ping frame through every stage process, no compute; loopback TCP):
-
-| stages | payload B | hops | ring median ms | ring p90 ms | per hop µs |
-|---|---|---|---|---|---|
-| 1 | 0 | 2 | 0.05 | 0.06 | 26.96 |
-| 1 | 2,048 | 2 | 0.06 | 0.06 | 28.60 |
-| 1 | 14,336 | 2 | 0.07 | 0.07 | 33.71 |
-| 1 | 28,672 | 2 | 0.07 | 0.08 | 36.38 |
-| 1 | 57,344 | 2 | 0.09 | 0.10 | 45.50 |
-| 2 | 0 | 3 | 0.09 | 0.09 | 29.86 |
-| 2 | 2,048 | 3 | 0.10 | 0.10 | 31.78 |
-| 2 | 14,336 | 3 | 0.11 | 0.11 | 35.00 |
-| 2 | 28,672 | 3 | 0.12 | 0.12 | 38.57 |
-| 2 | 57,344 | 3 | 0.14 | 0.15 | 46.51 |
-| 4 | 0 | 5 | 0.14 | 0.15 | 28.97 |
-| 4 | 2,048 | 5 | 0.15 | 0.16 | 30.24 |
-| 4 | 14,336 | 5 | 0.17 | 0.18 | 34.42 |
-| 4 | 28,672 | 5 | 0.19 | 0.20 | 37.87 |
-| 4 | 57,344 | 5 | 0.22 | 0.24 | 44.77 |
-
-**Throughput, stage processes on one host** (decode tok/s per answer, mean; aggregate = generated / wall time):
-
-| stages | G | B | tokens | per answer tok/s | aggregate tok/s | bit-exact |
-|---|---|---|---|---|---|---|
-| 1 | 1 | 1 | 128 | 230.82 | 195.77 | yes |
-| 1 | 2 | 8 | 128 | 30.60 | 214.87 | yes |
-| 2 | 1 | 1 | 128 | 237.36 | 200.95 | yes |
-| 2 | 2 | 2 | 128 | 176.31 | 293.07 | yes |
-| 2 | 2 | 8 | 128 | 46.32 | 305.87 | yes |
-| 4 | 1 | 1 | 128 | 228.90 | 193.17 | yes |
-| 4 | 4 | 4 | 128 | 106.30 | 360.27 | yes |
-| 4 | 4 | 8 | 128 | 56.07 | 370.69 | yes |
-
-**Emulated WAN, CI runner (GitHub ubuntu-latest)** (every stage's uplink shaped: one-way delay ± 10% jitter, bounded uplink; 28672 B per position on the wire = a Kimi K2 boundary at i32; G = stages micro-batches of `depth` sequences). Predicted = research-6 §2.6 round-time model fed with this run's measured compute per position and hop overhead. Median |error| per answer: 1.9%.
-
-| stages | one-way ms | uplink Mbit/s | depth | B | per answer tok/s | predicted | aggregate tok/s | predicted | bit-exact |
-|---|---|---|---|---|---|---|---|---|---|
-| 2 | 10.00 | 20.00 | 1 | 2 | 20.95 | 21.30 | 33.80 | 42.59 | yes |
-| 2 | 10.00 | 20.00 | 4 | 8 | 7.74 | 7.84 | 48.25 | 62.70 | yes |
-| 2 | 10.00 | 20.00 | 16 | 32 | 2.17 | 2.22 | 54.49 | 71.08 | yes |
-| 2 | 10.00 | 100.00 | 1 | 2 | 34.63 | 34.96 | 58.11 | 69.91 | yes |
-| 2 | 10.00 | 100.00 | 4 | 8 | 18.32 | 18.45 | 118.34 | 147.60 | yes |
-| 2 | 10.00 | 100.00 | 16 | 32 | 5.69 | 6.39 | 150.91 | 204.38 | yes |
-| 2 | 30.00 | 20.00 | 1 | 2 | 11.44 | 11.50 | 18.65 | 23.00 | yes |
-| 2 | 30.00 | 20.00 | 4 | 8 | 5.89 | 5.97 | 37.58 | 47.73 | yes |
-| 2 | 30.00 | 20.00 | 16 | 32 | 2.01 | 2.04 | 50.50 | 65.28 | yes |
-| 2 | 30.00 | 100.00 | 1 | 2 | 14.19 | 14.58 | 24.29 | 29.15 | yes |
-| 2 | 30.00 | 100.00 | 4 | 8 | 10.54 | 10.62 | 71.06 | 84.92 | yes |
-| 2 | 30.00 | 100.00 | 16 | 32 | 4.93 | 5.09 | 128.52 | 162.79 | yes |
-| 2 | 60.00 | 20.00 | 1 | 2 | 6.86 | 6.80 | 11.44 | 13.61 | yes |
-| 2 | 60.00 | 20.00 | 4 | 8 | 4.31 | 4.39 | 28.16 | 35.15 | yes |
-| 2 | 60.00 | 20.00 | 16 | 32 | 1.81 | 1.82 | 45.36 | 58.16 | yes |
-| 2 | 60.00 | 100.00 | 1 | 2 | 7.50 | 7.78 | 12.87 | 15.55 | yes |
-| 2 | 60.00 | 100.00 | 4 | 8 | 6.47 | 6.49 | 43.41 | 51.88 | yes |
-| 2 | 60.00 | 100.00 | 16 | 32 | 3.81 | 3.90 | 100.01 | 124.72 | yes |
-| 4 | 10.00 | 20.00 | 1 | 4 | 11.00 | 11.11 | 33.85 | 44.46 | yes |
-| 4 | 10.00 | 20.00 | 4 | 16 | 4.01 | 4.18 | 48.58 | 66.83 | yes |
-| 4 | 10.00 | 20.00 | 16 | 64 | 1.13 | 1.19 | 54.53 | 76.44 | yes |
-| 4 | 10.00 | 100.00 | 1 | 4 | 18.32 | 18.77 | 60.05 | 75.09 | yes |
-| 4 | 10.00 | 100.00 | 4 | 16 | 10.26 | 10.80 | 129.94 | 172.74 | yes |
-| 4 | 10.00 | 100.00 | 16 | 64 | 3.57 | 4.00 | 178.87 | 255.95 | yes |
-| 4 | 30.00 | 20.00 | 1 | 4 | 5.86 | 5.88 | 18.93 | 23.53 | yes |
-| 4 | 30.00 | 20.00 | 4 | 16 | 3.10 | 3.13 | 37.89 | 50.09 | yes |
-| 4 | 30.00 | 20.00 | 16 | 64 | 1.05 | 1.09 | 50.57 | 69.77 | yes |
-| 4 | 30.00 | 100.00 | 1 | 4 | 7.30 | 7.50 | 24.57 | 30.01 | yes |
-| 4 | 30.00 | 100.00 | 4 | 16 | 5.69 | 5.79 | 75.29 | 92.69 | yes |
-| 4 | 30.00 | 100.00 | 16 | 64 | 2.84 | 3.03 | 146.11 | 193.91 | yes |
-| 4 | 60.00 | 20.00 | 1 | 4 | 3.41 | 3.45 | 11.24 | 13.79 | yes |
-| 4 | 60.00 | 20.00 | 4 | 16 | 2.25 | 2.28 | 28.43 | 36.41 | yes |
-| 4 | 60.00 | 20.00 | 16 | 64 | 0.94 | 0.96 | 45.60 | 61.70 | yes |
-| 4 | 60.00 | 100.00 | 1 | 4 | 3.88 | 3.95 | 13.18 | 15.79 | yes |
-| 4 | 60.00 | 100.00 | 4 | 16 | 3.37 | 3.42 | 44.79 | 54.68 | yes |
-| 4 | 60.00 | 100.00 | 16 | 64 | 2.14 | 2.22 | 110.03 | 142.21 | yes |
-| 8 | 10.00 | 20.00 | 1 | 8 | 5.58 | 5.68 | 34.02 | 45.45 | yes |
-| 8 | 10.00 | 20.00 | 4 | 32 | 2.05 | 2.16 | 48.69 | 69.10 | yes |
-| 8 | 10.00 | 20.00 | 16 | 128 | 0.57 | 0.62 | 54.53 | 79.43 | yes |
-| 8 | 10.00 | 100.00 | 1 | 8 | 9.52 | 9.75 | 62.26 | 77.97 | yes |
-| 8 | 10.00 | 100.00 | 4 | 32 | 5.68 | 5.90 | 138.25 | 188.81 | yes |
-| 8 | 10.00 | 100.00 | 16 | 128 | 2.08 | 2.29 | 201.13 | 292.90 | yes |
-| 8 | 30.00 | 20.00 | 1 | 8 | 2.95 | 2.98 | 18.83 | 23.81 | yes |
-| 8 | 30.00 | 20.00 | 4 | 32 | 1.58 | 1.60 | 37.77 | 51.36 | yes |
-| 8 | 30.00 | 20.00 | 16 | 128 | 0.53 | 0.56 | 50.53 | 72.26 | yes |
-| 8 | 30.00 | 100.00 | 1 | 8 | 3.75 | 3.81 | 25.00 | 30.46 | yes |
-| 8 | 30.00 | 100.00 | 4 | 32 | 2.96 | 3.04 | 76.67 | 97.12 | yes |
-| 8 | 30.00 | 100.00 | 16 | 128 | 1.59 | 1.68 | 158.02 | 214.40 | yes |
-| 8 | 60.00 | 20.00 | 1 | 8 | 1.71 | 1.74 | 11.28 | 13.89 | yes |
-| 8 | 60.00 | 20.00 | 4 | 32 | 1.15 | 1.16 | 28.51 | 37.08 | yes |
-| 8 | 60.00 | 20.00 | 16 | 128 | 0.48 | 0.50 | 45.31 | 63.64 | yes |
-| 8 | 60.00 | 100.00 | 1 | 8 | 1.96 | 1.99 | 13.19 | 15.92 | yes |
-| 8 | 60.00 | 100.00 | 4 | 32 | 1.72 | 1.76 | 45.57 | 56.19 | yes |
-| 8 | 60.00 | 100.00 | 16 | 128 | 1.15 | 1.19 | 116.15 | 152.93 | yes |
-
-**Curve, measured on the emulated WAN (CI runner (GitHub ubuntu-latest))**: the smallest swept configuration (2/4/8 stages × depth 1/4/16, G = stages) whose aggregate reached each target, with Kimi-sized frames on the wire. Synthetic model, so compute per stage is small; the network and the uplink set these numbers.
+**Curve, measured on the emulated WAN (Studio lab)**: the smallest swept configuration (2/4/8 stages × depth 1/4/16, G = stages) whose steady-state aggregate reached each target, with Kimi-sized activations on the wire. Synthetic model, so compute per stage is small; the network and the uplink set these numbers.
 
 | one-way ms | uplink Mbit/s | target tok/s | stages | depth | concurrent | per answer tok/s | aggregate tok/s |
 |---|---|---|---|---|---|---|---|
-| 10.00 | 20.00 | 25 | 2 | 1 | 2 | 20.95 | 33.80 |
-| 10.00 | 20.00 | 50 | 2 | 16 | 32 | 2.17 | 54.49 |
-| 10.00 | 20.00 | 100 | – | – | – | – | not reached (best 55) |
-| 10.00 | 20.00 | 150 | – | – | – | – | not reached (best 55) |
-| 10.00 | 20.00 | 200 | – | – | – | – | not reached (best 55) |
-| 10.00 | 100.00 | 25 | 2 | 1 | 2 | 34.63 | 58.11 |
-| 10.00 | 100.00 | 50 | 2 | 1 | 2 | 34.63 | 58.11 |
-| 10.00 | 100.00 | 100 | 2 | 4 | 8 | 18.32 | 118.34 |
-| 10.00 | 100.00 | 150 | 2 | 16 | 32 | 5.69 | 150.91 |
-| 10.00 | 100.00 | 200 | 8 | 16 | 128 | 2.08 | 201.13 |
-| 30.00 | 20.00 | 25 | 2 | 4 | 8 | 5.89 | 37.58 |
-| 30.00 | 20.00 | 50 | 2 | 16 | 32 | 2.01 | 50.50 |
-| 30.00 | 20.00 | 100 | – | – | – | – | not reached (best 51) |
-| 30.00 | 20.00 | 150 | – | – | – | – | not reached (best 51) |
-| 30.00 | 20.00 | 200 | – | – | – | – | not reached (best 51) |
-| 30.00 | 100.00 | 25 | 2 | 4 | 8 | 10.54 | 71.06 |
-| 30.00 | 100.00 | 50 | 2 | 4 | 8 | 10.54 | 71.06 |
-| 30.00 | 100.00 | 100 | 2 | 16 | 32 | 4.93 | 128.52 |
-| 30.00 | 100.00 | 150 | 8 | 16 | 128 | 1.59 | 158.02 |
-| 30.00 | 100.00 | 200 | – | – | – | – | not reached (best 158) |
-| 60.00 | 20.00 | 25 | 2 | 4 | 8 | 4.31 | 28.16 |
-| 60.00 | 20.00 | 50 | – | – | – | – | not reached (best 46) |
-| 60.00 | 20.00 | 100 | – | – | – | – | not reached (best 46) |
-| 60.00 | 20.00 | 150 | – | – | – | – | not reached (best 46) |
-| 60.00 | 20.00 | 200 | – | – | – | – | not reached (best 46) |
-| 60.00 | 100.00 | 25 | 2 | 4 | 8 | 6.47 | 43.41 |
-| 60.00 | 100.00 | 50 | 2 | 16 | 32 | 3.81 | 100.01 |
-| 60.00 | 100.00 | 100 | 2 | 16 | 32 | 3.81 | 100.01 |
-| 60.00 | 100.00 | 150 | – | – | – | – | not reached (best 116) |
-| 60.00 | 100.00 | 200 | – | – | – | – | not reached (best 116) |
+| 10.00 | 20.00 | 25 | 2 | 1 | 2 | 28.79 | 57.73 |
+| 10.00 | 20.00 | 50 | 2 | 1 | 2 | 28.79 | 57.73 |
+| 10.00 | 20.00 | 100 | – | – | – | – | not reached (best 87) |
+| 10.00 | 20.00 | 150 | – | – | – | – | not reached (best 87) |
+| 10.00 | 20.00 | 200 | – | – | – | – | not reached (best 87) |
+| 10.00 | 100.00 | 25 | 2 | 1 | 2 | 39.88 | 79.11 |
+| 10.00 | 100.00 | 50 | 2 | 1 | 2 | 39.88 | 79.11 |
+| 10.00 | 100.00 | 100 | 2 | 4 | 8 | 23.83 | 190.16 |
+| 10.00 | 100.00 | 150 | 2 | 4 | 8 | 23.83 | 190.16 |
+| 10.00 | 100.00 | 200 | 2 | 16 | 32 | 9.64 | 309.59 |
+| 30.00 | 20.00 | 25 | 2 | 1 | 2 | 13.35 | 26.59 |
+| 30.00 | 20.00 | 50 | 2 | 4 | 8 | 8.46 | 67.83 |
+| 30.00 | 20.00 | 100 | – | – | – | – | not reached (best 87) |
+| 30.00 | 20.00 | 150 | – | – | – | – | not reached (best 87) |
+| 30.00 | 20.00 | 200 | – | – | – | – | not reached (best 87) |
+| 30.00 | 100.00 | 25 | 2 | 1 | 2 | 15.40 | 30.47 |
+| 30.00 | 100.00 | 50 | 2 | 4 | 8 | 12.51 | 99.33 |
+| 30.00 | 100.00 | 100 | 2 | 16 | 32 | 6.99 | 224.49 |
+| 30.00 | 100.00 | 150 | 2 | 16 | 32 | 6.99 | 224.49 |
+| 30.00 | 100.00 | 200 | 2 | 16 | 32 | 6.99 | 224.49 |
+| 60.00 | 20.00 | 25 | 2 | 4 | 8 | 5.56 | 44.49 |
+| 60.00 | 20.00 | 50 | 2 | 16 | 32 | 2.69 | 86.74 |
+| 60.00 | 20.00 | 100 | – | – | – | – | not reached (best 87) |
+| 60.00 | 20.00 | 150 | – | – | – | – | not reached (best 87) |
+| 60.00 | 20.00 | 200 | – | – | – | – | not reached (best 87) |
+| 60.00 | 100.00 | 25 | 2 | 4 | 8 | 7.07 | 56.14 |
+| 60.00 | 100.00 | 50 | 2 | 4 | 8 | 7.07 | 56.14 |
+| 60.00 | 100.00 | 100 | 2 | 16 | 32 | 4.96 | 157.32 |
+| 60.00 | 100.00 | 150 | 2 | 16 | 32 | 4.96 | 157.32 |
+| 60.00 | 100.00 | 200 | – | – | – | – | not reached (best 157) |
 
 ## Bit-exactness
 
 Every island run above was compared with the single process (tokens, every logits hash, the hash at every layer boundary of every position): **all identical**.
 
-## Projection for Kimi K2 (not a measurement)
+## Projection for Kimi K2 / K2.6 (not a measurement)
 
-Measured software cost per hop used below: 38.2 µs (CI runner (GitHub ubuntu-latest), loopback TCP, 28 KiB frame; the larger of the measured hosts). A real NIC adds wire time: 22.9 µs on 10 GbE, 2.9 µs on TB5 (80 Gb/s).
+Everything below is arithmetic, not a measurement, for **Kimi K2**; K2.6 has the same text shapes (`docs/protocol/kimi-k26-checkpoint.md` §1), so it applies to the requested K2.6 unchanged. No Kimi weights and no real network were run.
 
-**Islands (T1), pipeline parallel, PROJECTION** — per answer and aggregate tok/s; concurrency = stages × depth (one micro-batch per stage); the last column applies research-6 §2.7's 1.34× for one exact speculative draft (Kimi K2 has no MTP head; needs a drafter).
+Inputs: the measured software cost per hop, 61.9 µs (Studio lab, loopback TCP, 28 KiB frame; the larger of the measured hosts); research-6's memory bandwidths (456 GB/s M3 Ultra, 1,108 GB/s RTX 5090), which ARC's engine does not reach (1.4–2.7 GB/s measured); batched weight reads across a micro-batch's sequences, which this runtime does not have (the swarm table also shows per-sequence reads); and **4096 tokens of context per sequence** (sensitivity table below).
 
-| devices | stages | link | depth | concurrent | per answer tok/s | aggregate tok/s | with 1 draft | KV fits |
-|---|---|---|---|---|---|---|---|---|
-| M3 Ultra 512 GB | 2 | TB5 | 1 | 1 | 20.41 | 20.41 | 27.35 | yes |
-| M3 Ultra 512 GB | 2 | TB5 | 8 | 16 | 4.61 | 73.76 | – | yes |
-| M3 Ultra 512 GB | 2 | TB5 | 32 | 64 | 1.57 | 100.56 | – | yes |
-| M3 Ultra 512 GB | 4 | TB5 | 1 | 1 | 20.38 | 20.38 | 27.31 | yes |
-| M3 Ultra 512 GB | 4 | TB5 | 8 | 32 | 4.61 | 147.46 | – | yes |
-| M3 Ultra 512 GB | 4 | TB5 | 32 | 128 | 1.57 | 201.09 | – | yes |
-| M3 Ultra 512 GB | 2 | 10 GbE | 1 | 1 | 20.40 | 20.40 | 27.33 | yes |
-| M3 Ultra 512 GB | 2 | 10 GbE | 8 | 16 | 4.61 | 73.74 | – | yes |
-| M3 Ultra 512 GB | 2 | 10 GbE | 32 | 64 | 1.57 | 100.55 | – | yes |
-| RTX 5090 32 GB | 26 | 25 GbE | 1 | 1 | 46.82 | 46.82 | 62.74 | yes |
-| RTX 5090 32 GB | 26 | 25 GbE | 8 | 208 | 11.05 | 2,298.97 | – | yes |
-| RTX 5090 32 GB | 26 | 25 GbE | 32 | 832 | 3.80 | 3,161.88 | – | yes |
+**Aggregates are optimistic.** The same model, fed with measured costs, put the emulated-WAN steady-state aggregate at a median -3.1% from measured, and wall-clock aggregate (with prefill and fill/drain) at a median -7.7%. Read every projected aggregate below as an upper bound.
 
-**Swarm pipeline across homes (T2-batch), PROJECTION** — G = stages micro-batches of `depth`; uplink ceiling = uplink ÷ (28 KiB × 8): every token's activation crosses every stage's uplink, so no schedule can exceed it. KV fits = the concurrent sequences' MLA cache at 4096 tokens of context (34.3 KiB per token, spread over the stages) fits beside the device's share of the 582 GB of weights.
+**Islands (T1), pipeline parallel, PROJECTION**. Concurrency = stages × depth (one micro-batch per stage). "0.3 ms hop" replaces the measured loopback hop with research-6's streaming-transport hop (a real NIC, driver and GPU copies). "1 draft" is the model's verify pass over 2 positions (one draft token) at 1.85 tokens accepted per pass — DeepSeek-V3's MTP acceptance, ASSUMED: Kimi has no MTP head, and the drafter's acceptance and cost are not modelled.
 
-| devices | stages | one-way ms | uplink Mbit/s | depth | concurrent | per answer tok/s | aggregate tok/s | uplink ceiling tok/s | KV fits |
+| devices | stages | link | depth | concurrent | per answer tok/s | at 0.3 ms hop | 1 draft | aggregate tok/s | KV fits |
 |---|---|---|---|---|---|---|---|---|---|
-| RTX 5090 32 GB | 26 | 10 | 20 | 1 | 26 | 1.73 | 44.88 | 87.19 | yes |
-| RTX 5090 32 GB | 26 | 10 | 20 | 4 | 104 | 0.66 | 69.11 | 87.19 | yes |
-| RTX 5090 32 GB | 26 | 10 | 20 | 16 | 416 | 0.19 | 80.17 | 87.19 | yes |
-| RTX 5090 32 GB | 26 | 10 | 20 | 64 | 1,664 | 0.05 | 84.31 | 87.19 | no (9.2 > 4.6 GB) |
-| RTX 5090 32 GB | 26 | 10 | 100 | 1 | 26 | 2.93 | 76.30 | 435.97 | yes |
-| RTX 5090 32 GB | 26 | 10 | 100 | 4 | 104 | 1.82 | 188.90 | 435.97 | yes |
-| RTX 5090 32 GB | 26 | 10 | 100 | 16 | 416 | 0.73 | 303.23 | 435.97 | yes |
-| RTX 5090 32 GB | 26 | 10 | 100 | 64 | 1,664 | 0.22 | 372.39 | 435.97 | no (9.2 > 4.6 GB) |
-| RTX 5090 32 GB | 26 | 30 | 20 | 1 | 26 | 0.91 | 23.65 | 87.19 | yes |
-| RTX 5090 32 GB | 26 | 30 | 20 | 4 | 104 | 0.49 | 51.36 | 87.19 | yes |
-| RTX 5090 32 GB | 26 | 30 | 20 | 16 | 416 | 0.18 | 72.87 | 87.19 | yes |
-| RTX 5090 32 GB | 26 | 30 | 20 | 64 | 1,664 | 0.05 | 82.15 | 87.19 | no (9.2 > 4.6 GB) |
-| RTX 5090 32 GB | 26 | 30 | 100 | 1 | 26 | 1.16 | 30.21 | 435.97 | yes |
-| RTX 5090 32 GB | 26 | 30 | 100 | 4 | 104 | 0.93 | 97.15 | 435.97 | yes |
-| RTX 5090 32 GB | 26 | 30 | 100 | 16 | 416 | 0.53 | 219.88 | 435.97 | yes |
-| RTX 5090 32 GB | 26 | 30 | 100 | 64 | 1,664 | 0.20 | 333.57 | 435.97 | no (9.2 > 4.6 GB) |
-| RTX 5090 32 GB | 26 | 60 | 20 | 1 | 26 | 0.53 | 13.83 | 87.19 | yes |
-| RTX 5090 32 GB | 26 | 60 | 20 | 4 | 104 | 0.36 | 37.08 | 87.19 | yes |
-| RTX 5090 32 GB | 26 | 60 | 20 | 16 | 416 | 0.15 | 64.11 | 87.19 | yes |
-| RTX 5090 32 GB | 26 | 60 | 20 | 64 | 1,664 | 0.05 | 79.10 | 87.19 | no (9.2 > 4.6 GB) |
-| RTX 5090 32 GB | 26 | 60 | 100 | 1 | 26 | 0.61 | 15.85 | 435.97 | yes |
-| RTX 5090 32 GB | 26 | 60 | 100 | 4 | 104 | 0.54 | 56.20 | 435.97 | yes |
-| RTX 5090 32 GB | 26 | 60 | 100 | 16 | 416 | 0.37 | 155.69 | 435.97 | yes |
-| RTX 5090 32 GB | 26 | 60 | 100 | 64 | 1,664 | 0.17 | 288.47 | 435.97 | no (9.2 > 4.6 GB) |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 1 | 12 | 2.48 | 29.72 | 87.19 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 4 | 48 | 0.96 | 46.14 | 87.19 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 16 | 192 | 0.29 | 55.53 | 87.19 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 64 | 768 | 0.09 | 65.32 | 87.19 | no (9.2 > 2.5 GB) |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 1 | 12 | 3.40 | 40.85 | 435.97 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 4 | 48 | 1.67 | 80.02 | 435.97 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 16 | 192 | 0.59 | 113.22 | 435.97 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 64 | 768 | 0.21 | 163.02 | 435.97 | no (9.2 > 2.5 GB) |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 1 | 12 | 1.55 | 18.64 | 87.19 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 4 | 48 | 0.78 | 37.49 | 87.19 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 16 | 192 | 0.27 | 51.93 | 87.19 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 64 | 768 | 0.08 | 64.01 | 87.19 | no (9.2 > 2.5 GB) |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 1 | 12 | 1.87 | 22.48 | 435.97 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 4 | 48 | 1.19 | 57.15 | 435.97 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 16 | 192 | 0.52 | 99.19 | 435.97 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 64 | 768 | 0.20 | 155.12 | 435.97 | no (9.2 > 2.5 GB) |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 1 | 12 | 1.00 | 11.95 | 87.19 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 4 | 48 | 0.61 | 29.26 | 87.19 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 16 | 192 | 0.25 | 47.32 | 87.19 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 64 | 768 | 0.08 | 62.15 | 87.19 | no (9.2 > 2.5 GB) |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 1 | 12 | 1.12 | 13.43 | 435.97 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 4 | 48 | 0.83 | 40.00 | 435.97 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 16 | 192 | 0.44 | 83.63 | 435.97 | yes |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 64 | 768 | 0.19 | 144.61 | 435.97 | no (9.2 > 2.5 GB) |
+| M3 Ultra 512 GB | 2 | TB5 | 1 | 1 | 20.39 | 20.20 | 24.81 | 20.39 | yes |
+| M3 Ultra 512 GB | 2 | TB5 | 8 | 16 | 4.61 | – | – | 73.74 | yes |
+| M3 Ultra 512 GB | 2 | TB5 | 32 | 64 | 1.57 | – | – | 100.55 | yes |
+| M3 Ultra 512 GB | 4 | TB5 | 1 | 1 | 20.34 | 19.95 | 24.77 | 20.34 | yes |
+| M3 Ultra 512 GB | 4 | TB5 | 8 | 32 | 4.61 | – | – | 147.39 | yes |
+| M3 Ultra 512 GB | 4 | TB5 | 32 | 128 | 1.57 | – | – | 201.06 | yes |
+| M3 Ultra 512 GB | 2 | 10 GbE | 1 | 1 | 20.38 | 20.18 | 24.80 | 20.38 | yes |
+| M3 Ultra 512 GB | 2 | 10 GbE | 8 | 16 | 4.61 | – | – | 73.73 | yes |
+| M3 Ultra 512 GB | 2 | 10 GbE | 32 | 64 | 1.57 | – | – | 100.54 | yes |
+| RTX 5090 32 GB | 26 | 25 GbE | 1 | 1 | 45.46 | 35.48 | 56.91 | 45.46 | yes |
+| RTX 5090 32 GB | 26 | 25 GbE | 8 | 208 | 10.98 | – | – | 2,282.87 | yes |
+| RTX 5090 32 GB | 26 | 25 GbE | 32 | 832 | 3.79 | – | – | 3,154.23 | yes |
 
-**Curve: what one swarm pipeline needs to reach an aggregate, PROJECTION** — the smallest micro-batch depth (G = stages micro-batches) whose projected aggregate reaches the target with the KV cache fitting (4096 tokens of context), and the per-answer speed at that point. Two stage counts per device class: the memory minimum (with KV headroom) and about twice that. More stages give more KV room, so more sequences can be in flight, but each answer is slower and the uplink ceiling stays the same: every stage's uplink carries every token.
+**Swarm pipeline across homes (T2-batch), PROJECTION**. G = stages micro-batches of `depth`. Uplink ceiling = uplink ÷ (bytes per position × 8), with the activation (28,672 B) plus accumulated commitments (up to 32 B × (61 + stages)) on the busiest uplink: every token crosses every stage's uplink, so no schedule can exceed it. "Per-sequence reads" = the same with every sequence reading its own weights (this runtime today). KV fits = the MLA cache at 4096 tokens of context fits beside the device's share of the 582 GB of weights.
+
+| devices | stages | one-way ms | uplink Mbit/s | depth | concurrent | per answer tok/s | aggregate tok/s | per-sequence reads | uplink ceiling tok/s | KV fits |
+|---|---|---|---|---|---|---|---|---|---|---|
+| RTX 5090 32 GB | 26 | 10 | 20 | 1 | 26 | 1.68 | 43.60 | 43.60 | 79.48 | yes |
+| RTX 5090 32 GB | 26 | 10 | 20 | 4 | 104 | 0.64 | 66.21 | 64.99 | 79.48 | yes |
+| RTX 5090 32 GB | 26 | 10 | 20 | 16 | 416 | 0.18 | 76.31 | 74.07 | 79.48 | yes |
+| RTX 5090 32 GB | 26 | 10 | 20 | 64 | 1,664 | 0.05 | 79.48 | 76.75 | 79.48 | no (9.2 > 4.6 GB) |
+| RTX 5090 32 GB | 26 | 10 | 100 | 1 | 26 | 2.90 | 75.44 | 75.44 | 397.38 | yes |
+| RTX 5090 32 GB | 26 | 10 | 100 | 4 | 104 | 1.77 | 184.31 | 175.15 | 397.38 | yes |
+| RTX 5090 32 GB | 26 | 10 | 100 | 16 | 416 | 0.70 | 291.95 | 261.60 | 397.38 | yes |
+| RTX 5090 32 GB | 26 | 10 | 100 | 64 | 1,664 | 0.21 | 355.66 | 298.42 | 397.38 | no (9.2 > 4.6 GB) |
+| RTX 5090 32 GB | 26 | 30 | 20 | 1 | 26 | 0.90 | 23.29 | 23.29 | 79.48 | yes |
+| RTX 5090 32 GB | 26 | 30 | 20 | 4 | 104 | 0.48 | 49.74 | 49.05 | 79.48 | yes |
+| RTX 5090 32 GB | 26 | 30 | 20 | 16 | 416 | 0.17 | 69.67 | 67.79 | 79.48 | yes |
+| RTX 5090 32 GB | 26 | 30 | 20 | 64 | 1,664 | 0.05 | 78.11 | 74.95 | 79.48 | no (9.2 > 4.6 GB) |
+| RTX 5090 32 GB | 26 | 30 | 100 | 1 | 26 | 1.16 | 30.07 | 30.07 | 397.38 | yes |
+| RTX 5090 32 GB | 26 | 30 | 100 | 4 | 104 | 0.92 | 95.92 | 93.38 | 397.38 | yes |
+| RTX 5090 32 GB | 26 | 30 | 100 | 16 | 416 | 0.51 | 213.89 | 197.14 | 397.38 | yes |
+| RTX 5090 32 GB | 26 | 30 | 100 | 64 | 1,664 | 0.19 | 320.09 | 272.96 | 397.38 | no (9.2 > 4.6 GB) |
+| RTX 5090 32 GB | 26 | 60 | 20 | 1 | 26 | 0.53 | 13.71 | 13.71 | 79.48 | yes |
+| RTX 5090 32 GB | 26 | 60 | 20 | 4 | 104 | 0.35 | 36.23 | 35.86 | 79.48 | yes |
+| RTX 5090 32 GB | 26 | 60 | 20 | 16 | 416 | 0.15 | 61.62 | 60.15 | 79.48 | yes |
+| RTX 5090 32 GB | 26 | 60 | 20 | 64 | 1,664 | 0.05 | 75.35 | 72.41 | 79.48 | no (9.2 > 4.6 GB) |
+| RTX 5090 32 GB | 26 | 60 | 100 | 1 | 26 | 0.61 | 15.81 | 15.81 | 397.38 | yes |
+| RTX 5090 32 GB | 26 | 60 | 100 | 4 | 104 | 0.54 | 55.79 | 54.92 | 397.38 | yes |
+| RTX 5090 32 GB | 26 | 60 | 100 | 16 | 416 | 0.37 | 152.67 | 143.93 | 397.38 | yes |
+| RTX 5090 32 GB | 26 | 60 | 100 | 64 | 1,664 | 0.17 | 278.33 | 242.00 | 397.38 | no (9.2 > 4.6 GB) |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 1 | 12 | 2.48 | 29.78 | 29.78 | 80.62 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 4 | 48 | 0.97 | 46.34 | 38.42 | 80.62 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 16 | 192 | 0.29 | 55.84 | 41.42 | 80.62 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 64 | 768 | 0.09 | 65.74 | 42.24 | 80.62 | no (9.2 > 2.5 GB) |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 1 | 12 | 3.40 | 40.85 | 40.85 | 403.12 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 4 | 48 | 1.67 | 80.10 | 59.05 | 403.12 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 16 | 192 | 0.59 | 113.46 | 66.45 | 403.12 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 64 | 768 | 0.21 | 163.54 | 68.60 | 403.12 | no (9.2 > 2.5 GB) |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 1 | 12 | 1.56 | 18.66 | 18.66 | 80.62 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 4 | 48 | 0.78 | 37.62 | 32.23 | 80.62 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 16 | 192 | 0.27 | 52.19 | 39.38 | 80.62 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 64 | 768 | 0.08 | 64.42 | 41.69 | 80.62 | no (9.2 > 2.5 GB) |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 1 | 12 | 1.87 | 22.48 | 22.48 | 403.12 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 4 | 48 | 1.19 | 57.20 | 45.59 | 403.12 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 16 | 192 | 0.52 | 99.37 | 61.35 | 403.12 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 64 | 768 | 0.20 | 155.59 | 67.16 | 403.12 | no (9.2 > 2.5 GB) |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 1 | 12 | 1.00 | 11.96 | 11.96 | 80.62 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 4 | 48 | 0.61 | 29.34 | 25.95 | 80.62 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 16 | 192 | 0.25 | 47.54 | 36.67 | 80.62 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 64 | 768 | 0.08 | 62.53 | 40.89 | 80.62 | no (9.2 > 2.5 GB) |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 1 | 12 | 1.12 | 13.43 | 13.43 | 403.12 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 4 | 48 | 0.83 | 40.03 | 33.97 | 403.12 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 16 | 192 | 0.44 | 83.76 | 55.02 | 403.12 | yes |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 64 | 768 | 0.19 | 145.01 | 65.11 | 403.12 | no (9.2 > 2.5 GB) |
+
+**Context sensitivity, PROJECTION**: the most aggregate one swarm pipeline reaches before its KV cache runs out, by tokens of context held per sequence (agentic traffic is prompt-heavy, so 4k is optimistic).
+
+| devices | stages | one-way ms | uplink Mbit/s | 4k context | 8k context | 32k context |
+|---|---|---|---|---|---|---|
+| RTX 5090 32 GB | 26 | 10 | 20 | 79 (832 seqs, 0.09/answer) | 76 (416 seqs, 0.18/answer) | 66 (104 seqs, 0.64/answer) |
+| RTX 5090 32 GB | 26 | 10 | 100 | 328 (832 seqs, 0.39/answer) | 292 (416 seqs, 0.70/answer) | 184 (104 seqs, 1.77/answer) |
+| RTX 5090 32 GB | 26 | 30 | 20 | 75 (832 seqs, 0.09/answer) | 70 (416 seqs, 0.17/answer) | 50 (104 seqs, 0.48/answer) |
+| RTX 5090 32 GB | 26 | 30 | 100 | 272 (832 seqs, 0.33/answer) | 214 (416 seqs, 0.51/answer) | 96 (104 seqs, 0.92/answer) |
+| RTX 5090 32 GB | 26 | 60 | 20 | 70 (832 seqs, 0.08/answer) | 62 (416 seqs, 0.15/answer) | 36 (104 seqs, 0.35/answer) |
+| RTX 5090 32 GB | 26 | 60 | 100 | 217 (832 seqs, 0.26/answer) | 153 (416 seqs, 0.37/answer) | 56 (104 seqs, 0.54/answer) |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 56 (204 seqs, 0.28/answer) | 52 (96 seqs, 0.54/answer) | 39 (24 seqs, 1.62/answer) |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 115 (204 seqs, 0.56/answer) | 97 (96 seqs, 1.01/answer) | 60 (24 seqs, 2.52/answer) |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 53 (204 seqs, 0.26/answer) | 46 (96 seqs, 0.48/answer) | 28 (24 seqs, 1.17/answer) |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 101 (204 seqs, 0.50/answer) | 78 (96 seqs, 0.82/answer) | 38 (24 seqs, 1.57/answer) |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 48 (204 seqs, 0.24/answer) | 39 (96 seqs, 0.41/answer) | 20 (24 seqs, 0.82/answer) |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 86 (204 seqs, 0.42/answer) | 61 (96 seqs, 0.63/answer) | 24 (24 seqs, 1.00/answer) |
+
+**Curve: what one swarm pipeline needs to reach an aggregate, PROJECTION** — the smallest micro-batch depth (G = stages micro-batches) whose projected aggregate reaches the target with the KV cache fitting (4096 tokens of context, assumed), and the per-answer speed at that point. Upper bounds: the sequence counts are lower bounds (see the model error above), and batched weight reads are assumed. Two stage counts per device class: the memory minimum (with KV headroom) and about twice that. More stages give more KV room, so more sequences can be in flight, but each answer is slower and the uplink ceiling stays the same: every stage's uplink carries every token.
 
 | devices | stages | one-way ms | uplink Mbit/s | target tok/s | depth | concurrent | per answer tok/s | aggregate tok/s |
 |---|---|---|---|---|---|---|---|---|
-| RTX 5090 32 GB | 26 | 10 | 20 | 50 | 2 | 52 | 1.13 | 58.56 |
-| RTX 5090 32 GB | 26 | 10 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 10 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 10 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 10 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 10 | 100 | 50 | 1 | 26 | 2.93 | 76.30 |
-| RTX 5090 32 GB | 26 | 10 | 100 | 100 | 2 | 52 | 2.43 | 126.55 |
-| RTX 5090 32 GB | 26 | 10 | 100 | 200 | 5 | 130 | 1.61 | 209.66 |
-| RTX 5090 32 GB | 26 | 10 | 100 | 300 | 16 | 416 | 0.73 | 303.23 |
-| RTX 5090 32 GB | 26 | 10 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| RTX 5090 32 GB | 26 | 30 | 20 | 50 | 4 | 104 | 0.49 | 51.36 |
-| RTX 5090 32 GB | 26 | 30 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 30 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 30 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 30 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 30 | 100 | 50 | 2 | 52 | 1.07 | 55.86 |
-| RTX 5090 32 GB | 26 | 30 | 100 | 100 | 5 | 130 | 0.88 | 114.03 |
-| RTX 5090 32 GB | 26 | 30 | 100 | 200 | 13 | 338 | 0.59 | 200.12 |
+| RTX 5090 32 GB | 26 | 10 | 20 | 50 | 2 | 52 | 1.09 | 56.44 |
+| RTX 5090 32 GB | 26 | 10 | 20 | 100 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 10 | 20 | 200 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 10 | 20 | 300 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 10 | 20 | 400 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 10 | 100 | 50 | 1 | 26 | 2.90 | 75.44 |
+| RTX 5090 32 GB | 26 | 10 | 100 | 100 | 2 | 52 | 2.39 | 124.38 |
+| RTX 5090 32 GB | 26 | 10 | 100 | 200 | 5 | 130 | 1.57 | 204.07 |
+| RTX 5090 32 GB | 26 | 10 | 100 | 300 | 19 | 494 | 0.61 | 301.93 |
+| RTX 5090 32 GB | 26 | 10 | 100 | 400 | – | – | – | no: uplink ceiling 397 |
+| RTX 5090 32 GB | 26 | 30 | 20 | 50 | 5 | 130 | 0.41 | 53.82 |
+| RTX 5090 32 GB | 26 | 30 | 20 | 100 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 30 | 20 | 200 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 30 | 20 | 300 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 30 | 20 | 400 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 30 | 100 | 50 | 2 | 52 | 1.07 | 55.43 |
+| RTX 5090 32 GB | 26 | 30 | 100 | 100 | 5 | 130 | 0.86 | 112.36 |
+| RTX 5090 32 GB | 26 | 30 | 100 | 200 | 14 | 364 | 0.55 | 201.86 |
 | RTX 5090 32 GB | 26 | 30 | 100 | 300 | – | – | – | no: KV memory runs out first |
-| RTX 5090 32 GB | 26 | 30 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| RTX 5090 32 GB | 26 | 60 | 20 | 50 | 8 | 208 | 0.25 | 51.54 |
-| RTX 5090 32 GB | 26 | 60 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 60 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 60 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 60 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 26 | 60 | 100 | 50 | 4 | 104 | 0.54 | 56.20 |
-| RTX 5090 32 GB | 26 | 60 | 100 | 100 | 9 | 234 | 0.46 | 106.56 |
-| RTX 5090 32 GB | 26 | 60 | 100 | 200 | 26 | 676 | 0.30 | 202.51 |
+| RTX 5090 32 GB | 26 | 30 | 100 | 400 | – | – | – | no: uplink ceiling 397 |
+| RTX 5090 32 GB | 26 | 60 | 20 | 50 | 9 | 234 | 0.22 | 52.10 |
+| RTX 5090 32 GB | 26 | 60 | 20 | 100 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 60 | 20 | 200 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 60 | 20 | 300 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 60 | 20 | 400 | – | – | – | no: uplink ceiling 79 |
+| RTX 5090 32 GB | 26 | 60 | 100 | 50 | 4 | 104 | 0.54 | 55.79 |
+| RTX 5090 32 GB | 26 | 60 | 100 | 100 | 9 | 234 | 0.45 | 105.12 |
+| RTX 5090 32 GB | 26 | 60 | 100 | 200 | 27 | 702 | 0.29 | 200.97 |
 | RTX 5090 32 GB | 26 | 60 | 100 | 300 | – | – | – | no: KV memory runs out first |
-| RTX 5090 32 GB | 26 | 60 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| RTX 5090 32 GB | 44 | 10 | 20 | 50 | 2 | 88 | 0.67 | 59.40 |
-| RTX 5090 32 GB | 44 | 10 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 10 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 10 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 10 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 10 | 100 | 50 | 1 | 44 | 1.78 | 78.19 |
-| RTX 5090 32 GB | 44 | 10 | 100 | 100 | 2 | 88 | 1.48 | 130.53 |
-| RTX 5090 32 GB | 44 | 10 | 100 | 200 | 5 | 220 | 0.99 | 218.43 |
-| RTX 5090 32 GB | 44 | 10 | 100 | 300 | 13 | 572 | 0.53 | 303.22 |
-| RTX 5090 32 GB | 44 | 10 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| RTX 5090 32 GB | 44 | 30 | 20 | 50 | 4 | 176 | 0.29 | 51.90 |
-| RTX 5090 32 GB | 44 | 30 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 30 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 30 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 30 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 30 | 100 | 50 | 2 | 88 | 0.64 | 56.62 |
-| RTX 5090 32 GB | 44 | 30 | 100 | 100 | 5 | 220 | 0.53 | 116.58 |
-| RTX 5090 32 GB | 44 | 30 | 100 | 200 | 13 | 572 | 0.36 | 206.76 |
-| RTX 5090 32 GB | 44 | 30 | 100 | 300 | 35 | 1,540 | 0.19 | 300.08 |
-| RTX 5090 32 GB | 44 | 30 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| RTX 5090 32 GB | 44 | 60 | 20 | 50 | 8 | 352 | 0.15 | 52.01 |
-| RTX 5090 32 GB | 44 | 60 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 60 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 60 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 60 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| RTX 5090 32 GB | 44 | 60 | 100 | 50 | 4 | 176 | 0.32 | 56.84 |
-| RTX 5090 32 GB | 44 | 60 | 100 | 100 | 9 | 396 | 0.27 | 108.54 |
-| RTX 5090 32 GB | 44 | 60 | 100 | 200 | 24 | 1,056 | 0.19 | 200.09 |
-| RTX 5090 32 GB | 44 | 60 | 100 | 300 | 67 | 2,948 | 0.10 | 300.74 |
-| RTX 5090 32 GB | 44 | 60 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 50 | 7 | 84 | 0.60 | 50.51 |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 50 | 2 | 24 | 2.52 | 60.40 |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 100 | 10 | 120 | 0.85 | 102.39 |
+| RTX 5090 32 GB | 26 | 60 | 100 | 400 | – | – | – | no: uplink ceiling 397 |
+| RTX 5090 32 GB | 44 | 10 | 20 | 50 | 2 | 88 | 0.63 | 55.86 |
+| RTX 5090 32 GB | 44 | 10 | 20 | 100 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 10 | 20 | 200 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 10 | 20 | 300 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 10 | 20 | 400 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 10 | 100 | 50 | 1 | 44 | 1.75 | 76.78 |
+| RTX 5090 32 GB | 44 | 10 | 100 | 100 | 2 | 88 | 1.44 | 126.85 |
+| RTX 5090 32 GB | 44 | 10 | 100 | 200 | 5 | 220 | 0.95 | 208.62 |
+| RTX 5090 32 GB | 44 | 10 | 100 | 300 | 17 | 748 | 0.40 | 301.57 |
+| RTX 5090 32 GB | 44 | 10 | 100 | 400 | – | – | – | no: uplink ceiling 390 |
+| RTX 5090 32 GB | 44 | 30 | 20 | 50 | 5 | 220 | 0.24 | 53.16 |
+| RTX 5090 32 GB | 44 | 30 | 20 | 100 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 30 | 20 | 200 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 30 | 20 | 300 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 30 | 20 | 400 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 30 | 100 | 50 | 2 | 88 | 0.64 | 55.92 |
+| RTX 5090 32 GB | 44 | 30 | 100 | 100 | 5 | 220 | 0.52 | 113.72 |
+| RTX 5090 32 GB | 44 | 30 | 100 | 200 | 14 | 616 | 0.33 | 204.90 |
+| RTX 5090 32 GB | 44 | 30 | 100 | 300 | 46 | 2,024 | 0.15 | 301.17 |
+| RTX 5090 32 GB | 44 | 30 | 100 | 400 | – | – | – | no: uplink ceiling 390 |
+| RTX 5090 32 GB | 44 | 60 | 20 | 50 | 9 | 396 | 0.13 | 51.43 |
+| RTX 5090 32 GB | 44 | 60 | 20 | 100 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 60 | 20 | 200 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 60 | 20 | 300 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 60 | 20 | 400 | – | – | – | no: uplink ceiling 78 |
+| RTX 5090 32 GB | 44 | 60 | 100 | 50 | 4 | 176 | 0.32 | 56.15 |
+| RTX 5090 32 GB | 44 | 60 | 100 | 100 | 9 | 396 | 0.27 | 106.09 |
+| RTX 5090 32 GB | 44 | 60 | 100 | 200 | 27 | 1,188 | 0.17 | 203.06 |
+| RTX 5090 32 GB | 44 | 60 | 100 | 300 | 85 | 3,740 | 0.08 | 300.47 |
+| RTX 5090 32 GB | 44 | 60 | 100 | 400 | – | – | – | no: uplink ceiling 390 |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 50 | 7 | 84 | 0.60 | 50.76 |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 100 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 200 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 300 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 400 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 50 | 2 | 24 | 2.52 | 60.43 |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 100 | 9 | 108 | 0.93 | 100.16 |
 | Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 200 | – | – | – | no: KV memory runs out first |
 | Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 300 | – | – | – | no: KV memory runs out first |
 | Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 50 | 13 | 156 | 0.32 | 50.15 |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 50 | 4 | 48 | 1.19 | 57.15 |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 100 | 17 | 204 | 0.50 | 101.05 |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 50 | 13 | 156 | 0.32 | 50.39 |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 100 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 200 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 300 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 400 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 50 | 4 | 48 | 1.19 | 57.20 |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 100 | 17 | 204 | 0.50 | 101.24 |
 | Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 200 | – | – | – | no: KV memory runs out first |
 | Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 300 | – | – | – | no: KV memory runs out first |
 | Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 400 | – | – | – | no: KV memory runs out first |
 | Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 50 | – | – | – | no: KV memory runs out first |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 50 | 6 | 72 | 0.72 | 51.56 |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 100 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 200 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 300 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 400 | – | – | – | no: uplink ceiling 81 |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 50 | 6 | 72 | 0.72 | 51.61 |
 | Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 100 | – | – | – | no: KV memory runs out first |
 | Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 200 | – | – | – | no: KV memory runs out first |
 | Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 300 | – | – | – | no: KV memory runs out first |
 | Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 50 | 3 | 72 | 0.73 | 52.82 |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 50 | 1 | 24 | 2.26 | 54.33 |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 100 | 3 | 72 | 1.42 | 102.50 |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 200 | 35 | 840 | 0.24 | 200.92 |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 300 | 157 | 3,768 | 0.08 | 300.35 |
-| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 50 | 7 | 168 | 0.31 | 52.06 |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 50 | 3 | 72 | 0.85 | 60.89 |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 100 | 8 | 192 | 0.55 | 106.22 |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 200 | 50 | 1,200 | 0.17 | 201.01 |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 300 | 178 | 4,272 | 0.07 | 300.20 |
-| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 400 | – | – | – | no: KV memory runs out first |
-| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 50 | 12 | 288 | 0.18 | 51.02 |
-| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 100 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 200 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 300 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 400 | – | – | – | no: uplink ceiling 87 |
-| Mac 64 GB (M4 Pro) | 24 | 60 | 100 | 50 | 5 | 120 | 0.46 | 55.63 |
-| Mac 64 GB (M4 Pro) | 24 | 60 | 100 | 100 | 13 | 312 | 0.32 | 100.07 |
-| Mac 64 GB (M4 Pro) | 24 | 60 | 100 | 200 | 67 | 1,608 | 0.12 | 200.56 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 50 | 3 | 72 | 0.71 | 51.27 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 100 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 200 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 300 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 20 | 400 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 50 | 1 | 24 | 2.25 | 53.93 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 100 | 3 | 72 | 1.41 | 101.25 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 200 | 38 | 912 | 0.22 | 200.05 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 300 | 178 | 4,272 | 0.07 | 300.14 |
+| Mac 64 GB (M4 Pro) | 24 | 10 | 100 | 400 | – | – | – | no: uplink ceiling 398 |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 50 | 7 | 168 | 0.30 | 50.57 |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 100 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 200 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 300 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 20 | 400 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 50 | 3 | 72 | 0.84 | 60.45 |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 100 | 8 | 192 | 0.55 | 104.93 |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 200 | 53 | 1,272 | 0.16 | 200.03 |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 300 | – | – | – | no: KV memory runs out first |
+| Mac 64 GB (M4 Pro) | 24 | 30 | 100 | 400 | – | – | – | no: uplink ceiling 398 |
+| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 50 | 13 | 312 | 0.16 | 50.67 |
+| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 100 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 200 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 300 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 60 | 20 | 400 | – | – | – | no: uplink ceiling 80 |
+| Mac 64 GB (M4 Pro) | 24 | 60 | 100 | 50 | 5 | 120 | 0.46 | 55.27 |
+| Mac 64 GB (M4 Pro) | 24 | 60 | 100 | 100 | 14 | 336 | 0.31 | 102.74 |
+| Mac 64 GB (M4 Pro) | 24 | 60 | 100 | 200 | 71 | 1,704 | 0.12 | 200.37 |
 | Mac 64 GB (M4 Pro) | 24 | 60 | 100 | 300 | – | – | – | no: KV memory runs out first |
-| Mac 64 GB (M4 Pro) | 24 | 60 | 100 | 400 | – | – | – | no: KV memory runs out first |
+| Mac 64 GB (M4 Pro) | 24 | 60 | 100 | 400 | – | – | – | no: uplink ceiling 398 |
 
-**One billion tokens a day (11,574 tok/s sustained), swarm tier, PROJECTION** (the deepest micro-batch depth whose KV fits; decode tokens only, no prefill; 100% utilisation):
+**One billion tokens a day (11,574 tok/s sustained), swarm tier, PROJECTION, lower bound on devices** (the deepest micro-batch depth whose KV fits at 4096 tokens; batched weight reads; decode tokens only, no prefill; 100% utilisation):
 
 | devices | stages | one-way ms | uplink Mbit/s | depth | concurrent | per answer tok/s | aggregate per pipeline | pipelines | devices |
 |---|---|---|---|---|---|---|---|---|---|
-| RTX 5090 32 GB | 26 | 10 | 20 | 16 | 416 | 0.19 | 80.17 | 145 | 3,770 |
-| RTX 5090 32 GB | 26 | 10 | 100 | 16 | 416 | 0.73 | 303.23 | 39 | 1,014 |
-| RTX 5090 32 GB | 26 | 30 | 20 | 16 | 416 | 0.18 | 72.87 | 159 | 4,134 |
-| RTX 5090 32 GB | 26 | 30 | 100 | 16 | 416 | 0.53 | 219.88 | 53 | 1,378 |
-| RTX 5090 32 GB | 26 | 60 | 20 | 16 | 416 | 0.15 | 64.11 | 181 | 4,706 |
-| RTX 5090 32 GB | 26 | 60 | 100 | 16 | 416 | 0.37 | 155.69 | 75 | 1,950 |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 16 | 192 | 0.29 | 55.53 | 209 | 2,508 |
-| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 16 | 192 | 0.59 | 113.22 | 103 | 1,236 |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 16 | 192 | 0.27 | 51.93 | 223 | 2,676 |
-| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 16 | 192 | 0.52 | 99.19 | 117 | 1,404 |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 16 | 192 | 0.25 | 47.32 | 245 | 2,940 |
-| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 16 | 192 | 0.44 | 83.63 | 139 | 1,668 |
+| RTX 5090 32 GB | 26 | 10 | 20 | 16 | 416 | 0.18 | 76.31 | 152 | 3,952 |
+| RTX 5090 32 GB | 26 | 10 | 100 | 16 | 416 | 0.70 | 291.95 | 40 | 1,040 |
+| RTX 5090 32 GB | 26 | 30 | 20 | 16 | 416 | 0.17 | 69.67 | 167 | 4,342 |
+| RTX 5090 32 GB | 26 | 30 | 100 | 16 | 416 | 0.51 | 213.89 | 55 | 1,430 |
+| RTX 5090 32 GB | 26 | 60 | 20 | 16 | 416 | 0.15 | 61.62 | 188 | 4,888 |
+| RTX 5090 32 GB | 26 | 60 | 100 | 16 | 416 | 0.37 | 152.67 | 76 | 1,976 |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 20 | 16 | 192 | 0.29 | 55.84 | 208 | 2,496 |
+| Mac 64 GB (M4 Pro) | 12 | 10 | 100 | 16 | 192 | 0.59 | 113.46 | 103 | 1,236 |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 20 | 16 | 192 | 0.27 | 52.19 | 222 | 2,664 |
+| Mac 64 GB (M4 Pro) | 12 | 30 | 100 | 16 | 192 | 0.52 | 99.37 | 117 | 1,404 |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 20 | 16 | 192 | 0.25 | 47.54 | 244 | 2,928 |
+| Mac 64 GB (M4 Pro) | 12 | 60 | 100 | 16 | 192 | 0.44 | 83.76 | 139 | 1,668 |

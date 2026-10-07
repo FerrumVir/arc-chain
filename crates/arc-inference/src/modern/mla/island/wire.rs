@@ -198,12 +198,20 @@ impl<'a> Reader<'a> {
 
 /// One stage's commitment for one item: for every position of the item, the
 /// activation hashes (spec §6.2) at boundaries `first_layer ..= end_layer`,
-/// input boundary first. Position-major.
+/// input boundary first, position-major. The last stage (the one holding the
+/// LM head) also commits every position's logits hash and the token it
+/// selected at the item's last position, so its sampling is audited like any
+/// other output (research-6 §4.2.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageCommit {
     pub first_layer: u32,
     pub end_layer: u32,
     pub hashes: Vec<[u8; 32]>,
+    /// Logits hash per position (the last stage only; empty otherwise).
+    pub logits: Vec<[u8; 32]>,
+    /// The token selected at the item's last position, when that position is
+    /// the prompt's last or later (the last stage only).
+    pub selected: Option<u32>,
 }
 
 impl StageCommit {
@@ -222,20 +230,41 @@ impl StageCommit {
         &self.hashes[i * n..(i + 1) * n]
     }
 
-    fn write(&self, w: &mut Writer) {
+    /// Encoded size in bytes (what the commitment adds to a frame).
+    pub fn encoded_len(&self) -> usize {
+        let mut w = Writer::default();
+        self.write(&mut w);
+        w.bytes.len()
+    }
+
+    pub(crate) fn write(&self, w: &mut Writer) {
         w.u32(self.first_layer);
         w.u32(self.end_layer);
         w.hashes(&self.hashes);
+        w.hashes(&self.logits);
+        match self.selected {
+            Some(t) => {
+                w.u8(1);
+                w.u32(t);
+            }
+            None => w.u8(0),
+        }
     }
 
-    fn read(r: &mut Reader<'_>) -> Result<Self, ModernError> {
+    pub(crate) fn read(r: &mut Reader<'_>) -> Result<Self, ModernError> {
         let commit = Self {
             first_layer: r.u32()?,
             end_layer: r.u32()?,
             hashes: r.hashes()?,
+            logits: r.hashes()?,
+            selected: match r.u8()? {
+                0 => None,
+                _ => Some(r.u32()?),
+            },
         };
         if commit.end_layer <= commit.first_layer
             || !commit.hashes.len().is_multiple_of(commit.per_position())
+            || !(commit.logits.is_empty() || commit.logits.len() == commit.positions())
         {
             return Err(invalid("stage commit shape"));
         }
@@ -260,12 +289,9 @@ pub struct Item {
     /// Benchmark padding: zero bytes carried through every hop, to emulate
     /// the activation size of a wider model on a real link.
     pub pad: u32,
+    /// What every stage so far committed, in stage order; the last stage's
+    /// commit carries the logits hashes and the selected token.
     pub commits: Vec<StageCommit>,
-    /// Logits hash per position (filled by the last stage).
-    pub logits: Vec<[u8; 32]>,
-    /// The token selected at the item's last position, when that position
-    /// is the prompt's last or later (filled by the last stage).
-    pub next: Option<u32>,
     /// The first stage that failed this item, and why. Later stages pass the
     /// item through untouched.
     pub error: Option<String>,
@@ -289,8 +315,6 @@ impl Item {
             hidden: Vec::new(),
             pad: 0,
             commits: Vec::new(),
-            logits: Vec::new(),
-            next: None,
             error: None,
         }
     }
@@ -307,14 +331,6 @@ impl Item {
         w.count(self.commits.len());
         for c in &self.commits {
             c.write(w);
-        }
-        w.hashes(&self.logits);
-        match self.next {
-            Some(t) => {
-                w.u8(1);
-                w.u32(t);
-            }
-            None => w.u8(0),
         }
         match &self.error {
             Some(e) => {
@@ -338,11 +354,6 @@ impl Item {
         let commits = (0..n)
             .map(|_| StageCommit::read(r))
             .collect::<Result<_, _>>()?;
-        let logits = r.hashes()?;
-        let next = match r.u8()? {
-            0 => None,
-            _ => Some(r.u32()?),
-        };
         let error = match r.u8()? {
             0 => None,
             _ => Some(r.str()?),
@@ -356,8 +367,6 @@ impl Item {
             hidden,
             pad: pad as u32,
             commits,
-            logits,
-            next,
             error,
         })
     }
@@ -371,6 +380,8 @@ pub struct Revealed {
     pub first_layer: u32,
     pub end_layer: u32,
     pub prompt_len: u32,
+    /// The sequence's selection rule (the last stage's audit re-selects).
+    pub selection: Selection,
     pub tokens: Vec<u32>,
     /// `tokens.len() * d_model` input values (empty for the first stage).
     pub inputs: Vec<i64>,
@@ -422,6 +433,7 @@ impl Frame {
                     w.u32(s.first_layer);
                     w.u32(s.end_layer);
                     w.u32(s.prompt_len);
+                    w.selection(s.selection);
                     w.u32s(&s.tokens);
                     w.acts(&s.inputs);
                 }
@@ -467,6 +479,7 @@ impl Frame {
                             first_layer: r.u32()?,
                             end_layer: r.u32()?,
                             prompt_len: r.u32()?,
+                            selection: r.selection()?,
                             tokens: r.u32s()?,
                             inputs: r.acts()?,
                         })
@@ -517,9 +530,9 @@ mod tests {
             first_layer: 0,
             end_layer: 2,
             hashes: vec![[5; 32]; 6],
+            logits: vec![[1; 32], [2; 32]],
+            selected: Some(11),
         });
-        item.logits = vec![[1; 32], [2; 32]];
-        item.next = Some(11);
         item.error = Some("e".into());
         let frames = [
             Frame::Step {
@@ -536,6 +549,7 @@ mod tests {
                     first_layer: 2,
                     end_layer: 4,
                     prompt_len: 2,
+                    selection: Selection::Rp64Argmax,
                     tokens: vec![4, 9],
                     inputs: vec![1, -70_000],
                 }],

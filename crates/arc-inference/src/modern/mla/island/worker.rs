@@ -33,12 +33,20 @@ pub enum Fault {
     /// Send the honest output at `(seq, position)` but commit a different
     /// output hash: the link check catches it.
     LieInCommit { seq: u64, position: u32 },
+    /// The last stage emits (and commits) a token other than its sampler's
+    /// at `(seq, position)`; every hash stays honest, so only the audit's
+    /// re-selection catches it.
+    WrongToken { seq: u64, position: u32 },
 }
 
 impl Fault {
-    /// `tamper:SEQ:POS` or `lie:SEQ:POS`.
+    /// `tamper:SEQ:POS`, `lie:SEQ:POS` or `wrong-token:SEQ:POS`.
     pub fn parse(text: &str) -> Result<Self, ModernError> {
-        let bad = || ModernError::Invalid(format!("fault {text:?} is not tamper|lie:SEQ:POS"));
+        let bad = || {
+            ModernError::Invalid(format!(
+                "fault {text:?} is not tamper|lie|wrong-token:SEQ:POS"
+            ))
+        };
         let mut parts = text.split(':');
         let (kind, seq, position) = (parts.next(), parts.next(), parts.next());
         let seq = seq.and_then(|s| s.parse().ok()).ok_or_else(bad)?;
@@ -46,6 +54,7 @@ impl Fault {
         match kind {
             Some("tamper") => Ok(Fault::TamperOutput { seq, position }),
             Some("lie") => Ok(Fault::LieInCommit { seq, position }),
+            Some("wrong-token") => Ok(Fault::WrongToken { seq, position }),
             _ => Err(bad()),
         }
     }
@@ -75,6 +84,7 @@ struct SeqState {
     /// `None` once the sequence is closed (its log stays for audits).
     cache: Option<StageCache>,
     prompt_len: u32,
+    selection: arith::Selection,
     /// Every token forwarded so far (the last stage selects from them).
     tokens: Vec<u32>,
     /// Every boundary row received (empty for the first stage).
@@ -176,6 +186,7 @@ impl StageWorker {
                         first_layer: s.first_layer as u32,
                         end_layer: s.end_layer as u32,
                         prompt_len: state.prompt_len,
+                        selection: state.selection,
                         tokens: state.tokens.clone(),
                         inputs: state.inputs.clone(),
                     });
@@ -218,7 +229,7 @@ impl StageWorker {
                     w.selection(item.selection);
                     w.u32s(&item.tokens);
                     w.acts(&input);
-                    w.hashes(&commit.hashes);
+                    commit.write(&mut w);
                     write_record(log, &w.bytes)?;
                 }
                 item.commits.push(commit);
@@ -262,6 +273,7 @@ impl StageWorker {
                 SeqState {
                     cache: Some(cache),
                     prompt_len: item.prompt_len,
+                    selection: item.selection,
                     tokens: Vec::new(),
                     inputs: Vec::new(),
                 },
@@ -272,7 +284,10 @@ impl StageWorker {
             .cache
             .as_mut()
             .ok_or_else(|| ModernError::Invalid(format!("sequence {} is closed", item.seq)))?;
-        if cache.positions() != start || state.prompt_len != item.prompt_len {
+        if cache.positions() != start
+            || state.prompt_len != item.prompt_len
+            || state.selection != item.selection
+        {
             return Err(ModernError::Invalid(format!(
                 "sequence {}: item at position {start}, stage at {}",
                 item.seq,
@@ -285,6 +300,7 @@ impl StageWorker {
         let mut outputs = Vec::with_capacity(n * d);
         let mut trace = Vec::with_capacity(per);
         let mut last_logits = None;
+        let mut logits_hashes = Vec::new();
         for i in 0..n {
             let input = if first {
                 StageInput::Token(item.tokens[i])
@@ -310,7 +326,7 @@ impl StageWorker {
             }
             hashes.extend_from_slice(&trace);
             if let Some(logits) = logits {
-                item.logits.push(arith::logits_hash(&logits));
+                logits_hashes.push(arith::logits_hash(&logits));
                 last_logits = Some(logits);
             } else {
                 outputs.extend_from_slice(&out);
@@ -320,15 +336,28 @@ impl StageWorker {
         if !first {
             state.inputs.extend_from_slice(&item.hidden);
         }
+        let mut selected = None;
         if let Some(logits) = last_logits {
             let position = start + n - 1;
             let prompt_len = item.prompt_len as usize;
             if position + 1 >= prompt_len {
                 let history = &state.tokens[prompt_len..=position];
-                item.next = Some(arith::select(&logits, history, item.selection)?);
+                let mut token = arith::select(&logits, history, item.selection)?;
+                if let Some(Fault::WrongToken { seq, position: p }) = self.fault
+                    && seq == item.seq
+                    && p as usize == position
+                {
+                    token = (token + 1) % c.vocab_size as u32;
+                }
+                selected = Some(token);
             }
         }
         item.hidden = outputs;
+        if stage.has_head(c) {
+            // The last stage returns commitments only: the benchmark padding
+            // that stands for a wide activation stops here too.
+            item.pad = 0;
+        }
         self.stats.items += 1;
         self.stats.positions += n as u64;
         self.stats.compute_seconds += timer.elapsed().as_secs_f64();
@@ -336,6 +365,8 @@ impl StageWorker {
             first_layer: stage.first_layer as u32,
             end_layer: stage.end_layer as u32,
             hashes,
+            logits: logits_hashes,
+            selected,
         })
     }
 
@@ -364,13 +395,13 @@ impl StageWorker {
                         Item::new(r.u64()?, r.u32()?, r.u32()?, r.selection()?, Vec::new());
                     item.tokens = r.u32s()?;
                     item.hidden = r.acts()?;
-                    let committed = r.hashes()?;
+                    let committed = StageCommit::read(&mut r)?;
                     r.done()?;
                     let fault = self.fault.take();
                     let replayed = self.run_item(&mut item);
                     self.fault = fault;
                     let replayed = replayed?;
-                    if replayed.hashes != committed {
+                    if replayed != committed {
                         return Err(ModernError::Invalid(format!(
                             "{context}: replay of sequence {} at {} does not reproduce its commitment",
                             item.seq, item.start

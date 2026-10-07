@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 
 use arc_inference::modern::arith::Selection;
 use arc_inference::modern::mla::config::MlaConfig;
-use arc_inference::modern::mla::island::commit::{Verdict, audit_all};
+use arc_inference::modern::mla::island::commit::{Verdict, audit_all, audit_stage};
 use arc_inference::modern::mla::island::coordinator::{Completion, Request, Schedule};
 use arc_inference::modern::mla::island::even_cuts;
 use arc_inference::modern::mla::island::process::ProcessIsland;
@@ -265,6 +265,19 @@ fn tampered_and_lying_stage_processes_are_rejected() {
                 );
             }
         }
+        // A log altered after the fact (the reveal of a separate process)
+        // no longer hashes to what the stage committed.
+        assert!(revealed[2].tokens.len() > 1);
+        let mut forged = revealed[2].clone();
+        forged.inputs[c.d_model] += 1;
+        assert_eq!(
+            audit_stage(
+                &verifiers[2],
+                &forged,
+                got.ledger.stage_commits(3, 4).unwrap()
+            ),
+            Verdict::InputMismatch { position: 1 }
+        );
     }
     assert_matches(&expected[1..], &done[1..], "the honest neighbour");
     island.shutdown().unwrap();
@@ -327,4 +340,79 @@ fn a_stage_with_experts_in_another_process_matches_the_single_process() {
     island.shutdown().unwrap();
     let _ = server.kill();
     let _ = server.wait();
+}
+
+/// A last-stage process that emits a token other than its sampler's: every
+/// link agrees, and the audit's re-selection blames it at that position.
+#[test]
+fn a_wrong_token_from_the_last_stage_process_is_rejected() {
+    let scratch = Scratch::new("wrong-token");
+    let (path, c, model) = package(&scratch.0, "tiny-i4");
+    let reqs = vec![
+        Request {
+            id: 7,
+            prompt: vec![3, 17, 5],
+            max_tokens: 5,
+            eos: Vec::new(),
+            selection: Selection::Rp64Argmax,
+        },
+        Request {
+            id: 8,
+            prompt: vec![41, 2],
+            max_tokens: 4,
+            eos: Vec::new(),
+            selection: Selection::Argmax,
+        },
+    ];
+    let expected = reference(&model, &reqs);
+    let cuts = vec![0, 2, 4];
+    let mut island = ProcessIsland::launch(Path::new(EXE), &path, &cuts, &c, |s| {
+        if s == 1 {
+            vec!["--fault".into(), "wrong-token:7:3".into()]
+        } else {
+            Vec::new()
+        }
+    })
+    .unwrap();
+    let (done, _) = island.coordinator.run(&reqs, &schedule(2, 2)).unwrap();
+    assert!(done[0].ledger.complete(), "every hash is honest");
+    assert_eq!(done[0].tokens[0], expected[0].tokens[0]);
+    assert_ne!(done[0].tokens[1], expected[0].tokens[1]);
+    let verifiers: Vec<StageModel> = cuts
+        .windows(2)
+        .map(|w| {
+            StageModel::open_range(
+                &path,
+                Some(StageSpec {
+                    first_layer: w[0],
+                    end_layer: w[1],
+                }),
+            )
+            .unwrap()
+        })
+        .collect();
+    let verifier_refs: Vec<&StageModel> = verifiers.iter().collect();
+    for (r, got) in reqs.iter().zip(&done) {
+        let revealed = island.coordinator.reveal(r.id).unwrap();
+        for ((a, b), verdict) in audit_all(&got.ledger, &revealed, &verifier_refs).unwrap() {
+            if r.id == 7 && (a, b) == (2, 4) {
+                assert_eq!(
+                    verdict,
+                    Verdict::WrongToken {
+                        position: 3,
+                        committed: got.tokens[1],
+                        expected: expected[0].tokens[1],
+                    }
+                );
+            } else {
+                assert!(
+                    matches!(verdict, Verdict::Valid { .. }),
+                    "id {} [{a}, {b}): {verdict:?}",
+                    r.id
+                );
+            }
+        }
+    }
+    assert_matches(&expected[1..], &done[1..], "the honest neighbour");
+    island.shutdown().unwrap();
 }

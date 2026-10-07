@@ -537,6 +537,104 @@ fn a_tampered_stage_is_rejected_by_re_execution() {
     island.stop();
 }
 
+/// The last stage emits a token other than its sampler's. Every activation
+/// and logits hash it commits is honest, so every link agrees; re-executing
+/// it and re-applying the selection rule to the committed logits blames it
+/// at that position. A token altered on its way back to the ring is caught
+/// too (the committed token differs from the token fed next).
+#[test]
+fn a_wrong_token_from_the_last_stage_is_rejected_by_re_selection() {
+    let c = synthetic::tiny_config(true, ExpertFormat::Int4G32);
+    let whole = stage_model(&c, 0, c.n_layers, Router::Random);
+    let request = |id: u64, prompt: Vec<u32>, selection| Request {
+        id,
+        prompt,
+        max_tokens: 6,
+        eos: vec![],
+        selection,
+    };
+    let reqs = vec![
+        request(1, vec![3, 17, 5], Selection::Rp64Argmax),
+        request(2, vec![41, 2], Selection::Argmax),
+    ];
+    // Position 3 is where request 1's second token is selected.
+    let (victim, position) = (1u64, 3usize);
+    let cuts = [0, 2, 3, 4];
+    let mut island = ThreadIsland::start(&c, &cuts, Router::Random, |s, _, config| {
+        if s == 2 {
+            config.fault = Some(Fault::WrongToken {
+                seq: victim,
+                position: position as u32,
+            });
+        }
+    });
+    let (done, _) = island
+        .coordinator
+        .run(
+            &reqs,
+            &Schedule {
+                micro_batches: 2,
+                concurrency: 2,
+                ..Schedule::default()
+            },
+        )
+        .unwrap();
+    let honest = reference(&whole, &reqs[0]);
+    let got = &done[0];
+    // The lie is in the emitted token only: every link agrees, and the
+    // wrong token became the next position's input.
+    assert!(got.ledger.complete());
+    assert_eq!(got.tokens[0], honest.tokens[0]);
+    assert_eq!(got.tokens[1], (honest.tokens[1] + 1) % c.vocab_size as u32);
+    let verifiers: Vec<StageModel> = cuts
+        .windows(2)
+        .map(|w| stage_model(&c, w[0], w[1], Router::Random))
+        .collect();
+    let verifier_refs: Vec<&StageModel> = verifiers.iter().collect();
+    let revealed = island.coordinator.reveal(victim).unwrap();
+    for ((a, b), verdict) in audit_all(&got.ledger, &revealed, &verifier_refs).unwrap() {
+        if (a, b) == (3, 4) {
+            assert_eq!(
+                verdict,
+                Verdict::WrongToken {
+                    position,
+                    committed: got.tokens[1],
+                    expected: honest.tokens[1],
+                }
+            );
+        } else {
+            assert!(
+                matches!(verdict, Verdict::Valid { .. }),
+                "[{a}, {b}): {verdict:?}"
+            );
+        }
+    }
+    // Every logits hash and selection is in the last stage's record.
+    let head = got.ledger.stage_commits(3, 4).unwrap();
+    assert!(head.iter().all(|p| p.logits.is_some()));
+    assert_eq!(head[2].selected, Some(got.tokens[0]));
+    // An honest neighbour verifies, including its selections; changing a
+    // token it was fed after one it emitted is caught.
+    assert_matches(
+        &reference(&whole, &reqs[1]),
+        &done[1],
+        "the honest neighbour",
+    );
+    let revealed = island.coordinator.reveal(2).unwrap();
+    let commits = done[1].ledger.stage_commits(3, 4).unwrap();
+    assert!(matches!(
+        audit_stage(&verifiers[2], &revealed[2], commits),
+        Verdict::Valid { .. }
+    ));
+    let mut forged = revealed[2].clone();
+    forged.tokens[2] = (forged.tokens[2] + 1) % c.vocab_size as u32;
+    assert_eq!(
+        audit_stage(&verifiers[2], &forged, commits),
+        Verdict::ForwardMismatch { position: 1 }
+    );
+    island.stop();
+}
+
 /// A stage that sends honest activations but commits a different output
 /// hash breaks the link check at that position, and its own audit fails.
 #[test]

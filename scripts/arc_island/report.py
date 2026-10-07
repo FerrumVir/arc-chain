@@ -10,12 +10,17 @@ Every bench file is `arc-island bench` output, labelled with where it ran
    processes, the emulated-WAN sweep, and whether every run was byte-identical
    to the single process.
 2. Model check: the pipeline round-time model of research-6 §2.6, fed with the
-   measured compute and hop costs, against the measured emulated-WAN runs.
+   measured compute and hop costs, against the measured emulated-WAN runs:
+   per answer, steady-state aggregate and wall-clock aggregate, each with its
+   own error.
 3. Projection (NOT a measurement): Kimi K2 per-island and swarm speed from the
-   measured hop cost plus research-6's bandwidth math (§2.1, §2.5, §2.6). It
-   assumes kernels that run at the effective memory bandwidths research-6
-   calibrated from other engines; ARC's integer engine does not run at those
-   speeds today (the measured engine bandwidth is in part 1).
+   measured hop cost plus research-6's bandwidth math (§2.1, §2.5, §2.6).
+   Kimi K2.6 has the same text shapes as K2 (docs/protocol/kimi-k26-checkpoint.md
+   §1: 61 layers, hidden 7,168, 384 experts top-8, expert width 2,048), so the
+   numbers apply to K2.6 too. It assumes kernels that run at the effective
+   memory bandwidths research-6 calibrated from other engines, and batched
+   weight reads across a micro-batch's sequences; ARC's integer engine does
+   neither today (the measured engine bandwidth is in part 1).
 """
 
 import json
@@ -36,10 +41,16 @@ KIMI_SHARED_BYTES = KIMI_BYTES_PER_TOKEN - KIMI_ROUTED_BYTES  # read once per st
 KIMI_FLOPS_PER_TOKEN = 2 * 32.7e9
 KIMI_KV_PER_TOKEN = 34.3 * 1024        # INT8 MLA cache, all layers
 KIMI_WEIGHTS = 582e9                   # INT4 experts + INT8 elsewhere (§2.1)
-KV_CONTEXT = 4096                      # tokens of context held per sequence
+KV_CONTEXT = 4096                      # ASSUMED tokens of context per sequence
+KV_CONTEXTS = [4096, 8192, 32768]      # sensitivity
 # Lossless boundary activation: the synthetic MLA models' residual streams fit
 # i32 (measured, part 1); a Kimi boundary at i32 is 7168 * 4 bytes.
-KIMI_WIRE_BYTES = KIMI_HIDDEN * 4
+KIMI_ACTIVATION_BYTES = KIMI_HIDDEN * 4
+# Speculative decoding (research-6 §2.7): one draft token per pass, 1.85
+# tokens accepted per pass = DeepSeek-V3's MTP acceptance. ASSUMED: Kimi K2 has
+# no MTP head, its drafter's acceptance is unknown and its cost is not modelled.
+DRAFT_TOKENS_PER_PASS = 1.85
+RESEARCH_HOP_S = 0.3e-3                # research-6 §2.5's streaming-transport hop
 BILLION_PER_DAY = 1e9 / 86_400
 
 # Devices: effective bandwidth calibrated in research-6 §2.5 (M3 Ultra,
@@ -53,32 +64,46 @@ DEVICES = {
 
 
 def distinct_experts(b):
-    """Distinct routed experts per layer touched by b sequences (§2.6)."""
+    """Distinct routed experts per layer touched by b positions (§2.6)."""
     return KIMI_EXPERTS * (1 - (1 - KIMI_TOPK / KIMI_EXPERTS) ** b)
 
 
-def kimi_step_seconds(b, stages, device):
-    """One stage's time for a micro-batch of b positions (batched kernels)."""
+def kimi_step_seconds(b, stages, device, batched=True):
+    """One stage's time for a micro-batch of b positions. Batched kernels read
+    the shared weights once and each distinct expert once per step; without
+    them (this runtime today) every position reads its own weights."""
     d = DEVICES[device]
+    if not batched:
+        return b * kimi_step_seconds(1, stages, device)
     weight_bytes = KIMI_SHARED_BYTES + KIMI_MOE_LAYERS * distinct_experts(b) * KIMI_EXPERT_BYTES
     memory = weight_bytes / stages / d["bw"]
     compute = b * KIMI_FLOPS_PER_TOKEN / stages / d["flops"]
     return max(memory, compute)
 
 
-def kv_fit(device, stages, concurrent):
-    """Whether `concurrent` sequences' MLA cache at KV_CONTEXT tokens fits
+def kimi_wire_bytes(stages):
+    """Bytes per position on the busiest uplink: the i32 activation plus the
+    commitments the frame has accumulated by the second-to-last stage (32 B
+    per boundary covered so far, plus one input hash per stage; an upper
+    bound of 32 B x (layers + stages))."""
+    return KIMI_ACTIVATION_BYTES + 32 * (KIMI_LAYERS + stages)
+
+
+def kv_fit(device, stages, concurrent, context=KV_CONTEXT):
+    """Whether `concurrent` sequences' MLA cache at `context` tokens fits
     beside each device's share of the weights."""
-    kv = concurrent * KV_CONTEXT * KIMI_KV_PER_TOKEN / stages / 1e9
+    kv = concurrent * context * KIMI_KV_PER_TOKEN / stages / 1e9
     free = DEVICES[device]["usable_gb"] - KIMI_WEIGHTS / stages / 1e9
     return kv <= free, kv, free
 
 
 def round_seconds(stages, groups, step, serial, one_way, overhead):
-    """research-6 §2.6 with the uplink as a second per-stage resource: a frame
-    crosses every stage once per round; each stage handles every micro-batch
-    once per round on its compute and on its uplink."""
-    ring = stages * (step + serial + one_way + overhead)
+    """research-6 §2.6 with the uplink as a second per-stage resource. A frame
+    crosses every stage once per round: S compute steps and S delayed hops,
+    of which S - 1 carry the activation (the last stage returns commitments
+    only). Each stage handles every micro-batch once per round on its compute
+    and on its uplink, which overlap."""
+    ring = stages * (step + one_way + overhead) + (stages - 1) * serial
     busy = groups * max(step, serial)
     return max(ring, busy)
 
@@ -155,7 +180,7 @@ def measured_section(b):
 
 def wan_section(b):
     rows = []
-    errors = []
+    err_answer, err_steady, err_wall = [], [], []
     comp = b["compute"]
     t_pos = comp["single_process_ms_per_position"] / 1e3
     o = (hop_overhead_ms(b) or 0.05) / 1e3
@@ -165,21 +190,38 @@ def wan_section(b):
         step = depth * t_pos / s
         t = round_seconds(s, g, step, serial, d, o)
         pred_answer, pred_agg = 1 / t, g * depth / t
-        err = (r["per_answer_decode_tok_s_mean"] - pred_answer) / pred_answer
-        errors.append(abs(err))
+        err_answer.append((r["per_answer_decode_tok_s_mean"] - pred_answer) / pred_answer)
+        err_wall.append((r["aggregate_tok_s"] - pred_agg) / pred_agg)
+        steady = r.get("aggregate_steady_tok_s")
+        if steady:
+            err_steady.append((steady - pred_agg) / pred_agg)
         rows.append([s, r["one_way_ms"], r["uplink_mbit"], depth, r["concurrency"],
-                     r["per_answer_decode_tok_s_mean"], pred_answer, r["aggregate_tok_s"], pred_agg,
+                     r["per_answer_decode_tok_s_mean"], pred_answer, steady, r["aggregate_tok_s"], pred_agg,
                      "yes" if r["bit_exact_vs_single_process"] else "**NO**"])
     if not rows:
-        return ""
+        return "", {}
+    def stat(xs):
+        return (f"median {fmt(100 * median(xs), 1)}%, range {fmt(100 * min(xs), 1)}% to {fmt(100 * max(xs), 1)}%"
+                if xs else "not recorded")
+    errors = {
+        "per_answer": err_answer,
+        "aggregate_steady": err_steady,
+        "aggregate_wall": err_wall,
+    }
+    tokens = b["wan"][0].get("generated_tokens", 0) // max(b["wan"][0]["concurrency"], 1)
     head = (f"**Emulated WAN, {b['label']}** (every stage's uplink shaped: one-way delay ± 10% jitter, bounded uplink; "
-            f"{b['wan'][0]['wire_bytes_per_position']} B per position on the wire = a Kimi K2 boundary at i32; "
-            f"G = stages micro-batches of `depth` sequences). Predicted = research-6 §2.6 round-time model fed with this "
-            f"run's measured compute per position and hop overhead. Median |error| per answer: "
-            f"{fmt(100 * median(errors), 1)}%.")
+            f"{b['wan'][0]['wire_bytes_per_position']} B of activation per position on every hop but the last "
+            f"(a Kimi K2 boundary at i32; commitments ride on top); G = stages micro-batches of `depth` sequences; "
+            f"{tokens} tokens per answer). Predicted = research-6 §2.6 round-time model fed with this run's measured "
+            f"compute per position and hop overhead; it predicts steady state.\n\n"
+            f"Model error (measured − predicted) ÷ predicted, over {len(rows)} runs:\n"
+            f"- per answer: {stat(err_answer)};\n"
+            f"- aggregate, steady state (tokens while every sequence decodes): {stat(err_steady)};\n"
+            f"- aggregate, wall clock (prefill and pipeline fill/drain included): {stat(err_wall)}.")
     return head + "\n\n" + table(
-        ["stages", "one-way ms", "uplink Mbit/s", "depth", "B", "per answer tok/s", "predicted", "aggregate tok/s", "predicted", "bit-exact"],
-        rows)
+        ["stages", "one-way ms", "uplink Mbit/s", "depth", "B", "per answer tok/s", "predicted",
+         "aggregate steady tok/s", "aggregate wall tok/s", "predicted aggregate", "bit-exact"],
+        rows), errors
 
 
 MEASURED_TARGETS = [25, 50, 100, 150, 200]
@@ -189,39 +231,66 @@ PROJECTED_TARGETS = [50, 100, 200, 300, 400]
 def wan_targets_section(b):
     """The measured curve read the other way: for each emulated link, the
     smallest swept configuration (fewest concurrent sequences, then fewest
-    stages) that reached each aggregate, and its per-answer speed there."""
+    stages) whose steady-state aggregate reached each target, and its
+    per-answer speed there."""
     groups = {}
     for r in b["wan"]:
         groups.setdefault((r["one_way_ms"], r["uplink_mbit"]), []).append(r)
     rows = []
+
+    def agg(r):
+        return r.get("aggregate_steady_tok_s") or r["aggregate_tok_s"]
+
     for (ms, mbit), runs in sorted(groups.items()):
-        best_seen = max(r["aggregate_tok_s"] for r in runs)
+        best_seen = max(agg(r) for r in runs)
         for target in MEASURED_TARGETS:
-            hits = [r for r in runs if r["aggregate_tok_s"] >= target]
+            hits = [r for r in runs if agg(r) >= target]
             if hits:
                 r = min(hits, key=lambda r: (r["concurrency"], r["stages"]))
                 rows.append([ms, mbit, target, r["stages"], r["depth"], r["concurrency"],
-                             r["per_answer_decode_tok_s_mean"], r["aggregate_tok_s"]])
+                             r["per_answer_decode_tok_s_mean"], agg(r)])
             else:
                 rows.append([ms, mbit, target, "–", "–", "–", "–", f"not reached (best {fmt(best_seen, 0)})"])
     if not rows:
         return ""
     return (f"**Curve, measured on the emulated WAN ({b['label']})**: the smallest swept configuration (2/4/8 stages × "
-            "depth 1/4/16, G = stages) whose aggregate reached each target, with Kimi-sized frames on the wire. "
-            "Synthetic model, so compute per stage is small; the network and the uplink set these numbers.\n\n" + table(
+            "depth 1/4/16, G = stages) whose steady-state aggregate reached each target, with Kimi-sized activations "
+            "on the wire. Synthetic model, so compute per stage is small; the network and the uplink set these "
+            "numbers.\n\n" + table(
                 ["one-way ms", "uplink Mbit/s", "target tok/s", "stages", "depth", "concurrent", "per answer tok/s",
                  "aggregate tok/s"], rows))
 
 
-def projection(benches):
+def island_answer(device, stages, h, positions=1):
+    """Single-stream round time of a pipeline island (G = 1, b = positions)."""
+    return round_seconds(stages, 1, kimi_step_seconds(positions, stages, device), 0.0, h, 0.0)
+
+
+def projection(benches, errors):
     """Kimi K2 projections from measured hop overhead + research-6 math."""
     overheads = [(b["label"], hop_overhead_ms(b)) for b in benches if hop_overhead_ms(b) is not None]
     label, o_ms = max(overheads, key=lambda x: x[1]) if overheads else ("assumed", 0.3)
     o = o_ms / 1e3
-    out = {"hop_overhead_ms": o_ms, "hop_overhead_from": label, "islands": [], "swarm": [], "network": []}
-    md = [f"Measured software cost per hop used below: {fmt(o_ms * 1000, 1)} µs ({label}, loopback TCP, "
-          f"28 KiB frame; the larger of the measured hosts). A real NIC adds wire time: "
-          f"{fmt(KIMI_WIRE_BYTES * 8 / 10e9 * 1e6, 1)} µs on 10 GbE, {fmt(KIMI_WIRE_BYTES * 8 / 80e9 * 1e6, 1)} µs on TB5 (80 Gb/s)."]
+    steady = [e for b in errors for e in b.get("aggregate_steady", [])]
+    wall = [e for b in errors for e in b.get("aggregate_wall", [])]
+    out = {"hop_overhead_ms": o_ms, "hop_overhead_from": label, "islands": [], "swarm": [], "network": [],
+           "kv_sensitivity": [], "curve": [],
+           "aggregate_error_steady_median": median(steady) if steady else None,
+           "aggregate_error_wall_median": median(wall) if wall else None}
+    md = [
+        "Everything below is arithmetic, not a measurement, for **Kimi K2**; K2.6 has the same text shapes "
+        "(`docs/protocol/kimi-k26-checkpoint.md` §1), so it applies to the requested K2.6 unchanged. No Kimi weights "
+        "and no real network were run.",
+        f"Inputs: the measured software cost per hop, {fmt(o_ms * 1000, 1)} µs ({label}, loopback TCP, 28 KiB frame; "
+        f"the larger of the measured hosts); research-6's memory bandwidths (456 GB/s M3 Ultra, 1,108 GB/s RTX 5090), "
+        "which ARC's engine does not reach (1.4–2.7 GB/s measured); batched weight reads across a micro-batch's "
+        "sequences, which this runtime does not have (the swarm table also shows per-sequence reads); and "
+        f"**{KV_CONTEXT} tokens of context per sequence** (sensitivity table below).",
+        "**Aggregates are optimistic.** The same model, fed with measured costs, put the emulated-WAN steady-state "
+        f"aggregate at a median {fmt(100 * median(steady), 1) if steady else '–'}% from measured, and wall-clock "
+        f"aggregate (with prefill and fill/drain) at a median {fmt(100 * median(wall), 1) if wall else '–'}%. Read "
+        "every projected aggregate below as an upper bound.",
+    ]
 
     # Islands (T1): pipeline over a LAN or Thunderbolt.
     rows = []
@@ -229,66 +298,104 @@ def projection(benches):
         ("M3 Ultra 512 GB", 2, "TB5", 80e9), ("M3 Ultra 512 GB", 4, "TB5", 80e9),
         ("M3 Ultra 512 GB", 2, "10 GbE", 10e9), ("RTX 5090 32 GB", 26, "25 GbE", 25e9),
     ]:
-        h = o + KIMI_WIRE_BYTES * 8 / wire_bps
+        wire = kimi_wire_bytes(stages) * 8 / wire_bps
+        h = o + wire
         for b in [1, 8, 32]:
             g = stages if b > 1 else 1
             step = kimi_step_seconds(b, stages, device)
             t = round_seconds(stages, g, step, 0.0, h, 0.0)
             answer, agg = 1 / t, g * b / t
-            spec = answer * 1.34 if b == 1 else None
+            slow = draft = None
+            if b == 1:
+                slow = 1 / island_answer(device, stages, RESEARCH_HOP_S + wire)
+                draft = DRAFT_TOKENS_PER_PASS / island_answer(device, stages, h, positions=2)
             fits, kv, free = kv_fit(device, stages, g * b)
-            rows.append([device, stages, link, b, g * b, answer, agg, spec,
+            rows.append([device, stages, link, b, g * b, answer, slow, draft, agg,
                          "yes" if fits else f"no ({fmt(kv, 1)} > {fmt(free, 1)} GB)"])
             out["islands"].append({"device": device, "stages": stages, "link": link, "depth": b, "concurrency": g * b,
-                                   "per_answer_tok_s": answer, "aggregate_tok_s": agg})
-    md.append("**Islands (T1), pipeline parallel, PROJECTION** — per answer and aggregate tok/s; "
-              "concurrency = stages × depth (one micro-batch per stage); the last column applies research-6 §2.7's "
-              "1.34× for one exact speculative draft (Kimi K2 has no MTP head; needs a drafter).")
-    md.append(table(["devices", "stages", "link", "depth", "concurrent", "per answer tok/s", "aggregate tok/s",
-                     "with 1 draft", "KV fits"], rows))
+                                   "per_answer_tok_s": answer, "per_answer_at_0_3ms_hop": slow,
+                                   "per_answer_one_draft": draft, "aggregate_tok_s": agg})
+    md.append("**Islands (T1), pipeline parallel, PROJECTION**. Concurrency = stages × depth (one micro-batch per stage). "
+              "\"0.3 ms hop\" replaces the measured loopback hop with research-6's streaming-transport hop (a real NIC, "
+              "driver and GPU copies). \"1 draft\" is the model's verify pass over 2 positions (one draft token) at "
+              f"{DRAFT_TOKENS_PER_PASS} tokens accepted per pass — DeepSeek-V3's MTP acceptance, ASSUMED: Kimi has no "
+              "MTP head, and the drafter's acceptance and cost are not modelled.")
+    md.append(table(["devices", "stages", "link", "depth", "concurrent", "per answer tok/s", "at 0.3 ms hop",
+                     "1 draft", "aggregate tok/s", "KV fits"], rows))
 
     # Swarm (T2-batch): pipeline across homes, emulated in the measured sweep.
     rows = []
     # 26 GPUs rather than the 22 the weights need: 22 leave ~0.5 GB each for KV.
     for device, stages in [("RTX 5090 32 GB", 26), ("Mac 64 GB (M4 Pro)", 12)]:
+        wire = kimi_wire_bytes(stages)
         for one_way_ms in [10, 30, 60]:
             for mbit in [20, 100]:
-                ceiling = mbit * 1e6 / (KIMI_WIRE_BYTES * 8)
+                ceiling = mbit * 1e6 / (wire * 8)
                 for b in [1, 4, 16, 64]:
-                    serial = b * KIMI_WIRE_BYTES * 8 / (mbit * 1e6)
-                    step = kimi_step_seconds(b, stages, device)
-                    t = round_seconds(stages, stages, step, serial, one_way_ms / 1e3, o)
-                    answer, agg = 1 / t, stages * b / t
+                    serial = b * wire * 8 / (mbit * 1e6)
+                    t = round_seconds(stages, stages, kimi_step_seconds(b, stages, device), serial, one_way_ms / 1e3, o)
+                    t_seq = round_seconds(stages, stages, kimi_step_seconds(b, stages, device, batched=False),
+                                          serial, one_way_ms / 1e3, o)
+                    answer, agg, agg_seq = 1 / t, stages * b / t, stages * b / t_seq
                     fits, kv, free = kv_fit(device, stages, stages * b)
-                    rows.append([device, stages, one_way_ms, mbit, b, stages * b, answer, agg, ceiling,
+                    rows.append([device, stages, one_way_ms, mbit, b, stages * b, answer, agg, agg_seq, ceiling,
                                  "yes" if fits else f"no ({fmt(kv, 1)} > {fmt(free, 1)} GB)"])
                     out["swarm"].append({"device": device, "stages": stages, "one_way_ms": one_way_ms, "uplink_mbit": mbit,
                                          "depth": b, "concurrency": stages * b, "per_answer_tok_s": answer,
-                                         "aggregate_tok_s": agg, "uplink_ceiling_tok_s": ceiling, "kv_fits": fits})
-    md.append("**Swarm pipeline across homes (T2-batch), PROJECTION** — G = stages micro-batches of `depth`; "
-              "uplink ceiling = uplink ÷ (28 KiB × 8): every token's activation crosses every stage's uplink, so no "
-              f"schedule can exceed it. KV fits = the concurrent sequences' MLA cache at {KV_CONTEXT} tokens of context "
-              "(34.3 KiB per token, spread over the stages) fits beside the device's share of the 582 GB of weights.")
+                                         "aggregate_tok_s": agg, "aggregate_per_sequence_reads_tok_s": agg_seq,
+                                         "uplink_ceiling_tok_s": ceiling, "kv_fits": fits})
+    md.append("**Swarm pipeline across homes (T2-batch), PROJECTION**. G = stages micro-batches of `depth`. Uplink "
+              "ceiling = uplink ÷ (bytes per position × 8), with the activation (28,672 B) plus accumulated "
+              "commitments (up to 32 B × (61 + stages)) on the busiest uplink: every token crosses every stage's "
+              "uplink, so no schedule can exceed it. \"Per-sequence reads\" = the same with every sequence reading "
+              f"its own weights (this runtime today). KV fits = the MLA cache at {KV_CONTEXT} tokens of context fits "
+              "beside the device's share of the 582 GB of weights.")
     md.append(table(["devices", "stages", "one-way ms", "uplink Mbit/s", "depth", "concurrent", "per answer tok/s",
-                     "aggregate tok/s", "uplink ceiling tok/s", "KV fits"], rows))
+                     "aggregate tok/s", "per-sequence reads", "uplink ceiling tok/s", "KV fits"], rows))
+
+    # Context sensitivity: the most aggregate one pipeline reaches before KV runs out.
+    rows = []
+    for device, stages in [("RTX 5090 32 GB", 26), ("Mac 64 GB (M4 Pro)", 12)]:
+        wire = kimi_wire_bytes(stages)
+        for one_way_ms in [10, 30, 60]:
+            for mbit in [20, 100]:
+                row = [device, stages, one_way_ms, mbit]
+                for context in KV_CONTEXTS:
+                    best = None
+                    for b in range(1, 1025):
+                        if not kv_fit(device, stages, stages * b, context)[0]:
+                            break
+                        serial = b * wire * 8 / (mbit * 1e6)
+                        t = round_seconds(stages, stages, kimi_step_seconds(b, stages, device), serial,
+                                          one_way_ms / 1e3, o)
+                        best = (stages * b / t, stages * b, 1 / t)
+                    row.append(f"{fmt(best[0], 0)} ({best[1]} seqs, {fmt(best[2])}/answer)" if best else "none fits")
+                    out["kv_sensitivity"].append({"device": device, "stages": stages, "one_way_ms": one_way_ms,
+                                                  "uplink_mbit": mbit, "context": context,
+                                                  "max_aggregate_tok_s": best[0] if best else None,
+                                                  "concurrency": best[1] if best else None})
+                rows.append(row)
+    md.append("**Context sensitivity, PROJECTION**: the most aggregate one swarm pipeline reaches before its KV cache "
+              "runs out, by tokens of context held per sequence (agentic traffic is prompt-heavy, so 4k is optimistic).")
+    md.append(table(["devices", "stages", "one-way ms", "uplink Mbit/s"] + [f"{c // 1024}k context" for c in KV_CONTEXTS],
+                    rows))
 
     # The curve the other way: what it takes to reach an aggregate.
     rows = []
-    out["curve"] = []
     for device, stage_options in [("RTX 5090 32 GB", [26, 44]), ("Mac 64 GB (M4 Pro)", [12, 24])]:
         for stages in stage_options:
+            wire = kimi_wire_bytes(stages)
             for one_way_ms in [10, 30, 60]:
                 for mbit in [20, 100]:
-                    ceiling = mbit * 1e6 / (KIMI_WIRE_BYTES * 8)
+                    ceiling = mbit * 1e6 / (wire * 8)
                     for target in PROJECTED_TARGETS:
                         found = None
                         for b in range(1, 257):
-                            fits, _, _ = kv_fit(device, stages, stages * b)
-                            if not fits:
+                            if not kv_fit(device, stages, stages * b)[0]:
                                 break
-                            serial = b * KIMI_WIRE_BYTES * 8 / (mbit * 1e6)
-                            step = kimi_step_seconds(b, stages, device)
-                            t = round_seconds(stages, stages, step, serial, one_way_ms / 1e3, o)
+                            serial = b * wire * 8 / (mbit * 1e6)
+                            t = round_seconds(stages, stages, kimi_step_seconds(b, stages, device), serial,
+                                              one_way_ms / 1e3, o)
                             if stages * b / t >= target:
                                 found = (b, 1 / t, stages * b / t)
                                 break
@@ -307,10 +414,11 @@ def projection(benches):
                                              "aggregate_tok_s": found[2] if found else None})
     md.append("**Curve: what one swarm pipeline needs to reach an aggregate, PROJECTION** — the smallest micro-batch "
               "depth (G = stages micro-batches) whose projected aggregate reaches the target with the KV cache fitting "
-              f"({KV_CONTEXT} tokens of context), and the per-answer speed at that point. Two stage counts per device "
-              "class: the memory minimum (with KV headroom) and about twice that. More stages give more KV room, so "
-              "more sequences can be in flight, but each answer is slower and the uplink ceiling stays the same: every "
-              "stage's uplink carries every token.")
+              f"({KV_CONTEXT} tokens of context, assumed), and the per-answer speed at that point. Upper bounds: the "
+              "sequence counts are lower bounds (see the model error above), and batched weight reads are assumed. "
+              "Two stage counts per device class: the memory minimum (with KV headroom) and about twice that. More "
+              "stages give more KV room, so more sequences can be in flight, but each answer is slower and the uplink "
+              "ceiling stays the same: every stage's uplink carries every token.")
     md.append(table(["devices", "stages", "one-way ms", "uplink Mbit/s", "target tok/s", "depth", "concurrent",
                      "per answer tok/s", "aggregate tok/s"], rows))
 
@@ -326,8 +434,9 @@ def projection(benches):
         rows.append([r["device"], r["stages"], r["one_way_ms"], r["uplink_mbit"], r["depth"], r["concurrency"],
                      r["per_answer_tok_s"], r["aggregate_tok_s"], pipelines, pipelines * r["stages"]])
         out["network"].append({**r, "pipelines_for_1e9_per_day": pipelines, "devices": pipelines * r["stages"]})
-    md.append(f"**One billion tokens a day ({fmt(BILLION_PER_DAY, 0)} tok/s sustained), swarm tier, PROJECTION** "
-              "(the deepest micro-batch depth whose KV fits; decode tokens only, no prefill; 100% utilisation):")
+    md.append(f"**One billion tokens a day ({fmt(BILLION_PER_DAY, 0)} tok/s sustained), swarm tier, PROJECTION, lower "
+              f"bound on devices** (the deepest micro-batch depth whose KV fits at {KV_CONTEXT} tokens; batched weight "
+              "reads; decode tokens only, no prefill; 100% utilisation):")
     md.append(table(["devices", "stages", "one-way ms", "uplink Mbit/s", "depth", "concurrent", "per answer tok/s",
                      "aggregate per pipeline", "pipelines", "devices"], rows))
     return out, "\n\n".join(md)
@@ -347,19 +456,21 @@ def main(argv):
     benches = load(paths)
     failures = [f for b in benches for f in b.get("failures", [])]
     md = ["## Measured"]
+    errors = []
     for b in benches:
         md.append(measured_section(b))
-        w = wan_section(b)
+        w, e = wan_section(b)
         if w:
             md.append(w)
+            errors.append(e)
         w = wan_targets_section(b)
         if w:
             md.append(w)
     md.append("## Bit-exactness")
     md.append("Every island run above was compared with the single process (tokens, every logits hash, the hash at "
               "every layer boundary of every position): " + ("**all identical**." if not failures else f"**FAILURES**: {failures}"))
-    proj, proj_md = projection(benches)
-    md.append("## Projection for Kimi K2 (not a measurement)")
+    proj, proj_md = projection(benches, errors)
+    md.append("## Projection for Kimi K2 / K2.6 (not a measurement)")
     md.append(proj_md)
     text = "\n\n".join(md) + "\n"
     if out_path:
