@@ -144,11 +144,15 @@ jobs:
           python-version: '3.12'
       - name: Python dependencies
         run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
+      - name: Reproduce pinned K2.6 YaRN vectors (no network or weights)
+        run: python scripts/arc_mla/yarn_reference.py docs/protocol/reference/kimi-k26/yarn-vectors.json --check
       - name: Python reference unit tests
         working-directory: scripts
         run: python -m unittest arc_conformance.tests.test_mla_moe_reference -v
       - name: Build arc-mla
         run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: K2.6 YaRN preparation CLI (synthetic metadata, no weights)
+        run: python scripts/arc_mla/check_yarn_cli.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/yarn-cli"
       - name: Tiny models through every check
         shell: bash
         run: bash scripts/arc_mla/tiny_checks.sh ./target/release/arc-mla "$RUNNER_TEMP/tiny" "$RUNNER_TEMP/tiny-evidence"
@@ -633,7 +637,14 @@ jobs:
           set -euo pipefail
           cargo test -p arc-inference --lib --locked modern::mla -- --nocapture 2>&1 | tee mla-tests.log
           { echo "### Golden digests on $RUNNER_OS $RUNNER_ARCH"; echo; echo '```'
-            grep '^golden ' mla-tests.log; grep '^test result' mla-tests.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            grep -E '^(golden |yarn )' mla-tests.log; grep '^test result' mla-tests.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-arch-goldens-${{ matrix.os }}
+          path: mla-tests.log
+          if-no-files-found: warn
 
   matrix:
     name: matrix (${{ matrix.os }})
@@ -684,6 +695,8 @@ jobs:
       - name: Build arc-mla
         shell: bash
         run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: K2.6 YaRN preparation CLI (synthetic metadata, no weights)
+        run: python scripts/arc_mla/check_yarn_cli.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/yarn-cli"
       - name: Tiny models through every check on this OS
         shell: bash
         run: bash scripts/arc_mla/tiny_checks.sh ./target/release/arc-mla "$WORK/tiny" "$EVIDENCE/tiny"

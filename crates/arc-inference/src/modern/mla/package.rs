@@ -628,6 +628,11 @@ pub fn parse_header(prefix: &[u8], file_len: u64) -> Result<StageHeader, ModernE
     let mut config = MlaConfig::from_json(&value["model"])?;
     config.expert_format = format;
     config.validate()?;
+    if value["profile"].as_str() != Some(config.profile()) {
+        return Err(ModernError::Invalid(
+            "profile does not match model preparation".into(),
+        ));
+    }
     let stage = StageSpec::from_json(&value["stage"])?;
     stage.validate(&config)?;
     let source = value["source"].clone();
@@ -786,7 +791,7 @@ pub fn build_manifest(
         "schema": STAGE_MANIFEST_SCHEMA,
         "profile": c.profile(),
         "profile_blake3": identity_blake3(c.profile()),
-        "contract": CONTRACT,
+        "contract": if c.preparation.is_some() { super::yarn::CONTRACT } else { CONTRACT },
         "model": c.to_json(),
         "source": source,
         "segments": segment_list,

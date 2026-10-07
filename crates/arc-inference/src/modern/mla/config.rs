@@ -30,7 +30,9 @@ impl ExpertFormat {
     pub fn from_profile(profile: &str) -> Option<Self> {
         match profile {
             p if p == super::PROFILE => Some(ExpertFormat::Int8Dyadic),
-            p if p == super::PROFILE_I4G32 => Some(ExpertFormat::Int4G32),
+            p if p == super::PROFILE_I4G32 || super::yarn::is_profile(p) => {
+                Some(ExpertFormat::Int4G32)
+            }
             _ => None,
         }
     }
@@ -89,6 +91,8 @@ pub struct MlaConfig {
     pub attention_lambda: i64,
     /// Storage of the routed experts (named by the profile, not the object).
     pub expert_format: ExpertFormat,
+    /// Versioned preparation; absent means the original unchanged v1 profile.
+    pub preparation: Option<super::yarn::Preparation>,
 }
 
 const MODEL_KEYS: [&str; 25] = [
@@ -193,7 +197,12 @@ impl MlaConfig {
             && (1..(1i64 << 40)).contains(&self.routed_scaling_q32)
             && self.rms_eps_q32 >= 1
             && (2..=(1u64 << 53)).contains(&self.rope_theta)
-            && self.attention_lambda == attention_lambda(self.d_qk())
+            && self.attention_lambda
+                == if self.preparation.is_some() {
+                    super::yarn::ATTENTION_LAMBDA
+                } else {
+                    attention_lambda(self.d_qk())
+                }
             && self.n_layers <= 1024
             && self.d_model <= 1 << 20
             && self.n_heads <= 4096
@@ -215,12 +224,15 @@ impl MlaConfig {
                 "unsupported MLA + MoE model shape: {self:?}"
             )));
         }
+        if let Some(preparation) = &self.preparation {
+            preparation.validate(self)?;
+        }
         Ok(())
     }
 
     /// The `model` object of the header and manifest (spec §2.2).
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "architecture": self.architecture,
             "n_layers": self.n_layers,
             "d_model": self.d_model,
@@ -246,7 +258,11 @@ impl MlaConfig {
             "rope_theta": self.rope_theta,
             "attention_lambda": self.attention_lambda,
             "tied_embeddings": false,
-        })
+        });
+        if let Some(preparation) = &self.preparation {
+            value["preparation"] = preparation.to_json();
+        }
+        value
     }
 
     /// Parse the `model` object back; every field must be present and no
@@ -256,7 +272,16 @@ impl MlaConfig {
         let object = model.as_object().ok_or_else(|| bad("(not an object)"))?;
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        if keys != MODEL_KEYS {
+        let preparation = model
+            .get("preparation")
+            .map(super::yarn::Preparation::from_json)
+            .transpose()?;
+        let mut expected = MODEL_KEYS.to_vec();
+        if preparation.is_some() {
+            expected.push("preparation");
+            expected.sort_unstable();
+        }
+        if keys != expected {
             return Err(bad(&format!("fields {keys:?}")));
         }
         let size = |key: &str| -> Result<usize, ModernError> {
@@ -310,7 +335,12 @@ impl MlaConfig {
                 .and_then(Value::as_u64)
                 .ok_or_else(|| bad("rope_theta"))?,
             attention_lambda: int("attention_lambda")?,
-            expert_format: ExpertFormat::Int8Dyadic,
+            expert_format: if preparation.is_some() {
+                ExpertFormat::Int4G32
+            } else {
+                ExpertFormat::Int8Dyadic
+            },
+            preparation,
         };
         config.validate()?;
         Ok(config)
@@ -318,7 +348,9 @@ impl MlaConfig {
 
     /// The arithmetic profile identity of a package of this model.
     pub fn profile(&self) -> &'static str {
-        self.expert_format.profile()
+        self.preparation
+            .as_ref()
+            .map_or_else(|| self.expert_format.profile(), |p| p.profile())
     }
 }
 
@@ -481,6 +513,11 @@ pub fn parse_hf_config(bytes: &[u8], max_seq: usize) -> Result<HfMlaConfig, Mode
     if !missing.is_empty() {
         return Err(bad(&format!("not supported: {}", missing.join("; "))));
     }
+    parse_text_config(&value, max_seq)
+}
+
+pub(crate) fn parse_text_config(value: &Value, max_seq: usize) -> Result<HfMlaConfig, ModernError> {
+    let bad = |what: &str| ModernError::Invalid(format!("config.json: {what}"));
     let size = |key: &str| -> Result<usize, ModernError> {
         value
             .get(key)
@@ -578,6 +615,7 @@ pub fn parse_hf_config(bytes: &[u8], max_seq: usize) -> Result<HfMlaConfig, Mode
         rope_theta: theta as u64,
         attention_lambda: attention_lambda(qk_nope_dim + qk_rope_dim),
         expert_format: ExpertFormat::Int8Dyadic,
+        preparation: None,
     };
     config.validate()?;
     Ok(HfMlaConfig { config, eos })

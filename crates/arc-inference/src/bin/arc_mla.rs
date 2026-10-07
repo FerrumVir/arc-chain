@@ -32,6 +32,8 @@ const USAGE: &str = "usage: arc-mla <command> [options]
 
   convert   --source-dir DIR --source-manifest SRC.json --out PKG [--layers A:B]
             [--experts i8|i4g32] [--manifest-out MANIFEST.json] [--report OUT.json] [--threads N]
+  yarn-prepare --config PINNED_CONFIG.json --out PREPARATION.json [--max-seq N]
+               [--probe-layers 1|2|3] [--slice-manifest PENDING.json --manifest-out STAGE.json]
   verify    --package PKG --manifest MANIFEST.json [--full-digest]
   inspect   --package PKG
   golden    --package PKG --cases CASES.json --out RUN.json
@@ -227,6 +229,50 @@ fn cmd_convert(args: &Args) -> Result<(), ModernError> {
         "{}",
         serde_json::to_string_pretty(&summary).unwrap_or_default()
     );
+    Ok(())
+}
+
+fn cmd_yarn_prepare(args: &Args) -> Result<(), ModernError> {
+    use arc_inference::modern::mla::yarn;
+    let config =
+        std::fs::read(args.path("--config")?).map_err(|e| ModernError::Io(e.to_string()))?;
+    let max_seq = args.number("--max-seq", 4096)?;
+    let probe = if args.flag("--probe-layers") {
+        Some(
+            args.required("--probe-layers")?
+                .parse::<usize>()
+                .map_err(|_| ModernError::Invalid("--probe-layers needs 1..=3".into()))?,
+        )
+    } else {
+        None
+    };
+    let c = yarn::official_config(&config, max_seq, probe)?;
+    let manifest = if args.flag("--slice-manifest") {
+        let input = read_json(&args.path("--slice-manifest")?)?;
+        let target = args.path("--manifest-out")?;
+        Some((
+            target,
+            yarn::finalize_pending_slices(&config, &input, max_seq, probe)?,
+        ))
+    } else {
+        if args.flag("--manifest-out") {
+            return Err(ModernError::Invalid(
+                "--manifest-out needs --slice-manifest".into(),
+            ));
+        }
+        None
+    };
+    let out = args.path("--out")?;
+    let digest = yarn::tables_digest(&c)?;
+    let report = json!({"schema":"arc.kimi-k26-yarn-preparation.v1", "profile":c.profile(),
+        "contract":yarn::CONTRACT,"model":c.to_json(),"tables":digest.to_json(),
+        "weight_bytes_verified":false,"real_forward_measured":false,
+        "stage_manifest_finalized":manifest.is_some()});
+    if let Some((target, value)) = manifest {
+        write_json(&target, &value)?;
+    }
+    write_json(&out, &report)?;
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
     Ok(())
 }
 
@@ -781,6 +827,7 @@ fn main() -> ExitCode {
     let args = Args { items };
     let result = match command.as_str() {
         "convert" => cmd_convert(&args),
+        "yarn-prepare" => cmd_yarn_prepare(&args),
         "verify" => cmd_verify(&args),
         "inspect" => cmd_inspect(&args),
         "golden" => cmd_golden(&args),

@@ -478,6 +478,14 @@ impl StageModel {
             let c = &header.config;
             let rope_cos = loader.i32s("rope.cos")?;
             let rope_sin = loader.i32s("rope.sin")?;
+            if c.preparation.is_some() {
+                let (expected_cos, expected_sin) = super::yarn::tables(c)?;
+                if rope_cos != expected_cos || rope_sin != expected_sin {
+                    return Err(invalid(
+                        "package tables differ from versioned YaRN preparation",
+                    ));
+                }
+            }
             let embed = if stage.has_embed() {
                 Some(loader.mat("embed", 1, c.vocab_size, c.d_model)?)
             } else {
@@ -929,6 +937,7 @@ pub(crate) mod tests {
             rope_theta: 50_000,
             attention_lambda: crate::modern::tables::attention_lambda(12),
             expert_format: format,
+            preparation: None,
         }
     }
 
@@ -971,8 +980,7 @@ pub(crate) mod tests {
             std::process::id()
         ));
         let mut w = StageWriter::create(&path, &header, entries.clone()).unwrap();
-        let (cos, sin) =
-            crate::modern::tables::rope_tables(c.rope_theta, c.qk_rope_dim, c.max_seq).unwrap();
+        let (cos, sin) = super::super::yarn::tables(c).unwrap();
         for e in &entries {
             let seed = blake3::hash(e.name.as_bytes());
             let mut rng = Lcg(u64::from_le_bytes(seed.as_bytes()[..8].try_into().unwrap()));
@@ -1599,5 +1607,106 @@ pub(crate) mod tests {
             mismatches.is_empty(),
             "golden digests differ: {mismatches:#?}"
         );
+    }
+    #[test]
+    fn yarn_synthetic_package_engine_and_manifest_are_exact() {
+        use super::super::yarn::{self, Preparation, Scope};
+        let mut c = tiny_config_with(true, ExpertFormat::Int4G32);
+        c.architecture = "arc-test/kimi-k26-yarn".into();
+        c.qk_nope_dim = 128;
+        c.qk_rope_dim = 64;
+        c.attention_lambda = yarn::ATTENTION_LAMBDA;
+        c.preparation = Some(Preparation {
+            scope: Scope::SyntheticFixture,
+        });
+        c.validate().unwrap();
+        let bytes = tiny_package(&c, StageSpec::full(&c));
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        assert_eq!(
+            digest,
+            "c482e37976e2e950e5dd853d0458a2184faaf65c5be83bf10b59d82476699810"
+        );
+        let model = StageModel::from_owned(bytes.clone()).unwrap();
+        let segments = model.segments();
+        let manifest = yarn::finalize_manifest(
+            &c,
+            &model.header.source,
+            &segments[1..],
+            &[],
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        package::verify_against_manifest(
+            &model.header,
+            &segments,
+            serde_json::to_string(&manifest).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["segments"][0],
+            yarn::tables_digest(&c).unwrap().to_json()
+        );
+        let request = GenerationRequest {
+            prompt: &[3, 17, 5],
+            max_tokens: 4,
+            eos: &[],
+            selection: Selection::Rp64Argmax,
+        };
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let mut golden = None;
+        for (fast, threads) in [(false, 1), (false, 3), (true, 2)] {
+            crate::canonical_simd::set_fast_canonical_kernel(fast);
+            if fast {
+                assert!(crate::canonical_simd::fast_canonical_kernel_enabled());
+            }
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let run = pool.install(|| model.generate(&request)).unwrap();
+            let mut h = blake3::Hasher::new();
+            for t in &run.tokens {
+                h.update(&t.to_le_bytes());
+            }
+            for x in run.logits_hashes.iter().chain(&run.boundary_digests) {
+                h.update(x);
+            }
+            let got = h.finalize().to_hex().to_string();
+            if let Some(want) = &golden {
+                assert_eq!(&got, want);
+            } else {
+                golden = Some(got);
+            }
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+        let run_digest = golden.unwrap();
+        assert_eq!(
+            run_digest,
+            "cb534beca94b40578c1daa226103e8cf0a62d58bdff2636620b5b9c49d9ac92c"
+        );
+        assert_eq!(
+            manifest["model_root"],
+            "585aa1317c6c5c56ef5ceb582324b994f8439bfb482ac8207decd658cc5a7c72"
+        );
+        println!(
+            "yarn synthetic package {digest} run {run_digest} root {}",
+            manifest["model_root"]
+        );
+        let mut wrong_tables = bytes.clone();
+        let table = model.header.entry("rope.cos").unwrap();
+        wrong_tables[model.header.range(table).start] ^= 1;
+        assert!(StageModel::from_owned(wrong_tables).is_err());
+        // Reject a profile downgrade without relying on the manifest verifier.
+        let mut header = model.header.value.clone();
+        header["profile"] = super::super::PROFILE_I4G32.into();
+        let mut downgraded = bytes;
+        let text = crate::model_package::canonical_json(&header).unwrap();
+        let len = text.len() as u64;
+        // Header length changes; construct just a header. Rejection must occur
+        // for the profile/preparation mismatch before reading tensor payloads.
+        downgraded.truncate(16);
+        downgraded[8..16].copy_from_slice(&len.to_le_bytes());
+        downgraded.extend_from_slice(text.as_bytes());
+        assert!(StageModel::from_owned(downgraded).is_err());
     }
 }
