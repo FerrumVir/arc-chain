@@ -13,9 +13,10 @@
 //! `Simulated` state at most. The report counts them as simulated islands.
 
 use crate::device::{
-    Consent, DeviceDescriptor, Evidence, IslandFacts, LinkStats, Location, Measured, RdmaEvidence,
-    RttSource,
+    Consent, DeviceDescriptor, Evidence, IslandFacts, LinkStats, Location, Measured, PoolKind,
+    RdmaEvidence, RttSource,
 };
+use crate::economics::{CostAssumptions, CostProjection, project_cost};
 use crate::form::{FormationOutcome, FormationPolicy, IslandPlan, RejectReason, Tier, form};
 use crate::lifecycle::{GoldenSource, Island, Recovery, State, TrustedCheckpoint};
 use crate::model::ModelSpec;
@@ -286,7 +287,7 @@ const fn class(
 /// research-7 §4.1 device mix. Splits inside a research class (16 vs 24 GB
 /// Macs, Mac vs Strix at 128 GB, 256 vs 512 GB Ultras) are even \[ASSUMPTION\];
 /// Thunderbolt 5 is assumed on 128 GB Macs and Ultras only.
-pub const DEVICE_MIX: [DeviceClass; 14] = [
+pub const DEVICE_MIX: [DeviceClass; 16] = [
     class("8 GB GPU", 100, 16, false, Some(8), None),
     class("12 GB GPU", 150, 32, false, Some(12), None),
     class("16 GB GPU", 150, 32, false, Some(16), None),
@@ -301,6 +302,16 @@ pub const DEVICE_MIX: [DeviceClass; 14] = [
     class("M3 Ultra 256 GB", 5, 256, true, None, Some(true)),
     class("M3 Ultra 512 GB", 5, 512, true, None, Some(true)),
     class("CPU-only 32 GB", 30, 32, false, None, None),
+    // Zero-weight classes used only by the ordinary-node scenarios.
+    class("16 GB RAM, CPU pool", 0, 16, false, None, None),
+    class(
+        "16 GB RAM + 8 GB GPU, CPU pool",
+        0,
+        16,
+        false,
+        Some(8),
+        None,
+    ),
 ];
 
 /// Largest-remainder apportionment of `total` by `weights`.
@@ -530,6 +541,7 @@ impl Inventory {
             access_us: idx.iter().map(|&i| self.access_us[i]).collect(),
             devices: devices.clone(),
             at_ms: 0,
+            fixed_regional_rtt_us: None,
         };
         (devices, idx, rtt)
     }
@@ -544,6 +556,7 @@ pub struct SyntheticRtt {
     devices: Vec<DeviceDescriptor>,
     /// Time stamped on every link (probes repeat every 5 min).
     pub at_ms: u64,
+    pub fixed_regional_rtt_us: Option<u32>,
 }
 
 impl RttSource for SyntheticRtt {
@@ -560,6 +573,9 @@ impl RttSource for SyntheticRtt {
             return Some(stats(0));
         }
         let (da, db) = (&self.devices[a], &self.devices[b]);
+        if let Some(us) = self.fixed_regional_rtt_us {
+            return (da.location.region == db.location.region).then(|| stats(us));
+        }
         if da.site.is_some() && da.site == db.site {
             return Some(stats(if da.thunderbolt5() && db.thunderbolt5() {
                 40
@@ -593,9 +609,28 @@ pub enum Service {
     Batch,
 }
 
+/// Hardware/geography assumptions, never a discovered community inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InventoryProfile {
+    /// Retained research-7 comparison, not the deployment requirement.
+    ResearchMix,
+    /// Every host has 16 GB RAM; research-7's dispersed geography.
+    OrdinaryGlobal,
+    /// Every host has 16 GB RAM, in synthetic public-internet regions of this
+    /// many registered nodes. No links between regions are assumed.
+    OrdinaryRegional {
+        rtt_us: u32,
+        nodes_per_region: usize,
+    },
+}
+
 /// One simulator run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scenario {
+    pub inventory: InventoryProfile,
+    pub costs: CostAssumptions,
+    /// Reserved concurrent sequences; formation and batching share this budget.
+    pub kv_sequences: u64,
     pub nodes: usize,
     pub seed: u64,
     pub opt_in_permille: u32,
@@ -661,10 +696,14 @@ pub fn neighbour_map() -> BTreeMap<String, Vec<String>> {
 /// The formation policy a scenario uses: synthetic inputs allowed (so its
 /// islands can never serve), the neighbour table, and the spare policy.
 pub fn policy_for(s: &Scenario) -> FormationPolicy {
-    let kv_positions = kv_sequences(s.service) * CONTEXT_POSITIONS;
-    let mut policy = match s.service {
-        Service::Interactive => FormationPolicy::interactive(kv_positions),
-        Service::Batch => FormationPolicy::batch(kv_positions),
+    let kv_positions = s.kv_sequences * CONTEXT_POSITIONS;
+    let mut policy = if s.inventory != InventoryProfile::ResearchMix {
+        FormationPolicy::regional(kv_positions)
+    } else {
+        match s.service {
+            Service::Interactive => FormationPolicy::interactive(kv_positions),
+            Service::Batch => FormationPolicy::batch(kv_positions),
+        }
     };
     policy.allow_synthetic = true;
     policy.require_spares = s.require_spares;
@@ -766,6 +805,10 @@ pub struct ScenarioReport {
     pub tokens_per_day: f64,
     pub tokens_per_day_speculative: f64,
     pub churn: ChurnReport,
+    pub cost_plain: CostProjection,
+    pub cost_speculative: CostProjection,
+    /// Each external input is an assumption; outputs are derived projections.
+    pub input_basis: BTreeMap<String, String>,
 }
 
 fn mix_of(group: &[usize], inv: &Inventory, idx: &[usize]) -> String {
@@ -943,13 +986,40 @@ fn reject_label(reason: RejectReason) -> &'static str {
 
 /// Runs one scenario.
 pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
-    let inv = Inventory::synthetic(
+    let mut inv = Inventory::synthetic(
         scenario.nodes,
         scenario.seed,
         scenario.opt_in_permille,
         scenario.availability_permille,
     );
+    if scenario.inventory != InventoryProfile::ResearchMix {
+        for (i, d) in inv.devices.iter_mut().enumerate() {
+            // GPU presence is welcome but not required. RAM and VRAM are never
+            // summed, and no unmeasured GPU speedup is credited.
+            let class = if i % 4 == 0 { 15 } else { 14 };
+            inv.class_of[i] = class;
+            d.facts = DEVICE_MIX[class].facts;
+            d.measured.pool_kind = Some(PoolKind::Cpu);
+            d.site = None;
+            d.rdma = None;
+            if let InventoryProfile::OrdinaryRegional {
+                nodes_per_region, ..
+            } = scenario.inventory
+            {
+                let region = format!("synthetic-region-{}", i / nodes_per_region.max(1));
+                d.location = Location {
+                    continent: "synthetic".into(),
+                    region: region.clone(),
+                    zone: region.clone(),
+                    metro: region,
+                };
+            }
+        }
+    }
     let (devices, idx, mut rtt) = inv.online_snapshot();
+    if let InventoryProfile::OrdinaryRegional { rtt_us, .. } = scenario.inventory {
+        rtt.fixed_regional_rtt_us = Some(rtt_us);
+    }
     let policy = policy_for(scenario);
     let outcome = form(&devices, &rtt, model, &policy, 0);
     let golden = ToyPipeline::golden(&model.identity, model.layers.len());
@@ -1023,7 +1093,58 @@ pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
     let needed_gb = (need + need * policy.capacity_headroom_permille / 1000) as f64 / 1e9;
     let mut rng = Rng::new(scenario.seed ^ 0xC0FFEE);
     let sum = |f: &dyn Fn(&IslandRow) -> f64| rows.iter().map(f).sum::<f64>() + 0.0;
+    let churn = churn(&outcome, &devices, &mut rtt, model, &policy, &mut rng);
+    let available_ms = churn
+        .other_time_ms
+        .saturating_sub((churn.promotions as u64).saturating_mul(PROMOTION_STALL_MS));
+    let lease_available = if churn.total_island_time_ms == 0 {
+        0.0
+    } else {
+        available_ms as f64 / churn.total_island_time_ms as f64
+    };
+    let members = outcome.islands.iter().map(|p| p.members.len()).sum();
+    let spares = outcome.islands.iter().map(|p| p.spares.len()).sum();
+    let cost = |speculative: bool| {
+        let mut tokens = 0.0;
+        let mut egress = 0.0;
+        for row in &rows {
+            let b = if speculative {
+                row.projection.batch_speculative
+            } else {
+                row.projection.batch
+            };
+            let daily = b.aggregate_tok_s * 86_400.0;
+            tokens += daily;
+            // A feedback token is counted per verified pass, alongside all
+            // activation boundaries. No compression credit without ENG-9 data.
+            let bytes = model.boundary_bytes_per_position as f64
+                * row.members.saturating_sub(1) as f64
+                * f64::from(b.draft_tokens + 1)
+                + if row.members > 1 { 8.0 } else { 0.0 };
+            egress +=
+                daily * bytes / crate::perf::tau(b.draft_tokens, scenario.net.draft_acceptance);
+        }
+        project_cost(
+            scenario.costs,
+            members,
+            spares,
+            rows.len(),
+            tokens,
+            egress,
+            lease_available,
+        )
+        .expect("finite simulator inputs")
+    };
+    let cost_plain = cost(false);
+    let cost_speculative = cost(true);
     ScenarioReport {
+        cost_plain,
+        cost_speculative,
+        input_basis: assumptions().into_iter().map(|(key, value, basis)|
+            (key.into(), format!("ASSUMED input: {value}; provenance: {basis}"))).chain([
+                ("Scenario".into(), "ASSUMED node count (130 is TJ's approximate fleet size, not a measured inventory), seed, profile, opt-in, availability, service, transport, KV and spare policy; exact values in scenario".into()),
+                ("Costs".into(), "ASSUMED rates and utilisation: exact values in scenario.costs; no operator prices measured".into()),
+            ]).collect(),
         online: devices.len(),
         opted_in_online,
         eligible_online: devices.len() - outcome.rejected.len(),
@@ -1040,7 +1161,7 @@ pub fn run(scenario: &Scenario, model: &ModelSpec) -> ScenarioReport {
         aggregate_tok_s_speculative: sum(&|r| r.projection.batch_speculative.aggregate_tok_s),
         tokens_per_day: sum(&|r| r.tokens_per_day),
         tokens_per_day_speculative: sum(&|r| r.tokens_per_day_speculative),
-        churn: churn(&outcome, &devices, &mut rtt, model, &policy, &mut rng),
+        churn,
         rows,
         scenario: scenario.clone(),
     }
@@ -1065,6 +1186,9 @@ pub fn standard_scenarios(seed: u64, node_counts: &[usize]) -> Vec<Scenario> {
             (Service::Batch, p(), 700, false),
         ] {
             out.push(Scenario {
+                inventory: InventoryProfile::ResearchMix,
+                costs: CostAssumptions::default(),
+                kv_sequences: kv_sequences(service),
                 nodes,
                 seed,
                 opt_in_permille: OPT_IN_PERMILLE,
@@ -1079,31 +1203,79 @@ pub fn standard_scenarios(seed: u64, node_counts: &[usize]) -> Vec<Scenario> {
     out
 }
 
+/// Default scenarios for TJ's ordinary-node regional deployment target.
+/// Concentrated profiles are sensitivity cases, not a claim that today's
+/// ~130 nodes share a region. The dispersed case shows that uncertainty.
+pub fn regional_scenarios(seed: u64, node_counts: &[usize]) -> Vec<Scenario> {
+    let mut out = Vec::new();
+    for &nodes in node_counts {
+        for rtt_us in [5_000, 10_000, 20_000] {
+            for optimized in [false, true] {
+                let mut net = if optimized {
+                    NetAssumptions::optimized()
+                } else {
+                    NetAssumptions::pessimistic()
+                };
+                // Parameter sweep for ENG-8 integration, NOT an implemented
+                // token-tree verifier or an asserted acceptance measurement.
+                net.max_draft_tokens = 64;
+                net.draft_acceptance = 0.9;
+                out.push(Scenario {
+                    inventory: InventoryProfile::OrdinaryRegional {
+                        rtt_us,
+                        nodes_per_region: 130,
+                    },
+                    costs: CostAssumptions::default(),
+                    kv_sequences: 128,
+                    nodes,
+                    seed,
+                    opt_in_permille: OPT_IN_PERMILLE,
+                    availability_permille: 700,
+                    service: Service::Batch,
+                    transport: if optimized { "500-Mbps" } else { "50-Mbps" }.into(),
+                    net,
+                    require_spares: true,
+                });
+            }
+        }
+        let mut sensitivity = out.last().expect("six scenarios").clone();
+        sensitivity.availability_permille = 500;
+        out.push(sensitivity);
+        let mut dispersed = out.last().expect("scenario").clone();
+        dispersed.inventory = InventoryProfile::OrdinaryGlobal;
+        dispersed.availability_permille = 700;
+        out.push(dispersed);
+    }
+    out
+}
+
 /// Every labelled input, for the report.
 pub fn assumptions() -> Vec<(&'static str, String, &'static str)> {
     let p = NetAssumptions::pessimistic();
     let o = NetAssumptions::optimized();
     vec![
+        ("Cost inputs", format!("{:?}; USD; all rates assumed, not operator quotes. Costs charge all reserved members/spares for a full day; output discounted by demand utilisation and equal-weight simulated lease availability. Egress includes activation boundaries for every verification position and token feedback, no compression credit. Shard staging/checkpoint traffic, separate drafter resources, unallocated hosts, taxes, rewards and profit margins excluded.", CostAssumptions::default()), "ASSUMED"),
+        ("Cost downtime approximation", "Lease available fraction = max(0, other island-time minus promotions times 10 seconds) / total island-time; conservative promotion-stall subtraction may overlap shortfall time. Uses equal island-time weights, not throughput-weighted per-swarm downtime. Costs are planning estimates, not a measured TCO.".into(), "ASSUMED accounting model"),
         ("Model", "Kimi K2.6, INT4 g32 routed experts + INT8 elsewhere: 582.6 GB weights, 140,544 B KV per position, 56 KiB Q16 boundary per position, no MTP head".into(), "CALC from docs/protocol/kimi-k26-checkpoint.md (#156)"),
         ("Evidence", "every synthetic device, link and RDMA result is marked synthetic; formation allows it, so every island is a simulated island and none can serve; no Kimi golden is pinned".into(), "by construction"),
-        ("Inventory geography", "research-7 §4.1 shares (US/EU-skewed), Asia ×1.25/×1.55 and Africa ×1.2/×1.6 at 1,000/10,000; metros inside an area weighted by a fixed synthetic table".into(), "UNVERIFIED planning input (research-7) + ASSUMPTION"),
-        ("Device mix", "8 GB GPU 10%, 12 GB 15%, 16 GB 15%, 24 GB 20%, 32 GB 8%, Mac 16–24 GB 10%, Mac 36–64 GB 12%, 128 GB Mac/Strix 6%, 256–512 GB Ultra 1%, CPU-only 3%; even splits inside each class".into(), "UNVERIFIED planning input (research-7 §4.1)"),
+        ("Inventory geography", "Default regional-density sensitivity: consecutive groups of up to 130 registered machines in one synthetic region at p50 RTT 5, 10 or 20 ms; no inter-region links assumed. The dispersed sensitivity and legacy comparison use research-7 §4.1 shares (US/EU-skewed), Asia ×1.25/×1.55 and Africa ×1.2/×1.6 at 1,000/10,000; metros inside an area weighted by a fixed synthetic table".into(), "UNVERIFIED planning input (research-7) + ASSUMPTION"),
+        ("Device mix", "Default: all nodes have 16 GB system RAM; 25% also have an 8 GB consumer GPU. Placement uses the CPU memory pool, not RAM+VRAM, and credits no GPU speedup. Legacy comparison only: 8 GB GPU 10%, 12 GB 15%, 16 GB 15%, 24 GB 20%, 32 GB 8%, Mac 16–24 GB 10%, Mac 36–64 GB 12%, 128 GB Mac/Strix 6%, 256–512 GB Ultra 1%, CPU-only 3%; even splits inside each class".into(), "UNVERIFIED planning input (research-7 §4.1)"),
         ("Availability", "each node online at formation with probability 0.7 (base) or 0.5 (sensitivity)".into(), "UNVERIFIED (research-7 §4.1)"),
         ("Consent", format!("{}% of owners grant both answers for their own device (no expiry inside the run); the rest answered the compute question only", OPT_IN_PERMILLE / 10), "ASSUMPTION; consent model from #138"),
         ("Golden qualification", "every synthetic device passes its own Proof Kit self-test".into(), "ASSUMPTION"),
         ("Usable memory", "85% of GPU memory, 80% of unified/system memory".into(), "research-6 §2.2"),
         ("Bandwidth", "llama.cpp-class effective GB/s by class: GPU 8/12/16/24/32 GB = 250/300/450/680/1,108; Mac ≤24 GB 90, 36–192 GB 300, ≥256 GB 456; CPU 60. ARC's engine is not yet measured at these rates".into(), "CALC (research-6 §2.5, research-7 §2.6), UNVERIFIED for ARC"),
         ("Spare policy", "1 / 2 / 3 warm spares for 2–6 / 7–22 / 23+ stages; every spare holds the largest stage and meets the link rule with every member; the comparison rows drop the requirement".into(), "research-6 §6.4"),
-        ("LAN sites", "3% / 5% / 8% of nodes at <1,000 / 1,000 / 10,000 on sites of 3 devices of one owner; Thunderbolt 5 Macs there carry a synthetic RDMA result (collective p99 0.15 ms)".into(), "UNVERIFIED (research-7 §4.1) + ASSUMPTION"),
-        ("Home RTT", "access leg to the metro hub drawn from RIPE Atlas 0–100 km quantiles (p25 3.7, p50 5.5, p75 9.8, p90 22.1 ms); pair RTT = both legs + core (metro −1, zone +11, region +27, other region of the continent +45, world +181 ms); p95 = 1.25 × p50, p99 = 1.5 × p50, no loss".into(), "MEASURED quantiles (research-7 §1.6) + CALC + ASSUMPTION for jitter"),
-        ("Search levels", "metro 20 ms, zone 35 ms, region 60 ms, region + declared neighbours 75 ms (measured p95 between every pair); interactive stage caps 4 / 3 / 2 / 2, batch 30".into(), "research-7 §1.7, §6.2; 75 ms from the wide-region p75 (research-7 §1.6)"),
+        ("LAN sites", "Default ordinary-node profiles have no LAN sites or RDMA. Legacy comparison: 3% / 5% / 8% of nodes at <1,000 / 1,000 / 10,000 on sites of 3 devices of one owner; Thunderbolt 5 Macs there carry a synthetic RDMA result (collective p99 0.15 ms)".into(), "UNVERIFIED (research-7 §4.1) + ASSUMPTION"),
+        ("Home RTT", "Regional-density cases use fixed synthetic p50 5/10/20 ms, p95 1.25 times p50, p99 1.5 times p50; no packet loss. Dispersed/legacy cases: access leg to the metro hub drawn from RIPE Atlas 0–100 km quantiles (p25 3.7, p50 5.5, p75 9.8, p90 22.1 ms); pair RTT = both legs + core (metro −1, zone +11, region +27, other region of the continent +45, world +181 ms); p95 = 1.25 × p50, p99 = 1.5 × p50, no loss".into(), "MEASURED quantiles (research-7 §1.6) + CALC + ASSUMPTION for jitter"),
+        ("Search levels", "Default regional policy: up to 128 stages, no T0/LAN prerequisite. Geo hints at p95 20/35/60/75 ms, then direct-RTT fallback at 60 ms. Legacy comparison alone retains interactive caps 4/3/2/2 and batch 30".into(), "research-7 §1.7, §6.2; 75 ms from the wide-region p75 (research-7 §1.6)"),
         ("Neighbour table", NEIGHBOURS.iter().map(|(a, b)| format!("{a}–{b}")).collect::<Vec<_>>().join(", "), "ASSUMPTION"),
         ("LAN RTT", "0.3 ms p50 on one site, 0.04 ms when both machines have Thunderbolt 5".into(), "ASSUMPTION (research-6 §1.2: RDMA < 50 µs)"),
         ("Pessimistic transport", format!("{} ms per hop, {} Mb/s home uplink, {} ms fixed per pass", f64::from(p.wan_hop_overhead_us) / 1000.0, p.wan_uplink_mbps, f64::from(p.fixed_pass_us) / 1000.0), "research-7 §2.1 defaults"),
         ("Optimized transport", format!("{} ms per hop, {} Mb/s uplink", f64::from(o.wan_hop_overhead_us) / 1000.0, o.wan_uplink_mbps), "ASSUMPTION (fibre homes, tuned streaming transport)"),
         ("Tensor parallel", format!("{} ms per collective on RDMA, 122 per token", f64::from(p.collective_us) / 1000.0), "research-6 §2.5"),
-        ("Speculation", format!("chain drafts from a separate drafter (K2.6 has no MTP head), acceptance α = {}, {} ms per draft token, depth 0–{} chosen per island, separately for a single answer and under batching", p.draft_acceptance, f64::from(p.draft_us_per_token) / 1000.0, p.max_draft_tokens), "ASSUMPTION (research-7 §2.2 planning values)"),
-        ("Batching", format!("KV for {} (interactive) / {} (batch) sequences × {} positions per island; depth = max aggregate keeping per-stream ≥ min({} tok/s, half the single-stream rate)", kv_sequences(Service::Interactive), kv_sequences(Service::Batch), CONTEXT_POSITIONS, BATCH_FLOOR_TOK_S), "research-6 §2.6 model"),
+        ("Speculation", format!("Default ordinary-node sweep: depth 0–64, alpha 0.9 ASSUMED; exact settings in scenario.net. No token-tree execution implemented (ENG-8). Legacy comparison: chain drafts from a separate drafter (K2.6 has no MTP head), acceptance α = {}, {} ms per draft token, depth 0–{} chosen per island, separately for a single answer and under batching", p.draft_acceptance, f64::from(p.draft_us_per_token) / 1000.0, p.max_draft_tokens), "ASSUMPTION (research-7 §2.2 planning values)"),
+        ("Batching", format!("Default ordinary-node scenarios reserve 128 sequences × 4096 positions, with both batch and draft depth optimized. Legacy comparison: KV for {} (interactive) / {} (batch) sequences × {} positions per island; depth = max aggregate keeping per-stream ≥ min({} tok/s, half the single-stream rate)", kv_sequences(Service::Interactive), kv_sequences(Service::Batch), CONTEXT_POSITIONS, BATCH_FLOOR_TOK_S), "research-6 §2.6 model"),
         ("Compute model", "memory-bandwidth bound; distinct experts under uniform routing; FLOPs, prefill and queueing not modelled".into(), "CALC (research-6 §2.6)"),
         ("Tokens/day", "aggregate tok/s × 86,400: a fully loaded ceiling, excluding spare-shortfall and dissolved downtime, recovery stalls, prefill and audit; not a demand forecast".into(), "CALC"),
         ("Churn", format!("device MTBF {MTBF_H} h, lease {LEASE_H} h, exponential failures; a member loss promotes a spare, recovers from the ledger checkpoint and re-qualifies ({} s stall); lost spares are replaced from unused eligible devices after staging the largest stage at 1 Gb/s; spare-shortfall time counts only non-dissolved islands below policy, including time without an eligible replacement; dissolved time counts separately from dissolution to lease end", PROMOTION_STALL_MS / 1000), "research-6 §3.3 (Salad 92 h), §6.7"),
@@ -1150,10 +1322,18 @@ fn spread(values: &mut [f64]) -> String {
 
 fn scenario_label(s: &Scenario) -> String {
     format!(
-        "{} · {} · a = {} · opt-in {}%{}",
+        "{} · {} · {} · a = {} · opt-in {}%{}",
+        match s.inventory {
+            InventoryProfile::ResearchMix => "legacy research mix".into(),
+            InventoryProfile::OrdinaryGlobal => "16 GB, dispersed".into(),
+            InventoryProfile::OrdinaryRegional {
+                rtt_us,
+                nodes_per_region,
+            } => format!("16 GB, {nodes_per_region}/region, RTT {} ms", rtt_us / 1000),
+        },
         match s.service {
-            Service::Batch => "batch (S ≤ 30)",
-            Service::Interactive => "interactive (S ≤ 4/3/2/2)",
+            Service::Batch => "batch",
+            Service::Interactive => "interactive",
         },
         s.transport,
         f64::from(s.availability_permille) / 1000.0,
@@ -1171,7 +1351,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
     let mut md = String::new();
     let _ = writeln!(
         md,
-        "# Kimi K2.6 island and swarm capacity, synthetic inventory [CALC]\n"
+        "# Kimi K2.6 regional swarm capacity, synthetic inventory [CALC]\n"
     );
     let _ = writeln!(
         md,
@@ -1187,7 +1367,10 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
         "## Assumptions\n\n| Input | Value | Basis |\n|---|---|---|"
     );
     for (k, v, basis) in assumptions() {
-        let _ = writeln!(md, "| {k} | {v} | {basis} |");
+        let _ = writeln!(
+            md,
+            "| {k} | {v} | ASSUMED for this simulation; source: {basis} |"
+        );
     }
 
     let _ = writeln!(
@@ -1195,6 +1378,44 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
         "\n## Summary\n\nPer-answer tok/s: median (min–max) over the islands formed, one answer at a time. \
          \"With spec\" picks the best draft depth per island. Aggregates are at each island's planned \
          batching depth, without and with speculation. Daily figures are fully loaded ceilings excluding both spare-shortfall and dissolved downtime, as well as recovery stalls, prefill and audit.\n\nBoth downtime shares use initially formed islands × the full 6 h lease as denominator. The categories are mutually exclusive; no islands means no denominator (shown as –). Other time is not measured serving uptime.\n"
+    );
+    let _ = writeln!(
+        md,
+        "### Ordinary-node capacity and cost [ASSUMED inputs → CALC outputs]\n\nThe ~130 node count comes from TJ; no measured current inventory or RTT matrix was supplied. Regional-density rows are conditional recruitment/placement scenarios, not a claim that today’s nodes are colocated. No large-memory host is required. Each swarm still contains complete layers/all experts; expert-group placement in the runtime remains ENG-6 work. Deep draft and batching columns are performance-model sweeps for ENG-8/ENG-1, not implementations or measured gains.\n"
+    );
+    let _ = writeln!(
+        md,
+        "| Nodes | Scenario | Concurrent swarms | Stages (range) | Per-answer at speculative batch (range) | Aggregate speculative tok/s | Tokens/day ceiling | Projected tokens/day after demand + lease discount | Allocated cost USD/day | USD / million tokens, plain / spec |\n|---|---|---|---|---|---|---|---|---|---|"
+    );
+    for r in reports {
+        let mut stages: Vec<f64> = r.rows.iter().map(|x| x.members as f64).collect();
+        let mut loaded: Vec<f64> = r
+            .rows
+            .iter()
+            .map(|x| x.projection.batch_speculative.per_stream_tok_s)
+            .collect();
+        let price = |x: Option<f64>| {
+            x.map_or_else(|| "undefined (zero output)".into(), |v| format!("{v:.3}"))
+        };
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.2} | {} / {} |",
+            r.scenario.nodes,
+            scenario_label(&r.scenario),
+            r.rows.len(),
+            spread(&mut stages),
+            spread(&mut loaded),
+            fmt_big(r.aggregate_tok_s_speculative),
+            fmt_big(r.tokens_per_day_speculative),
+            fmt_big(r.cost_speculative.projected_tokens_per_day),
+            r.cost_speculative.total_usd_per_day,
+            price(r.cost_plain.usd_per_million_tokens),
+            price(r.cost_speculative.usd_per_million_tokens)
+        );
+    }
+    let _ = writeln!(
+        md,
+        "\nCost denominators discount the ceilings for assumed demand and simulated lease downtime; full-day costs still charge spares and downtime. They are not prices offered by ARC. The existing ceiling columns below exclude downtime; they must not be read as delivered volume.\n"
     );
     let best = reports
         .iter()
@@ -1210,7 +1431,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
         md,
         "Best per-answer projection: {best:.1} tok/s. {}\n",
         if best < 59.0 {
-            "No projection reaches 59 tok/s per answer."
+            "No projection in this assumption set reaches 59 tok/s per answer; this is not a measured limit of regional swarms. ENG-6, ENG-8, ENG-9 and ENG-1 measurements must calibrate the model."
         } else {
             "These are synthetic projections, not measured serving performance."
         }
@@ -1325,7 +1546,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
         md,
         "\nEvery required spare must hold the island's largest stage, so the largest machines in a cell become \
          the spares and every stage is capped at the smallest spare's memory. A swarm therefore needs more \
-         members and more large machines than the same swarm without spares, and fewer swarms form from the \
+         members than the same swarm without spares; ordinary 16 GB machines can fill every role, and fewer swarms form from the \
          same inventory. In exchange, an island survives member loss by promotion and checkpoint recovery \
          when a suitable spare remains. Spare-shortfall pauses include waiting for an eligible replacement as well as shard staging. Once dissolved, all remaining lease time counts only as dissolved time; optional-spares rows have zero spare-shortfall pause.\n"
     );
@@ -1417,6 +1638,50 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_130_node_report_has_capacity_cost_and_no_real_serving() {
+        let model = ModelSpec::kimi_k26_int4();
+        let scenarios = regional_scenarios(7, &[130]);
+        assert_eq!(scenarios.len(), 8);
+        let mut reports = Vec::new();
+        for s in &scenarios {
+            let a = run(s, &model);
+            assert_eq!(a, run(s, &model));
+            assert_eq!(a.serving_islands, 0);
+            for row in &a.rows {
+                assert!(row.members >= 40);
+                assert!(row.mix.contains("16 GB RAM"));
+                assert!(!row.mix.contains("Ultra"));
+                assert_eq!(row.required_spares, 3);
+                assert!(row.projection.batch_speculative.concurrent <= 128);
+                assert!(row.projection.batch_speculative.draft_tokens <= 64);
+            }
+            assert!(a.input_basis.values().all(|s| s.starts_with("ASSUMED")));
+            assert!(a.cost_speculative.projected_tokens_per_day <= a.tokens_per_day_speculative);
+            if !a.rows.is_empty() {
+                assert!(a.cost_speculative.total_usd_per_day > 0.0);
+                assert!(a.cost_speculative.usd_per_million_tokens.unwrap() > 0.0);
+            } else {
+                assert_eq!(a.cost_speculative.usd_per_million_tokens, None);
+            }
+            reports.push(a);
+        }
+        assert!(
+            reports[0].simulated_islands > 0,
+            "a concentrated region can hold Kimi on 16 GB nodes"
+        );
+        assert_eq!(
+            reports.last().unwrap().simulated_islands,
+            0,
+            "dispersed sensitivity is not a colocated fleet"
+        );
+        let md = markdown(&reports, 7);
+        assert!(md.contains("USD / million tokens"));
+        assert!(md.contains("Per-answer at speculative batch"));
+        assert!(md.contains("not a measured limit of regional swarms"));
+        serde_json::to_string(&reports).unwrap();
+    }
 
     #[test]
     fn inventory_follows_the_apportioned_mix() {

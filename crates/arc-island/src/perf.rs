@@ -80,6 +80,9 @@ pub fn tau(draft_tokens: u32, acceptance: f64) -> f64 {
     if draft_tokens == 0 {
         return 1.0;
     }
+    if (acceptance - 1.0).abs() < f64::EPSILON {
+        return f64::from(draft_tokens) + 1.0;
+    }
     (1.0 - acceptance.powi(draft_tokens as i32 + 1)) / (1.0 - acceptance)
 }
 
@@ -356,7 +359,8 @@ pub fn plan_batching(
                 best = p;
             }
         }
-        b = b.saturating_mul(2);
+        let Some(next) = b.checked_mul(2) else { break };
+        b = next;
     }
     best
 }
@@ -411,6 +415,8 @@ mod tests {
         assert!((tau(1, 0.85) - 1.85).abs() < 1e-9);
         assert!((tau(3, 0.7) - 2.533).abs() < 1e-3);
         assert!((tau(5, 0.8) - 3.689).abs() < 1e-3);
+        assert!((tau(64, 1.0) - 65.0).abs() < 1e-9);
+        assert!((tau(64, 0.9) - (0..=64).map(|i| 0.9f64.powi(i)).sum::<f64>()).abs() < 1e-9);
     }
 
     /// Two 512 GB Macs serving plus a third as the required spare. `rdma`

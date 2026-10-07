@@ -31,6 +31,7 @@ fn fixture(synthetic: bool) -> (Vec<DeviceDescriptor>, RttMatrix, Island) {
                 },
                 golden_qualified: true,
                 measured: Measured {
+                    pool_kind: None,
                     usable_memory_bytes: Some(409_600_000_000),
                     bandwidth_mb_s: Some(456_000),
                     uplink_mbps: Some(1000),

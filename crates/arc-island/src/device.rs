@@ -268,6 +268,10 @@ pub struct Location {
 /// assumptions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Measured {
+    /// Explicitly selected execution pool. A small GPU must not hide usable
+    /// host RAM. Bandwidth and usable bytes refer to this pool, never RAM+VRAM.
+    #[serde(default)]
+    pub pool_kind: Option<PoolKind>,
     pub usable_memory_bytes: Option<u64>,
     pub bandwidth_mb_s: Option<u64>,
     pub uplink_mbps: Option<u32>,
@@ -347,19 +351,28 @@ pub fn assumed_bandwidth_mb_s(kind: PoolKind, class_gb: u32) -> u64 {
 }
 
 impl DeviceDescriptor {
-    /// The memory pool a stage would use: GPU memory on a discrete GPU,
+    /// The explicitly measured execution pool, or by default GPU memory on a discrete GPU,
     /// otherwise unified or system memory. `None` when the facts carry no
     /// memory class.
     pub fn pool(&self) -> Option<ComputePool> {
         let f = &self.facts;
-        let (kind, class_gb, permille) = match (f.unified_memory, f.gpu_vram_class_gb) {
-            (false, Some(vram)) => (PoolKind::Gpu, vram, USABLE_PERMILLE_GPU),
-            (true, _) => (
+        let (kind, class_gb, permille) = match (
+            self.measured.pool_kind,
+            f.unified_memory,
+            f.gpu_vram_class_gb,
+        ) {
+            (Some(PoolKind::Cpu), _, _) => {
+                (PoolKind::Cpu, f.memory_class_gb?, USABLE_PERMILLE_UNIFIED)
+            }
+            (Some(PoolKind::Unified), false, _) | (Some(PoolKind::Gpu), true, _) => return None,
+            (_, false, Some(vram)) => (PoolKind::Gpu, vram, USABLE_PERMILLE_GPU),
+            (_, true, _) => (
                 PoolKind::Unified,
                 f.memory_class_gb?,
                 USABLE_PERMILLE_UNIFIED,
             ),
-            (false, None) => (PoolKind::Cpu, f.memory_class_gb?, USABLE_PERMILLE_UNIFIED),
+            (Some(PoolKind::Gpu), false, None) => return None,
+            (_, false, None) => (PoolKind::Cpu, f.memory_class_gb?, USABLE_PERMILLE_UNIFIED),
         };
         let assumed_bytes = u64::from(class_gb) * GB * permille / 1000;
         Some(ComputePool {
@@ -621,6 +634,23 @@ mod tests {
         d.facts.unified_memory = true;
         d.facts.gpu_vram_class_gb = None;
         assert_eq!(d.pool().unwrap().usable_bytes, 51_200_000_000);
+    }
+
+    #[test]
+    fn explicit_host_pool_does_not_sum_ram_and_vram() {
+        let mut d = gpu_device();
+        d.facts.memory_class_gb = Some(16);
+        d.facts.gpu_vram_class_gb = Some(8);
+        d.measured.pool_kind = Some(PoolKind::Cpu);
+        let host = d.pool().unwrap();
+        assert_eq!(host.kind, PoolKind::Cpu);
+        assert_eq!(host.usable_bytes, 12_800_000_000);
+        d.measured.pool_kind = Some(PoolKind::Unified);
+        assert!(d.pool().is_none());
+        d.measured.pool_kind = Some(PoolKind::Gpu);
+        assert_eq!(d.pool().unwrap().usable_bytes, 6_800_000_000);
+        d.facts.gpu_vram_class_gb = None;
+        assert!(d.pool().is_none());
     }
 
     #[test]

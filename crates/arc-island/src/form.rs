@@ -1,5 +1,11 @@
 //! Island and swarm formation (research-6 §6.2–§6.4, research-7 §3.5).
 //!
+//! The primary policy, [`FormationPolicy::regional`], skips T0 and T1 and
+//! permits 40+ stages on ordinary 16 GB nodes. Geography narrows the search;
+//! an RTT-only fallback also groups nodes whose location labels disagree.
+//! Every member and spare must have a fresh measured link within the bound.
+//! The legacy interactive and batch policies retain the T0/T1 steps below.
+//!
 //! Formation is a pure function of the device descriptors, the measured
 //! links, the policy and the time:
 //!
@@ -90,6 +96,8 @@ pub enum CellLevel {
     Region,
     /// A region plus the regions [`FormationPolicy::neighbours`] lists for it.
     Neighbourhood,
+    /// Labels are only hints: fallback cliques use direct RTT alone.
+    MeasuredRtt,
 }
 
 /// One swarm search level.
@@ -140,6 +148,9 @@ impl LinkRule {
 /// Formation parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormationPolicy {
+    /// Regional mode skips the legacy whole-machine and LAN-first paths.
+    #[serde(default)]
+    pub regional_only: bool,
     /// KV positions every island reserves: concurrent sequences × context.
     pub kv_positions: u64,
     /// Members are added until Σ usable ≥ (weights + KV) × (1 + this/1000).
@@ -173,6 +184,7 @@ impl FormationPolicy {
             max_stages,
         };
         Self {
+            regional_only: false,
             kv_positions,
             capacity_headroom_permille: 100,
             min_availability_permille: 0,
@@ -192,6 +204,23 @@ impl FormationPolicy {
             freshness: Freshness::default(),
             neighbours: BTreeMap::new(),
         }
+    }
+
+    /// Ordinary-node regional swarms: up to 128 placement stages, with no
+    /// minimum RAM class or LAN/RDMA requirement. Geo labels prune the search;
+    /// the final pass also considers directly measured neighbours across labels.
+    /// This is a capacity plan, not a promise of interactive speed. ENG-8/9/1
+    /// supply speculation, transport/overlap and batching respectively.
+    pub fn regional(kv_positions: u64) -> Self {
+        let mut policy = Self::base(kv_positions, [128; 4]);
+        policy.regional_only = true;
+        policy.swarm_levels.push(SwarmLevel {
+            tier: Tier::T2Region,
+            cell: CellLevel::MeasuredRtt,
+            diameter_p95_us: 60_000,
+            max_stages: 128,
+        });
+        policy
     }
 
     /// Interactive service: swarm stage caps of research-7 §6.2 `PIPE_S_MAX`
@@ -422,6 +451,7 @@ impl Ctx<'_> {
             }
             let members = &clique[k..];
             if members.len() > max_stages
+                || members.len() > self.model.layers.len()
                 || (self.policy.require_spares && spares_for(members.len()) != k)
             {
                 continue;
@@ -458,6 +488,7 @@ impl Ctx<'_> {
     /// every pair passing `rule`, until it splits into members that hold the
     /// model with headroom plus the spares the policy requires.
     fn pick(&self, pool: &[usize], rule: LinkRule, max_stages: usize) -> Option<Pick> {
+        let max_stages = max_stages.min(self.model.layers.len());
         let limit = max_stages + if self.policy.require_spares { 3 } else { 0 };
         if pool.iter().map(|&i| self.usable(i)).sum::<u64>() < self.target {
             return None;
@@ -584,6 +615,7 @@ fn cell_key(d: &DeviceDescriptor, level: CellLevel) -> String {
         CellLevel::Metro => format!("{}/{}/{}/{}", l.continent, l.region, l.zone, l.metro),
         CellLevel::Zone => format!("{}/{}/{}", l.continent, l.region, l.zone),
         CellLevel::Region | CellLevel::Neighbourhood => region_key(d),
+        CellLevel::MeasuredRtt => "measured-rtt".into(),
     }
 }
 
@@ -625,56 +657,63 @@ pub fn form(
     let lan_rule = LinkRule::LanP99 {
         max_us: policy.lan_p99_max_us,
     };
-    for i in free.clone() {
-        if ctx.usable(i) < ctx.target {
-            continue;
+    if !policy.regional_only {
+        for i in free.clone() {
+            if ctx.usable(i) < ctx.target {
+                continue;
+            }
+            let caps = [StageCapacity {
+                usable_bytes: ctx.usable(i),
+                bandwidth_mb_s: ctx.pools[&i].bandwidth_mb_s,
+            }];
+            if let Some(stages) = partition(model, &caps, policy.kv_positions) {
+                let pick = Pick {
+                    members: vec![i],
+                    stages,
+                    spares: Vec::new(),
+                };
+                take(&mut free, &pick);
+                let cell = devices[i]
+                    .site
+                    .clone()
+                    .unwrap_or_else(|| cell_key(&devices[i], CellLevel::Metro));
+                out.islands.push(ctx.plan(
+                    Tier::T0Single,
+                    Parallelism::Whole,
+                    cell,
+                    lan_rule,
+                    pick,
+                ));
+            }
         }
-        let caps = [StageCapacity {
-            usable_bytes: ctx.usable(i),
-            bandwidth_mb_s: ctx.pools[&i].bandwidth_mb_s,
-        }];
-        if let Some(stages) = partition(model, &caps, policy.kv_positions) {
-            let pick = Pick {
-                members: vec![i],
-                stages,
-                spares: Vec::new(),
-            };
-            take(&mut free, &pick);
-            let cell = devices[i]
-                .site
-                .clone()
-                .unwrap_or_else(|| cell_key(&devices[i], CellLevel::Metro));
-            out.islands
-                .push(ctx.plan(Tier::T0Single, Parallelism::Whole, cell, lan_rule, pick));
+
+        // T1: one LAN site.
+        let mut sites: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for &i in &free {
+            if let Some(site) = &devices[i].site {
+                sites.entry(site.clone()).or_default().push(i);
+            }
+        }
+        for (site, mut pool) in sites {
+            ctx.sort(&mut pool);
+            while let Some(pick) = ctx.pick(&pool, lan_rule, policy.max_stages_lan) {
+                let group: Vec<usize> = pick.members.iter().chain(&pick.spares).copied().collect();
+                let (tier, par) = if pick.members.len() <= policy.max_stages_rdma
+                    && rdma_qualified(devices, &group, policy, now_ms)
+                {
+                    (Tier::T1aRdma, Parallelism::Tensor)
+                } else {
+                    (Tier::T1bLan, Parallelism::Pipeline)
+                };
+                pool.retain(|i| !group.contains(i));
+                take(&mut free, &pick);
+                out.islands
+                    .push(ctx.plan(tier, par, site.clone(), lan_rule, pick));
+            }
         }
     }
 
-    // T1: one LAN site.
-    let mut sites: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for &i in &free {
-        if let Some(site) = &devices[i].site {
-            sites.entry(site.clone()).or_default().push(i);
-        }
-    }
-    for (site, mut pool) in sites {
-        ctx.sort(&mut pool);
-        while let Some(pick) = ctx.pick(&pool, lan_rule, policy.max_stages_lan) {
-            let group: Vec<usize> = pick.members.iter().chain(&pick.spares).copied().collect();
-            let (tier, par) = if pick.members.len() <= policy.max_stages_rdma
-                && rdma_qualified(devices, &group, policy, now_ms)
-            {
-                (Tier::T1aRdma, Parallelism::Tensor)
-            } else {
-                (Tier::T1bLan, Parallelism::Pipeline)
-            };
-            pool.retain(|i| !group.contains(i));
-            take(&mut free, &pick);
-            out.islands
-                .push(ctx.plan(tier, par, site.clone(), lan_rule, pick));
-        }
-    }
-
-    // T2: swarms, metro → zone → region → neighbouring regions.
+    // Regional swarms; location hints first, then an RTT-only fallback.
     for level in &policy.swarm_levels {
         let rule = LinkRule::SwarmP95 {
             max_us: level.diameter_p95_us,
@@ -759,6 +798,7 @@ pub(crate) mod tests {
             },
             golden_qualified: true,
             measured: Measured {
+                pool_kind: None,
                 usable_memory_bytes: Some(
                     u64::from(mem_gb) * 1_000_000_000 * USABLE_PERMILLE_UNIFIED / 1000,
                 ),
@@ -813,6 +853,72 @@ pub(crate) mod tests {
     }
 
     const KV: u64 = 8 * 4096;
+
+    #[test]
+    fn regional_kimi_uses_many_ordinary_nodes_without_lan_or_shared_geo_labels() {
+        let devices: Vec<_> = (0..70)
+            .map(|i| {
+                let mut d = device(
+                    &format!("ordinary-{i}"),
+                    16,
+                    false,
+                    None,
+                    &format!("hint-{i}"),
+                );
+                d.facts.unified_memory = false;
+                d.facts.gpu_vram_class_gb = (i % 4 == 0).then_some(8);
+                d.measured.pool_kind = Some(PoolKind::Cpu);
+                d.measured.bandwidth_mb_s = Some(30_000 + (i % 3) * 30_000);
+                d.location.region = format!("inconsistent-hint-{i}");
+                d.location.zone = format!("zone-{i}");
+                d
+            })
+            .collect();
+        let rtt = mesh(devices.len(), 10_000, &[]);
+        let model = kimi();
+        let policy = FormationPolicy::regional(128 * 4096);
+        let out = form(&devices, &rtt, &model, &policy, 0);
+        assert_eq!(out.islands.len(), 1);
+        let p = &out.islands[0];
+        assert!(p.members.len() >= 40, "{}", p.members.len());
+        assert_eq!(p.cell, "measured-rtt");
+        assert_eq!(p.parallelism, Parallelism::Pipeline);
+        assert_eq!(p.required_spares, 3);
+        let mut end = 0;
+        for (&member, stage) in p.members.iter().zip(&p.stages) {
+            assert_eq!(stage.layers.start, end);
+            end = stage.layers.end;
+            assert!(stage.need_bytes() <= devices[member].pool().unwrap().usable_bytes);
+        }
+        assert_eq!(end, model.layers.len());
+        assert!(p.spares.iter().all(|sp| sp.covers.len() == p.stages.len()
+            && devices[sp.device].pool().unwrap().usable_bytes >= p.largest_stage_bytes()));
+        let mut withdrawn = devices.clone();
+        for d in &mut withdrawn {
+            d.consent.withdraw();
+        }
+        assert!(
+            form(&withdrawn, &rtt, &model, &policy, 0)
+                .islands
+                .is_empty()
+        );
+        assert!(
+            form(&devices, &RttMatrix::new(), &model, &policy, 0)
+                .islands
+                .is_empty()
+        );
+        assert!(
+            form(
+                &devices,
+                &mesh(devices.len(), 100_000, &[]),
+                &model,
+                &policy,
+                0
+            )
+            .islands
+            .is_empty()
+        );
+    }
 
     fn kimi() -> ModelSpec {
         ModelSpec::kimi_k26_int4()

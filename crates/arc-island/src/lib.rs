@@ -1,5 +1,4 @@
-//! ARC-AC v0: finding, forming and running Kimi-class islands and regional
-//! swarms on community machines.
+//! ARC-AC v0: forming regional Kimi-class swarms on ordinary community nodes.
 //!
 //! A 1T-class model (Kimi K2.6, 582 GB with INT4 experts) fits on no single
 //! community machine. This crate decides which opted-in machines serve one
@@ -11,10 +10,12 @@
 //! - [`model`]: per-layer weight, active-byte and KV accounting.
 //! - [`fit`]: capacity fitting, heterogeneity-aware contiguous layer
 //!   partitioning, and ring ordering.
-//! - [`form`]: tiers T0–T2 and the formation algorithm: single devices, then
-//!   Thunderbolt/LAN islands, then metro → zone → region swarms; warm spares.
+//! - [`form`]: regional measured-RTT grouping, capacity across many small
+//!   nodes, and required warm spares. Legacy single-device/LAN policies are
+//!   retained as optional comparisons; large-memory machines are not required.
 //! - [`perf`]: projected per-answer tok/s (with and without speculative
 //!   decoding), batching depth, aggregate tok/s.
+//! - [`economics`]: explicit assumed operator costs and output-volume discounts.
 //! - [`lifecycle`]: form → qualify against a pinned golden → serve → member
 //!   lost → spare promoted → trusted-checkpoint recovery → re-qualify, or
 //!   dissolve; spare loss pauses admission until replenished.
@@ -45,6 +46,7 @@
 
 pub mod admission;
 pub mod device;
+pub mod economics;
 pub mod fit;
 pub mod form;
 pub mod lifecycle;
