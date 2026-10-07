@@ -236,7 +236,8 @@ jobs:
   report:
     name: report
     needs: [proof, logit]
-    if: always() && needs.proof.result != 'skipped'
+    # Not after a cancellation (a newer push or the label event superseded it).
+    if: always() && !cancelled() && needs.proof.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
