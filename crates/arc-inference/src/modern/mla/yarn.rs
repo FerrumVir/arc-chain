@@ -63,10 +63,15 @@ impl Preparation {
         {
             return Err(invalid("unsupported or unpinned YaRN preparation"));
         }
-        Ok(Self {
-            scope: serde_json::from_value(v["scope"].clone())
-                .map_err(|e| invalid(format!("YaRN scope: {e}")))?,
-        })
+        let scope: Scope = serde_json::from_value(v["scope"].clone())
+            .map_err(|e| invalid(format!("YaRN scope: {e}")))?;
+        // Serde's internally tagged unit variants can discard unknown fields
+        // despite deny_unknown_fields. Identity-bearing metadata must survive
+        // parsing exactly, for unit scopes as well as the layer probe.
+        if json!(scope) != v["scope"] {
+            return Err(invalid("YaRN scope fields differ from the canonical scope"));
+        }
+        Ok(Self { scope })
     }
     pub fn validate(&self, c: &MlaConfig) -> Result<(), ModernError> {
         if c.expert_format != ExpertFormat::Int4G32
@@ -345,6 +350,102 @@ mod tests {
         let mut altered = CONFIG.to_vec();
         altered.push(b' ');
         assert!(official_config(&altered, 4096, None).is_err());
+    }
+
+    // Real package-header parser with canonical JSON, the complete tensor table
+    // and its correct declared file length. No weight payload is allocated.
+    fn scope_header(c: &MlaConfig, model: Value) -> Result<package::StageHeader, ModernError> {
+        let stage = StageSpec::full(c);
+        let entries = package::layout(c, stage);
+        let mut header = package::header_json(c, &json!({}), stage, &entries);
+        header["model"] = model;
+        let text = crate::model_package::canonical_json(&header).unwrap();
+        let mut prefix = super::super::STAGE_MAGIC.to_vec();
+        prefix.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        prefix.extend_from_slice(text.as_bytes());
+        let last = entries.last().unwrap();
+        let file_len =
+            package::align_up(prefix.len() as u64) + package::align_up(last.offset + last.bytes);
+        package::parse_header(&prefix, file_len)
+    }
+
+    fn scope_controls() -> Vec<MlaConfig> {
+        let full = official_config(CONFIG, 4096, None).unwrap();
+        let mut fixture = full.clone();
+        fixture.architecture = "arc-test/kimi-k26-yarn".into();
+        fixture.preparation = Some(Preparation {
+            scope: Scope::SyntheticFixture,
+        });
+        let mut controls = vec![full, fixture];
+        controls.extend((1..=3).map(|n| official_config(CONFIG, 4096, Some(n)).unwrap()));
+        controls
+    }
+
+    #[test]
+    fn scope_identity_round_trips_through_model_and_package_header() {
+        for c in scope_controls() {
+            let model = c.to_json();
+            let parsed = MlaConfig::from_json(&model).unwrap();
+            assert_eq!(parsed, c);
+            assert_eq!(parsed.to_json(), model);
+            let header = scope_header(&c, model.clone()).unwrap();
+            assert_eq!(header.config, c);
+            assert_eq!(header.value["model"], header.config.to_json());
+            assert_eq!(header.value["profile"], c.profile());
+        }
+    }
+
+    #[test]
+    fn unit_scope_extra_fields_reject_in_model_and_package_header() {
+        // Includes the review's full + layers:2 and synthetic + unexpected
+        // reproductions, as well as null, matching-depth and nested extras.
+        for c in scope_controls().into_iter().take(2) {
+            for (key, value) in [
+                ("layers", json!(2)),
+                ("layers", json!(61)),
+                ("layers", Value::Null),
+                ("unexpected", json!("ignored")),
+                ("probe", json!({"layers": 2})),
+            ] {
+                let mut model = c.to_json();
+                model["preparation"]["scope"][key] = value;
+                let direct = MlaConfig::from_json(&model);
+                let header = scope_header(&c, model.clone());
+                assert!(
+                    direct.is_err(),
+                    "model accepted {}",
+                    model["preparation"]["scope"]
+                );
+                assert!(
+                    header.is_err(),
+                    "header accepted {}",
+                    model["preparation"]["scope"]
+                );
+                assert!(direct.unwrap_err().to_string().contains("YaRN scope"));
+                assert!(header.unwrap_err().to_string().contains("YaRN scope"));
+            }
+        }
+    }
+
+    #[test]
+    fn probe_scope_remains_strict_in_model_and_package_header() {
+        let c = official_config(CONFIG, 4096, Some(2)).unwrap();
+        for scope in [
+            json!({"kind":"early_layers_with_head_probe"}),
+            json!({"kind":"early_layers_with_head_probe", "layers":0}),
+            json!({"kind":"early_layers_with_head_probe", "layers":4}),
+            json!({"kind":"early_layers_with_head_probe", "layers":1}),
+            json!({"kind":"early_layers_with_head_probe", "layers":-1}),
+            json!({"kind":"early_layers_with_head_probe", "layers":"2"}),
+            json!({"kind":"early_layers_with_head_probe", "layers":null}),
+            json!({"kind":"early_layers_with_head_probe", "layers":2, "unexpected":true}),
+            json!({"kind":"other", "layers":2}),
+        ] {
+            let mut model = c.to_json();
+            model["preparation"]["scope"] = scope;
+            assert!(MlaConfig::from_json(&model).is_err(), "model: {model}");
+            assert!(scope_header(&c, model.clone()).is_err(), "header: {model}");
+        }
     }
 
     fn pending() -> Value {
