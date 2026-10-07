@@ -194,6 +194,44 @@ reports `chain_participation_enabled: false` and `/node/info` reports
    as the Settings switch from PR #138. Yes downloads and verifies the model
    if needed and promotes the node; Not now keeps it an observer.
 
+   An install counts as coming from v0.7 when any of these holds, so the
+   question is never skipped for one:
+
+   - the WAL fence moved v0.7 chain data on this launch (the node ran);
+   - the bridge recorded running under the v0.7 app
+     (`~/.arc/legacy-bridge/nodes/desktop-*/bridge-state.json`);
+   - the stored `dataDir` is still `"~/.arc"`, which every v0.6.0..v0.7.11
+     desktop wrote and no v0.8 build writes (the node never ran, because
+     the v0.7.10/v0.7.11 updater returned 404);
+   - an undismissed migration notice fenced the `~/.arc` root on an earlier
+     launch (the first v0.8 build to open it had no question).
+
+   The hold is applied before the question is written, and the held
+   observer config is persisted even when the question cannot be, so a
+   failed write never lets an unasked install start as a worker. A v0.7
+   install that never finished onboarding has no stored config; onboarding's
+   model step asks instead.
+
+### Consent on every path
+
+Compute stays off until the owner opts in on every path. Each row has a
+test; `tests/legacy-bridge/check_v07_fixtures.py` proves the fixtures
+match every released tag from v0.6.0 to v0.7.11.
+
+| Path | Until the owner opts in | Tests |
+|---|---|---|
+| Headless launcher (any v0.7.x installer or updater) | `--stake 0 --min-stake 0`, no `--model`, no `--full-integer-worker`; private `HOME` and working directory; refuses while a system-wide GGUF exists | `consent.rs` `every_released_v07_command_line_bridges_with_compute_off` (19 command lines; the ones it cannot recognize never start a node); `launch.rs`; headless acceptance |
+| Headless opt-in | only `--legacy-bridge-compute on` plus a verified model and a privacy-safe pin | `consent.rs` `headless_compute_needs_consent_a_verified_model_and_a_privacy_safe_pin` |
+| Desktop, v0.7 app running the launcher | always off (`--no-community` or community without a model) | `consent.rs` `desktop_never_turns_compute_on` and the command-line fixture test; desktop acceptance |
+| Desktop app updated, node already ran | held: observer, no model | `legacy_upgrade.rs` `a_v07_node_that_already_ran_is_fenced_and_held` |
+| Desktop app updated, node never ran | held | `a_v07_node_that_never_ran_is_held` |
+| Desktop app updated after the bridge ran | held | `a_desktop_the_bridge_ran_under_is_held` |
+| Desktop opened first by a v0.8 build without the question | held | `a_v07_install_first_opened_by_a_build_without_the_question_is_still_held` |
+| Every v0.6.0..v0.7.11 desktop store (worker, observer, custom ports; ran or not) | held | `every_released_v07_desktop_store_is_held_until_its_owner_answers` |
+| Relaunch before answering | still held | `relaunching_before_answering_keeps_the_hold` |
+| Question cannot be written, or its record is unreadable | still held | `an_unrecordable_question_still_holds_the_node`, `an_unreadable_question_record_is_still_pending` |
+| Answer | only an explicit Yes or Not now ends the hold | `only_an_explicit_answer_ends_the_hold` |
+
 ### Recovery
 
 | Situation | What happens |
@@ -253,21 +291,32 @@ None is automated.
 
 ### Stage 0: prerequisites (merges and a normal v0.8 release)
 
+TODO(v0.8.11-repin): the bridge still pins arc-node v0.8.10 and uses the
+v0.8.10 desktop `latest.json` as a CI stand-in. Both change only after
+v0.8.11 is published; `grep -rn 'TODO(v0.8.11-repin)'` lists every place.
+
 1. Merge PRs #134 (privacy-safe worker names), #135, #138 (consent switch)
-   and this PR.
-2. Cut the next v0.8 release (the release captain's v0.8.11 or v0.8.12,
-   carrying the privacy, joining, compute, and twin-verification fixes)
-   through the normal `release.yml` pipeline. It stays non-latest
-   automatically.
-3. Re-pin the bridge to it, in a reviewed PR:
+   and this PR. (#134, #135 and #138 are on main.)
+2. Cut the next v0.8 release through the normal `release.yml` pipeline. It
+   stays non-latest automatically.
+3. Re-pin the bridge's node to it, in a reviewed PR:
    `python3 scripts/legacy-bridge/pin-release.py --tag v0.8.11 --write`.
    The generator refuses unless the release is immutable, bot-published and
    owner-signed. It sets `worker_names_privacy_safe` from the tag's source.
+   v0.8.11 carries #134, so it qualifies for the headless node.
 4. Run **Legacy bridge release handoff** (`workflow_dispatch`) with
-   `desktop_tag=v0.8.11`. Proceed only if `legacy-bridge-provenance.json`
-   says `"eligible_for_latest": true`. That requires the pinned node to keep
-   hostnames private and the desktop release to contain the first-launch
-   question.
+   `desktop_tag` set to the **first release that contains this PR's
+   first-launch question** (`legacy_upgrade::hold_at_startup`). v0.8.11
+   does not: main is frozen until it publishes, so this PR lands after it.
+   A v0.8.11 desktop opens a v0.7 worker config as a worker without asking
+   (#138 counts a pre-question worker with a model as opted in). Proceed only
+   if `legacy-bridge-provenance.json` says `"eligible_for_latest": true`,
+   which requires the pinned node to keep hostnames private and the desktop
+   release to contain the question.
+
+Do not mark any v0.8 release without the question as Latest while v0.7
+desktops are in the field: its `latest.json` is signed with the key every
+v0.7 desktop trusts, so their Check for updates would install it.
 
 ### Stage 1: canary as a non-latest tagged release
 
@@ -310,9 +359,9 @@ None is automated.
     hostname;
   - optionally `--legacy-bridge-compute on --download-model`, a restart, and
     jobs on the scoreboard.
-- **Desktop (one v0.7.11 Mac or PC):** install the v0.8.11 desktop app from
-  its exact release over the v0.7.11 app (same bundle identifier, as the
-  Tauri update would). Check that the first launch asks "Your ARC node is
+- **Desktop (one v0.7.11 Mac or PC):** install the Stage 0 step 4 desktop
+  release from its exact release over the v0.7.11 app (same bundle
+  identifier, as the Tauri update would). Check that the first launch asks "Your ARC node is
   upgrading to the new network. Keep contributing compute?", that "Not now"
   leaves Settings > Contribute compute off, and that the v0.7 `~/.arc` files
   are untouched.

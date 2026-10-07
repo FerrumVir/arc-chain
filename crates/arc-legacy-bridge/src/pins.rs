@@ -13,6 +13,12 @@ use serde::Deserialize;
 use crate::sshsig;
 
 /// The reviewed pin set compiled into this bridge.
+///
+/// TODO(v0.8.11-repin): this pins arc-node v0.8.10, whose community
+/// registration publishes hostnames, so every headless node runs with
+/// `--no-community` and compute off. After v0.8.11 is published, regenerate
+/// with `pin-release.py --tag v0.8.11 --write` together with its
+/// `fixtures/v0.8.11` manifest; the tests below that name v0.8.10 move with it.
 pub const EMBEDDED_PINS: &str = include_str!("../pins/active.json");
 
 pub const PINS_SCHEMA: &str = "arc.legacy-bridge.pins.v1";

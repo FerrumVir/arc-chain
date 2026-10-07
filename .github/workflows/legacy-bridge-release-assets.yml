@@ -35,6 +35,9 @@ env:
   CARGO_TERM_COLOR: always
   # A branch push exercises the pipeline against the current release as a
   # stand-in; its handoff is always marked not eligible for "Latest".
+  # TODO(v0.8.11-repin): move the stand-in to v0.8.11 once it is published.
+  # The real desktop_tag is the first release containing this question
+  # (legacy_upgrade::hold_at_startup); v0.8.11 does not.
   DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.10' }}
 
 jobs:
@@ -170,7 +173,10 @@ jobs:
             "$verifier" "$pubkey" payload signature
             rm -f payload signature
           done
-          if git cat-file -e "$DESKTOP_TAG:desktop/src/components/LegacyUpgradeDialog.tsx" 2>/dev/null; then
+          # The dialog alone is not enough: the release must also hold every
+          # v0.7 origin fail-closed (never-ran nodes, earlier fences).
+          if git cat-file -e "$DESKTOP_TAG:desktop/src/components/LegacyUpgradeDialog.tsx" 2>/dev/null \
+            && git show "$DESKTOP_TAG:desktop/src-tauri/src/legacy_upgrade.rs" 2>/dev/null | grep -q '^pub fn hold_at_startup('; then
             echo true > handoff-desktop/has-consent-question
           else
             echo false > handoff-desktop/has-consent-question
