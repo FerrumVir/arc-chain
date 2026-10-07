@@ -679,6 +679,7 @@ pub fn run() {
             commands::import_identity,
             commands::load_identity,
             commands::save_config,
+            commands::complete_onboarding,
             commands::load_config,
             commands::load_data_migration_notice,
             commands::dismiss_data_migration_notice,

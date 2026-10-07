@@ -924,6 +924,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
+    case "complete_onboarding":
     case "save_config":
       return undefined as T;
     case "load_config":
@@ -2498,9 +2499,26 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
-    case "save_config":
+    case "complete_onboarding":
       mockConfig = (args as { config?: NodeConfig } | undefined)?.config ?? mockConfig;
       return undefined as T;
+    case "save_config": {
+      // Mirrors commands.rs::preserve_native_contribution_state: once a
+      // config is stored, a preference save keeps its contribution state.
+      const submitted = (args as { config?: NodeConfig } | undefined)?.config;
+      if (submitted) {
+        mockConfig = mockConfig
+          ? {
+              ...submitted,
+              computeConsent: mockConfig.computeConsent,
+              preventSleepDuringJobs: mockConfig.preventSleepDuringJobs,
+              role: mockConfig.role,
+              modelPath: mockConfig.modelPath,
+            }
+          : submitted;
+      }
+      return undefined as T;
+    }
     case "load_config":
       return null as T;
     case "load_data_migration_notice":
@@ -3093,6 +3111,14 @@ export const api = {
    */
   revealSeedPhrase: () => invoke<string>("reveal_seed_phrase"),
   saveConfig: (config: NodeConfig) => invoke<void>("save_config", { config }),
+  /**
+   * Onboarding's one save: records the wizard's compute choice (consent,
+   * role, model) with the defaults. `saveConfig` never changes those fields
+   * once a config is stored; the Settings switch and the observer banner
+   * use `setComputeContribution` instead.
+   */
+  completeOnboarding: (config: NodeConfig) =>
+    invoke<void>("complete_onboarding", { config }),
   loadConfig: () => invoke<NodeConfig | null>("load_config"),
   loadDataMigrationNotice: () =>
     invoke<DataMigrationNotice | null>("load_data_migration_notice"),

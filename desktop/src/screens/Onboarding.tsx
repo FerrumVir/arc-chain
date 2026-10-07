@@ -188,7 +188,10 @@ export function Onboarding() {
       // 3. Download the arc-node binary if it isn't already there.
       setLaunchStage("downloading");
       await api.ensureBinary();
-      await api.saveConfig(config);
+      // Onboarding's own save: it records the compute choice made above. A
+      // plain `saveConfig` keeps the stored contribution state once a config
+      // exists (commands.rs), so a re-run wizard has to go this way.
+      await api.completeOnboarding(config);
 
       // 4. Start the node + wait for either real peers OR a coordinator
       //    fallback (Lite mode survives residential UDP blocks).

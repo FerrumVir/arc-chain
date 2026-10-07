@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useIsMutating, useMutation, useQuery } from "@tanstack/react-query";
 import { Skeleton, SkeletonLines } from "../components/Skeleton";
 import { AlertTriangle, Check, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -17,12 +17,20 @@ import {
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import { setTheme, useTheme, type Theme } from "../lib/theme";
 
+/** The compute-contribution switch's mutation, so Save can wait for it. */
+const COMPUTE_CONTRIBUTION_MUTATION_KEY = ["compute-contribution"];
+
 export function Settings() {
   const config = useAppStore((s) => s.config);
   const identity = useAppStore((s) => s.identity);
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const setConfig = useAppStore((s) => s.setConfig);
   const setIdentity = useAppStore((s) => s.setIdentity);
+  // No Save while compute contribution is switching. The native side keeps
+  // the stored contribution state on a Settings save anyway; this also keeps
+  // a snapshot taken before the switch out of the UI store.
+  const contributionPending =
+    useIsMutating({ mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY }) > 0;
   // Defaults now match the real ones (types.ts DEFAULT_NODE_CONFIG and the
   // Rust NodeConfig::default). The RPC field used to default to 9944 while
   // onboarding wrote 9090 and the node bound 9090.
@@ -235,7 +243,7 @@ export function Settings() {
             <button
               className="btn btn-primary"
               onClick={save}
-              disabled={saving}
+              disabled={saving || contributionPending}
               aria-busy={saving || undefined}
               data-testid="btn-save-settings"
             >
@@ -499,6 +507,7 @@ function ComputeConsent() {
   const [progress, setProgress] = useState<ModelDownloadProgress | null>(null);
 
   const toggle = useMutation({
+    mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY,
     mutationFn: (next: boolean) => api.setComputeContribution(next),
     onMutate: () => setProgress(null),
     onSuccess: (saved) => setConfig(saved),
