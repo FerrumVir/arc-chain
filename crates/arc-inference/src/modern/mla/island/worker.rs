@@ -17,7 +17,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use super::transport::{Link, Listener, Transport};
-use super::wire::{Frame, Item, Reader, Revealed, StageCommit, Writer};
+use super::wire::{Frame, Item, Reader, Revealed, StageCommit, TreeNode, Writer};
 use crate::modern::ModernError;
 use crate::modern::arith;
 use crate::modern::mla::boundary::activation_hash;
@@ -80,6 +80,7 @@ pub struct WorkerStats {
     pub replayed_positions: u64,
 }
 
+#[derive(Clone)]
 struct SeqState {
     /// `None` once the sequence is closed (its log stays for audits).
     cache: Option<StageCache>,
@@ -164,6 +165,14 @@ impl StageWorker {
                 }
                 Frame::Step { id, items }
             }
+            Frame::Tree {
+                id,
+                prefix,
+                mut nodes,
+            } => {
+                self.verify_tree(prefix, &mut nodes)?;
+                Frame::Tree { id, prefix, nodes }
+            }
             Frame::Close { seqs, forget } => {
                 for &seq in &seqs {
                     self.close(seq, forget);
@@ -200,6 +209,53 @@ impl StageWorker {
                 .map_err(|e| ModernError::io("activation log", e))?;
         }
         Ok(out)
+    }
+
+    /// Fork caches locally, evaluate parents before children, and discard all
+    /// temporary branches even on failure. No draft mutates the live prefix or
+    /// persistent log. Returned items carry the same per-layer commitments as
+    /// ordinary sequential decoding for their individual paths.
+    fn verify_tree(&mut self, prefix: u64, nodes: &mut [TreeNode]) -> Result<(), ModernError> {
+        let invalid = || ModernError::Invalid("invalid tree topology or prefix".into());
+        let base = self.seqs.get(&prefix).ok_or_else(invalid)?;
+        let start = base.cache.as_ref().ok_or_else(invalid)?.positions();
+        if nodes.is_empty() || nodes.len() > 4096 {
+            return Err(invalid());
+        }
+        let mut ids = std::collections::HashSet::new();
+        for (i, node) in nodes.iter().enumerate() {
+            let at = match node.parent {
+                Some(p) if (p as usize) < i => nodes[p as usize].item.start as usize + 1,
+                Some(_) => return Err(invalid()),
+                None => start,
+            };
+            if node.item.tokens.len() != 1
+                || node.item.start as usize != at
+                || node.item.prompt_len != base.prompt_len
+                || node.item.selection != base.selection
+                || node.item.error.is_some()
+                || self.seqs.contains_key(&node.item.seq)
+                || !ids.insert(node.item.seq)
+            {
+                return Err(invalid());
+            }
+        }
+        let result = (|| {
+            for i in 0..nodes.len() {
+                let source = nodes[i]
+                    .parent
+                    .map_or(prefix, |p| nodes[p as usize].item.seq);
+                let state = self.seqs.get(&source).ok_or_else(invalid)?.clone();
+                self.seqs.insert(nodes[i].item.seq, state);
+                let commit = self.run_item(&mut nodes[i].item)?;
+                nodes[i].item.commits.push(commit);
+            }
+            Ok(())
+        })();
+        for id in ids {
+            self.seqs.remove(&id);
+        }
+        result
     }
 
     fn close(&mut self, seq: u64, forget: bool) {

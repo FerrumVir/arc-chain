@@ -176,14 +176,11 @@ fn islands_match_the_whole_model_for_every_split() {
         let whole = stage_model(&c, 0, c.n_layers, Router::Random);
         let reqs = requests(&c, 6, 7);
         let expected: Vec<MlaGeneration> = reqs.iter().map(|r| reference(&whole, r)).collect();
-        for cuts in [
-            vec![0, 4],
-            vec![0, 2, 4],
-            vec![0, 1, 4],
-            vec![0, 3, 4],
-            vec![0, 1, 3, 4],
-            vec![0, 1, 2, 3, 4],
-        ] {
+        // Exhaust all 2^(L-1) contiguous partitions of this model.
+        for mask in 0..(1 << (c.n_layers - 1)) {
+            let mut cuts = vec![0];
+            cuts.extend((1..c.n_layers).filter(|i| mask & (1 << (i - 1)) != 0));
+            cuts.push(c.n_layers);
             let mut island = ThreadIsland::start(&c, &cuts, Router::Random, |_, _, _| {});
             let schedule = Schedule {
                 micro_batches: 2,
@@ -703,10 +700,15 @@ fn expert_parallel_stages_are_byte_identical() {
             let mut island = ThreadIsland::start(&c, &cuts, Router::Random, |s, model, _| {
                 if s == cuts.len() - 2 {
                     let pool = Arc::new(
-                        RemoteExperts::connect(
+                        RemoteExperts::connect_placed(
                             &mem,
                             ExpertPlacement { devices, local: 0 },
                             &addresses,
+                            Some(
+                                (0..c.n_routed_experts)
+                                    .map(|e| (e / 3 + 1) % devices)
+                                    .collect(),
+                            ),
                         )
                         .unwrap(),
                     );
@@ -776,4 +778,266 @@ fn logits_digests_match_generate_on_a_prompt_only_budget() {
         arith::logits_digest(&g.logits_hashes)
     );
     island.stop();
+}
+
+#[test]
+fn tree_one_pass_matches_separate_paths_and_preserves_prefix() {
+    use super::wire::TreeNode;
+    for (lora, format) in FORMATS {
+        let c = synthetic::tiny_config(lora, format);
+        for mask in 0..8 {
+            let mut cuts = vec![0];
+            cuts.extend((1..4).filter(|i| mask & (1 << (i - 1)) != 0));
+            cuts.push(4);
+            let make = || {
+                cuts.windows(2)
+                    .map(|r| {
+                        StageWorker::new(
+                            stage_model(&c, r[0], r[1], Router::Random),
+                            WorkerConfig::default(),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut workers = make();
+            let prefix = Frame::Step {
+                id: 0,
+                items: vec![Item::new(7, 0, 2, Selection::Rp64Argmax, vec![3, 9])],
+            };
+            let mut frame = prefix.clone();
+            for w in &mut workers {
+                frame = w.process(frame).unwrap();
+            }
+            // Two siblings plus a grandchild: sibling KV must never leak.
+            let nodes = vec![
+                TreeNode {
+                    parent: None,
+                    item: Item::new(100, 2, 2, Selection::Rp64Argmax, vec![4]),
+                },
+                TreeNode {
+                    parent: None,
+                    item: Item::new(101, 2, 2, Selection::Rp64Argmax, vec![8]),
+                },
+                TreeNode {
+                    parent: Some(0),
+                    item: Item::new(102, 3, 2, Selection::Rp64Argmax, vec![6]),
+                },
+            ];
+            let mut tree = Frame::Tree {
+                id: 1,
+                prefix: 7,
+                nodes,
+            };
+            assert_eq!(Frame::decode(&tree.encode()).unwrap(), tree);
+            for w in &mut workers {
+                tree = w.process(tree).unwrap();
+            }
+            let Frame::Tree { nodes, .. } = tree else {
+                panic!("tree");
+            };
+            for (node, path) in nodes.iter().zip([vec![4], vec![8], vec![4, 6]]) {
+                let mut refs = make();
+                let mut frame = prefix.clone();
+                for w in &mut refs {
+                    frame = w.process(frame).unwrap();
+                }
+                for (j, token) in path.iter().enumerate() {
+                    frame = Frame::Step {
+                        id: j as u64 + 1,
+                        items: vec![Item::new(
+                            7,
+                            j as u32 + 2,
+                            2,
+                            Selection::Rp64Argmax,
+                            vec![*token],
+                        )],
+                    };
+                    for w in &mut refs {
+                        frame = w.process(frame).unwrap();
+                    }
+                }
+                let Frame::Step { items, .. } = frame else {
+                    panic!("step");
+                };
+                assert_eq!(node.item.hidden, items[0].hidden);
+                assert_eq!(node.item.commits, items[0].commits);
+            }
+            // The public ENG-8 coordinator API sends the whole tree in one
+            // frame, leaves the live prefix usable, then closes it explicitly.
+            let mut island = ThreadIsland::start(&c, &cuts, Router::Random, |_, _, _| {});
+            island
+                .coordinator
+                .forward_batch(
+                    0,
+                    vec![Item::new(7, 0, 2, Selection::Rp64Argmax, vec![3, 9])],
+                )
+                .unwrap();
+            let input_nodes = nodes
+                .iter()
+                .map(|node| super::wire::TreeNode {
+                    parent: node.parent,
+                    item: Item::new(
+                        node.item.seq,
+                        node.item.start,
+                        2,
+                        Selection::Rp64Argmax,
+                        node.item.tokens.clone(),
+                    ),
+                })
+                .collect();
+            assert_eq!(
+                island.coordinator.verify_tree(1, 7, input_nodes).unwrap(),
+                nodes
+            );
+            island.coordinator.close_sequences(vec![7], true).unwrap();
+            island.stop();
+            for w in &workers {
+                assert_eq!(w.cached_positions(7), Some(2));
+                for id in [100, 101, 102] {
+                    assert_eq!(w.cached_positions(id), None);
+                }
+            }
+            // Malformed trees fail before changing any live cache.
+            let bad = Frame::Tree {
+                id: 4,
+                prefix: 7,
+                nodes: vec![TreeNode {
+                    parent: Some(0),
+                    item: Item::new(200, 2, 2, Selection::Rp64Argmax, vec![5]),
+                }],
+            };
+            assert!(workers[0].process(bad).is_err());
+            assert_eq!(workers[0].cached_positions(7), Some(2));
+        }
+    }
+}
+
+#[test]
+fn replica_replays_after_lost_reply_and_rejects_changed_replay() {
+    use super::replica::{ReplicaConnector, ReplicatedStage, StageSession};
+    struct Session {
+        worker: StageWorker,
+        calls: usize,
+        lose: bool,
+        corrupt: bool,
+    }
+    impl StageSession for Session {
+        fn exchange(&mut self, input: &[u8]) -> Result<Vec<u8>, ModernError> {
+            self.calls += 1;
+            let output = self.worker.process(Frame::decode(input)?)?;
+            // Worker has advanced KV, but its reply is lost during churn.
+            if self.lose && self.calls == 2 {
+                return Err(ModernError::Io("lost in-flight reply".into()));
+            }
+            let mut bytes = output.encode();
+            if self.corrupt {
+                *bytes.last_mut().unwrap() ^= 1;
+            }
+            Ok(bytes)
+        }
+    }
+    struct Connector {
+        c: MlaConfig,
+    }
+    impl ReplicaConnector for Connector {
+        fn connect(&self, endpoint: &str) -> Result<Box<dyn StageSession>, ModernError> {
+            Ok(Box::new(Session {
+                worker: StageWorker::new(
+                    stage_model(&self.c, 0, 4, Router::Random),
+                    WorkerConfig::default(),
+                )?,
+                calls: 0,
+                lose: endpoint == "lost",
+                corrupt: endpoint == "bad",
+            }))
+        }
+    }
+    let c = synthetic::tiny_config(true, ExpertFormat::Int4G32);
+    let mut replica = ReplicatedStage::new(
+        Arc::new(Connector { c: c.clone() }),
+        vec!["lost".into(), "bad".into(), "healthy".into()],
+        1 << 20,
+    )
+    .unwrap();
+    let mut reference = StageWorker::new(
+        stage_model(&c, 0, 4, Router::Random),
+        WorkerConfig::default(),
+    )
+    .unwrap();
+    for pos in 0..5 {
+        // Two streams in every frame; frame IDs may be reused by the scheduler.
+        let frame = Frame::Step {
+            id: 0,
+            items: [7, 8]
+                .iter()
+                .map(|&seq| Item::new(seq, pos, 1, Selection::Argmax, vec![pos + 3]))
+                .collect(),
+        };
+        assert_eq!(
+            replica.process(frame.clone()).unwrap(),
+            reference.process(frame).unwrap()
+        );
+    }
+    assert_eq!(replica.failovers, 2);
+    assert_eq!(replica.replayed_frames, 1);
+    let mut full =
+        ReplicatedStage::new(Arc::new(Connector { c }), vec!["healthy".into()], 1).unwrap();
+    assert!(
+        full.process(Frame::Ping {
+            id: 0,
+            payload: vec![]
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn replica_identity_and_transport_timeout_fail_closed() {
+    use super::replica::{
+        ReplicaConnector, TransportConnector, serve_session_with, stage_identity,
+    };
+    use super::transport::{DeadlineTcpTransport, TcpTransport};
+    use std::time::Duration;
+    let c = synthetic::tiny_config(true, ExpertFormat::Int4G32);
+    for wrong_identity in [true, false] {
+        let model = stage_model(&c, 0, 4, Router::Random);
+        let mut identity = stage_identity(&model);
+        if wrong_identity {
+            identity[0] ^= 1;
+        }
+        let mut listener = TcpTransport.listen("127.0.0.1:0").unwrap();
+        let address = listener.address();
+        let server = std::thread::spawn(move || {
+            let link = listener.accept().unwrap();
+            let worker = StageWorker::new(model, WorkerConfig::default()).unwrap();
+            let _ = serve_session_with(worker, link, &mut |_| {
+                std::thread::sleep(Duration::from_millis(500));
+                true
+            });
+        });
+        let connector = TransportConnector {
+            transport: Arc::new(DeadlineTcpTransport {
+                timeout: Duration::from_millis(200),
+            }),
+            stage_id: identity,
+        };
+        let result = connector.connect(&address);
+        if wrong_identity {
+            assert!(result.is_err());
+        } else {
+            let mut session = result.unwrap();
+            let input = Frame::Ping {
+                id: 0,
+                payload: vec![],
+            }
+            .encode();
+            assert!(
+                session.exchange(&input).is_err(),
+                "slow reply must time out"
+            );
+            drop(session);
+        }
+        server.join().unwrap();
+    }
 }

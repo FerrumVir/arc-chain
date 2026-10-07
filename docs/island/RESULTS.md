@@ -1,3 +1,5 @@
+Historical topology experiments: the LAN/large-machine projections below are not the deployment target. See REGIONAL-SWARM.md and regional CI budgets for the 7 Oct ordinary-node scope.
+
 # Island runtime: recovered evidence and corrected projections
 
 This report reuses the **Studio lab** measurements first published in

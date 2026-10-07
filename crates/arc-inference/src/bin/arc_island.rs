@@ -21,7 +21,7 @@ use arc_inference::modern::mla::island::even_cuts;
 use arc_inference::modern::mla::island::expert::{ExpertPlacement, RemoteExperts, serve_experts};
 use arc_inference::modern::mla::island::process::ProcessIsland;
 use arc_inference::modern::mla::island::transport::{
-    ShapedTransport, TcpTransport, Transport, WanProfile, timer_mode,
+    DeadlineTcpTransport, ShapedTransport, TcpTransport, Transport, WanProfile, timer_mode,
 };
 use arc_inference::modern::mla::island::wire::activation_width;
 use arc_inference::modern::mla::island::worker::{Fault, StageWorker, WorkerConfig, serve};
@@ -33,17 +33,22 @@ use serde_json::{Value, json};
 
 const USAGE: &str = "usage: arc-island <command> [options]
 
-  synth      --shape tiny|tiny-lora|tiny-i4|small|kimi-mini --out PKG [--layers A:B]
+  synth      --shape tiny|tiny-lora|tiny-i4|small|kimi-mini|regional-40 --out PKG [--layers A:B]
              [--router random|paired|flat]
   stage      --package PKG [--layers A:B] --listen ADDR --next ADDR [--log-dir DIR]
              [--fault tamper:SEQ:POS|lie:SEQ:POS]
              [--wan-ms MS --wan-jitter-ms MS --wan-mbit MBIT --wan-seed N]
              [--experts-at ADDR0,ADDR1,... --expert-device K]
              [--kernel scalar|simd] [--threads N]
+  replica    --package PKG [--layers A:B] --listen ADDR [--sessions N]
+  relay      --listen ADDR --next ADDR --replicas ADDR0,ADDR1,... --stage-id HEX
+             [--timeout-ms 1000] [--journal-mib 256]
   experts    --package PKG [--layers A:B] --listen ADDR [--kernel scalar|simd] [--threads N]
   reference  --package PKG --requests REQ.json --out OUT.json
   run        --package PKG --first ADDR --listen ADDR --requests REQ.json --out OUT.json
              [--micro-batches G] [--concurrency B] [--prefill-chunk N] [--shutdown]
+  regional-bench --package PKG --out JSON [--stages 40] [--rtt-ms 5,10,20]
+             [--concurrencies 1,40] [--max-tokens 8] [--uplink-mbit 100]
   bench      --package PKG --out BENCH.json [--label TEXT] [--exe PATH]
              [--stages 1,2,4] [--pings N] [--payloads B,B,...]
              [--requests N] [--prompt-len N] [--max-tokens N]
@@ -185,6 +190,78 @@ fn cmd_synth(args: &Args) -> Result<(), ModernError> {
     Ok(())
 }
 
+fn cmd_replica(args: &Args) -> Result<(), ModernError> {
+    use arc_inference::modern::mla::island::replica::{serve_session_with, stage_identity};
+    configure(args)?;
+    let path = args.path("--package")?;
+    let range = layers(args)?;
+    // Check package before advertising readiness.
+    let identity = stage_identity(&StageModel::open_range(&path, range)?);
+    let mut listener = TcpTransport
+        .listen(&args.required("--listen")?)
+        .map_err(|e| ModernError::Io(e.to_string()))?;
+    say(
+        &json!({"listening": listener.address(), "stage_id": hex(&identity), "pid": std::process::id()}),
+    );
+    // One fresh state per connection. An optional finite session count makes
+    // process tests own and join the complete server lifecycle.
+    let sessions = args.number("--sessions", usize::MAX)?;
+    let drop_at = args.number("--drop-reply-at", 0)?;
+    let delay = std::time::Duration::from_millis(args.number("--reply-delay-ms", 0)? as u64);
+    for _ in 0..sessions {
+        let link = listener
+            .accept()
+            .map_err(|e| ModernError::Io(e.to_string()))?;
+        let worker = StageWorker::new(
+            StageModel::open_range(&path, range)?,
+            WorkerConfig::default(),
+        )?;
+        // Serial sessions bound memory. A dead peer drops its session before
+        // another caller is admitted; independent swarms run separate servers.
+        let _ = serve_session_with(worker, link, &mut |n| {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            n != drop_at
+        });
+    }
+    Ok(())
+}
+
+fn cmd_relay(args: &Args) -> Result<(), ModernError> {
+    use arc_inference::modern::mla::island::replica::{
+        ReplicatedStage, TransportConnector, serve_relay,
+    };
+    let timeout = std::time::Duration::from_millis(args.number("--timeout-ms", 1000)? as u64);
+    let transport: Arc<dyn Transport> = Arc::new(DeadlineTcpTransport { timeout });
+    let endpoints = args
+        .required("--replicas")?
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let limit = args
+        .number("--journal-mib", 256)?
+        .checked_mul(1 << 20)
+        .ok_or_else(|| ModernError::Invalid("journal size overflow".into()))?;
+    let stage_id: [u8; 32] = hex::decode(args.required("--stage-id")?)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| ModernError::Invalid("--stage-id needs 32 hexadecimal bytes".into()))?;
+    let stage = ReplicatedStage::new(
+        Arc::new(TransportConnector {
+            transport: transport.clone(),
+            stage_id,
+        }),
+        endpoints,
+        limit,
+    )?;
+    let listener = transport
+        .listen(&args.required("--listen")?)
+        .map_err(|e| ModernError::Io(e.to_string()))?;
+    say(&json!({"listening": listener.address(), "pid": std::process::id()}));
+    serve_relay(stage, listener, transport, args.required("--next")?)
+}
+
 fn cmd_stage(args: &Args) -> Result<(), ModernError> {
     configure(args)?;
     let mut model = StageModel::open_range(&args.path("--package")?, layers(args)?)?;
@@ -194,7 +271,19 @@ fn cmd_stage(args: &Args) -> Result<(), ModernError> {
             devices: devices.len(),
             local: args.number("--expert-device", 0)?,
         };
-        let pool = RemoteExperts::connect(&TcpTransport, placement, &devices)?;
+        let owners = args
+            .value("--expert-owners")
+            .map(|_| args.list::<usize>("--expert-owners", ""))
+            .transpose()?;
+        if owners
+            .as_ref()
+            .is_some_and(|map| map.len() != model.config().n_routed_experts)
+        {
+            return Err(ModernError::Invalid(
+                "--expert-owners must cover every routed expert".into(),
+            ));
+        }
+        let pool = RemoteExperts::connect_placed(&TcpTransport, placement, &devices, owners)?;
         model.set_expert_pool(Some(Arc::new(pool) as Arc<dyn ExpertPool>));
     }
     let config = WorkerConfig {
@@ -237,6 +326,7 @@ fn cmd_stage(args: &Args) -> Result<(), ModernError> {
         "items": s.items,
         "positions": s.positions,
         "compute_seconds": s.compute_seconds,
+        "emulated_data_hop": arc_inference::modern::mla::island::transport::shaped_hop_metrics(),
         "replayed_positions": s.replayed_positions,
     }));
     Ok(())
@@ -780,6 +870,112 @@ fn cmd_bench(args: &Args) -> Result<(), ModernError> {
     Ok(())
 }
 
+/// Regional latency budget: each cell uses fresh worker processes so counters
+/// cover precisely one run. Measures synthetic compute, emulated network hop
+/// residence, elapsed time and the service hidden by overlapping streams.
+fn cmd_regional_bench(args: &Args) -> Result<(), ModernError> {
+    configure(args)?;
+    let path = args.path("--package")?;
+    let model = StageModel::open(&path)?;
+    let c = model.config();
+    let exe = std::env::current_exe().map_err(|e| ModernError::Io(e.to_string()))?;
+    let stages = args.number("--stages", 40)?;
+    if stages == 0 || stages > c.n_layers {
+        return Err(ModernError::Invalid(
+            "regional stages must be 1..=layers".into(),
+        ));
+    }
+    let cuts = even_cuts(c.n_layers, stages);
+    let rtts: Vec<f64> = args.list("--rtt-ms", "5,10,20")?;
+    let concurrencies: Vec<usize> = args.list("--concurrencies", "1,40")?;
+    let tokens = args.number("--max-tokens", 8)?;
+    let uplink = args.float("--uplink-mbit", 100.0)?;
+    if rtts.iter().any(|v| !v.is_finite() || *v < 0.0)
+        || !uplink.is_finite()
+        || uplink <= 0.0
+        || concurrencies.contains(&0)
+        || tokens < 2
+    {
+        return Err(ModernError::Invalid(
+            "invalid regional benchmark inputs".into(),
+        ));
+    }
+    let mut rows = Vec::new();
+    for rtt in rtts {
+        for &concurrency in &concurrencies {
+            let reqs = bench_requests(c, concurrency, 2, tokens);
+            let reference = reference_generations(&model, &reqs)?;
+            let mut island = ProcessIsland::launch(&exe, &path, &cuts, c, |stage| {
+                vec![
+                    "--wan-ms".into(),
+                    (rtt / 2.0).to_string(),
+                    "--wan-jitter-ms".into(),
+                    "0".into(),
+                    "--wan-mbit".into(),
+                    uplink.to_string(),
+                    "--wan-seed".into(),
+                    (stage + 1).to_string(),
+                    "--threads".into(),
+                    "1".into(),
+                ]
+            })?;
+            let (done, stats) = island.coordinator.run(
+                &reqs,
+                &Schedule {
+                    micro_batches: concurrency,
+                    concurrency,
+                    pad_bytes_per_position: (7168usize * 4).saturating_sub(c.d_model * 4) as u32,
+                    forget_finished: true,
+                    ..Schedule::default()
+                },
+            )?;
+            let exact = matches_reference(&done, &reference);
+            let workers = island.shutdown()?;
+            if !exact {
+                return Err(ModernError::Invalid("regional digest mismatch".into()));
+            }
+            let compute: f64 = workers
+                .iter()
+                .map(|w| w["compute_seconds"].as_f64().unwrap_or(0.0))
+                .sum();
+            let network: f64 = workers
+                .iter()
+                .map(|w| {
+                    w["emulated_data_hop"]["residence_seconds"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                })
+                .sum();
+            let generated = stats.generated_tokens as f64;
+            let (mean, median) = answer_rates(&done);
+            rows.push(json!({
+                "assumed": {"regional_rtt_ms": rtt, "uplink_mbit": uplink,
+                    "activation_payload_target_bytes": 7168 * 4, "jitter_ms": 0,
+                    "stages": stages, "concurrency": concurrency},
+                "measured": {"wall_seconds": stats.seconds, "generated_tokens": stats.generated_tokens,
+                    "forwarded_positions": stats.forwarded_positions,
+                    "per_answer_decode_tok_s_mean": mean, "per_answer_decode_tok_s_median": median,
+                    "aggregate_tok_s": generated / stats.seconds,
+                    "compute_ms_per_output_token": compute * 1000.0 / generated,
+                    "network_residence_ms_per_output_token": network * 1000.0 / generated,
+                    "overlap_lower_bound_ms_per_output_token": (compute + network - stats.seconds).max(0.0) * 1000.0 / generated,
+                    "unattributed_ms_per_output_token": (stats.seconds - compute - network).max(0.0) * 1000.0 / generated,
+                    "wall_ms_per_output_token": stats.seconds * 1000.0 / generated,
+                    "stage_statistics": workers},
+                "bit_exact_vs_single_process": exact,
+            }));
+        }
+    }
+    write_json(
+        &args.path("--out")?,
+        &json!({
+            "schema": "arc-regional-budget-v1", "label": args.value("--label").unwrap_or("local synthetic lab".into()),
+            "platform": platform(), "config": c.to_json(), "rows": rows,
+            "scope": "Synthetic MLA/MoE, loopback processes, emulated regional RTT. Not Kimi throughput. Per-output-token budgets include prefill. Stage compute excludes hashing/log/dispatch outside forward; network residence includes queueing, timer overshoot and send. Overlap is a lower bound from summed service minus wall; residual includes dispatch and close. Coordinator-to-first-stage is local; S shaped hops include return. No replica relay RPC or remote expert RPC in this measurement."
+        }),
+    )
+}
+
 fn main() -> ExitCode {
     let mut items: Vec<String> = std::env::args().skip(1).collect();
     if items.is_empty() {
@@ -791,10 +987,13 @@ fn main() -> ExitCode {
     let result = match command.as_str() {
         "synth" => cmd_synth(&args),
         "stage" => cmd_stage(&args),
+        "replica" => cmd_replica(&args),
+        "relay" => cmd_relay(&args),
         "experts" => cmd_experts(&args),
         "reference" => cmd_reference(&args),
         "run" => cmd_run(&args),
         "bench" => cmd_bench(&args),
+        "regional-bench" => cmd_regional_bench(&args),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::FAILURE;

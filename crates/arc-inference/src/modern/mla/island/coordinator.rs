@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use super::commit::Ledger;
 use super::transport::{Listener, Transport};
-use super::wire::{Frame, Item, Revealed};
+use super::wire::{Frame, Item, Revealed, TreeNode};
 use super::worker::{Downstream, incoming};
 use crate::modern::ModernError;
 use crate::modern::arith::{self, Selection};
@@ -426,6 +426,46 @@ impl Coordinator {
         self.send(&frame, &mut RunStats::default())?;
         self.await_frame(|f| matches!(f, Frame::Ping { id: got, .. } if *got == id))?;
         Ok(start.elapsed().as_secs_f64())
+    }
+
+    /// Advance explicit batched streams without closing their caches. ENG-8
+    /// can prefill a prefix, verify trees, then commit an accepted path here.
+    /// The caller owns IDs/positions and must keep all other work quiescent.
+    pub fn forward_batch(&mut self, id: u64, items: Vec<Item>) -> Result<Vec<Item>, ModernError> {
+        self.send(&Frame::Step { id, items }, &mut RunStats::default())?;
+        match self.await_frame(|f| matches!(f, Frame::Step { id: got, .. } if *got == id))? {
+            Frame::Step { items, .. } => Ok(items),
+            _ => unreachable!("matched step"),
+        }
+    }
+
+    /// Release explicit streams admitted through `forward_batch`.
+    pub fn close_sequences(&mut self, seqs: Vec<u64>, forget: bool) -> Result<(), ModernError> {
+        self.send(
+            &Frame::Close {
+                seqs: seqs.clone(),
+                forget,
+            },
+            &mut RunStats::default(),
+        )?;
+        self.await_frame(|f| matches!(f, Frame::Close { seqs: got, .. } if *got == seqs))?;
+        Ok(())
+    }
+
+    /// Verify drafted branches against a still-live prefix in one ring pass.
+    /// Call with no other frames in flight. ENG-8 owns draft proposal and path
+    /// acceptance; this API returns exact per-node logits/commitments only.
+    pub fn verify_tree(
+        &mut self,
+        id: u64,
+        prefix: u64,
+        nodes: Vec<TreeNode>,
+    ) -> Result<Vec<TreeNode>, ModernError> {
+        self.send(&Frame::Tree { id, prefix, nodes }, &mut RunStats::default())?;
+        match self.await_frame(|f| matches!(f, Frame::Tree { id: got, .. } if *got == id))? {
+            Frame::Tree { nodes, .. } => Ok(nodes),
+            _ => unreachable!("matched tree"),
+        }
     }
 
     /// Every stage's activation log of `seq`, in stage order.

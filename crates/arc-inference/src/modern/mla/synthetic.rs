@@ -95,6 +95,12 @@ pub fn shape(name: &str) -> Result<MlaConfig, ModernError> {
     let base = |lora: bool| tiny_config(lora, ExpertFormat::Int8Dyadic);
     let c = match name {
         "tiny" => base(false),
+        // Forty independently placeable stages; synthetic arithmetic only.
+        "regional-40" => MlaConfig {
+            n_layers: 40,
+            max_seq: 64,
+            ..base(true)
+        },
         "tiny-lora" => base(true),
         "tiny-i4" => tiny_config(true, ExpertFormat::Int4G32),
         "small" => MlaConfig {

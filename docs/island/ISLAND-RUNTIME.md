@@ -1,6 +1,6 @@
-# Island runtime: one model across several machines, bit-exact
+# Regional swarm runtime: one model across ordinary nodes, bit-exact
 
-Status: draft (ENG-6, "Kimi islands 1"). Code: `crates/arc-inference/src/modern/mla/island/`,
+Status: draft (ENG-6, regional swarms; scope corrected 7 Oct 2026). Code: `crates/arc-inference/src/modern/mla/island/`,
 CLI `arc-island` (`crates/arc-inference/src/bin/arc_island.rs`), process tests
 `crates/arc-inference/tests/island_processes.rs`, CI `.github/workflows/island-runtime.yml`.
 Measured results and the labelled Kimi K2 projection: [`RESULTS.md`](RESULTS.md).
@@ -12,12 +12,17 @@ calls its `StageModel::forward` unchanged.
 
 ## Why
 
-A Kimi-class model (Kimi K2.6: 1T total, 32B active, MLA + MoE) is about 582 GB
-with INT4 experts and INT8 elsewhere. No single community machine holds it. It
-runs on an island: 2–4 big machines on one LAN or Thunderbolt link (research-6
-T1), or, as a cheap batch tier, on a longer pipeline across homes (T2-batch).
-This runtime is both, with verification built in: every stage boundary is
-hash-committed, and any stage can be re-executed alone.
+The deployment target is many ordinary community nodes (typically 16 GB RAM),
+connected over the public internet within a measured-RTT region. TJ's planning
+assumption of about 600 GB of K2.6 weights means roughly 40+ stages or expert
+groups, with additional capacity for KV, logs and redundancy. Large-memory
+machines can participate but are never required. ENG-7 owns formation and
+capacity/economic simulation. ENG-8, ENG-9 and ENG-1 own speculation, latency
+engineering and batched kernels. No measured Kimi speed is claimed here.
+
+See [REGIONAL-SWARM.md](REGIONAL-SWARM.md) for replica failover, draft trees,
+placement interfaces, regional CI budgets and remaining deployment limits.
+The `island` module and CLI names are retained for source compatibility.
 
 ## Shape
 
@@ -43,7 +48,8 @@ flowchart LR
   routed experts spread over devices (expert `e` on device `e mod D`). The
   stage evaluates its own and the shared experts while the others return exact
   `i128` partial sums `Σ w_e·y_e`; the sum is shifted once (spec §5.6). One round
-  trip per MoE layer per position: RDMA/Thunderbolt/LAN only.
+  trip per contacted device per MoE layer per position. Explicit expert-owner
+  maps support regional placement; the cost of these RPCs must be measured.
 * **Transport** (`transport.rs`). `Transport` / `Listener` / `Link` traits.
   `TcpTransport` (length-prefixed frames, Nagle off) is the first; RDMA or
   Thunderbolt implementations plug into the same traits. `MemTransport` joins

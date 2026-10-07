@@ -14,6 +14,7 @@ const REVEAL: u8 = 3;
 const PING: u8 = 4;
 const SHUTDOWN: u8 = 5;
 const ERROR: u8 = 6;
+const TREE: u8 = 7;
 
 fn invalid(what: impl Into<String>) -> ModernError {
     ModernError::Invalid(format!("island frame: {}", what.into()))
@@ -387,11 +388,26 @@ pub struct Revealed {
     pub inputs: Vec<i64>,
 }
 
+/// One drafted token. Parents precede children; None forks the live prefix.
+/// `item.seq` is a temporary branch ID, distinct from every live sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeNode {
+    pub parent: Option<u32>,
+    pub item: Item,
+}
+
 /// A frame on the ring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// Work for some sequences. `id` names the micro-batch.
     Step { id: u64, items: Vec<Item> },
+    /// ENG-8: verify an entire draft tree in one pass through all stages.
+    /// Prefix caches are unchanged; accepting a path is a later Step frame.
+    Tree {
+        id: u64,
+        prefix: u64,
+        nodes: Vec<TreeNode>,
+    },
     /// The sequences are finished: drop their caches; with `forget` also
     /// their activation logs.
     Close { seqs: Vec<u64>, forget: bool },
@@ -415,6 +431,16 @@ impl Frame {
                 w.count(items.len());
                 for item in items {
                     item.write(&mut w);
+                }
+            }
+            Frame::Tree { id, prefix, nodes } => {
+                w.u8(TREE);
+                w.u64(*id);
+                w.u64(*prefix);
+                w.count(nodes.len());
+                for node in nodes {
+                    w.u32(node.parent.unwrap_or(u32::MAX));
+                    node.item.write(&mut w);
                 }
             }
             Frame::Close { seqs, forget } => {
@@ -463,6 +489,24 @@ impl Frame {
                     .map(|_| Item::read(&mut r))
                     .collect::<Result<_, _>>()?;
                 Frame::Step { id, items }
+            }
+            TREE => {
+                let id = r.u64()?;
+                let prefix = r.u64()?;
+                let n = r.count()?;
+                if n == 0 || n > 4096 {
+                    return Err(invalid("tree must have 1..=4096 nodes"));
+                }
+                let nodes = (0..n)
+                    .map(|_| {
+                        let p = r.u32()?;
+                        Ok(TreeNode {
+                            parent: (p != u32::MAX).then_some(p),
+                            item: Item::read(&mut r)?,
+                        })
+                    })
+                    .collect::<Result<_, ModernError>>()?;
+                Frame::Tree { id, prefix, nodes }
             }
             CLOSE => {
                 let forget = r.u8()? != 0;

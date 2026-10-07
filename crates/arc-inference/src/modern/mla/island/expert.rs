@@ -1,9 +1,6 @@
-//! Expert parallelism inside an island: a stage's routed experts spread over
-//! several devices. Expert `e` lives on device `e % devices`; the stage's own
-//! device evaluates its experts and the shared experts while the others
-//! return exact partial sums over a [`Link`]. One round trip per MoE layer
-//! per position, so this belongs on RDMA/Thunderbolt or a fast LAN
-//! (research-6 §2.4), never across sites.
+//! Expert parallelism over placement-selected regional nodes. Integer i128
+//! partial sums preserve the profile regardless of placement. Each contacted
+//! device adds an RPC: measure regional latency before making speed claims.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +39,7 @@ fn encode_request(layer: usize, x: &[i64], experts: &[(usize, i64)]) -> Vec<u8> 
 /// Remote experts reached over links, one per remote device.
 pub struct RemoteExperts {
     placement: ExpertPlacement,
+    owners: Option<Vec<usize>>,
     links: Vec<Option<Mutex<Box<dyn Link>>>>,
     /// Requests sent.
     pub calls: AtomicU64,
@@ -55,6 +53,25 @@ impl RemoteExperts {
         placement: ExpertPlacement,
         devices: &[String],
     ) -> Result<Self, ModernError> {
+        Self::connect_placed(transport, placement, devices, None)
+    }
+
+    /// Explicit expert-id -> device-id map, supplied by ENG-7's placement.
+    /// The map must cover every routed expert; use `None` for legacy modulo.
+    pub fn connect_placed(
+        transport: &dyn Transport,
+        placement: ExpertPlacement,
+        devices: &[String],
+        owners: Option<Vec<usize>>,
+    ) -> Result<Self, ModernError> {
+        if owners
+            .as_ref()
+            .is_some_and(|map| map.is_empty() || map.iter().any(|&d| d >= placement.devices))
+        {
+            return Err(ModernError::Invalid(
+                "expert owner outside device list".into(),
+            ));
+        }
         if devices.len() != placement.devices || placement.local >= placement.devices {
             return Err(ModernError::Invalid(
                 "expert placement and device list differ".into(),
@@ -78,15 +95,25 @@ impl RemoteExperts {
             .collect::<Result<_, _>>()?;
         Ok(Self {
             placement,
+            owners,
             links,
             calls: AtomicU64::new(0),
         })
     }
 }
 
+impl RemoteExperts {
+    fn owner(&self, expert: usize) -> usize {
+        self.owners.as_ref().map_or_else(
+            || self.placement.device_of(expert),
+            |map| map.get(expert).copied().unwrap_or(usize::MAX),
+        )
+    }
+}
+
 impl ExpertPool for RemoteExperts {
     fn is_remote(&self, _layer: usize, expert: usize) -> bool {
-        self.placement.device_of(expert) != self.placement.local
+        self.owner(expert) != self.placement.local
     }
 
     fn evaluate(
@@ -95,12 +122,18 @@ impl ExpertPool for RemoteExperts {
         x: &[i64],
         experts: &[(usize, i64)],
     ) -> Result<Vec<i128>, ModernError> {
+        if experts
+            .iter()
+            .any(|&(e, _)| self.owner(e) >= self.placement.devices)
+        {
+            return Err(ModernError::Invalid("expert missing from placement".into()));
+        }
         let mut total = vec![0i128; x.len()];
         for (d, link) in self.links.iter().enumerate() {
             let mine: Vec<(usize, i64)> = experts
                 .iter()
                 .copied()
-                .filter(|&(e, _)| self.placement.device_of(e) == d)
+                .filter(|&(e, _)| self.owner(e) == d)
                 .collect();
             if mine.is_empty() {
                 continue;

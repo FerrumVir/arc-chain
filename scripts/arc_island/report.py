@@ -468,7 +468,7 @@ def main(argv):
             paths.append(a)
     benches = load(paths)
     failures = [f for b in benches for f in b.get("failures", [])]
-    md = ["## Measured"]
+    md = ["Historical topology experiments: the LAN/large-machine projections below are not the deployment target. See REGIONAL-SWARM.md and regional CI budgets for the 7 Oct ordinary-node scope.", "## Measured"]
     errors = []
     for b in benches:
         md.append(measured_section(b))

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -132,6 +132,33 @@ impl Transport for TcpTransport {
 
     fn connect(&self, address: &str) -> io::Result<Box<dyn Link>> {
         Ok(Box::new(TcpLink::new(TcpStream::connect(address)?)?))
+    }
+}
+
+/// TCP with bounded connection, read and write waits for replica failover.
+/// Endpoints are numeric socket addresses: DNS resolution must happen during
+/// discovery, outside the per-frame deadline.
+#[derive(Debug, Clone, Copy)]
+pub struct DeadlineTcpTransport {
+    pub timeout: Duration,
+}
+
+impl Transport for DeadlineTcpTransport {
+    fn listen(&self, address: &str) -> io::Result<Box<dyn Listener>> {
+        TcpTransport.listen(address)
+    }
+
+    fn connect(&self, address: &str) -> io::Result<Box<dyn Link>> {
+        let address: SocketAddr = address.parse().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("numeric endpoint: {e}"),
+            )
+        })?;
+        let stream = TcpStream::connect_timeout(&address, self.timeout)?;
+        stream.set_read_timeout(Some(self.timeout))?;
+        stream.set_write_timeout(Some(self.timeout))?;
+        Ok(Box::new(TcpLink::new(stream)?))
     }
 }
 
@@ -345,11 +372,32 @@ impl Transport for ShapedTransport {
     }
 }
 
+/// Process-local emulated data-hop telemetry. Only Step/Tree frames count;
+/// controls, startup and pings do not. Elapsed time includes uplink queueing,
+/// propagation, host scheduling and the underlying send. It is measured,
+/// not the configured delay multiplied by the number of hops.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct HopMetrics {
+    pub frames: u64,
+    pub bytes: u64,
+    pub residence_seconds: f64,
+}
+
+static HOP_METRICS: Mutex<HopMetrics> = Mutex::new(HopMetrics {
+    frames: 0,
+    bytes: 0,
+    residence_seconds: 0.0,
+});
+
+pub fn shaped_hop_metrics() -> HopMetrics {
+    HOP_METRICS.lock().expect("hop metrics").clone()
+}
+
 /// A send-only link whose frames leave through an emulated uplink and
 /// arrive after the propagation delay. The caller never waits: frames sit
 /// in a delay line, as packets sit on a wire.
 pub struct ShapedLink {
-    line: Option<Sender<(Instant, Vec<u8>)>>,
+    line: Option<Sender<(Instant, Instant, Vec<u8>)>>,
     dead: Arc<AtomicBool>,
     profile: WanProfile,
     rng: u64,
@@ -360,15 +408,22 @@ pub struct ShapedLink {
 
 impl ShapedLink {
     pub fn new(mut inner: Box<dyn Link>, profile: WanProfile, seed: u64) -> Self {
-        let (tx, rx) = channel::<(Instant, Vec<u8>)>();
+        let (tx, rx) = channel::<(Instant, Instant, Vec<u8>)>();
         let dead = Arc::new(AtomicBool::new(false));
         let flag = dead.clone();
         let worker = std::thread::spawn(move || {
-            for (at, frame) in rx {
+            for (at, queued, frame) in rx {
                 wait_until(at);
                 if !inner.alive() || inner.send(&frame).is_err() {
                     flag.store(true, Ordering::SeqCst);
                     return;
+                }
+                // Kind bytes 1 and 7 are Step and Tree in wire.rs.
+                if matches!(frame.first(), Some(1 | 7)) {
+                    let mut stats = HOP_METRICS.lock().expect("hop metrics");
+                    stats.frames += 1;
+                    stats.bytes += frame.len() as u64;
+                    stats.residence_seconds += queued.elapsed().as_secs_f64();
                 }
             }
         });
@@ -412,7 +467,7 @@ impl Link for ShapedLink {
         self.line
             .as_ref()
             .expect("line")
-            .send((arrival, frame.to_vec()))
+            .send((arrival, now, frame.to_vec()))
             .map_err(|_| gone())
     }
 

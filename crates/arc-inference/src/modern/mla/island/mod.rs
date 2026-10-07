@@ -1,9 +1,10 @@
-//! Islands: one model split across several processes or machines, bit-exact.
+//! Regional swarms: one model split across ordinary nodes, bit-exact.
 //!
 //! A Kimi-class model (about 600 GB at 4 bits) fits no single community
-//! machine; it runs on an island of 2-4 big machines on one LAN or
-//! Thunderbolt link, or, as a batch tier, on a longer pipeline across homes
-//! (research-6 §2, §6.2). This module is the runtime for both:
+//! machine. The target is 40+ stages or expert groups on roughly 16 GB
+//! community nodes, connected over regional public-internet links. Large
+//! machines are optional members. The legacy `island` module/CLI names stay
+//! compatible; they do not impose a LAN or large-machine requirement.
 //!
 //! * [`worker`]: a stage process holding layers `[a, b)`. It runs every item
 //!   through its layers, commits the activation hash at each layer boundary,
@@ -29,6 +30,7 @@ pub mod commit;
 pub mod coordinator;
 pub mod expert;
 pub mod process;
+pub mod replica;
 pub mod transport;
 pub mod wire;
 pub mod worker;

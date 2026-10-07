@@ -416,3 +416,96 @@ fn a_wrong_token_from_the_last_stage_process_is_rejected() {
     assert_matches(&expected[1..], &done[1..], "the honest neighbour");
     island.shutdown().unwrap();
 }
+
+#[test]
+fn regional_replicas_recover_lost_inflight_replies_with_heterogeneous_speeds() {
+    use arc_inference::modern::mla::island::process::StageProcess;
+    use arc_inference::modern::mla::island::replica::{
+        ReplicatedStage, TransportConnector, stage_identity,
+    };
+    use arc_inference::modern::mla::island::transport::DeadlineTcpTransport;
+    use arc_inference::modern::mla::island::wire::{Frame, Item};
+    use arc_inference::modern::mla::island::worker::{StageWorker, WorkerConfig};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let scratch = Scratch::new("regional-replicas");
+    let (path, c, _) = package(&scratch.0, "tiny-i4");
+    let cuts = [0, 1, 3, 4];
+    let mut children = Vec::new();
+    let mut stages = Vec::new();
+    let mut references = Vec::new();
+    for (index, range) in cuts.windows(2).enumerate() {
+        let spec = Some(StageSpec {
+            first_layer: range[0],
+            end_layer: range[1],
+        });
+        let model = StageModel::open_range(&path, spec).unwrap();
+        let identity = stage_identity(&model);
+        references.push(StageWorker::new(model, WorkerConfig::default()).unwrap());
+        let mut endpoints = Vec::new();
+        for primary in [true, false] {
+            let args = vec![
+                "--package".into(),
+                path.display().to_string(),
+                "--layers".into(),
+                format!("{}:{}", range[0], range[1]),
+                "--sessions".into(),
+                "1".into(),
+                "--drop-reply-at".into(),
+                if primary { "2" } else { "0" }.into(),
+                // Slow nodes are legitimate, not changed arithmetic.
+                "--reply-delay-ms".into(),
+                (index * 2).to_string(),
+                "--threads".into(),
+                "1".into(),
+            ];
+            let process =
+                StageProcess::spawn_command(Path::new(EXE), "replica", args, "127.0.0.1:0")
+                    .unwrap();
+            endpoints.push(process.address.clone());
+            children.push(process);
+        }
+        stages.push(
+            ReplicatedStage::new(
+                Arc::new(TransportConnector {
+                    transport: Arc::new(DeadlineTcpTransport {
+                        timeout: Duration::from_secs(5),
+                    }),
+                    stage_id: identity,
+                }),
+                endpoints,
+                1 << 20,
+            )
+            .unwrap(),
+        );
+    }
+    for position in 0..6 {
+        let mut frame = Frame::Step {
+            id: 0,
+            items: [10, 11]
+                .iter()
+                .map(|&seq| Item::new(seq, position, 1, Selection::Rp64Argmax, vec![position + 3]))
+                .collect(),
+        };
+        let mut expected = frame.clone();
+        for (stage, reference) in stages.iter_mut().zip(&mut references) {
+            frame = stage.process(frame).unwrap();
+            expected = reference.process(expected).unwrap();
+            assert_eq!(
+                frame, expected,
+                "every stage and every output byte after churn"
+            );
+        }
+    }
+    for stage in &mut stages {
+        assert_eq!(stage.failovers, 1);
+        assert_eq!(stage.replayed_frames, 1);
+        stage.process(Frame::Shutdown).unwrap();
+    }
+    drop(stages);
+    for child in children {
+        child.finish().unwrap();
+    }
+    assert_eq!(c.n_layers, 4);
+}

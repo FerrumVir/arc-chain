@@ -30,9 +30,20 @@ pub struct StageProcess {
 impl StageProcess {
     /// Start `exe stage <args> --listen <listen>` and wait for its hello.
     pub fn spawn(exe: &Path, args: Vec<String>, listen: &str) -> Result<Self, ModernError> {
+        Self::spawn_command(exe, "stage", args, listen)
+    }
+
+    /// A finite replica server or relay, with the same readiness/lifecycle
+    /// contract as a stage. `restart` is only supported for stage processes.
+    pub fn spawn_command(
+        exe: &Path,
+        subcommand: &str,
+        args: Vec<String>,
+        listen: &str,
+    ) -> Result<Self, ModernError> {
         let mut command = Command::new(exe);
         command
-            .arg("stage")
+            .arg(subcommand)
             .args(&args)
             .args(["--listen", listen])
             .stdin(Stdio::null())
