@@ -75,12 +75,16 @@ with prompt log-probabilities. Chat APIs do not provide them.
 `compare` writes `arc.quality-report.v1` (JSON) and a Markdown summary.
 
 - `overall`: `verdict` (PASS, FAIL, INCONCLUSIVE or NO DATA), `certifying`
-  (true only when every group reaches its certification size), and `scope`.
+  (true only with all certification sizes and validated evidence), `scope`,
+  and `blockers` explaining missing evidence. An incomplete run cannot return
+  overall PASS; known prompt mismatches return FAIL.
 - `groups.<group>`:
   - `n`, `reference_accuracy`, `arc_accuracy`;
   - `delta` and `delta_ci` (fractions, ARC − reference);
   - `both`, `only_a` (reference only), `only_b` (ARC only), `neither`;
   - `discordant_rate`, `mcnemar_p` and `answer_agreement`;
+  - `prompt_alignment`: matched, mismatched and unavailable input-ID counts,
+    including text-only API runs that have no generated token IDs;
   - `token_level`: same prompt ids, identical generations, and the median
     first divergence;
   - `policy`: verdict, margin, certification size, and the items needed at
@@ -97,6 +101,53 @@ Every number carries a label for where it was measured, for example "CI
 runner, ubuntu-latest". Per-item results stay in the `*-scored.json` files
 (text, extracted answer, tokens, output hash and logits digest), so any
 disagreement can be traced.
+
+### Evidence and provenance required for certification
+
+The full requested item manifest must be covered once on both sides. Duplicate
+item IDs are rejected; missing/extra results, missing policy groups or member
+benchmarks, changed item contents, or unavailable input IDs block certification.
+A supplied second reference must cover and align with the same inputs too.
+Prompt-ID mismatches are detected even if generated token IDs are unavailable.
+
+`score` records a SHA-256 of each source run file and a canonical JSON SHA-256
+of each item (including its prompt and grading target). For certification, pass
+`score --provenance MANIFEST.json`, an audited producer manifest containing:
+
+```json
+{
+  "model_id": "organization/model",
+  "model_revision": "immutable weight revision",
+  "weights_sha256": "<64 lowercase hex: source weight manifest digest>",
+  "tokenizer_sha256": "<64 lowercase hex: tokenizer.json digest>",
+  "run_sha256": ["<64 lowercase hex: actual source run file digest>"]
+}
+```
+
+`weights_sha256` identifies the pinned source-weight manifest shared by the
+integer conversion and native reference, not their different runtime tensor
+formats. The producer must audit that lineage. `score` checks that the declared
+run hashes match the files being graded and, when decoding, checks the tokenizer
+file hash. `compare` checks the item fingerprints and consistent model, source
+weights, tokenizer and run identities across every shard and reference. A label,
+API model alias or local directory name alone does not establish provenance.
+These checks verify consistency of supplied evidence, not producer authenticity.
+
+The logit track is required by this policy. Its report must have positive finite
+PPL values, positive scored-token counts, and a delta consistent with the two
+PPL values. For certification, it must also include `provenance` with the same
+four model identity fields and `tokens_sha256` (canonical JSON hash of the input
+token list). Both `bf16_reference` and `integer_engine` must record that token
+hash and matching `scored_tokens`; the ARC logits digest must be present.
+Missing identities or inconsistent coverage block certification. Invalid
+numeric evidence is rejected, rather than silently treated as a passing gate.
+
+The old CI scored/PPL artifacts lack this complete provenance contract. They
+remain readable as smoke evidence and are explicitly non-certifying. The current
+smoke workflow does not invent or backfill producer attestations. Certification
+runs need audited producer manifests and enriched PPL evidence; API token-ID
+alignment remains unavailable. The policy remains unapproved by TJ. Even a
+complete synthetic test fixture's PASS only exercises the proposed policy.
 
 ## Tolerance policy (PROPOSED for TJ's approval)
 
@@ -125,7 +176,8 @@ The overall verdict needs **all** of these:
   disagrees with itself, plus 1 point.
 
 A run below the certification sizes reports the same verdicts but is labelled
-"smoke". It can show a FAIL, but it cannot support a claim.
+"smoke". It can show a FAIL, but overall PASS requires complete evidence.
+Statistical group/pooled PASS values alone never establish certification.
 
 **Why these numbers**
 - Published INT8 quantisation results report 98.7–100.3% "recovery" of the
@@ -198,7 +250,8 @@ python -m arc_quality compare --items items.jsonl --arc arc-scored.json --refere
      token-id prompts on the `/completions` endpoint; that adapter is a small
      addition once the server exists.
    - With a vendor API, the comparison is text-level. The vendor renders its
-     own chat template, so the report's `same_prompt_ids` will be empty.
+     own chat template. The report explicitly marks prompt alignment unavailable
+     and cannot certify it under this policy.
 5. Run the reference **twice**, on different days or servers, to measure the
    noise floor. API "temperature 0" is not deterministic.
 
@@ -214,9 +267,28 @@ characters per token; `reference openai --dry-run`):
 | Moonshot API or another provider serving Kimi K2.6 | vendor-served model, text-level comparison, not bit-reproducible | per-token price × 2 passes (noise floor); the price was not checked for this document |
 | self-hosted vLLM/SGLang on the official `moonshotai/Kimi-K2.6` weights (native INT4 experts) | the exact published weights, token-id inputs, full logits for the logit track | GPU hours on a node class that holds ~600 GB of weights |
 
-The `openai` adapter refuses to send a request unless prices are passed
-explicitly and the worst-case cost fits `--budget-usd`, which defaults to 0.
-It also stops when the measured spend reaches the budget.
+The `openai` adapter requires finite nonnegative prices and budget (default
+0). Character/token estimates are advisory, including during `--dry-run`.
+Before sending, `--context-tokens` must specify the endpoint's **enforced**
+maximum input/context token count. Do not substitute an estimated prompt
+length: providers render their own templates. The guard reserves that entire
+input bound plus the item's positive integer output cap, with `n=1`, at the
+supplied prices. Output caps above the context bound are rejected.
+
+Every request and retry must fit the remaining budget **before** transport.
+`--max-attempts` defaults to 1 (maximum 6). Each attempt reserves its full
+bound; failed, timed-out and missing-usage responses never refund it. The
+single-attempt transport does not retry internally. Usage exceeding a bound
+or multiple returned choices stops the run before another request. Reserves
+can exhaust the budget before all items complete. This guard is per
+invocation, not an account spending limit. Its billing guarantee depends on
+correct configured prices and an endpoint that honors its declared token
+caps; an endpoint violation cannot be undone after a response.
+
+All nonempty `--extra-body` objects are rejected, including vendor extensions:
+unknown fields can affect billing, multiplicity or input alignment. Model,
+messages, generation parameters and token limits cannot be overridden.
+No endpoint was called to test these guards; regression tests mock transport.
 
 ## Not done, and why
 

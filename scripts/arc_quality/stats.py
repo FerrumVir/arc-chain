@@ -63,12 +63,20 @@ def newcombe_paired(table: dict, confidence: float = 0.95) -> tuple[float, float
 
 def mcnemar_exact(b: int, c: int) -> float:
     """Two-sided exact p-value that the discordant pairs split 50/50."""
+    if any(type(x) is not int or x < 0 for x in (b, c)):
+        raise ValueError("discordance counts must be nonnegative integers")
     m = b + c
     if m == 0:
         return 1.0
     k = min(b, c)
-    tail = sum(math.comb(m, i) for i in range(k + 1)) / 2.0**m
-    return min(1.0, 2.0 * tail)
+    # Integer recurrence keeps the exact numerator and denominator; Python
+    # divides large integers without first converting either to float.
+    # Only the final p-value is rounded (very small tails may underflow to 0).
+    term = total = 1
+    for i in range(1, k + 1):
+        term = term * (m - i + 1) // i
+        total += term
+    return min(1.0, (2 * total) / (1 << m))
 
 
 def summarize(pairs: list[tuple[bool, bool]], confidence: float = 0.95) -> dict:

@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from arc_quality import benchmarks, harness, report
+from arc_quality import benchmarks, harness, report, provenance
 
 HERE = Path(__file__).resolve().parents[1]
 
@@ -126,7 +126,7 @@ class Pipeline(unittest.TestCase):
         ppl.write_text(json.dumps({
             "schema": "arc.modern-quality.v1", "text": "t", "scored_tokens": 1022,
             "bf16_reference": {"ppl": 6.7756}, "integer_engine": {"ppl": 6.7906, "logits_digest": "ab"},
-            "ppl_delta_percent": 0.221, "top1_agreement": 0.94,
+            "ppl_delta_percent": 100 * (6.7906 / 6.7756 - 1), "top1_agreement": 0.94,
         }))
         items = [json.loads(x) for x in self.items.read_text().splitlines()]
         policy = json.loads((HERE / "policy.json").read_text())
@@ -159,6 +159,27 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(quiet(base + ["--price-in-per-mtok", "1", "--price-out-per-mtok", "4",
                                        "--budget-usd", "5", "--dry-run"]), 0)
         self.assertFalse((self.dir / "api.json").exists())
+
+    def test_score_binds_items_and_validates_manifest_run_hashes(self):
+        texts = {item["id"]: right_answer(item) for item in self.item_list}
+        run = self.write_run("arc.json", texts, tokens=lambda it: [7])
+        manifest = self.dir / "provenance.json"
+        evidence = {"model_id": "test/model", "model_revision": "test-revision",
+                    "weights_sha256": "a" * 64, "tokenizer_sha256": "b" * 64,
+                    "run_sha256": [harness._sha256(run)]}
+        manifest.write_text(json.dumps(evidence))
+        out = self.dir / "bound-score.json"
+        args = ["score", "--items", str(self.items), "--run", str(run), "--label", "test",
+                "--provenance", str(manifest), "--out", str(out)]
+        self.assertEqual(quiet(args), 0)
+        scored = json.loads(out.read_text())
+        self.assertEqual(scored["provenance"], evidence)
+        expected = {it["id"]: provenance.digest(it) for it in self.item_list}
+        for row in scored["results"]:
+            self.assertEqual(row["item_sha256"], expected[row["id"]])
+        run.write_text(run.read_text() + " ")
+        with self.assertRaisesRegex(ValueError, "does not bind"):
+            quiet(args)
 
     def test_every_benchmark_has_a_cap(self):
         self.assertEqual(set(benchmarks.MAX_TOKENS), set(benchmarks.BENCHMARKS))

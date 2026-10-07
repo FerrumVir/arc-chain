@@ -26,7 +26,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from . import benchmarks, reference, report
+from . import benchmarks, provenance, reference, report
 
 HERE = Path(__file__).resolve().parent
 SCORED_SCHEMA = "arc.quality-scored.v1"
@@ -184,6 +184,7 @@ def cmd_score(args) -> int:
         run = reference.load_run(path)
         run_meta.append({
             "file": Path(path).name,
+            "sha256": _sha256(Path(path)),
             "schema": run.get("schema"),
             "engine": run.get("engine"),
             "kernel": run.get("kernel"),
@@ -207,6 +208,7 @@ def cmd_score(args) -> int:
             results.append({
                 "id": item["id"],
                 "benchmark": item["benchmark"],
+                "item_sha256": provenance.digest(item),
                 **graded,
                 "text": text,
                 "tokens": tokens,
@@ -215,8 +217,18 @@ def cmd_score(args) -> int:
                 "logits_digest": case.get("logits_digest"),
             })
     missing = sorted(set(items) - {r["id"] for r in results})
+    evidence = None
+    if args.provenance:
+        evidence = json.loads(Path(args.provenance).read_text(encoding="utf-8"))
+        if provenance.identity(evidence) is None:
+            raise ValueError("invalid model provenance manifest")
+        if sorted(evidence.get("run_sha256", [])) != sorted(r["sha256"] for r in run_meta):
+            raise ValueError("provenance manifest does not bind these run files")
+        if args.tokenizer and _sha256(Path(args.tokenizer)) != evidence["tokenizer_sha256"]:
+            raise ValueError("provenance tokenizer digest mismatch")
     doc = {
         "schema": SCORED_SCHEMA,
+        "provenance": evidence,
         "engine": {"label": args.label},
         "run": run_meta,
         "missing": missing,
@@ -271,6 +283,7 @@ def main(argv: list[str]) -> int:
     p.add_argument("--items", action="append", required=True)
     p.add_argument("--run", action="append", required=True)
     p.add_argument("--label", required=True)
+    p.add_argument("--provenance", help="audited model and run identity manifest (see quality docs)")
     p.add_argument("--tokenizer", help="tokenizer.json: decode token ids (one decoder for every engine)")
     p.add_argument("--allow-exec", action="store_true",
                    help="execute model-written code for humaneval/mbpp (disposable machines only)")

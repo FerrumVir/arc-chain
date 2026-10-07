@@ -7,7 +7,8 @@ hf        Hugging Face transformers on the published weights (BF16 by
 openai    any OpenAI-compatible /chat/completions endpoint (a provider API or
           a self-hosted vLLM/SGLang server running the official weights),
           temperature 0. Refuses to send anything unless prices are given
-          explicitly and the worst-case cost fits --budget-usd (default 0).
+          explicitly, the endpoint context bound is supplied, and reserved
+          request/attempt costs fit --budget-usd (default 0).
 
 Both write arc.quality-run.v1: {"schema", "engine", "cases": [{"id",
 "prompt_tokens"?, "tokens"?, "text"?, "seconds", ...}]}.
@@ -21,6 +22,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from decimal import Decimal
 from pathlib import Path
 
 RUN_SCHEMA = "arc.quality-run.v1"
@@ -145,8 +147,12 @@ def run_hf(args) -> int:
 
 
 def estimate(items: list[dict], chars_per_token: float) -> dict:
-    """Worst case: every reply uses max_tokens; input from a chars/token ratio
-    (3.0 overestimates English for modern BPE vocabularies)."""
+    """Advisory estimate, never a billing bound."""
+    if not math.isfinite(chars_per_token) or chars_per_token <= 0:
+        raise SystemExit("chars-per-token must be finite and positive")
+    for item in items:
+        if type(item.get("max_tokens")) is not int or item["max_tokens"] <= 0:
+            raise SystemExit("max_tokens must be a positive integer")
     input_tokens = sum(
         math.ceil(sum(len(m["content"]) for m in messages_for(item)) / chars_per_token) + 16 for item in items
     )
@@ -159,93 +165,112 @@ def cost_usd(input_tokens: int, output_tokens: int, price_in: float, price_out: 
 
 
 def post_json(url: str, body: dict, headers: dict, timeout: float) -> dict:
-    data = json.dumps(body).encode("utf-8")
-    last = None
-    for attempt in range(1, 7):
-        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            last = f"HTTP {error.code}: {error.read()[:300]!r}"
-            if error.code not in (408, 409, 429) and error.code < 500:
-                break
-        except (urllib.error.URLError, TimeoutError) as error:
-            last = str(error)
-        time.sleep(min(60, 2**attempt))
-    raise RuntimeError(f"{url}: {last}")
+    # Exactly one attempt; the caller must reserve budget for every retry.
+    request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                     headers=headers, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _money(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise SystemExit(f"{name} must be finite and nonnegative")
+    return Decimal(str(value))
 
 
 def run_openai(args) -> int:
     items = read_items(args.items)
+    if type(args.limit) is not int or args.limit < 0:
+        raise SystemExit("limit must be a nonnegative integer")
     if args.limit:
-        items = items[: args.limit]
+        items = items[:args.limit]
     volume = estimate(items, args.chars_per_token)
-    print(json.dumps({"estimate": volume}, indent=1))
-    if args.price_in_per_mtok is None or args.price_out_per_mtok is None:
-        raise SystemExit(
-            "refusing: pass --price-in-per-mtok and --price-out-per-mtok explicitly "
-            "(0 and 0 for a self-hosted server you already run)"
-        )
-    worst = cost_usd(volume["input_tokens"], volume["output_tokens_max"],
-                     args.price_in_per_mtok, args.price_out_per_mtok)
-    print(f"worst-case cost: ${worst:.2f} (budget ${args.budget_usd:.2f})")
-    if worst > args.budget_usd:
-        raise SystemExit("refusing: the worst-case cost exceeds --budget-usd; no request was sent")
+    print(json.dumps({"advisory_estimate": volume}, indent=1))
+    price_in = _money(args.price_in_per_mtok, "price-in-per-mtok")
+    price_out = _money(args.price_out_per_mtok, "price-out-per-mtok")
+    budget = _money(args.budget_usd, "budget-usd")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise SystemExit("timeout must be finite and positive")
+    extra = json.loads(args.extra_body) if args.extra_body else {}
+    # Vendor extensions can alter billing too; fail closed until their cost
+    # semantics are supported explicitly.
+    if not isinstance(extra, dict) or extra:
+        raise SystemExit("refusing --extra-body overrides; request fields are protected")
+    context = getattr(args, "context_tokens", None)
+    attempts = getattr(args, "max_attempts", 1)
+    if type(attempts) is not int or not 1 <= attempts <= 6:
+        raise SystemExit("max-attempts must be an integer from 1 to 6")
+    if context is not None and (type(context) is not int or context <= 0):
+        raise SystemExit("context-tokens must be a positive integer")
+    if context is not None and any(it["max_tokens"] > context for it in items):
+        raise SystemExit("output token cap exceeds the endpoint context bound")
+
+    def cost(inputs, outputs):
+        return (inputs * price_in + outputs * price_out) / Decimal(1000000)
+
+    # Reserve the endpoint's whole enforced context as input PLUS the output
+    # cap, n=1. The chars/token ratio never authorizes a request.
+    bounds = [cost(context, it["max_tokens"]) for it in items] if context else []
+    first_pass = sum(bounds, Decimal(0)) if context else cost(volume["input_tokens"], volume["output_tokens_max"])
+    if first_pass > budget:
+        raise SystemExit("refusing: request cost exceeds --budget-usd; no request was sent")
     if args.dry_run:
+        print(json.dumps({"cost_usd": str(first_pass), "bounded": context is not None}))
         return 0
+    if context is None:
+        raise SystemExit("refusing: --context-tokens must specify the endpoint's enforced input/context bound; estimates cannot authorize requests")
     if not args.out:
         raise SystemExit("--out is required unless --dry-run")
     key = os.environ.get(args.api_key_env, "") if args.api_key_env else ""
     headers = {"Content-Type": "application/json", "User-Agent": "arc-quality/1"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
-    extra = json.loads(args.extra_body) if args.extra_body else {}
     url = args.base_url.rstrip("/") + "/chat/completions"
+    reserved = Decimal(0)
     spent_in = spent_out = 0
     cases = []
-    for item in items:
-        body = {
-            "model": args.model,
-            "messages": messages_for(item),
-            "max_tokens": int(item["max_tokens"]),
-            "temperature": 0,
-            "top_p": 1,
-            "stream": False,
-            **extra,
-        }
+    for item, bound in zip(items, bounds):
+        body = {"model": args.model, "messages": messages_for(item),
+                "max_tokens": item["max_tokens"], "n": 1,
+                "temperature": 0, "top_p": 1, "stream": False}
         begin = time.time()
-        reply = post_json(url, body, headers, args.timeout)
-        choice = reply["choices"][0]
+        for attempt in range(attempts):
+            if bound > budget - reserved:
+                raise SystemExit("refusing: request/retry exceeds remaining budget")
+            # Failures may be billed. Never refund reserves, including missing
+            # or lower reported usage; the remaining bound stays conservative.
+            reserved += bound
+            try:
+                reply = post_json(url, body, headers, args.timeout)
+                break
+            except (urllib.error.URLError, TimeoutError):
+                if attempt + 1 == attempts:
+                    raise
+        choices = reply.get("choices", [])
+        if len(choices) != 1:
+            raise RuntimeError("endpoint violated requested n=1; stopping")
         usage = reply.get("usage") or {}
-        spent_in += int(usage.get("prompt_tokens", 0))
-        spent_out += int(usage.get("completion_tokens", 0))
-        cases.append({
-            "id": item["id"],
-            "text": choice["message"].get("content") or "",
-            "finish_reason": choice.get("finish_reason"),
-            "usage": usage,
-            "model": reply.get("model"),
-            "system_fingerprint": reply.get("system_fingerprint"),
-            "seconds": time.time() - begin,
-        })
-        spent = cost_usd(spent_in, spent_out, args.price_in_per_mtok, args.price_out_per_mtok)
-        print(f"{item['id']}: {usage.get('completion_tokens')} tokens, spent ${spent:.4f}", flush=True)
-        if spent > args.budget_usd:
-            print("stopping: the budget is used up")
-            break
+        for field, cap in (("prompt_tokens", context), ("completion_tokens", item["max_tokens"])):
+            value = usage.get(field)
+            if field in usage and (type(value) is not int or not 0 <= value <= cap):
+                raise RuntimeError(f"endpoint violated {field} bound; stopping")
+        spent_in += usage.get("prompt_tokens", 0)
+        spent_out += usage.get("completion_tokens", 0)
+        choice = choices[0]
+        cases.append({"id": item["id"], "text": choice["message"].get("content") or "",
+                      "prompt_tokens": None, "prompt_alignment": "unavailable: provider chat template",
+                      "finish_reason": choice.get("finish_reason"), "usage": usage,
+                      "model": reply.get("model"), "system_fingerprint": reply.get("system_fingerprint"),
+                      "seconds": time.time() - begin})
     run = {
         "schema": RUN_SCHEMA,
-        "engine": {
-            "kind": "openai-compatible",
-            "label": args.label,
-            "base_url": args.base_url,
-            "model": args.model,
-            "decoding": "temperature 0, top_p 1",
-            "extra_body": extra,
-        },
+        "engine": {"kind": "openai-compatible", "label": args.label, "base_url": args.base_url,
+                   "model": args.model, "decoding": "temperature 0, top_p 1, n=1",
+                   "prompt_alignment": "unavailable: provider chat template"},
         "usage": {"prompt_tokens": spent_in, "completion_tokens": spent_out,
-                  "cost_usd": cost_usd(spent_in, spent_out, args.price_in_per_mtok, args.price_out_per_mtok)},
+                  "reported_cost_usd": float(cost(spent_in, spent_out)),
+                  "reserved_cost_usd": str(reserved), "budget_usd": str(budget),
+                  "endpoint_context_tokens": context},
         "cases": cases,
     }
     Path(args.out).write_text(json.dumps(run, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -276,7 +301,10 @@ def add_parsers(sub) -> None:
     p.add_argument("--price-in-per-mtok", type=float)
     p.add_argument("--price-out-per-mtok", type=float)
     p.add_argument("--chars-per-token", type=float, default=3.0)
-    p.add_argument("--extra-body", default="", help="JSON merged into each request (e.g. thinking off)")
+    p.add_argument("--extra-body", default="", help="reserved; nonempty overrides are rejected")
+    p.add_argument("--context-tokens", type=int,
+                   help="endpoint-enforced maximum input/context tokens; required before sending")
+    p.add_argument("--max-attempts", type=int, default=1, help="1..6; each attempt reserves its full cost")
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--dry-run", action="store_true", help="print the volume and cost estimate only")
