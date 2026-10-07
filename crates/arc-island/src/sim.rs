@@ -1655,12 +1655,15 @@ fn controlled_tables(md: &mut String, reports: &[ScenarioReport], checks: &[RttC
          compute, demand, downtime and cost inputs **and the same batch and draft depth**; only the RTT differs. \
          The fixed depths are the adaptive optimum of the group's RTT {} ms, a = 0.7 scenario (modal across its \
          swarms), applied unchanged at every RTT. Plain batches never speculate. 130-node rows are conditional \
-         placement (130 registered nodes in one region), not today's unmeasured fleet.\n",
+         placement (130 registered nodes in one region), not today's unmeasured fleet.\n\n\
+         Single-answer rates use B = 1; per-answer rates at fixed batch use the stated plain/speculative B and k, \
+         and these fixed-batch rates underlie aggregate output, daily tokens and cost per million tokens. \
+         Both rate columns show the median (min–max) across formed swarms.\n",
         REFERENCE_RTT_US / 1000
     );
     let _ = writeln!(
         md,
-        "| Nodes | Uplink | RTT ms | Fixed plain B | Fixed spec B / k | Swarms | Lease available | Per-answer tok/s, plain / spec (k) | Aggregate tok/s, plain / spec | Tokens/day ceiling, spec | Projected tokens/day, spec | USD / million tokens, plain / spec |\n|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "| Nodes | Uplink | RTT ms | Fixed plain B | Fixed spec B / k | Swarms | Lease available | Single-answer tok/s (B = 1), plain / spec (k) | Per-answer tok/s at fixed batch, plain / spec | Aggregate tok/s, plain / spec | Tokens/day ceiling, spec | Projected tokens/day, spec | USD / million tokens, plain / spec |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     );
     for c in checks {
         let mut rows: Vec<(u32, &ScenarioReport)> = reports
@@ -1686,9 +1689,19 @@ fn controlled_tables(md: &mut String, reports: &[ScenarioReport], checks: &[RttC
                 .iter()
                 .map(|x| x.projection.speculative.tok_s)
                 .collect();
+            let mut batch: Vec<f64> = r
+                .rows
+                .iter()
+                .map(|x| x.projection.batch.per_stream_tok_s)
+                .collect();
+            let mut batch_spec: Vec<f64> = r
+                .rows
+                .iter()
+                .map(|x| x.projection.batch_speculative.per_stream_tok_s)
+                .collect();
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} | {} / {} | {} | {} | {} / {} ({}) | {} / {} | {} | {} | {} / {} |",
+                "| {} | {} | {} | {} | {} / {} | {} | {} | {} / {} ({}) | {} / {} | {} / {} | {} | {} | {} / {} |",
                 c.nodes,
                 c.transport,
                 rtt / 1000,
@@ -1704,6 +1717,8 @@ fn controlled_tables(md: &mut String, reports: &[ScenarioReport], checks: &[RttC
                 spread(&mut single),
                 spread(&mut spec),
                 c.speculative.draft_tokens,
+                spread(&mut batch),
+                spread(&mut batch_spec),
                 fmt_big(r.aggregate_tok_s),
                 fmt_big(r.aggregate_tok_s_speculative),
                 fmt_big(r.tokens_per_day_speculative),
@@ -2213,6 +2228,23 @@ mod tests {
         let md = markdown(&reports, 7);
         assert!(md.contains("Controlled RTT comparison (default)"));
         assert!(!md.contains("**NO**"));
+        assert!(md.contains("Single-answer tok/s (B = 1), plain / spec (k)"));
+        assert!(md.contains("Per-answer tok/s at fixed batch, plain / spec"));
+        // Distinct sentinels catch accidental reuse of B=1 values for the
+        // fixed-batch column without changing any performance-model logic.
+        let mut display = reports.clone();
+        for row in &mut display[0].rows {
+            row.projection.single.tok_s = 12.3;
+            row.projection.speculative.tok_s = 23.4;
+            row.projection.batch.per_stream_tok_s = 3.4;
+            row.projection.batch_speculative.per_stream_tok_s = 4.5;
+        }
+        let rendered = markdown(&display, 7);
+        assert!(
+            rendered.contains(
+                "12.3 (12.3–12.3) / 23.4 (23.4–23.4) (1) | 3.4 (3.4–3.4) / 4.5 (4.5–4.5)"
+            )
+        );
     }
 
     #[test]
