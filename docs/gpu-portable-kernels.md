@@ -83,8 +83,37 @@ computes sigma with the shift-subtract divider of int.wgsl instead,
 branch-free, and adds the recovered pairs plus an edge sweep over both
 operands to the self-test as fixed cases, so lavapipe, WARP and every
 volunteer adapter exercise the same inputs (self-test counts become 2,242
-cases at 300 rounds and 198 at 8 rounds). Whether this removes the Metal
-mismatch is decided by the re-run on the Studio, not by this text.
+cases at 300 rounds and 198 at 8 rounds).
+
+**Re-run at commit `7caaeb0a` (lab: TJ's Mac Studio, Apple M2 Ultra, Metal,
+7 October 2026, 06:23 UTC):** all 26 summary rows pass. Known-answer tests:
+2,242 cases, 1,231 refused on both sides, 0 mismatches; 11 tests passed. Tiny
+model: CPU = GPU = GPU with 3 tokens per pass = `98cc9928…0918`; its gpu-check
+self-test 282 cases, 211 refused, 0 mismatches, 488 trace hashes equal. Full
+golden run: matrix digest `3e43f342…49f2`, identical to the CPU golden (every
+logits hash and token; the golden file is the same at both pins); self-test
+198 cases, 170 refused, 0 mismatches; 1,050 trace hashes equal;
+`first_divergence` null. Batched prefill (16 tokens per pass) identical; prefix
+run 4 of 4 with 525 trace hashes equal; package verified. Prefill 393 tokens in
+18.75 s (20.96 tok/s), decode 86 passes in 3.99 s (21.55 tok/s), batched
+prefill 43.88 tok/s; 706 dispatches per pass. On this machine the gated-SiLU
+mismatch is resolved. That says nothing about other GPUs or vendors; the PC
+run (DX12 and Vulkan) is pending.
+
+**CI at the same commit `7caaeb0a`** (the branch was rebased onto `main` on
+7 October after #137 merged, so the commit ids in the table above, `1a28b26d0`
+and `b2f90797b`, are pre-rebase ids; the kernels are unchanged apart from the
+gated-SiLU change). Run
+[37580297266](https://github.com/FerrumVir/arc-chain/actions/runs/37580297266),
+all jobs green: lavapipe known-answer tests 2,242 cases, 1,231 refused on both
+sides, 0 mismatches, 11 tests passed; WARP 1,192 cases, 688 refused, 0
+mismatches; the tiny model identical on both with self-tests 282 cases, 211
+refused, 0 mismatches; the SmolLM3-3B full run on lavapipe with the new sigma
+code gives matrix digest `3e43f342…49f2` again, 5 of 5 cases, self-test 198
+cases, 170 refused, 0 mismatches, 1,050 trace hashes equal, 707 dispatches per
+pass, 0.239 tok/s (software), and the 16-token batched prefill is identical;
+the WARP prefix run matches 4 of 4 passes with 525 trace hashes equal (430 s
+for the first pass on that runner instance, then about 28 s per pass).
 
 **Not yet shown.** The two CI adapters above are software rasterizers for two
 APIs (Vulkan and DX12), on two operating systems, through two shader
@@ -304,8 +333,10 @@ already reserves `--gpu`, the backend name `gpu-wgpu` and
     CPU (§1). Its two `u32` divisions by a per-thread divisor were the only
     native integer divisions in the kernels. Sigma is now computed with the
     same shift-subtract divider as every other quotient, branch-free, and the
-    failing inputs are fixed cases of the self-test. The Studio's re-run
-    decides whether that was the cause.
+    failing inputs are fixed cases of the self-test. The Studio's re-run at
+    `7caaeb0a` (lab, 7 October 2026) reports 0 mismatches in 2,242
+    known-answer cases with the real-model digests unchanged, so on that
+    machine the change resolved it; other GPUs are untested.
 - **Overflow bounds.** Every bound in §2–§3 is either proved in the comments
   of the WGSL or enforced by the host at build time (shape limits) or at run
   time (the status word). Out-of-domain inputs are refused, never wrapped.
