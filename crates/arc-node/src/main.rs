@@ -561,15 +561,15 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     prevent_sleep_during_jobs: bool,
 
-    /// Let the community worker use a GPU for the dyadic integer profile
-    /// (portable WGSL kernels through wgpu: Vulkan, Metal, DX12). OFF by
-    /// default. At startup the worker runs the GPU self-test on the selected
-    /// adapter and uses the GPU only if its digest equals the CPU golden bit
-    /// for bit; otherwise it stays on the CPU and logs why. A GPU that passes
-    /// is recorded in the worker's capabilities (`gpu-wgpu`, API, vendor,
-    /// device, driver) and in `GET /community/worker/status`. Jobs in the
-    /// network's canonical reward profile always run on the CPU: no GPU
-    /// kernels exist for it. See docs/gpu-worker-backend.md.
+    /// Run the GPU self-test for the dyadic integer profile (SmolLM3; portable
+    /// WGSL kernels through wgpu: Vulkan, Metal, DX12) at community-worker
+    /// startup. OFF by default. A GPU passes only if its self-test digest
+    /// equals the CPU golden bit for bit. The result, with the adapter's
+    /// vendor, device, API and driver, is logged and reported locally in
+    /// `GET /community/worker/status`; it is never sent in registration.
+    /// Community jobs use the canonical INT8 reward profile, which has no GPU
+    /// kernels, so they run on the CPU either way. See
+    /// docs/gpu-worker-backend.md.
     #[arg(long, default_value_t = false)]
     gpu_inference: bool,
 
@@ -5406,28 +5406,6 @@ fn community_audience_from_network_info(
 /// trips, signed, to every origin. Coordinators keep only the nearest
 /// validator's coarse region label; no IP or raw round trip is published.
 /// Coordinators without the endpoint answer 404, which is ignored.
-/// Log the GPU gate's decision and publish it on the worker status, with the
-/// capabilities a GPU that passed adds to registration.
-fn record_gpu_backend_decision(
-    status: &arc_node::community_worker::CommunityWorkerStatus,
-    decision: &arc_inference::modern::gpu::backend::BackendDecision,
-) {
-    let capabilities = decision
-        .adapter()
-        .map(arc_node::community_worker::gpu_capabilities)
-        .unwrap_or_default();
-    if decision.uses_gpu() {
-        tracing::info!(
-            reason = %decision.reason,
-            capabilities = ?capabilities,
-            "GPU backend selected for the dyadic profile; canonical reward-profile jobs still run on the CPU"
-        );
-    } else {
-        tracing::warn!(reason = %decision.reason, "GPU backend not used; serving on the CPU");
-    }
-    status.set_inference_backend(decision.to_json(), capabilities);
-}
-
 async fn run_community_region_probe_loop(
     targets: Vec<String>,
     keypair: arc_crypto::KeyPair,
@@ -5522,6 +5500,27 @@ async fn measure_community_origin_rtt(
         validator: format!("0x{}", validator.to_hex()),
         rtt_ms,
     })
+}
+
+/// Log the dyadic-profile GPU gate's decision and keep it in the local worker
+/// status. Jobs (canonical INT8 profile) stay on the CPU and registration is
+/// unchanged whatever it decided.
+fn record_dyadic_gpu_self_test(
+    status: &arc_node::community_worker::CommunityWorkerStatus,
+    decision: &arc_inference::modern::gpu::backend::BackendDecision,
+) {
+    if decision.gpu_eligible() {
+        tracing::info!(
+            reason = %decision.reason,
+            "dyadic-profile GPU self-test passed; community jobs (canonical INT8 profile) still run on the CPU"
+        );
+    } else {
+        tracing::warn!(
+            reason = %decision.reason,
+            "dyadic-profile GPU self-test did not pass; community jobs run on the CPU as always"
+        );
+    }
+    status.record_dyadic_gpu_self_test(decision);
 }
 
 async fn post_signed_community<T: serde::Serialize>(
@@ -9041,6 +9040,7 @@ async fn run_arc_node() -> Result<()> {
         // ── Optional GPU backend (--gpu-inference, default OFF) ──────────
         // The self-test runs off the async runtime; registration picks up the
         // capabilities of a GPU that passed from the next round on.
+        worker_status.set_gpu_inference_requested(cli.gpu_inference);
         if cli.gpu_inference {
             if worker_model.is_some() {
                 let config = arc_inference::modern::gpu::backend::GpuBackendConfig {
@@ -9056,10 +9056,10 @@ async fn run_arc_node() -> Result<()> {
                     })
                     .await
                     {
-                        Ok(decision) => record_gpu_backend_decision(&gate_status, &decision),
+                        Ok(decision) => record_dyadic_gpu_self_test(&gate_status, &decision),
                         Err(error) => tracing::warn!(
                             %error,
-                            "GPU self-test did not complete; the community worker stays on the CPU"
+                            "dyadic-profile GPU self-test did not complete; community jobs run on the CPU as always"
                         ),
                     }
                 }));
@@ -9102,20 +9102,16 @@ async fn run_arc_node() -> Result<()> {
             // black hole and blocked in dispatch_to_community_worker for the
             // full community_dispatch_timeout — 60 s at the desktop's 16-token
             // default — before falling back to local.
-            let capabilities: Vec<String> = if model_name_c.is_some() && model_id_c.is_some() {
-                vec!["inference".to_string()]
-            } else {
-                vec!["relay".to_string()]
-            };
-            let register_payload = rpc::CommunityRegisterRequest {
-                worker_id: worker_id_c.clone(),
-                name: public_worker_name,
-                capabilities,
-                model: model_name_c,
-                model_id: model_id_c,
-                execution_profile: execution_profile_c,
-                platform: platform_c,
-            };
+            //
+            // GPU facts are never registered: jobs run on the CPU, and a GPU
+            // self-test result stays in the local worker status.
+            let register_payload = arc_node::community_worker::registration_request(
+                worker_id_c.clone(),
+                public_worker_name,
+                model_name_c.zip(model_id_c),
+                execution_profile_c,
+                platform_c,
+            );
             let heartbeat_payload = rpc::CommunityHeartbeatRequest {
                 worker_id: worker_id_c,
                 work_completed: None,
@@ -9185,18 +9181,11 @@ async fn run_arc_node() -> Result<()> {
                             true,
                         ),
                     };
-                let round_payload = rpc::CommunityRegisterRequest {
-                    capabilities: arc_node::community_worker::registration_capabilities(
-                        &register_payload.capabilities,
-                        registration_status.inference_backend_capabilities(),
-                    ),
-                    ..register_payload.clone()
-                };
                 let mut set = tokio::task::JoinSet::new();
                 for addr in &targets {
                     let client = client.clone();
                     let addr = addr.clone();
-                    let register_payload = round_payload.clone();
+                    let register_payload = register_payload.clone();
                     let heartbeat_payload = heartbeat_payload.clone();
                     let keypair = registration_keypair.clone();
                     set.spawn(async move {
@@ -9774,6 +9763,7 @@ async fn run_arc_node() -> Result<()> {
                         }
                         let worker_execution_for_compute = worker_execution_permit.clone();
                         status_w.set_state(WorkerState::Computing);
+                        let status_for_compute = status_w.clone();
                         let inference = tokio::task::spawn_blocking(move || {
                             let _worker_execution_permit = worker_execution_for_compute;
                             // Created and dropped on this compute thread (the
@@ -9785,24 +9775,25 @@ async fn run_arc_node() -> Result<()> {
                             // admission immediately before allocating KV state;
                             // even a tokenizer-expanded prompt can only become
                             // a typed worker failure, never an indexing panic.
-                            let (generated, hash) = inference_model
-                                .try_generate(
-                                    &inference_tokens,
-                                    max_tokens,
-                                    &inference_model.config.eos_tokens,
-                                )
-                                .map_err(|error| {
+                            // compute_canonical_job runs it on the backend the
+                            // worker status names for this profile (the CPU).
+                            let job = arc_node::community_worker::compute_canonical_job(
+                                &inference_model,
+                                &inference_tokens,
+                                max_tokens,
+                                &status_for_compute,
+                            )
+                            .map_err(|error| {
                                     let helper_admitted = community_generation_fits_context(
                                         inference_tokens.len(),
                                         max_tokens,
                                         inference_model.config.max_seq,
                                     );
-                                    format!(
-                                        "{error}; worker_context_helper_admitted={helper_admitted}"
-                                    )
-                                })?;
-                            let output_text = inference_model.decode(&generated);
-                            Ok::<_, String>((generated, hash, output_text))
+                                format!(
+                                    "{error}; worker_context_helper_admitted={helper_admitted}"
+                                )
+                            })?;
+                            Ok::<_, String>((job.tokens, job.output_hash, job.text))
                         })
                         .await;
                         status_w.set_state(WorkerState::Polling);

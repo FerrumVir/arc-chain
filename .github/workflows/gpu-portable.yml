@@ -9,7 +9,8 @@ name: GPU portable kernels (bit-exact)
 #   lavapipe  Linux, Mesa lavapipe (Vulkan on llvmpipe): every kernel against
 #             the CPU operators (known-answer tests incl. domain refusals),
 #             the tiny SmolLM3-shaped model CPU vs GPU, the Proof Kit's
-#             gpu-check with per-layer trace hashes.
+#             gpu-check with per-layer trace hashes, and the community
+#             worker's job path offline with --gpu-inference off and on.
 #   warp      Windows, WARP (the DX12 software adapter): the same.
 #   smollm3   (pushes to gpu-portable-* branches, or the `gpu-proof` label)
 #             the real SmolLM3-3B golden prompts on lavapipe and WARP against
@@ -30,6 +31,8 @@ on:
       - 'crates/arc-gpu/**'
       - 'crates/arc-inference/src/modern/**'
       - 'crates/arc-inference/src/bin/arc_modern.rs'
+      - 'crates/arc-node/src/community_worker.rs'
+      - 'docs/gpu-worker-backend.md'
       - 'scripts/arc_modern/golden/**'
       - 'scripts/arc_modern/gpu_tiny_check.sh'
       - 'docs/gpu-portable-kernels.md'
@@ -136,6 +139,8 @@ jobs:
           { vulkaninfo --summary || true; } 2>&1 | tee "$RUNNER_TEMP/evidence/vulkaninfo.txt"
       - name: Every kernel vs the CPU operators, tiny model forward, generation and traces
         run: cargo test --release -p arc-inference --lib --locked modern::gpu -- --test-threads=1 --nocapture
+      - name: Community worker job path offline, --gpu-inference off and on (gate on this adapter)
+        run: cargo test --release -p arc-node --lib --locked community_worker::tests::gpu_inference -- --nocapture
       - name: Build arc-modern
         run: cargo build --release --locked -p arc-inference --bin arc-modern
       - name: Adapters seen by wgpu
