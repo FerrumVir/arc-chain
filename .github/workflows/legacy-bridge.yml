@@ -81,11 +81,17 @@ jobs:
       - name: ShellCheck and Python syntax
         run: |
           shellcheck -S warning tests/legacy-bridge/headless-v07-acceptance.sh tests/legacy-bridge/fake-github/curl
-          python3 -m py_compile tests/legacy-bridge/desktop_v07_harness.py tests/legacy-bridge/snapshot_tree.py
+          python3 -m py_compile tests/legacy-bridge/desktop_v07_harness.py tests/legacy-bridge/snapshot_tree.py tests/legacy-bridge/check_v07_fixtures.py
       - name: The harness reproduces the released v0.7.11 desktop source
         run: |
           git fetch --no-tags --depth=1 origin refs/tags/v0.7.11:refs/tags/v0.7.11
           python3 tests/legacy-bridge/desktop_v07_harness.py check-source --repo .
+      - name: The consent fixtures match every released v0.6.0..v0.7.11 tag
+        run: |
+          for tag in v0.6.0 v0.7.0 v0.7.1 v0.7.2 v0.7.3 v0.7.4 v0.7.5 v0.7.6 v0.7.7 v0.7.10 v0.7.11; do
+            git fetch --no-tags --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+          done
+          python3 tests/legacy-bridge/check_v07_fixtures.py --repo .
 
   build-linux:
     name: build static Linux launcher
@@ -209,6 +215,8 @@ jobs:
           # The bridge release republishes a qualified v0.8 desktop release's
           # latest.json byte for byte. v0.8.10 stands in until the release
           # with the first-launch consent dialog is published.
+          # TODO(v0.8.11-repin): this only proves the v0.7 key accepts a v0.8
+          # bundle; switch the stand-in to v0.8.11 once it is published.
           curl -fsSL --retry 3 -o "$out/latest.json" \
             https://github.com/FerrumVir/arc-chain/releases/download/v0.8.10/latest.json
           python3 - "$out/latest.json" <<'PY'

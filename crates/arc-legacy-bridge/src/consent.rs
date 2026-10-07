@@ -196,12 +196,15 @@ pub fn next_step(
             "Nothing to do now: the next bridge release enables community registration, and then you can opt in to compute.".to_string()
         }
         (LegacyKind::Headless, Compute::Off(_)) => {
+            // The v0.7 no-root fallback passed its model path with literal
+            // quote characters.
             let model = match &invocation.model {
-                Some(model) => format!(" --model {}", model.display()),
+                Some(model) => format!(" --model {}", model.display().to_string().trim_matches('"')),
                 None => " --download-model".to_string(),
             };
+            // Operator commands are recognized only as the first argument.
             format!(
-                "To contribute compute: {}{model} --legacy-bridge-compute on, then restart the node.",
+                "To contribute compute: {} --legacy-bridge-compute on{model}, then restart the node.",
                 layout.launcher.display()
             )
         }
@@ -306,6 +309,168 @@ mod tests {
         let error = verify_and_record_model(&layout, &pins, &model, |_| {}).unwrap_err();
         assert_eq!(exit::code_for(&error), exit::EX_CONFIG);
         assert!(!layout.model_record().exists());
+    }
+
+    /// Every command line a released v0.6.0..=v0.7.11 supervisor starts
+    /// `arc-node` with (`tests/legacy-bridge/check_v07_fixtures.py` checks
+    /// them against each tag).
+    const V07_ARGV: &str = include_str!("../../../tests/legacy-bridge/fixtures/v07-argv.json");
+
+    fn args_of(shape: &serde_json::Value) -> Vec<std::ffi::OsString> {
+        shape["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| std::ffi::OsString::from(arg.as_str().unwrap()))
+            .collect()
+    }
+
+    fn release_in(layout: &Layout) -> crate::release::VerifiedRelease {
+        let dir = layout.releases_dir().join("pinned");
+        crate::release::VerifiedRelease {
+            node: dir.join("arc-node"),
+            cli: dir.join("arc-cli"),
+            genesis: dir.join("genesis.toml"),
+            seeds: dir.join("testnet-seeds.txt"),
+            dir,
+        }
+    }
+
+    fn launch_args(
+        layout: &Layout,
+        invocation: &LegacyInvocation,
+        pins: &Pins,
+        compute: &Compute,
+    ) -> Vec<String> {
+        crate::launch::plan(layout, invocation, pins, &release_in(layout), compute)
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn every_released_v07_command_line_bridges_with_compute_off() {
+        let fixture: serde_json::Value = serde_json::from_str(V07_ARGV).unwrap();
+        let shapes = fixture["shapes"].as_array().unwrap();
+        assert!(shapes.len() >= 19);
+        let mut bridged = 0;
+        for shape in shapes {
+            let name = shape["name"].as_str().unwrap();
+            let expect = &shape["expect"];
+            let parsed = crate::argv::parse(&args_of(shape));
+            if let Some(error) = expect["error"].as_str() {
+                // Refused before anything starts: no node, so no compute.
+                assert_eq!(format!("{:?}", parsed.unwrap_err()), error, "{name}");
+                continue;
+            }
+            let parsed = parsed.unwrap_or_else(|error| panic!("{name}: {error}"));
+            let kind = LegacyKind::from_label(expect["kind"].as_str().unwrap()).unwrap();
+            assert_eq!(parsed.kind, kind, "{name}");
+            assert_eq!(
+                parsed.community_mode,
+                expect["community_mode"].as_bool().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                parsed.model.is_some(),
+                expect["model"].as_bool().unwrap(),
+                "{name}"
+            );
+            if expect["layout_refused"].as_bool() == Some(true) {
+                let temp = TempDir::new("consent-v07-layout");
+                let launcher = temp.path().join(shape["launcher"].as_str().unwrap());
+                fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+                fs::write(&launcher, b"").unwrap();
+                assert!(
+                    crate::layout::resolve(&launcher, &parsed, temp.path()).is_err(),
+                    "{name}"
+                );
+                continue;
+            }
+            if cfg!(windows) && kind == LegacyKind::Headless {
+                // Released v0.7 had no Windows headless installer; the layout
+                // refuses it before anything starts.
+                continue;
+            }
+
+            // Run it through the bridge as installed under a temporary root.
+            let temp = TempDir::new("consent-v07-argv");
+            let root = temp.path().join(".arc");
+            let launcher = fake_arc_dir(&root);
+            let data_dir = match kind {
+                LegacyKind::Desktop => root.clone(),
+                LegacyKind::Headless => root.join("data"),
+            };
+            fs::create_dir_all(&data_dir).unwrap();
+            let invocation = LegacyInvocation { data_dir, ..parsed };
+            let layout = resolve(&launcher, &invocation, temp.path()).unwrap();
+            prepare(&layout).unwrap();
+            let model_body = b"exact pinned model bytes".to_vec();
+            let model = temp.path().join("pinned.gguf");
+            fs::write(&model, &model_body).unwrap();
+
+            // Today's pin and a privacy-safe one: off without consent, even
+            // when v0.7 passed --model and --community-mode.
+            for pins in [Pins::embedded().unwrap(), privacy_safe_pins(&model_body)] {
+                let compute = decide(&layout, &invocation, &pins).unwrap();
+                assert!(!compute.is_on(), "{name}: {}", compute.describe());
+                let args = launch_args(&layout, &invocation, &pins, &compute);
+                for flag in ["--model", "--full-integer-worker"] {
+                    assert!(!args.contains(&flag.to_string()), "{name}: {flag}");
+                }
+                let stake = args.iter().position(|arg| arg == "--stake").unwrap();
+                assert_eq!(args[stake + 1], "0", "{name}");
+                assert!(
+                    !args.iter().any(|arg| arg.contains("validator-seed")),
+                    "{name}"
+                );
+            }
+
+            // Only the owner's own opt-in turns it on, and never under the
+            // v0.7 desktop app, which cannot ask.
+            let pins = privacy_safe_pins(&model_body);
+            write_consent(&layout, true).unwrap();
+            assert!(
+                !decide(&layout, &invocation, &pins).unwrap().is_on(),
+                "{name}"
+            );
+            verify_and_record_model(&layout, &pins, &model, |_| {}).unwrap();
+            let compute = decide(&layout, &invocation, &pins).unwrap();
+            assert_eq!(compute.is_on(), kind == LegacyKind::Headless, "{name}");
+            if compute.is_on() {
+                let args = launch_args(&layout, &invocation, &pins, &compute);
+                assert!(
+                    args.contains(&"--full-integer-worker".to_string()),
+                    "{name}"
+                );
+            }
+            write_consent(&layout, false).unwrap();
+            assert!(
+                !decide(&layout, &invocation, &pins).unwrap().is_on(),
+                "{name}"
+            );
+            bridged += 1;
+        }
+        assert!(bridged >= if cfg!(windows) { 5 } else { 13 });
+    }
+
+    #[test]
+    fn the_compute_hint_is_a_command_the_launcher_accepts() {
+        let temp = TempDir::new("consent-hint");
+        let quoted = PathBuf::from("\"/home/ops/.arc/model.gguf\"");
+        let (layout, invocation) = headless(&temp, Some(quoted));
+        if invocation.kind != LegacyKind::Headless {
+            return;
+        }
+        let mut pins = Pins::embedded().unwrap();
+        pins.node_release.worker_names_privacy_safe = true;
+        let hint = next_step(&layout, &invocation, &pins, &Compute::Off("none".into()));
+        let command = format!(
+            "{} --legacy-bridge-compute on --model /home/ops/.arc/model.gguf,",
+            layout.launcher.display()
+        );
+        assert!(hint.contains(&command), "{hint}");
     }
 
     #[test]
