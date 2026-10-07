@@ -61,6 +61,13 @@ path = "src/bin/arc_modern.rs"
 name = "arc-mla"
 path = "src/bin/arc_mla.rs"
 
+# Islands: one MLA + MoE model across several processes or machines,
+# bit-exact, with per-stage hash commitments (synth, stage, experts,
+# reference, run, bench).
+[[bin]]
+name = "arc-island"
+path = "src/bin/arc_island.rs"
+
 # Examples that load GGUF models or run inference benchmarks against candle-
 # backed tensors pull in candle-core/candle-nn/candle-transformers. Declare
 # required-features so `cargo test --workspace` (default features) skips

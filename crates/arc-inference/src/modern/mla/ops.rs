@@ -561,22 +561,46 @@ pub fn combine(
     shared: &[i64],
     out: &mut [i64],
 ) -> Result<(), ModernError> {
-    if weights.len() != outputs.len()
-        || shared.len() != out.len()
-        || outputs.iter().any(|y| y.len() != out.len())
-    {
+    if shared.len() != out.len() {
         return Err(invalid("combine shape"));
     }
-    for (j, slot) in out.iter_mut().enumerate() {
-        let mut acc: i128 = 0;
+    let partial = routed_partial(weights, outputs, out.len())?;
+    combine_partials(&partial, shared, out)
+}
+
+/// The exact routed sum `sum_e w_e y_ej` (i128 per output feature) over some
+/// of a token's experts: what one device of an expert-parallel group returns.
+/// Partial sums of disjoint expert sets add up to the whole sum exactly.
+pub fn routed_partial(
+    weights: &[i64],
+    outputs: &[Vec<i64>],
+    width: usize,
+) -> Result<Vec<i128>, ModernError> {
+    if weights.len() != outputs.len() || outputs.iter().any(|y| y.len() != width) {
+        return Err(invalid("combine shape"));
+    }
+    let mut partial = vec![0i128; width];
+    for (j, acc) in partial.iter_mut().enumerate() {
         for (&w, y) in weights.iter().zip(outputs) {
-            acc += i128::from(w) * i128::from(y[j]);
+            *acc += i128::from(w) * i128::from(y[j]);
         }
+    }
+    Ok(partial)
+}
+
+/// Finish [`combine`] from the summed routed partials of every device: one
+/// floor shift, then the shared experts.
+pub fn combine_partials(
+    partial: &[i128],
+    shared: &[i64],
+    out: &mut [i64],
+) -> Result<(), ModernError> {
+    if partial.len() != out.len() || shared.len() != out.len() {
+        return Err(invalid("combine shape"));
+    }
+    for ((slot, &acc), &s) in out.iter_mut().zip(partial).zip(shared) {
         let routed = to_activation(acc >> 32, "routed expert sum beyond 2^62")?;
-        *slot = to_activation(
-            i128::from(routed) + i128::from(shared[j]),
-            "MoE output beyond 2^62",
-        )?;
+        *slot = to_activation(i128::from(routed) + i128::from(s), "MoE output beyond 2^62")?;
     }
     Ok(())
 }

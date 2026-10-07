@@ -10,6 +10,7 @@
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -17,8 +18,9 @@ use rayon::prelude::*;
 use super::boundary::activation_hash;
 use super::config::{ExpertFormat, MlaConfig};
 use super::ops::{
-    LatentCache, Q4_GROUP, Q4View, QView, combine, gated_ffn, mla_attend, rope_interleaved,
-    router_logits, routing_weights, select_experts, selection_keys,
+    LatentCache, Q4_GROUP, Q4View, QView, combine, combine_partials, gated_ffn, mla_attend,
+    rope_interleaved, routed_partial, router_logits, routing_weights, select_experts,
+    selection_keys,
 };
 use super::package::{self, StageHeader, StageSpec};
 use crate::modern::ModernError;
@@ -384,6 +386,23 @@ pub enum StageInput<'a> {
     Hidden(&'a [i64]),
 }
 
+/// Expert parallelism (spec §5.6): the routed experts a device does not hold
+/// are evaluated on other devices, which return exact partial sums
+/// `sum_e w_e y_ej`. Integer partial sums add up exactly in any grouping, so
+/// the combined output is the single-device output byte for byte.
+pub trait ExpertPool: Send + Sync {
+    /// Whether routed expert `expert` of layer `layer` lives on another device.
+    fn is_remote(&self, layer: usize, expert: usize) -> bool;
+    /// The exact routed partial sums (`d_model` values) of `experts`
+    /// (`(expert, Q32 weight)` pairs) of layer `layer` at input `x`.
+    fn evaluate(
+        &self,
+        layer: usize,
+        x: &[i64],
+        experts: &[(usize, i64)],
+    ) -> Result<Vec<i128>, ModernError>;
+}
+
 /// A loaded stage package, executing the package's layer range or a
 /// sub-range of it.
 pub struct StageModel {
@@ -396,6 +415,8 @@ pub struct StageModel {
     embed: Option<MatRef>,
     layers: Vec<LayerWeights>,
     head: Option<HeadWeights>,
+    /// Where routed experts this device does not evaluate itself go.
+    experts: Option<Arc<dyn ExpertPool>>,
 }
 
 /// Tokens, digests and timings of one generation (spec §7).
@@ -506,7 +527,66 @@ impl StageModel {
             embed,
             layers,
             head,
+            experts: None,
         })
+    }
+
+    /// Evaluate the routed experts `pool` reports remote on other devices
+    /// (expert parallelism); `None` evaluates every expert here.
+    pub fn set_expert_pool(&mut self, pool: Option<Arc<dyn ExpertPool>>) {
+        self.experts = pool;
+    }
+
+    /// The exact routed partial sums of `experts` (`(expert, Q32 weight)`
+    /// pairs) of MoE layer `layer` at the normalised input `x`: the work one
+    /// device of an expert-parallel group does for another (spec §5.6).
+    pub fn expert_partial(
+        &self,
+        layer: usize,
+        x: &[i64],
+        experts: &[(usize, i64)],
+    ) -> Result<Vec<i128>, ModernError> {
+        let c = self.config();
+        if !self.stage.layers().contains(&layer) {
+            return Err(invalid(format!("layer {layer} is not executed here")));
+        }
+        if x.len() != c.d_model {
+            return Err(invalid("expert input width"));
+        }
+        let FfnWeights::Moe(moe) = &self.layers[layer - self.stage.first_layer].ffn else {
+            return Err(invalid(format!(
+                "layer {layer} is not a mixture-of-experts layer"
+            )));
+        };
+        if experts.iter().any(|&(e, _)| e >= c.n_routed_experts) {
+            return Err(invalid("expert index outside the layer"));
+        }
+        self.routed_sum(moe, x, experts)
+    }
+
+    fn routed_sum(
+        &self,
+        m: &MoeWeights,
+        x: &[i64],
+        experts: &[(usize, i64)],
+    ) -> Result<Vec<i128>, ModernError> {
+        let data = self.bytes.as_slice();
+        let outputs = match &m.experts {
+            ExpertStacks::Int8([gate, up, down]) => experts
+                .iter()
+                .map(|&(e, _)| {
+                    gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            ExpertStacks::Int4([gate, up, down]) => experts
+                .iter()
+                .map(|&(e, _)| {
+                    gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let weights: Vec<i64> = experts.iter().map(|&(_, w)| w).collect();
+        routed_partial(&weights, &outputs, self.config().d_model)
     }
 
     pub fn config(&self) -> &MlaConfig {
@@ -706,12 +786,17 @@ impl StageModel {
                 let [gate, up, down] = &**dense;
                 gated_ffn(gate.view(data, 0), up.view(data, 0), down.view(data, 0), &x)?
             }
-            FfnWeights::Moe(moe) => self.moe_forward(moe, &x)?,
+            FfnWeights::Moe(moe) => self.moe_forward(self.stage.first_layer + local, moe, &x)?,
         };
         add_residual(h, &out)
     }
 
-    fn moe_forward(&self, m: &MoeWeights, x: &[i64]) -> Result<Vec<i64>, ModernError> {
+    fn moe_forward(
+        &self,
+        layer: usize,
+        m: &MoeWeights,
+        x: &[i64],
+    ) -> Result<Vec<i64>, ModernError> {
         let c = self.config();
         let data = self.bytes.as_slice();
         let mut logits = vec![0i64; c.n_routed_experts];
@@ -720,6 +805,9 @@ impl StageModel {
         let chosen = select_experts(&keys, c.n_experts_per_tok, c.n_group, c.topk_group)?;
         let chosen_sigma: Vec<i64> = chosen.iter().map(|&e| sigma[e]).collect();
         let weights = routing_weights(&chosen_sigma, c.routed_scaling_q32, c.norm_topk_prob);
+        if let Some(pool) = &self.experts {
+            return self.moe_forward_parallel(pool.as_ref(), layer, m, x, &chosen, &weights);
+        }
         // Experts run one after another for the same reason as heads: their
         // projections are parallel over rows.
         let outputs = match &m.experts {
@@ -741,6 +829,59 @@ impl StageModel {
         )?;
         let mut out = vec![0i64; c.d_model];
         combine(&weights, &outputs, &shared, &mut out)?;
+        Ok(out)
+    }
+
+    /// The MoE layer with some routed experts on other devices: the remote
+    /// request runs while this device evaluates its own experts and the
+    /// shared experts; the partial sums are then added exactly.
+    fn moe_forward_parallel(
+        &self,
+        pool: &dyn ExpertPool,
+        layer: usize,
+        m: &MoeWeights,
+        x: &[i64],
+        chosen: &[usize],
+        weights: &[i64],
+    ) -> Result<Vec<i64>, ModernError> {
+        let data = self.bytes.as_slice();
+        let (remote, local): (Vec<_>, Vec<_>) = chosen
+            .iter()
+            .copied()
+            .zip(weights.iter().copied())
+            .partition(|&(e, _)| pool.is_remote(layer, e));
+        let (local_sum, shared, remote_sum) = std::thread::scope(|scope| {
+            let request =
+                (!remote.is_empty()).then(|| scope.spawn(|| pool.evaluate(layer, x, &remote)));
+            let local_sum = self.routed_sum(m, x, &local);
+            let [s_gate, s_up, s_down] = &m.shared;
+            let shared = gated_ffn(
+                s_gate.view(data, 0),
+                s_up.view(data, 0),
+                s_down.view(data, 0),
+                x,
+            );
+            let remote_sum = request.map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(invalid("the expert request thread panicked")))
+            });
+            (local_sum, shared, remote_sum)
+        });
+        let mut partial = local_sum?;
+        if let Some(remote_sum) = remote_sum {
+            let remote_sum = remote_sum?;
+            if remote_sum.len() != partial.len() {
+                return Err(invalid("remote expert partial width"));
+            }
+            for (acc, r) in partial.iter_mut().zip(remote_sum) {
+                *acc = acc
+                    .checked_add(r)
+                    .ok_or_else(|| ModernError::Domain("routed expert sum beyond i128".into()))?;
+            }
+        }
+        let mut out = vec![0i64; self.config().d_model];
+        combine_partials(&partial, &shared?, &mut out)?;
         Ok(out)
     }
 
@@ -878,22 +1019,8 @@ impl StageModel {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::super::boundary::{Boundary, BoundarySequence, boundary_digest};
-    use super::super::package::{StageWriter, header_json, layout};
+    use super::super::synthetic;
     use super::*;
-    use crate::modern::arith::ONE;
-
-    /// Deterministic generator for tiny packages.
-    pub(crate) struct Lcg(u64);
-
-    impl Lcg {
-        pub(crate) fn next(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            self.0 >> 33
-        }
-    }
 
     /// A tiny configuration exercising query LoRA (when `lora`), group
     /// routing, a dense first layer and shared experts.
@@ -903,50 +1030,15 @@ pub(crate) mod tests {
 
     /// The tiny configuration with the routed experts in `format`.
     pub(crate) fn tiny_config_with(lora: bool, format: ExpertFormat) -> MlaConfig {
-        MlaConfig {
-            architecture: "deepseek_v3".into(),
-            n_layers: 4,
-            d_model: 32,
-            n_heads: 4,
-            q_lora_rank: if lora { 24 } else { 0 },
-            kv_lora_rank: 16,
-            qk_nope_dim: 8,
-            qk_rope_dim: 4,
-            v_head_dim: 8,
-            d_ff: 48,
-            first_k_dense: 1,
-            n_routed_experts: 8,
-            n_experts_per_tok: 3,
-            n_shared_experts: 2,
-            moe_d_ff: 32,
-            n_group: if lora { 4 } else { 1 },
-            topk_group: if lora { 2 } else { 1 },
-            norm_topk_prob: true,
-            routed_scaling_q32: 10_505_490_006,
-            vocab_size: 50,
-            max_seq: 24,
-            rms_eps_q32: 42_950,
-            rope_theta: 50_000,
-            attention_lambda: crate::modern::tables::attention_lambda(12),
-            expert_format: format,
-        }
+        synthetic::tiny_config(lora, format)
     }
 
     /// How the tiny package's routers are filled.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum TinyRouter {
-        /// Random router rows and biases.
-        Random,
-        /// Expert `2j + 1` gets expert `2j`'s router row, shift and bias, so
-        /// every token's keys tie in pairs and the top-k cut falls in a tie.
-        Paired,
-        /// Zero router rows and biases: every key ties for every token.
-        Flat,
-    }
+    pub(crate) use synthetic::Router as TinyRouter;
 
-    /// Write a random but valid package for `stage` of `c` into memory, with
-    /// the same values whatever the stage (each tensor's content depends on
-    /// its name only), so stages of different layouts are consistent.
+    /// A random but valid package for `stage` of `c`, in memory, with the
+    /// same values whatever the stage (each tensor's content depends on its
+    /// name only), so stages of different layouts are consistent.
     pub(crate) fn tiny_package(c: &MlaConfig, stage: StageSpec) -> Vec<u8> {
         tiny_package_routed(c, stage, TinyRouter::Random)
     }
@@ -957,95 +1049,7 @@ pub(crate) mod tests {
         stage: StageSpec,
         router: TinyRouter,
     ) -> Vec<u8> {
-        let entries = layout(c, stage);
-        let header = header_json(
-            c,
-            &serde_json::json!({"repo": "arc-test/tiny-mla", "revision": "0", "files": []}),
-            stage,
-            &entries,
-        );
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "arc-mla-tiny-{}-{unique}.arcspkg",
-            std::process::id()
-        ));
-        let mut w = StageWriter::create(&path, &header, entries.clone()).unwrap();
-        let (cos, sin) =
-            crate::modern::tables::rope_tables(c.rope_theta, c.qk_rope_dim, c.max_seq).unwrap();
-        for e in &entries {
-            let seed = blake3::hash(e.name.as_bytes());
-            let mut rng = Lcg(u64::from_le_bytes(seed.as_bytes()[..8].try_into().unwrap()));
-            let count = e.shape.iter().product::<usize>();
-            let bytes: Vec<u8> = if e.name == "rope.cos" {
-                crate::modern::package::i32_bytes(&cos)
-            } else if e.name == "rope.sin" {
-                crate::modern::package::i32_bytes(&sin)
-            } else if e.name.ends_with(".q4") {
-                // Any nibble is a valid INT4 value.
-                (0..count).map(|_| rng.next() as u8).collect()
-            } else if e.name.ends_with(".s") {
-                // Positive BF16 group scales near 2^-11.
-                let values: Vec<u16> = (0..count)
-                    .map(|_| (((114 + rng.next() % 3) << 7) | (rng.next() % 128)) as u16)
-                    .collect();
-                super::super::package::u16_bytes(&values)
-            } else if e.name.ends_with(".q") && e.dtype == package::Dtype::I8 {
-                (0..count)
-                    .map(|_| ((rng.next() % 255) as i64 - 127) as i8 as u8)
-                    .collect()
-            } else if e.name.ends_with(".mu") {
-                let values: Vec<i32> = (0..count)
-                    .map(|_| ((1u64 << 30) + rng.next() % (1 << 30)) as i32)
-                    .collect();
-                crate::modern::package::i32_bytes(&values)
-            } else if e.name.ends_with(".k") && !e.name.contains("router") {
-                // Scales mu * 2^-k around 2^-8: projections of +-127 weights
-                // keep activations of order one.
-                (0..count).map(|_| 38 + (rng.next() % 2) as u8).collect()
-            } else if e.name.ends_with("router.q") {
-                let values: Vec<i16> = (0..count)
-                    .map(|_| ((rng.next() % 65_535) as i64 - 32_767) as i16)
-                    .collect();
-                super::super::package::i16_bytes(&values)
-            } else if e.name.ends_with("router.k") {
-                // Router weights q * 2^-k of order 0.1.
-                (0..count).map(|_| 17 + (rng.next() % 3) as u8).collect()
-            } else if e.name.ends_with("router_bias") {
-                let values: Vec<i64> = (0..count)
-                    .map(|_| (rng.next() % (1 << 30)) as i64 - (1 << 29))
-                    .collect();
-                crate::modern::package::i64_bytes(&values)
-            } else {
-                // Norm gains in [0.5, 1.5).
-                let values: Vec<i64> = (0..count)
-                    .map(|_| ONE / 2 + (rng.next() % ONE as u64) as i64)
-                    .collect();
-                crate::modern::package::i64_bytes(&values)
-            };
-            let routing = ["router.q", "router.k", "router_bias"]
-                .iter()
-                .any(|suffix| e.name.ends_with(suffix));
-            let bytes = match router {
-                TinyRouter::Paired if routing => {
-                    let row = bytes.len() / c.n_routed_experts;
-                    let mut paired = bytes;
-                    for expert in (1..c.n_routed_experts).step_by(2) {
-                        paired.copy_within((expert - 1) * row..expert * row, expert * row);
-                    }
-                    paired
-                }
-                TinyRouter::Flat if routing && !e.name.ends_with("router.k") => {
-                    vec![0; bytes.len()]
-                }
-                _ => bytes,
-            };
-            w.write_tensor(&e.name, &bytes).unwrap();
-        }
-        w.finish().unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        bytes
+        synthetic::package_bytes(c, stage, router).unwrap()
     }
 
     /// Per-sequence boundary digests, logits hashes and re-derived tokens.
@@ -1250,7 +1254,7 @@ pub(crate) mod tests {
         let FfnWeights::Moe(moe) = &layer.ffn else {
             panic!("layer 1 is an MoE layer");
         };
-        let single = model.moe_forward(moe, &x).unwrap();
+        let single = model.moe_forward(1, moe, &x).unwrap();
         let mut logits = vec![0i64; c.n_routed_experts];
         router_logits(&moe.router_q, &moe.router_k, &x, &mut logits).unwrap();
         let (sigma, keys) = selection_keys(&logits, &moe.bias).unwrap();
@@ -1502,7 +1506,7 @@ pub(crate) mod tests {
                             assert_eq!(keys[chosen[2]], keys[chosen[2] + 1], "{at}");
                         }
                         assert_eq!(
-                            model.moe_forward(moe, &x).unwrap(),
+                            model.moe_forward(l, moe, &x).unwrap(),
                             routed_by_hand(&model, moe, &x, &chosen, &sigma),
                             "{at}"
                         );

@@ -1,0 +1,137 @@
+name: Island runtime (Kimi islands, part 1)
+
+# Evidence for crates/arc-inference/src/modern/mla/island: one MLA + MoE model
+# (the Kimi K2 text architecture) split across several processes, bit-exact,
+# with per-stage hash commitments. Nothing here changes the network's canonical
+# model, consensus, rewards or native inference, and nothing talks to a node:
+# every process listens on 127.0.0.1.
+#
+#   tests   rustfmt (the island's files), clippy (arc-inference with candle, all
+#           targets, deny warnings), the profile's unit tests (the island proofs
+#           on threads: every split, every schedule, restarts, tampering, expert
+#           parallelism), and tests/island_processes.rs: 1, 2 and 4 stage
+#           processes over TCP and uneven splits against the single process; a
+#           stage killed with SIGKILL mid-generation and restarted from its
+#           activation log; a tampered stage blamed by re-execution; a lying
+#           commitment caught by the link check; experts in another process.
+#   arm64   the unit and process tests on linux arm64 (NEON kernels).
+#   bench   on a CI runner: hop latency (ring pings), 1/2/4-process throughput,
+#           and the emulated-WAN sweep (10/30/60 ms per hop, 20/100 Mbit/s
+#           uplinks, 2/4/8 stages, micro-batch depth 1/4/16, Kimi-sized
+#           activations on the wire); every run is checked byte for byte
+#           against the single process. Then the report, with the Kimi K2
+#           projection labelled as a projection.
+#
+# No macOS job: macOS runners serve the release sequence (work-99 standing
+# rule); the Studio lab numbers are measured locally and committed under
+# docs/island/. Pull requests only, so iterating does not double the runs.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/arc-inference/src/modern/mla/**'
+      - 'crates/arc-inference/src/bin/arc_island.rs'
+      - 'crates/arc-inference/tests/island_processes.rs'
+      - 'crates/arc-inference/Cargo.toml'
+      - 'scripts/arc_island/**'
+      - '.github/workflows/island-runtime.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+
+jobs:
+  tests:
+    name: tests (fmt, clippy, unit, processes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - name: rustfmt (the island's files)
+        run: |
+          rustfmt --check --edition 2024 \
+            crates/arc-inference/src/modern/mla/*.rs \
+            crates/arc-inference/src/modern/mla/island/*.rs \
+            crates/arc-inference/src/bin/arc_island.rs \
+            crates/arc-inference/tests/island_processes.rs
+      - name: Clippy (arc-inference with candle, all targets, deny warnings)
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+      - name: Unit tests (MLA + MoE profile and the island on threads)
+        run: cargo test -p arc-inference --lib --locked modern::mla -- --nocapture
+      - name: Stage processes over TCP
+        run: cargo test -p arc-inference --release --locked --test island_processes -- --nocapture
+
+  arm64:
+    name: tests (linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - name: Unit tests (MLA + MoE profile and the island on threads)
+        run: cargo test -p arc-inference --release --lib --locked modern::mla -- --nocapture
+      - name: Stage processes over TCP
+        run: cargo test -p arc-inference --release --locked --test island_processes -- --nocapture
+
+  bench:
+    name: bench (CI runner) and report
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - name: Build arc-island
+        run: cargo build --release --locked -p arc-inference --bin arc-island
+      - name: Synthetic model, benchmark, report
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/island"
+          mkdir -p "$out"
+          ./target/release/arc-island synth --shape small --out "$out/small.arcspkg" > "$out/synth.json"
+          ./target/release/arc-island bench --package "$out/small.arcspkg" --out "$out/bench-ci.json" \
+            --label "CI runner (GitHub ubuntu-latest)" --kernel simd --threads 1 --stage-threads 1 2> "$out/bench-ci.log"
+          python3 scripts/arc_island/report.py "$out/bench-ci.json" \
+            --out "$out/report-ci.md" --json "$out/projection-ci.json"
+          cat "$out/report-ci.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: island-bench-ci
+          path: |
+            ${{ runner.temp }}/island/*.json
+            ${{ runner.temp }}/island/*.md
+            ${{ runner.temp }}/island/*.log
+          if-no-files-found: warn
