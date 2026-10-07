@@ -1,6 +1,6 @@
 {
-  "hop_overhead_ms": 0.061873666666666674,
-  "hop_overhead_from": "Studio lab",
+  "hop_overhead_ms": 0.06221476666666667,
+  "hop_overhead_from": "CI runner (GitHub ubuntu-latest)",
   "islands": [
     {
       "device": "M3 Ultra 512 GB",
@@ -8,10 +8,10 @@
       "link": "TB5",
       "depth": 1,
       "concurrency": 1,
-      "per_answer_tok_s": 20.394264488624632,
-      "per_answer_at_0_3ms_hop": 20.198084076135974,
-      "per_answer_one_draft": 24.81004749333111,
-      "aggregate_tok_s": 20.394264488624632
+      "per_answer_tok_s": 20.393970266799943,
+      "per_answer_at_0_3ms_hop": 20.19807379548368,
+      "per_answer_one_draft": 24.807761826999823,
+      "aggregate_tok_s": 20.393970266799943
     },
     {
       "device": "M3 Ultra 512 GB",
@@ -19,10 +19,10 @@
       "link": "TB5",
       "depth": 8,
       "concurrency": 16,
-      "per_answer_tok_s": 4.608831879412602,
+      "per_answer_tok_s": 4.607900698935576,
       "per_answer_at_0_3ms_hop": null,
       "per_answer_one_draft": null,
-      "aggregate_tok_s": 73.74131007060163
+      "aggregate_tok_s": 73.72641118296922
     },
     {
       "device": "M3 Ultra 512 GB",
@@ -30,10 +30,10 @@
       "link": "TB5",
       "depth": 32,
       "concurrency": 64,
-      "per_answer_tok_s": 1.57107401814551,
+      "per_answer_tok_s": 1.5706008588656033,
       "per_answer_at_0_3ms_hop": null,
       "per_answer_one_draft": null,
-      "aggregate_tok_s": 100.54873716131264
+      "aggregate_tok_s": 100.51845496739861
     },
     {
       "device": "M3 Ultra 512 GB",
@@ -41,10 +41,10 @@
       "link": "TB5",
       "depth": 1,
       "concurrency": 1,
-      "per_answer_tok_s": 20.340374095826782,
-      "per_answer_at_0_3ms_hop": 19.953783218142508,
-      "per_answer_one_draft": 24.76689838205072,
-      "aggregate_tok_s": 20.340374095826782
+      "per_answer_tok_s": 20.339783139895584,
+      "per_answer_at_0_3ms_hop": 19.95375773635331,
+      "per_answer_one_draft": 24.762325854176453,
+      "aggregate_tok_s": 20.339783139895584
     },
     {
       "device": "M3 Ultra 512 GB",
@@ -52,10 +52,10 @@
       "link": "TB5",
       "depth": 8,
       "concurrency": 32,
-      "per_answer_tok_s": 4.6060740579421235,
+      "per_answer_tok_s": 4.6042081951685425,
       "per_answer_at_0_3ms_hop": null,
       "per_answer_one_draft": null,
-      "aggregate_tok_s": 147.39436985414795
+      "aggregate_tok_s": 147.33466224539336
     },
     {
       "device": "M3 Ultra 512 GB",
@@ -63,10 +63,10 @@
       "link": "TB5",
       "depth": 32,
       "concurrency": 128,
-      "per_answer_tok_s": 1.5707534288415315,
+      "per_answer_tok_s": 1.569804753011131,
       "per_answer_at_0_3ms_hop": null,
       "per_answer_one_draft": null,
-      "aggregate_tok_s": 201.05643889171603
+      "aggregate_tok_s": 200.93500838542477
     },
     {
       "device": "M3 Ultra 512 GB",
@@ -74,10 +74,10 @@
       "link": "10 GbE",
       "depth": 1,
       "concurrency": 1,
-      "per_answer_tok_s": 20.376410619280396,
-      "per_answer_at_0_3ms_hop": 20.180571893966835,
-      "per_answer_one_draft": 24.7957608590478,
-      "aggregate_tok_s": 20.376410619280396
+      "per_answer_tok_s": 20.376043673799224,
+      "per_answer_at_0_3ms_hop": 20.180489791595697,
+      "per_answer_one_draft": 24.779093168360355,
+      "aggregate_tok_s": 20.376043673799224
     },
     {
       "device": "M3 Ultra 512 GB",
@@ -85,10 +85,10 @@
       "link": "10 GbE",
       "depth": 8,
       "concurrency": 16,
-      "per_answer_tok_s": 4.607919464515433,
+      "per_answer_tok_s": 4.600584555196426,
       "per_answer_at_0_3ms_hop": null,
       "per_answer_one_draft": null,
-      "aggregate_tok_s": 73.72671143224693
+      "aggregate_tok_s": 73.60935288314282
     },
     {
       "device": "M3 Ultra 512 GB",
@@ -96,10 +96,10 @@
       "link": "10 GbE",
       "depth": 32,
       "concurrency": 64,
-      "per_answer_tok_s": 1.5709679803718228,
+      "per_answer_tok_s": 1.5672029075550356,
       "per_answer_at_0_3ms_hop": null,
       "per_answer_one_draft": null,
-      "aggregate_tok_s": 100.54195074379666
+      "aggregate_tok_s": 100.30098608352228
     },
     {
       "device": "RTX 5090 32 GB",
@@ -107,10 +107,10 @@
       "link": "25 GbE",
       "depth": 1,
       "concurrency": 1,
-      "per_answer_tok_s": 45.46119303000415,
-      "per_answer_at_0_3ms_hop": 35.47600389875135,
-      "per_answer_one_draft": 56.91428709907983,
-      "aggregate_tok_s": 45.46119303000415
+      "per_answer_tok_s": 45.433698565537554,
+      "per_answer_at_0_3ms_hop": 35.47041320729111,
+      "per_answer_one_draft": 56.4291266130628,
+      "aggregate_tok_s": 45.433698565537554
     },
     {
       "device": "RTX 5090 32 GB",
@@ -118,10 +118,10 @@
       "link": "25 GbE",
       "depth": 8,
       "concurrency": 208,
-      "per_answer_tok_s": 10.975330495156776,
+      "per_answer_tok_s": 10.753863180684313,
       "per_answer_at_0_3ms_hop": null,
       "per_answer_one_draft": null,
-      "aggregate_tok_s": 2282.8687429926094
+      "aggregate_tok_s": 2236.803541582337
     },
     {
       "device": "RTX 5090 32 GB",
@@ -129,10 +129,10 @@
       "link": "25 GbE",
       "depth": 32,
       "concurrency": 832,
-      "per_answer_tok_s": 3.791138213100857,
+      "per_answer_tok_s": 3.6759678633050217,
       "per_answer_at_0_3ms_hop": null,
       "per_answer_one_draft": null,
-      "aggregate_tok_s": 3154.2269932999134
+      "aggregate_tok_s": 3058.405262269778
     }
   ],
   "swarm": [
@@ -143,10 +143,10 @@
       "uplink_mbit": 20,
       "depth": 1,
       "concurrency": 26,
-      "per_answer_tok_s": 1.6770220848365562,
-      "aggregate_tok_s": 43.60257420575046,
-      "aggregate_per_sequence_reads_tok_s": 43.60257420575046,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 1.6621126505205992,
+      "aggregate_tok_s": 43.21492891353558,
+      "aggregate_per_sequence_reads_tok_s": 43.21492891353558,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true
     },
     {
@@ -156,10 +156,10 @@
       "uplink_mbit": 20,
       "depth": 4,
       "concurrency": 104,
-      "per_answer_tok_s": 0.6365990033508585,
-      "aggregate_tok_s": 66.20629634848929,
-      "aggregate_per_sequence_reads_tok_s": 64.98561663210185,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.6280553153886799,
+      "aggregate_tok_s": 65.31775280042271,
+      "aggregate_per_sequence_reads_tok_s": 64.129324217506,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true
     },
     {
@@ -169,10 +169,10 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.18344305084842832,
-      "aggregate_tok_s": 76.31230915294618,
-      "aggregate_per_sequence_reads_tok_s": 74.06628793490775,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.18061195819644138,
+      "aggregate_tok_s": 75.1345746097196,
+      "aggregate_per_sequence_reads_tok_s": 72.95635511368909,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true
     },
     {
@@ -182,10 +182,10 @@
       "uplink_mbit": 20,
       "depth": 64,
       "concurrency": 1664,
-      "per_answer_tok_s": 0.04776207547538931,
-      "aggregate_tok_s": 79.47609359104781,
-      "aggregate_per_sequence_reads_tok_s": 76.74733235122083,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.046964796691273715,
+      "aggregate_tok_s": 78.14942169427947,
+      "aggregate_per_sequence_reads_tok_s": 75.55632810063501,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": false
     },
     {
@@ -195,10 +195,10 @@
       "uplink_mbit": 100,
       "depth": 1,
       "concurrency": 26,
-      "per_answer_tok_s": 2.901518943834004,
-      "aggregate_tok_s": 75.43949253968411,
-      "aggregate_per_sequence_reads_tok_s": 75.43949253968411,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 2.8924812281829264,
+      "aggregate_tok_s": 75.20451193275609,
+      "aggregate_per_sequence_reads_tok_s": 75.20451193275609,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true
     },
     {
@@ -208,10 +208,10 @@
       "uplink_mbit": 100,
       "depth": 4,
       "concurrency": 104,
-      "per_answer_tok_s": 1.772246560152271,
-      "aggregate_tok_s": 184.31364225583619,
-      "aggregate_per_sequence_reads_tok_s": 175.15431628009105,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 1.7589022007007775,
+      "aggregate_tok_s": 182.92582887288089,
+      "aggregate_per_sequence_reads_tok_s": 173.9005391873877,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true
     },
     {
@@ -221,10 +221,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.701796206036402,
-      "aggregate_tok_s": 291.94722171114324,
-      "aggregate_per_sequence_reads_tok_s": 261.5986331740606,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.6934755277677719,
+      "aggregate_tok_s": 288.4858195513931,
+      "aggregate_per_sequence_reads_tok_s": 258.81603881865215,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true
     },
     {
@@ -234,10 +234,10 @@
       "uplink_mbit": 100,
       "depth": 64,
       "concurrency": 1664,
-      "per_answer_tok_s": 0.21373862801198062,
-      "aggregate_tok_s": 355.6610770119358,
-      "aggregate_per_sequence_reads_tok_s": 298.41841693437044,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.21066059064983292,
+      "aggregate_tok_s": 350.539222841322,
+      "aggregate_per_sequence_reads_tok_s": 294.80420556946694,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": false
     },
     {
@@ -247,10 +247,10 @@
       "uplink_mbit": 20,
       "depth": 1,
       "concurrency": 26,
-      "per_answer_tok_s": 0.8958204937559978,
-      "aggregate_tok_s": 23.291332837655943,
-      "aggregate_per_sequence_reads_tok_s": 23.291332837655943,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.8915485265575559,
+      "aggregate_tok_s": 23.18026169049645,
+      "aggregate_per_sequence_reads_tok_s": 23.18026169049645,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true
     },
     {
@@ -260,10 +260,10 @@
       "uplink_mbit": 20,
       "depth": 4,
       "concurrency": 104,
-      "per_answer_tok_s": 0.4782749409634474,
-      "aggregate_tok_s": 49.74059386019854,
-      "aggregate_per_sequence_reads_tok_s": 49.048410595301064,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.4734363296534594,
+      "aggregate_tok_s": 49.23737828395978,
+      "aggregate_per_sequence_reads_tok_s": 48.559034031902186,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true
     },
     {
@@ -273,10 +273,10 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.167468195009833,
-      "aggregate_tok_s": 69.66676912409054,
-      "aggregate_per_sequence_reads_tok_s": 67.79008773798951,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.16510554004975814,
+      "aggregate_tok_s": 68.68390466069938,
+      "aggregate_per_sequence_reads_tok_s": 66.8591089910218,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true
     },
     {
@@ -286,10 +286,10 @@
       "uplink_mbit": 20,
       "depth": 64,
       "concurrency": 1664,
-      "per_answer_tok_s": 0.046939357924562455,
-      "aggregate_tok_s": 78.10709158647192,
-      "aggregate_per_sequence_reads_tok_s": 74.94977140873513,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.046198226968481436,
+      "aggregate_tok_s": 76.8738496755531,
+      "aggregate_per_sequence_reads_tok_s": 73.81349172591723,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": false
     },
     {
@@ -299,10 +299,10 @@
       "uplink_mbit": 100,
       "depth": 1,
       "concurrency": 26,
-      "per_answer_tok_s": 1.1565412475325816,
-      "aggregate_tok_s": 30.07007243584712,
-      "aggregate_per_sequence_reads_tok_s": 30.07007243584712,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 1.15510263309696,
+      "aggregate_tok_s": 30.032668460520963,
+      "aggregate_per_sequence_reads_tok_s": 30.032668460520963,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true
     },
     {
@@ -312,10 +312,10 @@
       "uplink_mbit": 100,
       "depth": 4,
       "concurrency": 104,
-      "per_answer_tok_s": 0.922291776971317,
-      "aggregate_tok_s": 95.91834480501697,
-      "aggregate_per_sequence_reads_tok_s": 93.37720968633103,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.9186646959167003,
+      "aggregate_tok_s": 95.54112837533683,
+      "aggregate_per_sequence_reads_tok_s": 93.01967820925445,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true
     },
     {
@@ -325,10 +325,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.5141612650008104,
-      "aggregate_tok_s": 213.8910862403371,
-      "aggregate_per_sequence_reads_tok_s": 197.13562169303862,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.5096808908754217,
+      "aggregate_tok_s": 212.02725060417544,
+      "aggregate_per_sequence_reads_tok_s": 195.55127941387798,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true
     },
     {
@@ -338,10 +338,10 @@
       "uplink_mbit": 100,
       "depth": 64,
       "concurrency": 1664,
-      "per_answer_tok_s": 0.19235905639609474,
-      "aggregate_tok_s": 320.08546984310163,
-      "aggregate_per_sequence_reads_tok_s": 272.9630422614768,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.1898623977289864,
+      "aggregate_tok_s": 315.93102982103335,
+      "aggregate_per_sequence_reads_tok_s": 269.9359970778605,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": false
     },
     {
@@ -351,10 +351,10 @@
       "uplink_mbit": 20,
       "depth": 1,
       "concurrency": 26,
-      "per_answer_tok_s": 0.5273440912663352,
-      "aggregate_tok_s": 13.710946372924715,
-      "aggregate_per_sequence_reads_tok_s": 13.710946372924715,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.5258607987344293,
+      "aggregate_tok_s": 13.67238076709516,
+      "aggregate_per_sequence_reads_tok_s": 13.67238076709516,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true
     },
     {
@@ -364,10 +364,10 @@
       "uplink_mbit": 20,
       "depth": 4,
       "concurrency": 104,
-      "per_answer_tok_s": 0.3483291864987791,
-      "aggregate_tok_s": 36.226235395873026,
-      "aggregate_per_sequence_reads_tok_s": 35.85769024081972,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.34575558913369214,
+      "aggregate_tok_s": 35.95858126990398,
+      "aggregate_per_sequence_reads_tok_s": 35.59543462271605,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true
     },
     {
@@ -377,10 +377,10 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.1481199925305441,
-      "aggregate_tok_s": 61.61791689270634,
-      "aggregate_per_sequence_reads_tok_s": 60.14524171396633,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.14626871536095531,
+      "aggregate_tok_s": 60.847785590157415,
+      "aggregate_per_sequence_reads_tok_s": 59.41126370033154,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true
     },
     {
@@ -390,10 +390,10 @@
       "uplink_mbit": 20,
       "depth": 64,
       "concurrency": 1664,
-      "per_answer_tok_s": 0.04528148069345552,
-      "aggregate_tok_s": 75.34838387390998,
-      "aggregate_per_sequence_reads_tok_s": 72.40595434915673,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.04459139319174141,
+      "aggregate_tok_s": 74.20007827105769,
+      "aggregate_per_sequence_reads_tok_s": 71.34495112004893,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": false
     },
     {
@@ -403,10 +403,10 @@
       "uplink_mbit": 100,
       "depth": 1,
       "concurrency": 26,
-      "per_answer_tok_s": 0.6080331876508127,
-      "aggregate_tok_s": 15.808862878921131,
-      "aggregate_per_sequence_reads_tok_s": 15.808862878921131,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.6076353251463367,
+      "aggregate_tok_s": 15.798518453804753,
+      "aggregate_per_sequence_reads_tok_s": 15.798518453804753,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true
     },
     {
@@ -416,10 +416,10 @@
       "uplink_mbit": 100,
       "depth": 4,
       "concurrency": 104,
-      "per_answer_tok_s": 0.5364071396471822,
-      "aggregate_tok_s": 55.78634252330695,
-      "aggregate_per_sequence_reads_tok_s": 54.91713997511013,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.5351782160743652,
+      "aggregate_tok_s": 55.65853447173399,
+      "aggregate_per_sequence_reads_tok_s": 54.79327920892452,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true
     },
     {
@@ -429,10 +429,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.3669839129323712,
-      "aggregate_tok_s": 152.66530777986642,
-      "aggregate_per_sequence_reads_tok_s": 143.933561464623,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.36469571147819363,
+      "aggregate_tok_s": 151.71341597492855,
+      "aggregate_per_sequence_reads_tok_s": 143.08714145344757,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true
     },
     {
@@ -442,10 +442,10 @@
       "uplink_mbit": 100,
       "depth": 64,
       "concurrency": 1664,
-      "per_answer_tok_s": 0.16726291754470768,
-      "aggregate_tok_s": 278.3254947943936,
-      "aggregate_per_sequence_reads_tok_s": 241.99893360207565,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.16537201451794023,
+      "aggregate_tok_s": 275.1790321578526,
+      "aggregate_per_sequence_reads_tok_s": 239.61669761509427,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": false
     },
     {
@@ -455,10 +455,10 @@
       "uplink_mbit": 20,
       "depth": 1,
       "concurrency": 12,
-      "per_answer_tok_s": 2.481824864460327,
-      "aggregate_tok_s": 29.78189837352392,
-      "aggregate_per_sequence_reads_tok_s": 29.78189837352392,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 2.4738035877221582,
+      "aggregate_tok_s": 29.685643052665903,
+      "aggregate_per_sequence_reads_tok_s": 29.685643052665903,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true
     },
     {
@@ -468,10 +468,10 @@
       "uplink_mbit": 20,
       "depth": 4,
       "concurrency": 48,
-      "per_answer_tok_s": 0.9654295588047539,
-      "aggregate_tok_s": 46.34061882262819,
-      "aggregate_per_sequence_reads_tok_s": 38.415679130549975,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.9605944512770906,
+      "aggregate_tok_s": 46.108533661300356,
+      "aggregate_per_sequence_reads_tok_s": 38.256049733678466,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true
     },
     {
@@ -481,10 +481,10 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.2908156481847523,
-      "aggregate_tok_s": 55.836604451472446,
-      "aggregate_per_sequence_reads_tok_s": 41.41740875711897,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.2890635406482925,
+      "aggregate_tok_s": 55.50019980447216,
+      "aggregate_per_sequence_reads_tok_s": 41.23202740145359,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true
     },
     {
@@ -494,10 +494,10 @@
       "uplink_mbit": 20,
       "depth": 64,
       "concurrency": 768,
-      "per_answer_tok_s": 0.08560540119495796,
-      "aggregate_tok_s": 65.74494811772772,
-      "aggregate_per_sequence_reads_tok_s": 42.24259824700389,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.08499886048104455,
+      "aggregate_tok_s": 65.27912484944221,
+      "aggregate_per_sequence_reads_tok_s": 42.04980179229774,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": false
     },
     {
@@ -507,10 +507,10 @@
       "uplink_mbit": 100,
       "depth": 1,
       "concurrency": 12,
-      "per_answer_tok_s": 3.4038942689595326,
-      "aggregate_tok_s": 40.84673122751439,
-      "aggregate_per_sequence_reads_tok_s": 40.84673122751439,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 3.4008315508048943,
+      "aggregate_tok_s": 40.80997860965873,
+      "aggregate_per_sequence_reads_tok_s": 40.80997860965873,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true
     },
     {
@@ -520,10 +520,10 @@
       "uplink_mbit": 100,
       "depth": 4,
       "concurrency": 48,
-      "per_answer_tok_s": 1.6688480966933141,
-      "aggregate_tok_s": 80.10470864127907,
-      "aggregate_per_sequence_reads_tok_s": 59.04805820963414,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 1.665939970012089,
+      "aggregate_tok_s": 79.96511856058028,
+      "aggregate_per_sequence_reads_tok_s": 58.972174476172626,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true
     },
     {
@@ -533,10 +533,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.5909348402063341,
-      "aggregate_tok_s": 113.45948931961614,
-      "aggregate_per_sequence_reads_tok_s": 66.45067272837063,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.589481622917133,
+      "aggregate_tok_s": 113.18047160008953,
+      "aggregate_per_sequence_reads_tok_s": 66.35486696714966,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true
     },
     {
@@ -546,10 +546,10 @@
       "uplink_mbit": 100,
       "depth": 64,
       "concurrency": 768,
-      "per_answer_tok_s": 0.21294611574375233,
-      "aggregate_tok_s": 163.5426168912018,
-      "aggregate_per_sequence_reads_tok_s": 68.6007209619022,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.2121926542791085,
+      "aggregate_tok_s": 162.96395848635532,
+      "aggregate_per_sequence_reads_tok_s": 68.49869499132447,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": false
     },
     {
@@ -559,10 +559,10 @@
       "uplink_mbit": 20,
       "depth": 1,
       "concurrency": 12,
-      "per_answer_tok_s": 1.5553809291682228,
-      "aggregate_tok_s": 18.664571150018674,
-      "aggregate_per_sequence_reads_tok_s": 18.664571150018674,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 1.552226657747601,
+      "aggregate_tok_s": 18.62671989297121,
+      "aggregate_per_sequence_reads_tok_s": 18.62671989297121,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true
     },
     {
@@ -572,10 +572,10 @@
       "uplink_mbit": 20,
       "depth": 4,
       "concurrency": 48,
-      "per_answer_tok_s": 0.7838167845960385,
-      "aggregate_tok_s": 37.623205660609855,
-      "aggregate_per_sequence_reads_tok_s": 32.225799301995224,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.7806266909859215,
+      "aggregate_tok_s": 37.47008116732423,
+      "aggregate_per_sequence_reads_tok_s": 32.11339210604801,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true
     },
     {
@@ -585,10 +585,10 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.27184221536880254,
-      "aggregate_tok_s": 52.19370535081009,
-      "aggregate_per_sequence_reads_tok_s": 39.378703911817354,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.27031067037913875,
+      "aggregate_tok_s": 51.89964871279464,
+      "aggregate_per_sequence_reads_tok_s": 39.211086652340974,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true
     },
     {
@@ -598,10 +598,10 @@
       "uplink_mbit": 20,
       "depth": 64,
       "concurrency": 768,
-      "per_answer_tok_s": 0.08388202023607333,
-      "aggregate_tok_s": 64.42139154130432,
-      "aggregate_per_sequence_reads_tok_s": 41.692226998528355,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.08329957199352259,
+      "aggregate_tok_s": 63.974071291025346,
+      "aggregate_per_sequence_reads_tok_s": 41.504410469254516,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": false
     },
     {
@@ -611,10 +611,10 @@
       "uplink_mbit": 100,
       "depth": 1,
       "concurrency": 12,
-      "per_answer_tok_s": 1.8734269373076844,
-      "aggregate_tok_s": 22.481123247692214,
-      "aggregate_per_sequence_reads_tok_s": 22.481123247692214,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 1.8724988172407602,
+      "aggregate_tok_s": 22.46998580688912,
+      "aggregate_per_sequence_reads_tok_s": 22.46998580688912,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true
     },
     {
@@ -624,10 +624,10 @@
       "uplink_mbit": 100,
       "depth": 4,
       "concurrency": 48,
-      "per_answer_tok_s": 1.1915887489278543,
-      "aggregate_tok_s": 57.196259948537,
-      "aggregate_per_sequence_reads_tok_s": 45.588497067096036,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 1.1901053806827044,
+      "aggregate_tok_s": 57.12505827276981,
+      "aggregate_per_sequence_reads_tok_s": 45.54325158326884,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true
     },
     {
@@ -637,10 +637,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.5175356736588178,
-      "aggregate_tok_s": 99.36684934249303,
-      "aggregate_per_sequence_reads_tok_s": 61.354373487066546,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.5164206999602028,
+      "aggregate_tok_s": 99.15277439235894,
+      "aggregate_per_sequence_reads_tok_s": 61.27269043867744,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true
     },
     {
@@ -650,10 +650,10 @@
       "uplink_mbit": 100,
       "depth": 64,
       "concurrency": 768,
-      "per_answer_tok_s": 0.20259222135553787,
-      "aggregate_tok_s": 155.59082600105307,
-      "aggregate_per_sequence_reads_tok_s": 67.160943112527,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.20191013108530828,
+      "aggregate_tok_s": 155.06698067351675,
+      "aggregate_per_sequence_reads_tok_s": 67.06315174857981,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": false
     },
     {
@@ -663,10 +663,10 @@
       "uplink_mbit": 20,
       "depth": 1,
       "concurrency": 12,
-      "per_answer_tok_s": 0.9970792378541611,
-      "aggregate_tok_s": 11.964950854249933,
-      "aggregate_per_sequence_reads_tok_s": 11.964950854249933,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.9957820552307113,
+      "aggregate_tok_s": 11.949384662768535,
+      "aggregate_per_sequence_reads_tok_s": 11.949384662768535,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true
     },
     {
@@ -676,10 +676,10 @@
       "uplink_mbit": 20,
       "depth": 4,
       "concurrency": 48,
-      "per_answer_tok_s": 0.6113185563291487,
-      "aggregate_tok_s": 29.343290703799134,
-      "aggregate_per_sequence_reads_tok_s": 25.95310311108228,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.6093763353760246,
+      "aggregate_tok_s": 29.250064098049183,
+      "aggregate_per_sequence_reads_tok_s": 25.880147236329286,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true
     },
     {
@@ -689,10 +689,10 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.24761028148107558,
-      "aggregate_tok_s": 47.541174044366514,
-      "aggregate_per_sequence_reads_tok_s": 36.671091323065696,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.24633897147223816,
+      "aggregate_tok_s": 47.297082522669726,
+      "aggregate_per_sequence_reads_tok_s": 36.525689218032106,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true
     },
     {
@@ -702,10 +702,10 @@
       "uplink_mbit": 20,
       "depth": 64,
       "concurrency": 768,
-      "per_answer_tok_s": 0.08142323973261568,
-      "aggregate_tok_s": 62.53304811464885,
-      "aggregate_per_sequence_reads_tok_s": 40.89304476186921,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.0808743251909995,
+      "aggregate_tok_s": 62.11148174668762,
+      "aggregate_per_sequence_reads_tok_s": 40.71234398369295,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": false
     },
     {
@@ -715,10 +715,10 @@
       "uplink_mbit": 100,
       "depth": 1,
       "concurrency": 12,
-      "per_answer_tok_s": 1.1188421137141775,
-      "aggregate_tok_s": 13.42610536457013,
-      "aggregate_per_sequence_reads_tok_s": 13.42610536457013,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 1.1185110169615236,
+      "aggregate_tok_s": 13.422132203538283,
+      "aggregate_per_sequence_reads_tok_s": 13.422132203538283,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true
     },
     {
@@ -728,10 +728,10 @@
       "uplink_mbit": 100,
       "depth": 4,
       "concurrency": 48,
-      "per_answer_tok_s": 0.8338783341756348,
-      "aggregate_tok_s": 40.02616004043047,
-      "aggregate_per_sequence_reads_tok_s": 33.97274811021729,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.8331516195544505,
+      "aggregate_tok_s": 39.99127773861362,
+      "aggregate_per_sequence_reads_tok_s": 33.947615599140626,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true
     },
     {
@@ -741,10 +741,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.43625564447290843,
-      "aggregate_tok_s": 83.76108373879842,
-      "aggregate_per_sequence_reads_tok_s": 55.02439709304077,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.43546311918610403,
+      "aggregate_tok_s": 83.60891888373197,
+      "aggregate_per_sequence_reads_tok_s": 54.95869017043677,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true
     },
     {
@@ -754,10 +754,10 @@
       "uplink_mbit": 100,
       "depth": 64,
       "concurrency": 768,
-      "per_answer_tok_s": 0.18882090834215143,
-      "aggregate_tok_s": 145.01445760677228,
-      "aggregate_per_sequence_reads_tok_s": 65.11113442724861,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.18822826161380332,
+      "aggregate_tok_s": 144.55930491940094,
+      "aggregate_per_sequence_reads_tok_s": 65.01921723362098,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": false
     }
   ],
@@ -769,13 +769,13 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.18344305084842832,
-      "aggregate_tok_s": 76.31230915294618,
-      "aggregate_per_sequence_reads_tok_s": 74.06628793490775,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.18061195819644138,
+      "aggregate_tok_s": 75.1345746097196,
+      "aggregate_per_sequence_reads_tok_s": 72.95635511368909,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true,
-      "pipelines_for_1e9_per_day": 152,
-      "devices": 3952
+      "pipelines_for_1e9_per_day": 155,
+      "devices": 4030
     },
     {
       "device": "RTX 5090 32 GB",
@@ -784,13 +784,13 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.701796206036402,
-      "aggregate_tok_s": 291.94722171114324,
-      "aggregate_per_sequence_reads_tok_s": 261.5986331740606,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.6934755277677719,
+      "aggregate_tok_s": 288.4858195513931,
+      "aggregate_per_sequence_reads_tok_s": 258.81603881865215,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true,
-      "pipelines_for_1e9_per_day": 40,
-      "devices": 1040
+      "pipelines_for_1e9_per_day": 41,
+      "devices": 1066
     },
     {
       "device": "RTX 5090 32 GB",
@@ -799,13 +799,13 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.167468195009833,
-      "aggregate_tok_s": 69.66676912409054,
-      "aggregate_per_sequence_reads_tok_s": 67.79008773798951,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.16510554004975814,
+      "aggregate_tok_s": 68.68390466069938,
+      "aggregate_per_sequence_reads_tok_s": 66.8591089910218,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true,
-      "pipelines_for_1e9_per_day": 167,
-      "devices": 4342
+      "pipelines_for_1e9_per_day": 169,
+      "devices": 4394
     },
     {
       "device": "RTX 5090 32 GB",
@@ -814,10 +814,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.5141612650008104,
-      "aggregate_tok_s": 213.8910862403371,
-      "aggregate_per_sequence_reads_tok_s": 197.13562169303862,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.5096808908754217,
+      "aggregate_tok_s": 212.02725060417544,
+      "aggregate_per_sequence_reads_tok_s": 195.55127941387798,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true,
       "pipelines_for_1e9_per_day": 55,
       "devices": 1430
@@ -829,13 +829,13 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.1481199925305441,
-      "aggregate_tok_s": 61.61791689270634,
-      "aggregate_per_sequence_reads_tok_s": 60.14524171396633,
-      "uplink_ceiling_tok_s": 79.47609359104781,
+      "per_answer_tok_s": 0.14626871536095531,
+      "aggregate_tok_s": 60.847785590157415,
+      "aggregate_per_sequence_reads_tok_s": 59.41126370033154,
+      "uplink_ceiling_tok_s": 78.14942169427947,
       "kv_fits": true,
-      "pipelines_for_1e9_per_day": 188,
-      "devices": 4888
+      "pipelines_for_1e9_per_day": 191,
+      "devices": 4966
     },
     {
       "device": "RTX 5090 32 GB",
@@ -844,13 +844,13 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 416,
-      "per_answer_tok_s": 0.3669839129323712,
-      "aggregate_tok_s": 152.66530777986642,
-      "aggregate_per_sequence_reads_tok_s": 143.933561464623,
-      "uplink_ceiling_tok_s": 397.38046795523906,
+      "per_answer_tok_s": 0.36469571147819363,
+      "aggregate_tok_s": 151.71341597492855,
+      "aggregate_per_sequence_reads_tok_s": 143.08714145344757,
+      "uplink_ceiling_tok_s": 390.7471084713973,
       "kv_fits": true,
-      "pipelines_for_1e9_per_day": 76,
-      "devices": 1976
+      "pipelines_for_1e9_per_day": 77,
+      "devices": 2002
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -859,13 +859,13 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.2908156481847523,
-      "aggregate_tok_s": 55.836604451472446,
-      "aggregate_per_sequence_reads_tok_s": 41.41740875711897,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.2890635406482925,
+      "aggregate_tok_s": 55.50019980447216,
+      "aggregate_per_sequence_reads_tok_s": 41.23202740145359,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true,
-      "pipelines_for_1e9_per_day": 208,
-      "devices": 2496
+      "pipelines_for_1e9_per_day": 209,
+      "devices": 2508
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -874,10 +874,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.5909348402063341,
-      "aggregate_tok_s": 113.45948931961614,
-      "aggregate_per_sequence_reads_tok_s": 66.45067272837063,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.589481622917133,
+      "aggregate_tok_s": 113.18047160008953,
+      "aggregate_per_sequence_reads_tok_s": 66.35486696714966,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true,
       "pipelines_for_1e9_per_day": 103,
       "devices": 1236
@@ -889,13 +889,13 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.27184221536880254,
-      "aggregate_tok_s": 52.19370535081009,
-      "aggregate_per_sequence_reads_tok_s": 39.378703911817354,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.27031067037913875,
+      "aggregate_tok_s": 51.89964871279464,
+      "aggregate_per_sequence_reads_tok_s": 39.211086652340974,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true,
-      "pipelines_for_1e9_per_day": 222,
-      "devices": 2664
+      "pipelines_for_1e9_per_day": 224,
+      "devices": 2688
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -904,10 +904,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.5175356736588178,
-      "aggregate_tok_s": 99.36684934249303,
-      "aggregate_per_sequence_reads_tok_s": 61.354373487066546,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.5164206999602028,
+      "aggregate_tok_s": 99.15277439235894,
+      "aggregate_per_sequence_reads_tok_s": 61.27269043867744,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true,
       "pipelines_for_1e9_per_day": 117,
       "devices": 1404
@@ -919,13 +919,13 @@
       "uplink_mbit": 20,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.24761028148107558,
-      "aggregate_tok_s": 47.541174044366514,
-      "aggregate_per_sequence_reads_tok_s": 36.671091323065696,
-      "uplink_ceiling_tok_s": 80.62435500515996,
+      "per_answer_tok_s": 0.24633897147223816,
+      "aggregate_tok_s": 47.297082522669726,
+      "aggregate_per_sequence_reads_tok_s": 36.525689218032106,
+      "uplink_ceiling_tok_s": 79.86199846664962,
       "kv_fits": true,
-      "pipelines_for_1e9_per_day": 244,
-      "devices": 2928
+      "pipelines_for_1e9_per_day": 245,
+      "devices": 2940
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -934,10 +934,10 @@
       "uplink_mbit": 100,
       "depth": 16,
       "concurrency": 192,
-      "per_answer_tok_s": 0.43625564447290843,
-      "aggregate_tok_s": 83.76108373879842,
-      "aggregate_per_sequence_reads_tok_s": 55.02439709304077,
-      "uplink_ceiling_tok_s": 403.1217750257998,
+      "per_answer_tok_s": 0.43546311918610403,
+      "aggregate_tok_s": 83.60891888373197,
+      "aggregate_per_sequence_reads_tok_s": 54.95869017043677,
+      "uplink_ceiling_tok_s": 399.30999233324815,
       "kv_fits": true,
       "pipelines_for_1e9_per_day": 139,
       "devices": 1668
@@ -950,7 +950,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 20,
       "context": 4096,
-      "max_aggregate_tok_s": 78.56890284739319,
+      "max_aggregate_tok_s": 77.32111926021587,
       "concurrency": 832
     },
     {
@@ -959,7 +959,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 20,
       "context": 8192,
-      "max_aggregate_tok_s": 76.31230915294618,
+      "max_aggregate_tok_s": 75.1345746097196,
       "concurrency": 416
     },
     {
@@ -968,7 +968,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 20,
       "context": 32768,
-      "max_aggregate_tok_s": 66.20629634848929,
+      "max_aggregate_tok_s": 65.31775280042271,
       "concurrency": 104
     },
     {
@@ -977,7 +977,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "context": 4096,
-      "max_aggregate_tok_s": 327.9857836706553,
+      "max_aggregate_tok_s": 323.6245726737643,
       "concurrency": 832
     },
     {
@@ -986,7 +986,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "context": 8192,
-      "max_aggregate_tok_s": 291.94722171114324,
+      "max_aggregate_tok_s": 288.4858195513931,
       "concurrency": 416
     },
     {
@@ -995,7 +995,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "context": 32768,
-      "max_aggregate_tok_s": 184.31364225583619,
+      "max_aggregate_tok_s": 182.92582887288089,
       "concurrency": 104
     },
     {
@@ -1004,7 +1004,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 20,
       "context": 4096,
-      "max_aggregate_tok_s": 74.89132221059504,
+      "max_aggregate_tok_s": 73.75677167345837,
       "concurrency": 832
     },
     {
@@ -1013,7 +1013,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 20,
       "context": 8192,
-      "max_aggregate_tok_s": 69.66676912409054,
+      "max_aggregate_tok_s": 68.68390466069938,
       "concurrency": 416
     },
     {
@@ -1022,7 +1022,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 20,
       "context": 32768,
-      "max_aggregate_tok_s": 49.74059386019854,
+      "max_aggregate_tok_s": 49.23737828395978,
       "concurrency": 104
     },
     {
@@ -1031,7 +1031,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 100,
       "context": 4096,
-      "max_aggregate_tok_s": 272.1893793604302,
+      "max_aggregate_tok_s": 269.17898826708256,
       "concurrency": 832
     },
     {
@@ -1040,7 +1040,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 100,
       "context": 8192,
-      "max_aggregate_tok_s": 213.8910862403371,
+      "max_aggregate_tok_s": 212.02725060417544,
       "concurrency": 416
     },
     {
@@ -1049,7 +1049,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 100,
       "context": 32768,
-      "max_aggregate_tok_s": 95.91834480501697,
+      "max_aggregate_tok_s": 95.54112837533683,
       "concurrency": 104
     },
     {
@@ -1058,7 +1058,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 20,
       "context": 4096,
-      "max_aggregate_tok_s": 69.97811570063278,
+      "max_aggregate_tok_s": 68.98655985142793,
       "concurrency": 832
     },
     {
@@ -1067,7 +1067,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 20,
       "context": 8192,
-      "max_aggregate_tok_s": 61.61791689270634,
+      "max_aggregate_tok_s": 60.847785590157415,
       "concurrency": 416
     },
     {
@@ -1076,7 +1076,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 20,
       "context": 32768,
-      "max_aggregate_tok_s": 36.226235395873026,
+      "max_aggregate_tok_s": 35.95858126990398,
       "concurrency": 104
     },
     {
@@ -1085,7 +1085,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 100,
       "context": 4096,
-      "max_aggregate_tok_s": 216.85328967665794,
+      "max_aggregate_tok_s": 214.93819521072928,
       "concurrency": 832
     },
     {
@@ -1094,7 +1094,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 100,
       "context": 8192,
-      "max_aggregate_tok_s": 152.66530777986642,
+      "max_aggregate_tok_s": 151.71341597492855,
       "concurrency": 416
     },
     {
@@ -1103,7 +1103,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 100,
       "context": 32768,
-      "max_aggregate_tok_s": 55.78634252330695,
+      "max_aggregate_tok_s": 55.65853447173399,
       "concurrency": 104
     },
     {
@@ -1112,7 +1112,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 20,
       "context": 4096,
-      "max_aggregate_tok_s": 56.190122298565484,
+      "max_aggregate_tok_s": 55.8494613207577,
       "concurrency": 204
     },
     {
@@ -1121,7 +1121,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 20,
       "context": 8192,
-      "max_aggregate_tok_s": 51.65437320492439,
+      "max_aggregate_tok_s": 51.36628928973986,
       "concurrency": 96
     },
     {
@@ -1130,7 +1130,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 20,
       "context": 32768,
-      "max_aggregate_tok_s": 38.99500898432538,
+      "max_aggregate_tok_s": 38.830410411760184,
       "concurrency": 24
     },
     {
@@ -1139,7 +1139,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "context": 4096,
-      "max_aggregate_tok_s": 114.92876034137869,
+      "max_aggregate_tok_s": 114.64249501589195,
       "concurrency": 204
     },
     {
@@ -1148,7 +1148,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "context": 8192,
-      "max_aggregate_tok_s": 97.43013353032195,
+      "max_aggregate_tok_s": 97.22411198051904,
       "concurrency": 96
     },
     {
@@ -1157,7 +1157,7 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "context": 32768,
-      "max_aggregate_tok_s": 60.42797217511972,
+      "max_aggregate_tok_s": 60.34819211619046,
       "concurrency": 24
     },
     {
@@ -1166,7 +1166,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 20,
       "context": 4096,
-      "max_aggregate_tok_s": 52.70594191937626,
+      "max_aggregate_tok_s": 52.40610515286753,
       "concurrency": 204
     },
     {
@@ -1175,7 +1175,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 20,
       "context": 8192,
-      "max_aggregate_tok_s": 45.7468155026479,
+      "max_aggregate_tok_s": 45.52071389342676,
       "concurrency": 96
     },
     {
@@ -1184,7 +1184,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 20,
       "context": 32768,
-      "max_aggregate_tok_s": 28.05497065633695,
+      "max_aggregate_tok_s": 27.969671987997593,
       "concurrency": 24
     },
     {
@@ -1193,7 +1193,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 100,
       "context": 4096,
-      "max_aggregate_tok_s": 101.24006072283584,
+      "max_aggregate_tok_s": 101.01786026117664,
       "concurrency": 204
     },
     {
@@ -1202,7 +1202,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 100,
       "context": 8192,
-      "max_aggregate_tok_s": 78.34678839325514,
+      "max_aggregate_tok_s": 78.21351349455735,
       "concurrency": 96
     },
     {
@@ -1211,7 +1211,7 @@
       "one_way_ms": 30,
       "uplink_mbit": 100,
       "context": 32768,
-      "max_aggregate_tok_s": 37.66673065539834,
+      "max_aggregate_tok_s": 37.63571719752309,
       "concurrency": 24
     },
     {
@@ -1220,7 +1220,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 20,
       "context": 4096,
-      "max_aggregate_tok_s": 48.220893218319986,
+      "max_aggregate_tok_s": 47.969793329264974,
       "concurrency": 204
     },
     {
@@ -1229,7 +1229,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 20,
       "context": 8192,
-      "max_aggregate_tok_s": 39.04809330249933,
+      "max_aggregate_tok_s": 38.88324062448934,
       "concurrency": 96
     },
     {
@@ -1238,7 +1238,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 20,
       "context": 32768,
-      "max_aggregate_tok_s": 19.7455558196407,
+      "max_aggregate_tok_s": 19.70326436659898,
       "concurrency": 24
     },
     {
@@ -1247,7 +1247,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 100,
       "context": 4096,
-      "max_aggregate_tok_s": 85.89428042919573,
+      "max_aggregate_tok_s": 85.73428294255858,
       "concurrency": 204
     },
     {
@@ -1256,7 +1256,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 100,
       "context": 8192,
-      "max_aggregate_tok_s": 60.55554239541017,
+      "max_aggregate_tok_s": 60.47589317000412,
       "concurrency": 96
     },
     {
@@ -1265,7 +1265,7 @@
       "one_way_ms": 60,
       "uplink_mbit": 100,
       "context": 32768,
-      "max_aggregate_tok_s": 24.068183740581514,
+      "max_aggregate_tok_s": 24.055517431271678,
       "concurrency": 24
     }
   ],
@@ -1278,8 +1278,8 @@
       "target_tok_s": 50,
       "depth": 2,
       "concurrency": 52,
-      "per_answer_tok_s": 1.0853481945420378,
-      "aggregate_tok_s": 56.43810611618596
+      "per_answer_tok_s": 1.0729013116735606,
+      "aggregate_tok_s": 55.79086820702515
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1333,8 +1333,8 @@
       "target_tok_s": 50,
       "depth": 1,
       "concurrency": 26,
-      "per_answer_tok_s": 2.901518943834004,
-      "aggregate_tok_s": 75.43949253968411
+      "per_answer_tok_s": 2.8924812281829264,
+      "aggregate_tok_s": 75.20451193275609
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1344,8 +1344,8 @@
       "target_tok_s": 100,
       "depth": 2,
       "concurrency": 52,
-      "per_answer_tok_s": 2.3919593499815246,
-      "aggregate_tok_s": 124.38188619903927
+      "per_answer_tok_s": 2.3797501879913128,
+      "aggregate_tok_s": 123.74700977554826
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1355,8 +1355,8 @@
       "target_tok_s": 200,
       "depth": 5,
       "concurrency": 130,
-      "per_answer_tok_s": 1.5697782941743086,
-      "aggregate_tok_s": 204.0711782426601
+      "per_answer_tok_s": 1.5567073420913824,
+      "aggregate_tok_s": 202.37195447187972
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1364,10 +1364,10 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "target_tok_s": 300,
-      "depth": 19,
-      "concurrency": 494,
-      "per_answer_tok_s": 0.6111858804716093,
-      "aggregate_tok_s": 301.925824952975
+      "depth": 20,
+      "concurrency": 520,
+      "per_answer_tok_s": 0.578824973723962,
+      "aggregate_tok_s": 300.98898633646024
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1388,8 +1388,8 @@
       "target_tok_s": 50,
       "depth": 5,
       "concurrency": 130,
-      "per_answer_tok_s": 0.41403193425349993,
-      "aggregate_tok_s": 53.82415145295499
+      "per_answer_tok_s": 0.4095035115275982,
+      "aggregate_tok_s": 53.235456498587766
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1443,8 +1443,8 @@
       "target_tok_s": 50,
       "depth": 2,
       "concurrency": 52,
-      "per_answer_tok_s": 1.0660215895768534,
-      "aggregate_tok_s": 55.43312265799638
+      "per_answer_tok_s": 1.0635897169658528,
+      "aggregate_tok_s": 55.30666528222435
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1454,8 +1454,8 @@
       "target_tok_s": 100,
       "depth": 5,
       "concurrency": 130,
-      "per_answer_tok_s": 0.8642798581984672,
-      "aggregate_tok_s": 112.35638156580073
+      "per_answer_tok_s": 0.8603027479393346,
+      "aggregate_tok_s": 111.8393572321135
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1465,8 +1465,8 @@
       "target_tok_s": 200,
       "depth": 14,
       "concurrency": 364,
-      "per_answer_tok_s": 0.5545471409514894,
-      "aggregate_tok_s": 201.85515930634213
+      "per_answer_tok_s": 0.5499841932923937,
+      "aggregate_tok_s": 200.1942463584313
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1498,8 +1498,8 @@
       "target_tok_s": 50,
       "depth": 9,
       "concurrency": 234,
-      "per_answer_tok_s": 0.22266953951852061,
-      "aggregate_tok_s": 52.10467224733382
+      "per_answer_tok_s": 0.2203114419837134,
+      "aggregate_tok_s": 51.552877424188935
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1553,8 +1553,8 @@
       "target_tok_s": 50,
       "depth": 4,
       "concurrency": 104,
-      "per_answer_tok_s": 0.5364071396471822,
-      "aggregate_tok_s": 55.78634252330695
+      "per_answer_tok_s": 0.5351782160743652,
+      "aggregate_tok_s": 55.65853447173399
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1564,8 +1564,8 @@
       "target_tok_s": 100,
       "depth": 9,
       "concurrency": 234,
-      "per_answer_tok_s": 0.44921046332855463,
-      "aggregate_tok_s": 105.11524841888178
+      "per_answer_tok_s": 0.4472774220731512,
+      "aggregate_tok_s": 104.66291676511737
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1573,10 +1573,10 @@
       "one_way_ms": 60,
       "uplink_mbit": 100,
       "target_tok_s": 200,
-      "depth": 27,
-      "concurrency": 702,
-      "per_answer_tok_s": 0.28628827850124233,
-      "aggregate_tok_s": 200.9743715078721
+      "depth": 28,
+      "concurrency": 728,
+      "per_answer_tok_s": 0.27840526208652755,
+      "aggregate_tok_s": 202.67903079899207
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1608,8 +1608,8 @@
       "target_tok_s": 50,
       "depth": 2,
       "concurrency": 88,
-      "per_answer_tok_s": 0.6348167138649679,
-      "aggregate_tok_s": 55.86387082011717
+      "per_answer_tok_s": 0.6233757789134771,
+      "aggregate_tok_s": 54.85706854438598
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1663,8 +1663,8 @@
       "target_tok_s": 50,
       "depth": 1,
       "concurrency": 44,
-      "per_answer_tok_s": 1.7450823031573595,
-      "aggregate_tok_s": 76.78362133892382
+      "per_answer_tok_s": 1.7362814731081528,
+      "aggregate_tok_s": 76.39638481675873
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1674,8 +1674,8 @@
       "target_tok_s": 100,
       "depth": 2,
       "concurrency": 88,
-      "per_answer_tok_s": 1.4414680551088863,
-      "aggregate_tok_s": 126.849188849582
+      "per_answer_tok_s": 1.4295283961943668,
+      "aggregate_tok_s": 125.79849886510426
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1685,8 +1685,8 @@
       "target_tok_s": 200,
       "depth": 5,
       "concurrency": 220,
-      "per_answer_tok_s": 0.9482836813830957,
-      "aggregate_tok_s": 208.62240990428106
+      "per_answer_tok_s": 0.9354538985642549,
+      "aggregate_tok_s": 205.79985768413607
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1694,10 +1694,10 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "target_tok_s": 300,
-      "depth": 17,
-      "concurrency": 748,
-      "per_answer_tok_s": 0.4031720248029947,
-      "aggregate_tok_s": 301.57267455264
+      "depth": 19,
+      "concurrency": 836,
+      "per_answer_tok_s": 0.3609485300365755,
+      "aggregate_tok_s": 301.7529711105771
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1718,8 +1718,8 @@
       "target_tok_s": 50,
       "depth": 5,
       "concurrency": 220,
-      "per_answer_tok_s": 0.2416428801235378,
-      "aggregate_tok_s": 53.16143362717831
+      "per_answer_tok_s": 0.23749621792903267,
+      "aggregate_tok_s": 52.24916794438719
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1773,8 +1773,8 @@
       "target_tok_s": 50,
       "depth": 2,
       "concurrency": 88,
-      "per_answer_tok_s": 0.6354301121458661,
-      "aggregate_tok_s": 55.91784986883622
+      "per_answer_tok_s": 0.6330991584883788,
+      "aggregate_tok_s": 55.712725946977336
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1784,8 +1784,8 @@
       "target_tok_s": 100,
       "depth": 5,
       "concurrency": 220,
-      "per_answer_tok_s": 0.5169196167174931,
-      "aggregate_tok_s": 113.72231567784848
+      "per_answer_tok_s": 0.5130836938591771,
+      "aggregate_tok_s": 112.87841264901894
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1795,8 +1795,8 @@
       "target_tok_s": 200,
       "depth": 14,
       "concurrency": 616,
-      "per_answer_tok_s": 0.33263700758006215,
-      "aggregate_tok_s": 204.90439666931826
+      "per_answer_tok_s": 0.32821865185715543,
+      "aggregate_tok_s": 202.18268954400776
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1804,10 +1804,10 @@
       "one_way_ms": 30,
       "uplink_mbit": 100,
       "target_tok_s": 300,
-      "depth": 46,
-      "concurrency": 2024,
-      "per_answer_tok_s": 0.1488004392374426,
-      "aggregate_tok_s": 301.1720890165838
+      "depth": 50,
+      "concurrency": 2200,
+      "per_answer_tok_s": 0.1365847525363072,
+      "aggregate_tok_s": 300.48645557987584
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1828,8 +1828,8 @@
       "target_tok_s": 50,
       "depth": 9,
       "concurrency": 396,
-      "per_answer_tok_s": 0.12987709014237797,
-      "aggregate_tok_s": 51.43132769638168
+      "per_answer_tok_s": 0.1277198850591258,
+      "aggregate_tok_s": 50.57707448341381
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1883,8 +1883,8 @@
       "target_tok_s": 50,
       "depth": 4,
       "concurrency": 176,
-      "per_answer_tok_s": 0.31903201908463746,
-      "aggregate_tok_s": 56.14963535889619
+      "per_answer_tok_s": 0.3178583943971296,
+      "aggregate_tok_s": 55.94307741389481
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1894,8 +1894,8 @@
       "target_tok_s": 100,
       "depth": 9,
       "concurrency": 396,
-      "per_answer_tok_s": 0.26789939913831967,
-      "aggregate_tok_s": 106.08816205877459
+      "per_answer_tok_s": 0.26604476921320197,
+      "aggregate_tok_s": 105.35372860842797
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1905,8 +1905,8 @@
       "target_tok_s": 200,
       "depth": 27,
       "concurrency": 1188,
-      "per_answer_tok_s": 0.17092250684511354,
-      "aggregate_tok_s": 203.0559381319949
+      "per_answer_tok_s": 0.16867278258065477,
+      "aggregate_tok_s": 200.38326570581788
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1914,10 +1914,10 @@
       "one_way_ms": 60,
       "uplink_mbit": 100,
       "target_tok_s": 300,
-      "depth": 85,
-      "concurrency": 3740,
-      "per_answer_tok_s": 0.08033834895995902,
-      "aggregate_tok_s": 300.4654251102467
+      "depth": 93,
+      "concurrency": 4092,
+      "per_answer_tok_s": 0.07347019411238392,
+      "aggregate_tok_s": 300.640034307875
     },
     {
       "device": "RTX 5090 32 GB",
@@ -1938,8 +1938,8 @@
       "target_tok_s": 50,
       "depth": 7,
       "concurrency": 84,
-      "per_answer_tok_s": 0.6042284625149059,
-      "aggregate_tok_s": 50.755190851252095
+      "per_answer_tok_s": 0.6009167482555929,
+      "aggregate_tok_s": 50.47700685346981
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -1993,8 +1993,8 @@
       "target_tok_s": 50,
       "depth": 2,
       "concurrency": 24,
-      "per_answer_tok_s": 2.517832173963322,
-      "aggregate_tok_s": 60.42797217511972
+      "per_answer_tok_s": 2.514508004841269,
+      "aggregate_tok_s": 60.34819211619046
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2002,10 +2002,10 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "target_tok_s": 100,
-      "depth": 9,
-      "concurrency": 108,
-      "per_answer_tok_s": 0.9274032300679894,
-      "aggregate_tok_s": 100.15954884734286
+      "depth": 10,
+      "concurrency": 120,
+      "per_answer_tok_s": 0.8528940796737026,
+      "aggregate_tok_s": 102.3472895608443
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2048,8 +2048,8 @@
       "target_tok_s": 50,
       "depth": 13,
       "concurrency": 156,
-      "per_answer_tok_s": 0.323035085379132,
-      "aggregate_tok_s": 50.39347331914459
+      "per_answer_tok_s": 0.3212774746631738,
+      "aggregate_tok_s": 50.11928604745511
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2103,8 +2103,8 @@
       "target_tok_s": 50,
       "depth": 4,
       "concurrency": 48,
-      "per_answer_tok_s": 1.1915887489278543,
-      "aggregate_tok_s": 57.196259948537
+      "per_answer_tok_s": 1.1901053806827044,
+      "aggregate_tok_s": 57.12505827276981
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2114,8 +2114,8 @@
       "target_tok_s": 100,
       "depth": 17,
       "concurrency": 204,
-      "per_answer_tok_s": 0.49627480746488156,
-      "aggregate_tok_s": 101.24006072283584
+      "per_answer_tok_s": 0.4951855895155718,
+      "aggregate_tok_s": 101.01786026117664
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2213,8 +2213,8 @@
       "target_tok_s": 50,
       "depth": 6,
       "concurrency": 72,
-      "per_answer_tok_s": 0.7167515451724997,
-      "aggregate_tok_s": 51.60611125241998
+      "per_answer_tok_s": 0.7159474427900651,
+      "aggregate_tok_s": 51.54821588088468
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2268,8 +2268,8 @@
       "target_tok_s": 50,
       "depth": 3,
       "concurrency": 72,
-      "per_answer_tok_s": 0.7121147148756913,
-      "aggregate_tok_s": 51.27225947104977
+      "per_answer_tok_s": 0.7051806644316005,
+      "aggregate_tok_s": 50.773007839075234
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2323,8 +2323,8 @@
       "target_tok_s": 50,
       "depth": 1,
       "concurrency": 24,
-      "per_answer_tok_s": 2.247201706972113,
-      "aggregate_tok_s": 53.93284096733071
+      "per_answer_tok_s": 2.242524200519051,
+      "aggregate_tok_s": 53.82058081245723
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2334,8 +2334,8 @@
       "target_tok_s": 100,
       "depth": 3,
       "concurrency": 72,
-      "per_answer_tok_s": 1.4062071672398782,
-      "aggregate_tok_s": 101.24691604127123
+      "per_answer_tok_s": 1.4007545291485402,
+      "aggregate_tok_s": 100.85432609869488
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2343,10 +2343,10 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "target_tok_s": 200,
-      "depth": 38,
-      "concurrency": 912,
-      "per_answer_tok_s": 0.21935814152432648,
-      "aggregate_tok_s": 200.05462507018575
+      "depth": 40,
+      "concurrency": 960,
+      "per_answer_tok_s": 0.209196357339671,
+      "aggregate_tok_s": 200.82850304608417
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2354,10 +2354,10 @@
       "one_way_ms": 10,
       "uplink_mbit": 100,
       "target_tok_s": 300,
-      "depth": 178,
-      "concurrency": 4272,
-      "per_answer_tok_s": 0.07025659760380237,
-      "aggregate_tok_s": 300.1361849634437
+      "depth": null,
+      "concurrency": null,
+      "per_answer_tok_s": null,
+      "aggregate_tok_s": null
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2378,8 +2378,8 @@
       "target_tok_s": 50,
       "depth": 7,
       "concurrency": 168,
-      "per_answer_tok_s": 0.3009923096888427,
-      "aggregate_tok_s": 50.56670802772558
+      "per_answer_tok_s": 0.29810238107229825,
+      "aggregate_tok_s": 50.081200020146106
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2433,8 +2433,8 @@
       "target_tok_s": 50,
       "depth": 3,
       "concurrency": 72,
-      "per_answer_tok_s": 0.8395369718740469,
-      "aggregate_tok_s": 60.446661974931374
+      "per_answer_tok_s": 0.8375904160792315,
+      "aggregate_tok_s": 60.30650995770466
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2444,8 +2444,8 @@
       "target_tok_s": 100,
       "depth": 8,
       "concurrency": 192,
-      "per_answer_tok_s": 0.546490537668421,
-      "aggregate_tok_s": 104.92618323233685
+      "per_answer_tok_s": 0.544298839930192,
+      "aggregate_tok_s": 104.50537726659685
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2453,10 +2453,10 @@
       "one_way_ms": 30,
       "uplink_mbit": 100,
       "target_tok_s": 200,
-      "depth": 53,
-      "concurrency": 1272,
-      "per_answer_tok_s": 0.15725570933670271,
-      "aggregate_tok_s": 200.02926227628586
+      "depth": 55,
+      "concurrency": 1320,
+      "per_answer_tok_s": 0.15207743814439978,
+      "aggregate_tok_s": 200.74221835060771
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2488,8 +2488,8 @@
       "target_tok_s": 50,
       "depth": 13,
       "concurrency": 312,
-      "per_answer_tok_s": 0.16241129959012557,
-      "aggregate_tok_s": 50.67232547211918
+      "per_answer_tok_s": 0.16084888983258103,
+      "aggregate_tok_s": 50.18485362776528
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2543,8 +2543,8 @@
       "target_tok_s": 50,
       "depth": 5,
       "concurrency": 120,
-      "per_answer_tok_s": 0.4606050241233513,
-      "aggregate_tok_s": 55.272602894802155
+      "per_answer_tok_s": 0.4596294359139124,
+      "aggregate_tok_s": 55.15553230966949
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2554,8 +2554,8 @@
       "target_tok_s": 100,
       "depth": 14,
       "concurrency": 336,
-      "per_answer_tok_s": 0.30576445616090725,
-      "aggregate_tok_s": 102.73685727006483
+      "per_answer_tok_s": 0.30456424482463557,
+      "aggregate_tok_s": 102.33358626107754
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2563,10 +2563,10 @@
       "one_way_ms": 60,
       "uplink_mbit": 100,
       "target_tok_s": 200,
-      "depth": 71,
-      "concurrency": 1704,
-      "per_answer_tok_s": 0.117587467610684,
-      "aggregate_tok_s": 200.36904480860554
+      "depth": 73,
+      "concurrency": 1752,
+      "per_answer_tok_s": 0.1146591916355683,
+      "aggregate_tok_s": 200.88290374551568
     },
     {
       "device": "Mac 64 GB (M4 Pro)",
@@ -2591,6 +2591,6 @@
       "aggregate_tok_s": null
     }
   ],
-  "aggregate_error_steady_median": -0.03077597208869348,
-  "aggregate_error_wall_median": -0.07703706486600626
+  "aggregate_error_steady_median": -0.028168344948247763,
+  "aggregate_error_wall_median": -0.07364822781143285
 }

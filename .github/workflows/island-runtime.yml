@@ -112,6 +112,8 @@ jobs:
         with:
           shared-key: clippy
           save-if: false
+      - name: Projection accounting regressions
+        run: python3 -m unittest discover -s scripts/arc_island -p 'test_*.py'
       - name: Build arc-island
         run: cargo build --release --locked -p arc-inference --bin arc-island
       - name: Synthetic model, benchmark, report

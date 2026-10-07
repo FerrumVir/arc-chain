@@ -1,0 +1,19 @@
+{
+  "published_runtime_sha": "962b640a6207f917289a10fd25c7e9e5129687d5",
+  "no_new_measurement": true,
+  "ci_run": "https://github.com/FerrumVir/arc-chain/actions/runs/37635536328",
+  "files": {
+    "studio-kimi-mini.json": {
+      "sha256": "d223dee4611ed859d3414121252ab43e8185c6f5b97f03603f5d14c3b885b796",
+      "label": "Studio lab"
+    },
+    "studio-small.json": {
+      "sha256": "24a6090914e9897572f9e180a3255d18f23293e1b3a656fa359211f5b8fdc0f8",
+      "label": "Studio lab"
+    },
+    "ci-small-962b640a.json": {
+      "sha256": "a42363c5484fb0fbc1043b9e1dac992b4006b80079865d78cc79f1eea34b6cfc",
+      "label": "CI runner (GitHub ubuntu-latest)"
+    }
+  }
+}

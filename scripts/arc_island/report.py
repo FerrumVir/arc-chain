@@ -83,10 +83,13 @@ def kimi_step_seconds(b, stages, device, batched=True):
 
 def kimi_wire_bytes(stages):
     """Bytes per position on the busiest uplink: the i32 activation plus the
-    commitments the frame has accumulated by the second-to-last stage (32 B
-    per boundary covered so far, plus one input hash per stage; an upper
-    bound of 32 B x (layers + stages))."""
-    return KIMI_ACTIVATION_BYTES + 32 * (KIMI_LAYERS + stages)
+    full accumulated stage records, item fields and length-prefix/Step framing.
+    This envelope conservatively includes all stages even on earlier hops."""
+    # Conservative full-record envelope per decode item: all stages' hashes
+    # (including duplicated shared boundaries), record headers, head logits /
+    # selected token, item fields and a whole length-prefix/Step header per position.
+    # Actual early hops carry fewer records; the last carries no activation.
+    return KIMI_ACTIVATION_BYTES + 32 * (KIMI_LAYERS + stages) + 17 * stages + 36 + 39 + 17
 
 
 def kv_fit(device, stages, concurrent, context=KV_CONTEXT):
@@ -261,9 +264,15 @@ def wan_targets_section(b):
                  "aggregate tok/s"], rows))
 
 
-def island_answer(device, stages, h, positions=1):
-    """Single-stream round time of a pipeline island (G = 1, b = positions)."""
-    return round_seconds(stages, 1, kimi_step_seconds(positions, stages, device), 0.0, h, 0.0)
+def island_answer(device, stages, hop, wire_bps, positions=1):
+    """Single-stream verify round, including transfer of every position.
+
+    Charge the full-record envelope on every hop, conservatively including
+    the return hop where the runtime actually sends commitments only.
+    """
+    transfer = positions * kimi_wire_bytes(stages) * 8 / wire_bps
+    return round_seconds(stages, 1, kimi_step_seconds(positions, stages, device),
+                         0.0, hop + transfer, 0.0)
 
 
 def projection(benches, errors):
@@ -283,12 +292,13 @@ def projection(benches, errors):
         "and no real network were run.",
         f"Inputs: the measured software cost per hop, {fmt(o_ms * 1000, 1)} µs ({label}, loopback TCP, 28 KiB frame; "
         f"the larger of the measured hosts); research-6's memory bandwidths (456 GB/s M3 Ultra, 1,108 GB/s RTX 5090), "
-        "which ARC's engine does not reach (1.4–2.7 GB/s measured); batched weight reads across a micro-batch's "
+        "which ARC's engine does not reach (see the measured host-specific bandwidths above); batched weight reads across a micro-batch's "
         "sequences, which this runtime does not have (the swarm table also shows per-sequence reads); and "
         f"**{KV_CONTEXT} tokens of context per sequence** (sensitivity table below).",
         "**Aggregates are optimistic.** The same model, fed with measured costs, put the emulated-WAN steady-state "
-        f"aggregate at a median {fmt(100 * median(steady), 1) if steady else '–'}% from measured, and wall-clock "
-        f"aggregate (with prefill and fill/drain) at a median {fmt(100 * median(wall), 1) if wall else '–'}%. Read "
+        f"aggregate error at a median {fmt(100 * median(steady), 1) if steady else '–'}%, and wall-clock "
+        f"aggregate error (with prefill and fill/drain) at a median {fmt(100 * median(wall), 1) if wall else '–'}%, "
+        "using (measured − predicted) / predicted. Read "
         "every projected aggregate below as an upper bound.",
     ]
 
@@ -298,17 +308,16 @@ def projection(benches, errors):
         ("M3 Ultra 512 GB", 2, "TB5", 80e9), ("M3 Ultra 512 GB", 4, "TB5", 80e9),
         ("M3 Ultra 512 GB", 2, "10 GbE", 10e9), ("RTX 5090 32 GB", 26, "25 GbE", 25e9),
     ]:
-        wire = kimi_wire_bytes(stages) * 8 / wire_bps
-        h = o + wire
         for b in [1, 8, 32]:
             g = stages if b > 1 else 1
             step = kimi_step_seconds(b, stages, device)
-            t = round_seconds(stages, g, step, 0.0, h, 0.0)
+            transfer = b * kimi_wire_bytes(stages) * 8 / wire_bps
+            t = round_seconds(stages, g, step, 0.0, o + transfer, 0.0)
             answer, agg = 1 / t, g * b / t
             slow = draft = None
             if b == 1:
-                slow = 1 / island_answer(device, stages, RESEARCH_HOP_S + wire)
-                draft = DRAFT_TOKENS_PER_PASS / island_answer(device, stages, h, positions=2)
+                slow = 1 / island_answer(device, stages, RESEARCH_HOP_S, wire_bps)
+                draft = DRAFT_TOKENS_PER_PASS / island_answer(device, stages, o, wire_bps, positions=2)
             fits, kv, free = kv_fit(device, stages, g * b)
             rows.append([device, stages, link, b, g * b, answer, slow, draft, agg,
                          "yes" if fits else f"no ({fmt(kv, 1)} > {fmt(free, 1)} GB)"])
@@ -319,7 +328,9 @@ def projection(benches, errors):
               "\"0.3 ms hop\" replaces the measured loopback hop with research-6's streaming-transport hop (a real NIC, "
               "driver and GPU copies). \"1 draft\" is the model's verify pass over 2 positions (one draft token) at "
               f"{DRAFT_TOKENS_PER_PASS} tokens accepted per pass — DeepSeek-V3's MTP acceptance, ASSUMED: Kimi has no "
-              "MTP head, and the drafter's acceptance and cost are not modelled.")
+              "MTP head; acceptance is unknown and draft generation cost is assumed zero. Transfer scales with "
+              "the number of positions, including the two-position verify pass. Full-record wire envelopes "
+              "are charged on every hop, conservatively including the return hop.")
     md.append(table(["devices", "stages", "link", "depth", "concurrent", "per answer tok/s", "at 0.3 ms hop",
                      "1 draft", "aggregate tok/s", "KV fits"], rows))
 
@@ -345,9 +356,11 @@ def projection(benches, errors):
                                          "aggregate_tok_s": agg, "aggregate_per_sequence_reads_tok_s": agg_seq,
                                          "uplink_ceiling_tok_s": ceiling, "kv_fits": fits})
     md.append("**Swarm pipeline across homes (T2-batch), PROJECTION**. G = stages micro-batches of `depth`. Uplink "
-              "ceiling = uplink ÷ (bytes per position × 8), with the activation (28,672 B) plus accumulated "
-              "commitments (up to 32 B × (61 + stages)) on the busiest uplink: every token crosses every stage's "
-              "uplink, so no schedule can exceed it. \"Per-sequence reads\" = the same with every sequence reading "
+              "modeled payload cap = uplink ÷ (bytes per position × 8), using a conservative envelope: activation "
+              "28,672 B + hashes 32 × (61 + stages) + stage headers 17 × stages + head logits/token 36 B "
+              "+ item fields 39 B + length-prefix/Step header 17 B per position. Early hops carry fewer commitments; "
+              "the return hop has no activation. This is a model capacity estimate, not an exact wire trace; "
+              "TLS/IP overhead is excluded. \"Per-sequence reads\" = the same with every sequence reading "
               f"its own weights (this runtime today). KV fits = the MLA cache at {KV_CONTEXT} tokens of context fits "
               "beside the device's share of the 582 GB of weights.")
     md.append(table(["devices", "stages", "one-way ms", "uplink Mbit/s", "depth", "concurrent", "per answer tok/s",
