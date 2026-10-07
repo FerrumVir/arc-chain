@@ -6,7 +6,8 @@
 //! native inference.
 //!
 //! Subcommands (run with no arguments for usage): convert, verify, inspect,
-//! golden, stage, ppl, tokenize, render.
+//! golden, stage, ppl, tokenize, render, and the weight-slice commands
+//! slice-plan, slice, slice-manifest, slice-verify, slice-assemble.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,6 +21,7 @@ use arc_inference::modern::mla::config::ExpertFormat;
 use arc_inference::modern::mla::convert::{self, blake3_hex};
 use arc_inference::modern::mla::model::{StageInput, StageModel};
 use arc_inference::modern::mla::package::{self, StageSpec};
+use arc_inference::modern::mla::slices::{self, SliceManifest, SliceSource};
 use arc_inference::modern::mla::{RUN_SCHEMA, STAGE_RUN_SCHEMA};
 use arc_inference::modern::model::GenerationRequest;
 use arc_inference::modern::tiktoken::{
@@ -43,6 +45,24 @@ const USAGE: &str = "usage: arc-mla <command> [options]
             [--window N] [--max-tokens N] [--kernel scalar|simd] [--threads N]
   tokenize  --tokenizer-dir DIR --input IN.jsonl --out OUT.jsonl [--special-tokens N]
   render    --user TEXT [--system TEXT]
+
+  slice-plan     --source-dir DIR --source-manifest SRC.json --out PLAN.json
+                 [UNITS] [--expert-groups G] [--experts i8|i4g32]
+  slice          --source-dir DIR --source-manifest SRC.json --out-dir SLICES
+                 [UNITS] [--expert-groups G] [--experts i8|i4g32] [--report OUT.json] [--threads N]
+                 [--discard]
+  slice-manifest --source-dir DIR --source-manifest SRC.json --out-dir SLICES --out MANIFEST.json
+                 [--expert-groups G] [--experts i8|i4g32]
+  slice-verify   --manifest MANIFEST.json --slices SLICES [--only NAME[,NAME..]] [--segments]
+  slice-assemble --manifest MANIFEST.json --slices SLICES --out PKG [--layers A:B]
+
+UNITS selects what to slice: --layers A:B, --embed, --head (everything when
+none is given). A slice is a segment (embed, a dense layer, head) or, for an
+MoE layer, its core (attention, norms, router, shared experts) and G groups of
+its routed experts. Slices are files named by their BLAKE3 (spec section 14).
+Experts default to i4g32 for checkpoints that ship INT4 experts (repacked,
+never requantised) and to i8 otherwise. `slice --discard` hashes the slices
+and writes the unit records without storing the slice files.
 
 A package holds a layer range [A, B) of the model (the whole model when
 converted without --layers). Its routed experts are INT8 dyadic rows, or with
@@ -772,6 +792,157 @@ fn cmd_render(args: &Args) -> Result<(), ModernError> {
     Ok(())
 }
 
+fn slice_source(args: &Args) -> Result<SliceSource, ModernError> {
+    let experts = args
+        .value("--experts")
+        .map(|e| ExpertFormat::parse(&e))
+        .transpose()?;
+    SliceSource::open(
+        &args.path("--source-dir")?,
+        &args.path("--source-manifest")?,
+        experts,
+        args.number("--expert-groups", 1)?,
+    )
+}
+
+fn slice_units(args: &Args, src: &SliceSource) -> Result<Vec<slices::Unit>, ModernError> {
+    let layers = args
+        .value("--layers")
+        .map(|s| StageSpec::parse(&s))
+        .transpose()?;
+    slices::select_units(
+        &src.config,
+        layers,
+        args.flag("--embed"),
+        args.flag("--head"),
+    )
+}
+
+fn cmd_slice_plan(args: &Args) -> Result<(), ModernError> {
+    let src = slice_source(args)?;
+    let units = slice_units(args, &src)?;
+    let plan = slices::plan(&src, &args.path("--source-dir")?, &units)?;
+    write_json(&args.path("--out")?, &plan)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&plan).unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn cmd_slice(args: &Args) -> Result<(), ModernError> {
+    let threads = configure_threads(args)?;
+    let start = Instant::now();
+    let src = slice_source(args)?;
+    let units = slice_units(args, &src)?;
+    let out = args.path("--out-dir")?;
+    std::fs::create_dir_all(&out)
+        .map_err(|e| ModernError::Io(format!("{}: {e}", out.display())))?;
+    let report = slices::convert_units(
+        &src,
+        &args.path("--source-dir")?,
+        &units,
+        &out,
+        args.flag("--discard"),
+    )?;
+    let units_json: Vec<Value> = report
+        .records
+        .iter()
+        .zip(&report.seconds)
+        .map(|(r, (_, seconds))| {
+            json!({
+                "unit": r.unit.name(),
+                "segment": r.segment.to_json(),
+                "slices": r.slices.len(),
+                "slice_bytes": r.slices.iter().map(|s| s.bytes).sum::<u64>(),
+                "seconds": seconds,
+            })
+        })
+        .collect();
+    let summary = json!({
+        "profile": src.config.profile(),
+        "expert_groups": src.expert_groups,
+        "pending": src.hf.pending,
+        "units": units_json,
+        "shards_read": report.shards_read,
+        "seconds": start.elapsed().as_secs_f64(),
+        "threads": threads,
+        "platform": platform(),
+    });
+    if let Some(path) = args.value("--report") {
+        write_json(Path::new(&path), &summary)?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn cmd_slice_manifest(args: &Args) -> Result<(), ModernError> {
+    let src = slice_source(args)?;
+    let records = slices::read_records(&src, &args.path("--out-dir")?)?;
+    if records.is_empty() {
+        return Err(ModernError::Invalid("no unit records in --out-dir".into()));
+    }
+    let manifest = slices::build_manifest(&src, &records)?;
+    let path = args.path("--out")?;
+    let text = arc_inference::modern::package::manifest_text(&manifest)?;
+    std::fs::write(&path, format!("{text}\n"))
+        .map_err(|e| ModernError::Io(format!("{}: {e}", path.display())))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "manifest_blake3": manifest["manifest_blake3"],
+            "complete": manifest["complete"],
+            "model_root": manifest["model_root"],
+            "pending": manifest["pending"],
+            "segments": manifest["segments"].as_array().map_or(0, Vec::len),
+            "slices": manifest["slices"].as_array().map_or(0, Vec::len),
+        }))
+        .unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn cmd_slice_verify(args: &Args) -> Result<(), ModernError> {
+    let manifest = SliceManifest::read(&args.path("--manifest")?)?;
+    let only: Vec<String> = args
+        .value("--only")
+        .map(|s| s.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    let report = slices::verify_slices(
+        &manifest,
+        &args.path("--slices")?,
+        &only,
+        args.flag("--segments"),
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn cmd_slice_assemble(args: &Args) -> Result<(), ModernError> {
+    let manifest = SliceManifest::read(&args.path("--manifest")?)?;
+    let stage = match args.value("--layers") {
+        Some(text) => StageSpec::parse(&text)?,
+        None => StageSpec::full(&manifest.config()?),
+    };
+    let report = slices::assemble_stage(
+        &manifest,
+        &args.path("--slices")?,
+        stage,
+        &args.path("--out")?,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let items: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = items.first().cloned() else {
@@ -788,6 +959,11 @@ fn main() -> ExitCode {
         "ppl" => cmd_ppl(&args),
         "tokenize" => cmd_tokenize(&args),
         "render" => cmd_render(&args),
+        "slice-plan" => cmd_slice_plan(&args),
+        "slice" => cmd_slice(&args),
+        "slice-manifest" => cmd_slice_manifest(&args),
+        "slice-verify" => cmd_slice_verify(&args),
+        "slice-assemble" => cmd_slice_assemble(&args),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

@@ -19,6 +19,9 @@
 //! * [`package`]: stage packages (any contiguous layer range), segment
 //!   digests, the layout-independent model root, and the stage manifest;
 //! * [`convert`]: BF16 safetensors to stage packages, integer-only;
+//! * [`slices`]: the same weights as content-addressed slices (a layer, or a
+//!   group of its routed experts), converted one source shard at a time,
+//!   including checkpoints that ship pre-quantised INT4 experts (Kimi K2.6);
 //! * [`model`]: the stage forward pass, generation, and teacher-forced stage
 //!   runs;
 //! * [`boundary`]: the serialised stage-boundary activations and their hashes.
@@ -31,6 +34,7 @@ pub mod convert;
 pub mod model;
 pub mod ops;
 pub mod package;
+pub mod slices;
 
 /// Arithmetic profile implemented by this module.
 pub const PROFILE: &str = "arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1";
