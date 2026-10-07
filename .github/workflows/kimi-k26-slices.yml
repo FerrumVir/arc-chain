@@ -16,7 +16,9 @@ name: Kimi-K2.6 weight slices (streamed per shard)
 #          through scripts/arc_mla/slice_checks.sh: streamed = all shards,
 #          1 thread = all threads, expert groups change slices not segments,
 #          Rust = the independent Python preparer, packed = the BF16 twin's
-#          i4g32 conversion, slices reassemble the converter's package.
+#          i4g32 conversion, slices reassemble the converter's package,
+#          which executes through scalar/SIMD and 1/2/4 file-backed stages.
+#          YaRN and incompatible i8 conversion fail before package output.
 #
 # Real-shard jobs (label kimi-slices-proof on the pull request, or a push whose
 # head commit message contains [kimi-slices]):
@@ -60,6 +62,7 @@ on:
       - 'scripts/arc_mla/stream_slices.py'
       - 'scripts/arc_mla/tests/**'
       - 'scripts/arc_mla/slice_checks.sh'
+      - 'scripts/arc_mla/check_slice_engine.py'
       - 'scripts/arc_mla/make_tiny_kimi_packed.py'
       - 'scripts/arc_mla/ct_unpack_check.py'
       - 'scripts/arc_mla/slice_report.py'

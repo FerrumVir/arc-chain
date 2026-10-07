@@ -792,6 +792,13 @@ pub fn convert_stage(
         )));
     }
     let mut c = hf.config.clone();
+    // Refuse before creating a package, even for a dense-only stage. The
+    // source's packed-expert contract must not silently become an i8 model.
+    if hf.source.packed_experts && experts != ExpertFormat::Int4G32 {
+        return Err(ModernError::Invalid(
+            "pre-quantised INT4 experts require --experts i4g32, never requantised".into(),
+        ));
+    }
     c.expert_format = experts;
     c.validate()?;
     let full = StageSpec::full(&c);

@@ -34,9 +34,13 @@ still to be checked.
 
 ## 2. What the engine is missing for it
 
-`parse_hf_config` (stage packages) refuses K2.6 with three gaps (unit test
-`kimi_k26_and_k3_refusals_list_every_missing_feature`). The weight-slice path
-(spec §14) closes the first two:
+`parse_hf_config`, the strict legacy parser, lists three K2.6 gaps (unit
+test `kimi_k26_and_k3_refusals_list_every_missing_feature`). The actual
+`convert_stage` and weight-slice entry points use `parse_hf_weights_config`:
+both accept the wrapper and packed experts, leaving YaRN as the stage-package
+blocker. Direct conversion requires `--experts i4g32`. See
+[kimi-first-light-loader.md](kimi-first-light-loader.md) for the loader-to-engine
+contract, fixture execution evidence and remaining architecture work:
 
 | Gap | Status |
 |---|---|

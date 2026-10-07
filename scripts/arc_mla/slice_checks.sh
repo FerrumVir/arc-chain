@@ -16,7 +16,9 @@
 #      (the spec 13.3 quantiser produced the packed values), a stage package
 #      assembled from the slices is byte-identical to the converter's package
 #      (whole model and a 2-layer stage), and the model roots agree;
-#   4. slice-verify re-hashes every slice and every segment.
+#   4. slice-verify re-hashes every slice and every segment;
+#   5. assembled packages execute through the engine, exact across kernels and
+#      pipeline splits; absent vision is harmless, YaRN/i8 fail before output.
 # Writes EVIDENCE_DIR/slices-summary.json (one manifest digest per variant) for
 # the cross-OS comparison. Works with bash on Linux, macOS and Windows (Git
 # Bash). Exits non-zero on the first mismatch.
@@ -125,4 +127,5 @@ PY
 done
 printf '\n}\n' >> "$summary"
 cat "$summary"
+python "$ROOT/scripts/arc_mla/check_slice_engine.py" "$BIN" "$WORK" "$EV"
 echo "slice checks: all passed"
