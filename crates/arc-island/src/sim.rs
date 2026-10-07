@@ -1217,7 +1217,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
     );
     let _ = writeln!(
         md,
-        "| Nodes | Scenario | Online | Eligible | Largest region, GB (one copy needs) | Islands T0 / T1a / T1b | Swarms metro / zone / region / neighbour | Members + spares (required) | Unused eligible | Hops per token | Per-answer tok/s | With spec | Aggregate tok/s, plain / spec | Tokens/day ceiling, plain / spec (excludes both downtimes) | Survive 6 h lease | Spare-shortfall / total lease | Dissolved / total lease | Serving / simulated |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        "| Nodes | Scenario | Online | Eligible | Largest region, GB (one copy needs) | Islands T0 / T1a / T1b | Swarms metro / zone / region / neighbour | Members + spares (required) | Unused eligible | Hops per token | Per-answer tok/s | With spec | Aggregate tok/s, plain / spec | Tokens/day ceiling, plain / spec (excludes both downtimes) | Survive 6 h lease | Spare-shortfall / total lease | Dissolved / total lease | Serving / simulated |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
     );
     for r in reports {
         let t = |tier: Tier| r.islands_by_tier.get(tier.label()).copied().unwrap_or(0);
@@ -1366,7 +1366,7 @@ pub fn markdown(reports: &[ScenarioReport], seed: u64) -> String {
         }
         let _ = writeln!(
             md,
-            "| Tier | Cell | Members | Spares | Hops | Mean hop RTT ms | Ring RTT ms | Max pair p95 ms | Per-answer tok/s | With spec (k) | Batch B / k | Per-stream at B | Aggregate tok/s | Spec batch B / k | Spec aggregate tok/s | Tokens/day ceiling, plain / spec (excludes both downtimes) | Members | Spare machines |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            "| Tier | Cell | Members | Spares | Hops | Mean hop RTT ms | Ring RTT ms | Max pair p95 ms | Per-answer tok/s | With spec (k) | Batch B / k | Per-stream at B | Aggregate tok/s | Spec batch B / k | Spec aggregate tok/s | Tokens/day ceiling, plain / spec (excludes both downtimes) | Members | Spare machines |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
         );
         let mut rows: Vec<&IslandRow> = r.rows.iter().collect();
         rows.sort_by(|a, b| {
@@ -1529,6 +1529,18 @@ mod tests {
         assert!(md.contains("Spare-shortfall / total lease"));
         assert!(md.contains("Dissolved / total lease"));
         assert!(md.contains("excludes both downtimes"));
+        let mut previous_columns = None;
+        for line in md.lines() {
+            if line.starts_with('|') {
+                let columns = line.matches('|').count();
+                if let Some(previous) = previous_columns {
+                    assert_eq!(columns, previous, "{line}");
+                }
+                previous_columns = Some(columns);
+            } else {
+                previous_columns = None;
+            }
+        }
     }
 
     #[test]
