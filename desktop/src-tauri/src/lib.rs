@@ -291,10 +291,9 @@ pub fn run() {
             // pointer: a v0.7 install whose node never ran has no WAL to fence
             // and no bridge record, yet must still be asked before it
             // contributes compute.
-            let config_uses_v07_layout = loaded_store
-                .config
-                .as_ref()
-                .is_some_and(legacy_upgrade::config_uses_v07_layout);
+            let config_uses_v07_layout = loaded_store.config.as_ref().is_some_and(|config| {
+                legacy_upgrade::config_uses_v07_layout(config, &paths::home_dir())
+            });
             // A v0.7 desktop stored unbound chain state in the same ~/.arc
             // root as binaries and models. Fence that WAL before deriving the
             // auto-start config: old bytes stay untouched while only the
@@ -351,31 +350,24 @@ pub fn run() {
             // v0.7 legacy bridge release) is asked once whether to keep
             // contributing compute. Until it answers, it auto-starts as an
             // observer without a model: no compute without consent.
-            let v07_origin = legacy_upgrade::detect_v07_origin(
+            let startup_hold = legacy_upgrade::hold_at_startup(
+                &mut loaded_store,
+                &resolved,
+                &paths::home_dir(),
                 migration_created_notice,
                 config_uses_v07_layout,
-                &paths::home_dir(),
+                legacy_upgrade::now_unix_ms(),
             );
-            if let Some(config) = loaded_store.config.as_mut() {
-                match legacy_upgrade::hold_until_answered(
-                    config,
-                    &resolved,
-                    v07_origin,
-                    legacy_upgrade::now_unix_ms(),
-                ) {
-                    Ok(true) => {
-                        tracing::warn!(
-                            "upgraded from v0.7: compute contribution is held until the user answers the first-launch question"
-                        );
-                        if let Err(error) = loaded_store.save_to(&resolved) {
-                            tracing::error!(%error, "could not persist the held observer config");
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "could not record the v0.7 upgrade compute question");
-                    }
-                }
+            if startup_hold.hold.held {
+                tracing::warn!(
+                    "upgraded from v0.7: compute contribution is held until the user answers the first-launch question"
+                );
+            }
+            if let Some(error) = startup_hold.hold.record_error {
+                tracing::error!(%error, "could not record the v0.7 upgrade compute question; the node is held as an observer anyway");
+            }
+            if let Some(error) = startup_hold.persist_error {
+                tracing::error!(%error, "could not persist the held observer config");
             }
             let autostart_desired = loaded_store
                 .config

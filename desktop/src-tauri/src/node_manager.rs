@@ -3139,7 +3139,7 @@ fn request_graceful_stop(
 /// flags, `--model`, the keep-awake flag and the recorded launch plan agree
 /// with each other. Consent `None` keeps the existing rule: a worker with a
 /// model from before the question counts as opted in.
-fn effective_launch_config(config: &NodeConfig) -> std::borrow::Cow<'_, NodeConfig> {
+pub(crate) fn effective_launch_config(config: &NodeConfig) -> std::borrow::Cow<'_, NodeConfig> {
     if config.role == "worker"
         && config.model_path.is_some()
         && !crate::commands::compute_contribution_enabled(config)
