@@ -85,6 +85,9 @@ pub struct CommunityWorkerStatus {
     jobs_declined: AtomicU64,
     last_job_completed_unix_ms: AtomicU64,
     last_registration_unix_ms: AtomicU64,
+    /// The inference backend decision (`arc.inference-backend.v1`) and the
+    /// capabilities it adds to registration; `None` until a GPU gate ran.
+    inference_backend: Mutex<Option<(serde_json::Value, Vec<String>)>>,
 }
 
 /// What `GET /community/worker/status` returns.
@@ -110,6 +113,11 @@ pub struct CommunityWorkerSnapshot {
     pub last_registration_unix_ms: Option<u64>,
     pub started_unix_ms: u64,
     pub prevent_sleep_during_jobs: bool,
+    /// `--gpu-inference`: which backend serves the dyadic profile and why
+    /// (`arc.inference-backend.v1`: backend, reason, self-test digests, the
+    /// adapter's vendor, device, backend and driver). `null` when the switch
+    /// is off.
+    pub inference_backend: Option<serde_json::Value>,
 }
 
 fn unix_ms_now() -> u64 {
@@ -145,7 +153,27 @@ impl CommunityWorkerStatus {
             jobs_declined: AtomicU64::new(0),
             last_job_completed_unix_ms: AtomicU64::new(0),
             last_registration_unix_ms: AtomicU64::new(0),
+            inference_backend: Mutex::new(None),
         }
+    }
+
+    /// Record the GPU gate's decision and the capabilities it adds.
+    pub fn set_inference_backend(&self, decision: serde_json::Value, capabilities: Vec<String>) {
+        *self
+            .inference_backend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((decision, capabilities));
+    }
+
+    /// Capabilities the inference backend adds to registration (empty unless
+    /// a GPU passed the gate).
+    pub fn inference_backend_capabilities(&self) -> Vec<String> {
+        self.inference_backend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(_, capabilities)| capabilities.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_state(&self, state: WorkerState) {
@@ -207,8 +235,82 @@ impl CommunityWorkerStatus {
             ),
             started_unix_ms: self.started_unix_ms,
             prevent_sleep_during_jobs: self.prevent_sleep_during_jobs,
+            inference_backend: self
+                .inference_backend
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .map(|(decision, _)| decision.clone()),
         }
     }
+}
+
+/// Longest capability a coordinator accepts, and how many it accepts
+/// (`validate_community_registration_shape` in `rpc.rs`).
+const CAPABILITY_MAX_BYTES: usize = 32;
+const CAPABILITIES_MAX: usize = 16;
+
+/// `prefix` and `raw` as one capability: lower-case ASCII letters, digits
+/// and single hyphens, at most 32 bytes; `None` when `raw` has no letter or
+/// digit.
+fn capability(prefix: &str, raw: &str) -> Option<String> {
+    let mut token = String::new();
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() {
+            token.push(c.to_ascii_lowercase());
+        } else if !token.is_empty() && !token.ends_with('-') {
+            token.push('-');
+        }
+    }
+    let token = token.trim_end_matches('-');
+    if token.is_empty() {
+        return None;
+    }
+    let mut out = format!("{prefix}{token}");
+    out.truncate(CAPABILITY_MAX_BYTES);
+    Some(out.trim_end_matches('-').to_string())
+}
+
+/// What a worker whose GPU passed the gate adds to its registered
+/// capabilities: `gpu-wgpu` (the Proof Kit's backend name) and the adapter's
+/// API, vendor, device and driver as capability tokens. Registration has no
+/// other field for them, and a coordinator rejects unknown fields, so the
+/// exact strings stay in the local status
+/// ([`CommunityWorkerSnapshot::inference_backend`]).
+pub fn gpu_capabilities(adapter: &arc_gpu::modern::AdapterReport) -> Vec<String> {
+    let driver = format!("{} {}", adapter.driver, adapter.driver_info);
+    let mut out = vec![arc_inference::modern::gpu::backend::PROOF_BACKEND.to_string()];
+    out.extend(
+        [
+            capability("gpu-api-", &adapter.backend),
+            capability("gpu-vendor-", &adapter.vendor),
+            capability("gpu-device-", &adapter.name),
+            capability("gpu-driver-", &driver),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    out.dedup();
+    out
+}
+
+/// `base` capabilities plus the backend's, within the coordinator's limits
+/// (unique entries, at most 16). The backend's are added only to a worker
+/// that advertises `inference`.
+pub fn registration_capabilities(base: &[String], backend: Vec<String>) -> Vec<String> {
+    let mut out = base.to_vec();
+    if !base.iter().any(|c| c == "inference") {
+        return out;
+    }
+    for capability in backend {
+        if out.len() >= CAPABILITIES_MAX {
+            break;
+        }
+        if !out.contains(&capability) {
+            out.push(capability);
+        }
+    }
+    out
 }
 
 static INSTALLED: OnceLock<Arc<CommunityWorkerStatus>> = OnceLock::new();
@@ -560,6 +662,98 @@ mod tests {
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["state"], "computing");
         assert_eq!(json["jobs_verified"], 1);
+    }
+
+    fn adapter(
+        name: &str,
+        vendor: &str,
+        backend: &str,
+        driver: &str,
+    ) -> arc_gpu::modern::AdapterReport {
+        arc_gpu::modern::AdapterReport {
+            index: 0,
+            name: name.into(),
+            vendor_id: 0,
+            vendor: vendor.into(),
+            device_id: 0,
+            device_type: "DiscreteGpu".into(),
+            backend: backend.into(),
+            driver: driver.into(),
+            driver_info: String::new(),
+            software: false,
+        }
+    }
+
+    /// The coordinator's rule for one capability (`rpc.rs`).
+    fn coordinator_accepts(capability: &str) -> bool {
+        !capability.is_empty()
+            && capability.len() <= CAPABILITY_MAX_BYTES
+            && capability
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }
+
+    #[test]
+    fn gpu_capabilities_name_the_adapter_within_the_coordinator_rules() {
+        let apple = gpu_capabilities(&adapter("Apple M2 Ultra", "Apple", "Metal", ""));
+        assert_eq!(
+            apple,
+            [
+                "gpu-wgpu",
+                "gpu-api-metal",
+                "gpu-vendor-apple",
+                "gpu-device-apple-m2-ultra"
+            ]
+        );
+        let long = gpu_capabilities(&adapter(
+            "NVIDIA GeForce RTX 4090 Laptop GPU (Engineering Sample)",
+            "NVIDIA",
+            "Vulkan",
+            "NVIDIA 560.94",
+        ));
+        assert_eq!(long[4], "gpu-driver-nvidia-560-94");
+        assert_eq!(long[3], "gpu-device-nvidia-geforce-rtx-40");
+        for capability in apple.iter().chain(&long) {
+            assert!(coordinator_accepts(capability), "{capability}");
+        }
+        assert!(capability("gpu-x-", "--").is_none());
+        assert_eq!(capability("gpu-x-", " -A__b- ").unwrap(), "gpu-x-a-b");
+    }
+
+    #[test]
+    fn registration_adds_backend_capabilities_only_to_inference_workers() {
+        let gpu = vec!["gpu-wgpu".to_string(), "inference".to_string()];
+        let inference = vec!["inference".to_string()];
+        assert_eq!(
+            registration_capabilities(&inference, gpu.clone()),
+            ["inference", "gpu-wgpu"]
+        );
+        let relay = vec!["relay".to_string()];
+        assert_eq!(registration_capabilities(&relay, gpu), ["relay"]);
+        let many: Vec<String> = (0..20).map(|i| format!("gpu-x-{i}")).collect();
+        assert_eq!(
+            registration_capabilities(&inference, many).len(),
+            CAPABILITIES_MAX
+        );
+    }
+
+    #[test]
+    fn the_status_reports_the_backend_decision() {
+        let status = CommunityWorkerStatus::new("0xabc", "node-abc", 6, false);
+        assert!(status.inference_backend_capabilities().is_empty());
+        assert_eq!(
+            serde_json::to_value(status.snapshot()).unwrap()["inference_backend"],
+            serde_json::Value::Null
+        );
+        status.set_inference_backend(
+            serde_json::json!({"backend": "gpu-wgpu"}),
+            vec!["gpu-wgpu".into()],
+        );
+        assert_eq!(status.inference_backend_capabilities(), ["gpu-wgpu"]);
+        assert_eq!(
+            serde_json::to_value(status.snapshot()).unwrap()["inference_backend"]["backend"],
+            "gpu-wgpu"
+        );
     }
 
     #[test]

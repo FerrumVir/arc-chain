@@ -561,6 +561,33 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     prevent_sleep_during_jobs: bool,
 
+    /// Let the community worker use a GPU for the dyadic integer profile
+    /// (portable WGSL kernels through wgpu: Vulkan, Metal, DX12). OFF by
+    /// default. At startup the worker runs the GPU self-test on the selected
+    /// adapter and uses the GPU only if its digest equals the CPU golden bit
+    /// for bit; otherwise it stays on the CPU and logs why. A GPU that passes
+    /// is recorded in the worker's capabilities (`gpu-wgpu`, API, vendor,
+    /// device, driver) and in `GET /community/worker/status`. Jobs in the
+    /// network's canonical reward profile always run on the CPU: no GPU
+    /// kernels exist for it. See docs/gpu-worker-backend.md.
+    #[arg(long, default_value_t = false)]
+    gpu_inference: bool,
+
+    /// GPU for --gpu-inference: an adapter index or a name substring
+    /// (`arc-modern gpu-info` lists them). Default: the best hardware GPU,
+    /// software rasterizers last.
+    #[arg(long, value_name = "N|NAME", requires = "gpu_inference")]
+    gpu_adapter: Option<String>,
+
+    /// Operator known-answer rounds of the --gpu-inference self-test.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = arc_inference::modern::gpu::backend::DEFAULT_SELF_TEST_ROUNDS,
+        requires = "gpu_inference"
+    )]
+    gpu_self_test_rounds: usize,
+
     /// Ask a seed to assign this node a layer range at boot (POST /shards/join).
     ///
     /// OFF by default, and it used to be implicit for any staked node with a
@@ -5379,6 +5406,28 @@ fn community_audience_from_network_info(
 /// trips, signed, to every origin. Coordinators keep only the nearest
 /// validator's coarse region label; no IP or raw round trip is published.
 /// Coordinators without the endpoint answer 404, which is ignored.
+/// Log the GPU gate's decision and publish it on the worker status, with the
+/// capabilities a GPU that passed adds to registration.
+fn record_gpu_backend_decision(
+    status: &arc_node::community_worker::CommunityWorkerStatus,
+    decision: &arc_inference::modern::gpu::backend::BackendDecision,
+) {
+    let capabilities = decision
+        .adapter()
+        .map(arc_node::community_worker::gpu_capabilities)
+        .unwrap_or_default();
+    if decision.uses_gpu() {
+        tracing::info!(
+            reason = %decision.reason,
+            capabilities = ?capabilities,
+            "GPU backend selected for the dyadic profile; canonical reward-profile jobs still run on the CPU"
+        );
+    } else {
+        tracing::warn!(reason = %decision.reason, "GPU backend not used; serving on the CPU");
+    }
+    status.set_inference_backend(decision.to_json(), capabilities);
+}
+
 async fn run_community_region_probe_loop(
     targets: Vec<String>,
     keypair: arc_crypto::KeyPair,
@@ -8989,6 +9038,38 @@ async fn run_arc_node() -> Result<()> {
                 cli.prevent_sleep_during_jobs,
             ),
         ));
+        // ── Optional GPU backend (--gpu-inference, default OFF) ──────────
+        // The self-test runs off the async runtime; registration picks up the
+        // capabilities of a GPU that passed from the next round on.
+        if cli.gpu_inference {
+            if worker_model.is_some() {
+                let config = arc_inference::modern::gpu::backend::GpuBackendConfig {
+                    enabled: true,
+                    adapter: cli.gpu_adapter.clone(),
+                    self_test_rounds: cli.gpu_self_test_rounds,
+                    ..Default::default()
+                };
+                let gate_status = worker_status.clone();
+                runtime_tasks.push(tokio::spawn(async move {
+                    match tokio::task::spawn_blocking(move || {
+                        arc_inference::modern::gpu::backend::select(&config)
+                    })
+                    .await
+                    {
+                        Ok(decision) => record_gpu_backend_decision(&gate_status, &decision),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "GPU self-test did not complete; the community worker stays on the CPU"
+                        ),
+                    }
+                }));
+            } else {
+                tracing::warn!(
+                    "--gpu-inference has no effect: this node is not an inference worker \
+                     (no complete canonical model loaded)"
+                );
+            }
+        }
         let reregister = Arc::new(arc_node::community_worker::ReregistrationQueue::new());
         let registration_status = worker_status.clone();
         let registration_wakeup = reregister.clone();
@@ -9104,11 +9185,18 @@ async fn run_arc_node() -> Result<()> {
                             true,
                         ),
                     };
+                let round_payload = rpc::CommunityRegisterRequest {
+                    capabilities: arc_node::community_worker::registration_capabilities(
+                        &register_payload.capabilities,
+                        registration_status.inference_backend_capabilities(),
+                    ),
+                    ..register_payload.clone()
+                };
                 let mut set = tokio::task::JoinSet::new();
                 for addr in &targets {
                     let client = client.clone();
                     let addr = addr.clone();
-                    let register_payload = register_payload.clone();
+                    let register_payload = round_payload.clone();
                     let heartbeat_payload = heartbeat_payload.clone();
                     let keypair = registration_keypair.clone();
                     set.spawn(async move {
@@ -10257,6 +10345,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn gpu_inference_is_off_by_default_and_its_options_require_it() {
+        let default = Cli::try_parse_from(["arc-node"]).unwrap();
+        assert!(!default.gpu_inference);
+        assert_eq!(default.gpu_adapter, None);
+        assert!(Cli::try_parse_from(["arc-node", "--gpu-adapter", "0"]).is_err());
+        assert!(Cli::try_parse_from(["arc-node", "--gpu-self-test-rounds", "2"]).is_err());
+        let on = Cli::try_parse_from([
+            "arc-node",
+            "--gpu-inference",
+            "--gpu-adapter",
+            "M2 Ultra",
+            "--gpu-self-test-rounds",
+            "2",
+        ])
+        .unwrap();
+        assert!(on.gpu_inference);
+        assert_eq!(on.gpu_adapter.as_deref(), Some("M2 Ultra"));
+        assert_eq!(on.gpu_self_test_rounds, 2);
     }
 
     #[test]
