@@ -223,38 +223,66 @@ impl Planes {
     /// Add each weight row's exact dot product with every plane into the
     /// plane owner's slot of that row's output (`width` slots per row).
     ///
-    /// Loop order: column chunks, then groups of planes, then weight rows. A
-    /// chunk of one plane group and of the block's weight rows stay in L1
-    /// while every pair is multiplied. Partial sums of chunks add up exactly.
+    /// Loop order: column chunks, then groups of up to eight planes, then
+    /// weight rows. A chunk of one plane group and of the block's weight rows
+    /// stay in L1 while every pair is multiplied. Partial sums of chunks add
+    /// up exactly. Each group runs on the narrowest kernel that holds it, so a
+    /// step of one or two rows (a small decode batch, a short speculative
+    /// verification) does not pay for padding.
     fn accumulate(&self, rows: &[&[i8]], out: &mut [i64], width: usize) {
         let count = self.owners.len();
-        let cols = self.cols;
         let mut c0 = 0usize;
-        while c0 < cols {
-            let c1 = (c0 + simd::CHUNK).min(cols);
+        while c0 < self.cols {
+            let c1 = (c0 + simd::CHUNK).min(self.cols);
             let mut start = 0usize;
             while start < count {
                 let take = (count - start).min(simd::GROUP);
-                let group: [&[simd::Digit]; simd::GROUP] = std::array::from_fn(|q| {
-                    let p = start + q.min(take - 1);
-                    &self.digits[p * cols + c0..p * cols + c1]
-                });
-                for (row, slots) in rows.iter().zip(out.chunks_mut(width)) {
-                    // SAFETY: `digit_kernel_enabled` checked the CPU feature,
-                    // every plane chunk holds `c1 - c0` digits like the row
-                    // chunk, and `c1 - c0 <= CHUNK <= MAX_SIMD_COLS`.
-                    let sums = unsafe { simd::dot_planes(&row[c0..c1], &group) };
-                    for (q, &sum) in sums.iter().enumerate().take(take) {
-                        let (t, shift) = self.owners[start + q];
-                        slots[t] += sum * (1i64 << shift);
-                    }
+                let planes = start..start + take;
+                if take > 4 {
+                    self.pass::<8>(simd::dot_planes_8, rows, out, width, planes, c0..c1);
+                } else if take > 2 {
+                    self.pass::<4>(simd::dot_planes_4, rows, out, width, planes, c0..c1);
+                } else {
+                    self.pass::<2>(simd::dot_planes_2, rows, out, width, planes, c0..c1);
                 }
                 start += take;
             }
             c0 = c1;
         }
     }
+
+    /// One pass of an `N`-plane kernel over the block's weight rows, for
+    /// planes `planes` (at most `N`; spare kernel inputs repeat the last plane
+    /// and their sums are dropped) restricted to columns `cols`.
+    fn pass<const N: usize>(
+        &self,
+        kernel: Kernel<N>,
+        rows: &[&[i8]],
+        out: &mut [i64],
+        width: usize,
+        planes: std::ops::Range<usize>,
+        cols: std::ops::Range<usize>,
+    ) {
+        let group: [&[simd::Digit]; N] = std::array::from_fn(|q| {
+            let p = (planes.start + q).min(planes.end - 1);
+            &self.digits[p * self.cols + cols.start..p * self.cols + cols.end]
+        });
+        for (row, slots) in rows.iter().zip(out.chunks_mut(width)) {
+            // SAFETY: `digit_kernel_enabled` checked the CPU feature, every
+            // plane chunk holds `cols.len()` digits like the row chunk, and
+            // `cols.len() <= CHUNK <= MAX_SIMD_COLS`.
+            let sums = unsafe { kernel(&row[cols.clone()], &group) };
+            for (&sum, p) in sums.iter().zip(planes.clone()) {
+                let (t, shift) = self.owners[p];
+                slots[t] += sum * (1i64 << shift);
+            }
+        }
+    }
 }
+
+/// An exact `N`-plane dot-product kernel from [`simd`].
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+type Kernel<const N: usize> = unsafe fn(&[i8], &[&[simd::Digit]; N]) -> [i64; N];
 
 /// One activation row's digit planes, least significant first (`used` planes
 /// of `x.len()` digits each), or `None` when a value is outside the digit
@@ -284,9 +312,11 @@ mod simd {
     //!
     //! With `|w| <= 128` and `|d| <= 2^15`, one `vpmaddwd` lane gains at most
     //! `2 * 128 * 2^15 = 2^23` per 16 columns. Flushing the `i32` lanes to
-    //! `i64` every [`FLUSH`] iterations keeps each lane below `2^30`. The eight
-    //! accumulators are named variables so they stay in registers: each weight
-    //! vector is loaded and widened once and feeds eight `vpmaddwd`.
+    //! `i64` every [`FLUSH`] iterations keeps each lane below `2^30`. Each
+    //! kernel keeps one named accumulator per plane so they stay in registers:
+    //! a weight vector is loaded and widened once and feeds one `vpmaddwd` per
+    //! plane. Kernels exist for eight, four and two planes, so a step with few
+    //! planes does not multiply padding.
 
     use std::arch::x86_64::{
         _mm_loadu_si128, _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
@@ -299,7 +329,7 @@ mod simd {
     pub(super) const DIGIT_BITS: u32 = 16;
     /// Digits that cover any accepted activation.
     pub(super) const MAX_DIGITS: usize = 2;
-    /// Planes multiplied per pass over a weight row.
+    /// Most planes multiplied per pass over a weight row.
     pub(super) const GROUP: usize = 8;
     /// Columns per call: eight 2 KiB plane chunks and eight 1 KiB weight
     /// chunks (24 KiB) fit in a 32 KiB L1.
@@ -311,69 +341,75 @@ mod simd {
         std::arch::is_x86_feature_detected!("avx2")
     }
 
-    /// `sum_c row[c] * planes[q][c]` for every `q`, exactly.
-    ///
-    /// # Safety
-    /// AVX2 must be available ([`available`]) and every plane must hold at
-    /// least `row.len()` digits.
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn dot_planes(row: &[i8], planes: &[&[Digit]; GROUP]) -> [i64; GROUP] {
-        let len = row.len();
-        let full = len - len % 16;
-        let w = row.as_ptr();
-        let [p0, p1, p2, p3, p4, p5, p6, p7] = planes.map(|plane| plane.as_ptr());
-        let mut total = [0i64; GROUP];
-        let mut start = 0usize;
-        while start < full {
-            let stop = (start + FLUSH * 16).min(full);
-            // SAFETY: AVX2 is available (caller contract). Every load starts at
-            // a column `j` with `j + 16 <= full <= len`: 16 weight bytes from
-            // `row` and 16 digits (32 bytes) from each plane, which holds at
-            // least `len` digits.
-            let lanes = unsafe {
-                let zero = _mm256_setzero_si256();
-                let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
-                let (mut a4, mut a5, mut a6, mut a7) = (zero, zero, zero, zero);
-                let mut j = start;
-                while j < stop {
-                    let x = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(j).cast()));
-                    let d0 = _mm256_loadu_si256(p0.add(j).cast());
-                    let d1 = _mm256_loadu_si256(p1.add(j).cast());
-                    let d2 = _mm256_loadu_si256(p2.add(j).cast());
-                    let d3 = _mm256_loadu_si256(p3.add(j).cast());
-                    a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(x, d0));
-                    a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(x, d1));
-                    a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(x, d2));
-                    a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(x, d3));
-                    let d4 = _mm256_loadu_si256(p4.add(j).cast());
-                    let d5 = _mm256_loadu_si256(p5.add(j).cast());
-                    let d6 = _mm256_loadu_si256(p6.add(j).cast());
-                    let d7 = _mm256_loadu_si256(p7.add(j).cast());
-                    a4 = _mm256_add_epi32(a4, _mm256_madd_epi16(x, d4));
-                    a5 = _mm256_add_epi32(a5, _mm256_madd_epi16(x, d5));
-                    a6 = _mm256_add_epi32(a6, _mm256_madd_epi16(x, d6));
-                    a7 = _mm256_add_epi32(a7, _mm256_madd_epi16(x, d7));
-                    j += 16;
+    /// Generates an exact `$n`-plane kernel with one named accumulator per
+    /// plane: each weight vector is loaded and widened once and feeds `$n`
+    /// `vpmaddwd`, with every accumulator in a register.
+    macro_rules! dot_kernel {
+        ($(#[$doc:meta])* $name:ident, $n:literal, $($p:ident $a:ident),+) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// AVX2 must be available ([`available`]) and every plane must
+            /// hold at least `row.len()` digits.
+            #[target_feature(enable = "avx2")]
+            pub(super) unsafe fn $name(row: &[i8], planes: &[&[Digit]; $n]) -> [i64; $n] {
+                let len = row.len();
+                let full = len - len % 16;
+                let w = row.as_ptr();
+                let [$($p),+] = planes.map(|plane| plane.as_ptr());
+                let mut total = [0i64; $n];
+                let mut start = 0usize;
+                while start < full {
+                    let stop = (start + FLUSH * 16).min(full);
+                    // SAFETY: AVX2 is available (caller contract). Every load
+                    // starts at a column `j` with `j + 16 <= full <= len`: 16
+                    // weight bytes from `row` and 16 digits (32 bytes) from
+                    // each plane, which holds at least `len` digits.
+                    let lanes = unsafe {
+                        $(let mut $a = _mm256_setzero_si256();)+
+                        let mut j = start;
+                        while j < stop {
+                            let x = _mm256_cvtepi8_epi16(_mm_loadu_si128(w.add(j).cast()));
+                            $($a = _mm256_add_epi32(
+                                $a,
+                                _mm256_madd_epi16(x, _mm256_loadu_si256($p.add(j).cast())),
+                            );)+
+                            j += 16;
+                        }
+                        let mut lanes = [[0i32; 8]; $n];
+                        for (out, value) in lanes.iter_mut().zip([$($a),+]) {
+                            _mm256_storeu_si256(out.as_mut_ptr().cast(), value);
+                        }
+                        lanes
+                    };
+                    for (sum, lane) in total.iter_mut().zip(&lanes) {
+                        *sum += lane.iter().map(|&v| i64::from(v)).sum::<i64>();
+                    }
+                    start = stop;
                 }
-                let mut lanes = [[0i32; 8]; GROUP];
-                for (out, value) in lanes.iter_mut().zip([a0, a1, a2, a3, a4, a5, a6, a7]) {
-                    _mm256_storeu_si256(out.as_mut_ptr().cast(), value);
+                for (c, &weight) in row.iter().enumerate().skip(full) {
+                    let weight = i64::from(weight);
+                    for (sum, plane) in total.iter_mut().zip(planes) {
+                        *sum += weight * i64::from(plane[c]);
+                    }
                 }
-                lanes
-            };
-            for (sum, lane) in total.iter_mut().zip(&lanes) {
-                *sum += lane.iter().map(|&v| i64::from(v)).sum::<i64>();
+                total
             }
-            start = stop;
-        }
-        for (c, &weight) in row.iter().enumerate().skip(full) {
-            let weight = i64::from(weight);
-            for (sum, plane) in total.iter_mut().zip(planes) {
-                *sum += weight * i64::from(plane[c]);
-            }
-        }
-        total
+        };
     }
+
+    dot_kernel!(
+        /// `sum_c row[c] * planes[q][c]` for eight planes, exactly.
+        dot_planes_8, 8, p0 a0, p1 a1, p2 a2, p3 a3, p4 a4, p5 a5, p6 a6, p7 a7
+    );
+    dot_kernel!(
+        /// `sum_c row[c] * planes[q][c]` for four planes, exactly.
+        dot_planes_4, 4, p0 a0, p1 a1, p2 a2, p3 a3
+    );
+    dot_kernel!(
+        /// `sum_c row[c] * planes[q][c]` for two planes, exactly.
+        dot_planes_2, 2, p0 a0, p1 a1
+    );
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -383,9 +419,10 @@ mod simd {
     //!
     //! With `|w|, |d| <= 128` every product is at most `2^14`, so a plane's
     //! whole sum (the four lanes added) is at most `cols * 2^14 < 2^31` for
-    //! `cols <= 131_071`. The eight accumulators are named variables so they
-    //! stay in registers: each weight vector is loaded once and feeds eight
-    //! independent `sdot` chains.
+    //! `cols <= 131_071`. Each kernel keeps one named accumulator per plane so
+    //! they stay in registers: a weight vector is loaded once and feeds one
+    //! independent `sdot` chain per plane. Kernels exist for eight, four and
+    //! two planes, so a step with few planes does not multiply padding.
 
     use std::arch::aarch64::{int8x16_t, int32x4_t, vaddvq_s32, vdupq_n_s32, vld1q_s8};
 
@@ -395,7 +432,7 @@ mod simd {
     pub(super) const DIGIT_BITS: u32 = 8;
     /// Digits that cover any accepted activation.
     pub(super) const MAX_DIGITS: usize = 4;
-    /// Planes multiplied per pass over a weight row.
+    /// Most planes multiplied per pass over a weight row.
     pub(super) const GROUP: usize = 8;
     /// Columns per call: eight 2 KiB plane chunks and eight 2 KiB weight
     /// chunks (32 KiB) stay in a 64 KiB L1.
@@ -428,54 +465,57 @@ mod simd {
         out
     }
 
-    /// `sum_c row[c] * planes[q][c]` for every `q`, exactly.
-    ///
-    /// # Safety
-    /// `dotprod` must be available ([`available`]), every plane must hold at
-    /// least `row.len()` digits, and `row.len() <= 131_071`.
-    #[target_feature(enable = "neon,dotprod")]
-    pub(super) unsafe fn dot_planes(row: &[i8], planes: &[&[Digit]; GROUP]) -> [i64; GROUP] {
-        let len = row.len();
-        let full = len - len % 16;
-        let w = row.as_ptr();
-        let [p0, p1, p2, p3, p4, p5, p6, p7] = planes.map(|plane| plane.as_ptr());
-        // SAFETY: `dotprod` is available (caller contract). Every load starts
-        // at a column `j` with `j + 16 <= full <= len`, inside `row` and inside
-        // every plane, which holds at least `len` digits.
-        let mut total = unsafe {
-            let zero = vdupq_n_s32(0);
-            let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
-            let (mut a4, mut a5, mut a6, mut a7) = (zero, zero, zero, zero);
-            let mut j = 0usize;
-            while j < full {
-                let x = vld1q_s8(w.add(j));
-                a0 = sdot(a0, x, vld1q_s8(p0.add(j)));
-                a1 = sdot(a1, x, vld1q_s8(p1.add(j)));
-                a2 = sdot(a2, x, vld1q_s8(p2.add(j)));
-                a3 = sdot(a3, x, vld1q_s8(p3.add(j)));
-                a4 = sdot(a4, x, vld1q_s8(p4.add(j)));
-                a5 = sdot(a5, x, vld1q_s8(p5.add(j)));
-                a6 = sdot(a6, x, vld1q_s8(p6.add(j)));
-                a7 = sdot(a7, x, vld1q_s8(p7.add(j)));
-                j += 16;
+    /// Generates an exact `$n`-plane kernel with one named accumulator per
+    /// plane: each weight vector is loaded once and feeds `$n` independent
+    /// `sdot` chains, with every accumulator in a register.
+    macro_rules! dot_kernel {
+        ($(#[$doc:meta])* $name:ident, $n:literal, $($p:ident $a:ident),+) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// `dotprod` must be available ([`available`]), every plane must
+            /// hold at least `row.len()` digits, and `row.len() <= 131_071`.
+            #[target_feature(enable = "neon,dotprod")]
+            pub(super) unsafe fn $name(row: &[i8], planes: &[&[Digit]; $n]) -> [i64; $n] {
+                let len = row.len();
+                let full = len - len % 16;
+                let w = row.as_ptr();
+                let [$($p),+] = planes.map(|plane| plane.as_ptr());
+                // SAFETY: `dotprod` is available (caller contract). Every load
+                // starts at a column `j` with `j + 16 <= full <= len`, inside
+                // `row` and inside every plane, which holds at least `len`
+                // digits.
+                let mut total = unsafe {
+                    $(let mut $a = vdupq_n_s32(0);)+
+                    let mut j = 0usize;
+                    while j < full {
+                        let x = vld1q_s8(w.add(j));
+                        $($a = sdot($a, x, vld1q_s8($p.add(j)));)+
+                        j += 16;
+                    }
+                    [$(i64::from(vaddvq_s32($a))),+]
+                };
+                for (c, &weight) in row.iter().enumerate().skip(full) {
+                    let weight = i64::from(weight);
+                    for (sum, plane) in total.iter_mut().zip(planes) {
+                        *sum += weight * i64::from(plane[c]);
+                    }
+                }
+                total
             }
-            [
-                i64::from(vaddvq_s32(a0)),
-                i64::from(vaddvq_s32(a1)),
-                i64::from(vaddvq_s32(a2)),
-                i64::from(vaddvq_s32(a3)),
-                i64::from(vaddvq_s32(a4)),
-                i64::from(vaddvq_s32(a5)),
-                i64::from(vaddvq_s32(a6)),
-                i64::from(vaddvq_s32(a7)),
-            ]
         };
-        for (c, &weight) in row.iter().enumerate().skip(full) {
-            let weight = i64::from(weight);
-            for (sum, plane) in total.iter_mut().zip(planes) {
-                *sum += weight * i64::from(plane[c]);
-            }
-        }
-        total
     }
+
+    dot_kernel!(
+        /// `sum_c row[c] * planes[q][c]` for eight planes, exactly.
+        dot_planes_8, 8, p0 a0, p1 a1, p2 a2, p3 a3, p4 a4, p5 a5, p6 a6, p7 a7
+    );
+    dot_kernel!(
+        /// `sum_c row[c] * planes[q][c]` for four planes, exactly.
+        dot_planes_4, 4, p0 a0, p1 a1, p2 a2, p3 a3
+    );
+    dot_kernel!(
+        /// `sum_c row[c] * planes[q][c]` for two planes, exactly.
+        dot_planes_2, 2, p0 a0, p1 a1
+    );
 }
