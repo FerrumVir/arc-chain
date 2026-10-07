@@ -1815,8 +1815,12 @@ mod tests {
             for limbs in 1..=most {
                 let cols = 4111;
                 let (min, max) = digit_range(bits, limbs);
-                let value = min.max(-magnitude_cap(cols));
-                for fill in [value, max.min(magnitude_cap(cols))] {
+                // The precondition assumes |w| <= 127; with -128 weights the
+                // accumulator itself must stay in i64 (beyond it the kernels
+                // refuse, which `refuses_an_accumulator_beyond_i64` checks).
+                let cap = ((1u128 << 63) / (128 * cols as u128) - 1) as i64;
+                let value = min.max(-cap);
+                for fill in [value, max.min(cap)] {
                     let m = DyadicMatrix {
                         rows: 5,
                         cols,
@@ -1840,6 +1844,41 @@ mod tests {
             }
         }
         set_tiling(Tiling::default());
+    }
+
+    #[test]
+    fn refuses_an_accumulator_beyond_i64() {
+        // -128 weights are outside the profile, so the 127-based precondition
+        // admits inputs whose exact sum leaves i64; the SIMD kernels refuse
+        // them instead of wrapping.
+        let cols = 4111;
+        let cap = magnitude_cap(cols);
+        let m = DyadicMatrix {
+            rows: 1,
+            cols,
+            q: vec![-128; cols],
+            mu: vec![1 << 30],
+            k: vec![62],
+        };
+        let x = vec![-cap; cols];
+        let exact: i128 = 128 * i128::from(cap) * cols as i128;
+        assert!(exact > i128::from(i64::MAX));
+        for kernel in Kernel::available_kernels() {
+            let mut input = PreparedInput::new();
+            input.prepare(&x, kernel).unwrap();
+            if input.kernel() == Kernel::Scalar {
+                // The scalar loop is the reference, defined for profile
+                // weights only; it is not asked about this input.
+                continue;
+            }
+            let mut out = vec![0i64; 1];
+            let result = project(MatrixRows::of(&m), &input, &mut out);
+            assert!(
+                matches!(result, Err(ModernError::Domain(_))),
+                "{}: {result:?}",
+                kernel.name()
+            );
+        }
     }
 
     #[test]
@@ -1940,11 +1979,11 @@ mod tests {
         for kernel in Kernel::available_kernels() {
             for tokens in [1usize, 2, 5, MAX_BATCH] {
                 // Mixed magnitudes, so the inputs use different digit counts
-                // (and the scalar fallback) inside one batch.
+                // (and, on NEON, the scalar fallback) inside one batch, all
+                // small enough that the gated SiLU stays below 2^62.
                 let inputs: Vec<PreparedInput> = (0..tokens)
                     .map(|t| {
-                        let bound =
-                            [1i64 << 10, 1 << 20, 1 << 33, 1 << 50][t % 4].min(magnitude_cap(cols));
+                        let bound = [1i64 << 10, 1 << 20, 1 << 33, 1 << 36][t % 4];
                         let x: Vec<i64> = (0..cols).map(|_| rng.signed(bound)).collect();
                         let mut input = PreparedInput::new();
                         input.prepare(&x, kernel).unwrap();
