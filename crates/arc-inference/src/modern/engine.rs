@@ -580,8 +580,10 @@ struct GroupScratch<'a> {
 /// of [`arith::attention_head`]: exact dot products, the exact maximum, exact
 /// sums in position order and one truncating division. Heads outside the
 /// SIMD domain (`|q_t| >= 2^31` or `Σ|q_t| >= 2^32`, the reference's i128
-/// case), the scalar kernel and groups over [`MAX_GROUP`] heads run the
-/// reference function itself.
+/// case), the scalar kernel, groups over [`MAX_GROUP`] heads and contexts
+/// over [`arith::MAX_I64_WEIGHTED_POSITIONS`] (whose weighted sums need
+/// i128) run the reference function itself. With a SIMD kernel, every head
+/// is counted by [`kernels::attention_census`]: SIMD or reference fallback.
 #[allow(clippy::needless_range_loop)]
 fn attend_group(
     isa: Isa,
@@ -602,7 +604,13 @@ fn attend_group(
     if width == 0 || q.len() != heads * width || out.len() != q.len() {
         return Err(ModernError::Invalid("attention group shape".into()));
     }
-    if isa.kernel() == Kernel::Scalar || heads > MAX_GROUP {
+    if isa.kernel() == Kernel::Scalar
+        || heads > MAX_GROUP
+        || cache.positions > arith::MAX_I64_WEIGHTED_POSITIONS
+    {
+        if isa.kernel() != Kernel::Scalar {
+            kernels::count_attention_heads(0, heads as u64);
+        }
         for (q_head, out_head) in q.chunks_exact(width).zip(out.chunks_exact_mut(width)) {
             arith::attention_head(q_head, cache, lambda, out_head)?;
         }
@@ -638,6 +646,8 @@ fn attend_group(
             arith::attention_head(q_head, cache, lambda, out_head)?;
         }
     }
+    let simd_heads = simd[..heads].iter().filter(|&&s| s).count() as u64;
+    kernels::count_attention_heads(simd_heads, heads as u64 - simd_heads);
     for position in 0..positions {
         let base = position * cache.stride + cache.offset;
         let key = &cache.keys[base..base + width];
@@ -903,9 +913,11 @@ fn simd_kernel() -> Result<Kernel, ModernError> {
 /// `model`: both orders project the gate matrix of every layer (one pass
 /// streams the weights from memory, as a decoded token does) and the faster
 /// one becomes the order of single-input calls ([`kernels::calibrate_auto`]).
-/// `None` when the configured tiling is not `auto` or the CPU has no SIMD
-/// kernel. Speed only: every order computes the same integers, and CI
-/// checks each order against the golden digests.
+/// `None` when the configured tiling is not `auto`, the CPU has no SIMD
+/// kernel, or the model's inputs are outside that kernel's domain (wider
+/// than the NEON column bound, say): `auto` then keeps its built-in order.
+/// Speed only: every order computes the same integers, and CI checks each
+/// order against the golden digests.
 pub fn calibrate_auto_tiling(
     model: &ModernModel,
 ) -> Result<Option<kernels::Calibration>, ModernError> {
@@ -931,11 +943,17 @@ pub fn calibrate_auto_tiling(
     let counting = kernels::census_enabled();
     kernels::set_census_enabled(false);
     let mut input = PreparedInput::new();
-    let calibrated = input
-        .prepare(&x, kernel)
-        .and_then(|()| kernels::calibrate_auto(kernel, &matrices, &input, 3));
+    let calibrated = input.prepare(&x, kernel).and_then(|()| {
+        // An input the kernel refuses runs the scalar kernel, which has no
+        // row order to measure.
+        if input.kernel() == kernel {
+            kernels::calibrate_auto(kernel, &matrices, &input, 3).map(Some)
+        } else {
+            Ok(None)
+        }
+    });
     kernels::set_census_enabled(counting);
-    calibrated.map(Some)
+    calibrated
 }
 
 #[cfg(test)]
@@ -980,6 +998,213 @@ mod tests {
             "an explicit order is kept"
         );
         kernels::set_tiling(before);
+    }
+
+    #[test]
+    fn calibration_skips_a_model_outside_the_kernel_domain() {
+        // One column past the NEON bound: projections there run the scalar
+        // kernel, so `auto` keeps its built-in order instead of failing the
+        // model load (ARC-54). AVX2 has no column bound and calibrates.
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let d = kernels::I8_MAX_COLS + 1;
+        let zeros = |rows: usize, cols: usize| arith::DyadicMatrix {
+            rows,
+            cols,
+            q: vec![0; rows * cols],
+            mu: vec![0; rows],
+            k: vec![16; rows],
+        };
+        let model = ModernModel {
+            config: ModernConfig {
+                architecture: "llama".into(),
+                n_layers: 1,
+                d_model: d,
+                n_heads: 1,
+                n_kv_heads: 1,
+                d_head: 2,
+                d_ff: 1,
+                vocab_size: 1,
+                max_seq: 4,
+                rms_eps_q32: 4295,
+                rope_theta: 10_000,
+                rope_layers: vec![false],
+            },
+            embed: zeros(1, d),
+            final_norm: vec![arith::ONE; d],
+            rope_cos: vec![arith::ONE as i32; 4],
+            rope_sin: vec![0; 4],
+            layers: vec![crate::modern::model::ModernLayer {
+                attn_norm: vec![arith::ONE; d],
+                wq: zeros(2, d),
+                wk: zeros(2, d),
+                wv: zeros(2, d),
+                wo: zeros(d, 2),
+                ffn_norm: vec![arith::ONE; d],
+                w_gate: zeros(1, d),
+                w_up: zeros(1, d),
+                w_down: zeros(d, 1),
+            }],
+        };
+        model.validate().unwrap();
+        let before = kernels::tiling();
+        kernels::set_tiling(Tiling::Auto);
+        let calibration = calibrate_auto_tiling(&model).unwrap();
+        match Kernel::best() {
+            Kernel::Avx2 => {
+                assert!(calibration.is_some());
+                kernels::set_auto_order(Kernel::Avx2, Tiling::Auto);
+            }
+            _ => assert!(calibration.is_none(), "{calibration:?}"),
+        }
+        let expected = reference_trace(&model, &[0, 0]).unwrap();
+        for kernel in Kernel::available_kernels() {
+            let mut engine = Engine::new(&model, kernel);
+            engine.begin_sequence(2);
+            let mut logits = Vec::new();
+            for _ in 0..2 {
+                logits.push(engine.forward(0).unwrap().to_vec());
+            }
+            assert_eq!(logits, expected.0, "{}", kernel.name());
+        }
+        kernels::set_tiling(before);
+    }
+
+    /// Spec §5.6 written independently of both attention paths: exact i128
+    /// dot products and weighted sums, one truncating division (the Python
+    /// executor's `attention_int`).
+    fn exact_attention(q: &[i64], cache: HeadCache<'_>, lambda: i64) -> Vec<i64> {
+        let width = q.len();
+        let at = |p: usize| p * cache.stride + cache.offset;
+        let scores: Vec<i64> = (0..cache.positions)
+            .map(|p| {
+                let dot: i128 = q
+                    .iter()
+                    .zip(&cache.keys[at(p)..at(p) + width])
+                    .map(|(&a, &b)| i128::from(a) * i128::from(b))
+                    .sum();
+                i64::try_from((dot * i128::from(lambda)) >> 46).unwrap()
+            })
+            .collect();
+        let top = *scores.iter().max().unwrap();
+        let weights: Vec<i128> = scores
+            .iter()
+            .map(|&s| i128::from(exp_q16(s - top)))
+            .collect();
+        let total: i128 = weights.iter().sum();
+        (0..width)
+            .map(|t| {
+                let sum: i128 = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(p, &w)| w * i128::from(cache.values[at(p) + t]))
+                    .sum();
+                i64::try_from(sum / total).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn long_contexts_with_extreme_values_attend_exactly() {
+        // Equal scores weigh every position 2^16; with i32-extreme values the
+        // weighted sums leave i64 after 2^16 positions (ARC-54 finding 3).
+        // Both attention paths must match the exact sums there, in debug
+        // and release alike, up to the generic context limit 2^20.
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let width = 2;
+        let lambda = attention_lambda(128);
+        for positions in [65_535usize, 65_536, 65_537, 70_001, 1 << 20] {
+            for (pattern, (keys, values)) in [
+                // Zero keys: equal weights, values at both i32 extremes.
+                (
+                    "flat",
+                    (
+                        vec![0i32; positions * width],
+                        (0..positions * width)
+                            .map(|i| if i % 2 == 0 { i32::MAX } else { i32::MIN })
+                            .collect::<Vec<i32>>(),
+                    ),
+                ),
+                // Varied keys (unequal weights) and near-extreme values.
+                (
+                    "varied",
+                    (
+                        (0..positions * width)
+                            .map(|i| ((i * 7919) % 2001) as i32 - 1000)
+                            .collect(),
+                        (0..positions * width)
+                            .map(|i| i32::MAX - ((i * 104_729) % 1_000_003) as i32)
+                            .collect(),
+                    ),
+                ),
+            ] {
+                let cache = HeadCache {
+                    keys: &keys,
+                    values: &values,
+                    positions,
+                    stride: width,
+                    offset: 0,
+                };
+                // Two query heads of one KV group.
+                let q: Vec<i64> = vec![0, 0, 3, -5];
+                let expected: Vec<i64> = q
+                    .chunks_exact(width)
+                    .flat_map(|h| exact_attention(h, cache, lambda))
+                    .collect();
+                if pattern == "flat" {
+                    assert_eq!(
+                        expected,
+                        [i32::MAX, i32::MIN, i32::MAX, i32::MIN].map(i64::from)
+                    );
+                }
+                for (h, head) in q.chunks_exact(width).enumerate() {
+                    let mut out = vec![0i64; width];
+                    arith::attention_head(head, cache, lambda, &mut out).unwrap();
+                    assert_eq!(
+                        out,
+                        expected[h * width..(h + 1) * width],
+                        "{pattern} {positions}"
+                    );
+                }
+                for kernel in Kernel::available_kernels() {
+                    kernels::set_census_enabled(true);
+                    kernels::reset_census();
+                    let mut out = vec![0i64; q.len()];
+                    let mut q32 = vec![0i32; q.len()];
+                    let mut scores = vec![0i64; 2 * positions];
+                    let mut weighted = vec![0i64; q.len()];
+                    attend_group(
+                        Isa::new(kernel),
+                        &q,
+                        cache,
+                        lambda,
+                        GroupScratch {
+                            out: &mut out,
+                            q32: &mut q32,
+                            scores: &mut scores,
+                            score_stride: positions,
+                            weighted: &mut weighted,
+                        },
+                        width,
+                    )
+                    .unwrap();
+                    let counted = kernels::attention_census();
+                    kernels::set_census_enabled(false);
+                    assert_eq!(out, expected, "{} {pattern} {positions}", kernel.name());
+                    // Past the i64 bound the SIMD kernels hand the group to
+                    // the reference function, and the census says so (other
+                    // tests may count concurrently: lower bounds only).
+                    if kernel != Kernel::Scalar {
+                        let counted = if positions > arith::MAX_I64_WEIGHTED_POSITIONS {
+                            counted.reference_heads
+                        } else {
+                            counted.simd_heads
+                        };
+                        assert!(counted >= 2, "{} {positions}", kernel.name());
+                    }
+                }
+            }
+        }
+        kernels::reset_census();
     }
 
     /// Reference and engine logits for the same tokens, and both caches.

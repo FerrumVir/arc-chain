@@ -212,6 +212,17 @@ fn census(spec: Spec) -> Value {
     serde_json::to_value(spec.census()).unwrap_or(Value::Null)
 }
 
+/// Which attention path the fast engine's heads took (SIMD or the reference
+/// fallback); null for specs without SIMD attention.
+fn attention_census(spec: Spec) -> Value {
+    match spec {
+        Spec::Fast(kernel) if kernel != Kernel::Scalar => {
+            serde_json::to_value(kernels::attention_census()).unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
+    }
+}
+
 fn load(path: &Path) -> Result<(ModernModel, f64), ModernError> {
     let start = Instant::now();
     let model = package::load_package(path)?;
@@ -481,6 +492,7 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
         "cases": records,
         "matrix_digest": matrix_digest,
         "census": census(spec),
+        "attention_census": attention_census(spec),
         "timing": {
             "load_seconds": load_seconds,
             "prompt_tokens": prompt_total,
@@ -528,6 +540,7 @@ fn cmd_generate(args: &Args) -> Result<(), ModernError> {
     record["kernel"] = Value::from(kernel);
     record["spec"] = Value::from(spec.name());
     record["census"] = census(spec);
+    record["attention_census"] = attention_census(spec);
     record["tiling"] = Value::from(kernels::tiling().name());
     record["row_orders"] = row_orders(spec);
     record["tiling_calibration"] = calibration;

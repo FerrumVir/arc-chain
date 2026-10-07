@@ -346,23 +346,49 @@ pub fn attention_head(
     }
     let max_score = scores.iter().copied().max().unwrap_or(0);
     let mut total: i64 = 0;
-    let mut weighted = vec![0i64; width];
-    for (position, &score) in scores.iter().enumerate() {
-        let weight = exp_q16(score - max_score);
-        if weight == 0 {
-            continue;
+    if cache.positions <= MAX_I64_WEIGHTED_POSITIONS {
+        let mut weighted = vec![0i64; width];
+        for (position, &score) in scores.iter().enumerate() {
+            let weight = exp_q16(score - max_score);
+            if weight == 0 {
+                continue;
+            }
+            total += weight;
+            let base = position * cache.stride + cache.offset;
+            for (acc, &v) in weighted.iter_mut().zip(&cache.values[base..base + width]) {
+                *acc += weight * i64::from(v);
+            }
         }
-        total += weight;
-        let base = position * cache.stride + cache.offset;
-        for (acc, &v) in weighted.iter_mut().zip(&cache.values[base..base + width]) {
-            *acc += weight * i64::from(v);
+        for (slot, &acc) in out.iter_mut().zip(&weighted) {
+            *slot = acc / total;
         }
-    }
-    for (slot, &acc) in out.iter_mut().zip(&weighted) {
-        *slot = acc / total;
+    } else {
+        // Longer contexts can carry a weighted sum past i64; i128 holds it
+        // for every position count a usize can index.
+        let mut weighted = vec![0i128; width];
+        for (position, &score) in scores.iter().enumerate() {
+            let weight = exp_q16(score - max_score);
+            if weight == 0 {
+                continue;
+            }
+            total += weight;
+            let base = position * cache.stride + cache.offset;
+            for (acc, &v) in weighted.iter_mut().zip(&cache.values[base..base + width]) {
+                *acc += i128::from(weight * i64::from(v));
+            }
+        }
+        for (slot, &acc) in out.iter_mut().zip(&weighted) {
+            // A weighted mean of values in i32, so the quotient fits.
+            *slot = (acc / i128::from(total)) as i64;
+        }
     }
     Ok(())
 }
+
+/// Most attended positions whose weighted value sums fit i64: each term is
+/// `weight * v` with `0 < weight <= 2^16` and `v` an i32, so `2^16` terms
+/// stay inside `[-2^63, 2^63)`. Beyond it [`attention_head`] sums in i128.
+pub const MAX_I64_WEIGHTED_POSITIONS: usize = 1 << 16;
 
 /// `sigma(g)` in Q16 (spec §5.7).
 #[inline]

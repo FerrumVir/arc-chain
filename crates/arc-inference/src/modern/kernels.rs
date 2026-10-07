@@ -171,6 +171,10 @@ static REFUSED_DOMAIN: AtomicU64 = AtomicU64::new(0);
 static REFUSED_INNER_DIM: AtomicU64 = AtomicU64::new(0);
 /// Accepted inputs by number of digit planes (index = planes, 1..=4).
 static LIMBS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Query heads the fast engine attended with a SIMD kernel selected: on the
+/// SIMD path, and through the reference function (outside the SIMD domain).
+static ATTENTION_SIMD: AtomicU64 = AtomicU64::new(0);
+static ATTENTION_REFERENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Count prepared inputs (one per activation vector, however many matrices
 /// read it). Off by default, so timed runs do no counting unless asked.
@@ -191,6 +195,8 @@ pub fn reset_census() {
         &REFUSED_UNAVAILABLE,
         &REFUSED_DOMAIN,
         &REFUSED_INNER_DIM,
+        &ATTENTION_SIMD,
+        &ATTENTION_REFERENCE,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
@@ -210,6 +216,32 @@ pub fn census() -> ProjectionCensus {
         refused_inner_dim_above_i32_bound: REFUSED_INNER_DIM.load(Ordering::Relaxed),
         refused_activation_out_of_domain: REFUSED_DOMAIN.load(Ordering::Relaxed),
         refused_scale_multiply_would_overflow: 0,
+    }
+}
+
+/// Query heads of the fast engine's attention with a SIMD kernel selected,
+/// since the last reset: run by the SIMD path, and run by the reference
+/// function because the head (or its group or context) is outside the SIMD
+/// domain. The values are the same either way; the gate wants to see which.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AttentionCensus {
+    pub simd_heads: u64,
+    pub reference_heads: u64,
+}
+
+/// Count `simd` and `reference` attended heads (see [`AttentionCensus`]).
+pub fn count_attention_heads(simd: u64, reference: u64) {
+    if CENSUS_ON.load(Ordering::Relaxed) {
+        ATTENTION_SIMD.fetch_add(simd, Ordering::Relaxed);
+        ATTENTION_REFERENCE.fetch_add(reference, Ordering::Relaxed);
+    }
+}
+
+/// The attention heads counted since the last reset.
+pub fn attention_census() -> AttentionCensus {
+    AttentionCensus {
+        simd_heads: ATTENTION_SIMD.load(Ordering::Relaxed),
+        reference_heads: ATTENTION_REFERENCE.load(Ordering::Relaxed),
     }
 }
 
@@ -2124,6 +2156,145 @@ mod tests {
             let ok = magnitude_cap(2);
             input.prepare(&[ok, -ok], kernel).unwrap();
             assert!(input.prepare(&[], kernel).is_err());
+        }
+    }
+
+    /// One kernel's projection of `m` against the independent reference, as
+    /// a value or a refusal: both must agree (ARC-54 boundary inputs).
+    fn project_or_refuse(kernel: Kernel, m: &DyadicMatrix, x: &[i64]) -> Option<Vec<i64>> {
+        let mut input = PreparedInput::new();
+        input.prepare(x, kernel).ok()?;
+        let mut out = vec![0i64; m.rows];
+        project(MatrixRows::of(m), &input, &mut out).ok()?;
+        Some(out)
+    }
+
+    /// The reference projection with the profile's refusals: the
+    /// precondition, then `|y| <= 2^62` after the epilogue.
+    fn reference_or_refuse(m: &DyadicMatrix, x: &[i64]) -> Option<Vec<i64>> {
+        arith::check_projection_input(x).ok()?;
+        (0..m.rows)
+            .map(|r| {
+                let acc: i128 = m.q[r * m.cols..(r + 1) * m.cols]
+                    .iter()
+                    .zip(x)
+                    .map(|(&w, &v)| i128::from(w) * i128::from(v))
+                    .sum();
+                arith::to_activation((acc * i128::from(m.mu[r])) >> m.k[r], "test").ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_neon_column_bound_falls_back_exactly_and_is_counted() {
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let mut rng = Rng(0x0013_1071);
+        for cols in [I8_MAX_COLS - 1, I8_MAX_COLS, I8_MAX_COLS + 1] {
+            let m = matrix(&mut rng, 2, cols, 127);
+            // Values that need every NEON digit plane.
+            let (min, max) = digit_range(8, I8_MAX_LIMBS);
+            let bound = (max.min(-min)).min(magnitude_cap(cols));
+            let mut x: Vec<i64> = (0..cols).map(|_| rng.signed(bound)).collect();
+            x[0] = bound;
+            x[cols - 1] = -bound;
+            for kernel in Kernel::available_kernels() {
+                set_census_enabled(true);
+                reset_census();
+                let mut input = PreparedInput::new();
+                input.prepare(&x, kernel).unwrap();
+                let c = census();
+                set_census_enabled(false);
+                if kernel == Kernel::Neon {
+                    let inside = cols <= I8_MAX_COLS;
+                    let expected = if inside { Kernel::Neon } else { Kernel::Scalar };
+                    assert_eq!(input.kernel(), expected, "cols {cols}");
+                    // Other tests may count concurrently: lower bounds only.
+                    if inside {
+                        assert!(c.accepted >= 1, "{c:?}");
+                    } else {
+                        assert!(c.refused_inner_dim_above_i32_bound >= 1, "{c:?}");
+                    }
+                }
+                let mut out = vec![0i64; m.rows];
+                project(MatrixRows::of(&m), &input, &mut out).unwrap();
+                assert_eq!(out, reference(&m, &x), "{} cols {cols}", kernel.name());
+            }
+        }
+        reset_census();
+    }
+
+    #[test]
+    fn projection_mass_and_epilogue_edges_match_the_reference() {
+        // Profile weights only (|w| <= 127). 600 columns: 599 weights of 127
+        // and one of 1, so the exact sum hits any target `A` with values
+        // inside the three-digit AVX2 domain (|x| < 2^47).
+        let cols = 600;
+        let mut q = vec![127i8; cols];
+        q[cols - 1] = 1;
+        let with_scale = |mu: i32, k: u8| DyadicMatrix {
+            rows: 1,
+            cols,
+            q: q.clone(),
+            mu: vec![mu],
+            k: vec![k],
+        };
+        let hitting = |target: i128| -> Vec<i64> {
+            let step = 127 * (cols as i128 - 1);
+            let c = target.div_euclid(step);
+            let d = target - c * step;
+            let mut x = vec![c as i64; cols];
+            x[cols - 1] = d as i64;
+            x
+        };
+        // (mu, k) = (2^30, 30) makes the output the exact sum: straddle the
+        // activation limit 2^62 on both sides.
+        let unit = with_scale(1 << 30, 30);
+        let limit = 1i128 << 62;
+        for (target, accepted) in [
+            (limit - 1, true),
+            (limit, true),
+            (limit + 1, false),
+            (-limit, true),
+            (-limit - 1, false),
+        ] {
+            let x = hitting(target);
+            let expected = reference_or_refuse(&unit, &x);
+            assert_eq!(expected.is_some(), accepted, "target {target}");
+            if let Some(y) = &expected {
+                assert_eq!(i128::from(y[0]), target);
+            }
+            for kernel in Kernel::available_kernels() {
+                assert_eq!(
+                    project_or_refuse(kernel, &unit, &x),
+                    expected,
+                    "{} target {target}",
+                    kernel.name()
+                );
+            }
+        }
+        // The precondition `127 · Σ|x| < 2^63`, at its last accepted mass and
+        // one past it, with every value inside the AVX2 digit domain.
+        let small = with_scale(1 << 30, 62);
+        let last = ((1i128 << 63) - 1) / 127;
+        for (mass, accepted) in [(last, true), (last + 1, false)] {
+            for sign in [1i64, -1] {
+                let mut x = vec![(mass / cols as i128) as i64 * sign; cols];
+                x[0] += (mass % cols as i128) as i64 * sign;
+                assert_eq!(
+                    x.iter().map(|v| i128::from(v.unsigned_abs())).sum::<i128>(),
+                    mass
+                );
+                let expected = reference_or_refuse(&small, &x);
+                assert_eq!(expected.is_some(), accepted, "mass {mass}");
+                for kernel in Kernel::available_kernels() {
+                    assert_eq!(
+                        project_or_refuse(kernel, &small, &x),
+                        expected,
+                        "{} mass {mass} sign {sign}",
+                        kernel.name()
+                    );
+                }
+            }
         }
     }
 
