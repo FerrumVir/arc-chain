@@ -25,13 +25,6 @@ on:
       - 'scripts/arc_modern/**'
       - 'docs/serving-optimizations.md'
       - '.github/workflows/serving-speed.yml'
-  push:
-    branches: [serving-speed-bitexact]
-    paths:
-      - 'crates/arc-inference/**'
-      - 'scripts/arc_modern/**'
-      - 'docs/serving-optimizations.md'
-      - '.github/workflows/serving-speed.yml'
 
 permissions:
   contents: read
