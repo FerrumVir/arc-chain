@@ -111,26 +111,36 @@ impl Rng {
     }
 }
 
-fn first_difference(a: &[i64], b: &[i64]) -> String {
-    if a.len() != b.len() {
-        return format!("lengths {} vs {}", a.len(), b.len());
-    }
-    match a.iter().zip(b).position(|(x, y)| x != y) {
-        Some(i) => format!("index {i}: CPU {} vs GPU {}", a[i], b[i]),
-        None => "equal".into(),
-    }
-}
-
 fn compare(
     report: &mut KatReport,
     label: &str,
     cpu: Result<Vec<i64>, ModernError>,
     gpu: Result<Vec<i64>, GpuModernError>,
 ) {
+    compare_with(report, label, cpu, gpu, &|_, _, _| String::new());
+}
+
+/// Like [`compare`], with `detail(index, cpu_value, gpu_value)` describing
+/// the inputs behind the first disagreeing element: what a driver fault needs
+/// to be reproduced and localised.
+fn compare_with(
+    report: &mut KatReport,
+    label: &str,
+    cpu: Result<Vec<i64>, ModernError>,
+    gpu: Result<Vec<i64>, GpuModernError>,
+    detail: &dyn Fn(usize, i64, i64) -> String,
+) {
     report.cases += 1;
     let mismatch = match (&cpu, &gpu) {
-        (Ok(a), Ok(b)) if a == b => None,
-        (Ok(a), Ok(b)) => Some(first_difference(a, b)),
+        (Ok(a), Ok(b)) if a.len() != b.len() => Some(format!("lengths {} vs {}", a.len(), b.len())),
+        (Ok(a), Ok(b)) => a.iter().zip(b).position(|(x, y)| x != y).map(|i| {
+            let inputs = detail(i, a[i], b[i]);
+            if inputs.is_empty() {
+                format!("index {i}: CPU {} vs GPU {}", a[i], b[i])
+            } else {
+                format!("index {i}: CPU {} vs GPU {} ({inputs})", a[i], b[i])
+            }
+        }),
         (Err(ModernError::Domain(_)), Err(GpuModernError::Domain(_))) => {
             report.refusals += 1;
             None
@@ -139,10 +149,10 @@ fn compare(
         (Ok(_), Err(g)) => Some(format!("CPU returned values, GPU failed ({g})")),
         (Err(c), Err(g)) => Some(format!("CPU {c} vs GPU {g}")),
     };
-    if let Some(detail) = mismatch {
+    if let Some(text) = mismatch {
         report.mismatch_count += 1;
         if report.mismatches.len() < MAX_REPORTED {
-            report.mismatches.push(format!("{label}: {detail}"));
+            report.mismatches.push(format!("{label}: {text}"));
         }
     }
 }
@@ -357,13 +367,152 @@ fn silu_case(lab: &OpLab, rng: &mut Rng, round: usize, report: &mut KatReport) {
     let n = rng.range(1, 200);
     let gate: Vec<i64> = (0..n).map(|_| rng.activation()).collect();
     let up: Vec<i64> = (0..n).map(|_| rng.activation()).collect();
+    compare_silu(
+        lab,
+        report,
+        &format!("gated_silu #{round} (n {n})"),
+        &gate,
+        &up,
+    );
+}
+
+/// One gated-SiLU vector against the CPU operator. A disagreement names the
+/// inputs, the CPU's sigma and the sigma the GPU's value implies.
+fn compare_silu(lab: &OpLab, report: &mut KatReport, label: &str, gate: &[i64], up: &[i64]) {
     let cpu = gate
         .iter()
-        .zip(&up)
+        .zip(up)
         .map(|(&g, &u)| arith::gated_silu(g, u))
         .collect::<Result<Vec<i64>, _>>();
-    let gpu = lab.gated_silu(&gate, &up, &EXP_TABLE);
-    compare(report, &format!("gated_silu #{round} (n {n})"), cpu, gpu);
+    let gpu = lab.gated_silu(gate, up, &EXP_TABLE);
+    let detail = |i: usize, _cpu: i64, gpu_value: i64| {
+        let (g, u) = (gate[i], up[i]);
+        let implied = if g == 0 || u == 0 {
+            "-".to_string()
+        } else {
+            ((i128::from(gpu_value) << 32) / (i128::from(g) * i128::from(u))).to_string()
+        };
+        format!(
+            "g {g} u {u} sigma_cpu {} sigma_implied_by_gpu {implied}",
+            arith::sigmoid_q16(g)
+        )
+    };
+    compare_with(report, label, cpu, gpu, &detail);
+}
+
+/// Gated-SiLU pairs that must agree on every adapter, run once per self-test
+/// ahead of the random rounds.
+///
+/// `STUDIO_PAIRS` disagreed with the CPU on an Apple M2 Ultra (Metal, wgpu 25,
+/// macOS 14.6.1) at commit b2f90797b: positive gates of 55 to 59 bits with a
+/// small `up`, where the GPU's product came out multiplied by 2^15 + 1 (the
+/// first three as values, CPU -1238448962902, -2349452961666 and
+/// -3075646391134; the others as refusals of values the CPU accepts).
+/// lavapipe and WARP agreed with the CPU on the same inputs. `GATES` x `UPS`
+/// then sweeps the edges of both operands: 0, +-1, powers of two around the
+/// Q16 point, the exp table's saturation at |g| = 2^20, the 32-bit word
+/// boundary, the 55-to-59-bit range above, +-2^62 and the i64 extremes. Pairs
+/// the CPU accepts form one vector compared value by value; every pair it
+/// refuses is its own case, which the GPU must refuse too.
+fn silu_fixed_cases(lab: &OpLab, report: &mut KatReport) {
+    const STUDIO_PAIRS: [(i64, i64); 11] = [
+        (81_162_991_232_727_707, -1),
+        (38_493_437_323_926_438, -4),
+        (67_188_520_629_767_615, -3),
+        (28_796_822_396_299_033, 16_527),
+        (83_688_805_347_835_055, -898_890),
+        (4_611_686_018_427_387_904, -164),
+        (83_353_978_609_894_701, -367_888),
+        (52_805_664_596_650_435, 418),
+        (9_519_343_811_666_446, 1_914_723),
+        (81_345_222_359_341_819, -14_139),
+        (102_130_806_940_335_517, -127_254),
+    ];
+    const GATES: [i64; 32] = [
+        0,
+        1,
+        -1,
+        1 << 15,
+        -(1 << 15),
+        1 << 16,
+        -(1 << 16),
+        (1 << 20) - 1,
+        -((1 << 20) - 1),
+        1 << 20,
+        -(1 << 20),
+        (1 << 31) - 1,
+        -((1 << 31) - 1),
+        1 << 31,
+        -(1 << 31),
+        (1 << 32) - 1,
+        1 << 32,
+        -(1 << 32),
+        (1 << 32) + 1,
+        1 << 40,
+        -(1 << 40),
+        1 << 48,
+        1 << 55,
+        1 << 56,
+        1 << 57,
+        1 << 59,
+        (1 << 62) - 1,
+        1 << 62,
+        -(1 << 62),
+        (1 << 62) + 1,
+        i64::MAX,
+        i64::MIN,
+    ];
+    const UPS: [i64; 21] = [
+        0,
+        1,
+        -1,
+        3,
+        -3,
+        1 << 15,
+        -(1 << 15),
+        1 << 16,
+        -(1 << 16),
+        1 << 20,
+        -(1 << 20),
+        1 << 31,
+        -(1 << 31),
+        1 << 32,
+        -(1 << 32),
+        1 << 40,
+        -(1 << 40),
+        1 << 62,
+        -(1 << 62),
+        i64::MAX,
+        i64::MIN,
+    ];
+    let (gate, up): (Vec<i64>, Vec<i64>) = STUDIO_PAIRS.iter().copied().unzip();
+    compare_silu(
+        lab,
+        report,
+        "gated_silu Mac Studio b2f90797b pairs",
+        &gate,
+        &up,
+    );
+    let mut accepted_gate = Vec::new();
+    let mut accepted_up = Vec::new();
+    for &g in &GATES {
+        for &u in &UPS {
+            if arith::gated_silu(g, u).is_ok() {
+                accepted_gate.push(g);
+                accepted_up.push(u);
+            } else {
+                let label = format!("gated_silu edge refused (g {g}, u {u})");
+                compare_silu(lab, report, &label, &[g], &[u]);
+            }
+        }
+    }
+    compare_silu(
+        lab,
+        report,
+        "gated_silu edges accepted by the CPU",
+        &accepted_gate,
+        &accepted_up,
+    );
 }
 
 fn residual_case(lab: &OpLab, rng: &mut Rng, round: usize, report: &mut KatReport) {
@@ -408,6 +557,7 @@ fn embed_case(lab: &OpLab, rng: &mut Rng, round: usize, report: &mut KatReport) 
 pub fn run(lab: &OpLab, seed: u64, rounds: usize) -> KatReport {
     let mut rng = Rng(seed);
     let mut report = KatReport::default();
+    silu_fixed_cases(lab, &mut report);
     for round in 0..rounds {
         project_case(lab, &mut rng, round, &mut report);
         rms_case(lab, &mut rng, round, &mut report);

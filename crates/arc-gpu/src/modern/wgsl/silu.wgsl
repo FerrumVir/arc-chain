@@ -4,6 +4,14 @@
 //   a = (g * sigma(g) * u) >> 32
 // with the CPU's checked i128 product and refusal of |a| > 2^62.
 // Grid: x = element within a token (n per token), y = token in the batch.
+//
+// sigma uses the shift-subtract divider of int.wgsl (div_word), never the
+// native `/`. The previous version divided with `/` (the only two native
+// integer divisions in these kernels, both with a per-thread divisor). On an
+// Apple M2 Ultra (Metal, wgpu 25, macOS 14.6.1) at commit b2f90797b it
+// returned products multiplied by exactly 2^15 + 1 for positive gates of 55 to
+// 59 bits, while lavapipe and WARP agreed with the CPU on the same inputs
+// (docs/gpu-portable-kernels.md §5). sigma is also branch-free now.
 
 struct SiluParams {
     n: u32,
@@ -29,19 +37,17 @@ struct Cursor {
 @group(0) @binding(2) var<storage, read_write> gate: array<vec2<u32>>;
 @group(0) @binding(3) var<storage, read> up: array<vec2<u32>>;
 
-// floor(2^32 / d) for d >= 2, from floor((2^32 - 1) / d).
-fn div_2pow32(d: u32) -> u32 {
-    let q = 0xFFFFFFFFu / d;
-    let r = 0xFFFFFFFFu - q * d;
-    return select(q, q + 1u, r + 1u == d);
-}
-
+// sigma(g) in Q16, in [0, 65536], as one long division:
+//   e = exp(-|g|) in Q16 (0 for |g| >= 2^20, 65536 for g = 0), d = 2^16 + e;
+//   the numerator is 2^32 (the 64-bit pair (0, 1)) for g >= 0 and e * 2^16
+//   (< 2^32, since e <= 65535 for g < 0) for g < 0.
+// d lies in [2^16, 2^17], within div_word's bound of 2^31, and the quotient is
+// at most 2^16, so its high word is zero.
 fn sigmoid_q16(g: vec2<u32>) -> u32 {
-    if (!i64_is_neg(g)) {
-        return div_2pow32(65536u + exp_q16(i64_neg(g)));
-    }
-    let e = exp_q16(g); // <= 65535 for g < 0, so e << 16 < 2^32
-    return (e << 16u) / (65536u + e);
+    let e = exp_q16(i64_neg(i64_abs(g)));
+    let d = 65536u + e;
+    let n = select(vec2<u32>(0u, 1u), vec2<u32>(e << 16u, 0u), i64_is_neg(g));
+    return div64_u32(n, d).x;
 }
 
 @compute @workgroup_size(64)
