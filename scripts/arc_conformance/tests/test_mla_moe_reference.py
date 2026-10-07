@@ -119,6 +119,40 @@ class RouterAndRouting(unittest.TestCase):
         self.assertEqual(mm.select_experts_int([5, 5, 4, 6, 1, 1, 0, 0], 2, 4, 1), [0, 1])
         self.assertEqual(mm.select_experts_int([5, 5, 4, 6, 1, 1, 0, 0], 2, 4, 2), [3, 0])
 
+    def test_routing_tie_vectors(self):
+        # The same file is checked by the Rust unit tests (ops.rs).
+        vectors = json.loads((SCRIPTS / "arc_mla" / "routing_ties.json").read_text(encoding="utf-8"))
+        for v in vectors["selection"]:
+            with self.subTest(v["name"]):
+                self.assertEqual(mm.select_experts_int(v["keys"], v["top_k"], v["n_group"], v["topk_group"]),
+                                 v["expected"])
+        for v in vectors["logits"]:
+            with self.subTest(v["name"]):
+                sigma = [mm.sigmoid_int(g) for g in v["logits"]]
+                self.assertEqual(sigma, v["sigma"])
+                keys = [(s << 16) + b for s, b in zip(sigma, v["bias"])]
+                self.assertEqual(mm.select_experts_int(keys, v["top_k"], v["n_group"], v["topk_group"]),
+                                 v["expected"])
+        for v in vectors["weights"]:
+            with self.subTest(v["name"]):
+                self.assertEqual(mm.routing_weights_int(v["sigma"], v["rho"], v["normalize"]), v["expected"])
+
+    def test_selection_matches_the_literal_rule_under_heavy_ties(self):
+        # Keys drawn from three values, so most selections cut through a tie.
+        rng = random.Random(66)
+        for _ in range(2000):
+            n_group = rng.choice([1, 2, 4])
+            experts = n_group * rng.choice([2, 3, 4])
+            topk_group = rng.randint(1, n_group)
+            top_k = rng.randint(1, topk_group * experts // n_group)
+            keys = [rng.choice([-1, 0, 1]) for _ in range(experts)]
+            size = experts // n_group
+            ranked_groups = sorted(range(n_group), key=lambda g: (
+                -sum(sorted(keys[g * size:(g + 1) * size], reverse=True)[:2]), g))
+            kept = set(ranked_groups[:topk_group])
+            ranked = sorted((e for e in range(experts) if e // size in kept), key=lambda e: (-keys[e], e))
+            self.assertEqual(mm.select_experts_int(keys, top_k, n_group, topk_group), ranked[:top_k])
+
     def test_weights_and_combine(self):
         rho = 1 << 32
         self.assertEqual(mm.routing_weights_int([30000, 20000, 10000], rho, True),

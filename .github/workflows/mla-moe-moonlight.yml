@@ -16,6 +16,10 @@ name: MLA + MoE model (Moonlight-16B-A3B, Kimi-K2 architecture)
 #              the Python executor.
 #   tokenizer  the Rust tiktoken encoder and chat prompt vs the tiktoken library
 #              built as Moonlight's pinned wrapper builds it, and jinja2.
+#   golden     the unit tests on linux arm64 (NEON) and windows x86-64 (AVX2):
+#              pinned golden digests of seven tiny MLA + MoE configurations
+#              (scalar on 1 and 3 threads and SIMD must all match the constants
+#              the rust job checks on linux x86-64) and the routing tie vectors.
 #
 # Real-model jobs (label kimi-arch-proof on the pull request, or a push whose
 # head commit message contains [kimi-proof]):
@@ -45,7 +49,7 @@ name: MLA + MoE model (Moonlight-16B-A3B, Kimi-K2 architecture)
 
 on:
   push:
-    branches: [kimi-arch-integer]
+    branches: [agent/builder/ARC-66]
     paths:
       - 'crates/arc-inference/**'
       - 'scripts/arc_conformance/mla_moe_reference.py'
@@ -605,6 +609,32 @@ jobs:
           path: ${{ runner.temp }}/kimi-arch-evidence/
           if-no-files-found: warn
 
+  golden:
+    name: golden digests (${{ matrix.os }})
+    if: github.event_name == 'push' || github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest (x86-64, AVX2) runs the same tests in the rust job.
+        # macOS legs are withheld while macOS runners serve the release sequence.
+        os: [ubuntu-24.04-arm, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - name: Pinned tiny-model digests, routing ties, scalar vs SIMD
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p arc-inference --lib --locked modern::mla -- --nocapture 2>&1 | tee mla-tests.log
+          { echo "### Golden digests on $RUNNER_OS $RUNNER_ARCH"; echo; echo '```'
+            grep '^golden ' mla-tests.log; grep '^test result' mla-tests.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
   matrix:
     name: matrix (${{ matrix.os }})
     needs: [moonlight, moonlight-int4]
@@ -719,7 +749,7 @@ jobs:
 
   report:
     name: report
-    needs: [rust, tiny, tokenizer, moonlight, moonlight-int4, quality, matrix]
+    needs: [rust, golden, tiny, tokenizer, moonlight, moonlight-int4, quality, matrix]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15

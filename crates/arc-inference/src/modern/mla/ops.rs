@@ -782,6 +782,101 @@ mod tests {
         assert!(select_experts(&keys, 6, 1, 1).is_err());
     }
 
+    /// The routing tie vectors shared with the Python reference tests.
+    #[test]
+    fn routing_tie_vectors_match_the_shared_file() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../scripts/arc_mla/routing_ties.json"
+        ))
+        .unwrap();
+        let ints = |v: &serde_json::Value| -> Vec<i64> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap())
+                .collect()
+        };
+        let count = |v: &serde_json::Value| v.as_u64().unwrap() as usize;
+        let indices = |v: &serde_json::Value| -> Vec<usize> {
+            ints(v).into_iter().map(|e| e as usize).collect()
+        };
+        let mut checked = 0;
+        for v in vectors["selection"].as_array().unwrap() {
+            let chosen = select_experts(
+                &ints(&v["keys"]),
+                count(&v["top_k"]),
+                count(&v["n_group"]),
+                count(&v["topk_group"]),
+            )
+            .unwrap();
+            assert_eq!(chosen, indices(&v["expected"]), "{}", v["name"]);
+            checked += 1;
+        }
+        for v in vectors["logits"].as_array().unwrap() {
+            let (sigma, keys) = selection_keys(&ints(&v["logits"]), &ints(&v["bias"])).unwrap();
+            assert_eq!(sigma, ints(&v["sigma"]), "{}", v["name"]);
+            let chosen = select_experts(
+                &keys,
+                count(&v["top_k"]),
+                count(&v["n_group"]),
+                count(&v["topk_group"]),
+            )
+            .unwrap();
+            assert_eq!(chosen, indices(&v["expected"]), "{}", v["name"]);
+            checked += 1;
+        }
+        for v in vectors["weights"].as_array().unwrap() {
+            let weights = routing_weights(
+                &ints(&v["sigma"]),
+                v["rho"].as_i64().unwrap(),
+                v["normalize"].as_bool().unwrap(),
+            );
+            assert_eq!(weights, ints(&v["expected"]), "{}", v["name"]);
+            checked += 1;
+        }
+        assert_eq!(checked, 19);
+    }
+
+    /// Selection against a literal reading of spec §5.4 when most selections
+    /// cut through a tie: keys drawn from three values.
+    #[test]
+    fn selection_matches_the_literal_rule_under_heavy_ties() {
+        let mut state = 66u64;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        for _ in 0..5_000 {
+            let n_group = [1, 2, 4][next(3) as usize];
+            let size = 2 + next(3) as usize;
+            let experts = n_group * size;
+            let topk_group = 1 + next(n_group as u64) as usize;
+            let top_k = 1 + next((topk_group * size) as u64) as usize;
+            let keys: Vec<i64> = (0..experts).map(|_| next(3) as i64 - 1).collect();
+            // Group score: the two largest keys; ties to the lower group.
+            let mut groups: Vec<usize> = (0..n_group).collect();
+            let score = |g: usize| {
+                let mut members = keys[g * size..(g + 1) * size].to_vec();
+                members.sort_unstable();
+                members[size - 1] + members[size - 2]
+            };
+            groups.sort_by_key(|&g| (-score(g), g));
+            let kept = &groups[..topk_group];
+            let mut ranked: Vec<usize> = (0..experts)
+                .filter(|e| kept.contains(&(e / size)))
+                .collect();
+            ranked.sort_by_key(|&e| (-keys[e], e));
+            ranked.truncate(top_k);
+            assert_eq!(
+                select_experts(&keys, top_k, n_group, topk_group).unwrap(),
+                ranked,
+                "keys {keys:?}, top_k {top_k}, groups {n_group}/{topk_group}"
+            );
+        }
+    }
+
     #[test]
     fn group_limited_routing_keeps_the_best_groups() {
         // Groups of two: sums 3, 10, 6, 18 -> keep groups 3 and 1.

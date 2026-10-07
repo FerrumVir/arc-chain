@@ -658,7 +658,15 @@ the context length; only the 24 MLA layers keep a per-token cache.
   - the stage layout, segment digests and the boundary file format;
   - thread-count and kernel (scalar/SIMD) invariance;
   - 1/2/4-stage layout invariance and per-stage replay, on tiny models;
-  - the tokenizer's BPE merge order and pattern.
+  - the tokenizer's BPE merge order and pattern;
+  - pinned golden digests of seven tiny configurations (INT8 and INT4 g32
+    experts; query LoRA and group routing on and off; random routers, routers
+    tied in pairs so the top-k cut falls in a tie, and fully tied routers):
+    the package bytes and one generation, equal to the constants for scalar on
+    1 and 3 threads and for SIMD, on every runner;
+  - routing ties end to end on every MoE layer, and the shared vectors in
+    `scripts/arc_mla/routing_ties.json`, which the Python reference checks
+    too.
 - The independent Python executor prepares the same stage packages from the
   same BF16 files. CI requires byte equality on tiny models and segment-digest
   equality on Moonlight-16B-A3B.

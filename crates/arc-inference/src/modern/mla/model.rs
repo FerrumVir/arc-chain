@@ -932,10 +932,31 @@ pub(crate) mod tests {
         }
     }
 
+    /// How the tiny package's routers are filled.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum TinyRouter {
+        /// Random router rows and biases.
+        Random,
+        /// Expert `2j + 1` gets expert `2j`'s router row, shift and bias, so
+        /// every token's keys tie in pairs and the top-k cut falls in a tie.
+        Paired,
+        /// Zero router rows and biases: every key ties for every token.
+        Flat,
+    }
+
     /// Write a random but valid package for `stage` of `c` into memory, with
     /// the same values whatever the stage (each tensor's content depends on
     /// its name only), so stages of different layouts are consistent.
     pub(crate) fn tiny_package(c: &MlaConfig, stage: StageSpec) -> Vec<u8> {
+        tiny_package_routed(c, stage, TinyRouter::Random)
+    }
+
+    /// [`tiny_package`] with the routers filled as `router` says.
+    pub(crate) fn tiny_package_routed(
+        c: &MlaConfig,
+        stage: StageSpec,
+        router: TinyRouter,
+    ) -> Vec<u8> {
         let entries = layout(c, stage);
         let header = header_json(
             c,
@@ -1001,6 +1022,23 @@ pub(crate) mod tests {
                     .map(|_| ONE / 2 + (rng.next() % ONE as u64) as i64)
                     .collect();
                 crate::modern::package::i64_bytes(&values)
+            };
+            let routing = ["router.q", "router.k", "router_bias"]
+                .iter()
+                .any(|suffix| e.name.ends_with(suffix));
+            let bytes = match router {
+                TinyRouter::Paired if routing => {
+                    let row = bytes.len() / c.n_routed_experts;
+                    let mut paired = bytes;
+                    for expert in (1..c.n_routed_experts).step_by(2) {
+                        paired.copy_within((expert - 1) * row..expert * row, expert * row);
+                    }
+                    paired
+                }
+                TinyRouter::Flat if routing && !e.name.ends_with("router.k") => {
+                    vec![0; bytes.len()]
+                }
+                _ => bytes,
             };
             w.write_tensor(&e.name, &bytes).unwrap();
         }
@@ -1377,6 +1415,189 @@ pub(crate) mod tests {
         assert_eq!(
             boundary_digest(&run.hidden, c.d_model),
             out.boundary_digests[c.n_layers]
+        );
+    }
+
+    /// The routed output for experts `chosen`, computed by hand: the spec's
+    /// weights from `sigma` and one exact combine with the shared expert.
+    fn routed_by_hand(
+        model: &StageModel,
+        moe: &MoeWeights,
+        x: &[i64],
+        chosen: &[usize],
+        sigma: &[i64],
+    ) -> Vec<i64> {
+        let c = model.config();
+        let data = model.bytes();
+        let chosen_sigma: Vec<i64> = chosen.iter().map(|&e| sigma[e]).collect();
+        let weights = routing_weights(&chosen_sigma, c.routed_scaling_q32, c.norm_topk_prob);
+        let outputs: Vec<Vec<i64>> = chosen
+            .iter()
+            .map(|&e| match &moe.experts {
+                ExpertStacks::Int8([g, u, d]) => {
+                    gated_ffn(g.view(data, e), u.view(data, e), d.view(data, e), x)
+                }
+                ExpertStacks::Int4([g, u, d]) => {
+                    gated_ffn(g.view(data, e), u.view(data, e), d.view(data, e), x)
+                }
+            })
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let [s_gate, s_up, s_down] = &moe.shared;
+        let shared = gated_ffn(
+            s_gate.view(data, 0),
+            s_up.view(data, 0),
+            s_down.view(data, 0),
+            x,
+        )
+        .unwrap();
+        let mut out = vec![0i64; c.d_model];
+        combine(&weights, &outputs, &shared, &mut out).unwrap();
+        out
+    }
+
+    /// Routers whose keys tie for every token: with all keys equal the lowest
+    /// experts (and groups) are taken; with keys tied in pairs the top-k cut
+    /// falls inside a pair and keeps its lower expert. Every MoE layer of every
+    /// tiny format, and the layer output is the hand-computed one.
+    #[test]
+    fn routing_ties_resolve_to_the_lower_index_end_to_end() {
+        for (lora, format) in FORMATS {
+            let c = tiny_config_with(lora, format);
+            let k = c.n_experts_per_tok;
+            assert_eq!(
+                k, 3,
+                "the pair argument below assumes three experts per token"
+            );
+            for router in [TinyRouter::Flat, TinyRouter::Paired] {
+                let model =
+                    StageModel::from_owned(tiny_package_routed(&c, StageSpec::full(&c), router))
+                        .unwrap();
+                let mut layers = 0;
+                for (l, layer) in model.layers.iter().enumerate() {
+                    let FfnWeights::Moe(moe) = &layer.ffn else {
+                        continue;
+                    };
+                    layers += 1;
+                    for t in 0..16i64 {
+                        let x: Vec<i64> = (0..c.d_model as i64)
+                            .map(|i| ((i * 37 + t * 101) % 61 - 30) * (1 << (8 + t % 5)))
+                            .collect();
+                        let mut logits = vec![0i64; c.n_routed_experts];
+                        router_logits(&moe.router_q, &moe.router_k, &x, &mut logits).unwrap();
+                        let (sigma, keys) = selection_keys(&logits, &moe.bias).unwrap();
+                        let chosen = select_experts(&keys, k, c.n_group, c.topk_group).unwrap();
+                        let at = format!("lora {lora}, {format:?}, {router:?}, layer {l}, x {t}");
+                        if router == TinyRouter::Flat {
+                            assert!(keys.iter().all(|&key| key == keys[0]), "{at}");
+                            assert_eq!(chosen, vec![0, 1, 2], "{at}");
+                        } else {
+                            // [2a, 2a + 1, 2b]: one whole pair, then the lower
+                            // expert of a pair whose upper expert ties with it.
+                            assert!(
+                                chosen[0].is_multiple_of(2) && chosen[1] == chosen[0] + 1,
+                                "{at}"
+                            );
+                            assert!(chosen[2].is_multiple_of(2), "{at}: {chosen:?}");
+                            assert_eq!(keys[chosen[2]], keys[chosen[2] + 1], "{at}");
+                        }
+                        assert_eq!(
+                            model.moe_forward(moe, &x).unwrap(),
+                            routed_by_hand(&model, moe, &x, &chosen, &sigma),
+                            "{at}"
+                        );
+                    }
+                }
+                assert_eq!(layers, c.n_layers - c.first_k_dense);
+            }
+        }
+    }
+
+    /// Golden digests of the tiny MLA + MoE models: the package bytes, and one
+    /// generation (tokens, every logits hash, every boundary digest). Scalar on
+    /// one and three threads and the SIMD kernel must all give the pinned
+    /// values, and CI checks the same constants on every OS and CPU.
+    #[test]
+    fn golden_digests_are_pinned_on_every_kernel() {
+        use ExpertFormat::{Int4G32, Int8Dyadic};
+        use TinyRouter::{Flat, Paired, Random};
+        #[rustfmt::skip]
+        const GOLDEN: [(&str, bool, ExpertFormat, TinyRouter, &str, &str); 7] = [
+            ("int8", false, Int8Dyadic, Random,
+             "1df20f1df05824b7d48eaa0b8c8808d8d2529779f724c1325b682c0e2a52c68d",
+             "68b58e73eacc60547e9f977f60ce6c9c0b153f70bd023e0a2f7bcf3b440f0410"),
+            ("int8 query-lora groups", true, Int8Dyadic, Random,
+             "bf34916e74c2ff4d73877ad93df413e6172d9dc1efd4fc423f94ce13451e285b",
+             "f9250a027dfe281902c02f369fb426866ecb136607eb0e8f620d3927c98fa8fb"),
+            ("int4g32", false, Int4G32, Random,
+             "4137e2ed9243e915f47875f722e0f5d2233a81d7211595abfb16ca0f20113548",
+             "a233c3a605505e4ef2a11cba5c66d3c4a6d84ece4cc2c2af7cf0d5a5c3d5d264"),
+            ("int4g32 query-lora groups", true, Int4G32, Random,
+             "68a1bb8245acb16a55585bc652ca5dad0ba1f2391efc1bf1c363fa0d452002a7",
+             "e3b5f2a88b3e3a6da299cb6817932d56fda80524703ebb2055ea2907eefe03f1"),
+            ("int8 paired-router ties", false, Int8Dyadic, Paired,
+             "0ddac66f936aa73e4456d8a63b8de577841696865e4547bf5e64e810a9723da8",
+             "8237eda7f197cf92fbc5e741bd74be0887953ed2b4c5c15173fb25190d0e6f6f"),
+            ("int4g32 query-lora groups paired-router ties", true, Int4G32, Paired,
+             "bd71b84e22f6e3ad2e353d17d70c58a53bbba9db8f9dcf42249b79e72eb34bbd",
+             "fa8a7a47a461c3edaa04e9fc6d494a0d9aa505aac23548f68fc50521dd50571e"),
+            ("int8 query-lora groups flat-router ties", true, Int8Dyadic, Flat,
+             "f267317159174653e87a2c8fb5a5ef31d0d6d377014ad34be82b25c0a1aea9b7",
+             "54a6b84b4251c035b1eed1a90bf1ebcf39671149651aee46cf49a400e7625edc"),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, lora, format, router, package_golden, run_golden) in GOLDEN {
+            let c = tiny_config_with(lora, format);
+            let bytes = tiny_package_routed(&c, StageSpec::full(&c), router);
+            let package = blake3::hash(&bytes).to_hex().to_string();
+            let model = StageModel::from_owned(bytes).unwrap();
+            let request = GenerationRequest {
+                prompt: &[3, 17, 5, 49, 0],
+                max_tokens: 8,
+                eos: &[],
+                selection: Selection::Rp64Argmax,
+            };
+            let run = |threads: usize| -> String {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let out = pool.install(|| model.generate(&request)).unwrap();
+                assert_eq!(out.boundary_digests.len(), c.n_layers + 1);
+                let mut h = blake3::Hasher::new();
+                for t in &out.tokens {
+                    h.update(&t.to_le_bytes());
+                }
+                for x in out.logits_hashes.iter().chain(&out.boundary_digests) {
+                    h.update(x);
+                }
+                h.finalize().to_hex().to_string()
+            };
+            // Held throughout, so no other test flips the kernel mid-run.
+            let _guard = crate::canonical_simd::kernel_switch_guard();
+            crate::canonical_simd::set_fast_canonical_kernel(false);
+            let scalar = run(1);
+            assert_eq!(scalar, run(3), "{name}: thread count");
+            crate::canonical_simd::set_fast_canonical_kernel(true);
+            let simd_on = crate::canonical_simd::fast_canonical_kernel_enabled();
+            let simd = run(2);
+            crate::canonical_simd::set_fast_canonical_kernel(false);
+            if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+                assert!(
+                    simd_on,
+                    "{name}: the SIMD kernel is unavailable on this CPU"
+                );
+            }
+            assert_eq!(scalar, simd, "{name}: SIMD kernel");
+            let line = format!("golden {name}: package {package} run {scalar}");
+            println!("{line}");
+            if (package.as_str(), scalar.as_str()) != (package_golden, run_golden) {
+                mismatches.push(line);
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "golden digests differ: {mismatches:#?}"
         );
     }
 }
