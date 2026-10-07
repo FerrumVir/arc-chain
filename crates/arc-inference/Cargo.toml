@@ -49,6 +49,8 @@ candle-transformers = { version = "0.8", optional = true }
 
 [dev-dependencies]
 rand.workspace = true
+# Already locked; bound socket buffers for portable deadline/backpressure tests.
+socket2 = "=0.6.5"
 
 # Modern-model CLI (SmolLM3-3B): convert, verify, generate, golden, ppl.
 [[bin]]

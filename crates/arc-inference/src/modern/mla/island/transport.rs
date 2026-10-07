@@ -798,11 +798,32 @@ mod tests {
     #[test]
     fn slow_tcp_reader_cannot_extend_outbound_deadline() {
         for accepted in [false, true] {
-            let (mut link, mut peer) = deadline_pair(accepted, Duration::from_millis(150));
+            // Windows loopback may buffer a whole large write. Explicitly
+            // constrain both ends before connecting; frame size alone is not
+            // a portable way to establish backpressure.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener_ref = socket2::SockRef::from(&listener);
+            listener_ref.set_send_buffer_size(4096).unwrap();
+            listener_ref.set_recv_buffer_size(4096).unwrap();
+            let socket =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            socket.set_send_buffer_size(4096).unwrap();
+            socket.set_recv_buffer_size(4096).unwrap();
+            socket
+                .connect(&listener.local_addr().unwrap().into())
+                .unwrap();
+            let client: TcpStream = socket.into();
+            let server = listener.accept().unwrap().0;
+            let (stream, mut peer) = if accepted {
+                (server, client)
+            } else {
+                (client, server)
+            };
+            let mut link = DeadlineTcpLink::new(stream, Duration::from_millis(150)).unwrap();
             let reader = std::thread::spawn(move || {
                 peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                 // Consume a little, then keep the socket open past the sender's
-                // budget. The 32 MiB frame exceeds the loopback socket buffers.
+                // budget. The frame exceeds our explicitly bounded buffers.
                 let until = Instant::now() + Duration::from_millis(500);
                 while Instant::now() < until {
                     let mut byte = [0];
@@ -819,7 +840,7 @@ mod tests {
                 io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
             ));
             assert!(start.elapsed() < Duration::from_secs(3));
-            assert_closed(&mut *link);
+            assert_closed(&mut link);
             reader.join().unwrap();
         }
     }
