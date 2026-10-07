@@ -3830,8 +3830,20 @@ impl CachedIntegerModel {
         max_tokens: u32,
         eos_tokens: &[u32],
     ) -> Result<(Vec<u32>, Hash256), GenerationError> {
+        self.try_generate_observed(prompt, max_tokens, eos_tokens, || {})
+    }
+
+    /// Observe each accepted output token without changing generation or hashes.
+    /// The observer must be fast and must not perform IO.
+    pub fn try_generate_observed(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+        mut on_token: impl FnMut(),
+    ) -> Result<(Vec<u32>, Hash256), GenerationError> {
         let _admission = self.preflight_generation(prompt.len(), max_tokens)?;
-        Ok(self.generate_preflighted(prompt, max_tokens, eos_tokens))
+        Ok(self.generate_preflighted(prompt, max_tokens, eos_tokens, &mut on_token))
     }
 
     /// Trusted compatibility wrapper around [`Self::try_generate`].
@@ -3960,6 +3972,7 @@ impl CachedIntegerModel {
         prompt: &[u32],
         max_tokens: u32,
         eos_tokens: &[u32],
+        on_token: &mut impl FnMut(),
     ) -> (Vec<u32>, Hash256) {
         let mut cache = KVCache::new(self.config.n_layers);
         let mut generated = Vec::new();
@@ -3981,6 +3994,7 @@ impl CachedIntegerModel {
             let mut logits = self.forward_one_token(last_token, &mut cache);
             let next = select_next_token_with_repetition_penalty(&mut logits, &generated);
             generated.push(next);
+            on_token();
             if eos_tokens.contains(&next) {
                 break;
             }
@@ -7765,6 +7779,29 @@ mod tests {
             let (_, hash) = model.generate(&prompt, 4, &[99]);
             assert_eq!(hash, first_hash, "Determinism broken");
         }
+    }
+
+    #[test]
+    fn serving_observer_preserves_tokens_digest_and_eos() {
+        let model = build_test_model(50, 32, 2, 64, 1);
+        let prompt = [1, 2, 3];
+        let baseline = model.try_generate(&prompt, 4, &[]).unwrap();
+        for eos in [vec![], vec![baseline.0[0]]] {
+            let expected = model.try_generate(&prompt, 4, &eos).unwrap();
+            let mut observed = 0;
+            let result = model
+                .try_generate_observed(&prompt, 4, &eos, || observed += 1)
+                .unwrap();
+            assert_eq!(result, expected);
+            assert_eq!(observed, result.0.len());
+        }
+        let mut observed = 0;
+        assert!(
+            model
+                .try_generate_observed(&vec![1; model.config.max_seq + 1], 4, &[], || observed += 1)
+                .is_err()
+        );
+        assert_eq!(observed, 0);
     }
 
     #[test]

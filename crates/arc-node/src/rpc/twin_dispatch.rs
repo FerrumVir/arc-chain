@@ -1208,6 +1208,25 @@ pub(super) fn twin_inference_response(
         .collect();
     let mut response = match chosen {
         Some(chosen) if receipt.verdict == Verdict::Verified => {
+            if let Some(model_id) = node.model_artifact_id {
+                let input = node.inference_model.as_ref().map(|model| {
+                    let input = if public_demo {
+                        model.apply_chat_template(input_text)
+                    } else {
+                        input_text.to_string()
+                    };
+                    model.encode(&input).len() as u64
+                });
+                node.serving_stats.lock().record(serving_stats::Answer {
+                    model: model_id.0,
+                    input,
+                    output: chosen.tokens_generated,
+                    verified: true,
+                    cached: false,
+                    timing: serving_stats::AnswerTiming::default(),
+                    hops: Vec::new(),
+                });
+            }
             retain_inference_result(
                 node,
                 chosen.job_id.clone(),

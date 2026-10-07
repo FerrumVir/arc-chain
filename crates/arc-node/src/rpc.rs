@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 
+mod serving_stats;
 /// Twin execution v0 orchestration (coordinator-side, off by default).
 mod twin_dispatch;
 
@@ -407,6 +408,7 @@ pub struct ChainIdentity {
 /// Shared node state passed to all handlers.
 #[derive(Clone)]
 pub struct NodeState {
+    serving_stats: Arc<parking_lot::Mutex<serving_stats::ServingStats>>,
     pub state: Arc<StateDB>,
     pub mempool: Arc<Mempool>,
     pub validator_address: Hash256,
@@ -1572,6 +1574,9 @@ pub fn build_node_state(
         .persistence_dir()
         .map(|directory| Arc::new(directory.join("community-settlements")));
     NodeState {
+        serving_stats: Arc::new(parking_lot::Mutex::new(
+            serving_stats::ServingStats::default(),
+        )),
         state,
         mempool,
         validator_address,
@@ -2448,6 +2453,7 @@ pub async fn serve(
             get(inference_onchain_result),
         )
         // Deterministic inference cache introspection
+        .merge(serving_stats_routes())
         .route("/inference/cache_stats", get(inference_cache_stats))
         .route("/inference/latency_stats", get(inference_latency_stats))
         .route("/inference/cache_check", post(inference_cache_check))
@@ -7416,6 +7422,7 @@ async fn inference_run(
     AxumState(node): AxumState<NodeState>,
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let request_started = Instant::now();
     let req = match body {
         Some(Json(v)) => v,
         None => {
@@ -7714,6 +7721,23 @@ async fn inference_run(
                 verification,
                 settlement,
             }) => {
+                if recovery_probe_id.is_none()
+                    && let Some(model_id) = node.model_artifact_id
+                {
+                    let input = node
+                        .inference_model
+                        .as_ref()
+                        .map(|m| m.encode(input_text).len() as u64);
+                    node.serving_stats.lock().record(serving_stats::Answer {
+                        model: model_id.0,
+                        input,
+                        output: result.tokens_generated,
+                        verified: true,
+                        cached: false,
+                        timing: serving_stats::AnswerTiming::default(),
+                        hops: Vec::new(),
+                    });
+                }
                 let total_ms = dispatched_at.elapsed().as_millis() as u64;
                 let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
                 retain_inference_result(
@@ -7967,7 +7991,7 @@ async fn inference_run(
     // calls occupied every runtime thread and stalled DAG gossip, consensus
     // and all other RPC on the node. Both paths now go through
     // spawn_blocking, and inside it through the configurable compute pool.
-    let (generated_tokens, output_hash, engine_name) =
+    let (generated_tokens, output_hash, engine_name, serving_timing) =
         if let (Some(engine), Some(mid)) = (&node.candle_engine, &node.candle_model_id) {
             if *mid != model_id_hash {
                 return Err(api_error(
@@ -7984,7 +8008,12 @@ async fn inference_run(
             let result = spawn_blocking_with_public_compute_permit(inference_permit, move || {
                 let _worker_execution_permit = worker_execution_for_compute;
                 install_on_compute_pool(&pool_node, move || {
-                    engine_c.generate(&mid_c, &toks, max_tokens)
+                    let mut timing = serving_stats::AnswerTiming::default();
+                    engine_c
+                        .generate_observed(&mid_c, &toks, max_tokens, || {
+                            timing.token(request_started.elapsed())
+                        })
+                        .map(|result| (result, timing))
                 })
             })
             .await
@@ -7995,6 +8024,7 @@ async fn inference_run(
                     format!("Inference failed: {}", e),
                 )
             })?;
+            let (result, timing) = result;
             let gen_tokens: Vec<u32> = result
                 .output
                 .chunks(4)
@@ -8011,6 +8041,7 @@ async fn inference_run(
                 gen_tokens,
                 result.output_hash,
                 "candle Q4 (float, deterministic per-arch)",
+                timing,
             )
         } else {
             // Integer engine — bit-identical across architectures. Precision
@@ -8027,7 +8058,15 @@ async fn inference_run(
             let result = spawn_blocking_with_public_compute_permit(inference_permit, move || {
                 let _worker_execution_permit = worker_execution_for_compute;
                 install_on_compute_pool(&pool_node, move || {
-                    model_c.try_generate(&toks, max_tokens, &model_c.config.eos_tokens)
+                    let mut timing = serving_stats::AnswerTiming::default();
+                    model_c
+                        .try_generate_observed(
+                            &toks,
+                            max_tokens,
+                            &model_c.config.eos_tokens,
+                            || timing.token(request_started.elapsed()),
+                        )
+                        .map(|result| (result, timing))
                 })
             })
             .await
@@ -8038,12 +8077,23 @@ async fn inference_run(
                     format!("Invalid generation context: {error}"),
                 )
             })?;
-            let (generated, hash) = result;
-            (generated, hash, model.effective_precision_label())
+            let ((generated, hash), timing) = result;
+            (generated, hash, model.effective_precision_label(), timing)
         };
 
     let inference_ms = start.elapsed().as_millis() as u64;
     let tokens_generated = generated_tokens.len() as u64;
+    if recovery_probe_id.is_none() {
+        node.serving_stats.lock().record(serving_stats::Answer {
+            model: model_id_hash.0,
+            input: Some(prompt_tokens.len() as u64),
+            output: tokens_generated,
+            verified: false,
+            cached: false,
+            timing: serving_timing,
+            hops: Vec::new(),
+        });
+    }
     let ms_per_token = inference_ms.checked_div(tokens_generated).unwrap_or(0);
 
     // Decode output tokens to text
@@ -9281,6 +9331,45 @@ impl CommunityAuthenticatedPayload for ValidatorCleanupShardRequest {
         }
         Ok(())
     }
+}
+
+fn serving_stats_routes() -> Router<NodeState> {
+    Router::new()
+        .route("/inference/model_stats", get(model_stats_v1))
+        .route("/community/model_stats", get(model_stats_v1))
+        .route("/inference/model_stats/v2", get(model_stats_v2))
+        .route("/community/model_stats/v2", get(model_stats_v2))
+}
+
+// Read-only projections share one store: these routes are aliases, never
+// independent sources to sum. No registry maintenance or network IO on GET.
+async fn model_stats_v1(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    Json(node.serving_stats.lock().snapshot(true))
+}
+
+async fn model_stats_v2(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    Json(node.serving_stats.lock().snapshot(false))
+}
+
+fn public_hop_samples(
+    pipeline: &[PipelineHop],
+    stats: &[HopStats],
+) -> Vec<serving_stats::HopSample> {
+    pipeline
+        .iter()
+        .zip(stats)
+        .enumerate()
+        .map(
+            |(hop, (((start, end), _), stats))| serving_stats::HopSample {
+                hop,
+                start_layer: *start,
+                end_layer: *end,
+                positions: stats.positions,
+                wall_ms: stats.wall_ms,
+                compute_ms: stats.compute_ms,
+            },
+        )
+        .collect()
 }
 
 /// GET /inference/cache_stats
@@ -10955,6 +11044,7 @@ async fn pipeline_hop(
 
 /// Everything one pipeline run produced.
 struct PipelineRun {
+    timing: serving_stats::AnswerTiming,
     generated: Vec<u32>,
     hop_stats: Vec<HopStats>,
     total_bytes: usize,
@@ -11070,7 +11160,9 @@ async fn run_pipeline(
     strategy: HopStrategy,
     collect_votes: bool,
     include_eos: bool,
+    serving_started: Instant,
 ) -> Result<PipelineRun, String> {
+    let mut timing = serving_stats::AnswerTiming::default();
     preflight_sharded_generation(model, all_tokens.len(), max_tokens)?;
     // Profile validation is a strict pre-work boundary. No feeder, worker, or
     // outbound shard request is launched until every replica is proven to be
@@ -11202,6 +11294,11 @@ async fn run_pipeline(
             positions_seen += 1;
             if flow.position == prompt_len - 1 {
                 first_generated = flow.terminal_token;
+                if first_generated
+                    .is_some_and(|t| include_eos || !model.config.eos_tokens.contains(&t))
+                {
+                    timing.token(serving_started.elapsed());
+                }
             }
             if positions_seen >= prompt_len {
                 break;
@@ -11310,6 +11407,9 @@ async fn run_pipeline(
 
             match next_tok {
                 Some(token) => {
+                    if include_eos || !model.config.eos_tokens.contains(&token) {
+                        timing.token(serving_started.elapsed());
+                    }
                     if record_generated_token(
                         &mut generated,
                         token,
@@ -11325,6 +11425,7 @@ async fn run_pipeline(
     }
 
     Ok(PipelineRun {
+        timing,
         generated,
         hop_stats,
         total_bytes,
@@ -11823,6 +11924,7 @@ async fn inference_run_sharded(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let request_started = Instant::now();
     let _worker_execution_permit = node
         .native_request_admission
         .worker_execution_gate()
@@ -12052,6 +12154,15 @@ async fn inference_run_sharded(
                 );
             }
         }
+        node.serving_stats.lock().record(serving_stats::Answer {
+            model: model_id_hash.0,
+            input: Some(prompt_tokens.len() as u64),
+            output: cached_tokens.len() as u64,
+            verified: false,
+            cached: true,
+            timing: serving_stats::AnswerTiming::default(),
+            hops: Vec::new(),
+        });
         return Ok(Json(resp));
     }
 
@@ -12076,6 +12187,7 @@ async fn inference_run_sharded(
         strategy,
         false,
         false,
+        request_started,
     )
     .await;
 
@@ -12085,6 +12197,15 @@ async fn inference_run_sharded(
     cleanup_shards(&node, &pipeline, &request_id).await;
     let run = run_result.map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
 
+    node.serving_stats.lock().record(serving_stats::Answer {
+        model: model_id_hash.0,
+        input: Some(prompt_tokens.len() as u64),
+        output: run.generated.len() as u64,
+        verified: false,
+        cached: false,
+        timing: run.timing.clone(),
+        hops: public_hop_samples(&pipeline, &run.hop_stats),
+    });
     let total_ms = overall_start.elapsed().as_millis() as u64;
     let generated = run.generated;
     let output_text = model.decode(&generated);
@@ -12389,6 +12510,7 @@ async fn inference_run_consensus(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let request_started = Instant::now();
     let _worker_execution_permit = node
         .native_request_admission
         .worker_execution_gate()
@@ -12522,12 +12644,22 @@ async fn inference_run_consensus(
         strategy,
         true,
         false,
+        request_started,
     )
     .await;
 
     cleanup_shards(&node, &pipeline, &request_id).await;
     let run = run_result.map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
 
+    node.serving_stats.lock().record(serving_stats::Answer {
+        model: model_id.0,
+        input: Some(prompt_tokens.len() as u64),
+        output: run.generated.len() as u64,
+        verified: free_consensus_quorum_verified(&pipeline, &run.hop_stats, &run.votes),
+        cached: false,
+        timing: run.timing.clone(),
+        hops: public_hop_samples(&pipeline, &run.hop_stats),
+    });
     let total_ms = overall_start.elapsed().as_millis() as u64;
     let generated = run.generated;
     let votes = run.votes;
@@ -14396,6 +14528,7 @@ async fn recompute_community_output_with_quorum(
         },
         true,
         true,
+        Instant::now(),
     )
     .await;
     cleanup_shards(node, &pipeline, &request_id).await;
@@ -21209,6 +21342,9 @@ mod tests {
         }
         let (tx, rx) = tokio::sync::mpsc::channel::<WorkItem>(16);
         NodeState {
+            serving_stats: Arc::new(parking_lot::Mutex::new(
+                serving_stats::ServingStats::default(),
+            )),
             // Fields the router actually reads ↓
             community_workers: Arc::new(workers_map),
             community_registration_gate: Arc::new(parking_lot::Mutex::new(())),
