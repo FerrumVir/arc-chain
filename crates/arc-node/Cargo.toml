@@ -93,6 +93,7 @@ sha2.workspace = true
 rayon.workspace = true
 lz4_flex.workspace = true
 reqwest.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 thiserror.workspace = true
 toml.workspace = true
 zeroize.workspace = true

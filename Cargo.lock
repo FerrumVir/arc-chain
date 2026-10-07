@@ -467,6 +467,7 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "ed25519-dalek",
+ "futures-util",
  "hex",
  "k256",
  "libc",
