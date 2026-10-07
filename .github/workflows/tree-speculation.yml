@@ -11,6 +11,9 @@ on:
       - 'crates/arc-inference/src/modern/serving/mod.rs'
       - 'crates/arc-inference/src/modern/serving/tree/**'
       - 'crates/arc-inference/examples/tree_speculation.rs'
+      - 'crates/arc-inference/examples/tree_public.rs'
+      - 'crates/arc-inference/tests/fixtures/tree_public/**'
+      - 'scripts/tree_speculation/**'
       - 'crates/arc-inference/tests/fixtures/tree_traffic.json'
       - '.github/workflows/tree-speculation.yml'
 permissions:
@@ -26,7 +29,7 @@ jobs:
   acceptance:
     name: SmolLM3 tree acceptance + exactness
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,7 +45,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Build measurement and converter
-        run: cargo build --locked --release -p arc-inference --example tree_speculation --bin arc-modern
+        run: cargo build --locked --release -p arc-inference --example tree_public --bin arc-modern
       - name: Fetch pinned public SmolLM3 weights (hash checked)
         run: python scripts/arc_modern/fetch_source.py --manifest docs/protocol/packages/smollm3-3b.source.json --dir "$RUNNER_TEMP/tree-model"
       - name: Convert and verify integer package identity
@@ -56,15 +59,21 @@ jobs:
             > "$RUNNER_TEMP/tree-evidence/convert.json"
           ./target/release/arc-modern verify --package "$RUNNER_TEMP/tree-model/model.arcipkg" \
             --manifest docs/protocol/packages/smollm3-3b.integer-package.json
-      - name: Measure acceptance and prove greedy byte identity on each case
+      - name: Validate measurement report contracts
+        run: python -m unittest discover -s scripts/tree_speculation -p 'test_*.py'
+      - name: Measure public sample and full-tree identity subset
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          ./target/release/examples/tree_speculation \
+          ./target/release/examples/tree_public \
             --package "$RUNNER_TEMP/tree-model/model.arcipkg" \
             --tokenizer "$RUNNER_TEMP/tree-model/tokenizer.json" \
-            --cases crates/arc-inference/tests/fixtures/tree_traffic.json \
-            --out "$RUNNER_TEMP/tree-evidence/results.json" \
+            --cases crates/arc-inference/tests/fixtures/tree_public/cases.json \
+            --out "$RUNNER_TEMP/tree-evidence/records.jsonl"
+          python scripts/tree_speculation/report.py "$RUNNER_TEMP/tree-evidence/records.jsonl" \
+            --json "$RUNNER_TEMP/tree-evidence/results.json" \
             --summary "$RUNNER_TEMP/tree-evidence/summary.md"
           cat "$RUNNER_TEMP/tree-evidence/summary.md" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

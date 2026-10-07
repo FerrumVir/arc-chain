@@ -2,7 +2,7 @@
 //!
 //! A drafter proposes a tree of candidate continuations; the target verifies
 //! EVERY node in ONE [`BatchModel::forward_tree`] call, so a model split across
-//! devices traverses the network once per tree, not once per token. Node `i`
+//! devices could traverse a pipeline once per tree (network unmeasured). Node `i`
 //! sees the committed prefix and its own ancestors, in the reference attention
 //! order. [`dense::DenseModel`] computes each node once with per-node attention
 //! masks (shared ancestors are not duplicated); any other model falls back to
@@ -19,13 +19,15 @@
 //! Drafters: [`LookupTree`] (n-gram/prompt lookup, for code and agent traffic),
 //! [`RecycleTree`] (token recycling: the target's own top-k candidates from
 //! earlier rows, no draft model, optionally merged with lookup), [`head_tree`]
-//! (Medusa/EAGLE-style ranked heads) and [`LocalModelTree`] (a small local
+//! (ranked candidate lists; no trained head) and [`LocalModelTree`] (a small local
 //! model with the target's tokenizer).
 //!
 //! [`dense::DenseModel`]: super::dense::DenseModel
 
+use super::TargetFeatures;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::time::Instant;
 
 use super::{BatchModel, Row, SeqKv};
 use crate::modern::ModernError;
@@ -198,6 +200,9 @@ enum Caches {
 /// The result of [`BatchModel::forward_tree`].
 #[derive(Debug)]
 pub struct TreeOutput {
+    /// Optional node-aligned final residuals; empty means unsupported.
+    /// Rejected-node features are never passed to the next proposal.
+    pub features: Vec<Option<TargetFeatures>>,
     /// Per node: its logits, if it and every ancestor succeeded.
     pub logits: Vec<Option<Vec<i64>>>,
     /// Per node: its own error, when every ancestor succeeded and it failed
@@ -228,6 +233,7 @@ impl TreeOutput {
                 .collect();
             logits = (0..n).map(|_| None).collect();
             return Self {
+                features: Vec::new(),
                 logits,
                 errors,
                 physical_rows: n,
@@ -246,6 +252,7 @@ impl TreeOutput {
             }
         }
         Self {
+            features: Vec::new(),
             logits,
             errors,
             physical_rows: n,
@@ -370,7 +377,17 @@ pub fn forward_tree_by_paths<M: BatchModel + ?Sized>(
             }
         }
     }
+    let features = if step.features.len() == rows.len() {
+        row_of
+            .iter()
+            .enumerate()
+            .map(|(node, &r)| logits[node].as_ref().and_then(|_| step.features[r].take()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     TreeOutput {
+        features,
         logits,
         errors,
         physical_rows: rows.len(),
@@ -387,6 +404,20 @@ fn invalid(message: &str) -> ModernError {
 /// token is the root. Depth excludes the root. No target output may be
 /// peeked ahead.
 pub trait TreeDrafter {
+    /// Final residual of the last committed row (before the pending root).
+    /// On the first proposal this is the last prompt row. Later it is the
+    /// final visited node of the preceding successful verification. A head
+    /// combines it with the pending token in `context.last()`. No future or
+    /// rejected-row features are provided. Models without the hook pass None.
+    fn propose_with_features(
+        &mut self,
+        context: &[u32],
+        depth: usize,
+        _features: Option<&TargetFeatures>,
+    ) -> Result<DraftTree, ModernError> {
+        self.propose(context, depth)
+    }
+
     fn propose(&mut self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError>;
 
     /// The target's logits after feeding `token`, for every prompt position
@@ -680,6 +711,7 @@ impl TreeDrafter for LocalModelTree<'_> {
 
 #[derive(Debug)]
 pub struct TreeStep {
+    pub accepted_features: Option<TargetFeatures>,
     pub emitted: Vec<u32>,
     pub logits_hashes: Vec<[u8; 32]>,
     pub finished: bool,
@@ -780,14 +812,20 @@ pub fn verify_tree_observed(
         let finished = history.len() == max_tokens || eos.contains(&next);
         let child = tree.child(node, next);
         if finished || child.is_none() {
-            for (i, logits) in result.logits.iter().enumerate() {
+            let observed_logits = std::mem::take(&mut result.logits);
+            let accepted_features = result.features.get_mut(node).and_then(Option::take);
+            let physical = result.physical_rows;
+            if let Err(error) = result.commit(tree, node, kv) {
+                kv.rollback(base);
+                return Err(error);
+            }
+            for (i, logits) in observed_logits.iter().enumerate() {
                 if let Some(logits) = logits {
                     observe(tree.nodes[i].token, logits);
                 }
             }
-            let physical = result.physical_rows;
-            result.commit(tree, node, kv)?;
             return Ok(TreeStep {
+                accepted_features,
                 emitted,
                 logits_hashes: hashes,
                 finished,
@@ -802,6 +840,13 @@ pub fn verify_tree_observed(
 
 #[derive(Debug)]
 pub struct TreeGeneration {
+    /// Wall time: prefill includes KV setup, prompt forward, hashing/observe,
+    /// and first selection. Decode includes draft, verification, commit and
+    /// bookkeeping, excluding prefill. Subtimes are contained in decode.
+    pub prefill_seconds: f64,
+    pub decode_seconds: f64,
+    pub draft_seconds: f64,
+    pub verify_seconds: f64,
     pub tokens: Vec<u32>,
     pub logits_hashes: Vec<[u8; 32]>,
     pub kv_digest: [u8; 32],
@@ -830,6 +875,7 @@ pub fn generate_tree(
             "generation needs a nonempty prompt and a bounded output",
         ));
     }
+    let prefill_start = Instant::now();
     let mut kv = model.new_kv();
     let rows: Vec<_> = request
         .prompt
@@ -859,9 +905,15 @@ pub fn generate_tree(
         &[],
         request.selection,
     )?;
+    let mut features = step.features.last_mut().and_then(Option::take);
+    drop(step);
     let mut tokens = vec![first];
+    let prefill_seconds = prefill_start.elapsed().as_secs_f64();
+    let decode_start = Instant::now();
+    let (mut draft_seconds, mut verify_seconds) = (0.0, 0.0);
     let (mut passes, mut physical, mut logical, mut expanded) = (0, 0, 0, 0);
     while tokens.len() < request.max_tokens && !request.eos.contains(tokens.last().unwrap()) {
+        let draft_start = Instant::now();
         let context: Vec<_> = request.prompt.iter().chain(&tokens).copied().collect();
         let budget = depth
             .min(MAX_DEPTH)
@@ -869,7 +921,7 @@ pub fn generate_tree(
         // Draft-only failures cannot cause a target refusal. Fall back to the
         // single root, whose verification still uses exactly the target rule.
         let proposed = drafter
-            .propose(&context, budget)
+            .propose_with_features(&context, budget, features.as_ref())
             .unwrap_or_else(|_| DraftTree::root(*tokens.last().unwrap()));
         let tree = if proposed.nodes[0].token != *tokens.last().unwrap()
             || proposed.depths().into_iter().any(|d| d > budget)
@@ -878,6 +930,8 @@ pub fn generate_tree(
         } else {
             proposed
         };
+        draft_seconds += draft_start.elapsed().as_secs_f64();
+        let verify_start = Instant::now();
         let verified = verify_tree_observed(
             model,
             &tree,
@@ -888,6 +942,8 @@ pub fn generate_tree(
             request.max_tokens,
             &mut |token, logits| drafter.observe(token, logits),
         )?;
+        verify_seconds += verify_start.elapsed().as_secs_f64();
+        features = verified.accepted_features;
         passes += 1;
         physical += verified.verified_rows;
         logical += verified.logical_nodes;
@@ -895,7 +951,12 @@ pub fn generate_tree(
         tokens.extend(verified.emitted);
         hashes.extend(verified.logits_hashes);
     }
+    let decode_seconds = decode_start.elapsed().as_secs_f64();
     Ok(TreeGeneration {
+        prefill_seconds,
+        decode_seconds,
+        draft_seconds,
+        verify_seconds,
         tokens,
         logits_hashes: hashes,
         kv_digest: kv.digest(),
@@ -904,6 +965,50 @@ pub fn generate_tree(
         logical_nodes: logical,
         expanded_rows: expanded,
     })
+}
+
+/// Exact acceptance replay for prompt lookup ONLY. Proposals see only prompt
+/// plus emitted tokens; the recorded greedy continuation is used exclusively
+/// to walk each proposed tree. This cannot replay recycling or feature heads:
+/// their inputs include target results for rejected nodes or hidden states.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LookupReplay {
+    pub passes: usize,
+    pub nodes: usize,
+    pub expanded_rows: usize,
+}
+
+pub fn replay_lookup(
+    prompt: &[u32],
+    output: &[u32],
+    max_tokens: usize,
+    lookup: LookupTree,
+    depth: usize,
+) -> Result<LookupReplay, ModernError> {
+    if prompt.is_empty() || output.is_empty() || output.len() > max_tokens {
+        return Err(invalid("replay requires a complete bounded greedy output"));
+    }
+    let mut drafter = lookup;
+    let mut totals = LookupReplay::default();
+    let mut at = 1;
+    while at < output.len() {
+        let context: Vec<_> = prompt.iter().chain(&output[..at]).copied().collect();
+        let budget = depth.min(MAX_DEPTH).min(max_tokens - at - 1);
+        let tree = drafter.propose(&context, budget)?;
+        totals.passes += 1;
+        totals.nodes += tree.nodes.len();
+        totals.expanded_rows += tree.expanded_rows();
+        let mut node = 0;
+        loop {
+            let child = tree.child(node, output[at]);
+            at += 1;
+            if at == output.len() || child.is_none() {
+                break;
+            }
+            node = child.unwrap();
+        }
+    }
+    Ok(totals)
 }
 
 /// Projection only: assumes one traversal of `hops` one-way links per tree

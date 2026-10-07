@@ -1830,6 +1830,29 @@ fn every_tree_node_equals_its_path_alone_and_any_path_commits_exactly() {
                     for step in tree.path_to(node) {
                         logits = model.forward(tree.nodes()[step].token, &mut alone).unwrap();
                     }
+                    let mut feature_kv = before.clone();
+                    let mut features = None;
+                    for step in tree.path_to(node) {
+                        let row = Row {
+                            seq: 0,
+                            token: tree.nodes()[step].token,
+                            position: feature_kv.len(),
+                            logits: true,
+                        };
+                        features = dense
+                            .forward_rows(&[row], &mut [&mut feature_kv])
+                            .features
+                            .pop()
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        shared.features[node], features,
+                        "shared features node {node}"
+                    );
+                    assert_eq!(
+                        lowered.features[node], features,
+                        "fallback features node {node}"
+                    );
                     assert_eq!(shared.logits[node].as_ref(), Some(&logits), "node {node}");
                     assert_eq!(lowered.logits[node].as_ref(), Some(&logits), "node {node}");
                 }

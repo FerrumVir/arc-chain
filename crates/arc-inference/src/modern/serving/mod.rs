@@ -52,9 +52,22 @@ pub struct Row {
     pub logits: bool,
 }
 
+/// Last-layer residual stream, before the final RMSNorm/LM head, in signed
+/// Q16 integers. `position` and `token` identify the row that produced it.
+/// This is an integration hook, not an EAGLE/Medusa architecture or trained head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetFeatures {
+    pub token: u32,
+    pub position: usize,
+    pub hidden: Vec<i64>,
+}
+
 /// What a batched step returns.
 #[derive(Debug, Default)]
 pub struct StepOutput {
+    /// Optional row-aligned target features. Empty means unsupported. Failed
+    /// rows and rows not requesting logits must never expose features.
+    pub features: Vec<Option<TargetFeatures>>,
     /// Logits per row, for rows that asked for them, succeeded, and precede
     /// any failure of their sequence.
     pub logits: Vec<Option<Vec<i64>>>,

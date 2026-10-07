@@ -1,0 +1,178 @@
+{
+  "swe-bench-MIT.txt": {
+    "url": "https://raw.githubusercontent.com/SWE-bench/SWE-bench/02e7a74ffd0b707aab73d203fe87bdc7c76afc8e/LICENSE",
+    "sha256": "2bd2e08df7147f67a69b42c10efae09bd4bf119df397371036187d5dd1b02f57"
+  },
+  "swe-smith-MIT.txt": {
+    "url": "https://raw.githubusercontent.com/SWE-bench/SWE-smith/9b74ac08118a85c39c356802f7961893af73e07f/LICENSE",
+    "sha256": "f5485bde0430fdbecd6efc6b704ab330257f4581e51d90687cc265b92c35202b"
+  },
+  "oasst-Apache-2.0.txt": {
+    "url": "https://huggingface.co/datasets/OpenAssistant/oasst1/resolve/fdf72ae0827c1cda404aff25b6603abec9e3399b/LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "swe-smith-dataset-card.md": {
+    "url": "https://huggingface.co/datasets/SWE-bench/SWE-smith-trajectories/resolve/08e109b4a59eaeebf80e4675cd125d42e7ac99a4/README.md",
+    "sha256": "1fa2f5971a723a60a6ca60a5842aa83eb78259bfd175bce9a80692c5a2248aa0"
+  },
+  "django-ee36e101e8f8c0acde4bb148b738ab7034e902a0.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/ee36e101e8f8c0acde4bb148b738ab7034e902a0/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-71e7c8e73712419626f1c2b6ec036e8559a2d667.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/71e7c8e73712419626f1c2b6ec036e8559a2d667/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-19e6efa50b603af325e7f62058364f278596758f.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/19e6efa50b603af325e7f62058364f278596758f/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-321ecb40f4da842926e1bc07e11df4aabe53ca4b.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/321ecb40f4da842926e1bc07e11df4aabe53ca4b/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "sympy-3ff4717b6aef6086e78f01cdfa06f64ae23aed7e.txt": {
+    "url": "https://raw.githubusercontent.com/sympy/sympy/3ff4717b6aef6086e78f01cdfa06f64ae23aed7e/LICENSE",
+    "sha256": "5b9b04818a656e98d186d1deada65ad4557798264225271136cea080bafbcbe7"
+  },
+  "django-a5308514fb4bc5086c9a16a8a24a945eeebb073c.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/a5308514fb4bc5086c9a16a8a24a945eeebb073c/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-fbacaa58ffc5a62456ee68b90efa13957f761ce4.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/fbacaa58ffc5a62456ee68b90efa13957f761ce4/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-5e04e84d67da8163f365e9f5fcd169e2630e2873.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/5e04e84d67da8163f365e9f5fcd169e2630e2873/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "sympy-479939f8c65c8c2908bbedc959549a257a7c0b0b.txt": {
+    "url": "https://raw.githubusercontent.com/sympy/sympy/479939f8c65c8c2908bbedc959549a257a7c0b0b/LICENSE",
+    "sha256": "e6d5cc1bce88c52ec90cb34802a1b9fca23d01caee535431395aca3ba743123a"
+  },
+  "django-63884829acd207404f2a5c3cc1d6b4cd0a822b70.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/63884829acd207404f2a5c3cc1d6b4cd0a822b70/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "sympy-94fb720696f5f5d12bad8bc813699fd696afd2fb.txt": {
+    "url": "https://raw.githubusercontent.com/sympy/sympy/94fb720696f5f5d12bad8bc813699fd696afd2fb/LICENSE",
+    "sha256": "a7212a73709d040d7b932440f84c71e2334c045faaae589e9905ec1e9fbfd443"
+  },
+  "django-f2051eb8a7febdaaa43bd33bf5a6108c5f428e59.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/f2051eb8a7febdaaa43bd33bf5a6108c5f428e59/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-7fa1a93c6c8109010a6ff3f604fda83b604e0e97.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/7fa1a93c6c8109010a6ff3f604fda83b604e0e97/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-36fa071d6ebd18a61c4d7f1b5c9d17106134bd44.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/36fa071d6ebd18a61c4d7f1b5c9d17106134bd44/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "sympy-1d3327b8e90a186df6972991963a5ae87053259d.txt": {
+    "url": "https://raw.githubusercontent.com/sympy/sympy/1d3327b8e90a186df6972991963a5ae87053259d/LICENSE",
+    "sha256": "f8254a405fae8fc9b2a13b9c3202e6fdfce7fa4c0886deb691dd7d72f1e09286"
+  },
+  "django-e065b293878b1e3ea56655aa9d33e87576cd77ff.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/e065b293878b1e3ea56655aa9d33e87576cd77ff/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-0c3981eb5094419fe200eb46c71b5376a2266166.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/0c3981eb5094419fe200eb46c71b5376a2266166/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-dab48b7482295956973879d15bfd4d3bb0718772.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/dab48b7482295956973879d15bfd4d3bb0718772/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-652c68ffeebd510a6f59e1b56b3e007d07683ad8.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/652c68ffeebd510a6f59e1b56b3e007d07683ad8/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "django-444b6da7cc229a58a2c476a52e45233001dc7073.txt": {
+    "url": "https://raw.githubusercontent.com/django/django/444b6da7cc229a58a2c476a52e45233001dc7073/LICENSE",
+    "sha256": "b846415d1b514e9c1dff14a22deb906d794bc546ca6129f950a18cd091e2a669"
+  },
+  "agent-mahmoud__glom-fb3c4e76f28816aebfd2538980e617742e98a7c2.txt": {
+    "url": "https://raw.githubusercontent.com/mahmoud/glom/fb3c4e76f28816aebfd2538980e617742e98a7c2/LICENSE",
+    "sha256": "ba81ea9a55099a9c4491141f9aace8ffd1f169701815582d7a80ed57f7b625d5",
+    "spdx": "BSD-3-Clause"
+  },
+  "agent-Project-MONAI__MONAI-a09c1f08461cec3d2131fde3939ef38c3c4ad5fc.txt": {
+    "url": "https://raw.githubusercontent.com/Project-MONAI/MONAI/a09c1f08461cec3d2131fde3939ef38c3c4ad5fc/LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "spdx": "Apache-2.0"
+  },
+  "agent-seperman__deepdiff-ed2520229d0369813f6e54cdf9c7e68e8073ef62.txt": {
+    "url": "https://raw.githubusercontent.com/qlustered/deepdiff/ed2520229d0369813f6e54cdf9c7e68e8073ef62/LICENSE",
+    "sha256": "64e51909f73ac2891c05075c027018fc8d9f9f882c605f35461bef7df82feeea",
+    "spdx": "NOASSERTION"
+  },
+  "agent-hukkin__tomli-443a0c1bc5da39b7ed84306912ee1900e6b72e2f.txt": {
+    "url": "https://raw.githubusercontent.com/hukkin/tomli/443a0c1bc5da39b7ed84306912ee1900e6b72e2f/LICENSE",
+    "sha256": "b80816b0d530b8accb4c2211783790984a6e3b61922c2b5ee92f3372ab2742fe",
+    "spdx": "NOASSERTION"
+  },
+  "agent-conan-io__conan-86f29e137a10bb6ed140c1a8c05c3099987b13c5.txt": {
+    "url": "https://raw.githubusercontent.com/conan-io/conan/86f29e137a10bb6ed140c1a8c05c3099987b13c5/LICENSE.md",
+    "sha256": "cb0cfe10fad4eeb3ec0c1482474ddae67dcf2b2715cfd58655f6d18e5ce92aac",
+    "spdx": "MIT"
+  },
+  "agent-bottlepy__bottle-a8dfef301dec35f13e7578306002c40796651629.txt": {
+    "url": "https://raw.githubusercontent.com/bottlepy/bottle/a8dfef301dec35f13e7578306002c40796651629/LICENSE",
+    "sha256": "af150257b1f7cce92b6207854f2e8f90ea9ae52d7cac758d13a47bd12e2a2443",
+    "spdx": "MIT"
+  },
+  "agent-python-hyper__h11-bed0dd4ae9774b962b19833941bb9ec4dc403da9.txt": {
+    "url": "https://raw.githubusercontent.com/python-hyper/h11/bed0dd4ae9774b962b19833941bb9ec4dc403da9/LICENSE.txt",
+    "sha256": "37db5bb85926db28a427a25867f10b1232003aea1be69ccb851138adb8e6f361",
+    "spdx": "MIT"
+  },
+  "agent-python-jsonschema__jsonschema-93e0caa5752947ec77333da81a634afe41a022ed.txt": {
+    "url": "https://raw.githubusercontent.com/python-jsonschema/jsonschema/93e0caa5752947ec77333da81a634afe41a022ed/COPYING",
+    "sha256": "4f92a015a13c4d1a040bef018aa13430b4f1bc73b41b16bb846c346766de7439",
+    "spdx": "MIT"
+  },
+  "agent-alecthomas__voluptuous-a7a55f83b9fa7ba68b0669b3d78a61de703e0a16.txt": {
+    "url": "https://raw.githubusercontent.com/alecthomas/voluptuous/a7a55f83b9fa7ba68b0669b3d78a61de703e0a16/COPYING",
+    "sha256": "247b4976b7a7fa4d89d9587caa5095561eb46dc5457f2279f62a62b5452adea9",
+    "spdx": "BSD-3-Clause"
+  },
+  "agent-mido__mido-a0158ff95a08f9a4eef628a2e7c793fd3a466640.txt": {
+    "url": "https://raw.githubusercontent.com/mido/mido/a0158ff95a08f9a4eef628a2e7c793fd3a466640/LICENSE",
+    "sha256": "bd038e5ad24b8d703970b51c070669e8ab0d06f4efb008665261b0183af7eb1c",
+    "spdx": "MIT"
+  },
+  "agent-pndurette__gTTS-dbcda4f396074427172d4a1f798a172686ace6e0.txt": {
+    "url": "https://raw.githubusercontent.com/pndurette/gTTS/dbcda4f396074427172d4a1f798a172686ace6e0/LICENSE",
+    "sha256": "4dfee45a597e4e01a0682744273613a93ce607765d87df5c3732a872bfb5d1a5",
+    "spdx": "MIT"
+  },
+  "agent-pexpect__ptyprocess-1067dbdaf5cc3ab4786ae355aba7b9512a798734.txt": {
+    "url": "https://raw.githubusercontent.com/pexpect/ptyprocess/1067dbdaf5cc3ab4786ae355aba7b9512a798734/LICENSE",
+    "sha256": "419f33c779a60c909606c5b8fab9b8db0eba923bacf48ce9d3e728c5d46eaf21",
+    "spdx": "NOASSERTION"
+  },
+  "agent-pyca__pyopenssl-04766a496eb11f69f6226a5a0dfca4db90a5cbd1.txt": {
+    "url": "https://raw.githubusercontent.com/pyca/pyopenssl/04766a496eb11f69f6226a5a0dfca4db90a5cbd1/LICENSE",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "spdx": "Apache-2.0"
+  },
+  "agent-gawel__pyquery-811cd048ffbe4e69fdc512863671131f98d691fb.txt": {
+    "url": "https://raw.githubusercontent.com/gawel/pyquery/811cd048ffbe4e69fdc512863671131f98d691fb/LICENSE.txt",
+    "sha256": "6e96459ce221aca0d34a41d909f55d2bc8898b14e5e24e74cdd2a51ceb603cb6",
+    "spdx": "BSD-3-Clause"
+  },
+  "agent-spulec__freezegun-5f171db0aaa02c4ade003bbc8885e0bb19efbc81.txt": {
+    "url": "https://raw.githubusercontent.com/spulec/freezegun/5f171db0aaa02c4ade003bbc8885e0bb19efbc81/LICENSE",
+    "sha256": "f12ef9fd396a13e90878630b1b4fab471c6ed9cb7a48cf2abb2516281632218e",
+    "spdx": "Apache-2.0"
+  },
+  "agent-jawah__charset_normalizer-1fdd64633572040ab60e62e8b24f29cb7e17660b.txt": {
+    "url": "https://raw.githubusercontent.com/jawah/charset_normalizer/1fdd64633572040ab60e62e8b24f29cb7e17660b/LICENSE",
+    "sha256": "eb31a0c5a4fb09b8a4e32055d25c1e5f9c358a2752fef3cd720213d1ccfee241",
+    "spdx": "MIT"
+  }
+}

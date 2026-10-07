@@ -1,16 +1,15 @@
 # Exact tree speculation (ENG-8)
 
-Kimi-class models are served on ARC's network split across many nodes, so every
-forward pass crosses the network. Per-answer speed is then set by how many
-tokens each traversal yields, not by how fast one node computes. This layer
-lets a drafter propose a tree of candidate continuations and has the sharded
-target verify the whole tree in one pass, while the output stays byte-identical
-to plain greedy decoding.
+This layer verifies candidate token trees in one target call and preserves
+plain greedy output byte for byte. It is intended for models split across
+network stages. The implementation and tests cover dense models, a portable
+fallback, and an in-process two-stage pipeline; no live network or Kimi-class
+throughput has been measured.
 
 Code: `crates/arc-inference/src/modern/serving/tree.rs` (trees, drafters,
 verification), `dense.rs` (shared-node tree forward), `mod.rs`
 (`BatchModel::forward_tree`, `SeqKv::keep_path`). Measurement:
-`examples/tree_speculation.rs`, run by `.github/workflows/tree-speculation.yml`
+`examples/tree_public.rs`, run by `.github/workflows/tree-speculation.yml`
 on pinned SmolLM3-3B weights.
 
 ## How a pass works
@@ -59,9 +58,10 @@ Any `BatchModel` that does not override `forward_tree` uses
 cache. Pipeline stages call `forward_tree_layers` for their own layer range;
 the two-stage pipeline fixture in the tests does exactly that.
 
-On the network the difference matters: every row crosses every hop as a hidden
-state. On the measured SmolLM3 trees the shared form sends about 2.7× fewer
-rows than path lowering (30 vs 83 rows per pass, Studio lab table below).
+Shared-node verification reduces computed and transferred rows when branches
+share ancestors. Savings depend on tree shape and drafter. Historical
+`422e1c88` CI found about 2.5–2.8× fewer rows for recycle/hybrid, but only about
+1.05× for lookup. These are row counts, not measured network speedups.
 
 ## Drafters
 
@@ -70,7 +70,7 @@ rows than path lowering (30 vs 83 rows per pass, Studio lab table below).
 | `LookupTree` | n-gram matches in the prompt and output (prompt lookup), several matches as branches | nothing |
 | `RecycleTree` | token recycling: the target's own top-k candidates after each token, from every prompt row and every verified node, accepted or not, grown best-first | nothing; the last stage returns `top_k` ids per row |
 | `RecycleTree` with `lookup` ("hybrid") | lookup branches with n ≥ 2 first, then recycling | nothing |
-| `head_tree` | ranked per-depth candidate heads (Medusa/EAGLE layout) | trained heads (not included) |
+| `head_tree` | Cartesian tree from ranked per-depth candidate lists | candidate lists; no model or trained heads included |
 | `LocalModelTree` | a small local model's greedy rollout with top-k per depth | a draft package with the target's tokenizer (not included) |
 
 `RecycleTree` follows Token Recycling (Luo et al., arXiv 2408.08696). Its
@@ -103,67 +103,95 @@ SIMD kernels:
 - `deep_branch_verification_is_one_batch_and_rejected_invalid_sibling_is_harmless`:
   one target call per tree. The fallback and the shared form agree.
 
-## Measured acceptance
+## Target hidden-feature hook
 
-The real-model job (`tree-speculation.yml`, Ubuntu x86-64, 4 threads) runs nine
-authored fixtures: three coding, three agent transcripts, three chat. It
-checks every output against plain greedy generation, then records tokens per
-verification pass. The CI numbers are in the PR and in the job's
-`tree-speculation-evidence` artifact.
+`StepOutput::features` and `TreeOutput::features` expose `TargetFeatures`:
+last-layer residuals **before** final RMSNorm/LM head, signed Q16 i64 values,
+with source token and absolute position. Dense shared-node and path fallback
+passes expose the same values. Empty features mean the model does not implement
+the capability; failed rows expose none. This hook currently copies residuals
+for successful rows requesting logits; it adds memory/copy overhead, included
+in measured timings. Pipeline adapters can use `dense::target_features` on their
+final stage's residual after row/ancestor error filtering.
 
-Studio lab (Apple M2 Ultra, 16 threads), same package
-(`sha256 19c67496…aa91`), defaults (depth 8, lookup 32 nodes, recycle 48
-nodes, top-k 8, hybrid lookup n ≥ 2). Drafter settings were chosen on the
-first two cases of each category. The `-holdout` cases were added afterwards.
+`TreeDrafter::propose_with_features` receives the last **committed** row's
+features and the full current token context including the pending root. The
+first call receives the last prompt row. Later calls receive the last visited
+node of the preceding successful verification. Rejected-node features are not
+handed to the proposal. Existing drafters delegate to `propose` by default;
+recycling still observes successful logits from all verified nodes, separately.
 
-| Traffic | Drafter | Decode tokens | Passes | Tokens/pass | Rows/pass (shared) | Rows/pass (path-lowered) |
-|---|---|---:|---:|---:|---:|---:|
-| coding | lookup | 123 | 65 | 1.89 | 6.5 | 6.8 |
-| coding | recycle | 123 | 52 | 2.37 | 38.1 | 97.8 |
-| coding | hybrid | 123 | 48 | 2.56 | 30.4 | 86.2 |
-| agent | lookup | 124 | 82 | 1.51 | 6.8 | 7.2 |
-| agent | recycle | 124 | 68 | 1.82 | 32.5 | 80.6 |
-| agent | hybrid | 124 | 62 | 2.00 | 31.6 | 83.4 |
-| chat | lookup | 140 | 134 | 1.04 | 5.2 | 5.6 |
-| chat | recycle | 140 | 86 | 1.63 | 28.4 | 73.0 |
-| chat | hybrid | 140 | 86 | 1.63 | 27.4 | 71.0 |
+The untrained deterministic stub test consumes residual values plus the pending
+token, independently checks each supplied feature against serial accepted-prefix
+forward rows, and verifies tokens/logits/KV identity with wrong proposals and
+head failure. Random-tree tests compare every node's features to its isolated
+path under scalar/SIMD kernels. This is a target-feature integration hook, **not
+trained EAGLE/Medusa**, nor an implementation of their architectures (including
+EAGLE multi-layer feature selection). No training or head-performance claim.
 
-All 27 outputs were byte-identical to plain greedy decoding.
+## Public sample and measurement
 
-Tree size vs tokens per pass (hybrid, Studio lab, all nine cases):
+`tests/fixtures/tree_public/cases.json` pins 60 public cases, 20/class:
 
-| Recycle nodes | Coding tokens/pass | Agent | Chat | Rows/pass (coding / agent / chat) |
-|---:|---:|---:|---:|---|
-| 8 | 1.98 | 1.51 | 1.14 | 5.0 / 5.0 / 3.4 |
-| 16 | 2.16 | 1.70 | 1.30 | 10.5 / 9.3 / 7.5 |
-| 32 | 2.41 | 1.91 | 1.56 | 20.5 / 21.4 / 18.8 |
-| 48 (default) | 2.56 | 2.00 | 1.63 | 30.4 / 31.6 / 27.4 |
-| 64 | 2.67 | 2.07 | 1.61 | 43.5 / 39.9 / 34.5 |
+- Coding: SWE-bench Verified issues from Django/SymPy, full issue text plus all
+  old code hunks localized using the reference patch. No added gold lines or
+  tests. Oracle localization and the two-project restriction limit generality.
+- Agent: actual model/tool rollouts on SWE-smith synthetic repair tasks. Every
+  original message/field through the first tool response is retained, including
+  calls, arguments, IDs and complete observations. The source provides no tool
+  schema. One shard and one stable trajectory per instance define the population.
+- Chat: human English OpenAssistant conversations, complete root-to-final-user
+  prefixes of at least three turns, one per conversation tree.
 
-Returns flatten past about 32 nodes. On slow links, fewer rows per pass can
-beat more tokens per pass; the harness's bandwidth table shows the tradeoff.
+The pinned source revisions, SHA-256s, licensing notices and base-commit source
+licenses are bundled alongside the fixture. `scripts/tree_speculation/sample.py`
+reproduces selection: SHA256(`ARC-70-public-v1:` + source ID), ascending, first
+20 eligible/class. Complete content must be 256–1,536 pinned-tokenizer tokens;
+no messages are truncated. The harness wraps each context in a fixed-date,
+no-thinking SmolLM3 user turn (transcripts serialized as JSON); it does not
+claim native tool execution or evaluate task success. 128 output tokens are
+allowed and EOS is honored. These are public benchmark samples, not production
+logs, and the sample does not represent all traffic distributions.
 
-## Per-answer speed on the network (projection)
+All 60 cases run full target greedy generation. Only **lookup** acceptance is
+replayed from prompt + already-emitted tokens; each proposed tree is fixed
+before later greedy tokens score its path. Greedy traces cannot replay recycling,
+which observes rejected-node logits, or feature heads. The first two sampled
+cases/class form the predeclared full-tree subset: shared-node lookup, recycle,
+and hybrid outputs must match all greedy tokens, every logits hash and committed
+KV; replay counts must match full lookup. The same six greedy outputs are checked
+against independent serial `ModernModel::generate`. The other 54 cases have
+lookup replay evidence, not full-tree identity evidence. Recycling/hybrid results
+are exploratory n=2/class, never reported as a 20/class sample.
 
-`tok/s = tokens per pass ÷ (network traversal + compute)`, with one sequential
-traversal of all hops per pass. Tokens per pass come from SmolLM3 and are
-measured. Everything else is assumed, and Kimi's own acceptance is
-unmeasured. The harness prints the full grid of 8–60 hops at 10–60 ms per hop,
-with 0 or 50 ms compute. It also adds the time to serialize each pass's rows on
-every hop as raw Kimi `i64` hidden states (7,168 × 8 bytes per row) at 1 and
-10 Gbit/s.
+The CI artifact contains flushed per-case `records.jsonl`, consolidated raw
+`results.json`, and `summary.md` with per-case timings and pooled plus median,
+p10/p90 acceptance. Quantiles use linear interpolation (R type 7); immediate
+EOS has no decode pass and is excluded from quantiles with counts reported.
+No model weights, outputs or successful tool commands are inputs to sampling.
 
-The arithmetic sets the target. At 8 hops × 10 ms with 50 ms compute, plain
-decoding gives 7.7 tok/s, and 59 tok/s needs 7.7 tokens per pass. At 16 hops ×
-30 ms it needs 31. Training-free drafters reach 1.6–2.6 tokens per pass on
-SmolLM3. Closing the gap needs short, fast-linked islands (few hops) and
-trained drafters (EAGLE-3-style heads). The tree interface and verification
-here are already exact for those.
+## Timing and projections
 
-## Not done
+Baseline depth-zero greedy and full trees now share **batched prefill**.
+Prefill includes cache/row setup, prompt forward, feature extraction, hashes,
+observer updates and first selection. Decode includes drafting, verification,
+feature extraction, hashes, observer updates, commit and bookkeeping. Draft and
+verify subtimes are within decode. Package loading, tokenization, serial identity
+checks, text decoding and evidence writing are outside. Lookup replay time is
+CPU scoring only, not target inference. Each case has one ordered trial; timings
+are descriptive, with no repetition/confidence interval or throughput claim.
+Historical greedy/tree totals at `422e1c88` used serial/batched prefill and are
+not comparable. Studio tables were removed because raw evidence was unavailable.
 
-- No trained EAGLE/Medusa heads and no small draft model with SmolLM3's or
-  Kimi's tokenizer. Training them would be new spend.
-- No Kimi weights through this path (ENG-5 plugs in via `BatchModel`).
-- No live network measurement; hop latency and bandwidth are assumptions.
-- The fixtures are authored, not sampled production traffic.
+Projection only: tokens/s = tokens/pass / ((hops × latency + assumed compute +
+forward payload transfer) / 1000). The grid uses 8/16/32/60 hops, 10/30/60 ms,
+0/50 ms compute and 1/10 Gbit/s. Forward payload counts 7,168 × 8 bytes of i64
+hidden state per row per hop. Return logits/tokens, serialization and drafting
+must fit inside the compute assumption; 50 ms is illustrative, does not scale
+with tree rows and is not a measured compute estimate. Kimi acceptance and
+lossless-codec ratios are unmeasured. Drafter-specific row reductions and these
+assumptions determine projected gains; neither faster islands nor trained heads
+are demonstrated necessary or sufficient to reach 59 tokens/s.
+
+No training, new draft package, live node access, deployment, or Kimi/network
+performance measurement is included.

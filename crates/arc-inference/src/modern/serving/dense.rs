@@ -27,7 +27,7 @@ use rayon::prelude::*;
 
 use super::gemm::project_rows;
 use super::tree::{DraftTree, TreeOutput, TreePlan};
-use super::{BatchModel, Failure, Row, SeqKv, StepOutput, check_rows};
+use super::{BatchModel, Failure, Row, SeqKv, StepOutput, TargetFeatures, check_rows};
 use crate::modern::ModernError;
 use crate::modern::arith::{
     HeadCache, add_residual, attention_head, embed_row, exp_q16, gated_silu, rms_norm,
@@ -148,7 +148,9 @@ pub fn layered_forward(
         ffn,
     );
     let logits = final_logits(model, rows, &hidden, &mut errors);
-    finish_step(rows, kvs, &base, errors, logits)
+    let mut output = finish_step(rows, kvs, &base, errors, logits);
+    output.features = target_features(rows, &hidden, model.config.d_model, &output.logits);
+    output
 }
 
 /// A token tree verified in one step with each node computed once (ENG-8):
@@ -175,7 +177,30 @@ pub fn layered_forward_tree(
         ffn,
     );
     let logits = final_logits(model, &plan.rows, &hidden, &mut errors);
-    TreeOutput::in_place(tree, kv, plan.prefix, logits, errors)
+    let mut output = TreeOutput::in_place(tree, kv, plan.prefix, logits, errors);
+    output.features = target_features(&plan.rows, &hidden, model.config.d_model, &output.logits);
+    output
+}
+
+/// Extract features only for successful, retained rows. Pipeline adapters can
+/// call this on the final stage's residual, after error/ancestor filtering.
+pub fn target_features(
+    rows: &[Row],
+    hidden: &[i64],
+    width: usize,
+    logits: &[Option<Vec<i64>>],
+) -> Vec<Option<TargetFeatures>> {
+    rows.iter()
+        .zip(logits)
+        .enumerate()
+        .map(|(i, (row, logits))| {
+            logits.as_ref().map(|_| TargetFeatures {
+                token: row.token,
+                position: row.position,
+                hidden: hidden[i * width..(i + 1) * width].to_vec(),
+            })
+        })
+        .collect()
 }
 
 /// The cache view of one query head of a tree node: the committed positions
@@ -262,6 +287,7 @@ pub fn attention_head_tree(
 pub fn failed_step(rows: usize, sequences: usize, error: &ModernError) -> StepOutput {
     let message = error.to_string();
     StepOutput {
+        features: Vec::new(),
         logits: (0..rows).map(|_| None).collect(),
         errors: (0..sequences)
             .map(|_| {
@@ -620,6 +646,7 @@ pub fn finish_step(
         seen[row.seq] += 1;
     }
     StepOutput {
+        features: Vec::new(),
         logits,
         errors: failures,
     }

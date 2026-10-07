@@ -459,6 +459,7 @@ impl<'m, M: BatchModel> Scheduler<'m, M> {
         let StepOutput {
             mut logits,
             mut errors,
+            ..
         } = output;
         let all_logits = self.config.all_logits;
         let max_draft = self.config.draft_tokens.max(1);

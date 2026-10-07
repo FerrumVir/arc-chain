@@ -464,3 +464,132 @@ fn recycle_tree_grows_best_first_from_observed_candidates() {
     hybrid.clear();
     assert_eq!(hybrid.known_tokens(), 0);
 }
+
+// A deterministic untrained stub, deliberately a poor predictor. It reads the
+// actual final residual and pending token; it never sees baseline tokens.
+struct FeatureStub<'a> {
+    model: &'a dyn BatchModel,
+    calls: usize,
+    fail: bool,
+}
+impl TreeDrafter for FeatureStub<'_> {
+    fn propose(&mut self, _: &[u32], _: usize) -> Result<DraftTree, ModernError> {
+        panic!("feature-aware dispatch must be used")
+    }
+    fn propose_with_features(
+        &mut self,
+        context: &[u32],
+        depth: usize,
+        features: Option<&TargetFeatures>,
+    ) -> Result<DraftTree, ModernError> {
+        let features = features.expect("dense and path fallback expose features");
+        let committed = &context[..context.len() - 1];
+        // Recompute the accepted prefix independently, one row at a time.
+        let mut kv = self.model.new_kv();
+        let mut expected = None;
+        for (position, &token) in committed.iter().enumerate() {
+            let mut step = self.model.forward_rows(
+                &[Row {
+                    seq: 0,
+                    token,
+                    position,
+                    logits: true,
+                }],
+                &mut [&mut kv],
+            );
+            expected = step.features.pop().unwrap();
+        }
+        assert_eq!(
+            Some(features),
+            expected.as_ref(),
+            "only last ACCEPTED row may reach the head"
+        );
+        assert_eq!(features.position, context.len() - 2);
+        self.calls += 1;
+        if self.fail {
+            return Err(invalid("stub unavailable"));
+        }
+        let candidate = (features
+            .hidden
+            .iter()
+            .fold(0u64, |a, &v| a.wrapping_add(v.unsigned_abs()))
+            + u64::from(*context.last().unwrap())) as u32
+            % self.model.vocab_size() as u32;
+        head_tree(
+            *context.last().unwrap(),
+            &vec![vec![candidate, (candidate + 1) % 40]; depth],
+            12,
+        )
+    }
+}
+
+#[test]
+fn accepted_hidden_features_drive_stub_head_without_changing_target_bytes() {
+    let model = tiny_model();
+    let dense = DenseModel::new(&model, [0; 32]);
+    let fallback = Counting {
+        inner: &dense,
+        calls: AtomicUsize::new(0),
+    };
+    for target in [&dense as &dyn BatchModel, &fallback] {
+        for fail in [false, true] {
+            let req = GenerationRequest {
+                prompt: &[3, 9, 2],
+                max_tokens: 15,
+                eos: &[],
+                selection: Selection::Argmax,
+            };
+            let reference = model.generate(&req).unwrap();
+            let mut stub = FeatureStub {
+                model: &dense,
+                calls: 0,
+                fail,
+            };
+            let out = generate_tree(target, &req, &mut stub, 3).unwrap();
+            assert!(stub.calls > 1);
+            assert_eq!(out.tokens, reference.tokens);
+            assert_eq!(out.logits_hashes, reference.logits_hashes);
+            let mut kv = model.new_cache();
+            for &token in req.prompt.iter().chain(&out.tokens[..out.tokens.len() - 1]) {
+                model.forward(token, &mut kv).unwrap();
+            }
+            assert_eq!(out.kv_digest, kv.digest());
+        }
+    }
+}
+
+#[test]
+fn lookup_replay_matches_full_tree_including_eos_and_output_budget() {
+    let model = tiny_model();
+    let dense = DenseModel::new(&model, [0; 32]);
+    for prompt in [vec![1, 2, 1, 2, 1], vec![3, 9, 2]] {
+        for max_tokens in [1, 2, 8, 15] {
+            for depth in [0, 1, 4, 8] {
+                let req = GenerationRequest {
+                    prompt: &prompt,
+                    max_tokens,
+                    eos: &[],
+                    selection: Selection::Argmax,
+                };
+                let reference = model.generate(&req).unwrap();
+                for eos in [
+                    vec![],
+                    vec![reference.tokens[0]],
+                    vec![*reference.tokens.last().unwrap()],
+                ] {
+                    let request = GenerationRequest {
+                        eos: &eos,
+                        ..req.clone()
+                    };
+                    let lookup = LookupTree::default();
+                    let out = generate_tree(&dense, &request, &mut { lookup }, depth).unwrap();
+                    let replay =
+                        replay_lookup(&prompt, &out.tokens, max_tokens, lookup, depth).unwrap();
+                    assert_eq!(replay.passes, out.verification_passes);
+                    assert_eq!(replay.nodes, out.verified_rows);
+                    assert_eq!(replay.expanded_rows, out.expanded_rows);
+                }
+            }
+        }
+    }
+}
