@@ -5911,13 +5911,17 @@ mod release_binary_tests {
             "async fn start_node_transaction(",
             "let (config, mut recovery_phrase, persisted_address)",
         );
+        // Separate searches: a Windows checkout has CRLF line endings.
+        let branch = transaction
+            .find("if start_after_recovery {")
+            .expect("the gate depends on which transaction this is");
         let start_gate = transaction
-            .find("if start_after_recovery {\n        require_data_migration_ready(state).await?;")
+            .find("require_data_migration_ready(state).await?;")
             .expect("Start and auto-start keep the full migration gate");
         let recovery_gate = transaction
             .find("startup_recovery_gate(reason.as_deref())?;")
             .expect("the recovery-only transaction uses the startup recovery gate");
-        assert!(start_gate < recovery_gate);
+        assert!(branch < start_gate && start_gate < recovery_gate);
         let recovery = source_between(
             source,
             "pub(crate) async fn recover_managed_shutdown_inner(",
