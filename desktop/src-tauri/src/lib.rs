@@ -29,6 +29,25 @@ fn next_autostart_retry_delay(current: std::time::Duration) -> std::time::Durati
     current.saturating_mul(2).min(AUTOSTART_RETRY_MAX_DELAY)
 }
 
+/// The longest startup reconciliation waits, in total, for another process
+/// to let go of the managed data directory before it gives up as before.
+const STARTUP_BUSY_RECONCILIATION_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The wait before reconciling again after `waited` in total, doubling from
+/// one second and never past `STARTUP_BUSY_RECONCILIATION_LIMIT`. `None`
+/// once the limit is spent.
+fn next_busy_reconciliation_delay(
+    waited: std::time::Duration,
+    previous: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let remaining = STARTUP_BUSY_RECONCILIATION_LIMIT.saturating_sub(waited);
+    if remaining.is_zero() {
+        return None;
+    }
+    let delay = previous.map_or(AUTOSTART_RETRY_BASE_DELAY, next_autostart_retry_delay);
+    Some(delay.min(remaining))
+}
+
 async fn cancellable_autostart_attempt<F>(
     cancel: &mut tokio::sync::watch::Receiver<()>,
     attempt: F,
@@ -390,12 +409,9 @@ pub fn run() {
             let migration_error_shared = data_migration_error.clone();
             let node_shared = app.state::<AppState>().node.clone();
             let configured_rpc_port = start_config.rpc_port;
-            let startup_boundary_reason = migration_failure_reason.clone().or_else(|| {
-                Some(
-                    "managed-node startup reconciliation is still in progress; binary replacement and node start are temporarily blocked"
-                        .to_string(),
-                )
-            });
+            let startup_boundary_reason = migration_failure_reason
+                .clone()
+                .or_else(|| Some(commands::STARTUP_RECONCILIATION_IN_PROGRESS.to_string()));
             tauri::async_runtime::block_on(async move {
                 *store_shared.lock().await = loaded_store;
                 *data_dir_shared.lock().await = resolved;
@@ -542,7 +558,7 @@ pub fn run() {
                 // must not leave the pre-update child alive. A stop failure is
                 // a hard updater/startup boundary; do not race two versions
                 // against one data directory.
-                {
+                let mut reconciliation = {
                     let legacy_resources = commands::resolve_testnet_resources(&handle);
                     let mut node = state.node.lock().await;
                     if let Err(error) =
@@ -580,23 +596,49 @@ pub fn run() {
                             return;
                         }
                     }
-                    if let Err(error) = node.stop().await {
-                        if node_manager::is_managed_durability_recovery_required(&error) {
-                            managed_recovery_required = true;
-                            tracing::warn!(
-                                %error,
-                                "an inherited managed-node durability fence requires a quarantined recovery cycle"
-                            );
-                        } else {
-                            *state.data_migration_error.lock().await = Some(format!(
-                                "managed-node startup reconciliation failed: {error}"
-                            ));
-                            tracing::error!(
-                                %error,
-                                "could not stop stale managed arc-node; suppressing auto-start"
-                            );
-                            return;
-                        }
+                    node.stop().await
+                };
+                // A desktop that is still quitting keeps the managed lifecycle
+                // until its own node has stopped, and a node that is exiting
+                // keeps its data-directory lock until it is gone. Both let go
+                // on their own, so wait a bounded time for them rather than
+                // failing this launch at once (ARC-50 checklist 1.12).
+                let mut busy_waited = std::time::Duration::ZERO;
+                let mut busy_delay = None;
+                while let Err(error) = &reconciliation {
+                    if !node_manager::is_managed_lifecycle_busy(error) {
+                        break;
+                    }
+                    let Some(delay) = next_busy_reconciliation_delay(busy_waited, busy_delay)
+                    else {
+                        break;
+                    };
+                    tracing::warn!(
+                        %error,
+                        delay_secs = delay.as_secs(),
+                        "the managed node data directory is still held by another process; waiting before reconciling again"
+                    );
+                    tokio::time::sleep(delay).await;
+                    busy_waited += delay;
+                    busy_delay = Some(delay);
+                    reconciliation = state.node.lock().await.stop().await;
+                }
+                if let Err(error) = reconciliation {
+                    if node_manager::is_managed_durability_recovery_required(&error) {
+                        managed_recovery_required = true;
+                        tracing::warn!(
+                            %error,
+                            "an inherited managed-node durability fence requires a quarantined recovery cycle"
+                        );
+                    } else {
+                        *state.data_migration_error.lock().await = Some(format!(
+                            "managed-node startup reconciliation failed: {error}"
+                        ));
+                        tracing::error!(
+                            %error,
+                            "could not stop stale managed arc-node; suppressing auto-start"
+                        );
+                        return;
                     }
                 }
 
@@ -747,6 +789,7 @@ pub fn run() {
             commands::save_logs,
             commands::set_worker_threads,
             commands::reveal_seed_phrase,
+            commands::identity_store_location,
             commands::fetch_balance,
             commands::faucet_claim,
             commands::send_arc,
@@ -783,6 +826,20 @@ pub fn run() {
 mod startup_retry_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn busy_reconciliation_waits_at_most_one_minute_in_total() {
+        let mut waited = std::time::Duration::ZERO;
+        let mut previous = None;
+        let mut delays = Vec::new();
+        while let Some(delay) = next_busy_reconciliation_delay(waited, previous) {
+            delays.push(delay.as_secs());
+            waited += delay;
+            previous = Some(delay);
+        }
+        assert_eq!(delays, [1, 2, 4, 8, 16, 29]);
+        assert_eq!(waited, STARTUP_BUSY_RECONCILIATION_LIMIT);
+    }
 
     #[test]
     fn autostart_backoff_doubles_and_caps_at_one_minute() {

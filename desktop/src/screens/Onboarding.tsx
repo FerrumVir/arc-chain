@@ -90,6 +90,13 @@ export function Onboarding() {
   const next = () => setStep(STEPS[Math.min(stepIndex + 1, STEPS.length - 1)]);
   const back = () => setStep(STEPS[Math.max(stepIndex - 1, 0)]);
 
+  // The steps scroll when the window is shorter than a step (the app allows
+  // 960x640), so a step's action is never cut off. Each step starts at its top.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [step]);
+
   useEffect(() => {
     if (step === "identity" && !identity) {
       setIdentityError(null);
@@ -100,9 +107,10 @@ export function Onboarding() {
     }
   }, [step, identity, identityAttempt]);
 
-  // Load the network-compatible model and recommend it only when local RAM is
-  // sufficient. Lower-memory machines default to observer/router mode rather
-  // than downloading an artifact that cannot run safely.
+  // Load the network-compatible model and mark it recommended only when local
+  // RAM is sufficient. Every machine starts on observer/router mode:
+  // contributing compute is off until the user selects the model (ARC-50
+  // checklist 1.5).
   useEffect(() => {
     if (step !== "model" || tiers.length > 0) return;
     let cancelled = false;
@@ -112,7 +120,7 @@ export function Onboarding() {
         if (cancelled) return;
         setTiers(loadedTiers);
         setRecommendedTier(rec);
-        setSelectedTier(rec === "none" ? "skip" : rec);
+        setSelectedTier((current) => current ?? "skip");
         setTiersLoaded(true);
       },
       (err) => {
@@ -152,7 +160,8 @@ export function Onboarding() {
     setLaunchError(null);
     setStoreIdentity(identity);
 
-    const tier = selectedTier ?? recommendedTier;
+    // Only an explicit selection of the model opts in.
+    const tier = selectedTier ?? "skip";
     const wantsModel = tier !== "skip";
 
     try {
@@ -234,6 +243,7 @@ export function Onboarding() {
 
   return (
     <div className="onboarding" data-testid="onboarding">
+      <div className="onboarding-scroll" ref={scrollRef} data-testid="onboarding-scroll">
       <div className="onboarding-inner">
         <div className="onboarding-steps" aria-label="Progress">
           {STEPS.map((_, i) => (
@@ -568,33 +578,22 @@ export function Onboarding() {
             {step === "model" && (
               <div data-testid="step-model">
                 <h1 className="onboarding-title">Choose your compute mode</h1>
-                <p className="onboarding-subtitle">
-                  ARC production work currently uses one exact 7B artifact.
-                  Machines with at least 16 GB RAM pre-select it; smaller
-                  machines stay useful as observer/routers. A model creates
-                  eligibility, not guaranteed assignments or rewards.
-                  Continuing with the model lets ARC run inference jobs on
-                  this computer while the app is open; choose Skip to keep it
-                  an observer. You can change this any time in Settings.
-                </p>
                 <p
-                  style={{
-                    color: "var(--text-muted)",
-                    fontSize: "var(--text-sm)",
-                    lineHeight: 1.5,
-                    marginTop: "var(--space-3)",
-                  }}
+                  className="onboarding-subtitle"
+                  style={{ marginBottom: "var(--space-5)" }}
+                  data-testid="compute-choice-default"
                 >
-                  Exact artifact ID: <code>llama-2-7b-chat.Q4_K_M.gguf</code>.
-                  Extra copies or machines do not multiply rewards or guarantee
-                  demand.
+                  Contributing compute is off until you select the ARC model.
+                  A model creates eligibility, not guaranteed jobs or rewards.
                 </p>
+
+                <ContributionDisclosure />
 
                 <div
                   style={{
                     display: "grid",
                     gap: "var(--space-3)",
-                    margin: "var(--space-6) 0",
+                    margin: "var(--space-4) 0",
                   }}
                 >
                   {tiers.length === 0 &&
@@ -620,6 +619,7 @@ export function Onboarding() {
                         key={tier.id}
                         type="button"
                         onClick={() => setSelectedTier(tier.id)}
+                        aria-pressed={isSelected}
                         data-testid={`tier-${tier.id}`}
                         style={{
                           textAlign: "left",
@@ -718,6 +718,7 @@ export function Onboarding() {
                 <button
                   type="button"
                   onClick={() => setSelectedTier("skip")}
+                  aria-pressed={selectedTier === "skip"}
                   data-testid="tier-skip"
                   style={{
                     background: "none",
@@ -735,6 +736,19 @@ export function Onboarding() {
                 >
                   Skip — observer/router mode (no local model execution)
                 </button>
+
+                <p
+                  style={{
+                    color: "var(--text-muted)",
+                    fontSize: "var(--text-sm)",
+                    lineHeight: 1.5,
+                    marginTop: "var(--space-2)",
+                  }}
+                >
+                  Exact artifact ID: <code>llama-2-7b-chat.Q4_K_M.gguf</code>.
+                  Extra copies or machines do not multiply rewards or guarantee
+                  demand. You can change your choice any time in Settings.
+                </p>
 
                 <div className="onboarding-actions">
                   <button className="btn btn-ghost" onClick={back}>
@@ -797,7 +811,7 @@ export function Onboarding() {
                   {!launching &&
                     (selectedTier === "skip"
                       ? "We'll download the node binary and start an observer/router without local model execution. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards."
-                      : "We'll fetch the selected model, download the node binary, and start the process. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards.")}
+                      : "We'll fetch the selected model, download the node binary, and start the process. Your node then offers this computer's compute to the ARC network until you turn contribution off in Settings. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards.")}
                   {launching && launchStage === "model" && modelProgress && (
                     <span data-testid="model-download-status">
                       {modelDownloadStatus(modelProgress)}
@@ -894,7 +908,69 @@ export function Onboarding() {
           </motion.div>
         </AnimatePresence>
       </div>
+      </div>
+    </div>
+  );
+}
 
+/**
+ * What selecting the model means, shown on the compute step before anything
+ * is chosen (ARC-50 checklist 1.5). Each sentence states only what the node
+ * and this app do: worker registration and job results
+ * (crates/arc-node/src/main.rs, rpc.rs), the core limit and background
+ * running (node_manager.rs, lib.rs), and keep-awake (community_worker.rs).
+ */
+function ContributionDisclosure() {
+  return (
+    <div
+      data-testid="contribution-disclosure"
+      style={{
+        display: "grid",
+        gap: "var(--space-1)",
+        padding: "var(--space-3) var(--space-4)",
+        background: "var(--surface)",
+        border: "1px solid var(--border)",
+        borderRadius: "var(--radius-md)",
+        fontSize: "var(--text-sm)",
+        color: "var(--text-secondary)",
+        lineHeight: 1.5,
+      }}
+    >
+      <div
+        style={{
+          fontSize: "var(--text-xs)",
+          color: "var(--text-muted)",
+          textTransform: "uppercase",
+          letterSpacing: "var(--tracking-wider)",
+          fontWeight: 600,
+        }}
+      >
+        If you contribute compute
+      </div>
+      <p style={{ margin: 0 }} data-testid="disclosure-shared">
+        <strong style={{ color: "var(--text)" }}>What is shared.</strong> Your
+        node registers with ARC&rsquo;s coordinators, giving its address, a
+        public label made from that address (never this computer&rsquo;s
+        name), your operating system and processor type, and its model. For
+        each job it takes, it receives the prompt and sends back the generated
+        text, timings and a signed result.
+      </p>
+      <p style={{ margin: 0 }} data-testid="disclosure-power">
+        <strong style={{ color: "var(--text)" }}>Power use.</strong> Jobs can
+        use every processor core (you can lower this in Settings), so expect
+        more power use, heat and battery drain while one runs. Your node can
+        take jobs whenever it runs: from the menu bar or system tray after you
+        close the window, and after you log in while Start node on app launch
+        is on.
+      </p>
+      <p style={{ margin: 0 }} data-testid="disclosure-keep-awake">
+        <strong style={{ color: "var(--text)" }}>Keep-awake.</strong> Off
+        unless you turn it on in Settings. When on, the computer does not
+        sleep on its own while a job is computing, and on Linux a sleep you
+        request is also blocked until the job ends. It can sleep between jobs,
+        and closing the lid can still put it to sleep. A change applies the
+        next time the node starts.
+      </p>
     </div>
   );
 }

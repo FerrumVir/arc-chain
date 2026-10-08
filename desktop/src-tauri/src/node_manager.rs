@@ -502,10 +502,12 @@ fn acquire_managed_lifecycle_lock_for_reconciliation(
     )?;
     let file = arc_crypto::secret_file::open_private_read_write(&owner_path)?;
     file.try_lock_exclusive().map_err(|error| {
-        anyhow::anyhow!(
-            "another ARC desktop currently owns the managed node lifecycle for {}: {error}",
-            data_dir.display()
-        )
+        anyhow::Error::new(ManagedLifecycleBusy {
+            reason: format!(
+                "another ARC desktop currently owns the managed node lifecycle for {}: {error}",
+                data_dir.display()
+            ),
+        })
     })?;
     Ok(ManagedLifecycleLock {
         data_dir,
@@ -589,10 +591,12 @@ fn refresh_managed_lifecycle_namespace(
     match arc_crypto::secret_file::open_private_read_write(&node_lock_path) {
         Ok(node_lock) => {
             node_lock.try_lock_exclusive().map_err(|error| {
-                anyhow::anyhow!(
-                    "managed node still owns {} after detached-process reconciliation: {error}",
-                    node_lock_path.display()
-                )
+                anyhow::Error::new(ManagedLifecycleBusy {
+                    reason: format!(
+                        "managed node still owns {} after detached-process reconciliation: {error}",
+                        node_lock_path.display()
+                    ),
+                })
             })?;
             fs2::FileExt::unlock(&node_lock)?;
         }
@@ -1183,6 +1187,29 @@ pub fn is_managed_durability_recovery_required(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<ManagedDurabilityRecoveryRequired>())
+}
+
+/// Another process still holds the managed data directory: a desktop that is
+/// still quitting (it keeps the lifecycle lock until its own node has
+/// stopped), a second copy of the app, or a node that is still exiting. Each
+/// lets go on its own, so startup waits a bounded time and tries again.
+#[derive(Debug)]
+struct ManagedLifecycleBusy {
+    reason: String,
+}
+
+impl std::fmt::Display for ManagedLifecycleBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for ManagedLifecycleBusy {}
+
+pub fn is_managed_lifecycle_busy(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<ManagedLifecycleBusy>())
 }
 
 pub struct NodeManager {
@@ -4294,6 +4321,11 @@ async fn stop_detached_arc_node(
         if still_targeted.contains(&index) {
             continue;
         }
+        // A node that is gone without a clean ACK (for example one left
+        // behind by an app that quit without stopping it, which then died)
+        // leaves its receipt armed. That is the quarantined recovery case,
+        // not a failed stop, so it is reported as one: startup reconciliation
+        // then runs the recovery instead of blocking every start.
         #[cfg(windows)]
         {
             let code = target.handle.exit_code()?.ok_or_else(|| {
@@ -4302,17 +4334,25 @@ async fn stop_detached_arc_node(
                     target.identity.pid
                 )
             })?;
-            anyhow::ensure!(
-                code == 0,
-                "managed detached arc-node pid {} exited with code {code}; final WAL durability was not proven",
-                target.identity.pid
-            );
+            if code != 0 {
+                return Err(ManagedDurabilityRecoveryRequired {
+                    reason: format!(
+                        "managed detached arc-node pid {} exited with code {code}; final WAL durability was not proven",
+                        target.identity.pid
+                    ),
+                }
+                .into());
+            }
         }
-        anyhow::ensure!(
-            target.shutdown_control.validate_clean_ack()?,
-            "managed detached arc-node pid {} exited without publishing its authenticated clean shutdown ACK",
-            target.identity.pid
-        );
+        if !target.shutdown_control.validate_clean_ack()? {
+            return Err(ManagedDurabilityRecoveryRequired {
+                reason: format!(
+                    "managed detached arc-node pid {} exited without publishing its authenticated clean shutdown ACK",
+                    target.identity.pid
+                ),
+            }
+            .into());
+        }
         target.shutdown_control.consume_clean_ack()?;
     }
     #[cfg(unix)]
@@ -6835,6 +6875,83 @@ mod tests {
         assert!(!is_managed_durability_recovery_required(&anyhow::anyhow!(
             "detached process is still live"
         )));
+    }
+
+    /// ARC-50 checklist 1.12. Quitting from the app menu or the Dock leaves
+    /// the managed node running without its desktop, and it can then exit
+    /// without its clean-shutdown ACK. A relaunched desktop that watches it go
+    /// that way must get the quarantined-recovery error its startup runs a
+    /// recovery for, not a plain failure that blocks every start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_node_that_exits_without_its_ack_requires_recovery() {
+        let root = resource_test_dir("relaunch-unacked-detached-exit");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let data = data.canonicalize().unwrap();
+        // The receipt binds the process image. macOS /bin/sh re-executes
+        // another shell, so use a shell whose image is the file itself.
+        let shell = PathBuf::from("/bin/bash").canonicalize().unwrap();
+        let (control, genesis) = receipt_control_for_executable(&data, &shell);
+        // The desktop's own argv shape, from an app process that is gone.
+        let mut orphan = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg("while [ ! -f \"$ARC_STOP_REQUEST\" ]; do sleep 0.01; done; exit 3")
+            .arg("arc-node")
+            .arg("--data-dir")
+            .arg(&data)
+            .arg("--desktop-shutdown-token-file")
+            .arg(&control.token_file)
+            .arg("--genesis")
+            .arg(&genesis)
+            .env("ARC_STOP_REQUEST", &control.request_file)
+            .spawn()
+            .expect("spawn the detached fixture node");
+        // launchd or init reaps a real orphan as soon as it exits.
+        let reaper = std::thread::spawn(move || orphan.wait());
+
+        let mut relaunched = NodeManager::new();
+        relaunched
+            .configure_managed_data_dir(&data.to_string_lossy())
+            .unwrap();
+        let error = relaunched
+            .stop()
+            .await
+            .expect_err("an exit without the clean ACK leaves the receipt armed");
+        assert!(
+            is_managed_durability_recovery_required(&error),
+            "startup must run the recovery instead of failing the launch: {error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("without publishing its authenticated clean shutdown ACK"),
+            "{error}"
+        );
+        assert_eq!(reaper.join().unwrap().unwrap().code(), Some(3));
+        assert!(arc_crypto::secret_file::desktop_shutdown_receipt_exists(&data).unwrap());
+        drop(relaunched);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_desktop_that_is_still_quitting_is_busy_not_failed() {
+        let root = resource_test_dir("lifecycle-busy-while-quitting");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
+        let configured = root.join("data-v3").to_string_lossy().into_owned();
+        let quitting = acquire_managed_lifecycle_lock(&configured).unwrap();
+        let error = match acquire_managed_lifecycle_lock_for_reconciliation(&configured) {
+            Ok(_) => panic!("a relaunched desktop must wait while the old one owns the lifecycle"),
+            Err(error) => error,
+        };
+        assert!(is_managed_lifecycle_busy(&error), "{error:#}");
+        assert!(!is_managed_durability_recovery_required(&error));
+        assert!(error
+            .to_string()
+            .contains("another ARC desktop currently owns the managed node lifecycle"));
+        drop(quitting);
+        assert!(acquire_managed_lifecycle_lock_for_reconciliation(&configured).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
