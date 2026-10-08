@@ -1,6 +1,7 @@
 """Regressions run against records produced by two actual engines, never mocks."""
 import copy
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -51,6 +52,12 @@ class ActualFixture(unittest.TestCase):
         self.assertEqual(result['metrics']['layer.0.output']['count'], 256)
         self.assertEqual(result['metrics']['logits']['count'], 1200)
         self.assertGreater(result['metrics']['logits']['max_absolute_error'], 0)
+        for name, metrics in result['metrics'].items():
+            reference = [v for row in self.ref['tensors'][name] for v in row]
+            integer = [v * 2**-16 for row in self.arc['tensors'][name] for v in row]
+            norm = max(math.sqrt(math.fsum(v*v for v in reference)), 1e-8)
+            expected = max(abs(a-b) for a, b in zip(integer, reference)) / norm
+            self.assertAlmostEqual(metrics['max_absolute_error_over_reference_l2'], expected, places=14)
 
     def test_mismatched_alignment(self):
         changes = {'model_root': '0'*64, 'token_ids': [1,42,7,4],

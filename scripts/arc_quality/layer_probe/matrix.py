@@ -10,6 +10,12 @@ from .compare import canonical, sha
 from .policies import CLASSES, NAMES
 
 
+def process_cell(measurement):
+    rss = measurement['peak_rss_bytes']
+    peak = 'not measured' if rss is None else f'{rss/2**20:.3f}'
+    return f"{measurement['wall_seconds']:.6f} / {peak}"
+
+
 def preserved_payload(package):
     raw=package.read_bytes();n=struct.unpack_from('<Q',raw,8)[0]
     header=json.loads(raw[16:16+n]);start=((16+n+63)//64)*64
@@ -66,16 +72,17 @@ def summarize(root):
           'host':json.loads((root/'depth-1/legacy/arc-resources.json').read_bytes())['host']}
     (root/'matrix.json').write_bytes(canonical(data))
     lines=['# Synthetic precision errors (non-certifying)', '',str(data['host']),'',
-           '|Depth|Policy|Tensor|max abs|relative L2|top-1|routing set differences|','|---:|---|---|---:|---:|---|---|']
+           '|Depth|Policy|Tensor|max abs|relative L2|max abs / ref L2|top-1|routing set differences|','|---:|---|---|---:|---:|---:|---|---|']
     for r in rows:
         top='' if r['top1_positions'] is None else f"{r['top1_agreements']}/{r['top1_positions']}"
-        lines.append(f"|{r['depth']}|{r['policy']}{' (inactive)' if r['inactive'] else ''}|{r['tensor']}|{r['max_absolute_error']:.9g}|{r['relative_l2_error']:.9g}|{top}|{r['routing_set_mismatches']}|")
-    lines+=['','All single-class controls use original sources. Simultaneous promotions are nonlinear; `matrix.json` reports the per-tensor nonadditive residual. No tolerance PASS or shipping-precision recommendation.','',
+        lines.append(f"|{r['depth']}|{r['policy']}{' (inactive)' if r['inactive'] else ''}|{r['tensor']}|{r['max_absolute_error']:.9g}|{r['relative_l2_error']:.9g}|{r['max_absolute_error_over_reference_l2']:.9g}|{top}|{r['routing_set_mismatches']}|")
+    lines+=['','All single-class controls use original sources. Simultaneous promotions are nonlinear; `matrix.json` reports the per-tensor nonadditive residual. No ranking of precision classes, tolerance PASS or shipping-precision recommendation.',
+            'Norm denominators use max(reference L2, 1e-8). JSON retains max_relative_error for diagnostics only: its elementwise 1e-8 floor makes it unbounded and dominated by near-zero reference values; do not use it for decisions.','',
             '|Depth|Policy|ARC process seconds / peak MiB|Reference process seconds / peak MiB|','|---:|---|---:|---:|']
     for depth in (1,2,3):
         for name in NAMES:
             m=[json.loads((root/f'depth-{depth}'/name/f'{k}-resources.json').read_bytes()) for k in ('arc','reference')]
-            lines.append(f"|{depth}|{name}|{m[0]['wall_seconds']:.6f} / {m[0]['peak_rss_bytes']/2**20:.3f}|{m[1]['wall_seconds']:.6f} / {m[1]['peak_rss_bytes']/2**20:.3f}|")
+            lines.append(f"|{depth}|{name}|{process_cell(m[0])}|{process_cell(m[1])}|")
     lines+=['','Measurements are one fresh CPU process per command, including imports/load/capture/serialization, uncontrolled warm OS cache, no repetitions; ARC diagnostic runs whole, split and observed forwards for verification. This is not inference-only timing, a matched throughput benchmark or real-model RAM admission.']
     (root/'matrix.md').write_text('\n'.join(lines)+'\n')
     return data

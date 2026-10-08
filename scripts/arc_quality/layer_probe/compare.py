@@ -114,6 +114,7 @@ def compare(arc, reference, request, request_bytes):
              'rmse':float(np.sqrt(np.mean(error*error))),
              'max_relative_error':float(np.max(relative)),
              'relative_l2_error':float(np.linalg.norm(error)/max(float(np.linalg.norm(b)),1e-8)),
+             'max_absolute_error_over_reference_l2':float(np.max(np.abs(error))/max(float(np.linalg.norm(b)),1e-8)),
              'relative_denominator_floor':1e-8}
         if any(not math.isfinite(v) for v in row.values()): raise ValueError('nonfinite metrics')
         metrics[name]=row
@@ -124,6 +125,7 @@ def compare(arc, reference, request, request_bytes):
             'alignment_sha256':sha(canonical(request)), 'request_sha256':sha(request_bytes),
             'arc_raw_sha256':sha(canonical(arc)), 'reference_raw_sha256':sha(canonical(reference)),
             'precision':request['precision'], 'metrics':metrics,'routing_comparison':routing,
+            'metric_notice':'Use relative L2 and max absolute error / reference L2 for interpretation; max_relative_error is unbounded and dominated by near-zero elements (1e-8 floor), not a decision metric. No ranking of precision classes from these synthetic fixtures.',
             'top1':{'arc':np.argmax(outputs[0]['logits'],axis=1).tolist(),
                     'reference':np.argmax(outputs[1]['logits'],axis=1).tolist(),
                     'agreements':int(np.sum(np.argmax(outputs[0]['logits'],axis=1)==np.argmax(outputs[1]['logits'],axis=1))),

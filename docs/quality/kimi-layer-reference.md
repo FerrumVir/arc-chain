@@ -57,6 +57,12 @@ into thread-local storage. No arithmetic, selection or accumulation is changed.
 Every observer stage output/logit must also equal the unmodified pinned stage.
 The observer is neither a production engine patch nor a new engine pin.
 
+Every engine bump requires re-pinning the source hash and independent review of
+all import/error-helper/test-truncation substitutions and the single insertion
+anchor, followed by runtime neutrality checks. A feature-gated, read-only
+engine routing hook remains follow-up work; this harness does not modify the
+engine to introduce it.
+
 ## Alignment, routing and scales
 
 Both implementations receive IDs `[1,42,7,3]`, positions `[0,1,2,3]`, causal
@@ -95,6 +101,15 @@ Relative error denominator floor is 1e-8. FP32 reference results are labeled per
 host and **must never become golden-digest expectations**. Only integer ARC
 captures are compared for cross-platform exactness.
 
+`max_relative_error` is an unbounded elementwise diagnostic dominated by
+near-zero reference elements, even for all-INT16. Do not use it in decision
+text. Use relative L2 and `max_absolute_error_over_reference_l2` instead:
+`max(abs(ARC-reference)) / max(norm(reference, 2), 1e-8)`, over the whole captured
+tensor. Generated tables include those norm-based metrics and omit the
+elementwise maximum. These four-position random fixtures establish **no ranking**
+of precision classes. The attention-only promotion removes the observed routing
+flip here; that does not establish its priority on real K2.6 weights.
+
 ## Reproduce without model downloads
 
 Dependency/build setup may access package registries/GitHub; execution uses only
@@ -117,8 +132,13 @@ python -m unittest discover -s scripts/arc_quality/tests -t scripts -v
 
 Use fresh output directories. `capture` also supports existing verified 2/3-layer
 synthetic bundles; real-weight capture remains restricted to one layer. The CI
-CPU x86 job runs all depths and uploads raw artifacts. No labels are changed;
-ordinary pushes still cannot fetch weights. Existing Windows coverage remains.
+Linux x86, macOS ARM64 and Windows x86 jobs each run all 21 depth/policy pairs
+and upload separate artifacts. A dependent job downloads all three and compares
+every ARC record from ARM64 and Windows against Linux using `cross_host.py`;
+missing records or differing alignment, weights, tensors or routing fail the
+job. FP32 values remain host-specific. No labels are changed; ordinary pushes
+still cannot fetch weights. This matrix covers these CPU runners, not all
+backends or macOS Intel.
 
 Eighteen targeted tests run for each graph: honest alignment, actual reference
 reexecution, native observer/full/stage equality, immutable one-layer integer
@@ -146,6 +166,20 @@ nonfinite values, package/source corruption and no-output CLI rejection. The
 4. Run the comparison below on the already-present source and one-stage bundle.
    `tokens.json` is a JSON array of agreed token IDs. Start with four tokens;
    positions are 0..N-1, causal/no padding. No tokenizer/chat equivalence claim.
+
+Expected stop condition for INT16 conversion at this pin: a nonzero row with
+maximum absolute magnitude below `2^-17` is outside the supported row-magnitude
+window and can be rejected. Preserve the conversion error and log tensor/row,
+magnitude, policy and engine pin when available; report the run as stopped before
+comparison, not as a quality result or a newly discovered converter defect.
+Do not silently rescale, clamp or substitute a policy to proceed.
+
+The current real probe has no MoE layer, so routing margins are not applicable.
+The first admitted real **MoE** report must include the selection-score margin
+between the 8th and 9th expert for each flipped position, on each implementation,
+with its layer, selected IDs, score units, correction-bias/group eligibility and
+tie rules. Counts alone are insufficient. This requires future score capture;
+selected weights in the current records cannot reconstruct that margin.
 
 ```sh
 PYTHONPATH=scripts python -m arc_quality.layer_probe.capture \
@@ -236,7 +270,9 @@ is inferred. Small fixtures do not select a production precision policy.
 
 Resource measurements use one fresh child for each implementation, Unix
 `getrusage` maximum RSS (bytes on macOS, KiB converted to bytes on Linux) and
-wall/user/system seconds. ARC diagnostic uses a debug build and verifies whole,
+wall/user/system seconds. Windows records wall seconds with RSS and CPU times
+explicitly null (tables say "not measured"); no sampled RSS is passed off as a
+peak. ARC diagnostic uses a debug build and verifies whole,
 split and observed forwards; FP32 includes interpreter/torch imports, weight
 load, forward and serialization. Local conversion uses a release binary and
 CI uses debug; conversion is outside the measured children. OS cache is
@@ -255,3 +291,12 @@ do not authorize a larger real plan. Before a real run: fresh disk and available
 RAM on both hosts, gaming-PC access profile/target volume, explicit admission,
 retained original source/reference bytes, same requested graph/tokens/positions,
 and independently reviewed dependencies. No new weight fetch or paid call occurs.
+
+## Historical evidence log labels
+
+In the reviewed Studio evidence archive, `studio/[123]-*-tests.log` contains
+superseded 17-test runs. Only `depth-*-final-tests.log` is the final 18-test
+rerun evidence cited in the review. Do not add those two sets when counting
+tests. This labels the old archive; it does not rewrite its raw evidence.
+Fresh CI matrix artifacts have one test log per depth/policy in a new output
+directory, so their `[123]-*-tests.log` files are current, not superseded.
