@@ -1,0 +1,42 @@
+{
+  "schema": "arc.modern-cases.v1",
+  "cases": [
+    {
+      "id": "capital-of-france",
+      "user": "What is the capital of France? Answer in one sentence.",
+      "max_tokens": 24,
+      "eos": [
+        163586
+      ],
+      "selection": "rp64-argmax"
+    },
+    {
+      "id": "arithmetic",
+      "user": "Compute 17 * 23. Reply with the equation and the result only.",
+      "max_tokens": 24,
+      "eos": [
+        163586
+      ],
+      "selection": "argmax"
+    },
+    {
+      "id": "chinese-intro",
+      "user": "\u7528\u4e00\u53e5\u8bdd\u4ecb\u7ecd\u4e00\u4e0b\u4f60\u81ea\u5df1\u3002",
+      "max_tokens": 24,
+      "eos": [
+        163586
+      ],
+      "selection": "rp64-argmax"
+    },
+    {
+      "id": "python-one-liner",
+      "system": "You are a concise programming assistant.",
+      "user": "Write a Python one-liner that reverses a string s.",
+      "max_tokens": 32,
+      "eos": [
+        163586
+      ],
+      "selection": "rp64-argmax"
+    }
+  ]
+}

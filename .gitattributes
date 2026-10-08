@@ -12,6 +12,9 @@ vendor/third_party/glib-0.18.5/** text eol=lf
 vendor/third_party/glib-0.18.5/LICENSE whitespace=-blank-at-eof
 vendor/shared-buffer/** text eol=lf
 vendor/wasmer-compiler/** text eol=lf
+# Official K2.6 configuration and vectors are pinned as exact source bytes.
+# CRLF conversion would break the official config SHA-256 on Windows.
+docs/protocol/reference/kimi-k26/*.json -text
 # The legacy bridge verifies these real v0.8.11 release-manifest bytes with the
 # release key in its unit tests. Any CRLF conversion would break the signature.
 crates/arc-legacy-bridge/fixtures/** -text

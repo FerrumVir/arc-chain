@@ -13,15 +13,23 @@
 //!   embedding, i32 KV cache) and generation;
 //! * [`arith`] and [`tables`]: the operators and their exact tables;
 //! * [`bpe`] and [`chat`]: the byte-level BPE tokenizer and the chat prompt.
+//!
+//! [`mla`] adds DeepSeek-V3-architecture models (Moonlight-16B-A3B; the Kimi
+//! K2 text architecture) under a second profile,
+//! `arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1`: multi-head latent
+//! attention, the mixture-of-experts layer, and pipeline stages. [`tiktoken`]
+//! is their tokenizer.
 
 pub mod arith;
 pub mod bpe;
 pub mod chat;
 pub mod convert;
+pub mod mla;
 pub mod model;
 pub mod package;
 pub mod safetensors;
 pub mod tables;
+pub mod tiktoken;
 
 /// Arithmetic profile implemented by this module.
 pub const PROFILE: &str = "arc.hf-llama.i8-dyadic-row.q16.v1";
