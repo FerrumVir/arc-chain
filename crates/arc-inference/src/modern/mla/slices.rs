@@ -45,7 +45,10 @@ use crate::modern::{ModernError, hex_lower, identity_blake3};
 
 /// Slice manifest schema.
 mod prepared;
-pub use prepared::{assemble_yarn_bundle, prepare_yarn_manifest};
+pub use prepared::{
+    assemble_yarn_bundle, assemble_yarn_bundle_with_precision, prepare_yarn_manifest,
+    prepare_yarn_manifest_with_precision,
+};
 
 pub const SLICE_MANIFEST_SCHEMA: &str = "arc.integer-slice-manifest.v1";
 /// Unit record schema (one file per converted unit, under `units/`).
@@ -252,6 +255,16 @@ impl SliceSource {
         })
     }
 
+    /// Select a complete policy before planning, conversion or record hashing.
+    pub fn with_precision(
+        mut self,
+        precision: Option<super::precision::Precision>,
+    ) -> Result<Self, ModernError> {
+        self.config.precision = precision;
+        self.config.validate()?;
+        Ok(self)
+    }
+
     /// The pinned `model.safetensors.index.json`, if the manifest has one.
     pub fn index_entry(&self) -> Result<Option<SourceFile>, ModernError> {
         let Some(value) = self.raw.get("index") else {
@@ -298,11 +311,15 @@ impl SliceSource {
     /// What every unit record and the manifest are bound to: the profile,
     /// the source and the expert grouping.
     fn context(&self) -> Value {
-        json!({
+        let mut value = json!({
             "profile": self.config.profile(),
             "source_blake3": blake3::hash(canonical(&self.manifest.header_json()).unwrap_or_default().as_bytes()).to_hex().to_string(),
             "expert_groups": self.expert_groups,
-        })
+        });
+        if let Some(p) = &self.config.precision {
+            value["precision"] = serde_json::to_value(p).unwrap();
+        }
+        value
     }
 
     /// The safetensors shards of the manifest that hold `names`; every shard
@@ -400,14 +417,18 @@ pub fn plan(src: &SliceSource, dir: &Path, units: &[Unit]) -> Result<Value, Mode
             "source_bytes": shards.iter().map(|s| sizes[s.as_str()]).sum::<u64>(),
         }));
     }
-    Ok(json!({
+    let mut value = json!({
         "schema": SLICE_PLAN_SCHEMA,
         "profile": src.config.profile(),
         "expert_groups": src.expert_groups,
         "indexed": map.is_some(),
         "steps": out,
         "peak_source_bytes": peak,
-    }))
+    });
+    if let Some(p) = &src.config.precision {
+        value["precision"] = serde_json::to_value(p).unwrap();
+    }
+    Ok(value)
 }
 
 /// One tensor's place in a slice file.
@@ -863,7 +884,8 @@ pub fn convert_units(
         paths.push(verify_source_file(dir, file)?);
     }
     let expected = stage_source_tensors_in(c, &src.hf.source, StageSpec::full(c));
-    let tensors = SourceTensors::open(&paths, &expected, &src.hf.source)?;
+    let mut tensors = SourceTensors::open(&paths, &expected, &src.hf.source)?;
+    tensors.precision = c.precision.clone();
     tensors.require(needed.iter())?;
     std::fs::create_dir_all(units_dir(out)).map_err(|e| io(out, e))?;
     let context = src.context();
@@ -999,10 +1021,23 @@ pub fn build_manifest(src: &SliceSource, records: &[UnitRecord]) -> Result<Value
         "slices": records.iter().flat_map(|r| r.slices.iter().map(SliceRecord::to_json)).collect::<Vec<_>>(),
         "model_root": model_root,
     });
+    if let Some(p) = &c.precision {
+        manifest["precision"] = serde_json::to_value(p).unwrap();
+    }
     let hash = crate::model_package::manifest_body_blake3(&manifest)
         .map_err(|e| invalid(format!("manifest hash: {e}")))?;
     manifest["manifest_blake3"] = Value::from(hash);
     Ok(manifest)
+}
+
+/// Strict optional policy: absence is the legacy identity; null is invalid.
+pub fn manifest_precision(
+    value: &Value,
+) -> Result<Option<super::precision::Precision>, ModernError> {
+    value
+        .get("precision")
+        .map(super::precision::Precision::from_json)
+        .transpose()
 }
 
 /// A parsed slice manifest whose `manifest_blake3` has been checked.
@@ -1021,6 +1056,7 @@ impl SliceManifest {
                 "slice manifest schema is not {SLICE_MANIFEST_SCHEMA}"
             )));
         }
+        manifest_precision(&value)?;
         let recorded = value
             .get("manifest_blake3")
             .and_then(Value::as_str)
@@ -1077,6 +1113,9 @@ impl SliceManifest {
             .and_then(ExpertFormat::from_profile)
             .ok_or_else(|| invalid("slice manifest profile is not an MLA + MoE profile"))?;
         c.validate()?;
+        if self.value["profile"] != c.profile() || c.precision != manifest_precision(&self.value)? {
+            return Err(invalid("slice model/profile/precision mismatch"));
+        }
         Ok(c)
     }
 
@@ -1319,6 +1358,7 @@ fn config_for_layout(shape: &Value, manifest: &Value) -> Result<MlaConfig, Moder
         rope_theta: 2,
         attention_lambda: 0,
         preparation: None,
+        precision: manifest_precision(manifest)?,
         expert_format: manifest
             .get("profile")
             .and_then(Value::as_str)
@@ -2070,6 +2110,7 @@ mod tests {
             attention_lambda: crate::modern::tables::attention_lambda(192),
             expert_format: ExpertFormat::Int4G32,
             preparation: None,
+            precision: None,
         };
         c.validate().unwrap();
         let bytes = |unit: Unit, experts: bool| -> u64 {

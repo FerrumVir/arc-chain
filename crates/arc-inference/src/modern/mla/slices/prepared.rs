@@ -12,6 +12,24 @@ pub fn prepare_yarn_manifest(
     scope: Scope,
     max_seq: usize,
 ) -> Result<(MlaConfig, Value), ModernError> {
+    prepare_yarn_manifest_with_precision(input, config_bytes, source_bytes, scope, max_seq, None)
+}
+
+/// Caller-owned policy must match the committed conversion policy.
+pub fn prepare_yarn_manifest_with_precision(
+    input: &SliceManifest,
+    config_bytes: &[u8],
+    source_bytes: &[u8],
+    scope: Scope,
+    max_seq: usize,
+    precision: Option<super::super::precision::Precision>,
+) -> Result<(MlaConfig, Value), ModernError> {
+    if let Some(p) = &precision {
+        p.validate()?;
+    }
+    if manifest_precision(&input.value)? != precision {
+        return Err(invalid("slice precision differs from requested policy"));
+    }
     // Reparse to reject mutations to the public parsed fields or value.
     let sealed = SliceManifest::parse(canonical(&input.value)?.as_bytes())?;
     if sealed.segments != input.segments || sealed.slices != input.slices {
@@ -34,7 +52,8 @@ pub fn prepare_yarn_manifest(
     let hf = parse_hf_weights_config(config_bytes, max_seq)?;
     let mut original = hf.config;
     original.expert_format = ExpertFormat::Int4G32;
-    if input.value["profile"] != super::super::PROFILE_I4G32
+    original.precision = precision.clone();
+    if input.value["profile"] != original.profile()
         || input.value["pending"] != json!(["rope_scaling yarn"])
         || hf.pending != ["rope_scaling yarn"]
         || input.value["weights"] != json!({"prefix":hf.source.prefix,"packed_experts":true})
@@ -46,7 +65,7 @@ pub fn prepare_yarn_manifest(
     {
         return Err(invalid("not the pinned pending YaRN slice layout"));
     }
-    let c = match scope {
+    let mut c = match scope {
         Scope::SyntheticFixture => {
             let v: Value =
                 serde_json::from_slice(config_bytes).map_err(|e| invalid(e.to_string()))?;
@@ -67,6 +86,8 @@ pub fn prepare_yarn_manifest(
             yarn::official_config(config_bytes, max_seq, Some(layers))?
         }
     };
+    c.precision = precision;
+    c.validate()?;
     let allowed = package::segment_names(&original);
     let mut previous = 0;
     for s in &input.segments {
@@ -140,9 +161,39 @@ pub fn assemble_yarn_bundle(
     out: &Path,
     stage_count: usize,
 ) -> Result<Value, ModernError> {
+    assemble_yarn_bundle_with_precision(
+        input,
+        config_bytes,
+        source_bytes,
+        scope,
+        dir,
+        out,
+        stage_count,
+        None,
+    )
+}
+
+/// Atomic assembly with an explicitly expected conversion policy.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_yarn_bundle_with_precision(
+    input: &SliceManifest,
+    config_bytes: &[u8],
+    source_bytes: &[u8],
+    scope: Scope,
+    dir: &Path,
+    out: &Path,
+    stage_count: usize,
+    precision: Option<super::super::precision::Precision>,
+) -> Result<Value, ModernError> {
     let source = SourceManifest::parse(source_bytes)?;
-    let (c, finalized) =
-        prepare_yarn_manifest(input, config_bytes, source_bytes, scope, source.max_seq)?;
+    let (c, finalized) = prepare_yarn_manifest_with_precision(
+        input,
+        config_bytes,
+        source_bytes,
+        scope,
+        source.max_seq,
+        precision,
+    )?;
     if stage_count == 0 || stage_count > c.n_layers || out.exists() {
         return Err(invalid(
             "stage count invalid or output directory already exists",
@@ -324,6 +375,125 @@ mod tests {
     }
     fn parsed(v: &Value) -> SliceManifest {
         SliceManifest::parse(canonical(v).unwrap().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn precision_budgets_equal_actual_layout_and_reference_element_counts() {
+        use crate::modern::mla::precision::{Bits, Precision};
+        let data: Value = serde_json::from_str(include_str!(
+            "../../../../../../docs/protocol/reference/kimi-k26/precision-budgets.json"
+        ))
+        .unwrap();
+        for row in data["rows"].as_array().unwrap() {
+            let depth = row["layers"].as_u64().unwrap() as usize;
+            let mut c = parse_hf_weights_config(yarn::CONFIG, 4096).unwrap().config;
+            c.expert_format = ExpertFormat::Int4G32;
+            if row["policy"] != "legacy" {
+                let mut p = Precision::all_int16();
+                if row["policy"] == "mixed" {
+                    p.embedding = Bits::Int8;
+                    p.shared = Bits::Int8;
+                }
+                c.precision = Some(p);
+            }
+            let mut units = vec![Unit::Embed];
+            units.extend((0..depth).map(Unit::Layer));
+            units.push(Unit::Head);
+            let entries: Vec<_> = units.iter().flat_map(|u| u.entries(&c)).collect();
+            let bytes: u64 = entries.iter().map(|e| e.bytes).sum();
+            assert_eq!(row["slice_payload_bytes"], bytes);
+            let fp32: u64 = entries
+                .iter()
+                .map(|e| {
+                    if e.name.ends_with(".q4") {
+                        e.bytes * 8
+                    } else if e.name.ends_with(".q")
+                        || e.name.contains("norm")
+                        || e.name.ends_with("router_bias")
+                    {
+                        e.shape.iter().map(|&n| n as u64).product::<u64>() * 4
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+            assert_eq!(row["reference_fp32_parameters_bytes"], fp32);
+            let expected = row["retained_source_bytes"].as_u64().unwrap()
+                + 2 * bytes
+                + row["canonical_table_bytes"].as_u64().unwrap()
+                + row["disk_header_alignment_scratch_margin_bytes"]
+                    .as_u64()
+                    .unwrap()
+                + row["disk_reserve_bytes"].as_u64().unwrap();
+            assert_eq!(row["peak_disk_with_retained_sources_bytes"], expected);
+        }
+    }
+
+    #[test]
+    fn precision_official_full_probe_controls_bind_policy_and_layout() {
+        use crate::modern::mla::precision::{Bits, Precision};
+        for mixed in [false, true] {
+            let mut precision = Precision::all_int16();
+            if mixed {
+                precision.embedding = Bits::Int8;
+                precision.shared = Bits::Int8;
+            }
+            let mut original = parse_hf_weights_config(yarn::CONFIG, 4096).unwrap().config;
+            original.expert_format = ExpertFormat::Int4G32;
+            original.precision = Some(precision.clone());
+            let layout = package::layout(&original, StageSpec::full(&original));
+            let mut v = pending_official();
+            v["precision"] = serde_json::to_value(&precision).unwrap();
+            v["profile"] = original.profile().into();
+            for seg in v["segments"].as_array_mut().unwrap() {
+                let bytes: u64 = layout
+                    .iter()
+                    .filter(|e| e.segment == seg["name"].as_str().unwrap())
+                    .map(|e| e.bytes)
+                    .sum();
+                seg["bytes"] = bytes.into();
+            }
+            seal(&mut v);
+            for depth in [None, Some(1), Some(2), Some(3)] {
+                let scope = depth.map_or(Scope::FullKimiK26, |layers| {
+                    Scope::EarlyLayersWithHeadProbe { layers }
+                });
+                let (c, m) = prepare_yarn_manifest_with_precision(
+                    &parsed(&v),
+                    yarn::CONFIG,
+                    SOURCE,
+                    scope.clone(),
+                    4096,
+                    Some(precision.clone()),
+                )
+                .unwrap();
+                assert_eq!(c.precision, Some(precision.clone()));
+                assert_eq!(MlaConfig::from_json(&m["model"]).unwrap(), c);
+                assert_eq!(m["profile"], c.profile());
+                assert!(
+                    prepare_yarn_manifest(&parsed(&v), yarn::CONFIG, SOURCE, scope.clone(), 4096)
+                        .is_err()
+                );
+                let mut relabeled = pending_official();
+                relabeled["precision"] = v["precision"].clone();
+                relabeled["profile"] = v["profile"].clone();
+                seal(&mut relabeled);
+                assert!(
+                    prepare_yarn_manifest_with_precision(
+                        &parsed(&relabeled),
+                        yarn::CONFIG,
+                        SOURCE,
+                        scope,
+                        4096,
+                        Some(precision.clone())
+                    )
+                    .is_err()
+                );
+                if depth.is_some() {
+                    println!("precision probe {mixed} {depth:?} root {}", m["model_root"]);
+                }
+            }
+        }
     }
 
     #[test]

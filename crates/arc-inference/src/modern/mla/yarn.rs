@@ -102,6 +102,12 @@ impl Preparation {
                 expected.expert_format = ExpertFormat::Int4G32;
                 expected.attention_lambda = ATTENTION_LAMBDA;
                 expected.preparation = Some(self.clone());
+                // Precision is an explicit execution choice, independent of the
+                // pinned official shape and YaRN constants. Validate it separately.
+                if let Some(p) = &c.precision {
+                    p.validate()?;
+                }
+                expected.precision = c.precision.clone();
                 if &expected != c {
                     return Err(invalid(
                         "YaRN model shape differs from pinned official scope",
@@ -392,6 +398,18 @@ mod tests {
             assert_eq!(header.config, c);
             assert_eq!(header.value["model"], header.config.to_json());
             assert_eq!(header.value["profile"], c.profile());
+        }
+    }
+
+    #[test]
+    fn mixed_precision_full_probe_fixture_profiles_round_trip() {
+        for mut c in scope_controls() {
+            let old = c.profile();
+            c.precision = Some(super::super::precision::Precision::all_int16());
+            c.validate().unwrap();
+            assert_ne!(old, c.profile());
+            assert_eq!(scope_header(&c, c.to_json()).unwrap().config, c);
+            assert_eq!(MlaConfig::from_json(&c.to_json()).unwrap(), c);
         }
     }
 

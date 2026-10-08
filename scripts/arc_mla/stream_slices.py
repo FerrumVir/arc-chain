@@ -94,6 +94,7 @@ def main(argv: list) -> int:
     parser.add_argument("--head", action="store_true")
     parser.add_argument("--expert-groups", default="1")
     parser.add_argument("--experts")
+    parser.add_argument("--precision", help="complete precision policy JSON, selected before conversion")
     parser.add_argument("--threads")
     parser.add_argument("--keep-source", action="store_true", help="do not delete shards after use")
     parser.add_argument("--discard", action="store_true",
@@ -107,6 +108,20 @@ def main(argv: list) -> int:
     if manifest.get("schema") != "arc.hf-source.v1":
         raise SystemExit("not an arc.hf-source.v1 manifest")
     work, out = Path(args.work), Path(args.out)
+    precision = None
+    if args.precision:
+        precision = json.loads(Path(args.precision).read_text(encoding="utf-8"))
+        fields = {"attention", "dense", "shared", "embedding", "head"}
+        if (not isinstance(precision, dict) or set(precision) != fields | {"version"}
+                or type(precision["version"]) is not int or precision["version"] != 1
+                or any(precision[k] not in ("int8", "int16") for k in fields)):
+            raise SystemExit("invalid complete precision policy")
+    # Refuse a stale policy before fetching or deleting any source file.
+    if args.resume:
+        for record in (out / "units").glob("*.json"):
+            context = json.loads(record.read_text(encoding="utf-8")).get("context", {})
+            if context.get("precision") != precision:
+                raise SystemExit("resume precision differs from existing unit records")
     work.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
     template = manifest.get("url_template", "https://huggingface.co/{repo}/resolve/{revision}/{name}")
@@ -129,6 +144,8 @@ def main(argv: list) -> int:
               "--expert-groups", args.expert_groups]
     if args.experts:
         common += ["--experts", args.experts]
+    if args.precision:
+        common += ["--precision", str(Path(args.precision).resolve())]
     select = []
     if args.layers:
         select += ["--layers", args.layers]

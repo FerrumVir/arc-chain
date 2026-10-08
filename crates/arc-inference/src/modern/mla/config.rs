@@ -28,7 +28,7 @@ impl ExpertFormat {
 
     /// The format a profile identity names, if any.
     pub fn from_profile(profile: &str) -> Option<Self> {
-        match profile {
+        match super::precision::legacy_profile(profile) {
             p if p == super::PROFILE => Some(ExpertFormat::Int8Dyadic),
             p if p == super::PROFILE_I4G32 || super::yarn::is_profile(p) => {
                 Some(ExpertFormat::Int4G32)
@@ -93,6 +93,8 @@ pub struct MlaConfig {
     pub expert_format: ExpertFormat,
     /// Versioned preparation; absent means the original unchanged v1 profile.
     pub preparation: Option<super::yarn::Preparation>,
+    /// Explicit versioned BF16 matrix precision; absent preserves legacy identity.
+    pub precision: Option<super::precision::Precision>,
 }
 
 const MODEL_KEYS: [&str; 25] = [
@@ -166,6 +168,9 @@ impl MlaConfig {
 
     /// Reject shapes and constants the profile does not define (spec §2.1).
     pub fn validate(&self) -> Result<(), ModernError> {
+        if let Some(p) = &self.precision {
+            p.validate()?;
+        }
         let positive = [
             self.n_layers,
             self.d_model,
@@ -262,6 +267,9 @@ impl MlaConfig {
         if let Some(preparation) = &self.preparation {
             value["preparation"] = preparation.to_json();
         }
+        if let Some(precision) = &self.precision {
+            value["precision"] = serde_json::to_value(precision).expect("precision serialization");
+        }
         value
     }
 
@@ -279,6 +287,14 @@ impl MlaConfig {
         let mut expected = MODEL_KEYS.to_vec();
         if preparation.is_some() {
             expected.push("preparation");
+            expected.sort_unstable();
+        }
+        let precision = model
+            .get("precision")
+            .map(super::precision::Precision::from_json)
+            .transpose()?;
+        if precision.is_some() {
+            expected.push("precision");
             expected.sort_unstable();
         }
         if keys != expected {
@@ -341,6 +357,7 @@ impl MlaConfig {
                 ExpertFormat::Int8Dyadic
             },
             preparation,
+            precision,
         };
         config.validate()?;
         Ok(config)
@@ -348,9 +365,15 @@ impl MlaConfig {
 
     /// The arithmetic profile identity of a package of this model.
     pub fn profile(&self) -> &'static str {
-        self.preparation
+        let base = self
+            .preparation
             .as_ref()
-            .map_or_else(|| self.expert_format.profile(), |p| p.profile())
+            .map_or_else(|| self.expert_format.profile(), |p| p.profile());
+        if self.precision.is_some() {
+            super::precision::mixed_profile(base)
+        } else {
+            base
+        }
     }
 }
 
@@ -753,6 +776,7 @@ pub(crate) fn parse_text_config(
         attention_lambda: attention_lambda(qk_nope_dim + qk_rope_dim),
         expert_format: ExpertFormat::Int8Dyadic,
         preparation: None,
+        precision: None,
     };
     config.validate()?;
     Ok(HfMlaConfig { config, eos })

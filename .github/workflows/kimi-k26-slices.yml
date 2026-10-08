@@ -162,6 +162,14 @@ jobs:
           bin=./target/release/arc-mla
           [ -f "$bin.exe" ] && bin="$bin.exe"
           bash scripts/arc_mla/slice_checks.sh "$PWD/$bin" "$RUNNER_TEMP/slices-work" "$RUNNER_TEMP/evidence"
+      - name: Provisional precision integration (offline; legacy, all-INT16, mixed)
+        shell: bash
+        run: |
+          bin=./target/release/arc-mla
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          python scripts/arc_mla/check_precision_slices.py "$PWD/$bin" "$RUNNER_TEMP/precision-work" "$RUNNER_TEMP/evidence/precision"
+          python scripts/arc_mla/precision_budget.py "$RUNNER_TEMP/evidence/precision-budgets.json"
+          python -c 'import json,os; assert json.load(open(os.environ["RUNNER_TEMP"]+"/evidence/precision-budgets.json")) == json.load(open("docs/protocol/reference/kimi-k26/precision-budgets.json"))'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

@@ -120,6 +120,18 @@ class OneShardBound(unittest.TestCase):
         self.assertEqual(report["steps"][0]["skipped"], "unit records exist")
         self.assertEqual(report["steps"][0]["deleted"], [SHARDS[0]])
 
+    def test_resume_rejects_precision_change_before_fetch_or_delete(self):
+        self.work.mkdir(); (self.out / "units").mkdir(parents=True)
+        source=self.work / SHARDS[0]; source.write_bytes(b"retained source")
+        old={"version":1, **{k:"int16" for k in ["attention","dense","shared","embedding","head"]}}
+        (self.out / "units/layer.0.json").write_text(json.dumps({"context":{"precision":old}}))
+        fakes=Fakes(self.work,self.out)
+        with mock.patch.object(self.module,"fetch") as fetch, mock.patch.object(self.module,"run") as run:
+            with self.assertRaisesRegex(SystemExit,"resume precision"):
+                self.module.main(["--arc-mla","arc-mla","--source-manifest",str(self.manifest),"--work",str(self.work),"--out",str(self.out),"--resume"])
+            fetch.assert_not_called();run.assert_not_called()
+        self.assertEqual(source.read_bytes(),b"retained source")
+
     def test_keep_source_still_keeps_shards_when_resuming(self):
         first = Fakes(self.work, self.out, crash_after_unit="layer.0")
         with self.assertRaises(Interrupted):

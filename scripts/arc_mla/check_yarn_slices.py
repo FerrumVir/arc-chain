@@ -14,7 +14,9 @@ def read(p):
 
 
 def main():
-    binary, work, evidence = (Path(p).resolve() for p in sys.argv[1:])
+    binary, work, evidence = (Path(p).resolve() for p in sys.argv[1:4])
+    policy = Path(sys.argv[4]).resolve() if len(sys.argv) == 5 else None
+    settings = ["--precision", policy] if policy else []
     root = Path(__file__).resolve().parents[2]
     work.mkdir(parents=True)
     evidence.mkdir(parents=True)
@@ -39,22 +41,23 @@ def main():
     for f in vision:
         (source / f).unlink()
     run('slice', '--source-dir', source, '--source-manifest', pin, '--out-dir', slices,
-        '--expert-groups', 4)
+        '--expert-groups', 4, *settings)
     run('slice-manifest', '--source-dir', source, '--source-manifest', pin, '--out-dir', slices,
-        '--expert-groups', 4, '--out', manifest)
+        '--expert-groups', 4, '--out', manifest, *settings)
     original = read(manifest)
     assert original['pending'] == ['rope_scaling yarn']
-    run('slice-assemble', '--manifest', manifest, '--slices', slices, '--out', work / 'legacy.pkg', fails=True)
+    run('slice-assemble', '--manifest', manifest, '--slices', slices, '--out', work / 'legacy.pkg', *settings, fails=True)
     assert not (work / 'legacy.pkg').exists()
 
     def assemble(out, m=manifest, src=pin, cfg=config, *extra, fails=False):
         return run('slice-assemble-yarn', '--config', cfg, '--source-manifest', src,
-                   '--manifest', m, '--slices', slices, '--out-dir', out, '--fixture', *extra, fails=fails)
+                   '--manifest', m, '--slices', slices, '--out-dir', out, '--fixture', *settings, *extra, fails=fails)
 
     full = work / 'bundle-1'
     assemble(full)
     finalized = read(full / 'manifest.json')
-    assert finalized['profile'] == 'arc.synthetic.kimi-k26-yarn.i4g32.q16.v1'
+    assert finalized['profile'] == ('arc.synthetic.kimi-k26-yarn.mixed-dyadic-row.i4g32.q16.v1' if policy else 'arc.synthetic.kimi-k26-yarn.i4g32.q16.v1')
+    assert finalized['model'].get('precision') == (read(policy) if policy else None)
     assert read(manifest) == original, 'pending input changed'
     assert finalized['segments'][1:] == original['segments'], 'weight bytes requantized'
     run('verify', '--package', full / 'stage-0.arcspkg', '--manifest', full / 'manifest.json')
@@ -126,6 +129,28 @@ def main():
         assemble(out, altered, fails=True)
         assert not out.exists() and not list(work.glob('.yarn-assembly-*'))
         failures.append(kind)
+    # Same sealed manifest, independently changed/omitted caller policy.
+    if policy:
+        out = work / 'bad-omitted-policy'
+        run('slice-assemble-yarn', '--config', config, '--source-manifest', pin,
+            '--manifest', manifest, '--slices', slices, '--out-dir', out, '--fixture', fails=True)
+        assert not out.exists()
+        failures.append('omitted-caller-policy')
+    substitutions = []
+    if policy:
+        for key, value in [('version', 2), ('head', 'int8' if read(policy)['head']=='int16' else 'int16'), ('experts','int16')]:
+            m = copy.deepcopy(original);m['precision'][key]=value
+            substitutions.append((key,m))
+        m=copy.deepcopy(original);m.pop('precision');substitutions.append(('removed',m))
+    else:
+        m=copy.deepcopy(original);m['precision']={'version':1, **{k:'int16' for k in ['attention','dense','shared','embedding','head']}}
+        substitutions.append(('legacy-relabel',m))
+    for label,m in substitutions:
+        altered=work/f'policy-{label}.json';altered.write_text(json.dumps(seal(m)))
+        out=work/f'bad-policy-{label}'
+        assemble(out,altered,fails=True)
+        assert not out.exists() and not list(work.glob('.yarn-assembly-*'))
+        failures.append('policy-'+label)
     changed_config = work / 'changed-config.json'; changed_config.write_bytes(config.read_bytes()+b' ')
     assemble(work / 'bad-config', manifest, pin, changed_config, fails=True)
     assert not (work / 'bad-config').exists()
@@ -134,7 +159,7 @@ def main():
     for extra in ([], ['--probe-layers', '2'], ['--fixture','--probe-layers','2']):
         out = work / ('bad-identity-' + str(len(extra)))
         run('slice-assemble-yarn', '--config', config, '--source-manifest', pin, '--manifest', manifest,
-            '--slices', slices, '--out-dir', out, *extra, fails=True)
+            '--slices', slices, '--out-dir', out, *settings, *extra, fails=True)
         assert not out.exists()
     failures.append('fixture-to-full-or-probe-substitution')
     before = (full / 'report.json').read_bytes()
@@ -145,6 +170,8 @@ def main():
     data = bytearray((full / 'stage-0.arcspkg').read_bytes()); data[-64] ^= 1; corrupt.write_bytes(data)
     run('verify', '--package', corrupt, '--manifest', full / 'manifest.json', fails=True)
     failures.append('assembled-package-corruption')
+    shutil.copy(full / 'stage-0.arcspkg', evidence / 'stage-0.arcspkg')
+    shutil.copy(manifest, evidence / 'pending.json')
     shutil.copy(full / 'manifest.json', evidence / 'manifest.json')
     shutil.copy(full / 'report.json', evidence / 'assembly.json')
     (evidence / 'summary.json').write_text(json.dumps({'scope':'synthetic fixture only; no real K2.6 execution',

@@ -80,7 +80,7 @@ cargo build --release --locked -p arc-inference --bin arc-mla
 python scripts/arc_mla/stream_slices.py --arc-mla ./target/release/arc-mla \
   --source-manifest docs/protocol/packages/kimi-k26.source.json \
   --work first-light-source --out first-light-slices \
-  --layers 0:1 --embed --head --expert-groups 48 --report first-light-stream.json
+  --layers 0:1 --embed --head --expert-groups 48 --keep-source --report first-light-stream.json
 ./target/release/arc-mla slice-assemble-yarn \
   --config first-light-source/config.json \
   --source-manifest docs/protocol/packages/kimi-k26.source.json \
@@ -126,3 +126,7 @@ assumed. Download bounds additionally include the largest live source shard
 These are planning bounds, not measured peaks, and do not budget extra package
 copies, reference weights or reference-runtime scratch/RAM. Those need separate
 admission. Historical real-shard results remain at `7a952ec7`, run 37622036049.
+
+Precision policies and revised retained-source disk/RAM budgets are specified in
+`kimi-k26-precision-integration.md`. The legacy command above omits precision;
+INT16/mixed use the same explicit policy during conversion and assembly.

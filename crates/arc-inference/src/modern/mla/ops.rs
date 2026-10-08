@@ -25,14 +25,16 @@ fn invalid(what: impl Into<String>) -> ModernError {
     ModernError::Invalid(what.into())
 }
 
-/// A borrowed per-row dyadic INT8 matrix (dyadic v1 §5.2): weights may live
+/// A borrowed per-row dyadic INT8 or INT16 matrix: weights may live
 /// in a memory-mapped package, scales in memory.
 #[derive(Debug, Clone, Copy)]
 pub struct QView<'a> {
     pub rows: usize,
     pub cols: usize,
-    /// Row-major weights in `[-127, 127]`.
+    /// Row-major INT8 weights in `[-127, 127]`, empty when q16 is present.
     pub q: &'a [i8],
+    /// Little-endian INT16 bytes (q is empty when present); no alignment assumption.
+    pub q16: Option<&'a [u8]>,
     pub mu: &'a [i32],
     pub k: &'a [u8],
 }
@@ -41,12 +43,14 @@ impl<'a> QView<'a> {
     fn consistent(&self) -> bool {
         self.rows > 0
             && self.cols > 0
-            && self.q.len() == self.rows * self.cols
+            && self.q16.map_or(self.q.len() == self.rows * self.cols, |q| {
+                self.q.is_empty() && q.len() == self.rows * self.cols * 2
+            })
             && self.mu.len() == self.rows
             && self.k.len() == self.rows
     }
 
-    /// Row `r` of the weights.
+    /// Row `r` of a legacy INT8 view. Wide callers use project/embed_row.
     pub fn row(&self, r: usize) -> &'a [i8] {
         &self.q[r * self.cols..(r + 1) * self.cols]
     }
@@ -62,6 +66,9 @@ impl<'a> QView<'a> {
                 x.len(),
                 out.len()
             )));
+        }
+        if let Some(q) = self.q16 {
+            return super::precision::project_i16(q, self.rows, self.cols, self.mu, self.k, x, out);
         }
         check_projection_input(x)?;
         let simd = crate::canonical_simd::fast_canonical_kernel_enabled()
@@ -91,6 +98,12 @@ impl<'a> QView<'a> {
         }
         let mu = i64::from(self.mu[token]);
         let shift = u32::from(self.k[token]).saturating_sub(FRAC_BITS);
+        if let Some(q) = self.q16 {
+            return Ok(q[token * self.cols * 2..(token + 1) * self.cols * 2]
+                .chunks_exact(2)
+                .map(|v| (i64::from(i16::from_le_bytes([v[0], v[1]])) * mu) >> shift)
+                .collect());
+        }
         Ok(self
             .row(token)
             .iter()
@@ -1069,6 +1082,7 @@ mod tests {
         let mu = vec![1 << 30, (1 << 30) + 12_345, 1 << 30];
         let k = vec![46, 40, 50];
         let view = QView {
+            q16: None,
             rows: 3,
             cols: 4,
             q: &q,

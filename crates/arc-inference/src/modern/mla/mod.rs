@@ -34,6 +34,7 @@ pub mod convert;
 pub mod model;
 pub mod ops;
 pub mod package;
+pub mod precision;
 pub mod slices;
 pub mod yarn;
 mod yarn_constants;

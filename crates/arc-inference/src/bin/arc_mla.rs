@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 const USAGE: &str = "usage: arc-mla <command> [options]
 
   convert   --source-dir DIR --source-manifest SRC.json --out PKG [--layers A:B]
-            [--experts i8|i4g32] [--manifest-out MANIFEST.json] [--report OUT.json] [--threads N]
+            [--experts i8|i4g32] [--precision PRECISION.json] [--manifest-out MANIFEST.json] [--report OUT.json] [--threads N]
   yarn-prepare --config PINNED_CONFIG.json --out PREPARATION.json [--max-seq N]
                [--probe-layers 1|2|3] [--slice-manifest PENDING.json --manifest-out STAGE.json]
   verify    --package PKG --manifest MANIFEST.json [--full-digest]
@@ -56,7 +56,8 @@ const USAGE: &str = "usage: arc-mla <command> [options]
   slice-manifest --source-dir DIR --source-manifest SRC.json --out-dir SLICES --out MANIFEST.json
                  [--expert-groups G] [--experts i8|i4g32]
   slice-verify   --manifest MANIFEST.json --slices SLICES [--only NAME[,NAME..]] [--segments]
-  slice-assemble-yarn --config CONFIG --source-manifest SOURCE --manifest SLICES.json --slices DIR --out-dir NEW_DIR [--probe-layers N | --fixture] [--stages N]
+  slice-assemble-yarn --config CONFIG --source-manifest SOURCE --manifest SLICES.json --slices DIR --out-dir NEW_DIR [--probe-layers N | --fixture] [--stages N] [--precision POLICY.json]
+  # --precision POLICY.json also applies to slice-plan, slice and slice-manifest.
   slice-assemble --manifest MANIFEST.json --slices SLICES --out PKG [--layers A:B]
 
 UNITS selects what to slice: --layers A:B, --embed, --head (everything when
@@ -218,6 +219,30 @@ fn open_model(args: &Args) -> Result<(StageModel, f64), ModernError> {
     Ok((model, start.elapsed().as_secs_f64()))
 }
 
+fn precision_policy(
+    args: &Args,
+) -> Result<Option<arc_inference::modern::mla::precision::Precision>, ModernError> {
+    if args.flag("--precision")
+        && (args.items.iter().filter(|a| *a == "--precision").count() != 1
+            || args
+                .value("--precision")
+                .is_none_or(|v| v.starts_with("--")))
+    {
+        return Err(ModernError::Invalid(
+            "--precision requires exactly one JSON path".into(),
+        ));
+    }
+    args.value("--precision")
+        .map(|path| {
+            let bytes =
+                std::fs::read(&path).map_err(|e| ModernError::Io(format!("{path}: {e}")))?;
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|e| ModernError::Invalid(format!("precision: {e}")))?;
+            arc_inference::modern::mla::precision::Precision::from_json(&value)
+        })
+        .transpose()
+}
+
 fn cmd_convert(args: &Args) -> Result<(), ModernError> {
     configure_threads(args)?;
     let source = SourceManifest::read(&args.path("--source-manifest")?)?;
@@ -226,11 +251,13 @@ fn cmd_convert(args: &Args) -> Result<(), ModernError> {
         .map(|s| StageSpec::parse(&s))
         .transpose()?;
     let experts = ExpertFormat::parse(&args.value("--experts").unwrap_or_else(|| "i8".into()))?;
-    let report = convert::convert_stage(
+    let precision = precision_policy(args)?;
+    let report = convert::convert_stage_with_precision(
         &args.path("--source-dir")?,
         &source,
         stage,
         experts,
+        precision,
         &args.path("--out")?,
     )?;
     if let Some(path) = args.value("--manifest-out") {
@@ -849,7 +876,8 @@ fn slice_source(args: &Args) -> Result<SliceSource, ModernError> {
         &args.path("--source-manifest")?,
         experts,
         args.number("--expert-groups", 1)?,
-    )
+    )?
+    .with_precision(precision_policy(args)?)
 }
 
 fn slice_units(args: &Args, src: &SliceSource) -> Result<Vec<slices::Unit>, ModernError> {
@@ -973,6 +1001,11 @@ fn cmd_slice_verify(args: &Args) -> Result<(), ModernError> {
 
 fn cmd_slice_assemble(args: &Args) -> Result<(), ModernError> {
     let manifest = SliceManifest::read(&args.path("--manifest")?)?;
+    if slices::manifest_precision(&manifest.value)? != precision_policy(args)? {
+        return Err(ModernError::Invalid(
+            "slice precision differs from requested policy".into(),
+        ));
+    }
     let stage = match args.value("--layers") {
         Some(text) => StageSpec::parse(&text)?,
         None => StageSpec::full(&manifest.config()?),
@@ -1027,7 +1060,7 @@ fn cmd_slice_assemble_yarn(args: &Args) -> Result<(), ModernError> {
     } else {
         1
     };
-    let report = slices::assemble_yarn_bundle(
+    let report = slices::assemble_yarn_bundle_with_precision(
         &manifest,
         &config,
         &source,
@@ -1035,6 +1068,7 @@ fn cmd_slice_assemble_yarn(args: &Args) -> Result<(), ModernError> {
         &args.path("--slices")?,
         &args.path("--out-dir")?,
         count,
+        precision_policy(args)?,
     )?;
     println!(
         "{}",
