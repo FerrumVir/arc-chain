@@ -27,7 +27,9 @@ NODE_BYTES = PINS["node_release"]["assets"]["arc-node-linux-x86_64"]["size"]
 
 class HelperTests(unittest.TestCase):
     def test_effective_config(self):
-        eff = hr.effective_config(CONFIG, PINS)
+        smoke = json.loads(json.dumps(CONFIG))
+        smoke["stage_b"]["profile"] = "smoke"
+        eff = hr.effective_config(smoke, PINS)
         self.assertEqual(eff["schema"], hr.EFFECTIVE_SCHEMA)
         self.assertEqual(eff["profile"], "smoke")
         self.assertEqual(eff["expected_launcher_sha256"], CONFIG["stage_b"]["expect_sha256"])
@@ -148,6 +150,21 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(hr.parse_apply_output(out), {"begin": 1790000000.5, "end": 1790000042.25, "rc": 1})
         self.assertEqual(hr.parse_apply_output("nothing"), {"begin": None, "end": None, "rc": None})
 
+    def test_stop_is_clean(self):
+        self.assertTrue(hr.stop_is_clean("state=inactive\nprocs=0\nrpc=closed\n"))
+        for bad in ("state=active\nprocs=0\nrpc=closed\n", "state=inactive\nprocs=1\nrpc=closed\n", "state=inactive\nprocs=3175\nrpc=closed\n",
+                    "state=inactive\nprocs=0\nrpc=open\n", "inactive\n3175\nrpc-closed\n", ""):
+            with self.subTest(bad):
+                self.assertFalse(hr.stop_is_clean(bad))
+
+    def test_the_updater_evidence_command_skips_the_curl_progress_meter(self):
+        lab, tmp = None, None
+        import re as _re
+        pattern = hr.UPDATER_DECISION_LINES
+        sample = "  % Total    % Received % Xferd  Average Speed\n100 2600k  100 2600k\n[x] new version available: 0.7.12 -> 0.7.11. Downloading.\ncurl: (22) The requested URL returned error: 404\n"
+        kept = [line for line in sample.splitlines() if _re.search(pattern, line)]
+        self.assertEqual(len(kept), 2)
+
     def test_last_int_tolerates_chatter(self):
         self.assertEqual(hr.last_int("sudo: unable to resolve host\n12345\n"), 12345)
         self.assertEqual(hr.last_int("nothing here"), 0)
@@ -226,7 +243,7 @@ class PhaseTests(unittest.TestCase):
         tail = "[x] new version available: 0.7.12 → 0.7.11. Downloading.\ncurl: (22) The requested URL returned error: 404\n"
         lab = self.make(**{
             "systemctl start arc-updater": hr.Result(1, "Job for arc-updater.service failed"),
-            "tail -n 8": hr.Result(0, tail),
+            "auto-update.log": hr.Result(0, tail),
             "systemctl show arc-updater": hr.Result(0, "Result=exit-code\nExecMainStatus=22\nActiveState=failed\n"),
         })
         lab.states = [state(), state(), state(), state()]
@@ -243,7 +260,7 @@ class PhaseTests(unittest.TestCase):
         self.assertTrue(all(event["forced"] for event in forced))
 
     def test_updater_fails_when_the_binary_changed(self):
-        lab = self.make(**{"tail -n 8": hr.Result(0, "log")})
+        lab = self.make(**{"auto-update.log": hr.Result(0, "log")})
         lab.states = [state(), state(bin_arc_node_sha256="other"), state(), state()]
         with mock.patch.object(hr.time, "sleep"):
             lab.phase_updaters()

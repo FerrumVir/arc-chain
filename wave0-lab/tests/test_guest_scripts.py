@@ -307,6 +307,12 @@ class ProbeContractTests(unittest.TestCase):
             second = invariants.unit_hashes("community-bbb")
         self.assertEqual(first, second)
 
+    def test_count_nodes_prints_a_single_integer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            done = subprocess.run([sys.executable, "-B", str(GUEST / "count_nodes.py"), "--arc-dir", tmp], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertRegex(done.stdout, r"^\d+\n$")
+
     def test_capture_state_has_the_fields_the_orchestrator_compares(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = capture_state.capture(tmp)

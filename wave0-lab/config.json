@@ -27,11 +27,11 @@
   },
   "stage_b": {
     "enabled": true,
-    "profile": "smoke",
+    "profile": "full",
     "launcher_source": "published",
     "tag": "v0.7.12",
     "expect_sha256": "41d92a475db819eb190b6409ac82cb3258a557980c193decc629896718a3f69e",
-    "live_network": "blocked",
+    "live_network": "allowed",
     "live_network_authorization": "work-99 relay of 2026-10-08T07:55Z: TJ authorized one stake-0 test node on the live testnet, in a separate clean environment; the nested VM on a hosted runner is that environment; stake 0, compute off; the node is stopped at the end of the job",
     "image": {
       "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-amd64.img",

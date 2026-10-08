@@ -80,9 +80,13 @@ class CheckConfigTests(unittest.TestCase):
     def test_allowed_network_with_the_recorded_authorization_is_valid(self):
         self.assertEqual(check_config.validate(with_live("allowed", CONFIG["stage_b"]["live_network_authorization"])), [])
 
-    def test_the_shipped_default_keeps_the_live_network_blocked_for_the_smoke(self):
-        self.assertEqual(CONFIG["stage_b"]["live_network"], "blocked")
-        self.assertEqual(CONFIG["stage_b"]["profile"], "smoke")
+    def test_the_shipped_config_is_one_of_the_two_runs_the_lab_is_for(self):
+        stage_b = CONFIG["stage_b"]
+        self.assertIn(stage_b["profile"], ("smoke", "full"))
+        if stage_b["live_network"] == "allowed":
+            self.assertEqual(stage_b["profile"], "full", "only the real Wave 0 may register on the live network")
+            self.assertEqual(stage_b["launcher_source"], "published")
+            self.assertIn("TJ authorized one stake-0 test node", stage_b["live_network_authorization"])
 
     def test_blocked_network_needs_no_authorization(self):
         cfg = mutated(["stage_b", "live_network"], "blocked")

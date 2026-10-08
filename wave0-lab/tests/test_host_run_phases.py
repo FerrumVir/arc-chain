@@ -253,7 +253,7 @@ class Apply2Tests(unittest.TestCase):
 
 
 class FinalPhaseTests(unittest.TestCase):
-    def script(self, stop="inactive\nno-node-process\nrpc-closed\n", rollback=None, rebridge=None, compute="compute_rc=78\nvalidator_rc=78\nls: cannot access\n"):
+    def script(self, stop="state=inactive\nprocs=0\nrpc=closed\n", rollback=None, rebridge=None, compute="compute_rc=78\nvalidator_rc=78\nls: cannot access\n"):
         rollback = rollback or f"rc=0\n{hr.LEGACY_NODE_SHA256}\n"
         rebridge = rebridge or f"{EXPECT}\n"
         addresses = iter(["aa\n", "aa\n", "aa\n"])
@@ -293,8 +293,18 @@ class FinalPhaseTests(unittest.TestCase):
             self.assertNotRegex(command, r"systemctl\s+(start|restart)\b[^;&|]*arc-node|kickstart|canary-consume|legacy-bridge-rollback")
 
     def test_unclean_stop_fails(self):
-        lab = self.run_phase(self.script(stop="active\nno-node-process\nrpc-still-open\n"))
+        lab = self.run_phase(self.script(stop="state=active\nprocs=0\nrpc=open\n"))
         self.assertEqual(checks_of(lab)["L11-stop-rollback"]["result"], "FAIL")
+
+    def test_a_leftover_node_process_fails_the_stop(self):
+        lab = self.run_phase(self.script(stop="state=inactive\nprocs=1\nrpc=closed\n"))
+        self.assertEqual(checks_of(lab)["L11-stop-rollback"]["result"], "FAIL")
+
+    def test_the_stop_command_cannot_match_its_own_shell(self):
+        lab = self.run_phase(self.script())
+        stop = next(c for c in lab.commands if "systemctl stop arc-node; sleep 2" in c)
+        self.assertNotIn("pgrep", stop)
+        self.assertIn("count_nodes.py", stop)
 
     def test_rollback_that_does_not_restore_v077_fails(self):
         lab = self.run_phase(self.script(rollback="rc=0\n" + "0" * 64 + "\n"))

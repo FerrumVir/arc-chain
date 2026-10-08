@@ -79,6 +79,10 @@ REQUIRED_LIVE_IDS = (
     "L11-stop-rollback",
     "L12-pre-post-boot-logs",
 )
+UPDATER_DECISION_LINES = (
+    "auto-update check starting|new version available|up to date|binary updated|ROLLED BACK|WARNING|no version|"
+    "curl: \\([0-9]+\\)|auto-update complete|Rolling back"
+)
 PRE_FLIP_NOTE = (
     "expected before the Latest flip (v0.7.11 updater compares =, Latest v0.7.11 has no arc-node-linux-x86_64)"
 )
@@ -272,6 +276,14 @@ def parse_apply_output(out: str) -> dict:
         "end": float(end.group(1)) if end else None,
         "rc": int(end.group(2)) if end else None,
     }
+
+
+def stop_is_clean(output: str) -> bool:
+    """state=inactive, no node or launcher process under the ARC directory, RPC closed."""
+    state = re.search(r"^state=(\S+)", output, re.MULTILINE)
+    procs = re.search(r"^procs=(\d+)\s*$", output, re.MULTILINE)
+    rpc = re.search(r"^rpc=(\S+)", output, re.MULTILINE)
+    return bool(state and procs and rpc and state.group(1) == "inactive" and procs.group(1) == "0" and rpc.group(1) == "closed")
 
 
 def last_int(text: str, default: int = 0) -> int:
@@ -811,7 +823,11 @@ class Lab:
                 started = self.guest_epoch()
                 ran = self.guest("sudo systemctl start arc-updater.service", timeout=240)
                 props = self.guest("systemctl show arc-updater.service -p Result -p ExecMainStatus -p ActiveState", timeout=30).out.replace("\n", " ").strip()
-                tail = self.guest(f"tail -n 8 {GUEST_ARC}/auto-update.log", timeout=30).out
+                tail = self.guest(
+                    f"tail -n +{int(pre.get('auto_update_log_lines') or 0) + 1} {GUEST_ARC}/auto-update.log | "
+                    f"grep -E {shlex.quote(UPDATER_DECISION_LINES)} | tail -n 12; true",
+                    timeout=30,
+                ).out
                 time.sleep(3)
                 post = self.capture()
                 changes = state_changes(pre, post)
@@ -960,8 +976,14 @@ class Lab:
         self.event("final_stop_begin", forced=True)
         problems = []
         self.guest("sudo systemctl enable --now arc-w0-live-block.service", timeout=60)
-        stop = self.guest("sudo systemctl stop arc-node; sleep 2; systemctl is-active arc-node; pgrep -f 'legacy-bridge/releases' || echo no-node-process; curl -sf -m 2 http://127.0.0.1:9944/health >/dev/null && echo rpc-still-open || echo rpc-closed", timeout=120)
-        if "inactive" not in stop.out or "no-node-process" not in stop.out or "rpc-closed" not in stop.out:
+        stop = self.guest(
+            "sudo systemctl stop arc-node; sleep 2; "
+            'echo "state=$(systemctl is-active arc-node)"; '
+            f'echo "procs=$(python3 {GUEST_LAB}/count_nodes.py --arc-dir {GUEST_ARC})"; '
+            "if curl -sf -m 2 http://127.0.0.1:9944/health >/dev/null; then echo rpc=open; else echo rpc=closed; fi",
+            timeout=120,
+        )
+        if not stop_is_clean(stop.out):
             problems.append(f"stop was not clean: {stop.out.strip()[-200:]}")
         rollback = self.guest(f"{GUEST_ARC}/bin/arc-node --legacy-bridge-rollback > {GUEST_WORK}/rollback.txt 2>&1; echo rc=$?; sha256sum {GUEST_ARC}/bin/arc-node | cut -d' ' -f1", timeout=120)
         if "rc=0" not in rollback.out or LEGACY_NODE_SHA256 not in rollback.out:
