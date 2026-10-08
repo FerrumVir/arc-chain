@@ -371,6 +371,7 @@ impl SourceTensors {
                 p.source(name.strip_prefix(&self.src.prefix).unwrap_or(name))
             }),
         )
+        .map_err(|e| ModernError::Invalid(format!("source tensor {name}: {e}")))
     }
 
     fn norm(&self, name: &str) -> Result<Vec<i64>, ModernError> {
@@ -592,7 +593,12 @@ pub(crate) fn convert_layer<W: TensorSink>(
             h * rank,
             nope,
             c.precision.as_ref().map_or(Bits::Int8, |p| p.attention),
-        )?,
+        )
+        .map_err(|e| {
+            ModernError::Invalid(format!(
+                "{hf}.self_attn.kv_b_proj.weight: transposed key rows [head,rank,nope]: {e}"
+            ))
+        })?,
     )?;
     drop(key_bits);
     let mut value_bits = vec![0u16; h * vh * rank];
@@ -611,7 +617,12 @@ pub(crate) fn convert_layer<W: TensorSink>(
             h * vh,
             rank,
             c.precision.as_ref().map_or(Bits::Int8, |p| p.attention),
-        )?,
+        )
+        .map_err(|e| {
+            ModernError::Invalid(format!(
+                "{hf}.self_attn.kv_b_proj.weight: value rows [head,value,rank]: {e}"
+            ))
+        })?,
     )?;
     drop(value_bits);
     drop(b);
