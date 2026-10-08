@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -96,6 +97,7 @@ class PureHelperTests(unittest.TestCase):
         conf = m.pf_conf_text(LIVE)
         self.assertEqual(conf.count("block drop out quick to "), 6)
         self.assertEqual(len(conf.splitlines()), 6)
+        self.assertEqual(len(set(re.findall(r'label "(wave0-live-\d+)"', conf))), 6, "a distinct label per rule keeps pf's optimizer from merging them into a table")
         listing = "\n".join("block drop out quick inet from any to %s" % ip for ip in LIVE[:4]) + "\npass all flags S/SA\n"
         self.assertEqual(m.count_pf_block_rules(listing, LIVE), 4)
         self.assertEqual(m.count_pf_block_rules("", LIVE), 0)
@@ -562,6 +564,21 @@ class InterceptionTests(unittest.TestCase):
             commands = self.joined(rec)
             self.assertTrue(any(c.startswith("sudo -n pfctl -f ") for c in commands))
             self.assertNotIn("149.28.32.76", json.dumps(info), "the masked listing never carries a live address")
+
+    def test_a_merged_anonymous_table_is_read_back_and_verifies_the_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            listing = "block drop out quick inet from any to <__automatic_227272d_0>\nNo ALTQ support in kernel\n"
+            table = "\n".join("   %s" % ip for ip in LIVE) + "\n"
+            rec, env = self.make(tmp, [("pfctl -t __automatic_227272d_0 -T show", (0, table)), ("pfctl -sr", (0, listing)), ("pfctl -s info", (0, "Status: Enabled"))])
+            info = env.block_live_network()
+            self.assertTrue(info["verified"])
+            self.assertEqual(info["table_addresses_listed"], 6)
+            self.assertNotIn("149.28.32.76", json.dumps(info))
+            partial = "\n".join("   %s" % ip for ip in LIVE[:5]) + "\n"
+            rec2, env2 = self.make(tmp, [("pfctl -t __automatic_227272d_0 -T show", (0, partial)), ("pfctl -sr", (0, listing)), ("pfctl -s info", (0, "Status: Enabled"))])
+            self.assertFalse(env2.block_live_network()["verified"], "five of six addresses in the table is not a verified block")
+            rec3, env3 = self.make(tmp, [("pfctl -t __automatic_227272d_0 -T show", (1, "", "pfctl: Table does not exist")), ("pfctl -sr", (0, listing)), ("pfctl -s info", (0, "Status: Enabled"))])
+            self.assertFalse(env3.block_live_network()["verified"], "an unreadable table never verifies")
 
     def test_live_block_is_not_verified_when_a_rule_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

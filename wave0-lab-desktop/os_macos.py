@@ -271,8 +271,25 @@ def load_live_ips(root: Path = ROOT) -> List[str]:
 
 
 def pf_conf_text(live_ips: Sequence[str]) -> str:
-    """pf rules that drop every outbound packet to a live node (the Stage A jobs load exactly this and nothing else)."""
-    return "".join("block drop out quick to %s\n" % address for address in live_ips)
+    """pf rules that drop every outbound packet to a live node: one rule per address. Each rule carries its own label because
+    pf's ruleset optimizer otherwise merges identical rules that differ only in the address into ONE rule on an anonymous table
+    (`block drop out quick inet from any to <__automatic_xxx_0>`), which the listing no longer names address by address (the first
+    CI run of this lab could not verify the block for that reason and, failing closed, launched nothing)."""
+    return "".join('block drop out quick to %s label "wave0-live-%d"\n' % (address, index) for index, address in enumerate(live_ips, 1))
+
+
+def automatic_tables(rules_text: str) -> List[str]:
+    """Names of the anonymous tables a `pfctl -sr` listing refers to (`<__automatic_227272d_0>`)."""
+    return sorted(set(re.findall(r"<(__automatic_[0-9A-Za-z]+_[0-9]+)>", rules_text)))
+
+
+def addresses_in_tables(table_outputs: Sequence[str], live_ips: Sequence[str]) -> int:
+    """How many live addresses appear in the `pfctl -t NAME -T show` outputs of the anonymous tables."""
+    seen = set()
+    for text in table_outputs:
+        for token in re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text):
+            seen.add(token)
+    return sum(1 for address in live_ips if address in seen)
 
 
 def count_pf_block_rules(rules_text: str, live_ips: Sequence[str]) -> int:
@@ -1457,6 +1474,15 @@ class Interception:
         rules = self.rec.run(["pfctl", "-sr"], label="pf rules loaded", timeout=30, sudo=True)
         self.pf_enabled_by_us = not was_enabled and "Status: Enabled" in status.text
         count = count_pf_block_rules(rules.text, self.live_ips)
+        table_count = None
+        if count != len(self.live_ips) and automatic_tables(rules.text):
+            # the optimizer merged the rules into an anonymous table: read the table, the block rule must still name it
+            outputs = [self.rec.run(["pfctl", "-t", name, "-T", "show"], label="pf anonymous table %s" % name, timeout=30, sudo=True).text
+                       for name in automatic_tables(rules.text)]
+            table_count = addresses_in_tables(outputs, self.live_ips)
+            if table_count == len(self.live_ips):
+                count = table_count
+        info["table_addresses_listed"] = table_count
         info.update({
             "load_rc": load.rc, "enable_rc": enable.rc, "status_enabled": "Status: Enabled" in status.text,
             "block_rules_listed": count, "verified": load.ok and "Status: Enabled" in status.text and count == len(self.live_ips),

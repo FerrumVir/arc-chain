@@ -51,8 +51,12 @@ class ConfigTests(unittest.TestCase):
         self.assertIn(CONFIG["mode"], ("probe", "full"))
 
     def test_outputs(self):
-        self.assertEqual(check_config.outputs(CONFIG), {"mode": CONFIG["mode"], "linux": "true", "windows": "true", "macos_arm64": "true", "macos_intel": "true"})
-        cfg = mutated(["jobs", "macos_intel", "enabled"], False)
+        enabled = {name: ("true" if CONFIG["jobs"][name]["enabled"] else "false") for name in ("linux", "windows", "macos_arm64", "macos_intel")}
+        self.assertEqual(check_config.outputs(CONFIG), dict({"mode": CONFIG["mode"]}, **enabled))
+        cfg = copy.deepcopy(CONFIG)
+        for name in ("linux", "windows", "macos_arm64"):
+            cfg["jobs"][name]["enabled"] = True
+        cfg["jobs"]["macos_intel"]["enabled"] = False
         cfg["mode"] = "full"
         self.assertEqual(check_config.outputs(cfg), {"mode": "full", "linux": "true", "windows": "true", "macos_arm64": "true", "macos_intel": "false"})
 
@@ -107,7 +111,8 @@ class ConfigTests(unittest.TestCase):
                 code = check_config.main(["--config", str(LAB / "config.json"), "--github-output", str(out)])
             self.assertEqual(code, 0)
             self.assertIn("mode=" + CONFIG["mode"], buffer.getvalue())
-            self.assertEqual(out.read_text(), "mode=%s\nlinux=true\nwindows=true\nmacos_arm64=true\nmacos_intel=true\n" % CONFIG["mode"])
+            flags = {name: ("true" if CONFIG["jobs"][name]["enabled"] else "false") for name in ("linux", "windows", "macos_arm64", "macos_intel")}
+            self.assertEqual(out.read_text(), "mode=%s\nlinux=%s\nwindows=%s\nmacos_arm64=%s\nmacos_intel=%s\n" % ((CONFIG["mode"],) + tuple(flags[n] for n in ("linux", "windows", "macos_arm64", "macos_intel"))))
             bad = Path(tmp) / "bad.json"
             bad.write_text("{not json")
             with contextlib.redirect_stderr(io.StringIO()):
