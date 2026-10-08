@@ -155,6 +155,8 @@ jobs:
         run: cargo build --release --locked -p arc-inference --bin arc-mla
       - name: K2.6 YaRN preparation CLI (synthetic metadata, no weights)
         run: python scripts/arc_mla/check_yarn_cli.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/yarn-cli"
+      - name: Mixed INT16 BF16 conversion, scalar/SIMD and split stages (no download)
+        run: python scripts/arc_mla/check_int16.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/int16" --build-label release
       - name: Tiny models through every check
         shell: bash
         run: bash scripts/arc_mla/tiny_checks.sh ./target/release/arc-mla "$RUNNER_TEMP/tiny" "$RUNNER_TEMP/tiny-evidence"

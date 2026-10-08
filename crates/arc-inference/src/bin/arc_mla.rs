@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 const USAGE: &str = "usage: arc-mla <command> [options]
 
   convert   --source-dir DIR --source-manifest SRC.json --out PKG [--layers A:B]
-            [--experts i8|i4g32] [--manifest-out MANIFEST.json] [--report OUT.json] [--threads N]
+            [--experts i8|i4g32] [--precision PRECISION.json] [--manifest-out MANIFEST.json] [--report OUT.json] [--threads N]
   yarn-prepare --config PINNED_CONFIG.json --out PREPARATION.json [--max-seq N]
                [--probe-layers 1|2|3] [--slice-manifest PENDING.json --manifest-out STAGE.json]
   verify    --package PKG --manifest MANIFEST.json [--full-digest]
@@ -205,11 +205,32 @@ fn cmd_convert(args: &Args) -> Result<(), ModernError> {
         .map(|s| StageSpec::parse(&s))
         .transpose()?;
     let experts = ExpertFormat::parse(&args.value("--experts").unwrap_or_else(|| "i8".into()))?;
-    let report = convert::convert_stage(
+    if args.flag("--precision")
+        && (args.items.iter().filter(|a| *a == "--precision").count() != 1
+            || args
+                .value("--precision")
+                .is_none_or(|v| v.starts_with("--")))
+    {
+        return Err(ModernError::Invalid(
+            "--precision requires exactly one JSON path".into(),
+        ));
+    }
+    let precision = args
+        .value("--precision")
+        .map(|path| {
+            let bytes =
+                std::fs::read(&path).map_err(|e| ModernError::Io(format!("{path}: {e}")))?;
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|e| ModernError::Invalid(format!("precision: {e}")))?;
+            arc_inference::modern::mla::precision::Precision::from_json(&value)
+        })
+        .transpose()?;
+    let report = convert::convert_stage_with_precision(
         &args.path("--source-dir")?,
         &source,
         stage,
         experts,
+        precision,
         &args.path("--out")?,
     )?;
     if let Some(path) = args.value("--manifest-out") {

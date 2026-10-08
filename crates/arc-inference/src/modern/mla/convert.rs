@@ -24,9 +24,9 @@ use super::ops::{
 use super::package::{
     self, PackageDigest, SegmentDigest, StageSpec, StageWriter, i16_bytes, u16_bytes,
 };
-use crate::modern::arith::DyadicMatrix;
-use crate::modern::convert::{SourceManifest, bf16_to_q16, quantize_matrix, verify_source_file};
-use crate::modern::package::{i8_bytes, i32_bytes, i64_bytes};
+use super::precision::{Bits, Matrix, Precision, quantize_matrix};
+use crate::modern::convert::{SourceManifest, bf16_to_q16, verify_source_file};
+use crate::modern::package::{i32_bytes, i64_bytes};
 use crate::modern::safetensors::SafetensorsFile;
 use crate::modern::tables::rope_tables;
 use crate::modern::tiktoken::TOKENIZER_IDENTITY;
@@ -193,6 +193,7 @@ fn ignored(name: &str) -> bool {
 
 /// The tensors of the shards present on disk, by name.
 struct SourceTensors {
+    precision: Option<Precision>,
     shards: Vec<SafetensorsFile>,
     index: BTreeMap<String, usize>,
     dtypes: BTreeMap<String, String>,
@@ -235,6 +236,7 @@ impl SourceTensors {
             shards.push(shard);
         }
         Ok(Self {
+            precision: None,
             shards,
             index,
             dtypes,
@@ -277,8 +279,15 @@ impl SourceTensors {
         Ok(bytes)
     }
 
-    fn matrix(&self, name: &str, rows: usize, cols: usize) -> Result<DyadicMatrix, ModernError> {
-        quantize_matrix(&self.bf16(name)?, rows, cols)
+    fn matrix(&self, name: &str, rows: usize, cols: usize) -> Result<Matrix, ModernError> {
+        quantize_matrix(
+            &self.bf16(name)?,
+            rows,
+            cols,
+            self.precision
+                .as_ref()
+                .map_or(Bits::Int8, |p| p.source(name)),
+        )
     }
 
     fn norm(&self, name: &str) -> Result<Vec<i64>, ModernError> {
@@ -300,8 +309,8 @@ impl SourceTensors {
     }
 }
 
-fn write_dyadic(w: &mut StageWriter, name: &str, m: &DyadicMatrix) -> Result<(), ModernError> {
-    w.write_tensor(&format!("{name}.q"), &i8_bytes(&m.q))?;
+fn write_dyadic(w: &mut StageWriter, name: &str, m: &Matrix) -> Result<(), ModernError> {
+    w.write_tensor(&format!("{name}.q"), &m.q)?;
     w.write_tensor(&format!("{name}.mu"), &i32_bytes(&m.mu))?;
     w.write_tensor(&format!("{name}.k"), &m.k)
 }
@@ -321,7 +330,7 @@ fn write_stack(
     let mut k = Vec::with_capacity(sources.len() * rows);
     for source in sources {
         let m = t.matrix(source, rows, cols)?;
-        w.chunk(&i8_bytes(&m.q))?;
+        w.chunk(&m.q)?;
         mu.extend_from_slice(&m.mu);
         k.extend_from_slice(&m.k);
     }
@@ -428,7 +437,12 @@ fn convert_layer(
     write_dyadic(
         w,
         &format!("{p}.wk_b"),
-        &quantize_matrix(&key_bits, h * rank, nope)?,
+        &quantize_matrix(
+            &key_bits,
+            h * rank,
+            nope,
+            c.precision.as_ref().map_or(Bits::Int8, |p| p.attention),
+        )?,
     )?;
     drop(key_bits);
     let mut value_bits = vec![0u16; h * vh * rank];
@@ -442,7 +456,12 @@ fn convert_layer(
     write_dyadic(
         w,
         &format!("{p}.wv_b"),
-        &quantize_matrix(&value_bits, h * vh, rank)?,
+        &quantize_matrix(
+            &value_bits,
+            h * vh,
+            rank,
+            c.precision.as_ref().map_or(Bits::Int8, |p| p.attention),
+        )?,
     )?;
     drop(value_bits);
     drop(b);
@@ -570,6 +589,18 @@ pub fn convert_stage(
     experts: ExpertFormat,
     out: &Path,
 ) -> Result<ConversionReport, ModernError> {
+    convert_stage_with_precision(dir, source, stage, experts, None, out)
+}
+
+/// Convert with explicit class precision, binding the choice to the model identity.
+pub fn convert_stage_with_precision(
+    dir: &Path,
+    source: &SourceManifest,
+    stage: Option<StageSpec>,
+    experts: ExpertFormat,
+    precision: Option<Precision>,
+    out: &Path,
+) -> Result<ConversionReport, ModernError> {
     let start = Instant::now();
     let config_entry = source
         .files
@@ -582,6 +613,7 @@ pub fn convert_stage(
     let hf = parse_hf_config(&config_bytes, source.max_seq)?;
     let mut c = hf.config.clone();
     c.expert_format = experts;
+    c.precision = precision;
     c.validate()?;
     let full = StageSpec::full(&c);
     let stage = stage.unwrap_or(full);
@@ -599,7 +631,8 @@ pub fn convert_stage(
         }
     }
     let expected = stage_source_tensors(&c, full);
-    let tensors = SourceTensors::open(&paths, &expected)?;
+    let mut tensors = SourceTensors::open(&paths, &expected)?;
+    tensors.precision = c.precision.clone();
     tensors.require(stage_source_tensors(&c, stage).keys())?;
     let (cos, sin) = rope_tables(c.rope_theta, c.qk_rope_dim, c.max_seq)?;
     let source_json = source.header_json();

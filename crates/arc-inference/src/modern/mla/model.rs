@@ -51,24 +51,30 @@ fn invalid(what: impl Into<String>) -> ModernError {
 }
 
 /// One dyadic matrix, or a stack of `count` of them, whose INT8 weights stay
-/// in the package bytes.
+/// in the package bytes. INT16 matrices also stay mapped as little-endian bytes.
 #[derive(Debug, Clone)]
 struct MatRef {
     rows: usize,
     cols: usize,
     q: Range<usize>,
+    wide: bool,
     mu: Vec<i32>,
     k: Vec<u8>,
 }
 
 impl MatRef {
     fn view<'a>(&'a self, bytes: &'a [u8], index: usize) -> QView<'a> {
-        let size = self.rows * self.cols;
+        let size = self.rows * self.cols * if self.wide { 2 } else { 1 };
         let start = self.q.start + index * size;
         QView {
             rows: self.rows,
             cols: self.cols,
-            q: as_i8(&bytes[start..start + size]),
+            q: if self.wide {
+                &[]
+            } else {
+                as_i8(&bytes[start..start + size])
+            },
+            q16: self.wide.then_some(&bytes[start..start + size]),
             mu: &self.mu[index * self.rows..(index + 1) * self.rows],
             k: &self.k[index * self.rows..(index + 1) * self.rows],
         }
@@ -238,13 +244,22 @@ impl Loader<'_> {
         let q = self.header.range(entry);
         let mu = self.i32s(&format!("{name}.mu"))?;
         let k = self.bytes(&format!("{name}.k"))?.to_vec();
-        if q.len() != count * rows * cols || mu.len() != count * rows || k.len() != count * rows {
+        let wide = entry.dtype == package::Dtype::I16;
+        let width = if wide { 2 } else { 1 };
+        if q.len() != count * rows * cols * width
+            || mu.len() != count * rows
+            || k.len() != count * rows
+        {
             return Err(invalid(format!("{name}: inconsistent matrix shape")));
         }
         let weights = &self.data[q.clone()];
-        if weights.par_chunks(1 << 20).any(|c| c.contains(&0x80)) {
+        if if wide {
+            weights.chunks_exact(2).any(|v| v == [0, 128])
+        } else {
+            weights.par_chunks(1 << 20).any(|c| c.contains(&0x80))
+        } {
             return Err(invalid(format!(
-                "{name}: weight -128 is not a profile value"
+                "{name}: weight minimum is not a profile value"
             )));
         }
         for (row, (&m, &s)) in mu.iter().zip(&k).enumerate() {
@@ -256,7 +271,7 @@ impl Loader<'_> {
                 )));
             }
             if m == 0
-                && weights[row * cols..(row + 1) * cols]
+                && weights[row * cols * width..(row + 1) * cols * width]
                     .iter()
                     .any(|&b| b != 0)
             {
@@ -269,6 +284,7 @@ impl Loader<'_> {
             rows,
             cols,
             q,
+            wide,
             mu,
             k,
         })
@@ -938,6 +954,7 @@ pub(crate) mod tests {
             attention_lambda: crate::modern::tables::attention_lambda(12),
             expert_format: format,
             preparation: None,
+            precision: None,
         }
     }
 
@@ -1002,6 +1019,14 @@ pub(crate) mod tests {
                 (0..count)
                     .map(|_| ((rng.next() % 255) as i64 - 127) as i8 as u8)
                     .collect()
+            } else if e.name.ends_with(".q")
+                && e.dtype == package::Dtype::I16
+                && !e.name.contains("router")
+            {
+                let values: Vec<i16> = (0..count)
+                    .map(|_| ((rng.next() % 65535) as i64 - 32767) as i16)
+                    .collect();
+                super::super::package::i16_bytes(&values)
             } else if e.name.ends_with(".mu") {
                 let values: Vec<i32> = (0..count)
                     .map(|_| ((1u64 << 30) + rng.next() % (1 << 30)) as i32)
@@ -1010,7 +1035,17 @@ pub(crate) mod tests {
             } else if e.name.ends_with(".k") && !e.name.contains("router") {
                 // Scales mu * 2^-k around 2^-8: projections of +-127 weights
                 // keep activations of order one.
-                (0..count).map(|_| 38 + (rng.next() % 2) as u8).collect()
+                (0..count)
+                    .map(|_| {
+                        38 + if c.precision.as_ref().is_some_and(|p| {
+                            p.canonical(&e.name) == super::super::precision::Bits::Int16
+                        }) {
+                            8
+                        } else {
+                            0
+                        } + (rng.next() % 2) as u8
+                    })
+                    .collect()
             } else if e.name.ends_with("router.q") {
                 let values: Vec<i16> = (0..count)
                     .map(|_| ((rng.next() % 65_535) as i64 - 32_767) as i16)
@@ -1224,6 +1259,7 @@ pub(crate) mod tests {
         wo.project(&inputs, &mut whole).unwrap();
         let half = wo.rows / 2;
         let top = QView {
+            q16: None,
             rows: half,
             q: &wo.q[..half * wo.cols],
             mu: &wo.mu[..half],
@@ -1231,6 +1267,7 @@ pub(crate) mod tests {
             ..wo
         };
         let bottom = QView {
+            q16: None,
             rows: wo.rows - half,
             q: &wo.q[half * wo.cols..],
             mu: &wo.mu[half..],
@@ -1608,6 +1645,217 @@ pub(crate) mod tests {
             "golden digests differ: {mismatches:#?}"
         );
     }
+    #[test]
+    fn mixed_precision_goldens_and_split_stages() {
+        use super::super::precision::{Bits, Precision};
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        for (name, dense_only, mixed, lora) in [
+            ("int16-dense", true, false, false),
+            ("int16-moe", false, false, true),
+            ("mixed-moe", false, true, true),
+            ("int16-yarn-moe", false, false, true),
+        ] {
+            let mut c = tiny_config_with(lora, ExpertFormat::Int4G32);
+            if dense_only {
+                c.n_layers = 1;
+            }
+            let mut precision = Precision::all_int16();
+            if mixed {
+                precision.head = Bits::Int8;
+                precision.dense = Bits::Int8;
+            }
+            c.precision = Some(precision);
+            if name == "int16-yarn-moe" {
+                use super::super::yarn::{ATTENTION_LAMBDA, Preparation, Scope};
+                c.architecture = "arc-test/kimi-k26-yarn".into();
+                c.qk_nope_dim = 128;
+                c.qk_rope_dim = 64;
+                c.attention_lambda = ATTENTION_LAMBDA;
+                c.preparation = Some(Preparation {
+                    scope: Scope::SyntheticFixture,
+                });
+            }
+            c.validate().unwrap();
+            let bytes = tiny_package(&c, StageSpec::full(&c));
+            let package_hash = blake3::hash(&bytes).to_hex().to_string();
+            let model = StageModel::from_owned(bytes).unwrap();
+            assert_eq!(model.config(), &c);
+            let manifest = package::build_manifest(
+                &c,
+                &model.header.source,
+                &model.segments(),
+                None,
+                &[],
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+            let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+            package::verify_against_manifest(&model.header, &model.segments(), &manifest_bytes)
+                .unwrap();
+            let request = GenerationRequest {
+                prompt: &[3, 17, 5, 49, 0],
+                max_tokens: 8,
+                eos: &[],
+                selection: Selection::Rp64Argmax,
+            };
+            let mut golden = None;
+            for (fast, threads) in [(false, 1), (false, 3), (true, 2)] {
+                crate::canonical_simd::set_fast_canonical_kernel(fast);
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let run = pool.install(|| model.generate(&request)).unwrap();
+                let mut h = blake3::Hasher::new();
+                for t in &run.tokens {
+                    h.update(&t.to_le_bytes());
+                }
+                for d in run.logits_hashes.iter().chain(&run.boundary_digests) {
+                    h.update(d);
+                }
+                let digest = h.finalize().to_hex().to_string();
+                if let Some(ref want) = golden {
+                    assert_eq!(want, &digest);
+                } else {
+                    golden = Some(digest);
+                }
+                let tokens = [3, 17, 5, 49, 0];
+                let reference = pool
+                    .install(|| model.run_sequence(&tokens, None, 3, Selection::Rp64Argmax))
+                    .unwrap();
+                let mut inputs = None;
+                for layer in 0..c.n_layers {
+                    let stage = StageSpec {
+                        first_layer: layer,
+                        end_layer: layer + 1,
+                    };
+                    let part = StageModel::from_owned(tiny_package(&c, stage)).unwrap();
+                    package::verify_against_manifest(
+                        &part.header,
+                        &part.segments(),
+                        &manifest_bytes,
+                    )
+                    .unwrap();
+                    let out = pool
+                        .install(|| {
+                            part.run_sequence(&tokens, inputs.as_deref(), 3, Selection::Rp64Argmax)
+                        })
+                        .unwrap();
+                    if layer + 1 == c.n_layers {
+                        assert_eq!(out.hidden, reference.hidden);
+                        assert_eq!(out.logits_hashes, reference.logits_hashes);
+                        assert_eq!(out.derived, reference.derived);
+                    }
+                    inputs = Some(out.hidden);
+                }
+            }
+            let pinned: serde_json::Value = serde_json::from_str(include_str!(
+                "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+            ))
+            .unwrap();
+            assert_eq!(pinned[name][0], package_hash);
+            assert_eq!(pinned[name][1], golden.as_ref().unwrap().as_str());
+            assert_eq!(pinned[name][2], manifest["model_root"]);
+            println!(
+                "golden {name}: package {package_hash} run {} root {}",
+                golden.unwrap(),
+                manifest["model_root"]
+            );
+            // Published expert interpretation is unaffected by BF16 precision.
+            let mut legacy = c.clone();
+            legacy.precision = None;
+            let old =
+                StageModel::from_owned(tiny_package(&legacy, StageSpec::full(&legacy))).unwrap();
+            let legacy_manifest = package::build_manifest(
+                &legacy,
+                &old.header.source,
+                &old.segments(),
+                None,
+                &[],
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+            assert!(
+                package::verify_against_manifest(
+                    &model.header,
+                    &model.segments(),
+                    &serde_json::to_vec(&legacy_manifest).unwrap()
+                )
+                .is_err()
+            );
+            for e in &model.header.entries {
+                if e.name.contains(".experts.")
+                    || e.name.contains("router")
+                    || e.name.contains("norm")
+                {
+                    let old_e = old.header.entry(&e.name).unwrap();
+                    assert_eq!(
+                        &model.bytes()[model.header.range(e)],
+                        &old.bytes()[old.header.range(old_e)]
+                    );
+                }
+            }
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+    }
+
+    #[test]
+    fn mixed_precision_packages_reject_mislabeled_and_invalid_payloads() {
+        use super::super::precision::Precision;
+        let mut c = tiny_config_with(true, ExpertFormat::Int4G32);
+        c.precision = Some(Precision::all_int16());
+        let bytes = tiny_package(&c, StageSpec::full(&c));
+        let model = StageModel::from_owned(bytes.clone()).unwrap();
+        for tensor in [
+            "embed.q",
+            "layers.0.wq_a.q",
+            "layers.0.w_gate.q",
+            "layers.1.shared.w_down.q",
+            "lm_head.q",
+        ] {
+            let range = model.header.range(model.header.entry(tensor).unwrap());
+            let mut bad = bytes.clone();
+            bad[range.start..range.start + 2].copy_from_slice(&i16::MIN.to_le_bytes());
+            assert!(StageModel::from_owned(bad).is_err(), "{tensor}");
+        }
+        let entries = &model.header.entries;
+        for kind in [
+            "profile",
+            "precision",
+            "dtype",
+            "unknown",
+            "version",
+            "zero-scale",
+        ] {
+            let mut h = model.header.value.clone();
+            match kind {
+                "profile" => h["profile"] = super::super::PROFILE_I4G32.into(),
+                "precision" => h["model"]["precision"]["head"] = "int8".into(),
+                "dtype" => h["tensors"][2]["dtype"] = "I8".into(),
+                "unknown" => h["model"]["precision"]["experts"] = "int16".into(),
+                "version" => h["model"]["precision"]["version"] = 2.into(),
+                _ => {
+                    let mut bad = bytes.clone();
+                    let r = model.header.range(model.header.entry("embed.mu").unwrap());
+                    bad[r.start..r.start + 4].fill(0);
+                    let r = model.header.range(model.header.entry("embed.k").unwrap());
+                    bad[r.start] = 16;
+                    assert!(StageModel::from_owned(bad).is_err());
+                    continue;
+                }
+            }
+            let text = crate::model_package::canonical_json(&h).unwrap();
+            let mut prefix = super::super::STAGE_MAGIC.to_vec();
+            prefix.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            prefix.extend_from_slice(text.as_bytes());
+            let last = entries.last().unwrap();
+            let len = package::align_up(prefix.len() as u64)
+                + package::align_up(last.offset + last.bytes);
+            assert!(package::parse_header(&prefix, len).is_err(), "{kind}");
+        }
+        assert!(StageModel::from_owned(bytes[..bytes.len() - 1].to_vec()).is_err());
+    }
+
     #[test]
     fn yarn_synthetic_package_engine_and_manifest_are_exact() {
         use super::super::yarn::{self, Preparation, Scope};

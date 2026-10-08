@@ -277,6 +277,15 @@ pub fn layout(c: &MlaConfig, stage: StageSpec) -> Vec<Entry> {
         vector(&mut specs, "head", "final_norm", Dtype::I64, &[c.d_model]);
         dyadic(&mut specs, "head", "lm_head", &[c.vocab_size, c.d_model]);
     }
+    if let Some(precision) = &c.precision {
+        for spec in &mut specs {
+            if spec.dtype == Dtype::I8
+                && precision.canonical(&spec.name) == super::precision::Bits::Int16
+            {
+                spec.dtype = Dtype::I16;
+            }
+        }
+    }
     let mut offset = 0u64;
     specs
         .into_iter()
