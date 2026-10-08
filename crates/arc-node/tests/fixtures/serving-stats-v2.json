@@ -1,0 +1,142 @@
+[
+  {
+    "schema": "arc.community.model-stats.v2",
+    "scope": "completed_public_answers_on_this_coordinator",
+    "window_secs": 60,
+    "window_start_unix_ms": 0,
+    "window_end_unix_ms": 60000,
+    "available": true,
+    "rejected_model_answers": 0,
+    "models": [
+      {
+        "model_id": "0x0707070707070707070707070707070707070707070707070707070707070707",
+        "model_name": null,
+        "answers": 3,
+        "served_tokens": 36,
+        "verified_tokens": 36,
+        "input_tokens": 12,
+        "input_tokens_last_day": null,
+        "output_tokens_last_day": null,
+        "day_window_secs": 86400,
+        "answer_tokens_per_second": [
+          12.0,
+          11.0,
+          10.0
+        ],
+        "ttft_samples_ms": [
+          200.0,
+          200.0,
+          200.0
+        ],
+        "hop_samples": [
+          {
+            "hop": 0,
+            "start_layer": 0,
+            "end_layer": 8,
+            "positions": 15,
+            "wall_ms": 240,
+            "compute_ms": 150
+          }
+        ],
+        "sampled_answers": 3,
+        "cached_answers": 0,
+        "omitted_hop_samples": 0,
+        "untimed_answers_no_worker_timestamps": 0,
+        "short_answers": 0,
+        "zero_output_answers": 0,
+        "decode_missing_timestamps_answers": 0,
+        "ttft_missing_timestamps_answers": 0,
+        "invalid_decode_timing_answers": 0,
+        "speed_eligible_answers": 3,
+        "ttft_eligible_answers": 3,
+        "timing_coverage": {
+          "speed": {
+            "eligible_answers": 3,
+            "sampled_answers": 3,
+            "total_answers": 3,
+            "partial": false,
+            "reasons": []
+          },
+          "ttft": {
+            "eligible_answers": 3,
+            "sampled_answers": 3,
+            "total_answers": 3,
+            "partial": false,
+            "reasons": []
+          }
+        }
+      }
+    ],
+    "day_available": false,
+    "day_window_start_unix_ms": null,
+    "day_window_end_unix_ms": 60000
+  },
+  {
+    "schema": "arc.community.model-stats.v2",
+    "scope": "completed_public_answers_on_this_coordinator",
+    "window_secs": 60,
+    "window_start_unix_ms": 0,
+    "window_end_unix_ms": 60000,
+    "available": true,
+    "rejected_model_answers": 0,
+    "models": [
+      {
+        "model_id": "0x0707070707070707070707070707070707070707070707070707070707070707",
+        "model_name": null,
+        "answers": 1,
+        "served_tokens": 51,
+        "verified_tokens": 51,
+        "input_tokens": 4,
+        "input_tokens_last_day": null,
+        "output_tokens_last_day": null,
+        "day_window_secs": 86400,
+        "answer_tokens_per_second": [
+          50.0
+        ],
+        "ttft_samples_ms": [
+          200.0
+        ],
+        "hop_samples": [
+          {
+            "hop": 0,
+            "start_layer": 0,
+            "end_layer": 8,
+            "positions": 5,
+            "wall_ms": 80,
+            "compute_ms": 50
+          }
+        ],
+        "sampled_answers": 1,
+        "cached_answers": 0,
+        "omitted_hop_samples": 0,
+        "untimed_answers_no_worker_timestamps": 0,
+        "short_answers": 0,
+        "zero_output_answers": 0,
+        "decode_missing_timestamps_answers": 0,
+        "ttft_missing_timestamps_answers": 0,
+        "invalid_decode_timing_answers": 0,
+        "speed_eligible_answers": 1,
+        "ttft_eligible_answers": 1,
+        "timing_coverage": {
+          "speed": {
+            "eligible_answers": 1,
+            "sampled_answers": 1,
+            "total_answers": 1,
+            "partial": false,
+            "reasons": []
+          },
+          "ttft": {
+            "eligible_answers": 1,
+            "sampled_answers": 1,
+            "total_answers": 1,
+            "partial": false,
+            "reasons": []
+          }
+        }
+      }
+    ],
+    "day_available": false,
+    "day_window_start_unix_ms": null,
+    "day_window_end_unix_ms": 60000
+  }
+]
