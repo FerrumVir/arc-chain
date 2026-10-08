@@ -20,6 +20,24 @@ import _paths  # noqa: F401
 import os_macos as m
 
 LIVE = ["149.28.32.76", "140.82.16.112", "136.244.109.1", "104.238.171.11", "202.182.107.41", "149.28.153.31"]
+RSMS = ["104.21.58.14", "172.67.197.50"]  # what the real resolver answered for rsms.me on the CI runner (test data, never looked up here)
+
+_NETWORK_GUARD = []
+
+
+def _no_network(*args, **kwargs):
+    raise AssertionError("a unit test tried to use the network (name resolution): patch socket.getaddrinfo or the method that calls it")
+
+
+def setUpModule():
+    guard = mock.patch("socket.getaddrinfo", side_effect=_no_network)
+    guard.start()
+    _NETWORK_GUARD.append(guard)
+
+
+def tearDownModule():
+    while _NETWORK_GUARD:
+        _NETWORK_GUARD.pop().stop()
 CONFIG = json.loads((_paths.LAB / "config.json").read_text(encoding="utf-8"))
 
 
@@ -59,7 +77,7 @@ class FakeRecorder(m.Recorder):
         for needle, answer in self.answers:
             if needle in " ".join(full):
                 result = answer(full) if callable(answer) else answer
-                return m.CmdResult(full, result[0], result[1], result[2] if len(result) > 2 else "", 0.0)
+                return m.CmdResult(full, result[0], result[1], result[2] if len(result) > 2 else "", 0.0, timed_out=bool(len(result) > 3 and result[3]))
         return m.CmdResult(full, 0, "", "", 0.0)
 
 
@@ -450,6 +468,19 @@ class FeasibilityTests(unittest.TestCase):
         self.assertIn("Install button present after Check for updates = NO", second)
         self.assertIn("Native-check tier", second)
 
+    def test_the_real_banner_switch_in_the_text_is_the_probes_own_option_even_when_the_app_part_did_not_run(self):
+        off = self.probe(real_banner_api=False, released_app_ui={"attempted": False, "problem": "x"})
+        on = self.probe(real_banner_api=True, released_app_ui={"attempted": False, "problem": "x"})
+        self.assertIn("was OFF", m.build_feasibility(off))
+        self.assertIn("was ON", m.build_feasibility(on), "ON in the probe's options means ON, whatever the UI dict says")
+        self.assertIn("was ON", m.build_feasibility(self.probe(released_app_ui={"attempted": True, "real_banner_api": True})))
+
+    def test_the_text_quotes_what_the_updates_card_said_when_no_install_button_appeared(self):
+        ui = {"attempted": True, "window_appeared": True, "nodes": 133, "settings_button": True, "check_button": True, "install_button": False, "real_banner_api": True,
+              "banner_attempts": [{"attempt": n, "install_button": False, "card_texts": ["Updates", "vUNKNOWN"]} for n in range(1, 5)], "banner_ui_text": "Updates vUNKNOWN You're running the latest version."}
+        text = m.build_feasibility(self.probe(released_app_ui=ui, real_banner_api=True))
+        self.assertIn("UI after 4 Check for updates click(s): Updates vUNKNOWN You're running the latest version.", text)
+
     def test_denied_answer_quotes_the_error(self):
         acc = {"summary": {"system_events_reachable": False, "click_works": False, "first_error": "osascript is not allowed assistive access. (-25211)"}}
         text = m.build_feasibility(self.probe(accessibility=acc, released_app_ui={"attempted": False, "problem": "isolation not ready"}))
@@ -545,28 +576,80 @@ class RecorderTests(unittest.TestCase):
 class InterceptionTests(unittest.TestCase):
     def make(self, tmp, answers=None):
         rec = FakeRecorder(Path(tmp) / "evidence", answers)
-        env = m.Interception(rec, Path(tmp) / "evidence", Path(tmp) / "work", LIVE)
+        env = m.Interception(rec, Path(tmp) / "evidence", Path(tmp) / "work", LIVE, shared_dir=Path(tmp) / "shared")
         (Path(tmp) / "work").mkdir(parents=True, exist_ok=True)
         return rec, env
 
     def joined(self, rec):
         return [" ".join(call["argv"]) for call in rec.calls]
 
+    @staticmethod
+    def rsms_resolves(addresses=RSMS):
+        """The real resolver's answers for rsms.me, scripted: getaddrinfo (before the mapping) and dig (any time)."""
+        infos = [(2, 1, 6, "", (a, 443)) for a in addresses]
+        return mock.patch("socket.getaddrinfo", return_value=infos)
+
     def test_live_block_writes_only_block_rules_and_verifies_them(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            listing = "\n".join("block drop out quick inet from any to %s" % ip for ip in LIVE)
+        with tempfile.TemporaryDirectory() as tmp, self.rsms_resolves():
+            listing = "\n".join("block drop out quick inet from any to %s" % ip for ip in LIVE + RSMS)
             rec, env = self.make(tmp, [("pfctl -sr", (0, listing)), ("pfctl -s info", (0, "Status: Enabled for 0 days"))])
             info = env.block_live_network()
             conf = (Path(tmp) / "work" / "pf-live-block.conf").read_text()
-            self.assertEqual(conf, m.pf_conf_text(LIVE))
+            self.assertEqual(conf, m.pf_conf_text(LIVE, RSMS))
+            self.assertEqual(conf.count("wave0-live-"), 6)
+            self.assertEqual(conf.count("wave0-extra-"), 2)
             self.assertTrue(info["verified"])
-            self.assertEqual(info["block_rules_listed"], 6)
+            self.assertEqual(info["block_rules_listed"], 8)
+            self.assertEqual(info["extra_addresses"], 2)
+            self.assertEqual(env.extra_block_ips, sorted(RSMS))
             commands = self.joined(rec)
             self.assertTrue(any(c.startswith("sudo -n pfctl -f ") for c in commands))
+            self.assertTrue(any(c.startswith("dig +short") and "rsms.me" in c for c in commands), "the real resolver is asked directly, /etc/hosts cannot answer dig")
             self.assertNotIn("149.28.32.76", json.dumps(info), "the masked listing never carries a live address")
 
-    def test_a_merged_anonymous_table_is_read_back_and_verifies_the_block(self):
+    def test_one_missing_extra_rule_is_enough_for_the_block_to_be_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp, self.rsms_resolves():
+            listing = "\n".join("block drop out quick inet from any to %s" % ip for ip in LIVE + RSMS[:1])
+            rec, env = self.make(tmp, [("pfctl -sr", (0, listing)), ("pfctl -s info", (0, "Status: Enabled"))])
+            self.assertFalse(env.block_live_network()["verified"])
+
+    def test_the_extra_addresses_include_ipv6_in_the_form_pf_prints(self):
+        with tempfile.TemporaryDirectory() as tmp, self.rsms_resolves(["2606:4700:3037:0:0:0:6815:3A0E", "104.21.58.14"]):
+            listing = "\n".join("block drop out quick inet from any to %s" % ip for ip in LIVE) + "\nblock drop out quick inet6 from any to 2606:4700:3037::6815:3a0e\nblock drop out quick inet from any to 104.21.58.14\n"
+            rec, env = self.make(tmp, [("pfctl -sr", (0, listing)), ("pfctl -s info", (0, "Status: Enabled"))])
+            info = env.block_live_network()
+            self.assertTrue(info["verified"], info)
+            self.assertIn("2606:4700:3037::6815:3a0e", env.extra_block_ips, "compressed lower case, exactly as pf lists it")
+
+    def test_addresses_that_appear_later_are_blocked_before_the_next_case(self):
         with tempfile.TemporaryDirectory() as tmp:
+            with self.rsms_resolves():
+                listing = "\n".join("block drop out quick inet from any to %s" % ip for ip in LIVE + RSMS + ["104.21.99.9"])
+                dig_calls = {"n": 0}
+
+                def dig(argv):  # the first resolution sees the usual pair, a later one a third address
+                    dig_calls["n"] += 1
+                    return (0, "104.21.58.14\n172.67.197.50\n") if dig_calls["n"] == 1 else (0, "104.21.58.14\n172.67.197.50\n104.21.99.9\n")
+
+                rec, env = self.make(tmp, [("pfctl -sr", (0, listing)), ("pfctl -s info", (0, "Status: Enabled")), ("dig +short +time=3 +tries=2 A rsms.me", dig)])
+                env.block_live_network()
+                loads = len([c for c in self.joined(rec) if c.startswith("sudo -n pfctl -f")])
+                refreshed = env.refresh_extra_blocks()
+            self.assertEqual(refreshed["added"], ["104.21.99.9"])
+            self.assertTrue(refreshed["verified"])
+            self.assertEqual(len([c for c in self.joined(rec) if c.startswith("sudo -n pfctl -f")]), loads + 1, "the rules are reloaded once, with the new address")
+            self.assertIn("104.21.99.9", (Path(tmp) / "work" / "pf-live-block.conf").read_text())
+            again = env.refresh_extra_blocks()
+            self.assertEqual(again["added"], [])
+            self.assertEqual(len([c for c in self.joined(rec) if c.startswith("sudo -n pfctl -f")]), loads + 1, "nothing new, no reload")
+
+    def test_dig_output_parsing_skips_cnames_loopback_and_private_addresses(self):
+        text = "alias.example.\n104.21.58.14\n127.0.0.1\n10.0.0.1\n2606:4700:3037::6815:3A0E\n::1\n104.21.58.14\nnot an address\n"
+        self.assertEqual(m.parse_dig_addresses(text), ["104.21.58.14", "2606:4700:3037::6815:3a0e"])
+        self.assertEqual(m.parse_dig_addresses(""), [])
+
+    def test_a_merged_anonymous_table_is_read_back_and_verifies_the_block(self):
+        with tempfile.TemporaryDirectory() as tmp, self.rsms_resolves([]):
             listing = "block drop out quick inet from any to <__automatic_227272d_0>\nNo ALTQ support in kernel\n"
             table = "\n".join("   %s" % ip for ip in LIVE) + "\n"
             rec, env = self.make(tmp, [("pfctl -t __automatic_227272d_0 -T show", (0, table)), ("pfctl -sr", (0, listing)), ("pfctl -s info", (0, "Status: Enabled"))])
@@ -581,35 +664,152 @@ class InterceptionTests(unittest.TestCase):
             self.assertFalse(env3.block_live_network()["verified"], "an unreadable table never verifies")
 
     def test_live_block_is_not_verified_when_a_rule_is_missing(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, self.rsms_resolves([]):
             listing = "\n".join("block drop out quick inet from any to %s" % ip for ip in LIVE[:5])
             rec, env = self.make(tmp, [("pfctl -sr", (0, listing)), ("pfctl -s info", (0, "Status: Enabled"))])
             self.assertFalse(env.block_live_network()["verified"])
             rec2, env2 = self.make(tmp, [("pfctl -sr", (0, "")), ("pfctl -f", (1, "", "pfctl: syntax error"))])
             self.assertFalse(env2.block_live_network()["verified"])
 
-    def test_trust_uses_the_system_keychain_non_interactively_and_verifies_with_security_framework(self):
+    def test_trust_grants_the_right_first_then_adds_non_interactively_and_verifies_with_security_framework(self):
         with tempfile.TemporaryDirectory() as tmp:
             rec, env = self.make(tmp)
             env.ca = {"ca_cert": "/w/ca/ca.crt", "server_cert": "/w/ca/server.crt", "ca_sha256": "ab" * 32}
             info = env.trust_ca()
             commands = self.joined(rec)
-            self.assertEqual(commands[0], "sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /w/ca/ca.crt")
-            self.assertIn("security verify-cert -c /w/ca/server.crt -p ssl -s github.com", commands[1])
+            self.assertEqual(commands[0], "sudo -n security authorizationdb write com.apple.trust-settings.admin allow", "the right is granted BEFORE the first add")
+            self.assertEqual(commands[1], "sudo -n security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /w/ca/ca.crt")
+            self.assertIn("security verify-cert -c /w/ca/server.crt -p ssl -s github.com", commands[2])
             self.assertTrue(info["trusted"])
+            self.assertEqual(len(info["attempts"]), 1)
             env.ca_sha1 = "AA" * 20
             env.untrust_ca()
             commands = self.joined(rec)
             self.assertTrue(any("security remove-trusted-cert -d /w/ca/ca.crt" in c for c in commands))
             self.assertTrue(any("security delete-certificate -Z %s /Library/Keychains/System.keychain" % ("AA" * 20) in c for c in commands))
 
+    def test_a_hung_trust_call_is_killed_and_retried_with_the_right_granted_again(self):
+        calls = {"add": 0}
+
+        def add(argv):
+            calls["add"] += 1
+            return (124, "", "[timed out after 60s]", True) if calls["add"] == 1 else (0, "")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(m.time, "sleep"):
+            rec, env = self.make(tmp, [("add-trusted-cert", add)])
+            env.ca = {"ca_cert": "/w/ca.crt", "server_cert": "/w/s.crt"}
+            info = env.trust_ca()
+            commands = self.joined(rec)
+            self.assertTrue(info["trusted"])
+            self.assertEqual([a["timed_out"] for a in info["attempts"]], [True, False])
+            for victim in ("security", "SecurityAgent", "authorizationhost"):
+                self.assertIn("sudo -n pkill -KILL -x %s" % victim, commands, "the hung process (root's child of the killed sudo) and the dialog are killed")
+            self.assertEqual(len([c for c in commands if "authorizationdb write" in c]), 2, "the right is granted again before the retry")
+            first_kill = commands.index("sudo -n pkill -KILL -x security")
+            second_add = [i for i, c in enumerate(commands) if "add-trusted-cert" in c][1]
+            self.assertLess(first_kill, second_add, "the kill comes before the next attempt")
+
+    def test_the_trust_attempts_use_bounded_timeouts_and_give_up_after_three(self):
+        timeouts = []
+
+        class Rec(FakeRecorder):
+            def run(self, argv, label="", timeout=120.0, **kw):
+                if "add-trusted-cert" in argv:
+                    timeouts.append(timeout)
+                return super().run(argv, label=label, timeout=timeout, **kw)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(m.time, "sleep"):
+            rec = Rec(Path(tmp) / "evidence", [("add-trusted-cert", (124, "", "[timed out]", True))])
+            env = m.Interception(rec, Path(tmp) / "evidence", Path(tmp) / "work", LIVE, shared_dir=Path(tmp) / "shared")
+            env.ca = {"ca_cert": "/w/ca.crt", "server_cert": "/w/s.crt"}
+            info = env.trust_ca()
+        self.assertEqual(timeouts, [60.0, 45.0, 45.0])
+        self.assertTrue(all(t <= 60 for t in timeouts))
+        self.assertFalse(info["trusted"], "fail closed")
+        self.assertEqual(len(info["attempts"]), 3)
+
     def test_failed_trust_is_reported_not_trusted(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(m.time, "sleep"):
             rec, env = self.make(tmp, [("add-trusted-cert", (1, "", "SecTrustSettingsSetTrustSettings: authorization denied"))])
             env.ca = {"ca_cert": "/w/ca.crt", "server_cert": "/w/s.crt"}
             self.assertFalse(env.trust_ca()["trusted"])
             env.untrust_ca()
             self.assertFalse(any("remove-trusted-cert" in c for c in self.joined(rec)), "nothing was trusted, so nothing is removed")
+
+    def fake_ca(self, tmp, hostnames=None):
+        """What lib/ca.make_ca leaves on disk, without running openssl."""
+        def make(outdir, hosts):
+            out = Path(outdir)
+            (out / "private").mkdir(parents=True, exist_ok=True)
+            for name in ("ca.crt", "server.crt", "private/ca.key", "private/server.key"):
+                (out / name).write_text("x", encoding="ascii")
+            (out / "ca.sha256").write_text("cd" * 32 + "\n", encoding="ascii")
+            return {"ca_cert": str(out / "ca.crt"), "ca_key": str(out / "private" / "ca.key"), "server_cert": str(out / "server.crt"), "server_key": str(out / "private" / "server.key"),
+                    "ca_sha256": "cd" * 32, "hostnames": list(hosts)}
+        return mock.patch.object(m.ca_lib, "make_ca", side_effect=make)
+
+    def test_one_ca_per_job_generated_once_trusted_once_and_kept_for_the_next_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fingerprint = "SHA1 Fingerprint=" + ":".join(["AB"] * 20)
+            with self.fake_ca(tmp) as make:
+                rec1, env1 = self.make(tmp, [("openssl x509", (0, fingerprint))])
+                env1.keep_ca = True
+                env1.make_ca()
+                env1.trust_ca()
+                state = json.loads((Path(tmp) / "shared" / "ca-state.json").read_text())
+                self.assertTrue(state["trusted"])
+                self.assertEqual(state["ca_sha1"], "AB" * 20)
+                self.assertEqual(state["hostnames"], sorted(env1.hosts))
+                env1.teardown()
+                self.assertFalse(any("remove-trusted-cert" in c for c in self.joined(rec1)), "the probe phase leaves the CA trusted for the run phase")
+                self.assertTrue(env1.facts["ca_kept_trusted_for_the_next_phase"])
+                # the run phase of the same job
+                rec2, env2 = self.make(tmp)
+                env2.make_ca()
+                self.assertTrue(env2.ca_reused)
+                self.assertTrue(env2.trusted)
+                self.assertEqual(make.call_count, 1, "the CA is generated once")
+                info = env2.trust_ca()
+                commands = self.joined(rec2)
+                self.assertTrue(info["trusted"])
+                self.assertTrue(info["trusted_by_an_earlier_phase"])
+                self.assertFalse(any("add-trusted-cert" in c or "authorizationdb" in c for c in commands), "trusted once: no second trust call, no second prompt")
+                env2.keep_ca = False
+                env2.teardown()
+                self.assertTrue(any("remove-trusted-cert" in c for c in self.joined(rec2)), "removed once, at the end of the job")
+                self.assertFalse(json.loads((Path(tmp) / "shared" / "ca-state.json").read_text())["trusted"])
+
+    def test_a_ca_for_other_host_names_is_replaced_and_the_old_trust_removed(self):
+        with tempfile.TemporaryDirectory() as tmp, self.fake_ca(tmp) as make:
+            rec1, env1 = self.make(tmp)
+            env1.make_ca()
+            env1.ca_sha1 = "AB" * 20
+            env1.trust_ca()
+            rec2 = FakeRecorder(Path(tmp) / "evidence")
+            env2 = m.Interception(rec2, Path(tmp) / "evidence", Path(tmp) / "work", LIVE, real_banner=False, shared_dir=Path(tmp) / "shared")
+            env2.make_ca()
+            self.assertFalse(env2.ca_reused, "api.github.com is in the SAN list only when the switch is off: a different CA is needed")
+            self.assertEqual(make.call_count, 2)
+            self.assertTrue(any("remove-trusted-cert" in c for c in self.joined(rec2)), "the earlier CA is untrusted first")
+
+    def test_cleanup_removes_the_job_ca_once_and_never_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(m.os.environ, {"GITHUB_ACTIONS": "true", "RUNNER_TEMP": str(Path(tmp) / "rt")}):
+            (Path(tmp) / "rt").mkdir()
+            shared = m.shared_dir()
+            (shared / "ca").mkdir(parents=True, exist_ok=True)
+            (shared / "ca-state.json").write_text(json.dumps({"ca_sha256": "ab" * 32, "ca_sha1": "CD" * 20, "hostnames": ["github.com"], "trusted": True}))
+            commands = []
+
+            def fake_run(argv, **kwargs):
+                commands.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+            with mock.patch.object(m.subprocess, "run", side_effect=fake_run):
+                self.assertEqual(m.main(["cleanup", "--evidence", str(Path(tmp) / "ev")]), 0)
+                self.assertEqual(m.main(["cleanup", "--evidence", str(Path(tmp) / "ev")]), 0)
+            removals = [c for c in commands if "remove-trusted-cert" in c]
+            self.assertEqual(len(removals), 1, "the second cleanup finds nothing trusted any more")
+            self.assertFalse(json.loads((shared / "ca-state.json").read_text())["trusted"])
 
     def make_with(self, tmp, answers, real_banner):
         rec = FakeRecorder(Path(tmp) / "evidence", answers)
@@ -618,8 +818,9 @@ class InterceptionTests(unittest.TestCase):
         return rec, env
 
     def run_map_hosts(self, env):
+        loopback = [(2, 1, 6, "", ("127.0.0.1", 443))]
         with mock.patch.object(m.shutil, "copyfile", side_effect=lambda src, dst: Path(dst).write_text("127.0.0.1 localhost\n")), \
-                mock.patch.object(env, "resolve_banner_api", return_value=["140.82.112.5"]):
+                mock.patch.object(env, "resolve_banner_api", return_value=["140.82.112.5"]), mock.patch("socket.getaddrinfo", return_value=loopback):
             return env.map_hosts()
 
     def test_hosts_are_appended_flushed_and_restored_from_the_backup(self):
@@ -747,15 +948,25 @@ class FakeEnv:
         "bait-0.8.11": [dict(MANIFEST_200)],
     }
 
-    def __init__(self, rec=None, evidence=None, work=None, live_ips=(), real_banner=True, rows=None):
+    def __init__(self, rec=None, evidence=None, work=None, live_ips=(), real_banner=True, rows=None, shared_dir=None, keep_ca=False, refresh=None):
         self.real_banner = real_banner
+        self.keep_ca = keep_ca
+        self.refresh = refresh if refresh is not None else {"added": [], "verified": True}
         self.banner_api_ips = ["140.82.112.5"] if real_banner else []
+        self.extra_block_ips = list(RSMS)
         self.live_ips = list(LIVE)
         self.hosts = m.intercept_hosts(real_banner)
         self.facts = {"hosts_mapped": list(self.hosts), "ca_sha256": "ab" * 32, "live_block": {"verified": True}, "real_banner_api": {"enabled": real_banner}}
         self.rows = rows or {}
         self.torn = False
         self.served = []
+
+    @property
+    def blocked_ips(self):
+        return list(LIVE) + list(self.extra_block_ips)
+
+    def refresh_extra_blocks(self):
+        return dict(self.refresh)
 
     def block_live_network(self):
         return {"verified": True}
@@ -1315,7 +1526,8 @@ class TierFlowTests(unittest.TestCase):
         nodes += [{"role": "AXStaticText", "title": None, "description": None, "name": None, "value": text} for text in texts]
         return {"pid": 4242, "windows": 1, "error": None, "truncated": False, "nodes": nodes}
 
-    def run_app(self, install=True, error_text="Update failed: Could not fetch a valid release JSON from the remote", lsof_rows=None, env=None, click_ok=True):
+    def run_app(self, install=True, error_text="Update failed: Could not fetch a valid release JSON from the remote", lsof_rows=None, env=None, click_ok=True,
+                install_from_attempt=None, pill="v0.7.12", sentence=None, install_before_check=False, sleeps=None):
         class FakeProc:
             pid = 4242
             terminated = False
@@ -1332,14 +1544,22 @@ class TierFlowTests(unittest.TestCase):
             def kill(self):
                 self.terminated = True
 
+        checks = {"dumps": 0}
+
         def osascript(rec, script, label, timeout=150.0):
             result = m.CmdResult(["osascript"], 0, "", "", 0.0)
             if label == "wait for the app window":
                 return {"windows": 1, "nodes": []}, result
-            if label in ("AX dump after launch", "AX dump on the Settings page"):
+            if label == "AX dump after launch":
                 return self.dump(["Settings", " Check for updates"], ["Configure your node and app preferences."]), result
+            if label == "AX dump on the Settings page":
+                return self.dump(["Settings", " Check for updates"] + (["Install v0.7.12 & relaunch"] if install_before_check else []), ["Configure your node and app preferences."]), result
             if label == "AX dump after Check for updates":
-                return self.dump(["Settings", " Check for updates"] + (["Install v0.7.12 & relaunch"] if install else []), ["Version 0.7.12 is available." if install else "You're running the latest version."]), result
+                attempt = checks["dumps"] // 7 + 1  # seven polls per click while no Install button shows up
+                checks["dumps"] += 1
+                shows = install_from_attempt is not None and attempt >= install_from_attempt if install_from_attempt is not None else install
+                texts = [sentence or ("Version 0.7.12 is available. Click below to download, install, and relaunch." if shows else "You're running the latest version.")]
+                return self.dump(["Settings", " Check for updates"] + (["Install v0.7.12 & relaunch"] if shows else []), ["Updates", pill] + texts), result
             if label == "AX dump after Install":
                 return self.dump(["Settings"], [error_text] if error_text else []), result
             raise AssertionError("unexpected osascript label " + label)
@@ -1386,7 +1606,8 @@ class TierFlowTests(unittest.TestCase):
         click = mock.Mock(side_effect=lambda rec, pid, patterns, label: {"label": label, "report": {"clicked": click_ok}})
         with mock.patch("pathlib.Path.home", return_value=self.home), mock.patch.object(m, "osascript_json", osascript), mock.patch.object(m, "click_step", click), \
                 mock.patch.object(m, "screenshot"), mock.patch.object(m, "ProcessWatcher", SeenWatcher), mock.patch.object(m, "CaptureWatcher", FakeCapture), \
-                mock.patch.object(m, "LsofWatcher", FakeLsof), mock.patch.object(m.subprocess, "Popen", return_value=FakeProc()), mock.patch.object(m.time, "sleep"):
+                mock.patch.object(m, "LsofWatcher", FakeLsof), mock.patch.object(m.subprocess, "Popen", return_value=FakeProc()), \
+                mock.patch.object(m.time, "sleep", side_effect=(sleeps.append if sleeps is not None else (lambda seconds: None))):
             entry = m.run_app_case(rec, env, self.ev, self.work, app, facts, "clean")
         return entry, click, env
 
@@ -1411,6 +1632,61 @@ class TierFlowTests(unittest.TestCase):
         self.assertIn("140.82.112.5", network_file, "the pass-through flow is labelled with the address resolved at run time")
         self.assertIn(("latest-404", "requests-clean-released_app.jsonl"), env.served)
 
+    def test_a_banner_without_a_tag_is_retried_three_times_20_seconds_apart_then_the_tier_is_infeasible_with_the_exact_ui_text(self):
+        sleeps = []
+        entry, click, env = self.run_app(install=False, pill="vUNKNOWN", sleeps=sleeps)
+        attempts = entry["trigger_outcome"]["ui"]["banner_attempts"]
+        self.assertEqual([a["attempt"] for a in attempts], [1, 2, 3, 4])
+        self.assertTrue(all(not a["install_button"] for a in attempts))
+        self.assertEqual(sleeps.count(20), 3, "20 s between the clicks")
+        self.assertIn("vUNKNOWN", " ".join(attempts[-1]["card_texts"]), "the UI text after every click is recorded")
+        reason = entry["trigger_outcome"]["plugin_check"]["reason"]
+        self.assertIn("the banner's own unintercepted API call returned no release tag (UI: ", reason)
+        self.assertIn("vUNKNOWN", reason)
+        self.assertIn("not attributable from here", reason)
+        self.assertFalse(entry["trigger_outcome"]["plugin_check"]["reached"], "never claim the plugin path was reached")
+        self.assertEqual(entry["verdict"], "UNPROVED")
+        self.assertFalse(any(call.args[3].startswith("click Install") for call in click.call_args_list))
+
+    def test_an_install_button_that_shows_up_on_a_retry_is_clicked(self):
+        entry, click, env = self.run_app(install_from_attempt=3, pill="v0.7.12")
+        labels = [call.args[3] for call in click.call_args_list]
+        self.assertEqual(labels, ["click Settings", "click Check for updates", "click Check for updates (retry 1)", "click Check for updates (retry 2)", "click Install (calls the plugin check())"])
+        ui = entry["trigger_outcome"]["ui"]
+        self.assertEqual([a["install_button"] for a in ui["banner_attempts"]], [False, False, True])
+        self.assertTrue(entry["trigger_outcome"]["plugin_check"]["reached"])
+        self.assertEqual(entry["verdict"], "PASS", json.dumps(entry["criteria_reasons"]))
+
+    def test_an_install_button_present_before_the_check_is_not_clicked(self):
+        entry, click, env = self.run_app(install_before_check=True, install_from_attempt=1)
+        self.assertFalse(any(call.args[3].startswith("click Install") for call in click.call_args_list))
+        ui = entry["trigger_outcome"]["ui"]
+        self.assertTrue(ui["install_button_before_check"])
+        self.assertIn("BEFORE the check", ui["problem"])
+        self.assertFalse(entry["trigger_outcome"]["plugin_check"]["reached"])
+        self.assertIn("already present before the check", entry["trigger_outcome"]["plugin_check"]["reason"])
+
+    def test_the_rsms_addresses_are_blocked_before_the_app_starts_and_a_failed_block_prevents_the_launch(self):
+        launched = []
+        entry, click, env = self.run_app(env=FakeEnv(refresh={"added": ["104.21.99.9"], "verified": True}))
+        self.assertEqual(entry["trigger_outcome"]["ui"]["extra_block_refresh"]["added"], ["104.21.99.9"])
+        broken = FakeEnv(refresh={"added": ["104.21.99.9"], "verified": False})
+        entry, click, env = self.run_app(env=broken)
+        self.assertNotIn("pid", entry["trigger_outcome"]["ui"], "the app was not launched")
+        self.assertIn("pf block could not be verified", entry["trigger_outcome"]["ui"]["problem"])
+        self.assertEqual(entry["verdict"], "UNPROVED")
+        self.assertEqual(click.call_count, 0)
+
+    def test_attempts_to_a_blocked_rsms_address_are_information_but_an_established_connection_fails(self):
+        syn = [{"pid": 555, "command": "com.apple.WebKit.Networking", "remote_ip": RSMS[0], "remote_port": 443, "state": "SYN_SENT", "t": 1.0}]
+        entry, click, env = self.run_app(lsof_rows=syn)
+        self.assertEqual(entry["network"]["violations"], [])
+        self.assertEqual(entry["network"]["blocked_live_node_attempts"], 1)
+        up = [dict(syn[0], state="ESTABLISHED")]
+        entry, click, env = self.run_app(lsof_rows=up)
+        self.assertEqual(entry["verdict"], "FAIL")
+        self.assertIn("%s:443" % RSMS[0], json.dumps(entry["criteria_reasons"]))
+
     def test_a_rotated_api_address_seen_by_the_resolver_or_by_tcpdump_is_allowed(self):
         rows = [{"pid": 4242, "command": "ARC Node", "remote_ip": "140.82.112.6", "remote_port": 443, "state": "ESTABLISHED", "t": 1.0}]
         entry, click, env = self.run_app(lsof_rows=rows)
@@ -1434,7 +1710,9 @@ class TierFlowTests(unittest.TestCase):
         plugin = entry["trigger_outcome"]["plugin_check"]
         self.assertFalse(plugin["reached"])
         self.assertIn("Install button was not rendered", plugin["reason"])
-        self.assertEqual([call.args[3] for call in click.call_args_list], ["click Settings", "click Check for updates"], "nothing is clicked that is not there")
+        self.assertEqual([call.args[3] for call in click.call_args_list],
+                         ["click Settings", "click Check for updates", "click Check for updates (retry 1)", "click Check for updates (retry 2)", "click Check for updates (retry 3)"],
+                         "the check is clicked again up to three times; nothing is clicked that is not there")
 
     def test_switch_off_means_no_network_record_is_required_and_the_banner_address_is_not_allowed(self):
         env = FakeEnv(real_banner=False)
@@ -1629,33 +1907,6 @@ class CiHelperTests(unittest.TestCase):
         other = FakeRecorder(self.root / "ev", [("strings -a", (0, "tauri-plugin-updater-2.9.0/src/x.rs"))])
         self.assertFalse(m.collect_provenance(other, binary, self.root / "ev")["plugin_pinned"])
 
-    def test_trust_falls_back_to_the_authorization_database_once_when_a_prompt_would_be_needed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            calls = {"n": 0}
-
-            def add(argv):
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return (1, "", "SecTrustSettingsSetTrustSettings: The authorization was denied since no user interaction was possible.")
-                return (0, "")
-
-            rec = FakeRecorder(Path(tmp) / "evidence", [("add-trusted-cert", add)])
-            env = m.Interception(rec, Path(tmp) / "evidence", Path(tmp) / "work", LIVE, real_banner=True)
-            env.ca = {"ca_cert": "/w/ca.crt", "server_cert": "/w/s.crt"}
-            info = env.trust_ca()
-            self.assertTrue(info["trusted"])
-            self.assertEqual(info["authorizationdb_fallback_rc"], 0)
-            self.assertEqual(calls["n"], 2)
-            commands = [" ".join(call["argv"]) for call in rec.calls]
-            self.assertTrue(any("authorizationdb write com.apple.trust-settings.admin allow" in c for c in commands))
-            self.assertFalse(any("-s api.github.com" in c for c in commands), "in real-banner mode the api name is not served by the recorder")
-            calls["n"] = 0
-            plain = FakeRecorder(Path(tmp) / "evidence", [("add-trusted-cert", (1, "", "some other failure"))])
-            env2 = m.Interception(plain, Path(tmp) / "evidence", Path(tmp) / "work", LIVE, real_banner=False)
-            env2.ca = {"ca_cert": "/w/ca.crt", "server_cert": "/w/s.crt"}
-            self.assertFalse(env2.trust_ca()["trusted"])
-            self.assertFalse(any("authorizationdb" in " ".join(call["argv"]) for call in plain.calls), "no fallback for an unrelated failure")
-
     def test_system_facts_records_every_probe_command(self):
         rec = FakeRecorder(self.root / "ev", [("sudo -n true", (0, ""))])
         facts = m.system_facts(rec)
@@ -1736,7 +1987,10 @@ class EvidenceHygieneTests(unittest.TestCase):
             if "private" in line and ("evidence" in line and "/" in line):
                 self.assertNotIn("private/", line, line)
         self.assertIn('shutil.copyfile(str(self.ca["ca_cert"]), str(self.evidence / "ca.crt"))', source)
-        self.assertNotIn("server.key", source.replace('"server_key"', ""), "the server key is only passed by path through the CA dictionary")
+        for number, line in enumerate(source.splitlines(), 1):
+            if "ca.key" in line or "server.key" in line:
+                self.assertNotIn("evidence", line, "line %d: a private key file is named next to the evidence directory" % number)
+                self.assertNotIn("copyfile", line, "line %d: a private key file is copied" % number)
 
     def test_python_39_syntax(self):
         compile((_paths.LAB / "os_macos.py").read_text(encoding="utf-8"), "os_macos.py", "exec")

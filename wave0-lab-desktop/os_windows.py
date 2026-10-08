@@ -120,6 +120,9 @@ HOSTS_END = "# arcw0-desktop-lab end"
 BLACKHOLE_HOSTS = ("rsms.me", "huggingface.co", "cdn-lfs.huggingface.co")   # third-party hosts the page would fetch: keep the run hermetic
 INSTALLER_NSIS = re.compile(r"^ARC\.Node_[0-9]+\.[0-9]+\.[0-9]+_x64-setup\.exe$")
 INSTALLER_MSI = re.compile(r"^ARC\.Node_[0-9]+\.[0-9]+\.[0-9]+_x64_en-US\.msi$")
+TRIGGER_STRATEGIES = ("msedgedriver", "cdp-env", "cdp-registry")
+EDGE_DRIVER_DEFAULT = "C:\\SeleniumWebDrivers\\EdgeDriver\\msedgedriver.exe"
+REGISTRY_KEY = "HKCU\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments"
 CASE_NAMES = ("clean", "cached-bait")
 CASE_SCENARIO = {"clean": "latest-404", "cached-bait": "bait-0.8.11"}
 TIERS = ("released_app", "native_check")
@@ -610,6 +613,16 @@ class Poller:
         self._write({"t": round(time.time(), 3), "event": "stop", "cycles": self.cycles})
         return self.cycles
 
+    def finish(self, min_cycles: int = 2, extra_cycles: int = 2) -> int:
+        """Stop only after `extra_cycles` more FULL cycles have completed (the first of them may have started before the process ended)
+        and at least `min_cycles` in total, so that even a 0.1 s native check leaves a complete write log."""
+        if self.thread is not None:
+            target = max(min_cycles, self.cycles + extra_cycles)
+            deadline = time.time() + (target - self.cycles + 2) * self.interval + 5.0
+            while self.cycles < target and time.time() < deadline and self.thread.is_alive():
+                time.sleep(min(0.05, max(0.005, self.interval / 4.0)))
+        return self.stop()
+
 
 def payload_like_path(path: str) -> Optional[str]:
     low = norm_path(path)
@@ -706,7 +719,7 @@ PS_PROCESSES = ("Get-CimInstance Win32_Process | Select-Object ProcessId,ParentP
                 "| ConvertTo-Json -Compress -Depth 2")
 
 
-COMMAND_LINE_ALLOWED = re.compile(r"(?i)^(arc-desktop|msedgewebview2|native-updater-check|arc-node|.*setup.*|msiexec|.*updater.*)\.exe$")
+COMMAND_LINE_ALLOWED = re.compile(r"(?i)^(arc-desktop|msedgewebview2|msedgedriver|native-updater-check|arc-node|.*setup.*|msiexec|.*updater.*)\.exe$")
 
 
 def redact_processes(processes: Optional[List[dict]]) -> Optional[List[dict]]:
@@ -718,7 +731,7 @@ def redact_processes(processes: Optional[List[dict]]) -> Optional[List[dict]]:
         item = dict(process)
         if not COMMAND_LINE_ALLOWED.match(str(item.get("Name") or "")):
             item["CommandLine"] = "<omitted>"
-        item["CommandLine"] = mask_ips(str(item["CommandLine"]))[:400]
+        item["CommandLine"] = mask_ips(str(item["CommandLine"]))[:2500]      # WebView2 command lines are long; --remote-debugging-port must not be cut off
         out.append(item)
     return out
 
@@ -764,25 +777,37 @@ def descendants(root_pid: int, processes: Sequence[dict]) -> set:
 
 
 _SUSPECT_NAME = re.compile(r"(?i)(setup|install|updater?|arc-desktop|arc\.node)")
+# Processes this script itself (or the runner) starts to look at the machine: recorded, never counted as an app launch or an install.
+LAB_HELPER_NAMES = frozenset({
+    "powershell.exe", "pwsh.exe", "python.exe", "pythonw.exe", "py.exe", "conhost.exe", "cmd.exe", "bash.exe", "sh.exe", "curl.exe", "certutil.exe", "taskkill.exe",
+    "git.exe", "gh.exe", "reg.exe", "ipconfig.exe", "tasklist.exe", "cargo.exe", "rustc.exe", "wmiprvse.exe", "msedgedriver.exe",
+})
 
 
 def process_violations(before: Optional[List[dict]], after: Optional[List[dict]], app_pid: Optional[int], markers: Sequence[str],
-                       ignore_exes: Sequence[str] = ()) -> Optional[Dict[str, List[str]]]:
-    """New processes between the two snapshots that are not the app's own WebView2 helpers. None = a snapshot is missing."""
+                       ignore_exes: Sequence[str] = (), webview_markers: Sequence[str] = ()) -> Optional[Dict[str, List[str]]]:
+    """New processes between the two snapshots that are not the app's own WebView2 helpers or the lab's own helpers. None = a snapshot is missing.
+
+    app_pid is the process of the app under test; 0 means "there is no app process" (the native tier): then nothing counts as the
+    app's tree and only a new arc-desktop.exe, an installer or an updater process can be flagged."""
     if before is None or after is None or app_pid is None:
         return None
     old = {process_key(p) for p in before}
     skip = {norm_path(path) for path in ignore_exes if path}
     new = [p for p in after if process_key(p) not in old and norm_path(str(p.get("ExecutablePath") or "")) not in skip]
-    tree = descendants(app_pid, after)
+    tree = descendants(app_pid, after) if app_pid else set()
     low_markers = [m.lower() for m in markers if m]
-    result: Dict[str, List[str]] = {"new_app_launches": [], "installers": [], "other_in_app_tree": [], "unrelated": []}
+    own_webview = [m.lower() for m in webview_markers if m]
+    result: Dict[str, List[str]] = {"new_app_launches": [], "installers": [], "other_in_app_tree": [], "unrelated": [], "lab_helpers": []}
     for process in new:
         name = str(process.get("Name") or "")
         exe = str(process.get("ExecutablePath") or "")
         command = str(process.get("CommandLine") or "")
         text = "%s | %s | %s (pid %s)" % (name, exe, command[:160], process.get("ProcessId"))
-        if name.lower() == WEBVIEW2_PROCESS and process["ProcessId"] in tree:
+        if name.lower() == WEBVIEW2_PROCESS and (process["ProcessId"] in tree or any(m in command.lower() for m in own_webview)):
+            continue
+        if name.lower() in LAB_HELPER_NAMES:
+            result["lab_helpers"].append(text)
             continue
         related = process["ProcessId"] in tree or any(m in (exe + " " + command).lower() for m in low_markers)
         if name.lower() == APP_EXE_NAME:
@@ -1291,6 +1316,9 @@ class Context:
         self.rule_created = False           # the firewall rule exists, whether or not the connect test proved it effective
         self.live_block_detail: Dict[str, Any] = {}
         self.app_exe: Optional[str] = None
+        self.strategies: List[str] = list(TRIGGER_STRATEGIES)
+        self.winning_strategy: Optional[str] = None
+        self.registry_override = False
         self.notes: List[str] = []
         self.native_exe: Optional[Path] = None
 
@@ -1432,14 +1460,17 @@ def snapshot_processes(shell: Shell) -> Optional[List[dict]]:
     return parse_processes(out.out) if out.ok else None
 
 
-def sandbox_env(base: Dict[str, str], home: str, wv2: str, port: int = CDP_PORT) -> Dict[str, str]:
+def sandbox_env(base: Dict[str, str], home: str, wv2: str, port: Optional[int] = CDP_PORT) -> Dict[str, str]:
+    """Environment of the app under test. HOME only: the app reads HOME before USERPROFILE for ~/.arc (commands.rs, node_manager.rs), while
+    overriding USERPROFILE made Tauri's app_data_dir() fail (the first CI run logged the temp directory as the app data dir), so
+    USERPROFILE stays real. port=None leaves WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS alone (msedgedriver sets its own)."""
     env = dict(base)
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         env.pop(name, None)
     env["HOME"] = home
-    env["USERPROFILE"] = home
     env["WEBVIEW2_USER_DATA_FOLDER"] = wv2
-    env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--remote-debugging-port=%d --remote-allow-origins=*" % port
+    if port is not None:
+        env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--remote-debugging-port=%d --remote-allow-origins=*" % port
     return env
 
 
@@ -1459,13 +1490,338 @@ def wait_for_page(port: int, timeout: float, fetch: Callable[[str], Any] = http_
 
 
 def kill_app(ctx: Context, pid: Optional[int], wv2_dir: str) -> None:
+    """Stop everything a launch can leave behind: the app tree, its WebView2 helpers (any whose command line carries the profile directory) and msedgedriver."""
     shell = ctx.shell
     if pid:
         shell.run(["taskkill", "/F", "/T", "/PID", str(pid)], timeout=60, quiet=True)
     shell.run(["taskkill", "/F", "/T", "/IM", APP_EXE_NAME], timeout=60, quiet=True)
+    shell.run(["taskkill", "/F", "/T", "/IM", "msedgedriver.exe"], timeout=60, quiet=True)
     sweep = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -like '*%s*' } "
              "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" % wv2_dir.replace("'", "''"))
     shell.run(powershell_argv(sweep), timeout=60, quiet=True)
+
+
+def leftover_processes(processes: Optional[List[dict]], markers: Sequence[str]) -> List[str]:
+    """Processes of an earlier launch that are still alive: the app, msedgedriver, or a WebView2 helper whose command line carries one of the markers."""
+    low = [m.lower() for m in markers if m]
+    found = []
+    for process in processes or []:
+        name = str(process.get("Name") or "").lower()
+        command = str(process.get("CommandLine") or "").lower()
+        exe = str(process.get("ExecutablePath") or "").lower()
+        if name in (APP_EXE_NAME, "msedgedriver.exe") or (name == WEBVIEW2_PROCESS and any(m in command for m in low)):
+            found.append("%s pid %s %s" % (process.get("Name"), process.get("ProcessId"), exe))
+    return found
+
+
+# --- msedgedriver (W3C WebDriver) ------------------------------------------------------------------------------------
+
+class W3CError(RuntimeError):
+    def __init__(self, error: Any, message: Any, status: Optional[int] = None):
+        super().__init__("%s: %s" % (error, message))
+        self.error, self.message, self.status = error, message, status
+
+
+def find_edge_driver(env: Dict[str, str], exists: Callable[[str], bool] = os.path.isfile, which: Callable[[str], Optional[str]] = shutil.which) -> Optional[str]:
+    """msedgedriver.exe: the image's EdgeWebDriver directory, the usual SeleniumWebDrivers location, then PATH."""
+    candidates: List[str] = []
+    for key in ("EDGEWEBDRIVER", "EdgeWebDriver"):
+        base = env.get(key)
+        if base:
+            candidates.append(base.rstrip("\\") + "\\msedgedriver.exe")
+    candidates.append(EDGE_DRIVER_DEFAULT)
+    for candidate in candidates:
+        if exists(candidate):
+            return candidate
+    return which("msedgedriver")
+
+
+def free_port(bind: Callable[..., Any] = socket.socket) -> int:
+    sock = bind()
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def w3c_call(base: str, method: str, path: str, body: Optional[dict] = None, timeout: float = 30.0, opener: Optional[Callable[..., Any]] = None) -> Tuple[int, Any]:
+    """One W3C WebDriver HTTP call (JSON in, JSON out, never through a proxy). Returns (HTTP status, parsed body)."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(base + path, data=data, method=method, headers={"Content-Type": "application/json; charset=utf-8", "Accept": "application/json"})
+    open_url = opener or urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+    try:
+        with open_url(request, timeout=timeout) as response:
+            status, text = response.status, response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        status, text = error.code, error.read().decode("utf-8", "replace")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = {"raw": text[:300]}
+    return status, payload
+
+
+def w3c_value(status: int, payload: Any) -> Any:
+    """The `value` of a W3C response; raises W3CError for an HTTP error status or an error object."""
+    value = payload.get("value") if isinstance(payload, dict) else None
+    if status >= 400 or (isinstance(value, dict) and "error" in value and "message" in value):
+        detail = value if isinstance(value, dict) else {}
+        raise W3CError(detail.get("error") or "http %d" % status, detail.get("message") or json.dumps(payload)[:300], status)
+    return value
+
+
+def edge_capabilities(app_exe: str) -> dict:
+    """The capabilities tauri-driver sends to msedgedriver on Windows to drive a WebView2 application."""
+    return {"capabilities": {"alwaysMatch": {"browserName": "webview2", "ms:edgeOptions": {"binary": app_exe, "webviewOptions": {}}}}}
+
+
+def trigger_script_async() -> str:
+    """execute/async body: the same plugin:updater|check call as trigger_expression(), callback style, the outcome captured as plain data."""
+    return (
+        "const done = arguments[arguments.length - 1]; "
+        "(async () => { try { "
+        "const inv = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke; "
+        "if (typeof inv !== 'function') { done({ok: false, stage: 'no-ipc', error: 'window.__TAURI_INTERNALS__.invoke is not available'}); return; } "
+        "const value = await inv('plugin:updater|check', {}); "
+        "done({ok: true, value: (value === undefined ? null : value)}); "
+        "} catch (e) { "
+        "let extra = null; try { extra = (typeof e === 'object' && e !== null) ? JSON.stringify(e, Object.getOwnPropertyNames(e)) : null; } catch (_) {} "
+        "done({ok: false, stage: 'invoke', error: String(e), error_type: typeof e, error_json: extra}); } })();"
+    )
+
+
+def probe_script_async() -> str:
+    return (
+        "const done = arguments[arguments.length - 1]; "
+        "(async () => { const inv = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke; "
+        "let version = null, version_error = null; "
+        "if (typeof inv === 'function') { try { version = await inv('plugin:app|version', {}); } catch (e) { version_error = String(e); } } "
+        "done({ipc: typeof inv === 'function', href: String(location.href), title: String(document.title), app_version: version, app_version_error: version_error}); })();"
+    )
+
+
+class WebDriverPage:
+    """The app's window through msedgedriver (W3C): one session whose `binary` is the released arc-desktop.exe."""
+    kind = "msedgedriver"
+
+    def __init__(self, base: str, opener: Optional[Callable[..., Any]] = None):
+        self.base, self.opener, self.session_id = base, opener, None
+
+    def call(self, method: str, path: str, body: Optional[dict] = None, timeout: float = 60.0) -> Any:
+        status, payload = w3c_call(self.base, method, path, body, timeout, self.opener)
+        return w3c_value(status, payload)
+
+    def open(self, app_exe: str, timeout: float = 120.0) -> dict:
+        value = self.call("POST", "/session", edge_capabilities(app_exe), timeout=timeout)
+        session = value.get("sessionId") if isinstance(value, dict) else None
+        if not session:
+            raise W3CError("no session id", json.dumps(value)[:300])
+        self.session_id = session
+        self.call("POST", "/session/%s/timeouts" % session, {"script": 90000, "pageLoad": 60000, "implicit": 0}, timeout=30)
+        capabilities = value.get("capabilities") if isinstance(value.get("capabilities"), dict) else {}
+        return {key: capabilities.get(key) for key in ("browserName", "browserVersion", "platformName", "msedge", "webview2") if key in capabilities}
+
+    def _run(self, script: str) -> Tuple[bool, Any, Optional[str]]:
+        try:
+            return True, self.call("POST", "/session/%s/execute/async" % self.session_id, {"script": script, "args": []}, timeout=110), None
+        except (W3CError, OSError, ValueError) as error:
+            return False, None, "%s: %s" % (type(error).__name__, error)
+
+    def evaluate_probe(self) -> Tuple[bool, Any, Optional[str]]:
+        return self._run(probe_script_async())
+
+    def evaluate_trigger(self) -> Tuple[bool, Any, Optional[str]]:
+        return self._run(trigger_script_async())
+
+    def close(self) -> None:
+        if self.session_id:
+            try:
+                self.call("DELETE", "/session/%s" % self.session_id, timeout=20)
+            except (W3CError, OSError, ValueError):
+                pass
+            self.session_id = None
+
+
+class CdpPage:
+    """The app's window through the Chrome DevTools Protocol (a websocket to the page target)."""
+    kind = "cdp"
+
+    def __init__(self, ws: Any):
+        self.ws = ws
+
+    def evaluate_probe(self) -> Tuple[bool, Any, Optional[str]]:
+        return cdp_result(cdp_evaluate(self.ws, ipc_probe_expression(), 1, timeout=30))
+
+    def evaluate_trigger(self) -> Tuple[bool, Any, Optional[str]]:
+        return cdp_result(cdp_evaluate(self.ws, trigger_expression(), 2, timeout=90))
+
+    def close(self) -> None:
+        self.ws.close()
+
+
+def read_devtools_port(wv2_launch: str, read: Callable[[str], str]) -> Optional[int]:
+    """Chromium writes DevToolsActivePort (port on the first line) into its user data directory; WebView2's is <folder>\\EBWebView."""
+    for relative in ("EBWebView\\DevToolsActivePort", "DevToolsActivePort"):
+        try:
+            text = read(wv2_launch.rstrip("\\") + "\\" + relative)
+        except OSError:
+            continue
+        first = text.splitlines()[0].strip() if text.strip() else ""
+        if first.isdigit() and int(first) > 0:
+            return int(first)
+    return None
+
+
+def wait_for_devtools_port(wv2_launch: str, timeout: float, read: Optional[Callable[[str], str]] = None, sleep: Callable[[float], None] = time.sleep,
+                           clock: Callable[[], float] = time.time) -> Tuple[Optional[int], str]:
+    reader = read or (lambda path: open(path, "r", encoding="ascii", errors="replace").read())
+    deadline = clock() + timeout
+    while clock() < deadline:
+        port = read_devtools_port(wv2_launch, reader)
+        if port:
+            return port, "ok"
+        sleep(1.0)
+    return None, "DevToolsActivePort never appeared under %s" % wv2_launch
+
+
+def registry_override_argv(value: str) -> List[str]:
+    return ["reg", "add", REGISTRY_KEY, "/v", APP_EXE_NAME, "/t", "REG_SZ", "/d", value, "/f"]
+
+
+def registry_override_remove_argv() -> List[str]:
+    return ["reg", "delete", REGISTRY_KEY, "/v", APP_EXE_NAME, "/f"]
+
+
+def find_app_pid(processes: Optional[List[dict]], app_exe: str) -> Optional[int]:
+    """The newest running process of the installed app (it is a child of msedgedriver in the WebDriver strategy)."""
+    matches = [p for p in processes or [] if norm_path(str(p.get("ExecutablePath") or "")) == norm_path(app_exe)]
+    if not matches:
+        return None
+    matches.sort(key=lambda p: (str(p.get("CreationDate")), p.get("ProcessId") or 0))
+    return int(matches[-1]["ProcessId"])
+
+
+class Launch:
+    """One attempt to get a scripting handle on the app's window with one strategy."""
+
+    def __init__(self, strategy: str, wv2: str):
+        self.strategy, self.wv2 = strategy, wv2
+        self.page: Any = None
+        self.app_proc: Any = None
+        self.driver_proc: Any = None
+        self.handles: List[Any] = []
+        self.error: Optional[str] = None
+        self.notes: Dict[str, Any] = {}
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.page is not None
+
+
+def start_edge_driver(ctx: Context, launch: Launch, tag: str, home: str, popen: Optional[Callable[..., Any]] = None,
+                      call: Optional[Callable[..., Tuple[int, Any]]] = None, sleep: Optional[Callable[[float], None]] = None, clock: Optional[Callable[[], float]] = None) -> str:
+    """Start msedgedriver on a free port with the sandboxed environment and wait for /status; returns the base URL."""
+    popen = popen or subprocess.Popen             # resolved at call time, so a test (or a wrapper) can replace them
+    call = call or w3c_call
+    sleep = sleep or time.sleep
+    clock = clock or time.time
+    exe = find_edge_driver(ctx.env)
+    if not exe:
+        raise RuntimeError("msedgedriver.exe not found (EdgeWebDriver, %s, PATH)" % EDGE_DRIVER_DEFAULT)
+    port = free_port()
+    driver_log = ctx.work / ("msedgedriver-%s.log" % tag)
+    out = (ctx.work / ("msedgedriver-%s.out" % tag)).open("wb")
+    launch.handles.append(out)
+    launch.driver_proc = popen([exe, "--port=%d" % port, "--verbose", "--log-path=%s" % driver_log], env=sandbox_env(ctx.env, home, launch.wv2, port=None),
+                               stdout=out, stderr=subprocess.STDOUT)
+    launch.notes["driver"] = {"exe": exe, "port": port, "log": str(driver_log)}
+    base = "http://127.0.0.1:%d" % port
+    deadline = clock() + 30
+    while clock() < deadline:
+        if launch.driver_proc.poll() is not None:
+            raise RuntimeError("msedgedriver exited with code %s before it was ready" % launch.driver_proc.poll())
+        try:
+            status, _payload = call(base, "GET", "/status", None, 3.0)
+            if status == 200:
+                return base
+        except (OSError, ValueError, urllib.error.URLError):
+            pass
+        sleep(0.5)
+    raise RuntimeError("msedgedriver did not answer /status within 30 s")
+
+
+def try_strategy(ctx: Context, strategy: str, tag: str, home: str, wv2_launch: str, popen: Optional[Callable[..., Any]] = None) -> Launch:
+    """Start the app by one strategy and return the Launch; a failure is recorded in launch.error, never raised."""
+    popen = popen or subprocess.Popen
+    launch = Launch(strategy, wv2_launch)
+    try:
+        Path(wv2_launch).mkdir(parents=True, exist_ok=True)
+        if strategy == "msedgedriver":
+            base = start_edge_driver(ctx, launch, tag, home, popen)
+            page = WebDriverPage(base)
+            launch.page = page          # so a half-open session is still closed
+            launch.notes["session"] = page.open(ctx.app_exe, timeout=120)
+        elif strategy in ("cdp-env", "cdp-registry"):
+            args = "--remote-debugging-port=0 --remote-allow-origins=*"
+            if strategy == "cdp-registry":
+                done = ctx.shell.run(registry_override_argv(args), timeout=30)
+                if not done.ok:
+                    raise RuntimeError("reg add failed: %s" % done.out[-200:])
+                ctx.registry_override = True
+                launch.notes["registry"] = REGISTRY_KEY
+            log = (ctx.work / ("app-%s.raw.log" % tag)).open("wb")
+            launch.handles.append(log)
+            launch.app_proc = popen([ctx.app_exe], env=sandbox_env(ctx.env, home, wv2_launch, port=0), cwd=ctx.install_dir, stdout=log, stderr=subprocess.STDOUT)
+            port, why = wait_for_devtools_port(wv2_launch, 60.0)
+            launch.notes["devtools_port"] = port
+            if port is None:
+                raise RuntimeError(why)
+            target, why = wait_for_page(port, 60.0)
+            if target is None:
+                raise RuntimeError("the DevTools page target never appeared (%s)" % why)
+            host, wsport, path = parse_ws_url(target["webSocketDebuggerUrl"])
+            ws = WebSocketClient(host, wsport, path)
+            launch.page = CdpPage(ws)
+            ws.connect()
+        else:
+            raise RuntimeError("unknown strategy %r" % strategy)
+    except Exception as error:  # noqa: BLE001 - recorded, the next strategy is tried; launch.page stays so close_launch can close a half-open session
+        launch.error = "%s: %s" % (type(error).__name__, str(error)[:600])
+    return launch
+
+
+def close_launch(ctx: Context, launch: Launch, wv2_base: str) -> None:
+    if launch.page is not None:
+        try:
+            launch.page.close()
+        except Exception as error:  # noqa: BLE001
+            ctx.shell.log("closing the %s session failed: %s" % (launch.strategy, error))
+    if launch.driver_proc is not None and launch.driver_proc.poll() is None:
+        try:
+            launch.driver_proc.kill()
+        except OSError:
+            pass
+    pid = launch.app_proc.pid if launch.app_proc is not None else None
+    kill_app(ctx, pid, wv2_base)
+    if ctx.registry_override:
+        ctx.shell.run(registry_override_remove_argv(), timeout=30, quiet=True)
+        ctx.registry_override = False
+    for handle in launch.handles:
+        try:
+            handle.close()
+        except OSError:
+            pass
+    launch.handles = []
+
+
+def webview_command_lines(processes: Optional[List[dict]]) -> List[str]:
+    """Command lines of the msedgewebview2.exe processes (whether --remote-debugging-port arrived), IPs masked, trimmed."""
+    lines = []
+    for process in processes or []:
+        if str(process.get("Name") or "").lower() == WEBVIEW2_PROCESS:
+            lines.append(mask_ips(str(process.get("CommandLine") or ""))[:2500])
+    return lines
 
 
 def case_summary(requests: Dict[str, Any], classification: Optional[Dict[str, Any]], install_changes: Optional[List[str]], cycles: int) -> Dict[str, Any]:
@@ -1478,7 +1834,8 @@ def case_summary(requests: Dict[str, Any], classification: Optional[Dict[str, An
 
 def judge_recorded_case(scenario: str, trigger: Dict[str, Any], requests_path: Path, writes_path: Path, before: Optional[Dict[str, dict]], after: Dict[str, dict],
                         policies: Sequence[Dict[str, str]], install_dir: str, procs_before: Optional[List[dict]], procs_after: Optional[List[dict]],
-                        app_pid: Optional[int], markers: Sequence[str], ignore_exes: Sequence[str], cycles: int, min_cycles: int, diff_path: Optional[Path] = None) -> Dict[str, Any]:
+                        app_pid: Optional[int], markers: Sequence[str], ignore_exes: Sequence[str], cycles: int, min_cycles: int, diff_path: Optional[Path] = None,
+                        webview_markers: Sequence[str] = ()) -> Dict[str, Any]:
     """Everything a case recorded -> the case fields (requests, file_changes, criteria, verdict, reasons, process_changes)."""
     delta = diff_snapshots(before, after) if before is not None else None
     classification = classify_fs_changes(delta, policies) if delta is not None else None
@@ -1488,7 +1845,7 @@ def judge_recorded_case(scenario: str, trigger: Dict[str, Any], requests_path: P
     write_records = read_jsonl(writes_path)
     writes_ok = bool(write_records) and cycles >= min_cycles and any(r.get("event") == "stop" for r in write_records)
     requests = summarize_requests(read_jsonl(requests_path))
-    violations = process_violations(procs_before, procs_after, app_pid, markers, ignore_exes)
+    violations = process_violations(procs_before, procs_after, app_pid, markers, ignore_exes, webview_markers)
     judgement = evaluate_case(scenario, trigger, requests, classification, violations, writes_ok, install_changes)
     fields = case_summary(requests, classification, install_changes, cycles)
     fields.update(criteria=judgement["criteria"], verdict=judgement["verdict"], reasons=judgement["reasons"], process_changes=violations)
@@ -1503,8 +1860,56 @@ def mask_file(src: Path, dest: Path) -> None:
         pass
 
 
+def strategy_order(ctx: Context) -> List[str]:
+    """The configured strategies, the one that worked in an earlier case first."""
+    order = list(ctx.strategies)
+    if ctx.winning_strategy in order:
+        order.remove(ctx.winning_strategy)
+        order.insert(0, ctx.winning_strategy)
+    return order
+
+
+def acquire_page(ctx: Context, tag: str, home: str, wv2_base: str, evidence: Path, files: List[str],
+                 try_one: Optional[Callable[..., Launch]] = None) -> Tuple[Optional[Launch], List[dict]]:
+    """Try the strategies in order until one gives a scripting handle on the app's window. Every attempt leaves a launched-process record
+    (with the WebView2 command lines, to see whether --remote-debugging-port arrived) and a line in the attempts list."""
+    attempts: List[dict] = []
+    for strategy in strategy_order(ctx):
+        kill_app(ctx, None, wv2_base)                                  # nothing from an earlier attempt or case may survive into this one
+        left = leftover_processes(snapshot_processes(ctx.shell), [wv2_base, ctx.install_dir])
+        wv2_launch = wv2_base.rstrip("\\") + "\\" + tag + "-" + strategy
+        launch = (try_one or try_strategy)(ctx, strategy, tag, home, wv2_launch)
+        launched = snapshot_processes(ctx.shell)
+        name = "procs-%s-%s-launched.txt" % (tag, strategy)
+        write_process_list(evidence / name, launched)
+        files.append(name)
+        lines = webview_command_lines(launched)
+        attempts.append({
+            "strategy": strategy, "ok": launch.ok, "error": launch.error, "user_data_folder": wv2_launch, "leftovers_before_launch": left,
+            "webview2_process_count": len(lines),
+            "remote_debugging_in_webview2_command_line": any("--remote-debugging" in line for line in lines),     # did the flag arrive at the browser process at all?
+            "webview2_command_lines": lines, "notes": launch.notes,
+        })
+        if launch.ok:
+            ctx.winning_strategy = strategy
+            return launch, attempts
+        close_launch(ctx, launch, wv2_base)
+    return None, attempts
+
+
+def copy_driver_log(ctx: Context, tag: str, evidence: Path, files: List[str]) -> None:
+    """The masked tail of msedgedriver's own log (it records how it started the app) goes into the evidence."""
+    for suffix in (".log", ".out"):
+        source = ctx.work / ("msedgedriver-%s%s" % (tag, suffix))
+        if source.is_file():
+            lines = mask_ips(source.read_text(encoding="utf-8", errors="replace")).splitlines()[-300:]
+            name = "msedgedriver-%s%s" % (tag, suffix)
+            (evidence / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
+            files.append(name)
+
+
 def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: float = 10.0) -> Dict[str, Any]:
-    """One released-app case: record, launch, trigger over CDP, record again, evaluate."""
+    """One released-app case: record, launch (msedgedriver first, DevTools as the fallback), trigger, record again, evaluate."""
     shell, evidence = ctx.shell, ctx.evidence
     scenario = CASE_SCENARIO[name]
     tag = "app-" + name
@@ -1512,18 +1917,18 @@ def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: 
     case: Dict[str, Any] = {"name": name, "tier": "released_app", "scenario": scenario, "trigger_outcome": {}, "evidence_files": files}
     requests_path = evidence / ("requests-%s.jsonl" % tag)
     writes_path = evidence / ("writes-%s.jsonl" % tag)
-    raw_log = ctx.work / ("app-%s.raw.log" % tag)
-    home, wv2 = state["home"], state["wv2"]
-    policies = fs_policies(home, wv2, ctx.install_dir, ctx.env)
+    home, wv2_base = state["home"], state["wv2"]
+    policies = fs_policies(home, wv2_base, ctx.install_dir, ctx.env)
     roots = fs_watch_roots(policies)
     mitm = MitmProcess(scenario, ctx.ca_info["server_cert"], ctx.ca_info["server_key"], requests_path, evidence / ("ready-%s" % tag))
     poller = Poller(roots, writes_path)
-    pid: Optional[int] = None
+    launch: Optional[Launch] = None
     trigger: Dict[str, Any] = {"ran": False, "ok": False, "error_text": "not reached", "stage": "setup", "value": None}
     procs_before = procs_after = None
     before_snapshot: Optional[Dict[str, dict]] = None
+    app_pid: Optional[int] = None
+    attempts: List[dict] = []
     cycles = 0
-    app_log = None
     try:
         mitm.start()
         before_snapshot = take_snapshot(roots)
@@ -1531,33 +1936,22 @@ def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: 
         prelaunch = snapshot_processes(shell)
         write_process_list(evidence / ("procs-%s-prelaunch.txt" % tag), prelaunch)
         poller.start()
-        env = sandbox_env(ctx.env, home, wv2)
-        raw_log.parent.mkdir(parents=True, exist_ok=True)
-        app_log = raw_log.open("wb")
-        proc = subprocess.Popen([ctx.app_exe], env=env, cwd=ctx.install_dir, stdout=app_log, stderr=subprocess.STDOUT)
-        pid = proc.pid
-        shell.log("launched %s pid=%d case=%s" % (ctx.app_exe, pid, tag))
-        target, why = wait_for_page(CDP_PORT, 120.0)
-        if target is None:
-            trigger = {"ran": False, "ok": False, "error_text": "the DevTools page target never appeared (%s); app exit code %s" % (why, proc.poll()), "stage": "cdp", "value": None}
+        launch, attempts = acquire_page(ctx, tag, home, wv2_base, evidence, files)
+        if launch is None:
+            summary = "; ".join("%s: %s" % (a["strategy"], a["error"]) for a in attempts)
+            trigger = {"ran": False, "ok": False, "error_text": "no strategy gave a handle on the app window (%s)" % summary[:900], "stage": "launch", "value": None}
         else:
             time.sleep(5)       # let the page finish its first load before the call
             procs_before = snapshot_processes(shell)
             write_process_list(evidence / ("procs-%s-before.txt" % tag), procs_before)
-            host, port, path = parse_ws_url(target["webSocketDebuggerUrl"])
-            ws = WebSocketClient(host, port, path)
-            try:
-                ws.connect()
-                ok, value, error = cdp_result(cdp_evaluate(ws, ipc_probe_expression(), 1, timeout=30))
-                case["page_probe"] = {"ok": ok, "value": value, "error": error, "target_url": target.get("url")}
-                poller.mark("trigger_begin")
-                ok, value, error = cdp_result(cdp_evaluate(ws, trigger_expression(), 2, timeout=90))
-                poller.mark("trigger_end")
-                trigger = trigger_outcome_from(value, error, ok)
-            except (WebSocketError, OSError, ValueError) as error:
-                trigger = {"ran": False, "ok": False, "error_text": "%s: %s" % (type(error).__name__, error), "stage": "cdp", "value": None}
-            finally:
-                ws.close()
+            app_pid = launch.app_proc.pid if launch.app_proc is not None else find_app_pid(procs_before, ctx.app_exe)
+            ok, value, error = launch.page.evaluate_probe()
+            case["page_probe"] = {"ok": ok, "value": value, "error": error, "path": launch.page.kind}
+            poller.mark("trigger_begin")
+            ok, value, error = launch.page.evaluate_trigger()
+            poller.mark("trigger_end")
+            trigger = trigger_outcome_from(value, error, ok)
+            trigger["path"] = launch.page.kind
             time.sleep(settle_s)
             procs_after = snapshot_processes(shell)
             write_process_list(evidence / ("procs-%s-after.txt" % tag), procs_after)
@@ -1566,20 +1960,26 @@ def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: 
         shell.log("case %s crashed: %s: %s" % (tag, type(error).__name__, error))
     finally:
         if poller.thread is not None:
-            cycles = poller.stop()
+            cycles = poller.finish()
         after_snapshot = take_snapshot(roots)
         write_json(evidence / ("fs-%s-after.json" % tag), after_snapshot)
-        kill_app(ctx, pid, wv2)
+        if launch is not None:
+            close_launch(ctx, launch, wv2_base)
+        else:
+            kill_app(ctx, None, wv2_base)
         mitm.stop()
-        if app_log is not None:
-            app_log.close()
-        mask_file(raw_log, evidence / ("app-%s.log" % tag))
+        copy_driver_log(ctx, tag, evidence, files)
+        for source in sorted(ctx.work.glob("app-%s.raw.log" % tag)):
+            mask_file(source, evidence / ("app-%s.log" % tag))
+    trigger.setdefault("attempts", attempts)
     case["trigger_outcome"] = trigger
-    case.update(judge_recorded_case(scenario, trigger, requests_path, writes_path, before_snapshot, after_snapshot, policies, ctx.install_dir, procs_before, procs_after, pid,
-                                    [ctx.install_dir, home, "network.arc.desktop", "ARC.Node_"], [], cycles, 3, evidence / ("fs-%s-diff.json" % tag)))
+    case["launch_attempts"] = attempts
+    case.update(judge_recorded_case(scenario, trigger, requests_path, writes_path, before_snapshot, after_snapshot, policies, ctx.install_dir, procs_before, procs_after, app_pid,
+                                    [ctx.install_dir, home, "network.arc.desktop", "ARC.Node_"], [], cycles, 3, evidence / ("fs-%s-diff.json" % tag),
+                                    webview_markers=[wv2_base]))
     for pattern in ("requests-%s.jsonl", "writes-%s.jsonl", "fs-%s-before.json", "fs-%s-after.json", "fs-%s-diff.json", "procs-%s-prelaunch.txt", "procs-%s-before.txt",
                     "procs-%s-after.txt", "app-%s.log"):
-        if (evidence / (pattern % tag)).is_file():
+        if (evidence / (pattern % tag)).is_file() and (pattern % tag) not in files:
             files.append(pattern % tag)
     return case
 
@@ -1668,13 +2068,13 @@ def run_native_case(ctx: Context, name: str, exe: Path, pubkey: str, control: bo
         shell.log("native case %s crashed: %s: %s" % (tag, type(error).__name__, error))
     finally:
         if poller.thread is not None:
-            cycles = poller.stop()
+            cycles = poller.finish()          # a 0.1 s check still leaves at least two full cycles of the write log
         after = take_snapshot(roots)
         write_json(evidence / ("fs-%s-after.json" % tag), after)
         mitm.stop()
     case["trigger_outcome"] = trigger
     case["native_report"] = report
-    case.update(judge_recorded_case(scenario, trigger, requests_path, writes_path, before, after, policies, ctx.install_dir, procs_before, procs_after, os.getpid(), [],
+    case.update(judge_recorded_case(scenario, trigger, requests_path, writes_path, before, after, policies, ctx.install_dir, procs_before, procs_after, 0, [],
                                     [str(exe)], cycles, 2, evidence / ("fs-%s-diff.json" % tag)))
     for pattern in ("requests-%s.jsonl", "writes-%s.jsonl", "fs-%s-before.json", "fs-%s-after.json", "fs-%s-diff.json", "procs-%s-before.txt", "procs-%s-after.txt"):
         if (evidence / (pattern % tag)).is_file():
@@ -1720,6 +2120,9 @@ def cleanup(ctx: Context) -> None:
     shell.run(["ipconfig", "/flushdns"], timeout=30, quiet=True)
     if ctx.thumbprint:
         shell.run(certutil_del_argv(ctx.thumbprint), timeout=60)
+    if ctx.registry_override:
+        shell.run(registry_override_remove_argv(), timeout=30, quiet=True)
+        ctx.registry_override = False
     if ctx.live_block or ctx.rule_created:
         shell.run(powershell_argv(firewall_remove_script()), timeout=60)
 
@@ -1763,6 +2166,11 @@ def released_app_tier(ctx: Context, asset: dict, installer: Path, pubkey: Option
         run_released_case(ctx, "clean", state)
     cases = [run_released_case(ctx, name, state) for name in ordered]
     tier["result"] = tier_result(cases_wanted, cases, "ran")
+    used = sorted({str((c.get("trigger_outcome") or {}).get("path")) for c in cases if (c.get("trigger_outcome") or {}).get("ran")})
+    tier["trigger"] = ("msedgedriver W3C session (browserName webview2) -> plugin:updater|check" if used == ["msedgedriver"] else
+                       "WebView2 DevTools Protocol -> plugin:updater|check" if used == ["cdp"] else
+                       "mixed: %s -> plugin:updater|check" % ", ".join(used) if used else "none ran (see launch_attempts in each case)")
+    tier["paths_used"] = used
     clean = next((c for c in cases if c["name"] == "clean"), None)
     if clean:
         reported = (((clean.get("page_probe") or {}).get("value")) or {}).get("app_version")
@@ -1811,6 +2219,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     shell = Shell(evidence / "steps.log")
     work = Path(args.work) if args.work else Path(os.environ.get("ARCW0_WORK", r"C:\arcw0" if IS_WINDOWS else str(evidence / "work")))
     ctx = Context(evidence, work, shell, load_config(args.config))
+    strategies = [name for name in str(getattr(args, "strategies", ",".join(TRIGGER_STRATEGIES))).split(",") if name]
+    if not strategies or any(name not in TRIGGER_STRATEGIES for name in strategies):
+        print("unknown strategy in %r" % (strategies,), file=sys.stderr)
+        return 2
+    ctx.strategies = strategies
     wanted_tiers = list(TIERS) if args.tier == "both" else [args.tier]
     cases_wanted = [name for name in args.cases.split(",") if name]
     for name in cases_wanted:
@@ -1985,39 +2398,33 @@ def native_selftest(shell: Shell, exe: str, pubkey: str) -> Dict[str, Any]:
 
 
 def probe_app_launch(ctx: Context, mitm: Optional[MitmProcess], port: int = CDP_PORT) -> Dict[str, Any]:
-    """Launch the installed released app (live network blocked, GitHub names on the recording server) and look at its page. NO updater call."""
-    home, wv2 = ctx.work / "probe-home", ctx.work / "probe-wv2"
+    """Launch the installed released app (live network blocked, GitHub names on the recording server) by the trigger strategies and look at its page. NO updater call."""
+    home, wv2_base = ctx.work / "probe-home", ctx.work / "probe-wv2"
     home.mkdir(parents=True, exist_ok=True)
-    wv2.mkdir(parents=True, exist_ok=True)
+    wv2_base.mkdir(parents=True, exist_ok=True)
     before = len(read_jsonl(mitm.log_path) or []) if mitm else 0
-    log_path = ctx.work / "probe-app.raw.log"
-    handle = log_path.open("wb")
-    proc = subprocess.Popen([ctx.app_exe], env=sandbox_env(ctx.env, str(home), str(wv2), port), cwd=ctx.install_dir, stdout=handle, stderr=subprocess.STDOUT)
-    result: Dict[str, Any] = {"pid": proc.pid}
+    files: List[str] = []
+    launch, attempts = acquire_page(ctx, "probe", str(home), str(wv2_base), ctx.evidence, files)
+    result: Dict[str, Any] = {"attempts": attempts, "files": files, "port_hint": port}
     try:
-        target, why = wait_for_page(port, 90.0)
-        result["page_target"] = {"found": bool(target), "why": why, "url": (target or {}).get("url")}
-        if target:
+        if launch is not None:
             time.sleep(5)
-            host, wsport, path = parse_ws_url(target["webSocketDebuggerUrl"])
-            ws = WebSocketClient(host, wsport, path)
-            try:
-                ws.connect()
-                ok, value, error = cdp_result(cdp_evaluate(ws, ipc_probe_expression(), 1, timeout=30))
-                result["ipc_probe"] = {"ok": ok, "value": value, "error": error}
-            finally:
-                ws.close()
+            ok, value, error = launch.page.evaluate_probe()
+            result["ipc_probe"] = {"ok": ok, "value": value, "error": error, "path": launch.page.kind}
             time.sleep(5)
         if mitm:
             records = (read_jsonl(mitm.log_path) or [])[before:]
             result["idle_launch_requests"] = {key: value for key, value in summarize_requests(records).items() if key != "present"}
-        result["exit_code_while_probing"] = proc.poll()
     finally:
-        kill_app(ctx, proc.pid, str(wv2))
-        handle.close()
-        mask_file(log_path, ctx.evidence / "probe-app.log")
-    if not result["page_target"]["found"]:
-        raise RuntimeError("the DevTools page target never appeared: %s" % json.dumps(result, default=str)[:600])
+        if launch is not None:
+            close_launch(ctx, launch, str(wv2_base))
+        else:
+            kill_app(ctx, None, str(wv2_base))
+        copy_driver_log(ctx, "probe", ctx.evidence, files)
+        for source in sorted(ctx.work.glob("app-probe.raw.log")):
+            mask_file(source, ctx.evidence / "probe-app.log")
+    if launch is None:
+        raise RuntimeError("no strategy gave a handle on the app window: %s" % json.dumps(attempts, default=str)[:1200])
     return result
 
 
@@ -2246,6 +2653,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     run.add_argument("--config", default=None)
     run.add_argument("--work", default=None)
     run.add_argument("--native-exe", default=None, help="path of the pre-built native-updater-check.exe (default: the workflow's cargo target directory)")
+    run.add_argument("--strategies", default=",".join(TRIGGER_STRATEGIES), help="how to get a handle on the app window, in order: msedgedriver, cdp-env, cdp-registry")
     args = parser.parse_args(argv)
     if args.command == "probe":
         try:

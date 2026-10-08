@@ -46,6 +46,9 @@ KNOWN_BLOBS = {
 
 
 def _has_tag(path: Optional[Path]) -> bool:
+    # Reading the real repository (even read-only) is opt-in: the shared checkout is never touched by a default local run.
+    if os.environ.get("WAVE0_TEST_REAL_REPO") != "1":
+        return False
     if path is None or not Path(path).is_dir():
         return False
     try:

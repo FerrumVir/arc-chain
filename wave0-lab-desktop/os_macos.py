@@ -13,6 +13,23 @@ macOS) therefore talks to the recorder. The app's own banner (check_for_update) 
 webpki roots: their handshake is refused by the client and shows up as kind "tls_failure"; they are NOT intercepted, and the
 evidence says so. Every ARC address (the six live nodes) is blocked with pf for the whole run and the rules are verified.
 
+Fixes after the first macOS CI run (37800515512):
+  * ONE CA per job: the probe and run phases share it (RUNNER_TEMP/wave0-desktop-macos-shared): generated once, trusted once, removed
+    once (the run phase removes it, or `cleanup`; `probe --keep-ca` is the default so the run phase finds it trusted). Every security(1)
+    call is bounded; the admin trust-settings right is granted (`authorizationdb write ... allow`) BEFORE every add attempt, a timed
+    out call is followed by killing the orphaned security process and any SecurityAgent dialog (killing sudo does not kill root's
+    child), and an add gets three attempts of 60/45/45 s. A repeated add and a remove had hung for their full timeouts before.
+  * The hosts file did not keep WebKit's network process away from rsms.me (it held ESTABLISHED TLS to Cloudflare addresses): the real
+    addresses of rsms.me (system resolver before the mapping, `dig` any time) are added to the pf block next to the six ARC addresses,
+    one labelled rule per address, verified the same way, refreshed before every case; a blocked attempt is information, an
+    ESTABLISHED connection to any of them fails the case. isolation.json holds, for every mapped name, what dscacheutil and
+    getaddrinfo answer after the mapping, to find out who ignores /etc/hosts.
+  * The banner's unintercepted API call may answer without a tag (the UI then shows "vUNKNOWN"; most likely the unauthenticated rate
+    limit of a shared runner address). Check for updates is clicked up to three more times, 20 s apart, the Updates card text is
+    recorded after every click, and an Install button that is present BEFORE the check is never clicked. If it never appears the
+    released-app tier is infeasible with the exact UI text; the plugin path is claimed reached through the released app ONLY when
+    a manifest request arrived at the recorder after an Install click.
+
 Two tiers, labelled honestly in result.json:
 
   released_app   the real v0.7.11 .dmg (digest-verified against the release API BEFORE use) is mounted, the .app copied into a
@@ -40,7 +57,8 @@ Two tiers, labelled honestly in result.json:
                  "cached-bait", plus a --control-download POSITIVE CONTROL proving the recorder sees a bundle request). This
                  is the macOS evidence for the plugin path: same plugin version, same OS trust-store verifier.
 
-Subcommands (both refuse to run unless GITHUB_ACTIONS=true: they change /etc/hosts, the keychain and pf and drive the GUI):
+Subcommands (all refuse to run unless GITHUB_ACTIONS=true: they change /etc/hosts, the keychain and pf and drive the GUI):
+  cleanup --evidence DIR   take the per-job CA's trust away once (bounded, never fails); for an `if: always()` step at the end of a job
   probe --evidence DIR [--arch arm64|x86_64] [--no-build] [--build-wait-min 15] [--budget-min 25] [--no-real-banner-api]
         what this runner can do (hosts, port 443, trust store, release download, Accessibility three ways, the app window and its AX
         tree, the whole Settings > Check for updates > Install chain once); writes probe.json, accessibility.json, feasibility.txt
@@ -87,6 +105,11 @@ UNVERIFIED ON CI (nothing below could be run on the author's Mac; the first CI r
     process names the lsof records still attribute sockets to processes);
   * that the Updates card shows the plugin error as text the AX tree exposes ("Update failed: ...", data-testid update-error) and that
     the banner's react-query result renders the Install button within about 30 s of the click;
+  * that `authorizationdb write com.apple.trust-settings.admin allow` really prevents the dialog that hung the second add/remove, and that
+    killing `security`/`SecurityAgent` after a timeout leaves the trust store usable;
+  * which resolver path let WebKit reach rsms.me despite the hosts line (HTTPS/SVCB hints, a cached answer, or the mapping not yet
+    in effect for that process): the pf block does not depend on the answer, the resolution views in isolation.json should tell;
+  * that `dig` (BIND tools) is present on the runner image (without it the system resolver's answers before the mapping are used);
   * that the mitm_server ready file appears within 20 s after `sudo -n python3 lib/mitm_server.py ...`.
 """
 from __future__ import annotations
@@ -270,12 +293,24 @@ def load_live_ips(root: Path = ROOT) -> List[str]:
     )
 
 
-def pf_conf_text(live_ips: Sequence[str]) -> str:
-    """pf rules that drop every outbound packet to a live node: one rule per address. Each rule carries its own label because
+def canonical_ip(address: str) -> str:
+    """The textual form pf prints (compressed, lower case); anything that is not an address is returned unchanged."""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(address.strip().strip("[]")).compressed
+    except ValueError:
+        return address
+
+
+def pf_conf_text(live_ips: Sequence[str], extra_ips: Sequence[str] = ()) -> str:
+    """pf rules that drop every outbound packet to a live node (labels wave0-live-N) and to the extra addresses (wave0-extra-N, the
+    second line of defence for a name the hosts file cannot hold back): one rule per address. Each rule carries its own label because
     pf's ruleset optimizer otherwise merges identical rules that differ only in the address into ONE rule on an anonymous table
     (`block drop out quick inet from any to <__automatic_xxx_0>`), which the listing no longer names address by address (the first
     CI run of this lab could not verify the block for that reason and, failing closed, launched nothing)."""
-    return "".join('block drop out quick to %s label "wave0-live-%d"\n' % (address, index) for index, address in enumerate(live_ips, 1))
+    lines = ['block drop out quick to %s label "wave0-live-%d"\n' % (canonical_ip(address), index) for index, address in enumerate(live_ips, 1)]
+    lines += ['block drop out quick to %s label "wave0-extra-%d"\n' % (canonical_ip(address), index) for index, address in enumerate(extra_ips, 1)]
+    return "".join(lines)
 
 
 def automatic_tables(rules_text: str) -> List[str]:
@@ -284,22 +319,39 @@ def automatic_tables(rules_text: str) -> List[str]:
 
 
 def addresses_in_tables(table_outputs: Sequence[str], live_ips: Sequence[str]) -> int:
-    """How many live addresses appear in the `pfctl -t NAME -T show` outputs of the anonymous tables."""
+    """How many of the given addresses (IPv4 or IPv6) appear in the `pfctl -t NAME -T show` outputs of the anonymous tables."""
     seen = set()
     for text in table_outputs:
-        for token in re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text):
-            seen.add(token)
-    return sum(1 for address in live_ips if address in seen)
+        for token in text.split():
+            seen.add(canonical_ip(token))
+    return sum(1 for address in live_ips if canonical_ip(address) in seen)
 
 
 def count_pf_block_rules(rules_text: str, live_ips: Sequence[str]) -> int:
-    """How many live addresses appear in a `pfctl -sr` listing as block rules."""
+    """How many of the given addresses appear in a `pfctl -sr` listing as block rules."""
     count = 0
     for address in live_ips:
-        pattern = re.compile(r"block\s+drop\s+out\s+quick.*\b" + re.escape(address) + r"\b")
+        pattern = re.compile(r"block\s+drop\s+out\s+quick.*\b" + re.escape(canonical_ip(address)) + r"(?![0-9A-Fa-f:.])")
         if any(pattern.search(line) for line in rules_text.splitlines()):
             count += 1
     return count
+
+
+def parse_dig_addresses(text: str) -> List[str]:
+    """Addresses (A and AAAA answers) in `dig +short` output; CNAME targets and other lines are skipped."""
+    import ipaddress
+    found: List[str] = []
+    for line in (text or "").splitlines():
+        token = line.strip().split(" ")[0]
+        try:
+            address = ipaddress.ip_address(token)
+        except ValueError:
+            continue
+        if address.is_loopback or address.is_private or address.is_unspecified or address.is_link_local:
+            continue
+        if address.compressed not in found:
+            found.append(address.compressed)
+    return found
 
 
 def hosts_block(hostnames: Sequence[str], blackholes: Sequence[str] = BLACKHOLE_NAMES) -> str:
@@ -1094,10 +1146,12 @@ def build_feasibility(probe: Dict[str, Any]) -> str:
         first += "; the released app window did NOT appear within the wait (%s)." % (ui.get("problem") or "no window")
     else:
         first += "; the released app was not launched in this run (%s)." % (ui.get("problem") or "not attempted")
-    real = bool(ui.get("real_banner_api"))
+    real = bool(probe["real_banner_api"]) if "real_banner_api" in probe else bool(ui.get("real_banner_api"))
     second = ("The plugin check() is reachable from the released app only through the Install button, which Settings.tsx renders only after the banner call "
               "check_for_update (bundled webpki roots, not interceptable) reports an update; real-banner mode (one read-only GET to api.github.com allowed through, "
               "approved by work-99) was %s: Install button present after Check for updates = %s" % ("ON" if real else "OFF", "YES" if ui.get("install_button") else "NO"))
+    if not ui.get("install_button") and ui.get("banner_ui_text"):
+        second += " (UI after %s Check for updates click(s): %s)" % (len(ui.get("banner_attempts") or []), ui.get("banner_ui_text"))
     if ui.get("install_clicked"):
         second += "; clicked, the recorder saw %s manifest request(s) and the UI said: %r" % (ui.get("manifest_requests"), ui.get("ui_error_text"))
     if ui.get("network_violations"):
@@ -1434,7 +1488,8 @@ def collect_provenance(rec: Recorder, binary: Path, evidence: Path) -> Dict[str,
 class Interception:
     """Everything that touches the runner: torn down by teardown() (idempotent, also registered with atexit)."""
 
-    def __init__(self, rec: Recorder, evidence: Path, work: Path, live_ips: Sequence[str], real_banner: bool = True):
+    def __init__(self, rec: Recorder, evidence: Path, work: Path, live_ips: Sequence[str], real_banner: bool = True,
+                 shared_dir: Optional[Path] = None, keep_ca: bool = False):
         self.rec = rec
         self.evidence = evidence
         self.work = work
@@ -1442,6 +1497,14 @@ class Interception:
         self.real_banner = real_banner
         self.hosts = intercept_hosts(real_banner)
         self.banner_api_ips: List[str] = []
+        # second line of defence: names whose addresses are blocked in pf next to the live nodes (the hosts file did not hold WebKit back from rsms.me)
+        self.extra_block_names: Tuple[str, ...] = EXTRA_INTERCEPT_HOSTS
+        self.extra_block_ips: List[str] = []
+        self.pf_conf = work / "pf-live-block.conf"
+        # one CA per JOB, shared by the probe and run phases: generated once, trusted once, removed once (a repeated security(1) call hung)
+        self.shared_dir = Path(shared_dir) if shared_dir is not None else work / "shared"
+        self.keep_ca = keep_ca
+        self.ca_reused = False
         self.ca: Optional[Dict[str, Any]] = None
         self.ca_sha1: Optional[str] = None
         self.trusted = False
@@ -1461,34 +1524,84 @@ class Interception:
         atexit.register(self.teardown)
 
     # ---- live-network block (pf) ----------------------------------------------------------------------------
-    def block_live_network(self) -> Dict[str, Any]:
-        info: Dict[str, Any] = {"method": "pf", "addresses": len(self.live_ips), "verified": False}
-        conf = self.work / "pf-live-block.conf"
-        conf.write_text(pf_conf_text(self.live_ips), encoding="utf-8")
+    @property
+    def blocked_ips(self) -> List[str]:
+        """Every address pf drops traffic to: the six live nodes and the resolved addresses of the extra names."""
+        return [canonical_ip(a) for a in self.live_ips] + list(self.extra_block_ips)
+
+    def resolve_names(self, names: Sequence[str], system: bool = True) -> Dict[str, List[str]]:
+        """Real addresses of names, resolved ON THE RUNNER at run time (never hard-coded): the system resolver before the hosts mapping
+        and `dig +short` (which does not read /etc/hosts) at any time."""
+        import socket
+        found: Dict[str, List[str]] = {}
+        for name in names:
+            addresses: List[str] = []
+            if system:
+                try:
+                    for item in socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP):
+                        candidate = canonical_ip(item[4][0])
+                        if candidate not in addresses and not is_loopback(candidate):
+                            addresses.append(candidate)
+                except OSError as error:
+                    self.rec.note("could not resolve %s: %s" % (name, error))
+            for record in ("A", "AAAA"):
+                done = self.rec.run(["dig", "+short", "+time=3", "+tries=2", record, name], label="dig %s %s (real resolver, ignores /etc/hosts)" % (record, name), timeout=20)
+                for candidate in parse_dig_addresses(done.out):
+                    if candidate not in addresses:
+                        addresses.append(candidate)
+            found[name] = addresses
+        return found
+
+    def apply_pf(self) -> Dict[str, Any]:
+        """Write the rules (live nodes + extra addresses), load them, make sure pf is on, and verify one rule per address."""
+        total = self.blocked_ips
+        info: Dict[str, Any] = {"method": "pf", "addresses": len(self.live_ips), "extra_addresses": len(self.extra_block_ips), "verified": False}
+        self.pf_conf.write_text(pf_conf_text(self.live_ips, self.extra_block_ips), encoding="utf-8")
         before = self.rec.run(["pfctl", "-s", "info"], label="pf status before", timeout=30, sudo=True)
         was_enabled = "Status: Enabled" in before.text
-        load = self.rec.run(["pfctl", "-f", str(conf)], label="load the pf block rules (live nodes)", timeout=30, sudo=True)
+        load = self.rec.run(["pfctl", "-f", str(self.pf_conf)], label="load the pf block rules (live nodes and extra addresses)", timeout=30, sudo=True)
         self.pf_loaded = load.ok
         enable = self.rec.run(["pfctl", "-e"], label="enable pf", timeout=30, sudo=True)
         status = self.rec.run(["pfctl", "-s", "info"], label="pf status after", timeout=30, sudo=True)
         rules = self.rec.run(["pfctl", "-sr"], label="pf rules loaded", timeout=30, sudo=True)
-        self.pf_enabled_by_us = not was_enabled and "Status: Enabled" in status.text
-        count = count_pf_block_rules(rules.text, self.live_ips)
+        if not self.pf_enabled_by_us:
+            self.pf_enabled_by_us = not was_enabled and "Status: Enabled" in status.text
+        count = count_pf_block_rules(rules.text, total)
         table_count = None
-        if count != len(self.live_ips) and automatic_tables(rules.text):
+        if count != len(total) and automatic_tables(rules.text):
             # the optimizer merged the rules into an anonymous table: read the table, the block rule must still name it
             outputs = [self.rec.run(["pfctl", "-t", name, "-T", "show"], label="pf anonymous table %s" % name, timeout=30, sudo=True).text
                        for name in automatic_tables(rules.text)]
-            table_count = addresses_in_tables(outputs, self.live_ips)
-            if table_count == len(self.live_ips):
+            table_count = addresses_in_tables(outputs, total)
+            if table_count == len(total):
                 count = table_count
         info["table_addresses_listed"] = table_count
         info.update({
             "load_rc": load.rc, "enable_rc": enable.rc, "status_enabled": "Status: Enabled" in status.text,
-            "block_rules_listed": count, "verified": load.ok and "Status: Enabled" in status.text and count == len(self.live_ips),
-            "rules_masked": self.rec.mask(tail_lines(rules.text.strip(), 12)),
+            "block_rules_listed": count, "verified": load.ok and "Status: Enabled" in status.text and count == len(total),
+            "rules_masked": self.rec.mask(tail_lines(rules.text.strip(), 14)),
+            "extra_block": {"names": list(self.extra_block_names), "addresses": list(self.extra_block_ips),
+                            "why": "WebKit's network process reached rsms.me (index.html:14-15) although the hosts file maps it to loopback; an IP block does not depend on DNS"},
         })
         self.facts["live_block"] = info
+        return info
+
+    def block_live_network(self) -> Dict[str, Any]:
+        """The pf block of the six live nodes plus the real addresses of the extra names, resolved now (before any hosts mapping)."""
+        resolved = self.resolve_names(self.extra_block_names, system=True)
+        self.extra_block_ips = sorted({a for addresses in resolved.values() for a in addresses if a not in self.blocked_ips})
+        self.facts["extra_block_resolution"] = resolved
+        return self.apply_pf()
+
+    def refresh_extra_blocks(self) -> Dict[str, Any]:
+        """Before a case: resolve the extra names again (dig only; the hosts mapping is in effect) and block any address not blocked yet."""
+        fresh = self.resolve_names(self.extra_block_names, system=False)
+        new = sorted({a for addresses in fresh.values() for a in addresses if a not in self.blocked_ips})
+        if not new:
+            return {"added": [], "verified": self.facts.get("live_block", {}).get("verified")}
+        self.extra_block_ips = sorted(set(self.extra_block_ips) | set(new))
+        info = self.apply_pf()
+        info["added"] = new
         return info
 
     def live_block_counters(self) -> str:
@@ -1496,47 +1609,129 @@ class Interception:
         return self.rec.mask(result.out)
 
     # ---- CA and trust ------------------------------------------------------------------------------------------
+    @property
+    def ca_state_path(self) -> Path:
+        return self.shared_dir / "ca-state.json"
+
+    def read_ca_state(self) -> Optional[Dict[str, Any]]:
+        try:
+            value = json.loads(self.ca_state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def write_ca_state(self) -> None:
+        if self.ca is None:
+            return
+        self.shared_dir.mkdir(parents=True, exist_ok=True)
+        write_json(self.ca_state_path, {"ca_sha256": self.ca.get("ca_sha256"), "ca_sha1": self.ca_sha1, "hostnames": sorted(self.hosts), "trusted": self.trusted,
+                                        "updated": now_iso()})
+
+    def load_shared_ca(self, state: Dict[str, Any]) -> bool:
+        """Reuse the CA a previous phase of this job generated (and trusted) when it covers the same host names. The private keys
+        stay where they were created; nothing here copies them."""
+        directory = self.shared_dir / "ca"
+        paths = {"ca_cert": directory / "ca.crt", "ca_key": directory / "private" / "ca.key", "server_cert": directory / "server.crt",
+                 "server_key": directory / "private" / "server.key"}
+        if sorted(state.get("hostnames") or []) != sorted(self.hosts) or not all(path.is_file() for path in paths.values()):
+            return False
+        try:
+            digest = (directory / "ca.sha256").read_text(encoding="ascii").strip()
+        except OSError:
+            return False
+        self.ca = {key: str(path) for key, path in paths.items()}
+        self.ca.update({"ca_sha256": digest, "hostnames": list(self.hosts)})
+        self.ca_sha1 = state.get("ca_sha1")
+        self.trusted = bool(state.get("trusted"))
+        self.ca_reused = True
+        return True
+
     def make_ca(self) -> Dict[str, Any]:
         if ca_lib is None:
             raise StepFailed("lib/ca.py is missing")
-        directory = self.work / "ca"
-        self.ca = ca_lib.make_ca(directory, self.hosts)
+        state = self.read_ca_state()
+        if state and self.load_shared_ca(state):
+            self.rec.note("reusing the CA of an earlier phase of this job (sha256 %s, trusted=%s)" % (str(self.ca["ca_sha256"])[:16], self.trusted))
+        else:
+            if state and state.get("trusted") and state.get("ca_sha1"):
+                # a CA with a different host list is still trusted from an earlier phase: take its trust away before making a new one
+                self.ca_sha1 = state.get("ca_sha1")
+                self.trusted = True
+                self.untrust_ca(state_ca_cert=str(self.shared_dir / "ca" / "ca.crt"))
+            self.ca = ca_lib.make_ca(self.shared_dir / "ca", self.hosts)
+            self.ca_reused = False
+            self.trusted = False
+            finger = self.rec.run(["openssl", "x509", "-in", str(self.ca["ca_cert"]), "-noout", "-fingerprint", "-sha1"], label="CA sha1 (for removal)", timeout=20)
+            match = re.search(r"=([0-9A-Fa-f:]{59})", finger.text)
+            self.ca_sha1 = match.group(1).replace(":", "").upper() if match else None
+            self.write_ca_state()
         shutil.copyfile(str(self.ca["ca_cert"]), str(self.evidence / "ca.crt"))
         (self.evidence / "ca.sha256").write_text(str(self.ca["ca_sha256"]) + "\n", encoding="utf-8")
-        finger = self.rec.run(["openssl", "x509", "-in", str(self.ca["ca_cert"]), "-noout", "-fingerprint", "-sha1"], label="CA sha1 (for removal)", timeout=20)
-        match = re.search(r"=([0-9A-Fa-f:]{59})", finger.text)
-        self.ca_sha1 = match.group(1).replace(":", "").upper() if match else None
         self.facts["ca_sha256"] = self.ca["ca_sha256"]
+        self.facts["ca_reused_from_an_earlier_phase"] = self.ca_reused
         return self.ca
+
+    def run_security(self, argv: Sequence[str], label: str, timeout: float) -> CmdResult:
+        """A security(1) call that cannot hang the job. When it times out, the sudo that started it dies but root's security(1) child
+        (and a SecurityAgent authorization dialog nobody can click) survives and blocks the next call: kill both."""
+        result = self.rec.run(["security"] + list(argv), label=label, timeout=timeout, sudo=True)
+        if result.timed_out:
+            for name in ("security", "SecurityAgent", "authorizationhost"):
+                self.rec.run(["pkill", "-KILL", "-x", name], label="kill a hung %s after the timeout" % name, timeout=20, sudo=True)
+        return result
+
+    def allow_trust_settings(self) -> CmdResult:
+        """A throwaway runner only: let the admin trust-settings right be exercised without an authorization dialog."""
+        return self.run_security(["authorizationdb", "write", "com.apple.trust-settings.admin", "allow"], "allow the admin trust-settings right without a prompt", 30)
 
     def trust_ca(self) -> Dict[str, Any]:
         assert self.ca is not None
-        argv = ["security", "add-trusted-cert", "-d", "-r", "trustRoot", "-k", "/Library/Keychains/System.keychain", str(self.ca["ca_cert"])]
-        add = self.rec.run(argv, label="trust the per-run CA in the System keychain", timeout=120, sudo=True)
-        fallback = None
-        if not add.ok and re.search(r"(?i)authoriz|user interaction", add.text):
-            # a throwaway runner only: let the admin trust-settings right be granted without a dialog, then try once more
-            fallback = self.rec.run(["security", "authorizationdb", "write", "com.apple.trust-settings.admin", "allow"],
-                                    label="fallback: allow the admin trust-settings right without a prompt", timeout=60, sudo=True)
-            add = self.rec.run(argv, label="trust the per-run CA again after the fallback", timeout=120, sudo=True)
-        self.trusted = add.ok
-        verify = self.rec.run(["security", "verify-cert", "-c", str(self.ca["server_cert"]), "-p", "ssl", "-s", "github.com"], label="Security.framework verifies the github.com leaf", timeout=60)
+        verify_argv = ["security", "verify-cert", "-c", str(self.ca["server_cert"]), "-p", "ssl", "-s", "github.com"]
+        attempts: List[Dict[str, Any]] = []
+        add_ok = False
+        allow_rc: Optional[int] = None
+        reused_trust = self.trusted
+        if self.trusted:  # trusted by an earlier phase of this job: do not touch the trust store again, only check it still holds
+            check = self.rec.run(verify_argv, label="Security.framework still trusts the CA of the earlier phase", timeout=60)
+            if check.ok:
+                add_ok = True
+            else:
+                self.trusted = False
+        if not add_ok:
+            argv = ["add-trusted-cert", "-d", "-r", "trustRoot", "-k", "/Library/Keychains/System.keychain", str(self.ca["ca_cert"])]
+            for number, timeout in enumerate((60.0, 45.0, 45.0), 1):
+                allow = self.allow_trust_settings()  # before EVERY attempt, the first included
+                allow_rc = allow.rc
+                add = self.run_security(argv, "trust the per-run CA in the System keychain (attempt %d)" % number, timeout)
+                attempts.append({"attempt": number, "rc": add.rc, "timed_out": add.timed_out, "allow_rc": allow.rc, "out": tail_lines(add.text.strip(), 4)})
+                if add.ok:
+                    add_ok = True
+                    break
+                time.sleep(2)
+        verify = self.rec.run(verify_argv, label="Security.framework verifies the github.com leaf", timeout=60)
         api_rc = None
         if not self.real_banner:
             api_rc = self.rec.run(["security", "verify-cert", "-c", str(self.ca["server_cert"]), "-p", "ssl", "-s", "api.github.com"],
                                   label="Security.framework verifies the api.github.com leaf", timeout=60).rc
-        info = {"add_rc": add.rc, "add_out": tail_lines(add.text.strip(), 6), "verify_github_rc": verify.rc, "verify_github_out": tail_lines(verify.text.strip(), 6),
-                "verify_api_rc": api_rc, "authorizationdb_fallback_rc": fallback.rc if fallback is not None else None, "trusted": add.ok and verify.ok}
+        self.trusted = bool(add_ok and verify.ok)
+        info = {"add_rc": attempts[-1]["rc"] if attempts else 0, "add_out": attempts[-1]["out"] if attempts else "reused: trusted by an earlier phase of this job",
+                "attempts": attempts, "trusted_by_an_earlier_phase": reused_trust and not attempts, "authorizationdb_rc": allow_rc,
+                "verify_github_rc": verify.rc, "verify_github_out": tail_lines(verify.text.strip(), 6), "verify_api_rc": api_rc, "trusted": self.trusted}
         self.facts["trust"] = info
+        self.write_ca_state()
         return info
 
-    def untrust_ca(self) -> None:
-        if not self.trusted or self.ca is None:
+    def untrust_ca(self, state_ca_cert: Optional[str] = None) -> None:
+        """Take the CA's trust away, bounded: a hung call is killed (run_security) and never retried; this runs at the end of a job."""
+        cert = state_ca_cert or (str(self.ca["ca_cert"]) if self.ca is not None else None)
+        if not self.trusted or cert is None:
             return
-        self.rec.run(["security", "remove-trusted-cert", "-d", str(self.ca["ca_cert"])], label="remove the trust setting of the per-run CA", timeout=60, sudo=True)
+        self.run_security(["remove-trusted-cert", "-d", cert], "remove the trust setting of the per-run CA", 45)
         if self.ca_sha1:
-            self.rec.run(["security", "delete-certificate", "-Z", self.ca_sha1, "/Library/Keychains/System.keychain"], label="delete the per-run CA from the System keychain", timeout=60, sudo=True)
+            self.run_security(["delete-certificate", "-Z", self.ca_sha1, "/Library/Keychains/System.keychain"], "delete the per-run CA from the System keychain", 45)
         self.trusted = False
+        if self.ca is not None:
+            self.write_ca_state()
 
     # ---- hosts -----------------------------------------------------------------------------------------------
     def resolve_banner_api(self) -> List[str]:
@@ -1576,11 +1771,27 @@ class Interception:
             return "127.0.0.1" in text or "::1" in text
 
         api_ok = (not loopback(resolved[BANNER_API_HOST]) and bool(re.search(r"ip(v6)?_address", resolved[BANNER_API_HOST]))) if self.real_banner else loopback(resolved[BANNER_API_HOST])
+        views = self.resolution_views(tuple(dict.fromkeys(tuple(self.hosts) + self.extra_block_names + (BANNER_API_HOST,))))
         info = {"hosts_added_rc": add.rc, "resolved": resolved, "ok": add.ok and loopback(resolved["github.com"]) and api_ok,
-                "api_github_com_left_to_real_dns": self.real_banner}
+                "api_github_com_left_to_real_dns": self.real_banner, "resolution_views": views}
         self.facts["hosts_mapped"] = list(self.hosts)
         self.facts["hosts"] = info
         return info
+
+    def resolution_views(self, names: Sequence[str]) -> Dict[str, Any]:
+        """For every name two views of what the resolvers answer after the mapping: dscacheutil (Directory Services) and the C library's
+        getaddrinfo (what most programs use). Evidence for WHO honours /etc/hosts."""
+        import socket
+        views: Dict[str, Any] = {}
+        for name in names:
+            query = self.rec.run(["dscacheutil", "-q", "host", "-a", "name", name], label="resolution view (dscacheutil) " + name, timeout=30, quiet=True)
+            libc: List[str] = []
+            try:
+                libc = sorted({canonical_ip(item[4][0]) for item in socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)})
+            except OSError as error:
+                libc = ["error: %s" % error]
+            views[name] = {"dscacheutil": [canonical_ip(a) for a in re.findall(r"ip(?:v6)?_address:\s*(\S+)", query.text)], "getaddrinfo": libc}
+        return views
 
     def unmap_hosts(self) -> None:
         if not self.hosts_on or self.hosts_backup is None:
@@ -1667,11 +1878,13 @@ class Interception:
             self.stop_server()
         except Exception as error:  # noqa: BLE001 - teardown must go on
             self.rec.note("teardown: stopping the server failed: %s" % error)
-        for step in (self.unmap_hosts, self.untrust_ca):
+        steps = [self.unmap_hosts] + ([] if self.keep_ca else [self.untrust_ca])
+        for step in steps:
             try:
                 step()
             except Exception as error:  # noqa: BLE001
                 self.rec.note("teardown: %s failed: %s" % (step.__name__, error))
+        self.facts["ca_kept_trusted_for_the_next_phase"] = bool(self.keep_ca and self.trusted)
         if self.pf_enabled_by_us:
             self.rec.run(["pfctl", "-d"], label="disable pf again", timeout=30, sudo=True)
         if Path(self.evidence).is_dir():  # an atexit teardown after the evidence directory is gone must not create it again
@@ -1962,6 +2175,15 @@ def ax_visible_texts(dump: Optional[Dict[str, Any]]) -> List[str]:
     return ax_texts((dump or {}).get("nodes") or [], 400)
 
 
+CARD_TEXT = re.compile(r"(?i)^updates?$|latest version|is available|update failed|install|^v[0-9A-Za-z.\-]+$|no update")
+
+
+def banner_card_texts(dump: Optional[Dict[str, Any]]) -> List[str]:
+    """The texts of the Updates card the banner call drives: the card title, the version pill ("v0.7.12", or "vUNKNOWN" when the
+    API answered without a tag) and the sentence below it, plus any button or error text."""
+    return [text for text in ax_visible_texts(dump) if CARD_TEXT.search(text)][:14]
+
+
 def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, app: Path, facts: Dict[str, Any], case: str, probe: bool = False) -> Dict[str, Any]:
     """Launch the released app under interception and drive Settings > Check for updates > Install. See the module docstring:
     in real-banner mode the one banner request reaches api.github.com and the Install button drives the plugin check(); with the
@@ -2021,6 +2243,10 @@ def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, a
         lsof.start()
         with env.server(scenario, log):
             try:
+                refresh = env.refresh_extra_blocks()  # the addresses of rsms.me as the real resolver gives them now
+                ui["extra_block_refresh"] = refresh
+                if refresh.get("verified") is False:
+                    raise StepFailed("the pf block could not be verified after adding addresses: the app is not launched")
                 binary = Path(facts["binary"])
                 child_env = {"HOME": str(home), "TMPDIR": str(tmp) + "/", "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "RUST_LOG": "info", "LANG": "en_US.UTF-8"}
                 app_handle = open(str(app_log), "w", encoding="utf-8")
@@ -2049,17 +2275,31 @@ def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, a
                     ui["steps"].append(click_step(rec, proc.pid, SETTINGS_PATTERNS, "click Settings"))
                     time.sleep(3)
                     dump_step("AX dump on the Settings page", "2-settings", "settings_page")
-                    ui["steps"].append(click_step(rec, proc.pid, CHECK_PATTERNS, "click Check for updates"))
+                    ui["install_button_before_check"] = bool((ui.get("settings_page") or {}).get("install_button"))
+                    attempts: List[Dict[str, Any]] = []
                     dump = None
-                    for _ in range(7):  # the banner command has an 8 s timeout; with the real API it answers in well under a second
-                        time.sleep(4)
-                        dump, result = osascript_json(rec, jxa_ax_dump(proc.pid), "AX dump after Check for updates")
-                        if summarize_ax(dump).get("install_button"):
+                    result = CmdResult(["osascript"], 0, "", "", 0.0)
+                    for attempt in range(1, 5):  # the first click and up to three more, 20 s apart: the banner call may have been rate limited
+                        if attempt > 1:
+                            time.sleep(20)
+                        ui["steps"].append(click_step(rec, proc.pid, CHECK_PATTERNS, "click Check for updates" if attempt == 1 else "click Check for updates (retry %d)" % (attempt - 1)))
+                        dump = None
+                        for _ in range(7):  # the banner command has an 8 s timeout; with the real API it answers in well under a second
+                            time.sleep(4)
+                            dump, result = osascript_json(rec, jxa_ax_dump(proc.pid), "AX dump after Check for updates")
+                            if summarize_ax(dump).get("install_button"):
+                                break
+                        found = bool(summarize_ax(dump).get("install_button"))
+                        attempts.append({"attempt": attempt, "install_button": found, "card_texts": banner_card_texts(dump)})
+                        if found:
                             break
+                    ui["banner_attempts"] = attempts
                     write_json(evidence / ("ax-%s-3-after-check.json" % stem), dump if dump else {"raw": rec.mask(result.text)})
                     ui["after_check"] = summarize_ax(dump)
                     ui["install_button"] = bool(ui["after_check"].get("install_button"))
-                    if ui["install_button"]:
+                    if ui["install_button"] and ui["install_button_before_check"]:
+                        ui["problem"] = "the Install button was already present BEFORE the check: not clicked (it would not prove the banner's answer)"
+                    elif ui["install_button"]:
                         ui["steps"].append(click_step(rec, proc.pid, INSTALL_PATTERNS, "click Install (calls the plugin check())"))
                         ui["install_clicked"] = bool((ui["steps"][-1].get("report") or {}).get("clicked") or (ui["steps"][-1].get("retry_report") or {}).get("clicked"))
                         final = None
@@ -2108,9 +2348,9 @@ def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, a
         if packet.get("dns_query") == BANNER_API_HOST:
             api_ips.update(packet.get("dns_answers") or [])
     api_ips = sorted(api_ips) if env.real_banner else []
-    flows = summarize_flows(packets, api_ips, env.live_ips) if (capture.proc is not None or packets) else None
+    flows = summarize_flows(packets, api_ips, env.blocked_ips) if (capture.proc is not None or packets) else None
     pids = related_pids(seen, ui.get("pid"))
-    network = network_report(endpoints, flows, pids, api_ips, env.live_ips, env.real_banner)
+    network = network_report(endpoints, flows, pids, api_ips, env.blocked_ips, env.real_banner)
     network.update({
         "capture": {"interface": capture.iface, "error": capture.error if capture.proc is None else None, "packets": len(packets), "flows": (flows or {}).get("flows", []),
                     "dns_names": (flows or {}).get("dns_names", {}), "raw_capture_kept": False},
@@ -2132,11 +2372,21 @@ def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, a
         plugin_check: Dict[str, Any] = {"reached": True, "outcome": "error" if message else None, "error_kind": infer_error_kind(message),
                                         "error": message, "source": "UI text of the Updates card (data-testid update-error)"}
     else:
-        plugin_check = {"reached": False, "reason": (
-            "the Install button was not rendered (Settings.tsx shows it only after check_for_update reports an update%s)" % (
-                "; real-banner mode is on but the banner did not report one" if env.real_banner else "; the banner call is not interceptable and real-banner mode is off")
-            if not ui["install_button"] else
-            "the Install button was rendered but not clicked, or the recorder saw no manifest request")}
+        last_texts = ((ui.get("banner_attempts") or [{}])[-1]).get("card_texts") or []
+        banner_text = " ".join(last_texts)
+        clicks = len(ui.get("banner_attempts") or [])
+        if ui["install_button"] and ui.get("install_button_before_check"):
+            reason = "the Install button was already present before the check; it was not clicked"
+        elif ui["install_button"]:
+            reason = "the Install button was rendered but not clicked, or the recorder saw no manifest request"
+        elif not env.real_banner:
+            reason = "the Install button was not rendered: Settings.tsx shows it only after check_for_update reports an update, and with real-banner mode off that call cannot succeed"
+        elif re.search(r"(?i)vunknown|\bunknown\b", banner_text):
+            reason = ("the banner's own unintercepted API call returned no release tag (UI: %s); not attributable from here (after %d Check for updates click(s) 20 s apart)"
+                      % (banner_text, clicks))
+        else:
+            reason = "the Install button was not rendered after %d Check for updates click(s) (UI: %s); not attributable from here" % (clicks, banner_text or "no card text found")
+        plugin_check = {"reached": False, "reason": reason}
     expected = expected_prefixes(real_home, str(home), case)
     fs_record = dict(fs_result, expected_prefixes=expected, temp_roots=[str(tmp)])
     procs = {"seen": seen, "app_pid": ui.get("pid"), "bundle_path": str(app)}
@@ -2219,6 +2469,14 @@ def not_run_tier(reason: str, result: str = "not_attempted", trigger: Optional[s
 # ------------------------------------------------------------------------------------------------------------------
 # subcommands
 # ------------------------------------------------------------------------------------------------------------------
+
+def shared_dir() -> Path:
+    """Where the probe and run phases of one job share their CA (its private keys never leave this directory)."""
+    base = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir())
+    path = base / "wave0-desktop-macos-shared"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
 
 def work_dir() -> Path:
     base = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir())
@@ -2306,7 +2564,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
                 native_proc, native_binary = build_native(rec, evidence, background=True)
             except OSError as error:
                 probe["native_check"] = {"status": "build not started: %s" % error}
-        env = Interception(rec, evidence, work, live_ips, real_banner=bool(args.real_banner_api))
+        env = Interception(rec, evidence, work, live_ips, real_banner=bool(args.real_banner_api), shared_dir=shared_dir(), keep_ca=bool(args.keep_ca))
         sudo = isinstance(probe["system"], dict) and (probe["system"].get("sudo") or {}).get("rc") == 0
         probe["steps"]["sudo"] = {"ok": bool(sudo)}
         if sudo and live_ips:
@@ -2345,6 +2603,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
                     "attempted": True, "real_banner_api": ui.get("real_banner_api"), "window_appeared": ui.get("window_appeared"), "nodes": ui.get("nodes"),
                     "settings_button": ui.get("settings_button"), "check_button": ui.get("check_button"), "install_button": ui.get("install_button"),
                     "install_clicked": ui.get("install_clicked"), "ui_error_text": ui.get("ui_error_text"), "problem": ui.get("problem"),
+                    "banner_attempts": ui.get("banner_attempts"),
+                    "banner_ui_text": " ".join(((ui.get("banner_attempts") or [{}])[-1]).get("card_texts") or []),
+                    "install_button_before_check": ui.get("install_button_before_check"),
                     "manifest_requests": sum(count for host, path, count in (requests_summary.get("by_host_path") or []) if path == MANIFEST_PATH),
                     "network_recorded": net.get("recorded"), "network_violations": [
                         "%s:%s" % (item.get("remote_ip"), item.get("remote_port")) for item in net.get("violations", [])],
@@ -2422,7 +2683,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 tiers["native_check"] = not_run_tier("cargo build --release --locked failed or timed out (see cargo-build.log)", "infeasible", "native-updater-check")
                 problems.append("native-updater-check did not build")
         # 2. isolation
-        env = Interception(rec, evidence, work, live_ips, real_banner=bool(args.real_banner_api))
+        env = Interception(rec, evidence, work, live_ips, real_banner=bool(args.real_banner_api), shared_dir=shared_dir(), keep_ca=bool(args.keep_ca))
         block = env.block_live_network()
         if not block["verified"]:
             raise StepFailed("the live-network block could not be verified: no case may run without it")
@@ -2492,6 +2753,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """End of the job: take the shared CA's trust away once. Never fails; every call is bounded."""
+    evidence = Path(args.evidence)
+    evidence.mkdir(parents=True, exist_ok=True)
+    rec = Recorder(evidence)
+    try:
+        env = Interception(rec, evidence, work_dir(), [], real_banner=True, shared_dir=shared_dir(), keep_ca=False)
+        state = env.read_ca_state()
+        if state and state.get("trusted") and state.get("ca_sha1"):
+            env.ca_sha1 = state.get("ca_sha1")
+            env.trusted = True
+            env.untrust_ca(state_ca_cert=str(env.shared_dir / "ca" / "ca.crt"))
+            state["trusted"] = env.trusted
+            write_json(env.ca_state_path, state)
+            rec.note("cleanup: the per-job CA trust was removed (still trusted: %s)" % env.trusted)
+        else:
+            rec.note("cleanup: no trusted per-job CA recorded")
+        env.torn_down = True
+    except Exception as error:  # noqa: BLE001 - cleanup never fails the job
+        rec.note("cleanup failed: %s: %s" % (type(error).__name__, error))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2503,6 +2787,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     probe.add_argument("--budget-min", type=float, default=25.0, help="soft budget: the released-app part is skipped if less than 2 minutes of it are left")
     probe.add_argument("--real-banner-api", action=argparse.BooleanOptionalAction, default=True,
                        help="let the banner's one read-only GET reach the real api.github.com (default on; approved); off = every GitHub name goes to the recorder")
+    probe.add_argument("--keep-ca", action=argparse.BooleanOptionalAction, default=True,
+                       help="leave the per-job CA trusted for the run phase that follows in the same job (default on; `cleanup` or the run phase removes it)")
     run = sub.add_parser("run", help="the isolation cases")
     run.add_argument("--evidence", required=True)
     run.add_argument("--arch", choices=("arm64", "aarch64", "x86_64", "x64"), help="the architecture the workflow job expects (cross-checked against the runner)")
@@ -2511,10 +2797,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     run.add_argument("--native-real-home", action="store_true", help="run the native checker with the runner's real HOME (debug switch: use it if Security.framework misbehaves with the sandbox HOME)")
     run.add_argument("--real-banner-api", action=argparse.BooleanOptionalAction, default=True,
                      help="let the banner's one read-only GET reach the real api.github.com (default on; approved); off = negative control")
+    run.add_argument("--keep-ca", action=argparse.BooleanOptionalAction, default=False,
+                     help="leave the per-job CA trusted at the end (default off: the run phase is the last one and removes it, once)")
+    cleanup = sub.add_parser("cleanup", help="remove the per-job CA's trust (bounded, best effort); for an `if: always()` step at the end of a job")
+    cleanup.add_argument("--evidence", required=True)
     args = parser.parse_args(argv)
     refused = refuse_outside_ci(args.command)
     if refused is not None:
         return refused
+    if args.command == "cleanup":
+        return cmd_cleanup(args)
     if args.command == "probe":
         try:
             return cmd_probe(args)

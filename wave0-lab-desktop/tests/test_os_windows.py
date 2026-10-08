@@ -451,7 +451,7 @@ class ProcessTests(unittest.TestCase):
 
     def test_webview2_helpers_are_the_apps_own(self):
         found = self.violations([self.proc(110, 101, "msedgewebview2.exe", "C:\\wv2\\msedgewebview2.exe", created="2")])
-        self.assertEqual(found, {"new_app_launches": [], "installers": [], "other_in_app_tree": [], "unrelated": []})
+        self.assertEqual(found, {"new_app_launches": [], "installers": [], "other_in_app_tree": [], "unrelated": [], "lab_helpers": []})
 
     def test_a_second_app_instance_is_a_new_launch(self):
         found = self.violations([self.proc(120, 1, "arc-desktop.exe", "C:\\arcw0\\app2\\arc-desktop.exe", created="3")])
@@ -477,7 +477,7 @@ class ProcessTests(unittest.TestCase):
         exe = "C:\\native\\native-updater-check.exe"
         extra = [self.proc(160, 1, "native-updater-check.exe", exe, created="9")]
         self.assertEqual(len(self.violations(extra)["installers"]), 1, "it would look like an updater without the ignore list")
-        self.assertEqual(self.violations(extra, ignore=[exe]), {"new_app_launches": [], "installers": [], "other_in_app_tree": [], "unrelated": []})
+        self.assertEqual(self.violations(extra, ignore=[exe]), {"new_app_launches": [], "installers": [], "other_in_app_tree": [], "unrelated": [], "lab_helpers": []})
 
     def test_a_missing_snapshot_is_unknown_not_clean(self):
         self.assertIsNone(ow.process_violations(None, self.base(), 100, []))
@@ -497,6 +497,13 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("9222", redacted[2]["CommandLine"])
         self.assertEqual(procs[0]["CommandLine"], "Runner.Worker.exe --jitconfig SECRETTOKEN", "the in-memory list used for the criteria is untouched")
         self.assertIsNone(ow.redact_processes(None))
+
+    def test_long_webview2_command_lines_keep_the_debugging_flag(self):
+        flag = "--remote-debugging-port=0"
+        command = "msedgewebview2.exe --webview-exe-name=arc-desktop.exe " + "--enable-features=" + ("a" * 900) + " " + flag + " --lang=en"
+        redacted = ow.redact_processes([ProcessTests.proc(3, 2, "msedgewebview2.exe", cmd=command)])
+        self.assertIn(flag, redacted[0]["CommandLine"])
+        self.assertIn(flag, ow.webview_command_lines([ProcessTests.proc(3, 2, "msedgewebview2.exe", cmd=command)])[0])
 
     def test_the_written_list_never_contains_the_omitted_secret(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -905,7 +912,8 @@ class ShellAndInstallTests(unittest.TestCase):
 
     def test_sandbox_environment(self):
         env = ow.sandbox_env({"PATH": "p", "HTTPS_PROXY": "http://proxy", "USERPROFILE": "C:\\Users\\r"}, "C:\\arcw0\\home", "C:\\arcw0\\wv2")
-        self.assertEqual((env["HOME"], env["USERPROFILE"], env["WEBVIEW2_USER_DATA_FOLDER"]), ("C:\\arcw0\\home", "C:\\arcw0\\home", "C:\\arcw0\\wv2"))
+        self.assertEqual((env["HOME"], env["USERPROFILE"], env["WEBVIEW2_USER_DATA_FOLDER"]), ("C:\\arcw0\\home", "C:\\Users\\r", "C:\\arcw0\\wv2"),
+                         "HOME is the sandbox; USERPROFILE stays real so Tauri's app_data_dir() still resolves")
         self.assertIn("--remote-debugging-port=9222", env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"])
         self.assertNotIn("HTTPS_PROXY", env)
         self.assertEqual(env["PATH"], "p")
@@ -918,8 +926,9 @@ class ShellAndInstallTests(unittest.TestCase):
         argvs = [call[0][0] for call in shell.run.call_args_list]
         self.assertEqual(argvs[0], ["taskkill", "/F", "/T", "/PID", "4321"])
         self.assertEqual(argvs[1], ["taskkill", "/F", "/T", "/IM", "arc-desktop.exe"])
-        self.assertIn("C:\\arcw0\\wv2", argvs[2][-1])
-        self.assertNotIn('"', argvs[2][-1])
+        self.assertEqual(argvs[2], ["taskkill", "/F", "/T", "/IM", "msedgedriver.exe"])
+        self.assertIn("C:\\arcw0\\wv2", argvs[3][-1])
+        self.assertNotIn('"', argvs[3][-1])
 
     def test_mitm_process_start_waits_for_the_ready_file_and_detects_an_early_exit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1323,35 +1332,29 @@ class FakeProc:
         return self.rc
 
 
-class ScriptedPage:
-    """Stands in for WebSocketClient: answers Runtime.evaluate by call id like a Tauri page would."""
+class FakePage:
+    """Stands in for WebDriverPage / CdpPage: answers the probe and the trigger like a Tauri page would, and records what was asked."""
 
-    def __init__(self, trigger_value, probe_value=None, fail_connect=False):
+    def __init__(self, trigger_value, kind="msedgedriver", probe_value=None, on_trigger=None):
+        self.kind = kind
         self.trigger_value = trigger_value
         self.probe_value = probe_value if probe_value is not None else {"ipc": True, "href": "http://tauri.localhost/", "title": "ARC Node", "app_version": "0.7.11", "app_version_error": None}
-        self.fail_connect = fail_connect
-        self.pending = []
-        self.seen = []
+        self.on_trigger = on_trigger
+        self.calls = []
+        self.closed = False
 
-    def __call__(self, host, port, path, timeout=10.0):
-        self.target = (host, port, path)
-        return self
+    def evaluate_probe(self):
+        self.calls.append("probe")
+        return True, self.probe_value, None
 
-    def connect(self):
-        if self.fail_connect:
-            raise ow.WebSocketError("connection refused by the page")
-
-    def send_text(self, text):
-        message = json.loads(text)
-        self.seen.append(message["params"]["expression"])
-        value = self.probe_value if message["id"] == 1 else self.trigger_value
-        self.pending.append({"id": message["id"], "result": {"result": {"type": "object", "value": value}}})
-
-    def recv_text(self, timeout=60.0):
-        return json.dumps(self.pending.pop(0))
+    def evaluate_trigger(self):
+        self.calls.append("trigger")
+        if self.on_trigger:
+            self.on_trigger()
+        return True, self.trigger_value, None
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class FakeMitm:
@@ -1388,70 +1391,92 @@ class CaseRunnerTests(unittest.TestCase):
         self.evidence.mkdir()
         self.shell = ow.Shell(self.evidence / "steps.log")
         self.ctx = ow.Context(self.evidence, Path(self.tmp.name) / "w", self.shell, {}, env=self.ENV)
+        self.ctx.work.mkdir()
         self.ctx.app_exe = APP_EXE
         self.ctx.install_dir = "C:\\arcw0\\app"
         self.ctx.ca_info = {"server_cert": "s.crt", "server_key": "s.key", "ca_cert": "ca.crt", "ca_sha256": "ab" * 32}
         self.killed = []
+        self.launched = []
 
     def procs(self, extra=()):
         base = [ProcessTests.proc(1, 0, "System"), ProcessTests.proc(4242, 1, "arc-desktop.exe", APP_EXE), ProcessTests.proc(4300, 4242, "msedgewebview2.exe", "C:\\wv2\\msedgewebview2.exe")]
         return base + list(extra)
 
-    def run_case(self, name="clean", trigger_value=None, procs_after=None, fs_after=None, target_found=True, fail_connect=False, fail_mitm=False):
+    def run_case(self, name="clean", trigger_value=None, procs_after=None, fs_after=None, outcomes=None, strategies=None, kind="msedgedriver", app_proc=False):
+        """outcomes: strategy -> error text (the attempt fails) or None (it works)."""
         scenario = ow.CASE_SCENARIO[name]
         if trigger_value is None:
             trigger_value = ({"ok": False, "stage": "invoke", "error": ow.RELEASE_NOT_FOUND, "error_type": "string", "error_json": None} if name == "clean"
                              else {"ok": True, "value": {"rid": 3, "currentVersion": "0.7.11", "version": "0.8.11"}})
-        page = ScriptedPage(trigger_value, fail_connect=fail_connect)
-        snapshots = iter([{}, fs_after or {}, fs_after or {}])
-        third = None if procs_after == "missing" else (procs_after if procs_after is not None else self.procs([ProcessTests.proc(4400, 4300, "msedgewebview2.exe", created="9")]))
-        process_lists = iter([self.procs(), self.procs(), third])
-        target = {"webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/A", "url": "http://tauri.localhost/"} if target_found else None
-        FakeMitm.fail_start = fail_mitm
+        outcomes = outcomes if outcomes is not None else {"msedgedriver": None}
+        if strategies:
+            self.ctx.strategies = list(strategies)
+        state = {"triggered": False}
+        pages = []
+
+        def fake_try(ctx, strategy, tag, home, wv2_launch):
+            self.launched.append((strategy, tag, wv2_launch))
+            launch = ow.Launch(strategy, wv2_launch)
+            error = outcomes.get(strategy, "not configured")
+            if error:
+                launch.error = error
+                return launch
+            page = FakePage(trigger_value, kind=kind if strategy == "msedgedriver" else "cdp", on_trigger=lambda: state.__setitem__("triggered", True))
+            pages.append(page)
+            launch.page = page
+            launch.notes["fake"] = True
+            if app_proc:
+                launch.app_proc = FakeProc(4242)
+            return launch
+
+        after_list = procs_after if procs_after is not None else self.procs([ProcessTests.proc(4400, 4300, "msedgewebview2.exe", created="9")])
+
+        def fake_snapshot(shell):
+            if state["triggered"]:
+                return None if after_list == "missing" else after_list
+            return self.procs()
+
+        snapshots = iter([{}, fs_after or {}])
         real_sleep = time.sleep
         real_poller = ow.Poller
-        raw_log_written = []
-
-        def fake_popen(argv, **kwargs):
-            handle = kwargs.get("stdout")
-            if handle is not None and hasattr(handle, "write"):
-                handle.write(b"connecting to 149.28.32.76:9090 failed\n")
-                raw_log_written.append(True)
-            return FakeProc()
-
-        with mock.patch.object(ow, "MitmProcess", FakeMitm), mock.patch.object(ow, "WebSocketClient", page), \
-                mock.patch.object(ow, "wait_for_page", return_value=(target, "ok" if target else "no page target yet")), \
-                mock.patch.object(ow, "snapshot_processes", side_effect=lambda shell: next(process_lists)), \
+        raw = self.ctx.work / ("app-app-%s.raw.log" % name)
+        raw.write_bytes(b"connecting to 149.28.32.76:9090 failed\n")
+        with mock.patch.object(ow, "MitmProcess", FakeMitm), mock.patch.object(ow, "try_strategy", fake_try), \
+                mock.patch.object(ow, "snapshot_processes", side_effect=fake_snapshot), \
                 mock.patch.object(ow, "take_snapshot", side_effect=lambda roots, hash_limit=1 << 20: {} if hash_limit == 0 else next(snapshots)), \
                 mock.patch.object(ow, "kill_app", side_effect=lambda ctx, pid, wv2: self.killed.append((pid, wv2))), \
                 mock.patch.object(ow, "Poller", lambda roots, out, interval=1.0: real_poller(roots, out, interval=0.01)), \
-                mock.patch.object(ow.subprocess, "Popen", fake_popen), \
                 mock.patch.object(ow.time, "sleep", lambda seconds: real_sleep(0.1)):
             case = ow.run_released_case(self.ctx, name, {"home": self.HOME, "wv2": self.WV2})
-        return case, page
+        return case, pages
 
     def test_a_clean_run_records_everything_and_passes(self):
-        case, page = self.run_case("clean")
+        case, pages = self.run_case("clean")
         self.assertEqual(case["verdict"], "PASS", case["reasons"])
         self.assertEqual(case["criteria"], {k: True for k in ow.CRITERIA})
         self.assertEqual(case["trigger_outcome"]["error_text"], ow.RELEASE_NOT_FOUND)
+        self.assertEqual(case["trigger_outcome"]["path"], "msedgedriver", "the result says which path ran")
         self.assertEqual(case["requests"]["total"], 2)
         self.assertEqual(case["page_probe"]["value"]["app_version"], "0.7.11")
-        self.assertEqual(page.target, ("127.0.0.1", 9222, "/devtools/page/A"))
-        self.assertIn("plugin:updater|check", page.seen[1])
+        self.assertEqual(pages[0].calls, ["probe", "trigger"])
+        self.assertTrue(pages[0].closed)
         for name in case["evidence_files"]:
             self.assertTrue((self.evidence / name).is_file(), name)
         self.assertEqual(sorted(case["evidence_files"]), sorted([
-            "requests-app-clean.jsonl", "writes-app-clean.jsonl", "fs-app-clean-before.json", "fs-app-clean-after.json", "fs-app-clean-diff.json",
-            "procs-app-clean-prelaunch.txt", "procs-app-clean-before.txt", "procs-app-clean-after.txt", "app-app-clean.log"]))
-        self.assertEqual(self.killed, [(4242, self.WV2)])
+            "procs-app-clean-msedgedriver-launched.txt", "requests-app-clean.jsonl", "writes-app-clean.jsonl", "fs-app-clean-before.json", "fs-app-clean-after.json",
+            "fs-app-clean-diff.json", "procs-app-clean-prelaunch.txt", "procs-app-clean-before.txt", "procs-app-clean-after.txt", "app-app-clean.log"]))
         self.assertTrue(FakeMitm.instances[0].stopped)
         writes = ow.read_jsonl(self.evidence / "writes-app-clean.jsonl")
         self.assertEqual([r["event"] for r in writes if r["event"] in ("start", "stop")], ["start", "stop"])
         self.assertEqual([r["label"] for r in writes if r["event"] == "mark"], ["trigger_begin", "trigger_end"])
+        self.assertGreaterEqual(case["file_changes"]["poller_cycles"], 2)
         app_log = (self.evidence / "app-app-clean.log").read_text(encoding="utf-8")
         self.assertIn("149.28.x.x", app_log)
         self.assertNotIn("149.28.32.76", app_log)
+        self.assertEqual(case["launch_attempts"][0]["strategy"], "msedgedriver")
+        self.assertTrue(case["launch_attempts"][0]["ok"])
+        self.assertFalse(case["launch_attempts"][0]["remote_debugging_in_webview2_command_line"], "recorded, so a refused flag is visible without reading the lists")
+        self.assertEqual(case["launch_attempts"][0]["webview2_process_count"], 1)
 
     def test_the_bait_case_passes_only_when_the_update_was_really_offered(self):
         case, _ = self.run_case("cached-bait")
@@ -1460,24 +1485,47 @@ class CaseRunnerTests(unittest.TestCase):
         case, _ = self.run_case("cached-bait", trigger_value={"ok": False, "stage": "invoke", "error": "no update"})
         self.assertEqual(case["verdict"], "UNPROVED")
 
-    def test_a_page_that_never_appears_is_unproved_and_still_leaves_evidence(self):
-        case, _ = self.run_case("clean", target_found=False)
+    def test_the_driver_apps_pid_is_found_from_the_process_list(self):
+        case, _ = self.run_case("clean", app_proc=False)
+        self.assertEqual(case["verdict"], "PASS", case["reasons"])
+        case, _ = self.run_case("clean", app_proc=True, outcomes={"msedgedriver": None})
+        self.assertEqual(case["verdict"], "PASS", case["reasons"])
+
+    def test_the_cdp_fallback_runs_when_the_driver_fails_and_the_attempts_are_recorded(self):
+        case, pages = self.run_case("clean", outcomes={"msedgedriver": "RuntimeError: session not created: this version of Microsoft Edge WebDriver only supports", "cdp-env": None})
+        self.assertEqual(case["verdict"], "PASS", case["reasons"])
+        self.assertEqual(case["trigger_outcome"]["path"], "cdp")
+        self.assertEqual([a["strategy"] for a in case["launch_attempts"]], ["msedgedriver", "cdp-env"])
+        self.assertFalse(case["launch_attempts"][0]["ok"])
+        self.assertIn("session not created", case["launch_attempts"][0]["error"])
+        self.assertEqual(self.ctx.winning_strategy, "cdp-env")
+        self.assertIn("procs-app-clean-msedgedriver-launched.txt", case["evidence_files"])
+        self.assertIn("procs-app-clean-cdp-env-launched.txt", case["evidence_files"])
+        user_data = [a["user_data_folder"] for a in case["launch_attempts"]]
+        self.assertEqual(len(set(user_data)), 2, "a distinct WebView2 user data folder per launch")
+
+    def test_no_strategy_working_is_unproved_with_every_reason(self):
+        case, _ = self.run_case("clean", outcomes={"msedgedriver": "no driver", "cdp-env": "no port", "cdp-registry": "no port either"})
         self.assertEqual(case["verdict"], "UNPROVED")
         self.assertFalse(case["trigger_outcome"]["ran"])
-        self.assertIn("never appeared", case["trigger_outcome"]["error_text"])
+        for reason in ("no driver", "no port", "no port either"):
+            self.assertIn(reason, case["trigger_outcome"]["error_text"])
+        self.assertEqual(len(case["launch_attempts"]), 3)
         self.assertTrue((self.evidence / "fs-app-clean-after.json").is_file())
-        self.assertEqual(self.killed, [(4242, self.WV2)], "the app is always stopped")
+        self.assertGreaterEqual(len([k for k in self.killed if k[0] is None]), 3, "everything is cleaned between attempts and at the end")
 
-    def test_a_refused_websocket_is_unproved(self):
-        case, _ = self.run_case("clean", fail_connect=True)
-        self.assertEqual(case["verdict"], "UNPROVED")
-        self.assertEqual(case["trigger_outcome"]["stage"], "cdp")
+    def test_the_winning_strategy_is_tried_first_in_the_next_case(self):
+        self.run_case("clean", outcomes={"msedgedriver": "no driver", "cdp-env": None})
+        self.launched.clear()
+        self.run_case("cached-bait", outcomes={"msedgedriver": "no driver", "cdp-env": None})
+        self.assertEqual([entry[0] for entry in self.launched][0], "cdp-env")
 
     def test_a_server_that_cannot_start_is_unproved_and_cleans_up(self):
-        case, _ = self.run_case("clean", fail_mitm=True)
+        FakeMitm.fail_start = True
+        case, _ = self.run_case("clean")
         self.assertEqual(case["verdict"], "UNPROVED")
         self.assertIn("cannot bind 443", case["trigger_outcome"]["error_text"])
-        self.assertEqual(self.killed, [(None, self.WV2)])
+        self.assertTrue(self.killed)
 
     def test_a_payload_dropped_in_temp_fails_no_new_files_and_no_install(self):
         dropped = "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\ARC Node-0.8.11-updater-x\\ARC.Node_0.8.11_x64-setup.exe"
@@ -1500,11 +1548,611 @@ class CaseRunnerTests(unittest.TestCase):
         self.assertEqual(case["verdict"], "FAIL")
         self.assertFalse(case["criteria"]["no_new_app_launch"])
 
+    def test_the_labs_own_helpers_are_not_a_launch(self):
+        helper = ProcessTests.proc(6000, 1, "powershell.exe", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "powershell -Command Get-CimInstance", created="8")
+        case, _ = self.run_case("clean", procs_after=self.procs([helper]))
+        self.assertEqual(case["verdict"], "PASS", case["reasons"])
+        self.assertEqual(len(case["process_changes"]["lab_helpers"]), 1)
+
     def test_missing_process_lists_leave_it_unproved(self):
         case, _ = self.run_case("clean", procs_after="missing")
         self.assertEqual(case["verdict"], "UNPROVED")
         self.assertIsNone(case["criteria"]["no_new_app_launch"])
         self.assertIsNone(case["criteria"]["no_install"])
+
+
+class FakeResponse:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self._body if isinstance(self._body, bytes) else json.dumps(self._body).encode()
+
+
+class W3CTests(unittest.TestCase):
+    """The WebDriver client against fake openers: nothing here touches a network or starts a process."""
+
+    def opener(self, answers):
+        calls = []
+
+        def open_url(request, timeout=None):
+            calls.append((request.get_method(), request.full_url, json.loads(request.data.decode()) if request.data else None, timeout))
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return FakeResponse(*answer)
+
+        open_url.calls = calls
+        return open_url
+
+    def test_call_sends_json_and_parses_the_answer(self):
+        opener = self.opener([(200, {"value": {"sessionId": "S1", "capabilities": {"browserName": "webview2"}}})])
+        status, payload = ow.w3c_call("http://127.0.0.1:9515", "POST", "/session", {"a": 1}, 12.0, opener)
+        self.assertEqual((status, payload["value"]["sessionId"]), (200, "S1"))
+        self.assertEqual(opener.calls[0], ("POST", "http://127.0.0.1:9515/session", {"a": 1}, 12.0))
+
+    def test_http_errors_and_non_json_bodies_are_returned_not_raised(self):
+        import io
+        import urllib.error
+        error = urllib.error.HTTPError("http://x", 500, "boom", {}, io.BytesIO(json.dumps({"value": {"error": "unknown error", "message": "bad"}}).encode()))
+        status, payload = ow.w3c_call("http://x", "GET", "/status", opener=self.opener([error]))
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["value"]["error"], "unknown error")
+        status, payload = ow.w3c_call("http://x", "GET", "/status", opener=self.opener([(200, b"<html>")]))
+        self.assertEqual((status, payload), (200, {"raw": "<html>"}))
+
+    def test_value_unwraps_success_and_raises_w3c_errors(self):
+        self.assertEqual(ow.w3c_value(200, {"value": {"ready": True}}), {"ready": True})
+        self.assertIsNone(ow.w3c_value(200, {"value": None}))
+        with self.assertRaises(ow.W3CError) as caught:
+            ow.w3c_value(500, {"value": {"error": "session not created", "message": "This version of Microsoft Edge WebDriver only supports Microsoft Edge version 152"}})
+        self.assertIn("session not created", str(caught.exception))
+        self.assertIn("only supports", str(caught.exception))
+        with self.assertRaises(ow.W3CError):
+            ow.w3c_value(200, {"value": {"error": "javascript error", "message": "x is not defined"}})
+        with self.assertRaises(ow.W3CError):
+            ow.w3c_value(404, {"raw": "not found"})
+
+    def test_capabilities_are_what_tauri_driver_sends_on_windows(self):
+        caps = ow.edge_capabilities("C:\\arcw0\\app\\arc-desktop.exe")["capabilities"]["alwaysMatch"]
+        self.assertEqual(caps["browserName"], "webview2")
+        self.assertEqual(caps["ms:edgeOptions"], {"binary": "C:\\arcw0\\app\\arc-desktop.exe", "webviewOptions": {}})
+
+    def test_the_async_scripts_only_call_the_updater_check_and_the_version(self):
+        script = ow.trigger_script_async()
+        self.assertIn("arguments[arguments.length - 1]", script)
+        self.assertIn("plugin:updater|check", script)
+        for forbidden in ("download", "install", "relaunch", "fetch(", "XMLHttpRequest"):
+            self.assertNotIn(forbidden, script)
+        probe = ow.probe_script_async()
+        self.assertIn("plugin:app|version", probe)
+        self.assertNotIn("updater", probe)
+
+    def test_the_page_session_lifecycle(self):
+        opener = self.opener([
+            (200, {"value": {"sessionId": "S9", "capabilities": {"browserName": "webview2", "browserVersion": "153.0", "msedge": {"x": 1}}}}),
+            (200, {"value": None}),                                                                       # timeouts
+            (200, {"value": {"ipc": True, "app_version": "0.7.11"}}),                                    # probe
+            (200, {"value": {"ok": False, "stage": "invoke", "error": ow.RELEASE_NOT_FOUND}}),           # trigger
+            (200, {"value": None}),                                                                       # delete
+        ])
+        page = ow.WebDriverPage("http://127.0.0.1:9515", opener)
+        caps = page.open("C:\\app\\arc-desktop.exe", timeout=99)
+        self.assertEqual(caps["browserVersion"], "153.0")
+        self.assertEqual(page.session_id, "S9")
+        self.assertEqual(opener.calls[1][1], "http://127.0.0.1:9515/session/S9/timeouts")
+        self.assertGreaterEqual(opener.calls[1][2]["script"], 60000)
+        self.assertEqual(page.evaluate_probe(), (True, {"ipc": True, "app_version": "0.7.11"}, None))
+        ok, value, error = page.evaluate_trigger()
+        self.assertEqual((ok, value["error"], error), (True, ow.RELEASE_NOT_FOUND, None))
+        execute = opener.calls[3]
+        self.assertEqual(execute[1], "http://127.0.0.1:9515/session/S9/execute/async")
+        self.assertIn("plugin:updater|check", execute[2]["script"])
+        self.assertEqual(execute[2]["args"], [])
+        page.close()
+        self.assertEqual((opener.calls[4][0], opener.calls[4][1]), ("DELETE", "http://127.0.0.1:9515/session/S9"))
+        self.assertIsNone(page.session_id)
+        page.close()
+        self.assertEqual(len(opener.calls), 5, "closing twice does nothing")
+
+    def test_session_creation_failures_surface_with_the_drivers_message(self):
+        opener = self.opener([(500, {"value": {"error": "session not created", "message": "version mismatch 153 vs 152"}})])
+        page = ow.WebDriverPage("http://x", opener)
+        with self.assertRaises(ow.W3CError) as caught:
+            page.open("app.exe")
+        self.assertIn("version mismatch", str(caught.exception))
+        self.assertIsNone(page.session_id)
+        page.close()                         # nothing to close, and no call is made
+        self.assertEqual(len(opener.calls), 1)
+
+    def test_a_missing_session_id_is_an_error(self):
+        page = ow.WebDriverPage("http://x", self.opener([(200, {"value": {"capabilities": {}}})]))
+        with self.assertRaises(ow.W3CError):
+            page.open("app.exe")
+
+    def test_script_errors_become_a_failed_evaluation_not_an_exception(self):
+        opener = self.opener([(500, {"value": {"error": "script timeout", "message": "script timeout after 90000 ms"}})])
+        page = ow.WebDriverPage("http://x", opener)
+        page.session_id = "S"
+        ok, value, error = page.evaluate_trigger()
+        self.assertEqual((ok, value), (False, None))
+        self.assertIn("script timeout", error)
+        opener = self.opener([OSError("connection reset")])
+        page = ow.WebDriverPage("http://x", opener)
+        page.session_id = "S"
+        self.assertFalse(page.evaluate_trigger()[0])
+
+    def test_driver_discovery(self):
+        default = ow.EDGE_DRIVER_DEFAULT
+        self.assertEqual(ow.find_edge_driver({}, exists=lambda p: p == default, which=lambda n: None), default)
+        found = ow.find_edge_driver({"EdgeWebDriver": "D:\\drivers\\"}, exists=lambda p: p == "D:\\drivers\\msedgedriver.exe", which=lambda n: None)
+        self.assertEqual(found, "D:\\drivers\\msedgedriver.exe")
+        self.assertEqual(ow.find_edge_driver({}, exists=lambda p: False, which=lambda n: "C:\\path\\msedgedriver.exe"), "C:\\path\\msedgedriver.exe")
+        self.assertIsNone(ow.find_edge_driver({}, exists=lambda p: False, which=lambda n: None))
+
+    def test_free_port_uses_an_os_chosen_port_and_closes_the_socket(self):
+        class Sock:
+            closed = False
+
+            def bind(self, address):
+                self.address = address
+
+            def getsockname(self):
+                return ("127.0.0.1", 54321)
+
+            def close(self):
+                Sock.closed = True
+
+        self.assertEqual(ow.free_port(bind=Sock), 54321)
+        self.assertTrue(Sock.closed)
+
+
+class DevToolsPortTests(unittest.TestCase):
+    def test_the_active_port_file_is_read_from_the_webview2_folder(self):
+        files = {"C:\\wv\\EBWebView\\DevToolsActivePort": "40123\n/devtools/browser/abc\n"}
+
+        def read(path):
+            if path in files:
+                return files[path]
+            raise FileNotFoundError(path)
+
+        self.assertEqual(ow.read_devtools_port("C:\\wv\\", read), 40123)
+        files.clear()
+        files["C:\\wv\\DevToolsActivePort"] = "9333\n"
+        self.assertEqual(ow.read_devtools_port("C:\\wv", read), 9333)
+        files.clear()
+        self.assertIsNone(ow.read_devtools_port("C:\\wv", read))
+        files["C:\\wv\\DevToolsActivePort"] = "garbage"
+        self.assertIsNone(ow.read_devtools_port("C:\\wv", read))
+        files["C:\\wv\\DevToolsActivePort"] = "0\n"
+        self.assertIsNone(ow.read_devtools_port("C:\\wv", read), "port 0 is a request, not an answer")
+
+    def test_waiting_gives_up_with_the_reason(self):
+        clock = {"t": 0.0}
+        port, why = ow.wait_for_devtools_port("C:\\wv", 5, read=lambda p: (_ for _ in ()).throw(OSError()), sleep=lambda s: clock.__setitem__("t", clock["t"] + s), clock=lambda: clock["t"])
+        self.assertIsNone(port)
+        self.assertIn("DevToolsActivePort never appeared", why)
+        answers = iter([OSError(), OSError(), "55555\n"])
+
+        def read(path):
+            value = next(answers)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        clock["t"] = 0.0
+        port, why = ow.wait_for_devtools_port("C:\\wv", 60, read=read, sleep=lambda s: clock.__setitem__("t", clock["t"] + s), clock=lambda: clock["t"])
+        self.assertEqual((port, why), (55555, "ok"))
+
+    def test_registry_override_commands(self):
+        argv = ow.registry_override_argv("--remote-debugging-port=0 --remote-allow-origins=*")
+        self.assertEqual(argv[:2], ["reg", "add"])
+        self.assertIn("HKCU\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments", argv)
+        self.assertEqual(argv[argv.index("/v") + 1], "arc-desktop.exe")
+        self.assertEqual(argv[argv.index("/d") + 1], "--remote-debugging-port=0 --remote-allow-origins=*")
+        self.assertEqual(ow.registry_override_remove_argv()[:2], ["reg", "delete"])
+        self.assertIn("/f", ow.registry_override_remove_argv())
+
+    def test_app_pid_and_leftovers_and_command_lines(self):
+        procs = [ProcessTests.proc(10, 1, "msedgedriver.exe", "C:\\SeleniumWebDrivers\\EdgeDriver\\msedgedriver.exe"),
+                 ProcessTests.proc(20, 10, "arc-desktop.exe", APP_EXE, created="2"), ProcessTests.proc(21, 10, "arc-desktop.exe", APP_EXE, created="5"),
+                 ProcessTests.proc(30, 21, "msedgewebview2.exe", "C:\\wv\\msedgewebview2.exe", "msedgewebview2.exe --user-data-dir=C:\\arcw0\\wv2\\app-clean\\EBWebView --remote-debugging-port=0"),
+                 ProcessTests.proc(31, 1, "msedgewebview2.exe", "C:\\wv\\msedgewebview2.exe", "msedgewebview2.exe --user-data-dir=C:\\other"),
+                 ProcessTests.proc(40, 1, "svchost.exe")]
+        self.assertEqual(ow.find_app_pid(procs, "c:/arcw0/app/ARC-DESKTOP.exe".replace("/", "\\")), 21, "the newest instance")
+        self.assertIsNone(ow.find_app_pid(procs, "C:\\nowhere\\arc-desktop.exe"))
+        self.assertIsNone(ow.find_app_pid(None, APP_EXE))
+        left = ow.leftover_processes(procs, ["C:\\arcw0\\wv2"])
+        self.assertEqual(len(left), 4, left)          # driver, two app instances, the one webview2 helper with our folder
+        self.assertEqual(ow.leftover_processes(None, ["x"]), [])
+        lines = ow.webview_command_lines(procs)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("--remote-debugging-port=0", lines[0])
+
+
+class TryStrategyTests(unittest.TestCase):
+    ENV = {"USERPROFILE": "C:\\Users\\runneradmin", "PATH": "p"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.shell = mock.Mock()
+        self.shell.run.return_value = ow.CmdResult(0, "")
+        self.shell.log = lambda line: None
+        self.ctx = ow.Context(Path(self.tmp.name) / "ev", Path(self.tmp.name) / "w", self.shell, {}, env=self.ENV)
+        self.ctx.work.mkdir(parents=True)
+        self.ctx.app_exe = APP_EXE
+        self.ctx.install_dir = "C:\\arcw0\\app"
+        self.wv2 = str(Path(self.tmp.name) / "wv2" / "app-clean-x")
+
+    def test_msedgedriver_strategy_starts_the_driver_with_the_sandbox_environment_and_opens_a_session(self):
+        popen_calls = []
+
+        class Driver:
+            def poll(self):
+                return None
+
+            def kill(self):
+                pass
+
+        def popen(argv, **kwargs):
+            popen_calls.append((argv, kwargs))
+            return Driver()
+
+        statuses = iter([(503, {}), (200, {"value": {"ready": True}})])
+        sessions = []
+
+        class Page:
+            session_id = None
+
+            def __init__(self, base):
+                self.base = base
+
+            def open(self, app_exe, timeout=120.0):
+                sessions.append((self.base, app_exe, timeout))
+                self.session_id = "S"
+                return {"browserVersion": "153"}
+
+            def close(self):
+                pass
+
+        with mock.patch.object(ow, "find_edge_driver", return_value="C:\\drv\\msedgedriver.exe"), mock.patch.object(ow, "free_port", return_value=45678), \
+                mock.patch.object(ow, "WebDriverPage", Page), mock.patch.object(ow, "w3c_call", side_effect=lambda *a, **k: next(statuses)), \
+                mock.patch.object(ow.time, "sleep", lambda s: None):
+            launch = ow.try_strategy(self.ctx, "msedgedriver", "app-clean", "C:\\arcw0\\home", self.wv2, popen=popen)
+        self.addCleanup(ow.close_launch, self.ctx, launch, "C:\\arcw0\\wv2")
+        self.assertTrue(launch.ok, launch.error)
+        self.assertEqual(sessions, [("http://127.0.0.1:45678", APP_EXE, 120)])
+        argv, kwargs = popen_calls[0]
+        self.assertEqual(argv[0], "C:\\drv\\msedgedriver.exe")
+        self.assertIn("--port=45678", argv)
+        env = kwargs["env"]
+        self.assertEqual((env["HOME"], env["WEBVIEW2_USER_DATA_FOLDER"], env["USERPROFILE"]), ("C:\\arcw0\\home", self.wv2, "C:\\Users\\runneradmin"))
+        self.assertNotIn("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", env, "msedgedriver sets its own debugging arguments")
+        ow.close_launch(self.ctx, launch, "C:\\arcw0\\wv2")
+
+    def test_a_session_that_will_not_open_is_an_error_with_the_message_and_is_cleaned_up(self):
+        class Driver:
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+        driver = Driver()
+
+        class Page:
+            session_id = None
+
+            def __init__(self, base):
+                pass
+
+            def open(self, app_exe, timeout=120.0):
+                raise ow.W3CError("session not created", "This version of Microsoft Edge WebDriver only supports Edge 152")
+
+            def close(self):
+                pass
+
+        with mock.patch.object(ow, "find_edge_driver", return_value="d.exe"), mock.patch.object(ow, "free_port", return_value=1), mock.patch.object(ow, "WebDriverPage", Page), \
+                mock.patch.object(ow, "w3c_call", return_value=(200, {})), mock.patch.object(ow.time, "sleep", lambda s: None):
+            launch = ow.try_strategy(self.ctx, "msedgedriver", "t", "h", self.wv2, popen=lambda argv, **kw: driver)
+        self.addCleanup(ow.close_launch, self.ctx, launch, "C:\\arcw0\\wv2")
+        self.assertFalse(launch.ok)
+        self.assertIn("session not created", launch.error)
+        ow.close_launch(self.ctx, launch, "C:\\arcw0\\wv2")
+        self.assertTrue(driver.killed)
+
+    def test_the_driver_exiting_or_missing_is_reported(self):
+        with mock.patch.object(ow, "find_edge_driver", return_value=None):
+            launch = ow.try_strategy(self.ctx, "msedgedriver", "t", "h", self.wv2)
+        self.assertIn("msedgedriver.exe not found", launch.error)
+
+        class Dead:
+            def poll(self):
+                return 3
+
+            def kill(self):
+                pass
+
+        with mock.patch.object(ow, "find_edge_driver", return_value="d.exe"), mock.patch.object(ow, "free_port", return_value=1):
+            launch = ow.try_strategy(self.ctx, "msedgedriver", "t", "h", self.wv2, popen=lambda argv, **kw: Dead())
+        self.addCleanup(ow.close_launch, self.ctx, launch, "C:\\arcw0\\wv2")
+        self.assertIn("exited with code 3", launch.error)
+
+    def test_driver_never_ready_is_reported(self):
+        class Alive:
+            def poll(self):
+                return None
+
+            def kill(self):
+                pass
+
+        clock = {"t": 0.0}
+        with mock.patch.object(ow, "find_edge_driver", return_value="d.exe"), mock.patch.object(ow, "free_port", return_value=1), \
+                mock.patch.object(ow, "w3c_call", side_effect=OSError("refused")), mock.patch.object(ow.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)), \
+                mock.patch.object(ow.time, "time", lambda: clock["t"]):
+            launch = ow.try_strategy(self.ctx, "msedgedriver", "t", "h", self.wv2, popen=lambda argv, **kw: Alive())
+        self.addCleanup(ow.close_launch, self.ctx, launch, "C:\\arcw0\\wv2")
+        self.assertIn("did not answer /status", launch.error)
+
+    def cdp_launch(self, strategy, port=40001, devtools_port=None, target=True):
+        popen_calls = []
+
+        class App:
+            pid = 777
+
+            def poll(self):
+                return None
+
+        def popen(argv, **kwargs):
+            popen_calls.append((argv, kwargs))
+            return App()
+
+        class Ws:
+            def __init__(self, host, port, path, timeout=10.0):
+                self.target = (host, port, path)
+
+            def connect(self):
+                pass
+
+            def close(self):
+                pass
+
+        page_target = {"webSocketDebuggerUrl": "ws://127.0.0.1:40001/devtools/page/A", "url": "http://tauri.localhost/"} if target else None
+        with mock.patch.object(ow, "wait_for_devtools_port", return_value=(devtools_port if devtools_port is not None else port, "ok") if devtools_port != 0 else (None, "never appeared")), \
+                mock.patch.object(ow, "wait_for_page", return_value=(page_target, "ok" if target else "no page")), mock.patch.object(ow, "WebSocketClient", Ws):
+            launch = ow.try_strategy(self.ctx, strategy, "app-clean", "C:\\arcw0\\home", self.wv2, popen=popen)
+        self.addCleanup(ow.close_launch, self.ctx, launch, "C:\\arcw0\\wv2")
+        return launch, popen_calls
+
+    def test_the_env_strategy_asks_for_an_os_chosen_debugging_port_and_finds_it_in_the_user_data_folder(self):
+        launch, calls = self.cdp_launch("cdp-env")
+        self.assertTrue(launch.ok, launch.error)
+        self.assertEqual(launch.page.kind, "cdp")
+        env = calls[0][1]["env"]
+        self.assertEqual(env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"], "--remote-debugging-port=0 --remote-allow-origins=*")
+        self.assertEqual((env["HOME"], env["WEBVIEW2_USER_DATA_FOLDER"], env["USERPROFILE"]), ("C:\\arcw0\\home", self.wv2, "C:\\Users\\runneradmin"))
+        self.assertEqual(launch.notes["devtools_port"], 40001)
+        self.assertFalse(self.ctx.registry_override)
+        ow.close_launch(self.ctx, launch, "C:\\arcw0\\wv2")
+
+    def test_the_registry_strategy_sets_the_override_and_close_removes_it(self):
+        launch, calls = self.cdp_launch("cdp-registry")
+        self.assertTrue(launch.ok, launch.error)
+        self.assertTrue(self.ctx.registry_override)
+        added = [c[0][0] for c in self.shell.run.call_args_list if c[0][0][:2] == ["reg", "add"]]
+        self.assertEqual(len(added), 1)
+        ow.close_launch(self.ctx, launch, "C:\\arcw0\\wv2")
+        removed = [c[0][0] for c in self.shell.run.call_args_list if c[0][0][:2] == ["reg", "delete"]]
+        self.assertEqual(len(removed), 1)
+        self.assertFalse(self.ctx.registry_override)
+        ow.cleanup(self.ctx)
+        self.assertEqual(len([c for c in self.shell.run.call_args_list if c[0][0][:2] == ["reg", "delete"]]), 1, "nothing left to remove")
+
+    def test_a_registry_write_that_fails_stops_that_strategy(self):
+        self.shell.run.return_value = ow.CmdResult(1, "Access is denied")
+        launch, calls = self.cdp_launch("cdp-registry")
+        self.assertFalse(launch.ok)
+        self.assertIn("reg add failed", launch.error)
+        self.assertEqual(calls, [], "the app is not started when the override could not be set")
+
+    def test_no_debugging_port_is_a_recorded_failure(self):
+        launch, _ = self.cdp_launch("cdp-env", devtools_port=0)
+        self.assertFalse(launch.ok)
+        self.assertIn("never appeared", launch.error)
+        launch, _ = self.cdp_launch("cdp-env", target=False)
+        self.assertIn("page target never appeared", launch.error)
+
+    def test_unknown_strategy(self):
+        launch = ow.try_strategy(self.ctx, "telepathy", "t", "h", self.wv2)
+        self.assertIn("unknown strategy", launch.error)
+
+    def test_closing_a_launch_stops_everything_it_started(self):
+        class Proc:
+            def __init__(self, pid):
+                self.pid, self.killed = pid, False
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+        launch = ow.Launch("cdp-env", self.wv2)
+        launch.app_proc, launch.driver_proc = Proc(55), Proc(56)
+        page = mock.Mock()
+        launch.page = page
+        handle = mock.Mock()
+        launch.handles = [handle]
+        ow.close_launch(self.ctx, launch, "C:\\arcw0\\wv2")
+        page.close.assert_called_once()
+        self.assertTrue(launch.driver_proc.killed)
+        handle.close.assert_called_once()
+        taskkills = [c[0][0] for c in self.shell.run.call_args_list if c[0][0][0] == "taskkill"]
+        self.assertIn(["taskkill", "/F", "/T", "/PID", "55"], taskkills)
+
+
+class NativeTierCriteriaTests(unittest.TestCase):
+    """The first CI run failed no_new_app_launch in the native tier only because the lab's own PowerShell snapshot was counted."""
+
+    def base(self):
+        return [ProcessTests.proc(1, 0, "System"), ProcessTests.proc(900, 1, "python.exe", "C:\\hostedtoolcache\\python.exe")]
+
+    def native(self, extra, **kwargs):
+        return ow.process_violations(self.base(), self.base() + extra, 0, [], ["C:\\native\\native-updater-check.exe"], **kwargs)
+
+    def test_the_labs_helpers_are_listed_but_do_not_count(self):
+        helpers = [ProcessTests.proc(901, 900, "powershell.exe", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "powershell -Command Get-CimInstance", created="2"),
+                   ProcessTests.proc(902, 901, "conhost.exe", "C:\\Windows\\System32\\conhost.exe", created="3"),
+                   ProcessTests.proc(903, 900, "python.exe", created="4"), ProcessTests.proc(904, 900, "native-updater-check.exe", "C:\\native\\native-updater-check.exe", created="5"),
+                   ProcessTests.proc(905, 900, "curl.exe", created="6"), ProcessTests.proc(906, 900, "certutil.exe", created="7")]
+        found = self.native(helpers)
+        self.assertEqual(found["new_app_launches"] + found["installers"] + found["other_in_app_tree"], [])
+        self.assertEqual(len(found["lab_helpers"]), 5, "the checker itself is ignored by path, the other five are recorded as lab helpers")
+
+    def test_no_app_tree_exists_in_the_native_tier(self):
+        everything = [ProcessTests.proc(910, 0, "SomethingElse.exe", "C:\\x\\something.exe", created="2")]
+        found = self.native(everything)
+        self.assertEqual(found["other_in_app_tree"], [], "pid 0 means there is no app; children of the idle process are not an app tree")
+        self.assertEqual(len(found["unrelated"]), 1)
+
+    def test_a_new_app_an_installer_or_an_updater_is_still_flagged(self):
+        flagged = self.native([ProcessTests.proc(920, 1, "arc-desktop.exe", APP_EXE, created="2")])
+        self.assertEqual(len(flagged["new_app_launches"]), 1)
+        flagged = self.native([ProcessTests.proc(921, 1, "ARC.Node_0.8.11_x64-setup.exe", "C:\\Temp\\ARC.Node_0.8.11_x64-setup.exe", created="3")])
+        self.assertEqual(len(flagged["installers"]), 1)
+        flagged = self.native([ProcessTests.proc(922, 1, "Update.exe", "C:\\Users\\x\\AppData\\Local\\ARC Node\\updater\\Update.exe", created="4")])
+        self.assertEqual(len(flagged["installers"]), 1)
+
+    def test_webview_helpers_carrying_the_launch_folder_are_the_apps_own_even_outside_its_tree(self):
+        helper = ProcessTests.proc(930, 77, "msedgewebview2.exe", "C:\\wv\\msedgewebview2.exe", "msedgewebview2.exe --user-data-dir=C:\\arcw0\\wv2\\app-clean-cdp-env\\EBWebView", created="2")
+        before = [ProcessTests.proc(1, 0, "System"), ProcessTests.proc(100, 1, "arc-desktop.exe", APP_EXE)]
+        found = ow.process_violations(before, before + [helper], 100, [], webview_markers=["C:\\arcw0\\wv2"])
+        self.assertEqual(found["other_in_app_tree"] + found["unrelated"], [])
+        found = ow.process_violations(before, before + [helper], 100, [])
+        self.assertEqual(len(found["unrelated"]), 1, "without the marker an orphan helper is only recorded")
+
+    def test_the_native_case_with_a_powershell_snapshot_passes(self):
+        error = {"outcome": "error", "error": ow.RELEASE_NOT_FOUND}
+        trigger = ow.native_trigger(error, 0, "latest-404")
+        procs = ow.process_violations(self.base(), self.base() + [ProcessTests.proc(901, 900, "powershell.exe", created="2")], 0, [], ["C:\\native\\n.exe"])
+        result = ow.evaluate_case("latest-404", trigger, requests_for(MANIFEST, REDIRECT), NO_FS, procs, True, [])
+        self.assertEqual(result["verdict"], "PASS", result["reasons"])
+
+
+class PollerFinishTests(unittest.TestCase):
+    def test_a_fast_check_still_gets_at_least_two_full_cycles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "writes.jsonl"
+            poller = ow.Poller([(str(Path(tmp) / "watched"), False)], log, interval=0.05)
+            poller.start()
+            cycles = poller.finish(min_cycles=2, extra_cycles=2)
+            records = ow.read_jsonl(log)
+        self.assertGreaterEqual(cycles, 2)
+        self.assertEqual(records[-1]["event"], "stop")
+        self.assertEqual(records[-1]["cycles"], cycles)
+
+    def test_finish_waits_for_extra_cycles_after_the_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            poller = ow.Poller([(str(Path(tmp) / "watched"), False)], Path(tmp) / "w.jsonl", interval=0.03)
+            poller.start()
+            deadline = time.time() + 10
+            while poller.cycles < 3 and time.time() < deadline:
+                time.sleep(0.02)
+            before = poller.cycles
+            cycles = poller.finish(min_cycles=2, extra_cycles=2)
+        self.assertGreaterEqual(cycles, before + 2)
+
+    def test_finish_without_a_started_poller_just_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            poller = ow.Poller([], Path(tmp) / "w.jsonl")
+            self.assertEqual(poller.finish(), 0)
+
+
+class ProbeAppLaunchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.shell = mock.Mock()
+        self.shell.log = lambda line: None
+        self.ctx = ow.Context(Path(self.tmp.name) / "ev", Path(self.tmp.name) / "w", self.shell, {}, env={})
+        self.ctx.evidence.mkdir()
+        self.ctx.app_exe = APP_EXE
+
+    def mitm(self, records):
+        log = Path(self.tmp.name) / "requests-probe.jsonl"
+        log.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        return mock.Mock(log_path=log)
+
+    def test_the_idle_launch_goes_through_the_strategies_and_reports_only_its_own_traffic(self):
+        mitm = self.mitm([{"kind": "request", "host": "github.com", "path": "/earlier"}])
+        page = FakePage({}, kind="msedgedriver")
+        launch = ow.Launch("msedgedriver", "C:\\wv")
+        launch.page = page
+
+        def acquire(ctx, tag, home, wv2_base, evidence, files, try_one=None):
+            self.assertEqual(tag, "probe")
+            files.append("procs-probe-msedgedriver-launched.txt")
+            with mitm.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"kind": "tls_failure", "sni": "rsms.me"}) + "\n")
+            return launch, [{"strategy": "msedgedriver", "ok": True, "error": None}]
+
+        with mock.patch.object(ow, "acquire_page", acquire), mock.patch.object(ow, "kill_app"), mock.patch.object(ow.time, "sleep", lambda s: None):
+            result = ow.probe_app_launch(self.ctx, mitm)
+        self.assertEqual(result["ipc_probe"]["path"], "msedgedriver")
+        self.assertTrue(result["ipc_probe"]["value"]["ipc"])
+        self.assertEqual(result["idle_launch_requests"]["total"], 0, "the earlier request was before the launch")
+        self.assertEqual(result["idle_launch_requests"]["tls_failures"], [{"sni": "rsms.me", "count": 1}])
+        self.assertEqual(page.calls, ["probe"], "the probe never calls the updater")
+        self.assertTrue(page.closed)
+
+    def test_no_strategy_working_is_an_error_carrying_every_attempt(self):
+        attempts = [{"strategy": "msedgedriver", "ok": False, "error": "session not created"}, {"strategy": "cdp-env", "ok": False, "error": "no port"}]
+        with mock.patch.object(ow, "acquire_page", lambda *a, **k: (None, attempts)), mock.patch.object(ow, "kill_app") as killed:
+            with self.assertRaises(RuntimeError) as caught:
+                ow.probe_app_launch(self.ctx, None)
+        self.assertIn("session not created", str(caught.exception))
+        self.assertIn("no port", str(caught.exception))
+        killed.assert_called()
+
+
+class StrategyOptionTests(unittest.TestCase):
+    def args(self, tmp, strategies):
+        import argparse
+        return argparse.Namespace(evidence=str(Path(tmp) / "evidence"), tier="released_app", cases="clean,cached-bait", config=None, work=str(Path(tmp) / "work"), native_exe=None,
+                                  strategies=strategies)
+
+    def test_unknown_strategies_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(ow.cmd_run(self.args(tmp, "msedgedriver,telepathy")), 2)
+            self.assertEqual(ow.cmd_run(self.args(tmp, "")), 2)
+
+    def test_the_strategy_order_is_carried_into_the_context_and_the_winner_goes_first(self):
+        seen = []
+        original = ow.Context
+
+        class Spy(original):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                seen.append(self)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(ow, "Context", Spy):
+            ow.cmd_run(self.args(tmp, "cdp-registry,msedgedriver"))
+        self.assertEqual(seen[0].strategies, ["cdp-registry", "msedgedriver"])
+        seen[0].winning_strategy = "msedgedriver"
+        self.assertEqual(ow.strategy_order(seen[0]), ["msedgedriver", "cdp-registry"])
+        seen[0].winning_strategy = "something-not-configured"
+        self.assertEqual(ow.strategy_order(seen[0]), ["cdp-registry", "msedgedriver"])
+
+    def test_the_default_order_puts_msedgedriver_first(self):
+        self.assertEqual(ow.TRIGGER_STRATEGIES[0], "msedgedriver")
+        self.assertEqual(set(ow.TRIGGER_STRATEGIES), {"msedgedriver", "cdp-env", "cdp-registry"})
 
 
 class StepTests(unittest.TestCase):

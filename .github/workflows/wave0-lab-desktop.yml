@@ -256,6 +256,10 @@ jobs:
           set -Eeuo pipefail
           python3 -u wave0-lab-desktop/os_macos.py run --evidence "$EVIDENCE" --arch arm64
 
+      - name: Remove the per-run CA from the keychain and restore hosts and pf (always)
+        if: always()
+        run: python3 -u wave0-lab-desktop/os_macos.py cleanup --evidence "$EVIDENCE" || true
+
       - name: Refuse to upload any private key material
         id: keys
         if: always()
@@ -323,6 +327,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           python3 -u wave0-lab-desktop/os_macos.py run --evidence "$EVIDENCE" --arch x86_64
+
+      - name: Remove the per-run CA from the keychain and restore hosts and pf (always)
+        if: always()
+        run: python3 -u wave0-lab-desktop/os_macos.py cleanup --evidence "$EVIDENCE" || true
 
       - name: Refuse to upload any private key material
         id: keys

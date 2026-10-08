@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import unittest
@@ -59,6 +60,8 @@ class NamesTests(unittest.TestCase):
 
     def test_the_released_v0711_files_hold_addresses_only(self):
         def show(path):
+            if os.environ.get("WAVE0_TEST_REAL_REPO") != "1":
+                return None  # opt-in: a default local run never reads the shared repository
             done = subprocess.run(["git", "show", "v0.7.11:" + path], cwd=str(_paths.ROOT), capture_output=True, text=True)
             return done.stdout if done.returncode == 0 else None
 
