@@ -265,7 +265,34 @@ fn cmd_relay(args: &Args) -> Result<(), ModernError> {
     serve_relay(stage, listener, transport, args.required("--next")?)
 }
 
+fn stage_wan_profile(args: &Args) -> Result<Option<WanProfile>, ModernError> {
+    let mut values = [0.0; 3];
+    for (value, flag) in values
+        .iter_mut()
+        .zip(["--wan-ms", "--wan-jitter-ms", "--wan-mbit"])
+    {
+        *value = args.float(flag, 0.0)?;
+        if !value.is_finite() || *value < 0.0 {
+            return Err(ModernError::Invalid(format!(
+                "{flag} must be finite and non-negative"
+            )));
+        }
+    }
+    // Zero uplink preserves the lab protocol's unlimited-bandwidth setting.
+    Ok(if args.value("--wan-ms").is_some() {
+        Some(WanProfile {
+            one_way_ms: values[0],
+            jitter_ms: values[1],
+            uplink_mbit: values[2],
+            seed: args.number("--wan-seed", 1)? as u64,
+        })
+    } else {
+        None
+    })
+}
+
 fn cmd_stage(args: &Args) -> Result<(), ModernError> {
+    let wan = stage_wan_profile(args)?;
     configure(args)?;
     let mut model = StageModel::open_range(&args.path("--package")?, layers(args)?)?;
     if let Some(list) = args.value("--experts-at") {
@@ -298,15 +325,10 @@ fn cmd_stage(args: &Args) -> Result<(), ModernError> {
     };
     let worker = StageWorker::new(model, config)?;
     let tcp: Arc<dyn Transport> = Arc::new(TcpTransport);
-    let transport: Arc<dyn Transport> = match args.value("--wan-ms") {
-        Some(_) => Arc::new(ShapedTransport {
+    let transport: Arc<dyn Transport> = match wan {
+        Some(profile) => Arc::new(ShapedTransport {
             inner: tcp.clone(),
-            profile: WanProfile {
-                one_way_ms: args.float("--wan-ms", 0.0)?,
-                jitter_ms: args.float("--wan-jitter-ms", 0.0)?,
-                uplink_mbit: args.float("--wan-mbit", 0.0)?,
-                seed: args.number("--wan-seed", 1)? as u64,
-            },
+            profile,
         }),
         None => tcp.clone(),
     };

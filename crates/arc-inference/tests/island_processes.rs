@@ -27,6 +27,47 @@ use arc_inference::modern::model::GenerationRequest;
 
 const EXE: &str = env!("CARGO_BIN_EXE_arc-island");
 
+#[test]
+fn stage_rejects_invalid_wan_flags_before_startup() {
+    for flag in ["--wan-ms", "--wan-jitter-ms", "--wan-mbit"] {
+        for value in ["nan", "inf", "-inf", "-1"] {
+            // No package or endpoints: validation must precede loading/binding,
+            // including jitter/uplink flags supplied without --wan-ms.
+            let output = Command::new(EXE)
+                .args(["stage", flag, value])
+                .output()
+                .unwrap();
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success());
+            assert!(
+                error.contains(&format!("{flag} must be finite and non-negative")),
+                "{error}"
+            );
+            assert!(!error.contains("panicked"), "{error}");
+            assert!(output.stdout.is_empty());
+        }
+    }
+    for value in ["0", "1.5"] {
+        let output = Command::new(EXE)
+            .args([
+                "stage",
+                "--wan-ms",
+                value,
+                "--wan-jitter-ms",
+                value,
+                "--wan-mbit",
+                value,
+            ])
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("missing --package"),
+            "valid WAN flags: {error}"
+        );
+    }
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {

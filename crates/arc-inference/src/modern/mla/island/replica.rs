@@ -87,6 +87,9 @@ pub struct ReplicatedStage {
     failed: Option<String>,
     pub failovers: usize,
     pub replayed_frames: usize,
+    /// Replicas retired after a replay response differed from its journaled hash.
+    /// Transport/connect failures do not increment this counter.
+    pub divergent_replays: usize,
 }
 
 impl ReplicatedStage {
@@ -111,16 +114,20 @@ impl ReplicatedStage {
             failed: None,
             failovers: 0,
             replayed_frames: 0,
+            divergent_replays: 0,
         })
     }
 
     fn recover(&mut self) -> Result<(), ModernError> {
+        let mut divergent = 0;
+        let mut unreachable = 0;
         while let Some(endpoint) = self.endpoints.get(self.next) {
             self.next += 1;
             if self.next > 1 {
                 self.failovers += 1;
             }
             let Ok(mut session) = self.connector.connect(endpoint) else {
+                unreachable += 1;
                 continue;
             };
             let mut valid = true;
@@ -129,7 +136,14 @@ impl ReplicatedStage {
                     Ok(output) if blake3::hash(&output).as_bytes() == expected => {
                         self.replayed_frames += 1;
                     }
-                    _ => {
+                    Ok(_) => {
+                        self.divergent_replays += 1;
+                        divergent += 1;
+                        valid = false;
+                        break;
+                    }
+                    Err(_) => {
+                        unreachable += 1;
                         valid = false;
                         break;
                     }
@@ -140,9 +154,14 @@ impl ReplicatedStage {
                 return Ok(());
             }
         }
-        Err(ModernError::Io(
-            "stage replicas exhausted; no unchecked continuation".into(),
-        ))
+        let reason = match (divergent, unreachable) {
+            (0, _) => "no reachable remaining replica".to_string(),
+            (_, 0) => format!("all {divergent} remaining replicas diverged during replay"),
+            _ => format!("{divergent} divergent replays and {unreachable} unreachable replicas"),
+        };
+        Err(ModernError::Io(format!(
+            "stage replicas exhausted: {reason}; no unchecked continuation"
+        )))
     }
 
     /// ENG-1 supplies ordinary Step frames containing multiple independent

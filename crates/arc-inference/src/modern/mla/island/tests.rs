@@ -946,9 +946,13 @@ fn replica_replays_after_lost_reply_and_rejects_changed_replay() {
         calls: usize,
         lose: bool,
         corrupt: bool,
+        unreachable: bool,
     }
     impl StageSession for Session {
         fn exchange(&mut self, input: &[u8]) -> Result<Vec<u8>, ModernError> {
+            if self.unreachable {
+                return Err(ModernError::Io("replay transport failed".into()));
+            }
             self.calls += 1;
             let output = self.worker.process(Frame::decode(input)?)?;
             // Worker has advanced KV, but its reply is lost during churn.
@@ -967,6 +971,9 @@ fn replica_replays_after_lost_reply_and_rejects_changed_replay() {
     }
     impl ReplicaConnector for Connector {
         fn connect(&self, endpoint: &str) -> Result<Box<dyn StageSession>, ModernError> {
+            if endpoint == "unreachable" {
+                return Err(ModernError::Io("connect failed".into()));
+            }
             Ok(Box::new(Session {
                 worker: StageWorker::new(
                     stage_model(&self.c, 0, 4, Router::Random),
@@ -975,6 +982,7 @@ fn replica_replays_after_lost_reply_and_rejects_changed_replay() {
                 calls: 0,
                 lose: endpoint == "lost",
                 corrupt: endpoint == "bad",
+                unreachable: endpoint == "replay-error",
             }))
         }
     }
@@ -1006,6 +1014,58 @@ fn replica_replays_after_lost_reply_and_rejects_changed_replay() {
     }
     assert_eq!(replica.failovers, 2);
     assert_eq!(replica.replayed_frames, 1);
+    assert_eq!(replica.divergent_replays, 1);
+    for (spares, divergences, reason) in [
+        (
+            vec!["bad", "bad"],
+            2,
+            "all 2 remaining replicas diverged during replay",
+        ),
+        (
+            vec!["unreachable", "unreachable"],
+            0,
+            "no reachable remaining replica",
+        ),
+        (
+            vec!["replay-error", "replay-error"],
+            0,
+            "no reachable remaining replica",
+        ),
+        (
+            vec!["bad", "unreachable"],
+            1,
+            "1 divergent replays and 1 unreachable replicas",
+        ),
+    ] {
+        let mut relay = ReplicatedStage::new(
+            Arc::new(Connector { c: c.clone() }),
+            std::iter::once("lost")
+                .chain(spares)
+                .map(str::to_string)
+                .collect(),
+            1 << 20,
+        )
+        .unwrap();
+        let frame = |position| Frame::Step {
+            id: 0,
+            items: vec![Item::new(7, position, 1, Selection::Argmax, vec![3])],
+        };
+        relay.process(frame(0)).unwrap();
+        let error = relay.process(frame(1)).unwrap_err().to_string();
+        assert!(error.contains(reason), "{error}");
+        assert_eq!(relay.divergent_replays, divergences);
+        assert!(
+            relay
+                .process(Frame::Ping {
+                    id: 1,
+                    payload: vec![]
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("permanently refused")
+        );
+        println!("replay exhaustion: {error}; divergent_replays={divergences}");
+    }
     let mut full =
         ReplicatedStage::new(Arc::new(Connector { c }), vec!["healthy".into()], 1).unwrap();
     assert!(

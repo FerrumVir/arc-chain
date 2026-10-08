@@ -56,6 +56,17 @@ peer authentication or proof that a malicious worker ran those weights. Existing
 commitment audits remain necessary. `--sessions`, `--drop-reply-at` and
 `--reply-delay-ms` support finite process tests and synthetic churn/heterogeneity.
 
+`ReplicatedStage::divergent_replays` counts replicas retired because replayed
+response bytes differ from the journaled hash, separately from transport
+failures and `failovers`. Exhaustion distinguishes all-divergent remaining
+replicas, no reachable remaining replica, and mixed failures (with counts).
+Every case still permanently refuses continuation. The counter does not prove
+why a replica diverged, and does not authenticate its identity.
+
+Stage lab flags `--wan-ms`, `--wan-jitter-ms` and `--wan-mbit` must be finite
+and non-negative; invalid values are rejected before loading a package or
+opening endpoints. Zero uplink retains the unlimited-bandwidth setting.
+
 Current recovery limits: this is warm activation replay, not hot KV mirroring.
 The relay and its journal must survive. The journal is bounded and refuses work
 before overflow; it is not silently truncated. Relay/coordinator crash recovery,
