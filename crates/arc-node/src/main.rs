@@ -605,6 +605,51 @@ struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum OperatorCommand {
+    /// Acquire explicitly selected, pinned ENG-10 slices and serve verified
+    /// cache objects. Requires node config slice_distribution.host_slices=true.
+    /// This local worker does not join an island or enable inference.
+    /// Revoke by stopping the process (Ctrl-C); saved consent is checked on
+    /// restart. There is no live consent toggle or config watcher.
+    SliceWorker {
+        #[arg(long)]
+        node_config: String,
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Trusted out-of-band digest; never obtain this from the same manifest.
+        #[arg(long)]
+        manifest_blake3: String,
+        #[arg(long = "slice", required = true)]
+        slices: Vec<String>,
+        #[arg(long)]
+        cache: PathBuf,
+        /// Directory URLs containing <blake3>.slice files.
+        #[arg(long = "mirror")]
+        mirrors: Vec<reqwest::Url>,
+        #[arg(long = "peer")]
+        peers: Vec<reqwest::Url>,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+    },
+    /// Verify downloaded cache objects and publish one stage package offline.
+    /// Never downloads, starts a listener, or activates inference.
+    SliceAssemble {
+        #[arg(long)]
+        node_config: String,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        manifest_blake3: String,
+        #[arg(long = "slice", required = true)]
+        slices: Vec<String>,
+        #[arg(long)]
+        cache: PathBuf,
+        /// Complete stage interval, FIRST:END (end exclusive).
+        #[arg(long)]
+        stage: String,
+        /// Create-only package output; parent directory must exist.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Print the actual native assignment policy commitment without starting
     /// a node, connecting workers, reading chain state, or loading a model.
     NativeAssignmentPolicy {
@@ -4650,6 +4695,74 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
 
 async fn run_operator_command(command: OperatorCommand) -> Result<()> {
     match command {
+        OperatorCommand::SliceAssemble {
+            node_config,
+            manifest,
+            manifest_blake3,
+            slices,
+            cache,
+            stage,
+            output,
+        } => {
+            use arc_node::slice_distribution::manifest::{ManifestAssignment, SliceWorker};
+            use std::io::Read;
+            let config = arc_node::config::load_config(&node_config)?;
+            let mut bytes = Vec::new();
+            std::fs::File::open(manifest)?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            let assignment = ManifestAssignment::parse(&bytes, &manifest_blake3, &slices)?;
+            let worker = SliceWorker::new(
+                assignment,
+                cache,
+                &config.slice_distribution,
+                vec![],
+                vec![],
+            )?;
+            let stage = arc_inference::modern::mla::package::StageSpec::parse(&stage)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&worker.assemble_cached_stage(stage, &output)?)?
+            );
+            Ok(())
+        }
+        OperatorCommand::SliceWorker {
+            node_config,
+            manifest,
+            manifest_blake3,
+            slices,
+            cache,
+            mirrors,
+            peers,
+            listen,
+        } => {
+            use arc_node::slice_distribution::manifest::{ManifestAssignment, SliceWorker};
+            let config = arc_node::config::load_config(&node_config)?;
+            // Bound the read before parsing, including files changed after stat.
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::new();
+            tokio::fs::File::open(manifest)
+                .await?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            let assignment = ManifestAssignment::parse(&bytes, &manifest_blake3, &slices)?;
+            let worker = SliceWorker::new(
+                assignment,
+                cache,
+                &config.slice_distribution,
+                mirrors,
+                peers,
+            )?;
+            worker
+                .run(listen, async {
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        tracing::error!(%error, "slice worker signal handler failed");
+                    }
+                })
+                .await?;
+            Ok(())
+        }
         OperatorCommand::NativeAssignmentPolicy {
             row_workers,
             low_residency,

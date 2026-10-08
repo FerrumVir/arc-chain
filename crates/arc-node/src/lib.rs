@@ -21,6 +21,7 @@ pub mod recovery_dag_wal;
 pub mod row_cohort;
 pub mod row_residency;
 pub mod rpc;
+pub mod slice_distribution;
 pub mod state_sync;
 /// Twin execution v0: pure rules (see docs/twin-execution.md).
 pub mod twin;

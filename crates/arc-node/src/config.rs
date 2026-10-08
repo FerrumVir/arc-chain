@@ -314,6 +314,36 @@ pub struct NodeConfig {
     pub inference: InferenceConfig,
     #[serde(default)]
     pub community: CommunityConfig,
+    #[serde(default)]
+    pub slice_distribution: SliceDistributionConfig,
+}
+
+/// Owner-controlled model slice storage and transfer. This permission is
+/// separate from compute consent; old configs never opt in implicitly.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SliceDistributionConfig {
+    pub host_slices: Option<bool>,
+    /// Aggregate payload bytes/second for this store, shared by all transfers.
+    /// Zero pauses that direction; it never means unlimited.
+    pub download_bytes_per_second: u64,
+    pub upload_bytes_per_second: u64,
+    pub max_slice_bytes: u64,
+    /// Shared verification + response-body slots. Excess requests get 503,
+    /// with no waiting queue. Must be between 1 and 64.
+    pub max_concurrent_serves: usize,
+}
+
+impl Default for SliceDistributionConfig {
+    fn default() -> Self {
+        Self {
+            host_slices: None,
+            download_bytes_per_second: 8 * 1024 * 1024,
+            upload_bytes_per_second: 1024 * 1024,
+            max_slice_bytes: 64 * 1024 * 1024 * 1024,
+            max_concurrent_serves: 2,
+        }
+    }
 }
 
 /// Outbound authenticated community/reward RPC configuration. Kept separate
