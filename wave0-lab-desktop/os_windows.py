@@ -80,11 +80,13 @@ UNVERIFIED ON CI (nothing below could be exercised on the Mac this file was writ
   * that the runner's `python` (3.12) is on PATH as `python`; there may be no `python3`.
 UNVERIFIED ON CI (UI Automation round; the PowerShell below was never executed on the Mac this file was written on, only parsed by tests
 that count brackets; `probe` now runs the real PowerShell parser over the scripts first, check uia_scripts_parse):
-  * that Chromium exposes the WebView2 page to a UIA client at all (it builds its accessibility tree lazily when it believes an assistive
-    technology runs): the tree walk is retried for ~60 s, SPI_SETSCREENREADER is set for the run and restored, and
-    --force-renderer-accessibility is passed in WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS (wry's own arguments probably override it);
-  * that the buttons are Button/Hyperlink nodes named exactly 'Settings', 'Check for updates' and 'Install v... & relaunch' (as in the
-    macOS accessibility dumps), that they support InvokePattern (otherwise a bounding-rectangle mouse click is used and recorded as
+  * SEEN IN RUN 6 (no longer a guess): with SPI_SETSCREENREADER set, Chromium exposes the page: the Tauri window hosts WRY_WEBVIEW > Chrome_WidgetWin_0 >
+    Chrome_WidgetWin_1 (an Edge browser frame, whose toolbar/tab/caption nodes are noise) and the page is the Document with AutomationId RootWebArea under
+    Chrome_RenderWidgetHostHWND. A FRESH app state shows the first-run onboarding ('welcome to arc', 'Get started'), not the Settings page: the lab therefore
+    seeds store.json (as a finished onboarding leaves it, like the macOS runner) into %APPDATA%\\network.arc.desktop before the snapshot, and never clicks
+    'Get started'. The walk is rooted at RootWebArea, the Edge frame is skipped, the page tree is read up to 4000 nodes and waited for up to 90 s;
+  * that, with the state seeded, the app shows its main UI and the buttons are Button/Hyperlink nodes named exactly 'Settings', 'Check for updates' and
+    'Install v... & relaunch' (as in the macOS accessibility dumps; a button is also matched by its first Text child), that they support InvokePattern (otherwise a bounding-rectangle mouse click is used and recorded as
     method 'mouse'; that needs the runner's interactive desktop), and that "Update failed: " and the plugin's message render as two
     adjacent Text nodes (the text search also covers non-adjacent nodes; nothing found = UNPROVED);
   * the output format of `nslookup` on the runner (parse_nslookup_addresses starts at the first "Name:" line) and that a program-scoped
@@ -153,6 +155,8 @@ BANNER_API_HOST = "api.github.com"
 BANNER_API_PATH = "/repos/FerrumVir/arc-chain/releases/latest"
 RSMS_HOST = "rsms.me"
 APP_SCENARIO = "latest-404"          # both released-app cases when the app is driven through its own UI (bait is exercised at plugin level only)
+ONBOARDING_PATTERN = r"^\s*(Get started|welcome to arc)\s*$"          # the first-run screen of a fresh app state (run 6: 'welcome to arc' + a 'Get started' button)
+APP_IDENTIFIER = "network.arc.desktop"
 SETTINGS_PATTERN = r"^\s*Settings\s*$"
 CHECK_PATTERN = r"Check for updates"
 INSTALL_PATTERN = r"Install\s+v?\d"
@@ -1387,6 +1391,7 @@ class Context:
         self.webview2_rule_created = False
         self.screen_reader_before: Optional[int] = None
         self.extra_block_log: List[Dict[str, Any]] = []
+        self.seed_log: List[Dict[str, Any]] = []
         self.webview2_block = True               # block msedgewebview2.exe's egress by program (UNVERIFIED ON CI that the page keeps working); --no-webview2-block observes only
         self.notes: List[str] = []
         self.native_exe: Optional[Path] = None
@@ -1397,6 +1402,52 @@ class Context:
 
     def scenario_for(self, name: str) -> str:
         return APP_SCENARIO if self.ui_mode() else CASE_SCENARIO[name]
+
+
+def store_json_win(home: str) -> Dict[str, Any]:
+    """The persisted app state a FINISHED onboarding leaves (store.rs: {identity, config}, camelCase), exactly what os_macos.store_json writes: without it the released app
+    shows its first-run onboarding and the Settings page does not exist. autoStart is false so the app starts no node and calls no ensure_binary; the identity is a
+    throwaway test value, not a secret."""
+    return {
+        "identity": {
+            "address": "0x" + "00" * 19 + "01",
+            "publicKey": "00" * 32,
+            "seedPhrase": "test test test test test test test test test test test junk",
+            "createdAt": 1790000000,
+        },
+        "config": {
+            "role": "worker",
+            "modelPath": None,
+            "rpcPort": 9090,
+            "p2pPort": 9091,
+            "autoStart": False,
+            "autoUpdate": True,
+            "dataDir": str(Path(home) / ".arc"),
+        },
+    }
+
+
+def seed_app_state(ctx: "Context", home: str) -> Dict[str, Any]:
+    """Write store.json into the app's data dir (%APPDATA%\\network.arc.desktop, which the app logs as 'app data dir') when it is not there yet, BEFORE the case's
+    snapshot (so it is not a new file); the second case finds the first case's state instead. Never raises."""
+    info: Dict[str, Any] = {"seeded": False, "path": None, "reason": None}
+    appdata = ctx.env.get("APPDATA")
+    if not appdata:
+        info["reason"] = "APPDATA is not set: the app will show its first-run onboarding"
+        return info
+    try:
+        target = Path(appdata) / APP_IDENTIFIER / "store.json"
+        info["path"] = str(target)
+        if target.exists():
+            info["reason"] = "a store.json was already there (the first case's state): left as it is"
+            return info
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(store_json_win(home), indent=2), encoding="utf-8")
+        info["seeded"] = True
+    except OSError as error:
+        info["reason"] = "%s: %s" % (type(error).__name__, error)
+    ctx.seed_log.append(info)
+    return info
 
 
 def hosts_path() -> Path:
@@ -1975,9 +2026,10 @@ param(
   [string]$Out,
   [string]$Pattern = '',
   [string]$Types = 'Button,Hyperlink',
-  [int]$MaxNodes = 900,
-  [int]$MaxDepth = 40,
+  [int]$MaxNodes = 4000,
+  [int]$MaxDepth = 60,
   [int]$BudgetMs = 60000,
+  [int]$ChromeCap = 60,
   [switch]$WindowsOnly,
   [switch]$Click
 )
@@ -1986,7 +2038,10 @@ $ErrorActionPreference = 'Stop'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $windows = New-Object System.Collections.ArrayList
 $nodes = New-Object System.Collections.ArrayList
-$result = [ordered]@{ pid = $ProcessId; windows = $windows; nodes = $nodes; truncated = $false; error = $null; elapsed_ms = 0; clicked = $false; method = $null; matched = $null; visited = 0 }
+$chrome = New-Object System.Collections.ArrayList
+$result = [ordered]@{ pid = $ProcessId; windows = $windows; page_found = $false; page_root = $null; from_handle = $null; nodes = $nodes; chrome = $chrome; truncated = $false; error = $null; elapsed_ms = 0; clicked = $false; method = $null; matched = $null; visited = 0; visited_chrome = 0; pruned = 0 }
+# the Edge browser frame around the page (toolbar, tabs, caption buttons, side pane, shadows): never walked, only counted and summarised
+$skip = '^(Edge|BrowserCaptionButtonContainer|TabStrip|TopContainerView|InfoBarContainerView|SidePane|SidePanel|HubWebView|ShadowOverlayView|ShadowFrameView|CornerView|FrameGrabHandle|WindowedFindBar|EmbeddedBrowserDownloadView|MultiContentsDropTargetView|LocationBarView|PageAction|AXVirtualView|Intermediate D3D Window)'
 function Get-Info($el, $depth) {
   $c = $el.Current
   return [ordered]@{
@@ -1999,6 +2054,68 @@ function Get-Info($el, $depth) {
     offscreen = [bool]$c.IsOffscreen
     pid = [int]$c.ProcessId
   }
+}
+function Get-Kids($el) {
+  $kids = New-Object System.Collections.ArrayList
+  try {
+    $child = $walker.GetFirstChild($el)
+    while ($child -ne $null -and $kids.Count -lt 300) {
+      [void]$kids.Add($child)
+      $child = $walker.GetNextSibling($child)
+    }
+  } catch { }
+  return ,$kids
+}
+function Test-Match($el, $info) {
+  if (-not $info.enabled) { return $false }
+  if ($wanted -notcontains $info.type) { return $false }
+  if ($info.name -match $Pattern) { return $true }
+  if ($info.type -eq 'Button' -or $info.type -eq 'Hyperlink') {
+    foreach ($k in (Get-Kids $el)) {
+      try { $kc = $k.Current } catch { continue }
+      if (([string]$kc.ControlType.ProgrammaticName) -eq 'ControlType.Text' -and ([string]$kc.Name).Trim() -ne '') {
+        if (([string]$kc.Name) -match $Pattern) { return $true }
+        break
+      }
+    }
+  }
+  return $false
+}
+function Find-PageRoot($tops) {
+  foreach ($w in $tops) {
+    $stack = New-Object System.Collections.Stack
+    $stack.Push(@($w, 0))
+    while ($stack.Count -gt 0) {
+      if ($sw.ElapsedMilliseconds -gt $BudgetMs) { $result.truncated = $true; return $null }
+      $item = $stack.Pop()
+      $el = $item[0]
+      $depth = [int]$item[1]
+      try { $info = Get-Info $el $depth } catch { continue }
+      if ($info.type -eq 'Document' -and $info.id -eq 'RootWebArea') {
+        $result.page_root = $info
+        return @($el, $depth)
+      }
+      if ($info.class -match $skip) {
+        $result.pruned = $result.pruned + 1
+        if ($chrome.Count -lt $ChromeCap) { $info['pruned'] = $true; [void]$chrome.Add($info) }
+        continue
+      }
+      $result.visited_chrome = $result.visited_chrome + 1
+      if ($chrome.Count -lt $ChromeCap) { [void]$chrome.Add($info) }
+      if ($info.class -eq 'Chrome_RenderWidgetHostHWND' -and $result.from_handle -eq $null) {
+        try {
+          $hwnd = [int64]$el.Current.NativeWindowHandle
+          [void][System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$hwnd)
+          $result.from_handle = [ordered]@{ hwnd = $hwnd; ok = $true }
+        } catch { $result.from_handle = [ordered]@{ ok = $false; error = [string]$_.Exception.Message } }
+      }
+      if ($depth -lt $MaxDepth) {
+        $kids = Get-Kids $el
+        for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push(@($kids[$i], ($depth + 1))) }
+      }
+    }
+  }
+  return $null
 }
 try {
   Add-Type -AssemblyName UIAutomationClient
@@ -2014,10 +2131,11 @@ try {
     $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
     $wanted = $Types -split ','
     $target = $null
-    foreach ($w in $tops) {
-      if ($target -ne $null) { break }
+    $found = Find-PageRoot $tops
+    if ($found -ne $null) {
+      $result.page_found = $true
       $stack = New-Object System.Collections.Stack
-      $stack.Push(@($w, 0))
+      $stack.Push(@($found[0], [int]$found[1]))
       while ($stack.Count -gt 0) {
         if ($sw.ElapsedMilliseconds -gt $BudgetMs -or $result.visited -ge $MaxNodes) { $result.truncated = $true; break }
         $item = $stack.Pop()
@@ -2026,30 +2144,25 @@ try {
         try { $info = Get-Info $el $depth } catch { continue }
         $result.visited = $result.visited + 1
         if ($Click) {
-          if (($wanted -contains $info.type) -and ($info.name -match $Pattern) -and $info.enabled) { $target = $el; $result.matched = $info; break }
+          if (Test-Match $el $info) { $target = $el; $result.matched = $info; break }
         } else {
           [void]$nodes.Add($info)
         }
         if ($depth -lt $MaxDepth) {
-          $kids = New-Object System.Collections.ArrayList
-          try {
-            $child = $walker.GetFirstChild($el)
-            while ($child -ne $null -and $kids.Count -lt 300) {
-              [void]$kids.Add($child)
-              $child = $walker.GetNextSibling($child)
-            }
-          } catch { }
+          $kids = Get-Kids $el
           for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push(@($kids[$i], ($depth + 1))) }
         }
       }
     }
     if ($Click) {
-      if ($target -eq $null) {
+      if (-not $result.page_found) {
+        $result.error = 'page root not found'
+      } elseif ($target -eq $null) {
         $result.error = 'no matching element'
       } else {
         $pat = $null
         if ($target.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
-          try { $pat.Invoke(); $result.clicked = $true; $result.method = 'InvokePattern' } catch { $result.invoke_error = [string]$_.Exception.Message }
+          try { $pat.Invoke(); $result.clicked = $true; $result.method = 'InvokePattern' } catch { $result['invoke_error'] = [string]$_.Exception.Message }
         }
         if (-not $result.clicked) {
           Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class W0Mouse { [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y); [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e); public static void Click(int x, int y) { SetCursorPos(x, y); mouse_event(2, 0, 0, 0, UIntPtr.Zero); mouse_event(4, 0, 0, 0, UIntPtr.Zero); } }'
@@ -2071,7 +2184,7 @@ try {
 $result.elapsed_ms = $sw.ElapsedMilliseconds
 $json = $result | ConvertTo-Json -Depth 6 -Compress
 if ($Out) { [System.IO.File]::WriteAllText($Out, $json, (New-Object System.Text.UTF8Encoding($false))) }
-Write-Output ('uia-walk done: windows={0} nodes={1} clicked={2}' -f $windows.Count, $nodes.Count, $result.clicked)
+Write-Output ('uia-walk done: windows={0} page={1} nodes={2} chrome_visited={3} pruned={4} clicked={5}' -f $windows.Count, $result.page_found, $nodes.Count, $result.visited_chrome, $result.pruned, $result.clicked)
 """
 
 SCREEN_READER_PS = r"""
@@ -2273,14 +2386,21 @@ def uia_card_texts(dump: Optional[dict]) -> List[str]:
 def summarize_uia(dump: Optional[dict]) -> Dict[str, Any]:
     """What the sequence needs to know about a tree: the three buttons, the Updates card texts, sizes."""
     if not dump:
-        return {"available": False, "windows": 0, "nodes": 0, "settings_button": False, "check_for_updates_button": False, "install_button": False, "update_card_texts": []}
+        return {"available": False, "windows": 0, "nodes": 0, "page_found": False, "onboarding": False, "buttons": [], "settings_button": False, "settings_present": False, "check_for_updates_button": False,
+                "install_button": False, "update_card_texts": []}
     return {
         "available": True,
         "error": dump.get("error"),
         "windows": len(dump.get("windows") or []),
         "nodes": len(dump.get("nodes") or []),
+        "page_found": bool(dump.get("page_found")),
+        "chrome_visited": dump.get("visited_chrome"),
+        "chrome_pruned": dump.get("pruned"),
+        "onboarding": bool(uia_find(dump, ONBOARDING_PATTERN)),
+        "buttons": uia_names(dump, BUTTON_TYPES)[:14],
         "truncated": bool(dump.get("truncated")),
         "settings_button": bool(uia_find(dump, SETTINGS_PATTERN, BUTTON_TYPES)),
+        "settings_present": bool(uia_find(dump, SETTINGS_PATTERN)),          # the main UI is up even if the sidebar entry is not exposed as a Button (the click then tries other control types)
         "check_for_updates_button": bool(uia_find(dump, CHECK_PATTERN, BUTTON_TYPES)),
         "install_button": bool(uia_find(dump, INSTALL_PATTERN, BUTTON_TYPES)),
         "update_card_texts": uia_card_texts(dump),
@@ -2343,7 +2463,7 @@ class UiaPage:
         result = self.ctx.shell.run(argv, timeout=timeout)
         return parse_json_file(out), result
 
-    def dump(self, name: Optional[str], max_nodes: int = 900, budget_ms: int = 60000, windows_only: bool = False) -> Optional[dict]:
+    def dump(self, name: Optional[str], max_nodes: int = 4000, budget_ms: int = 60000, windows_only: bool = False) -> Optional[dict]:
         extra = ["-MaxNodes", str(max_nodes), "-BudgetMs", str(budget_ms)]
         if windows_only:
             extra.append("-WindowsOnly")
@@ -2357,10 +2477,10 @@ class UiaPage:
 
     def click(self, pattern: str, label: str, types: Sequence[str] = BUTTON_TYPES) -> Dict[str, Any]:
         """Click the first enabled element whose Name matches; InvokePattern first, a bounding-rectangle mouse click only when Invoke is unsupported (the report says which)."""
-        report, result = self.walk("-Click", "-Pattern", pattern, "-Types", ",".join(types), "-MaxNodes", "1500", "-BudgetMs", "60000", timeout=150)
+        report, result = self.walk("-Click", "-Pattern", pattern, "-Types", ",".join(types), "-MaxNodes", "4000", "-BudgetMs", "60000", timeout=150)
         step = {"label": label, "pattern": pattern, "rc": result.rc, "report": {k: report.get(k) for k in ("clicked", "method", "matched", "visited", "error", "invoke_error", "truncated")} if report else None}
         if report is not None and not report.get("clicked") and report.get("error") == "no matching element" and set(types) == set(BUTTON_TYPES):
-            report, result = self.walk("-Click", "-Pattern", pattern, "-Types", "Text,Custom,Group,ListItem,TabItem,MenuItem,Pane", "-MaxNodes", "1500", "-BudgetMs", "60000", timeout=150)
+            report, result = self.walk("-Click", "-Pattern", pattern, "-Types", "Text,Custom,Group,ListItem,TabItem,MenuItem,Pane", "-MaxNodes", "4000", "-BudgetMs", "60000", timeout=150)
             step["retry_report"] = {k: report.get(k) for k in ("clicked", "method", "matched", "visited", "error", "invoke_error")} if report else None
         if report is None:
             step["raw"] = mask_ips(result.out.strip()[-400:])
@@ -2372,8 +2492,9 @@ class UiaPage:
         return bool((step.get("report") or {}).get("clicked") or (step.get("retry_report") or {}).get("clicked"))
 
     # -- lifecycle ----------------------------------------------------------------------------------------------
-    def open(self, window_timeout: float = 90.0, content_timeout: float = 60.0) -> Dict[str, Any]:
-        """Wait for the app window, then for the web content tree (it appears lazily, once the first UIA client asks)."""
+    def open(self, window_timeout: float = 90.0, content_timeout: float = 90.0) -> Dict[str, Any]:
+        """Wait for the app window, then for the page: the walk is rooted at the web content (the Document with AutomationId RootWebArea inside Edge's browser frame, whose
+        own toolbar and tab nodes are skipped) and repeated until the page has its Settings button; the page tree is built lazily."""
         start = self.clock()
         dump = None
         while self.clock() - start < window_timeout:
@@ -2387,18 +2508,31 @@ class UiaPage:
             raise UiaWindowNotFound("no window of pid %d appeared within %.0f s" % (self.pid, window_timeout))
         start = self.clock()
         dump = None
+        onboarding_seen = 0
         while self.clock() - start < content_timeout:
-            dump = self.dump(None, max_nodes=900, budget_ms=60000)
-            if dump and summarize_uia(dump)["settings_button"]:
+            dump = self.dump(None)
+            summary = summarize_uia(dump)
+            if summary["settings_button"] or summary["settings_present"]:
                 break
-            self.sleep(5)
+            onboarding_seen = onboarding_seen + 1 if summary["onboarding"] else 0
+            if onboarding_seen >= 3:
+                break                       # a first-run screen does not change by itself: waiting longer proves nothing
+            self.sleep(4)
         self.launch_dump = dump
         write_json(self.evidence / ("uia-%s-1-launch.json" % self.stem), dump or {"error": "no tree"})
         self.files.append("uia-%s-1-launch.json" % self.stem)
         self.ui["after_launch"] = summarize_uia(dump)
-        if not self.ui["after_launch"]["settings_button"]:
-            raise UiaContentNotFound("the window of pid %d is there but its web content never exposed a Settings button (nodes: %s)" % (self.pid, self.ui["after_launch"].get("nodes")))
-        return self.ui["after_launch"]
+        after = self.ui["after_launch"]
+        if not (after["settings_button"] or after["settings_present"]):
+            if after["onboarding"]:
+                reason = "the app shows its FIRST-RUN ONBOARDING ('welcome to arc' / 'Get started'): the persisted app state was not picked up, nothing was clicked"
+            elif not after["page_found"]:
+                reason = "UI Automation found no RootWebArea document (the web page) in the window of pid %d (Edge frame nodes visited: %s, skipped: %s)" % (
+                    self.pid, after.get("chrome_visited"), after.get("chrome_pruned"))
+            else:
+                reason = "the page is exposed (%s nodes) but has no Settings button; buttons seen: %s" % (after.get("nodes"), after.get("buttons"))
+            raise UiaContentNotFound("the window of pid %d is there but %s" % (self.pid, reason))
+        return after
 
     def evaluate_probe(self) -> Tuple[bool, Any, Optional[str]]:
         summary = self.ui.get("after_launch") or {}
@@ -2850,6 +2984,8 @@ def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: 
             blocks = refresh_extra_blocks(ctx)                      # the real addresses of rsms.me as the resolver gives them now, and the WebView2 runtime's egress block
             if ctx.real_banner:
                 banner_addresses(ctx, tag)
+            case["app_state_seed"] = seed_app_state(ctx, home)      # as a finished onboarding leaves it (macOS does the same); before the snapshot, so it is not a new file
+            shell.log("app state seed: %s" % json.dumps(case["app_state_seed"]))
         before_snapshot = take_snapshot(roots)
         write_json(evidence / ("fs-%s-before.json" % tag), before_snapshot)
         prelaunch = snapshot_processes(shell)
@@ -3272,6 +3408,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         cleanup(ctx)
     fail_tiers(wanted_tiers, "the tier did not complete")
+    if ctx.seed_log:
+        isolation["app_state_seed"] = {"entries": ctx.seed_log, "what": "store.json as a finished onboarding leaves it (identity: throwaway test values; autoStart false); without it the app shows its first-run onboarding"}
     if ctx.extra_block_log or ctx.rsms_addresses:
         isolation["extra_block_resolution"] = {"rsms.me": sorted(ctx.rsms_addresses), "refreshes": len(ctx.extra_block_log), "last": ctx.extra_block_log[-1] if ctx.extra_block_log else None,
                                                "why": "the hosts mapping alone is not trusted to keep the webview off rsms.me; an address block does not depend on DNS"}
@@ -3376,8 +3514,9 @@ def probe_app_launch(ctx: Context, mitm: Optional[MitmProcess], port: int = CDP_
     wv2_base.mkdir(parents=True, exist_ok=True)
     before = len(read_jsonl(mitm.log_path) or []) if mitm else 0
     files: List[str] = []
+    seed = seed_app_state(ctx, str(home)) if ctx.ui_mode() else None
     launch, attempts = acquire_page(ctx, "probe", str(home), str(wv2_base), ctx.evidence, files)
-    result: Dict[str, Any] = {"attempts": attempts, "files": files, "port_hint": port}
+    result: Dict[str, Any] = {"attempts": attempts, "files": files, "port_hint": port, "app_state_seed": seed}
     try:
         if launch is not None:
             time.sleep(5)

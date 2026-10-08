@@ -2684,6 +2684,8 @@ def uia_node(kind, name, depth=6, **extra):
 def uia_dump(*nodes, **extra):
     windows = extra.pop("windows", 1)
     value = {"pid": 4242, "windows": [{"name": "ARC Node", "class": "Tauri Window", "type": "Window", "handle": 66000 + i, "offscreen": False} for i in range(windows)],
+             "page_found": True, "page_root": {"depth": 13, "type": "Document", "name": "ARC - Node", "id": "RootWebArea", "class": "", "pid": 8344},
+             "chrome": [], "visited_chrome": 60, "pruned": 25,
              "nodes": list(nodes), "truncated": False, "error": None, "visited": len(nodes), "clicked": False}
     value.update(extra)
     return value
@@ -2739,7 +2741,7 @@ class PowerShellScriptTests(unittest.TestCase):
 
     def test_the_walk_script_declares_every_flag_the_python_side_passes(self):
         declared = declared_params(ow.UIA_WALK_PS)
-        self.assertEqual(declared, {"ProcessId", "Out", "Pattern", "Types", "MaxNodes", "MaxDepth", "BudgetMs", "WindowsOnly", "Click"})
+        self.assertEqual(declared, {"ProcessId", "Out", "Pattern", "Types", "MaxNodes", "MaxDepth", "BudgetMs", "ChromeCap", "WindowsOnly", "Click"})
         self.assertEqual(declared_params(ow.SCREEN_READER_PS), {"Mode", "Value", "Out"})
         self.assertEqual(declared_params(ow.SCREENSHOT_PS), {"Out"})
         self.assertEqual(declared_params(ow.NET_WATCH_PS), {"Out", "Stop", "IntervalMs", "Names", "DnsName"})
@@ -2752,6 +2754,125 @@ class PowerShellScriptTests(unittest.TestCase):
         self.assertIn("Test-Path -LiteralPath $Stop", text)
         for event in ("'start'", "'conn'", "'dns'", "'poll'", "'stop'"):
             self.assertIn("event = " + event, text)
+
+
+# Facts from the REAL run-6 dump of the released app (uia-app-clean-1-launch.json, 200 nodes, truncated false): the window hosts WRY_WEBVIEW > Chrome_WidgetWin_0 >
+# Chrome_WidgetWin_1 (an Edge browser frame) and the page is the Document RootWebArea under Chrome_RenderWidgetHostHWND; a FRESH app state showed the first-run screen.
+RUN6_ANCESTORS = ["Tauri Window", "WRY_WEBVIEW", "Chrome_WidgetWin_0", "Chrome_WidgetWin_1", "BrowserRootView", "NonClientView", "EmbeddedBrowserFrameView", "BrowserView",
+                  "SidebarContentsSplitView", "SidebarContentsSplitView", "MultiContentsView", "View", "Chrome_RenderWidgetHostHWND"]
+RUN6_EDGE_FRAME = ["EdgeToolbarView", "BrowserCaptionButtonContainer", "EdgeWindowsCaptionButton", "EdgeTabStripRegionView", "EdgeTabStrip", "EdgeTabContainerImpl", "EdgeTab",
+                   "EdgeNewTabButton", "TabStrip::EdgeTabDragContextImpl", "TopContainerView", "LocationBarView", "PageActionView", "AXVirtualView", "InfoBarContainerView",
+                   "SidePaneRootContainer", "SidePaneRootContainerBackgroundAndBorderView", "HubWebViewContainerView", "HubWebView", "SidePanel", "SidePanelResizeArea",
+                   "ShadowOverlayView", "ShadowFrameView", "CornerView", "FrameGrabHandle", "WindowedFindBarFocusProxyView", "EmbeddedBrowserDownloadView",
+                   "MultiContentsDropTargetView", "Intermediate D3D Window", "EdgePageActionIconView"]       # roots of Edge's own subtrees (their children, e.g. CollaboratorProfilePhoto, go with them)
+RUN6_ONBOARDING_PAGE = [
+    (13, "Document", "ARC - Node", "", "RootWebArea"), (14, "Group", "", "", ""), (15, "Group", "", "", "root"), (16, "Group", "", "onboarding", ""),
+    (17, "Group", "", "onboarding-inner", ""), (18, "Group", "Progress", "onboarding-steps", ""), (18, "Image", "arc", "", ""), (18, "Text", "ai for humans first", "", ""),
+    (18, "Text", "welcome to arc", "onboarding-title", ""), (19, "Text", "welcome to arc", "", ""), (18, "Group", "", "onboarding-subtitle", ""),
+    (19, "Text", "Run a node on your machine. Serve inference. Earn ARC.", "", ""), (18, "Group", "", "", ""), (19, "Text", "One click setup", "", ""),
+    (18, "Group", "", "", ""), (19, "Text", "Your identity, on-chain", "", ""), (18, "Group", "", "", ""), (19, "Text", "Always on", "", ""),
+    (18, "Button", "Get started", "btn btn-primary btn-lg", ""), (19, "Text", "Get started", "", ""), (19, "Image", "", "lucide lucide-arrow-right", "")]
+
+
+class PageRootWalkTests(unittest.TestCase):
+    SKIP = re.search(r"\$skip = '([^']+)'", ow.UIA_WALK_PS).group(1)
+
+    def test_the_edge_frame_is_skipped_and_every_ancestor_of_the_page_is_walked(self):
+        for name in RUN6_EDGE_FRAME:
+            self.assertIsNotNone(re.search(self.SKIP, name), "%s is Edge's own chrome and must be skipped" % name)
+        for name in RUN6_ANCESTORS + ["", "Document", "ContentsWebView", "WebView", "NativeViewHost", "EmbeddedBrowserTabRootView", "Label"]:
+            self.assertIsNone(re.search(self.SKIP, name), "%r leads to the page (or is harmless) and must not be skipped" % name)
+
+    def test_the_script_roots_the_search_at_the_page_and_clicks_only_inside_it(self):
+        text = ow.UIA_WALK_PS
+        self.assertIn("$info.type -eq 'Document' -and $info.id -eq 'RootWebArea'", text)
+        self.assertLess(text.index("function Find-PageRoot"), text.index("$found = Find-PageRoot $tops"))
+        self.assertLess(text.index("$found = Find-PageRoot $tops"), text.index("if ($Click) {\n      if (-not $result.page_found)"))
+        self.assertIn("$result.error = 'page root not found'", text)
+        self.assertIn("[int]$MaxNodes = 4000", text)
+        self.assertIn("[int]$ChromeCap = 60", text)
+        self.assertIn("AutomationElement]::FromHandle", text, "the render widget's window is asked for its UIA provider, which tells Chromium that a client listens")
+        self.assertIn("if ($chrome.Count -lt $ChromeCap)", text)
+
+    def test_a_button_is_matched_by_its_own_name_or_by_its_first_text_child(self):
+        text = ow.UIA_WALK_PS
+        body = text[text.index("function Test-Match"):text.index("function Find-PageRoot")]
+        self.assertIn("$info.name -match $Pattern", body)
+        self.assertIn("ControlType.Text", body)
+        self.assertIn("break", body, "only the FIRST text child counts")
+        self.assertIn("-not $info.enabled", body)
+
+    def test_the_first_run_page_of_run_6_is_recognised_as_onboarding_not_as_a_missing_page(self):
+        nodes = [uia_node(kind, name, depth=depth, **{"class": cls, "id": ident}) for depth, kind, name, cls, ident in RUN6_ONBOARDING_PAGE]
+        summary = ow.summarize_uia(uia_dump(*nodes))
+        self.assertTrue(summary["page_found"] and summary["onboarding"])
+        self.assertFalse(summary["settings_button"] or summary["check_for_updates_button"] or summary["install_button"])
+        self.assertEqual(summary["buttons"], ["Get started"])
+        self.assertEqual(summary["nodes"], 21)
+
+    def test_a_normal_page_is_not_onboarding(self):
+        summary = ow.summarize_uia(uia_dump(uia_node("Button", "Home"), uia_node("Button", "Settings"), uia_node("Text", "Dashboard")))
+        self.assertFalse(summary["onboarding"])
+        self.assertTrue(summary["settings_button"])
+
+
+class AppStateSeedTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.appdata = self.root / "Roaming"
+        self.ctx = ow.Context(self.root / "ev", self.root / "w", mock.Mock(), {}, env={"APPDATA": str(self.appdata)})
+        self.home = str(self.root / "home")
+
+    def test_the_state_of_a_finished_onboarding_is_the_one_the_macos_runner_writes(self):
+        state = ow.store_json_win(self.home)
+        self.assertEqual(sorted(state), ["config", "identity"])
+        self.assertEqual(sorted(state["identity"]), ["address", "createdAt", "publicKey", "seedPhrase"])
+        self.assertEqual(sorted(state["config"]), ["autoStart", "autoUpdate", "dataDir", "modelPath", "p2pPort", "role", "rpcPort"])
+        self.assertIs(state["config"]["autoStart"], False, "no node is started, no ensure_binary is called")
+        self.assertEqual(state["config"]["dataDir"], str(Path(self.home) / ".arc"))
+        try:
+            import os_macos
+        except ImportError:        # pragma: no cover - the macOS runner is a sibling file; its absence only loses the drift check
+            self.skipTest("os_macos not importable")
+        self.assertEqual(state, os_macos.store_json(Path(self.home)))
+
+    def test_it_is_written_to_the_app_data_dir_before_anything_else_when_absent(self):
+        info = ow.seed_app_state(self.ctx, self.home)
+        target = self.appdata / "network.arc.desktop" / "store.json"
+        self.assertTrue(info["seeded"])
+        self.assertEqual(info["path"], str(target))
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), ow.store_json_win(self.home))
+        self.assertEqual(self.ctx.seed_log, [info])
+
+    def test_an_existing_state_is_left_alone_so_the_second_case_starts_from_the_first_ones(self):
+        ow.seed_app_state(self.ctx, self.home)
+        target = self.appdata / "network.arc.desktop" / "store.json"
+        target.write_text('{"identity": null, "config": {"role": "after the first case"}}', encoding="utf-8")
+        info = ow.seed_app_state(self.ctx, self.home)
+        self.assertFalse(info["seeded"])
+        self.assertIn("already there", info["reason"])
+        self.assertIn("after the first case", target.read_text(encoding="utf-8"))
+
+    def test_without_appdata_nothing_is_written_and_the_reason_says_what_will_happen(self):
+        ctx = ow.Context(self.root / "ev", self.root / "w", mock.Mock(), {}, env={})
+        info = ow.seed_app_state(ctx, self.home)
+        self.assertFalse(info["seeded"])
+        self.assertIn("onboarding", info["reason"])
+
+    def test_a_write_error_is_reported_not_raised(self):
+        self.appdata.write_text("a file where the directory should be", encoding="utf-8")
+        info = ow.seed_app_state(self.ctx, self.home)
+        self.assertFalse(info["seeded"])
+        self.assertTrue(info["reason"])
+
+    def test_the_probe_launch_seeds_the_state_too_in_the_ui_world(self):
+        seen = []
+        with mock.patch.object(ow, "seed_app_state", side_effect=lambda ctx, home: seen.append(home) or {"seeded": True}), mock.patch.object(ow, "acquire_page", return_value=(None, [])), \
+                mock.patch.object(ow, "kill_app"), self.assertRaises(RuntimeError):
+            ow.probe_app_launch(self.ctx, None)
+        self.assertEqual(seen, [str(self.ctx.work / "probe-home")])
 
 
 class ParseCheckTests(unittest.TestCase):
@@ -2925,7 +3046,9 @@ class FakeUi:
     so the whole UiaPage sequence runs without Windows."""
     INSTALL = "Install v0.7.12 & relaunch"
 
-    def __init__(self, install_before=False, install_from_check=1, invoke=True, install_clicks=True, failure=("Update failed: ", ow.RELEASE_NOT_FOUND), window_after=0, content_after=0):
+    def __init__(self, install_before=False, install_from_check=1, invoke=True, install_clicks=True, failure=("Update failed: ", ow.RELEASE_NOT_FOUND), window_after=0, content_after=0,
+                 onboarding=False, page_after=0):
+        self.onboarding, self.page_after = onboarding, page_after
         self.screen, self.install_present, self.checks, self.installed = "home", install_before, 0, False
         self.install_from_check, self.invoke, self.install_clicks, self.failure = install_from_check, invoke, install_clicks, tuple(failure)
         self.window_after, self.content_after = window_after, content_after
@@ -2934,8 +3057,11 @@ class FakeUi:
         self.argvs = []
 
     def nodes(self):
-        if self.full_dumps <= self.content_after:
+        if self.full_dumps <= self.page_after or self.full_dumps <= self.content_after:
             return []                                              # the web content is not exposed yet
+        if self.onboarding:                                        # a fresh app state: the first-run screen, no Settings button anywhere
+            return [uia_node("Group", "", id="root", depth=15), uia_node("Text", "welcome to arc", depth=18), uia_node("Button", "Get started", depth=18),
+                    uia_node("Text", "Get started", depth=19)]
         found = [uia_node("Button", "Home"), uia_node("Button", "Settings")]
         if self.screen == "settings":
             found += [uia_node("Text", "Updates"), uia_node("Text", "Latest version"), uia_node("Text", "v0.7.11"), uia_node("Button", "Check for updates")]
@@ -2978,6 +3104,8 @@ class FakeUi:
         else:
             self.full_dumps += 1
             report = uia_dump(*self.nodes())
+            if self.full_dumps <= self.page_after:
+                report.update(page_found=False, page_root=None)       # only the Edge frame so far
         out.write_text(json.dumps(report), encoding="utf-8")
         return ow.CmdResult(0, "uia-walk done")
 
@@ -3120,8 +3248,79 @@ class UiaPageTests(unittest.TestCase):
         launch = page.open()
         self.assertTrue(launch["settings_button"])
         self.assertGreaterEqual(self.sleeps.count(3), 2, "polls the window every 3 s")
-        self.assertGreaterEqual(self.sleeps.count(5), 2, "polls the content every 5 s")
+        self.assertGreaterEqual(self.sleeps.count(4), 2, "polls the page every 4 s")
         self.assertEqual(page.evaluate_probe()[1]["title"], "ARC Node")
+
+    def test_the_first_run_onboarding_stops_the_wait_early_with_its_name_and_nothing_is_clicked(self):
+        page = self.page(FakeUi(onboarding=True))
+        with self.assertRaises(ow.UiaContentNotFound) as caught:
+            page.open()
+        self.assertIn("FIRST-RUN ONBOARDING", str(caught.exception))
+        self.assertIn("nothing was clicked", str(caught.exception))
+        self.assertEqual(self.ui.clicks, [], "'Get started' would create an identity and set a node up: it is never clicked")
+        self.assertEqual(self.ui.full_dumps, 3, "three looks at an unchanging first-run screen are enough")
+        self.assertTrue(page.ui["after_launch"]["onboarding"])
+        self.assertEqual(page.ui["after_launch"]["buttons"], ["Get started"])
+        self.assertTrue((self.evidence / "uia-app-clean-1-launch.json").is_file())
+
+    def test_a_window_whose_page_root_never_appears_says_so_with_the_edge_frame_counts(self):
+        page = self.page(FakeUi(page_after=10 ** 6))
+        with self.assertRaises(ow.UiaContentNotFound) as caught:
+            page.open(content_timeout=20)
+        self.assertIn("RootWebArea", str(caught.exception))
+        self.assertIn("visited: 60", str(caught.exception))
+        self.assertFalse(page.ui["after_launch"]["page_found"])
+
+    def test_a_page_without_a_settings_button_lists_the_buttons_it_does_have(self):
+        class NoSettings(FakeUi):
+            def nodes(self):
+                return [uia_node("Button", "Home"), uia_node("Button", "Wallet")] if self.full_dumps > self.content_after else []
+
+        page = self.page(NoSettings())
+        with self.assertRaises(ow.UiaContentNotFound) as caught:
+            page.open(content_timeout=12)
+        self.assertIn("has no Settings button", str(caught.exception))
+        self.assertIn("'Home', 'Wallet'", str(caught.exception))
+
+    def test_a_settings_entry_exposed_as_another_control_type_is_enough_to_go_on_and_is_clicked_by_the_type_retry(self):
+        class ListItemSettings(FakeUi):
+            def nodes(self):
+                return [dict(n, type="ListItem") if n["name"] == "Settings" else n for n in FakeUi.nodes(self)]
+
+        ui = ListItemSettings()
+        page = self.page(ui)
+        after = page.open()
+        self.assertFalse(after["settings_button"])
+        self.assertTrue(after["settings_present"])
+        ok, value, _error = page.evaluate_trigger()
+        self.assertEqual(ui.clicked_names[:2], [None, "Settings"], "first as a Button (nothing), then by the other control types")
+        self.assertEqual(value["stage"], "ui")
+
+    def test_a_page_root_that_appears_late_is_waited_for(self):
+        page = self.page(FakeUi(page_after=3))
+        self.assertTrue(page.open()["settings_button"])
+        self.assertGreaterEqual(self.sleeps.count(4), 3)
+
+    def test_the_dumps_are_the_page_subtree_with_a_short_summary_of_the_frame(self):
+        page = self.page(FakeUi())
+        page.open()
+        written = json.loads((self.evidence / "uia-app-clean-1-launch.json").read_text(encoding="utf-8"))
+        self.assertTrue(written["page_found"])
+        self.assertEqual(written["page_root"]["id"], "RootWebArea")
+        self.assertLessEqual(len(written["chrome"]), 60)
+        self.assertTrue(all(n["pid"] == 4242 for n in written["nodes"]))
+
+    def test_the_walks_ask_for_the_larger_page_cap(self):
+        page = self.page(FakeUi())
+        page.open()
+        page.evaluate_trigger()
+        full = [argv for argv in self.ui.argvs if "-WindowsOnly" not in argv]
+        self.assertTrue(full)
+        for argv in full:
+            if "-Click" in argv:
+                self.assertEqual(argv[argv.index("-MaxNodes") + 1], "4000")
+            else:
+                self.assertEqual(argv[argv.index("-MaxNodes") + 1], "4000")
 
     def test_no_window_at_all_is_a_window_error_so_the_other_strategies_may_try(self):
         page = self.page(FakeUi(window_after=10 ** 6))
@@ -3547,7 +3746,7 @@ class UiCaseRunnerTests(unittest.TestCase):
     def procs(self, extra=()):
         return [ProcessTests.proc(1, 0, "System"), ProcessTests.proc(4242, 1, "arc-desktop.exe", APP_EXE), ProcessTests.proc(4300, 4242, "msedgewebview2.exe", "C:\\wv2\\msedgewebview2.exe")] + list(extra)
 
-    def run_case(self, name="clean", trigger_value=None, net=None, uia_error=None, requests=None, watcher_error=None, strategies=None):
+    def run_case(self, name="clean", trigger_value=None, net=None, uia_error=None, requests=None, watcher_error=None, strategies=None, trace_snapshots=False):
         trigger_value = trigger_value or self.SUCCESS
         net_rows = net if net is not None else [
             {"event": "start", "t": 0.0}, {"event": "poll", "poll": 1},
@@ -3608,18 +3807,39 @@ class UiCaseRunnerTests(unittest.TestCase):
             return list(self.API)
 
         snapshots = iter([{}, {}])
+
+        def fake_take_snapshot(roots, hash_limit=1 << 20):
+            if hash_limit == 0:
+                return {}
+            if trace_snapshots:
+                calls.append(("snapshot",))
+            return next(snapshots)
+
         real_sleep, real_poller = time.sleep, ow.Poller
         with mock.patch.object(ow, "MitmProcess", FakeMitm), mock.patch.object(ow, "try_strategy", fake_try), mock.patch.object(ow, "NetWatcher", FakeWatcher), \
                 mock.patch.dict(FakeMitm.records, requests or {}), \
                 mock.patch.object(ow, "refresh_extra_blocks", side_effect=lambda ctx: calls.append(("blocks",)) or {"rsms_rule": "created", "webview2_rule": "created"}), \
                 mock.patch.object(ow, "banner_addresses", side_effect=fake_banner), \
+                mock.patch.object(ow, "seed_app_state", side_effect=lambda ctx, home: calls.append(("seed", home)) or {"seeded": True, "path": "APPDATA\\network.arc.desktop\\store.json", "reason": None}), \
                 mock.patch.object(ow, "dns_cache_entries", return_value=[]), mock.patch.object(ow, "take_screenshot", side_effect=fake_screenshot), \
                 mock.patch.object(ow, "snapshot_processes", side_effect=fake_snapshot), \
-                mock.patch.object(ow, "take_snapshot", side_effect=lambda roots, hash_limit=1 << 20: {} if hash_limit == 0 else next(snapshots)), \
+                mock.patch.object(ow, "take_snapshot", side_effect=fake_take_snapshot), \
                 mock.patch.object(ow, "kill_app"), mock.patch.object(ow, "Poller", lambda roots, out, interval=1.0: real_poller(roots, out, interval=0.01)), \
                 mock.patch.object(ow.time, "sleep", lambda seconds: real_sleep(0.05)):
             case = ow.run_released_case(self.ctx, name, {"home": self.HOME, "wv2": self.WV2}, settle_s=0.1)
         return case
+
+    def test_the_finished_onboarding_state_is_seeded_before_the_first_snapshot_and_recorded(self):
+        case = self.run_case("clean", trace_snapshots=True)
+        kinds = [c[0] for c in self.calls]
+        self.assertLess(kinds.index("seed"), kinds.index("snapshot"), "seeded before the 'before' snapshot, so the state file is not a new file")
+        self.assertLess(kinds.index("snapshot"), kinds.index("try"))
+        self.assertEqual(self.calls[kinds.index("seed")][1], self.HOME)
+        self.assertTrue(case["app_state_seed"]["seeded"])
+
+    def test_the_debugging_strategies_do_not_seed(self):
+        self.run_case("clean", trigger_value={"ok": False, "stage": "invoke", "error": ow.RELEASE_NOT_FOUND, "error_type": "string", "error_json": None}, strategies=["msedgedriver"])
+        self.assertNotIn("seed", [c[0] for c in self.calls])
 
     def test_a_clean_ui_run_passes_with_the_banner_call_labelled_and_everything_recorded(self):
         case = self.run_case("clean")
@@ -3651,7 +3871,7 @@ class UiCaseRunnerTests(unittest.TestCase):
     def test_the_order_of_the_steps_blocks_and_banner_addresses_before_the_launch_and_the_watcher_around_it(self):
         self.run_case("clean")
         kinds = [c[0] for c in self.calls]
-        self.assertEqual(kinds, ["watcher", "blocks", "banner", "watcher-start", "try", "watcher-stop", "banner"],
+        self.assertEqual(kinds, ["watcher", "blocks", "banner", "seed", "watcher-start", "try", "watcher-stop", "banner"],
                          "blocks and the banner host's addresses first, the watcher around the launch, the addresses again for the report")
 
     def test_both_cases_run_the_world_after_the_flip_and_bait_is_not_driven_through_the_app(self):
