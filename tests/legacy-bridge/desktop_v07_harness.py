@@ -367,6 +367,7 @@ def run(args: argparse.Namespace) -> None:
         "arc-node-macos-x86_64": "arc-node-macos-x86_64",
     }[asset]
     pinned_node_sha = pins["node_release"]["assets"][node_asset]["sha256"]
+    privacy_safe = pins["node_release"]["worker_names_privacy_safe"] is True
     report: dict[str, object] = {"platform": asset, "node_release": node_tag}
 
     home = (evidence / "home").resolve()
@@ -425,8 +426,12 @@ def run(args: argparse.Namespace) -> None:
     running = node_process(node.process.pid, node_binary)
     report["node_process"] = {k: v for k, v in running.items() if k != "cmdline"}
     cmdline = str(running["cmdline"])
-    for required in ("--stake 0", "--min-stake 0", "--no-community"):
+    # A privacy-safe pin registers as a stake-0 community observer; any other pin must run read-only.
+    for required in ("--stake 0", "--min-stake 0", "--community-mode" if privacy_safe else "--no-community"):
         assert required in cmdline, f"{required} missing from {cmdline}"
+    if privacy_safe:
+        assert "--no-community" not in cmdline, f"--no-community in {cmdline}"
+        assert cmdline.count("--community-rpc-url") == len(pins["community_rpc_origins"]), cmdline
     for forbidden in ("--validator-seed", "--model", "--shard-range", "--insecure-dev-validator-seed"):
         assert forbidden not in cmdline, f"{forbidden} in {cmdline}"
     states = list(bridge_root.glob("nodes/desktop-*/bridge-state.json"))
@@ -434,6 +439,7 @@ def run(args: argparse.Namespace) -> None:
     state = json.loads(states[0].read_text(encoding="utf-8"))
     report["bridge_state"] = state
     assert state["legacy_kind"] == "desktop" and state["stake"] == 0
+    assert state["community_registration"] is privacy_safe, state
     assert state["compute"].startswith("off: the updated ARC desktop app asks")
     assert (states[0].parent / "data" / "genesis.network-hash").is_file()
     assert not (arc / "genesis.network-hash").exists(), "v0.8 initialized the v0.7 data directory"

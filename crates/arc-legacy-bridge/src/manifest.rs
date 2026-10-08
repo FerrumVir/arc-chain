@@ -118,14 +118,14 @@ impl ReleaseManifest {
 mod tests {
     use super::*;
 
-    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.10/SHA256SUMS");
+    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.11/SHA256SUMS");
 
     #[test]
-    fn real_v0810_manifest_parses_and_matches_pins() {
+    fn real_v0811_manifest_parses_and_matches_pins() {
         let manifest = parse(MANIFEST).unwrap();
         assert_eq!(manifest.repository, "FerrumVir/arc-chain");
-        assert_eq!(manifest.tag, "v0.8.10");
-        assert_eq!(manifest.commit, "fd4e8cd2f76b97d08221a622397f513ad04000ad");
+        assert_eq!(manifest.tag, "v0.8.11");
+        assert_eq!(manifest.commit, "cd2344138b32a46eea9192cf0fa7344db6481420");
         assert_eq!(manifest.digests.len(), 28);
         manifest.check_pins(&Pins::embedded().unwrap()).unwrap();
     }
@@ -138,11 +138,11 @@ mod tests {
         let extra_header = text.replacen("# commit=", "# signer=someone\n# commit=", 1);
         assert!(parse(extra_header.as_bytes()).is_err());
         let duplicated = format!(
-            "{text}1fd253cd09520549534bb8b3be64b81022f4adcf66c24884967c621305097724  arc-node-linux-x86_64\n"
+            "{text}54d4d0708ae41d32958110cce9961851911c9b72ca269756cd49dfbc731e061b  arc-node-linux-x86_64\n"
         );
         assert!(parse(duplicated.as_bytes()).is_err());
         let path_name = format!(
-            "{text}1fd253cd09520549534bb8b3be64b81022f4adcf66c24884967c621305097724  ../arc-node\n"
+            "{text}54d4d0708ae41d32958110cce9961851911c9b72ca269756cd49dfbc731e061b  ../arc-node\n"
         );
         assert!(parse(path_name.as_bytes()).is_err());
         assert!(parse(text.trim_end().as_bytes()).is_err());
@@ -153,7 +153,7 @@ mod tests {
         let pins = Pins::embedded().unwrap();
         let text = std::str::from_utf8(MANIFEST)
             .unwrap()
-            .replace("# tag=v0.8.10", "# tag=v0.8.11");
+            .replace("# tag=v0.8.11", "# tag=v0.8.10");
         assert!(parse(text.as_bytes()).unwrap().check_pins(&pins).is_err());
         let mut manifest = parse(MANIFEST).unwrap();
         manifest

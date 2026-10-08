@@ -273,8 +273,10 @@ mod tests {
     fn observer_plan_is_stake_zero_fresh_and_never_registers_on_an_unsafe_pin() {
         let temp = TempDir::new("launch-observer");
         let (layout, invocation, release) = fixture(&temp);
-        let pins = Pins::embedded().unwrap();
-        assert!(!pins.node_release.worker_names_privacy_safe);
+        // The shipped pin is privacy-safe; an unsafe one is built from it so
+        // the refusal to register stays covered.
+        let mut pins = Pins::embedded().unwrap();
+        pins.node_release.worker_names_privacy_safe = false;
         let plan = plan(
             &layout,
             &invocation,

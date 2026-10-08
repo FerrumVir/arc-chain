@@ -410,9 +410,16 @@ mod tests {
             let model = temp.path().join("pinned.gguf");
             fs::write(&model, &model_body).unwrap();
 
-            // Today's pin and a privacy-safe one: off without consent, even
-            // when v0.7 passed --model and --community-mode.
-            for pins in [Pins::embedded().unwrap(), privacy_safe_pins(&model_body)] {
+            // The shipped pin, an unsafe one built from it, and a privacy-safe
+            // one with the test model: off without consent, even when v0.7
+            // passed --model and --community-mode.
+            let mut unsafe_pins = Pins::embedded().unwrap();
+            unsafe_pins.node_release.worker_names_privacy_safe = false;
+            for pins in [
+                Pins::embedded().unwrap(),
+                unsafe_pins,
+                privacy_safe_pins(&model_body),
+            ] {
                 let compute = decide(&layout, &invocation, &pins).unwrap();
                 assert!(!compute.is_on(), "{name}: {}", compute.describe());
                 let args = launch_args(&layout, &invocation, &pins, &compute);

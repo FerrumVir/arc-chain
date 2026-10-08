@@ -35,10 +35,9 @@ env:
   CARGO_TERM_COLOR: always
   # A branch push exercises the pipeline against the current release as a
   # stand-in; its handoff is always marked not eligible for "Latest".
-  # TODO(v0.8.11-repin): move the stand-in to v0.8.11 once it is published.
-  # The real desktop_tag is the first release containing this question
-  # (legacy_upgrade::hold_at_startup); v0.8.11 does not.
-  DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.10' }}
+  # v0.8.11 is the stand-in. The real desktop_tag is the first release
+  # containing this question (legacy_upgrade::hold_at_startup); v0.8.11 does not.
+  DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.11' }}
 
 jobs:
   pins:

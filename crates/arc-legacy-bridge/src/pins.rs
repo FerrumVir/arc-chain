@@ -14,11 +14,12 @@ use crate::sshsig;
 
 /// The reviewed pin set compiled into this bridge.
 ///
-/// TODO(v0.8.11-repin): this pins arc-node v0.8.10, whose community
-/// registration publishes hostnames, so every headless node runs with
-/// `--no-community` and compute off. After v0.8.11 is published, regenerate
-/// with `pin-release.py --tag v0.8.11 --write` together with its
-/// `fixtures/v0.8.11` manifest; the tests below that name v0.8.10 move with it.
+/// It pins arc-node v0.8.11, whose community registration publishes a
+/// privacy-safe public name (PR #134), so a bridged node registers as a
+/// stake-0 community observer and computes only after the operator opts in.
+/// Regenerate with `pin-release.py --tag <tag> --write` together with that
+/// tag's `fixtures/<tag>` manifest; the tests below that name the tag move
+/// with it.
 pub const EMBEDDED_PINS: &str = include_str!("../pins/active.json");
 
 pub const PINS_SCHEMA: &str = "arc.legacy-bridge.pins.v1";
@@ -342,13 +343,14 @@ mod tests {
     use super::*;
     use crate::manifest;
 
-    const FIXTURE_MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.10/SHA256SUMS");
-    const FIXTURE_SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.10/SHA256SUMS.sig");
+    const FIXTURE_MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.11/SHA256SUMS");
+    const FIXTURE_SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.11/SHA256SUMS.sig");
 
     #[test]
     fn embedded_pins_parse_and_validate() {
         let pins = Pins::embedded().unwrap();
-        assert_eq!(pins.node_release.tag, "v0.8.10");
+        assert_eq!(pins.node_release.tag, "v0.8.11");
+        assert!(pins.node_release.worker_names_privacy_safe);
         assert_eq!(pins.community_rpc_origins.len(), 6);
     }
 
@@ -395,7 +397,7 @@ mod tests {
 
     #[test]
     fn pins_reject_tampering() {
-        let text = EMBEDDED_PINS.replace("\"v0.8.10\"", "\"v0.8.9\"");
+        let text = EMBEDDED_PINS.replace("\"v0.8.11\"", "\"v0.8.9\"");
         assert!(
             Pins::parse(&text).is_err(),
             "tag/version mismatch must fail"

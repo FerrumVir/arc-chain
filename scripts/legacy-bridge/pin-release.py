@@ -18,7 +18,7 @@ never from memory:
    pin from the tag's arc-node TESTNET_MODEL_SHA256.
 
 Usage:
-  pin-release.py --tag v0.8.10 --write   # regenerate the pin file
+  pin-release.py --tag v0.8.11 --write   # regenerate the pin file
   pin-release.py --check                 # recompute and compare (CI)
 """
 

@@ -42,6 +42,7 @@ bridge_version="$(jq -er '.bridge_version' "$pins")"
 bridge_tag="v$bridge_version"
 node_version="$(jq -er '.node_release.version' "$pins")"
 node_sha256="$(jq -er --arg a "$asset" '.node_release.assets[$a].sha256' "$pins")"
+privacy_safe="$(jq -er '.node_release.worker_names_privacy_safe' "$pins")"
 
 export USER="${USER:-$(id -un)}"
 arc_dir="$HOME/.arc"
@@ -219,8 +220,18 @@ for forbidden in --validator-seed --insecure-dev-validator-seed --shard-range --
         fail "the bridged node was started with $forbidden"
     fi
 done
-grep -qx -- --no-community "$evidence/bridged-node.argv" \
-    || fail "a node build that publishes hostnames must run without community registration"
+if [ "$privacy_safe" = true ]; then
+    grep -qx -- --community-mode "$evidence/bridged-node.argv" \
+        || fail "a privacy-safe node build must register as a stake-0 community observer"
+    if grep -qx -- --no-community "$evidence/bridged-node.argv"; then
+        fail "a privacy-safe node build was started without community registration"
+    fi
+    [ "$(grep -cx -- --community-rpc-url "$evidence/bridged-node.argv")" = "$(jq -er '.community_rpc_origins | length' "$pins")" ] \
+        || fail "the node was not given every pinned community origin"
+else
+    grep -qx -- --no-community "$evidence/bridged-node.argv" \
+        || fail "a node build that publishes hostnames must run without community registration"
+fi
 [ "$(argv_value --rpc)" = 127.0.0.1:9944 ] || fail "the node RPC is not loopback-only"
 /usr/bin/curl -sf http://127.0.0.1:9944/node/info > "$evidence/node-info.json"
 /usr/bin/curl -sf http://127.0.0.1:9944/health > "$evidence/health.json"
@@ -233,6 +244,8 @@ jq -e '.chain_participation_enabled == false' "$evidence/health.json" >/dev/null
 node_dir="$(dirname "$node_data")"
 state_json="$node_dir/bridge-state.json"
 jq -e '.stake == 0 and .legacy_kind == "headless" and (.compute | startswith("off:"))' "$state_json" >/dev/null
+jq -e --argjson safe "$privacy_safe" '.community_registration == $safe' "$state_json" >/dev/null \
+    || fail "bridge-state community_registration does not follow the pin"
 jq -e --slurpfile info "$evidence/node-info.json" '.node_address == ($info[0].validator | ltrimstr("0x"))' \
     "$state_json" >/dev/null || fail "bridge-state address differs from /node/info"
 grep -q 'Your ARC node is upgrading to the new network' "$arc_dir/node.log"

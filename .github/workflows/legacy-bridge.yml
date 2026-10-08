@@ -67,7 +67,7 @@ jobs:
         run: cargo fmt -p arc-legacy-bridge -- --check
       - name: clippy (deny warnings)
         run: cargo clippy -p arc-legacy-bridge --all-targets --locked -- -D warnings
-      - name: Unit tests (real v0.8.10 signed manifest, local HTTP server)
+      - name: Unit tests (real v0.8.11 signed manifest, local HTTP server)
         run: cargo test -p arc-legacy-bridge --locked
 
   scripts:
@@ -213,12 +213,11 @@ jobs:
           mkdir -p "$out"
           pubkey="$(git show v0.7.11:desktop/src-tauri/tauri.conf.json | jq -er '.plugins.updater.pubkey')"
           # The bridge release republishes a qualified v0.8 desktop release's
-          # latest.json byte for byte. v0.8.10 stands in until the release
-          # with the first-launch consent dialog is published.
-          # TODO(v0.8.11-repin): this only proves the v0.7 key accepts a v0.8
-          # bundle; switch the stand-in to v0.8.11 once it is published.
+          # latest.json byte for byte. v0.8.11 stands in until the release
+          # with the first-launch consent dialog is published; this only
+          # proves the v0.7 key accepts a v0.8 bundle.
           curl -fsSL --retry 3 -o "$out/latest.json" \
-            https://github.com/FerrumVir/arc-chain/releases/download/v0.8.10/latest.json
+            https://github.com/FerrumVir/arc-chain/releases/download/v0.8.11/latest.json
           python3 - "$out/latest.json" <<'PY'
           import json, sys
           manifest = json.load(open(sys.argv[1], encoding="utf-8"))

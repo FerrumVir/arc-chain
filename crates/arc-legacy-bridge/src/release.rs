@@ -231,11 +231,11 @@ mod tests {
     use crate::layout::test_support::TempDir;
     use std::collections::BTreeMap;
 
-    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.10/SHA256SUMS");
-    const SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.10/SHA256SUMS.sig");
+    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.11/SHA256SUMS");
+    const SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.11/SHA256SUMS.sig");
 
     /// Pins whose asset digests describe small local stand-ins, while the
-    /// manifest and its signature stay the real v0.8.10 bytes. This drives
+    /// manifest and its signature stay the real v0.8.11 bytes. This drives
     /// the full ordering and refusal logic without downloading 30 MB.
     fn stand_in_pins(platform: Platform) -> (Pins, BTreeMap<String, Vec<u8>>) {
         let mut pins = Pins::embedded().unwrap();

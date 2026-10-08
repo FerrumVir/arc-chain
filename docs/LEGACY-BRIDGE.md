@@ -150,7 +150,9 @@ line. The launcher sits in that slot permanently and on every start:
    every v0.7 community installer hard-coded `--community-mode`, and `--model`
    named a file, not a choice about the new network. A pin whose node build
    would publish the computer's hostname (`main.rs:8749-8826` at `v0.8.10`,
-   fixed by PR #134) runs with `--no-community` and no compute.
+   fixed by PR #134) runs with `--no-community` and no compute. The pinned
+   v0.8.11 carries that fix, so its nodes register under a privacy-safe public
+   name.
 9. **Starts the node exactly as `install.sh:4578-4595` would.**
    - **Network and stake:** `--rpc 127.0.0.1:<v0.7 port> --p2p-port <v0.7 port>`
      with the release's seeds and genesis, and `--stake 0 --min-stake 0
@@ -171,8 +173,8 @@ line. The launcher sits in that slot permanently and on every start:
      node runs in a kill-on-close job object, so the v0.7 desktop's "stop"
      still stops it.
 
-A stake-0 v0.8.10 node never joins consensus
-(`chain_participation_allowed`, `main.rs:5734` at `v0.8.10`). Its `/health`
+A stake-0 v0.8.11 node never joins consensus
+(`chain_participation_allowed`, `main.rs:5915` at `v0.8.11`). Its `/health`
 reports `chain_participation_enabled: false` and `/node/info` reports
 `stake: 0`. The acceptance asserts both.
 
@@ -282,8 +284,8 @@ public testnet. The jobs read only public release assets.
 
 | Job | What it proves |
 |---|---|
-| bridge unit tests (Linux, Windows) | The real v0.8.10 `SHA256SUMS` signature verifies with the release key, and any byte change, wrong key or namespace fails. Every pin equals the signed manifest. Downloads resume after a cut and reject tampered or oversized bodies against a local HTTP server. Exact v0.7 command lines are accepted, validator stakes refused, and seeds never retained. The observer and worker command lines are correct. Auto-discovery hazards are refused. Archive generations and the stat-only manifest work. |
-| headless acceptance (systemd, real updater) | The **unmodified v0.7.11 `install-community-node.sh`** installs the pinned v0.7.7 binary under systemd, and v0.7.7 writes real state. Its own **`arc-auto-update.sh`, run as `arc-updater.service`**, consumes a simulated v0.7.12 Latest and passes its 30-second health check. The service's process is the pinned v0.8.10 binary with `--stake 0 --min-stake 0`, a fresh data directory, `--no-community` and no `--model`. `/node/info` reports stake 0 and `/health` reports `chain_participation_enabled: false`. The v0.7 data is byte-identical to the moment systemd stopped v0.7, captured by an `ExecStartPre` hook. No seed appears anywhere the bridge wrote. A second updater run is a no-op, restarts reuse the cache, and a corrupted cache self-heals. Compute and validator command lines are refused. Rollback runs v0.7.7 again on its untouched data, and reinstall bridges again with the same identity. |
+| bridge unit tests (Linux, Windows) | The real v0.8.11 `SHA256SUMS` signature verifies with the release key, and any byte change, wrong key or namespace fails. Every pin equals the signed manifest. Downloads resume after a cut and reject tampered or oversized bodies against a local HTTP server. Exact v0.7 command lines are accepted, validator stakes refused, and seeds never retained. The observer and worker command lines are correct. Auto-discovery hazards are refused. Archive generations and the stat-only manifest work. |
+| headless acceptance (systemd, real updater) | The **unmodified v0.7.11 `install-community-node.sh`** installs the pinned v0.7.7 binary under systemd, and v0.7.7 writes real state. Its own **`arc-auto-update.sh`, run as `arc-updater.service`**, consumes a simulated v0.7.12 Latest and passes its 30-second health check. The service's process is the pinned v0.8.11 binary with `--stake 0 --min-stake 0`, a fresh data directory, `--community-mode` with the six pinned origins (the runner rejects every live-network address, so nothing registers) and no `--model`; `bridge-state.json` reports `community_registration` as the pin says. `/node/info` reports stake 0 and `/health` reports `chain_participation_enabled: false`. The v0.7 data is byte-identical to the moment systemd stopped v0.7, captured by an `ExecStartPre` hook. No seed appears anywhere the bridge wrote. A second updater run is a no-op, restarts reuse the cache, and a corrupted cache self-heals. Compute and validator command lines are refused. Rollback runs v0.7.7 again on its untouched data, and reinstall bridges again with the same identity. |
 | desktop acceptance (Linux, Windows) | A line-for-line harness of the v0.7.11 app's `ensure_binary` and `NodeManager::start`, checked against the tag's source, reproduces today's stranding (HTTP 404 from the desktop-only Latest). With the bridge as Latest, the next start installs the launcher and runs the pinned node at stake 0 in a fresh directory, with the v0.7 `~/.arc` state byte-identical. Stopping the app's child stops the node (job object on Windows), and a restart reuses the verified cache. |
 | Tauri updater check (Linux job) | The v0.8 desktop `latest.json` and all four platform bundles verify with the key embedded in v0.7.11, with a version above 0.7.11. A v0.7 desktop will install it. |
 | `legacy-bridge-release-assets.yml` | `pin-release.py --check` re-derives every pin from the live release and its owner signature. The workflow builds the five launchers, verifies the desktop `latest.json`, and assembles the owner handoff with an `eligible_for_latest` verdict. |
@@ -295,9 +297,10 @@ None is automated.
 
 ### Stage 0: prerequisites (merges and a normal v0.8 release)
 
-TODO(v0.8.11-repin): the bridge still pins arc-node v0.8.10 and uses the
-v0.8.10 desktop `latest.json` as a CI stand-in. Both change only after
-v0.8.11 is published; `grep -rn 'TODO(v0.8.11-repin)'` lists every place.
+The bridge pins arc-node v0.8.11 (`pins/active.json` and `fixtures/v0.8.11`,
+regenerated with `pin-release.py --tag v0.8.11 --write`) and uses the v0.8.11
+desktop `latest.json` as its CI stand-in. The real `desktop_tag` for the
+handoff is the first release that contains the first-launch question (step 4).
 
 1. Merge PRs #134 (privacy-safe worker names), #135, #138 (consent switch)
    and this PR. (#134, #135 and #138 are on main.)
