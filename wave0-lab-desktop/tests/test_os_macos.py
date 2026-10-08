@@ -1361,6 +1361,43 @@ class NetworkParsingTests(unittest.TestCase):
         self.assertEqual(m.related_pids(seen, 4242), [555, 4242, 4300])
         self.assertEqual(m.related_pids(seen, None), [555, 4242])
 
+    def error_nodes(self, *pieces, **extra):
+        parent = [0, 9, 14]
+        nodes = [{"role": "AXStaticText", "value": text, "name": text, "path": parent + [i], "depth": 3} for i, text in enumerate(pieces)]
+        for node in nodes:
+            node.update(extra)
+        return nodes
+
+    def test_the_updates_card_error_is_the_texts_that_follow_the_marker_among_its_siblings(self):
+        nodes = self.error_nodes("Update failed: ", "Could not fetch a valid release JSON from the remote")
+        found = m.update_error_from_nodes(nodes)
+        self.assertEqual(found["message"], "Could not fetch a valid release JSON from the remote")
+        self.assertEqual(found["line"], "Update failed: Could not fetch a valid release JSON from the remote")
+        self.assertTrue(found["marker_found"])
+        three = m.update_error_from_nodes(self.error_nodes("Update failed: ", "error sending request for url (", "https://github.com/x)"))
+        self.assertEqual(three["message"], "error sending request for url (https://github.com/x)", "adjacent siblings are concatenated")
+        single = m.update_error_from_nodes(self.error_nodes("Update failed: Could not fetch a valid release JSON from the remote"))
+        self.assertEqual(single["message"], "Could not fetch a valid release JSON from the remote")
+        self.assertEqual(single["source"], "the 'Update failed:' node itself")
+
+    def test_siblings_of_other_parents_and_earlier_siblings_are_not_part_of_the_message(self):
+        nodes = self.error_nodes("Version 0.7.12 is available.", "Update failed: ", "the real message")
+        nodes.append({"role": "AXStaticText", "value": "IDENTITY", "path": [0, 9, 17, 0], "depth": 3})
+        nodes.append({"role": "AXButton", "title": "Check for updates", "path": [0, 9, 14, 3], "depth": 3})
+        found = m.update_error_from_nodes(nodes)
+        self.assertEqual(found["message"], "the real message")
+
+    def test_the_exact_release_not_found_text_anywhere_in_a_static_text_is_the_fallback(self):
+        nodes = [{"role": "AXStaticText", "value": "Could not fetch a valid release JSON from the remote", "path": [0, 5], "depth": 2}]
+        found = m.update_error_from_nodes(nodes)
+        self.assertEqual(found["message"], "Could not fetch a valid release JSON from the remote")
+        self.assertFalse(found["marker_found"])
+        self.assertIn("holds the ReleaseNotFound text", found["source"])
+        self.assertIsNone(m.update_error_from_nodes([{"role": "AXButton", "title": "Could not fetch a valid release JSON from the remote", "path": [0, 1]}])["message"],
+                          "a button label is not an error text")
+        self.assertIsNone(m.update_error_from_nodes([])["message"])
+        self.assertIsNone(m.update_error_from_nodes(None)["message"])
+
     def test_update_error_text_is_taken_verbatim_from_the_updates_card(self):
         texts = ["You're running the latest version.", "Update failed: Could not fetch a valid release JSON from the remote", "Check for updates"]
         self.assertEqual(m.extract_update_error(texts), "Could not fetch a valid release JSON from the remote")
@@ -1526,6 +1563,20 @@ class TierFlowTests(unittest.TestCase):
         nodes += [{"role": "AXStaticText", "title": None, "description": None, "name": None, "value": text} for text in texts]
         return {"pid": 4242, "windows": 1, "error": None, "truncated": False, "nodes": nodes}
 
+    @classmethod
+    def error_dump(cls, error_text):
+        """The window after an Install click. React renders `Update failed: {error}` as two text nodes and the AX tree keeps them as two
+        adjacent AXStaticText siblings (run 37805882472): "Update failed: " and the message."""
+        base = cls.dump(["Settings", "Check for updates", "Install v0.7.12 & relaunch"], ["UPDATES", "V0.7.12", "Version 0.7.12 is available. Click below to download, install, and relaunch."])
+        if error_text:
+            marker, _, message = error_text.partition("Update failed: ") if error_text.startswith("Update failed: ") else ("", "", error_text)
+            parent = [0, 0, 0, 0, 0, 9, 14]
+            first = {"role": "AXStaticText", "title": None, "description": None, "name": "Update failed: ", "value": "Update failed: ", "path": parent + [0], "depth": 7}
+            second = {"role": "AXStaticText", "title": None, "description": None, "name": message, "value": message, "path": parent + [1], "depth": 7}
+            base["nodes"] += [first, second] if error_text.startswith("Update failed: ") else [{"role": "AXStaticText", "title": None, "description": None, "name": error_text, "value": error_text,
+                                                                                             "path": parent + [0], "depth": 7}]
+        return base
+
     def run_app(self, install=True, error_text="Update failed: Could not fetch a valid release JSON from the remote", lsof_rows=None, env=None, click_ok=True,
                 install_from_attempt=None, pill="v0.7.12", sentence=None, install_before_check=False, sleeps=None):
         class FakeProc:
@@ -1561,7 +1612,7 @@ class TierFlowTests(unittest.TestCase):
                 texts = [sentence or ("Version 0.7.12 is available. Click below to download, install, and relaunch." if shows else "You're running the latest version.")]
                 return self.dump(["Settings", " Check for updates"] + (["Install v0.7.12 & relaunch"] if shows else []), ["Updates", pill] + texts), result
             if label == "AX dump after Install":
-                return self.dump(["Settings"], [error_text] if error_text else []), result
+                return self.error_dump(error_text), result
             raise AssertionError("unexpected osascript label " + label)
 
         class FakeCapture:
@@ -1601,6 +1652,7 @@ class TierFlowTests(unittest.TestCase):
         (app / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
         (app / "Contents" / "MacOS" / "arc-desktop").write_bytes(b"binary")
         rec = FakeRecorder(self.ev)
+        self.last_rec = rec
         env = env or FakeEnv()
         facts = {"binary": str(app / "Contents" / "MacOS" / "arc-desktop")}
         click = mock.Mock(side_effect=lambda rec, pid, patterns, label: {"label": label, "report": {"clicked": click_ok}})
@@ -1631,6 +1683,53 @@ class TierFlowTests(unittest.TestCase):
         self.assertIn("NOT recorded", network_file)
         self.assertIn("140.82.112.5", network_file, "the pass-through flow is labelled with the address resolved at run time")
         self.assertIn(("latest-404", "requests-clean-released_app.jsonl"), env.served)
+
+    def test_the_error_text_split_over_two_sibling_static_texts_is_joined_and_classified(self):
+        entry, click, env = self.run_app()
+        plugin = entry["trigger_outcome"]["plugin_check"]
+        self.assertEqual(plugin["error"], "Could not fetch a valid release JSON from the remote")
+        self.assertEqual(plugin["error_kind"], "ReleaseNotFound")
+        self.assertEqual(plugin["outcome"], "error")
+        self.assertEqual(plugin["error_line"], "Update failed: Could not fetch a valid release JSON from the remote")
+        self.assertIn("AXStaticText siblings that follow", plugin["source"])
+        ui = entry["trigger_outcome"]["ui"]
+        self.assertEqual(ui["ui_error_text"], "Could not fetch a valid release JSON from the remote")
+        self.assertTrue(ui["ui_error_marker_found"])
+        self.assertEqual(entry["verdict"], "PASS", json.dumps({"reasons": entry["criteria_reasons"], "notes": entry["notes"]}))
+        self.assertEqual(entry["notes"], [], "nothing is withholding the PASS")
+        self.assertTrue(any("rsms.me" in line for line in entry["info"]), "the font request answered by the recorder is listed, as information")
+
+    def test_another_error_text_is_recorded_verbatim_and_the_case_stays_unproved(self):
+        entry, click, env = self.run_app(error_text="Update failed: error sending request for url (https://github.com/x)")
+        plugin = entry["trigger_outcome"]["plugin_check"]
+        self.assertEqual(plugin["error"], "error sending request for url (https://github.com/x)")
+        self.assertIsNone(plugin["error_kind"])
+        self.assertEqual(entry["verdict"], "UNPROVED")
+        self.assertTrue(any("did not end in ReleaseNotFound" in note for note in entry["notes"]))
+
+    def test_no_error_text_at_all_keeps_the_case_unproved(self):
+        entry, click, env = self.run_app(error_text="")
+        plugin = entry["trigger_outcome"]["plugin_check"]
+        self.assertIsNone(plugin["error"])
+        self.assertEqual(plugin["source"], "UI text of the Updates card (data-testid update-error): no error text found")
+        self.assertEqual(entry["verdict"], "UNPROVED")
+
+    def test_a_marker_without_its_message_is_not_a_pass(self):
+        dump = self.error_dump("")
+        dump["nodes"].append({"role": "AXStaticText", "name": "Update failed: ", "value": "Update failed: ", "path": [0, 9, 14, 0], "depth": 4, "title": None, "description": None})
+        found = m.update_error_from_nodes(dump["nodes"])
+        self.assertTrue(found["marker_found"])
+        self.assertIsNone(found["message"])
+
+    def test_finder_windows_are_closed_before_the_launch_and_the_app_is_brought_to_the_front(self):
+        entry, click, env = self.run_app()
+        commands = [" ".join(call["argv"]) for call in self.last_rec.calls]
+        close = [i for i, c in enumerate(commands) if "close every Finder window" in c]
+        self.assertTrue(close, "every Finder window is closed")
+        self.assertEqual(entry["trigger_outcome"]["ui"]["finder_cleanup"]["rc"], 0)
+        front = [i for i, c in enumerate(commands) if "set frontmost of (first process whose unix id is 4242) to true" in c]
+        self.assertGreaterEqual(len(front), 2, "before the first and before the final screenshot")
+        self.assertIn("bring_to_front", entry["trigger_outcome"]["ui"])
 
     def test_a_banner_without_a_tag_is_retried_three_times_20_seconds_apart_then_the_tier_is_infeasible_with_the_exact_ui_text(self):
         sleeps = []
@@ -1771,6 +1870,7 @@ class CiHelperTests(unittest.TestCase):
             ("sqlite3", (1, "", "Error: unable to open database file")),
         ]
         rec = FakeRecorder(self.root / "ev", answers)
+        self.last_accessibility_rec = rec
         return m.accessibility_tests(rec, self.root / "ev")
 
     def test_accessibility_granted_is_proved_by_a_click_that_opened_a_window(self):
@@ -1782,9 +1882,10 @@ class CiHelperTests(unittest.TestCase):
         self.assertEqual(summary["assistive_access"], "granted")
         self.assertEqual(result["tests"]["b_tcc_system_db"]["rc"], 1, "an unreadable TCC database is recorded, not hidden")
         self.assertIn("unable to open database file", result["tests"]["b_tcc_system_db"]["stderr"])
+        self.assertTrue(any("close every Finder window" in " ".join(call["argv"]) for call in self.last_accessibility_rec.calls), "the window the click opened is closed, whichever way it was opened")
         saved = json.loads((self.root / "ev" / "accessibility.json").read_text())
         self.assertEqual(saved["summary"]["click_works"], True)
-        self.assertEqual(set(saved["tests"]), {"a_system_events_process_list", "a2_ui_elements_enabled", "b_tcc_system_db", "b_tcc_user_db", "b_process_chain", "c_finder_menu_click"})
+        self.assertEqual(set(saved["tests"]), {"a_system_events_process_list", "a2_ui_elements_enabled", "b_tcc_system_db", "b_tcc_user_db", "b_process_chain", "c_finder_menu_click", "c_finder_cleanup"})
 
     def test_accessibility_denied_keeps_the_exact_error(self):
         error = "execution error: System Events got an error: osascript is not allowed assistive access. (-25211)"

@@ -669,6 +669,53 @@ def extract_update_error(texts: Sequence[str]) -> Optional[str]:
     return None
 
 
+UPDATE_FAILED_MARK = re.compile(r"^\s*Update failed:\s*(?P<rest>.*)$", re.DOTALL)
+
+
+def node_text(node: Dict[str, Any]) -> str:
+    """The text of an AX node as the page rendered it (static texts keep it in value, buttons in title)."""
+    for key in ("value", "title", "name", "description"):
+        text = node.get(key)
+        if isinstance(text, str) and text.strip():
+            return text
+    return ""
+
+
+def update_error_from_nodes(nodes: Optional[Sequence[Dict[str, Any]]]) -> Dict[str, Any]:
+    """The error the Updates card shows after an Install click (Settings.tsx renders `Update failed: {error}`). WebKit's accessibility
+    tree keeps the two React text nodes apart ("Update failed: " and the message, adjacent AXStaticText siblings), so the message is the
+    concatenation of the static texts that FOLLOW the marker node among its siblings; when the marker node itself carries the text that is
+    used. Fallback: a static text of the window that holds the exact ReleaseNotFound text. Nothing found = message None (fail closed)."""
+    found: Dict[str, Any] = {"message": None, "line": None, "source": None, "marker_found": False}
+    items = list(nodes or [])
+    for node in items:
+        match = UPDATE_FAILED_MARK.match(node_text(node))
+        if not match:
+            continue
+        found["marker_found"] = True
+        rest = match.group("rest").strip()
+        if rest:
+            found.update(message=rest, line="Update failed: " + rest, source="the 'Update failed:' node itself")
+            return found
+        path = node.get("path") or []
+        if path and isinstance(path[-1], int):
+            parent, index = path[:-1], path[-1]
+            siblings = [n for n in items if isinstance(n.get("path"), list) and n["path"][:-1] == parent and n["path"] and isinstance(n["path"][-1], int) and n["path"][-1] > index
+                        and n.get("role") == "AXStaticText" and node_text(n)]
+            siblings.sort(key=lambda n: n["path"][-1])
+            message = "".join(node_text(n) for n in siblings).strip()
+            if message:
+                found.update(message=message, line="Update failed: " + message, source="the AXStaticText siblings that follow the 'Update failed:' node")
+                return found
+        break
+    for node in items:
+        if node.get("role") == "AXStaticText" and RELEASE_NOT_FOUND_TEXT in node_text(node):
+            message = node_text(node).strip()
+            found.update(message=message, line="Update failed: " + message, source="a static text of the window that holds the ReleaseNotFound text")
+            return found
+    return found
+
+
 def infer_error_kind(message: Optional[str]) -> Optional[str]:
     """The updater error variant behind a UI message (the Display text of tauri-plugin-updater 2.10.1's Error)."""
     if message and RELEASE_NOT_FOUND_TEXT in message:
@@ -694,6 +741,18 @@ AS_FINDER_CLICK = "\n".join([
     "end tell",
     'return ((count of idsBefore) as string) & "," & ((count of idsAfter) as string)',
 ])
+
+
+AS_FINDER_CLOSE_ALL = "\n".join([
+    'tell application "Finder"',
+    "  close every Finder window",
+    "  return count of Finder windows",
+    "end tell",
+])
+
+
+def as_bring_to_front(pid: int) -> str:
+    return 'tell application "System Events" to set frontmost of (first process whose unix id is %d) to true' % pid
 
 
 def osascript_argv(script: str) -> List[str]:
@@ -1317,6 +1376,7 @@ def accessibility_tests(rec: Recorder, evidence: Path) -> Dict[str, Any]:
     # (c) a real click through System Events on a harmless app
     click = rec.run(osascript_argv(AS_FINDER_CLICK), label="Accessibility (c): click Finder > File > New Finder Window", timeout=90)
     record("c_finder_menu_click", click)
+    tests["c_finder_cleanup"] = close_finder_windows(rec)
     counts = (click.out.strip().splitlines() or [""])[-1]
     match = re.fullmatch(r"(\d+),(\d+)", counts)
     click_works = bool(match) and click.ok and int(match.group(2)) > int(match.group(1))
@@ -2069,6 +2129,20 @@ def screenshot(rec: Recorder, evidence: Path, name: str) -> None:
     rec.run(["screencapture", "-x", "-t", "png", str(evidence / ("screenshot-%s.png" % name))], label="screenshot " + name, timeout=30)
 
 
+def close_finder_windows(rec: Recorder) -> Dict[str, Any]:
+    """The Accessibility test leaves a Finder window on the screen, in front of the app in every screenshot. On a throwaway runner nothing
+    of anyone's is open, so every Finder window is closed (the count left is recorded)."""
+    result = rec.run(osascript_argv(AS_FINDER_CLOSE_ALL), label="close every Finder window (throwaway runner)", timeout=40)
+    left = (result.out.strip().splitlines() or [""])[-1]
+    return {"rc": result.rc, "windows_left": int(left) if left.isdigit() else None}
+
+
+def bring_app_to_front(rec: Recorder, pid: int) -> Dict[str, Any]:
+    """The app exec'd from the runner session does not take focus from Finder: make it the frontmost process before the screenshots."""
+    result = rec.run(osascript_argv(as_bring_to_front(pid)), label="bring the app to the front", timeout=30)
+    return {"rc": result.rc, "error": tail_lines(result.text.strip(), 2) if not result.ok else None}
+
+
 class CaptureWatcher:
     """A text capture of DNS and HTTPS packets (tcpdump -n -tt -l [-k NP]) while a case runs. Darwin's pktap interface names the
     process of every packet. The raw capture stays on the runner; only the per-flow summary goes into the evidence."""
@@ -2247,6 +2321,7 @@ def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, a
                 ui["extra_block_refresh"] = refresh
                 if refresh.get("verified") is False:
                     raise StepFailed("the pf block could not be verified after adding addresses: the app is not launched")
+                ui["finder_cleanup"] = close_finder_windows(rec)
                 binary = Path(facts["binary"])
                 child_env = {"HOME": str(home), "TMPDIR": str(tmp) + "/", "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "RUST_LOG": "info", "LANG": "en_US.UTF-8"}
                 app_handle = open(str(app_log), "w", encoding="utf-8")
@@ -2267,6 +2342,8 @@ def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, a
                     ui["problem"] = "the app exited with rc %s before a window appeared" % proc.poll()
                 elif window is None:
                     ui["problem"] = "no window appeared within 90 s (System Events saw none)"
+                if window is not None:
+                    ui["bring_to_front"] = bring_app_to_front(rec, proc.pid)
                 if probe or window is not None:
                     screenshot(rec, evidence, "%s-after-launch" % case)
                 if window is not None:
@@ -2306,11 +2383,16 @@ def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, a
                         for _ in range(8):
                             time.sleep(4)
                             final, result = osascript_json(rec, jxa_ax_dump(proc.pid), "AX dump after Install")
-                            if extract_update_error(ax_visible_texts(final)) or "No update available" in " ".join(ax_visible_texts(final)):
+                            if update_error_from_nodes((final or {}).get("nodes"))["message"] or "No update available" in " ".join(ax_visible_texts(final)):
                                 break
                         write_json(evidence / ("ax-%s-4-after-install.json" % stem), final if final else {"raw": rec.mask(result.text)})
                         ui["after_install"] = summarize_ax(final)
-                        ui["ui_error_text"] = extract_update_error(ax_visible_texts(final))
+                        error = update_error_from_nodes((final or {}).get("nodes"))
+                        ui["ui_error_text"] = error["message"]
+                        ui["ui_error_line"] = error["line"]
+                        ui["ui_error_source"] = error["source"]
+                        ui["ui_error_marker_found"] = error["marker_found"]
+                    ui["bring_to_front_final"] = bring_app_to_front(rec, proc.pid)
                     screenshot(rec, evidence, "%s-final" % case)
             finally:
                 if proc is not None and proc.poll() is None:
@@ -2370,7 +2452,8 @@ def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, a
     message = ui.get("ui_error_text")
     if ui.get("install_clicked") and manifest_rows:
         plugin_check: Dict[str, Any] = {"reached": True, "outcome": "error" if message else None, "error_kind": infer_error_kind(message),
-                                        "error": message, "source": "UI text of the Updates card (data-testid update-error)"}
+                                        "error": message, "error_line": ui.get("ui_error_line"),
+                                        "source": "UI text of the Updates card (data-testid update-error): %s" % (ui.get("ui_error_source") or "no error text found")}
     else:
         last_texts = ((ui.get("banner_attempts") or [{}])[-1]).get("card_texts") or []
         banner_text = " ".join(last_texts)
@@ -2397,7 +2480,7 @@ def run_app_case(rec: Recorder, env: Interception, evidence: Path, work: Path, a
                             "note": ("real-banner mode: one unauthenticated read-only GET to api.github.com reached the real Internet (not recorded by us); everything else stayed on the recorder"
                                      if env.real_banner else "NEGATIVE CONTROL: the plugin check() is not reachable from the released macOS app without the non-interceptable banner call succeeding")
                             + "; the bait scenario is exercised at plugin level only (the app's Install handler downloads by design when an update exists)"},
-        "requests": summarize_requests(rows), "criteria": evaluated["criteria"], "criteria_reasons": evaluated["reasons"], "notes": evaluated["notes"] + evaluated.get("info", []),
+        "requests": summarize_requests(rows), "criteria": evaluated["criteria"], "criteria_reasons": evaluated["reasons"], "notes": evaluated["notes"], "info": evaluated.get("info", []),
         "network": {"violations": network["violations"], "allowed_banner_endpoints": network["allowed_banner_endpoints"], "blocked_live_node_attempts": len(network["blocked_live_node_attempts"]),
                     "recorded": network["recorded"], "file": "network-%s.json" % stem},
         "file_writes": {"expected_prefixes": expected, "poller_scans": fs_result.get("poller_scans"), "poller_events": len(fs_result.get("poller_events") or []),

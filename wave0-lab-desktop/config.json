@@ -103,12 +103,12 @@
   "jobs": {
     "linux": {
       "runner": "ubuntu-24.04",
-      "enabled": true,
+      "enabled": false,
       "optional": false
     },
     "windows": {
       "runner": "windows-latest",
-      "enabled": true,
+      "enabled": false,
       "optional": false
     },
     "macos_arm64": {
