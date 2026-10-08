@@ -1,119 +1,130 @@
 # Read-only BF16 row census
 
-`scripts/arc_mla/bf16_row_census.py` inventories retained local sources against
-reviewed engine `616ba16a60f43b5e70666ca24f5d7f9ce99ab932`. It does not fetch
-weights or change source files. A report is **not admission approval** and does
-not implement a flush, clamp, fallback, conversion or forward-execution oracle.
-No real-weight census has been performed for this change.
+`scripts/arc_mla/bf16_row_census.py` scans retained, hash-pinned local BF16
+sources. Engine admission reference remains `616ba16a60f43b5e70666ca24f5d7f9ce99ab932`
+(restacked unchanged into #168). It never fetches, converts or modifies weights,
+selects a flush/fallback policy or approves admission. This delivery uses only
+synthetic fixtures; it is not the real K2.6 census.
 
-## Usage
+## Invocation and trust
 
-Requires the existing Python conformance dependencies (`numpy`, `blake3`).
-Use a trusted pinned `arc.hf-source.v1` manifest, its local `config.json`, any
-pinned index, and retained safetensors shards. The manifest itself is the trust
-anchor: the report includes its SHA-256, but the caller must authenticate that
-pin independently. Do not regenerate the manifest to bless changed weights.
+Requires existing `numpy` and `blake3` dependencies. The caller must authenticate
+the pinned `arc.hf-source.v1` manifest; its hash alone is not an external trust
+anchor. Keep its config, index and retained shards together. Do not regenerate
+pins to bless changed real inputs.
 
 ```sh
 python scripts/arc_mla/bf16_row_census.py \
-  --source-dir retained-source \
-  --source-manifest pinned.source.json \
-  --precision policy.json \
-  --out census.json
+  --source-dir retained-source --source-manifest pinned.source.json \
+  --precision complete-policy.json --out census.json
 ```
 
-A complete policy is mandatory, including for all-INT8:
+The policy requires integer `version:1` and exactly `attention`, `dense`,
+`shared`, `embedding`, `head`, each `int8` or `int16`. Both complete mixed
+policies from #156 and #168 remain supported and explicitly recorded.
 
-```json
-{"version":1,"attention":"int16","dense":"int16","shared":"int8","embedding":"int8","head":"int16"}
-```
+Present pinned files are length/SHA256-verified before and after scanning using
+the same read-only descriptor. Hashing buffers are at most 1 MiB. Absent shards
+and missing language tensors are listed, never fetched. Config/index must be
+present. Names, prefix, dtype, shape, header extents, duplicates and overlaps
+retain their validation. Unlisted local files are not inputs. Report output
+must be a fresh path outside the source directory; links/existing paths reject.
+Avoid concurrent source writers: verification does not lock paths after scanning.
 
-This is #168's mixed policy. #156's mixed policy instead uses attention/shared/
-embedding INT16 and dense/head INT8. The report records all five selections,
-including classes absent from a retained subset. Missing/unknown fields,
-unknown selections, duplicate JSON keys and versions other than integer 1 fail.
+Exit 0 means a report was written, **including if rows are unsupported**. Exit 2
+means invalid inputs/hash/metadata/output location. A partial or empty scan is
+not whole-model support. `admission_approved` is always false. Inspect inventory,
+missing scope and both native/selectable admission flags before further work.
 
-The output must be a new file outside the source directory. Existing paths,
-including links to inputs, are refused. Exit 0 means a valid report was written;
-unsupported rows **still produce a report and exit 0**. Exit 2 means invalid
-inputs, hashes or output location; no census report is written for those errors.
-Before considering conversion, inspect `scanned_selectable_rows_supported`,
-`complete_language_tensor_inventory`, `missing_language_tensors` and
-`absent_shards`, and match the scanned scope to the separately authorized scope.
-An empty or partial scan cannot establish whole-model support.
+## Version 2 report
 
-Every present pinned source is checked for exact length and SHA-256 before and
-after scanning, using the same read-only file descriptor. Pinned config/index
-metadata must be present; absent shards are explicitly recorded. Unlisted local
-files are not inputs. Safetensors metadata, extents, duplicates and expected
-language tensor shapes/dtypes are validated. The scanner never rewrites a pin,
-fetches a missing shard, or modifies/deletes a source. Avoid concurrent source
-writers: checks describe the bytes read, not a lock on paths after the scan.
+The schema is `arc.bf16-row-census.v2`: `tensors`, `classes`, top-level `rows`
+and `counts` now include BF16 **norms and routers**, in addition to the five
+selectable classes. `native_or_ignored_tensors` retains shape-only experts,
+correction biases and ignored vision/rotary tensors; they are not value-scanned.
+Native INT4 payloads/scales are never quantized by this tool. Header extents,
+expected shapes/dtypes and whole-file hashes still cover them.
 
-## Counts and row layout
+Each tensor/component record carries source file/hash, original tensor name,
+source dtype/shape, class, actual precision, layout and semantic shape. Fields:
 
-Counts are exhaustive and disjoint, with nonfinite taking precedence over any
-finite value in a row, then the all-zero exception (including negative zero):
+- `counts`: actual selected-matrix or native converter admission, exhaustive
+  zero/below/in/at-or-above/nonfinite categories.
+- `int16_window_counts`: the **fixed diagnostic** matrix window, independent
+  of selected policy or native representation: zero, `(0,2^-17)`,
+  `[2^-17,2^30)`, `[2^30,infinity)` finite, and nonfinite separately.
+- `int8_accepted_int16_rejected`: exact intersection, equivalently finite row
+  maxima in `[127*2^-32,2^-17)`; zero is accepted by both. It is not computed
+  from the selected policy. INT8's exact upper bound is `127*2^15`, below the
+  INT16 upper bound, so there is no upper-tail contribution to this intersection.
+- `row_max_abs`: finite-row count, nonfinite-row count and numeric min/median/max
+  of absolute row maxima (weight units, not q values). Nonfinite rows are
+  excluded, not treated as zeros or finite maxima. Empty finite populations
+  have null statistics. Finite signed-zero rows contribute zero. Numeric values
+  are binary64 representations; `median_bf16_pair` and `median_exact` decimal
+  numerator/denominator strings preserve the exact even median independently
+  of display rounding. Even medians are the mean of the two middle observations.
+- `rejected_rows`: **every** row rejected by actual admission or fixed INT16
+  diagnostics, with zero-based semantic row, semantic coordinates, maximum
+  absolute BF16 encoding, separate actual/diagnostic rejection categories and
+  intersection flag. Tensor name/component live in the enclosing record;
+  identity is `(tensor, layout, semantic_row)`. No truncation/sampling of these
+  identities occurs. Nonfinite rows have their own rejection category.
 
-| Category | Meaning |
-|---|---|
-| `zero` | All entries are positive or negative zero; supported separately |
-| `below_range` | Nonzero finite maximum yields scale shift k > 62 |
-| `in_range` | Nonzero finite maximum yields 16 <= k <= 62 |
-| `at_or_above_range` | Nonzero finite maximum yields k < 16 |
-| `nonfinite` | At least one BF16 infinity or NaN |
+`tensor_totals` also pools both KV-B components into one tensor summary (ordinary
+tensors have one component). Tensor, class and global statistics use pooled histogram counts, **not averages or
+medians of tensor statistics**. All counts and statistics are repeated at these
+aggregate levels; rejection identities appear once under tensor components.
+`scanned_selectable_rows_supported` checks actual selected policy only;
+`scanned_native_rows_supported` checks scanned norms/router only. Neither flag
+certifies diagnostic INT16 support, unscanned bias/expert values, whole inventory,
+YaRN preparation, resources or quality.
 
-The classifier derives k using integer mantissa/exponent arithmetic and the
-converter's scale normalization/rounding. Exhaustively over finite positive
-BF16 encodings, INT16 accepts maxima `0x3700..0x4e7f` (2^-17 inclusive to 2^30
-exclusive); INT8 accepts `0x32fe..0x4a7d`. Signs do not affect admission. A small
-entry in a row with an admissible maximum does not make that row below-range.
+## Converter geometry and distinct domains
 
-`language_model.` is stripped according to the wrapped source config before
-class selection. Normal matrices use source row order. KV-B `[H*(N+V),R]`
-is reported as two semantic matrices, in the converter's order:
+| Class/component | Semantic rows | Actual admission |
+|---|---|---|
+| Attention, dense, shared, embedding, head | Source output rows; vocabulary rows for embed/head | Selected dyadic INT8/INT16, zero exception. INT16 maxima `[2^-17,2^30)`; INT8 `[127*2^-32,127*2^15)`. |
+| KV-B key | Source `[H*(N+V),R]` → key `[H*R,N]`; row `h*R+r` gathers source `[h*(N+V)+n,r]`; coordinates `[h,r]` | Selected attention policy, evaluated **after transpose**. |
+| KV-B value | `[H*V,R]`; row `h*V+v` is source `[h*(N+V)+N+v,:]`; coordinates `[h,v]` | Selected attention policy. |
+| Norms | `norm_scalar_q16`: one source scalar per semantic row, `[elements,1]`; coordinates `[element]` | I64 Q16, finite `abs(w)<2^46`; small values round as specified by the native converter, not a new matrix flush. |
+| Router | `router_expert_row`: source `[experts,hidden]`, coordinates `[expert]` | Existing INT16 power-of-two scale, nonzero maxima `[2^-48,2^15)`, zero exception. |
 
-- key `[H*R,N]`: row `(head,rank)` gathers the N key positions;
-- value `[H*V,R]`: row `(head,value)` reads the contiguous R columns after
-  the key block of that head.
+Prefix handling remains driven by the wrapped source config. Nonfinite entries
+win over finite maxima in every row, regardless of sign. A diagnostic matrix
+rejection on a norm/router row is **not** a native conversion rejection. Bias
+is deliberately separate from router weight distributions.
 
-Each record includes the original tensor and shard name/hash, semantic shape,
-layout, class, selected precision, row total and five counts. Class aggregates
-and global totals count **semantic conversion rows**, so KV-B contributes
-`H*R + H*V`, not its source row count. Native routed experts (including BF16
-scales), routers, correction biases and norms are listed separately; their
-admission rules are not inferred from selectable-matrix counts. Ignored vision,
-projector and rotary-frequency tensors are also identified separately. The
-scanner does not validate native tensor values or approve YaRN preparation.
+## Bounds, tests and handoff
 
-## Resource bounds and synthetic validation
-
-Payloads are streamed, with `--chunk-elements` (default 32768, maximum 524288)
-limiting each BF16 read. Even a row larger than that limit is chunked. KV-B keys
-are accumulated in rank-column tiles; the complete tensor is never transposed
-or loaded. Hashing reads at most 1 MiB at a time. JSON metadata is limited to
-16 MiB per file/header. Memory also includes parsed model/tensor metadata,
-per-tensor result records and a bounded category cache; it scales with inventory
-size, not weight payload size. This is not a measured real-model RAM budget.
+Payload reads are bounded by `--chunk-elements` (default 32768, max 524288).
+Rows span chunks; KV-B uses rank-column tiles, never a whole-tensor transpose.
+Per-file JSON metadata is capped at 16 MiB. Histograms have 32768 unsigned-64
+bins per active component/class/global accumulator, independent of tensor size.
+Metadata/result memory scales with tensor inventory **and every rejected row**;
+required rejection identities can be large and are not capped silently. This
+is bounded payload reading, not a constant-memory output or measured RAM budget.
 
 ```sh
 python scripts/arc_mla/check_bf16_row_census.py \
   target/release/arc-mla fresh-synthetic-evidence
 ```
 
-The harness checks 146 actual-converter cases with independent expected counts:
-all five classes, both mixed policies, boundary neighbors, zeros, infinities,
-NaNs, and non-constant KV-B key/value patterns. It compares small and large read
-tiles, exhaustively checks finite maximum classifications, refuses bad hashes,
-policies and malformed tensor metadata, and verifies source bytes unchanged.
-It retains raw converter stdout/stderr, counts, policies, hashes, deterministic
-CLI outputs and a reproducible synthetic sample source/report. Fixture setup
-mutates only generated synthetic inputs between cases; the census does not.
-The existing three-host slice CI runs these checks without a real-weight job.
+The harness retains the original 146 converter cases and 16 malformed-input
+controls. It adds 10 native norm/router converter cases, independently recomputes
+all statistics and rejection identities from tiny fixture arrays in converter
+order, checks aggregation and policy independence, tests exact even medians and
+empty/all-nonfinite distributions, and checks admission against #156's Fraction
+oracle corpus. Read-tile invariance includes nonconstant KV-B; row 1 in a key
+transpose and row 33 in a value component are explicit converter-error controls.
+Source snapshots, deterministic CLI outputs, hashes and ignored/expert shape-only
+handling are retained. The existing Linux x86/ARM and Windows slice CI runs it.
 
-Stop on unsupported/nonfinite rows before any later authorized conversion.
-Owner acceptance, resource admission and real-weight authorization remain
-separate gates. LOW-1 (independent INT16/YaRN forward execution) and LOW-5
-(`provisional/unreviewed` label pending owner acceptance) remain open. Preserve
-the recorded `INT16-CONTRACT.md` merge-order follow-up: whichever of #156/#168
-lands second must reconcile the file while retaining both complete policies.
+Next is a **separately dispatched** admitted Studio census, not a download by
+this tool-completion pass. Operator conditions: fresh Studio disk/RAM/heavy-job
+report; at least 140 GB free; at most 60 GB cumulative anonymous downloads and
+40 GB resident; exact official revision and LFS SHA256 verification before use;
+retain the verified layer-0 shard. The gaming PC gates the later pipeline, not
+this census. The independent full-forward oracle remains a nonblocking follow-up.
+Real-layer conversion/quality is conditional on census and reviewed heads. No
+implicit fallback, owner precision decision or Kimi performance claim follows.
