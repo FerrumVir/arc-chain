@@ -1,0 +1,595 @@
+use super::*;
+use crate::modern::model::tests::tiny_model;
+use crate::modern::serving::dense::DenseModel;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct Counting<'a> {
+    inner: &'a dyn BatchModel,
+    calls: AtomicUsize,
+}
+impl BatchModel for Counting<'_> {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+    fn max_positions(&self) -> usize {
+        self.inner.max_positions()
+    }
+    fn kv_widths(&self) -> Vec<usize> {
+        self.inner.kv_widths()
+    }
+    fn identity(&self) -> [u8; 32] {
+        self.inner.identity()
+    }
+    fn forward_rows(&self, rows: &[Row], kvs: &mut [&mut SeqKv]) -> super::super::StepOutput {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.forward_rows(rows, kvs)
+    }
+}
+
+// Deliberately oracle-fed ONLY in tests to exercise deep acceptance. Benchmark
+// drafters never get the baseline continuation.
+struct KnownHeads {
+    prompt: usize,
+    output: Vec<u32>,
+    wrong_first: bool,
+}
+impl TreeDrafter for KnownHeads {
+    fn propose(&mut self, context: &[u32], depth: usize) -> Result<DraftTree, ModernError> {
+        let at = context.len() - self.prompt;
+        let heads: Vec<_> = self
+            .output
+            .iter()
+            .skip(at)
+            .take(depth)
+            .map(|&t| {
+                if self.wrong_first {
+                    vec![(t + 1) % 40, t]
+                } else {
+                    vec![t, (t + 1) % 40]
+                }
+            })
+            .collect();
+        head_tree(*context.last().unwrap(), &heads, 64)
+    }
+}
+
+#[test]
+fn exact_tokens_logits_and_committed_kv_across_trees_kernels_and_stops() {
+    let model = tiny_model();
+    let dense = DenseModel::new(&model, [0; 32]);
+    let _guard = crate::canonical_simd::kernel_switch_guard();
+    for fast in [false, true] {
+        crate::canonical_simd::set_fast_canonical_kernel(fast);
+        for selection in [Selection::Argmax, Selection::Rp64Argmax] {
+            for prompt in [vec![1, 2, 3], vec![9, 3, 9, 3, 9], vec![0, 39, 18]] {
+                for max_tokens in [1, 2, 7, 15] {
+                    let request = GenerationRequest {
+                        prompt: &prompt,
+                        max_tokens,
+                        eos: &[],
+                        selection,
+                    };
+                    let reference = model.generate(&request).unwrap();
+                    for eos in [
+                        vec![],
+                        vec![reference.tokens[0]],
+                        vec![*reference.tokens.last().unwrap()],
+                    ] {
+                        let req = GenerationRequest {
+                            eos: &eos,
+                            ..request.clone()
+                        };
+                        let baseline = model.generate(&req).unwrap();
+                        let mut reference_kv = model.new_cache();
+                        for &t in prompt
+                            .iter()
+                            .chain(&baseline.tokens[..baseline.tokens.len() - 1])
+                        {
+                            model.forward(t, &mut reference_kv).unwrap();
+                        }
+                        for depth in [0, 1, 4, 12] {
+                            let mut drafters: Vec<Box<dyn TreeDrafter>> = vec![
+                                Box::new(KnownHeads {
+                                    prompt: prompt.len(),
+                                    output: reference.tokens.clone(),
+                                    wrong_first: true,
+                                }),
+                                Box::new(LookupTree::default()),
+                                Box::new(RecycleTree::new(3, 24, None)),
+                                Box::new(RecycleTree::new(4, 40, Some(LookupTree::default()))),
+                            ];
+                            for drafter in &mut drafters {
+                                let out =
+                                    generate_tree(&dense, &req, drafter.as_mut(), depth).unwrap();
+                                assert_eq!(out.tokens, baseline.tokens);
+                                assert_eq!(arith::tokens_hash(&out.tokens), baseline.output_hash);
+                                assert_eq!(out.logits_hashes, baseline.logits_hashes);
+                                assert_eq!(
+                                    arith::logits_digest(&out.logits_hashes),
+                                    baseline.logits_digest
+                                );
+                                assert_eq!(out.kv_digest, reference_kv.digest());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    crate::canonical_simd::set_fast_canonical_kernel(false);
+}
+
+#[test]
+fn deep_branch_verification_is_one_batch_and_rejected_invalid_sibling_is_harmless() {
+    let model = tiny_model();
+    let dense = DenseModel::new(&model, [0; 32]);
+    let request = GenerationRequest {
+        prompt: &[1, 2, 3],
+        max_tokens: 8,
+        eos: &[],
+        selection: Selection::Rp64Argmax,
+    };
+    let baseline = model.generate(&request).unwrap();
+    let mut kv = dense.new_kv();
+    let rows: Vec<_> = request
+        .prompt
+        .iter()
+        .enumerate()
+        .map(|(position, &token)| Row {
+            seq: 0,
+            token,
+            position,
+            logits: true,
+        })
+        .collect();
+    dense.forward_rows(&rows, &mut [&mut kv]);
+    let mut nodes = vec![Node {
+        parent: None,
+        token: baseline.tokens[0],
+    }];
+    for &token in &baseline.tokens[1..7] {
+        let parent = nodes.len() - 1;
+        nodes.push(Node {
+            parent: Some(parent),
+            token: u32::MAX,
+        });
+        nodes.push(Node {
+            parent: Some(parent),
+            token,
+        });
+    }
+    let tree = DraftTree::new(nodes).unwrap();
+    let count = Counting {
+        inner: &dense,
+        calls: AtomicUsize::new(0),
+    };
+    let out = verify_tree(
+        &count,
+        &tree,
+        &mut kv,
+        &baseline.tokens[..1],
+        request.selection,
+        &[],
+        8,
+    )
+    .unwrap();
+    assert_eq!(count.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(out.emitted, baseline.tokens[1..]);
+    assert_eq!(out.logits_hashes, baseline.logits_hashes[3..]);
+    // `Counting` has no tree kernel, so it takes the path-lowering fallback,
+    // which duplicates ancestors; the dense model computes each node once.
+    assert!(out.verified_rows > out.logical_nodes);
+    assert_eq!(out.expanded_rows, out.verified_rows);
+    let mut shared_kv = dense.new_kv();
+    dense.forward_rows(&rows, &mut [&mut shared_kv]);
+    let shared = verify_tree(
+        &dense,
+        &tree,
+        &mut shared_kv,
+        &baseline.tokens[..1],
+        request.selection,
+        &[],
+        8,
+    )
+    .unwrap();
+    assert_eq!(shared.emitted, out.emitted);
+    assert_eq!(shared.logits_hashes, out.logits_hashes);
+    assert_eq!(shared.verified_rows, tree.nodes().len());
+    assert_eq!(shared_kv, kv);
+    let mut plain = model.new_cache();
+    for &t in request.prompt.iter().chain(&baseline.tokens[..7]) {
+        model.forward(t, &mut plain).unwrap();
+    }
+    assert_eq!(kv.digest(), plain.digest());
+}
+
+struct FailAtPosition<'a> {
+    inner: &'a dyn BatchModel,
+    position: usize,
+}
+impl BatchModel for FailAtPosition<'_> {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+    fn max_positions(&self) -> usize {
+        self.inner.max_positions()
+    }
+    fn kv_widths(&self) -> Vec<usize> {
+        self.inner.kv_widths()
+    }
+    fn identity(&self) -> [u8; 32] {
+        self.inner.identity()
+    }
+    fn forward_rows(&self, rows: &[Row], kvs: &mut [&mut SeqKv]) -> super::super::StepOutput {
+        let base: Vec<_> = kvs.iter().map(|kv| kv.len()).collect();
+        let mut result = self.inner.forward_rows(rows, kvs);
+        for seq in 0..kvs.len() {
+            if let Some((offset, _)) = rows
+                .iter()
+                .filter(|r| r.seq == seq)
+                .enumerate()
+                .find(|(_, r)| r.position == self.position)
+            {
+                kvs[seq].rollback(base[seq] + offset);
+                result.errors[seq] = Some(super::super::Failure {
+                    kept: offset,
+                    error: ModernError::Domain("injected row failure".into()),
+                });
+                for (i, _) in rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.seq == seq)
+                    .skip(offset)
+                {
+                    result.logits[i] = None;
+                }
+            }
+        }
+        result
+    }
+}
+
+#[test]
+fn chosen_failure_is_transactional_but_eos_and_limit_do_not_forward_it() {
+    let mut model = tiny_model();
+    for gain in &mut model.final_norm {
+        *gain = -*gain;
+    }
+    let dense = DenseModel::new(&model, [0; 32]);
+    let mut kv = dense.new_kv();
+    let root = 3;
+    let mut reference = model.new_cache();
+    let next = arith::select(
+        &model.forward(root, &mut reference).unwrap(),
+        &[root],
+        Selection::Argmax,
+    )
+    .unwrap();
+    assert_ne!(root, next);
+    let failing = FailAtPosition {
+        inner: &dense,
+        position: 1,
+    };
+    let tree = DraftTree::new(vec![
+        Node {
+            parent: None,
+            token: root,
+        },
+        Node {
+            parent: Some(0),
+            token: next,
+        },
+    ])
+    .unwrap();
+    let before = kv.clone();
+    assert!(verify_tree(&failing, &tree, &mut kv, &[root], Selection::Argmax, &[], 5).is_err());
+    assert_eq!(kv, before);
+    for (eos, limit) in [(vec![next], 5), (vec![], 2)] {
+        let out = verify_tree(
+            &failing,
+            &tree,
+            &mut kv,
+            &[root],
+            Selection::Argmax,
+            &eos,
+            limit,
+        )
+        .unwrap();
+        assert_eq!(out.emitted, vec![next]);
+        assert!(out.finished);
+        assert_eq!(kv.digest(), reference.digest());
+        kv = before.clone();
+    }
+}
+
+#[test]
+fn malformed_trees_context_limits_and_projection_inputs_refuse() {
+    assert!(DraftTree::new(vec![]).is_err());
+    assert!(
+        DraftTree::new(vec![Node {
+            parent: Some(0),
+            token: 0
+        }])
+        .is_err()
+    );
+    for parent in [None, Some(1), Some(5)] {
+        assert!(
+            DraftTree::new(vec![
+                Node {
+                    parent: None,
+                    token: 0
+                },
+                Node { parent, token: 1 }
+            ])
+            .is_err()
+        );
+    }
+    assert!(
+        DraftTree::new(vec![
+            Node {
+                parent: None,
+                token: 0
+            },
+            Node {
+                parent: Some(0),
+                token: 1
+            },
+            Node {
+                parent: Some(0),
+                token: 1
+            }
+        ])
+        .is_err()
+    );
+    let nodes = (0usize..66)
+        .map(|i| Node {
+            parent: i.checked_sub(1),
+            token: 0,
+        })
+        .collect();
+    assert!(DraftTree::new(nodes).is_err());
+    let model = tiny_model();
+    let dense = DenseModel::new(&model, [0; 32]);
+    for (prompt, max_tokens) in [(vec![], 1), (vec![1], 0), (vec![1; 31], 2), (vec![40], 1)] {
+        let request = GenerationRequest {
+            prompt: &prompt,
+            max_tokens,
+            eos: &[],
+            selection: Selection::Argmax,
+        };
+        assert!(generate_tree(&dense, &request, &mut LookupTree::default(), 8).is_err());
+    }
+    assert!((projected_tokens_per_second(8.0, 8, 10.0, 20.0).unwrap() - 80.0).abs() < 1e-12);
+    for (tokens, hops, hop_ms, compute) in [
+        (f64::NAN, 8, 10.0, 0.0),
+        (1.0, 0, 10.0, 0.0),
+        (1.0, 8, 0.0, 0.0),
+        (1.0, 8, 10.0, -1.0),
+    ] {
+        assert!(projected_tokens_per_second(tokens, hops, hop_ms, compute).is_err());
+    }
+}
+
+#[test]
+fn lookup_forks_matches_and_local_draft_keeps_target_bytes() {
+    let mut lookup = LookupTree::default();
+    let tree = lookup.propose(&[1, 2, 7, 8, 1, 2, 9, 10, 1, 2], 2).unwrap();
+    assert!(
+        tree.nodes
+            .iter()
+            .any(|n| n.parent == Some(0) && n.token == 7)
+    );
+    assert!(
+        tree.nodes
+            .iter()
+            .any(|n| n.parent == Some(0) && n.token == 9)
+    );
+    let model = tiny_model();
+    let dense = DenseModel::new(&model, [0; 32]);
+    let mut draft = LocalModelTree {
+        model: &dense,
+        top_k: 2,
+        max_nodes: 32,
+    };
+    let request = GenerationRequest {
+        prompt: &[1, 2, 3],
+        max_tokens: 12,
+        eos: &[],
+        selection: Selection::Argmax,
+    };
+    let out = generate_tree(&dense, &request, &mut draft, 5).unwrap();
+    let baseline = model.generate(&request).unwrap();
+    assert_eq!(out.tokens, baseline.tokens);
+    assert_eq!(out.logits_hashes, baseline.logits_hashes);
+    assert!(out.verification_passes < 11);
+}
+
+#[test]
+fn top_k_ranks_by_logit_then_token_id() {
+    assert_eq!(top_k(&[5, 9, 9, -1, 7], 3), vec![1, 2, 4]);
+    assert_eq!(top_k(&[5, 9, 9, -1, 7], 9), vec![1, 2, 4, 0, 3]);
+    assert_eq!(top_k(&[3, 3, 3], 2), vec![0, 1]);
+    assert!(top_k(&[], 4).is_empty());
+}
+
+/// The recycler drafts only from candidates the target already returned,
+/// best-first by rank cost, within the node and depth budgets, merges lookup
+/// branches first, and is deterministic.
+#[test]
+fn recycle_tree_grows_best_first_from_observed_candidates() {
+    let mut recycle = RecycleTree::new(2, 6, None);
+    assert_eq!(recycle.propose(&[4], 8).unwrap(), DraftTree::root(4));
+    let logits = |best: u32, second: u32| {
+        let mut l = vec![0i64; 16];
+        l[best as usize] = 10;
+        l[second as usize] = 5;
+        l
+    };
+    recycle.observe(4, &logits(5, 9));
+    recycle.observe(5, &logits(6, 10));
+    recycle.observe(6, &logits(7, 11));
+    recycle.observe(9, &logits(12, 13));
+    assert_eq!(recycle.known_tokens(), 4);
+    let tree = recycle.propose(&[1, 4], 8).unwrap();
+    let tokens: Vec<_> = tree.nodes().iter().map(|n| (n.parent, n.token)).collect();
+    // cost 1: 4->5; cost 2: 4->9 (depth 1) before 5->6 (depth 2); cost 3 at
+    // depth 2 in insertion order: 5->10, 9->12; the budget of 6 stops there.
+    assert_eq!(
+        tokens,
+        vec![
+            (None, 4),
+            (Some(0), 5),
+            (Some(0), 9),
+            (Some(1), 6),
+            (Some(1), 10),
+            (Some(2), 12),
+        ]
+    );
+    assert_eq!(recycle.propose(&[1, 4], 8).unwrap(), tree);
+    let shallow = recycle.propose(&[1, 4], 1).unwrap();
+    assert!(shallow.depths().iter().all(|&d| d <= 1));
+    assert_eq!(shallow.nodes().len(), 3);
+    // Newer candidates replace older ones for the same token.
+    recycle.observe(4, &logits(9, 5));
+    assert_eq!(recycle.propose(&[4], 1).unwrap().nodes()[1].token, 9);
+    let mut hybrid = RecycleTree::new(2, 8, Some(LookupTree::default()));
+    hybrid.observe(4, &logits(5, 9));
+    let tree = hybrid.propose(&[4, 8, 3, 4], 4).unwrap();
+    assert_eq!(tree.nodes()[1].token, 8, "lookup branch first");
+    assert!(
+        tree.nodes()
+            .iter()
+            .any(|n| n.parent == Some(0) && n.token == 5)
+    );
+    hybrid.clear();
+    assert_eq!(hybrid.known_tokens(), 0);
+}
+
+// A deterministic untrained stub, deliberately a poor predictor. It reads the
+// actual final residual and pending token; it never sees baseline tokens.
+struct FeatureStub<'a> {
+    model: &'a dyn BatchModel,
+    calls: usize,
+    fail: bool,
+}
+impl TreeDrafter for FeatureStub<'_> {
+    fn propose(&mut self, _: &[u32], _: usize) -> Result<DraftTree, ModernError> {
+        panic!("feature-aware dispatch must be used")
+    }
+    fn propose_with_features(
+        &mut self,
+        context: &[u32],
+        depth: usize,
+        features: Option<&TargetFeatures>,
+    ) -> Result<DraftTree, ModernError> {
+        let features = features.expect("dense and path fallback expose features");
+        let committed = &context[..context.len() - 1];
+        // Recompute the accepted prefix independently, one row at a time.
+        let mut kv = self.model.new_kv();
+        let mut expected = None;
+        for (position, &token) in committed.iter().enumerate() {
+            let mut step = self.model.forward_rows(
+                &[Row {
+                    seq: 0,
+                    token,
+                    position,
+                    logits: true,
+                }],
+                &mut [&mut kv],
+            );
+            expected = step.features.pop().unwrap();
+        }
+        assert_eq!(
+            Some(features),
+            expected.as_ref(),
+            "only last ACCEPTED row may reach the head"
+        );
+        assert_eq!(features.position, context.len() - 2);
+        self.calls += 1;
+        if self.fail {
+            return Err(invalid("stub unavailable"));
+        }
+        let candidate = (features
+            .hidden
+            .iter()
+            .fold(0u64, |a, &v| a.wrapping_add(v.unsigned_abs()))
+            + u64::from(*context.last().unwrap())) as u32
+            % self.model.vocab_size() as u32;
+        head_tree(
+            *context.last().unwrap(),
+            &vec![vec![candidate, (candidate + 1) % 40]; depth],
+            12,
+        )
+    }
+}
+
+#[test]
+fn accepted_hidden_features_drive_stub_head_without_changing_target_bytes() {
+    let model = tiny_model();
+    let dense = DenseModel::new(&model, [0; 32]);
+    let fallback = Counting {
+        inner: &dense,
+        calls: AtomicUsize::new(0),
+    };
+    for target in [&dense as &dyn BatchModel, &fallback] {
+        for fail in [false, true] {
+            let req = GenerationRequest {
+                prompt: &[3, 9, 2],
+                max_tokens: 15,
+                eos: &[],
+                selection: Selection::Argmax,
+            };
+            let reference = model.generate(&req).unwrap();
+            let mut stub = FeatureStub {
+                model: &dense,
+                calls: 0,
+                fail,
+            };
+            let out = generate_tree(target, &req, &mut stub, 3).unwrap();
+            assert!(stub.calls > 1);
+            assert_eq!(out.tokens, reference.tokens);
+            assert_eq!(out.logits_hashes, reference.logits_hashes);
+            let mut kv = model.new_cache();
+            for &token in req.prompt.iter().chain(&out.tokens[..out.tokens.len() - 1]) {
+                model.forward(token, &mut kv).unwrap();
+            }
+            assert_eq!(out.kv_digest, kv.digest());
+        }
+    }
+}
+
+#[test]
+fn lookup_replay_matches_full_tree_including_eos_and_output_budget() {
+    let model = tiny_model();
+    let dense = DenseModel::new(&model, [0; 32]);
+    for prompt in [vec![1, 2, 1, 2, 1], vec![3, 9, 2]] {
+        for max_tokens in [1, 2, 8, 15] {
+            for depth in [0, 1, 4, 8] {
+                let req = GenerationRequest {
+                    prompt: &prompt,
+                    max_tokens,
+                    eos: &[],
+                    selection: Selection::Argmax,
+                };
+                let reference = model.generate(&req).unwrap();
+                for eos in [
+                    vec![],
+                    vec![reference.tokens[0]],
+                    vec![*reference.tokens.last().unwrap()],
+                ] {
+                    let request = GenerationRequest {
+                        eos: &eos,
+                        ..req.clone()
+                    };
+                    let lookup = LookupTree::default();
+                    let out = generate_tree(&dense, &request, &mut { lookup }, depth).unwrap();
+                    let replay =
+                        replay_lookup(&prompt, &out.tokens, max_tokens, lookup, depth).unwrap();
+                    assert_eq!(replay.passes, out.verification_passes);
+                    assert_eq!(replay.nodes, out.verified_rows);
+                    assert_eq!(replay.expanded_rows, out.expanded_rows);
+                }
+            }
+        }
+    }
+}
