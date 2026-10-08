@@ -62,7 +62,7 @@ def budget():
                 engine_resident_planning_bytes=engine_ram,reference_resident_planning_bytes=reference_ram,
                 sequential_available_ram_planning_bytes=max(conversion_scratch+transpose_scratch+3*GIB,engine_ram,reference_ram)))
     return dict(engine_dependency='596a61f6b1ae88e8ad7072e1d514467308ddae22',dependency_review='provisional/unreviewed',
-        pins={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (config_path,source_path)},
+        pins={p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in (config_path,source_path)},
         assumptions=['Calculated bytes, not measured disk/RSS. No host admission.',
         'Retain every selected original shard; do not delete source needed by reference.',
         'Slices and one assembled package set coexist; atomic rename does not duplicate the staging bundle.',
