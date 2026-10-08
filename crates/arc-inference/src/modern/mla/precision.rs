@@ -412,6 +412,13 @@ mod tests {
                 assert!(quantize_matrix(&[b], 1, 1, precision).is_err());
             }
         }
+        // Exact INT8 edges differ from rounded power-of-two summaries.
+        for b in [0x32fe, 0x4a7d] {
+            assert!(quantize_matrix(&[b], 1, 1, Bits::Int8).is_ok());
+        }
+        for b in [0x32fd, 0x4a7e] {
+            assert!(quantize_matrix(&[b], 1, 1, Bits::Int8).is_err());
+        }
         // Router and norm use different scales: neither inherits matrix admission.
         assert!(super::super::ops::quantize_router_row(&[0x3680], &mut [0]).is_ok());
         assert_eq!(crate::modern::convert::bf16_to_q16(0x3680).unwrap(), 0);
