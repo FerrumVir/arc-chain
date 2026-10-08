@@ -214,6 +214,19 @@ export interface DataMigrationNotice {
 }
 
 /**
+ * Asked once, on the first launch after a v0.7 install reached this app
+ * (normally through the v0.7 legacy bridge release). Until it is answered the
+ * node runs as an observer without a model. Mirrors
+ * `legacy_upgrade::LegacyComputeQuestion`.
+ */
+export interface LegacyComputeQuestion {
+  previousRole: string;
+  previousModelPath: string | null;
+  detectedBy: string;
+  recordedUnixMs: number;
+}
+
+/**
  * The identity as the UI sees it — no `seedPhrase`.
  *
  * The phrase is the signing key. It used to be returned here and persisted

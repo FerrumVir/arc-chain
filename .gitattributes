@@ -17,3 +17,7 @@ vendor/wasmer-compiler/** text eol=lf
 scripts/arc_quality/layer_probe/reference/* -text
 
 tools/quality-layer-probe/reference/model.rs -text
+
+# The legacy bridge verifies these real v0.8.11 release-manifest bytes with the
+# release key in its unit tests. Any CRLF conversion would break the signature.
+crates/arc-legacy-bridge/fixtures/** -text
