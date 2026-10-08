@@ -115,6 +115,11 @@ pub fn mixed_profile(p: &'static str) -> &'static str {
         .1
 }
 
+/// BF16 encodings of the inclusive lower / exclusive upper nonzero row maximum.
+/// This admission rule applies only to dyadic INT16 matrices, not router/norms.
+pub const INT16_MIN_MAX: u16 = 0x3700; // 2^-17
+pub const INT16_MAX_MAX: u16 = 0x4e80; // 2^30
+
 /// INT16 symmetric row calibration, all integer; ties away from zero.
 /// Scales are mu * 2^-k, mu in [2^30,2^31), k in [16,62].
 pub fn quantize_row(bits: &[u16], q: &mut [i16]) -> Result<(i32, u8), ModernError> {
@@ -129,6 +134,13 @@ pub fn quantize_row(bits: &[u16], q: &mut [i16]) -> Result<(i32, u8), ModernErro
     if maximum == 0 {
         q.fill(0);
         return Ok((0, 16));
+    }
+    // Validate before writing q: an unsupported nonzero row must never look
+    // like a successfully converted (or silently flushed) row to a caller.
+    if !(INT16_MIN_MAX..INT16_MAX_MAX).contains(&maximum) {
+        return Err(ModernError::Invalid(format!(
+            "INT16 nonzero row maximum BF16 0x{maximum:04x} outside [2^-17,2^30); no flush/clamp/fallback"
+        )));
     }
     let (_, ma, ea) = bf16_parts(maximum)?;
     let ma = u64::from(ma);
@@ -188,8 +200,9 @@ pub fn quantize_matrix(
         k: Vec::with_capacity(rows),
     };
     let mut q = vec![0i16; cols];
-    for row in bits.chunks_exact(cols) {
-        let (mu, k) = quantize_row(row, &mut q)?;
+    for (index, row) in bits.chunks_exact(cols).enumerate() {
+        let (mu, k) = quantize_row(row, &mut q)
+            .map_err(|e| ModernError::Invalid(format!("conversion row {index}: {e}")))?;
         m.q.extend(q.iter().flat_map(|v| v.to_le_bytes()));
         m.mu.push(mu);
         m.k.push(k);
@@ -284,6 +297,126 @@ pub fn project_i16(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn independent_python_row_router_norm_and_projection_oracle() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-row-oracle.json"
+        ))
+        .unwrap();
+        let bits = |v: &Value| -> Vec<u16> {
+            v["bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| b.as_u64().unwrap() as u16)
+                .collect()
+        };
+        for v in corpus["rows"].as_array().unwrap() {
+            let row = bits(v);
+            let mut q = vec![123; row.len()];
+            match quantize_row(&row, &mut q) {
+                Ok((mu, k)) => assert_eq!(
+                    serde_json::json!({"q":q,"mu":mu,"k":k}),
+                    v["ok"],
+                    "{row:x?}"
+                ),
+                Err(_) => {
+                    assert_eq!(v["error"], true, "{row:x?}");
+                    assert!(q.iter().all(|&v| v == 123), "rejected row mutated output");
+                }
+            }
+        }
+        for v in corpus["routers"].as_array().unwrap() {
+            let row = bits(v);
+            let mut q = vec![123; row.len()];
+            match super::super::ops::quantize_router_row(&row, &mut q) {
+                Ok(k) => assert_eq!(serde_json::json!({"q":q,"k":k}), v["ok"], "router {row:x?}"),
+                Err(_) => assert_eq!(v["error"], true, "router {row:x?}"),
+            }
+        }
+        for v in corpus["norms"].as_array().unwrap() {
+            let b = v["bits"].as_u64().unwrap() as u16;
+            match crate::modern::convert::bf16_to_q16(b) {
+                Ok(n) => assert_eq!(serde_json::json!(n), v["ok"], "norm {b:x}"),
+                Err(_) => assert_eq!(v["error"], true, "norm {b:x}"),
+            }
+        }
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        for fast in [false, true] {
+            crate::canonical_simd::set_fast_canonical_kernel(fast);
+            for v in corpus["projections"].as_array().unwrap() {
+                let q: Vec<u8> = v["q"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|q| (q.as_i64().unwrap() as i16).to_le_bytes())
+                    .collect();
+                let x: Vec<i64> = v["x"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_i64().unwrap())
+                    .collect();
+                let mut output = [0];
+                match project_i16(
+                    &q,
+                    1,
+                    x.len(),
+                    &[v["mu"].as_i64().unwrap() as i32],
+                    &[v["k"].as_u64().unwrap() as u8],
+                    &x,
+                    &mut output,
+                ) {
+                    Ok(()) => assert_eq!(serde_json::json!(output[0]), v["ok"], "projection {v}"),
+                    Err(_) => assert_eq!(v["error"], true, "projection {v}"),
+                }
+            }
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+    }
+
+    #[test]
+    fn int16_window_is_per_matrix_row_and_preserves_legacy_admission() {
+        for class in ["attention", "dense", "shared", "embedding", "head"] {
+            let mut p = serde_json::to_value(Precision {
+                version: 1,
+                attention: Bits::Int8,
+                dense: Bits::Int8,
+                shared: Bits::Int8,
+                embedding: Bits::Int8,
+                head: Bits::Int8,
+            })
+            .unwrap();
+            p[class] = serde_json::json!("int16");
+            let p = Precision::from_json(&p).unwrap();
+            let name = match class {
+                "attention" => "model.layers.0.self_attn.q_proj.weight",
+                "dense" => "model.layers.0.mlp.up_proj.weight",
+                "shared" => "model.layers.1.mlp.shared_experts.up_proj.weight",
+                "embedding" => "model.embed_tokens.weight",
+                _ => "lm_head.weight",
+            };
+            let precision = p.source(name);
+            assert_eq!(precision, Bits::Int16);
+            // An accepted maximum in row 0 must not mask row 1's small maximum.
+            let bad = quantize_matrix(&[0x3f80, 0, 0x36ff, 0], 2, 2, precision)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(bad.contains("conversion row 1") && bad.contains("[2^-17,2^30)"));
+            assert!(quantize_matrix(&[0x36ff], 1, 1, Bits::Int8).is_ok());
+            for b in [0, 0x3700, 0x3701, 0x4e7f] {
+                assert!(quantize_matrix(&[b], 1, 1, precision).is_ok());
+            }
+            for b in [1, 0x36ff, 0x4e80, 0x4e81, 0x7f80] {
+                assert!(quantize_matrix(&[b], 1, 1, precision).is_err());
+            }
+        }
+        // Router and norm use different scales: neither inherits matrix admission.
+        assert!(super::super::ops::quantize_router_row(&[0x3680], &mut [0]).is_ok());
+        assert_eq!(crate::modern::convert::bf16_to_q16(0x3680).unwrap(), 0);
+        assert_eq!(crate::modern::convert::bf16_to_q16(0x3700).unwrap(), 1);
+    }
     #[test]
     fn int16_conversion_ties_zeros_nonfinite_and_scale_domains() {
         let mut q = [0; 6];

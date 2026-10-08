@@ -148,6 +148,8 @@ jobs:
         run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
       - name: Reproduce pinned K2.6 YaRN vectors (no network or weights)
         run: python scripts/arc_mla/yarn_reference.py docs/protocol/reference/kimi-k26/yarn-vectors.json --check
+      - name: Independent exact-rational INT16 arithmetic corpus (offline)
+        run: python scripts/arc_mla/int16_oracle.py docs/protocol/reference/int16-row-oracle.json --check
       - name: Python reference unit tests
         working-directory: scripts
         run: python -m unittest arc_conformance.tests.test_mla_moe_reference -v
@@ -157,6 +159,8 @@ jobs:
         run: python scripts/arc_mla/check_yarn_cli.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/yarn-cli"
       - name: Mixed INT16 BF16 conversion, scalar/SIMD and split stages (no download)
         run: python scripts/arc_mla/check_int16.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/int16" --build-label release
+      - name: Per-class INT16 row admission through actual converter (offline)
+        run: python scripts/arc_mla/check_int16_rows.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/int16-rows"
       - name: Tiny models through every check
         shell: bash
         run: bash scripts/arc_mla/tiny_checks.sh ./target/release/arc-mla "$RUNNER_TEMP/tiny" "$RUNNER_TEMP/tiny-evidence"

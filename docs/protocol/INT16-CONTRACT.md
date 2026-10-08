@@ -158,3 +158,78 @@ cache, OS overhead and actual available RAM must be budgeted separately. There
 is no inference from tiny RSS to real-model admission. Fresh Studio and gaming
 PC disk/RAM measurements and PC endpoint/target-volume information remain
 required; no new download is admitted by these results.
+
+## Row admission clarification (row-window prerequisite)
+
+This revision **enforces the existing window**, rather than widening it or
+introducing a flush/clamp/INT8 fallback. No profile or successful-package byte
+changes are intended. The engine, loader and quality harness must keep this
+restriction visible until real tensor census and quality measurements justify
+an owner-approved new arithmetic contract.
+
+| Class | Admission / rounding | Conversion rows |
+|---|---|---|
+| INT16 attention, dense, shared, embedding, head | Nonzero maximum `A` must satisfy **2^-17 <= A < 2^30** (BF16 max bits `0x3700..0x4e7f`). Both signs identical. Zero rows accepted separately. | Output rows of each selected projection; embedding/head vocabulary rows. |
+| Attention KV-B key | Same INT16 window, evaluated **after transpose**. | Source `[H*(N+V), C]` → key `[H,C,N]`; row `(h,c)` consists of source `[(h*(N+V)+n),c]` for every n. |
+| Attention KV-B value | Same INT16 window, after key/value split. | `[H,V,C]`, row `(h,v)` is source `[h*(N+V)+N+v,:]`. |
+| INT8-selected or legacy matrices | Existing nonzero window **2^-25 <= A < 2^22**; unchanged. | Same semantic rows. A valid INT8 row may reject at INT16. |
+| Router (already INT16) | Independent power-of-two scale: nonzero maximum **2^-48 <= A < 2^15**, shift `0..62`, ties away from zero; no dyadic-matrix window. | One routed expert per row. All-zero row q=0,k=16. |
+| Norm gains (already I64 Q16) | Per-value finite BF16, **abs(w) < 2^46**; round `w*2^16` half away from zero. Values below 2^-17 round to zero by the pre-existing Q16 rule, including subnormals. | Per scalar, not matrix row maximum. This is disclosed fixed-point rounding, not a new whole-row flush policy. |
+| Routing bias (I64 Q32) / native INT4 experts and BF16 group scales | Existing arithmetic / packed payloads unchanged; no matrix-policy override. | No new row admission rule. |
+
+For an INT16 matrix the converter rejects out-of-window/nonfinite rows before
+writing that row's caller-provided q buffer. Errors identify the original
+source tensor, zero-based **conversion row**, and (for KV-B) key transpose or
+value split. A large maximum elsewhere in the tensor cannot admit a small row.
+Do not retry a rejection under another precision policy silently. Zero rows
+use exactly q=0,mu=0,k=16; individual very small entries in an otherwise valid
+row still undergo the specified round-half-away quantization.
+
+`int16_oracle.py` uses Python `Fraction`, rational interval search and integer
+floor to generate a pinned arithmetic corpus. It does not import Rust or copy
+Rust's significand/shift algorithm. Rust consumes that corpus for conversion,
+router, norm and scalar/SIMD projection controls. CI regenerates and checks it.
+The corpus spans every finite BF16 exponent at representative significands,
+both signs, signed zeros, subnormals, both window neighbors, nonfinite inputs,
+half ties, accumulator/output overflow, invalid weights/scales and negative
+floor. It is an arithmetic oracle, **not** a full independent INT16 forward
+executor or a quality test. The latter Python executor remains a separate low
+item; its legacy profile restriction has not been removed in this revision.
+
+```sh
+python scripts/arc_mla/int16_oracle.py docs/protocol/reference/int16-row-oracle.json --check
+cargo test --locked -p arc-inference --lib modern::mla::precision
+python scripts/arc_mla/check_int16_rows.py target/release/arc-mla FRESH_ROW_EVIDENCE
+```
+
+The actual-converter test changes original synthetic BF16 and updates its source
+hashes explicitly, then covers zero/below/lower/upper-neighbor/upper rows for
+attention, dense, shared, embedding, head and the KV-B key transpose. These are
+synthetic controls, not evidence about real K2.6 row distributions.
+
+### #168 / #164 handoff and still-open real-tensor gate
+
+Integrate this rejection/diagnostic delta without relabeling slices or changing
+precision identities. For each **retained, hash-verified original real tensor**,
+record official source revision, source file SHA256/length, tensor name/class,
+shape/dtype, selected policy, semantic conversion-row ordering and transpose.
+Count zero, below, in-range, above and nonfinite rows *after* the same layout
+transformation that conversion uses. Norm/router counts must use their own
+contracts above. Source-order KV-B counts alone are insufficient.
+
+A rejected row blocks that conversion; no package from a failed conversion is
+execution evidence. #164 must use the same original bytes and explicit policy,
+not dequantized ARC weights as the reference. No additional conversion buffers,
+package storage or new download budgets are introduced here. Precision and
+source/manifest bindings, source retention, current disk/RAM gates and native
+INT4 preservation requirements remain unchanged.
+
+No retained official real K2.6 source shard/tensor was available for this pass
+in this workspace. A workspace inventory found 1,466 safetensors files, largest
+345,160 bytes, all compatible with the existing tiny-fixture holdings; no file
+matches the pinned official source-shard lengths. Thus **the required pinned
+real-tensor census/regression is missing**. Historical real-shard packing at
+`7a952ec7` / run `37622036049` does not establish row maxima or this gate. Supply
+an already-authorized retained official BF16 tensor plus its verifiable source
+hash/provenance, or later admit a fetch only after the separate resource gate.
+No new weights were fetched, and synthetic counts must not close this gate.
