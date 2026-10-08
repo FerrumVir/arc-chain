@@ -5,7 +5,9 @@ that only remembers the command lines; nothing here changes the system it runs o
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -205,7 +207,8 @@ class OsascriptTests(unittest.TestCase):
         self.assertEqual(m.summarize_ax(None), {"available": False})
         self.assertFalse(m.summarize_ax({"error": "no process with that unix id", "nodes": []})["available"])
 
-    @unittest.skipUnless(shutil.which("node"), "node is needed to run the generated JavaScript against a stub")
+    @unittest.skipUnless(os.environ.get("WAVE0_TEST_NODE") == "1" and shutil.which("node"),
+                         "opt-in (WAVE0_TEST_NODE=1 and node on PATH): the only test that starts a process, node on a temp .js file against a stub System Events tree")
     def test_generated_javascript_walks_and_clicks_a_stub_tree(self):
         harness = r"""
 var clicks = [];
@@ -257,8 +260,9 @@ class RequestAndPathTests(unittest.TestCase):
         prefixes = m.expected_prefixes("/Users/runner", "/tmp/sbx/home", "cached-bait")
         self.assertIn("/tmp/sbx/home", prefixes)
         self.assertIn("/Users/runner/Library/Application Support/network.arc.desktop", prefixes)
-        self.assertNotIn("/Users/runner/Library/LaunchAgents", prefixes, "autostart is off in the saved config of the cached case")
-        self.assertIn("/Users/runner/Library/LaunchAgents", m.expected_prefixes("/Users/runner", "/tmp/sbx/home", "clean"))
+        self.assertNotIn("/Users/runner/Library/LaunchAgents", prefixes, "the whole LaunchAgents folder is never expected")
+        self.assertIn("/Users/runner/Library/LaunchAgents/ARC Node.plist", prefixes, "the autostart plugin's own registration is app state")
+        self.assertEqual(m.classify_written("/Users/runner/Library/LaunchAgents/evil-updater.plist", prefixes), "unexpected")
         self.assertEqual(m.classify_written("/tmp/sbx/home/Library/Application Support/network.arc.desktop/store.json", prefixes), "expected")
         self.assertEqual(m.classify_written("/Users/runner/Library/Caches/network.arc.desktop/WebKit/x", prefixes), "expected")
         self.assertEqual(m.classify_written("/Users/runner/Downloads/ARC.Node_aarch64.app.tar.gz", prefixes), "unexpected")
@@ -478,17 +482,33 @@ class ResultAssemblyTests(unittest.TestCase):
 
 
 class RecorderTests(unittest.TestCase):
+    """The recorder's own behavior, with subprocess.run replaced: no process is started."""
+
     def test_commands_are_logged_masked_and_timed_out(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((list(argv), kwargs))
+            if argv[0] == "echo":
+                return subprocess.CompletedProcess(argv, 0, b"reach 149.28.32.76 now\n", b"")
+            if argv[0] == "fail":
+                return subprocess.CompletedProcess(argv, 3, b"", b"it broke\n")
+            if argv[0] == "slow":
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"], output=b"partial output", stderr=b"")
+            raise FileNotFoundError(argv[0])
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(m.subprocess, "run", side_effect=fake_run):
             rec = m.Recorder(Path(tmp), LIVE)
             done = rec.run(["echo", "reach 149.28.32.76 now"], label="mask test")
             self.assertEqual(done.rc, 0)
             self.assertIn("149.28.32.76", done.out, "the caller still sees the real output")
-            failed = rec.run(["sh", "-c", "exit 3"])
+            failed = rec.run(["fail"])
             self.assertEqual(failed.rc, 3)
-            slow = rec.run(["sleep", "5"], timeout=1)
+            slow = rec.run(["slow"], timeout=1)
             self.assertEqual(slow.rc, 124)
             self.assertTrue(slow.timed_out)
+            self.assertIn("partial output", slow.out)
+            self.assertIn("timed out after 1", slow.err)
             missing = rec.run(["/no/such/binary"])
             self.assertEqual(missing.rc, 127)
             log = (Path(tmp) / "steps.log").read_text()
@@ -496,13 +516,28 @@ class RecorderTests(unittest.TestCase):
             self.assertIn("<live-ip-1>", log)
             self.assertIn("rc=3", log)
             self.assertIn("rc=124", log)
+            self.assertIn("rc=127", log)
             self.assertIn("# mask test", log)
+            self.assertIn("it broke", log)
+        self.assertEqual(calls[2][1]["timeout"], 1)
 
     def test_sudo_prefix_is_non_interactive(self):
         with tempfile.TemporaryDirectory() as tmp:
             rec = FakeRecorder(tmp)
             rec.run(["pfctl", "-s", "info"], sudo=True)
             self.assertEqual(rec.calls[0]["argv"][:3], ["sudo", "-n", "pfctl"])
+
+    def test_the_real_recorder_prefixes_sudo_with_dash_n_and_passes_input(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"], seen["input"] = list(argv), kwargs.get("input")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(m.subprocess, "run", side_effect=fake_run):
+            m.Recorder(Path(tmp)).run(["tee", "-a", "/etc/hosts"], sudo=True, input_text="127.0.0.1 x\n", quiet=True)
+        self.assertEqual(seen["argv"], ["sudo", "-n", "tee", "-a", "/etc/hosts"])
+        self.assertEqual(seen["input"], b"127.0.0.1 x\n")
 
 
 class InterceptionTests(unittest.TestCase):
@@ -766,15 +801,8 @@ class World:
         self.stack = contextlib.ExitStack()
         self.overrides = overrides
 
-    def __enter__(self):
-        patch = self.stack.enter_context
-        patch(mock.patch.dict(m.os.environ, {"GITHUB_ACTIONS": "true"}))
-        patch(mock.patch.object(m.subprocess, "run", side_effect=forbid))
-        patch(mock.patch.object(m.subprocess, "Popen", side_effect=forbid))
-        patch(mock.patch.object(m, "work_dir", return_value=self.tmp / "work"))
-        patch(mock.patch.object(m, "system_facts", return_value={"machine": "arm64", "mac_ver": "15.0", "image": "macos-15 test", "sudo": {"rc": 0, "out": ""}}))
-        patch(mock.patch.object(m, "load_live_ips", return_value=list(LIVE)))
-        defaults = {
+    def defaults(self):
+        return {
             "accessibility_tests": lambda rec, evidence: self.accessibility(evidence),
             "ensure_tag": lambda rec: {"fetched": False},
             "prepare_app": lambda rec, evidence, work, system: (self.tmp / "ARC Node.app", {"name": "a.dmg", "sha256": "1" * 64, "release_digest": "sha256:" + "1" * 64, "digest_match": True},
@@ -783,6 +811,16 @@ class World:
             "build_native": lambda rec, evidence, timeout_s=1500.0, background=False: Path("/x/native"),
             "Interception": FakeEnv,
         }
+
+    def __enter__(self):
+        patch = self.stack.enter_context
+        patch(mock.patch.dict(m.os.environ, {"GITHUB_ACTIONS": "true"}))
+        patch(mock.patch.object(m.subprocess, "run", side_effect=forbid))
+        patch(mock.patch.object(m.subprocess, "Popen", side_effect=forbid))
+        patch(mock.patch.object(m, "work_dir", return_value=self.tmp / "work"))
+        patch(mock.patch.object(m, "system_facts", return_value={"machine": "arm64", "mac_ver": "15.0", "image": "macos-15 test", "sudo": {"rc": 0, "out": ""}}))
+        patch(mock.patch.object(m, "load_live_ips", return_value=list(LIVE)))
+        defaults = self.defaults()
         defaults.update(self.overrides)
         for name, value in defaults.items():
             patch(mock.patch.object(m, name, value))
@@ -842,7 +880,7 @@ class FlowTests(unittest.TestCase):
             self.assertTrue(any("live-network block" in item for item in result["problems"]))
             self.assertTrue(created["env"].torn, "the environment is torn down even when the run stopped early")
 
-    def native_case(self, rec, env, evidence, work, binary, case):
+    def native_case(self, rec, env, evidence, work, binary, case, real_home=False):
         outcome = {"error": "Could not fetch a valid release JSON from the remote"} if case == "clean" else {}
         return {"name": case, "tier": "native_check", "scenario": m.SCENARIO_FOR_CASE[case], "trigger_outcome": outcome, "verdict": "PASS"}
 
@@ -964,6 +1002,40 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(m.arch_matches("aarch64", "arm64"))
         self.assertTrue(m.arch_matches("x64", "x86_64"))
         self.assertFalse(m.arch_matches("bogus", "arm64"))
+
+    @staticmethod
+    def accepted_by(double, real):
+        """Names of the real function's parameters that the double cannot take (drift between a double and the function it replaces)."""
+        d, r = inspect.signature(double), inspect.signature(real)
+        takes_any = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in d.parameters.values())
+        wanted = [p.name for p in r.parameters.values() if p.name != "self" and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)]
+        return [name for name in wanted if name not in d.parameters and not takes_any]
+
+    def test_every_test_double_accepts_every_parameter_of_the_function_it_replaces(self):
+        flow = FlowTests("test_tier_option_is_validated")
+        with tempfile.TemporaryDirectory() as tmp:
+            doubles = World(tmp).defaults()
+            doubles["run_native_case"] = flow.native_case
+            doubles["run_app_case"] = flow.app_case(True)
+            for name, double in doubles.items():
+                real = m.Interception.__init__ if name == "Interception" else getattr(m, name)
+                double = FakeEnv.__init__ if name == "Interception" else double
+                with self.subTest(function=name):
+                    self.assertEqual(self.accepted_by(double, real), [], "the double of %s lost a parameter the real function has" % name)
+            self.assertEqual(self.accepted_by(FakeWatcher.__init__, m.ProcessWatcher.__init__), [])
+
+    def test_nothing_in_the_flows_depends_on_the_host_platform(self):
+        for machine in ("arm64", "x86_64", "AMD64"):
+            for plat in ("linux", "darwin", "win32"):
+                with self.subTest(machine=machine, platform=plat), tempfile.TemporaryDirectory() as tmp, mock.patch.object(m.platform, "machine", return_value=machine), \
+                        mock.patch.object(m.sys, "platform", plat), World(tmp, run_native_case=self.native_case, run_app_case=self.app_case(True, "Could not fetch a valid release JSON from the remote")):
+                    self.assertEqual(self.run_cmd(["run", "--evidence", str(Path(tmp) / "ev")]), 0)
+                    result = json.loads((Path(tmp) / "ev" / "result.json").read_text())
+                    self.assertEqual(result["verdict"], "PASS")
+                    self.assertEqual(result["tiers"]["released_app"]["result"], "ran")
+                    self.assertEqual(result["tiers"]["native_check"]["result"], "ran")
+                    self.assertEqual(self.run_cmd(["probe", "--evidence", str(Path(tmp) / "pev"), "--no-build"]), 0)
+                    self.assertTrue((Path(tmp) / "pev" / "feasibility.txt").exists())
 
     def test_unknown_case_is_refused_before_anything_runs(self):
         with tempfile.TemporaryDirectory() as tmp, World(tmp) as world:
@@ -1518,6 +1590,7 @@ class CiHelperTests(unittest.TestCase):
         attach_call = next(call["argv"] for call in rec.calls if call["argv"][:2] == ["hdiutil", "attach"])
         for flag in ("-nobrowse", "-readonly", "-noverify", "-noautoopen", "-mountpoint"):
             self.assertIn(flag, attach_call)
+        self.assertEqual(next(call["input"] for call in rec.calls if call["argv"][:2] == ["hdiutil", "attach"]), "Y\n", "a license agreement in the image is answered")
         self.assertTrue(any(call["argv"][:2] == ["hdiutil", "detach"] for call in rec.calls))
 
     def test_provenance_reads_crate_versions_from_the_strings_of_the_binary(self):

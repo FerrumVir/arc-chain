@@ -12,7 +12,11 @@ base_tree="$(jq -er .base_tree "$cfg")"
 workflow=".github/workflows/wave0-lab-desktop.yml"
 
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:-$(git rev-parse HEAD)}"
-git fetch --no-tags --depth=1 origin "$base_commit"
+# In CI the checkout is shallow and does not hold the base commit: fetch it. A complete checkout (a developer machine, a
+# worktree of the shared repository) already has it and must NEVER be turned shallow by a fetch with --depth.
+if ! git cat-file -e "${base_commit}^{commit}" 2>/dev/null; then
+    git fetch --no-tags --depth=1 origin "$base_commit"
+fi
 test "$(git rev-parse "$base_commit")" = "$base_commit"
 test "$(git rev-parse "$base_commit^{tree}")" = "$base_tree"
 

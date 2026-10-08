@@ -1076,7 +1076,14 @@ class RunBaselineTests(StubCase):
         rows = [json.loads(line) for line in (self.evidence / "control-requests.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(self.result["control_request_count"], len(rows))
         paths = [(r["step"], r["path"], r["status"]) for r in rows]
-        self.assertIn(("control_install_click", f"/{REPO}/releases/download/v0.8.11/ARC.Node_aarch64.app.tar.gz", 200), paths)
+        # the bait manifest lists one bundle per updater target; the harness follows the entry of the HOST it runs on
+        os_name, arch = duc.updater_targets()
+        bundle = {
+            "darwin-aarch64": "ARC.Node_aarch64.app.tar.gz", "darwin-x86_64": "ARC.Node_x64.app.tar.gz",
+            "linux-x86_64": "ARC.Node_0.8.11_amd64.AppImage", "linux-aarch64": "ARC.Node_0.8.11_aarch64.AppImage",
+            "windows-x86_64": "ARC.Node_0.8.11_x64-setup.exe", "windows-aarch64": "ARC.Node_0.8.11_arm64-setup.exe",
+        }["%s-%s" % (os_name, arch)]
+        self.assertIn(("control_install_click", f"/{REPO}/releases/download/v0.8.11/{bundle}", 200), paths)
         self.assertIn(("control_tauri_check", f"/{REPO}/releases/download/v0.8.11/latest.json", 200), paths)
 
     def test_ui_text_has_the_exact_settings_text_and_the_install_error(self):

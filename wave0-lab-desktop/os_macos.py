@@ -40,17 +40,23 @@ Two tiers, labelled honestly in result.json:
                  "cached-bait", plus a --control-download POSITIVE CONTROL proving the recorder sees a bundle request). This
                  is the macOS evidence for the plugin path: same plugin version, same OS trust-store verifier.
 
-Subcommands:
-  probe --evidence DIR [--no-build] [--build-wait-min N]   what this runner can do (hosts, port 443, trust store, release
-        download, Accessibility three ways, app window and AX tree); writes probe.json, accessibility.json, feasibility.txt;
-        never fails the job.
-  run --evidence DIR [--tier released_app|native_check|both] [--cases clean,cached-bait]
+Subcommands (both refuse to run unless GITHUB_ACTIONS=true: they change /etc/hosts, the keychain and pf and drive the GUI):
+  probe --evidence DIR [--arch arm64|x86_64] [--no-build] [--build-wait-min 15] [--budget-min 25] [--no-real-banner-api]
+        what this runner can do (hosts, port 443, trust store, release download, Accessibility three ways, the app window and its AX
+        tree, the whole Settings > Check for updates > Install chain once); writes probe.json, accessibility.json, feasibility.txt
+        (the two-line answer, also printed to the log before the optional wait for the background cargo build); never fails the job.
+  run --evidence DIR [--arch ...] [--tier released_app|native_check|both] [--cases clean,cached-bait] [--no-real-banner-api]
+        [--native-real-home]
         the isolation cases; writes result.json and the per-case evidence; exit 0 whenever evidence was produced.
+Released-app cases: both use scenario latest-404 (the world after the flip) in ONE shared sandbox HOME seeded as a finished onboarding
+leaves it (store.json, autoStart false); the second case therefore starts from the state the first one left behind.
 
 Evidence files in DIR: result.json, probe.json, accessibility.json, feasibility.txt, steps.log (every command, exit code and
 output tail; live addresses and tokens masked; never a private key), isolation.json, provenance.json, ca.crt, ca.sha256,
-manifest404-error.txt, and per case and tier (<case>-<tier>): requests-*.jsonl, writes-*.jsonl, fs-*-before.json, fs-*-after.json,
-procs-*-before.txt, procs-*-after.txt, procs-*-seen.txt (+ ax-*.json and app-*.log for the released app).
+manifest404-error.txt, hosts.before.txt, hosts.mapped.txt, cargo-build.log, and per case and tier (<case>-<tier>): requests-*.jsonl,
+writes-*.jsonl, fs-*-before.json, fs-*-after.json, procs-*-before.txt, procs-*-after.txt, procs-*-seen.txt, and for the released app
+ax-*.json (AX trees), ui-*.json (the steps and what the Updates card said), network-*.json (what the app's processes talked to: tcpdump
+flows, DNS names, lsof endpoints, violations; the raw capture stays on the runner), app-*.log and screenshot-*.png.
 
 The CA private key and the server key never leave the runner: they stay under <runner temp>/.../ca/private and only ca.crt and
 ca.sha256 are copied into DIR.
@@ -77,6 +83,10 @@ UNVERIFIED ON CI (nothing below could be run on the author's Mac; the first CI r
   * that `cargo build --release --locked` of native-updater-check finishes inside 25 minutes on macos-15 and macos-15-intel;
   * that Security.framework evaluates trust normally for a process whose HOME is a sandbox directory (the native checker runs with
     HOME=<sandbox> so stray writes are visible; if it fails with a trust or keychain error, rerun with --native-real-home);
+  * that `tcpdump -i pktap,all -k NP` is available (the script falls back to `-i any`, then `-i en0`, and says which one ran; without
+    process names the lsof records still attribute sockets to processes);
+  * that the Updates card shows the plugin error as text the AX tree exposes ("Update failed: ...", data-testid update-error) and that
+    the banner's react-query result renders the Install button within about 30 s of the click;
   * that the mitm_server ready file appears within 20 s after `sudo -n python3 lib/mitm_server.py ...`.
 """
 from __future__ import annotations
@@ -858,7 +868,7 @@ def classify_written(path: str, prefixes: Sequence[str], temp_roots: Sequence[st
 def expected_prefixes(real_home: str, sandbox_home: str, case: str) -> List[str]:
     """Where the released app is expected to write: its data, cache, WebKit, log and preference locations (identifier
     network.arc.desktop) in the real home and in the sandbox HOME, plus the autostart LaunchAgent the plugin registers when the
-    saved config asks for it (the clean case has no config: autostart defaults to on)."""
+    saved config asks for it (both cases seed autoStart=false, so none is expected, but the two names it would use are tolerated)."""
     prefixes: List[str] = [sandbox_home]
     for home in (real_home,):
         library = home.rstrip("/") + "/Library"
@@ -869,8 +879,9 @@ def expected_prefixes(real_home: str, sandbox_home: str, case: str) -> List[str]
         prefixes.append("%s/Saved Application State/%s.savedState" % (library, APP_IDENTIFIER))
         prefixes.append("%s/HTTPStorages/%s.binarycookies" % (library, APP_IDENTIFIER))
         prefixes.append("%s/.arc" % home.rstrip("/"))
-        if case == "clean":
-            prefixes.append("%s/LaunchAgents" % library)
+        # the autostart plugin's LaunchAgent registration (lib.rs setup) is app state, not an update artifact
+        prefixes.append("%s/LaunchAgents/%s.plist" % (library, APP_PRODUCT))
+        prefixes.append("%s/LaunchAgents/%s.plist" % (library, APP_IDENTIFIER))
     return prefixes
 
 
@@ -1322,7 +1333,9 @@ def extract_app(rec: Recorder, assets: Dict[str, Any], downloads: Path, sandbox:
         dmg, info = download_verified(rec, assets["dmg"], downloads)
         mount = sandbox / "mnt"
         mount.mkdir(parents=True, exist_ok=True)
-        attach = rec.run(["hdiutil", "attach", "-nobrowse", "-readonly", "-noverify", "-noautoopen", "-mountpoint", str(mount), str(dmg)], label="mount the dmg", timeout=180)
+        # a license agreement inside the image would wait for "Y" on stdin: answer it (harmless when there is none)
+        attach = rec.run(["hdiutil", "attach", "-nobrowse", "-readonly", "-noverify", "-noautoopen", "-mountpoint", str(mount), str(dmg)], label="mount the dmg",
+                         timeout=180, input_text="Y\n")
         if attach.ok:
             try:
                 bundles = sorted(item for item in mount.iterdir() if item.suffix == ".app")
@@ -1635,7 +1648,8 @@ class Interception:
                 self.rec.note("teardown: %s failed: %s" % (step.__name__, error))
         if self.pf_enabled_by_us:
             self.rec.run(["pfctl", "-d"], label="disable pf again", timeout=30, sudo=True)
-        write_json(self.evidence / "isolation.json", dict(self.facts, finished=now_iso()))
+        if Path(self.evidence).is_dir():  # an atexit teardown after the evidence directory is gone must not create it again
+            write_json(self.evidence / "isolation.json", dict(self.facts, finished=now_iso()))
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -2298,16 +2312,17 @@ def cmd_probe(args: argparse.Namespace) -> int:
         if ready and deadline.left() > 120:
             entry = guarded("released app", lambda: run_app_case(rec, env, evidence, work, app, facts, "clean", probe=True), rec, default={"error": True})
             if "trigger_outcome" in entry:
-                ui = entry["trigger_outcome"]["ui"]
-                net = entry.get("network", {})
+                ui = (entry.get("trigger_outcome") or {}).get("ui") or {}
+                net = entry.get("network") or {}
+                requests_summary = entry.get("requests") or {}
                 probe["released_app_ui"] = {
                     "attempted": True, "real_banner_api": ui.get("real_banner_api"), "window_appeared": ui.get("window_appeared"), "nodes": ui.get("nodes"),
                     "settings_button": ui.get("settings_button"), "check_button": ui.get("check_button"), "install_button": ui.get("install_button"),
                     "install_clicked": ui.get("install_clicked"), "ui_error_text": ui.get("ui_error_text"), "problem": ui.get("problem"),
-                    "manifest_requests": sum(count for host, path, count in (entry["requests"].get("by_host_path") or []) if path == MANIFEST_PATH),
+                    "manifest_requests": sum(count for host, path, count in (requests_summary.get("by_host_path") or []) if path == MANIFEST_PATH),
                     "network_recorded": net.get("recorded"), "network_violations": [
                         "%s:%s" % (item.get("remote_ip"), item.get("remote_port")) for item in net.get("violations", [])],
-                    "requests": entry["requests"], "criteria": entry["criteria"], "case_verdict": entry["verdict"],
+                    "requests": requests_summary, "criteria": entry.get("criteria"), "case_verdict": entry.get("verdict"),
                 }
             else:
                 probe["released_app_ui"] = {"attempted": True, "problem": "the released-app case crashed: %s" % entry.get("error")}

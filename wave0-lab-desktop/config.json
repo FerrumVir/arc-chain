@@ -3,7 +3,7 @@
   "repository": "FerrumVir/arc-chain",
   "base_commit": "b26f973913df34c238c63081d0245657ed2c2826",
   "base_tree": "d5ecb73580330b4d60f56d58a221398a38681a41",
-  "mode": "probe",
+  "mode": "full",
   "mode_help": "probe = every job only records what its runner can do (hosts file, port 443, trust store, release download, app launch, UI automation); full = the two isolation cases per OS",
   "app": {
     "tag": "v0.7.11",

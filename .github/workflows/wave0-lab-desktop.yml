@@ -108,11 +108,16 @@ jobs:
           if [ -f "$native" ]; then args+=(--native-check "$native"); fi
           python3 -u wave0-lab-desktop/desktop_updater_check.py run "${args[@]}"
 
-      - name: Desktop updater isolation on Linux
+      - name: Probe on Linux (what this runner can do; never fails the job)
         run: |
           set -Eeuo pipefail
-          case "$MODE" in probe) command=probe ;; full) command=run ;; *) echo "unknown mode $MODE" >&2; exit 2 ;; esac
-          python3 -u wave0-lab-desktop/os_linux.py "$command" --evidence "$EVIDENCE"
+          python3 -u wave0-lab-desktop/os_linux.py probe --evidence "$EVIDENCE/probe"
+
+      - name: Desktop updater isolation on Linux
+        if: ${{ env.MODE == 'full' }}
+        run: |
+          set -Eeuo pipefail
+          python3 -u wave0-lab-desktop/os_linux.py run --evidence "$EVIDENCE"
 
       - name: Refuse to upload any private key material
         id: keys
@@ -171,11 +176,18 @@ jobs:
           if [ -f "$native" ]; then args+=(--native-check "$native"); fi
           python -u wave0-lab-desktop/desktop_updater_check.py run "${args[@]}"
 
-      - name: Desktop updater isolation on Windows
+      - name: Probe on Windows (what this runner can do; never fails the job)
         run: |
           set -Eeuo pipefail
-          case "$MODE" in probe) command=probe ;; full) command=run ;; *) echo "unknown mode $MODE" >&2; exit 2 ;; esac
-          python -u wave0-lab-desktop/os_windows.py "$command" --evidence "$EVIDENCE"
+          extra=""
+          if [ "$MODE" = full ]; then extra="--no-cargo-check"; fi
+          python -u wave0-lab-desktop/os_windows.py probe --evidence "$EVIDENCE/probe" $extra
+
+      - name: Desktop updater isolation on Windows
+        if: ${{ env.MODE == 'full' }}
+        run: |
+          set -Eeuo pipefail
+          python -u wave0-lab-desktop/os_windows.py run --evidence "$EVIDENCE"
 
       - name: Refuse to upload any private key material
         id: keys
@@ -231,11 +243,18 @@ jobs:
           if [ -f "$native" ]; then args+=(--native-check "$native"); fi
           python3 -u wave0-lab-desktop/desktop_updater_check.py run "${args[@]}"
 
-      - name: Desktop updater isolation on macOS arm64
+      - name: Probe on macOS arm64 (what this runner can do; never fails the job)
         run: |
           set -Eeuo pipefail
-          case "$MODE" in probe) command=probe ;; full) command=run ;; *) echo "unknown mode $MODE" >&2; exit 2 ;; esac
-          python3 -u wave0-lab-desktop/os_macos.py "$command" --evidence "$EVIDENCE" --arch arm64
+          extra=""
+          if [ "$MODE" = full ]; then extra="--no-build"; fi
+          python3 -u wave0-lab-desktop/os_macos.py probe --evidence "$EVIDENCE/probe" --arch arm64 $extra
+
+      - name: Desktop updater isolation on macOS arm64
+        if: ${{ env.MODE == 'full' }}
+        run: |
+          set -Eeuo pipefail
+          python3 -u wave0-lab-desktop/os_macos.py run --evidence "$EVIDENCE" --arch arm64
 
       - name: Refuse to upload any private key material
         id: keys
@@ -292,11 +311,18 @@ jobs:
           if [ -f "$native" ]; then args+=(--native-check "$native"); fi
           python3 -u wave0-lab-desktop/desktop_updater_check.py run "${args[@]}"
 
-      - name: Desktop updater isolation on macOS x86_64
+      - name: Probe on macOS x86_64 (what this runner can do; never fails the job)
         run: |
           set -Eeuo pipefail
-          case "$MODE" in probe) command=probe ;; full) command=run ;; *) echo "unknown mode $MODE" >&2; exit 2 ;; esac
-          python3 -u wave0-lab-desktop/os_macos.py "$command" --evidence "$EVIDENCE" --arch x86_64
+          extra=""
+          if [ "$MODE" = full ]; then extra="--no-build"; fi
+          python3 -u wave0-lab-desktop/os_macos.py probe --evidence "$EVIDENCE/probe" --arch x86_64 $extra
+
+      - name: Desktop updater isolation on macOS x86_64
+        if: ${{ env.MODE == 'full' }}
+        run: |
+          set -Eeuo pipefail
+          python3 -u wave0-lab-desktop/os_macos.py run --evidence "$EVIDENCE" --arch x86_64
 
       - name: Refuse to upload any private key material
         id: keys

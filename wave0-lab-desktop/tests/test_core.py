@@ -47,11 +47,11 @@ class ConfigTests(unittest.TestCase):
     def test_the_shipped_config_is_valid(self):
         self.assertEqual(check_config.validate(CONFIG), [])
 
-    def test_it_ships_in_probe_mode_first(self):
-        self.assertEqual(CONFIG["mode"], "probe")
+    def test_the_shipped_mode_is_probe_or_full(self):
+        self.assertIn(CONFIG["mode"], ("probe", "full"))
 
     def test_outputs(self):
-        self.assertEqual(check_config.outputs(CONFIG), {"mode": "probe", "linux": "true", "windows": "true", "macos_arm64": "true", "macos_intel": "true"})
+        self.assertEqual(check_config.outputs(CONFIG), {"mode": CONFIG["mode"], "linux": "true", "windows": "true", "macos_arm64": "true", "macos_intel": "true"})
         cfg = mutated(["jobs", "macos_intel", "enabled"], False)
         cfg["mode"] = "full"
         self.assertEqual(check_config.outputs(cfg), {"mode": "full", "linux": "true", "windows": "true", "macos_arm64": "true", "macos_intel": "false"})
@@ -106,8 +106,8 @@ class ConfigTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()) as buffer:
                 code = check_config.main(["--config", str(LAB / "config.json"), "--github-output", str(out)])
             self.assertEqual(code, 0)
-            self.assertIn("mode=probe", buffer.getvalue())
-            self.assertEqual(out.read_text(), "mode=probe\nlinux=true\nwindows=true\nmacos_arm64=true\nmacos_intel=true\n")
+            self.assertIn("mode=" + CONFIG["mode"], buffer.getvalue())
+            self.assertEqual(out.read_text(), "mode=%s\nlinux=true\nwindows=true\nmacos_arm64=true\nmacos_intel=true\n" % CONFIG["mode"])
             bad = Path(tmp) / "bad.json"
             bad.write_text("{not json")
             with contextlib.redirect_stderr(io.StringIO()):
@@ -362,9 +362,9 @@ class WorkflowTests(unittest.TestCase):
                    "desktop-macos-arm64": "python3 -u wave0-lab-desktop/os_macos.py", "desktop-macos-intel": "python3 -u wave0-lab-desktop/os_macos.py"}
         for name, call in scripts.items():
             body = self.jobs[name]
-            self.assertIn(call + ' "$command" --evidence "$EVIDENCE"', body, name)
-            self.assertIn("probe) command=probe", body)
-            self.assertIn("full) command=run", body)
+            # the probe runs in every mode (into $EVIDENCE/probe); the isolation run only in full mode (into $EVIDENCE)
+            self.assertRegex(body, re.escape(call) + r' probe --evidence "\$EVIDENCE/probe"', name)
+            self.assertRegex(body, r"if: \$\{\{ env\.MODE == 'full' \}\}\n\s+run: \|\n\s+set -Eeuo pipefail\n\s+" + re.escape(call) + r' run --evidence "\$EVIDENCE"', name)
             self.assertIn("cargo build --release --locked --manifest-path wave0-lab-desktop/native-updater-check/Cargo.toml", body)
             build = body.split("Build the native tauri-plugin-updater check", 1)[1].split("- name:", 1)[0]
             self.assertIn("continue-on-error: true", build, "a compile failure must not hide the other results")
