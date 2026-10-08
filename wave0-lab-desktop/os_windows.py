@@ -21,11 +21,17 @@ What `run` does (released_app tier, primary)
   3. generates a per-run CA (lib/ca.py), adds ONLY its certificate to the machine Root store, maps the GitHub host names to
      127.0.0.1 in the hosts file and starts the recording server (lib/mitm_server.py) on 127.0.0.1:443;
   4. blocks every live ARC address in the Windows firewall (the Stage A rule) and proves it with a connect test;
-  5. per case (clean = latest-404, cached-bait = bait-0.8.11 on top of the state the first launch left): snapshots the
-     files and processes, starts the file-write poller, launches the installed app with a sandboxed home and a dedicated
-     WebView2 profile, drives the page over the Chrome DevTools Protocol (WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
-     --remote-debugging-port) and calls the Tauri command `plugin:updater|check` (what the Install button's JavaScript
-     `check()` calls), records the resolved value or the rejection text VERBATIM, then snapshots again;
+  5. per case: snapshots the files and processes, starts the file-write poller and the connection watcher, launches the
+     installed app with a sandboxed home and a dedicated WebView2 profile, and drives it. The strategies, in order (--strategies):
+       uia           (default, first) the RELEASED app's own window through Windows UI Automation (PowerShell + System.Windows.Automation)
+                     on the CI runner: find the window by process id, walk the UIA tree, click Settings, click "Check for updates"
+                     (retried up to 4 times, 20 s apart, while no "Install v... & relaunch" button exists), click Install ONCE (the
+                     button's handler calls the plugin check()), read ALL text nodes and join "Update failed: " + the plugin's message.
+                     Both cases then run the latest-404 world (as on macOS); the bait scenario stays at plugin level (native tier).
+       msedgedriver / cdp-env / cdp-registry   debugging-port strategies, kept as fallbacks for when UIA cannot even find the window
+                     (wry's own browser arguments override WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS, so they failed on the first CI runs);
+     the plugin path counts as reached through the released app only when Install was clicked AND a manifest request reached the
+     recorder; the result records the resolved value or the rejection text VERBATIM, then snapshots again;
   6. computes the five criteria (only_manifest_url, no_bundle_download, no_install, no_new_app_launch, no_new_files)
      fail-closed from the recorded request log, file-write log, snapshots and process lists.
 native_check tier (supporting): builds wave0-lab-desktop/native-updater-check (the real tauri-plugin-updater 2.10.1 check()
@@ -35,12 +41,21 @@ positive control (--control-download) that proves the harness sees a bundle requ
 WHAT THE INTERCEPTION COVERS: the updater plugin's check/download/install path (it verifies TLS with the operating system trust
 store, so a per-run CA in the machine Root store plus the hosts mapping lets the recording server answer for github.com).
 The app's own reqwest calls (the "update available" banner `check_for_update`, and `ensure_binary`) use bundled webpki roots
-and are NOT interceptable: their TLS handshake to the recording server fails and is logged as kind tls_failure. They are
-covered by the cited source and the Stage A replica, and result.json says so (interception.not_covered).
+and are NOT interceptable. REAL-BANNER MODE (default; --no-real-banner-api is the labelled negative control; approved by work-99 via
+the captain, 2026-10-08): the banner's ONE unauthenticated read-only GET https://api.github.com/repos/FerrumVir/arc-chain/releases/latest
+is the only request allowed to reach the real Internet. api.github.com is left to the real DNS (NOT in the hosts file), its content is
+NOT recorded by this lab, its addresses are resolved at run time and labelled in network-*.json; github.com, the asset hosts and rsms.me
+go to the recording server by the hosts file; the ARC addresses stay blocked by the firewall and the real addresses of rsms.me carry the
+same block as an independent second line (refreshed before each case); msedgewebview2.exe is blocked from the Internet by program, so
+Edge platform traffic cannot be mistaken for the app's. A watcher polls Get-NetTCPConnection for arc-desktop.exe and its msedgewebview2.exe
+children about once a second; any other real destination fails the case with the endpoint named (blocked attempts at ARC or rsms.me
+addresses are recorded as information, an ESTABLISHED one is a violation). No connection record at all leaves the case UNPROVED.
+result.json says all this (interception.not_covered, isolation.real_banner_api).
 
 Safety (by construction): the live ARC addresses are blocked in the firewall before the app starts; only ca.crt and its
 sha256 are ever copied into the evidence directory (the private keys stay under the CA's private/ directory, and the evidence
-directory is scanned for key material before the run ends); IPv4 addresses are masked in every log and JSON written here.
+directory is scanned for key material before the run ends); IPv4 addresses are masked in every log written here, and in the connection
+evidence the ARC addresses are replaced by live-ip-N (the banner's public addresses and any violating endpoint stay readable on purpose).
 Cleanup (hosts file, Root certificate, firewall rule, processes) runs in a finally block.
 
 Fail closed: a case with no recorded request log or no recorded file-write log has criteria null (UNPROVED), never PASS.
@@ -63,6 +78,19 @@ UNVERIFIED ON CI (nothing below could be exercised on the Mac this file was writ
   * that `cargo build --release --locked` of native-updater-check succeeds on windows-latest (RUSTUP_TOOLCHAIN=stable is set
     because the repository root pins a nightly) and how long it takes (started in the background, joined with a 40 minute cap);
   * that the runner's `python` (3.12) is on PATH as `python`; there may be no `python3`.
+UNVERIFIED ON CI (UI Automation round; the PowerShell below was never executed on the Mac this file was written on, only parsed by tests
+that count brackets; `probe` now runs the real PowerShell parser over the scripts first, check uia_scripts_parse):
+  * that Chromium exposes the WebView2 page to a UIA client at all (it builds its accessibility tree lazily when it believes an assistive
+    technology runs): the tree walk is retried for ~60 s, SPI_SETSCREENREADER is set for the run and restored, and
+    --force-renderer-accessibility is passed in WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS (wry's own arguments probably override it);
+  * that the buttons are Button/Hyperlink nodes named exactly 'Settings', 'Check for updates' and 'Install v... & relaunch' (as in the
+    macOS accessibility dumps), that they support InvokePattern (otherwise a bounding-rectangle mouse click is used and recorded as
+    method 'mouse'; that needs the runner's interactive desktop), and that "Update failed: " and the plugin's message render as two
+    adjacent Text nodes (the text search also covers non-adjacent nodes; nothing found = UNPROVED);
+  * the output format of `nslookup` on the runner (parse_nslookup_addresses starts at the first "Name:" line) and that a program-scoped
+    outbound block of msedgewebview2.exe leaves the page working; the 1 s connection poll is a sample, a connection that opens and
+    closes between two polls is not seen;
+  * System.Drawing CopyFromScreen in the runner's session (screenshots are best effort and listed only when the file exists).
 """
 from __future__ import annotations
 
@@ -120,7 +148,25 @@ HOSTS_END = "# arcw0-desktop-lab end"
 BLACKHOLE_HOSTS = ("rsms.me", "huggingface.co", "cdn-lfs.huggingface.co")   # third-party hosts the page would fetch: keep the run hermetic
 INSTALLER_NSIS = re.compile(r"^ARC\.Node_[0-9]+\.[0-9]+\.[0-9]+_x64-setup\.exe$")
 INSTALLER_MSI = re.compile(r"^ARC\.Node_[0-9]+\.[0-9]+\.[0-9]+_x64_en-US\.msi$")
-TRIGGER_STRATEGIES = ("msedgedriver", "cdp-env", "cdp-registry")
+TRIGGER_STRATEGIES = ("uia", "msedgedriver", "cdp-env", "cdp-registry")
+BANNER_API_HOST = "api.github.com"
+BANNER_API_PATH = "/repos/FerrumVir/arc-chain/releases/latest"
+RSMS_HOST = "rsms.me"
+APP_SCENARIO = "latest-404"          # both released-app cases when the app is driven through its own UI (bait is exercised at plugin level only)
+SETTINGS_PATTERN = r"^\s*Settings\s*$"
+CHECK_PATTERN = r"Check for updates"
+INSTALL_PATTERN = r"Install\s+v?\d"
+RSMS_RULE = "arcw0-rsms-block"
+WEBVIEW2_RULE = "arcw0-webview2-egress-block"
+REAL_BANNER_SCOPE = (
+    "Only one kind of request leaves the sandbox for the real Internet: the banner's unauthenticated read-only GET (one per click on Check for updates) "
+    "https://api.github.com/repos/FerrumVir/arc-chain/releases/latest (Settings.tsx:20-26 queryFn api.checkForUpdate; commands.rs:934-957 "
+    "check_for_update: reqwest with bundled webpki roots, no Authorization header). Approved by work-99, relayed by the captain, 2026-10-08. "
+    "github.com and every other GitHub/asset host and rsms.me stay mapped to the recorder (hosts file), api.github.com is left to the real DNS and is NOT mapped, "
+    "the six ARC node addresses stay blocked by the Windows firewall, the real addresses of rsms.me carry the same block as an independent second line, and any "
+    "other real destination of the app process tree fails the case with the endpoint named. The CONTENT of that pass-through request was NOT recorded by this lab "
+    "(it is not intercepted); its answer is independently checkable: real Latest = v0.7.12 since 2026-10-08T14:18:32Z."
+)
 EDGE_DRIVER_DEFAULT = "C:\\SeleniumWebDrivers\\EdgeDriver\\msedgedriver.exe"
 REGISTRY_KEY = "HKCU\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments"
 CASE_NAMES = ("clean", "cached-bait")
@@ -781,6 +827,7 @@ _SUSPECT_NAME = re.compile(r"(?i)(setup|install|updater?|arc-desktop|arc\.node)"
 LAB_HELPER_NAMES = frozenset({
     "powershell.exe", "pwsh.exe", "python.exe", "pythonw.exe", "py.exe", "conhost.exe", "cmd.exe", "bash.exe", "sh.exe", "curl.exe", "certutil.exe", "taskkill.exe",
     "git.exe", "gh.exe", "reg.exe", "ipconfig.exe", "tasklist.exe", "cargo.exe", "rustc.exe", "wmiprvse.exe", "msedgedriver.exe",
+    "nslookup.exe", "netsh.exe", "netstat.exe", "csc.exe", "cvtres.exe",       # name resolution, firewall and connection listing, and the C# compiler PowerShell's Add-Type starts
 })
 
 
@@ -843,7 +890,8 @@ def scenario_problem(scenario: str, trigger: Optional[dict]) -> Optional[str]:
 
 
 def evaluate_case(scenario: str, trigger: Optional[dict], requests: Dict[str, Any], fs: Optional[Dict[str, Any]], procs: Optional[Dict[str, List[str]]],
-                  writes_ok: bool, install_changes: Optional[List[str]]) -> Dict[str, Any]:
+                  writes_ok: bool, install_changes: Optional[List[str]], network: Optional[Dict[str, Any]] = None, require_network: bool = False,
+                  require_manifest: bool = False) -> Dict[str, Any]:
     """criteria (true / false / None), verdict and reasons for one case from its recorded evidence."""
     reasons: List[str] = []
     criteria: Dict[str, Optional[bool]] = {key: None for key in CRITERIA}
@@ -859,6 +907,17 @@ def evaluate_case(scenario: str, trigger: Optional[dict], requests: Dict[str, An
             criteria["no_bundle_download"] = not classes.get("payload")
     elif not requests.get("present"):
         reasons.append("no request log")
+    if require_manifest and ran and requests.get("present") and requests.get("total") and not classes.get("manifest"):
+        criteria["only_manifest_url"] = None
+        reasons.append("no request for the manifest URL reached the recorder after the Install click: the plugin check was not shown to reach its endpoint")
+    # what reached the real Internet (real-banner mode lets exactly one kind of request through; everything else fails the case)
+    if network is not None and network.get("violations"):
+        criteria["only_manifest_url"] = False
+        reasons.append("a real destination other than the allowed ones was contacted: %s" % [
+            "%s:%s (%s pid %s, %s)" % (v.get("remote_ip"), v.get("remote_port"), v.get("proc"), v.get("pid"), ",".join(v.get("states") or [])) for v in network["violations"]][:6])
+    elif require_network and (network is None or not network.get("recorded")) and criteria["only_manifest_url"] is not False:
+        criteria["only_manifest_url"] = None
+        reasons.append("a request was allowed to leave the sandbox, but no network record of the app's processes was captured to prove nothing else did")
     # no_install: nothing changed in the install directory, no payload-like file anywhere, no installer process
     if ran and install_changes is not None and fs is not None and procs is not None:
         payload_files = [item for item in fs.get("unexpected", []) if "payload" in item["reason"] or "updater" in item["reason"]]
@@ -1127,8 +1186,8 @@ def trigger_outcome_from(value: Any, error: Optional[str], cdp_ok: bool) -> Dict
         return {"ran": False, "ok": False, "error_text": error, "stage": "cdp", "value": None}
     if not isinstance(value, dict):
         return {"ran": False, "ok": False, "error_text": "unexpected page result %r" % (value,), "stage": "page", "value": None}
-    if value.get("stage") == "no-ipc":
-        return {"ran": False, "ok": False, "error_text": value.get("error"), "stage": "no-ipc", "value": None}
+    if value.get("stage") in ("no-ipc", "ui-not-reached"):
+        return {"ran": False, "ok": False, "error_text": value.get("error"), "stage": value.get("stage"), "value": None}
     if value.get("ok"):
         return {"ran": True, "ok": True, "error_text": None, "stage": "invoke", "value": value.get("value")}
     return {"ran": True, "ok": False, "error_text": value.get("error"), "stage": "invoke", "error_type": value.get("error_type"),
@@ -1267,7 +1326,8 @@ def build_result(*, runner: dict, app: dict, plugin: dict, tiers: Dict[str, dict
         "interception": {
             "covers": "the tauri-plugin-updater check / download / install path (it verifies TLS with the operating system trust store)",
             "not_covered": ["check_for_update (the 'update available' banner) and ensure_binary: the app's reqwest uses bundled webpki roots, "
-                            "so their TLS handshake to the recording server fails (logged as tls_failure); covered by the cited source and the Stage A replica"],
+                            "so their TLS handshake to the recording server fails (logged as tls_failure); covered by the cited source and the Stage A replica. "
+                            "In real-banner mode the banner's one read-only GET to api.github.com is passed through to the real Internet, observed but not recorded (see isolation.real_banner_api)"],
         },
         "file_policy": FS_POLICY_DOC,
         "generated_at": now_iso(),
@@ -1319,8 +1379,24 @@ class Context:
         self.strategies: List[str] = list(TRIGGER_STRATEGIES)
         self.winning_strategy: Optional[str] = None
         self.registry_override = False
+        self.real_banner = True                  # the banner's one read-only GET to api.github.com may reach the real Internet (approved); False = negative control
+        self.live_ips: List[str] = []
+        self.api_addresses: List[str] = []
+        self.rsms_addresses: List[str] = []
+        self.rsms_rule_created = False
+        self.webview2_rule_created = False
+        self.screen_reader_before: Optional[int] = None
+        self.extra_block_log: List[Dict[str, Any]] = []
+        self.webview2_block = True               # block msedgewebview2.exe's egress by program (UNVERIFIED ON CI that the page keeps working); --no-webview2-block observes only
         self.notes: List[str] = []
         self.native_exe: Optional[Path] = None
+
+    def ui_mode(self) -> bool:
+        """The released app is driven through its own window (UI Automation first): both cases then use the latest-404 world, bait stays plugin-level (native tier)."""
+        return bool(self.strategies) and self.strategies[0] == "uia"
+
+    def scenario_for(self, name: str) -> str:
+        return APP_SCENARIO if self.ui_mode() else CASE_SCENARIO[name]
 
 
 def hosts_path() -> Path:
@@ -1428,11 +1504,17 @@ def trust_ca(ctx: Context) -> None:
         raise RuntimeError("the CA is not in the machine Root store (certutil rc %d, store count %r)" % (added.rc, check.out.strip()))
 
 
+def intercepted_names(ctx: Context, names: Sequence[str]) -> List[str]:
+    """The names pointed at the recorder: in real-banner mode api.github.com is the one name left to the real DNS."""
+    return [name for name in names if not (ctx.real_banner and name == BANNER_API_HOST)]
+
+
 def map_hosts(ctx: Context, names: Sequence[str]) -> None:
+    names = intercepted_names(ctx, names)
     path = hosts_path()
     with open(str(path), "r", encoding="utf-8", errors="replace", newline="") as handle:
         ctx.hosts_original = handle.read()
-    blackholed = blackhole_names()
+    blackholed = [name for name in blackhole_names() if name != BANNER_API_HOST]
     write_hosts(path, hosts_with_block(ctx.hosts_original, hosts_block(names, blackholed)))
     ctx.hosts_mapped = list(names)
     ctx.hosts_blackholed = blackholed
@@ -1757,7 +1839,24 @@ def try_strategy(ctx: Context, strategy: str, tag: str, home: str, wv2_launch: s
     launch = Launch(strategy, wv2_launch)
     try:
         Path(wv2_launch).mkdir(parents=True, exist_ok=True)
-        if strategy == "msedgedriver":
+        if strategy == "uia":
+            parsed = check_ps_scripts(ctx)
+            launch.notes["ps_parse"] = parsed
+            if parsed["ran"] and not parsed["ok"]:
+                raise RuntimeError("the UI Automation PowerShell scripts do not parse on this runner: %s" % json.dumps(parsed["errors"])[:600])
+            launch.notes["screen_reader"] = set_screen_reader(ctx)
+            env = sandbox_env(ctx.env, home, wv2_launch, port=None)
+            env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--force-renderer-accessibility"      # a hint only: the first CI runs showed wry's own browser arguments win over this variable
+            log = (ctx.work / ("app-%s.raw.log" % tag)).open("wb")
+            launch.handles.append(log)
+            launch.app_proc = popen([ctx.app_exe], env=env, cwd=ctx.install_dir, stdout=log, stderr=subprocess.STDOUT)
+            page = UiaPage(ctx, launch.app_proc.pid, ctx.evidence, tag, real_banner=ctx.real_banner)
+            launch.page = page
+            launch.notes["window_found"] = False
+            page.open()
+            launch.notes["window_found"] = True
+            launch.notes["uia"] = page.ui.get("after_launch")
+        elif strategy == "msedgedriver":
             base = start_edge_driver(ctx, launch, tag, home, popen)
             page = WebDriverPage(base)
             launch.page = page          # so a half-open session is still closed
@@ -1788,6 +1887,8 @@ def try_strategy(ctx: Context, strategy: str, tag: str, home: str, wv2_launch: s
             raise RuntimeError("unknown strategy %r" % strategy)
     except Exception as error:  # noqa: BLE001 - recorded, the next strategy is tried; launch.page stays so close_launch can close a half-open session
         launch.error = "%s: %s" % (type(error).__name__, str(error)[:600])
+        if isinstance(error, UiaContentNotFound):
+            launch.notes["window_found"] = True
     return launch
 
 
@@ -1835,7 +1936,8 @@ def case_summary(requests: Dict[str, Any], classification: Optional[Dict[str, An
 def judge_recorded_case(scenario: str, trigger: Dict[str, Any], requests_path: Path, writes_path: Path, before: Optional[Dict[str, dict]], after: Dict[str, dict],
                         policies: Sequence[Dict[str, str]], install_dir: str, procs_before: Optional[List[dict]], procs_after: Optional[List[dict]],
                         app_pid: Optional[int], markers: Sequence[str], ignore_exes: Sequence[str], cycles: int, min_cycles: int, diff_path: Optional[Path] = None,
-                        webview_markers: Sequence[str] = ()) -> Dict[str, Any]:
+                        webview_markers: Sequence[str] = (), network: Optional[Dict[str, Any]] = None, require_network: bool = False,
+                        require_manifest: bool = False) -> Dict[str, Any]:
     """Everything a case recorded -> the case fields (requests, file_changes, criteria, verdict, reasons, process_changes)."""
     delta = diff_snapshots(before, after) if before is not None else None
     classification = classify_fs_changes(delta, policies) if delta is not None else None
@@ -1846,8 +1948,11 @@ def judge_recorded_case(scenario: str, trigger: Dict[str, Any], requests_path: P
     writes_ok = bool(write_records) and cycles >= min_cycles and any(r.get("event") == "stop" for r in write_records)
     requests = summarize_requests(read_jsonl(requests_path))
     violations = process_violations(procs_before, procs_after, app_pid, markers, ignore_exes, webview_markers)
-    judgement = evaluate_case(scenario, trigger, requests, classification, violations, writes_ok, install_changes)
+    judgement = evaluate_case(scenario, trigger, requests, classification, violations, writes_ok, install_changes, network, require_network, require_manifest)
     fields = case_summary(requests, classification, install_changes, cycles)
+    if network is not None:
+        fields["network"] = {"violations": network.get("violations"), "allowed_banner_endpoints": network.get("allowed_banner_endpoints"),
+                             "blocked_attempts": len(network.get("blocked_attempts") or []), "recorded": network.get("recorded"), "watcher_polls": network.get("watcher_polls")}
     fields.update(criteria=judgement["criteria"], verdict=judgement["verdict"], reasons=judgement["reasons"], process_changes=violations)
     return fields
 
@@ -1858,6 +1963,792 @@ def mask_file(src: Path, dest: Path) -> None:
         dest.write_text(mask_ips(Path(src).read_text(encoding="utf-8", errors="replace")), encoding="utf-8")
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# UI Automation: drive the RELEASED app through its own window (the WebView2 debugging switches never arrive: wry sets its own browser arguments)
+# ---------------------------------------------------------------------------------------------------------------------
+
+UIA_WALK_PS = r"""
+param(
+  [int]$ProcessId,
+  [string]$Out,
+  [string]$Pattern = '',
+  [string]$Types = 'Button,Hyperlink',
+  [int]$MaxNodes = 900,
+  [int]$MaxDepth = 40,
+  [int]$BudgetMs = 60000,
+  [switch]$WindowsOnly,
+  [switch]$Click
+)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$windows = New-Object System.Collections.ArrayList
+$nodes = New-Object System.Collections.ArrayList
+$result = [ordered]@{ pid = $ProcessId; windows = $windows; nodes = $nodes; truncated = $false; error = $null; elapsed_ms = 0; clicked = $false; method = $null; matched = $null; visited = 0 }
+function Get-Info($el, $depth) {
+  $c = $el.Current
+  return [ordered]@{
+    depth = $depth
+    type = ([string]$c.ControlType.ProgrammaticName -replace '^ControlType\.', '')
+    name = [string]$c.Name
+    id = [string]$c.AutomationId
+    class = [string]$c.ClassName
+    enabled = [bool]$c.IsEnabled
+    offscreen = [bool]$c.IsOffscreen
+    pid = [int]$c.ProcessId
+  }
+}
+try {
+  Add-Type -AssemblyName UIAutomationClient
+  Add-Type -AssemblyName UIAutomationTypes
+  $root = [System.Windows.Automation.AutomationElement]::RootElement
+  $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty, $ProcessId)
+  $tops = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+  foreach ($w in $tops) {
+    $c = $w.Current
+    [void]$windows.Add([ordered]@{ name = [string]$c.Name; class = [string]$c.ClassName; type = ([string]$c.ControlType.ProgrammaticName -replace '^ControlType\.', ''); handle = [int64]$c.NativeWindowHandle; offscreen = [bool]$c.IsOffscreen })
+  }
+  if (-not $WindowsOnly) {
+    $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+    $wanted = $Types -split ','
+    $target = $null
+    foreach ($w in $tops) {
+      if ($target -ne $null) { break }
+      $stack = New-Object System.Collections.Stack
+      $stack.Push(@($w, 0))
+      while ($stack.Count -gt 0) {
+        if ($sw.ElapsedMilliseconds -gt $BudgetMs -or $result.visited -ge $MaxNodes) { $result.truncated = $true; break }
+        $item = $stack.Pop()
+        $el = $item[0]
+        $depth = [int]$item[1]
+        try { $info = Get-Info $el $depth } catch { continue }
+        $result.visited = $result.visited + 1
+        if ($Click) {
+          if (($wanted -contains $info.type) -and ($info.name -match $Pattern) -and $info.enabled) { $target = $el; $result.matched = $info; break }
+        } else {
+          [void]$nodes.Add($info)
+        }
+        if ($depth -lt $MaxDepth) {
+          $kids = New-Object System.Collections.ArrayList
+          try {
+            $child = $walker.GetFirstChild($el)
+            while ($child -ne $null -and $kids.Count -lt 300) {
+              [void]$kids.Add($child)
+              $child = $walker.GetNextSibling($child)
+            }
+          } catch { }
+          for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push(@($kids[$i], ($depth + 1))) }
+        }
+      }
+    }
+    if ($Click) {
+      if ($target -eq $null) {
+        $result.error = 'no matching element'
+      } else {
+        $pat = $null
+        if ($target.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pat)) {
+          try { $pat.Invoke(); $result.clicked = $true; $result.method = 'InvokePattern' } catch { $result.invoke_error = [string]$_.Exception.Message }
+        }
+        if (-not $result.clicked) {
+          Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class W0Mouse { [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y); [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e); public static void Click(int x, int y) { SetCursorPos(x, y); mouse_event(2, 0, 0, 0, UIntPtr.Zero); mouse_event(4, 0, 0, 0, UIntPtr.Zero); } }'
+          $r = $target.Current.BoundingRectangle
+          if ((-not $r.IsEmpty) -and ($r.Width -gt 0) -and ($r.Height -gt 0)) {
+            [W0Mouse]::Click([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+            $result.clicked = $true
+            $result.method = 'mouse'
+          } else {
+            $result.error = 'Invoke is not supported and the element has no bounding rectangle'
+          }
+        }
+      }
+    }
+  }
+} catch {
+  $result.error = ([string]$_.Exception.GetType().Name) + ': ' + ([string]$_.Exception.Message)
+}
+$result.elapsed_ms = $sw.ElapsedMilliseconds
+$json = $result | ConvertTo-Json -Depth 6 -Compress
+if ($Out) { [System.IO.File]::WriteAllText($Out, $json, (New-Object System.Text.UTF8Encoding($false))) }
+Write-Output ('uia-walk done: windows={0} nodes={1} clicked={2}' -f $windows.Count, $nodes.Count, $result.clicked)
+"""
+
+SCREEN_READER_PS = r"""
+param([string]$Mode = 'get', [int]$Value = 1, [string]$Out)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+$result = [ordered]@{ mode = $Mode; before = $null; after = $null; ok = $false; error = $null }
+try {
+  Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class W0Spi { [DllImport("user32.dll", SetLastError = true)] public static extern bool SystemParametersInfo(uint action, uint param, ref int value, uint winIni); [DllImport("user32.dll", SetLastError = true)] public static extern bool SystemParametersInfo(uint action, uint param, IntPtr value, uint winIni); }'
+  $v = 0
+  [void][W0Spi]::SystemParametersInfo(0x46, 0, [ref]$v, 0)
+  $result.before = $v
+  if ($Mode -eq 'set') {
+    [void][W0Spi]::SystemParametersInfo(0x47, [uint32]$Value, [IntPtr]::Zero, 3)
+    $w = 0
+    [void][W0Spi]::SystemParametersInfo(0x46, 0, [ref]$w, 0)
+    $result.after = $w
+  } else {
+    $result.after = $v
+  }
+  $result.ok = $true
+} catch {
+  $result.error = ([string]$_.Exception.GetType().Name) + ': ' + ([string]$_.Exception.Message)
+}
+$json = $result | ConvertTo-Json -Compress
+if ($Out) { [System.IO.File]::WriteAllText($Out, $json, (New-Object System.Text.UTF8Encoding($false))) }
+Write-Output $json
+"""
+
+SCREENSHOT_PS = r"""
+param([string]$Out)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
+  $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+  $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+  Write-Output ('screenshot {0}x{1}' -f $b.Width, $b.Height)
+} catch {
+  Write-Output ('screenshot failed: ' + [string]$_.Exception.Message)
+  exit 1
+}
+"""
+
+NET_WATCH_PS = r"""
+param([string]$Out, [string]$Stop, [int]$IntervalMs = 1000, [string]$Names = 'arc-desktop,msedgewebview2', [string]$DnsName = 'api.github.com')
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'SilentlyContinue'
+$seen = @{}
+$polls = 0
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+function Write-Line($obj) { [System.IO.File]::AppendAllText($Out, (($obj | ConvertTo-Json -Compress) + [Environment]::NewLine), $utf8) }
+Write-Line ([ordered]@{ event = 'start'; t = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0; interval_ms = $IntervalMs; names = $Names })
+while (-not (Test-Path -LiteralPath $Stop)) {
+  $polls = $polls + 1
+  $ids = @{}
+  foreach ($p in @(Get-Process -Name ($Names -split ',') -ErrorAction SilentlyContinue)) { $ids[[int]$p.Id] = [string]$p.ProcessName }
+  if ($ids.Count -gt 0) {
+    foreach ($c in @(Get-NetTCPConnection -ErrorAction SilentlyContinue | Where-Object { $ids.ContainsKey([int]$_.OwningProcess) })) {
+      $key = '{0}|{1}|{2}|{3}' -f $c.OwningProcess, $c.RemoteAddress, $c.RemotePort, $c.State
+      if (-not $seen.ContainsKey($key)) {
+        $seen[$key] = $true
+        Write-Line ([ordered]@{ event = 'conn'; t = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0; poll = $polls; pid = [int]$c.OwningProcess; proc = $ids[[int]$c.OwningProcess]; local = ('{0}:{1}' -f $c.LocalAddress, $c.LocalPort); remote = [string]$c.RemoteAddress; port = [int]$c.RemotePort; state = [string]$c.State })
+      }
+    }
+  }
+  foreach ($d in @(Get-DnsClientCache -ErrorAction SilentlyContinue)) {
+    if (([string]$d.Name).ToLower() -ne $DnsName) { continue }
+    $dk = 'dns|{0}|{1}' -f $d.Type, $d.Data
+    if (-not $seen.ContainsKey($dk)) {
+      $seen[$dk] = $true
+      Write-Line ([ordered]@{ event = 'dns'; t = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0; poll = $polls; name = [string]$d.Name; type = [string]$d.Type; data = [string]$d.Data; ttl = [int]$d.TimeToLive })
+    }
+  }
+  if (($polls % 5) -eq 1) { Write-Line ([ordered]@{ event = 'poll'; t = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0; poll = $polls; processes = $ids.Count }) }
+  Start-Sleep -Milliseconds $IntervalMs
+}
+Write-Line ([ordered]@{ event = 'stop'; t = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0; polls = $polls })
+"""
+
+DNS_CACHE_PS = r"""
+param([string]$Out, [string]$Names)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'SilentlyContinue'
+$wanted = $Names -split ','
+$rows = New-Object System.Collections.ArrayList
+foreach ($e in @(Get-DnsClientCache -ErrorAction SilentlyContinue)) {
+  if ($wanted -contains ([string]$e.Name).ToLower()) { [void]$rows.Add([ordered]@{ name = [string]$e.Name; type = [string]$e.Type; data = [string]$e.Data; ttl = [int]$e.TimeToLive }) }
+}
+$json = ConvertTo-Json -InputObject @($rows) -Compress
+[System.IO.File]::WriteAllText($Out, $json, (New-Object System.Text.UTF8Encoding($false)))
+Write-Output ('dns cache rows: {0}' -f $rows.Count)
+"""
+
+PS_PARSE_PS = r"""
+param([string]$Dir, [string]$Out)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+$result = [ordered]@{}
+try {
+  foreach ($f in @(Get-ChildItem -LiteralPath $Dir -Filter '*.ps1')) {
+    $tokens = $null
+    $errors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors)
+    $messages = New-Object System.Collections.ArrayList
+    foreach ($e in @($errors)) { if ($e -ne $null) { [void]$messages.Add(('{0}:{1} {2}' -f $e.Extent.StartLineNumber, $e.Extent.StartColumnNumber, $e.Message)) } }
+    $result[$f.Name] = $messages
+  }
+} catch {
+  $result['_error'] = ([string]$_.Exception.GetType().Name) + ': ' + ([string]$_.Exception.Message)
+}
+$json = $result | ConvertTo-Json -Depth 4 -Compress
+[System.IO.File]::WriteAllText($Out, $json, (New-Object System.Text.UTF8Encoding($false)))
+Write-Output ('parsed {0} scripts' -f $result.Count)
+"""
+
+POWERSHELL_FILE_ARGV = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
+
+
+def write_ps_scripts(directory: Path) -> Dict[str, Path]:
+    """The PowerShell scripts as files (so no quoting problem can reach them); returns name -> path."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    scripts = {"uia-walk": UIA_WALK_PS, "screen-reader": SCREEN_READER_PS, "screenshot": SCREENSHOT_PS, "net-watch": NET_WATCH_PS, "dns-cache": DNS_CACHE_PS}
+    paths: Dict[str, Path] = {}
+    for name, text in scripts.items():
+        path = directory / (name + ".ps1")
+        path.write_text(text.lstrip("\n"), encoding="utf-8")
+        paths[name] = path
+    return paths
+
+
+def ps_file_argv(script: Path, *args: str) -> List[str]:
+    return POWERSHELL_FILE_ARGV + [str(script)] + [str(a) for a in args]
+
+
+def check_ps_scripts(ctx: "Context") -> Dict[str, Any]:
+    """The PowerShell parser (nothing is executed) over every script this module writes: a syntax error shows up in seconds, not after a 90 s wait for a window.
+    ran=False means the check itself could not run (that never blocks the strategy); errors is name -> parser messages."""
+    directory = ctx.work / "uia"
+    scripts = write_ps_scripts(directory)
+    parser = directory / "ps-parse.ps1"
+    parser.write_text(PS_PARSE_PS.lstrip("\n"), encoding="utf-8")
+    out = directory / "ps-parse.json"
+    if out.exists():
+        out.unlink()
+    done = ctx.shell.run(ps_file_argv(parser, "-Dir", str(directory), "-Out", str(out)), timeout=120, quiet=True)
+    value = parse_json_file(out)
+    if value is None:
+        return {"ran": False, "ok": False, "checked": 0, "errors": {}, "detail": mask_ips(done.out.strip()[-300:]) or "no output (rc %d)" % done.rc}
+    errors: Dict[str, List[str]] = {}
+    for name, messages in value.items():
+        found = [messages] if isinstance(messages, str) else [str(m) for m in (messages or [])]
+        if found:
+            errors[name] = found
+    missing = sorted(path.name for path in scripts.values() if path.name not in value)
+    if missing:
+        errors["_missing"] = ["not seen by the parser: %s" % ", ".join(missing)]
+    return {"ran": True, "ok": not errors, "checked": len(value), "errors": errors}
+
+
+# --- reading the UIA tree ------------------------------------------------------------------------------------------
+
+def parse_json_file(path: Path) -> Optional[dict]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def uia_matches(node: dict, pattern: str, types: Sequence[str] = ()) -> bool:
+    if types and node.get("type") not in types:
+        return False
+    return re.search(pattern, str(node.get("name") or ""), re.IGNORECASE) is not None
+
+
+def uia_find(dump: Optional[dict], pattern: str, types: Sequence[str] = ()) -> List[dict]:
+    return [n for n in (dump or {}).get("nodes") or [] if isinstance(n, dict) and uia_matches(n, pattern, types)]
+
+
+def uia_names(dump: Optional[dict], types: Sequence[str] = ()) -> List[str]:
+    """Names of the nodes (optionally of the given control types), in document order, empty names dropped, whitespace kept as rendered."""
+    return [str(n.get("name")) for n in (dump or {}).get("nodes") or [] if isinstance(n, dict) and str(n.get("name") or "").strip() and (not types or n.get("type") in types)]
+
+
+CARD_TEXT = re.compile(r"(?i)^updates?$|latest version|is available|update failed|install|^v[0-9A-Za-z.\-]+$|no update|could not|release json")
+BUTTON_TYPES = ("Button", "Hyperlink")
+
+
+def uia_card_texts(dump: Optional[dict]) -> List[str]:
+    return [text for text in uia_names(dump) if CARD_TEXT.search(text)][:14]
+
+
+def summarize_uia(dump: Optional[dict]) -> Dict[str, Any]:
+    """What the sequence needs to know about a tree: the three buttons, the Updates card texts, sizes."""
+    if not dump:
+        return {"available": False, "windows": 0, "nodes": 0, "settings_button": False, "check_for_updates_button": False, "install_button": False, "update_card_texts": []}
+    return {
+        "available": True,
+        "error": dump.get("error"),
+        "windows": len(dump.get("windows") or []),
+        "nodes": len(dump.get("nodes") or []),
+        "truncated": bool(dump.get("truncated")),
+        "settings_button": bool(uia_find(dump, SETTINGS_PATTERN, BUTTON_TYPES)),
+        "check_for_updates_button": bool(uia_find(dump, CHECK_PATTERN, BUTTON_TYPES)),
+        "install_button": bool(uia_find(dump, INSTALL_PATTERN, BUTTON_TYPES)),
+        "update_card_texts": uia_card_texts(dump),
+    }
+
+
+def join_update_error(dump: Optional[dict]) -> Dict[str, Any]:
+    """The Updates card after the Install click renders "Update failed: " and the plugin's message as two ADJACENT text nodes (the macOS tree showed exactly that).
+    Join them; separately search every text value for the exact ReleaseNotFound string. Nothing found => found False (the caller fails closed)."""
+    nodes = [n for n in (dump or {}).get("nodes") or [] if isinstance(n, dict)]
+    texts = [(i, n) for i, n in enumerate(nodes) if str(n.get("name") or "").strip() and n.get("type") in ("Text", "Custom", "Group", "ListItem", "Document", "Pane", "Edit")]
+    joined = ""
+    for position, (index, node) in enumerate(texts):
+        if re.match(r"^\s*Update failed", str(node.get("name"))):
+            parts = [str(node.get("name"))]
+            for _i, follower in texts[position + 1:position + 4]:
+                if follower.get("depth") == node.get("depth") and follower.get("type") == node.get("type") and not re.search(r"(?i)^(check for updates|install)", str(follower.get("name"))):
+                    parts.append(str(follower.get("name")))
+                else:
+                    break
+            joined = "".join(parts) if parts[0].endswith(" ") else " ".join(parts)
+            break
+    all_text = " ".join(str(n.get("name")) for n in nodes if str(n.get("name") or "").strip())
+    release_not_found = RELEASE_NOT_FOUND in all_text or RELEASE_NOT_FOUND in joined
+    if release_not_found and not joined:
+        joined = RELEASE_NOT_FOUND
+    message = None
+    match = re.match(r"^\s*Update failed:\s*(.*)$", joined, re.DOTALL)
+    if match and match.group(1).strip():
+        message = match.group(1).strip()
+    elif release_not_found:
+        message = RELEASE_NOT_FOUND
+    return {"found": bool(joined), "joined": joined.strip(), "message": message, "release_not_found": release_not_found}
+
+
+class UiaPage:
+    """The released app's window through Windows UI Automation (PowerShell + System.Windows.Automation) on the CI runner:
+    Settings > Check for updates > (the banner's own result) > Install. kind "uia"; same probe/trigger interface as the other pages."""
+    kind = "uia"
+
+    def __init__(self, ctx: "Context", pid: int, evidence: Path, stem: str, sleep: Optional[Callable[[float], None]] = None, clock: Optional[Callable[[], float]] = None,
+                 real_banner: bool = True):
+        self.ctx, self.pid, self.evidence, self.stem = ctx, pid, Path(evidence), stem
+        self.sleep = sleep or time.sleep
+        self.clock = clock or time.time
+        self.real_banner = real_banner
+        self.scripts = write_ps_scripts(ctx.work / "uia")
+        self.counter = 0
+        self.ui: Dict[str, Any] = {"attempted": True, "trigger": "Windows UI Automation (System.Windows.Automation via PowerShell): Settings > Check for updates > Install",
+                                   "steps": [], "pid": pid, "real_banner_api": real_banner, "window_found": False}
+        self.files: List[str] = []
+
+    # -- one PowerShell walk ------------------------------------------------------------------------------------
+    def walk(self, *extra: str, timeout: float = 150.0) -> Tuple[Optional[dict], CmdResult]:
+        self.counter += 1
+        out = self.ctx.work / "uia" / ("walk-%s-%d.json" % (self.stem, self.counter))
+        if out.exists():
+            out.unlink()
+        argv = ps_file_argv(self.scripts["uia-walk"], "-ProcessId", str(self.pid), "-Out", str(out), *extra)
+        result = self.ctx.shell.run(argv, timeout=timeout)
+        return parse_json_file(out), result
+
+    def dump(self, name: Optional[str], max_nodes: int = 900, budget_ms: int = 60000, windows_only: bool = False) -> Optional[dict]:
+        extra = ["-MaxNodes", str(max_nodes), "-BudgetMs", str(budget_ms)]
+        if windows_only:
+            extra.append("-WindowsOnly")
+        dump, result = self.walk(*extra, timeout=budget_ms / 1000.0 + 60)
+        if name:
+            record = dump if dump else {"raw": mask_ips(result.out[-600:]), "rc": result.rc}
+            file_name = "uia-%s-%s.json" % (self.stem, name)
+            write_json(self.evidence / file_name, record)
+            self.files.append(file_name)
+        return dump
+
+    def click(self, pattern: str, label: str, types: Sequence[str] = BUTTON_TYPES) -> Dict[str, Any]:
+        """Click the first enabled element whose Name matches; InvokePattern first, a bounding-rectangle mouse click only when Invoke is unsupported (the report says which)."""
+        report, result = self.walk("-Click", "-Pattern", pattern, "-Types", ",".join(types), "-MaxNodes", "1500", "-BudgetMs", "60000", timeout=150)
+        step = {"label": label, "pattern": pattern, "rc": result.rc, "report": {k: report.get(k) for k in ("clicked", "method", "matched", "visited", "error", "invoke_error", "truncated")} if report else None}
+        if report is not None and not report.get("clicked") and report.get("error") == "no matching element" and set(types) == set(BUTTON_TYPES):
+            report, result = self.walk("-Click", "-Pattern", pattern, "-Types", "Text,Custom,Group,ListItem,TabItem,MenuItem,Pane", "-MaxNodes", "1500", "-BudgetMs", "60000", timeout=150)
+            step["retry_report"] = {k: report.get(k) for k in ("clicked", "method", "matched", "visited", "error", "invoke_error")} if report else None
+        if report is None:
+            step["raw"] = mask_ips(result.out.strip()[-400:])
+        self.ui["steps"].append(step)
+        return step
+
+    @staticmethod
+    def clicked(step: Dict[str, Any]) -> bool:
+        return bool((step.get("report") or {}).get("clicked") or (step.get("retry_report") or {}).get("clicked"))
+
+    # -- lifecycle ----------------------------------------------------------------------------------------------
+    def open(self, window_timeout: float = 90.0, content_timeout: float = 60.0) -> Dict[str, Any]:
+        """Wait for the app window, then for the web content tree (it appears lazily, once the first UIA client asks)."""
+        start = self.clock()
+        dump = None
+        while self.clock() - start < window_timeout:
+            dump = self.dump(None, max_nodes=1, budget_ms=15000, windows_only=True)
+            if dump and (dump.get("windows") or []):
+                self.ui["window_found"] = True
+                self.ui["windows"] = dump["windows"]
+                break
+            self.sleep(3)
+        if not self.ui["window_found"]:
+            raise UiaWindowNotFound("no window of pid %d appeared within %.0f s" % (self.pid, window_timeout))
+        start = self.clock()
+        dump = None
+        while self.clock() - start < content_timeout:
+            dump = self.dump(None, max_nodes=900, budget_ms=60000)
+            if dump and summarize_uia(dump)["settings_button"]:
+                break
+            self.sleep(5)
+        self.launch_dump = dump
+        write_json(self.evidence / ("uia-%s-1-launch.json" % self.stem), dump or {"error": "no tree"})
+        self.files.append("uia-%s-1-launch.json" % self.stem)
+        self.ui["after_launch"] = summarize_uia(dump)
+        if not self.ui["after_launch"]["settings_button"]:
+            raise UiaContentNotFound("the window of pid %d is there but its web content never exposed a Settings button (nodes: %s)" % (self.pid, self.ui["after_launch"].get("nodes")))
+        return self.ui["after_launch"]
+
+    def evaluate_probe(self) -> Tuple[bool, Any, Optional[str]]:
+        summary = self.ui.get("after_launch") or {}
+        windows = self.ui.get("windows") or [{}]
+        return True, {"ipc": None, "href": None, "title": windows[0].get("name"), "app_version": None, "nodes": summary.get("nodes"), "path": "uia"}, None
+
+    def evaluate_trigger(self) -> Tuple[bool, Any, Optional[str]]:
+        ui = self.ui
+        self.click(SETTINGS_PATTERN, "click Settings")
+        self.sleep(3)
+        settings = self.dump("2-settings")
+        ui["settings_page"] = summarize_uia(settings)
+        ui["install_button_before_check"] = ui["settings_page"]["install_button"]
+        attempts: List[Dict[str, Any]] = []
+        dump = None
+        for attempt in range(1, 5):          # the first click and up to three more, 20 s apart (the banner call may have been rate limited)
+            if attempt > 1:
+                self.sleep(20)
+            self.click(CHECK_PATTERN, "click Check for updates" if attempt == 1 else "click Check for updates (retry %d)" % (attempt - 1))
+            dump = None
+            for _ in range(7):               # the banner command has an 8 s timeout; with the real API it answers in well under a second
+                self.sleep(4)
+                dump = self.dump(None)
+                if summarize_uia(dump)["install_button"]:
+                    break
+            found = summarize_uia(dump)["install_button"]
+            attempts.append({"attempt": attempt, "install_button": found, "card_texts": uia_card_texts(dump)})
+            if found:
+                break
+        ui["banner_attempts"] = attempts
+        write_json(self.evidence / ("uia-%s-3-after-check.json" % self.stem), dump or {"error": "no tree"})
+        self.files.append("uia-%s-3-after-check.json" % self.stem)
+        ui["after_check"] = summarize_uia(dump)
+        ui["install_button"] = ui["after_check"]["install_button"]
+        if not ui["install_button"]:
+            return self._not_reached(self._no_install_reason(attempts))
+        if ui["install_button_before_check"]:
+            return self._not_reached("the Install button was already present BEFORE the check: not clicked (it would not prove the banner's answer)")
+        step = self.click(INSTALL_PATTERN, "click Install (calls the plugin check())")
+        ui["install_clicked"] = self.clicked(step)
+        if not ui["install_clicked"]:
+            return self._not_reached("the Install button was rendered but could not be clicked: %s" % json.dumps(step.get("report") or step.get("retry_report") or step.get("raw"))[:300])
+        final = None
+        error: Dict[str, Any] = {"found": False}
+        for _ in range(8):
+            self.sleep(4)
+            final = self.dump(None)
+            error = join_update_error(final)
+            if error["found"] and (error["release_not_found"] or error["message"]) or "No update available" in " ".join(uia_names(final)):
+                break
+        write_json(self.evidence / ("uia-%s-4-after-install.json" % self.stem), final or {"error": "no tree"})
+        self.files.append("uia-%s-4-after-install.json" % self.stem)
+        ui["after_install"] = summarize_uia(final)
+        ui["update_error"] = error
+        ui["ui_error_text"] = error.get("joined") or None
+        if error["release_not_found"]:
+            text = error["joined"] if RELEASE_NOT_FOUND in error["joined"] else ("%s %s" % (error["joined"], RELEASE_NOT_FOUND)).strip()
+        else:
+            text = error["joined"] or "(no 'Update failed' text found after the Install click; card texts: %s)" % uia_card_texts(final)
+        return True, {"ok": False, "stage": "ui", "error": text, "error_type": "ui-text", "error_json": None}, None
+
+    def _no_install_reason(self, attempts: List[Dict[str, Any]]) -> str:
+        texts = " ".join((attempts[-1].get("card_texts") or [])) if attempts else ""
+        if not self.real_banner:
+            return "the Install button was not rendered: Settings.tsx shows it only after check_for_update reports an update, and with real-banner mode off that call cannot succeed (negative control)"
+        if re.search(r"(?i)vunknown|\bunknown\b", texts):
+            return "the banner's own unintercepted API call returned no release tag (UI: %s) after %d click(s) 20 s apart; not attributable from here" % (texts, len(attempts))
+        return "the Install button was not rendered after %d Check for updates click(s) (UI: %s); not attributable from here" % (len(attempts), texts or "no card text found")
+
+    def _not_reached(self, reason: str) -> Tuple[bool, Any, Optional[str]]:
+        self.ui["problem"] = reason
+        return True, {"ok": False, "stage": "ui-not-reached", "error": reason}, None
+
+    def close(self) -> None:
+        pass
+
+
+class UiaWindowNotFound(RuntimeError):
+    """The app has no window at all: the other strategies may still find one."""
+
+
+class UiaContentNotFound(RuntimeError):
+    """The window exists but UI Automation does not see the web content: the other strategies cannot do better (no debugging port), so none is tried."""
+
+
+# --- what the app's processes talk to ------------------------------------------------------------------------------
+
+def set_screen_reader(ctx: "Context", value: int = 1) -> Dict[str, Any]:
+    """SPI_SETSCREENREADER: Chromium builds its accessibility tree when it believes a screen reader runs. Best effort; the previous value is kept for the restore."""
+    out = ctx.work / "uia" / "screen-reader.json"
+    scripts = write_ps_scripts(ctx.work / "uia")
+    done = ctx.shell.run(ps_file_argv(scripts["screen-reader"], "-Mode", "set", "-Value", str(value), "-Out", str(out)), timeout=60, quiet=True)
+    info = parse_json_file(out) or {"error": done.out[-200:]}
+    if ctx.screen_reader_before is None and isinstance(info.get("before"), int):
+        ctx.screen_reader_before = info["before"]
+    return info
+
+
+def restore_screen_reader(ctx: "Context") -> None:
+    if ctx.screen_reader_before is None:
+        return
+    scripts = write_ps_scripts(ctx.work / "uia")
+    ctx.shell.run(ps_file_argv(scripts["screen-reader"], "-Mode", "set", "-Value", str(ctx.screen_reader_before), "-Out", str(ctx.work / "uia" / "screen-reader-restore.json")), timeout=60, quiet=True)
+    ctx.screen_reader_before = None
+
+
+def take_screenshot(ctx: "Context", name: str, files: Optional[List[str]] = None) -> Optional[str]:
+    """A PNG of the runner's screen (System.Drawing CopyFromScreen); best effort, recorded in the case's evidence list only when it exists."""
+    scripts = write_ps_scripts(ctx.work / "uia")
+    target = ctx.evidence / name
+    ctx.shell.run(ps_file_argv(scripts["screenshot"], "-Out", str(target)), timeout=60, quiet=True)
+    if target.is_file() and target.stat().st_size > 0:
+        if files is not None and name not in files:
+            files.append(name)
+        return name
+    return None
+
+
+def parse_nslookup_addresses(text: str) -> List[str]:
+    """Addresses from `nslookup NAME` output: only those after the "Name:" line (the lines before it name the DNS server)."""
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if re.match(r"^\s*Name:", line)), None)
+    if start is None:
+        return []
+    found: List[str] = []
+    for line in lines[start:]:
+        if re.match(r"^\s*(Aliases?:)", line):
+            continue
+        for token in re.findall(r"[0-9A-Fa-f:.]{3,}", line.split(":", 1)[1] if re.match(r"^\s*(Name|Address|Addresses):", line) else line):
+            address = canonical_address(token)
+            if address and address not in found:
+                found.append(address)
+    return found
+
+
+def canonical_address(value: str) -> Optional[str]:
+    """Compressed, scope-less, IPv4-mapped addresses unwrapped; None when it is not an IP address."""
+    import ipaddress
+    text = str(value).strip().strip("[]").split("%")[0]
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if address.version == 6 and getattr(address, "ipv4_mapped", None):
+        return str(address.ipv4_mapped)
+    return str(address)
+
+
+def is_loopback_address(value: str) -> bool:
+    import ipaddress
+    address = canonical_address(value)
+    if not address:
+        return False
+    return ipaddress.ip_address(address).is_loopback
+
+
+def is_unspecified_address(value: str) -> bool:
+    address = canonical_address(value)
+    return address in ("0.0.0.0", "::", None)
+
+
+def resolve_real(shell: "Shell", name: str) -> List[str]:
+    """The addresses a name has in the REAL DNS right now, through nslookup (it does not read the hosts file, so it works after the mapping, too)."""
+    done = shell.run(["nslookup", name], timeout=45, quiet=True)
+    return parse_nslookup_addresses(done.out) if done.out else []
+
+
+def rsms_block_script(addresses: Sequence[str], rule: str = RSMS_RULE) -> str:
+    """Replace the second-line block rule for the real addresses of rsms.me (the hosts mapping alone is not trusted to keep the webview off it)."""
+    remove = "Remove-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue; " % rule
+    if not addresses:
+        return remove + "Write-Output 'no addresses to block'"
+    quoted = ",".join("'%s'" % a for a in addresses)
+    return remove + "New-NetFirewallRule -DisplayName '%s' -Direction Outbound -Action Block -RemoteAddress %s | Out-Null; Write-Output 'rule-created'" % (rule, quoted)
+
+
+def webview2_block_script(program: str, rule: str = WEBVIEW2_RULE) -> str:
+    """Block ALL outbound traffic of the WebView2 runtime's browser binary: the page needs nothing from the Internet, and its own platform services (component
+    updater, variations, SmartScreen) must not reach it either. The banner's request is made by arc-desktop.exe itself, not by the webview."""
+    quoted = program.replace("'", "''")
+    return ("Remove-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue; "
+            "New-NetFirewallRule -DisplayName '%s' -Direction Outbound -Action Block -Program '%s' | Out-Null; Write-Output 'rule-created'" % (rule, rule, quoted))
+
+
+def find_webview2_binaries(patterns: Sequence[str] = ()) -> List[str]:
+    import glob
+    roots = list(patterns) or [r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe", r"C:\Program Files\Microsoft\EdgeWebView\Application\*\msedgewebview2.exe"]
+    found: List[str] = []
+    for pattern in roots:
+        found.extend(sorted(glob.glob(pattern)))
+    return found
+
+
+def refresh_extra_blocks(ctx: "Context") -> Dict[str, Any]:
+    """Before every case: the real addresses of rsms.me as the resolver gives them now are added to the block (an independent second line behind the hosts
+    mapping), and the WebView2 runtime's browser binary is blocked from the Internet. Returns what was done; never raises."""
+    info: Dict[str, Any] = {"rsms_resolved": [], "rsms_rule": None, "webview2_programs": [], "webview2_rule": None}
+    try:
+        resolved = resolve_real(ctx.shell, RSMS_HOST)
+        ctx.rsms_addresses = sorted(set(ctx.rsms_addresses) | set(resolved))
+        info["rsms_resolved"] = resolved
+        info["rsms_addresses_blocked"] = list(ctx.rsms_addresses)
+        done = ctx.shell.run(powershell_argv(rsms_block_script(ctx.rsms_addresses)), timeout=90)
+        ctx.rsms_rule_created = ctx.rsms_rule_created or (done.ok and bool(ctx.rsms_addresses))
+        info["rsms_rule"] = "created" if (done.ok and ctx.rsms_addresses) else ("no addresses resolved" if done.ok else "failed: %s" % done.out[-200:])
+        programs = find_webview2_binaries() if ctx.webview2_block else []
+        info["webview2_programs"] = programs
+        if not ctx.webview2_block:
+            info["webview2_rule"] = "disabled (--no-webview2-block): the runtime's egress is observed, not blocked"
+        elif programs:
+            made_all = []
+            for index, program in enumerate(programs):
+                rule = WEBVIEW2_RULE if index == 0 else "%s-%d" % (WEBVIEW2_RULE, index)         # one rule per program: a rule with the same name would replace the earlier one
+                made = ctx.shell.run(powershell_argv(webview2_block_script(program, rule)), timeout=90)
+                ctx.webview2_rule_created = ctx.webview2_rule_created or made.ok
+                made_all.append("created" if made.ok else "failed: %s" % made.out[-200:])
+            info["webview2_rule"] = made_all[0] if len(set(made_all)) == 1 else "; ".join(made_all)
+        else:
+            info["webview2_rule"] = "msedgewebview2.exe not found: its egress is observed, not blocked"
+    except Exception as error:  # noqa: BLE001 - recorded
+        info["error"] = "%s: %s" % (type(error).__name__, error)
+    ctx.extra_block_log.append(info)
+    return info
+
+
+class NetWatcher:
+    """A PowerShell process that polls Get-NetTCPConnection for arc-desktop.exe and its msedgewebview2.exe children about once a second and writes one JSON line per new
+    (process, remote endpoint, state). One long-lived process: starting PowerShell once a second would be slower than the poll."""
+
+    def __init__(self, ctx: "Context", stem: str, interval_ms: int = 1000, popen: Optional[Callable[..., Any]] = None):
+        self.ctx, self.stem, self.interval_ms = ctx, stem, interval_ms
+        self.popen = popen
+        self.out = ctx.work / ("netwatch-%s.jsonl" % stem)
+        self.stop_file = ctx.work / ("netwatch-%s.stop" % stem)
+        self.proc: Any = None
+        self.handle: Any = None
+        self.error: Optional[str] = None
+
+    def start(self) -> None:
+        scripts = write_ps_scripts(self.ctx.work / "uia")
+        for path in (self.out, self.stop_file):
+            if path.exists():
+                path.unlink()
+        argv = ps_file_argv(scripts["net-watch"], "-Out", str(self.out), "-Stop", str(self.stop_file), "-IntervalMs", str(self.interval_ms))
+        try:
+            self.handle = (self.ctx.work / ("netwatch-%s.out" % self.stem)).open("wb")
+            self.proc = (self.popen or subprocess.Popen)(argv, stdout=self.handle, stderr=subprocess.STDOUT)
+        except OSError as error:
+            self.error = "%s: %s" % (type(error).__name__, error)
+
+    def stop(self, timeout: float = 20.0) -> List[dict]:
+        records: List[dict] = []
+        if self.proc is not None:
+            try:
+                self.stop_file.write_text("stop", encoding="ascii")
+                try:
+                    self.proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+            except OSError as error:
+                self.error = "%s: %s" % (type(error).__name__, error)
+        if self.handle is not None:
+            self.handle.close()
+        return read_jsonl(self.out) or records
+
+
+def dns_cache_entries(ctx: "Context", names: Sequence[str], stem: str) -> List[dict]:
+    scripts = write_ps_scripts(ctx.work / "uia")
+    out = ctx.work / ("dnscache-%s.json" % stem)
+    ctx.shell.run(ps_file_argv(scripts["dns-cache"], "-Out", str(out), "-Names", ",".join(n.lower() for n in names)), timeout=60, quiet=True)
+    try:
+        value = json.loads(out.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def label_live(address: str, live_ips: Sequence[str]) -> str:
+    """ARC addresses never appear in evidence: live-ip-N."""
+    canon = canonical_address(address) or address
+    for index, live in enumerate(sorted(live_ips), 1):
+        if canonical_address(live) == canon:
+            return "live-ip-%d" % index
+    return address
+
+
+def network_report_win(records: Sequence[dict], api_ips: Sequence[str], live_ips: Sequence[str], rsms_ips: Sequence[str], real_banner: bool,
+                       watcher_error: Optional[str] = None) -> Dict[str, Any]:
+    """Judge what the app's process tree talked to. Allowed: loopback (the recorder, local IPC) and, in real-banner mode, the api.github.com addresses on 443.
+    A non-established attempt at an ARC or rsms.me address is information (the firewall refused it); an ESTABLISHED one means a block failed. Anything else is a violation."""
+    api = {canonical_address(a) for a in api_ips if canonical_address(a)}
+    observed = {canonical_address(str(r.get("data") or "")) for r in records if r.get("event") == "dns" and canonical_address(str(r.get("data") or ""))}
+    api |= observed                    # what the system resolver handed the app, sampled every second (a cache entry lives only as long as its TTL, 60 s)
+    live = {canonical_address(a) for a in live_ips if canonical_address(a)}
+    rsms = {canonical_address(a) for a in rsms_ips if canonical_address(a)}
+    merged: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    polls = 0
+    started = stopped = False
+    for record in records:
+        event = record.get("event")
+        if event == "start":
+            started = True
+        elif event == "stop":
+            stopped = True
+            polls = max(polls, int(record.get("polls") or 0))
+        elif event == "poll":
+            polls = max(polls, int(record.get("poll") or 0))
+        elif event == "conn":
+            address = canonical_address(str(record.get("remote") or ""))
+            if address is None:
+                continue
+            key = (record.get("pid"), record.get("proc"), address, record.get("port"))
+            item = merged.setdefault(key, {"pid": record.get("pid"), "proc": record.get("proc"), "remote_ip": address, "remote_port": record.get("port"), "states": [], "first_seen": record.get("t")})
+            if record.get("state") and record["state"] not in item["states"]:
+                item["states"].append(record["state"])
+    allowed: List[dict] = []
+    blocked: List[dict] = []
+    violations: List[dict] = []
+    loopback = listeners = 0
+    for item in merged.values():
+        address, port, states = item["remote_ip"], item["remote_port"], item["states"]
+        if is_unspecified_address(address) or (states and all(s in ("Listen", "Bound") for s in states)):
+            listeners += 1
+        elif is_loopback_address(address):
+            loopback += 1
+        elif real_banner and address in api and port == 443:
+            allowed.append(dict(item, label="api.github.com"))
+        elif address in live:
+            entry = dict(item, remote_ip=label_live(address, live_ips), label="arc-live-node")
+            (violations if "Established" in states else blocked).append(entry)
+        elif address in rsms:
+            entry = dict(item, label="rsms.me")
+            (violations if "Established" in states else blocked).append(entry)
+        else:
+            violations.append(dict(item, label="other real destination"))
+    return {
+        "recorded": bool(started and (polls > 0 or merged)) and watcher_error is None,
+        "watcher_polls": polls, "watcher_started": started, "watcher_stopped": stopped, "watcher_error": watcher_error,
+        "real_banner": real_banner,
+        "allowed_banner_endpoints": allowed, "blocked_attempts": blocked, "violations": violations,
+        "loopback_endpoints": loopback, "listener_entries": listeners,
+        "api_addresses": sorted(api), "api_addresses_seen_in_the_resolver_cache": sorted(observed), "rsms_addresses": sorted(rsms),
+    }
+
+
+def selective_mask(text: str, live_ips: Sequence[str]) -> str:
+    """Only the ARC addresses are masked (live-ip-N); the addresses that name a violation or label the banner call must stay readable."""
+    for index, live in enumerate(sorted(live_ips), 1):
+        text = text.replace(live, "live-ip-%d" % index)
+    return text
 
 
 def strategy_order(ctx: Context) -> List[str]:
@@ -1894,6 +2785,9 @@ def acquire_page(ctx: Context, tag: str, home: str, wv2_base: str, evidence: Pat
             ctx.winning_strategy = strategy
             return launch, attempts
         close_launch(ctx, launch, wv2_base)
+        if strategy == "uia" and launch.notes.get("window_found"):
+            attempts[-1]["fallbacks_skipped"] = "the window exists but UI Automation does not see the web content; the debugging-port strategies cannot work here (the switches never arrive) and each failed strategy costs minutes"
+            break
     return None, attempts
 
 
@@ -1908,10 +2802,28 @@ def copy_driver_log(ctx: Context, tag: str, evidence: Path, files: List[str]) ->
             files.append(name)
 
 
+def write_masked_json(path: Path, value: Any, live_ips: Sequence[str]) -> None:
+    """JSON evidence with the ARC addresses replaced by live-ip-N (every other address stays readable: it names a violation or labels the banner call)."""
+    text = selective_mask(json.dumps(value, indent=2, sort_keys=True, default=str), live_ips)
+    Path(path).write_text(text + "\n", encoding="utf-8")
+
+
+def banner_addresses(ctx: Context, stem: str) -> List[str]:
+    """api.github.com's addresses: resolved at run time on the runner (never hard-coded), plus what the system resolver cached for the app."""
+    found = set(ctx.api_addresses)
+    found.update(resolve_real(ctx.shell, BANNER_API_HOST))
+    for row in dns_cache_entries(ctx, [BANNER_API_HOST], stem):
+        address = canonical_address(str(row.get("data") or ""))
+        if address:
+            found.add(address)
+    ctx.api_addresses = sorted(found)
+    return ctx.api_addresses
+
+
 def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: float = 10.0) -> Dict[str, Any]:
-    """One released-app case: record, launch (msedgedriver first, DevTools as the fallback), trigger, record again, evaluate."""
+    """One released-app case: record, launch (UI Automation first, then the debugging strategies when UIA cannot even find the window), drive, record again, evaluate."""
     shell, evidence = ctx.shell, ctx.evidence
-    scenario = CASE_SCENARIO[name]
+    scenario = ctx.scenario_for(name)
     tag = "app-" + name
     files: List[str] = []
     case: Dict[str, Any] = {"name": name, "tier": "released_app", "scenario": scenario, "trigger_outcome": {}, "evidence_files": files}
@@ -1922,25 +2834,35 @@ def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: 
     roots = fs_watch_roots(policies)
     mitm = MitmProcess(scenario, ctx.ca_info["server_cert"], ctx.ca_info["server_key"], requests_path, evidence / ("ready-%s" % tag))
     poller = Poller(roots, writes_path)
+    watcher = NetWatcher(ctx, tag) if ctx.ui_mode() else None
     launch: Optional[Launch] = None
     trigger: Dict[str, Any] = {"ran": False, "ok": False, "error_text": "not reached", "stage": "setup", "value": None}
     procs_before = procs_after = None
     before_snapshot: Optional[Dict[str, dict]] = None
     app_pid: Optional[int] = None
     attempts: List[dict] = []
+    blocks: Dict[str, Any] = {}
+    net_records: List[dict] = []
     cycles = 0
     try:
         mitm.start()
+        if ctx.ui_mode():
+            blocks = refresh_extra_blocks(ctx)                      # the real addresses of rsms.me as the resolver gives them now, and the WebView2 runtime's egress block
+            if ctx.real_banner:
+                banner_addresses(ctx, tag)
         before_snapshot = take_snapshot(roots)
         write_json(evidence / ("fs-%s-before.json" % tag), before_snapshot)
         prelaunch = snapshot_processes(shell)
         write_process_list(evidence / ("procs-%s-prelaunch.txt" % tag), prelaunch)
         poller.start()
+        if watcher is not None:
+            watcher.start()
         launch, attempts = acquire_page(ctx, tag, home, wv2_base, evidence, files)
         if launch is None:
             summary = "; ".join("%s: %s" % (a["strategy"], a["error"]) for a in attempts)
             trigger = {"ran": False, "ok": False, "error_text": "no strategy gave a handle on the app window (%s)" % summary[:900], "stage": "launch", "value": None}
         else:
+            take_screenshot(ctx, "screenshot-%s-after-launch.png" % name, files)
             time.sleep(5)       # let the page finish its first load before the call
             procs_before = snapshot_processes(shell)
             write_process_list(evidence / ("procs-%s-before.txt" % tag), procs_before)
@@ -1952,6 +2874,11 @@ def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: 
             poller.mark("trigger_end")
             trigger = trigger_outcome_from(value, error, ok)
             trigger["path"] = launch.page.kind
+            if launch.page.kind == "uia":
+                trigger["ui"] = {k: v for k, v in launch.page.ui.items() if k != "steps"}
+                trigger["ui_steps"] = launch.page.ui.get("steps")
+                files.extend(f for f in launch.page.files if f not in files)
+                take_screenshot(ctx, "screenshot-%s-final.png" % name, files)
             time.sleep(settle_s)
             procs_after = snapshot_processes(shell)
             write_process_list(evidence / ("procs-%s-after.txt" % tag), procs_after)
@@ -1963,6 +2890,8 @@ def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: 
             cycles = poller.finish()
         after_snapshot = take_snapshot(roots)
         write_json(evidence / ("fs-%s-after.json" % tag), after_snapshot)
+        if watcher is not None:
+            net_records = watcher.stop()
         if launch is not None:
             close_launch(ctx, launch, wv2_base)
         else:
@@ -1971,12 +2900,33 @@ def run_released_case(ctx: Context, name: str, state: Dict[str, str], settle_s: 
         copy_driver_log(ctx, tag, evidence, files)
         for source in sorted(ctx.work.glob("app-%s.raw.log" % tag)):
             mask_file(source, evidence / ("app-%s.log" % tag))
+    network: Optional[Dict[str, Any]] = None
+    if watcher is not None:
+        api_ips = banner_addresses(ctx, tag) if ctx.real_banner else []
+        rsms_rows = dns_cache_entries(ctx, [RSMS_HOST], tag + "-rsms")
+        rsms = set(ctx.rsms_addresses) | {a for a in (canonical_address(str(r.get("data") or "")) for r in rsms_rows) if a}
+        network = network_report_win(net_records, api_ips, ctx.live_ips, sorted(rsms), ctx.real_banner, watcher.error)
+        network.update({"extra_blocks": blocks, "statement": REAL_BANNER_SCOPE if ctx.real_banner else "real-banner mode off: no request was allowed to leave the sandbox",
+                        "banner_api_addresses_sources": "nslookup on the runner at run time and the system resolver's cache for the app (never hard-coded)",
+                        "raw_connection_log_kept": True})
+        write_masked_json(evidence / ("network-%s.json" % tag), network, ctx.live_ips)
+        write_masked_json(evidence / ("netwatch-%s.jsonl.json" % tag), net_records, ctx.live_ips)
+        files.extend(n for n in ("network-%s.json" % tag, "netwatch-%s.jsonl.json" % tag) if n not in files)
     trigger.setdefault("attempts", attempts)
+    if ctx.ui_mode():
+        trigger["note"] = ("real-banner mode: one unauthenticated read-only GET to api.github.com may reach the real Internet (not recorded by us); everything else stays on the recorder; "
+                           "the bait scenario is exercised at plugin level only (the app's Install handler downloads by design when an update exists)") if ctx.real_banner else \
+            "NEGATIVE CONTROL: the Install button cannot appear with the banner call blocked"
     case["trigger_outcome"] = trigger
     case["launch_attempts"] = attempts
     case.update(judge_recorded_case(scenario, trigger, requests_path, writes_path, before_snapshot, after_snapshot, policies, ctx.install_dir, procs_before, procs_after, app_pid,
                                     [ctx.install_dir, home, "network.arc.desktop", "ARC.Node_"], [], cycles, 3, evidence / ("fs-%s-diff.json" % tag),
-                                    webview_markers=[wv2_base]))
+                                    webview_markers=[wv2_base], network=network, require_network=bool(ctx.ui_mode() and ctx.real_banner),
+                                    require_manifest=bool(trigger.get("path") == "uia")))
+    if trigger.get("path") == "uia":
+        write_masked_json(evidence / ("ui-%s.json" % tag), {"trigger": trigger.get("ui"), "steps": trigger.get("ui_steps"), "window_found": True}, ctx.live_ips)
+        if "ui-%s.json" % tag not in files:
+            files.append("ui-%s.json" % tag)
     for pattern in ("requests-%s.jsonl", "writes-%s.jsonl", "fs-%s-before.json", "fs-%s-after.json", "fs-%s-diff.json", "procs-%s-prelaunch.txt", "procs-%s-before.txt",
                     "procs-%s-after.txt", "app-%s.log"):
         if (evidence / (pattern % tag)).is_file() and (pattern % tag) not in files:
@@ -2123,6 +3073,14 @@ def cleanup(ctx: Context) -> None:
     if ctx.registry_override:
         shell.run(registry_override_remove_argv(), timeout=30, quiet=True)
         ctx.registry_override = False
+    if ctx.screen_reader_before is not None:
+        restore_screen_reader(ctx)
+    if ctx.rsms_rule_created:
+        shell.run(powershell_argv("Remove-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue" % RSMS_RULE), timeout=60, quiet=True)
+        ctx.rsms_rule_created = False
+    if ctx.webview2_rule_created:
+        shell.run(powershell_argv("Remove-NetFirewallRule -DisplayName '%s*' -ErrorAction SilentlyContinue" % WEBVIEW2_RULE), timeout=60, quiet=True)
+        ctx.webview2_rule_created = False
     if ctx.live_block or ctx.rule_created:
         shell.run(powershell_argv(firewall_remove_script()), timeout=60)
 
@@ -2133,6 +3091,14 @@ def prepare_isolation(ctx: Context, isolation: Dict[str, Any]) -> None:
     ctx.ca_info = make_ca(ctx.ca_dir, DEFAULT_HOSTS)
     copy_public(ctx.ca_dir, ctx.evidence)                      # ONLY ca.crt and ca.sha256
     isolation["ca_sha256"] = ctx.ca_info["ca_sha256"]
+    try:
+        ctx.live_ips = load_live_ips(ROOT)
+    except (OSError, ValueError):
+        ctx.live_ips = []
+    if ctx.real_banner:
+        ctx.api_addresses = resolve_real(ctx.shell, BANNER_API_HOST)       # at run time, on this runner, never hard-coded; before the mapping
+    isolation["real_banner_api"] = {"enabled": ctx.real_banner, "api_addresses": list(ctx.api_addresses), "content_recorded": False,
+                                    "scope": REAL_BANNER_SCOPE if ctx.real_banner else "off: every GitHub name, including api.github.com, is mapped to the recorder; the banner call cannot succeed"}
     block_live_network(ctx)
     isolation["live_block"] = ctx.live_block
     isolation["live_block_detail"] = ctx.live_block_detail
@@ -2167,7 +3133,8 @@ def released_app_tier(ctx: Context, asset: dict, installer: Path, pubkey: Option
     cases = [run_released_case(ctx, name, state) for name in ordered]
     tier["result"] = tier_result(cases_wanted, cases, "ran")
     used = sorted({str((c.get("trigger_outcome") or {}).get("path")) for c in cases if (c.get("trigger_outcome") or {}).get("ran")})
-    tier["trigger"] = ("msedgedriver W3C session (browserName webview2) -> plugin:updater|check" if used == ["msedgedriver"] else
+    tier["trigger"] = ("Windows UI Automation: Settings > Check for updates > Install (the app's own button calls the plugin check())" if used == ["uia"] else
+                       "msedgedriver W3C session (browserName webview2) -> plugin:updater|check" if used == ["msedgedriver"] else
                        "WebView2 DevTools Protocol -> plugin:updater|check" if used == ["cdp"] else
                        "mixed: %s -> plugin:updater|check" % ", ".join(used) if used else "none ran (see launch_attempts in each case)")
     tier["paths_used"] = used
@@ -2224,6 +3191,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("unknown strategy in %r" % (strategies,), file=sys.stderr)
         return 2
     ctx.strategies = strategies
+    ctx.real_banner = bool(getattr(args, "real_banner", True))
+    ctx.webview2_block = bool(getattr(args, "webview2_block", True))
     wanted_tiers = list(TIERS) if args.tier == "both" else [args.tier]
     cases_wanted = [name for name in args.cases.split(",") if name]
     for name in cases_wanted:
@@ -2303,6 +3272,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         cleanup(ctx)
     fail_tiers(wanted_tiers, "the tier did not complete")
+    if ctx.extra_block_log or ctx.rsms_addresses:
+        isolation["extra_block_resolution"] = {"rsms.me": sorted(ctx.rsms_addresses), "refreshes": len(ctx.extra_block_log), "last": ctx.extra_block_log[-1] if ctx.extra_block_log else None,
+                                               "why": "the hosts mapping alone is not trusted to keep the webview off rsms.me; an address block does not depend on DNS"}
     write_json(evidence / "isolation.json", isolation)
     result = build_result(runner=runner_info(), app=app, plugin=plugin, tiers=tiers, cases=cases, manifest404=manifest404, manifest404_source=manifest404_source,
                           isolation=isolation, controls=controls, notes=notes)
@@ -2434,6 +3406,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     shell = Shell(evidence / "steps.log")
     work = Path(os.environ.get("ARCW0_WORK", r"C:\arcw0" if IS_WINDOWS else str(evidence / "work")))
     ctx = Context(evidence, work, shell, load_config(None))
+    ctx.real_banner = bool(getattr(args, "real_banner", True))
     probe: Dict[str, Any] = {"schema": SCHEMA_PROBE, "os": "windows", "runner": runner_info(), "started": now_iso(), "checks": {}}
     checks = probe["checks"]
     state: Dict[str, Any] = {}
@@ -2499,6 +3472,18 @@ def cmd_probe(args: argparse.Namespace) -> int:
             check("edge_driver", lambda: ps("Get-Command msedgedriver -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source"))
             check("firewall_cmdlets", lambda: ps("Get-Command New-NetFirewallRule | Select-Object -ExpandProperty Name"))
             check("seven_zip", lambda: "present" if shell.run(["7z"], timeout=30).ok else "absent")
+
+            def uia_scripts() -> Any:
+                found = check_ps_scripts(ctx)
+                if found["errors"]:
+                    raise RuntimeError("PowerShell parse errors: %s" % json.dumps(found["errors"])[:700])
+                if not found["ran"]:
+                    raise RuntimeError("the parse check did not run: %s" % found.get("detail"))
+                return found
+            check("uia_scripts_parse", uia_scripts)
+            check("uia_desktop", lambda: ps("Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes; $r = [System.Windows.Automation.AutomationElement]::RootElement; "
+                                            "$k = $r.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition); "
+                                            "('desktop root={0} top_level_elements={1}' -f $r.Current.Name, $k.Count)"))
 
             def hosts_writable() -> str:
                 path = hosts_path()
@@ -2645,6 +3630,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     probe.add_argument("--no-launch", dest="launch", action="store_false", help="skip installing and launching the released app (live network blocked) to look at its page")
     probe.set_defaults(launch=True)
     probe.add_argument("--no-cargo-check", dest="cargo_check", action="store_false", help="skip the background cargo check of the native-updater-check crate")
+    probe.add_argument("--no-real-banner-api", dest="real_banner", action="store_false", default=True, help="map api.github.com to the recorder too (negative control)")
     probe.set_defaults(cargo_check=True)
     run = sub.add_parser("run", help="the isolation test")
     run.add_argument("--evidence", required=True)
@@ -2653,7 +3639,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     run.add_argument("--config", default=None)
     run.add_argument("--work", default=None)
     run.add_argument("--native-exe", default=None, help="path of the pre-built native-updater-check.exe (default: the workflow's cargo target directory)")
-    run.add_argument("--strategies", default=",".join(TRIGGER_STRATEGIES), help="how to get a handle on the app window, in order: msedgedriver, cdp-env, cdp-registry")
+    run.add_argument("--strategies", default=",".join(TRIGGER_STRATEGIES), help="how to get a handle on the app window, in order: uia, msedgedriver, cdp-env, cdp-registry")
+    run.add_argument("--no-real-banner-api", dest="real_banner", action="store_false", default=True,
+                     help="map api.github.com to the recorder too: the banner call cannot succeed, the Install button never appears (a labelled negative control)")
+    run.add_argument("--no-webview2-block", dest="webview2_block", action="store_false", default=True,
+                     help="do not block msedgewebview2.exe's outbound traffic by program (it is then only observed); use when the block disturbs the page")
     args = parser.parse_args(argv)
     if args.command == "probe":
         try:

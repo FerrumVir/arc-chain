@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import socket
 import struct
 import sys
@@ -1395,6 +1396,7 @@ class CaseRunnerTests(unittest.TestCase):
         self.ctx.app_exe = APP_EXE
         self.ctx.install_dir = "C:\\arcw0\\app"
         self.ctx.ca_info = {"server_cert": "s.crt", "server_key": "s.key", "ca_cert": "ca.crt", "ca_sha256": "ab" * 32}
+        self.ctx.strategies = ["msedgedriver", "cdp-env", "cdp-registry"]      # the debugging-port strategies; the UI Automation world has its own tests (UiCaseRunnerTests)
         self.killed = []
         self.launched = []
 
@@ -2150,9 +2152,9 @@ class StrategyOptionTests(unittest.TestCase):
         seen[0].winning_strategy = "something-not-configured"
         self.assertEqual(ow.strategy_order(seen[0]), ["cdp-registry", "msedgedriver"])
 
-    def test_the_default_order_puts_msedgedriver_first(self):
-        self.assertEqual(ow.TRIGGER_STRATEGIES[0], "msedgedriver")
-        self.assertEqual(set(ow.TRIGGER_STRATEGIES), {"msedgedriver", "cdp-env", "cdp-registry"})
+    def test_the_default_order_puts_uia_first_and_keeps_the_debugging_strategies_as_fallbacks(self):
+        self.assertEqual(ow.TRIGGER_STRATEGIES, ("uia", "msedgedriver", "cdp-env", "cdp-registry"))
+        self.assertEqual(ow.Context(Path("e"), Path("w"), mock.Mock(), {}, env={}).strategies, list(ow.TRIGGER_STRATEGIES))
 
 
 class StepTests(unittest.TestCase):
@@ -2506,6 +2508,8 @@ class WindowsProbeTests(unittest.TestCase):
 
         def shell_run(self, argv, timeout=120.0, env=None, cwd=None, quiet=False, capture=True):
             record(("run", " ".join(argv)[:80]))
+            if any(str(part).endswith("ps-parse.ps1") for part in argv):        # the PowerShell parser over the scripts: a clean parse lists every file with no messages
+                Path(argv[argv.index("-Out") + 1]).write_text(json.dumps({p.name: [] for p in Path(argv[argv.index("-Dir") + 1]).glob("*.ps1")}), encoding="utf-8")
             return ow.CmdResult(0, "True" if "IsInRole" in " ".join(argv) else "ok")
 
         def fake_install(ctx, asset, installer, **kwargs):
@@ -2664,6 +2668,1130 @@ class WindowsProbeTests(unittest.TestCase):
         self.assertEqual(argv[1:], ["--endpoint", ow.MANIFEST_URL, "--current-version", "0.7.11", "--pubkey", "KEY"])
         shell.run.return_value = ow.CmdResult(2, "usage")
         self.assertFalse(ow.native_selftest(shell, "n.exe", "KEY")["release_not_found"])
+
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# UI Automation strategy: the released app is driven through its own window on the runner (round 3)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def uia_node(kind, name, depth=6, **extra):
+    base = {"depth": depth, "type": kind, "name": name, "id": "", "class": "", "enabled": True, "offscreen": False, "pid": 4242}
+    base.update(extra)
+    return base
+
+
+def uia_dump(*nodes, **extra):
+    windows = extra.pop("windows", 1)
+    value = {"pid": 4242, "windows": [{"name": "ARC Node", "class": "Tauri Window", "type": "Window", "handle": 66000 + i, "offscreen": False} for i in range(windows)],
+             "nodes": list(nodes), "truncated": False, "error": None, "visited": len(nodes), "clicked": False}
+    value.update(extra)
+    return value
+
+
+def declared_params(script):
+    """The parameters a PowerShell script declares (everything before the first statement after param(...))."""
+    head = script.split("[Console]::OutputEncoding")[0]
+    return set(re.findall(r"\[(?:int|string|switch)\]\$(\w+)", head))
+
+
+def flags_in(argv):
+    return {token[1:] for token in argv if token.startswith("-") and token[1:2].isalpha() and token not in ("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "-File")}
+
+
+class PowerShellScriptTests(unittest.TestCase):
+    SCRIPTS = {"uia-walk": ow.UIA_WALK_PS, "screen-reader": ow.SCREEN_READER_PS, "screenshot": ow.SCREENSHOT_PS, "net-watch": ow.NET_WATCH_PS, "dns-cache": ow.DNS_CACHE_PS}
+
+    def test_every_script_is_a_plain_ascii_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = ow.write_ps_scripts(Path(tmp) / "uia")
+            self.assertEqual(sorted(paths), sorted(self.SCRIPTS))
+            for name, path in paths.items():
+                self.assertEqual(path.suffix, ".ps1")
+                text = path.read_bytes().decode("ascii")            # Windows PowerShell 5.1 reads a BOM-less file as ANSI: one non-ASCII character would be garbled
+                self.assertTrue(text.strip(), name)
+                self.assertFalse(text.startswith("\n"))
+            self.assertEqual(ow.ps_file_argv(paths["uia-walk"], "-Click", 5)[-2:], ["-Click", "5"])
+            self.assertEqual(ow.ps_file_argv(paths["uia-walk"])[:7], ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(paths["uia-walk"])])
+
+    def test_brackets_and_try_blocks_balance_in_every_script(self):
+        for name, text in self.SCRIPTS.items():
+            for pair in ("{}", "()", "[]"):
+                self.assertEqual(text.count(pair[0]), text.count(pair[1]), "%s: unbalanced %s" % (name, pair))
+            self.assertEqual(len(re.findall(r"\btry\s*\{", text)), len(re.findall(r"\bcatch\b", text)), "%s: a try without its catch" % name)
+            self.assertEqual(text.count("'") % 2, 0, "%s: an unterminated single-quoted string" % name)
+
+    def test_the_scripts_make_no_network_call_start_nothing_and_delete_nothing(self):
+        for name, text in self.SCRIPTS.items():
+            for word in ("Invoke-WebRequest", "Invoke-RestMethod", "Start-BitsTransfer", "WebClient", "HttpClient", "Test-NetConnection", "Resolve-DnsName", "TcpClient", "Sockets.Socket",
+                         "Read-Host", "Remove-Item", "Stop-Process", "Start-Process", "Invoke-Expression", "New-NetFirewallRule", "Set-Content", "Add-Content"):
+                self.assertNotIn(word, text, "%s must not use %s" % (name, word))
+
+    def test_the_walk_script_invokes_first_and_clicks_with_the_mouse_only_when_invoke_is_unsupported(self):
+        text = ow.UIA_WALK_PS
+        self.assertIn("RawViewWalker", text)
+        self.assertLess(text.index("InvokePattern]::Pattern"), text.index("[W0Mouse]::Click"))
+        self.assertIn("BoundingRectangle", text)
+        self.assertIn("$result.method = 'InvokePattern'", text)
+        self.assertIn("$result.method = 'mouse'", text)
+        self.assertIn("if (-not $result.clicked)", text, "the mouse is the fallback, never the first choice")
+        self.assertIn("UTF8Encoding($false)", text)
+
+    def test_the_walk_script_declares_every_flag_the_python_side_passes(self):
+        declared = declared_params(ow.UIA_WALK_PS)
+        self.assertEqual(declared, {"ProcessId", "Out", "Pattern", "Types", "MaxNodes", "MaxDepth", "BudgetMs", "WindowsOnly", "Click"})
+        self.assertEqual(declared_params(ow.SCREEN_READER_PS), {"Mode", "Value", "Out"})
+        self.assertEqual(declared_params(ow.SCREENSHOT_PS), {"Out"})
+        self.assertEqual(declared_params(ow.NET_WATCH_PS), {"Out", "Stop", "IntervalMs", "Names", "DnsName"})
+        self.assertEqual(declared_params(ow.DNS_CACHE_PS), {"Out", "Names"})
+
+    def test_the_net_watcher_polls_connections_of_the_app_processes_only(self):
+        text = ow.NET_WATCH_PS
+        self.assertIn("Get-NetTCPConnection", text)
+        self.assertIn("arc-desktop,msedgewebview2", text)
+        self.assertIn("Test-Path -LiteralPath $Stop", text)
+        for event in ("'start'", "'conn'", "'dns'", "'poll'", "'stop'"):
+            self.assertIn("event = " + event, text)
+
+
+class ParseCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.shell = mock.Mock()
+        self.ctx = ow.Context(self.root / "ev", self.root / "w", self.shell, {}, env={})
+        self.names = sorted(p + ".ps1" for p in ("uia-walk", "screen-reader", "screenshot", "net-watch", "dns-cache"))
+
+    def answer(self, document, rc=0, out="parsed"):
+        def run(argv, **kw):
+            self.argv = list(argv)
+            if document is not None:
+                Path(argv[argv.index("-Out") + 1]).write_text(json.dumps(document), encoding="utf-8")
+            return ow.CmdResult(rc, out)
+        self.shell.run.side_effect = run
+
+    def test_a_clean_parse(self):
+        self.answer({name: [] for name in self.names + ["ps-parse.ps1"]})
+        found = ow.check_ps_scripts(self.ctx)
+        self.assertEqual((found["ran"], found["ok"], found["errors"]), (True, True, {}))
+        self.assertEqual(found["checked"], 6)
+        self.assertEqual(self.argv[:6], ow.POWERSHELL_FILE_ARGV)
+        self.assertEqual(Path(self.argv[self.argv.index("-Dir") + 1]), self.ctx.work / "uia")
+        for name in self.names + ["ps-parse.ps1"]:
+            self.assertTrue((self.ctx.work / "uia" / name).is_file(), name)
+
+    def test_parser_messages_are_reported_per_script(self):
+        self.answer(dict({name: [] for name in self.names}, **{"uia-walk.ps1": ["31:9 Missing closing '}'"], "net-watch.ps1": "7:1 Unexpected token"}))
+        found = ow.check_ps_scripts(self.ctx)
+        self.assertFalse(found["ok"])
+        self.assertTrue(found["ran"])
+        self.assertEqual(found["errors"], {"uia-walk.ps1": ["31:9 Missing closing '}'"], "net-watch.ps1": ["7:1 Unexpected token"]})
+
+    def test_a_script_the_parser_never_saw_is_an_error(self):
+        self.answer({name: [] for name in self.names if name != "dns-cache.ps1"})
+        found = ow.check_ps_scripts(self.ctx)
+        self.assertFalse(found["ok"])
+        self.assertIn("dns-cache.ps1", found["errors"]["_missing"][0])
+
+    def test_the_parser_itself_failing_is_a_check_that_did_not_run(self):
+        self.answer(None, rc=1, out="powershell: The term is not recognized")
+        found = ow.check_ps_scripts(self.ctx)
+        self.assertEqual((found["ran"], found["ok"]), (False, False))
+        self.assertIn("not recognized", found["detail"])
+
+    def test_the_parse_script_is_plain_ascii_balanced_and_executes_nothing(self):
+        text = ow.PS_PARSE_PS
+        text.encode("ascii")
+        for pair in ("{}", "()", "[]"):
+            self.assertEqual(text.count(pair[0]), text.count(pair[1]), pair)
+        self.assertEqual(declared_params(text), {"Dir", "Out"})
+        self.assertIn("[System.Management.Automation.Language.Parser]::ParseFile", text)
+        for word in ("Invoke-Expression", "& $", "Start-Process", "Invoke-Command", ". $"):
+            self.assertNotIn(word, text)
+
+
+class AddressHelperTests(unittest.TestCase):
+    WINDOWS_OUTPUT = ("Server:  UnKnown\r\nAddress:  168.63.129.16\r\n\r\nNon-authoritative answer:\r\nName:    api.github.com\r\n"
+                      "Addresses:  2606:50c0:8000::154\r\n          192.0.2.10\r\n          192.0.2.11\r\n")
+
+    def test_nslookup_output_gives_the_answers_not_the_resolver(self):
+        self.assertEqual(ow.parse_nslookup_addresses(self.WINDOWS_OUTPUT), ["2606:50c0:8000::154", "192.0.2.10", "192.0.2.11"])
+        single = "Server:  dns.example\nAddress:  10.0.0.2\n\nName:    rsms.me\nAddress:  198.51.100.7\n"
+        self.assertEqual(ow.parse_nslookup_addresses(single), ["198.51.100.7"])
+
+    def test_aliases_duplicates_and_failures(self):
+        with_alias = "Server: x\nAddress: 10.0.0.2\n\nName:    cdn.example.net\nAddresses:  198.51.100.7\n          198.51.100.7\nAliases:  www.example.com\n"
+        self.assertEqual(ow.parse_nslookup_addresses(with_alias), ["198.51.100.7"])
+        self.assertEqual(ow.parse_nslookup_addresses("*** UnKnown can't find nope.invalid: Non-existent domain\n"), [])
+        self.assertEqual(ow.parse_nslookup_addresses(""), [])
+
+    def test_canonical_addresses(self):
+        self.assertEqual(ow.canonical_address("::ffff:192.0.2.5"), "192.0.2.5")
+        self.assertEqual(ow.canonical_address("[::1]"), "::1")
+        self.assertEqual(ow.canonical_address("2606:4700:0:0::1"), "2606:4700::1")
+        self.assertEqual(ow.canonical_address("fe80::1%12"), "fe80::1")
+        self.assertIsNone(ow.canonical_address("api.github.com"))
+        self.assertIsNone(ow.canonical_address(""))
+
+    def test_loopback_and_unspecified(self):
+        for value in ("127.0.0.1", "127.0.0.2", "::1", "::ffff:127.0.0.1"):
+            self.assertTrue(ow.is_loopback_address(value), value)
+        for value in ("192.0.2.5", "2606:4700::1", "not an address", "0.0.0.0"):
+            self.assertFalse(ow.is_loopback_address(value), value)
+        for value in ("0.0.0.0", "::", "", "garbage"):
+            self.assertTrue(ow.is_unspecified_address(value), value)
+        self.assertFalse(ow.is_unspecified_address("192.0.2.5"))
+
+    def test_live_addresses_are_labelled_never_printed(self):
+        self.assertEqual(ow.label_live("192.0.2.2", ["192.0.2.9", "192.0.2.2"]), "live-ip-1")
+        self.assertEqual(ow.label_live("::ffff:192.0.2.9", ["192.0.2.9", "192.0.2.2"]), "live-ip-2")
+        self.assertEqual(ow.label_live("203.0.113.5", ["192.0.2.9"]), "203.0.113.5")
+        self.assertEqual(ow.selective_mask("a 192.0.2.9 b 203.0.113.5 c 192.0.2.2", ["192.0.2.9", "192.0.2.2"]), "a live-ip-2 b 203.0.113.5 c live-ip-1")
+
+
+class UiaTreeTests(unittest.TestCase):
+    def test_finding_buttons_by_name_and_type(self):
+        dump = uia_dump(uia_node("Button", "Settings"), uia_node("Text", "Settings"), uia_node("Hyperlink", "Check for updates"), uia_node("Button", "Install v0.7.12 & relaunch"),
+                        uia_node("Text", "Install the thing"))
+        summary = ow.summarize_uia(dump)
+        self.assertTrue(summary["available"])
+        self.assertTrue(summary["settings_button"] and summary["check_for_updates_button"] and summary["install_button"])
+        self.assertEqual(len(ow.uia_find(dump, ow.SETTINGS_PATTERN, ow.BUTTON_TYPES)), 1, "a Text named Settings is not the sidebar button")
+        self.assertEqual(len(ow.uia_find(dump, ow.INSTALL_PATTERN, ow.BUTTON_TYPES)), 1, "Install in a sentence is not an 'Install vX' button")
+        self.assertEqual([n["name"] for n in ow.uia_find(dump, "settings")], ["Settings", "Settings"], "case-insensitive, any type when none is given")
+
+    def test_an_empty_or_missing_tree_is_summarised_as_unavailable_or_without_buttons(self):
+        self.assertFalse(ow.summarize_uia(None)["available"])
+        empty = ow.summarize_uia(uia_dump())
+        self.assertTrue(empty["available"])
+        self.assertFalse(empty["settings_button"] or empty["install_button"] or empty["check_for_updates_button"])
+        self.assertEqual(empty["update_card_texts"], [])
+
+    def test_the_updates_card_texts(self):
+        dump = uia_dump(uia_node("Text", "Updates"), uia_node("Text", "Latest version"), uia_node("Text", "v0.7.11"), uia_node("Text", "ARC Node"), uia_node("Text", "  "),
+                        uia_node("Button", "Install v0.7.12 & relaunch"))
+        self.assertEqual(ow.uia_card_texts(dump), ["Updates", "Latest version", "v0.7.11", "Install v0.7.12 & relaunch"])
+        self.assertEqual(ow.uia_names(dump, ("Button",)), ["Install v0.7.12 & relaunch"])
+
+    def test_the_error_is_read_from_two_adjacent_text_nodes(self):
+        dump = uia_dump(uia_node("Button", "Check for updates", depth=8), uia_node("Text", "Update failed: ", depth=9), uia_node("Text", ow.RELEASE_NOT_FOUND, depth=9))
+        error = ow.join_update_error(dump)
+        self.assertTrue(error["found"] and error["release_not_found"])
+        self.assertEqual(error["joined"], "Update failed: " + ow.RELEASE_NOT_FOUND)
+        self.assertEqual(error["message"], ow.RELEASE_NOT_FOUND)
+
+    def test_a_label_without_a_trailing_space_is_joined_with_one(self):
+        dump = uia_dump(uia_node("Text", "Update failed:", depth=9), uia_node("Text", ow.RELEASE_NOT_FOUND, depth=9))
+        self.assertEqual(ow.join_update_error(dump)["joined"], "Update failed: " + ow.RELEASE_NOT_FOUND)
+
+    def test_buttons_after_the_error_are_not_swallowed(self):
+        dump = uia_dump(uia_node("Text", "Update failed: ", depth=9), uia_node("Text", ow.RELEASE_NOT_FOUND, depth=9), uia_node("Text", "Check for updates", depth=9),
+                        uia_node("Text", "Install v0.7.12", depth=9))
+        self.assertEqual(ow.join_update_error(dump)["joined"], "Update failed: " + ow.RELEASE_NOT_FOUND)
+
+    def test_the_exact_string_is_searched_in_every_text_value_even_when_not_adjacent(self):
+        dump = uia_dump(uia_node("Text", "Update failed: ", depth=9), uia_node("Text", "Retry", depth=12), uia_node("Group", "details: " + ow.RELEASE_NOT_FOUND, depth=3))
+        error = ow.join_update_error(dump)
+        self.assertTrue(error["release_not_found"])
+
+    def test_a_different_failure_is_found_but_is_not_release_not_found(self):
+        dump = uia_dump(uia_node("Text", "Update failed: ", depth=9), uia_node("Text", "error sending request for url", depth=9))
+        error = ow.join_update_error(dump)
+        self.assertTrue(error["found"])
+        self.assertFalse(error["release_not_found"])
+        self.assertEqual(error["message"], "error sending request for url")
+
+    def test_nothing_found_fails_closed(self):
+        for dump in (None, uia_dump(), uia_dump(uia_node("Text", "Updates"), uia_node("Text", "Up to date"))):
+            error = ow.join_update_error(dump)
+            self.assertFalse(error["found"] or error["release_not_found"], dump)
+            self.assertIsNone(error["message"])
+
+    def test_json_files_are_read_leniently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x.json"
+            self.assertIsNone(ow.parse_json_file(path))
+            path.write_text("[1]", encoding="utf-8")
+            self.assertIsNone(ow.parse_json_file(path))
+            path.write_text("{bad", encoding="utf-8")
+            self.assertIsNone(ow.parse_json_file(path))
+            path.write_text('{"a": 1}', encoding="utf-8")
+            self.assertEqual(ow.parse_json_file(path), {"a": 1})
+
+
+class FakeUi:
+    """The app's window as UI Automation shows it, changed by the clicks the page makes. Answers like the PowerShell walk script (a JSON file named by -Out),
+    so the whole UiaPage sequence runs without Windows."""
+    INSTALL = "Install v0.7.12 & relaunch"
+
+    def __init__(self, install_before=False, install_from_check=1, invoke=True, install_clicks=True, failure=("Update failed: ", ow.RELEASE_NOT_FOUND), window_after=0, content_after=0):
+        self.screen, self.install_present, self.checks, self.installed = "home", install_before, 0, False
+        self.install_from_check, self.invoke, self.install_clicks, self.failure = install_from_check, invoke, install_clicks, tuple(failure)
+        self.window_after, self.content_after = window_after, content_after
+        self.window_polls = self.full_dumps = 0
+        self.clicks = []
+        self.argvs = []
+
+    def nodes(self):
+        if self.full_dumps <= self.content_after:
+            return []                                              # the web content is not exposed yet
+        found = [uia_node("Button", "Home"), uia_node("Button", "Settings")]
+        if self.screen == "settings":
+            found += [uia_node("Text", "Updates"), uia_node("Text", "Latest version"), uia_node("Text", "v0.7.11"), uia_node("Button", "Check for updates")]
+            if self.install_present:
+                found.append(uia_node("Button", self.INSTALL))
+            if self.installed:
+                found += [uia_node("Text", text, depth=9) for text in self.failure]
+        return found
+
+    def click(self, pattern, types):
+        hit = next((n for n in self.nodes() if n["type"] in types and re.search(pattern, n["name"], re.IGNORECASE)), None)
+        self.clicks.append((pattern, hit["name"] if hit else None))
+        report = uia_dump(visited=12)
+        report["nodes"] = []
+        if hit is None:
+            report["error"] = "no matching element"
+            return report
+        if hit["name"] == "Settings":
+            self.screen = "settings"
+        elif hit["name"] == "Check for updates":
+            self.checks += 1
+            if self.install_from_check and self.checks >= self.install_from_check:
+                self.install_present = True
+        elif hit["name"] == self.INSTALL:
+            if not self.install_clicks:
+                report["error"] = "Invoke is not supported and the element has no bounding rectangle"
+                return report
+            self.installed = True
+        report.update(clicked=True, method="InvokePattern" if self.invoke else "mouse", matched=hit)
+        return report
+
+    def run(self, argv, timeout=120.0, env=None, cwd=None, quiet=False, capture=True):
+        self.argvs.append(list(argv))
+        out = Path(argv[argv.index("-Out") + 1])
+        if "-WindowsOnly" in argv:
+            self.window_polls += 1
+            report = uia_dump(windows=1 if self.window_polls > self.window_after else 0)
+        elif "-Click" in argv:
+            report = self.click(argv[argv.index("-Pattern") + 1], argv[argv.index("-Types") + 1].split(","))
+        else:
+            self.full_dumps += 1
+            report = uia_dump(*self.nodes())
+        out.write_text(json.dumps(report), encoding="utf-8")
+        return ow.CmdResult(0, "uia-walk done")
+
+    @property
+    def clicked_names(self):
+        return [name for _pattern, name in self.clicks]
+
+
+class UiaPageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.evidence = self.root / "ev"
+        self.evidence.mkdir()
+        self.shell = mock.Mock()
+        self.shell.log = lambda line: None
+        self.ctx = ow.Context(self.evidence, self.root / "w", self.shell, {}, env={})
+        self.ctx.work.mkdir()
+        self.sleeps = []
+        self.now = [0.0]
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now[0] += seconds
+
+    def page(self, ui, real_banner=True):
+        self.ui = ui
+        self.shell.run.side_effect = ui.run
+        return ow.UiaPage(self.ctx, 4242, self.evidence, "app-clean", sleep=self.sleep, clock=lambda: self.now[0], real_banner=real_banner)
+
+    def test_the_whole_sequence_in_order_with_the_error_text_joined(self):
+        page = self.page(FakeUi())
+        launch = page.open()
+        self.assertTrue(launch["settings_button"] and page.ui["window_found"])
+        ok, value, error = page.evaluate_trigger()
+        self.assertEqual(self.ui.clicked_names, ["Settings", "Check for updates", FakeUi.INSTALL])
+        self.assertEqual([c[0] for c in self.ui.clicks], [ow.SETTINGS_PATTERN, ow.CHECK_PATTERN, ow.INSTALL_PATTERN])
+        self.assertTrue(ok)
+        self.assertIsNone(error)
+        self.assertEqual(value["error"], "Update failed: " + ow.RELEASE_NOT_FOUND)
+        outcome = ow.trigger_outcome_from(value, error, ok)
+        self.assertTrue(outcome["ran"])
+        self.assertFalse(outcome["ok"])
+        self.assertIsNone(ow.scenario_problem("latest-404", outcome))
+        self.assertTrue(page.ui["install_clicked"])
+        self.assertEqual([s["report"]["method"] for s in page.ui["steps"]], ["InvokePattern"] * 3, "which way each click was made is recorded")
+        self.assertEqual(page.ui["update_error"]["joined"], "Update failed: " + ow.RELEASE_NOT_FOUND)
+        for name in ("1-launch", "2-settings", "3-after-check", "4-after-install"):
+            self.assertTrue((self.evidence / ("uia-app-clean-%s.json" % name)).is_file(), name)
+        self.assertEqual(sorted(page.files), sorted("uia-app-clean-%s.json" % n for n in ("1-launch", "2-settings", "3-after-check", "4-after-install")))
+
+    def test_every_flag_passed_to_the_walk_script_is_declared_by_it(self):
+        page = self.page(FakeUi())
+        page.open()
+        page.evaluate_trigger()
+        declared = declared_params(ow.UIA_WALK_PS)
+        for argv in self.ui.argvs:
+            self.assertEqual(argv[:6], ow.POWERSHELL_FILE_ARGV)
+            self.assertLessEqual(flags_in(argv), declared)
+
+    def test_check_is_retried_up_to_four_times_twenty_seconds_apart_and_install_is_clicked_once(self):
+        page = self.page(FakeUi(install_from_check=3))
+        page.open()
+        self.sleeps.clear()
+        ok, value, _error = page.evaluate_trigger()
+        self.assertEqual(self.ui.clicked_names.count("Check for updates"), 3)
+        self.assertEqual(self.ui.clicked_names.count(FakeUi.INSTALL), 1)
+        self.assertEqual(self.sleeps.count(20), 2)
+        self.assertEqual([a["install_button"] for a in page.ui["banner_attempts"]], [False, False, True])
+        self.assertEqual(value["stage"], "ui")
+
+    def test_without_an_install_button_after_four_checks_nothing_is_installed_and_the_case_is_not_reached(self):
+        page = self.page(FakeUi(install_from_check=0))
+        page.open()
+        self.sleeps.clear()
+        ok, value, _error = page.evaluate_trigger()
+        self.assertEqual(self.ui.clicked_names.count("Check for updates"), 4)
+        self.assertEqual(self.sleeps.count(20), 3)
+        self.assertNotIn(FakeUi.INSTALL, self.ui.clicked_names)
+        self.assertEqual(value["stage"], "ui-not-reached")
+        self.assertFalse(ow.trigger_outcome_from(value, None, ok)["ran"])
+        self.assertIn("4 Check for updates click(s)", page.ui["problem"])
+        self.assertFalse(page.ui["install_button"])
+
+    def test_the_negative_control_names_why_there_is_no_install_button(self):
+        page = self.page(FakeUi(install_from_check=0), real_banner=False)
+        page.open()
+        _ok, value, _error = page.evaluate_trigger()
+        self.assertIn("negative control", value["error"])
+
+    def test_an_install_button_that_was_already_there_is_never_clicked(self):
+        page = self.page(FakeUi(install_before=True))
+        page.open()
+        _ok, value, _error = page.evaluate_trigger()
+        self.assertNotIn(FakeUi.INSTALL, self.ui.clicked_names)
+        self.assertEqual(value["stage"], "ui-not-reached")
+        self.assertIn("already present BEFORE the check", value["error"])
+        self.assertTrue(page.ui["install_button_before_check"])
+
+    def test_the_mouse_fallback_is_recorded_as_such(self):
+        page = self.page(FakeUi(invoke=False))
+        page.open()
+        page.evaluate_trigger()
+        self.assertEqual([s["report"]["method"] for s in page.ui["steps"]], ["mouse"] * 3)
+
+    def test_an_install_button_that_cannot_be_clicked_is_not_reached(self):
+        page = self.page(FakeUi(install_clicks=False))
+        page.open()
+        _ok, value, _error = page.evaluate_trigger()
+        self.assertEqual(value["stage"], "ui-not-reached")
+        self.assertFalse(page.ui["install_clicked"])
+        self.assertIn("could not be clicked", value["error"])
+
+    def test_a_missing_release_not_found_text_is_not_proof(self):
+        for failure in (("Update failed: ", "error sending request for url"), ()):
+            page = self.page(FakeUi(failure=failure))
+            page.open()
+            ok, value, error = page.evaluate_trigger()
+            outcome = ow.trigger_outcome_from(value, error, ok)
+            self.assertIsNotNone(ow.scenario_problem("latest-404", outcome), failure)
+            self.assertFalse(page.ui["update_error"]["release_not_found"])
+
+    def test_a_button_exposed_under_another_control_type_is_found_by_the_retry_and_recorded(self):
+        class TextOnly(FakeUi):
+            def nodes(self):
+                return [dict(n, type="Text") if n["name"] == "Settings" else n for n in FakeUi.nodes(self)]
+
+        ui = TextOnly()
+        page = self.page(ui)
+        ui.full_dumps = 5                  # past content_after
+        step = page.click(ow.SETTINGS_PATTERN, "click Settings")
+        self.assertTrue(ow.UiaPage.clicked(step))
+        self.assertEqual(step["report"]["error"], "no matching element")
+        self.assertIn("retry_report", step)
+        self.assertEqual(ui.screen, "settings")
+
+    def test_open_waits_for_the_window_and_then_for_the_web_content(self):
+        page = self.page(FakeUi(window_after=2, content_after=2))
+        launch = page.open()
+        self.assertTrue(launch["settings_button"])
+        self.assertGreaterEqual(self.sleeps.count(3), 2, "polls the window every 3 s")
+        self.assertGreaterEqual(self.sleeps.count(5), 2, "polls the content every 5 s")
+        self.assertEqual(page.evaluate_probe()[1]["title"], "ARC Node")
+
+    def test_no_window_at_all_is_a_window_error_so_the_other_strategies_may_try(self):
+        page = self.page(FakeUi(window_after=10 ** 6))
+        with self.assertRaises(ow.UiaWindowNotFound):
+            page.open(window_timeout=30)
+        self.assertFalse(page.ui["window_found"])
+
+    def test_a_window_without_web_content_is_a_content_error_and_leaves_the_dump_as_evidence(self):
+        page = self.page(FakeUi(content_after=10 ** 6))
+        with self.assertRaises(ow.UiaContentNotFound):
+            page.open(content_timeout=20)
+        self.assertTrue(page.ui["window_found"])
+        self.assertTrue((self.evidence / "uia-app-clean-1-launch.json").is_file())
+
+    def test_a_walk_that_wrote_nothing_is_recorded_with_its_raw_output(self):
+        self.shell.run.side_effect = lambda argv, **kw: ow.CmdResult(1, "Add-Type : Cannot add type 149.28.32.76")
+        page = ow.UiaPage(self.ctx, 4242, self.evidence, "app-clean", sleep=self.sleep, clock=lambda: self.now[0])
+        self.assertIsNone(page.dump("x"))
+        written = json.loads((self.evidence / "uia-app-clean-x.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["rc"], 1)
+        self.assertIn("149.28.x.x", written["raw"])
+        self.assertNotIn("149.28.32.76", written["raw"])
+
+
+class UiaStrategyTests(unittest.TestCase):
+    ENV = {"USERPROFILE": "C:\\Users\\runneradmin", "PATH": "p"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.shell = mock.Mock()
+        self.shell.run.return_value = ow.CmdResult(0, "")
+        self.shell.log = lambda line: None
+        self.ctx = ow.Context(Path(self.tmp.name) / "ev", Path(self.tmp.name) / "w", self.shell, {}, env=self.ENV)
+        self.ctx.work.mkdir(parents=True)
+        self.ctx.app_exe = APP_EXE
+        self.ctx.install_dir = "C:\\arcw0\\app"
+        self.wv2 = str(Path(self.tmp.name) / "wv2" / "app-clean-uia")
+        self.popen_calls = []
+
+    def popen(self, argv, **kwargs):
+        self.popen_calls.append((argv, kwargs))
+        return FakeProc(4242)
+
+    def page_class(self, raises=None):
+        class Page:
+            kind = "uia"
+
+            def __init__(self, ctx, pid, evidence, stem, real_banner=True):
+                self.pid, self.real_banner = pid, real_banner
+                self.ui = {"after_launch": {"settings_button": True, "nodes": 40}}
+
+            def open(self):
+                if raises:
+                    raise raises
+
+            def close(self):
+                pass
+
+        return Page
+
+    CLEAN_PARSE = {"ran": True, "ok": True, "checked": 6, "errors": {}}
+
+    def start(self, raises=None, parse=None):
+        with mock.patch.object(ow, "UiaPage", self.page_class(raises)), mock.patch.object(ow, "set_screen_reader", return_value={"before": 0, "after": 1, "ok": True}), \
+                mock.patch.object(ow, "check_ps_scripts", return_value=parse or self.CLEAN_PARSE):
+            launch = ow.try_strategy(self.ctx, "uia", "app-clean", "C:\\arcw0\\home", self.wv2, popen=self.popen)
+        self.addCleanup(ow.close_launch, self.ctx, launch, "C:\\arcw0\\wv2")
+        return launch
+
+    def test_scripts_that_do_not_parse_stop_the_strategy_before_the_app_is_started(self):
+        launch = self.start(parse={"ran": True, "ok": False, "checked": 6, "errors": {"uia-walk.ps1": ["12:5 Unexpected token '}'"]}})
+        self.assertFalse(launch.ok)
+        self.assertIn("do not parse", launch.error)
+        self.assertIn("uia-walk.ps1", launch.error)
+        self.assertEqual(self.popen_calls, [], "no app launch is wasted on a script that cannot run")
+        self.assertFalse(launch.notes.get("window_found"), "the other strategies may still try")
+
+    def test_a_parse_check_that_could_not_run_does_not_block_the_strategy(self):
+        launch = self.start(parse={"ran": False, "ok": False, "checked": 0, "errors": {}, "detail": "no output (rc 1)"})
+        self.assertTrue(launch.ok, launch.error)
+        self.assertFalse(launch.notes["ps_parse"]["ran"])
+
+    def test_the_app_is_started_with_its_own_profile_the_home_sandbox_and_no_debugging_switch(self):
+        launch = self.start()
+        self.assertTrue(launch.ok, launch.error)
+        argv, kwargs = self.popen_calls[0]
+        self.assertEqual(argv, [APP_EXE])
+        env = kwargs["env"]
+        self.assertEqual(env["HOME"], "C:\\arcw0\\home")
+        self.assertEqual(env["WEBVIEW2_USER_DATA_FOLDER"], self.wv2)
+        self.assertEqual(env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"], "--force-renderer-accessibility", "the only switch: a hint, wry's own arguments win")
+        self.assertEqual(env["USERPROFILE"], "C:\\Users\\runneradmin", "USERPROFILE stays real: overriding it broke Tauri's app_data_dir")
+        self.assertNotIn("remote-debugging", json.dumps(env))
+        self.assertEqual(launch.notes["screen_reader"]["after"], 1)
+        self.assertTrue(launch.notes["window_found"])
+        self.assertEqual(launch.page.pid, 4242)
+
+    def test_no_window_leaves_the_fallbacks_open(self):
+        launch = self.start(raises=ow.UiaWindowNotFound("no window of pid 4242 appeared"))
+        self.assertFalse(launch.ok)
+        self.assertIn("UiaWindowNotFound", launch.error)
+        self.assertFalse(launch.notes["window_found"])
+
+    def test_a_window_without_content_is_marked_so_no_fallback_is_tried(self):
+        launch = self.start(raises=ow.UiaContentNotFound("never exposed a Settings button"))
+        self.assertFalse(launch.ok)
+        self.assertTrue(launch.notes["window_found"])
+
+
+class UiaFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.evidence = Path(self.tmp.name) / "ev"
+        self.evidence.mkdir()
+        self.ctx = ow.Context(self.evidence, Path(self.tmp.name) / "w", mock.Mock(), {}, env={})
+        self.ctx.app_exe = APP_EXE
+        self.ctx.install_dir = "C:\\arcw0\\app"
+        self.ctx.strategies = ["uia", "msedgedriver"]
+        self.tried = []
+
+    def acquire(self, outcomes):
+        def try_one(ctx, strategy, tag, home, wv2_launch):
+            self.tried.append(strategy)
+            launch = ow.Launch(strategy, wv2_launch)
+            error, notes = outcomes[strategy]
+            launch.error, launch.notes = error, dict(notes)
+            if not error:
+                launch.page = FakePage({"ok": True})
+            return launch
+
+        files = []
+        with mock.patch.object(ow, "kill_app"), mock.patch.object(ow, "snapshot_processes", return_value=[]):
+            launch, attempts = ow.acquire_page(self.ctx, "app-clean", "C:\\h", "C:\\arcw0\\wv2", self.evidence, files, try_one=try_one)
+        return launch, attempts, files
+
+    def test_a_window_that_uia_cannot_read_stops_the_search(self):
+        launch, attempts, _files = self.acquire({"uia": ("UiaContentNotFound: nothing", {"window_found": True}), "msedgedriver": (None, {})})
+        self.assertIsNone(launch)
+        self.assertEqual(self.tried, ["uia"])
+        self.assertIn("fallbacks_skipped", attempts[0])
+
+    def test_no_window_at_all_goes_on_to_the_next_strategy(self):
+        launch, attempts, files = self.acquire({"uia": ("UiaWindowNotFound: none", {"window_found": False}), "msedgedriver": (None, {})})
+        self.assertEqual(self.tried, ["uia", "msedgedriver"])
+        self.assertEqual(launch.strategy, "msedgedriver")
+        self.assertEqual([a["strategy"] for a in attempts], ["uia", "msedgedriver"])
+        self.assertIn("procs-app-clean-uia-launched.txt", files)
+
+    def test_uia_working_is_the_winner(self):
+        launch, attempts, _files = self.acquire({"uia": (None, {"window_found": True}), "msedgedriver": ("unused", {})})
+        self.assertEqual(self.tried, ["uia"])
+        self.assertEqual(self.ctx.winning_strategy, "uia")
+
+
+class ContextModeTests(unittest.TestCase):
+    def make(self, strategies=None, real_banner=True):
+        ctx = ow.Context(Path("e"), Path("w"), mock.Mock(), {}, env={})
+        if strategies is not None:
+            ctx.strategies = strategies
+        ctx.real_banner = real_banner
+        return ctx
+
+    def test_ui_mode_is_on_when_uia_is_first(self):
+        self.assertTrue(self.make().ui_mode())
+        self.assertTrue(self.make(["uia"]).ui_mode())
+        self.assertFalse(self.make(["msedgedriver", "uia"]).ui_mode())
+        self.assertFalse(self.make([]).ui_mode())
+
+    def test_both_released_app_cases_use_the_world_after_the_flip_in_ui_mode(self):
+        ctx = self.make()
+        self.assertEqual((ctx.scenario_for("clean"), ctx.scenario_for("cached-bait")), ("latest-404", "latest-404"))
+        legacy = self.make(["msedgedriver"])
+        self.assertEqual((legacy.scenario_for("clean"), legacy.scenario_for("cached-bait")), ("latest-404", "bait-0.8.11"))
+
+    def test_the_context_keeps_the_attributes_the_native_tier_and_cleanup_read(self):
+        ctx = self.make()
+        self.assertIsNone(ctx.native_exe)
+        self.assertEqual(ctx.notes, [])
+        self.assertTrue(ctx.real_banner)
+
+    def test_api_github_com_is_left_to_the_real_dns_only_in_real_banner_mode(self):
+        names = ["github.com", "api.github.com", "objects.githubusercontent.com"]
+        self.assertEqual(ow.intercepted_names(self.make(), names), ["github.com", "objects.githubusercontent.com"])
+        self.assertEqual(ow.intercepted_names(self.make(real_banner=False), names), names)
+
+    def test_the_hosts_file_never_names_the_banner_host_in_real_banner_mode(self):
+        for real, expected in ((True, False), (False, True)):
+            with tempfile.TemporaryDirectory() as tmp:
+                hosts = Path(tmp) / "hosts"
+                hosts.write_bytes(b"127.0.0.1 localhost\r\n")
+                ctx = ow.Context(Path(tmp) / "ev", Path(tmp) / "w", mock.Mock(), {}, env={})
+                ctx.real_banner = real
+                with mock.patch.object(ow, "hosts_path", return_value=hosts), mock.patch.object(ow, "blackhole_names", return_value=["arc.ai", "rsms.me", "api.github.com"]):
+                    ow.map_hosts(ctx, ["github.com", "api.github.com", "codeload.github.com"])
+                text = hosts.read_text(encoding="utf-8")
+                self.assertEqual("api.github.com" in text, expected, text)
+                self.assertIn("127.0.0.1 github.com", text)
+                self.assertIn("::1 codeload.github.com", text)
+                self.assertIn("::1 rsms.me", text, "rsms.me goes to the recorder's loopback")
+                self.assertEqual("api.github.com" in ctx.hosts_mapped, expected)
+
+
+class ExtraBlockTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def make(self, responses):
+        calls = []
+
+        def run(argv, timeout=120.0, env=None, cwd=None, quiet=False, capture=True):
+            calls.append(list(argv))
+            for needle, result in responses:
+                if needle in " ".join(argv):
+                    return result
+            return ow.CmdResult(0, "")
+
+        shell = mock.Mock()
+        shell.run.side_effect = run
+        shell.log = lambda line: None
+        return ow.Context(self.root / "e", self.root / "w", shell, {}, env={}), calls
+
+    RSMS = "Server: x\nAddress: 10.0.0.2\n\nName:    rsms.me\nAddresses:  2606:4700:3030::ac43:c532\n          198.51.100.7\n"
+
+    def test_rsms_addresses_are_resolved_before_every_case_and_added_to_the_block(self):
+        ctx, calls = self.make([("nslookup", ow.CmdResult(0, self.RSMS)), ("New-NetFirewallRule", ow.CmdResult(0, "rule-created"))])
+        with mock.patch.object(ow, "find_webview2_binaries", return_value=[]):
+            info = ow.refresh_extra_blocks(ctx)
+        self.assertEqual(calls[0], ["nslookup", "rsms.me"])
+        self.assertEqual(ctx.rsms_addresses, ["198.51.100.7", "2606:4700:3030::ac43:c532"])
+        self.assertEqual(info["rsms_rule"], "created")
+        self.assertTrue(ctx.rsms_rule_created)
+        self.assertEqual(ctx.extra_block_log, [info], "every refresh is kept for isolation.json")
+        script = calls[1][-1]
+        self.assertIn("Remove-NetFirewallRule -DisplayName 'arcw0-rsms-block'", script)
+        self.assertIn("-Action Block -RemoteAddress '198.51.100.7','2606:4700:3030::ac43:c532'", script)
+        self.assertIn("not found", info["webview2_rule"])
+
+    def test_a_second_refresh_keeps_what_the_first_one_saw(self):
+        ctx, _calls = self.make([("nslookup", ow.CmdResult(0, self.RSMS))])
+        with mock.patch.object(ow, "find_webview2_binaries", return_value=[]):
+            ow.refresh_extra_blocks(ctx)
+            ctx.shell.run.side_effect = lambda argv, **kw: ow.CmdResult(0, "*** can't find rsms.me" if argv[0] == "nslookup" else "rule-created")
+            info = ow.refresh_extra_blocks(ctx)
+        self.assertEqual(info["rsms_resolved"], [])
+        self.assertEqual(len(ctx.rsms_addresses), 2, "an address seen once stays blocked")
+
+    def test_the_webview2_runtime_is_blocked_by_program(self):
+        ctx, calls = self.make([("nslookup", ow.CmdResult(0, self.RSMS)), ("New-NetFirewallRule", ow.CmdResult(0, "rule-created"))])
+        with mock.patch.object(ow, "find_webview2_binaries", return_value=["C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\150.0\\msedgewebview2.exe"]):
+            info = ow.refresh_extra_blocks(ctx)
+        self.assertEqual(info["webview2_rule"], "created")
+        self.assertTrue(ctx.webview2_rule_created)
+        script = next(c[-1] for c in calls if "-Program" in c[-1])
+        self.assertIn("-Direction Outbound -Action Block -Program 'C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\150.0\\msedgewebview2.exe'", script)
+
+    def test_every_webview2_binary_gets_its_own_rule(self):
+        ctx, calls = self.make([("nslookup", ow.CmdResult(0, self.RSMS)), ("New-NetFirewallRule", ow.CmdResult(0, "rule-created"))])
+        programs = ["C:\\wv2\\150.0\\msedgewebview2.exe", "C:\\wv2\\149.0\\msedgewebview2.exe"]
+        with mock.patch.object(ow, "find_webview2_binaries", return_value=programs):
+            info = ow.refresh_extra_blocks(ctx)
+        scripts = [c[-1] for c in calls if "-Program" in c[-1]]
+        self.assertEqual(len(scripts), 2)
+        self.assertIn("-DisplayName 'arcw0-webview2-egress-block' ", scripts[0])
+        self.assertIn("-DisplayName 'arcw0-webview2-egress-block-1' ", scripts[1])
+        self.assertNotIn("egress-block-1", scripts[0])
+        self.assertEqual(info["webview2_rule"], "created")
+
+    def test_the_webview2_block_can_be_switched_off_and_the_egress_is_then_only_observed(self):
+        ctx, calls = self.make([("nslookup", ow.CmdResult(0, self.RSMS))])
+        ctx.webview2_block = False
+        with mock.patch.object(ow, "find_webview2_binaries", side_effect=AssertionError("not even looked for")):
+            info = ow.refresh_extra_blocks(ctx)
+        self.assertIn("observed, not blocked", info["webview2_rule"])
+        self.assertFalse(any("-Program" in c[-1] for c in calls))
+        self.assertFalse(ctx.webview2_rule_created)
+        self.assertEqual(info["rsms_rule"], "created", "the rsms.me block does not depend on it")
+
+    def test_nothing_resolved_creates_no_rule_and_says_so(self):
+        ctx, _calls = self.make([("nslookup", ow.CmdResult(1, "*** UnKnown can't find rsms.me"))])
+        with mock.patch.object(ow, "find_webview2_binaries", return_value=[]):
+            info = ow.refresh_extra_blocks(ctx)
+        self.assertEqual(info["rsms_rule"], "no addresses resolved")
+        self.assertFalse(ctx.rsms_rule_created)
+
+    def test_a_crash_is_recorded_not_raised(self):
+        ctx, _calls = self.make([])
+        ctx.shell.run.side_effect = RuntimeError("boom")
+        self.assertIn("RuntimeError: boom", ow.refresh_extra_blocks(ctx)["error"])
+
+    def test_cleanup_removes_the_new_rules_and_restores_the_screen_reader_flag(self):
+        ctx, calls = self.make([])
+        ctx.rsms_rule_created = ctx.webview2_rule_created = True
+        ctx.screen_reader_before = 0
+        ow.cleanup(ctx)
+        text = "\n".join(" ".join(c) for c in calls)
+        self.assertIn("Remove-NetFirewallRule -DisplayName 'arcw0-rsms-block'", text)
+        self.assertIn("Remove-NetFirewallRule -DisplayName 'arcw0-webview2-egress-block*'", text, "every per-program rule goes")
+        self.assertIn("-Mode set -Value 0", text)
+        self.assertFalse(ctx.rsms_rule_created or ctx.webview2_rule_created)
+        self.assertIsNone(ctx.screen_reader_before)
+
+    def test_the_screen_reader_flag_is_remembered_once_and_restored(self):
+        ctx, calls = self.make([])
+        out = ctx.work / "uia" / "screen-reader.json"
+
+        def run(argv, **kw):
+            calls.append(list(argv))
+            out.write_text(json.dumps({"before": 0, "after": 1, "ok": True}), encoding="utf-8")
+            return ow.CmdResult(0, "")
+
+        ctx.shell.run.side_effect = run
+        self.assertEqual(ow.set_screen_reader(ctx)["after"], 1)
+        ow.set_screen_reader(ctx)
+        self.assertEqual(ctx.screen_reader_before, 0)
+        ow.restore_screen_reader(ctx)
+        self.assertIsNone(ctx.screen_reader_before)
+        self.assertEqual(calls[-1][-4:-2], ["-Value", "0"])
+        before = len(calls)
+        ow.restore_screen_reader(ctx)
+        self.assertEqual(len(calls), before, "restoring twice does nothing")
+
+
+class NetworkReportTests(unittest.TestCase):
+    API, LIVE, RSMS = ["203.0.113.10", "2001:db8::10"], ["192.0.2.2", "192.0.2.9"], ["198.51.100.7"]
+
+    @staticmethod
+    def conn(remote, port=443, state="Established", proc="arc-desktop", pid=4242):
+        return {"event": "conn", "t": 1.0, "poll": 2, "pid": pid, "proc": proc, "local": "10.0.0.5:50000", "remote": remote, "port": port, "state": state}
+
+    def report(self, *records, real_banner=True, error=None, started=True, polls=7):
+        rows = ([{"event": "start", "t": 0.0}] if started else []) + list(records) + [{"event": "poll", "poll": polls}, {"event": "stop", "polls": polls}]
+        return ow.network_report_win(rows, self.API, self.LIVE, self.RSMS, real_banner, error)
+
+    def test_the_banner_call_to_api_github_com_on_443_is_allowed_and_labelled(self):
+        report = self.report(self.conn("203.0.113.10"), self.conn("127.0.0.1", 443, proc="msedgewebview2"), self.conn("::1", 443))
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(len(report["allowed_banner_endpoints"]), 1)
+        self.assertEqual(report["allowed_banner_endpoints"][0]["label"], "api.github.com")
+        self.assertEqual(report["loopback_endpoints"], 2)
+        self.assertTrue(report["recorded"])
+
+    def test_an_address_the_resolver_gave_the_app_is_the_banner_host_even_when_nslookup_did_not_list_it(self):
+        dns = {"event": "dns", "t": 2.0, "poll": 2, "name": "api.github.com", "type": "A", "data": "203.0.113.77", "ttl": 60}
+        cname = {"event": "dns", "t": 2.0, "poll": 2, "name": "api.github.com", "type": "CNAME", "data": "something.example.net", "ttl": 60}
+        report = self.report(dns, cname, self.conn("203.0.113.77"))
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["allowed_banner_endpoints"][0]["remote_ip"], "203.0.113.77")
+        self.assertEqual(report["api_addresses_seen_in_the_resolver_cache"], ["203.0.113.77"])
+        self.assertEqual(len(self.report(self.conn("203.0.113.77"))["violations"]), 1, "without that sample it is an unknown destination")
+        self.assertEqual(len(self.report(dns, self.conn("203.0.113.77"), real_banner=False)["violations"]), 1, "the negative control allows nothing")
+
+    def test_ipv4_mapped_forms_match_too(self):
+        report = self.report(self.conn("::ffff:203.0.113.10"))
+        self.assertEqual(len(report["allowed_banner_endpoints"]), 1)
+
+    def test_the_banner_host_on_another_port_or_with_banner_mode_off_is_a_violation(self):
+        self.assertEqual(len(self.report(self.conn("203.0.113.10", 8443))["violations"]), 1)
+        self.assertEqual(len(self.report(self.conn("203.0.113.10"), real_banner=False)["violations"]), 1)
+
+    def test_every_other_real_destination_fails_and_is_named(self):
+        report = self.report(self.conn("198.51.100.200", 443, proc="msedgewebview2", pid=4300))
+        self.assertEqual(report["violations"][0]["remote_ip"], "198.51.100.200")
+        self.assertEqual(report["violations"][0]["label"], "other real destination")
+        self.assertEqual(report["violations"][0]["proc"], "msedgewebview2")
+        for state in ("SynSent", "Closed", "TimeWait"):
+            self.assertEqual(len(self.report(self.conn("198.51.100.200", 443, state))["violations"]), 1, "even an attempt that did not complete: %s" % state)
+
+    def test_blocked_attempts_to_arc_and_rsms_are_information_and_established_ones_are_violations(self):
+        report = self.report(self.conn("192.0.2.2", 9090, "SynSent"), self.conn("198.51.100.7", 443, "SynSent"))
+        self.assertEqual(report["violations"], [])
+        self.assertEqual([a["label"] for a in report["blocked_attempts"]], ["arc-live-node", "rsms.me"])
+        self.assertEqual(report["blocked_attempts"][0]["remote_ip"], "live-ip-1", "the ARC address itself is never in the report")
+        established = self.report(self.conn("192.0.2.9", 9090, "Established"), self.conn("198.51.100.7", 443, "Established"))
+        self.assertEqual(len(established["violations"]), 2)
+        self.assertEqual(established["violations"][0]["remote_ip"], "live-ip-2")
+
+    def test_listeners_and_unspecified_entries_are_not_connections(self):
+        report = self.report(self.conn("0.0.0.0", 0, "Listen", proc="arc-desktop"), self.conn("::", 0, "Listen"), self.conn("192.0.2.77", 5000, "Bound"))
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["listener_entries"], 3)
+
+    def test_states_of_one_endpoint_are_merged(self):
+        report = self.report(self.conn("203.0.113.10", state="SynSent"), self.conn("203.0.113.10", state="Established"), self.conn("203.0.113.10", state="TimeWait"))
+        self.assertEqual(report["allowed_banner_endpoints"][0]["states"], ["SynSent", "Established", "TimeWait"])
+
+    def test_no_record_of_the_watcher_means_not_recorded(self):
+        self.assertFalse(self.report(started=False)["recorded"])
+        self.assertFalse(self.report(error="OSError: no powershell")["recorded"])
+        self.assertFalse(ow.network_report_win([], self.API, self.LIVE, self.RSMS, True)["recorded"])
+        self.assertTrue(self.report()["recorded"], "a started watcher that polled and saw nothing is a recording")
+        self.assertFalse(self.report(polls=0)["recorded"], "a watcher that never polled proves nothing")
+
+
+class UiCaseRunnerTests(unittest.TestCase):
+    """run_released_case in the UI Automation world, every machine-touching step replaced by a fake."""
+    ENV = CaseRunnerTests.ENV
+    HOME, WV2 = CaseRunnerTests.HOME, CaseRunnerTests.WV2
+    API, LIVE, RSMS = ["203.0.113.10"], ["192.0.2.2"], ["198.51.100.7"]
+    SUCCESS = {"ok": False, "stage": "ui", "error": "Update failed: " + ow.RELEASE_NOT_FOUND, "error_type": "ui-text", "error_json": None}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        FakeMitm.fail_start = False
+        FakeMitm.instances = []
+        self.evidence = Path(self.tmp.name) / "ev"
+        self.evidence.mkdir()
+        self.shell = mock.Mock()
+        self.shell.log = lambda line: None
+        self.ctx = ow.Context(self.evidence, Path(self.tmp.name) / "w", self.shell, {}, env=self.ENV)
+        self.ctx.work.mkdir()
+        self.ctx.app_exe = APP_EXE
+        self.ctx.install_dir = "C:\\arcw0\\app"
+        self.ctx.ca_info = {"server_cert": "s.crt", "server_key": "s.key", "ca_cert": "ca.crt", "ca_sha256": "ab" * 32}
+        self.ctx.live_ips = list(self.LIVE)
+        self.ctx.rsms_addresses = list(self.RSMS)
+        self.calls = []
+
+    def procs(self, extra=()):
+        return [ProcessTests.proc(1, 0, "System"), ProcessTests.proc(4242, 1, "arc-desktop.exe", APP_EXE), ProcessTests.proc(4300, 4242, "msedgewebview2.exe", "C:\\wv2\\msedgewebview2.exe")] + list(extra)
+
+    def run_case(self, name="clean", trigger_value=None, net=None, uia_error=None, requests=None, watcher_error=None, strategies=None):
+        trigger_value = trigger_value or self.SUCCESS
+        net_rows = net if net is not None else [
+            {"event": "start", "t": 0.0}, {"event": "poll", "poll": 1},
+            {"event": "conn", "t": 3.0, "poll": 2, "pid": 4242, "proc": "arc-desktop", "remote": "203.0.113.10", "port": 443, "state": "Established"},
+            {"event": "conn", "t": 3.0, "poll": 2, "pid": 4242, "proc": "arc-desktop", "remote": "127.0.0.1", "port": 443, "state": "Established"},
+            {"event": "conn", "t": 3.5, "poll": 3, "pid": 4242, "proc": "arc-desktop", "remote": "192.0.2.2", "port": 9090, "state": "SynSent"},
+            {"event": "stop", "polls": 12}]
+        if strategies:
+            self.ctx.strategies = list(strategies)
+        state = {"triggered": False}
+        calls = self.calls
+        outer = self
+
+        class UiPage(FakePage):
+            def __init__(self, *a, **k):
+                FakePage.__init__(self, *a, **k)
+                self.ui = {"steps": [{"label": "click Settings", "report": {"clicked": True, "method": "InvokePattern"}}], "window_found": True, "install_clicked": True,
+                           "after_launch": {"nodes": 40}}
+                self.files = ["uia-app-%s-1-launch.json" % name, "uia-app-%s-4-after-install.json" % name]
+                for file_name in self.files:
+                    (outer.evidence / file_name).write_text("{}", encoding="utf-8")
+
+        def fake_try(ctx, strategy, tag, home, wv2_launch):
+            calls.append(("try", strategy, tag))
+            launch = ow.Launch(strategy, wv2_launch)
+            if uia_error:
+                launch.error = uia_error
+                return launch
+            launch.page = UiPage(trigger_value, kind="uia" if strategy == "uia" else strategy, on_trigger=lambda: state.__setitem__("triggered", True),
+                                 probe_value={"ipc": None, "href": None, "title": "ARC Node", "app_version": None, "nodes": 40, "path": "uia"})
+            launch.app_proc = FakeProc(4242)
+            return launch
+
+        class FakeWatcher:
+            def __init__(self, ctx, stem, **kwargs):
+                calls.append(("watcher", stem))
+                self.error = watcher_error
+
+            def start(self):
+                calls.append(("watcher-start",))
+
+            def stop(self, timeout=20.0):
+                calls.append(("watcher-stop",))
+                return net_rows
+
+        def fake_snapshot(shell):
+            return self.procs([ProcessTests.proc(4400, 4300, "msedgewebview2.exe", created="9")]) if state["triggered"] else self.procs()
+
+        def fake_screenshot(ctx, shot, files=None):
+            (ctx.evidence / shot).write_bytes(b"\x89PNG")
+            if files is not None and shot not in files:
+                files.append(shot)
+            return shot
+
+        def fake_banner(ctx, stem):
+            calls.append(("banner", stem))
+            ctx.api_addresses = list(self.API)
+            return list(self.API)
+
+        snapshots = iter([{}, {}])
+        real_sleep, real_poller = time.sleep, ow.Poller
+        with mock.patch.object(ow, "MitmProcess", FakeMitm), mock.patch.object(ow, "try_strategy", fake_try), mock.patch.object(ow, "NetWatcher", FakeWatcher), \
+                mock.patch.dict(FakeMitm.records, requests or {}), \
+                mock.patch.object(ow, "refresh_extra_blocks", side_effect=lambda ctx: calls.append(("blocks",)) or {"rsms_rule": "created", "webview2_rule": "created"}), \
+                mock.patch.object(ow, "banner_addresses", side_effect=fake_banner), \
+                mock.patch.object(ow, "dns_cache_entries", return_value=[]), mock.patch.object(ow, "take_screenshot", side_effect=fake_screenshot), \
+                mock.patch.object(ow, "snapshot_processes", side_effect=fake_snapshot), \
+                mock.patch.object(ow, "take_snapshot", side_effect=lambda roots, hash_limit=1 << 20: {} if hash_limit == 0 else next(snapshots)), \
+                mock.patch.object(ow, "kill_app"), mock.patch.object(ow, "Poller", lambda roots, out, interval=1.0: real_poller(roots, out, interval=0.01)), \
+                mock.patch.object(ow.time, "sleep", lambda seconds: real_sleep(0.05)):
+            case = ow.run_released_case(self.ctx, name, {"home": self.HOME, "wv2": self.WV2}, settle_s=0.1)
+        return case
+
+    def test_a_clean_ui_run_passes_with_the_banner_call_labelled_and_everything_recorded(self):
+        case = self.run_case("clean")
+        self.assertEqual(case["verdict"], "PASS", case["reasons"])
+        self.assertEqual(case["criteria"], {k: True for k in ow.CRITERIA})
+        self.assertEqual(case["scenario"], "latest-404")
+        self.assertEqual(case["trigger_outcome"]["path"], "uia")
+        self.assertIn(ow.RELEASE_NOT_FOUND, case["trigger_outcome"]["error_text"])
+        self.assertTrue(case["trigger_outcome"]["ui"]["install_clicked"])
+        self.assertEqual(case["trigger_outcome"]["ui_steps"][0]["report"]["method"], "InvokePattern")
+        self.assertEqual(case["network"]["violations"], [])
+        self.assertEqual(case["network"]["allowed_banner_endpoints"][0]["label"], "api.github.com")
+        self.assertEqual(case["network"]["blocked_attempts"], 1)
+        self.assertTrue(case["network"]["recorded"])
+        self.assertEqual(case["page_probe"]["path"], "uia")
+        for name in case["evidence_files"]:
+            self.assertTrue((self.evidence / name).is_file(), name)
+        for expected in ("network-app-clean.json", "netwatch-app-clean.jsonl.json", "ui-app-clean.json", "screenshot-clean-after-launch.png", "screenshot-clean-final.png",
+                         "uia-app-clean-1-launch.json", "requests-app-clean.jsonl", "writes-app-clean.jsonl", "procs-app-clean-uia-launched.txt"):
+            self.assertIn(expected, case["evidence_files"])
+        self.assertEqual(case["launch_attempts"][0]["strategy"], "uia")
+        text = (self.evidence / "network-app-clean.json").read_text(encoding="utf-8")
+        self.assertIn("live-ip-1", text)
+        self.assertNotIn("192.0.2.2", text, "the ARC address is masked in the evidence")
+        self.assertIn("203.0.113.10", text, "the banner's address is labelled, not hidden")
+        self.assertIn("NOT recorded", json.loads(text)["statement"])
+        self.assertNotIn("192.0.2.2", (self.evidence / "netwatch-app-clean.jsonl.json").read_text(encoding="utf-8"))
+
+    def test_the_order_of_the_steps_blocks_and_banner_addresses_before_the_launch_and_the_watcher_around_it(self):
+        self.run_case("clean")
+        kinds = [c[0] for c in self.calls]
+        self.assertEqual(kinds, ["watcher", "blocks", "banner", "watcher-start", "try", "watcher-stop", "banner"],
+                         "blocks and the banner host's addresses first, the watcher around the launch, the addresses again for the report")
+
+    def test_both_cases_run_the_world_after_the_flip_and_bait_is_not_driven_through_the_app(self):
+        case = self.run_case("cached-bait")
+        self.assertEqual(case["scenario"], "latest-404")
+        self.assertEqual(FakeMitm.instances[-1].scenario, "latest-404")
+        self.assertIn("plugin level only", case["trigger_outcome"]["note"])
+
+    def test_a_real_destination_other_than_the_allowed_ones_fails_the_case_and_names_the_endpoint(self):
+        rows = [{"event": "start", "t": 0.0}, {"event": "conn", "t": 3.0, "poll": 2, "pid": 4300, "proc": "msedgewebview2", "remote": "198.51.100.200", "port": 443, "state": "SynSent"},
+                {"event": "stop", "polls": 9}]
+        case = self.run_case("clean", net=rows)
+        self.assertEqual(case["verdict"], "FAIL")
+        self.assertFalse(case["criteria"]["only_manifest_url"])
+        self.assertTrue(any("198.51.100.200:443" in reason and "msedgewebview2" in reason for reason in case["reasons"]), case["reasons"])
+
+    def test_an_established_connection_to_an_arc_address_fails_without_printing_the_address(self):
+        rows = [{"event": "start", "t": 0.0}, {"event": "conn", "t": 3.0, "poll": 2, "pid": 4242, "proc": "arc-desktop", "remote": "192.0.2.2", "port": 9090, "state": "Established"},
+                {"event": "stop", "polls": 9}]
+        case = self.run_case("clean", net=rows)
+        self.assertEqual(case["verdict"], "FAIL")
+        self.assertNotIn("192.0.2.2", json.dumps(case))
+        self.assertIn("live-ip-1", json.dumps(case))
+
+    def test_no_connection_record_leaves_it_unproved_because_a_real_request_was_allowed(self):
+        for rows, error in (([], None), (None, "OSError: no powershell")):
+            case = self.run_case("clean", net=rows, watcher_error=error)
+            self.assertEqual(case["verdict"], "UNPROVED", case["reasons"])
+            self.assertIsNone(case["criteria"]["only_manifest_url"])
+            self.assertTrue(any("no network record" in reason for reason in case["reasons"]))
+
+    def test_no_manifest_request_after_the_install_click_is_unproved(self):
+        case = self.run_case("clean", requests={"latest-404": [rec("/somewhere/else")]})
+        self.assertEqual(case["verdict"], "UNPROVED")
+        self.assertIsNone(case["criteria"]["only_manifest_url"])
+        self.assertTrue(any("no request for the manifest URL" in reason for reason in case["reasons"]), case["reasons"])
+        case = self.run_case("clean", requests={"latest-404": []})
+        self.assertEqual(case["verdict"], "UNPROVED")
+
+    def test_a_bundle_request_fails_even_when_the_manifest_was_requested(self):
+        case = self.run_case("clean", requests={"latest-404": [MANIFEST, rec("/FerrumVir/arc-chain/releases/download/v0.7.12/ARC.Node_0.7.12_x64-setup.exe", host="objects.githubusercontent.com")]})
+        self.assertEqual(case["verdict"], "FAIL")
+        self.assertFalse(case["criteria"]["no_bundle_download"])
+
+    def test_install_not_clicked_is_unproved_and_nothing_else_is_claimed(self):
+        value = {"ok": False, "stage": "ui-not-reached", "error": "the Install button was not rendered after 4 Check for updates click(s)"}
+        case = self.run_case("clean", trigger_value=value)
+        self.assertEqual(case["verdict"], "UNPROVED")
+        self.assertFalse(case["trigger_outcome"]["ran"])
+        self.assertEqual(case["trigger_outcome"]["stage"], "ui-not-reached")
+
+    def test_the_wrong_error_text_is_unproved(self):
+        value = {"ok": False, "stage": "ui", "error": "Update failed: error sending request for url", "error_type": "ui-text", "error_json": None}
+        case = self.run_case("clean", trigger_value=value)
+        self.assertEqual(case["verdict"], "UNPROVED")
+        self.assertTrue(any("expected the rejection" in reason for reason in case["reasons"]))
+
+    def test_uia_not_finding_the_window_is_unproved_with_the_reason_and_still_records_the_network(self):
+        case = self.run_case("clean", uia_error="UiaWindowNotFound: no window of pid 4242 appeared within 90 s")
+        self.assertEqual(case["verdict"], "UNPROVED")
+        self.assertIn("UiaWindowNotFound", case["trigger_outcome"]["error_text"])
+        self.assertIn("network-app-clean.json", case["evidence_files"])
+
+    def test_the_negative_control_does_not_resolve_the_banner_host_and_needs_no_network_record(self):
+        self.ctx.real_banner = False
+        rows = [{"event": "start", "t": 0.0}, {"event": "stop", "polls": 5}]
+        case = self.run_case("clean", net=rows)
+        self.assertNotIn("banner", [c[0] for c in self.calls])
+        self.assertIn("NEGATIVE CONTROL", case["trigger_outcome"]["note"])
+        self.assertIn("no request was allowed", json.loads((self.evidence / "network-app-clean.json").read_text(encoding="utf-8"))["statement"])
+
+    def test_the_debugging_strategy_order_starts_no_watcher_and_no_extra_blocks_and_keeps_the_bait_scenario(self):
+        legacy = {"ok": False, "stage": "invoke", "error": ow.RELEASE_NOT_FOUND, "error_type": "string", "error_json": None}
+        case = self.run_case("clean", trigger_value=legacy, strategies=["msedgedriver", "cdp-env"])
+        kinds = [c[0] for c in self.calls]
+        self.assertEqual(kinds, ["try"])
+        self.assertEqual(case["verdict"], "PASS", case["reasons"])
+        self.assertNotIn("network", case)
+        self.assertEqual(self.run_case("cached-bait", trigger_value={"ok": True, "value": {"version": "0.8.11"}}, strategies=["msedgedriver"])["scenario"], "bait-0.8.11")
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_the_negative_control_flag_and_the_uia_strategy_are_accepted(self):
+        import argparse
+        with mock.patch.object(ow, "cmd_run", return_value=0) as run, mock.patch.object(ow, "cmd_probe", return_value=0) as probe:
+            self.assertEqual(ow.main(["run", "--evidence", "e", "--no-real-banner-api", "--strategies", "uia,msedgedriver"]), 0)
+            args = run.call_args[0][0]
+            self.assertFalse(args.real_banner)
+            self.assertEqual(args.strategies, "uia,msedgedriver")
+            ow.main(["run", "--evidence", "e"])
+            self.assertTrue(run.call_args[0][0].real_banner)
+            self.assertEqual(run.call_args[0][0].strategies.split(",")[0], "uia")
+            ow.main(["probe", "--evidence", "e", "--no-real-banner-api"])
+            self.assertFalse(probe.call_args[0][0].real_banner)
+            ow.main(["probe", "--evidence", "e"])
+            self.assertTrue(probe.call_args[0][0].real_banner)
+            ow.main(["run", "--evidence", "e", "--no-webview2-block"])
+            self.assertFalse(run.call_args[0][0].webview2_block)
+            ow.main(["run", "--evidence", "e"])
+            self.assertTrue(run.call_args[0][0].webview2_block)
+
+    def test_cmd_run_carries_the_flag_into_the_context(self):
+        import argparse
+        seen = []
+        original = ow.Context
+
+        class Spy(original):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                seen.append(self)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(ow, "Context", Spy):
+            args = argparse.Namespace(evidence=str(Path(tmp) / "evidence"), tier="released_app", cases="clean", config=None, work=str(Path(tmp) / "work"), native_exe=None,
+                                      strategies="uia", real_banner=False, webview2_block=False)
+            ow.cmd_run(args)
+        self.assertFalse(seen[0].real_banner)
+        self.assertFalse(seen[0].webview2_block)
+        self.assertTrue(seen[0].ui_mode())
+
+    def test_the_released_app_tier_names_the_ui_path_and_takes_the_error_text_from_the_clean_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = Path(tmp) / "ev"
+            evidence.mkdir()
+            ctx = ow.Context(evidence, Path(tmp) / "w", mock.Mock(), {}, env={})
+            ctx.work.mkdir()
+
+            def install(ctx_, asset, installer):
+                ctx_.app_exe = APP_EXE
+                return {"ok": True}
+
+            cases = {name: {"name": name, "tier": "released_app", "verdict": "PASS", "page_probe": {"value": {"app_version": None}},
+                            "trigger_outcome": {"ran": True, "path": "uia", "error_text": "Update failed: " + ow.RELEASE_NOT_FOUND}} for name in ow.CASE_NAMES}
+            with mock.patch.object(ow, "install_app", side_effect=install), mock.patch.object(ow, "run_released_case", side_effect=lambda c, name, state: cases[name]), \
+                    mock.patch.object(ow, "provenance_of_binary", return_value={"plugin_version_from_binary": ["2.10.1"], "pubkey_in_binary": "KEY"}):
+                tier, got, pubkey, text = ow.released_app_tier(ctx, {"name": "x"}, Path("i.exe"), None, list(ow.CASE_NAMES), {}, {}, [])
+            self.assertEqual(tier["paths_used"], ["uia"])
+            self.assertIn("UI Automation", tier["trigger"])
+            self.assertEqual(tier["result"], "PASS")
+            self.assertEqual(text, "Update failed: " + ow.RELEASE_NOT_FOUND)
+            self.assertEqual(pubkey, "KEY")
 
 
 if __name__ == "__main__":
