@@ -68,3 +68,43 @@ HOW TO DRIVE IT (edit wave0-lab/config.json on the lab branch and push; the guar
   pre-G0   stage_a.enabled true; stage_b profile smoke, launcher_source artifact     -> Stage A evidence + rehearsal
   post-G0  stage_b profile full, launcher_source published (tag v0.7.12, digest 41d92a47...), live_network allowed
            -> the real Wave 0
+  supplement  stage_b profile resources, launcher_source published, live_network allowed -> the ARC-83 resources and
+           public-freshness SUPPLEMENT described next
+
+RESOURCES SUPPLEMENT (profile "resources"; ARC-83 independent review criteria D and E; Astra's decision of 2026-10-08T13:19Z)
+Why: Wave 0 run 37750760170 (WAVE0_PASS, 4 h, VM 6144 MiB) recorded no per-sample RSS, available memory, swap or disk
+series, no public scoreboard freshness and no kernel OOM scan. This run supplies exactly those, on the published
+v0.7.12 launcher, with the live network, on a 4096 MiB VM (the 4 GiB canary criterion E is written for; the change from
+6144 is disclosed in binding.json and in the report). It is combined evidence with run 37750760170; it does not repeat
+the interruption, updater runs, kickstarts or reboot (those checks show as "covered by" rows).
+  same bytes     binding.json holds, for this run and for 37750760170: launcher, node, legacy v0.7.7 node, v0.7.11
+                 installer and cloud image sha256, the sha256 of the three units the installer wrote, and the
+                 baseline-result line. This run's values are MEASURED from the real bytes during the run; the prior
+                 values are the committed config stage_b.prior_run block (each read from that run's own evidence, with
+                 its source named there). The evaluator compares them itself.
+  window         consume, then 600 s settle, then a quiet window: first sample to last sample >= 135 min (8100 s),
+                 >= 136 samples, no gap between adjacent samples above 65 s, nothing forced inside it. The run goes
+                 three sample intervals past the nominal end so the window cannot fall short by sampler phase.
+  samples        every 60 s, absolute schedule: node RSS/peak/swap, threads, fds, cpu seconds; MemTotal, MemAvailable,
+                 swap; cgroup memory and swap; disk total and free of the data volume; bytes of data, release cache
+                 and logs; largest file; partial files; bridge download log lines; the age of the last SUCCESSFUL
+                 registration/heartbeat (registration_age_s) and its timestamp.
+  local freshness a second guest observer polls the node's LOCAL /community/worker/status every 5 s (the next round is
+                 scheduled 15 s after the previous one completes, so the period is 15 s plus the round's latency) and
+                 logs every poll, failures included, to heartbeats.jsonl, so every distinct last_registration_unix_ms
+                 is seen. Source: crates/arc-node/src/community_worker.rs:156-164 (stamp set only when a coordinator
+                 accepted), main.rs:9181 (once per round), main.rs:9183 (next round 15 s later), main.rs:5595 (15 s),
+                 main.rs:9103 (registration every 4th tick).
+  public freshness the runner (not the VM) reads GET /workers/scoreboard?worker_id=0x<address> on all six coordinators
+                 every 30 s, in parallel, keeping per coordinator the HTTP status, the server's Date header, count_total
+                 and our row. The node serves a row only while its last heartbeat is within 90 s (rpc.rs:784, handler
+                 rpc.rs:8470, filter rpc.rs:8514). Read-only; /community/list is never called; the evidence stores an
+                 index and a short hash for each coordinator, never its address. Missing coverage is UNPROVED, never PASS.
+  kernel         the journal of every boot of the guest is scanned for out-of-memory kills over the whole run
+                 (kernel-oom.json); any kill fails.
+  bounds         RSS slope <= 100 MiB/h; MemAvailable >= 512 MiB; 24 h projection <= half of the headroom; disk reserve
+                 max(2 GiB, 20% of the volume) never reached and a 72 h runway if free space falls; swap is a series only;
+                 no unbounded log or cache growth, no second full binary download, no model-sized download.
+  verdict        SUPPLEMENT_PASS / SUPPLEMENT_FAIL. SUPPLEMENT_PASS is evidence to be read together with run
+                 37750760170; it never stands in for the four-hour Wave 0.
+  stop           the job still ends with the final stop, rollback test and re-bridge, and the node stopped.

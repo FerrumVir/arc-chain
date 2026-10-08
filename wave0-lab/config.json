@@ -27,12 +27,12 @@
   },
   "stage_b": {
     "enabled": true,
-    "profile": "full",
+    "profile": "resources",
     "launcher_source": "published",
     "tag": "v0.7.12",
     "expect_sha256": "41d92a475db819eb190b6409ac82cb3258a557980c193decc629896718a3f69e",
     "live_network": "allowed",
-    "live_network_authorization": "work-99 relay of 2026-10-08T07:55Z: TJ authorized one stake-0 test node on the live testnet, in a separate clean environment; the nested VM on a hosted runner is that environment; stake 0, compute off; the node is stopped at the end of the job",
+    "live_network_authorization": "work-99 relay of 2026-10-08T07:55Z: TJ authorized one stake-0 test node on the live testnet, in a separate clean environment; the nested VM on a hosted runner is that environment; stake 0, compute off; the node is stopped at the end of the job. Repeated once for the ARC-83 resources supplement as directed by the work-99 relays of 2026-10-08T13:05Z and 13:22Z (Astra's supplement decision of 13:19Z): same node class, same conditions, stopped at the end of the job.",
     "image": {
       "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-amd64.img",
       "sha256": "6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2",
@@ -41,7 +41,7 @@
     },
     "vm": {
       "cpus": 2,
-      "memory_mb": 6144,
+      "memory_mb": 4096,
       "disk_gb": 20
     },
     "profiles": {
@@ -78,6 +78,67 @@
         "heartbeat_s": 600,
         "pull_samples_s": 900,
         "deadline_min": 315
+      },
+      "resources": {
+        "sample_interval_s": 60,
+        "baseline_s": 120,
+        "min_total_s": 8700,
+        "min_steady_s": 8100,
+        "min_steady_samples": 136,
+        "post_reboot_healthy_s": 600,
+        "max_gap_factor": 1.0834,
+        "reboot_recovery_deadline_s": 300,
+        "forced_grace_s": 90,
+        "updater_runs": 2,
+        "kickstarts": 3,
+        "kickstart_gap_s": 120,
+        "heartbeat_s": 600,
+        "pull_samples_s": 900,
+        "deadline_min": 240,
+        "battery": false,
+        "settle_s": 600
+      }
+    },
+    "scoreboard_interval_s": 30,
+    "resource_bounds": {
+      "rss_slope_mib_per_h_max": 100,
+      "mem_available_min_mib": 512,
+      "projection_fraction": 0.5,
+      "projection_hours": 24,
+      "disk_reserve_floor_b": 2147483648,
+      "disk_reserve_fraction": 0.2,
+      "disk_runway_h_min": 72,
+      "min_points": 121
+    },
+    "prior_run": {
+      "run_id": 37750760170,
+      "head_sha": "fd0d245b1830fb6c577016250ac245273114d65b",
+      "verdict": "WAVE0_PASS",
+      "evidence_artifact_id": 11550354579,
+      "evidence_artifact_digest": "sha256:1413863b19014eb0c847694896784be130abcb4fa8460bb41d6e88122355f4fb",
+      "tag": "v0.7.12",
+      "vm_memory_mb": 6144,
+      "launcher_sha256": "41d92a475db819eb190b6409ac82cb3258a557980c193decc629896718a3f69e",
+      "node_sha256": "54d4d0708ae41d32958110cce9961851911c9b72ca269756cd49dfbc731e061b",
+      "legacy_node_sha256": "1cfc3039786d023cde24ad0b452f35735b39f9e83aaf293e6ed0bf623a11b20c",
+      "installer_sha256": "34aabc144750ca656c88412372fff7b94384514776eca7b747de52f57bfa5430",
+      "image_sha256": "6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2",
+      "baseline_result": "installer=v0.7.11 legacy_node=v0.7.7 bridge_tag=v0.7.12 legacy_node_sha256=1cfc3039786d023cde24ad0b452f35735b39f9e83aaf293e6ed0bf623a11b20c",
+      "units": {
+        "arc-node.service": "096629e905a1c943e36e6021fcbbe5e22b5ba34dbaa427d1152032c0e566f127",
+        "arc-updater.service": "4abced7e2a26cf2dc7e5cf52ad9997647c2cd1feeb2c658851eabc70d345edc5",
+        "arc-updater.timer": "62445935543cdbb51a9f0f085e28dfabf309a3c8c61fe48a0323f487913f45d0"
+      },
+      "sources": {
+        "launcher_sha256": "that run's config-effective.json expected_launcher_sha256 and published-release.json arc-node-linux-x86_64 digest",
+        "node_sha256": "that run's config-effective.json node_sha256",
+        "legacy_node_sha256": "that run's guest evidence baseline/baseline-result.txt",
+        "installer_sha256": "sha256 of git show v0.7.11:scripts/install-community-node.sh (tag v0.7.11 = commit d60632afdf38c1d5671bff463ae6f9c278d84860), the command that run's ship phase used; that run's evidence holds no copy of the script, so the unit digests below are the byte-level cross-check of what the installer wrote",
+        "image_sha256": "that run's checks-live.jsonl L17-vm-image-digest",
+        "baseline_result": "that run's guest evidence baseline/baseline-result.txt, without its run-specific v07_pid field",
+        "units": "sha256 of units/arc-node.service, arc-updater.service, arc-updater.timer in that run's guest-evidence.tgz (seed redacted)",
+        "vm_memory_mb": "that run's events.jsonl vm_started",
+        "evidence_artifact_digest": "GitHub API GET /repos/FerrumVir/arc-chain/actions/artifacts/11550354579 on 2026-10-08"
       }
     }
   }

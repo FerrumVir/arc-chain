@@ -5,7 +5,8 @@
 #               disables it before the bridged node first starts when live_network is "allowed", and enables it
 #               again before the final stop/rollback test.
 #   sampler     arc-w0-sampler.service, enabled observer: one JSON line per interval, across reboots, never starts
-#               anything.
+#               anything; plus arc-w0-heartbeat.service, an observer that logs the node's local registration
+#               timestamp every 5 s (every poll, including failures).
 # Usage: install-units.sh --units live-block
 #        install-units.sh --units sampler --interval SECONDS --arc-dir DIR --user USER
 set -Eeuo pipefail
@@ -65,9 +66,26 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
 
+cat > /etc/systemd/system/arc-w0-heartbeat.service <<UNIT
+[Unit]
+Description=ARC Wave 0 lab heartbeat poller (observer only; logs the node's local registration timestamp every 5 s)
+After=network.target
+
+[Service]
+Type=simple
+User=$user
+ExecStart=/usr/bin/python3 /opt/arc-w0/lab/heartbeat_poller.py --out /var/lib/arc-w0/heartbeats.jsonl --interval 5
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 systemctl daemon-reload
 systemctl enable --now arc-w0-sampler.service
-systemctl is-active arc-w0-sampler.service
+systemctl enable --now arc-w0-heartbeat.service
+systemctl is-active arc-w0-sampler.service arc-w0-heartbeat.service
 }
 
 case "$units" in

@@ -32,8 +32,11 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import traceback
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,6 +86,11 @@ UPDATER_DECISION_LINES = (
     "auto-update check starting|new version available|up to date|binary updated|ROLLED BACK|WARNING|no version|"
     "curl: \\([0-9]+\\)|auto-update complete|Rolling back"
 )
+SUPPLEMENT_LIVE_IDS = ("L01-kvm", "L02-consume-dry-run", "L11-stop-rollback")
+BINDING_SCHEMA = "arc.legacy-bridge.wave0-lab.binding.v1"
+# The files the unmodified v0.7.11 installer wrote; the baseline of two runs is the same when these hash the same.
+BASELINE_UNIT_FILES = ("arc-node.service", "arc-updater.service", "arc-updater.timer")
+HEARTBEAT_POLL_S = 5
 PRE_FLIP_NOTE = (
     "expected before the Latest flip (v0.7.11 updater compares =, Latest v0.7.11 has no arc-node-linux-x86_64)"
 )
@@ -119,6 +127,8 @@ def effective_config(cfg: dict, pins: dict) -> dict:
     sb = cfg["stage_b"]
     profile = sb["profiles"][sb["profile"]]
     node_tag = pins["node_release"]["tag"]
+    bounds = dict(sb.get("resource_bounds", {}))
+    bounds["min_points"] = profile["min_steady_samples"]
     return {
         "schema": EFFECTIVE_SCHEMA,
         "profile": sb["profile"],
@@ -138,7 +148,57 @@ def effective_config(cfg: dict, pins: dict) -> dict:
         "forced_grace_s": profile["forced_grace_s"],
         "updater_runs": profile["updater_runs"],
         "kickstarts": profile["kickstarts"],
+        "resources_required": True,
+        "resource_bounds": bounds,
+        "scoreboard_required": sb["live_network"] == "allowed",
+        "scoreboard_interval_s": sb.get("scoreboard_interval_s", 300),
+        "battery": bool(profile.get("battery", True)),
+        "settle_s": int(profile.get("settle_s", 0)),
+        "vm_memory_mb": sb["vm"]["memory_mb"],
     }
+
+
+def scoreboard_lookup(origin: str, address: str, opener=urllib.request.urlopen) -> dict:
+    """One read-only public lookup: GET <origin>/workers/scoreboard?worker_id=0x<address>.
+
+    In the node source a worker row is served only while its last heartbeat is within COMMUNITY_WORKER_TTL_SECS (90 s,
+    rpc.rs:784; handler rpc.rs:8470, filter rpc.rs:8514), so a found row means the node was seen at most 90 s before the
+    server's own clock read. The answer keeps the server's HTTP Date header (that server time), count_total (the size
+    of its worker table) and our row itself. /community/list is never called (it prunes the registry)."""
+    url = origin.rstrip("/") + "/workers/scoreboard?limit=5&worker_id=0x" + address
+    request = urllib.request.Request(url, headers={"User-Agent": "wave0-lab-scoreboard-probe/1", "Accept": "application/json"})
+    started = time.monotonic()
+    empty = {"http": None, "error": None, "found": False, "name": None, "registered_at": None, "worker_id": None,
+             "server_date": None, "count_total": None, "row": None, "elapsed_ms": None}
+    try:
+        with opener(request, timeout=8) as response:
+            status = response.status
+            server_date = response.headers.get("Date") if getattr(response, "headers", None) is not None else None
+            body = response.read(1 << 20)
+        parsed = json.loads(body.decode("utf-8", "replace"))
+    except Exception as error:  # noqa: BLE001 - a failed lookup is a recorded miss, not a crash
+        failed = dict(empty)
+        failed.update(http=getattr(error, "code", None), error=type(error).__name__, elapsed_ms=int((time.monotonic() - started) * 1000))
+        headers = getattr(error, "headers", None)
+        if headers is not None and hasattr(headers, "get"):
+            failed["server_date"] = headers.get("Date")
+        return failed
+    rows = parsed.get("workers") if isinstance(parsed, dict) else None
+    rows = rows if isinstance(rows, list) else []
+    count_total = parsed.get("count_total") if isinstance(parsed, dict) else None
+    match = next((row for row in rows if isinstance(row, dict) and str(row.get("worker_id", "")).lower() == "0x" + address), None)
+    found = dict(empty)
+    found.update(
+        http=status, found=match is not None,
+        name=match.get("name") if match else None,
+        registered_at=match.get("registered_at") if match else None,
+        worker_id=match.get("worker_id") if match else None,
+        server_date=server_date,
+        count_total=count_total if isinstance(count_total, int) and not isinstance(count_total, bool) else None,
+        row=match,
+        elapsed_ms=int((time.monotonic() - started) * 1000),
+    )
+    return found
 
 
 def interrupt_quota(network_launcher_bytes: int, node_bytes: int) -> int:
@@ -345,10 +405,23 @@ class Lab:
         self.t0_guest_epoch: float | None = None
         self.last_forced_end_guest: float | None = None
         self.partial_bytes = 0
+        self.battery = bool(self.profile.get("battery", True))
+        self.settle_s = int(self.profile.get("settle_s", 0))
+        self.scoreboard_interval = int(self.sb.get("scoreboard_interval_s", 300))
+        self.origins: list[str] = list(self.pins.get("community_rpc_origins", []))
+        self.probe_stop = threading.Event()
+        self.probe_thread: threading.Thread | None = None
+        self.probe_lock = threading.Lock()
+        self.probe_count = 0
+        self.probe_registration_wait_s = 300  # the first public read waits for the node's own registration (plus a margin)
+        self.probe_margin_s = 20
+        self.required_ids = REQUIRED_LIVE_IDS if self.battery else SUPPLEMENT_LIVE_IDS
+        # Digests measured in THIS run from the real bytes (binding.json); nothing here is typed in or recalled.
+        self.measured: dict = {}
 
     # --- evidence files ----------------------------------------------------------------------
     def _append(self, name: str, record: dict) -> None:
-        with (self.evidence / name).open("a", encoding="utf-8") as handle:
+        with self.probe_lock, (self.evidence / name).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -448,6 +521,142 @@ class Lab:
 
     def pull_samples(self) -> None:
         self.get_file(f"{GUEST_WORK}/samples.jsonl", self.evidence / "samples.jsonl")
+        self.get_file(f"{GUEST_WORK}/heartbeats.jsonl", self.evidence / "heartbeats.jsonl")
+
+    # --- public scoreboard freshness (ARC-83 D) ------------------------------------------------------
+    def scoreboard_probe(self) -> dict:
+        """Look the lab node up on every public coordinator once (all in parallel, so a round takes seconds even when some
+        coordinators are slow) and append the full matrix to scoreboard.jsonl."""
+        address = self.t0_address
+        started = time.time()
+
+        def one(item: tuple[int, str]) -> dict:
+            index, origin = item
+            found = scoreboard_lookup(origin, address)
+            found.update({"origin": index, "origin_sha8": hashlib.sha256(origin.encode()).hexdigest()[:8]})
+            return found
+
+        with ThreadPoolExecutor(max_workers=max(1, len(self.origins))) as pool:
+            results = list(pool.map(one, list(enumerate(self.origins))))
+        self.probe_count += 1
+        record = {
+            "probe": self.probe_count, "host_epoch": round(started, 3), "finished_epoch": round(time.time(), 3),
+            "address": address, "results": results,
+            "found_count": sum(1 for item in results if item["found"]),
+        }
+        self._append("scoreboard.jsonl", record)
+        self.say(f"public scoreboard probe {self.probe_count}: found on {record['found_count']} of {len(results)} coordinators")
+        return record
+
+    def start_scoreboard(self) -> None:
+        """Background prober: one probe now, then one every scoreboard_interval_s until stopped (read-only GETs from the runner)."""
+        if not self.live_allowed or self.probe_thread is not None or not self.t0_address:
+            return
+
+        def loop() -> None:
+            # A read before the node has registered says nothing about freshness: wait (bounded) until the node reports
+            # at least one coordinator registered, then a margin; if it never does, probe anyway and let the miss show.
+            waited = 0
+            while waited < self.probe_registration_wait_s and not self.probe_stop.is_set():
+                tail = self.samples_tail(1)
+                if tail and (tail[-1].get("coordinators_registered") or 0) >= 1:
+                    break
+                self.probe_stop.wait(5)
+                waited += 5
+            self.probe_stop.wait(self.probe_margin_s)
+            # Fixed-rate schedule (start + n * interval): a slow round never stretches the cadence.
+            begin = time.monotonic()
+            rounds = 0
+            while True:
+                try:
+                    self.scoreboard_probe()
+                except Exception as error:  # noqa: BLE001
+                    self.say(f"scoreboard probe crashed: {type(error).__name__}: {error}")
+                rounds += 1
+                if self.probe_stop.wait(max(0.0, begin + rounds * self.scoreboard_interval - time.monotonic())):
+                    return
+
+        self.probe_thread = threading.Thread(target=loop, name="scoreboard-prober", daemon=True)
+        self.probe_thread.start()
+
+    def stop_scoreboard(self) -> None:
+        self.probe_stop.set()
+        if self.probe_thread is not None:
+            self.probe_thread.join(timeout=60)
+
+    def kernel_oom_scan(self) -> None:
+        """ARC-83 E: grep the kernel journal of EVERY boot of the guest, not only the unit's log, for out-of-memory kills."""
+        result = self.guest(f"sudo python3 {GUEST_LAB}/oom_scan.py", timeout=180)
+        scan = last_json_line(result.out)
+        if scan is None:
+            scan = {"schema": "arc.legacy-bridge.wave0-lab.kernel-oom.v1", "scans": [], "total": None, "error": result.out[-300:]}
+        (self.evidence / "kernel-oom.json").write_text(json.dumps(scan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self.event("kernel_oom_scan", total=scan.get("total"), boots=[item.get("boot") for item in scan.get("scans", [])])
+
+    # --- binding to the prior run (ARC-83 supplement) -------------------------------------------------
+    def write_binding(self) -> None:
+        """binding.json: the digests this run measured next to the ones recorded for the prior four-hour run.
+
+        The prior values are the committed config stage_b.prior_run (each was read from that run's own evidence artifact,
+        see its "sources"); the values of this run are measured from the real bytes during the run. Never raises."""
+        try:
+            prior = self.sb.get("prior_run")
+            if not isinstance(prior, dict):
+                return
+            fields = ("launcher_sha256", "node_sha256", "legacy_node_sha256", "installer_sha256", "image_sha256")
+            this = {key: self.measured.get(key) for key in fields}
+            this.update(
+                run_id=int(os.environ["GITHUB_RUN_ID"]) if os.environ.get("GITHUB_RUN_ID", "").isdigit() else None,
+                run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]) if os.environ.get("GITHUB_RUN_ATTEMPT", "").isdigit() else None,
+                commit=os.environ.get("GITHUB_SHA"),
+                vm_memory_mb=self.sb["vm"]["memory_mb"],
+                tag=self.tag,
+                launcher_source=self.source,
+                baseline_result=self.measured.get("baseline_result"),
+                units=self.measured.get("units"),
+                legacy_tag_commit=self.measured.get("legacy_tag_commit"),
+            )
+            equal = {key: (this.get(key) is not None and this.get(key) == prior.get(key)) for key in fields}
+            if isinstance(prior.get("units"), dict):
+                equal["units"] = bool(this.get("units")) and this.get("units") == prior.get("units")
+            if prior.get("baseline_result") is not None:
+                equal["baseline_result"] = this.get("baseline_result") == prior.get("baseline_result")
+            record = {
+                "schema": BINDING_SCHEMA,
+                "prior_run": prior,
+                "this_run": this,
+                "equal": equal,
+                "all_equal": all(equal.values()),
+                "disclosed_changes": {"vm_memory_mb": {"prior": prior.get("vm_memory_mb"), "this": this["vm_memory_mb"]}},
+            }
+            (self.evidence / "binding.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except Exception as error:  # noqa: BLE001 - a failed binding file is a missing file the evaluator reports, never a crash
+            self.say(f"binding.json not written: {type(error).__name__}: {error}")
+
+    def measure_baseline(self) -> None:
+        """After the v0.7.11 installer ran: the v0.7.7 binary it installed and the line the baseline printed. Never raises."""
+        try:
+            legacy = self.guest(f"sha256sum {GUEST_ARC}/bin/arc-node | cut -d' ' -f1", timeout=60)
+            digest = legacy.out.strip().splitlines()[-1] if legacy.ok and legacy.out.strip() else None
+            if digest and re.fullmatch(r"[0-9a-f]{64}", digest):
+                self.measured["legacy_node_sha256"] = digest
+            result = self.guest(f"cat {GUEST_WORK}/baseline/baseline-result.txt", timeout=30)
+            if result.ok and result.out.strip():
+                # the process id of the v0.7.7 node differs from run to run: it is not part of the baseline's identity
+                self.measured["baseline_result"] = re.sub(r"\s+v07_pid=\d+\s*$", "", result.out.strip().splitlines()[-1])
+        except Exception as error:  # noqa: BLE001
+            self.say(f"baseline measurement failed: {type(error).__name__}: {error}")
+
+    def measure_units(self) -> None:
+        """At collection: digests of the three files the v0.7.11 installer wrote (from the collected, seed-redacted copies)."""
+        units = {}
+        folder = self.evidence / "guest" / "units"
+        for name in BASELINE_UNIT_FILES:
+            path = folder / name
+            if path.is_file():
+                units[name] = sha256_file(path)
+        if units:
+            self.measured["units"] = units
 
     # --- phases ---------------------------------------------------------------------------------
     def phase(self, name: str, ids: tuple[str, ...], fn, fatal: bool = False) -> bool:
@@ -494,6 +703,7 @@ class Lab:
             self.say("downloading the Ubuntu 24.04 cloud image")
             self.run_process(["curl", "-fL", "--retry", "5", "--retry-delay", "5", "--proto", "=https", "--tlsv1.2", "-o", str(base), image["url"]], timeout=900)
         digest = sha256_file(base)
+        self.measured["image_sha256"] = digest
         if digest != image["sha256"] or base.stat().st_size != image["size"]:
             self.check("L17-vm-image-digest", "Ubuntu 24.04 cloud image matches its pinned digest", "FAIL", f"got {digest} / {base.stat().st_size} bytes")
             raise Fatal("the cloud image does not match its pinned digest")
@@ -527,6 +737,13 @@ class Lab:
         info = self.guest("uname -a; systemctl --version | head -1; python3 --version; id -un; sudo -n true && echo sudo-ok", timeout=30)
         (self.evidence / "guest-info.txt").write_text(info.out, encoding="utf-8")
         self.event("vm_ready", detail={"info": info.out.strip()[:400]})
+        meminfo = self.guest("grep -E '^(MemTotal|SwapTotal):' /proc/meminfo", timeout=30).out
+        total = re.search(r"MemTotal:\s+(\d+)", meminfo)
+        swap = re.search(r"SwapTotal:\s+(\d+)", meminfo)
+        self.event(
+            "vm_memory", configured_mb=self.sb["vm"]["memory_mb"],
+            mem_total_kb=int(total.group(1)) if total else None, swap_total_kb=int(swap.group(1)) if swap else None,
+        )
 
     def dump_console(self) -> None:
         console = self.work / "console.log"
@@ -566,12 +783,18 @@ class Lab:
         ):
             data = self.run_process(["git", "-C", str(ROOT), "show", f"{LEGACY_TAG}:{source}"]).stdout
             (ship / "legacy-source" / dest).write_bytes(data)
+            if dest == "install-community-node.sh":
+                self.measured["installer_sha256"] = hashlib.sha256(data).hexdigest()
+        tag_commit = self.run_process(["git", "-C", str(ROOT), "rev-parse", f"refs/tags/{LEGACY_TAG}^{{commit}}"], check=False).stdout.decode("utf-8", "replace").strip()
+        if re.fullmatch(r"[0-9a-f]{40}", tag_commit):
+            self.measured["legacy_tag_commit"] = tag_commit
         (ship / "live-ips.txt").write_text("\n".join(live_ips.load(ROOT)) + "\n", encoding="utf-8")
 
         if self.source == "artifact":
             verified = fetch_handoff.fetch(self.cfg, self.work / "handoff")
             launcher = self.work / "handoff" / "v0.7.12" / X86
-            if sha256_file(launcher) != self.expect:
+            self.measured["launcher_sha256"] = sha256_file(launcher)
+            if self.measured["launcher_sha256"] != self.expect:
                 raise Fatal("the handoff launcher is not the expected digest")
             (ship / "launcher" / X86).write_bytes(launcher.read_bytes())
             (ship / "launcher" / X86).chmod(0o755)
@@ -616,7 +839,8 @@ class Lab:
         )
         local = self.work / "published-launcher"
         self.run_process(["curl", "-fL", "--retry", "3", "--proto", "=https", "--tlsv1.2", "-o", str(local), f"https://github.com/{repo}/releases/download/{self.tag}/{X86}"], timeout=300)
-        if sha256_file(local) != self.expect:
+        self.measured["launcher_sha256"] = sha256_file(local)
+        if self.measured["launcher_sha256"] != self.expect:
             problems.append("the downloaded published launcher does not hash to the expected digest")
         self.launcher_bytes = local.stat().st_size
         if problems:
@@ -651,6 +875,18 @@ class Lab:
             self.check("L20-sampler-running", "the guest sampler writes samples", "FAIL", "no sample appeared within 2 minutes")
             raise Fatal("the sampler is not running")
         self.check("L20-sampler-running", "the guest sampler writes samples", "PASS", f"first sample seen; interval {self.profile['sample_interval_s']} s")
+        self.measure_baseline()
+        poller_lines = 0
+        for _ in range(20):  # up to about a minute: the poller writes a line every 5 s
+            counted = self.guest(f"wc -l < {GUEST_WORK}/heartbeats.jsonl", timeout=30, log=False)
+            poller_lines = last_int(counted.out)
+            if poller_lines >= 3:
+                break
+            time.sleep(3)
+        if poller_lines < 3:
+            self.check("L21-heartbeat-poller-running", "the guest heartbeat poller logs the local registration timestamp every 5 s", "FAIL", f"only {poller_lines} poll line(s) after 60 s")
+            raise Fatal("the heartbeat poller is not running")
+        self.check("L21-heartbeat-poller-running", "the guest heartbeat poller logs the local registration timestamp every 5 s", "PASS", f"{poller_lines} poll lines in the first minute; period {HEARTBEAT_POLL_S} s")
         selftest = self.guest(f"sudo {GUEST_LAB}/interrupt.sh selftest", timeout=60)
         self.interrupt_mode = "quota" if selftest.ok else "watch"
         self.event("interrupt_mode", detail={"mode": self.interrupt_mode, "selftest": selftest.out.strip()[-200:]})
@@ -769,15 +1005,25 @@ class Lab:
             raise Fatal("the bridged node is not healthy after the successful consume")
         bound = resume_bound(self.network_launcher_bytes(), sizes, self.partial_bytes, len(attempts))
         state = self.capture()
-        final_ok = self.guest(f"sha256sum {GUEST_ARC}/legacy-bridge/releases/{self.node_tag}/{X86} | cut -d' ' -f1", timeout=60).out.strip() == self.node_sha
+        cache_digest = self.guest(f"sha256sum {GUEST_ARC}/legacy-bridge/releases/{self.node_tag}/{X86} | cut -d' ' -f1", timeout=60).out.strip()
+        if re.fullmatch(r"[0-9a-f]{64}", cache_digest):
+            self.measured["node_sha256"] = cache_digest
+        final_ok = cache_digest == self.node_sha
         partial_gone = not self.guest(f"test -e {GUEST_ARC}/legacy-bridge/releases/{self.node_tag}/{X86}.partial", timeout=30).ok
         resumed = counters <= bound
-        ok = final_ok and partial_gone and resumed and self.partial_bytes > 0 and state.get("bin_arc_node_sha256") == self.expect
-        self.check(
-            "L04-interrupt-resumes", "after the interruption, the next run resumes the .partial and the bridged node comes up", "PASS" if ok else "FAIL",
-            f"partial before {self.partial_bytes} bytes; inbound TLS bytes {counters} <= bound {bound} (a restart from zero would need about {self.network_launcher_bytes() + sizes}); "
-            f"node cache digest ok={final_ok}; .partial consumed={partial_gone}; installed launcher is the expected digest={state.get('bin_arc_node_sha256') == self.expect}; node_bytes {node_bytes}",
-        )
+        if self.battery:
+            ok = final_ok and partial_gone and resumed and self.partial_bytes > 0 and state.get("bin_arc_node_sha256") == self.expect
+            self.check(
+                "L04-interrupt-resumes", "after the interruption, the next run resumes the .partial and the bridged node comes up", "PASS" if ok else "FAIL",
+                f"partial before {self.partial_bytes} bytes; inbound TLS bytes {counters} <= bound {bound} (a restart from zero would need about {self.network_launcher_bytes() + sizes}); "
+                f"node cache digest ok={final_ok}; .partial consumed={partial_gone}; installed launcher is the expected digest={state.get('bin_arc_node_sha256') == self.expect}; node_bytes {node_bytes}",
+            )
+        else:
+            ok = final_ok and partial_gone and state.get("bin_arc_node_sha256") == self.expect
+            self.check(
+                "L04-interrupt-resumes", "not applicable in the resources supplement (no interruption); the consume itself must still leave a verified cache", "PASS" if ok else "FAIL",
+                f"node cache digest ok={final_ok}; .partial absent={partial_gone}; installed launcher is the expected digest={state.get('bin_arc_node_sha256') == self.expect}; inbound TLS bytes {counters}",
+            )
         # The bridged node is up and the v0.7.7 process is gone: now the live network may open, if it is allowed.
         self.open_live_network()
         # Find the t0 sample (the first healthy sample of the v0.8 node) and the hook snapshot taken at the start of this kept run.
@@ -812,6 +1058,7 @@ class Lab:
             raise Fatal(f"BEFORE invariants failed: {made.out[-300:]}")
         self.get_file(f"{GUEST_WORK}/invariants-before.json", self.evidence / "invariants-before.json")
         self.event("before_invariants", detail={"hook_snapshot": chosen})
+        self.start_scoreboard()
 
     # 4. battery ----------------------------------------------------------------------------------
     def phase_updaters(self) -> None:
@@ -923,10 +1170,28 @@ class Lab:
     # 5. steady state ------------------------------------------------------------------------------
     def phase_steady(self) -> None:
         profile = self.profile
-        assert self.last_forced_end_guest is not None and self.t0_guest_epoch is not None
+        assert self.t0_guest_epoch is not None
+        # The battery's reboot sets last_forced_end_guest; the supplement has no battery and sets it below, after the settle period.
+        assert self.last_forced_end_guest is not None or not self.battery
         interval = profile["sample_interval_s"]
-        target = max(self.last_forced_end_guest + profile["min_steady_s"], self.t0_guest_epoch + profile["min_total_s"]) + 2 * interval
-        self.event("steady_begin", guest_epoch=self.last_forced_end_guest, last_forced_event="reboot_issued", target_guest_epoch=target)
+        last_forced = "reboot_issued"
+        if not self.battery:
+            # Supplement: the consume is the only forced event; the steady window starts after a quiet settle period.
+            settle_end = self.t0_guest_epoch + self.settle_s
+            while True:
+                now_guest = self.guest_epoch()
+                if now_guest is not None and now_guest >= settle_end:
+                    break
+                if time.time() > self.deadline - 600:
+                    self.event("settle_cut_short_by_deadline", guest_epoch=now_guest, settle_end=settle_end)
+                    break
+                time.sleep(15)
+            self.last_forced_end_guest = settle_end
+            last_forced = "apply2"
+        # The supplement judges first-to-last sample >= min_steady_s, so it runs a few intervals past the nominal end.
+        margin_intervals = 2 if self.battery else 3
+        target = max(self.last_forced_end_guest + profile["min_steady_s"], self.t0_guest_epoch + profile["min_total_s"]) + margin_intervals * interval
+        self.event("steady_begin", guest_epoch=self.last_forced_end_guest, last_forced_event=last_forced, target_guest_epoch=target)
         last_pull = 0.0
         last_beat = 0.0
         while True:
@@ -954,9 +1219,11 @@ class Lab:
             time.sleep(min(60.0, max(1.0, target - now_guest)))
         self.pull_samples()
         self.event("steady_end", guest_epoch=self.guest_epoch())
+        self.stop_scoreboard()
 
     # 6. final -----------------------------------------------------------------------------------
     def phase_final(self) -> None:
+        self.kernel_oom_scan()
         after = self.guest(f"python3 {GUEST_LAB}/invariants.py collect --label after --arc-dir {GUEST_ARC} --out {GUEST_WORK}/invariants-after.json", timeout=180)
         if not after.ok:
             raise Fatal(f"AFTER invariants failed: {after.out[-300:]}")
@@ -1026,6 +1293,8 @@ class Lab:
         for name in ("invariants-before.json", "invariants-after.json"):
             if not (self.evidence / name).exists():
                 self.get_file(f"{GUEST_WORK}/{name}", self.evidence / name)
+        self.measure_units()
+        self.write_binding()
         if record:
             verdict = "PASS" if result.ok else "FAIL"
             self.check("L18-redaction", "the v0.7 seed was redacted from the collected evidence", verdict, result.out.strip()[-300:])
@@ -1033,7 +1302,11 @@ class Lab:
     # --- orchestration -------------------------------------------------------------------------
     def run(self) -> int:
         (self.evidence / "config-effective.json").write_text(json.dumps(effective_config(self.cfg, self.pins), indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        self.event("run_begin", detail={"profile": self.sb["profile"], "launcher_source": self.source, "deadline_min": self.profile["deadline_min"], "base_commit": self.cfg["base_commit"]})
+        prior = self.sb.get("prior_run") if isinstance(self.sb.get("prior_run"), dict) else {}
+        self.event("run_begin", detail={
+            "profile": self.sb["profile"], "launcher_source": self.source, "deadline_min": self.profile["deadline_min"], "base_commit": self.cfg["base_commit"],
+            "prior_run_id": prior.get("run_id"), "vm_memory_mb": self.sb["vm"]["memory_mb"],
+        })
         crashed = False
         try:
             self.phase("kvm", ("L01-kvm",), self.phase_kvm, fatal=True)
@@ -1041,11 +1314,13 @@ class Lab:
             self.phase("ship", (), self.phase_ship, fatal=True)
             self.phase("baseline", (), self.phase_baseline, fatal=True)
             self.phase("dry-run", ("L02-consume-dry-run",), self.phase_dry_run, fatal=True)
-            self.phase("apply1", ("L03-interrupt-took-effect",), self.phase_apply1, fatal=True)
+            if self.battery:
+                self.phase("apply1", ("L03-interrupt-took-effect",), self.phase_apply1, fatal=True)
             self.phase("apply2", ("L04-interrupt-resumes",), self.phase_apply2, fatal=True)
-            self.phase("updaters", ("L05-updater-1-noop", "L06-updater-2-noop"), self.phase_updaters)
-            self.phase("kickstarts", ("L07-kickstart-1", "L08-kickstart-2", "L09-kickstart-3"), self.phase_kickstarts)
-            self.phase("reboot", ("L10-reboot-boot-id-changed", "L12-pre-post-boot-logs"), self.phase_reboot, fatal=True)
+            if self.battery:
+                self.phase("updaters", ("L05-updater-1-noop", "L06-updater-2-noop"), self.phase_updaters)
+                self.phase("kickstarts", ("L07-kickstart-1", "L08-kickstart-2", "L09-kickstart-3"), self.phase_kickstarts)
+                self.phase("reboot", ("L10-reboot-boot-id-changed", "L12-pre-post-boot-logs"), self.phase_reboot, fatal=True)
             self.phase("steady", (), self.phase_steady)
             self.phase("final", ("L11-stop-rollback",), self.phase_final)
         except Fatal as error:
@@ -1053,7 +1328,8 @@ class Lab:
             self.say(f"STOPPED EARLY: {error}")
             self.event("stopped_early", detail={"error": str(error)})
         finally:
-            for check_id in REQUIRED_LIVE_IDS:
+            self.stop_scoreboard()
+            for check_id in self.required_ids:
                 if check_id not in self.recorded:
                     self.check(check_id, "not reached", "FAIL", "the run stopped before this check could be made")
             try:

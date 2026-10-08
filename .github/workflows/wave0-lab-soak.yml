@@ -16,6 +16,10 @@ name: Wave 0 lab - Stage B (soak in a nested KVM VM, throwaway branch)
 #   launcher_source "artifact"  -> rehearsal on the Stage A handoff artifact bytes (pre-G0)
 #   launcher_source "published" -> the real Wave 0: canary-consume.sh --tag v0.7.12 --expect-sha256 <digest>
 #   profile "smoke" | "full"    -> a ~40 minute machinery check | Astra's thresholds (<= 350 minutes)
+#   profile "resources"         -> the ARC-83 supplement (Astra's decision of 2026-10-08T13:19Z): no battery, no reboot; a
+#                                  >= 135 minute quiet window on the 4096 MiB VM with per-sample RSS/memory/swap/disk series,
+#                                  a 5-second local heartbeat poll, public scoreboard reads every 30 s, a kernel OOM scan of
+#                                  the whole run, bound by digest to Wave 0 run 37750760170 (about 3 hours in total)
 #
 # Live network: ALLOWED for this nested VM only (config stage_b.live_network, with the recorded authorization:
 # one stake-0 test node, compute off, in a separate clean environment). The v0.7.7 baseline and the interrupted
@@ -27,10 +31,6 @@ on:
 permissions:
   contents: read
   actions: read
-
-concurrency:
-  group: wave0-lab-stage-b
-  cancel-in-progress: false
 
 jobs:
   guard:
@@ -64,6 +64,11 @@ jobs:
     name: "Stage B: Wave 0 soak in a nested KVM VM (stranded v0.7.11 headless -> v0.7.12)"
     needs: guard
     if: needs.guard.outputs.stage_b == 'true'
+    # One live lab node at a time (ARC-83 scoped a single node): only the soak job takes the lock, so a guard-only push
+    # never queues behind a running soak.
+    concurrency:
+      group: wave0-lab-stage-b
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:

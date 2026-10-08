@@ -97,9 +97,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertLessEqual(gate["timeout-minutes"], 30, "a hung apt must not hold the Stage B concurrency group for hours")
 
     def test_independent_concurrency_groups(self):
-        self.assertNotEqual(load(A)["concurrency"]["group"], load(B)["concurrency"]["group"])
-        for path in (A, B):
-            self.assertFalse(load(path)["concurrency"]["cancel-in-progress"])
+        soak = load(B)["jobs"]["stage-b"]["concurrency"]
+        self.assertNotEqual(load(A)["concurrency"]["group"], soak["group"])
+        self.assertFalse(load(A)["concurrency"]["cancel-in-progress"])
+        self.assertFalse(soak["cancel-in-progress"])
+        self.assertNotIn("concurrency", load(B), "the soak lock is job-level so guard-only pushes never queue behind a running soak")
+        self.assertNotIn("concurrency", load(B)["jobs"]["guard"])
 
     def test_stage_a_summary_needs_every_stage_a_leg(self):
         jobs = load(A)["jobs"]

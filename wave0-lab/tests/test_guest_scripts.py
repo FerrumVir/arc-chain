@@ -14,6 +14,7 @@ from unittest import mock
 
 import _paths  # noqa: F401
 import capture_state
+import heartbeat_poller
 import invariants
 import probe
 import sampler
@@ -214,6 +215,11 @@ class ProbeContractTests(unittest.TestCase):
         "health_ok", "chain_participation_enabled", "info_ok", "address", "stake", "node_version", "bridge_node_address", "bridge_compute",
         "compute_consent", "community_registration", "public_name", "coordinators_total", "coordinators_registered", "version_txt", "launcher_sha256",
         "updater_timer_active", "legacy_fingerprint", "legacy_byte_compare", "errors",
+        # resource series and registration continuity (ARC-83 D and E)
+        "last_registration_unix_ms", "registration_age_s", "node_rss_kb", "node_hwm_kb", "node_swap_kb", "node_threads", "node_fds", "node_cpu_s",
+        "mem_total_kb", "mem_available_kb", "swap_total_kb", "swap_free_kb", "cg_mem_current_b", "cg_mem_peak_b", "cg_swap_current_b",
+        "disk_total_b", "disk_free_b", "log_bytes", "bridge_downloads", "arc_dir_bytes", "largest_file_bytes", "legacy_data_bytes",
+        "node_data_bytes", "release_cache_bytes", "release_cache_files", "models_bytes", "partial_files",
     }
 
     def test_a_sample_has_exactly_the_contract_keys_and_never_raises(self):
@@ -306,6 +312,115 @@ class ProbeContractTests(unittest.TestCase):
         with mock.patch.object(probe, "read_text", return_value=text_b):
             second = invariants.unit_hashes("community-bbb")
         self.assertEqual(first, second)
+
+    MEMINFO = (
+        "MemTotal:        3921412 kB\nMemFree:         3401000 kB\nMemAvailable:    3500123 kB\nBuffers:           10000 kB\n"
+        "SwapTotal:       2097148 kB\nSwapFree:        2097100 kB\n"
+    )
+    STATUS = "Name:\tarc-node\nVmPeak:\t  900000 kB\nVmHWM:\t   52000 kB\nVmRSS:\t   41232 kB\nVmSwap:\t      48 kB\nThreads:\t17\n"
+
+    def test_resource_fields_parse_the_real_proc_formats(self):
+        def fake_read(path):
+            if path == "/proc/meminfo":
+                return self.MEMINFO
+            if path == "/proc/4242/status":
+                return self.STATUS
+            return None
+
+        with mock.patch.object(probe, "read_text", side_effect=fake_read), mock.patch.object(probe, "count_fds", return_value=33), \
+                mock.patch.object(probe, "cpu_seconds", return_value=12.5), mock.patch.object(probe, "cgroup_dir", return_value=None):
+            with tempfile.TemporaryDirectory() as tmp:
+                fields = probe.resource_fields(tmp, 4242)
+        self.assertEqual((fields["mem_total_kb"], fields["mem_available_kb"], fields["swap_total_kb"], fields["swap_free_kb"]), (3921412, 3500123, 2097148, 2097100))
+        self.assertEqual((fields["node_rss_kb"], fields["node_hwm_kb"], fields["node_swap_kb"], fields["node_threads"], fields["node_fds"], fields["node_cpu_s"]), (41232, 52000, 48, 17, 33, 12.5))
+        self.assertGreater(fields["disk_total_b"], fields["disk_free_b"] - 1)
+
+    def test_cgroup_counters_come_from_the_units_cgroup_v2_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            group = Path(tmp)
+            (group / "memory.current").write_text("12345678\n")
+            (group / "memory.peak").write_text("44666666\n")
+            (group / "memory.swap.current").write_text("0\n")
+            with mock.patch.object(probe, "cgroup_dir", return_value=str(group)):
+                fields = probe.resource_fields(tmp, 1)
+        self.assertEqual((fields["cg_mem_current_b"], fields["cg_mem_peak_b"], fields["cg_swap_current_b"]), (12345678, 44666666, 0))
+        self.assertEqual(probe.parse_kb(self.MEMINFO, "MemAvailable"), 3500123)
+        self.assertIsNone(probe.parse_kb(self.MEMINFO, "Nope"))
+        self.assertIsNone(probe.parse_kb(None, "MemTotal"))
+
+    def test_oom_scan_counts_only_oom_lines_in_every_boot(self):
+        import oom_scan
+
+        outputs = {
+            ("--list-boots",): " -1 abc Thu 2026-10-08 08:35:40 UTC Thu 2026-10-08 08:54:04 UTC\n  0 def Thu 2026-10-08 08:54:19 UTC Thu 2026-10-08 12:45:41 UTC\n",
+            ("-k", "-b", "-1", "-o", "short-iso"): "2026-10-08T08:40:00+0000 kernel: Out of memory: Killed process 99 (x)\n2026-10-08T08:41:00+0000 kernel: normal line\n",
+            ("-k", "-b", "0", "-o", "short-iso"): "-- No entries --\n2026-10-08T09:00:00+0000 kernel: normal\n",
+        }
+        with mock.patch.object(oom_scan, "journal", side_effect=lambda args: outputs[tuple(args)]):
+            self.assertEqual(oom_scan.boot_indexes(), [-1, 0])
+            scans = [oom_scan.scan_boot(i) for i in oom_scan.boot_indexes()]
+        self.assertEqual([scan["count"] for scan in scans], [1, 0])
+        self.assertEqual(scans[0]["boot"], -1)
+        self.assertEqual(scans[1]["kernel_lines"], 1, "the '-- No entries --' marker is not a kernel line")
+
+    def test_registration_age_is_the_sample_time_minus_the_last_successful_round(self):
+        status = {"public_name": "node-abcd1234", "coordinators_total": 6, "coordinators_registered": 5, "last_registration_unix_ms": 1_800_000_000_000}
+
+        def fake_http(path, timeout=3.0):
+            return (True, status) if path == "/community/worker/status" else (False, None)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(probe, "http_json", side_effect=fake_http), \
+                mock.patch.object(probe.time, "time", return_value=1_800_000_012.25):
+            sample = probe.sample_once(tmp, 3)
+        self.assertEqual(sample["last_registration_unix_ms"], 1_800_000_000_000)
+        self.assertEqual(sample["registration_age_s"], 12.25)
+
+    def test_registration_age_is_null_when_the_node_reports_no_round_yet(self):
+        for status in ({"coordinators_registered": 0}, {"last_registration_unix_ms": None}, {"last_registration_unix_ms": "soon"}, {"last_registration_unix_ms": True}):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(probe, "http_json", side_effect=lambda path, timeout=3.0, s=status: (True, s) if path == "/community/worker/status" else (False, None)):
+                sample = probe.sample_once(tmp, 3)
+            self.assertIsNone(sample["last_registration_unix_ms"])
+            self.assertIsNone(sample["registration_age_s"])
+
+    def test_heartbeat_poll_records_the_node_timestamp_and_every_failure(self):
+        good = {"coordinators_registered": 6, "coordinators_total": 6, "last_registration_unix_ms": 1_800_000_015_000}
+        with mock.patch.object(probe, "http_json", return_value=(True, good)):
+            record = heartbeat_poller.poll_once()
+        self.assertEqual((record["ts_ms"], record["registered"], record["total"]), (1_800_000_015_000, 6, 6))
+        self.assertIsInstance(record["obs_epoch"], float)
+        for answer in ((False, None), (True, None), (True, [1, 2]), (True, {"last_registration_unix_ms": "x"})):
+            with self.subTest(answer=answer), mock.patch.object(probe, "http_json", return_value=answer):
+                record = heartbeat_poller.poll_once()
+            self.assertIsNone(record["ts_ms"], "a failed poll is still a line, with no timestamp")
+            self.assertIn("obs_epoch", record)
+
+    def test_heartbeat_poller_writes_one_line_per_poll_and_survives_a_crashing_poll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "sub" / "heartbeats.jsonl"
+            calls = {"n": 0}
+
+            def flaky(path, timeout=3.0):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise RuntimeError("boom")
+                return True, {"coordinators_registered": 6, "coordinators_total": 6, "last_registration_unix_ms": 1_800_000_000_000 + calls["n"] * 15_000}
+
+            with mock.patch.object(probe, "http_json", side_effect=flaky), \
+                    mock.patch.object(sys, "argv", ["heartbeat_poller.py", "--out", str(out), "--interval", "0.01", "--max-polls", "4"]):
+                self.assertEqual(heartbeat_poller.main(), 0)
+            lines = [json.loads(line) for line in out.read_text().splitlines()]
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(lines[1]["error"], "RuntimeError")
+        self.assertIsNone(lines[1]["ts_ms"])
+        self.assertEqual([line["ts_ms"] for line in lines if line["ts_ms"]], [1_800_000_015_000, 1_800_000_045_000, 1_800_000_060_000])
+
+    def test_the_heartbeat_poller_is_a_unit_polling_every_five_seconds_and_is_collected(self):
+        units = (GUEST / "install-units.sh").read_text()
+        self.assertIn("arc-w0-heartbeat.service", units)
+        self.assertIn("heartbeat_poller.py --out /var/lib/arc-w0/heartbeats.jsonl --interval 5", units)
+        self.assertIn("enable --now arc-w0-heartbeat.service", units)
+        self.assertIn('"$work"/heartbeats.jsonl', (GUEST / "collect.sh").read_text())
 
     def test_count_nodes_prints_a_single_integer(self):
         with tempfile.TemporaryDirectory() as tmp:

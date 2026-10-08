@@ -20,19 +20,19 @@ mkdir -p "$out/logs" "$out/units" "$out/state"
 sudo iptables -S > "$out/state/iptables-rules.txt" 2>&1
 # shellcheck disable=SC2024
 sudo iptables -nvxL INPUT > "$out/state/iptables-input-counters.txt" 2>&1
-systemctl status arc-node arc-updater.service arc-updater.timer arc-w0-sampler arc-w0-live-block --no-pager -l > "$out/state/systemctl-status.txt" 2>&1
+systemctl status arc-node arc-updater.service arc-updater.timer arc-w0-sampler arc-w0-heartbeat arc-w0-live-block --no-pager -l > "$out/state/systemctl-status.txt" 2>&1
 systemctl show arc-node -p ActiveState -p SubState -p MainPID -p NRestarts -p ActiveEnterTimestamp -p ExecMainStartTimestamp > "$out/state/arc-node-properties.txt" 2>&1
 # shellcheck disable=SC2024
-sudo journalctl -b 0 --no-pager -o short-iso -u arc-node -u arc-updater.service -u arc-updater.timer -u arc-w0-sampler -u arc-w0-live-block > "$out/logs/journal-current-boot.txt" 2>&1
+sudo journalctl -b 0 --no-pager -o short-iso -u arc-node -u arc-updater.service -u arc-updater.timer -u arc-w0-sampler -u arc-w0-heartbeat -u arc-w0-live-block > "$out/logs/journal-current-boot.txt" 2>&1
 # shellcheck disable=SC2024
-sudo journalctl -b -1 --no-pager -o short-iso -u arc-node -u arc-updater.service -u arc-updater.timer -u arc-w0-sampler -u arc-w0-live-block > "$out/logs/journal-previous-boot.txt" 2>&1
+sudo journalctl -b -1 --no-pager -o short-iso -u arc-node -u arc-updater.service -u arc-updater.timer -u arc-w0-sampler -u arc-w0-heartbeat -u arc-w0-live-block > "$out/logs/journal-previous-boot.txt" 2>&1
 tail -n 20000 "$arc_dir/node.log" > "$out/logs/node.log.tail" 2>&1
 cp "$arc_dir/auto-update.log" "$out/logs/auto-update.log" 2>&1
 cp "$arc_dir/version.txt" "$out/state/version.txt" 2>&1
 cp "$arc_dir/legacy-bridge/bridge.log" "$out/logs/bridge.log" 2>&1
 find "$arc_dir/legacy-bridge" -maxdepth 4 -printf '%M %u %s %p\n' > "$out/state/legacy-bridge.tree" 2>&1
 find "$arc_dir/legacy-bridge" -maxdepth 3 \( -name 'bridge-state.json' -o -name 'compute-consent' -o -name 'v0.7-data-archive-*.json' \) -exec cp --parents {} "$out/state/" \; 2>/dev/null
-for f in "$work"/samples.jsonl "$work"/before-snapshot.json "$work"/invariants-*.json "$work"/state-*.json "$work"/journal-*.txt "$work"/node-log-*.txt "$work"/bridge-log-*.txt "$work"/watch.log; do
+for f in "$work"/samples.jsonl "$work"/heartbeats.jsonl "$work"/before-snapshot.json "$work"/invariants-*.json "$work"/state-*.json "$work"/journal-*.txt "$work"/node-log-*.txt "$work"/bridge-log-*.txt "$work"/watch.log; do
     [ -f "$f" ] && cp "$f" "$out/state/" 2>/dev/null
 done
 mkdir -p "$out/snapshots" "$out/baseline"

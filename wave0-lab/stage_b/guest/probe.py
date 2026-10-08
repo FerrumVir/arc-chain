@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import re
+import stat as stat_module
 import subprocess
 import time
 import urllib.error
@@ -22,6 +23,9 @@ from pathlib import Path
 RPC = "http://127.0.0.1:9944"
 SNAPSHOT_TOOL = os.environ.get("ARC_W0_SNAPSHOT_TOOL", "/opt/arc-w0/tests/legacy-bridge/snapshot_tree.py")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+# An unfinished DOWNLOAD (the launcher's resume file is `<asset>.partial`). The node's own atomic-write temp files (`.tmp`,
+# `.new`) exist for milliseconds and are not downloads, so they are not counted.
+PARTIAL_SUFFIXES = (".partial", ".part", ".download", ".crdownload")
 
 
 def read_text(path: str) -> str | None:
@@ -203,10 +207,152 @@ def bridge_state(arc_dir: str) -> tuple[dict | None, str | None]:
         return None, node_dir
 
 
+# ---- resource series (ARC-83 criteria E and D): RSS, memory, swap, disk, data/cache/log bytes, registration continuity ----
+
+def parse_kb(text: str | None, name: str) -> int | None:
+    """`Name:   12345 kB` from /proc/<pid>/status or /proc/meminfo."""
+    if not text:
+        return None
+    match = re.search(r"^" + re.escape(name) + r":\s+(\d+)\s*kB\s*$", text, re.MULTILINE)
+    return int(match.group(1)) if match else None
+
+
+def read_int_file(path: str) -> int | None:
+    text = read_text(path)
+    try:
+        return int(text.strip()) if text and text.strip().isdigit() else None
+    except ValueError:
+        return None
+
+
+def cgroup_dir(pid: int) -> str | None:
+    """cgroup v2 directory of a process (the line `0::/system.slice/arc-node.service`)."""
+    text = read_text(f"/proc/{pid}/cgroup")
+    if not text:
+        return None
+    for line in text.splitlines():
+        if line.startswith("0::"):
+            return "/sys/fs/cgroup" + line[3:]
+    return None
+
+
+def cpu_seconds(pid: int) -> float | None:
+    stat = read_text(f"/proc/{pid}/stat")
+    if not stat:
+        return None
+    try:
+        fields = stat.rsplit(")", 1)[1].split()
+        return round((int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"), 3)
+    except (IndexError, ValueError):
+        return None
+
+
+def count_fds(pid: int) -> int | None:
+    try:
+        return len(os.listdir(f"/proc/{pid}/fd"))
+    except OSError:
+        return None
+
+
+def tree_stats(arc_dir: str) -> dict:
+    """One walk of the ARC directory: bytes per category, the largest file, partial files. Never raises."""
+    stats = {"arc_dir_bytes": 0, "largest_file_bytes": 0, "legacy_data_bytes": 0, "node_data_bytes": 0,
+             "release_cache_bytes": 0, "release_cache_files": 0, "models_bytes": 0, "partial_files": 0}
+    if not os.path.isdir(arc_dir):
+        return {key: None for key in stats}
+    for current, _dirs, files in os.walk(arc_dir, followlinks=False):
+        relative_dir = os.path.relpath(current, arc_dir)
+        for name in files:
+            try:
+                info = os.lstat(os.path.join(current, name))
+            except OSError:
+                continue
+            if not stat_module.S_ISREG(info.st_mode):
+                continue
+            size = info.st_size
+            parts = ([] if relative_dir == "." else relative_dir.split(os.sep)) + [name]
+            stats["arc_dir_bytes"] += size
+            stats["largest_file_bytes"] = max(stats["largest_file_bytes"], size)
+            if parts[0] == "data":
+                stats["legacy_data_bytes"] += size
+            if parts[:2] == ["legacy-bridge", "nodes"]:
+                stats["node_data_bytes"] += size
+            if parts[:2] == ["legacy-bridge", "releases"]:
+                stats["release_cache_bytes"] += size
+                stats["release_cache_files"] += 1
+            if "models" in parts[:-1] or name.endswith(".gguf"):
+                stats["models_bytes"] += size
+            if name.endswith(PARTIAL_SUFFIXES):
+                stats["partial_files"] += 1
+    return stats
+
+
+def file_size(path: str) -> int:
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return 0
+
+
+def bridge_download_lines(arc_dir: str) -> int | None:
+    text = read_text(os.path.join(arc_dir, "legacy-bridge", "bridge.log"))
+    if text is None:
+        return None
+    return sum(1 for line in text.splitlines() if "downloaded and verified" in line or re.search(r"download of .+ failed", line))
+
+
+def resource_fields(arc_dir: str, pid: int) -> dict:
+    """Every resource field of a sample; None where unavailable. Never raises."""
+    fields: dict = {key: None for key in (
+        "node_rss_kb", "node_hwm_kb", "node_swap_kb", "node_threads", "node_fds", "node_cpu_s",
+        "mem_total_kb", "mem_available_kb", "swap_total_kb", "swap_free_kb",
+        "cg_mem_current_b", "cg_mem_peak_b", "cg_swap_current_b",
+        "disk_total_b", "disk_free_b", "log_bytes", "bridge_downloads",
+    )}
+    try:
+        meminfo = read_text("/proc/meminfo")
+        for key, name in (("mem_total_kb", "MemTotal"), ("mem_available_kb", "MemAvailable"), ("swap_total_kb", "SwapTotal"), ("swap_free_kb", "SwapFree")):
+            fields[key] = parse_kb(meminfo, name)
+        if pid:
+            status = read_text(f"/proc/{pid}/status")
+            fields["node_rss_kb"] = parse_kb(status, "VmRSS")
+            fields["node_hwm_kb"] = parse_kb(status, "VmHWM")
+            fields["node_swap_kb"] = parse_kb(status, "VmSwap")
+            threads = re.search(r"^Threads:\s+(\d+)", status or "", re.MULTILINE)
+            fields["node_threads"] = int(threads.group(1)) if threads else None
+            fields["node_fds"] = count_fds(pid)
+            fields["node_cpu_s"] = cpu_seconds(pid)
+            group = cgroup_dir(pid)
+            if group:
+                fields["cg_mem_current_b"] = read_int_file(os.path.join(group, "memory.current"))
+                fields["cg_mem_peak_b"] = read_int_file(os.path.join(group, "memory.peak"))
+                fields["cg_swap_current_b"] = read_int_file(os.path.join(group, "memory.swap.current"))
+        try:
+            usage = os.statvfs("/")
+            fields["disk_total_b"] = usage.f_frsize * usage.f_blocks
+            fields["disk_free_b"] = usage.f_frsize * usage.f_bavail
+        except OSError:
+            pass
+        fields["log_bytes"] = (
+            file_size(os.path.join(arc_dir, "node.log"))
+            + file_size(os.path.join(arc_dir, "legacy-bridge", "bridge.log"))
+            + file_size(os.path.join(arc_dir, "auto-update.log"))
+        )
+        fields["bridge_downloads"] = bridge_download_lines(arc_dir)
+    except Exception:  # noqa: BLE001 - a probe must never raise
+        pass
+    fields.update(tree_stats(arc_dir))
+    return fields
+
+
 def sample_once(arc_dir: str, seq: int, before_snapshot_json: str | None = None, compare: bool = False) -> dict:
     """One sample with exactly the fields the evaluator reads. Never raises."""
     errors: list[str] = []
     now = time.time()
+    # The node's local registration status is read FIRST, so registration_age_s = epoch - last_registration_unix_ms/1000 is
+    # measured within milliseconds of the sample epoch (a heartbeat landing between the epoch and the read would make it negative).
+    _, community = http_json("/community/worker/status")
+    community = community if isinstance(community, dict) else {}
     unit = systemd_props("arc-node", ["ActiveState", "MainPID", "NRestarts"])
     if not unit:
         errors.append("systemctl show arc-node failed")
@@ -236,11 +382,13 @@ def sample_once(arc_dir: str, seq: int, before_snapshot_json: str | None = None,
     sample["address"] = str(validator).lower().removeprefix("0x") if isinstance(validator, str) else None
     sample["stake"] = info.get("stake") if isinstance(info, dict) else None
     sample["node_version"] = info.get("version") if isinstance(info, dict) else None
-    _, community = http_json("/community/worker/status")
-    community = community if isinstance(community, dict) else {}
     sample["public_name"] = community.get("public_name")
     sample["coordinators_total"] = community.get("coordinators_total")
     sample["coordinators_registered"] = community.get("coordinators_registered")
+    registration_ms = community.get("last_registration_unix_ms")
+    sample["last_registration_unix_ms"] = registration_ms if isinstance(registration_ms, int) and not isinstance(registration_ms, bool) else None
+    # AGE of the last SUCCESSFUL registration/heartbeat round at the moment of this sample (ARC-83 D): null when the node reports none.
+    sample["registration_age_s"] = round(now - sample["last_registration_unix_ms"] / 1000.0, 3) if sample["last_registration_unix_ms"] is not None else None
     state, node_dir = bridge_state(arc_dir)
     state = state or {}
     sample["bridge_node_address"] = state.get("node_address")
@@ -259,5 +407,6 @@ def sample_once(arc_dir: str, seq: int, before_snapshot_json: str | None = None,
     sample["legacy_fingerprint"] = legacy_fingerprint(os.path.join(arc_dir, "data"))
     bridged = bool(sample["node_exe"] and "/legacy-bridge/releases/" in sample["node_exe"])
     sample["legacy_byte_compare"] = byte_compare(before_snapshot_json, os.path.join(arc_dir, "data")) if (compare and bridged and before_snapshot_json) else None
+    sample.update(resource_fields(arc_dir, pid))
     sample["errors"] = errors
     return sample
