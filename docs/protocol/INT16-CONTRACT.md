@@ -172,7 +172,7 @@ an owner-approved new arithmetic contract.
 | INT16 attention, dense, shared, embedding, head | Nonzero maximum `A` must satisfy **2^-17 <= A < 2^30** (BF16 max bits `0x3700..0x4e7f`). Both signs identical. Zero rows accepted separately. | Output rows of each selected projection; embedding/head vocabulary rows. |
 | Attention KV-B key | Same INT16 window, evaluated **after transpose**. | Source `[H*(N+V), C]` → key `[H,C,N]`; row `(h,c)` consists of source `[(h*(N+V)+n),c]` for every n. |
 | Attention KV-B value | Same INT16 window, after key/value split. | `[H,V,C]`, row `(h,v)` is source `[h*(N+V)+N+v,:]`. |
-| INT8-selected or legacy matrices | Existing nonzero window **2^-25 <= A < 2^22**; unchanged. | Same semantic rows. A valid INT8 row may reject at INT16. |
+| INT8-selected or legacy matrices | Existing nonzero window **127*2^-32 <= A < 127*2^15**; unchanged (BF16 maximum bits `0x32fe..0x4a7d`). | Same semantic rows. A valid INT8 row may reject at INT16. |
 | Router (already INT16) | Independent power-of-two scale: nonzero maximum **2^-48 <= A < 2^15**, shift `0..62`, ties away from zero; no dyadic-matrix window. | One routed expert per row. All-zero row q=0,k=16. |
 | Norm gains (already I64 Q16) | Per-value finite BF16, **abs(w) < 2^46**; round `w*2^16` half away from zero. Values below 2^-17 round to zero by the pre-existing Q16 rule, including subnormals. | Per scalar, not matrix row maximum. This is disclosed fixed-point rounding, not a new whole-row flush policy. |
 | Routing bias (I64 Q32) / native INT4 experts and BF16 group scales | Existing arithmetic / packed payloads unchanged; no matrix-policy override. | No new row admission rule. |
