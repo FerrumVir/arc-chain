@@ -1,0 +1,90 @@
+{
+  "schema": "arc.legacy-bridge.pins.v1",
+  "bridge_version": "0.7.12",
+  "repository": "FerrumVir/arc-chain",
+  "node_release": {
+    "tag": "v0.8.11",
+    "version": "0.8.11",
+    "commit": "cd2344138b32a46eea9192cf0fa7344db6481420",
+    "manifest": {
+      "name": "SHA256SUMS",
+      "sha256": "946053d8fe1b5997e8f23ae1e13e48da463317058bb1ff9b407512b9d19721ca",
+      "size": 2737
+    },
+    "manifest_signature": {
+      "name": "SHA256SUMS.sig",
+      "sha256": "06348fa7a5bf33deb04b4b8e487132c1ce8f24763e4624170906c1bdf4fe5b7d",
+      "size": 322
+    },
+    "worker_names_privacy_safe": true,
+    "assets": {
+      "arc-cli-linux-arm64": {
+        "sha256": "a46bc270f5e98d193e1fea1638600bc8d197761fa3653aad9396ffefdf7a657e",
+        "size": 3706968
+      },
+      "arc-cli-linux-x86_64": {
+        "sha256": "71d8f3bdb1449a256de49f539d9bf98f543312611e72b0978e0b2eeb9cf8a3a1",
+        "size": 4622792
+      },
+      "arc-cli-macos-arm64": {
+        "sha256": "52f28ec085f25751282741be85fdfdbd08e3ec09ad958a572c593322374c2baf",
+        "size": 3391152
+      },
+      "arc-cli-macos-x86_64": {
+        "sha256": "de06101571cc4defaef7a9c0fdbbbc001493e8a96604e22bb62eb748080bcf03",
+        "size": 4177040
+      },
+      "arc-cli-windows-x86_64.exe": {
+        "sha256": "ad3e93c38aaa6c4967d4be93ecd2f8328dc2e90eb93c5741f94858ffb4b1be59",
+        "size": 4006912
+      },
+      "arc-node-linux-arm64": {
+        "sha256": "7b7345abef49b8daae57bcc16a32b882c4be5467a1b24926fd7b4e7c3738cfcb",
+        "size": 24972600
+      },
+      "arc-node-linux-x86_64": {
+        "sha256": "54d4d0708ae41d32958110cce9961851911c9b72ca269756cd49dfbc731e061b",
+        "size": 29210392
+      },
+      "arc-node-macos-arm64": {
+        "sha256": "c5a2e1c4683d887688faea5769312cbfc629590f09caafde1703190531829262",
+        "size": 21745072
+      },
+      "arc-node-macos-x86_64": {
+        "sha256": "5073a8614dab70ca11f5020967619ee5960872634a2241f03fc6ee6714da83f6",
+        "size": 26079644
+      },
+      "arc-node-windows-x86_64.exe": {
+        "sha256": "b12470e797a69e90c7d494ab2c97e9e2463dda12526ef7276aa8a6e4f5700c98",
+        "size": 26774528
+      },
+      "genesis.toml": {
+        "sha256": "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269",
+        "size": 2008
+      },
+      "testnet-seeds.txt": {
+        "sha256": "b48c45ef083607d011aefe86ccba939606a782c1800650459b36de2ece80eae1",
+        "size": 1743
+      }
+    }
+  },
+  "manifest_signer": {
+    "principal": "arc-release",
+    "namespace": "arc-release-manifest-v1",
+    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPs2NAiDRXit9EM96A2GdXZgRqvXtl0lvryEAEAEjQfY"
+  },
+  "community_rpc_origins": [
+    "https://149.28.32.76",
+    "https://140.82.16.112",
+    "https://136.244.109.1",
+    "https://104.238.171.11",
+    "https://202.182.107.41",
+    "https://149.28.153.31"
+  ],
+  "model": {
+    "file_name": "llama-2-7b-chat.Q4_K_M.gguf",
+    "sha256": "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa",
+    "size": 4081004224,
+    "url": "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf"
+  }
+}

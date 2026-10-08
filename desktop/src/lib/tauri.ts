@@ -9,6 +9,7 @@ import type {
   BinaryStatus,
   BlockTxs,
   DataMigrationNotice,
+  LegacyComputeQuestion,
   Earnings,
   EarningsProjection,
   FaucetResult,
@@ -2183,9 +2184,12 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             : null,
       } as T;
     }
+    case "load_legacy_compute_question":
+      return null as T;
     case "set_compute_contribution":
     case "promote_consented_install":
     case "set_prevent_sleep_during_jobs":
+    case "answer_legacy_compute_question":
       throw new Error(
         "Compute contribution can only be changed in the ARC desktop app, which owns the node.",
       );
@@ -2993,6 +2997,21 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         preventSleepDuringJobs: config.preventSleepDuringJobs === true,
       } as T;
     }
+    case "load_legacy_compute_question":
+      return null as T;
+    case "answer_legacy_compute_question": {
+      const { contribute } = args as { contribute: boolean };
+      const config = mockConfig ?? DEFAULT_NODE_CONFIG;
+      mockConfig = contribute
+        ? {
+            ...config,
+            computeConsent: true,
+            role: "worker",
+            modelPath: config.modelPath ?? "/mock/.arc/models/standard.gguf",
+          }
+        : { ...config, computeConsent: false, role: "observer" };
+      return mockConfig as T;
+    }
     case "set_compute_contribution": {
       const { enabled } = args as { enabled: boolean };
       const config = mockConfig ?? DEFAULT_NODE_CONFIG;
@@ -3124,6 +3143,12 @@ export const api = {
     invoke<DataMigrationNotice | null>("load_data_migration_notice"),
   dismissDataMigrationNotice: () =>
     invoke<void>("dismiss_data_migration_notice"),
+  /** The first-launch question for an install upgraded from v0.7, if pending. */
+  loadLegacyComputeQuestion: () =>
+    invoke<LegacyComputeQuestion | null>("load_legacy_compute_question"),
+  /** Answer it; recorded exactly like the Settings compute switch. */
+  answerLegacyComputeQuestion: (contribute: boolean) =>
+    invoke<NodeConfig>("answer_legacy_compute_question", { contribute }),
   startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
   stopNode: () => invoke<void>("stop_node"),
   prepareUpdateRelaunch: () => invoke<void>("prepare_update_relaunch"),

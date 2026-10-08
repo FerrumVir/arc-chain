@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# PATH shim used only by the legacy-bridge acceptance test.
+#
+# Released v0.7 scripts hard-code https://api.github.com and
+# https://github.com URLs. This shim answers exactly those FerrumVir/arc-chain
+# release and raw-file URLs from a local fixture directory, so the unmodified
+# v0.7.11 installer and its generated arc-auto-update.sh can be run against a
+# simulated "Latest" release. Every other URL (for example the updater's
+# http://localhost:9944/health check) is passed to the real curl unchanged.
+# The bridge itself does not use curl: it downloads the pinned v0.8 release
+# from the real github.com with its own HTTPS client.
+set -uo pipefail
+
+state="${ARC_FAKE_GITHUB_STATE:?ARC_FAKE_GITHUB_STATE must name the fixture directory}"
+real_curl="${ARC_REAL_CURL:-/usr/bin/curl}"
+repo="FerrumVir/arc-chain"
+
+url=""
+output=""
+args=("$@")
+index=0
+while [ "$index" -lt "${#args[@]}" ]; do
+    arg="${args[$index]}"
+    case "$arg" in
+        -o | --output)
+            index=$((index + 1))
+            output="${args[$index]}"
+            ;;
+        -m | --max-time | --retry | -H | --header | -A | --user-agent | -w | --write-out | --connect-timeout)
+            index=$((index + 1))
+            ;;
+        http://* | https://*)
+            url="$arg"
+            ;;
+    esac
+    index=$((index + 1))
+done
+
+serve() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        printf '404 %s\n' "$url" >> "$state/requests.log"
+        # curl --fail exits 22 on HTTP >= 400 without writing the body.
+        exit 22
+    fi
+    printf '200 %s\n' "$url" >> "$state/requests.log"
+    if [ -n "$output" ]; then
+        cp "$file" "$output"
+    else
+        cat "$file"
+    fi
+    exit 0
+}
+
+case "$url" in
+    "https://api.github.com/repos/$repo/releases/latest")
+        serve "$state/api/releases-latest.json"
+        ;;
+    "https://github.com/$repo/releases/latest/download/"*)
+        serve "$state/releases/$(cat "$state/latest-tag")/${url#"https://github.com/$repo/releases/latest/download/"}"
+        ;;
+    "https://github.com/$repo/releases/download/"*)
+        serve "$state/releases/${url#"https://github.com/$repo/releases/download/"}"
+        ;;
+    "https://raw.githubusercontent.com/$repo/main/"*)
+        serve "$state/raw/main/${url#"https://raw.githubusercontent.com/$repo/main/"}"
+        ;;
+    *)
+        exec "$real_curl" "$@"
+        ;;
+esac
