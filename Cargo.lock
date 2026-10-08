@@ -391,11 +391,13 @@ dependencies = [
  "fancy-regex",
  "hex",
  "libc",
+ "memmap2",
  "rand 0.8.8",
  "rayon",
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "thiserror 2.0.20",
  "tracing",
 ]

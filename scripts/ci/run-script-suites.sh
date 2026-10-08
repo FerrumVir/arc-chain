@@ -49,6 +49,7 @@ run_unittest "arc_conformance: integer reference"        arc_conformance.tests.t
 run_unittest "arc_conformance: M3/M4 llama.cpp compare"  arc_conformance.tests.test_m4_compare
 run_unittest "arc_conformance: model-package manifest"   arc_conformance.tests.test_package_manifest
 run_unittest "arc_conformance: dyadic modern reference"  arc_conformance.tests.test_modern_reference
+run_unittest "arc_conformance: MLA + MoE reference"      arc_conformance.tests.test_mla_moe_reference
 run_unittest "arc_soak: analyzer (verdict/exit-status)"  arc_soak.tests.test_analyze
 run_unittest "arc_soak: growth fitter"                   arc_soak.tests.test_growth
 run_unittest "arc_soak: orchestrator pure helpers"       arc_soak.tests.test_orchestrate
