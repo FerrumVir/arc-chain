@@ -1,0 +1,70 @@
+{
+  "schema": "arc.legacy-bridge.v07-desktop-stores.v1",
+  "about": "store.json exactly as each released v0.6.0..v0.7.11 desktop wrote it. tests/legacy-bridge/check_v07_fixtures.py proves every tag below has this Store and NodeConfig shape and only ever writes dataDir \"~/.arc\"; desktop/src-tauri/src/legacy_upgrade.rs runs each store through the first v0.8 launch.",
+  "tags": ["v0.6.0", "v0.7.0", "v0.7.1", "v0.7.2", "v0.7.3", "v0.7.4", "v0.7.5", "v0.7.6", "v0.7.7", "v0.7.10", "v0.7.11"],
+  "store_fields": ["identity", "config"],
+  "identity_fields": ["address", "publicKey", "seedPhrase", "createdAt"],
+  "node_config_fields": ["role", "modelPath", "rpcPort", "p2pPort", "autoStart", "autoUpdate", "dataDir"],
+  "stores": {
+    "onboarding-worker": {
+      "source": "Onboarding.tsx: a model was downloaded, so role worker with modelPath",
+      "store": {
+        "identity": {
+          "address": "0x00000000000000000000000000000000000000a7",
+          "publicKey": "00000000000000000000000000000000000000000000000000000000000000a7",
+          "seedPhrase": "fixture fixture fixture fixture fixture fixture fixture fixture fixture fixture fixture fixture",
+          "createdAt": 1767225600000
+        },
+        "config": {
+          "role": "worker",
+          "modelPath": "~/.arc/models/llama-2-7b-chat.Q4_K_M.gguf",
+          "rpcPort": 9090,
+          "p2pPort": 9091,
+          "autoStart": true,
+          "autoUpdate": true,
+          "dataDir": "~/.arc"
+        }
+      }
+    },
+    "onboarding-observer": {
+      "source": "Onboarding.tsx: no model, so role observer with modelPath null",
+      "store": {
+        "identity": {
+          "address": "0x00000000000000000000000000000000000000a7",
+          "publicKey": "00000000000000000000000000000000000000000000000000000000000000a7",
+          "seedPhrase": "fixture fixture fixture fixture fixture fixture fixture fixture fixture fixture fixture fixture",
+          "createdAt": 1767225600000
+        },
+        "config": {
+          "role": "observer",
+          "modelPath": null,
+          "rpcPort": 9090,
+          "p2pPort": 9091,
+          "autoStart": true,
+          "autoUpdate": true,
+          "dataDir": "~/.arc"
+        }
+      }
+    },
+    "settings-worker-custom-ports": {
+      "source": "ObserverUpgradeBanner.tsx or Settings.tsx: the stored config spread with a model and other ports",
+      "store": {
+        "identity": {
+          "address": "0x00000000000000000000000000000000000000a7",
+          "publicKey": "00000000000000000000000000000000000000000000000000000000000000a7",
+          "seedPhrase": "fixture fixture fixture fixture fixture fixture fixture fixture fixture fixture fixture fixture",
+          "createdAt": 1767225600000
+        },
+        "config": {
+          "role": "worker",
+          "modelPath": "/Users/ada/.arc/models/llama-2-7b-chat.Q4_K_M.gguf",
+          "rpcPort": 9944,
+          "p2pPort": 9945,
+          "autoStart": false,
+          "autoUpdate": false,
+          "dataDir": "~/.arc"
+        }
+      }
+    }
+  }
+}

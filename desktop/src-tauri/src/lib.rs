@@ -2,6 +2,7 @@ mod auto_update;
 mod commands;
 mod hardware;
 mod identity;
+mod legacy_upgrade;
 mod native_paid;
 mod node_manager;
 mod paths;
@@ -284,6 +285,15 @@ pub fn run() {
                 }
                 _ => Ok(None),
             };
+            // A v0.7 desktop kept `dataDir` at the ~/.arc root itself (v0.7.11
+            // `types.rs` default "~/.arc"); every v0.8 build defaults to a
+            // `data-v3*` child. Read this before the fence below rewrites the
+            // pointer: a v0.7 install whose node never ran has no WAL to fence
+            // and no bridge record, yet must still be asked before it
+            // contributes compute.
+            let config_uses_v07_layout = loaded_store.config.as_ref().is_some_and(|config| {
+                legacy_upgrade::config_uses_v07_layout(config, &paths::home_dir())
+            });
             // A v0.7 desktop stored unbound chain state in the same ~/.arc
             // root as binaries and models. Fence that WAL before deriving the
             // auto-start config: old bytes stay untouched while only the
@@ -293,6 +303,7 @@ pub fn run() {
                 Ok(None) => loaded_store.protect_legacy_v07_data(),
                 Err(error) => Err(error),
             };
+            let migration_created_notice = matches!(migration_result, Ok(Some(_)));
             let (
                 migration_allows_autostart,
                 migration_failure_reason,
@@ -335,6 +346,29 @@ pub fn run() {
                     )
                 }
             };
+            // A v0.7 install that reached this build (normally through the
+            // v0.7 legacy bridge release) is asked once whether to keep
+            // contributing compute. Until it answers, it auto-starts as an
+            // observer without a model: no compute without consent.
+            let startup_hold = legacy_upgrade::hold_at_startup(
+                &mut loaded_store,
+                &resolved,
+                &paths::home_dir(),
+                migration_created_notice,
+                config_uses_v07_layout,
+                legacy_upgrade::now_unix_ms(),
+            );
+            if startup_hold.hold.held {
+                tracing::warn!(
+                    "upgraded from v0.7: compute contribution is held until the user answers the first-launch question"
+                );
+            }
+            if let Some(error) = startup_hold.hold.record_error {
+                tracing::error!(%error, "could not record the v0.7 upgrade compute question; the node is held as an observer anyway");
+            }
+            if let Some(error) = startup_hold.persist_error {
+                tracing::error!(%error, "could not persist the held observer config");
+            }
             let autostart_desired = loaded_store
                 .config
                 .as_ref()
@@ -683,6 +717,8 @@ pub fn run() {
             commands::load_config,
             commands::load_data_migration_notice,
             commands::dismiss_data_migration_notice,
+            legacy_upgrade::load_legacy_compute_question,
+            legacy_upgrade::answer_legacy_compute_question,
             commands::start_node,
             commands::stop_node,
             commands::prepare_update_relaunch,
