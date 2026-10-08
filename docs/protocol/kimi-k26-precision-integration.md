@@ -1,9 +1,10 @@
 # Provisional precision integration into lossless slices
 
 This #168 revision integrates ARC-66 engine commit
-`596a61f6b1ae88e8ad7072e1d514467308ddae22` over the reviewed assembly base
-`b0673684a8c16f83b318fe1a33ab6b33f3dc79df`. **The dependency is provisional and
-unreviewed.** This is offline code/fixture readiness, not independent acceptance,
+`616ba16a60f43b5e70666ca24f5d7f9ce99ab932` over the reviewed slice integration
+`df02231f4f999926e95e13b459ab5f14a5a8302c`. The recorded dependency label remains
+**`provisional/unreviewed`** pending owner acceptance. This new integration
+requires its own independent review. This is offline code/fixture readiness, not acceptance,
 a shipping precision choice, API quality or a real K2.6 result. No weights were
 fetched. #156/#164/#166/#167 are unchanged by this work.
 
@@ -11,9 +12,25 @@ The engine is already part of this repository's crate rather than an external
 Cargo dependency. The integration imports that exact commit's precision module,
 config/layout/model/ops changes, four new engine goldens and arithmetic contract;
 it reconciles the existing streaming converter and prefixed packed-source
-reader. No production Cargo lock change is required. The source engine's
+reader. The precision engine itself adds no Cargo dependency. The source engine's
 arithmetic is unchanged; `INT16-CONTRACT.md` defines conversion, domains,
 rounding, scales and SIMD fallback. Historical evidence keeps its original SHA.
+
+The row-admission updates were imported with provenance-preserving cherry-picks:
+`07a44d7c` → `0788c258`, then `616ba16a` → `b7b2d78b`. The earlier integration
+had already imported the `596a61f6` engine. The new changes add an explicit
+pre-write row-window rejection, tensor/row diagnostics, independent rational
+arithmetic corpus and actual-converter row controls; successful arithmetic and
+fixture identities must remain unchanged. `language_model.` class selection
+and the existing KV-B key transpose/value split remain intact.
+
+Main `b26f973913df34c238c63081d0245657ed2c2826` was merged separately at
+`c550bb1b`. The sole conflict was `.gitattributes`: retain main's legacy-bridge
+fixture `-text` rule together with both K2.6 rules (config/vector JSON and
+retained-source manifest). `Cargo.lock` auto-merges main's legacy-bridge entry
+while retaining the existing inference `memmap2` dependency; no dependency
+upgrade was introduced. #156's later main merge `f0f02dca` was not imported and
+is not treated as independently reviewed.
 
 ## Select policy before bytes exist
 
@@ -82,6 +99,11 @@ Each policy verifies a full bundle, scalar/SIMD tokens/logits/boundaries/root,
 and separately assembled 1/2/4-stage pipelines. Raw package/run/manifest evidence
 is retained. The existing portable workflow executes this on Linux x86-64,
 Linux ARM64 and Windows; local Studio supplies ARM evidence.
+The same slice-workflow matrix also runs the standalone `check_int16.py`,
+the independent arithmetic corpus regeneration and `check_int16_rows.py`, so
+the separate dense/head INT8 fixture and row controls have CI coverage even on
+the branch push. PR workflows supply repository-wide checks after main is
+reconciled. Each CI result must be tied to the new head.
 
 The inherited corruption controls cover alteration, truncation, appended/missing
 bytes, tensor/slice/segment metadata, ordering/coverage, source/config/scope,

@@ -86,7 +86,7 @@ def main():
                     (evidence/label/f'payload-substitution-{kind}.log').write_text(r.stderr)
                 finally:path.write_bytes(saved)
     assert len(set(roots.values()))==3
-    (evidence/'summary.json').write_text(json.dumps({'engine_dependency':'596a61f6b1ae88e8ad7072e1d514467308ddae22','dependency_review':'provisional/unreviewed','scope':'synthetic fixtures only; no quality or precision acceptance','policies':policies,'roots':roots,'native_int4_norm_router_bytes_unchanged':True,'commands':commands},indent=2)+'\n')
+    (evidence/'summary.json').write_text(json.dumps({'engine_dependency':'616ba16a60f43b5e70666ca24f5d7f9ce99ab932','dependency_review':'provisional/unreviewed','scope':'synthetic fixtures only; no quality or precision acceptance','policies':policies,'roots':roots,'native_int4_norm_router_bytes_unchanged':True,'commands':commands},indent=2)+'\n')
     print('PASS: legacy/all-INT16/mixed slice conversion, byte verification and engine consumption')
 
 

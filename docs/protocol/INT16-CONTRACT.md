@@ -97,13 +97,18 @@ The CLI accepts `convert --precision policy.json`; omitted precision preserves
 legacy behavior. Bad schema and missing/option-as-value precision flags reject
 before package creation. The offline script builds deterministic tiny BF16
 weights (4 layers, dense0 then MoE1–3, width64, vocab300), converts legacy,
-all-INT16-BF16 and mixed policies, verifies manifests and compares scalar/SIMD
+all-INT16-BF16 and mixed policies (attention/shared/embedding INT16,
+dense/head INT8), verifies manifests and compares scalar/SIMD
 and four separately converted stage packages. It retains exact commands, raw
 runs, generated source, packages and OS-specific peak-RSS/time logs. Process
 wall includes startup; internal prefill/decode timing is separately available.
 Fresh process per operation; filesystem caches may be warm; one Rayon thread.
 Windows retains golden/unit coverage; OS peak RSS is unavailable in this script
 on Windows and is reported null rather than estimated.
+
+Every fixture report carries the complete version-1 policy. The packed slice
+integration's mixed fixture instead uses attention/dense/head INT16 and
+embedding/shared INT8; a bare "mixed" label does not identify either policy.
 
 `reference/int16-fixture-goldens.json` pins package, generation and model-root
 identities for a dense-only fixture and three dense+MoE fixtures (including

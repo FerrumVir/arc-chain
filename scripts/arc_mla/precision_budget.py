@@ -62,7 +62,7 @@ def budget():
                 reference_fp32_parameters_bytes=reference_fp32,reference_largest_fp32_tensor_scratch_bytes=reference_transient,
                 engine_resident_planning_bytes=engine_ram,reference_resident_planning_bytes=reference_ram,
                 sequential_available_ram_planning_bytes=max(conversion_scratch+transpose_scratch+3*GIB,engine_ram,reference_ram)))
-    return dict(engine_dependency='596a61f6b1ae88e8ad7072e1d514467308ddae22',dependency_review='provisional/unreviewed',
+    return dict(engine_dependency='616ba16a60f43b5e70666ca24f5d7f9ce99ab932',dependency_review='provisional/unreviewed',
         pins={p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in (config_path,source_path)},
         assumptions=['Calculated bytes, not measured disk/RSS. No host admission.',
         'INT16 nonzero rows require 2^-17 <= max(abs(w)) < 2^30 after semantic transpose. All-zero rows are supported. Count zero, below-range, in-range, at/above-range and nonfinite rows per tensor/class from retained BF16 before first real-tensor conversion. No flush rule is approved.',
