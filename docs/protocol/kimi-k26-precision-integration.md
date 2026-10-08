@@ -195,6 +195,11 @@ counts are zero. Stop on unsupported/nonfinite rows and take any proposed flush
 or other conversion-rule change to the owner before conversion proceeds. No
 such real-row census or flush decision is supplied by the synthetic fixtures.
 
+The [read-only BF16 census](bf16-row-census.md) now provides the retained-source
+scan and synthetic converter/count controls. Its report distinguishes selected
+INT8 and INT16 windows and native tensors; it is not admission approval. The
+independent INT16/YaRN forward-execution oracle remains separate work.
+
 After a later explicit admission, the existing one-layer commands in
 `kimi-k26-yarn-assembly.md` must add `--keep-source` to streaming and the same
 `--precision POLICY.json` to streaming and assembly, using fresh directories.

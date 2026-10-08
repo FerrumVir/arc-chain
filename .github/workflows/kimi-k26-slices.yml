@@ -75,6 +75,8 @@ on:
       - 'scripts/arc_mla/check_precision_slices.py'
       - 'scripts/arc_mla/check_int16.py'
       - 'scripts/arc_mla/check_int16_rows.py'
+      - 'scripts/arc_mla/bf16_row_census.py'
+      - 'scripts/arc_mla/check_bf16_row_census.py'
       - 'scripts/arc_mla/int16_oracle.py'
       - 'scripts/arc_mla/precision_budget.py'
       - 'scripts/arc_mla/make_tiny_kimi_packed.py'
@@ -184,6 +186,13 @@ jobs:
           python scripts/arc_mla/int16_oracle.py docs/protocol/reference/int16-row-oracle.json --check
           python scripts/arc_mla/check_int16.py "$PWD/$bin" "$RUNNER_TEMP/evidence/int16" --build-label release
           python scripts/arc_mla/check_int16_rows.py "$PWD/$bin" "$RUNNER_TEMP/evidence/int16-rows"
+      - name: Read-only BF16 row census (synthetic converter controls only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=./target/release/arc-mla
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          python scripts/arc_mla/check_bf16_row_census.py "$PWD/$bin" "$RUNNER_TEMP/evidence/row-census"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
