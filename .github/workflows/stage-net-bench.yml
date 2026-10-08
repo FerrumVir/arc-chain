@@ -1,0 +1,74 @@
+name: Stage network bench (ENG-9)
+
+# Measured per-hop latency for pipeline-sharded inference: stage-to-stage
+# transport, exact activation codec, compute/transfer overlap and the WAN
+# simulation (10/30/60 ms hop RTT, ±1 ms jitter, 50 Mb/s uplink), on a
+# synthetic integer model. Every networked run is checked bit for bit against
+# a transport-free reference; the job fails on any mismatch. The tables land
+# in the job summary and the JSON/Markdown as an artifact.
+#
+# Loopback only: nothing here contacts a node, a seed or any network service.
+# The unit tests for the module run in ci.yml's test job with the rest of
+# `cargo test --workspace --lib`; this job only builds and runs the bench.
+# Paths keep it off unrelated pull requests (CI capacity is shared with
+# releases).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/arc-inference/src/stage_net/**'
+      - 'integrations/arc-stage-eng6/**'
+      - 'crates/arc-inference/src/bin/arc_wan_bench.rs'
+      - '.github/workflows/stage-net-bench.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: WAN bench (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: stage-net-bench
+      - name: Placement and pinned ARC-68 transport regression tests
+        run: |
+          cargo test --locked -p arc-inference --lib stage_net
+          cargo test --locked --manifest-path integrations/arc-stage-eng6/Cargo.toml
+      - name: Build
+        run: cargo build --release --locked -p arc-inference --bin arc_wan_bench
+      - name: Run
+        run: |
+          ./target/release/arc_wan_bench \
+            --label "CI runner (GitHub ubuntu-latest)" \
+            --model small \
+            --out-json stage-net-bench.json \
+            --out-md stage-net-bench.md
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f stage-net-bench.md ]; then cat stage-net-bench.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: stage-net-bench
+          path: |
+            stage-net-bench.json
+            stage-net-bench.md
+          if-no-files-found: warn
