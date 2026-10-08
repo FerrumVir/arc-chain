@@ -5842,9 +5842,24 @@ mod tests {
         });
         tokio::task::yield_now().await;
         assert!(gate.is_closed());
+        // A second timer completing does not mean the spawned expiry task has
+        // run (both timers can become ready during a scheduler stall). Register
+        // before cancellation so even an immediate expiry cannot be missed.
+        let reopened = gate.changed.notified();
+        tokio::pin!(reopened);
+        reopened.as_mut().enable();
         drain.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+        assert!(drain.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(5), reopened)
+            .await
+            .expect("lease expiry must notify after canceled drain");
         assert!(!gate.is_closed());
+        assert_eq!(
+            gate.active_jobs(),
+            1,
+            "cancellation does not drop active work"
+        );
+        assert!(gate.try_enter().is_some(), "expired lease admits new work");
     }
 
     #[tokio::test]
