@@ -923,6 +923,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     case "reveal_seed_phrase":
       return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
+    case "identity_store_location":
+      return "~/Library/Application Support/network.arc.desktop/store.json" as T;
     case "load_identity":
       return null as T;
     case "complete_onboarding":
@@ -2501,6 +2503,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     case "reveal_seed_phrase":
       return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
+    case "identity_store_location":
+      return "~/Library/Application Support/network.arc.desktop/store.json" as T;
     case "load_identity":
       return null as T;
     case "complete_onboarding":
@@ -3129,6 +3133,8 @@ export const api = {
    * it. See `IdentityPublic` in the Rust types for why.
    */
   revealSeedPhrase: () => invoke<string>("reveal_seed_phrase"),
+  /** Where this computer keeps the store that holds the recovery phrase. */
+  identityStoreLocation: () => invoke<string>("identity_store_location"),
   saveConfig: (config: NodeConfig) => invoke<void>("save_config", { config }),
   /**
    * Onboarding's one save: records the wizard's compute choice (consent,

@@ -58,6 +58,11 @@ export function Settings() {
     queryFn: api.updateInstallPolicy,
     staleTime: Infinity,
   });
+  const identityStoreLocation = useQuery({
+    queryKey: ["identity-store-location"],
+    queryFn: api.identityStoreLocation,
+    staleTime: Infinity,
+  });
   const savedAutoUpdate =
     config?.autoUpdate ?? DEFAULT_NODE_CONFIG.autoUpdate;
   const savedAutoInstallUpdates =
@@ -442,9 +447,22 @@ export function Settings() {
                 <div style={{ color: "var(--warning)", fontWeight: 500, marginBottom: 2 }}>
                   Keep your recovery phrase safe
                 </div>
-                <div style={{ fontSize: "var(--text-sm)", color: "var(--text-secondary)" }}>
-                  The phrase you saw during setup is the only way to restore this identity.
-                  We don't store it.
+                {/* Kept locally by store.rs (store.json in the app data
+                    directory); no network request ever carries it. */}
+                <div
+                  style={{ fontSize: "var(--text-sm)", color: "var(--text-secondary)" }}
+                  data-testid="recovery-phrase-storage"
+                >
+                  The phrase you saw during setup is the only way to restore this
+                  identity on another computer, or here if this app&rsquo;s data is
+                  deleted. This app keeps a copy only on this computer, in{" "}
+                  {identityStoreLocation.data ? (
+                    <code style={{ wordBreak: "break-all" }}>{identityStoreLocation.data}</code>
+                  ) : (
+                    "its private data folder"
+                  )}
+                  , and never sends it to ARC or anywhere else over the network. Keep
+                  your own offline backup.
                 </div>
               </div>
             </div>

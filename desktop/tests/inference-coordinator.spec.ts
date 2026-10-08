@@ -399,7 +399,12 @@ test.describe("Inference - community-first coordinator routing", () => {
     );
 
     const inferencePosts: string[] = [];
-    await page.route("**/inference/run", (route) => {
+    // The network's answer is held until the wait message has been checked.
+    let releaseNetworkAnswer: () => void = () => {};
+    const networkAnswerHeld = new Promise<void>((resolve) => {
+      releaseNetworkAnswer = () => resolve();
+    });
+    await page.route("**/inference/run", async (route) => {
       const url = new URL(route.request().url());
       inferencePosts.push(url.href);
       if (url.hostname === "127.0.0.1") {
@@ -409,6 +414,7 @@ test.describe("Inference - community-first coordinator routing", () => {
           body: JSON.stringify({ error: "No model loaded" }),
         });
       }
+      await networkAnswerHeld;
       return route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -447,6 +453,18 @@ test.describe("Inference - community-first coordinator routing", () => {
     await page.getByTestId("nav-inference").click();
     await page.getByTestId("inference-prompt").fill("Biggest planet?");
     await page.getByTestId("btn-run-inference").click();
+
+    // ARC-50: when the prompt goes to the network (including when the app
+    // skipped its own node on purpose), the wait message says so and says
+    // it can take minutes, instead of "Your node can't take it".
+    const pending = page.getByTestId("inference-pending");
+    await expect(pending).toContainText("Waiting for the ARC network");
+    await expect(pending).toContainText(
+      "a community worker normally answers it and validators check the answer",
+    );
+    await expect(pending).toContainText("This can take several minutes.");
+    await expect(pending).not.toContainText("can't take it");
+    releaseNetworkAnswer();
 
     await expect(page.getByTestId("inference-output")).toContainText("Jupiter");
     await expect(page.getByTestId("inference-community-worker")).toContainText(

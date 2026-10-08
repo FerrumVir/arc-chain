@@ -87,6 +87,38 @@ mod identity_generation_tests {
         }
     }
 
+    /// Settings says the recovery phrase is kept on this computer, in this
+    /// file. It is: the native store writes it into store.json in the app
+    /// data directory (fixture phrase only).
+    #[test]
+    fn settings_names_the_local_store_that_keeps_the_phrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = saved_identity();
+        let phrase = identity.seed_phrase.clone();
+        let store = Store {
+            identity: Some(identity),
+            config: None,
+            data_migration_notice: None,
+        };
+        store.save_to(dir.path()).unwrap();
+        let written = std::fs::read_to_string(Store::file(dir.path())).unwrap();
+        assert!(written.contains(&phrase));
+
+        let app_data = paths::home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join("network.arc.desktop");
+        let shown = display_location(&Store::file(&app_data));
+        if cfg!(windows) {
+            assert_eq!(shown, app_data.join("store.json").display().to_string());
+        } else {
+            assert_eq!(
+                shown,
+                "~/Library/Application Support/network.arc.desktop/store.json"
+            );
+        }
+    }
+
     #[test]
     fn onboarding_reuses_saved_identity_even_without_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -211,6 +243,29 @@ pub async fn reveal_seed_phrase(state: State<'_, AppState>) -> CmdResult<String>
         .as_ref()
         .map(|i| i.seed_phrase.clone())
         .ok_or_else(|| "no identity on this device".to_string())
+}
+
+/// Where this computer keeps the identity store (`store.json`, which holds
+/// the recovery phrase), so Settings can say exactly where the local copy
+/// lives. Only the path crosses IPC, never the phrase.
+#[tauri::command]
+pub async fn identity_store_location(state: State<'_, AppState>) -> CmdResult<String> {
+    let dir = state.data_dir.lock().await.clone();
+    if dir.as_os_str().is_empty() {
+        return Err("the app data directory is not resolved yet".to_string());
+    }
+    Ok(display_location(&crate::store::Store::file(&dir)))
+}
+
+/// A path for on-screen copy. Outside Windows the home directory is shown as
+/// `~`, so a screenshot of Settings does not carry the account name.
+fn display_location(path: &std::path::Path) -> String {
+    if !cfg!(windows) {
+        if let Ok(relative) = path.strip_prefix(paths::home_dir()) {
+            return format!("~/{}", relative.display());
+        }
+    }
+    path.display().to_string()
 }
 
 /// A preference save from Settings: ports, update and start flags.
@@ -436,7 +491,15 @@ async fn start_node_transaction(
     state: &AppState,
     start_after_recovery: bool,
 ) -> Result<(), StartupFailure> {
-    require_data_migration_ready(state).await?;
+    if start_after_recovery {
+        require_data_migration_ready(state).await?;
+    } else {
+        // The recovery-only transaction is run by startup reconciliation
+        // itself (`recover_managed_shutdown_inner`), while the gate still
+        // holds the placeholder that keeps every other start waiting for it.
+        let reason = state.data_migration_error.lock().await.clone();
+        startup_recovery_gate(reason.as_deref())?;
+    }
     let (config, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
         let config = store.config.clone().unwrap_or_default();
@@ -556,6 +619,13 @@ pub(crate) async fn autostart_node_inner(
     start_node_transaction(app, state, true).await
 }
 
+/// Startup reconciliation's own durability recovery: launch the exact
+/// receipt-bound node once, let it replay its WAL and acknowledge a clean
+/// shutdown, then return. `lib.rs` runs this while it still holds
+/// `STARTUP_RECONCILIATION_IN_PROGRESS` in the migration gate, which keeps
+/// WebView Start, Ensure and Update out until recovery is done. That
+/// placeholder used to refuse this recovery too, so a relaunch after a node
+/// that died without its ACK never started again (ARC-50 checklist 1.12).
 pub(crate) async fn recover_managed_shutdown_inner(
     app: &AppHandle,
     state: &AppState,
@@ -565,12 +635,27 @@ pub(crate) async fn recover_managed_shutdown_inner(
         .map_err(|failure| failure.to_string())
 }
 
+/// What `lib.rs` holds in `AppState::data_migration_error` while startup
+/// reconciliation runs. Start, auto-start, Ensure and Update are refused
+/// while it is set; startup's own recovery is not (`startup_recovery_gate`).
+pub(crate) const STARTUP_RECONCILIATION_IN_PROGRESS: &str = "managed-node startup reconciliation is still in progress; binary replacement and node start are temporarily blocked";
+
 fn data_migration_start_gate(reason: Option<&str>) -> Result<(), String> {
     match reason {
         None => Ok(()),
         Some(reason) => Err(format!(
             "ARC refused to start the node because chain-data migration is not safely resolved: {reason}. Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory."
         )),
+    }
+}
+
+/// The gate for `recover_managed_shutdown_inner`: it passes the startup
+/// placeholder that exists to wait for it, and nothing else. A real
+/// migration failure still refuses recovery like any other start.
+fn startup_recovery_gate(reason: Option<&str>) -> Result<(), String> {
+    match reason {
+        Some(STARTUP_RECONCILIATION_IN_PROGRESS) => Ok(()),
+        other => data_migration_start_gate(other),
     }
 }
 
@@ -5798,6 +5883,51 @@ mod release_binary_tests {
         assert!(error.contains("refused to start"));
         assert!(error.contains("migration is not safely resolved"));
         assert!(error.contains("preserved legacy directory"));
+    }
+
+    /// ARC-50 checklist 1.12: quit, reopen a second later, and the node
+    /// never started. Startup found the old node's unacknowledged shutdown,
+    /// ran its durability recovery, and that recovery was refused by the
+    /// "reconciliation in progress" placeholder startup itself had set.
+    #[test]
+    fn startup_durability_recovery_passes_its_own_reconciliation_placeholder() {
+        let placeholder = Some(STARTUP_RECONCILIATION_IN_PROGRESS);
+        // WebView Start, auto-start, Ensure and Update still wait for it.
+        assert!(data_migration_start_gate(placeholder).is_err());
+        // The recovery it waits for does not.
+        assert!(startup_recovery_gate(placeholder).is_ok());
+        assert!(startup_recovery_gate(None).is_ok());
+        // A real migration failure still refuses recovery and every start.
+        let failure = Some("legacy-data migration preflight failed: test fixture");
+        assert!(startup_recovery_gate(failure).is_err());
+        assert!(data_migration_start_gate(failure).is_err());
+    }
+
+    #[test]
+    fn only_the_recovery_only_transaction_uses_the_startup_recovery_gate() {
+        let source = include_str!("commands.rs");
+        let transaction = source_between(
+            source,
+            "async fn start_node_transaction(",
+            "let (config, mut recovery_phrase, persisted_address)",
+        );
+        let start_gate = transaction
+            .find("if start_after_recovery {\n        require_data_migration_ready(state).await?;")
+            .expect("Start and auto-start keep the full migration gate");
+        let recovery_gate = transaction
+            .find("startup_recovery_gate(reason.as_deref())?;")
+            .expect("the recovery-only transaction uses the startup recovery gate");
+        assert!(start_gate < recovery_gate);
+        let recovery = source_between(
+            source,
+            "pub(crate) async fn recover_managed_shutdown_inner(",
+            "pub(crate) const STARTUP_RECONCILIATION_IN_PROGRESS",
+        );
+        assert!(recovery.contains("start_node_transaction(app, state, false)"));
+        // lib.rs must hold exactly the placeholder the recovery gate expects.
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("commands::STARTUP_RECONCILIATION_IN_PROGRESS"));
+        assert!(!lib.contains("\"managed-node startup reconciliation is still in progress"));
     }
 
     #[test]

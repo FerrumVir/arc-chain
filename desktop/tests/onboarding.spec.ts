@@ -31,11 +31,35 @@ test.describe("Onboarding wizard", () => {
     // Model picker. Added in v0.6.0 - this spec previously jumped straight
     // to launch and stalled here.
     await expect(page.getByTestId("step-model")).toBeVisible();
-    // The recommended tier is pre-selected, so the user can keep clicking
-    // through without choosing anything - Continue is enabled on arrival.
+    // ARC-50 checklist 1.5: nothing opts in by default. Observer mode is
+    // pre-selected (Continue is enabled on arrival), and what contributing
+    // shares, its power use and keep-awake are explained before any choice.
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("compute-choice-default")).toContainText(
+      "Contributing compute is off until you select the ARC model.",
+    );
+    const disclosure = page.getByTestId("contribution-disclosure");
+    await expect(disclosure).toBeVisible();
+    const shared = disclosure.getByTestId("disclosure-shared");
+    await expect(shared).toContainText("a public label made from that address");
+    await expect(shared).toContainText("your operating system and processor type");
+    await expect(shared).toContainText("it receives the prompt and sends back the generated text");
+    const power = disclosure.getByTestId("disclosure-power");
+    await expect(power).toContainText("every processor core");
+    await expect(power).toContainText("battery drain");
+    await expect(power).toContainText("after you log in while Start node on app launch is on");
+    const keepAwake = disclosure.getByTestId("disclosure-keep-awake");
+    await expect(keepAwake).toContainText("Off unless you turn it on in Settings.");
+    await expect(keepAwake).toContainText("only while a job is computing");
+    await expect(keepAwake).toContainText("applies the next time the node starts");
     await expect(page.getByTestId("btn-continue-model")).toBeEnabled();
-    // Opting out is still available and keeps Continue usable.
+    // Selecting the model is the explicit opt-in; Skip takes it back.
+    await page.getByTestId("tier-standard").click();
+    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "false");
     await page.getByTestId("tier-skip").click();
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByTestId("btn-continue-model")).toBeEnabled();
     await page.getByTestId("btn-continue-model").click();
 
@@ -140,7 +164,8 @@ test.describe("Onboarding wizard", () => {
     await page.getByTestId("btn-continue-welcome").click();
     await page.getByTestId("btn-reveal-seed").click();
     await page.getByTestId("btn-continue-identity").click();
-    await page.getByTestId("tier-skip").click();
+    // No choice made: continuing keeps contribution off (ARC-50 1.5).
+    await expect(page.getByTestId("tier-standard")).toBeVisible();
     await page.getByTestId("btn-continue-model").click();
 
     const summary = page.getByTestId("launch-summary");

@@ -23,6 +23,17 @@ test.describe("Settings", () => {
     await page.goto("/");
     page.once("dialog", (d) => d.accept());
     await page.getByTestId("nav-settings").click();
+    // The identity card says where this computer keeps the recovery phrase,
+    // instead of claiming it is not stored (ARC-50).
+    const storage = page.getByTestId("recovery-phrase-storage");
+    await expect(storage).toContainText("This app keeps a copy only on this computer, in");
+    await expect(storage).toContainText(
+      "~/Library/Application Support/network.arc.desktop/store.json",
+    );
+    await expect(storage).toContainText(
+      "never sends it to ARC or anywhere else over the network",
+    );
+    await expect(page.getByText("We don't store it")).toHaveCount(0);
     await page.getByTestId("btn-reset").click();
     await expect(page.getByTestId("onboarding")).toBeVisible();
     await expect(page.getByTestId("step-welcome")).toBeVisible();
