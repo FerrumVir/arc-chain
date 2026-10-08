@@ -14,7 +14,7 @@ mod observed {
     include!(concat!(env!("OUT_DIR"), "/observed_model.rs"));
 }
 
-const ENGINE: &str = "b0673684a8c16f83b318fe1a33ab6b33f3dc79df";
+const ENGINE: &str = "05afa5b068268860e4206307fb44c909645557ed";
 fn hash(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }
@@ -44,7 +44,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     {
         return Err("diagnostic supports 1-3 layer fixtures or a one-layer real probe".into());
     }
-    if request["engine_sha"] != ENGINE
+    if request.get("precision").is_none()
+        || request["precision"] != c.to_json()["precision"]
+        || request["engine_sha"] != ENGINE
         || request["model_root"] != m["model_root"]
         || request["source_manifest_sha256"] != hash(&source)
         || request["package_sha256"] != hash(model.bytes())
@@ -165,7 +167,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let out = json!({"schema":"arc.layer-probe.raw.v2","engine":"arc-integer","alignment":request,
         "provenance":{"engine_sha":ENGINE,"request_sha256":hash(&request_bytes),"package_sha256":hash(model.bytes()),"source_manifest_sha256":hash(&source)},
         "numeric":{"dtype":"int64","fraction_bits":16,"unit_scale":1.0/65536.0},
-        "tensors":tensors,"tensor_sha256":tensor_hashes,"layer_order":(0..c.n_layers).collect::<Vec<_>>(),"routing":routing,"routing_numeric":{"weights_fraction_bits":32,"activations_fraction_bits":16},"observer":{"base_model_sha256":"1d3da70c67a2735d15daa660804ccaaf770422041eea0b27ac65d7805dde663b","verified_against_unmodified_engine":true}});
+        "tensors":tensors,"tensor_sha256":tensor_hashes,"layer_order":(0..c.n_layers).collect::<Vec<_>>(),"routing":routing,"routing_numeric":{"weights_fraction_bits":32,"activations_fraction_bits":16},"observer":{"base_model_sha256":"15f2baef5e3db2a54ecba6831ee25d02570c84b3ce6026ba87cd3ca012af29eb","verified_against_unmodified_engine":true}});
     // Validation completes before creating the output; never replace a record.
     let out_path = Path::new(&args[4]);
     let bytes = serde_json::to_vec_pretty(&out)?;

@@ -6,7 +6,7 @@ fn main() {
     let bytes = fs::read(path).unwrap();
     assert_eq!(
         format!("{:x}", Sha256::digest(&bytes)),
-        "1d3da70c67a2735d15daa660804ccaaf770422041eea0b27ac65d7805dde663b"
+        "15f2baef5e3db2a54ecba6831ee25d02570c84b3ce6026ba87cd3ca012af29eb"
     );
     let source = String::from_utf8(bytes).unwrap();
     let mut source = source

@@ -26,17 +26,19 @@ def validate_request(request, request_bytes):
         raise ValueError('request bytes mismatch')
     required = {'engine_sha', 'model_root', 'scope', 'graph', 'shape', 'token_ids',
                 'positions', 'mask', 'source_manifest_sha256', 'config_sha256',
-                'original_source_manifest_sha256', 'package_sha256', 'reference_sha256'}
+                'original_source_manifest_sha256', 'package_sha256', 'reference_sha256', 'precision'}
     if len(request.get('graph',{}).get('executed_layers',[]))>1: required.add('moe')
     if set(request) != required:
         raise ValueError('request fields mismatch')
-    if request['engine_sha'] != 'b0673684a8c16f83b318fe1a33ab6b33f3dc79df' or request['reference_sha256'] != REFERENCE_SHA:
+    if request['engine_sha'] != '05afa5b068268860e4206307fb44c909645557ed' or request['reference_sha256'] != REFERENCE_SHA:
         raise ValueError('implementation pin mismatch')
     for key in required:
         if key.endswith('sha256') or key == 'model_root':
             value = request[key]
             if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
                 raise ValueError('invalid digest')
+    from .policies import validate
+    validate(request['precision'])
     graph = request['graph']
     if set(graph) != {'embedding', 'head', 'executed_layers', 'source_layer_count'} or graph['embedding'] != 'original' or graph['head'] != 'original' or graph['executed_layers'] not in ([0], [0,1], [0,1,2]) or type(graph['source_layer_count']) is not int or graph['source_layer_count'] < len(graph['executed_layers']):
         raise ValueError('unsupported graph')
@@ -121,7 +123,11 @@ def compare(arc, reference, request, request_bytes):
             'graph':request['graph'], 'complete_kimi_forward':False,
             'alignment_sha256':sha(canonical(request)), 'request_sha256':sha(request_bytes),
             'arc_raw_sha256':sha(canonical(arc)), 'reference_raw_sha256':sha(canonical(reference)),
-            'metrics':metrics,'routing_comparison':routing}
+            'precision':request['precision'], 'metrics':metrics,'routing_comparison':routing,
+            'top1':{'arc':np.argmax(outputs[0]['logits'],axis=1).tolist(),
+                    'reference':np.argmax(outputs[1]['logits'],axis=1).tolist(),
+                    'agreements':int(np.sum(np.argmax(outputs[0]['logits'],axis=1)==np.argmax(outputs[1]['logits'],axis=1))),
+                    'positions':len(request['positions']), 'tie_rule':'first index'}}
 
 
 def compare_routing(arc, reference, request):

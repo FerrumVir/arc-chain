@@ -16,7 +16,11 @@ def main():
     for name in ('bundle', 'source-dir', 'source-manifest', 'original-source-dir',
                  'original-source-manifest', 'tokens', 'diagnostic', 'out'):
         p.add_argument('--' + name, required=True)
+    p.add_argument('--precision', help='complete caller-owned policy JSON; omitted requires legacy')
     args = p.parse_args()
+    from .policies import validate
+    precision = json.loads(Path(args.precision).read_bytes()) if args.precision else None
+    validate(precision)
     bundle = Path(args.bundle)
     source = Path(args.source_dir)
     original = Path(args.original_source_dir)
@@ -25,9 +29,11 @@ def main():
     cfg = json.loads((source / 'config.json').read_bytes())['text_config']
     original_cfg = json.loads((original / 'config.json').read_bytes())['text_config']
     manifest = json.loads((bundle / 'manifest.json').read_bytes())
+    if manifest['model'].get('precision') != precision:
+        raise ValueError('caller precision does not match finalized manifest')
     package = bundle / 'stage-0.arcspkg'
     tokens = json.loads(Path(args.tokens).read_bytes())
-    request = dict(engine_sha=ENGINE_SHA, model_root=manifest['model_root'],
+    request = dict(engine_sha=ENGINE_SHA, precision=precision, model_root=manifest['model_root'],
                    scope=manifest['model']['preparation']['scope'],
                    graph=dict(embedding='original', executed_layers=list(range(manifest['model']['n_layers'])), head='original',
                               source_layer_count=original_cfg['num_hidden_layers']),

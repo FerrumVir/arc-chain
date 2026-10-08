@@ -8,7 +8,7 @@ never produce certification or a tolerance PASS.
 
 ## Implementations and provenance
 
-ARC stays pinned to #168 `b0673684a8c16f83b318fe1a33ab6b33f3dc79df`, with an
+ARC is pinned to **provisional/unreviewed** #168 `05afa5b068268860e4206307fb44c909645557ed`, with an
 isolated diagnostic Cargo.lock. The production lock, engine and other PRs are
 unchanged. The reviewed four-layer fixture generator produces the original
 source; only declared experiment depth changes. Embedding, selected original
@@ -47,7 +47,7 @@ match exactly. The output boundary is after residual/FFN, before final norm.
 
 Routing is private in the engine. `tools/quality-layer-probe/reference/model.rs`
 is the unchanged pinned source (SHA-256
-`1d3da70c67a2735d15daa660804ccaaf770422041eea0b27ac65d7805dde663b`). `build.rs`
+`15f2baef5e3db2a54ecba6831ee25d02570c84b3ce6026ba87cd3ca012af29eb`). `build.rs`
 verifies that hash and generates a diagnostic-only module: module imports are
 redirected to the pinned crate, its private I/O error helper is expanded with
 identical formatting, doc comments are adapted, upstream in-crate tests are
@@ -98,7 +98,7 @@ captures are compared for cross-platform exactness.
 ## Reproduce without model downloads
 
 Dependency/build setup may access package registries/GitHub; execution uses only
-local inputs. Use Python 3.12 and a clean reviewed-engine checkout at the pin:
+local inputs. Use Python 3.12 and a clean provisional-engine checkout (named reviewed-engine below for compatibility) at the pin:
 
 ```sh
 python -m pip install -r scripts/arc_quality/layer_probe/requirements.txt
@@ -120,7 +120,7 @@ synthetic bundles; real-weight capture remains restricted to one layer. The CI
 CPU x86 job runs all depths and uploads raw artifacts. No labels are changed;
 ordinary pushes still cannot fetch weights. Existing Windows coverage remains.
 
-Sixteen targeted tests run for each graph: honest alignment, actual reference
+Eighteen targeted tests run for each graph: honest alignment, actual reference
 reexecution, native observer/full/stage equality, immutable one-layer integer
 control, three routed experts, nonzero shared outputs, official MoE combination
 with one **and two** shared experts, nibble -8/zero-scale decoding, model/input/
@@ -179,9 +179,79 @@ RAM planning: original one-layer graph has 2,846,317,568 parameters, requiring
 matrix is 2.1875 GiB; source mappings, library allocations, activations, JSON and
 OS add to this. File verification is streamed once per shard; loaded layer-state
 copies are released. ARC export exits before reference construction, so ARC
-weights are not deliberately kept resident with PyTorch. Budget **at least
-16 GiB available process headroom**, then measure RSS before admission; 16-GB
+weights are not deliberately kept resident with PyTorch. Budget a **23.2800 GiB conservative available-process-headroom plan**
+(including source residency, FP32 parameters, a largest FP32 temporary and reserve),
+then measure RSS; this is not a measured minimum or admission; 16-GB
 physical RAM is not demonstrated sufficient. Long sequences add quadratic eager
 attention memory and potentially large vocabulary logits/JSON. The four-token
 fixture's measured peak RSS (~216.3 MiB, macOS `/usr/bin/time -l`) cannot predict
 real-weight peak. There is no real-layer timing or quality result in this PR.
+
+## Provisional precision matrix
+
+The dependency incorporates unreviewed #156 `596a61f6`; neither that independent
+review nor cumulative #168/#164 review is closed by these fixture results.
+The isolated lock changes only git revision pins. The observer source is copied
+byte-for-byte from the exact engine revision and hash-checked before compilation.
+No production lock, engine arithmetic or other PR is changed.
+
+`run --policy` accepts `legacy`, `int16`, or a single class: `attention`, `dense`,
+`shared`, `embedding`, `head`. Legacy omits engine precision (request explicitly
+records null); all-INT16 promotes the five classes; each single-class control
+sets that class INT16 and all other classes INT8. Native INT4 experts, router,
+norm and bias retain their representations. No legacy slice is reused under a
+new policy. The same complete policy is passed before conversion, manifest
+construction and canonical YaRN assembly. Capture requests include the complete
+policy; the actual diagnostic rejects missing or mismatched policy against its
+verified package. Generic `capture --precision POLICY.json` likewise requires a
+caller policy matching the manifest; omitted means legacy.
+
+The reference always reads retained **original** source weights, never ARC's
+converted/dequantized package. The matrix checks original weight provenance,
+FP32 tensors and FP32 routes are identical across policies on each host. Every
+ARC policy must retain identical native expert/norm/router package bytes. It
+also checks shared promotion is inactive at depth 1 and head promotion leaves
+upstream boundaries unchanged. The original legacy tensors/routes at all three
+depths remain equal to the earlier capture; their original provenance is retained.
+
+```sh
+# CPU dependencies are those in layer_probe/requirements.txt; no model downloads.
+# ENGINE is a clean checkout of 05afa5b068268860e4206307fb44c909645557ed.
+cargo build --locked --manifest-path "$ENGINE/Cargo.toml" -p arc-inference --bin arc-mla
+cargo build --locked --manifest-path tools/quality-layer-probe/Cargo.toml
+PYTHONPATH=scripts python -m arc_quality.layer_probe.matrix \
+  --engine-source "$ENGINE" --arc-mla "$ENGINE/target/debug/arc-mla" \
+  --diagnostic tools/quality-layer-probe/target/debug/arc-quality-layer-probe \
+  --out precision-evidence
+PYTHONPATH=scripts python -m arc_quality.layer_probe.cross_host \
+  studio-evidence x86-evidence cross-host.json
+```
+
+This executes 21 paired captures and 18 regressions per capture, retains original
+inputs, policies, packages and both raw outputs, and writes per-layer absolute,
+relative/RMSE errors, per-position final-logit top-1 IDs/agreement and native
+routing differences. `matrix.json` reports `(all - legacy) - sum(single - legacy)`
+for every tensor to expose nonadditivity; no ranking or additive quality claim
+is inferred. Small fixtures do not select a production precision policy.
+
+Resource measurements use one fresh child for each implementation, Unix
+`getrusage` maximum RSS (bytes on macOS, KiB converted to bytes on Linux) and
+wall/user/system seconds. ARC diagnostic uses a debug build and verifies whole,
+split and observed forwards; FP32 includes interpreter/torch imports, weight
+load, forward and serialization. Local conversion uses a release binary and
+CI uses debug; conversion is outside the measured children. OS cache is
+uncontrolled, there is one sample, and shapes are tiny. These are host-specific
+whole-process setup measurements, not matched inference throughput or real-model
+RAM estimates. Cross-host comparison requires exact ARC raw records while
+retaining each host's FP32 outputs/errors; FP32 equality is never a golden rule.
+
+One-layer disk planning remains **16.1087 GiB legacy / 21.4103 GiB all-INT16 /
+19.2228 GiB the earlier mixed policy** (the latter is not a single-class control).
+Retained sources, slice/assembly copies, scratch, reference expansion and reserve
+must all be budgeted for the selected policy. The conservative sequential
+reference RAM envelope is **23.2800 GiB**, not measured admission or a proven
+minimum. Two/three-layer reference expansion is much larger, so fixture depths
+do not authorize a larger real plan. Before a real run: fresh disk and available
+RAM on both hosts, gaming-PC access profile/target volume, explicit admission,
+retained original source/reference bytes, same requested graph/tokens/positions,
+and independently reviewed dependencies. No new weight fetch or paid call occurs.

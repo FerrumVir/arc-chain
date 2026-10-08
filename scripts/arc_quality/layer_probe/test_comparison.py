@@ -24,6 +24,26 @@ class ActualFixture(unittest.TestCase):
         return compare(self.arc if arc is None else arc, self.ref if ref is None else ref,
                        self.request, self.request_bytes)
 
+    def test_valid_but_substituted_policy_cli_rejected(self):
+        from .policies import policy
+        for value in (None, policy('int16'), policy('attention')):
+            if value==self.request['precision']:continue
+            with tempfile.TemporaryDirectory(dir=self.root) as tmp:
+                req=copy.deepcopy(self.request);req['precision']=value
+                path=Path(tmp)/'request.json';path.write_bytes(canonical(req));output=Path(tmp)/'out.json'
+                result=subprocess.run([os.environ['ARC_LAYER_DIAGNOSTIC'],str(self.root/'bundle/stage-0.arcspkg'),
+                    str(self.root/'bundle/manifest.json'),str(self.root/'source/tiny-kimi-packed.source.json'),str(path),str(output)],capture_output=True,text=True)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('layer diagnostic:',result.stderr)
+                self.assertFalse(output.exists())
+
+    def test_precision_schema_rejection(self):
+        from .compare import validate_request
+        for value in ({}, {'version':1}, {'version':True, **{k:'int8' for k in ('attention','dense','shared','embedding','head')}},
+                      {'version':1, **{k:'int8' for k in ('attention','dense','shared','embedding','head')}, 'experts':'int16'}):
+            request=copy.deepcopy(self.request);request['precision']=value
+            with self.assertRaises(ValueError):validate_request(request,canonical(request))
+
     def test_actual_aligned_values_noncertifying(self):
         result = self.check()
         self.assertFalse(result['certified'])
@@ -35,7 +55,7 @@ class ActualFixture(unittest.TestCase):
     def test_mismatched_alignment(self):
         changes = {'model_root': '0'*64, 'token_ids': [1,42,7,4],
                    'positions': [1,2,3,4], 'scope': {'kind':'full_kimi_k26'},
-                   'mask': 'bidirectional', 'graph': {'executed_layers':[1]}}
+                   'mask': 'bidirectional', 'graph': {'executed_layers':[1]}, 'precision':{'version':999}}
         for engine in ('arc', 'ref'):
             for key, value in changes.items():
                 with self.subTest(engine=engine, field=key):
@@ -80,7 +100,7 @@ class ActualFixture(unittest.TestCase):
         for field,value in [('model_root','0'*64),('scope',{'kind':'full_kimi_k26'}),
                             ('positions',[1,2,3,4]),('token_ids',[999999]),
                             ('shape',{'hidden_size':1,'vocab_size':300}),
-                            ('source_manifest_sha256','0'*64)]:
+                            ('source_manifest_sha256','0'*64), ('precision',{'version':999})]:
             with self.subTest(field=field), tempfile.TemporaryDirectory(dir=self.root) as tmp:
                 request=copy.deepcopy(self.request);request[field]=value
                 request_path=Path(tmp)/'request.json';request_path.write_bytes(canonical(request))
@@ -139,9 +159,9 @@ class ActualFixture(unittest.TestCase):
                     self.assertTrue(all(w>0 for w in row['weights']))
                     self.assertTrue(any(x!=0 for x in row['shared']))
         self.assertTrue(self.arc['observer']['verified_against_unmodified_engine'])
-        if len(self.arc['layer_order'])==1:
+        if len(self.arc['layer_order'])==1 and self.request['precision'] is None:
             self.assertEqual(sha(canonical(self.arc['tensors'])),'fd1309caa28fdc3e58f7b12f3f9ccff5d897100d1e9252061e3e3e97573f3596')
-        else:
+        elif len(self.arc['layer_order'])>1:
             self.assertIn('layer.1',self.check()['routing_comparison'])
             self.assertTrue(any(v['source_dtype']=='torch.int32' for v in self.ref['provenance']['weight_tensors'].values()))
 
