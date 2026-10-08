@@ -45,6 +45,8 @@ run_unittest() {
 # scripts/ as the working directory, exactly like scripts/arc-soak.sh does.
 cd "$REPO_ROOT/scripts" || exit 1
 
+run_unittest "arc_autocluster: offline formation and lifecycle" arc_autocluster.tests.test_planner
+run_unittest "arc_autocluster: synthetic capacity simulator" arc_autocluster.tests.test_simulate
 run_unittest "arc_conformance: integer reference"        arc_conformance.tests.test_integer_reference
 run_unittest "arc_conformance: M3/M4 llama.cpp compare"  arc_conformance.tests.test_m4_compare
 run_unittest "arc_conformance: model-package manifest"   arc_conformance.tests.test_package_manifest
