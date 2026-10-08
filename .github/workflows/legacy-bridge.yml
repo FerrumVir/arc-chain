@@ -82,6 +82,8 @@ jobs:
         run: |
           shellcheck -S warning tests/legacy-bridge/headless-v07-acceptance.sh tests/legacy-bridge/fake-github/curl
           python3 -m py_compile tests/legacy-bridge/desktop_v07_harness.py tests/legacy-bridge/snapshot_tree.py tests/legacy-bridge/check_v07_fixtures.py
+      - name: Offline privacy boolean parsing under errexit (no node)
+        run: python3 tests/legacy-bridge/test_privacy_flag.py -v
       - name: The harness reproduces the released v0.7.11 desktop source
         run: |
           git fetch --no-tags --depth=1 origin refs/tags/v0.7.11:refs/tags/v0.7.11

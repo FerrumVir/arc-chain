@@ -42,7 +42,7 @@ bridge_version="$(jq -er '.bridge_version' "$pins")"
 bridge_tag="v$bridge_version"
 node_version="$(jq -er '.node_release.version' "$pins")"
 node_sha256="$(jq -er --arg a "$asset" '.node_release.assets[$a].sha256' "$pins")"
-privacy_safe="$(jq -er '.node_release.worker_names_privacy_safe' "$pins")"
+privacy_safe="$(jq -er '.node_release.worker_names_privacy_safe | if type == "boolean" then tostring else error("privacy flag must be boolean") end' "$pins")"
 
 export USER="${USER:-$(id -un)}"
 arc_dir="$HOME/.arc"

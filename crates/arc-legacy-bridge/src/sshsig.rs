@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn real_v0810_release_manifest_signature_verifies() {
+    fn real_v0811_release_manifest_signature_verifies() {
         verify(SIGNATURE, MANIFEST, NAMESPACE, &release_key()).unwrap();
     }
 
@@ -255,7 +255,18 @@ mod tests {
         assert!(verify(&no_footer, MANIFEST, NAMESPACE, &release_key()).is_err());
         let trailing = format!("{SIGNATURE}\nextra\n");
         assert!(verify(&trailing, MANIFEST, NAMESPACE, &release_key()).is_err());
-        let truncated = SIGNATURE.replacen("Bg==", "", 1);
+        // Mutate decoded bytes, not a suffix that changes with each release.
+        let original = dearmor(SIGNATURE).unwrap();
+        let shortened = &original[..original.len() - 1];
+        assert_ne!(shortened, original.as_slice());
+        assert_eq!(shortened.len() + 1, original.len());
+        let truncated = format!(
+            "{ARMOR_BEGIN}\n{}\n{ARMOR_END}\n",
+            STANDARD.encode(shortened)
+        );
+        assert_ne!(truncated, SIGNATURE);
+        assert!(truncated.len() < SIGNATURE.len());
+        assert_eq!(dearmor(&truncated).unwrap(), shortened);
         assert!(verify(&truncated, MANIFEST, NAMESPACE, &release_key()).is_err());
     }
 
