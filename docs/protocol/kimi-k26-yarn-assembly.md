@@ -130,3 +130,8 @@ admission. Historical real-shard results remain at `7a952ec7`, run 37622036049.
 Precision policies and revised retained-source disk/RAM budgets are specified in
 `kimi-k26-precision-integration.md`. The legacy command above omits precision;
 INT16/mixed use the same explicit policy during conversion and assembly.
+That document also requires a real BF16 row-range census: nonzero INT16 rows
+must satisfy `2^-17 <= max(abs(w)) < 2^30` after semantic transpose; all-zero
+rows are supported. Unsupported/nonfinite rows stop conversion pending an
+owner decision; no flush rule is approved. Complete the independent Python
+INT16/YaRN execution oracle before real-weight admission.

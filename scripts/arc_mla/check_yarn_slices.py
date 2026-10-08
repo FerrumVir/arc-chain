@@ -86,7 +86,7 @@ def main():
             reports.append(report); previous = boundary
         layouts.extend(['--layout', f'{count}=' + ','.join(map(str,reports))])
     subprocess.run([sys.executable, str(root / 'scripts/arc_mla/layout_check.py'), '--run', str(evidence / 'scalar.json'),
-                    '--label', 'synthetic packed canonical YaRN', *layouts, '--out', str(evidence / 'layouts.json'),
+                    '--label', 'synthetic packed canonical YaRN; precision=' + json.dumps(read(policy) if policy else None, sort_keys=True), *layouts, '--out', str(evidence / 'layouts.json'),
                     '--summary-md', str(evidence / 'layouts.md')], check=True)
 
     failures = []
@@ -175,7 +175,7 @@ def main():
     shutil.copy(full / 'manifest.json', evidence / 'manifest.json')
     shutil.copy(full / 'report.json', evidence / 'assembly.json')
     (evidence / 'summary.json').write_text(json.dumps({'scope':'synthetic fixture only; no real K2.6 execution',
-        'pass':True, 'model_root':finalized['model_root'], 'rejections':failures,
+        'pass':True, 'precision':read(policy) if policy else None, 'model_root':finalized['model_root'], 'rejections':failures,
         'layouts':[1,2,4], 'cases':len(runs[0]['cases'])}, indent=2)+'\n')
     print(f'PASS: {len(failures)} corruption/identity/output checks; scalar/SIMD and 1/2/4 stages exact')
 

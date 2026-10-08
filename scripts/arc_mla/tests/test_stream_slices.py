@@ -125,12 +125,15 @@ class OneShardBound(unittest.TestCase):
         source=self.work / SHARDS[0]; source.write_bytes(b"retained source")
         old={"version":1, **{k:"int16" for k in ["attention","dense","shared","embedding","head"]}}
         (self.out / "units/layer.0.json").write_text(json.dumps({"context":{"precision":old}}))
-        fakes=Fakes(self.work,self.out)
-        with mock.patch.object(self.module,"fetch") as fetch, mock.patch.object(self.module,"run") as run:
-            with self.assertRaisesRegex(SystemExit,"resume precision"):
-                self.module.main(["--arc-mla","arc-mla","--source-manifest",str(self.manifest),"--work",str(self.work),"--out",str(self.out),"--resume"])
-            fetch.assert_not_called();run.assert_not_called()
-        self.assertEqual(source.read_bytes(),b"retained source")
+        mixed = self.work / "mixed.json"
+        mixed.write_text(json.dumps(dict(old, embedding="int8", shared="int8")))
+        for label, settings in [("omitted", []), ("different-non-null", ["--precision", str(mixed)])]:
+            with self.subTest(policy=label):
+                with mock.patch.object(self.module,"fetch") as fetch, mock.patch.object(self.module,"run") as run:
+                    with self.assertRaisesRegex(SystemExit,"resume precision"):
+                        self.module.main(["--arc-mla","arc-mla","--source-manifest",str(self.manifest),"--work",str(self.work),"--out",str(self.out),"--resume", *settings])
+                    fetch.assert_not_called();run.assert_not_called()
+                self.assertEqual(source.read_bytes(),b"retained source")
 
     def test_keep_source_still_keeps_shards_when_resuming(self):
         first = Fakes(self.work, self.out, crash_after_unit="layer.0")

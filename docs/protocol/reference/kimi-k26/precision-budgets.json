@@ -7,6 +7,7 @@
   },
   "assumptions": [
     "Calculated bytes, not measured disk/RSS. No host admission.",
+    "INT16 nonzero rows require 2^-17 <= max(abs(w)) < 2^30 after semantic transpose. All-zero rows are supported. Count zero, below-range, in-range, at/above-range and nonfinite rows per tensor/class from retained BF16 before first real-tensor conversion. No flush rule is approved.",
     "Retain every selected original shard; do not delete source needed by reference.",
     "Slices and one assembled package set coexist; atomic rename does not duplicate the staging bundle.",
     "No simultaneous whole-model plus split bundle copies; add another complete payload if retained.",
@@ -20,6 +21,7 @@
     {
       "layers": 1,
       "policy": "legacy",
+      "precision": null,
       "selected_sources": [
         "model-00001-of-000064.safetensors",
         "model-00062-of-000064.safetensors"
@@ -52,6 +54,14 @@
     {
       "layers": 1,
       "policy": "int16",
+      "precision": {
+        "version": 1,
+        "embedding": "int16",
+        "head": "int16",
+        "attention": "int16",
+        "dense": "int16",
+        "shared": "int16"
+      },
       "selected_sources": [
         "model-00001-of-000064.safetensors",
         "model-00062-of-000064.safetensors"
@@ -84,6 +94,14 @@
     {
       "layers": 1,
       "policy": "mixed",
+      "precision": {
+        "version": 1,
+        "embedding": "int8",
+        "head": "int16",
+        "attention": "int16",
+        "dense": "int16",
+        "shared": "int8"
+      },
       "selected_sources": [
         "model-00001-of-000064.safetensors",
         "model-00062-of-000064.safetensors"
@@ -116,6 +134,7 @@
     {
       "layers": 2,
       "policy": "legacy",
+      "precision": null,
       "selected_sources": [
         "model-00001-of-000064.safetensors",
         "model-00002-of-000064.safetensors",
@@ -149,6 +168,14 @@
     {
       "layers": 2,
       "policy": "int16",
+      "precision": {
+        "version": 1,
+        "embedding": "int16",
+        "head": "int16",
+        "attention": "int16",
+        "dense": "int16",
+        "shared": "int16"
+      },
       "selected_sources": [
         "model-00001-of-000064.safetensors",
         "model-00002-of-000064.safetensors",
@@ -182,6 +209,14 @@
     {
       "layers": 2,
       "policy": "mixed",
+      "precision": {
+        "version": 1,
+        "embedding": "int8",
+        "head": "int16",
+        "attention": "int16",
+        "dense": "int16",
+        "shared": "int8"
+      },
       "selected_sources": [
         "model-00001-of-000064.safetensors",
         "model-00002-of-000064.safetensors",
@@ -215,6 +250,7 @@
     {
       "layers": 3,
       "policy": "legacy",
+      "precision": null,
       "selected_sources": [
         "model-00001-of-000064.safetensors",
         "model-00002-of-000064.safetensors",
@@ -249,6 +285,14 @@
     {
       "layers": 3,
       "policy": "int16",
+      "precision": {
+        "version": 1,
+        "embedding": "int16",
+        "head": "int16",
+        "attention": "int16",
+        "dense": "int16",
+        "shared": "int16"
+      },
       "selected_sources": [
         "model-00001-of-000064.safetensors",
         "model-00002-of-000064.safetensors",
@@ -283,6 +327,14 @@
     {
       "layers": 3,
       "policy": "mixed",
+      "precision": {
+        "version": 1,
+        "embedding": "int8",
+        "head": "int16",
+        "attention": "int16",
+        "dense": "int16",
+        "shared": "int8"
+      },
       "selected_sources": [
         "model-00001-of-000064.safetensors",
         "model-00002-of-000064.safetensors",

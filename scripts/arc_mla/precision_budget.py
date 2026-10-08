@@ -44,13 +44,14 @@ def budget():
         reference_transient=4*largest_reference_matrix
         for policy in ('legacy','int16','mixed'):
             wide=set() if policy=='legacy' else set(classes) if policy=='int16' else {'attention','dense','head'}
+            precision=None if policy=='legacy' else dict(version=1, **{key:'int16' if key in wide else 'int8' for key in classes})
             weight_bytes=fixed_bytes+row_scales+sum(elements*(2 if key in wide else 1) for key,elements in bf16_elements.items())
             tables=depth*4096*32*2*4
             disk_margin=2**29;reserve=5*GIB
             peak_disk=retained+2*weight_bytes+tables+disk_margin+reserve
             engine_ram=weight_bytes+tables+assembly_ram+3*GIB
             reference_ram=retained+reference_fp32+reference_transient+3*GIB
-            rows.append(dict(layers=depth,policy=policy,selected_sources=selected_sources,
+            rows.append(dict(layers=depth,policy=policy,precision=precision,selected_sources=selected_sources,
                 class_matrix_elements=bf16_elements,retained_source_bytes=retained,
                 slice_payload_bytes=weight_bytes,assembly_copy_bytes=weight_bytes,canonical_table_bytes=tables,
                 disk_header_alignment_scratch_margin_bytes=disk_margin,disk_reserve_bytes=reserve,
@@ -64,6 +65,7 @@ def budget():
     return dict(engine_dependency='596a61f6b1ae88e8ad7072e1d514467308ddae22',dependency_review='provisional/unreviewed',
         pins={p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in (config_path,source_path)},
         assumptions=['Calculated bytes, not measured disk/RSS. No host admission.',
+        'INT16 nonzero rows require 2^-17 <= max(abs(w)) < 2^30 after semantic transpose. All-zero rows are supported. Count zero, below-range, in-range, at/above-range and nonfinite rows per tensor/class from retained BF16 before first real-tensor conversion. No flush rule is approved.',
         'Retain every selected original shard; do not delete source needed by reference.',
         'Slices and one assembled package set coexist; atomic rename does not duplicate the staging bundle.',
         'No simultaneous whole-model plus split bundle copies; add another complete payload if retained.',
@@ -77,10 +79,11 @@ def budget():
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('out',type=Path);args=ap.parse_args()
     data=budget();args.out.write_text(json.dumps(data,indent=2)+'\n')
-    print('| Layers | Policy | Retained source GiB | Slices GiB | Assembly copy GiB | Peak disk GiB | FP32 params GiB | Sequential RAM plan GiB |')
+    print('| Layers | Policy (complete precision) | Retained source GiB | Slices GiB | Assembly copy GiB | Peak disk GiB | FP32 params GiB | Sequential RAM plan GiB |')
     print('|---:|---|---:|---:|---:|---:|---:|---:|')
     for r in data['rows']:
-        print('| '+str(r['layers'])+' | '+r['policy']+' | '+' | '.join(f'{r[k]/GIB:.4f}' for k in ['retained_source_bytes','slice_payload_bytes','assembly_copy_bytes','peak_disk_with_retained_sources_bytes','reference_fp32_parameters_bytes','sequential_available_ram_planning_bytes'])+' |')
+        policy=r['policy']+' (`'+json.dumps(r['precision'],sort_keys=True,separators=(',',':'))+'`)'
+        print('| '+str(r['layers'])+' | '+policy+' | '+' | '.join(f'{r[k]/GIB:.4f}' for k in ['retained_source_bytes','slice_payload_bytes','assembly_copy_bytes','peak_disk_with_retained_sources_bytes','reference_fp32_parameters_bytes','sequential_available_ram_planning_bytes'])+' |')
 
 
 if __name__=='__main__':main()

@@ -31,6 +31,11 @@ embedding/shared INT8. It is a test policy, not a recommendation. All-INT16
 selects INT16 for all five classes; routers, i64 Q16 norms, Q32 bias and native
 INT4 experts keep their existing representations.
 
+The #156 `check_int16.py` mixed fixture instead selects attention/shared/embedding
+INT16 and dense/head INT8. The word "mixed" alone does not identify a policy.
+Both scripts print and retain the complete policy; budget rows and layout
+tables carry it too. #164 must include all five selections beside every result.
+
 `SliceSource::with_precision` validates policy before layout, planning and
 conversion. Complete policy is committed in unit-record context, plan and slice
 manifest, including manifests still pending YaRN. The prefixed source reader
@@ -83,8 +88,17 @@ bytes, tensor/slice/segment metadata, ordering/coverage, source/config/scope,
 pending-marker removal, existing outputs and assembled-package corruption.
 Additional controls reject policy changes/omission/invalid schemas, reused unit
 records and cross-policy BF16 payload substitution without a published output.
+Stale-unit controls try both omitted and different non-null policies. The
+streaming driver test checks both before any fetch/run/deletion. Payload
+controls try the raw legacy head slice and that payload zero-padded to the
+expected INT16 length; the latter must fail the committed-byte comparison,
+not the size check, and leave neither a bundle nor staging directory.
 Full and 1/2/3-layer official metadata controls verify policy-bound layouts and
 roots without allocating real weights. They do not claim real execution.
+
+Cross-host Rust execution is not an independent execution oracle. The Python
+reference still needs INT16 and YaRN execution support before real-weight
+admission; independent conversion-byte agreement alone does not close that gap.
 
 ## #164 handoff (future edit, not performed here)
 
@@ -118,7 +132,7 @@ free-space/RSS measurements. The one-layer peaks are:
 |---|---:|---:|---:|---:|
 | Legacy INT8 | 5.3017 | 2.6530 | 2.6530 | 16.1087 |
 | All five classes INT16 | 5.3017 | 5.3038 | 5.3038 | 21.4103 |
-| Mixed fixture policy above | 5.3017 | 4.2101 | 4.2101 | 19.2228 |
+| Attention/dense/head INT16; embedding/shared INT8 (v1) | 5.3017 | 4.2101 | 4.2101 | 19.2228 |
 
 Each row counts retained source shards, slices **and** one assembled package
 set, per-stage tables, 512 MiB metadata/alignment/scratch allowance and 5 GiB
@@ -143,6 +157,21 @@ The old 16.1087-GiB disk bound admits no INT16 plan. Fresh disk **and available
 RAM** checks on Studio and the gaming PC remain required. The PC endpoint,
 authorized connection profile and target volume are still unknown. No host
 admission is inferred from installed RAM, historical snapshots or tiny RSS.
+
+INT16 also has a conversion admission constraint: a **nonzero** row's maximum
+absolute original BF16 value must be at least **2^-17** (approximately 7.6e-6)
+and strictly below **2^30**. All-zero rows are supported separately. A row
+outside that range rejects; it is not silently flushed, clamped or retried as
+INT8. Small entries in an otherwise admissible row are not the same condition.
+Row semantics include the converter's KV-B transpose.
+
+The first real-tensor report must record the source/config hashes, complete
+policy, tensor/class and total row count, with separate counts for all-zero,
+nonzero below 2^-17, supported, at/above 2^30 and nonfinite rows, evaluated from
+retained BF16 in conversion row order. Resource headroom does not prove these
+counts are zero. Stop on unsupported/nonfinite rows and take any proposed flush
+or other conversion-rule change to the owner before conversion proceeds. No
+such real-row census or flush decision is supplied by the synthetic fixtures.
 
 After a later explicit admission, the existing one-layer commands in
 `kimi-k26-yarn-assembly.md` must add `--keep-source` to streaming and the same

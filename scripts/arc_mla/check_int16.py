@@ -51,7 +51,9 @@ def main():
     base = [binary, 'convert', '--source-dir', source, '--source-manifest', source / 'tiny-mla.source.json', '--experts', 'i4g32', '--threads', '1']
     wide = dict(version=1, attention='int16', dense='int16', shared='int16', embedding='int16', head='int16')
     mixed = dict(wide, dense='int8', head='int8')
-    for label, precision in [('legacy', None), ('int16', wide), ('mixed', mixed)]:
+    policies = dict(legacy=None, int16=wide, mixed=mixed)
+    for label, precision in policies.items():
+        print(f'{label}: precision={json.dumps(precision, sort_keys=True)}', flush=True)
         settings = []
         if precision:
             precision_path = out / (label + '-precision.json')
@@ -96,6 +98,7 @@ def main():
                  platform=platform.platform(), machine=platform.machine(), build=args.build_label,
                  threads=1, workload='synthetic BF16; 4 layers dense0+MoE1..3, width64, vocab300; fresh processes; warm filesystem caches; no GPU',
                  precision_decision='unapproved; no quality/tolerance assessment',
+                 policies=policies,
                  measurements=measures, files={p.name:dict(bytes=p.stat().st_size,sha256=hashlib.sha256(p.read_bytes()).hexdigest()) for p in out.glob('*.arcspkg')})
     (out/'measurements.json').write_text(json.dumps(facts,indent=2)+'\n')
     print(json.dumps({k:json.loads((out/(k+'-scalar.json')).read_text())['matrix_digest'] for k in ('legacy','int16','mixed')},indent=2))
