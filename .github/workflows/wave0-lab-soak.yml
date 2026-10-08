@@ -1,0 +1,103 @@
+name: Wave 0 lab - Stage B (soak in a nested KVM VM, throwaway branch)
+
+# THROWAWAY BRANCH ONLY. This workflow exists on `wave0-v0712-lab` and is never merged: main stays untouched.
+# It changes no product code and no existing workflow, publishes no release, creates no tag, uses no environment,
+# no secret and no deployment. The only token is the job token, read-only (contents, actions).
+#
+# What it does (Stage B): builds an x86_64 Ubuntu 24.04 VM with QEMU/KVM on the hosted runner, installs the
+# stranded v0.7.11 headless baseline in it (the repository acceptance script's own setup: unmodified v0.7.11
+# installer, v0.7.7 node, systemd, REAL updater), consumes the v0.7.12 bridge launcher with
+# scripts/legacy-bridge/canary-consume.sh, then runs Astra's battery: interrupt the first uncached download with
+# iptables and check it resumes, the real updater twice, three kickstarts, a REAL guest reboot (boot-id check, no
+# manual node start), >= 2 h uninterrupted steady state after the last forced event, >= 4 h in total, 60-second
+# samples, invariants before/after, and a stop/rollback test. The node is stopped at the end of the job.
+#
+# Which stage and profile runs is decided by wave0-lab/config.json (a push cannot take inputs):
+#   launcher_source "artifact"  -> rehearsal on the Stage A handoff artifact bytes (pre-G0)
+#   launcher_source "published" -> the real Wave 0: canary-consume.sh --tag v0.7.12 --expect-sha256 <digest>
+#   profile "smoke" | "full"    -> a ~40 minute machinery check | Astra's thresholds (<= 350 minutes)
+#
+# Live network: ALLOWED for this nested VM only (config stage_b.live_network, with the recorded authorization:
+# one stake-0 test node, compute off, in a separate clean environment). The v0.7.7 baseline and the interrupted
+# first attempt run with every live-network address rejected, exactly like the repository CI.
+on:
+  push:
+    branches: [wave0-v0712-lab]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: wave0-lab-stage-b
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: lab tree is base plus lab files only; configuration; offline self-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      stage_b: ${{ steps.config.outputs.stage_b }}
+      stage_b_profile: ${{ steps.config.outputs.stage_b_profile }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind the lab tree to the base commit's tree plus added lab files only
+        run: bash wave0-lab/guard.sh wave0-lab/config.json
+
+      - name: Validate the lab configuration
+        id: config
+        run: python3 wave0-lab/check_config.py --config wave0-lab/config.json --github-output "$GITHUB_OUTPUT"
+
+      - name: Offline self-tests (no network, no VM)
+        run: |
+          set -Eeuo pipefail
+          python3 --version
+          python3 -B -m unittest discover -s wave0-lab/tests -p 'test_*.py' -v
+          shellcheck -S warning wave0-lab/guard.sh wave0-lab/stage_b/guest/*.sh
+
+  stage-b:
+    name: "Stage B: Wave 0 soak in a nested KVM VM (stranded v0.7.11 headless -> v0.7.12)"
+    needs: guard
+    if: needs.guard.outputs.stage_b == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EVIDENCE: ${{ github.workspace }}/evidence/stage-b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: KVM gate (fails fast and says so when /dev/kvm is absent) and QEMU
+        run: python3 wave0-lab/stage_b/host_run.py preflight --evidence "$EVIDENCE"
+
+      - name: Run Wave 0 inside the nested VM
+        timeout-minutes: 335
+        run: python3 -u wave0-lab/stage_b/host_run.py run --config wave0-lab/config.json --evidence "$EVIDENCE" --work "$RUNNER_TEMP/wave0-work"
+
+      - name: Collect the guest evidence (best effort; also when the run step crashed or timed out)
+        if: always()
+        run: |
+          if [ ! -f "$EVIDENCE/guest-evidence.tgz" ]; then
+            python3 -u wave0-lab/stage_b/host_run.py collect --config wave0-lab/config.json --evidence "$EVIDENCE" --work "$RUNNER_TEMP/wave0-work" || true
+          fi
+          cp "$RUNNER_TEMP/wave0-work/console.log" "$EVIDENCE/console.log" 2>/dev/null || true
+
+      - name: Evaluate the evidence (every check PASS or FAIL; fails the job on any FAIL)
+        if: always()
+        run: python3 wave0-lab/evaluate_stage_b.py --evidence "$EVIDENCE"
+
+      - name: Keep the Stage B evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wave0-stage-b-evidence
+          path: evidence/stage-b/
+          if-no-files-found: error
+          retention-days: 90

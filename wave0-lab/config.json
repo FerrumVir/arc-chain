@@ -1,0 +1,83 @@
+{
+  "schema": "arc.legacy-bridge.wave0-lab.config.v1",
+  "repository": "FerrumVir/arc-chain",
+  "base_commit": "b26f973913df34c238c63081d0245657ed2c2826",
+  "base_tree": "d5ecb73580330b4d60f56d58a221398a38681a41",
+  "handoff": {
+    "run_id": 37741303661,
+    "artifact_id": 11534092076,
+    "artifact_name": "legacy-bridge-release-handoff",
+    "artifact_digest": "sha256:d1f5839200fa90ea6021a0709c64513ed138156041031bd9ba94d03f763b70ab",
+    "artifact_size": 6100854,
+    "tag": "v0.7.12",
+    "launchers": {
+      "arc-node-linux-aarch64": "ca15508fd94787fdfd45b7aca4ede870110335b4d7e237b291115f08a9a10df8",
+      "arc-node-linux-x86_64": "41d92a475db819eb190b6409ac82cb3258a557980c193decc629896718a3f69e",
+      "arc-node-macos-arm64": "012c8d00d22a924349ce7201f93c724ddb74ff3cbf28a2a14b9b35c60ba3f5af",
+      "arc-node-macos-x86_64": "3af3c00b78e63357e292d88e4d26ae059b5a006741c95d778b0a976c6c56bcb7",
+      "arc-node-windows-x86_64.exe": "f6c4d403014f3c2be512524f89054984df1a48c57083cc19fb56c723ce48d6f9"
+    }
+  },
+  "stage_a": {
+    "enabled": true,
+    "macos_arm64": true,
+    "macos_intel": true,
+    "aarch64_smoke": true
+  },
+  "stage_b": {
+    "enabled": true,
+    "profile": "smoke",
+    "launcher_source": "artifact",
+    "tag": "v0.7.12",
+    "expect_sha256": "41d92a475db819eb190b6409ac82cb3258a557980c193decc629896718a3f69e",
+    "live_network": "blocked",
+    "live_network_authorization": "work-99 relay of 2026-10-08T07:55Z: TJ authorized one stake-0 test node on the live testnet, in a separate clean environment; the nested VM on a hosted runner is that environment; stake 0, compute off; the node is stopped at the end of the job",
+    "image": {
+      "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-amd64.img",
+      "sha256": "6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2",
+      "size": 625612288,
+      "serial": "20260926"
+    },
+    "vm": {
+      "cpus": 2,
+      "memory_mb": 6144,
+      "disk_gb": 20
+    },
+    "profiles": {
+      "smoke": {
+        "sample_interval_s": 10,
+        "baseline_s": 30,
+        "min_total_s": 600,
+        "min_steady_s": 300,
+        "min_steady_samples": 31,
+        "post_reboot_healthy_s": 120,
+        "max_gap_factor": 2.5,
+        "reboot_recovery_deadline_s": 300,
+        "forced_grace_s": 90,
+        "updater_runs": 2,
+        "kickstarts": 3,
+        "kickstart_gap_s": 20,
+        "heartbeat_s": 60,
+        "pull_samples_s": 120,
+        "deadline_min": 100
+      },
+      "full": {
+        "sample_interval_s": 60,
+        "baseline_s": 300,
+        "min_total_s": 14400,
+        "min_steady_s": 7200,
+        "min_steady_samples": 121,
+        "post_reboot_healthy_s": 600,
+        "max_gap_factor": 2.5,
+        "reboot_recovery_deadline_s": 300,
+        "forced_grace_s": 90,
+        "updater_runs": 2,
+        "kickstarts": 3,
+        "kickstart_gap_s": 120,
+        "heartbeat_s": 600,
+        "pull_samples_s": 900,
+        "deadline_min": 315
+      }
+    }
+  }
+}

@@ -1,0 +1,70 @@
+WAVE 0 LAB - METHOD (for Astra's concurrence; throwaway branch wave0-v0712-lab, never merged, no PR, main untouched)
+
+This branch is main at b26f9739 (the merged #159) plus the files under wave0-lab/ and two workflows. A guard job in
+both workflows proves the tree is exactly that: base tree d5ecb735 plus ADDED lab files, nothing modified or removed.
+The workflows are test-only: read-only token (contents, actions), no secret, no environment, no release, no tag.
+All actions are SHA-pinned to the ones the repository's own workflows already use.
+
+WHAT IT PROVES, IN TWO STAGES
+Stage A (workflow wave0-lab.yml, pre-G0, hosted runners): the repository's EXISTING acceptance harnesses are run
+against the launcher bytes of handoff artifact 11534092076 (run 37741303661), not CI-built ones. Every job downloads
+the artifact itself and checks its digest (sha256:d1f58392...) and all five launcher digests before use, hashes the
+launcher file before and after the harness, and writes a record. A summary job writes stage-a-summary.json.
+  linux-x86_64   headless acceptance (systemd, real v0.7.11 updater)   and  desktop acceptance      ubuntu-24.04
+  windows-x86_64 desktop acceptance                                                                  windows-latest
+  macos-arm64    desktop acceptance                                                                  macos-15
+  macos-x86_64   desktop acceptance                                                                  macos-15-intel
+  linux-aarch64  NAMED EXCEPTION (approved by work-99; ARC-83 informed): "NOT CONSUMED: no v0.7 linux-aarch64
+                 baseline exists (v0.7.7 shipped none), so no stranded v0.7 install can ever fetch this asset;
+                 EXECUTED as a smoke on ubuntu-24.04-arm." The smoke runs --version and checks the ELF type.
+  Live network: every Stage A job rejects every live-network address (the repository CI rule). L6/L8
+  --dry-run-evidence accepts the summary only if all five final digests are CONSUMED with PASS (aarch64: the named
+  exception only, verbatim) and the lab run, commit, artifact digest and handoff binding all verify.
+
+Stage B (workflow wave0-lab-soak.yml, runs on the same push; separate concurrency group): the soak, entirely inside a
+nested KVM x86_64 Ubuntu 24.04 VM on a hosted ubuntu-24.04 runner (QEMU, qcow2 disk, cloud-init, ssh forward).
+  1 baseline   the unmodified v0.7.11 installer installs the pinned v0.7.7 node as a systemd service with the real
+               arc-updater timer - the repository acceptance script's own setup, with the live network rejected.
+  2 consume    scripts/legacy-bridge/canary-consume.sh --tag v0.7.12 --expect-sha256 41d92a47...: dry run, then
+               --apply. Published mode (post-G0) runs the script UNMODIFIED against the real release. Artifact mode
+               (pre-G0) is a REHEARSAL: the same script with its single download line replaced by a copy of the
+               Stage A launcher bytes; the verdict says so and is never the post-G0 Wave 0.
+  3 interrupt  an inbound byte quota (iptables) cuts the first uncached 29 MB node download mid-way; the v0.7
+               30-second health logic rolls the launcher back (v0.7.7 returns); the network is restored; the next
+               run must resume the .partial by Range (proved by the inbound byte count) and bring the node up.
+  4 battery    real arc-updater run twice (state unchanged: binary, version.txt, pid, process start, identity, legacy
+               data; exit status 22 before the Latest flip is recorded as information and labelled expected), three
+               kickstarts (same identity, verified cache reused), then a REAL guest reboot (boot id changes, the node
+               recovers by itself - the orchestrator issues no start command after it, audited in commands.jsonl,
+               updater timer active, pre- and post-boot logs, >= 10 min healthy samples).
+  5 soak       a guest service (enabled, observer only) writes one JSON sample per 60 s across the reboot. The run
+               lasts until BOTH hold: >= 2 h uninterrupted after the last forced event (>= 121 samples) and >= 4 h
+               since the first healthy bridged sample.
+  6 invariants one node, stable identity, stake 0, compute off without consent or model, unchanged legacy-data
+               hashes (BEFORE = the ExecStartPre snapshot at the start of the kept run, AFTER = end of soak),
+               privacy-safe registration (public name node-<first 8 hex of the address>), unit files unchanged.
+  7 stop       systemctl stop is clean, --legacy-bridge-rollback restores v0.7.7 on its untouched data, re-bridging
+               keeps the identity, then the node is stopped. The job ends with the node stopped.
+  Evidence: samples.jsonl, events.jsonl, commands.jsonl, checks-live.jsonl, invariants-before/after.json, guest logs
+  (the v0.7 seed redacted), then evaluate_stage_b.py writes checks.json, verdict.json, REPORT.md: every check PASS or
+  FAIL. The job fails on any FAIL. full profile: timeout 350 min, orchestrator deadline 315 min. smoke profile
+  (about 40 minutes, 10 s samples) exercises every path but can never yield WAVE0_PASS.
+
+DEVIATIONS AND LABELS (all recorded in the evidence)
+  * REBOOT is real (guest reboot under KVM), not a stop/kill/cold-start substitute. It reboots a VM, not field
+    hardware: boot ID, systemd ordering and unit enablement are real; firmware, disk and NIC are virtual.
+  * Network: the guest reaches the Internet through QEMU user-mode NAT with IPv6 off. The live network is opened to the
+    bridged node only when stage_b.live_network is "allowed" (the recorded authorization: one stake-0 test node,
+    compute off, separate clean environment); the v0.7.7 baseline and the interrupted first attempt always run with it
+    rejected, and it is opened only after the v0.7.7 process is gone. This commit ships "blocked" so the smoke
+    rehearsal registers nothing; the full run sets "allowed" (one config line). The node's address and public name are
+    in the evidence. Stage A is always blocked.
+  * linux-aarch64 is the named exception above; no stranded v0.7 install can consume it.
+  * Before the Latest flip the real updater compares "=": it tries a "downgrade" to v0.7.11, gets 404 for
+    arc-node-linux-x86_64 and exits 22. No state change. After the flip it reports "up to date".
+  * One VM, one node, one run: this is a rehearsal of the field, not a statistical sample.
+
+HOW TO DRIVE IT (edit wave0-lab/config.json on the lab branch and push; the guard binds every commit to the base tree)
+  pre-G0   stage_a.enabled true; stage_b profile smoke, launcher_source artifact     -> Stage A evidence + rehearsal
+  post-G0  stage_b profile full, launcher_source published (tag v0.7.12, digest 41d92a47...), live_network allowed
+           -> the real Wave 0
