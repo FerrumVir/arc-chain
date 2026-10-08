@@ -1,0 +1,36 @@
+[package]
+name = "native-updater-check"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+description = "Runs the REAL tauri-plugin-updater check() at the version the released v0.7.11 ARC desktop app shipped with (THROWAWAY LAB FILE)"
+
+# Exact versions found in the strings of the RELEASED v0.7.11 Linux desktop binary
+# (usr/bin/arc-desktop from ARC.Node_0.7.11_amd64.deb, sha256 db0df355bb17f23a02b9323adcd7506053a8969ee3d98a23cfe92d1b4219a9c3):
+# tauri-2.11.2 and tauri-plugin-updater-2.10.1. The v0.7.11 tag has no desktop Cargo.lock, so the shipped
+# versions cannot be read from a lockfile. Default features of the plugin = rustls-tls + zip, exactly what
+# the app's `tauri-plugin-updater = "2"` resolved to.
+[dependencies]
+# default-features = false: no wry runtime, so no webview is ever created (the mock runtime is used). The tauri-runtime
+# crate still depends on the webkit2gtk bindings on Linux, so building on Linux needs libwebkit2gtk-4.1-dev (it brings
+# gtk-3, libsoup-3 and javascriptcoregtk); Windows and macOS need no system packages.
+tauri = { version = "=2.11.2", default-features = false, features = ["test"] }
+tauri-plugin-updater = "=2.10.1"
+serde_json = "1"
+# Used only to parse --current-version into the type of tauri's PackageInfo.version (one semver in the lockfile).
+semver = "1"
+# Not used by the code: it only pins tauri-utils to the shipped 2.9.2 so the resolver picks the tauri-macros / tauri-codegen /
+# tauri-runtime generation that was current in the shipped build (strings of the released binary show tauri-utils-2.9.2).
+tauri-utils = "=2.9.2"
+
+# Keep this small tool independent of the application workspace. Its lockfile is reviewed and used with --locked.
+[workspace]
+
+[profile.release]
+# Small and quick to link; behaviour of the plugin code is unchanged.
+opt-level = 1
+debug = false
+strip = true
+codegen-units = 16
+lto = false

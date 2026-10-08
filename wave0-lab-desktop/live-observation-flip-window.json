@@ -1,0 +1,22 @@
+{
+  "schema": "arc.legacy-bridge.wave0-lab.live-observation.v1",
+  "purpose": "Live GitHub observations that bear on the desktop app-update isolation (ARC-83 audit item 4): what the v0.7.11 Tauri updater endpoint sees when v0.7.12 is Latest.",
+  "observations": [
+    {
+      "window": "2026-10-08T13:00:20Z to 2026-10-08T13:01:42Z (v0.7.12 was Latest for 82 seconds)",
+      "request": "GET https://github.com/FerrumVir/arc-chain/releases/latest/download/latest.json",
+      "status": 404,
+      "source": "work-99's plan note arc83-repoint-and-plan.md line 65 (sha256 8963896681988c696a3aff0906f72be8a2c030e54bff71d4cc9ffc93b47f25da; not published, internal) records: during the 13:00:20Z flip window that exact manifest URL answered 404 while Latest = v0.7.12 (L8 surface verify); the window itself is recorded in flip-window-observation-20261008T1312Z.json (sha256 9a5930dae0a2d9934eb67251defb76bfa6ceb6967d5cfd075627c8e78944b8ae, work-99, flip_window 13:00:20Z to 13:01:42Z)",
+      "independently_verified_by_lab": false
+    },
+    {
+      "window": "2026-10-08T08:13:21Z (G0, Latest still v0.7.11)",
+      "request": "GET https://github.com/FerrumVir/arc-chain/releases/download/v0.7.12/latest.json (the redirect target of releases/latest/download/latest.json once v0.7.12 is Latest)",
+      "status": 404,
+      "desktop_like_assets": [],
+      "source": "bridge-v0712/l8-verify-20261008T081321368329Z.json, section surface",
+      "source_sha256": "a6e0fc8f532cf5ec598ab0dacea14254baf934d348e684f0fb25f2d27d55ced7",
+      "independently_verified_by_lab": true
+    }
+  ]
+}
