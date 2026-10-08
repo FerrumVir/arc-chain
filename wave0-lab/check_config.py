@@ -92,6 +92,7 @@ def validate(cfg: object) -> list[str]:
     need("handoff.artifact_digest", digest.startswith("sha256:") and bool(HEX64.match(digest[7:])), "must be sha256:<64 hex>")
     need("handoff.artifact_size", _is_int(handoff.get("artifact_size")) and handoff["artifact_size"] > 0, "must be a positive integer")
     need("handoff.tag", bool(TAG.match(str(handoff.get("tag", "")))), "must look like v0.7.N")
+    need("handoff.latest_json_sha256", bool(HEX64.match(str(handoff.get("latest_json_sha256", "")))), "must be 64 lowercase hex")
     launchers = handoff.get("launchers")
     if not isinstance(launchers, dict) or sorted(launchers) != sorted(ASSETS):
         errors.append(f"handoff.launchers: must hold exactly {', '.join(ASSETS)}")

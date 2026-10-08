@@ -9,7 +9,9 @@ Checks (all must hold, every failure is listed):
     pinned digest and size, produced by the pinned handoff run at the base commit;
   * the downloaded zip hashes to the pinned digest;
   * the zip holds exactly the nine expected members and no path escapes;
-  * v0.7.12/SHA256SUMS lists exactly the five launchers and equals the config;
+  * v0.7.12/SHA256SUMS (the handoff's own, written before L7 regenerates a five-line one) lists exactly the five
+    launchers and latest.json; the five launcher lines equal the config digests and the latest.json line equals
+    the hash of the latest.json member (and the pinned latest_json_sha256);
   * every launcher file hashes to its config digest;
   * legacy-bridge-provenance.json has the handoff schema and is not eligible for latest.
 
@@ -144,8 +146,16 @@ def fetch(config: dict, out: Path, gh: GhRunner = run_gh) -> dict:
             except ValueError as error:
                 problems.append(str(error))
                 sums = {}
-            if sums and sums != handoff["launchers"]:
-                problems.append("v0.7.12/SHA256SUMS differs from the five pinned launcher digests")
+            latest_actual = sha256_bytes(data["v0.7.12/latest.json"])
+            if sums:
+                if set(sums) != set(ASSETS) | {"latest.json"}:
+                    problems.append(f"v0.7.12/SHA256SUMS names {sorted(sums)}, expected the five launchers and latest.json")
+                elif {asset: sums[asset] for asset in ASSETS} != handoff["launchers"]:
+                    problems.append("v0.7.12/SHA256SUMS differs from the five pinned launcher digests")
+                elif sums["latest.json"] != latest_actual:
+                    problems.append("v0.7.12/SHA256SUMS latest.json line differs from the latest.json member")
+            if handoff.get("latest_json_sha256") not in (None, latest_actual):
+                problems.append(f"latest.json hashes to {latest_actual}, pinned {handoff['latest_json_sha256']}")
             for asset in ASSETS:
                 actual = sha256_bytes(data[f"v0.7.12/{asset}"])
                 consumed[asset] = actual
@@ -176,6 +186,7 @@ def fetch(config: dict, out: Path, gh: GhRunner = run_gh) -> dict:
         "artifact_digest": handoff["artifact_digest"],
         "artifact_size": handoff["artifact_size"],
         "launchers": consumed,
+        "latest_json_sha256": latest_actual,
         "provenance_sha256": sha256_bytes(json.dumps(provenance, sort_keys=True).encode("utf-8")),
     }
     (out / "handoff-verified.json").write_text(json.dumps(verified, indent=2, sort_keys=True) + "\n", encoding="utf-8")

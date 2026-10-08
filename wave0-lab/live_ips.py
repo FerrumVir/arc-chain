@@ -43,7 +43,9 @@ def load(root: Path) -> list[str]:
 
 def main() -> int:
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
-    print(" ".join(load(root)))
+    # bytes, not print(): on Windows a text-mode stdout would end the line with CRLF and poison $GITHUB_ENV
+    sys.stdout.buffer.write((" ".join(load(root)) + "\n").encode("ascii"))
+    sys.stdout.buffer.flush()
     return 0
 
 

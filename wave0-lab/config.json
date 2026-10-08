@@ -16,7 +16,8 @@
       "arc-node-macos-arm64": "012c8d00d22a924349ce7201f93c724ddb74ff3cbf28a2a14b9b35c60ba3f5af",
       "arc-node-macos-x86_64": "3af3c00b78e63357e292d88e4d26ae059b5a006741c95d778b0a976c6c56bcb7",
       "arc-node-windows-x86_64.exe": "f6c4d403014f3c2be512524f89054984df1a48c57083cc19fb56c723ce48d6f9"
-    }
+    },
+    "latest_json_sha256": "4a36c70d5ad984926bc87a791932844c3b0a2b7ddb77b76c5f896d802e7aebfb"
   },
   "stage_a": {
     "enabled": true,
@@ -25,7 +26,7 @@
     "aarch64_smoke": true
   },
   "stage_b": {
-    "enabled": true,
+    "enabled": false,
     "profile": "smoke",
     "launcher_source": "artifact",
     "tag": "v0.7.12",

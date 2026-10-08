@@ -32,7 +32,7 @@ class CheckConfigTests(unittest.TestCase):
         self.assertEqual(check_config.validate(CONFIG), [])
 
     def test_outputs(self):
-        out = check_config.outputs(CONFIG)
+        out = check_config.outputs(mutated(["stage_b", "enabled"], True))
         self.assertEqual(out["stage_a"], "true")
         self.assertEqual(out["stage_b"], "true")
         self.assertEqual(out["stage_b_profile"], "smoke")
@@ -46,6 +46,7 @@ class CheckConfigTests(unittest.TestCase):
             "repository": mutated(["repository"], "other/repo"),
             "base commit": mutated(["base_commit"], "abc"),
             "digest format": mutated(["handoff", "artifact_digest"], "d1f5"),
+            "latest.json digest": mutated(["handoff", "latest_json_sha256"], "xyz"),
             "launcher missing": mutated(["handoff", "launchers"], {"arc-node-linux-x86_64": "0" * 64}),
             "launcher hex": mutated(["handoff", "launchers", "arc-node-macos-arm64"], "XYZ"),
             "tag": mutated(["handoff", "tag"], "v0.8.0"),

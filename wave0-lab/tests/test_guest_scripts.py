@@ -84,6 +84,16 @@ def state_of(root):
     return json.loads(path.read_text()) if path.exists() else {}
 
 
+class LiveIpsTests(unittest.TestCase):
+    def test_output_is_a_single_lf_terminated_line_without_carriage_returns(self):
+        done = subprocess.run([sys.executable, "-B", str(_paths.LAB / "live_ips.py"), str(_paths.ROOT)], capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.endswith(b"\n"))
+        self.assertNotIn(b"\r", done.stdout)
+        self.assertEqual(done.stdout.count(b"\n"), 1)
+        self.assertEqual(len(done.stdout.split()), 6)
+
+
 class ShellTests(unittest.TestCase):
     def test_every_shell_script_parses(self):
         self.assertEqual(len(SHELL), 6)

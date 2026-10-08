@@ -204,7 +204,7 @@ jobs:
         run: python wave0-lab/fetch_handoff.py --config wave0-lab/config.json --out handoff
       - name: Isolate the runner from every live-network address
         shell: bash
-        run: echo "LIVE_NETWORK_IPS=$(python wave0-lab/live_ips.py .)" >> "$GITHUB_ENV"
+        run: echo "LIVE_NETWORK_IPS=$(python wave0-lab/live_ips.py . | tr -d '\r')" >> "$GITHUB_ENV"
       - name: Block the live network in the Windows firewall
         shell: pwsh
         run: |

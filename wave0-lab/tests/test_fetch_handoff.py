@@ -21,12 +21,14 @@ def sha(data: bytes) -> str:
 def build_artifact(mutate=None):
     """Return (config, zip_bytes, record) for a synthetic nine-member handoff artifact."""
     launchers = {asset: (asset + " bytes\n").encode() * 50 for asset in fh.ASSETS}
-    sums = "".join(f"{sha(data)}  {asset}\n" for asset, data in sorted(launchers.items()))
+    latest = b"{}\n"
+    # the handoff's own SHA256SUMS: the five launchers AND latest.json (L7 later regenerates a five-line file)
+    sums = "".join(f"{sha(data)}  {asset}\n" for asset, data in sorted(launchers.items())) + f"{sha(latest)}  latest.json\n"
     members = {
         "RELEASE-NOTES.md": b"notes\n",
         "legacy-bridge-provenance.json": json.dumps({"schema": fh.PROVENANCE_SCHEMA, "eligible_for_latest": False}).encode(),
         "v0.7.12/SHA256SUMS": sums.encode(),
-        "v0.7.12/latest.json": b"{}\n",
+        "v0.7.12/latest.json": latest,
     }
     for asset, data in launchers.items():
         members[f"v0.7.12/{asset}"] = data
@@ -48,6 +50,7 @@ def build_artifact(mutate=None):
             "artifact_size": len(blob),
             "tag": "v0.7.12",
             "launchers": {asset: sha(data) for asset, data in launchers.items()},
+            "latest_json_sha256": sha(latest),
         },
     }
     record = {
@@ -133,6 +136,39 @@ class FetchHandoffTests(unittest.TestCase):
         config, blob, record = build_artifact()
         config["handoff"]["launchers"]["arc-node-macos-arm64"] = "0" * 64
         self.refuse(config, blob, record, "SHA256SUMS differs")
+
+    def test_a_five_line_sums_file_is_not_the_handoffs_own(self):
+        def five_lines(members):
+            members["v0.7.12/SHA256SUMS"] = "".join(line + "\n" for line in members["v0.7.12/SHA256SUMS"].decode().splitlines()[:5]).encode()
+        config, blob, record = build_artifact(five_lines)
+        self.refuse(config, blob, record, "expected the five launchers and latest.json")
+
+    def test_latest_json_line_must_match_the_member(self):
+        def wrong(members):
+            lines = members["v0.7.12/SHA256SUMS"].decode().splitlines()
+            lines[-1] = "0" * 64 + "  latest.json"
+            members["v0.7.12/SHA256SUMS"] = ("\n".join(lines) + "\n").encode()
+        config, blob, record = build_artifact(wrong)
+        self.refuse(config, blob, record, "latest.json line differs")
+
+    def test_latest_json_must_match_the_pin(self):
+        config, blob, record = build_artifact()
+        config["handoff"]["latest_json_sha256"] = "1" * 64
+        self.refuse(config, blob, record, "pinned")
+
+    REAL_ZIP = Path("/Users/excaulibur/work/outputs/arc-proof-sprint-20261006/bridge-v0712/handoff-run-37741303661.zip")
+
+    @unittest.skipUnless(REAL_ZIP.exists(), "the real handoff artifact is not on this machine")
+    def test_the_real_artifact_passes_with_the_shipped_config(self):
+        """The test that would have caught the first push: the real artifact against the shipped config."""
+        config = json.loads((_paths.LAB / "config.json").read_text())
+        blob = self.REAL_ZIP.read_bytes()
+        record = {"id": config["handoff"]["artifact_id"], "name": config["handoff"]["artifact_name"], "expired": False, "digest": "sha256:" + sha(blob),
+                  "size_in_bytes": len(blob), "workflow_run": {"id": config["handoff"]["run_id"], "head_sha": config["base_commit"]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            verified = fh.fetch(config, Path(tmp) / "out", gh=fake_gh(record, blob))
+        self.assertEqual(verified["launchers"], config["handoff"]["launchers"])
+        self.assertEqual(verified["latest_json_sha256"], config["handoff"]["latest_json_sha256"])
 
     def test_sums_file_lies(self):
         def lie(members):
