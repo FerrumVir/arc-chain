@@ -461,8 +461,12 @@ export function Settings() {
                   ) : (
                     "its private data folder"
                   )}
-                  , and never sends it to ARC or anywhere else over the network. Keep
-                  your own offline backup.
+                  , and never sends it to ARC or anywhere else over the network.
+                  Outside the app, your system can still copy it: backups can include
+                  that folder; on Windows it is in your roaming profile, which some
+                  workplace networks sync to a server; and if you used Copy during
+                  setup, the phrase went to the clipboard, which some systems keep in
+                  history or sync to your other devices. Keep your own offline backup.
                 </div>
               </div>
             </div>
@@ -627,9 +631,11 @@ function ComputeConsent() {
         <span>Keep this computer awake while a job runs</span>
       </label>
       <span className="field-hint">
-        Holds off idle sleep only while a job is computing, so it is not lost
-        halfway. The computer still sleeps between jobs and when the lid
-        closes. Takes effect the next time the node starts.
+        While a job is computing, the computer does not sleep on its own, so
+        the job is not lost halfway; on Linux a sleep you request is also
+        blocked until the job ends. It can sleep between jobs, and closing the
+        lid can still put it to sleep. Takes effect the next time the node
+        starts.
       </span>
       {awake.error && (
         <p

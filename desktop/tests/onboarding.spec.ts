@@ -1,14 +1,17 @@
 import { expect, test } from "@playwright/test";
-import { clearState } from "./helpers";
+import { clearState, wheelIntoView } from "./helpers";
 
 test.describe("Onboarding wizard", () => {
   test.beforeEach(async ({ page }) => {
     await clearState(page);
   });
 
-  test("walks through all four steps and lands on dashboard", async ({
+  test("walks through all four steps at the default 1180x780 window and lands on dashboard", async ({
     page,
   }) => {
+    // The app opens at 1180x780 (tauri.conf.json). Each step's action must be
+    // reachable by scrolling there, not only by Playwright's own scrolling.
+    await page.setViewportSize({ width: 1180, height: 780 });
     await page.goto("/");
 
     // Welcome
@@ -17,6 +20,7 @@ test.describe("Onboarding wizard", () => {
     await expect(
       page.getByRole("heading", { name: /welcome to arc/i }),
     ).toBeVisible();
+    await wheelIntoView(page, page.getByTestId("btn-continue-welcome"));
     await page.getByTestId("btn-continue-welcome").click();
 
     // Identity (no role / hardware step - the role is derived later from
@@ -26,6 +30,7 @@ test.describe("Onboarding wizard", () => {
     await expect(page.getByTestId("btn-continue-identity")).toBeDisabled();
     await page.getByTestId("btn-reveal-seed").click();
     await expect(page.getByTestId("btn-continue-identity")).toBeEnabled();
+    await wheelIntoView(page, page.getByTestId("btn-continue-identity"));
     await page.getByTestId("btn-continue-identity").click();
 
     // Model picker. Added in v0.6.0 - this spec previously jumped straight
@@ -51,7 +56,13 @@ test.describe("Onboarding wizard", () => {
     await expect(power).toContainText("after you log in while Start node on app launch is on");
     const keepAwake = disclosure.getByTestId("disclosure-keep-awake");
     await expect(keepAwake).toContainText("Off unless you turn it on in Settings.");
-    await expect(keepAwake).toContainText("only while a job is computing");
+    await expect(keepAwake).toContainText(
+      "does not sleep on its own while a job is computing",
+    );
+    await expect(keepAwake).toContainText(
+      "on Linux a sleep you request is also blocked until the job ends",
+    );
+    await expect(keepAwake).toContainText("closing the lid can still put it to sleep");
     await expect(keepAwake).toContainText("applies the next time the node starts");
     await expect(page.getByTestId("btn-continue-model")).toBeEnabled();
     // Selecting the model is the explicit opt-in; Skip takes it back.
@@ -61,11 +72,13 @@ test.describe("Onboarding wizard", () => {
     await page.getByTestId("tier-skip").click();
     await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByTestId("btn-continue-model")).toBeEnabled();
+    await wheelIntoView(page, page.getByTestId("btn-continue-model"));
     await page.getByTestId("btn-continue-model").click();
 
     // Launch
     await expect(page.getByTestId("step-launch")).toBeVisible();
     await expect(page.getByRole("button", { name: /set up this node/i })).toBeVisible();
+    await wheelIntoView(page, page.getByTestId("btn-launch"));
     await page.getByTestId("btn-launch").click();
 
     // Lands on dashboard (mock mode resolves startNode + faucetClaim fast)
@@ -157,16 +170,24 @@ test.describe("Onboarding wizard", () => {
     );
   });
 
-  test("observer setup never claims that a model will be downloaded", async ({
+  test("at the 960x640 minimum window every step's action is reachable, and observer setup never claims a model download", async ({
     page,
   }) => {
+    // The smallest window the app allows (tauri.conf.json minWidth/minHeight).
+    // The compute step is taller than this, so it must scroll.
+    await page.setViewportSize({ width: 960, height: 640 });
     await page.goto("/");
+    await wheelIntoView(page, page.getByTestId("btn-continue-welcome"));
     await page.getByTestId("btn-continue-welcome").click();
     await page.getByTestId("btn-reveal-seed").click();
+    await wheelIntoView(page, page.getByTestId("btn-continue-identity"));
     await page.getByTestId("btn-continue-identity").click();
     // No choice made: continuing keeps contribution off (ARC-50 1.5).
     await expect(page.getByTestId("tier-standard")).toBeVisible();
+    await wheelIntoView(page, page.getByTestId("btn-continue-model"));
     await page.getByTestId("btn-continue-model").click();
+    await wheelIntoView(page, page.getByTestId("btn-launch"));
+    await page.getByTestId("btn-launch").click({ trial: true });
 
     const summary = page.getByTestId("launch-summary");
     await expect(summary).toContainText("observer/router");

@@ -90,6 +90,13 @@ export function Onboarding() {
   const next = () => setStep(STEPS[Math.min(stepIndex + 1, STEPS.length - 1)]);
   const back = () => setStep(STEPS[Math.max(stepIndex - 1, 0)]);
 
+  // The steps scroll when the window is shorter than a step (the app allows
+  // 960x640), so a step's action is never cut off. Each step starts at its top.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [step]);
+
   useEffect(() => {
     if (step === "identity" && !identity) {
       setIdentityError(null);
@@ -236,6 +243,7 @@ export function Onboarding() {
 
   return (
     <div className="onboarding" data-testid="onboarding">
+      <div className="onboarding-scroll" ref={scrollRef} data-testid="onboarding-scroll">
       <div className="onboarding-inner">
         <div className="onboarding-steps" aria-label="Progress">
           {STEPS.map((_, i) => (
@@ -900,7 +908,7 @@ export function Onboarding() {
           </motion.div>
         </AnimatePresence>
       </div>
-
+      </div>
     </div>
   );
 }
@@ -957,10 +965,11 @@ function ContributionDisclosure() {
       </p>
       <p style={{ margin: 0 }} data-testid="disclosure-keep-awake">
         <strong style={{ color: "var(--text)" }}>Keep-awake.</strong> Off
-        unless you turn it on in Settings. When on, it stops idle sleep only
-        while a job is computing; the computer can still sleep between jobs
-        and when the lid closes. A change applies the next time the node
-        starts.
+        unless you turn it on in Settings. When on, the computer does not
+        sleep on its own while a job is computing, and on Linux a sleep you
+        request is also blocked until the job ends. It can sleep between jobs,
+        and closing the lid can still put it to sleep. A change applies the
+        next time the node starts.
       </p>
     </div>
   );

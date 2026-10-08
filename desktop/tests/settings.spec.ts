@@ -33,6 +33,9 @@ test.describe("Settings", () => {
     await expect(storage).toContainText(
       "never sends it to ARC or anywhere else over the network",
     );
+    // Copies the operating system can make are named, plainly.
+    await expect(storage).toContainText("on Windows it is in your roaming profile");
+    await expect(storage).toContainText("the phrase went to the clipboard");
     await expect(page.getByText("We don't store it")).toHaveCount(0);
     await page.getByTestId("btn-reset").click();
     await expect(page.getByTestId("onboarding")).toBeVisible();
