@@ -1,0 +1,43 @@
+[package]
+name = "arc-legacy-bridge"
+description = "One-time launcher that moves a stranded v0.7 ARC install onto a pinned, signature-verified v0.8 stake-zero node"
+# The bridge ships as GitHub release v0.7.12 under the legacy `arc-node-<platform>`
+# asset names, so its own version is the v0.7 line, not the workspace version.
+# `pins::tests::bridge_version_matches_crate_version` keeps the two in step.
+version = "0.7.12"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "arc-legacy-bridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+ed25519-dalek.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# Blocking HTTPS with rustls/ring and bundled Mozilla roots. No gzip: release
+# downloads resume with byte ranges, so the transfer must be the exact bytes.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

@@ -1,0 +1,375 @@
+name: Legacy v0.7 bridge
+
+# Builds the v0.7.12 bridge launcher (crates/arc-legacy-bridge) and proves,
+# against the released v0.7 updater code paths, that a stranded v0.7.11
+# desktop or headless install becomes a stake-zero v0.8 node in a fresh data
+# directory while its v0.7 data stays byte-identical. See
+# docs/LEGACY-BRIDGE.md.
+#
+# Safety: no job has release, deployment, environment, OIDC, or secret
+# access, and none creates or edits a GitHub release or tag. Acceptance jobs
+# reject every live-network address for their whole run, so no v0.7 or v0.8
+# process can register with or write to the public testnet. They read public
+# GitHub release assets (the pinned v0.7.7 and v0.8 bytes) only.
+#
+# Runs on pushes to non-main branches that touch the bridge, and on demand.
+# The macOS leg is opt-in so routine pushes never queue on scarce macOS
+# runners.
+on:
+  push:
+    branches-ignore: [main]
+    paths:
+      - crates/arc-legacy-bridge/**
+      - tests/legacy-bridge/**
+      - .github/workflows/legacy-bridge.yml
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: Also run the macOS desktop leg (uses a scarce macOS runner)
+        type: boolean
+        default: false
+
+concurrency:
+  group: legacy-bridge-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  LIVE_NETWORK_IPS: 149.28.32.76 140.82.16.112 136.244.109.1 104.238.171.11 202.182.107.41 149.28.153.31
+
+jobs:
+  unit:
+    name: bridge unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: legacy-bridge-unit-${{ matrix.os }}
+      # Windows checkouts use CRLF; rustfmt.toml pins Unix newlines, so the
+      # format gate runs on Linux only (as in ci.yml).
+      - name: rustfmt
+        if: runner.os == 'Linux'
+        run: cargo fmt -p arc-legacy-bridge -- --check
+      - name: clippy (deny warnings)
+        run: cargo clippy -p arc-legacy-bridge --all-targets --locked -- -D warnings
+      - name: Unit tests (real v0.8.11 signed manifest, local HTTP server)
+        run: cargo test -p arc-legacy-bridge --locked
+
+  scripts:
+    name: harness syntax and source fidelity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ShellCheck and Python syntax
+        run: |
+          shellcheck -S warning tests/legacy-bridge/headless-v07-acceptance.sh tests/legacy-bridge/fake-github/curl
+          python3 -m py_compile tests/legacy-bridge/desktop_v07_harness.py tests/legacy-bridge/snapshot_tree.py tests/legacy-bridge/check_v07_fixtures.py
+      - name: Offline privacy boolean parsing under errexit (no node)
+        run: python3 tests/legacy-bridge/test_privacy_flag.py -v
+      - name: The harness reproduces the released v0.7.11 desktop source
+        run: |
+          git fetch --no-tags --depth=1 origin refs/tags/v0.7.11:refs/tags/v0.7.11
+          python3 tests/legacy-bridge/desktop_v07_harness.py check-source --repo .
+      - name: The consent fixtures match every released v0.6.0..v0.7.11 tag
+        run: |
+          for tag in v0.6.0 v0.7.0 v0.7.1 v0.7.2 v0.7.3 v0.7.4 v0.7.5 v0.7.6 v0.7.7 v0.7.10 v0.7.11; do
+            git fetch --no-tags --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+          done
+          python3 tests/legacy-bridge/check_v07_fixtures.py --repo .
+
+  build-linux:
+    name: build static Linux launcher
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: legacy-bridge-musl
+      - name: Install the musl C toolchain for ring
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+      - name: Build the launcher
+        run: cargo build --release -p arc-legacy-bridge --target x86_64-unknown-linux-musl --locked
+      - name: Stage it under the legacy v0.7 asset name
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/arc-legacy-bridge dist/arc-node-linux-x86_64
+          file dist/arc-node-linux-x86_64 | tee dist/file.txt
+          grep -Eq 'statically linked|static-pie linked' dist/file.txt
+          dist/arc-node-linux-x86_64 --version | tee dist/version.txt
+          grep -qF "arc-node $(jq -er .bridge_version crates/arc-legacy-bridge/pins/active.json) " dist/version.txt
+          (cd dist && sha256sum arc-node-linux-x86_64 | tee SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  headless-linux:
+    name: v0.7.11 headless install consumes the bridge (systemd, real updater)
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-linux-x86_64
+          path: dist
+      - name: Run the acceptance
+        run: |
+          chmod 0755 dist/arc-node-linux-x86_64
+          bash tests/legacy-bridge/headless-v07-acceptance.sh dist/arc-node-linux-x86_64 evidence/headless
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evidence-headless-linux
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+  desktop-linux:
+    name: v0.7.11 desktop consumes the bridge (Linux)
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-linux-x86_64
+          path: dist
+      - name: Isolate the runner from every live-network address
+        run: |
+          set -euo pipefail
+          for ip in $LIVE_NETWORK_IPS; do
+            sudo iptables -I OUTPUT -d "$ip" -j REJECT
+          done
+          if curl -s -m 5 -o /dev/null "https://149.28.32.76/health"; then
+            echo "the live network is still reachable" >&2
+            exit 1
+          fi
+      - name: Released v0.7 inputs (v0.7.11 app resources, pinned v0.7.7 node)
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin refs/tags/v0.7.11:refs/tags/v0.7.11
+          python3 tests/legacy-bridge/desktop_v07_harness.py check-source --repo .
+          mkdir -p legacy
+          git show v0.7.11:desktop/src-tauri/resources/testnet-seeds.txt > legacy/testnet-seeds.txt
+          git show v0.7.11:desktop/src-tauri/resources/genesis.toml > legacy/genesis.toml
+          curl -fsSL --retry 3 -o legacy/arc-node-v0.7.7 \
+            https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/arc-node-linux-x86_64
+          echo "1cfc3039786d023cde24ad0b452f35735b39f9e83aaf293e6ed0bf623a11b20c  legacy/arc-node-v0.7.7" | sha256sum -c -
+          chmod 0755 legacy/arc-node-v0.7.7 dist/arc-node-linux-x86_64
+      - name: The v0.7.11 desktop lifecycle consumes the bridge
+        run: |
+          python3 tests/legacy-bridge/desktop_v07_harness.py run \
+            --bridge dist/arc-node-linux-x86_64 \
+            --legacy-node legacy/arc-node-v0.7.7 \
+            --legacy-seeds legacy/testnet-seeds.txt \
+            --legacy-genesis legacy/genesis.toml \
+            --pins crates/arc-legacy-bridge/pins/active.json \
+            --evidence evidence/desktop-linux
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - name: The v0.7.11 Tauri updater accepts a v0.8 desktop latest.json
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path tests/release/tauri-updater-verifier/Cargo.toml
+          verifier=tests/release/tauri-updater-verifier/target/release/tauri-updater-verifier
+          out=evidence/tauri-updater
+          mkdir -p "$out"
+          pubkey="$(git show v0.7.11:desktop/src-tauri/tauri.conf.json | jq -er '.plugins.updater.pubkey')"
+          # The bridge release republishes a qualified v0.8 desktop release's
+          # latest.json byte for byte. v0.8.11 stands in until the release
+          # with the first-launch consent dialog is published; this only
+          # proves the v0.7 key accepts a v0.8 bundle.
+          curl -fsSL --retry 3 -o "$out/latest.json" \
+            https://github.com/FerrumVir/arc-chain/releases/download/v0.8.11/latest.json
+          python3 - "$out/latest.json" <<'PY'
+          import json, sys
+          manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+          remote = tuple(int(part) for part in manifest["version"].split("."))
+          assert remote > (0, 7, 11), manifest["version"]
+          for platform in ("darwin-aarch64", "darwin-x86_64", "linux-x86_64", "windows-x86_64"):
+              url = manifest["platforms"][platform]["url"]
+              assert url.startswith("https://github.com/FerrumVir/arc-chain/releases/download/v"), url
+          print(f"latest.json version {manifest['version']} > 0.7.11 for all four v0.7 platforms")
+          PY
+          for platform in darwin-aarch64 darwin-x86_64 linux-x86_64 windows-x86_64; do
+            url="$(jq -er --arg p "$platform" '.platforms[$p].url' "$out/latest.json")"
+            jq -er --arg p "$platform" '.platforms[$p].signature' "$out/latest.json" > "$out/$platform.sig"
+            curl -fsSL --retry 3 -o "$out/$platform.payload" "$url"
+            "$verifier" "$pubkey" "$out/$platform.payload" "$out/$platform.sig" | tee -a "$out/verified.txt"
+            rm -f "$out/$platform.payload"
+          done
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evidence-desktop-linux
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+  desktop-windows:
+    name: v0.7.11 desktop consumes the bridge (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: legacy-bridge-windows-release
+      - name: Build the launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p arc-legacy-bridge --locked
+          mkdir -p dist
+          cp target/release/arc-legacy-bridge.exe dist/arc-node-windows-x86_64.exe
+          dist/arc-node-windows-x86_64.exe --version | tee dist/version.txt
+          grep -qF "arc-node $(jq -er .bridge_version crates/arc-legacy-bridge/pins/active.json) " dist/version.txt
+      - name: Isolate the runner from every live-network address
+        shell: pwsh
+        run: |
+          $ips = $env:LIVE_NETWORK_IPS -split ' '
+          New-NetFirewallRule -DisplayName 'arc-live-network-block' -Direction Outbound -Action Block -RemoteAddress $ips | Out-Null
+          Set-NetFirewallProfile -All -Enabled True
+          # A blocked connect fails fast ("access forbidden") or times out.
+          $client = New-Object System.Net.Sockets.TcpClient
+          $reachable = $false
+          try {
+            $reachable = $client.ConnectAsync('149.28.32.76', 443).Wait(5000) -and $client.Connected
+          } catch {
+            Write-Host "blocked as intended: $($_.Exception.InnerException.Message)"
+          }
+          $client.Dispose()
+          if ($reachable) { throw 'the live network is still reachable' }
+      - name: Released v0.7 inputs (v0.7.11 app resources, pinned v0.7.7 node)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin refs/tags/v0.7.11:refs/tags/v0.7.11
+          python tests/legacy-bridge/desktop_v07_harness.py check-source --repo .
+          mkdir -p legacy
+          git show v0.7.11:desktop/src-tauri/resources/testnet-seeds.txt > legacy/testnet-seeds.txt
+          git show v0.7.11:desktop/src-tauri/resources/genesis.toml > legacy/genesis.toml
+          curl -fsSL --retry 3 -o legacy/arc-node-v0.7.7.exe \
+            https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/arc-node-windows-x86_64.exe
+          echo "8c1530cfb41954079236dfdd5518dad52071b18f3a032630470b853e7249f240  legacy/arc-node-v0.7.7.exe" | sha256sum -c -
+      - name: The v0.7.11 desktop lifecycle consumes the bridge
+        shell: bash
+        run: |
+          python tests/legacy-bridge/desktop_v07_harness.py run \
+            --bridge dist/arc-node-windows-x86_64.exe \
+            --legacy-node legacy/arc-node-v0.7.7.exe \
+            --legacy-seeds legacy/testnet-seeds.txt \
+            --legacy-genesis legacy/genesis.toml \
+            --pins crates/arc-legacy-bridge/pins/active.json \
+            --evidence evidence/desktop-windows
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evidence-desktop-windows
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+  desktop-macos:
+    name: v0.7.11 desktop consumes the bridge (macOS, opt-in)
+    # Opt-in: a manual dispatch with `macos`, or one pre-merge push whose
+    # head commit message contains "[macos-acceptance]".
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.macos) ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[macos-acceptance]'))
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - name: Build the launcher
+        run: |
+          set -euo pipefail
+          cargo build --release -p arc-legacy-bridge --locked
+          mkdir -p dist legacy
+          cp target/release/arc-legacy-bridge dist/arc-node-macos-arm64
+          dist/arc-node-macos-arm64 --version
+      - name: Released v0.7 inputs and the desktop lifecycle
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin refs/tags/v0.7.11:refs/tags/v0.7.11
+          git show v0.7.11:desktop/src-tauri/resources/testnet-seeds.txt > legacy/testnet-seeds.txt
+          git show v0.7.11:desktop/src-tauri/resources/genesis.toml > legacy/genesis.toml
+          curl -fsSL --retry 3 -o legacy/arc-node-v0.7.7 \
+            https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/arc-node-macos-arm64
+          echo "415d6c2efbe3e6400d4dd2b7c23bc03e5e3a66c1c5c0a4e6280461611c047512  legacy/arc-node-v0.7.7" | shasum -a 256 -c -
+          chmod 0755 legacy/arc-node-v0.7.7
+          for ip in $LIVE_NETWORK_IPS; do
+            echo "block drop out quick to $ip" >> legacy/pf.conf
+          done
+          sudo pfctl -f legacy/pf.conf
+          sudo pfctl -e || sudo pfctl -s info | grep -q 'Status: Enabled'
+          if curl -s -m 5 -o /dev/null "https://149.28.32.76/health"; then
+            echo "the live network is still reachable" >&2
+            exit 1
+          fi
+          python3 tests/legacy-bridge/desktop_v07_harness.py run \
+            --bridge dist/arc-node-macos-arm64 \
+            --legacy-node legacy/arc-node-v0.7.7 \
+            --legacy-seeds legacy/testnet-seeds.txt \
+            --legacy-genesis legacy/genesis.toml \
+            --pins crates/arc-legacy-bridge/pins/active.json \
+            --evidence evidence/desktop-macos
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evidence-desktop-macos
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30

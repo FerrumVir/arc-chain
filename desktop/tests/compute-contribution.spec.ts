@@ -71,3 +71,47 @@ test.describe("Compute contribution opt-in", () => {
     await expect(page.getByTestId("worker-jobs-completed")).toHaveCount(0);
   });
 });
+
+// A stranded v0.7 install reaches this app through the v0.7 legacy bridge release.
+// The first launch asks once, in the user's words, before any compute runs.
+test.describe("First launch after a v0.7 upgrade", () => {
+  const pendingQuestion = {
+    load_legacy_compute_question: {
+      previousRole: "worker",
+      previousModelPath: "/Users/ada/.arc/models/standard.gguf",
+      detectedBy: "the v0.7 legacy bridge release ran on this computer",
+      recordedUnixMs: 1_759_766_400_000,
+    },
+  };
+
+  test.beforeEach(async ({ page }) => {
+    await seedOnboarded(page);
+    await seedMockOverrides(page, pendingQuestion);
+  });
+
+  test("Yes, keep contributing records consent like the Settings switch", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const dialog = page.getByTestId("legacy-upgrade-dialog");
+    await expect(dialog).toContainText("Your ARC node is upgrading to the new network.");
+    await expect(dialog).toContainText("Keep contributing compute?");
+    await expect(dialog.getByTestId("legacy-upgrade-yes")).toHaveText("Yes, keep contributing");
+    await expect(dialog.getByTestId("legacy-upgrade-not-now")).toHaveText("Not now");
+    await dialog.getByTestId("legacy-upgrade-yes").click();
+    await expect(dialog).toBeHidden();
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("compute-consent-toggle")).toBeChecked();
+  });
+
+  test("Not now keeps the upgraded node an observer with compute off", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const dialog = page.getByTestId("legacy-upgrade-dialog");
+    await dialog.getByTestId("legacy-upgrade-not-now").click();
+    await expect(dialog).toBeHidden();
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
+  });
+});
