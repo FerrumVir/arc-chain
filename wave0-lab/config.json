@@ -20,15 +20,15 @@
     "latest_json_sha256": "4a36c70d5ad984926bc87a791932844c3b0a2b7ddb77b76c5f896d802e7aebfb"
   },
   "stage_a": {
-    "enabled": true,
+    "enabled": false,
     "macos_arm64": true,
     "macos_intel": true,
     "aarch64_smoke": true
   },
   "stage_b": {
-    "enabled": false,
+    "enabled": true,
     "profile": "smoke",
-    "launcher_source": "artifact",
+    "launcher_source": "published",
     "tag": "v0.7.12",
     "expect_sha256": "41d92a475db819eb190b6409ac82cb3258a557980c193decc629896718a3f69e",
     "live_network": "blocked",

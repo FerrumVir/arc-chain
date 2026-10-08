@@ -32,13 +32,17 @@ class CheckConfigTests(unittest.TestCase):
         self.assertEqual(check_config.validate(CONFIG), [])
 
     def test_outputs(self):
-        out = check_config.outputs(mutated(["stage_b", "enabled"], True))
+        both = copy.deepcopy(CONFIG)
+        both["stage_a"]["enabled"] = True
+        both["stage_b"]["enabled"] = True
+        out = check_config.outputs(both)
         self.assertEqual(out["stage_a"], "true")
         self.assertEqual(out["stage_b"], "true")
-        self.assertEqual(out["stage_b_profile"], "smoke")
-        self.assertEqual(out["stage_b_launcher_source"], "artifact")
+        self.assertEqual(out["stage_b_profile"], CONFIG["stage_b"]["profile"])
+        self.assertEqual(out["stage_b_launcher_source"], CONFIG["stage_b"]["launcher_source"])
         off = mutated(["stage_a", "enabled"], False)
         self.assertEqual(check_config.outputs(off)["stage_a_macos_intel"], "false")
+        self.assertEqual(check_config.outputs(off)["stage_a"], "false")
 
     def test_rejections(self):
         cases = {

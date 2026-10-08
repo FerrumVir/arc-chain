@@ -1061,8 +1061,14 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         print(f"::error::{message}")
         return 2
     subprocess.run(["sudo", "chmod", "0666", "/dev/kvm"], check=False)
-    subprocess.run(["sudo", "apt-get", "update", "-q"], check=True)
-    subprocess.run(["sudo", "apt-get", "install", "-y", "-q", "qemu-system-x86", "qemu-utils", "genisoimage"], check=True)
+    # Non-interactive apt that cannot wait forever on a lock or a dialog, and without the recommended GUI stack.
+    apt_env = dict(os.environ, DEBIAN_FRONTEND="noninteractive", NEEDRESTART_MODE="a", NEEDRESTART_SUSPEND="1")
+    apt = ["sudo", "-E", "apt-get", "-o", "DPkg::Lock::Timeout=300", "-o", "Acquire::Retries=3", "-o", "Dpkg::Progress-Fancy=0"]
+    started = time.time()
+    subprocess.run(apt + ["update", "-q"], check=True, env=apt_env, timeout=600)
+    print(f"apt-get update took {time.time() - started:.0f} s", flush=True)
+    subprocess.run(apt + ["install", "-y", "-q", "--no-install-recommends", "qemu-system-x86", "qemu-utils", "genisoimage"], check=True, env=apt_env, timeout=900)
+    print(f"qemu installed after {time.time() - started:.0f} s", flush=True)
     print(subprocess.run(["qemu-system-x86_64", "--version"], stdout=subprocess.PIPE, check=True).stdout.decode().splitlines()[0])
     print(subprocess.run(["bash", "-c", "ls -l /dev/kvm; grep -c -E 'vmx|svm' /proc/cpuinfo; nproc; free -m | head -2; df -h / /mnt | cat"], stdout=subprocess.PIPE, check=False).stdout.decode())
     return 0

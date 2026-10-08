@@ -86,6 +86,16 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(profile=name):
                 self.assertLess(profile["deadline_min"], run_step["timeout-minutes"], "the orchestrator must stop before its step is killed")
 
+    def test_every_stage_b_step_before_the_soak_has_its_own_timeout(self):
+        steps = load(B)["jobs"]["stage-b"]["steps"]
+        for step in steps:
+            name = step.get("name", "")
+            if name.startswith("KVM gate") or name.startswith("Run Wave 0"):
+                with self.subTest(name):
+                    self.assertIn("timeout-minutes", step)
+        gate = next(step for step in steps if step.get("name", "").startswith("KVM gate"))
+        self.assertLessEqual(gate["timeout-minutes"], 30, "a hung apt must not hold the Stage B concurrency group for hours")
+
     def test_independent_concurrency_groups(self):
         self.assertNotEqual(load(A)["concurrency"]["group"], load(B)["concurrency"]["group"])
         for path in (A, B):

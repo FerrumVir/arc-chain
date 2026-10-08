@@ -75,7 +75,8 @@ jobs:
           persist-credentials: false
 
       - name: KVM gate (fails fast and says so when /dev/kvm is absent) and QEMU
-        run: python3 wave0-lab/stage_b/host_run.py preflight --evidence "$EVIDENCE"
+        timeout-minutes: 20
+        run: python3 -u wave0-lab/stage_b/host_run.py preflight --evidence "$EVIDENCE"
 
       - name: Run Wave 0 inside the nested VM
         timeout-minutes: 335
