@@ -922,13 +922,48 @@ struct ExactGemmParams {
     uint inputs;     // activation rows sharing each weight read, 1..8
 };
 
+// The 16 signed bytes of a block, widened once to 16 bits (exact: they lie in
+// [-128, 127]) so that every matrix row and every activation row and digit
+// plane of the multi-row projection reuses them instead of unpacking again.
+struct Wide16 {
+    short4 q0;
+    short4 q1;
+    short4 q2;
+    short4 q3;
+};
+
+static inline Wide16 widen16(uint4 v) {
+    Wide16 u;
+    u.q0 = short4(as_type<char4>(v.x));
+    u.q1 = short4(as_type<char4>(v.y));
+    u.q2 = short4(as_type<char4>(v.z));
+    u.q3 = short4(as_type<char4>(v.w));
+    return u;
+}
+
+// The integer dot16 computes: 16 products of magnitude at most 16,384 (exact
+// in 16 bits with MUL16, in 32 bits otherwise), summed in 32 bits. Any four
+// of them sum to at most 65,536 and all sixteen to at most 262,144.
+template <uint MUL16>
+static inline int dot_wide(Wide16 w, Wide16 c) {
+    int4 s;
+    if (MUL16 != 0) {
+        s = int4(w.q0 * c.q0) + int4(w.q1 * c.q1) + int4(w.q2 * c.q2) + int4(w.q3 * c.q3);
+    } else {
+        s = int4(w.q0) * int4(c.q0) + int4(w.q1) * int4(c.q1) + int4(w.q2) * int4(c.q2) +
+            int4(w.q3) * int4(c.q3);
+    }
+    return s.x + s.y + s.z + s.w;
+}
+
 // The exact projection of K activation rows (K = 1..8) with every weight
 // block read once and applied to all K rows. Digits are row-major: plane d of
 // activation row x is block row x * 4 + d; ctrl[x] holds row x's plane count
 // and the kernel runs the largest (planes above a row's own count are zero, so
-// they add nothing).
+// they add nothing). Each weight block is widened once for all K rows and
+// planes, and each digit block once for all the simdgroup's matrix rows.
 //
-// Exactness. Each block product is the int dot16 of #176's kernel: at most 16
+// Exactness. Each block product is the integer of #176's dot16: at most 16
 // terms of magnitude 16,384, so it is exact in 32 bits. It is scaled by 256^d
 // and added into a 64-bit accumulator per (matrix row, activation row). Every
 // partial sum is an integer of magnitude below 2^56 (the bound of #176's
@@ -974,16 +1009,17 @@ kernel void exact_gemm_dyn(
     }
 
     for (uint b = lane; b < p.blocks; b += sg_width) {
-        uint4 w[ROWS];
+        Wide16 w[ROWS];
         for (uint r = 0; r < ROWS; ++r) {
-            w[r] = row_ptr[r][b];
+            w[r] = widen16(row_ptr[r][b]);
         }
         for (uint x = 0; x < K; ++x) {
             for (uint d = 0; d < 4u; ++d) {
                 if (d < planes) {
-                    const uint4 c = digits[(ulong(x) * 4UL + ulong(d)) * ulong(p.blocks) + b];
+                    const Wide16 c =
+                        widen16(digits[(ulong(x) * 4UL + ulong(d)) * ulong(p.blocks) + b]);
                     for (uint r = 0; r < ROWS; ++r) {
-                        const long part = long(dot16<MUL16>(w[r], c));
+                        const long part = long(dot_wide<MUL16>(w[r], c));
                         acc[r][x] += as_type<ulong>(part) << (8u * d);
                     }
                 }
