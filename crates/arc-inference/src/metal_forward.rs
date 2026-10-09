@@ -6,9 +6,9 @@
 //! one host round trip per token, where the per-projection hook of
 //! [`crate::metal_gemv`] makes 225 for Llama-2-7B. Every value is
 //! byte-identical to the CPU engine, including the KV-cache rows it appends to
-//! the caller's [`KVCache`]; a token the GPU refuses (a status bit, a device
-//! error, a cache it cannot mirror, a position past its cache) runs on the CPU
-//! engine instead, so the caller always gets the CPU's answer.
+//! the caller's cache; a token the GPU refuses (a status bit, a device error,
+//! a cache it cannot mirror, a position past its cache) runs on the CPU engine
+//! instead, so the caller always gets the CPU's answer.
 //!
 //! Opt-in: this module exists only with the `metal-exact` feature, and only
 //! code that builds a [`MetalForward`] uses it. Nothing in the worker does.
@@ -22,18 +22,29 @@
 //!
 //! # KV-cache mirror
 //!
-//! The device keeps its own copy of the KV cache. Before each token, every
-//! row the device holds for a layer is compared with the caller's cache, and
-//! rows from the first difference on are uploaded. Rows the device has not
-//! seen are uploaded too, so CPU and GPU tokens can be mixed on one cache, and
-//! a caller can switch caches or change rows in place: the device copy always
-//! equals the caller's cache before a token runs. The check reads the caller's
-//! cache and the device copy once per token: for 7B, 2 MB of each per cached
-//! position. A cache whose layers do not hold exactly
-//! `position` rows runs on the CPU, which then behaves exactly as it always
-//! has.
+//! The device keeps its own copy of the KV cache. The GPU entry points take a
+//! [`MirroredKvCache`]: a [`KVCache`] that can be read freely (it derefs to
+//! one) but changed only through methods that record, per layer, the first
+//! row that may differ from the device copy. Before each token the device
+//! uploads the rows from that mark on and nothing else, so on one cache the
+//! cost per token does not grow with the context. The copy stays exact
+//! because:
+//! - every change goes through the wrapper: a CPU token or shard step marks
+//!   rows from the old length, [`MirroredKvCache::truncate`] from the new
+//!   length, and [`MirroredKvCache::edit`] (any other change) from row 0;
+//! - each wrapper and each [`MetalForward`] has a unique id, and the device
+//!   copy counts only for the pair that last synced, so switching caches, or
+//!   syncing one cache from two decoders, uploads everything again;
+//! - a token the GPU refuses leaves its row marked, so it is uploaded again.
+//!
+//! Test and debug builds also compare every mirrored row with the cache
+//! before each token ([`MetalForward::set_verify_mirror`]) and count any
+//! difference in [`MetalForwardStats::mirror_mismatches`], which the tests
+//! require to be zero. A cache whose layers do not hold exactly `position`
+//! rows runs on the CPU, which then behaves exactly as it always has.
 
-use std::ops::Range;
+use std::ops::{Deref, Range};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arc_gpu::metal_decoder::{
@@ -51,6 +62,13 @@ use crate::metal_gemv::metal_engine;
 
 static SELF_TEST: OnceLock<Result<(), String>> = OnceLock::new();
 
+/// Ids of [`MirroredKvCache`] and [`MetalForward`] values.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// What ran where, for one [`MetalForward`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct MetalForwardStats {
@@ -64,13 +82,136 @@ pub struct MetalForwardStats {
     pub device_errors: u64,
     /// CPU KV-cache rows copied to the device mirror.
     pub kv_rows_uploaded: u64,
+    /// Rows the mirror check compared with the cache (when it is on).
+    pub kv_rows_verified: u64,
+    /// Rows the check uploaded again, from the first one it found different
+    /// from the cache. Zero unless a change escaped the wrapper's marks.
+    pub mirror_mismatches: u64,
+}
+
+/// A [`KVCache`] for the GPU path. It records, per layer, the first row that
+/// may differ from the device's copy, so a [`MetalForward`] uploads only rows
+/// that changed.
+///
+/// It derefs to the cache for reading. Changes go through its methods, which
+/// lower the mark: the CPU-token methods mark rows from each layer's old
+/// length (the CPU engine only appends), [`Self::truncate`] from the new
+/// length, and [`Self::edit`] (any other change) from row 0.
+pub struct MirroredKvCache {
+    cache: KVCache,
+    id: u64,
+    /// The [`MetalForward`] whose device copy `dirty_from` refers to.
+    synced_by: Option<u64>,
+    /// Per layer: rows from here on may differ from that device copy.
+    dirty_from: Vec<usize>,
+}
+
+impl MirroredKvCache {
+    /// An empty cache of `n_layers` layers.
+    pub fn new(n_layers: usize) -> Self {
+        Self::from_cache(KVCache::new(n_layers))
+    }
+
+    /// Wrap `cache`. Every row will be uploaded.
+    pub fn from_cache(cache: KVCache) -> Self {
+        let layers = cache.k_data.len();
+        Self {
+            cache,
+            id: next_id(),
+            synced_by: None,
+            dirty_from: vec![0; layers],
+        }
+    }
+
+    /// The cache itself.
+    pub fn into_inner(self) -> KVCache {
+        self.cache
+    }
+
+    /// Exactly [`CachedIntegerModel::forward_one_token`], on the CPU engine.
+    pub fn cpu_forward_one_token(&mut self, model: &CachedIntegerModel, token: u32) -> Vec<i64> {
+        self.mark_appended(model.config.d_kv, 0..self.cache.k_data.len());
+        model.forward_one_token(token, &mut self.cache)
+    }
+
+    /// Exactly [`CachedIntegerModel::forward_shard_token_with_history`], on
+    /// the CPU engine.
+    pub fn cpu_forward_shard_token_with_history(
+        &mut self,
+        model: &CachedIntegerModel,
+        input: ShardInput,
+        start_layer: usize,
+        end_layer: usize,
+        position: usize,
+        generated_tokens: &[u32],
+    ) -> Result<ShardOutput, ShardForwardError> {
+        self.mark_appended(model.config.d_kv, start_layer..end_layer);
+        model.forward_shard_token_with_history(
+            input,
+            &mut self.cache,
+            start_layer,
+            end_layer,
+            position,
+            generated_tokens,
+        )
+    }
+
+    /// Keep the first `positions` rows (of `d_kv` values) of every layer, and
+    /// at most `positions` for `seq_len`.
+    pub fn truncate(&mut self, positions: usize, d_kv: usize) {
+        let len = positions.saturating_mul(d_kv);
+        for (keys, values) in self.cache.k_data.iter_mut().zip(&mut self.cache.v_data) {
+            keys.truncate(len);
+            values.truncate(len);
+        }
+        self.cache.seq_len = self.cache.seq_len.min(positions);
+        for mark in &mut self.dirty_from {
+            *mark = (*mark).min(positions);
+        }
+    }
+
+    /// Any other change to the cache. Every row will be uploaded.
+    pub fn edit<R>(&mut self, change: impl FnOnce(&mut KVCache) -> R) -> R {
+        // Marked first, so a panic inside `change` cannot leave a stale mark.
+        self.dirty_from.fill(0);
+        let result = change(&mut self.cache);
+        // `change` may have added or removed layers.
+        self.dirty_from.resize(self.cache.k_data.len(), 0);
+        result
+    }
+
+    /// Mark rows from each layer's current length on, in `layers`.
+    fn mark_appended(&mut self, d_kv: usize, layers: Range<usize>) {
+        for layer in layers {
+            if let (Some(mark), Some(keys), Some(values)) = (
+                self.dirty_from.get_mut(layer),
+                self.cache.k_data.get(layer),
+                self.cache.v_data.get(layer),
+            ) {
+                *mark = (*mark).min(keys.len().min(values.len()) / d_kv.max(1));
+            }
+        }
+    }
+}
+
+impl Deref for MirroredKvCache {
+    type Target = KVCache;
+
+    fn deref(&self) -> &KVCache {
+        &self.cache
+    }
 }
 
 /// A model resident on the GPU, served one command buffer per token.
 pub struct MetalForward<'a> {
     model: &'a CachedIntegerModel,
     decoder: MetalDecoder,
+    id: u64,
+    /// The [`MirroredKvCache`] the device rows belong to.
+    mirror_of: Option<u64>,
+    /// Per layer: device rows written for that cache.
     mirrored: Vec<usize>,
+    verify_mirror: bool,
     submission: Submission,
     stats: MetalForwardStats,
     last_gpu_seconds: f64,
@@ -143,7 +284,10 @@ impl<'a> MetalForward<'a> {
         Ok(Self {
             model,
             decoder,
+            id: next_id(),
+            mirror_of: None,
             mirrored: vec![0; cfg.n_layers],
+            verify_mirror: cfg!(any(test, debug_assertions)),
             submission: Submission::OneCommandBuffer,
             stats: MetalForwardStats::default(),
             last_gpu_seconds: 0.0,
@@ -154,6 +298,15 @@ impl<'a> MetalForward<'a> {
     /// token). Changes speed only.
     pub fn set_submission(&mut self, submission: Submission) {
         self.submission = submission;
+    }
+
+    /// Also compare every mirrored row with the cache before each token, and
+    /// upload any row that differs, counting it in
+    /// [`MetalForwardStats::mirror_mismatches`]. On by default in test and
+    /// debug builds. It reads the whole cache every token, so release builds
+    /// leave it off.
+    pub fn set_verify_mirror(&mut self, verify: bool) {
+        self.verify_mirror = verify;
     }
 
     pub fn stats(&self) -> MetalForwardStats {
@@ -171,7 +324,7 @@ impl<'a> MetalForward<'a> {
     }
 
     /// Exactly [`CachedIntegerModel::forward_one_token`].
-    pub fn forward_one_token(&mut self, token: u32, cache: &mut KVCache) -> Vec<i64> {
+    pub fn forward_one_token(&mut self, token: u32, cache: &mut MirroredKvCache) -> Vec<i64> {
         let model = self.model;
         let cfg = &model.config;
         let d = cfg.d_model;
@@ -196,14 +349,14 @@ impl<'a> MetalForward<'a> {
             }
         }
         self.stats.cpu_tokens += 1;
-        model.forward_one_token(token, cache)
+        cache.cpu_forward_one_token(model, token)
     }
 
     /// Exactly [`CachedIntegerModel::forward_shard_token`].
     pub fn forward_shard_token(
         &mut self,
         input: ShardInput,
-        cache: &mut KVCache,
+        cache: &mut MirroredKvCache,
         start_layer: usize,
         end_layer: usize,
         position: usize,
@@ -215,7 +368,7 @@ impl<'a> MetalForward<'a> {
     pub fn forward_shard_token_with_history(
         &mut self,
         input: ShardInput,
-        cache: &mut KVCache,
+        cache: &mut MirroredKvCache,
         start_layer: usize,
         end_layer: usize,
         position: usize,
@@ -257,9 +410,9 @@ impl<'a> MetalForward<'a> {
                     // Out of range: let the CPU path fail exactly as it does.
                     None => {
                         self.stats.cpu_tokens += 1;
-                        return model.forward_shard_token_with_history(
+                        return cache.cpu_forward_shard_token_with_history(
+                            model,
                             ShardInput::Token(token_id),
-                            cache,
                             start_layer,
                             end_layer,
                             position,
@@ -310,9 +463,9 @@ impl<'a> MetalForward<'a> {
             Some(token_id) => ShardInput::Token(token_id),
             None => ShardInput::Hidden(hidden),
         };
-        model.forward_shard_token_with_history(
+        cache.cpu_forward_shard_token_with_history(
+            model,
             input,
-            cache,
             start_layer,
             end_layer,
             position,
@@ -323,17 +476,22 @@ impl<'a> MetalForward<'a> {
     /// Append the step's KV rows to the caller's cache, as the CPU does.
     fn commit(
         &mut self,
-        cache: &mut KVCache,
+        cache: &mut MirroredKvCache,
         step: &DecoderStep,
         layers: Range<usize>,
         pos: usize,
     ) {
         for ((layer, k), v) in layers.zip(&step.k_rows).zip(&step.v_rows) {
-            cache.push_k(layer, k);
-            cache.push_v(layer, v);
+            cache.cache.push_k(layer, k);
+            cache.cache.push_v(layer, v);
+            // The appended row is the device's own row: both copies agree on
+            // one more row.
             self.mirrored[layer] = pos + 1;
+            if let Some(mark) = cache.dirty_from.get_mut(layer) {
+                *mark = pos + 1;
+            }
         }
-        cache.seq_len = pos + 1;
+        cache.cache.seq_len = pos + 1;
         self.stats.gpu_tokens += 1;
         self.last_gpu_seconds = step.gpu_seconds;
     }
@@ -346,48 +504,89 @@ impl<'a> MetalForward<'a> {
         }
     }
 
-    /// Reconcile the device KV cache with `cache` for `layers`. Returns false
-    /// when the GPU cannot run position `pos` from this cache; the CPU then
-    /// computes the token.
+    /// Bring the device KV cache of `layers` up to date with `cache`. Returns
+    /// false when the GPU cannot run position `pos` from this cache; the CPU
+    /// then computes the token.
     ///
-    /// Every row the device holds is compared with the caller's cache, and
-    /// rows from the first difference on are uploaded again. So a different
-    /// cache, or rows changed in place, never leave a stale device row behind,
-    /// even where a row matches by coincidence (at layer 0, a row depends only
-    /// on its position's token).
-    fn sync_mirror(&mut self, cache: &KVCache, pos: usize, layers: Range<usize>) -> bool {
+    /// Rows below both this decoder's count and the cache's mark are equal on
+    /// both sides (see the module documentation); the rest are uploaded.
+    fn sync_mirror(
+        &mut self,
+        cache: &mut MirroredKvCache,
+        pos: usize,
+        layers: Range<usize>,
+    ) -> bool {
         let shape = *self.decoder.shape();
         if pos >= shape.kv_capacity || pos >= shape.max_seq {
             return false;
         }
         let d_kv = shape.d_kv;
+        if self.mirror_of != Some(cache.id) || cache.synced_by != Some(self.id) {
+            // Another cache, or another decoder synced this one since: no
+            // device row counts.
+            self.mirrored.fill(0);
+            cache.dirty_from.fill(0);
+            self.mirror_of = Some(cache.id);
+            cache.synced_by = Some(self.id);
+        }
         for layer in layers {
-            let (Some(keys), Some(values)) = (cache.k_data.get(layer), cache.v_data.get(layer))
-            else {
+            let (Some(keys), Some(values), Some(&dirty)) = (
+                cache.cache.k_data.get(layer),
+                cache.cache.v_data.get(layer),
+                cache.dirty_from.get(layer),
+            ) else {
                 return false;
             };
             if keys.len() != pos * d_kv || values.len() != pos * d_kv {
                 return false;
             }
-            let held = self.mirrored[layer].min(pos) * d_kv;
-            let Ok(valid) = self
-                .decoder
-                .kv_rows_matching(layer, &keys[..held], &values[..held])
-            else {
+            let clean = self.mirrored[layer].min(dirty).min(pos);
+            if !self.upload_rows(layer, clean..pos, keys, values) {
                 return false;
-            };
-            for p in valid..pos {
-                let row = p * d_kv..(p + 1) * d_kv;
-                if self
-                    .decoder
-                    .write_kv(layer, p, &keys[row.clone()], &values[row])
-                    .is_err()
-                {
-                    return false;
-                }
-                self.stats.kv_rows_uploaded += 1;
+            }
+            if self.verify_mirror && !self.verify_rows(layer, pos, keys, values) {
+                return false;
             }
             self.mirrored[layer] = pos;
+            cache.dirty_from[layer] = pos;
+        }
+        true
+    }
+
+    /// Copy rows `rows` of one layer from the cache to the device.
+    fn upload_rows(
+        &mut self,
+        layer: usize,
+        rows: Range<usize>,
+        keys: &[i64],
+        values: &[i64],
+    ) -> bool {
+        let d_kv = self.decoder.shape().d_kv;
+        for p in rows {
+            let row = p * d_kv..(p + 1) * d_kv;
+            if self
+                .decoder
+                .write_kv(layer, p, &keys[row.clone()], &values[row])
+                .is_err()
+            {
+                return false;
+            }
+            self.stats.kv_rows_uploaded += 1;
+        }
+        true
+    }
+
+    /// Compare the first `pos` device rows of one layer with the cache, and
+    /// upload the rows from the first difference on, counting them as
+    /// mismatches.
+    fn verify_rows(&mut self, layer: usize, pos: usize, keys: &[i64], values: &[i64]) -> bool {
+        let Ok(equal) = self.decoder.kv_rows_matching(layer, keys, values) else {
+            return false;
+        };
+        self.stats.kv_rows_verified += pos as u64;
+        if equal < pos {
+            self.stats.mirror_mismatches += (pos - equal) as u64;
+            return self.upload_rows(layer, equal..pos, keys, values);
         }
         true
     }
@@ -572,7 +771,7 @@ fn run_self_test() -> Result<(), String> {
     let tokens = [1u32, 7, 42, 3, 299, 150, 7, 9];
     let mut gpu = MetalForward::build(&model, shape.max_seq)?;
     let mut cpu_cache = KVCache::new(shape.n_layers);
-    let mut gpu_cache = KVCache::new(shape.n_layers);
+    let mut gpu_cache = MirroredKvCache::new(shape.n_layers);
     for (index, &token) in tokens.iter().enumerate() {
         let want = model.forward_one_token(token, &mut cpu_cache);
         let got = gpu.forward_one_token(token, &mut gpu_cache);
@@ -596,7 +795,7 @@ fn run_self_test() -> Result<(), String> {
     }
     // A two-way shard split, token after token, with a penalty history.
     let mut cpu_cache = KVCache::new(shape.n_layers);
-    let mut gpu_cache = KVCache::new(shape.n_layers);
+    let mut gpu_cache = MirroredKvCache::new(shape.n_layers);
     for (position, &token) in tokens.iter().take(4).enumerate() {
         let history = &tokens[..position];
         let cpu_hidden = model
@@ -655,6 +854,12 @@ fn run_self_test() -> Result<(), String> {
     }
     if gpu_cache.k_data != cpu_cache.k_data || gpu_cache.v_data != cpu_cache.v_data {
         return Err("self-test: the shard KV caches differ".to_string());
+    }
+    if gpu.stats().mirror_mismatches != 0 {
+        return Err(format!(
+            "self-test: the device KV copy missed a change ({:?})",
+            gpu.stats()
+        ));
     }
     Ok(())
 }
@@ -953,7 +1158,7 @@ mod tests {
         let model = synthetic_model(0x5EED_0000_0000_0006, shape);
         // A device cache of 12 positions: tokens 12 to 15 run on the CPU.
         let mut gpu = MetalForward::new(&model, 12).expect("GPU decoder");
-        let (mut cpu_cache, mut gpu_cache) = (KVCache::new(3), KVCache::new(3));
+        let (mut cpu_cache, mut gpu_cache) = (KVCache::new(3), MirroredKvCache::new(3));
         let tokens: Vec<u32> = (0..shape.max_seq as u32)
             .map(|i| (i * 37 + 5) % 280)
             .collect();
@@ -967,6 +1172,7 @@ mod tests {
         assert_eq!(gpu_cache.seq_len, cpu_cache.seq_len);
         let stats = gpu.stats();
         assert_eq!((stats.gpu_tokens, stats.cpu_tokens), (12, 4), "{stats:?}");
+        assert_eq!(stats.mirror_mismatches, 0, "{stats:?}");
         // An out-of-range token returns empty logits without touching the cache.
         let before = gpu_cache.seq_len;
         assert!(gpu.forward_one_token(10_000, &mut gpu_cache).is_empty());
@@ -979,11 +1185,12 @@ mod tests {
         let shape = small_shape();
         let model = synthetic_model(0x5EED_0000_0000_0007, shape);
         let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
-        let (mut reference, mut mixed) = (KVCache::new(3), KVCache::new(3));
+        let mut reference = KVCache::new(3);
+        let mut mixed = MirroredKvCache::new(3);
         for (index, token) in [3u32, 9, 27, 81, 243, 2, 6, 18].into_iter().enumerate() {
             let want = model.forward_one_token(token, &mut reference);
             let got = if index % 3 == 1 {
-                model.forward_one_token(token, &mut mixed)
+                mixed.cpu_forward_one_token(&model, token)
             } else {
                 gpu.forward_one_token(token, &mut mixed)
             };
@@ -993,57 +1200,160 @@ mod tests {
         assert_eq!(mixed.v_data, reference.v_data);
         assert!(gpu.stats().kv_rows_uploaded > 0, "{:?}", gpu.stats());
 
-        fn filled(model: &CachedIntegerModel, tokens: &[u32]) -> KVCache {
-            let mut cache = KVCache::new(model.config.n_layers);
+        /// The same CPU tokens into a wrapped cache and a plain one.
+        fn filled(model: &CachedIntegerModel, tokens: &[u32]) -> (MirroredKvCache, KVCache) {
+            let mut wrapped = MirroredKvCache::new(model.config.n_layers);
+            let mut plain = KVCache::new(model.config.n_layers);
             for &token in tokens {
-                model.forward_one_token(token, &mut cache);
+                wrapped.cpu_forward_one_token(model, token);
+                model.forward_one_token(token, &mut plain);
             }
-            cache
+            (wrapped, plain)
         }
         let before = gpu.stats();
         // Switch to a different cache whose row at the device's last mirrored
         // position (6) comes from the mixed session's token there. At layer 0
-        // that row is then identical while rows 0 to 5 differ, so every held
-        // row must be compared, not only the last (review ARC-76, finding 3).
-        let mut other = filled(&model, &[5, 4, 3, 2, 1, 0, 6, 7]);
-        let mut other_reference = filled(&model, &[5, 4, 3, 2, 1, 0, 6, 7]);
+        // that row is then identical while rows 0 to 5 differ, so a check of
+        // the last row alone would keep them (review ARC-76, finding 3).
+        let (mut other, mut other_reference) = filled(&model, &[5, 4, 3, 2, 1, 0, 6, 7]);
         let want = model.forward_one_token(11, &mut other_reference);
         assert_eq!(gpu.forward_one_token(11, &mut other), want);
         assert_eq!(other.k_data, other_reference.k_data);
         assert_eq!(other.v_data, other_reference.v_data);
 
-        // A cache that shares rows 0 to 5 with the one the device holds: rows
-        // from the first difference on are uploaded again.
-        let mut other = filled(&model, &[5, 4, 3, 2, 1, 0, 8, 7]);
-        let mut other_reference = filled(&model, &[5, 4, 3, 2, 1, 0, 8, 7]);
+        // Another cache that shares rows 0 to 5 with the one just mirrored.
+        let (mut other, mut other_reference) = filled(&model, &[5, 4, 3, 2, 1, 0, 8, 7]);
         let want = model.forward_one_token(12, &mut other_reference);
         assert_eq!(gpu.forward_one_token(12, &mut other), want);
         assert_eq!(other.k_data, other_reference.k_data);
         assert_eq!(other.v_data, other_reference.v_data);
 
-        // Rows changed in place in the cache the device holds: row 3 of every
-        // layer is replaced by the mixed session's row 3.
+        // Rows changed in place, through the wrapper's escape hatch, in the
+        // cache the device holds: row 3 of every layer becomes the mixed
+        // session's row 3.
         let row = 3 * model.config.d_kv..4 * model.config.d_kv;
-        for layer in 0..model.config.n_layers {
-            for cache in [&mut other, &mut other_reference] {
-                cache.k_data[layer][row.clone()].copy_from_slice(&mixed.k_data[layer][row.clone()]);
-                cache.v_data[layer][row.clone()].copy_from_slice(&mixed.v_data[layer][row.clone()]);
+        let replace = |cache: &mut KVCache| {
+            let layers = cache.k_data.iter_mut().zip(cache.v_data.iter_mut());
+            for ((keys, values), (from_keys, from_values)) in
+                layers.zip(mixed.k_data.iter().zip(&mixed.v_data))
+            {
+                keys[row.clone()].copy_from_slice(&from_keys[row.clone()]);
+                values[row.clone()].copy_from_slice(&from_values[row.clone()]);
             }
-        }
+        };
+        other.edit(&replace);
+        replace(&mut other_reference);
         let want = model.forward_one_token(13, &mut other_reference);
         assert_eq!(gpu.forward_one_token(13, &mut other), want);
         assert_eq!(other.k_data, other_reference.k_data);
         assert_eq!(other.v_data, other_reference.v_data);
-        // All three ran on the GPU: none of these answers is a CPU fallback.
+
+        // All three ran on the GPU, so none of these answers is a CPU
+        // fallback, and the full compare of every mirrored row found none
+        // stale.
         let after = gpu.stats();
         assert_eq!(
             (
                 after.gpu_tokens - before.gpu_tokens,
-                after.cpu_tokens - before.cpu_tokens
+                after.cpu_tokens - before.cpu_tokens,
+                after.mirror_mismatches
             ),
-            (3, 0),
+            (3, 0, 0),
             "{before:?} {after:?}"
         );
+        assert!(
+            after.kv_rows_verified > before.kv_rows_verified,
+            "{after:?}"
+        );
+    }
+
+    /// On one cache the mirror uploads only rows that changed: none for GPU
+    /// tokens, one per layer for a CPU token, none after a truncation, and
+    /// every row after an edit or after another decoder synced the cache.
+    #[test]
+    fn the_mirror_uploads_only_rows_that_changed() {
+        let _guard = kernel_switch_guard();
+        let shape = small_shape();
+        let model = synthetic_model(0x5EED_0000_0000_000B, shape);
+        let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
+        let mut second = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
+        let layers = shape.n_layers as u64;
+        let d_kv = model.config.d_kv;
+        let mut reference = KVCache::new(shape.n_layers);
+        let mut cache = MirroredKvCache::new(shape.n_layers);
+
+        /// Run `token` on `gpu` and on the CPU; the rows `gpu` uploaded.
+        fn uploads(
+            gpu: &mut MetalForward<'_>,
+            model: &CachedIntegerModel,
+            cache: &mut MirroredKvCache,
+            reference: &mut KVCache,
+            token: u32,
+        ) -> u64 {
+            let before = gpu.stats();
+            let want = model.forward_one_token(token, reference);
+            assert_eq!(gpu.forward_one_token(token, cache), want, "token {token}");
+            let after = gpu.stats();
+            assert_eq!(
+                after.gpu_tokens,
+                before.gpu_tokens + 1,
+                "token {token}: {after:?}"
+            );
+            after.kv_rows_uploaded - before.kv_rows_uploaded
+        }
+
+        // GPU tokens on one cache (positions 0 to 3): nothing to upload.
+        for token in [1u32, 2, 3, 4] {
+            assert_eq!(
+                uploads(&mut gpu, &model, &mut cache, &mut reference, token),
+                0
+            );
+        }
+        // A CPU token at position 4: its one row per layer.
+        let want = model.forward_one_token(5, &mut reference);
+        assert_eq!(cache.cpu_forward_one_token(&model, 5), want);
+        assert_eq!(
+            uploads(&mut gpu, &model, &mut cache, &mut reference, 6),
+            layers
+        );
+        // Back to 3 positions: the rows kept are still on the device.
+        cache.truncate(3, d_kv);
+        for (keys, values) in reference.k_data.iter_mut().zip(&mut reference.v_data) {
+            keys.truncate(3 * d_kv);
+            values.truncate(3 * d_kv);
+        }
+        reference.seq_len = 3;
+        assert_eq!(uploads(&mut gpu, &model, &mut cache, &mut reference, 7), 0);
+        // Any other change: every row (4 positions) again.
+        cache.edit(|c| c.k_data[0][0] = c.k_data[0][0].wrapping_add(1));
+        reference.k_data[0][0] = reference.k_data[0][0].wrapping_add(1);
+        assert_eq!(
+            uploads(&mut gpu, &model, &mut cache, &mut reference, 8),
+            layers * 4
+        );
+        // Another decoder syncs this cache, then the first one again: each
+        // uploads every row (5, then 6 positions).
+        assert_eq!(
+            uploads(&mut second, &model, &mut cache, &mut reference, 9),
+            layers * 5
+        );
+        assert_eq!(
+            uploads(&mut gpu, &model, &mut cache, &mut reference, 10),
+            layers * 6
+        );
+        assert_eq!(cache.k_data, reference.k_data);
+        assert_eq!(cache.v_data, reference.v_data);
+        assert_eq!(gpu.stats().mirror_mismatches, 0, "{:?}", gpu.stats());
+        assert_eq!(second.stats().mirror_mismatches, 0, "{:?}", second.stats());
+
+        // A change that escapes the marks (written past the wrapper, which
+        // only this module can do) is found by the full compare and repaired:
+        // layer 1 from row 1 on, 6 of its 7 rows.
+        cache.cache.k_data[1][d_kv] = cache.cache.k_data[1][d_kv].wrapping_add(1);
+        reference.k_data[1][d_kv] = reference.k_data[1][d_kv].wrapping_add(1);
+        assert_eq!(uploads(&mut gpu, &model, &mut cache, &mut reference, 11), 6);
+        assert_eq!(gpu.stats().mirror_mismatches, 6, "{:?}", gpu.stats());
+        assert_eq!(cache.k_data, reference.k_data);
     }
 
     #[test]
@@ -1052,7 +1362,7 @@ mod tests {
         let shape = small_shape();
         let model = synthetic_model(0x5EED_0000_0000_0008, shape);
         let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
-        let (mut cpu_cache, mut gpu_cache) = (KVCache::new(3), KVCache::new(3));
+        let (mut cpu_cache, mut gpu_cache) = (KVCache::new(3), MirroredKvCache::new(3));
         let tokens = [11u32, 22, 33, 44, 55];
         for (position, &token) in tokens.iter().enumerate() {
             let history = &tokens[..position];
@@ -1105,6 +1415,7 @@ mod tests {
         }
         assert_eq!(gpu_cache.k_data, cpu_cache.k_data);
         assert_eq!(gpu_cache.v_data, cpu_cache.v_data);
+        assert_eq!(gpu.stats().mirror_mismatches, 0, "{:?}", gpu.stats());
         // The CPU's typed refusals come back unchanged.
         let error = gpu
             .forward_shard_token(
@@ -1136,7 +1447,7 @@ mod tests {
         // Gains of 2^40 push the normed vector far outside four digits.
         model.layers[1].ffn_norm = vec![1 << 40; shape.d_model];
         let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
-        let (mut cpu_cache, mut gpu_cache) = (KVCache::new(3), KVCache::new(3));
+        let (mut cpu_cache, mut gpu_cache) = (KVCache::new(3), MirroredKvCache::new(3));
         for token in [1u32, 2, 3, 4] {
             let want = model.forward_one_token(token, &mut cpu_cache);
             assert_eq!(gpu.forward_one_token(token, &mut gpu_cache), want);
@@ -1144,6 +1455,7 @@ mod tests {
         assert_eq!(gpu_cache.k_data, cpu_cache.k_data);
         let stats = gpu.stats();
         assert_eq!((stats.gpu_tokens, stats.cpu_tokens), (0, 4), "{stats:?}");
+        assert_eq!(stats.mirror_mismatches, 0, "{stats:?}");
         assert_ne!(
             stats.refusal_bits & (STATUS_SPLIT_DOMAIN | STATUS_SCALE_BOUND),
             0,
@@ -1166,7 +1478,7 @@ mod tests {
         };
         let model = synthetic_model(0x5EED_0000_0000_000A, shape);
         let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
-        let (mut cpu_cache, mut gpu_cache) = (KVCache::new(2), KVCache::new(2));
+        let (mut cpu_cache, mut gpu_cache) = (KVCache::new(2), MirroredKvCache::new(2));
         for (index, token) in [3u32, 1, 4].into_iter().enumerate() {
             let want = model.forward_one_token(token, &mut cpu_cache);
             assert_eq!(
@@ -1177,7 +1489,12 @@ mod tests {
         }
         assert_eq!(gpu_cache.k_data, cpu_cache.k_data);
         assert_eq!(gpu_cache.v_data, cpu_cache.v_data);
-        assert_eq!(gpu.stats().gpu_tokens, 3, "{:?}", gpu.stats());
+        let stats = gpu.stats();
+        assert_eq!(
+            (stats.gpu_tokens, stats.mirror_mismatches),
+            (3, 0),
+            "{stats:?}"
+        );
     }
 }
 
@@ -1208,10 +1525,13 @@ mod bench {
         samples[samples.len() / 2]
     }
 
-    /// Median wall time per token of `forward` over TOKENS tokens on a fresh
-    /// cache, after WARM_UP untimed tokens.
-    fn per_token(n_layers: usize, mut forward: impl FnMut(u32, &mut KVCache) -> Vec<i64>) -> f64 {
-        let mut cache = KVCache::new(n_layers);
+    /// Median wall time per token of `forward` over TOKENS tokens on the
+    /// fresh cache `make` returns, after WARM_UP untimed tokens.
+    fn per_token<C>(
+        make: impl FnOnce() -> C,
+        mut forward: impl FnMut(u32, &mut C) -> Vec<i64>,
+    ) -> f64 {
+        let mut cache = make();
         let mut samples = Vec::with_capacity(TOKENS);
         for step in 0..WARM_UP + TOKENS {
             let token = (step % EMBEDDING_ROWS) as u32;
@@ -1402,21 +1722,25 @@ mod bench {
                     embedding_rows: EMBEDDING_ROWS,
                 },
             );
-            let scalar = per_token(n_layers, |t, c| model.forward_one_token(t, c));
+            let plain = || KVCache::new(n_layers);
+            let scalar = per_token(plain, |t, c| model.forward_one_token(t, c));
             points[0].push((n_layers, scalar));
             canonical_simd::set_fast_canonical_kernel(true);
-            let simd = per_token(n_layers, |t, c| model.forward_one_token(t, c));
+            let simd = per_token(plain, |t, c| model.forward_one_token(t, c));
             points[1].push((n_layers, simd));
             canonical_simd::set_fast_canonical_kernel(false);
             {
                 let metal = MetalModel::new(&model).expect("resident model");
                 let _switch = SwitchGuard::set(true);
-                let hooked =
-                    per_token(n_layers, |t, c| metal.run(|| model.forward_one_token(t, c)));
+                let hooked = per_token(plain, |t, c| metal.run(|| model.forward_one_token(t, c)));
                 points[2].push((n_layers, hooked));
             }
             let mut fused = MetalForward::new(&model, 16).expect("GPU decoder");
-            let one_buffer = per_token(n_layers, |t, c| fused.forward_one_token(t, c));
+            fused.set_verify_mirror(false);
+            let one_buffer = per_token(
+                || MirroredKvCache::new(n_layers),
+                |t, c| fused.forward_one_token(t, c),
+            );
             points[3].push((n_layers, one_buffer));
             assert_eq!(fused.stats().cpu_tokens, 0, "{:?}", fused.stats());
         }
@@ -1571,6 +1895,163 @@ mod bench {
         });
         println!("METAL_TOKEN_BENCH {json}");
         if let Ok(path) = std::env::var("ARC_METAL_TOKEN_BENCH_MD") {
+            std::fs::write(path, md).expect("write the benchmark summary");
+        }
+    }
+
+    /// Cached positions for the KV-mirror benchmark.
+    const CONTEXTS: [usize; 3] = [128, 1024, 4096];
+
+    /// How the device copy of the KV cache is checked before each token.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MirrorCheck {
+        /// Each layer's last mirrored row only, as at 0fc7dda7 (not exact).
+        LastRow,
+        /// Every mirrored row, as at 205c48ec.
+        EveryRow,
+        /// The wrapper's marks: only rows that changed (this change).
+        Marks,
+    }
+
+    /// What the device-copy check costs per token as the context grows: the
+    /// last-row check of 0fc7dda7 (emulated), the every-row compare of
+    /// 205c48ec (the mirror check switched on), and the wrapper's marks.
+    #[test]
+    #[ignore = "benchmark: run explicitly in release with --ignored --nocapture"]
+    fn kv_mirror_cost_by_context() {
+        let _guard = kernel_switch_guard();
+        metal_forward_self_test().expect("self-test");
+        let device = metal_engine().expect("Metal device").report();
+        // Two real-width Llama-2-7B layers (d_kv 4096: 64 KiB of K and V per
+        // position and layer) and a small head, so the layers dominate.
+        let max_seq = CONTEXTS[CONTEXTS.len() - 1] + 64;
+        let shape = SyntheticShape {
+            n_layers: 2,
+            d_model: 4096,
+            n_heads: 32,
+            n_kv_heads: 32,
+            d_ff: 11008,
+            vocab: 4096,
+            max_seq,
+            embedding_rows: EMBEDDING_ROWS,
+        };
+        let model = synthetic_model(0x0007_B70C_E400_00C0, shape);
+        let d_kv = model.config.d_kv;
+        let mut fused = MetalForward::new(&model, max_seq).expect("GPU decoder");
+        let mut rng = SynthRng(0x0007_B70C_E400_00C1);
+        let checks = [
+            MirrorCheck::LastRow,
+            MirrorCheck::EveryRow,
+            MirrorCheck::Marks,
+        ];
+        let mut results: Vec<(usize, Vec<f64>)> = Vec::new();
+        for context in CONTEXTS {
+            // `context` cached positions of KV values at a real cache's
+            // magnitude (about 2^18).
+            let mut random_rows = || -> Vec<Vec<i64>> {
+                (0..shape.n_layers)
+                    .map(|_| {
+                        (0..context * d_kv)
+                            .map(|_| rng.below(1 << 19) - (1 << 18))
+                            .collect()
+                    })
+                    .collect()
+            };
+            let (keys, values) = (random_rows(), random_rows());
+            let mut ms = Vec::with_capacity(checks.len());
+            for check in checks {
+                fused.set_verify_mirror(check == MirrorCheck::EveryRow);
+                let mut cache = MirroredKvCache::from_cache(KVCache {
+                    k_data: keys.clone(),
+                    v_data: values.clone(),
+                    seq_len: context,
+                });
+                let before = fused.stats();
+                let mut samples = Vec::with_capacity(TOKENS);
+                for step in 0..WARM_UP + TOKENS {
+                    let token = (step % EMBEDDING_ROWS) as u32;
+                    let start = Instant::now();
+                    if check == MirrorCheck::LastRow {
+                        let last = cache.seq_len - 1;
+                        let row = last * d_kv..(last + 1) * d_kv;
+                        for (layer, (k, v)) in cache.k_data.iter().zip(&cache.v_data).enumerate() {
+                            let (device_k, device_v) =
+                                fused.decoder.read_kv(layer, last).expect("device row");
+                            let _ = std::hint::black_box(
+                                device_k[..] == k[row.clone()] && device_v[..] == v[row.clone()],
+                            );
+                        }
+                    }
+                    let logits = fused.forward_one_token(token, &mut cache);
+                    let seconds = start.elapsed().as_secs_f64();
+                    assert!(!logits.is_empty());
+                    if step >= WARM_UP {
+                        samples.push(seconds);
+                    }
+                }
+                let after = fused.stats();
+                assert_eq!(
+                    after.gpu_tokens - before.gpu_tokens,
+                    (WARM_UP + TOKENS) as u64,
+                    "{check:?} at {context}: {after:?}"
+                );
+                assert_eq!(after.mirror_mismatches, 0, "{after:?}");
+                ms.push(median(samples) * 1e3);
+            }
+            results.push((context, ms));
+        }
+
+        let mut md = String::new();
+        md.push_str("### KV-cache mirror cost by context\n\n");
+        md.push_str(
+            "Virtualized-runner measurement: GitHub-hosted macOS VM (Apple M1, virtual), \
+             paravirtual Metal GPU. Not Apple GPU hardware numbers.\n\n",
+        );
+        md.push_str(&format!(
+            "Device `{}`. Two real-width Llama-2-7B layers (d_kv 4096: 64 KiB of K and V per \
+             cached position and layer) and a 4,096-token head, so the layers dominate. Each \
+             time is the median of {TOKENS} tokens after {WARM_UP} warm-up tokens; the first \
+             uploads the whole cache.\n\n",
+            device.name,
+        ));
+        md.push_str(
+            "| Cached positions | Last row only (as 0fc7dda7, not exact) | Every row (as \
+             205c48ec) | Marks (this change) |\n|---|---|---|---|\n",
+        );
+        for (context, ms) in &results {
+            let (last, every, marks) = (ms[0], ms[1], ms[2]);
+            md.push_str(&format!(
+                "| {context} | {last:.1} ms, {:.2} tok/s | {every:.1} ms, {:.2} tok/s, {:+.1}% | \
+                 {marks:.1} ms, {:.2} tok/s, {:+.1}% |\n",
+                1e3 / last,
+                1e3 / every,
+                100.0 * (every / last - 1.0),
+                1e3 / marks,
+                100.0 * (marks / last - 1.0),
+            ));
+        }
+        md.push_str(
+            "\nPercentages are against the last-row column. DERIVED for a 32-layer 7B token: \
+             the every-row compare adds 16 times the two-layer difference per token.\n",
+        );
+        println!("{md}");
+        let json = serde_json::json!({
+            "label": "virtualized-runner measurement",
+            "device": device,
+            "layers": shape.n_layers,
+            "d_kv": d_kv,
+            "results": results
+                .iter()
+                .map(|(context, ms)| serde_json::json!({
+                    "cached_positions": context,
+                    "last_row_ms": ms[0],
+                    "every_row_ms": ms[1],
+                    "marks_ms": ms[2],
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!("METAL_KV_MIRROR_BENCH {json}");
+        if let Ok(path) = std::env::var("ARC_METAL_KV_BENCH_MD") {
             std::fs::write(path, md).expect("write the benchmark summary");
         }
     }

@@ -525,7 +525,7 @@ fn golden_cached_integer_kat_holds_on_the_exact_metal_gemv() {
 #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn golden_cached_integer_kat_holds_with_one_command_buffer_per_token() {
-    use crate::metal_forward::MetalForward;
+    use crate::metal_forward::{MetalForward, MirroredKvCache};
 
     let _guard = crate::canonical_simd::kernel_switch_guard();
     let fixture = fixture();
@@ -535,7 +535,7 @@ fn golden_cached_integer_kat_holds_with_one_command_buffer_per_token() {
     let mut gpu =
         MetalForward::new(&model, fixture.max_seq).expect("the GPU decoder must be available");
 
-    let mut cache = KVCache::new(model.config.n_layers);
+    let mut cache = MirroredKvCache::new(model.config.n_layers);
     let mut next_tokens = Vec::new();
     let mut logits_hashes = Vec::new();
     for &token in &fixture.sequence_tokens {
@@ -565,7 +565,7 @@ fn golden_cached_integer_kat_holds_with_one_command_buffer_per_token() {
         (boundaries[0], boundaries[1]),
         (boundaries[1], model.config.n_layers),
     ];
-    let mut cache = KVCache::new(model.config.n_layers);
+    let mut cache = MirroredKvCache::new(model.config.n_layers);
     let mut next_tokens = Vec::new();
     let mut logits_hashes = Vec::new();
     let mut hidden_hashes = Vec::new();
@@ -604,7 +604,12 @@ fn golden_cached_integer_kat_holds_with_one_command_buffer_per_token() {
         split.sequence, expected,
         "the GPU shard split drifted from the KAT"
     );
-    assert_eq!(gpu.stats().cpu_tokens, 0, "{:?}", gpu.stats());
+    let stats = gpu.stats();
+    assert_eq!(
+        (stats.cpu_tokens, stats.mirror_mismatches),
+        (0, 0),
+        "{stats:?}"
+    );
 }
 
 // ── Operator vectors from the independent reference ─────────────────────────

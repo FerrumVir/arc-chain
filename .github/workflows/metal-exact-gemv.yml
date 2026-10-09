@@ -16,15 +16,17 @@ name: Metal exact GEMV (hosted macOS)
 #
 # macOS runners also serve the release and proof sequences, so this workflow
 # takes at most one of them per push: it runs only when the exact Metal path
-# itself changes (other changes can run it by hand with workflow_dispatch, on
-# any branch), and a newer push cancels an older run that is still queued or
-# running.
+# or the CPU reference it must match changes (other changes can run it by hand
+# with workflow_dispatch, on any branch), and a newer push cancels an older run
+# that is still queued or running.
 
 on:
   pull_request:
     # The exact files, so changes to other Metal kernels (for example the
     # INT16 ones, which have their own workflow) do not start this job too.
-    # No branch filter: stacked pull requests are checked too.
+    # The GPU path's files come first, then the CPU reference it must equal
+    # integer for integer, and its golden KATs. No branch filter: stacked
+    # pull requests are checked too.
     paths:
       - .github/workflows/metal-exact-gemv.yml
       - crates/arc-gpu/src/metal_exact.rs
@@ -33,6 +35,12 @@ on:
       - crates/arc-gpu/src/metal_decoder.rs
       - crates/arc-inference/src/metal_gemv.rs
       - crates/arc-inference/src/metal_forward.rs
+      - crates/arc-inference/src/cached_integer_model.rs
+      - crates/arc-inference/src/integer_lut.rs
+      - crates/arc-inference/src/canonical_simd.rs
+      - crates/arc-inference/src/golden_vectors.rs
+      - crates/arc-inference/tests/fixtures/integer_inference_kat.json
+      - crates/arc-inference/tests/fixtures/integer_operator_kat.json
   workflow_dispatch:
 
 permissions:
@@ -129,15 +137,16 @@ jobs:
         env:
           ARC_METAL_BENCH_MD: ${{ runner.temp }}/metal-bench.md
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_gemv::bench -- --ignored --nocapture --test-threads=1
-      - name: Benchmark a 7B token, one command buffer per token (virtualized-runner measurement)
+      - name: Benchmark a 7B token and the KV-mirror cost by context (virtualized-runner measurement)
         if: ${{ !cancelled() }}
         env:
           ARC_METAL_TOKEN_BENCH_MD: ${{ runner.temp }}/metal-token-bench.md
+          ARC_METAL_KV_BENCH_MD: ${{ runner.temp }}/metal-kv-bench.md
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_forward::bench -- --ignored --nocapture --test-threads=1
       - name: Benchmark summary
         if: always()
         run: |
-          for summary in "$RUNNER_TEMP/metal-bench.md" "$RUNNER_TEMP/metal-token-bench.md"; do
+          for summary in "$RUNNER_TEMP/metal-bench.md" "$RUNNER_TEMP/metal-token-bench.md" "$RUNNER_TEMP/metal-kv-bench.md"; do
             if [ -f "$summary" ]; then
               cat "$summary" >> "$GITHUB_STEP_SUMMARY"
             fi
