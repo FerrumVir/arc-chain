@@ -83,7 +83,7 @@ enum Kernel {
 }
 
 /// One execution environment: a projection kernel and a rayon pool size.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Leg {
     kernel: Kernel,
     threads: usize,
@@ -326,8 +326,10 @@ fn truncate_kv(kv: &mut KVCache, positions: usize, d_kv: usize) {
 }
 
 /// Magic and version of this suite's KV image. The engine has no KV codec;
-/// this one writes exactly the state `KVCache` holds, so a restored cache that
-/// resumes bit-identically shows that no request state lives anywhere else.
+/// this one writes exactly the state `KVCache` holds. A restored cache that
+/// resumes bit-identically shows that the logits depend on no other request
+/// state. Selecting tokens also needs the generated history (the repetition
+/// penalty), which a resuming node must be given separately.
 const KV_IMAGE_MAGIC: [u8; 8] = *b"ARCKVv01";
 
 /// Serializes `kv`: the magic, the layer count and `seq_len`, then each
@@ -636,7 +638,23 @@ fn pin_generation(
             assert_eq!(hash, text(&run["output_hash"]));
         }
         (Profile::LegacySplitHalf, Generation::V2)
-        | (Profile::GgufInterleaved, Generation::Worker) => {}
+        | (Profile::GgufInterleaved, Generation::Worker) => {
+            let pins = pinned();
+            let run = &pins["generation"][format!("{profile:?}/{generation:?}").as_str()];
+            let (prompt, max_tokens) = generation_case(fixture, profile);
+            assert_eq!(token_ids(&run["prompt"]), prompt, "pinned prompt");
+            assert_eq!(run["max_tokens"], max_tokens, "pinned budget");
+            assert_eq!(
+                tokens,
+                token_ids(&run["tokens"]).as_slice(),
+                "{profile:?} {generation:?}: tokens drifted from the pinned reference"
+            );
+            assert_eq!(
+                hash,
+                text(&run["output_hash"]),
+                "{profile:?} {generation:?}: output hash drifted from the pinned reference"
+            );
+        }
     }
 }
 
@@ -679,20 +697,30 @@ fn recheck(trace: &Trace, first_row: usize, count: usize) -> Vec<u32> {
 
 // ── Mode 5: speculative verification ────────────────────────────────────────
 
-/// Where a simulated draft model proposes a wrong token, by generated index.
+/// Where a simulated draft model proposes a wrong token. Errors are placed by
+/// round and by draft slot within the round, never by generated index, so
+/// every pattern but `AllRight` is rejected in round 0 whatever k is.
 #[derive(Clone, Copy, Debug)]
 enum Drafts {
+    /// Every draft is the model's own next token.
     AllRight,
+    /// Every round's first draft is wrong, so each round is rejected whole.
     AllWrong,
-    WrongAt(&'static [usize]),
+    /// Every round's last draft is wrong: the drafts before it are accepted
+    /// and one row is rolled back.
+    LastWrong,
+    /// Even rounds go wrong half-way through their drafts; odd rounds are
+    /// right.
+    MiddleWrongEvenRounds,
 }
 
 impl Drafts {
-    fn wrong(self, index: usize) -> bool {
+    fn wrong(self, round: usize, slot: usize, drafted: usize) -> bool {
         match self {
             Drafts::AllRight => false,
             Drafts::AllWrong => true,
-            Drafts::WrongAt(indices) => indices.contains(&index),
+            Drafts::LastWrong => slot + 1 == drafted,
+            Drafts::MiddleWrongEvenRounds => round.is_multiple_of(2) && slot == drafted / 2,
         }
     }
 }
@@ -700,16 +728,58 @@ impl Drafts {
 const DRAFT_PATTERNS: [Drafts; 4] = [
     Drafts::AllRight,
     Drafts::AllWrong,
-    Drafts::WrongAt(&[0, 3]),
-    Drafts::WrongAt(&[2, 5, 6]),
+    Drafts::LastWrong,
+    Drafts::MiddleWrongEvenRounds,
 ];
 
 struct Speculation {
     tokens: Vec<u32>,
     trace: Trace,
     kv: KVCache,
+    counts: SpeculationCounts,
+}
+
+/// What a speculative decode did with its drafts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SpeculationCounts {
     accepted_drafts: usize,
     rejected_rounds: usize,
+    rolled_back_rows: usize,
+}
+
+/// The counts a speculative decode must reach when the model's selection is
+/// always `truth`, worked out from the draft pattern alone, without the
+/// model. A run that accepts or rolls back anything else verified the wrong
+/// rows.
+fn planned_speculation(
+    generation: Generation,
+    max_tokens: usize,
+    drafts: Drafts,
+    k: usize,
+) -> SpeculationCounts {
+    let mut emitted = match generation {
+        Generation::Worker => 0,
+        Generation::V2 => 1,
+    };
+    let mut counts = SpeculationCounts::default();
+    let mut round = 0;
+    while emitted < max_tokens {
+        let drafted = k.min(max_tokens - emitted - 1);
+        match (0..drafted).find(|&slot| drafts.wrong(round, slot, drafted)) {
+            Some(slot) => {
+                counts.accepted_drafts += slot;
+                counts.rejected_rounds += 1;
+                counts.rolled_back_rows += drafted - slot;
+                emitted += slot + 1;
+            }
+            None => {
+                counts.accepted_drafts += drafted;
+                emitted += drafted + 1;
+            }
+        }
+        round += 1;
+    }
+    counts
 }
 
 /// A speculative decode. Each round, a simulated draft model proposes up to
@@ -750,38 +820,43 @@ fn speculate(
             first
         }
     };
-    let (mut accepted_drafts, mut rejected_rounds) = (0, 0);
+    let mut counts = SpeculationCounts::default();
+    let mut round = 0;
     while tokens.len() < max_tokens {
         // Accepted drafts plus the model's own next token never exceed the budget.
         let n_drafts = k.min(max_tokens - tokens.len() - 1);
+        let first = tokens.len();
         let mut batch = vec![pending];
-        batch.extend((tokens.len()..tokens.len() + n_drafts).map(|index| {
-            if drafts.wrong(index) {
-                (truth[index] + 1) % vocab
+        batch.extend((0..n_drafts).map(|slot| {
+            let right = truth[first + slot];
+            if drafts.wrong(round, slot, n_drafts) {
+                (right + 1) % vocab
             } else {
-                truth[index]
+                right
             }
         }));
         let base = kv.seq_len;
-        let mut round = Trace::default();
-        prefill(model, &batch, &mut kv, batch.len(), true, &mut round);
+        let mut verified = Trace::default();
+        prefill(model, &batch, &mut kv, batch.len(), true, &mut verified);
 
         // Row `j` holds the logits after `batch[j]`; it selects what follows.
         let mut kept = 1;
-        let mut next = select(&round.logits[&base], &tokens);
+        let mut next = select(&verified.logits[&base], &tokens);
         while kept < batch.len() && batch[kept] == next {
             tokens.push(next);
-            next = select(&round.logits[&(base + kept)], &tokens);
+            next = select(&verified.logits[&(base + kept)], &tokens);
             kept += 1;
         }
-        accepted_drafts += kept - 1;
+        counts.accepted_drafts += kept - 1;
         if kept < batch.len() {
-            rejected_rounds += 1;
+            counts.rejected_rounds += 1;
+            counts.rolled_back_rows += batch.len() - kept;
             truncate_kv(&mut kv, base + kept, config.d_kv);
         }
-        trace.keep(round, &(base..base + kept));
+        trace.keep(verified, &(base..base + kept));
         tokens.push(next);
         pending = next;
+        round += 1;
     }
     if matches!(generation, Generation::V2) {
         // generate_v2 feeds every generated token back, the last one included.
@@ -791,8 +866,7 @@ fn speculate(
         tokens,
         trace,
         kv,
-        accepted_drafts,
-        rejected_rounds,
+        counts,
     }
 }
 
@@ -1016,6 +1090,67 @@ fn pin_reference(fixture: &GoldenFixture, profile: Profile, reference: &Referenc
     }
 }
 
+/// Reviewed constants for what the KAT files leave out: every position of the
+/// full-window references, the wide model, and the two generation calls the
+/// KATs do not cover. Each value comes from the token-by-token reference run
+/// (scalar kernel, one thread) and was byte-identical on all four golden
+/// runners of one CI run. A value that differed across runners would be a
+/// finding, not a pin.
+///
+/// Provenance: run 37965430159 on commit 44dc3cf6 (#179's 7d7fd472 plus a
+/// scratch printer), jobs 113938505754 (ubuntu-latest), 113938505688
+/// (windows-latest), 113938505276 (macos-15-intel) and 113938505553
+/// (macos-15). The same run also reproduced every existing KAT constant.
+const REFERENCE_JSON: &str = include_str!("../../tests/fixtures/execution_modes_reference.json");
+
+fn pinned() -> serde_json::Value {
+    let document: serde_json::Value =
+        serde_json::from_str(REFERENCE_JSON).expect("the pinned reference must be valid JSON");
+    assert_eq!(document["schema"], 1, "unsupported pinned reference schema");
+    document
+}
+
+/// Pins every row of a token-by-token reference to the reviewed constants:
+/// the boundary leaving each layer, then the logits, position by position,
+/// then the KV hash.
+fn pin_rows(section: &serde_json::Value, tokens: &[u32], reference: &Reference, name: &str) {
+    assert_eq!(
+        token_ids(&section["tokens"]),
+        tokens,
+        "{name}: pinned tokens"
+    );
+    let logits = section["logits_hashes"].as_array().expect("logits_hashes");
+    let boundaries = section["boundary_hashes"]
+        .as_array()
+        .expect("boundary_hashes");
+    assert_eq!(
+        (logits.len(), boundaries.len()),
+        (tokens.len(), tokens.len()),
+        "{name}: pinned row count"
+    );
+    for (position, (logits_hash, layers)) in logits.iter().zip(boundaries).enumerate() {
+        let layers = layers.as_array().expect("one boundary hash per layer");
+        assert_eq!(layers.len(), reference.n_layers(), "{name}: pinned layers");
+        for (layer, hash) in layers.iter().enumerate() {
+            assert_eq!(
+                reference.trace.boundaries[&(position, layer)],
+                text(hash),
+                "{name}: boundary at position {position}, layer {layer} drifted from the pinned reference"
+            );
+        }
+        assert_eq!(
+            hash_i64(&reference.trace.logits[&position]),
+            text(logits_hash),
+            "{name}: logits at position {position} drifted from the pinned reference"
+        );
+    }
+    assert_eq!(
+        hash_cache(&reference.kv),
+        text(&section["kv_cache_hash"]),
+        "{name}: KV drifted from the pinned reference"
+    );
+}
+
 /// The KAT recipe at a width where the gate, up and output projections each
 /// span two 256-row rayon tasks, so thread counts split projection rows too.
 fn wide_fixture() -> GoldenFixture {
@@ -1045,6 +1180,11 @@ fn sweep_schedules(
     let len = tokens.len();
     for leg in switch.legs() {
         for &schedule in schedules {
+            if leg == BASE_LEG && matches!(schedule, Schedule::TokenByToken) {
+                // This cell is the reference itself; comparing it with
+                // itself proves nothing, so it is not a covered mode.
+                continue;
+            }
             let mode = format!("{name}, {leg:?}: {schedule:?} over {len} positions");
             let (trace, kv) = switch.run(leg, || run_fresh(model, schedule, tokens));
             let logits_from = match schedule {
@@ -1074,6 +1214,12 @@ fn golden_modes_one_pass_and_chunked_prefill_match_token_by_token() {
         let model = build_model(&fixture, profile);
         let reference = switch.run(BASE_LEG, || Reference::new(&model, &tokens));
         pin_reference(&fixture, profile, &reference);
+        pin_rows(
+            &pinned()["full_window"][format!("{profile:?}").as_str()],
+            &tokens,
+            &reference,
+            &format!("{profile:?} full window"),
+        );
         sweep_schedules(
             &switch,
             &model,
@@ -1089,6 +1235,12 @@ fn golden_modes_one_pass_and_chunked_prefill_match_token_by_token() {
     let len = tokens.len();
     let model = build_model(&wide, Profile::LegacySplitHalf);
     let reference = switch.run(BASE_LEG, || Reference::new(&model, &tokens));
+    pin_rows(
+        &pinned()["wide"]["LegacySplitHalf"],
+        &tokens,
+        &reference,
+        "wide LegacySplitHalf",
+    );
     let schedules = [
         Schedule::TokenByToken,
         Schedule::Chunked(len),
@@ -1247,22 +1399,27 @@ fn golden_modes_speculative_verification_matches_incremental_decode() {
                         assert_eq!(output_hash(&run.tokens), truth_hash, "{mode}: output hash");
                         reference.assert_rows(&run.trace, 0..fed.len(), 0, &mode);
                         reference.assert_kv(&run.kv, fed.len(), &mode);
+                        // Every case must do exactly what its pattern plans,
+                        // and every pattern but AllRight must reject and roll
+                        // back, so no case quietly repeats the all-right one.
+                        let plan = planned_speculation(generation, truth.len(), drafts, k);
+                        assert_eq!(run.counts, plan, "{mode}: drafts accepted and rolled back");
                         match drafts {
-                            Drafts::AllRight => {
-                                assert_eq!(
-                                    run.rejected_rounds, 0,
-                                    "{mode}: a right draft was rejected"
-                                );
-                                assert!(run.accepted_drafts > 0, "{mode}: no draft was accepted");
-                            }
-                            Drafts::AllWrong => {
-                                assert_eq!(
-                                    run.accepted_drafts, 0,
-                                    "{mode}: a wrong draft was accepted"
-                                );
-                                assert!(run.rejected_rounds > 0, "{mode}: no draft was rejected");
-                            }
-                            Drafts::WrongAt(_) => {}
+                            Drafts::AllRight => assert!(
+                                plan.rejected_rounds == 0 && plan.accepted_drafts > 0,
+                                "{mode}: the all-right case must accept and never reject"
+                            ),
+                            Drafts::AllWrong => assert!(
+                                plan.accepted_drafts == 0 && plan.rejected_rounds > 0,
+                                "{mode}: the all-wrong case must reject every round"
+                            ),
+                            Drafts::LastWrong | Drafts::MiddleWrongEvenRounds => assert!(
+                                plan.rejected_rounds > 0 && plan.rolled_back_rows > 0,
+                                "{mode}: the case never rejected a draft"
+                            ),
+                        }
+                        if leg == BASE_LEG {
+                            println!("golden_modes speculative case: {mode}: {:?}", run.counts);
                         }
                     }
                 }

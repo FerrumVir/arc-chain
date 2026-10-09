@@ -63,18 +63,29 @@ and the generated tokens and output hash. The modes are:
   a validator re-check uses; it re-derives the tokens of both generation calls;
 - chunked prefill, at chunk sizes from 1 to the whole sequence;
 - resuming from a KV prefix serialized to bytes and restored on a separately
-  built model;
+  built model. This shows the KV cache is all the state the logits depend on.
+  Selecting the next token also needs the generated history (for the
+  repetition penalty), which a resuming node must be given separately;
 - speculative verification of k drafted tokens in one pass, accepted and
-  rejected, with the rejected rows rolled back;
+  rejected, with the rejected rows rolled back. Every case must accept, reject
+  and roll back exactly the rows its draft pattern plans, and every pattern
+  except the all-right one rejects at least once;
 - every 1-, 2-, 3- and 4-way stage split, with one KV cache per stage holder,
   including the worker's generation replayed through the stages.
 
-The token-by-token reference is itself pinned to the KAT constants. Two cases
-have no engine API yet, so they are ignored tests that state the contract to
-implement: a stage holder verifying several rows in one call
+The token-by-token references are pinned to reviewed constants: the KAT files
+for their first rows, and `tests/fixtures/execution_modes_reference.json` for
+everything else. That covers every position of both profiles, the wider model,
+and the two generation calls the KATs leave out. The pinned values were
+byte-identical on all four golden runners of one CI run, which the file names.
+
+Two cases have no engine API yet, so they are ignored tests that state the
+contract to implement: a stage holder verifying several rows in one call
 (`forward_shard_token` takes one position), and seeded sampling (the engine
 selects tokens only by greedy argmax after the deterministic repetition
-penalty).
+penalty). The vectorised legs force the limb kernel on, but they do not count
+projections it hands back to the scalar kernel. The counter on `main` is
+process-wide, and other tests run at the same time.
 
 ## Quality remains a separate question
 
