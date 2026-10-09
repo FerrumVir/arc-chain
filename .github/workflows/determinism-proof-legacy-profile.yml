@@ -11,8 +11,10 @@ name: Determinism proof (legacy split-half profile, lab)
 # "INT8 integer (per-row, cross-platform deterministic)"). This workflow runs the SAME
 # driver, SAME 16 prompts x 32 new tokens, SAME pinned model, SAME run scripts and the SAME
 # comparison script, with `--profile legacy`, for the scalar kernel and the exact SIMD kernel
-# (AVX2 on x86_64, NEON dotprod on arm64): Linux x86_64, Windows x86_64 and Linux arm64.
-# The compare job is green only if all six combined SHA-256 values are identical (there is no
+# (AVX2 on x86_64, NEON dotprod on arm64): Linux x86_64, Windows x86_64 and Linux arm64, then
+# (second run) Intel macOS (scalar + AVX2) and Apple Silicon macOS (NEON only, six prompt shards on
+# the swap-bound 7 GB runner; its joined transcript is compared with the other cells' hash).
+# The compare job is green only if all combined SHA-256 values are identical (there is no
 # published hash for this profile; the cells are compared with each other), and a final step
 # insists that the header names the legacy profile and that the hash is NOT the interleaved
 # profile's hash (which would mean the profile switch silently did nothing).
@@ -55,6 +57,14 @@ jobs:
           - {runner: windows-latest, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
           - {runner: ubuntu-24.04-arm, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
           - {runner: ubuntu-24.04-arm, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: macos-15-intel, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: macos-15-intel, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: macos-15, kernel: simd, shard: "0/6", shard_tag: 1of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "1/6", shard_tag: 2of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "2/6", shard_tag: 3of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "3/6", shard_tag: 4of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "4/6", shard_tag: 5of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "5/6", shard_tag: 6of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
     env:
       RUNNER_LABEL: ${{ matrix.runner }}
       KERNEL: ${{ matrix.kernel }}
@@ -75,6 +85,11 @@ jobs:
             echo "leg: $RUNNER_LABEL / $KERNEL / profile $PROOF_PROFILE / shard $SHARD"
             echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
             case "$RUNNER_OS" in
+              macOS)
+                sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+                sysctl vm.swapusage
+                vm_stat
+                ;;
               Linux)
                 uname -a
                 lscpu
@@ -119,7 +134,16 @@ jobs:
         shell: bash
         run: cargo build --locked --release -p arc-inference --features candle --example determinism_proof
 
-      - name: Run the proof with the bash script (Linux)
+      - name: Reduce background memory use (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mdutil -a -i off || true
+          sudo purge || true
+          sysctl vm.swapusage
+
+      - name: Run the proof with the bash script (Linux, macOS)
         if: runner.os != 'Windows'
         shell: bash
         timeout-minutes: ${{ matrix.run_timeout }}
@@ -166,6 +190,10 @@ jobs:
           mkdir -p "$out"
           {
             case "$RUNNER_OS" in
+              macOS)
+                sysctl vm.swapusage
+                vm_stat
+                ;;
               Linux)
                 free -b
                 grep -E '^(pswpin|pswpout|pgmajfault) ' /proc/vmstat || true
@@ -223,6 +251,8 @@ jobs:
             --expect ubuntu-24.04:scalar --expect ubuntu-24.04:simd \
             --expect windows-latest:scalar --expect windows-latest:simd \
             --expect ubuntu-24.04-arm:scalar --expect ubuntu-24.04-arm:simd \
+            --expect macos-15-intel:scalar --expect macos-15-intel:simd \
+            --expect macos-15:simd \
             --out-dir "$RUNNER_TEMP/evidence" \
             --summary "$GITHUB_STEP_SUMMARY"
 
@@ -244,8 +274,8 @@ jobs:
           if evidence.get("reference_combined_sha256") == interleaved_hash:
               problems.append("the combined hash equals the interleaved-profile hash: the profile switch did not take effect")
           pairs = evidence.get("pairs") or []
-          if len(pairs) != 6:
-              problems.append("expected 6 platform/kernel cells, found %d" % len(pairs))
+          if len(pairs) != 9:
+              problems.append("expected 9 platform/kernel cells, found %d" % len(pairs))
           rows = []
           for pair in pairs:
               ok = bool(pair.get("identical")) and not pair.get("problems")
@@ -254,7 +284,7 @@ jobs:
               census = pair.get("projection_census") or {}
               rows.append("| %s | %s | %s | `%s` | %s | %s |" % (pair.get("runner"), pair.get("kernel"), pair.get("kernel_effective"), pair.get("combined_sha256"), "yes" if ok else "**NO**", "%s of %s" % (census.get("accepted"), census.get("attempted")) if pair.get("kernel") == "simd" else "not used"))
           summary = [
-              "## Legacy split-half profile: %s" % ("ALL SIX CELLS IDENTICAL" if not problems else "NOT PASS"),
+              "## Legacy split-half profile: %s" % ("ALL %d CELLS IDENTICAL" % len(pairs) if not problems else "NOT PASS"),
               "",
               "Execution profile in the header: `%s`" % header.get("execution_profile"),
               "Reference combined SHA-256: `%s` (the interleaved profile's hash is `%s`)" % (evidence.get("reference_combined_sha256"), interleaved_hash),
