@@ -646,11 +646,12 @@ impl MetalExactMla {
         let mut report = SyncReport::default();
         // The append-only check (see the module documentation).
         if cache.rows > 0 {
-            let host_rows = if rope_dim == 0 {
-                latent.len() / rank
-            } else {
-                (latent.len() / rank).min(rope_keys.len() / rope_dim)
-            };
+            // rank >= 1 (checked above); a zero RoPE width bounds nothing.
+            let latent_rows = latent.len() / rank;
+            let host_rows = rope_keys
+                .len()
+                .checked_div(rope_dim)
+                .map_or(latent_rows, |rows| rows.min(latent_rows));
             let last = cache.rows - 1;
             let changed = host_rows < cache.rows || {
                 // SAFETY: shared buffers of `capacity >= rows` rows; `&mut
