@@ -3,9 +3,9 @@ name: INT16 projection hot path (bit-identical)
 # Gate and CI-runner timing for the INT16 projection hot path of the MLA + MoE
 # profile (crates/arc-inference/src/modern/mla/precision.rs `project_i16`),
 # stacked on #156 (branch agent/builder/ARC-66). The repository-wide workflows
-# run only for pull requests to main, so this branch carries its own push
-# trigger, as #156 does in mla-moe-moonlight.yml. Remove the trigger before the
-# change leaves draft.
+# run only for pull requests to main. The branch push trigger used while the
+# change was iterated is removed; run this by hand (workflow_dispatch), which
+# works once the file is on the default branch.
 #
 #   lint          rustfmt and clippy (deny warnings) for arc-inference.
 #   test-bench    the MLA profile unit tests (pinned golden digests, the INT16
@@ -22,12 +22,15 @@ name: INT16 projection hot path (bit-identical)
 #                 tiny models through every check.
 #
 # macOS runners serve the release sequence (standing rule, 2026-10-06), so the
-# macOS arm64 leg runs only for a push whose head commit message contains
-# [macos].
+# macOS arm64 leg runs only when the `macos` input is set.
 
 on:
-  push:
-    branches: [perf-int16-hotpath]
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: Also run the macOS arm64 leg (macOS runners serve the release sequence)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -78,7 +81,7 @@ jobs:
       matrix:
         # ubuntu-latest is x86-64 (AVX2), ubuntu-24.04-arm is arm64 (NEON
         # dotprod), windows-latest is x86-64 (AVX2), macos-15 is Apple Silicon.
-        os: ${{ fromJSON(contains(github.event.head_commit.message, '[macos]') && '["ubuntu-latest","ubuntu-24.04-arm","windows-latest","macos-15"]' || '["ubuntu-latest","ubuntu-24.04-arm","windows-latest"]') }}
+        os: ${{ fromJSON(inputs.macos && '["ubuntu-latest","ubuntu-24.04-arm","windows-latest","macos-15"]' || '["ubuntu-latest","ubuntu-24.04-arm","windows-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
