@@ -1121,6 +1121,43 @@ where
     }
 }
 
+/// The node's dedicated inference pool, as a handle that work started before
+/// the RPC server can hold.
+///
+/// main.rs spawns the community worker loop before `serve` builds the
+/// `NodeState`, so the loop cannot reach `node.compute_pool`. It holds this
+/// handle instead, and `serve` attaches the same handle to the node. As a
+/// result, `--threads`, `[inference] threads` and `POST /node/threads` size the
+/// pool that community jobs run on. With none of them set, `install` runs the
+/// job on the calling thread with rayon's global pool, exactly as before.
+#[derive(Clone, Default)]
+pub struct ComputePool {
+    pool: Arc<parking_lot::RwLock<Option<Arc<rayon::ThreadPool>>>>,
+    threads: Arc<AtomicU32>,
+}
+
+impl ComputePool {
+    /// Run `f` on the dedicated pool when one is configured, else on the
+    /// calling thread, where rayon work goes to its global pool.
+    pub fn install<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send,
+        R: Send,
+    {
+        let pool = self.pool.read().clone();
+        match pool {
+            Some(pool) => pool.install(f),
+            None => f(),
+        }
+    }
+
+    /// Make `node`'s pool controls and local compute use this same pool.
+    fn attach(&self, node: &mut NodeState) {
+        node.compute_pool = self.pool.clone();
+        node.compute_threads = self.threads.clone();
+    }
+}
+
 /// Build (or rebuild) the dedicated compute pool at `threads` width.
 ///
 /// `threads == 0` drops the dedicated pool and returns the node to rayon's
@@ -2071,6 +2108,10 @@ pub async fn serve(
     community_rpc_bases: Vec<String>,
     // compute_threads: dedicated inference-pool width; 0 = rayon's global pool.
     compute_threads: usize,
+    // compute_pool: the pool handle the community worker loop already holds.
+    //   The node's pool controls (`compute_threads`, POST /node/threads) size
+    //   this same pool, so they apply to community jobs too.
+    compute_pool: ComputePool,
     // chain_identity: the genesis file's declared chain name / chain_id, when
     //   the node was started with --genesis. Surfaced by GET /network/info so
     //   the desktop never has to guess which chain it is talking to.
@@ -2108,6 +2149,8 @@ pub async fn serve(
         candle_model_id,
         model_artifact_id,
     );
+    // Before anything clones the node: every clone must share this pool.
+    compute_pool.attach(&mut node);
     node.runtime_shutdown = shutdown.clone();
     node.transport_wire_policy = transport_wire_policy;
     node.chain_identity = chain_identity;
@@ -18494,7 +18537,8 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
 
 /// GET /node/threads
 ///
-/// Report the width of the pool that runs local inference compute.
+/// Report the width of the pool that runs local inference compute, and the
+/// canonical INT8 projection kernel that compute uses.
 async fn get_node_threads(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let dedicated = node.compute_threads.load(Ordering::Relaxed);
     Json(json!({
@@ -18504,6 +18548,8 @@ async fn get_node_threads(AxumState(node): AxumState<NodeState>) -> Json<Value> 
         "rayon_global_threads": rayon_global_width(),
         "rayon_num_threads_env": std::env::var("RAYON_NUM_THREADS").ok(),
         "available_parallelism": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "canonical_kernel": arc_inference::canonical_simd::effective_kernel_name(),
+        "canonical_kernel_source": arc_inference::canonical_simd::kernel_choice_source(),
         "note": "POST {\"threads\": n} to rebuild the pool live; n=0 returns to rayon's global pool",
     }))
 }
@@ -26840,6 +26886,7 @@ mod tests {
                     vec![poison_origin],
                     Vec::new(),
                     0,
+                    ComputePool::default(),
                     None,
                     false,
                     None,
@@ -26927,6 +26974,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 0,
+                ComputePool::default(),
                 None,
                 false,
                 None,
@@ -28114,6 +28162,37 @@ mod tests {
     fn compute_pool_rejects_absurd_widths() {
         let node = fake_node_with_workers(vec![]);
         assert!(set_compute_threads(&node, 100_000).is_err());
+    }
+
+    #[test]
+    fn community_jobs_run_on_the_pool_the_thread_setting_sizes() {
+        // main.rs gives the community worker loop this handle before `serve`
+        // exists; `serve` attaches the same handle to the node.
+        let worker_pool = ComputePool::default();
+        let mut node = fake_node_with_workers(vec![]);
+        worker_pool.attach(&mut node);
+
+        // Unset: no behaviour change. The job runs on the calling thread and
+        // its rayon work on the global pool, as before.
+        let global = rayon::current_num_threads();
+        assert_eq!(worker_pool.install(rayon::current_num_threads), global);
+
+        // --threads 3 / [inference] threads = 3 (serve calls this at start-up).
+        set_compute_threads(&node, 3).expect("3-thread pool");
+        assert_eq!(worker_pool.install(rayon::current_num_threads), 3);
+
+        // The desktop's live core setting: POST /node/threads.
+        set_compute_threads(&node, 2).expect("resize live");
+        assert_eq!(worker_pool.install(rayon::current_num_threads), 2);
+        assert_eq!(
+            install_on_compute_pool(&node, rayon::current_num_threads),
+            2,
+            "local RPC compute and community jobs share one pool"
+        );
+
+        // threads = 0 returns community jobs to rayon's global pool.
+        set_compute_threads(&node, 0).expect("back to global");
+        assert_eq!(worker_pool.install(rayon::current_num_threads), global);
     }
 }
 

@@ -1007,10 +1007,11 @@ fn matmul_i8_view_into(
         weights.scales.len(),
         "matmul output/scales mismatch"
     );
-    // Opt-in bit-exact vectorised path. Default OFF, so the scalar datapath
-    // below is unchanged unless a caller explicitly enables it. The fast path
-    // refuses any input it cannot prove exact and returns false, leaving the
-    // scalar kernel to run. See `crate::canonical_simd`.
+    // Bit-exact vectorised path: on by default where the CPU has it (AVX2 on
+    // x86-64, NEON dotprod on arm64), and forced either way by the
+    // `ARC_CANONICAL_KERNEL` override. The fast path refuses any input it
+    // cannot prove exact and returns false, leaving the scalar kernel below to
+    // run. See `crate::canonical_simd`.
     if crate::canonical_simd::fast_canonical_kernel_enabled()
         && crate::canonical_simd::matmul_i8_canonical_rows_fast_view(
             weights, input, in_size, output,

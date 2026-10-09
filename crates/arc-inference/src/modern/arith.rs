@@ -152,8 +152,8 @@ pub fn dyadic_epilogue(acc: i64, mu: i32, k: u8) -> Result<i64, ModernError> {
 
 /// `out = W x` for one dyadic matrix (spec §5.2).
 ///
-/// When the opt-in limb kernel is enabled (`ARC_FAST_CANONICAL_KERNEL=1` or
-/// `canonical_simd::set_fast_canonical_kernel`) it computes the exact row dot
+/// When the limb kernel is enabled (the default on x86-64 and arm64; see
+/// `canonical_simd` for the defaults and overrides) it computes the exact row dot
 /// products; on refusal, or when it is off, the scalar kernel computes the same
 /// integers. The epilogue is shared, so both paths produce identical outputs.
 pub fn project(m: &DyadicMatrix, x: &[i64], out: &mut [i64]) -> Result<(), ModernError> {
