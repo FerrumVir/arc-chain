@@ -13,7 +13,9 @@
 //! 5. speculative verification of k drafted tokens in one pass, accepted and
 //!    rejected, with the rejected rows rolled back;
 //! 6. stage splits: every 1-, 2-, 3- and 4-way split of the four layers, with
-//!    one KV cache per stage holder;
+//!    one KV cache per stage holder, one row per call (`forward_shard_token`)
+//!    or k rows per call (`forward_shard_rows`), with rejected rows rolled
+//!    back on every holder (`rollback_rows`);
 //! 7. rayon pools of 1, 2 and N threads, with the scalar and the vectorised
 //!    projection kernels.
 //!
@@ -34,8 +36,8 @@ use super::{
 };
 use crate::cached_integer_model::{
     CANONICAL_REWARD_INFERENCE_PROFILE, CachedIntegerModel,
-    GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, KVCache, ShardInput, ShardOutput,
-    select_next_token_with_repetition_penalty,
+    GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, I8Weights, KVCache, ShardInput, ShardOutput,
+    ShardRowsError, ShardRowsInput, ShardRowsOutput, select_next_token_with_repetition_penalty,
 };
 use crate::canonical_simd;
 use arc_crypto::hash_bytes;
@@ -1559,18 +1561,627 @@ fn golden_modes_seeded_sampling_rechecks_from_teacher_forced_logits() {
     panic!("not implemented: the engine has no seeded sampler to re-check");
 }
 
-/// TODO(stage holders): pending an engine API.
-///
-/// A stage holder executes one position per call (`forward_shard_token`), so a
-/// teacher-forced re-check or a speculative verification that crosses a stage
-/// split still runs token by token on every stage. Only a whole-model holder
-/// can verify k rows in one pass (`prefill_canonical_i8_batched`). Once a
-/// stage call takes k rows (k tokens on the first stage, k hidden states
-/// after it) for layers [start, end), replace this body with the stage-split
-/// test above driven k rows at a time, with the same boundary, KV and
-/// terminal checks, for k of 1, 2, 4 and the whole sequence.
+// ── Multi-row stage calls ───────────────────────────────────────────────────
+
+/// Feeds `tokens` at positions `position..` through every stage holder with
+/// one `forward_shard_rows` call per stage. Records the hidden rows handed
+/// across every cut and returns the last stage's raw logits rows.
+fn stage_rows_step(
+    model: &CachedIntegerModel,
+    ends: &[usize],
+    holders: &mut [KVCache],
+    position: usize,
+    tokens: &[u32],
+    trace: &mut StageTrace,
+) -> Vec<Vec<i64>> {
+    assert_eq!(ends.len(), holders.len());
+    let mut input = ShardRowsInput::Tokens(tokens.to_vec());
+    let mut start = 0;
+    for (&end, holder) in ends.iter().zip(holders.iter_mut()) {
+        let output = model
+            .forward_shard_rows(input, holder, start, end, position)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "stage [{start}, {end}) refused {} rows at position {position}: {error}",
+                    tokens.len()
+                )
+            });
+        match output {
+            ShardRowsOutput::Hidden(rows) => {
+                for (offset, row) in rows.iter().enumerate() {
+                    let previous = trace
+                        .boundaries
+                        .insert((position + offset, end - 1), hash_i64(row));
+                    assert!(previous.is_none(), "stage boundary {end} reported twice");
+                }
+                input = ShardRowsInput::Hidden(rows);
+            }
+            ShardRowsOutput::Logits(rows) => {
+                assert_eq!(end, model.config.n_layers, "only the last stage has logits");
+                assert_eq!(rows.len(), tokens.len(), "one logits row per input row");
+                return rows;
+            }
+        }
+        start = end;
+    }
+    panic!("the last stage of {ends:?} returned hidden rows, not logits");
+}
+
+/// Records what a one-row terminal stage would commit for `logits` rows at
+/// positions `position..`: each row's token and penalized logits hash,
+/// selected with that row's own generated history.
+fn record_terminal(
+    trace: &mut StageTrace,
+    position: usize,
+    logits: &[Vec<i64>],
+    history: impl Fn(usize) -> Vec<u32>,
+) {
+    for (offset, row) in logits.iter().enumerate() {
+        let selected = history(position + offset);
+        let commitment = (select(row, &selected), penalized_hash(row, &selected));
+        let previous = trace.terminal.insert(position + offset, commitment);
+        assert!(
+            previous.is_none(),
+            "position {} committed twice",
+            position + offset
+        );
+    }
+}
+
+impl Reference {
+    /// Holds raw logits rows at positions `position..` to the reference.
+    fn assert_logit_rows(&self, position: usize, rows: &[Vec<i64>], mode: &str) {
+        for (offset, row) in rows.iter().enumerate() {
+            let expected = &self.trace.logits[&(position + offset)];
+            assert!(
+                row == expected,
+                "{mode} DIFFERS from token by token: logits at position {} ({} vs {})",
+                position + offset,
+                hash_i64(row),
+                hash_i64(expected)
+            );
+        }
+    }
+}
+
+/// The generated history a row at `position` selects with: the tokens
+/// generated before it. Rows before `first_row` select nothing.
+fn generated_history(truth: &[u32], first_row: usize, position: usize) -> Vec<u32> {
+    truth[..position.saturating_sub(first_row).min(truth.len())].to_vec()
+}
+
+/// Multi-row stage calls: every 1-, 2-, 3- and 4-way split runs the whole
+/// window k rows per call on every stage, for k of 1, 2, 3, 4 and 8, and must
+/// hand on exactly the token-by-token boundaries, logits and K/V rows.
 #[test]
-#[ignore = "TODO: forward_shard_token takes one position; no multi-row stage call exists"]
 fn golden_modes_stage_holders_verify_rows_in_one_pass() {
-    panic!("not implemented: a stage holder cannot verify several rows in one call");
+    let switch = KernelSwitch::hold();
+    let fixture = fixture();
+    let tokens = full_window(&fixture);
+    let len = tokens.len();
+    let splits = stage_splits(fixture.n_layers);
+    for profile in PROFILES {
+        let model = build_model(&fixture, profile);
+        let reference = switch.run(BASE_LEG, || Reference::new(&model, &tokens));
+        for leg in switch.legs() {
+            for ends in &splits {
+                for k in [1, 2, 3, 4, 8] {
+                    let mode = format!(
+                        "{profile:?}, {leg:?}: {}-way split {ends:?}, {k} rows per stage call",
+                        ends.len()
+                    );
+                    let (trace, holders) = switch.run(leg, || {
+                        let mut holders = stage_holders(&model, ends);
+                        let mut trace = StageTrace::default();
+                        for (index, chunk) in tokens.chunks(k).enumerate() {
+                            let position = index * k;
+                            let logits = stage_rows_step(
+                                &model,
+                                ends,
+                                &mut holders,
+                                position,
+                                chunk,
+                                &mut trace,
+                            );
+                            reference.assert_logit_rows(position, &logits, &mode);
+                            record_terminal(&mut trace, position, &logits, |_| Vec::new());
+                        }
+                        (trace, holders)
+                    });
+                    reference.assert_stages(&trace, ends, 0..len, |_| Vec::new(), &mode);
+                    reference.assert_kv(&merge_holders(ends, &holders), len, &mode);
+                }
+            }
+        }
+    }
+}
+
+/// What a speculative decode through stage holders produced.
+struct StageSpeculation {
+    tokens: Vec<u32>,
+    trace: StageTrace,
+    holders: Vec<KVCache>,
+    counts: SpeculationCounts,
+}
+
+/// A speculative decode through stage holders. Each round runs the pending
+/// token and its drafts through every stage in one multi-row call per stage,
+/// selects each row's token with that row's history, and rolls every holder
+/// back to the last accepted row with `rollback_rows`.
+fn speculate_through_stages(
+    model: &CachedIntegerModel,
+    ends: &[usize],
+    generation: Generation,
+    prompt: &[u32],
+    truth: &[u32],
+    drafts: Drafts,
+    k: usize,
+) -> StageSpeculation {
+    let config = &model.config;
+    let vocab = u32::try_from(config.vocab_size).expect("vocabulary fits u32");
+    let max_tokens = truth.len();
+    let mut holders = stage_holders(model, ends);
+    let mut trace = StageTrace::default();
+    let mut prompt_rows = vec![config.bos_token];
+    prompt_rows.extend_from_slice(prompt);
+    let prompt_logits = stage_rows_step(model, ends, &mut holders, 0, &prompt_rows, &mut trace);
+    record_terminal(&mut trace, 0, &prompt_logits, |_| Vec::new());
+
+    let mut tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut pending = match generation {
+        Generation::Worker => *prompt.last().expect("a non-empty prompt"),
+        Generation::V2 => {
+            let first = select(&prompt_logits[prompt.len()], &tokens);
+            tokens.push(first);
+            first
+        }
+    };
+    let mut counts = SpeculationCounts::default();
+    let mut round = 0;
+    while tokens.len() < max_tokens {
+        let n_drafts = k.min(max_tokens - tokens.len() - 1);
+        let first = tokens.len();
+        let mut batch = vec![pending];
+        batch.extend((0..n_drafts).map(|slot| {
+            let right = truth[first + slot];
+            if drafts.wrong(round, slot, n_drafts) {
+                (right + 1) % vocab
+            } else {
+                right
+            }
+        }));
+        let base = holders[0].seq_len;
+        let mut verified = StageTrace::default();
+        let logits = stage_rows_step(model, ends, &mut holders, base, &batch, &mut verified);
+
+        // Row `j` selects what follows `batch[j]`, with every token accepted
+        // before it as its history, exactly as the one-row terminal stage does.
+        let mut kept = 1;
+        let mut next = select(&logits[0], &tokens);
+        let mut committed = vec![(next, penalized_hash(&logits[0], &tokens))];
+        while kept < batch.len() && batch[kept] == next {
+            tokens.push(next);
+            next = select(&logits[kept], &tokens);
+            committed.push((next, penalized_hash(&logits[kept], &tokens)));
+            kept += 1;
+        }
+        counts.accepted_drafts += kept - 1;
+        if kept < batch.len() {
+            counts.rejected_rounds += 1;
+            counts.rolled_back_rows += batch.len() - kept;
+            for holder in &mut holders {
+                model
+                    .rollback_rows(holder, base + kept)
+                    .expect("rolling back to an earlier position is accepted");
+            }
+        }
+        for ((position, layer), hash) in verified.boundaries {
+            if position < base + kept {
+                let previous = trace.boundaries.insert((position, layer), hash);
+                assert!(previous.is_none(), "position {position} kept twice");
+            }
+        }
+        for (offset, commitment) in committed.into_iter().enumerate() {
+            let previous = trace.terminal.insert(base + offset, commitment);
+            assert!(
+                previous.is_none(),
+                "position {} committed twice",
+                base + offset
+            );
+        }
+        tokens.push(next);
+        pending = next;
+        round += 1;
+    }
+    if matches!(generation, Generation::V2) {
+        // generate_v2 feeds every generated token back, the last one included.
+        let base = holders[0].seq_len;
+        let logits = stage_rows_step(model, ends, &mut holders, base, &[pending], &mut trace);
+        let history = tokens.clone();
+        record_terminal(&mut trace, base, &logits, |_| history.clone());
+    }
+    StageSpeculation {
+        tokens,
+        trace,
+        holders,
+        counts,
+    }
+}
+
+/// Partial acceptance through stage holders: drafts verified k rows per stage
+/// call, rejected rows rolled back on every holder, decoding continued. Each
+/// case must reproduce the production generation, commit the token-by-token
+/// boundaries and terminal outputs, end on the token-by-token KV, and reject
+/// and roll back exactly what its draft pattern plans, at least once.
+#[test]
+fn golden_modes_stage_holders_roll_back_rejected_rows() {
+    let switch = KernelSwitch::hold();
+    let fixture = fixture();
+    let splits: [&[usize]; 4] = [&[4], &[2, 4], &[1, 3, 4], &[1, 2, 3, 4]];
+    let patterns = [
+        Drafts::AllWrong,
+        Drafts::LastWrong,
+        Drafts::MiddleWrongEvenRounds,
+    ];
+    for profile in PROFILES {
+        let model = build_model(&fixture, profile);
+        let (prompt, max_tokens) = generation_case(&fixture, profile);
+        for generation in GENERATIONS {
+            let (truth, truth_hash) = switch.run(BASE_LEG, || {
+                production_generate(&model, generation, &prompt, max_tokens)
+            });
+            let (fed, first_row) = fed_sequence(&model, generation, &prompt, &truth);
+            let reference = switch.run(BASE_LEG, || Reference::new(&model, &fed));
+            for leg in switch.legs() {
+                for ends in splits {
+                    for k in [1, 3, 8] {
+                        for drafts in patterns {
+                            let mode = format!(
+                                "{profile:?}, {leg:?}: {generation:?} speculated through split \
+                                 {ends:?}, k={k}, {drafts:?}"
+                            );
+                            let run = switch.run(leg, || {
+                                speculate_through_stages(
+                                    &model, ends, generation, &prompt, &truth, drafts, k,
+                                )
+                            });
+                            assert_eq!(run.tokens, truth, "{mode}: tokens");
+                            assert_eq!(output_hash(&run.tokens), truth_hash, "{mode}: output hash");
+                            let plan = planned_speculation(generation, truth.len(), drafts, k);
+                            assert_eq!(run.counts, plan, "{mode}: drafts accepted and rolled back");
+                            assert!(
+                                plan.rejected_rounds > 0 && plan.rolled_back_rows > 0,
+                                "{mode}: the case never rejected a draft"
+                            );
+                            reference.assert_stages(
+                                &run.trace,
+                                ends,
+                                0..fed.len(),
+                                |position| generated_history(&truth, first_row, position),
+                                &mode,
+                            );
+                            reference.assert_kv(
+                                &merge_holders(ends, &run.holders),
+                                fed.len(),
+                                &mode,
+                            );
+                            if leg == BASE_LEG {
+                                println!(
+                                    "golden_modes stage speculation case: {mode}: {:?}",
+                                    run.counts
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One-row and multi-row calls interleaved on the same stage holders, then a
+/// rollback to mid-window and the rest fed again in one multi-row call: every
+/// boundary, terminal output and K/V row must stay token-by-token.
+#[test]
+fn golden_modes_stage_holders_mix_one_row_and_multi_row_calls() {
+    let switch = KernelSwitch::hold();
+    let fixture = fixture();
+    let tokens = full_window(&fixture);
+    let len = tokens.len();
+    // A segment of 1 goes through forward_shard_token, a longer one through
+    // forward_shard_rows.
+    let segments: [usize; 7] = [1, 3, 1, 4, 2, 1, 4];
+    assert_eq!(segments.iter().sum::<usize>(), len);
+    let splits: [&[usize]; 3] = [&[2, 4], &[1, 3, 4], &[1, 2, 3, 4]];
+    let resume = 9;
+    for profile in PROFILES {
+        let model = build_model(&fixture, profile);
+        let reference = switch.run(BASE_LEG, || Reference::new(&model, &tokens));
+        for leg in switch.legs() {
+            for ends in splits {
+                let mode = format!(
+                    "{profile:?}, {leg:?}: split {ends:?}, mixed one-row and multi-row calls"
+                );
+                let (trace, again, holders) = switch.run(leg, || {
+                    let mut holders = stage_holders(&model, ends);
+                    let mut trace = StageTrace::default();
+                    let mut position = 0;
+                    for &size in &segments {
+                        let chunk = &tokens[position..position + size];
+                        if size == 1 {
+                            stage_step(
+                                &model,
+                                ends,
+                                &mut holders,
+                                position,
+                                chunk[0],
+                                &[],
+                                &mut trace,
+                            );
+                        } else {
+                            let logits = stage_rows_step(
+                                &model,
+                                ends,
+                                &mut holders,
+                                position,
+                                chunk,
+                                &mut trace,
+                            );
+                            record_terminal(&mut trace, position, &logits, |_| Vec::new());
+                        }
+                        position += size;
+                    }
+                    for holder in &mut holders {
+                        model
+                            .rollback_rows(holder, resume)
+                            .expect("rolling back mid-window is accepted");
+                    }
+                    let mut again = StageTrace::default();
+                    let logits = stage_rows_step(
+                        &model,
+                        ends,
+                        &mut holders,
+                        resume,
+                        &tokens[resume..],
+                        &mut again,
+                    );
+                    record_terminal(&mut again, resume, &logits, |_| Vec::new());
+                    (trace, again, holders)
+                });
+                reference.assert_stages(&trace, ends, 0..len, |_| Vec::new(), &mode);
+                let mode = format!("{mode}, rolled back to {resume} and fed again");
+                reference.assert_stages(&again, ends, resume..len, |_| Vec::new(), &mode);
+                reference.assert_kv(&merge_holders(ends, &holders), len, &mode);
+            }
+        }
+    }
+}
+
+/// A teacher-forced re-check through stage holders whose multi-row calls
+/// cross the prompt/generation boundary: prompt rows select nothing, and each
+/// generation row selects with its own history. The re-derived tokens, the
+/// terminal commitments, the boundaries and the K/V rows must all match.
+#[test]
+fn golden_modes_stage_holders_recheck_rows_across_the_prompt_boundary() {
+    let switch = KernelSwitch::hold();
+    let fixture = fixture();
+    let splits = stage_splits(fixture.n_layers);
+    for profile in PROFILES {
+        let model = build_model(&fixture, profile);
+        let (prompt, max_tokens) = generation_case(&fixture, profile);
+        for generation in GENERATIONS {
+            let (truth, truth_hash) = switch.run(BASE_LEG, || {
+                production_generate(&model, generation, &prompt, max_tokens)
+            });
+            let (fed, first_row) = fed_sequence(&model, generation, &prompt, &truth);
+            let reference = switch.run(BASE_LEG, || Reference::new(&model, &fed));
+            let history = |position: usize| generated_history(&truth, first_row, position);
+            for leg in switch.legs() {
+                for ends in &splits {
+                    for k in [2, 3, 4, 8] {
+                        let mode = format!(
+                            "{profile:?}, {leg:?}: {generation:?} re-checked through split \
+                             {ends:?}, {k} rows per call across the prompt boundary"
+                        );
+                        // One call up to the row before the first selecting row,
+                        // then k rows per call, so the first k-row call holds a
+                        // prompt row and the first generation row together.
+                        let lead = first_row - 1;
+                        let (trace, holders) = switch.run(leg, || {
+                            let mut holders = stage_holders(&model, ends);
+                            let mut trace = StageTrace::default();
+                            let logits = stage_rows_step(
+                                &model,
+                                ends,
+                                &mut holders,
+                                0,
+                                &fed[..lead],
+                                &mut trace,
+                            );
+                            record_terminal(&mut trace, 0, &logits, history);
+                            let mut position = lead;
+                            for chunk in fed[lead..].chunks(k) {
+                                let logits = stage_rows_step(
+                                    &model,
+                                    ends,
+                                    &mut holders,
+                                    position,
+                                    chunk,
+                                    &mut trace,
+                                );
+                                record_terminal(&mut trace, position, &logits, history);
+                                position += chunk.len();
+                            }
+                            (trace, holders)
+                        });
+                        let rechecked: Vec<u32> = (first_row..first_row + truth.len())
+                            .map(|position| trace.terminal[&position].0)
+                            .collect();
+                        assert_eq!(rechecked, truth, "{mode}: re-derived tokens");
+                        assert_eq!(
+                            output_hash(&rechecked),
+                            truth_hash,
+                            "{mode}: re-derived output hash"
+                        );
+                        reference.assert_stages(&trace, ends, 0..fed.len(), history, &mode);
+                        reference.assert_kv(&merge_holders(ends, &holders), fed.len(), &mode);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Every refusal of `forward_shard_rows` and `rollback_rows` leaves the cache
+/// byte for byte as it was.
+#[test]
+fn golden_modes_stage_rows_refuse_without_touching_the_cache() {
+    let fixture = fixture();
+    let model = build_model(&fixture, Profile::LegacySplitHalf);
+    let n_layers = model.config.n_layers;
+    let d = model.config.d_model;
+    let mut holder = KVCache::new(n_layers);
+    model
+        .forward_shard_rows(ShardRowsInput::Tokens(vec![1, 3]), &mut holder, 0, 2, 0)
+        .expect("two rows on the first stage");
+    let before = kv_to_bytes(&holder);
+    let refuse =
+        |holder: &mut KVCache, input: ShardRowsInput, start: usize, end: usize, position: usize| {
+            model
+                .forward_shard_rows(input, holder, start, end, position)
+                .expect_err("the call must be refused")
+        };
+    assert_eq!(
+        refuse(&mut holder, ShardRowsInput::Tokens(Vec::new()), 0, 2, 2),
+        ShardRowsError::NoRows
+    );
+    assert_eq!(
+        refuse(&mut holder, ShardRowsInput::Tokens(vec![7]), 2, 2, 2).kind(),
+        "bad_layer_range"
+    );
+    assert_eq!(
+        refuse(
+            &mut holder,
+            ShardRowsInput::Tokens(vec![7]),
+            0,
+            n_layers + 1,
+            2
+        )
+        .kind(),
+        "bad_layer_range"
+    );
+    assert_eq!(
+        refuse(
+            &mut holder,
+            ShardRowsInput::Hidden(vec![vec![0; d]]),
+            0,
+            2,
+            2
+        ),
+        ShardRowsError::WrongInput { start_layer: 0 }
+    );
+    assert_eq!(
+        refuse(&mut holder, ShardRowsInput::Tokens(vec![7]), 0, 2, 1).kind(),
+        "kv_cache_out_of_sync"
+    );
+    assert_eq!(
+        refuse(&mut holder, ShardRowsInput::Tokens(vec![7; 15]), 0, 2, 2).kind(),
+        "position_out_of_range"
+    );
+    assert_eq!(
+        kv_to_bytes(&holder),
+        before,
+        "a refused call changed the cache"
+    );
+
+    let mut second = KVCache::new(n_layers);
+    assert_eq!(
+        refuse(&mut second, ShardRowsInput::Tokens(vec![7]), 2, 4, 0),
+        ShardRowsError::WrongInput { start_layer: 2 }
+    );
+    assert_eq!(
+        refuse(
+            &mut second,
+            ShardRowsInput::Hidden(vec![vec![0; d - 1]]),
+            2,
+            4,
+            0
+        )
+        .kind(),
+        "bad_hidden_dim"
+    );
+    assert_eq!(kv_to_bytes(&second), kv_to_bytes(&KVCache::new(n_layers)));
+
+    let mut promoted = build_model(&fixture, Profile::LegacySplitHalf);
+    promoted.enable_i16();
+    assert_eq!(
+        promoted
+            .forward_shard_rows(
+                ShardRowsInput::Tokens(vec![1]),
+                &mut KVCache::new(n_layers),
+                0,
+                2,
+                0
+            )
+            .expect_err("an I16-promoted model is refused"),
+        ShardRowsError::NotCanonicalProfile
+    );
+    let mut headless = build_model(&fixture, Profile::LegacySplitHalf);
+    headless.output_weight = I8Weights::empty();
+    assert_eq!(
+        headless
+            .forward_shard_rows(
+                ShardRowsInput::Tokens(vec![1]),
+                &mut KVCache::new(n_layers),
+                0,
+                n_layers,
+                0
+            )
+            .expect_err("a last stage without the head is refused"),
+        ShardRowsError::HeadNotLoaded
+    );
+    let mut embeddingless = build_model(&fixture, Profile::LegacySplitHalf);
+    embeddingless.embedding_q16.clear();
+    assert_eq!(
+        embeddingless
+            .forward_shard_rows(
+                ShardRowsInput::Tokens(vec![1]),
+                &mut KVCache::new(n_layers),
+                0,
+                2,
+                0
+            )
+            .expect_err("a first stage without the embedding is refused"),
+        ShardRowsError::TokenNotEmbedded { token: 1 }
+    );
+
+    assert_eq!(
+        model.rollback_rows(&mut holder, 3),
+        Err(ShardRowsError::RollbackGrows {
+            keep: 3,
+            cached_positions: 2
+        })
+    );
+    model
+        .rollback_rows(&mut holder, 2)
+        .expect("keeping every position is a no-op");
+    assert_eq!(
+        kv_to_bytes(&holder),
+        before,
+        "a no-op rollback changed the cache"
+    );
+    let mut ragged = clone_kv(&holder);
+    ragged.k_data[1].push(0);
+    let ragged_before = kv_to_bytes(&ragged);
+    assert_eq!(
+        model
+            .rollback_rows(&mut ragged, 1)
+            .map_err(|error| error.kind()),
+        Err("ragged_cache")
+    );
+    assert_eq!(
+        kv_to_bytes(&ragged),
+        ragged_before,
+        "a refused rollback changed the cache"
+    );
 }

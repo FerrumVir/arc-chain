@@ -71,7 +71,12 @@ and the generated tokens and output hash. The modes are:
   and roll back exactly the rows its draft pattern plans, and every pattern
   except the all-right one rejects at least once;
 - every 1-, 2-, 3- and 4-way stage split, with one KV cache per stage holder,
-  including the worker's generation replayed through the stages.
+  including the worker's generation replayed through the stages;
+- a stage holder running k rows in one call (`forward_shard_rows`, for k of
+  1, 2, 3, 4 and 8) on every split. This includes speculative decoding through
+  the stages, with rejected rows rolled back on every holder (`rollback_rows`),
+  one-row and k-row calls mixed on the same caches, and calls that cross the
+  prompt/generation boundary.
 
 The token-by-token references are pinned to reviewed constants: the KAT files
 for their first rows, and `tests/fixtures/execution_modes_reference.json` for
@@ -79,11 +84,9 @@ everything else. That covers every position of both profiles, the wider model,
 and the two generation calls the KATs leave out. The pinned values were
 byte-identical on all four golden runners of one CI run, which the file names.
 
-Two cases have no engine API yet, so they are ignored tests that state the
-contract to implement: a stage holder verifying several rows in one call
-(`forward_shard_token` takes one position), and seeded sampling (the engine
-selects tokens only by greedy argmax after the deterministic repetition
-penalty). The vectorised legs force the limb kernel on, but they do not count
+Seeded sampling has no engine API yet, so it is an ignored test that states
+the contract to implement (the engine selects tokens only by greedy argmax
+after the deterministic repetition penalty). The vectorised legs force the limb kernel on, but they do not count
 projections it hands back to the scalar kernel. The counter on `main` is
 process-wide, and other tests run at the same time.
 
