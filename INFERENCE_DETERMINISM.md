@@ -45,9 +45,12 @@ refuses, to the scalar kernel, any input it cannot prove exact.
   on Linux, Windows and Intel macOS; every transcript had the same SHA-256. CPUs
   without AVX2, and x86-64 processes translated by Rosetta 2, use the scalar
   kernel.
-- **arm64: the scalar kernel stays the default** until NEON passes the same full
-  workload. `NEON_ON_BY_DEFAULT` in `crates/arc-inference/src/canonical_simd.rs`
-  is the single switch for that.
+- **arm64: the scalar kernel stays the default for now.** NEON passed the same
+  full workload on GitHub's 7 GB Apple Silicon runner (run 37467005539,
+  attempt 4), but that runner swaps. NEON becomes the default once the proof
+  also passes on arm64 hardware that does not swap (`ubuntu-24.04-arm`).
+  `NEON_ON_BY_DEFAULT` in `crates/arc-inference/src/canonical_simd.rs` is the
+  single switch for that.
 - **Override:** `ARC_CANONICAL_KERNEL=scalar` forces the scalar kernel, `simd`
   forces the limb kernel where the CPU has one, and `auto` keeps the default.
   The older `ARC_FAST_CANONICAL_KERNEL` still applies when the new variable is

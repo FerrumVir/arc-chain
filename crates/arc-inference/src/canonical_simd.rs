@@ -14,9 +14,10 @@
 //!   SHA-256 (`d2c8c82b...`), and the AVX2 legs accepted 176,175 of 176,175
 //!   projections. CPUs without AVX2, and x86-64 processes that Rosetta 2
 //!   translates on Apple Silicon, keep the scalar kernel.
-//! * **arm64 (NEON dotprod): off** until the full 16 x 32 proof passes on
-//!   arm64 hardware that does not swap. [`NEON_ON_BY_DEFAULT`] is the single
-//!   switch that turns it on.
+//! * **arm64 (NEON dotprod): off for now.** The same 16 x 32 proof passed with
+//!   NEON on GitHub's 7 GB Apple Silicon runner (run 37467005539, attempt 4),
+//!   which swaps. NEON becomes the default once the proof also passes on arm64
+//!   hardware that does not swap. [`NEON_ON_BY_DEFAULT`] is the single switch.
 //! * **Overrides**, read once at first use: `ARC_CANONICAL_KERNEL=scalar`
 //!   forces the scalar reference, `simd` forces the vectorised kernel where the
 //!   CPU has one, and `auto` keeps the default. The older
@@ -141,11 +142,20 @@ pub const AVX2_ON_BY_DEFAULT: bool = true;
 
 /// Whether the vectorised kernel is on by default on arm64 (NEON dotprod).
 ///
-/// Off. NEON matched the scalar kernel on the proof's smoke run and on 3 of its
-/// 16 full-workload prompts (32,850 of 32,850 projections), not yet on the
-/// whole workload. This constant is the single switch: set it to `true` once
-/// the full 16 x 32 proof passes on arm64 hardware that does not swap, and
-/// arm64 builds then run NEON by default, with the same overrides.
+/// **This constant is the single switch for NEON. It is off for now.**
+///
+/// Two full proofs are required (kernel plan, note a):
+/// 1. Done: the 16 x 32 Llama-2-7B proof with NEON on GitHub's 7 GB Apple
+///    Silicon runner (run 37467005539, attempt 4). Its transcript matched
+///    every other cell (`d2c8c82b...`), and NEON accepted 176,175 of 176,175
+///    projections. That runner swaps the model, though.
+/// 2. Still to run: the same proof on arm64 hardware that does not swap
+///    (`ubuntu-24.04-arm`).
+///
+/// Once the second proof matches, set this to `true`. Nothing else changes:
+/// every arm64 build then runs NEON by default, and `ARC_CANONICAL_KERNEL`
+/// still overrides it either way. Until then, `ARC_CANONICAL_KERNEL=simd`
+/// opts a single node in.
 pub const NEON_ON_BY_DEFAULT: bool = false;
 
 /// Operator override, read once at first use: `scalar`, `simd` or `auto`, in
@@ -1519,13 +1529,14 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_on_only_where_the_full_proof_ran() {
+    fn the_default_is_avx2_on_x86_and_follows_the_neon_switch_on_arm64() {
         // x86-64: the AVX2 kernel, except under Rosetta 2 translation.
         #[cfg(target_arch = "x86_64")]
         assert_eq!(simd_on_by_default(), !running_under_rosetta());
-        // arm64: NEON stays off until the full-workload proof passes.
+        // arm64: `NEON_ON_BY_DEFAULT` alone decides, so turning NEON on stays
+        // a one-line change.
         #[cfg(target_arch = "aarch64")]
-        assert!(!simd_on_by_default());
+        assert_eq!(simd_on_by_default(), NEON_ON_BY_DEFAULT);
     }
 
     #[test]
