@@ -17,7 +17,7 @@
 //! stages.
 //!
 //! usage: stage_rows_bench --model GGUF [--kernel scalar|simd|both]
-//!        [--context N] [--repeats N] [--ks 1,2,4,8]
+//!        [--context N] [--repeats N] [--ks 1,2,3,4,5,6,7,8]
 //!        [--out FILE.json] [--summary FILE.md]
 
 use arc_crypto::{Hash256, hash_bytes};
@@ -50,7 +50,7 @@ fn parse_args() -> Result<Args, String> {
         kernels: vec![false, true],
         context: 32,
         repeats: 3,
-        ks: vec![1, 2, 4, 8],
+        ks: vec![1, 2, 3, 4, 5, 6, 7, 8],
         out: None,
         summary: None,
     };

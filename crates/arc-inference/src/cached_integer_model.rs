@@ -4673,17 +4673,24 @@ pub enum ShardRowsError {
     /// The stage ends at the last layer but does not hold the final norm and
     /// output head.
     HeadNotLoaded,
+    /// The call carries more rows than [`CachedIntegerModel::max_shard_rows`]
+    /// allows: its own allocations would exceed the prefill's scratch budget.
+    TooManyRows { rows: usize, max_rows: usize },
     /// A rollback asked to keep more positions than the cache holds.
     RollbackGrows {
         keep: usize,
         cached_positions: usize,
     },
-    /// A layer's K or V rows disagree with the cache's position count.
+    /// A layer's K and V lengths are not both whole rows for the position
+    /// count: a partial row, or K and V of different lengths.
     RaggedCache {
         layer: usize,
+        keys: usize,
         values: usize,
         expected: usize,
     },
+    /// The cache has a different number of K layers and V layers.
+    CacheLayersDisagree { k_layers: usize, v_layers: usize },
 }
 
 impl ShardRowsError {
@@ -4698,8 +4705,10 @@ impl ShardRowsError {
             ShardRowsError::NotCanonicalProfile => "not_canonical_profile",
             ShardRowsError::BadShape => "bad_shape",
             ShardRowsError::HeadNotLoaded => "head_not_loaded",
+            ShardRowsError::TooManyRows { .. } => "too_many_rows",
             ShardRowsError::RollbackGrows { .. } => "rollback_grows",
             ShardRowsError::RaggedCache { .. } => "ragged_cache",
+            ShardRowsError::CacheLayersDisagree { .. } => "cache_layers_disagree",
         }
     }
 }
@@ -4752,13 +4761,23 @@ impl std::fmt::Display for ShardRowsError {
                 f,
                 "rollback_grows: cannot keep {keep} positions of a cache holding {cached_positions}"
             ),
+            ShardRowsError::TooManyRows { rows, max_rows } => write!(
+                f,
+                "too_many_rows: {rows} rows in one call, but this stage takes at most {max_rows}"
+            ),
             ShardRowsError::RaggedCache {
                 layer,
+                keys,
                 values,
                 expected,
             } => write!(
                 f,
-                "ragged_cache: layer {layer} holds {values} values where its position count needs {expected}"
+                "ragged_cache: layer {layer} holds {keys} K and {values} V values where its \
+                 position count needs {expected} of each"
+            ),
+            ShardRowsError::CacheLayersDisagree { k_layers, v_layers } => write!(
+                f,
+                "cache_layers_disagree: the cache has {k_layers} K layers and {v_layers} V layers"
             ),
         }
     }
@@ -4767,6 +4786,37 @@ impl std::fmt::Display for ShardRowsError {
 impl std::error::Error for ShardRowsError {}
 
 impl CachedIntegerModel {
+    /// The most rows one [`Self::forward_shard_rows`] call takes on a stage
+    /// ending at `end_layer`, so that the call's own allocations stay within
+    /// the prefill's scratch budget
+    /// ([`crate::canonical_prefill::MAX_PREFILL_SCRATCH_BYTES`]). Per row
+    /// that is the prefill's activation and digit scratch
+    /// ([`crate::canonical_prefill::prefill_chunk_scratch_bytes`]) plus the
+    /// rows the call returns. On the stage that holds the head, those are the
+    /// final norm and the logits, which it holds twice (computed and
+    /// returned). The prefill's [`crate::canonical_simd::MAX_BATCH_TOKENS`]
+    /// ceiling applies too. At Llama-2-7B width this is 521 rows on an inner
+    /// stage and 261 on the last.
+    pub fn max_shard_rows(&self, end_layer: usize) -> usize {
+        let cfg = &self.config;
+        let scratch = crate::canonical_prefill::prefill_chunk_scratch_bytes(
+            1,
+            cfg.d_model,
+            cfg.d_kv,
+            cfg.d_ff,
+        );
+        let returned = if end_layer == cfg.n_layers {
+            cfg.d_model
+                .saturating_add(cfg.vocab_size.saturating_mul(2))
+                .saturating_mul(8)
+        } else {
+            cfg.d_model.saturating_mul(8)
+        };
+        let per_row = scratch.saturating_add(returned).max(1);
+        (crate::canonical_prefill::MAX_PREFILL_SCRATCH_BYTES / per_row)
+            .clamp(1, crate::canonical_simd::MAX_BATCH_TOKENS)
+    }
+
     /// Runs `k` consecutive positions through this stage's layers
     /// `[start_layer, end_layer)` in one pass over its weights.
     ///
@@ -4778,6 +4828,12 @@ impl CachedIntegerModel {
     /// once for all `k` rows. The stage that holds the head returns raw logits;
     /// the caller selects each row's token with that row's generated history,
     /// and [`Self::rollback_rows`] drops the rows of rejected drafts.
+    ///
+    /// It pays from four rows. The batched kernel works on quads of rows, so
+    /// one to three rows cost more per row than one-row calls; send those
+    /// through [`Self::forward_shard_token`], with the floor the prefill uses
+    /// ([`crate::canonical_prefill::batching_is_profitable`]).
+    /// `examples/stage_rows_bench.rs` measures both on the real model.
     ///
     /// Canonical per-row I8 only: any other profile is refused, so the caller
     /// falls back to one-row calls. A refusal leaves `cache` unchanged.
@@ -4822,6 +4878,10 @@ impl CachedIntegerModel {
                 n_layers: cfg.n_layers,
             });
         }
+        let max_rows = self.max_shard_rows(end_layer);
+        if rows > max_rows {
+            return Err(ShardRowsError::TooManyRows { rows, max_rows });
+        }
         // Every row must fit the RoPE table, as each one-row call requires.
         let last = position.saturating_add(rows - 1);
         if last >= cfg.max_seq {
@@ -4831,16 +4891,30 @@ impl CachedIntegerModel {
             }
             .into());
         }
+        // Every layer of the stage must hold exactly `position` whole K rows
+        // and as many V rows. Whole rows for another position are the one-row
+        // call's out-of-sync refusal; a partial row or a K/V mismatch is a
+        // torn cache.
+        let expected = position.saturating_mul(cfg.d_kv);
         for layer in start_layer..end_layer {
-            let cached = cache.k_data[layer].len() / cfg.d_kv;
-            if cached != position {
+            let (keys, values) = (cache.k_data[layer].len(), cache.v_data[layer].len());
+            if keys == expected && values == expected {
+                continue;
+            }
+            if keys == values && keys.is_multiple_of(cfg.d_kv) {
                 return Err(ShardForwardError::KvCacheOutOfSync {
                     layer,
                     expected_positions: position,
-                    cached_positions: cached,
+                    cached_positions: keys / cfg.d_kv,
                 }
                 .into());
             }
+            return Err(ShardRowsError::RaggedCache {
+                layer,
+                keys,
+                values,
+                expected,
+            });
         }
         for layer in start_layer..end_layer {
             if !self.layers[layer].is_loaded() {
@@ -4938,21 +5012,22 @@ impl CachedIntegerModel {
         let width = self.config.d_kv;
         let expected = held.saturating_mul(width);
         if cache.k_data.len() != cache.v_data.len() {
-            return Err(ShardRowsError::RaggedCache {
-                layer: cache.k_data.len().min(cache.v_data.len()),
-                values: 0,
-                expected,
+            return Err(ShardRowsError::CacheLayersDisagree {
+                k_layers: cache.k_data.len(),
+                v_layers: cache.v_data.len(),
             });
         }
         for (layer, (keys, values)) in cache.k_data.iter().zip(&cache.v_data).enumerate() {
-            for held_values in [keys.len(), values.len()] {
-                if held_values != 0 && held_values != expected {
-                    return Err(ShardRowsError::RaggedCache {
-                        layer,
-                        values: held_values,
-                        expected,
-                    });
-                }
+            // A layer the stage does not hold is empty; any other layer holds
+            // exactly `held` whole rows of K and of V.
+            let (keys, values) = (keys.len(), values.len());
+            if (keys, values) != (0, 0) && (keys, values) != (expected, expected) {
+                return Err(ShardRowsError::RaggedCache {
+                    layer,
+                    keys,
+                    values,
+                    expected,
+                });
             }
         }
         for rows in cache.k_data.iter_mut().chain(cache.v_data.iter_mut()) {

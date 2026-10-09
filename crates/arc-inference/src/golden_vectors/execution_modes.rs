@@ -2184,4 +2184,148 @@ fn golden_modes_stage_rows_refuse_without_touching_the_cache() {
         ragged_before,
         "a refused rollback changed the cache"
     );
+
+    // A torn stage cache is refused by the multi-row call too: a partial K
+    // row, which a floor-divided count would read as whole rows, and a V
+    // layer longer than its K layer.
+    let d_kv = model.config.d_kv;
+    let mut partial = clone_kv(&holder);
+    partial.k_data[0].push(0);
+    let partial_before = kv_to_bytes(&partial);
+    assert_eq!(
+        refuse(&mut partial, ShardRowsInput::Tokens(vec![7]), 0, 2, 2),
+        ShardRowsError::RaggedCache {
+            layer: 0,
+            keys: 2 * d_kv + 1,
+            values: 2 * d_kv,
+            expected: 2 * d_kv
+        }
+    );
+    assert_eq!(
+        kv_to_bytes(&partial),
+        partial_before,
+        "a refused call changed the cache"
+    );
+    let mut skewed = clone_kv(&holder);
+    skewed.v_data[1].extend(std::iter::repeat_n(0, d_kv));
+    let skewed_before = kv_to_bytes(&skewed);
+    assert_eq!(
+        refuse(&mut skewed, ShardRowsInput::Tokens(vec![7]), 0, 2, 2),
+        ShardRowsError::RaggedCache {
+            layer: 1,
+            keys: 2 * d_kv,
+            values: 3 * d_kv,
+            expected: 2 * d_kv
+        }
+    );
+    assert_eq!(
+        kv_to_bytes(&skewed),
+        skewed_before,
+        "a refused call changed the cache"
+    );
+
+    // The rollback refuses a K layer without its V rows, and K and V layer
+    // counts that disagree.
+    let mut half = clone_kv(&holder);
+    half.v_data[0].clear();
+    let half_before = kv_to_bytes(&half);
+    assert_eq!(
+        model.rollback_rows(&mut half, 1),
+        Err(ShardRowsError::RaggedCache {
+            layer: 0,
+            keys: 2 * d_kv,
+            values: 0,
+            expected: 2 * d_kv
+        })
+    );
+    assert_eq!(
+        kv_to_bytes(&half),
+        half_before,
+        "a refused rollback changed the cache"
+    );
+    let mut short = clone_kv(&holder);
+    short.v_data.pop();
+    assert_eq!(
+        model.rollback_rows(&mut short, 1),
+        Err(ShardRowsError::CacheLayersDisagree {
+            k_layers: n_layers,
+            v_layers: n_layers - 1
+        })
+    );
+}
+
+/// A multi-row call is held to the prefill's scratch budget: the cap itself is
+/// accepted, one more row is refused before anything is touched, and where the
+/// budget binds below the 1,024-row ceiling the cap is the budget's.
+#[test]
+fn golden_modes_stage_rows_respect_the_row_budget() {
+    use crate::canonical_prefill::{MAX_PREFILL_SCRATCH_BYTES, prefill_chunk_scratch_bytes};
+    use crate::canonical_simd::MAX_BATCH_TOKENS;
+
+    // At the fixture's width the budget is far above the ceiling, so the
+    // ceiling binds; give the RoPE table room past it.
+    let mut long = fixture();
+    long.max_seq = MAX_BATCH_TOKENS + 8;
+    let model = build_model(&long, Profile::LegacySplitHalf);
+    let n_layers = model.config.n_layers;
+    let cap = model.max_shard_rows(1);
+    assert_eq!(cap, MAX_BATCH_TOKENS);
+    assert_eq!(model.max_shard_rows(n_layers), MAX_BATCH_TOKENS);
+    let vocab = u32::try_from(model.config.vocab_size).expect("vocabulary fits u32");
+    let tokens: Vec<u32> = (0..cap)
+        .map(|index| u32::try_from(index).expect("index fits u32") % vocab)
+        .collect();
+    let mut holder = KVCache::new(n_layers);
+    model
+        .forward_shard_rows(ShardRowsInput::Tokens(tokens.clone()), &mut holder, 0, 1, 0)
+        .expect("a call at the cap is accepted");
+    assert_eq!(holder.seq_len, cap);
+    let mut over = tokens;
+    over.push(1);
+    let mut fresh = KVCache::new(n_layers);
+    assert_eq!(
+        model.forward_shard_rows(ShardRowsInput::Tokens(over), &mut fresh, 0, 1, 0),
+        Err(ShardRowsError::TooManyRows {
+            rows: cap + 1,
+            max_rows: cap
+        })
+    );
+    assert_eq!(
+        kv_to_bytes(&fresh),
+        kv_to_bytes(&KVCache::new(n_layers)),
+        "a refused call changed the cache"
+    );
+
+    // A far wider FFN and vocabulary make the scratch budget bind, harder on
+    // the last stage, which holds the logits. The call is refused from the
+    // configuration alone, before any weight is read.
+    let mut wide = build_model(&fixture(), Profile::LegacySplitHalf);
+    wide.config.d_ff = 1 << 15;
+    wide.config.vocab_size = 1 << 14;
+    let config = wide.config.clone();
+    let scratch = prefill_chunk_scratch_bytes(1, config.d_model, config.d_kv, config.d_ff);
+    let inner_cap = MAX_PREFILL_SCRATCH_BYTES / (scratch + 8 * config.d_model);
+    let last_cap =
+        MAX_PREFILL_SCRATCH_BYTES / (scratch + 8 * (config.d_model + 2 * config.vocab_size));
+    assert!(last_cap < inner_cap && inner_cap < MAX_BATCH_TOKENS);
+    assert_eq!(wide.max_shard_rows(1), inner_cap);
+    assert_eq!(wide.max_shard_rows(n_layers), last_cap);
+    let mut untouched = KVCache::new(n_layers);
+    assert_eq!(
+        wide.forward_shard_rows(
+            ShardRowsInput::Tokens(vec![1; inner_cap + 1]),
+            &mut untouched,
+            0,
+            1,
+            0
+        ),
+        Err(ShardRowsError::TooManyRows {
+            rows: inner_cap + 1,
+            max_rows: inner_cap
+        })
+    );
+    assert_eq!(
+        kv_to_bytes(&untouched),
+        kv_to_bytes(&KVCache::new(n_layers))
+    );
 }
