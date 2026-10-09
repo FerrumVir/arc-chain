@@ -475,6 +475,50 @@ fn golden_cached_integer_autoregressive_output_matches_known_answer() {
     }
 }
 
+/// The same pinned known answers with every per-row I8 projection of the
+/// whole-model path computed by the exact Metal GEMV (`metal-exact` feature,
+/// Apple Silicon only), and a three-way shard split that matches the CPU.
+#[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn golden_cached_integer_kat_holds_on_the_exact_metal_gemv() {
+    use crate::metal_gemv::test_support::SwitchGuard;
+    use crate::metal_gemv::{MetalModel, metal_census};
+
+    let _guard = crate::canonical_simd::kernel_switch_guard();
+    let fixture = fixture();
+    let expected = expected_sequence(&fixture);
+    let model = build_fixture_model(&fixture);
+    assert_eq!(
+        hex::encode(model.weight_hash().0),
+        fixture.expected.model_weight_hash
+    );
+    let cpu_split = run_split_shards(&model, &fixture.sequence_tokens, &fixture.shard_boundaries);
+
+    let metal = MetalModel::new(&model).expect("the exact Metal GEMV must be available");
+    assert_eq!(metal.resident_matrices(), fixture.n_layers * 7 + 1);
+    let _switch = SwitchGuard::set(true);
+    let before = metal_census();
+    let whole = metal.run(|| run_whole_model(&model, &fixture.sequence_tokens));
+    let delta = metal_census().since(&before);
+    assert_eq!(whole, expected, "the Metal GEMV path drifted from the KAT");
+    // Seven projections per layer per token reach the hook. The 23-row output
+    // projection takes matmul_i8's small-output loop and never does.
+    let projections = (fixture.n_layers * 7 * fixture.sequence_tokens.len()) as u64;
+    assert_eq!(delta.accepted, projections, "{delta:?}");
+    assert_eq!(delta.in_scope_fallbacks(), 0, "{delta:?}");
+
+    let before = metal_census();
+    let split =
+        metal.run(|| run_split_shards(&model, &fixture.sequence_tokens, &fixture.shard_boundaries));
+    let delta = metal_census().since(&before);
+    assert_eq!(
+        split, cpu_split,
+        "Metal shard split differs from the CPU shard split"
+    );
+    assert_eq!(delta.accepted, projections, "{delta:?}");
+    assert_eq!(delta.in_scope_fallbacks(), 0, "{delta:?}");
+}
+
 // ── Operator vectors from the independent reference ─────────────────────────
 //
 // `integer_operator_kat.json` is produced by `scripts/arc_conformance`, a

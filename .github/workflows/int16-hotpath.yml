@@ -5,7 +5,8 @@ name: INT16 projection hot path (bit-identical)
 # stacked on #156 (branch agent/builder/ARC-66). The repository-wide workflows
 # run only for pull requests to main. The branch push trigger used while the
 # change was iterated is removed; run this by hand (workflow_dispatch), which
-# works once the file is on the default branch.
+# works once the file is on the default branch. Pull requests stacked on this
+# branch (base perf-int16-hotpath) run the same gate, without the macOS leg.
 #
 #   lint          rustfmt and clippy (deny warnings) for arc-inference.
 #   test-bench    the MLA profile unit tests (pinned golden digests, the INT16
@@ -25,6 +26,8 @@ name: INT16 projection hot path (bit-identical)
 # macOS arm64 leg runs only when the `macos` input is set.
 
 on:
+  pull_request:
+    branches: [perf-int16-hotpath]
   workflow_dispatch:
     inputs:
       macos:

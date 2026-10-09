@@ -1,0 +1,115 @@
+name: Metal exact INT16 GEMV (hosted macOS)
+
+# GitHub-hosted Apple Silicon runners are virtual machines that expose a
+# paravirtual Metal GPU. This job runs the exact INT16 GEMV (crates/arc-gpu/
+# src/metal_exact_i16.rs) against the CPU INT16 projection (`project_i16`)
+# and the legacy oracle of the MLA + MoE profile: #174's random and edge
+# matrices, window-edge conversions, every INT16 view of the four pinned
+# INT16 fixtures, the four pinned fixture goldens end to end with the GPU
+# hooked in, and pinned Kimi K2.6 shapes. It also runs the INT8 kernel of
+# #176 that this branch carries, then benchmarks K2.6 projection shapes.
+# Every timing is a virtualized-runner measurement, not a measurement of
+# Apple GPU hardware.
+#
+# Optional and never a required check. The kernels and their engine hooks are
+# opt-in (`metal-exact` feature; ARC_METAL_EXACT_I16=1 and
+# ARC_METAL_EXACT_GEMV=1 at run time) and off by default.
+#
+# macOS runners also serve the release and proof sequences, so this workflow
+# takes at most one of them per push: it runs on pull requests only when its
+# own files change (the INT16 kernel, its engine, its hook module, the pinned
+# INT16 fixture goldens, this file), and a newer push cancels an older run
+# that is still queued or running. Other changes can run it by hand
+# (workflow_dispatch, once this file is on the default branch).
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/metal-exact-int16.yml
+      - crates/arc-gpu/src/metal_exact_i16.rs
+      - crates/arc-gpu/src/metal_exact_gemv_i16.metal
+      - crates/arc-inference/src/modern/mla/metal_i16.rs
+      - docs/protocol/reference/int16-fixture-goldens.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Release optimisation without fat LTO: the same code, a shorter build.
+  # Integer results cannot depend on optimisation settings.
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+
+jobs:
+  exact-int16-gemv:
+    name: Exact Metal INT16 GEMV (macos-15, hosted)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: metal-exact-int16
+      - name: Runner and GPU under test (virtualized)
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          system_profiler SPDisplaysDataType
+      - name: rustfmt (arc-gpu, arc-inference)
+        run: cargo fmt -p arc-gpu -p arc-inference -- --check
+      # No other workflow lints aarch64 or macOS-only code, so existing
+      # diagnostics there are only reported. Any diagnostic in the Metal GEMV
+      # files (INT8 and INT16) or in the INT16 projection files fails the job
+      # in the last step, after the tests have run, so one run reports both.
+      - name: Clippy on the Metal GEMV code
+        run: |
+          set -euo pipefail
+          cargo clippy -p arc-gpu -p arc-inference --all-targets --locked \
+            --features arc-gpu/metal-exact,arc-inference/metal-exact \
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.txt"
+          if grep -E '^crates/(arc-gpu/src/metal_exact(_i16)?|arc-inference/src/(metal_gemv|golden_vectors|modern/mla/(metal_i16|precision|model|mod)))\.rs:' "$RUNNER_TEMP/clippy.txt" > "$RUNNER_TEMP/clippy-metal.txt"; then
+            echo '::warning::clippy reported diagnostics in the Metal GEMV code; the last step fails the job'
+          fi
+      - name: Kernel unit tests and device self-tests (INT8 and INT16)
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p arc-gpu --features metal-exact --lib metal_exact -- --test-threads=1 --nocapture
+      - name: INT16 byte-identical tests (fixtures, goldens, random and window edges, K2.6 shapes)
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib -- --test-threads=1 --nocapture metal_i16
+      - name: INT8 byte-identical tests of #176 (CPU scalar kernel and golden KATs)
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib -- --test-threads=1 --nocapture metal_gemv golden_cached_integer_kat_holds_on_the_exact_metal_gemv
+      - name: Every other arc-inference library test with the feature compiled in (switches off)
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib -- --skip metal_i16 --skip metal_gemv
+      - name: Benchmark K2.6 INT16 projection shapes (virtualized-runner measurement)
+        if: ${{ !cancelled() }}
+        env:
+          ARC_METAL_BENCH_MD: ${{ runner.temp }}/metal-int16-bench.md
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib modern::mla::metal_i16::bench -- --ignored --nocapture --test-threads=1
+      - name: Benchmark summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/metal-int16-bench.md" ]; then
+            cat "$RUNNER_TEMP/metal-int16-bench.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: No clippy diagnostics in the Metal GEMV code
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -s "$RUNNER_TEMP/clippy-metal.txt" ]; then
+            cat "$RUNNER_TEMP/clippy-metal.txt"
+            echo '::error::clippy reported diagnostics in the Metal GEMV code'
+            exit 1
+          fi

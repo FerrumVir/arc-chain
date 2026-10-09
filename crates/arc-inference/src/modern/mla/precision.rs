@@ -379,6 +379,18 @@ pub(crate) fn project_i16_scheduled(
     {
         return Err(ModernError::Invalid("INT16 weight/scale domain".into()));
     }
+    // Opt-in exact Metal GEMV: compiled only with the `metal-exact` feature,
+    // and used only when ARC_METAL_EXACT_I16=1 (or set_metal_exact_i16) is on
+    // AND the call runs inside a MetalI16Model scope that uploaded these
+    // weights. It computes the same exact row dots as the kernels below, or
+    // refuses without writing and leaves them to the kernels below; the shared
+    // epilogue finishes either. See `super::metal_i16`.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    if super::metal_i16::metal_exact_i16_requested()
+        && super::metal_i16::try_dots(q, rows, cols, x, out)
+    {
+        return epilogue(out, mu, k);
+    }
     // Activation digits once per projection. `None` (kernel off, no vector
     // backend, or an activation outside the four-digit domain) means scalar.
     let digits = if crate::canonical_simd::fast_canonical_kernel_enabled() {
@@ -402,6 +414,12 @@ pub(crate) fn project_i16_scheduled(
             .enumerate()
             .for_each(|(chunk_index, dots)| task(chunk_index, dots)),
     }
+    epilogue(out, mu, k)
+}
+
+/// The dyadic epilogue of every INT16 projection path, row by row in place:
+/// `floor(dot * mu / 2^k)` in i128, refusing an output beyond 2^62.
+fn epilogue(out: &mut [i64], mu: &[i32], k: &[u8]) -> Result<(), ModernError> {
     for ((v, &m), &s) in out.iter_mut().zip(mu).zip(k) {
         *v = dyadic_epilogue(*v, m, s)?;
     }

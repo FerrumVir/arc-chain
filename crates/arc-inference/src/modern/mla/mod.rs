@@ -28,6 +28,9 @@
 pub mod boundary;
 pub mod config;
 pub mod convert;
+/// Opt-in exact Metal GEMV for the INT16 projection.
+#[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_i16;
 pub mod model;
 pub mod ops;
 pub mod package;
