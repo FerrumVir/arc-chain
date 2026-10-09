@@ -1353,7 +1353,7 @@ mod speculation {
                 scripted(Script::Rate { rate: 0.5, seed: 3 }),
                 Forces::Rejections,
             ),
-            case(Box::new(NgramDrafter::default()), Forces::Nothing),
+            case(Box::<NgramDrafter>::default(), Forces::Nothing),
             case(
                 Box::new(Garbage {
                     state: 11,
