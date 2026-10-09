@@ -1168,6 +1168,11 @@ impl MetalDecoder {
 
 // ---- single-kernel runs, for operator tests against the CPU engine -------
 
+/// [`MetalExactGemv::lab_rope`]'s output: (rotated q, key-cache row,
+/// value-cache row).
+#[doc(hidden)]
+pub type RopeLabRows = (Vec<i64>, Vec<i64>, Vec<i64>);
+
 /// Run one encoded dispatch on fresh buffers and wait.
 fn run_once(
     engine: &MetalExactGemv,
@@ -1247,7 +1252,7 @@ impl MetalExactGemv {
     }
 
     /// Split-half RoPE at `pos` on the GPU for `n_heads` query heads and
-    /// `n_kv_heads` key heads: (rotated q, key-cache row, value-cache row).
+    /// `n_kv_heads` key heads.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn lab_rope(
@@ -1260,7 +1265,7 @@ impl MetalExactGemv {
         d_head: usize,
         pos: usize,
         tables: (&[i64], &[i64]),
-    ) -> Result<(Vec<i64>, Vec<i64>, Vec<i64>), String> {
+    ) -> Result<RopeLabRows, String> {
         let pairs = d_head / 2;
         let d_kv = n_kv_heads * d_head;
         let need = (pos + 1) * pairs;

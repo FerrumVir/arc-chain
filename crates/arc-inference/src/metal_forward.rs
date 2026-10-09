@@ -1149,7 +1149,15 @@ mod bench {
     use std::time::Instant;
 
     const READ_PROBE_BYTES: usize = 256 << 20;
-    const TOKENS: usize = 6;
+    /// Untimed tokens before every measurement, then the timed tokens whose
+    /// median is reported.
+    const WARM_UP: usize = 2;
+    const TOKENS: usize = 10;
+    /// Depths of the real-width models, which have distinct weights in every
+    /// layer. Six layers, the head and one device copy fit in the VM's 7 GB.
+    const DEPTHS: [usize; 4] = [1, 2, 4, 6];
+    /// Embedding rows the synthetic models fill; token ids cycle through them.
+    const EMBEDDING_ROWS: usize = 16;
 
     fn median(mut samples: Vec<f64>) -> f64 {
         samples.sort_by(f64::total_cmp);
@@ -1157,26 +1165,55 @@ mod bench {
     }
 
     /// Median wall time per token of `forward` over TOKENS tokens on a fresh
-    /// cache, after one warm-up token.
+    /// cache, after WARM_UP untimed tokens.
     fn per_token(n_layers: usize, mut forward: impl FnMut(u32, &mut KVCache) -> Vec<i64>) -> f64 {
         let mut cache = KVCache::new(n_layers);
-        forward(0, &mut cache);
-        median(
-            (1..=TOKENS as u32)
-                .map(|token| {
-                    let start = Instant::now();
-                    let logits = forward(token, &mut cache);
-                    let seconds = start.elapsed().as_secs_f64();
-                    assert!(!logits.is_empty());
-                    seconds
-                })
-                .collect(),
-        )
+        let mut samples = Vec::with_capacity(TOKENS);
+        for step in 0..WARM_UP + TOKENS {
+            let token = (step % EMBEDDING_ROWS) as u32;
+            let start = Instant::now();
+            let logits = forward(token, &mut cache);
+            let seconds = start.elapsed().as_secs_f64();
+            assert!(!logits.is_empty());
+            if step >= WARM_UP {
+                samples.push(seconds);
+            }
+        }
+        median(samples)
     }
 
-    /// Time for 32 layers, from measurements at 1 and 2 layers: t1 + 31 (t2 - t1).
-    fn at_32(one: f64, two: f64) -> f64 {
-        one + 31.0 * (two - one)
+    /// Least-squares line through (layers, seconds): (fixed seconds per
+    /// token, seconds per layer).
+    fn fit(points: &[(usize, f64)]) -> (f64, f64) {
+        let n = points.len() as f64;
+        let mean_x = points.iter().map(|&(x, _)| x as f64).sum::<f64>() / n;
+        let mean_y = points.iter().map(|&(_, y)| y).sum::<f64>() / n;
+        let (mut sxx, mut sxy) = (0.0, 0.0);
+        for &(x, y) in points {
+            let dx = x as f64 - mean_x;
+            sxx += dx * dx;
+            sxy += dx * (y - mean_y);
+        }
+        let per_layer = sxy / sxx;
+        (mean_y - per_layer * mean_x, per_layer)
+    }
+
+    /// A fitted line's time for a 32-layer token.
+    fn at_32((fixed, per_layer): (f64, f64)) -> f64 {
+        fixed + 32.0 * per_layer
+    }
+
+    /// One path's measurements and fitted line, in milliseconds.
+    fn line_json(measured: &[(usize, f64)], line: (f64, f64)) -> serde_json::Value {
+        serde_json::json!({
+            "ms_by_depth": measured
+                .iter()
+                .map(|&(depth, seconds)| serde_json::json!([depth, seconds * 1e3]))
+                .collect::<Vec<_>>(),
+            "ms_per_layer": line.1 * 1e3,
+            "fixed_ms": line.0 * 1e3,
+            "derived_32_layers_ms": at_32(line) * 1e3,
+        })
     }
 
     #[test]
@@ -1194,9 +1231,10 @@ mod bench {
         };
         let read_gbps = read(Storage::Shared).max(read(Storage::Private));
 
-        // ---- After: a whole 7B-shaped token on the GPU. The 32 layers share
-        // one layer's weights (the VM cannot hold 6.6 GB twice); every layer
-        // still streams its 202 MB from memory, far past any cache.
+        // ---- After, measured directly: a whole 7B-shaped token on the GPU.
+        // The 32 layers share one layer's weights (the VM cannot hold 6.6 GB
+        // twice); every layer still streams its 202 MB from memory, far past
+        // any cache.
         let (d, d_ff, vocab, heads, d_head) =
             (4096usize, 11008usize, 32000usize, 32usize, 128usize);
         let mut rng = SynthRng(0x0007_B70C_E400_0001);
@@ -1260,40 +1298,53 @@ mod bench {
         .expect("decoder");
         let token_bytes = decoder.weight_bytes_per_token();
         let hidden: Vec<i64> = (0..d).map(|_| (rng.below(255) - 127) * 64).collect();
-        let mut modes = Vec::new();
-        for submission in [
-            Submission::OneCommandBuffer,
-            Submission::PerLayer,
-            Submission::PerDispatch,
-        ] {
+        // Median wall and GPU seconds, command buffers and dispatches of a
+        // token through layers 0..depth and the head.
+        let mut run = |depth: usize, submission: Submission| {
             let (mut walls, mut gpus) = (Vec::new(), Vec::new());
             let (mut buffers, mut dispatches) = (0, 0);
-            for pos in 0..=TOKENS {
+            for pos in 0..WARM_UP + TOKENS {
                 let start = Instant::now();
                 let step = decoder
-                    .step(&hidden, pos, 0..32, true, submission)
+                    .step(&hidden, pos, 0..depth, true, submission)
                     .expect("in-domain token");
-                if pos > 0 {
+                if pos >= WARM_UP {
                     walls.push(start.elapsed().as_secs_f64());
                     gpus.push(step.gpu_seconds);
                 }
                 buffers = step.command_buffers;
                 dispatches = step.dispatches;
             }
-            modes.push((submission, median(walls), median(gpus), buffers, dispatches));
-        }
+            (median(walls), median(gpus), buffers, dispatches)
+        };
+        let modes: Vec<(Submission, (f64, f64, usize, usize))> = [
+            Submission::OneCommandBuffer,
+            Submission::PerLayer,
+            Submission::PerDispatch,
+        ]
+        .into_iter()
+        .map(|submission| (submission, run(32, submission)))
+        .collect();
+        // The same decoder at the real-width depths, to check the 32-layer
+        // extrapolation that the before figures rely on.
+        let shared_points: Vec<(usize, f64)> = DEPTHS
+            .iter()
+            .map(|&depth| (depth, run(depth, Submission::OneCommandBuffer).0))
+            .collect();
         drop(decoder);
         drop(shared_layer);
 
-        // ---- Before: the same paths on real-width models of 1 and 2 layers,
-        // extrapolated to 32 (DERIVED).
-        let mut paths: Vec<(&str, [f64; 2])> = vec![
-            ("CPU scalar", [0.0; 2]),
-            ("CPU SIMD", [0.0; 2]),
-            ("GPU per projection (#176)", [0.0; 2]),
-            ("GPU one command buffer per token", [0.0; 2]),
+        // ---- Before and after on real-width models (distinct weights in
+        // every layer) of each depth. A least-squares line per path gives its
+        // cost per layer and its fixed cost per token; 32 layers is DERIVED.
+        let names = [
+            "CPU scalar",
+            "CPU SIMD",
+            "GPU per projection (#176)",
+            "GPU one command buffer per token",
         ];
-        for (slot, n_layers) in [1usize, 2].into_iter().enumerate() {
+        let mut points: Vec<Vec<(usize, f64)>> = vec![Vec::new(); names.len()];
+        for n_layers in DEPTHS {
             let model = synthetic_model(
                 0x0007_B70C_E400_0010 + n_layers as u64,
                 SyntheticShape {
@@ -1304,28 +1355,39 @@ mod bench {
                     d_ff,
                     vocab,
                     max_seq: 64,
-                    embedding_rows: 16,
+                    embedding_rows: EMBEDDING_ROWS,
                 },
             );
-            paths[0].1[slot] = per_token(n_layers, |t, c| model.forward_one_token(t, c));
+            let scalar = per_token(n_layers, |t, c| model.forward_one_token(t, c));
+            points[0].push((n_layers, scalar));
             canonical_simd::set_fast_canonical_kernel(true);
-            paths[1].1[slot] = per_token(n_layers, |t, c| model.forward_one_token(t, c));
+            let simd = per_token(n_layers, |t, c| model.forward_one_token(t, c));
+            points[1].push((n_layers, simd));
             canonical_simd::set_fast_canonical_kernel(false);
             {
                 let metal = MetalModel::new(&model).expect("resident model");
                 let _switch = SwitchGuard::set(true);
-                paths[2].1[slot] =
+                let hooked =
                     per_token(n_layers, |t, c| metal.run(|| model.forward_one_token(t, c)));
+                points[2].push((n_layers, hooked));
             }
             let mut fused = MetalForward::new(&model, 16).expect("GPU decoder");
-            paths[3].1[slot] = per_token(n_layers, |t, c| fused.forward_one_token(t, c));
+            let one_buffer = per_token(n_layers, |t, c| fused.forward_one_token(t, c));
+            points[3].push((n_layers, one_buffer));
             assert_eq!(fused.stats().cpu_tokens, 0, "{:?}", fused.stats());
         }
 
         // ---- Report.
-        let (one_cb_wall, one_cb_gpu) = (modes[0].1, modes[0].2);
-        let gbps = token_bytes as f64 / one_cb_gpu / 1e9;
+        let (one_wall, one_gpu, _, _) = modes[0].1;
+        let gbps = token_bytes as f64 / one_gpu / 1e9;
         let fraction = gbps / read_gbps;
+        let fits: Vec<(f64, f64)> = points.iter().map(Vec::as_slice).map(fit).collect();
+        let shared_fit = fit(&shared_points);
+        let shared_check = at_32(shared_fit) / one_wall - 1.0;
+        let before = at_32(fits[2]);
+        let after_derived = at_32(fits[3]);
+        let simd = at_32(fits[1]);
+
         let mut md = String::new();
         md.push_str("### One command buffer per token, Llama-2-7B shape\n\n");
         md.push_str(
@@ -1334,13 +1396,17 @@ mod bench {
         );
         md.push_str(&format!(
             "Device `{}`. Measured read bandwidth {read_gbps:.1} GB/s (256 MiB, best of 10, \
-             best of shared and private). A token reads {token_bytes} weight bytes. The 32 \
-             layers share one layer's weights, which still stream from memory every layer.\n\n",
+             best of shared and private). A token reads {token_bytes} weight bytes. Every \
+             time is the median of {TOKENS} tokens after {WARM_UP} warm-up tokens.\n\n",
             device.name,
         ));
+        md.push_str(
+            "**A whole 32-layer token on the GPU, measured.** The 32 layers share one layer's \
+             weights, which still stream from memory in every layer.\n\n",
+        );
         md.push_str("| Submission | Host round trips | Dispatches | Wall ms per token | GPU ms per token | tok/s (wall) |\n");
         md.push_str("|---|---|---|---|---|---|\n");
-        for (submission, wall, gpu, buffers, dispatches) in &modes {
+        for (submission, (wall, gpu, buffers, dispatches)) in &modes {
             md.push_str(&format!(
                 "| {submission:?} | {buffers} | {dispatches} | {:.2} | {:.2} | {:.2} |\n",
                 wall * 1e3,
@@ -1348,7 +1414,9 @@ mod bench {
                 1.0 / wall,
             ));
         }
-        let round_trip_ms = (modes[2].1 - modes[0].1) / (modes[2].3.max(2) - 1) as f64 * 1e3;
+        let (per_dispatch_wall, _, per_dispatch_buffers, _) = modes[2].1;
+        let round_trip_ms =
+            (per_dispatch_wall - one_wall) / (per_dispatch_buffers.max(2) - 1) as f64 * 1e3;
         md.push_str(&format!(
             "\nOne command buffer per token: {gbps:.1} GB/s of weights over GPU time, {:.0}% \
              of the measured read bandwidth. Each removed round trip saved about \
@@ -1356,27 +1424,74 @@ mod bench {
              the extra round trips).\n\n",
             100.0 * fraction,
         ));
-        md.push_str("| Path (real-width layers) | ms/token at 1 layer | at 2 layers | DERIVED 32 layers | DERIVED tok/s |\n");
-        md.push_str("|---|---|---|---|---|\n");
-        for (name, [one, two]) in &paths {
-            let total = at_32(*one, *two);
+        md.push_str(
+            "**Before and after on real-width models** (distinct weights in every layer). Wall \
+             ms per token at each depth; a least-squares line gives the cost per layer and the \
+             fixed cost per token (embedding, final norm, LM head, host overhead), extrapolated \
+             to 32 layers (DERIVED).\n\n",
+        );
+        md.push_str("| Path |");
+        for depth in DEPTHS {
             md.push_str(&format!(
-                "| {name} | {:.1} | {:.1} | {:.0} | {:.2} |\n",
-                one * 1e3,
-                two * 1e3,
+                " {depth} layer{} |",
+                if depth == 1 { "" } else { "s" }
+            ));
+        }
+        md.push_str(" ms per layer | fixed ms | DERIVED 32 layers, ms | DERIVED tok/s |\n|---|");
+        md.push_str(&"---|".repeat(DEPTHS.len() + 4));
+        md.push('\n');
+        let rows = names
+            .iter()
+            .copied()
+            .zip(points.iter().zip(&fits))
+            .chain(std::iter::once((
+                "GPU one command buffer, shared weights (decoder only)",
+                (&shared_points, &shared_fit),
+            )));
+        for (name, (measured, &(fixed, per_layer))) in rows {
+            md.push_str(&format!("| {name} |"));
+            for (_, seconds) in measured {
+                md.push_str(&format!(" {:.1} |", seconds * 1e3));
+            }
+            let total = at_32((fixed, per_layer));
+            md.push_str(&format!(
+                " {:.2} | {:.1} | {:.0} | {:.2} |\n",
+                per_layer * 1e3,
+                fixed * 1e3,
                 total * 1e3,
                 1.0 / total,
             ));
         }
+        md.push_str(&format!(
+            "\nCheck on the extrapolation: the shared-weight decoder's line through 1 to {} \
+             layers gives {:.0} ms at 32 layers; measured directly, {:.0} ms ({:+.0}%).\n\n",
+            DEPTHS[DEPTHS.len() - 1],
+            at_32(shared_fit) * 1e3,
+            one_wall * 1e3,
+            100.0 * shared_check,
+        ));
+        md.push_str(&format!(
+            "**Before and after, a 7B token on this VM:** GPU per projection (#176) {:.2} tok/s \
+             (DERIVED, {:.0} ms); one command buffer per token {:.2} tok/s measured at 32 \
+             layers ({:.0} ms), and {:.2} tok/s DERIVED from the real-width line, the before \
+             figure's method ({:.0} ms). CPU SIMD: {:.2} tok/s (DERIVED).\n\n",
+            1.0 / before,
+            before * 1e3,
+            1.0 / one_wall,
+            one_wall * 1e3,
+            1.0 / after_derived,
+            after_derived * 1e3,
+            1.0 / simd,
+        ));
         let ultra_ms = token_bytes as f64 / (fraction * 800e9) * 1e3;
         md.push_str(&format!(
-            "\nM2 Ultra (DERIVED, ASSUMED 800 GB/s read): at the same {:.0}% of read \
+            "M2 Ultra (DERIVED, ASSUMED 800 GB/s read): at the same {:.0}% of read \
              bandwidth, a token's weights take {ultra_ms:.1} ms, i.e. at most {:.0} tok/s \
              before per-token host and dispatch overhead; the VM measured {:.2} ms of wall time \
              above GPU time per token.\n",
             100.0 * fraction,
             1e3 / ultra_ms,
-            (one_cb_wall - one_cb_gpu) * 1e3,
+            (one_wall - one_gpu) * 1e3,
         ));
         println!("{md}");
         let json = serde_json::json!({
@@ -1384,9 +1499,11 @@ mod bench {
             "device": device,
             "read_gbps": read_gbps,
             "token_weight_bytes": token_bytes,
-            "modes": modes
+            "warm_up_tokens": WARM_UP,
+            "timed_tokens": TOKENS,
+            "modes_32_layers_shared_weights": modes
                 .iter()
-                .map(|(s, wall, gpu, buffers, dispatches)| serde_json::json!({
+                .map(|(s, (wall, gpu, buffers, dispatches))| serde_json::json!({
                     "submission": format!("{s:?}"),
                     "wall_ms": wall * 1e3,
                     "gpu_ms": gpu * 1e3,
@@ -1396,15 +1513,16 @@ mod bench {
                 .collect::<Vec<_>>(),
             "gbps_one_command_buffer": gbps,
             "fraction_of_read_bandwidth": fraction,
-            "paths_ms_at_1_and_2_layers": paths
+            "round_trip_ms": round_trip_ms,
+            "real_width_paths": names
                 .iter()
-                .map(|(name, [one, two])| serde_json::json!({
+                .zip(points.iter().zip(&fits))
+                .map(|(name, (measured, &line_fit))| serde_json::json!({
                     "path": name,
-                    "one_layer_ms": one * 1e3,
-                    "two_layers_ms": two * 1e3,
-                    "derived_32_layers_ms": at_32(*one, *two) * 1e3,
+                    "line": line_json(measured, line_fit),
                 }))
                 .collect::<Vec<_>>(),
+            "shared_weight_decoder_line": line_json(&shared_points, shared_fit),
             "derived_m2_ultra_ms": ultra_ms,
         });
         println!("METAL_TOKEN_BENCH {json}");
