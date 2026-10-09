@@ -1,0 +1,16 @@
+{"id": "special-kimi-1", "text": "<|im_system|>system<|im_middle|>You are helpful<|im_end|><|im_user|>user<|im_middle|>Hi<|im_end|>"}
+{"id": "special-kimi-2", "text": "[BOS]text[EOS] then [PAD] and [UNK]"}
+{"id": "special-reserved", "text": "a<|reserved_token_163600|>b<|reserved_token_163841|>c"}
+{"id": "special-near-miss", "text": "<|im_end| and <im_end|> and [BOS and <|reserved_token_99|>"}
+{"id": "han", "text": "\u7528\u4e00\u53e5\u8bdd\u4ecb\u7ecd\u4e00\u4e0b\u4f60\u81ea\u5df1\u3002\u6708\u4e4b\u6697\u9762Kimi\u6a21\u578b\uff0c2026\u5e7410\u6708"}
+{"id": "han-mixed", "text": "Kimi\u662fMoonshot AI\u7684\u6a21\u578b\uff0cMoonlight\u662f16B\u53c2\u6570\u7684MoE\u6a21\u578b\u3002"}
+{"id": "japanese-korean", "text": "\u3053\u308c\u306f\u65e5\u672c\u8a9e\u306e\u30c6\u30b9\u30c8\u3067\u3059\u3002\ud55c\uad6d\uc5b4 \ubb38\uc7a5\ub3c4 \uc788\uc2b5\ub2c8\ub2e4."}
+{"id": "case-contractions", "text": "DON'T Stop; I'LL see THEY'RE McDonald's iPhone XMLHttpRequest O'Neil"}
+{"id": "digit-groups", "text": "1234567 12,345,678.90 0.000001 2026-10-06 v0.8.11"}
+{"id": "emoji", "text": "Deploy \ud83d\ude80 done \u2705 \u2014 next: \ud83d\udc69\ud83c\udffd\u200d\ud83d\udcbb + \ud83c\uddfa\ud83c\uddf8 flags"}
+{"id": "rtl-combining", "text": "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645 \u05e9\u05dc\u05d5\u05dd e\u0301 n\u0303 \u1100\u1161"}
+{"id": "newline-mix", "text": "a\r\nb\r\n\r\n  c\n\t\n d  \n\n\n"}
+{"id": "math", "text": "\u2211_{i=1}^{n} x_i\u00b2 \u2264 \u221a(n\u00b7\u2211x_i\u00b2); \u03bb = \u230a2^30/\u221a192\u230b = 77490641"}
+{"id": "chat-default-system", "chat": {"user": "What is the capital of France? Answer in one sentence."}}
+{"id": "chat-custom-system", "chat": {"system": "You are Kimi, a careful assistant.", "user": "\u7528\u4e00\u53e5\u8bdd\u4ecb\u7ecd\u4e00\u4e0b\u4f60\u81ea\u5df1\u3002"}}
+{"id": "chat-special-in-user", "chat": {"user": "Explain <|im_end|> in one line."}}

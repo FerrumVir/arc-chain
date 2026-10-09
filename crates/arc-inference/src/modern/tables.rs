@@ -211,6 +211,40 @@ pub fn rope_tables(
     Ok((cos, sin))
 }
 
+/// Deterministic Q62-frequency preparation for a separately versioned profile.
+/// Uses the same Q62 Taylor/rotation recurrence and Q16 half-away rounding as
+/// the original profile, without altering its frequency generation.
+pub(crate) fn rope_tables_frequencies(
+    frequencies: &[i128],
+    max_seq: usize,
+) -> Result<(Vec<i32>, Vec<i32>), ModernError> {
+    if frequencies.len() != 32
+        || !(1..=262_144).contains(&max_seq)
+        || frequencies.iter().any(|w| !(0..=QONE).contains(w))
+    {
+        return Err(ModernError::Invalid(
+            "invalid K2.6 YaRN frequencies/context".into(),
+        ));
+    }
+    let half = frequencies.len();
+    let mut cos = vec![0; max_seq * half];
+    let mut sin = vec![0; max_seq * half];
+    for (i, &w) in frequencies.iter().enumerate() {
+        let (cw, sw) = cos_sin_q62(w);
+        let (mut c, mut s) = (QONE, 0i128);
+        for p in 0..max_seq {
+            if p > 0 {
+                let next_c = (c * cw - s * sw + QHALF) >> Q;
+                s = (s * cw + c * sw + QHALF) >> Q;
+                c = next_c;
+            }
+            cos[p * half + i] = round_q62_to_q16(c);
+            sin[p * half + i] = round_q62_to_q16(s);
+        }
+    }
+    Ok((cos, sin))
+}
+
 /// Attention scale `floor(2^30 / sqrt(d_head))`, exactly.
 pub fn attention_lambda(d_head: usize) -> i64 {
     let n = (1u128 << 60) / d_head.max(1) as u128;

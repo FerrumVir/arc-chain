@@ -1,0 +1,789 @@
+name: MLA + MoE model (Moonlight-16B-A3B, Kimi-K2 architecture)
+
+# Evidence for the integer profile arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.q16.v1
+# (docs/protocol/integer-profile-mla-moe-dyadic-v1.md): multi-head latent
+# attention, mixture-of-experts routing and pipeline stages on ARC's
+# deterministic integer engine. Nothing here changes the network's canonical
+# model or any consensus or native-inference binding.
+#
+#   rust       rustfmt, clippy (deny warnings), unit tests of the profile.
+#   tiny       two tiny DeepSeek-V3-shaped models (Moonlight-like and Kimi-like
+#              options): Rust converter vs the independent Python preparer
+#              (byte-identical stage packages), Rust scalar/SIMD generation vs
+#              Python generation and verification, and the same sequences
+#              through 1, 2 and 4 pipeline stages run as separate processes
+#              that exchange only boundary files, each stage also replayed by
+#              the Python executor.
+#   tokenizer  the Rust tiktoken encoder and chat prompt vs the tiktoken library
+#              built as Moonlight's pinned wrapper builds it, and jinja2.
+#   golden     the unit tests on linux arm64 (NEON) and windows x86-64 (AVX2):
+#              pinned golden digests of seven tiny MLA + MoE configurations
+#              (scalar on 1 and 3 threads and SIMD must all match the constants
+#              the rust job checks on linux x86-64) and the routing tie vectors.
+#
+# Real-model jobs (label kimi-arch-proof on the pull request, or a push whose
+# head commit message contains [kimi-proof]):
+#   moonlight  Moonlight-16B-A3B-Instruct downloaded at a pinned revision,
+#              converted on the runner; Rust package vs the Python preparer's
+#              digests; scalar vs SIMD golden generation; 1, 2 and 4 stages as
+#              separate processes; a verifier slice (layers 25-26 + LM head)
+#              converted from only its two shards and replayed; the Python
+#              executor re-derives every logits vector, boundary and token.
+#   moonlight-int4  the same with the routed experts as INT4 group-32 values
+#              with BF16 scales (profile section 13,
+#              arc.hf-deepseek-v3.mla-moe.i8-dyadic-row.i4g32-experts.q16.v1).
+#   quality    perplexity of the integer engine (INT8 and INT4 experts) vs the
+#              BF16 weights (float32 streaming reference, itself checked
+#              against transformers).
+#   matrix     linux arm64 (NEON) and windows x86-64 (AVX2): the tiny models
+#              through every check, and both Moonlight verifier slices replayed
+#              from the boundaries committed by the Linux x86-64 runs.
+#   report     one summary of every digest table.
+#
+# No macOS job: macOS runners are reserved for the release sequence (work-99
+# standing rule, 2026-10-06); macOS legs are added back when that ends.
+#
+# The push trigger covers only the development branch, so iterating does not
+# start the repository-wide workflows (and their macOS legs); it is removed
+# before the pull request leaves draft.
+
+on:
+  push:
+    branches: [agent/builder/ARC-66]
+    paths:
+      - '.gitattributes'
+      - 'crates/arc-inference/**'
+      - 'scripts/arc_conformance/mla_moe_reference.py'
+      - 'scripts/arc_conformance/tests/test_mla_moe_reference.py'
+      - 'scripts/arc_mla/**'
+      - 'docs/protocol/integer-profile-mla-moe-dyadic-v1.md'
+      - 'docs/protocol/packages/moonlight-16b-a3b*'
+      - '.github/workflows/mla-moe-moonlight.yml'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - '.gitattributes'
+      - 'crates/arc-inference/src/modern/mla/**'
+      - 'crates/arc-inference/src/modern/tiktoken.rs'
+      - 'crates/arc-inference/src/bin/arc_mla.rs'
+      - 'scripts/arc_conformance/mla_moe_reference.py'
+      - 'scripts/arc_conformance/tests/test_mla_moe_reference.py'
+      - 'scripts/arc_mla/**'
+      - 'docs/protocol/integer-profile-mla-moe-dyadic-v1.md'
+      - 'docs/protocol/packages/moonlight-16b-a3b*'
+      - '.github/workflows/mla-moe-moonlight.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  PY_NUMPY: numpy==2.5.3
+  PY_BLAKE3: blake3==1.0.10
+  SOURCE_MANIFEST: docs/protocol/packages/moonlight-16b-a3b-instruct.source.json
+  CASES: scripts/arc_mla/moonlight_cases.json
+  PROOF: ${{ (github.event_name == 'push' && contains(github.event.head_commit.message, '[kimi-proof]')) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'kimi-arch-proof')) }}
+
+jobs:
+  rust:
+    name: rust (fmt, clippy, unit tests)
+    if: github.event_name == 'push' || github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - name: rustfmt (the profile's files)
+        run: |
+          rustfmt --check --edition 2024 \
+            crates/arc-inference/src/modern/mla/*.rs \
+            crates/arc-inference/src/modern/tiktoken.rs \
+            crates/arc-inference/src/modern/mod.rs \
+            crates/arc-inference/src/bin/arc_mla.rs
+      - name: Clippy (arc-inference with candle, all targets, deny warnings)
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+      - name: Unit tests (MLA + MoE profile, stages, tokenizer)
+        run: |
+          cargo test -p arc-inference --lib --locked modern::mla -- --nocapture
+          cargo test -p arc-inference --lib --locked modern::tiktoken -- --nocapture
+
+  tiny:
+    name: tiny models (Rust vs Python, layouts, replay)
+    if: github.event_name == 'push' || github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
+      - name: Reproduce pinned K2.6 YaRN vectors (no network or weights)
+        run: python scripts/arc_mla/yarn_reference.py docs/protocol/reference/kimi-k26/yarn-vectors.json --check
+      - name: Independent exact-rational INT16 arithmetic corpus (offline)
+        run: python scripts/arc_mla/int16_oracle.py docs/protocol/reference/int16-row-oracle.json --check
+      - name: Python reference unit tests
+        working-directory: scripts
+        run: python -m unittest arc_conformance.tests.test_mla_moe_reference -v
+      - name: Build arc-mla
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: K2.6 YaRN preparation CLI (synthetic metadata, no weights)
+        run: python scripts/arc_mla/check_yarn_cli.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/yarn-cli"
+      - name: Mixed INT16 BF16 conversion, scalar/SIMD and split stages (no download)
+        run: python scripts/arc_mla/check_int16.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/int16" --build-label release
+      - name: Per-class INT16 row admission through actual converter (offline)
+        run: python scripts/arc_mla/check_int16_rows.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/int16-rows"
+      - name: Tiny models through every check
+        shell: bash
+        run: bash scripts/arc_mla/tiny_checks.sh ./target/release/arc-mla "$RUNNER_TEMP/tiny" "$RUNNER_TEMP/tiny-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-arch-tiny-ubuntu
+          path: ${{ runner.temp }}/tiny-evidence/
+          if-no-files-found: warn
+
+  tokenizer:
+    name: tokenizer and chat prompt vs tiktoken and jinja2
+    if: github.event_name == 'push' || github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies (tiktoken and jinja2)
+        run: python -m pip install --disable-pip-version-check 'tiktoken==0.9.0' 'jinja2==3.1.6'
+      - name: Build arc-mla
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: Fetch the pinned tokenizer files (no weights)
+        run: |
+          mkdir -p "$RUNNER_TEMP/tok" "$RUNNER_TEMP/evidence"
+          python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$RUNNER_TEMP/tok" --only tokenizer
+      - name: Rust encoder and chat prompt vs the references
+        run: |
+          set -euo pipefail
+          ev="$RUNNER_TEMP/evidence"
+          python scripts/arc_mla/tokenizer_check.py corpus --out "$ev/tokenizer-corpus.jsonl" \
+            scripts/arc_conformance/data/tokenizer_corpus.jsonl scripts/arc_modern/tokenizer_extra.jsonl \
+            scripts/arc_mla/tokenizer_extra.jsonl
+          ./target/release/arc-mla tokenize --tokenizer-dir "$RUNNER_TEMP/tok" \
+            --input "$ev/tokenizer-corpus.jsonl" --out "$ev/tokenizer-rust.jsonl"
+          python scripts/arc_mla/tokenizer_check.py compare --model-dir "$RUNNER_TEMP/tok" \
+            --corpus "$ev/tokenizer-corpus.jsonl" --rust "$ev/tokenizer-rust.jsonl" --out "$ev/tokenizer-check.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-arch-tokenizer
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  moonlight:
+    name: Moonlight-16B-A3B (golden, layouts, verifier slice, Python reference)
+    if: >-
+      ((github.event_name == 'push' && contains(github.event.head_commit.message, '[kimi-proof]')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'kimi-arch-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
+      - name: Directories and runner facts
+        run: |
+          set -euo pipefail
+          for d in model slice work evidence; do mkdir -p "$RUNNER_TEMP/kimi-arch-$d"; done
+          {
+            echo "MODEL_DIR=$RUNNER_TEMP/kimi-arch-model"
+            echo "SLICE_DIR=$RUNNER_TEMP/kimi-arch-slice"
+            echo "WORK=$RUNNER_TEMP/kimi-arch-work"
+            echo "EVIDENCE=$RUNNER_TEMP/kimi-arch-evidence"
+          } >> "$GITHUB_ENV"
+          { echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}";
+            lscpu | grep -E 'Model name|^CPU\(s\)' ; free -b; df -h "$RUNNER_TEMP" ; } 2>&1 | tee "$RUNNER_TEMP/kimi-arch-evidence/runner.txt"
+      - name: Build arc-mla
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: Fetch Moonlight-16B-A3B-Instruct (pinned revision, SHA-256 verified)
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR" | tail -3
+          echo "{\"fetch_seconds\": $(( $(date +%s) - start ))}" > "$EVIDENCE/fetch.json"
+          df -h "$RUNNER_TEMP"
+      - name: Convert the whole model on the runner (Rust)
+        run: |
+          set -euo pipefail
+          timed() { local out="$1"; shift; if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$out" "$@"; else "$@"; fi; }
+          timed "$EVIDENCE/time-convert.txt" ./target/release/arc-mla convert \
+            --source-dir "$MODEL_DIR" --source-manifest "$SOURCE_MANIFEST" --out "$WORK/moonlight.arcspkg" \
+            --manifest-out "$EVIDENCE/moonlight-manifest.json" --report "$EVIDENCE/convert.json" > /dev/null
+          python - "$EVIDENCE/convert.json" <<'PY'
+          import json, sys
+          c = json.load(open(sys.argv[1]))
+          print(json.dumps({k: c[k] for k in ("package", "model_root", "manifest_blake3", "seconds")}, indent=1))
+          PY
+          grep -E 'Maximum resident|Elapsed' "$EVIDENCE/time-convert.txt" || true
+      - name: Independent Python preparation (digests only) equals the Rust package
+        run: |
+          set -euo pipefail
+          timed() { local out="$1"; shift; if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$out" "$@"; else "$@"; fi; }
+          (cd scripts && timed "$EVIDENCE/time-prepare.txt" python -m arc_conformance.mla_moe_reference prepare \
+            --source-dir "$MODEL_DIR" --source-manifest "../$SOURCE_MANIFEST" --hash-only --json-out "$EVIDENCE/prepare.json")
+          python - "$EVIDENCE/convert.json" "$EVIDENCE/prepare.json" <<'PY'
+          import json, sys
+          rust, py = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+          assert rust["package"]["sha256"] == py["sha256"], (rust["package"], py["sha256"])
+          assert rust["segments"] == py["segments"], "segment digests differ"
+          assert rust["model_root"] == py["model_root"], (rust["model_root"], py["model_root"])
+          print("Rust converter == Python preparer:", py["sha256"], "model_root", py["model_root"])
+          PY
+      - name: Keep only the verifier slice's shards (frees disk)
+        run: |
+          set -euo pipefail
+          cp "$MODEL_DIR/config.json" "$SLICE_DIR/"
+          mv "$MODEL_DIR/model-26-of-27.safetensors" "$MODEL_DIR/model-27-of-27.safetensors" "$SLICE_DIR/"
+          rm -f "$MODEL_DIR"/model-*-of-27.safetensors
+          df -h "$RUNNER_TEMP"
+      - name: Golden generation, scalar and SIMD kernels
+        run: |
+          set -euo pipefail
+          timed() { local out="$1"; shift; if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$out" "$@"; else "$@"; fi; }
+          for kernel in scalar simd; do
+            timed "$EVIDENCE/time-golden-$kernel.txt" ./target/release/arc-mla golden \
+              --package "$WORK/moonlight.arcspkg" --tokenizer-dir "$MODEL_DIR" --cases "$CASES" \
+              --kernel "$kernel" --out "$EVIDENCE/run-$kernel.json"
+          done
+          python - "$EVIDENCE" <<'PY'
+          import json, sys
+          from pathlib import Path
+          ev = Path(sys.argv[1])
+          a, b = (json.loads((ev / f"run-{k}.json").read_text()) for k in ("scalar", "simd"))
+          for key in ("matrix_digest", "boundary_matrix_digest", "model_root"):
+              assert a[key] == b[key], (key, a[key], b[key])
+          for case in a["cases"]:
+              print(case["id"], repr(case["text"]))
+          print("scalar decode tok/s", round(a["timing"]["decode_tok_s"], 3), "| simd", round(b["timing"]["decode_tok_s"], 3))
+          PY
+      - name: One, two and four stages as separate processes
+        run: |
+          set -euo pipefail
+          pkg="$WORK/moonlight.arcspkg"
+          run="$EVIDENCE/run-scalar.json"
+          m="$EVIDENCE/moonlight-manifest.json"
+          ./target/release/arc-mla stage --package "$pkg" --run "$run" --out "$WORK/one-b27.bin" \
+            --report "$EVIDENCE/one-0-27.json" --manifest "$m" --kernel simd
+          ./target/release/arc-mla stage --package "$pkg" --layers 0:14 --run "$run" --out "$WORK/two-b14.bin" \
+            --report "$EVIDENCE/two-0-14.json" --manifest "$m" --kernel scalar
+          ./target/release/arc-mla stage --package "$pkg" --layers 14:27 --input "$WORK/two-b14.bin" \
+            --out "$WORK/two-b27.bin" --report "$EVIDENCE/two-14-27.json" --manifest "$m" --kernel simd
+          ./target/release/arc-mla stage --package "$pkg" --layers 0:7 --run "$run" --out "$WORK/four-b7.bin" \
+            --report "$EVIDENCE/four-0-7.json" --manifest "$m" --kernel simd
+          ./target/release/arc-mla stage --package "$pkg" --layers 7:14 --input "$WORK/four-b7.bin" \
+            --out "$WORK/four-b14.bin" --report "$EVIDENCE/four-7-14.json" --manifest "$m" --kernel scalar
+          ./target/release/arc-mla stage --package "$pkg" --layers 14:25 --input "$WORK/four-b14.bin" \
+            --out "$WORK/four-b25.bin" --report "$EVIDENCE/four-14-25.json" --manifest "$m" --kernel simd
+          ./target/release/arc-mla stage --package "$pkg" --layers 25:27 --input "$WORK/four-b25.bin" \
+            --out "$WORK/four-b27.bin" --report "$EVIDENCE/four-25-27.json" --manifest "$m" --kernel scalar
+          cp "$WORK/four-b25.bin" "$EVIDENCE/boundary-25.bin"
+      - name: Verifier slice from two shards only (layers 25-26 + LM head)
+        run: |
+          set -euo pipefail
+          ./target/release/arc-mla convert --source-dir "$SLICE_DIR" --source-manifest "$SOURCE_MANIFEST" \
+            --layers 25:27 --out "$WORK/slice-25-27.arcspkg" --report "$EVIDENCE/slice-convert.json" > /dev/null
+          ./target/release/arc-mla verify --package "$WORK/slice-25-27.arcspkg" \
+            --manifest "$EVIDENCE/moonlight-manifest.json" | tee "$EVIDENCE/slice-verify.json"
+          for kernel in scalar simd; do
+            ./target/release/arc-mla stage --package "$WORK/slice-25-27.arcspkg" --input "$EVIDENCE/boundary-25.bin" \
+              --out "$WORK/slice-b27-$kernel.bin" --report "$EVIDENCE/slice-replay-linux-x86_64-$kernel.json" \
+              --manifest "$EVIDENCE/moonlight-manifest.json" --kernel "$kernel"
+          done
+          (cd scripts && python -m arc_conformance.mla_moe_reference stage-replay --package "$WORK/slice-25-27.arcspkg" \
+            --input "$EVIDENCE/boundary-25.bin" --report "$EVIDENCE/slice-replay-python.json")
+      - name: Python executor re-derives every logits vector, boundary and token
+        run: |
+          set -euo pipefail
+          timed() { local out="$1"; shift; if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$out" "$@"; else "$@"; fi; }
+          (cd scripts && timed "$EVIDENCE/time-python-verify.txt" python -m arc_conformance.mla_moe_reference \
+            verify-run --package "$WORK/moonlight.arcspkg" --run "$EVIDENCE/run-scalar.json" --out "$EVIDENCE/python-golden.json")
+      - name: Layout and replay check
+        run: |
+          set -euo pipefail
+          ev="$EVIDENCE"
+          python scripts/arc_mla/layout_check.py --run "$ev/run-scalar.json" --label "Moonlight-16B-A3B, linux x86-64" \
+            --layout "one=$ev/one-0-27.json" --layout "two=$ev/two-0-14.json,$ev/two-14-27.json" \
+            --layout "four=$ev/four-0-7.json,$ev/four-7-14.json,$ev/four-14-25.json,$ev/four-25-27.json" \
+            --replay "slice-scalar=$ev/slice-replay-linux-x86_64-scalar.json" \
+            --replay "slice-simd=$ev/slice-replay-linux-x86_64-simd.json" \
+            --replay "slice-python=$ev/slice-replay-python.json" \
+            --out "$ev/layout-check.json" --summary-md "$ev/layout-check.md"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-arch-moonlight
+          path: ${{ runner.temp }}/kimi-arch-evidence/
+          if-no-files-found: warn
+
+  moonlight-int4:
+    name: Moonlight-16B-A3B, INT4 group-32 experts (golden, stages, verifier slice, Python reference)
+    if: >-
+      ((github.event_name == 'push' && contains(github.event.head_commit.message, '[kimi-proof]')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'kimi-arch-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
+      - name: Directories and runner facts
+        run: |
+          set -euo pipefail
+          for d in model slice work evidence; do mkdir -p "$RUNNER_TEMP/kimi-arch-$d"; done
+          {
+            echo "MODEL_DIR=$RUNNER_TEMP/kimi-arch-model"
+            echo "SLICE_DIR=$RUNNER_TEMP/kimi-arch-slice"
+            echo "WORK=$RUNNER_TEMP/kimi-arch-work"
+            echo "EVIDENCE=$RUNNER_TEMP/kimi-arch-evidence"
+          } >> "$GITHUB_ENV"
+          { echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}";
+            lscpu | grep -E 'Model name|^CPU\(s\)' ; free -b; df -h "$RUNNER_TEMP" ; } 2>&1 | tee "$RUNNER_TEMP/kimi-arch-evidence/runner.txt"
+      - name: Build arc-mla
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: Fetch Moonlight-16B-A3B-Instruct (pinned revision, SHA-256 verified)
+        run: python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR" | tail -3
+      - name: Convert with INT4 group-32 experts (Rust)
+        run: |
+          set -euo pipefail
+          timed() { local out="$1"; shift; if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$out" "$@"; else "$@"; fi; }
+          timed "$EVIDENCE/time-convert.txt" ./target/release/arc-mla convert --experts i4g32 \
+            --source-dir "$MODEL_DIR" --source-manifest "$SOURCE_MANIFEST" --out "$WORK/moonlight-i4.arcspkg" \
+            --manifest-out "$EVIDENCE/moonlight-i4-manifest.json" --report "$EVIDENCE/convert.json" > /dev/null
+          python - "$EVIDENCE/convert.json" <<'PY'
+          import json, sys
+          c = json.load(open(sys.argv[1]))
+          print(json.dumps({k: c[k] for k in ("profile", "package", "model_root", "manifest_blake3", "seconds")}, indent=1))
+          PY
+          grep -E 'Maximum resident|Elapsed' "$EVIDENCE/time-convert.txt" || true
+      - name: Independent Python preparation (digests only) equals the Rust package
+        run: |
+          set -euo pipefail
+          timed() { local out="$1"; shift; if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$out" "$@"; else "$@"; fi; }
+          (cd scripts && timed "$EVIDENCE/time-prepare.txt" python -m arc_conformance.mla_moe_reference prepare \
+            --experts i4g32 --source-dir "$MODEL_DIR" --source-manifest "../$SOURCE_MANIFEST" --hash-only \
+            --json-out "$EVIDENCE/prepare.json")
+          python - "$EVIDENCE/convert.json" "$EVIDENCE/prepare.json" <<'PY'
+          import json, sys
+          rust, py = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+          assert rust["profile"] == py["profile"], (rust["profile"], py["profile"])
+          assert rust["package"]["sha256"] == py["sha256"], (rust["package"], py["sha256"])
+          assert rust["segments"] == py["segments"], "segment digests differ"
+          assert rust["model_root"] == py["model_root"], (rust["model_root"], py["model_root"])
+          print("Rust converter == Python preparer (INT4 experts):", py["sha256"], "model_root", py["model_root"])
+          PY
+      - name: Keep only the verifier slice's shards (frees disk)
+        run: |
+          set -euo pipefail
+          cp "$MODEL_DIR/config.json" "$SLICE_DIR/"
+          mv "$MODEL_DIR/model-26-of-27.safetensors" "$MODEL_DIR/model-27-of-27.safetensors" "$SLICE_DIR/"
+          rm -f "$MODEL_DIR"/model-*-of-27.safetensors
+      - name: Golden generation, scalar and SIMD kernels
+        run: |
+          set -euo pipefail
+          timed() { local out="$1"; shift; if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$out" "$@"; else "$@"; fi; }
+          for kernel in scalar simd; do
+            timed "$EVIDENCE/time-golden-$kernel.txt" ./target/release/arc-mla golden \
+              --package "$WORK/moonlight-i4.arcspkg" --tokenizer-dir "$MODEL_DIR" --cases "$CASES" \
+              --kernel "$kernel" --out "$EVIDENCE/run-$kernel.json"
+          done
+          python - "$EVIDENCE" <<'PY'
+          import json, sys
+          from pathlib import Path
+          ev = Path(sys.argv[1])
+          a, b = (json.loads((ev / f"run-{k}.json").read_text()) for k in ("scalar", "simd"))
+          for key in ("matrix_digest", "boundary_matrix_digest", "model_root", "profile"):
+              assert a[key] == b[key], (key, a[key], b[key])
+          for case in a["cases"]:
+              print(case["id"], repr(case["text"]))
+          print("scalar decode tok/s", round(a["timing"]["decode_tok_s"], 3), "| simd", round(b["timing"]["decode_tok_s"], 3))
+          PY
+      - name: One and four stages as separate processes
+        run: |
+          set -euo pipefail
+          pkg="$WORK/moonlight-i4.arcspkg"
+          run="$EVIDENCE/run-scalar.json"
+          m="$EVIDENCE/moonlight-i4-manifest.json"
+          ./target/release/arc-mla stage --package "$pkg" --run "$run" --out "$WORK/one-b27.bin" \
+            --report "$EVIDENCE/one-0-27.json" --manifest "$m" --kernel simd
+          ./target/release/arc-mla stage --package "$pkg" --layers 0:7 --run "$run" --out "$WORK/four-b7.bin" \
+            --report "$EVIDENCE/four-0-7.json" --manifest "$m" --kernel simd
+          ./target/release/arc-mla stage --package "$pkg" --layers 7:14 --input "$WORK/four-b7.bin" \
+            --out "$WORK/four-b14.bin" --report "$EVIDENCE/four-7-14.json" --manifest "$m" --kernel scalar
+          ./target/release/arc-mla stage --package "$pkg" --layers 14:25 --input "$WORK/four-b14.bin" \
+            --out "$WORK/four-b25.bin" --report "$EVIDENCE/four-14-25.json" --manifest "$m" --kernel simd
+          ./target/release/arc-mla stage --package "$pkg" --layers 25:27 --input "$WORK/four-b25.bin" \
+            --out "$WORK/four-b27.bin" --report "$EVIDENCE/four-25-27.json" --manifest "$m" --kernel scalar
+          cp "$WORK/four-b25.bin" "$EVIDENCE/boundary-25.bin"
+      - name: Verifier slice from two shards only (layers 25-26 + LM head)
+        run: |
+          set -euo pipefail
+          m="$EVIDENCE/moonlight-i4-manifest.json"
+          ./target/release/arc-mla convert --experts i4g32 --source-dir "$SLICE_DIR" --source-manifest "$SOURCE_MANIFEST" \
+            --layers 25:27 --out "$WORK/slice-25-27.arcspkg" --report "$EVIDENCE/slice-convert.json" > /dev/null
+          ./target/release/arc-mla verify --package "$WORK/slice-25-27.arcspkg" --manifest "$m" | tee "$EVIDENCE/slice-verify.json"
+          for kernel in scalar simd; do
+            ./target/release/arc-mla stage --package "$WORK/slice-25-27.arcspkg" --input "$EVIDENCE/boundary-25.bin" \
+              --out "$WORK/slice-b27-$kernel.bin" --report "$EVIDENCE/slice-replay-linux-x86_64-$kernel.json" \
+              --manifest "$m" --kernel "$kernel"
+          done
+          (cd scripts && python -m arc_conformance.mla_moe_reference stage-replay --package "$WORK/slice-25-27.arcspkg" \
+            --input "$EVIDENCE/boundary-25.bin" --report "$EVIDENCE/slice-replay-python.json")
+      - name: Python executor re-derives every logits vector, boundary and token
+        run: |
+          set -euo pipefail
+          timed() { local out="$1"; shift; if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$out" "$@"; else "$@"; fi; }
+          (cd scripts && timed "$EVIDENCE/time-python-verify.txt" python -m arc_conformance.mla_moe_reference \
+            verify-run --package "$WORK/moonlight-i4.arcspkg" --run "$EVIDENCE/run-scalar.json" --out "$EVIDENCE/python-golden.json")
+      - name: Layout and replay check
+        run: |
+          set -euo pipefail
+          ev="$EVIDENCE"
+          python scripts/arc_mla/layout_check.py --run "$ev/run-scalar.json" \
+            --label "Moonlight-16B-A3B, INT4 group-32 experts, linux x86-64" \
+            --layout "one=$ev/one-0-27.json" \
+            --layout "four=$ev/four-0-7.json,$ev/four-7-14.json,$ev/four-14-25.json,$ev/four-25-27.json" \
+            --replay "slice-scalar=$ev/slice-replay-linux-x86_64-scalar.json" \
+            --replay "slice-simd=$ev/slice-replay-linux-x86_64-simd.json" \
+            --replay "slice-python=$ev/slice-replay-python.json" \
+            --out "$ev/layout-check.json" --summary-md "$ev/layout-check.md"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-arch-moonlight-int4
+          path: ${{ runner.temp }}/kimi-arch-evidence/
+          if-no-files-found: warn
+
+  quality:
+    name: Moonlight-16B-A3B perplexity vs BF16
+    if: >-
+      ((github.event_name == 'push' && contains(github.event.head_commit.message, '[kimi-proof]')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'kimi-arch-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies (CPU torch, transformers, tiktoken)
+        run: |
+          python -m pip install --disable-pip-version-check --index-url https://download.pytorch.org/whl/cpu 'torch==2.9.1'
+          python -m pip install --disable-pip-version-check "$PY_NUMPY" 'transformers==4.57.6' 'safetensors==0.7.0' \
+            'tiktoken==0.9.0' 'jinja2==3.1.6'
+      - name: Directories
+        run: |
+          for d in model work evidence tiny; do mkdir -p "$RUNNER_TEMP/kimi-arch-$d"; done
+          {
+            echo "MODEL_DIR=$RUNNER_TEMP/kimi-arch-model"
+            echo "WORK=$RUNNER_TEMP/kimi-arch-work"
+            echo "EVIDENCE=$RUNNER_TEMP/kimi-arch-evidence"
+            echo "TINY=$RUNNER_TEMP/kimi-arch-tiny"
+          } >> "$GITHUB_ENV"
+      - name: The float reference matches transformers DeepseekV3 (tiny models)
+        run: |
+          set -euo pipefail
+          for variant in moonlight kimi; do
+            python scripts/arc_mla/make_tiny_mla_model.py "$TINY/$variant" --variant "$variant" > /dev/null
+            python scripts/arc_mla/bf16_reference.py check-hf --model-dir "$TINY/$variant" \
+              --out "$EVIDENCE/float-reference-check-$variant.json"
+          done
+      - name: Build arc-mla
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: Fetch Moonlight-16B-A3B-Instruct (pinned revision, SHA-256 verified)
+        run: python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR" | tail -3
+      - name: Integer perplexity on two public-domain texts, INT8 then INT4 experts
+        run: |
+          set -euo pipefail
+          timed() { local out="$1"; shift; if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$out" "$@"; else "$@"; fi; }
+          for key in federal-register alice; do
+            case "$key" in
+              federal-register) file=scripts/arc_modern/data/fr_2026-20493_supplementary.txt ;;
+              alice) file=scripts/arc_modern/data/alice_ch1.txt ;;
+            esac
+            python scripts/arc_mla/tokenizer_check.py tokens --model-dir "$MODEL_DIR" --text "$file" \
+              --max-tokens 1024 --out "$EVIDENCE/ppl-tokens-$key.json"
+          done
+          # One package on disk at a time.
+          for experts in i8 i4g32; do
+            ./target/release/arc-mla convert --source-dir "$MODEL_DIR" --source-manifest "$SOURCE_MANIFEST" \
+              --experts "$experts" --out "$WORK/moonlight-$experts.arcspkg" \
+              --report "$EVIDENCE/convert-$experts.json" > /dev/null
+            for key in federal-register alice; do
+              timed "$EVIDENCE/time-ppl-$experts-$key.txt" ./target/release/arc-mla ppl \
+                --package "$WORK/moonlight-$experts.arcspkg" --tokens "$EVIDENCE/ppl-tokens-$key.json" --window 512 \
+                --kernel simd --out "$EVIDENCE/ppl-integer-$experts-$key.json"
+            done
+            rm -f "$WORK/moonlight-$experts.arcspkg"
+          done
+      - name: The BF16 weights on the same tokens (one pass per text, both integer variants compared)
+        run: |
+          set -euo pipefail
+          bf16() {
+            local key="$1" label="$2"
+            python scripts/arc_mla/bf16_reference.py ppl --model-dir "$MODEL_DIR" \
+              --tokens "$EVIDENCE/ppl-tokens-$key.json" \
+              --rust "$EVIDENCE/ppl-integer-i8-$key.json" --rust "$EVIDENCE/ppl-integer-i4g32-$key.json" \
+              --window 512 --threads "$(nproc)" --text-label "$label" --out "$EVIDENCE/quality-$key.json"
+          }
+          bf16 federal-register \
+            "Federal Register 2026-20493 (public domain, published after the model's data cutoff), first 1024 tokens"
+          bf16 alice "Alice in Wonderland ch. 1 (public domain, likely memorised), first 1024 tokens"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-arch-quality
+          path: ${{ runner.temp }}/kimi-arch-evidence/
+          if-no-files-found: warn
+
+  golden:
+    name: golden digests (${{ matrix.os }})
+    if: github.event_name == 'push' || github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest (x86-64, AVX2) runs the same tests in the rust job.
+        # macOS legs are withheld while macOS runners serve the release sequence.
+        os: [ubuntu-24.04-arm, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - name: Pinned tiny-model digests, routing ties, scalar vs SIMD
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p arc-inference --lib --locked modern::mla -- --nocapture 2>&1 | tee mla-tests.log
+          { echo "### Golden digests on $RUNNER_OS $RUNNER_ARCH"; echo; echo '```'
+            grep -E '^(golden |yarn )' mla-tests.log; grep '^test result' mla-tests.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-arch-goldens-${{ matrix.os }}
+          path: mla-tests.log
+          if-no-files-found: warn
+
+  matrix:
+    name: matrix (${{ matrix.os }})
+    needs: [moonlight, moonlight-int4]
+    # Runs once the INT8 job has committed its boundary, even when the INT4 job
+    # failed: the INT8 slice evidence still lands and the INT4 slice is skipped
+    # with a note in the evidence directory.
+    if: >-
+      always() && needs.moonlight.result == 'success' &&
+      ((github.event_name == 'push' && contains(github.event.head_commit.message, '[kimi-proof]')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'kimi-arch-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'kimi-arch-proof')))
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04-arm is arm64 (NEON dotprod); windows-latest is x86-64 (AVX2).
+        # macOS legs are withheld while macOS runners serve the release sequence.
+        os: [ubuntu-24.04-arm, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        shell: bash
+        run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
+      - name: Directories and runner facts
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/kimi-arch"
+          mkdir -p "$base/slice" "$base/work" "$base/evidence" "$base/linux" "$base/linux-int4"
+          { echo "SLICE_DIR=$base/slice"; echo "WORK=$base/work"; echo "EVIDENCE=$base/evidence"; echo "LINUX=$base/linux";
+            echo "LINUX_INT4=$base/linux-int4"; } >> "$GITHUB_ENV"
+          { echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            case "$RUNNER_OS" in
+              Linux) lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | cut -c1-300; free -b ;;
+              Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfLogicalProcessors" ;;
+            esac; } 2>&1 | tee "$base/evidence/runner.txt"
+      - name: Build arc-mla
+        shell: bash
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: K2.6 YaRN preparation CLI (synthetic metadata, no weights)
+        run: python scripts/arc_mla/check_yarn_cli.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/yarn-cli"
+      - name: Tiny models through every check on this OS
+        shell: bash
+        run: bash scripts/arc_mla/tiny_checks.sh ./target/release/arc-mla "$WORK/tiny" "$EVIDENCE/tiny"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kimi-arch-moonlight
+          path: ${{ runner.temp }}/kimi-arch/linux
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.moonlight-int4.result == 'success'
+        with:
+          name: kimi-arch-moonlight-int4
+          path: ${{ runner.temp }}/kimi-arch/linux-int4
+      - name: Fetch only the verifier slice's shards (26, 27) and config.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$SOURCE_MANIFEST" "$WORK/slice.source.json" <<'PY'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          keep = {"config.json", "model-26-of-27.safetensors", "model-27-of-27.safetensors"}
+          sub = {k: v for k, v in m.items() if k not in ("tokenizer", "chat_template", "reference_files")}
+          sub["files"] = [f for f in m["files"] if f["name"] in keep]
+          json.dump(sub, open(sys.argv[2], "w"), indent=1)
+          PY
+          python scripts/arc_modern/fetch_source.py --manifest "$WORK/slice.source.json" --dir "$SLICE_DIR" | tail -2
+      - name: Convert both slices from two shards, verify them, replay them (scalar and SIMD)
+        shell: bash
+        run: |
+          set -euo pipefail
+          os="$(echo "$RUNNER_OS-$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
+          for experts in i8 i4g32; do
+            if [ "$experts" = i8 ]; then
+              src="$LINUX"; manifest="$LINUX/moonlight-manifest.json"; tag=""; label="INT8"
+            else
+              src="$LINUX_INT4"; manifest="$LINUX_INT4/moonlight-i4-manifest.json"; tag="-int4"; label="INT4 g32 experts"
+            fi
+            if [ ! -f "$manifest" ]; then
+              echo "the Linux job for $label produced no manifest; its slice replay is skipped on $os" \
+                | tee "$EVIDENCE/slice$tag-skipped.txt"
+              continue
+            fi
+            ./target/release/arc-mla convert --experts "$experts" --source-dir "$SLICE_DIR" --source-manifest "$SOURCE_MANIFEST" \
+              --layers 25:27 --out "$WORK/slice$tag-25-27.arcspkg" --report "$EVIDENCE/slice$tag-convert.json" > /dev/null
+            ./target/release/arc-mla verify --package "$WORK/slice$tag-25-27.arcspkg" \
+              --manifest "$manifest" > "$EVIDENCE/slice$tag-verify.json"
+            for kernel in scalar simd; do
+              ./target/release/arc-mla stage --package "$WORK/slice$tag-25-27.arcspkg" --input "$src/boundary-25.bin" \
+                --out "$WORK/slice$tag-b27-$kernel.bin" --report "$EVIDENCE/slice$tag-replay-$os-$kernel.json" \
+                --manifest "$manifest" --kernel "$kernel"
+            done
+            python scripts/arc_mla/layout_check.py --run "$src/run-scalar.json" \
+              --label "Moonlight verifier slice ($label) on $os" \
+              --replay "$os-scalar=$EVIDENCE/slice$tag-replay-$os-scalar.json" \
+              --replay "$os-simd=$EVIDENCE/slice$tag-replay-$os-simd.json" \
+              --out "$EVIDENCE/slice-check$tag.json" --summary-md "$EVIDENCE/slice-check$tag.md"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-arch-matrix-${{ matrix.os }}
+          path: ${{ runner.temp }}/kimi-arch/evidence/
+          if-no-files-found: warn
+
+  report:
+    name: report
+    needs: [rust, golden, tiny, tokenizer, moonlight, moonlight-int4, quality, matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/all
+          pattern: kimi-arch-*
+      - name: Summary
+        run: python scripts/arc_mla/report.py "$RUNNER_TEMP/all" >> "$GITHUB_STEP_SUMMARY"

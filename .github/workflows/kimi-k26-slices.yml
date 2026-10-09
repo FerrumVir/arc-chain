@@ -1,0 +1,362 @@
+name: Kimi-K2.6 weight slices (streamed per shard)
+
+# Evidence for the weight slices of docs/protocol/integer-profile-mla-moe-dyadic-v1.md
+# section 14: Kimi-K2.6's weights converted to ARC's integer format one source
+# shard at a time, as content-addressed slices with a manifest of digests.
+# Nothing here changes the network's canonical model or any consensus or
+# native-inference binding, and no node is involved.
+#
+#   rust   rustfmt, clippy (deny warnings) and the profile's unit tests,
+#          including the slice tests (pinned slice manifests). Push only: on a
+#          pull request mla-moe-moonlight.yml's rust job runs the same.
+#   tiny   linux x86-64, linux arm64, windows x86-64: tiny checkpoints stored
+#          as Kimi-K2.6 stores its weights (multimodal wrapper,
+#          language_model. names, a vision tower, compressed-tensors INT4
+#          experts; also with YaRN, and with -8 values and a zero-scale group),
+#          through scripts/arc_mla/slice_checks.sh: streamed = all shards,
+#          1 thread = all threads, expert groups change slices not segments,
+#          Rust = the independent Python preparer, packed = the BF16 twin's
+#          i4g32 conversion, slices reassemble the converter's package,
+#          which executes through scalar/SIMD and 1/2/4 file-backed stages.
+#          Legacy YaRN and incompatible i8 conversion fail before output.
+#          Explicit prepared YaRN bundles verify copied slices/segments and
+#          packages before publication; fixture 1/2/4-stage execution is exact.
+#
+# Real-shard jobs (label kimi-slices-proof on the pull request, or a push whose
+# head commit message contains [kimi-slices]):
+#   kimi   linux x86-64: the first two Kimi-K2.6 shards (1.0 GB, layer 0,
+#          dense; 9.8 GB, layer 1, the first MoE layer with 384 INT4 experts)
+#          downloaded at the pinned revision, SHA-256 checked, sliced, and
+#          measured (download, conversion, peak RSS, disk); every slice and
+#          segment re-hashed; a second conversion on 1 thread must give the
+#          same manifest; the independent Python preparer must give the same
+#          manifest; compressed-tensors' own unpacker must give the same INT4
+#          values and scales for sampled experts; the manifest must equal the
+#          pinned one once it is committed.
+#          linux arm64: the same two shards streamed (each deleted after use)
+#          and hashed only, for the cross-architecture comparison.
+#   report one table of digests and per-shard resources.
+#
+# No macOS job: macOS runners are reserved for the release sequence (work-99
+# standing rule, 2026-10-06). The full 595 GB model is never downloaded.
+#
+# The push trigger covers only the development branch, so iterating does not
+# start the repository-wide workflows.
+
+on:
+  push:
+    branches: [agent/builder/ARC-72]
+    paths:
+      - '.gitattributes'
+      - 'crates/arc-inference/src/modern/tables.rs'
+      - 'docs/protocol/reference/kimi-k26/**'
+      - 'crates/arc-inference/src/modern/mla/**'
+      - 'crates/arc-inference/src/bin/arc_mla.rs'
+      - 'scripts/arc_conformance/mla_moe_reference.py'
+      - 'scripts/arc_mla/**'
+      - 'docs/protocol/packages/kimi-k26*'
+      - '.github/workflows/kimi-k26-slices.yml'
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - '.gitattributes'
+      - 'crates/arc-inference/src/modern/tables.rs'
+      - 'docs/protocol/reference/kimi-k26/**'
+      - 'crates/arc-inference/src/modern/mla/**'
+      - 'crates/arc-inference/src/modern/mla/convert.rs'
+      - 'crates/arc-inference/src/modern/mla/config.rs'
+      - 'scripts/arc_conformance/mla_moe_reference.py'
+      - 'scripts/arc_mla/stream_slices.py'
+      - 'scripts/arc_mla/tests/**'
+      - 'scripts/arc_mla/slice_checks.sh'
+      - 'scripts/arc_mla/check_slice_engine.py'
+      - 'scripts/arc_mla/check_yarn_slices.py'
+      - 'scripts/arc_mla/check_precision_slices.py'
+      - 'scripts/arc_mla/check_int16.py'
+      - 'scripts/arc_mla/check_int16_rows.py'
+      - 'scripts/arc_mla/bf16_row_census.py'
+      - 'scripts/arc_mla/check_bf16_row_census.py'
+      - 'scripts/arc_mla/check_census_memory.py'
+      - 'scripts/arc_mla/int16_oracle.py'
+      - 'scripts/arc_mla/precision_budget.py'
+      - 'scripts/arc_mla/make_tiny_kimi_packed.py'
+      - 'scripts/arc_mla/ct_unpack_check.py'
+      - 'scripts/arc_mla/slice_report.py'
+      - 'crates/arc-inference/src/bin/arc_mla.rs'
+      - 'docs/protocol/packages/kimi-k26*'
+      - '.github/workflows/kimi-k26-slices.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  PY_NUMPY: numpy==2.5.3
+  PY_BLAKE3: blake3==1.0.10
+  SOURCE_MANIFEST: docs/protocol/packages/kimi-k26.source.json
+  PINNED_SLICES: docs/protocol/packages/kimi-k26.slices-layers-0-1.json
+  EXPERT_GROUPS: '48'
+  PROOF: ${{ (github.event_name == 'push' && contains(github.event.head_commit.message, '[kimi-slices]')) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'kimi-slices-proof')) }}
+
+jobs:
+  rust:
+    name: rust (fmt, clippy, unit tests)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - name: rustfmt (the profile's files)
+        run: |
+          rustfmt --check --edition 2024 \
+            crates/arc-inference/src/modern/mla/*.rs \
+            crates/arc-inference/src/bin/arc_mla.rs
+      - name: Clippy (arc-inference with candle, all targets, deny warnings)
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+      - name: Unit tests (MLA + MoE profile, slices)
+        run: cargo test -p arc-inference --lib --locked modern::mla -- --nocapture
+
+  tiny:
+    name: tiny packed checkpoints (${{ matrix.os }})
+    if: github.event_name == 'push' || github.event.action != 'labeled' || github.event.label.name == 'kimi-slices-proof'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        shell: bash
+        run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
+      - name: Build arc-mla
+        shell: bash
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: Streaming driver keeps at most one step's shards (no downloads)
+        shell: bash
+        run: python -m unittest scripts/arc_mla/tests/test_stream_slices.py -v
+      - name: Slice checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=./target/release/arc-mla
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          bash scripts/arc_mla/slice_checks.sh "$PWD/$bin" "$RUNNER_TEMP/slices-work" "$RUNNER_TEMP/evidence"
+      - name: INT16-default integration (offline; omitted, explicit, historical)
+        shell: bash
+        run: |
+          bin=./target/release/arc-mla
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          python scripts/arc_mla/check_precision_slices.py "$PWD/$bin" "$RUNNER_TEMP/precision-work" "$RUNNER_TEMP/evidence/precision"
+          python scripts/arc_mla/precision_budget.py "$RUNNER_TEMP/evidence/precision-budgets.json"
+          python -c 'import json,os; assert json.load(open(os.environ["RUNNER_TEMP"]+"/evidence/precision-budgets.json")) == json.load(open("docs/protocol/reference/kimi-k26/precision-budgets.json"))'
+      - name: Standalone INT16 harness and reviewed row controls (offline)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=./target/release/arc-mla
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          python scripts/arc_mla/int16_oracle.py docs/protocol/reference/int16-row-oracle.json --check
+          python scripts/arc_mla/check_int16.py "$PWD/$bin" "$RUNNER_TEMP/evidence/int16" --build-label release
+          python scripts/arc_mla/check_int16_rows.py "$PWD/$bin" "$RUNNER_TEMP/evidence/int16-rows"
+      - name: Read-only BF16 row census (synthetic converter controls only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=./target/release/arc-mla
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          python scripts/arc_mla/check_bf16_row_census.py "$PWD/$bin" "$RUNNER_TEMP/evidence/row-census"
+      - name: Full-config synthetic rejection memory measurement
+        if: runner.os == 'Linux'
+        shell: bash
+        run: python scripts/arc_mla/check_census_memory.py "$RUNNER_TEMP/evidence/census-memory"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: tiny-${{ matrix.os }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  kimi:
+    name: Kimi-K2.6 shards 1-2 (${{ matrix.os }})
+    if: >-
+      (github.event_name == 'push' && contains(github.event.head_commit.message, '[kimi-slices]')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'kimi-slices-proof') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'kimi-slices-proof'))
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    env:
+      FULL: ${{ matrix.os == 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
+      - name: Model directory (the larger of / and /mnt)
+        run: |
+          set -euo pipefail
+          if [ -d /mnt ] && [ "$(df --output=avail -B1 /mnt | tail -1)" -gt "$(df --output=avail -B1 / | tail -1)" ]; then
+            sudo mkdir -p /mnt/arc-model
+            sudo chown "$(id -u):$(id -g)" /mnt/arc-model
+            dir=/mnt/arc-model
+          else
+            dir="$HOME/arc-model"
+            mkdir -p "$dir"
+          fi
+          mkdir -p "$RUNNER_TEMP/evidence"
+          echo "MODEL_DIR=$dir" >> "$GITHUB_ENV"
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+          df -h / /mnt 2>/dev/null || df -h /
+      - name: Record runner facts (CPU, memory, disk)
+        run: |
+          {
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            lscpu | grep -E 'Model name|^CPU\(s\)' || true
+            free -b
+            df -B1 "$MODEL_DIR"
+          } 2>&1 | tee "$EVIDENCE/runner.txt"
+      - name: Build arc-mla
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: Stream shards 1-2 (download, check, convert, hash, write, discard)
+        run: |
+          set -euo pipefail
+          keep=""
+          discard="--discard"
+          if [ "$FULL" = true ]; then keep="--keep-source"; discard=""; fi
+          # shellcheck disable=SC2086
+          python scripts/arc_mla/stream_slices.py --arc-mla target/release/arc-mla \
+            --source-manifest "$SOURCE_MANIFEST" --work "$MODEL_DIR/src" --out "$MODEL_DIR/slices" \
+            --layers 0:2 --expert-groups "$EXPERT_GROUPS" $keep $discard \
+            --report "$EVIDENCE/stream-report.json" | tee "$EVIDENCE/stream.txt"
+          cp "$MODEL_DIR/slices/manifest.json" "$EVIDENCE/manifest.json"
+          cp "$MODEL_DIR/slices/plan.json" "$EVIDENCE/plan.json"
+          ls -la "$MODEL_DIR/src"
+          df -h "$MODEL_DIR"
+      - name: Re-hash every slice and both segments
+        if: env.FULL == 'true'
+        run: |
+          target/release/arc-mla slice-verify --manifest "$EVIDENCE/manifest.json" \
+            --slices "$MODEL_DIR/slices" --segments | tee "$EVIDENCE/verify.json"
+      - name: Same manifest from a second conversion on one thread
+        if: env.FULL == 'true'
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o "$EVIDENCE/time-rerun.txt" target/release/arc-mla slice \
+            --source-dir "$MODEL_DIR/src" --source-manifest "$SOURCE_MANIFEST" --out-dir "$MODEL_DIR/rerun" \
+            --layers 0:2 --expert-groups "$EXPERT_GROUPS" --threads 1 --discard > "$EVIDENCE/rerun.json"
+          target/release/arc-mla slice-manifest --source-dir "$MODEL_DIR/src" --source-manifest "$SOURCE_MANIFEST" \
+            --out-dir "$MODEL_DIR/rerun" --expert-groups "$EXPERT_GROUPS" --out "$EVIDENCE/manifest-rerun.json"
+          cmp "$EVIDENCE/manifest.json" "$EVIDENCE/manifest-rerun.json"
+          echo "byte-identical manifest on 1 thread and on $(nproc) threads"
+      - name: Independent Python preparer (same manifest)
+        if: env.FULL == 'true'
+        run: |
+          set -euo pipefail
+          (cd scripts && /usr/bin/time -v -o "$EVIDENCE/time-python.txt" python -m arc_conformance.mla_moe_reference \
+            slices --source-dir "$MODEL_DIR/src" --source-manifest "../$SOURCE_MANIFEST" --units layer.0,layer.1 \
+            --expert-groups "$EXPERT_GROUPS" --json-out "$EVIDENCE/python-manifest.json")
+          python - "$EVIDENCE/manifest.json" "$EVIDENCE/python-manifest.json" <<'PY'
+          import json, sys
+          rust, py = (json.load(open(p)) for p in sys.argv[1:])
+          print("Rust  ", rust["manifest_blake3"])
+          print("Python", py["manifest_blake3"])
+          assert rust["manifest_blake3"] == py["manifest_blake3"], "Rust and Python slice manifests differ"
+          PY
+      - name: compressed-tensors' own unpacker (same INT4 values and scales)
+        if: env.FULL == 'true'
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --index-url https://download.pytorch.org/whl/cpu 'torch==2.14.1'
+          python -m pip install --disable-pip-version-check 'compressed-tensors==0.19.0' 'safetensors==0.8.0'
+          python scripts/arc_mla/ct_unpack_check.py --shard "$MODEL_DIR/src/model-00002-of-000064.safetensors" \
+            --manifest "$EVIDENCE/manifest.json" --slices "$MODEL_DIR/slices" --layer 1 \
+            --experts 0,1,7,8,190,191,382,383 --out "$EVIDENCE/ct-check.json"
+      - name: Pinned manifest
+        run: |
+          set -euo pipefail
+          if [ -f "$PINNED_SLICES" ]; then
+            python - "$PINNED_SLICES" "$EVIDENCE/manifest.json" <<'PY'
+          import json, sys
+          pinned, got = (json.load(open(p)) for p in sys.argv[1:])
+          assert pinned["manifest_blake3"] == got["manifest_blake3"], (pinned["manifest_blake3"], got["manifest_blake3"])
+          print("equal to the pinned manifest", pinned["manifest_blake3"])
+          PY
+          else
+            echo "no pinned slice manifest yet; the report job compares the runners" | tee "$EVIDENCE/pinned.txt"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-${{ matrix.os }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  report:
+    name: report
+    needs: [tiny, kimi]
+    if: always() && needs.tiny.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/all
+      - name: Digest and resource tables
+        run: |
+          python scripts/arc_mla/slice_report.py "$RUNNER_TEMP/all" --summary-md "$RUNNER_TEMP/kimi-k26-slices-report.md" \
+            --out "$RUNNER_TEMP/kimi-k26-slices-report.json"
+          cat "$RUNNER_TEMP/kimi-k26-slices-report.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: kimi-k26-slices-report
+          path: |
+            ${{ runner.temp }}/kimi-k26-slices-report.md
+            ${{ runner.temp }}/kimi-k26-slices-report.json
+          if-no-files-found: warn
