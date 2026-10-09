@@ -48,6 +48,34 @@ or “GPU verified.” Existing same-host tests such as
 `test_deterministic_1000_runs` and SIMD-versus-scalar comparisons remain useful
 regression tests, but they are not cross-host proof by themselves.
 
+## Execution-mode equivalence
+
+The `golden_modes_*` tests
+(`crates/arc-inference/src/golden_vectors/execution_modes.rs`) run in the same
+golden gate. They use the KAT model in both canonical INT8 profiles: the live
+legacy split-half profile and the GGUF interleaved-RoPE profile. Each test runs
+with the scalar and the vectorised projection kernels, on 1, 2 and N threads.
+Every way of scheduling a sequence must reproduce the token-by-token run: each
+position's logits, the residual stream leaving every layer, every K and V row,
+and the generated tokens and output hash. The modes are:
+
+- one batched pass over the whole sequence, which is the teacher-forced shape
+  a validator re-check uses; it re-derives the tokens of both generation calls;
+- chunked prefill, at chunk sizes from 1 to the whole sequence;
+- resuming from a KV prefix serialized to bytes and restored on a separately
+  built model;
+- speculative verification of k drafted tokens in one pass, accepted and
+  rejected, with the rejected rows rolled back;
+- every 1-, 2-, 3- and 4-way stage split, with one KV cache per stage holder,
+  including the worker's generation replayed through the stages.
+
+The token-by-token reference is itself pinned to the KAT constants. Two cases
+have no engine API yet, so they are ignored tests that state the contract to
+implement: a stage holder verifying several rows in one call
+(`forward_shard_token` takes one position), and seeded sampling (the engine
+selects tokens only by greedy argmax after the deterministic repetition
+penalty).
+
 ## Quality remains a separate question
 
 Historical Llama-2-7B Q8_0 measurements reported WikiText-2 perplexity around
