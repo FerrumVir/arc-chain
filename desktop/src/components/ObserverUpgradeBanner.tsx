@@ -2,11 +2,8 @@ import { useEffect, useState } from "react";
 import { Loader2, Sparkles, X } from "lucide-react";
 import { api, isTauri } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
-import type {
-  ModelDownloadProgress,
-  ModelTierInfo,
-  NodeConfig,
-} from "../lib/types";
+import { modelDownloadStatus } from "../lib/format";
+import type { ModelDownloadProgress, ModelTierInfo } from "../lib/types";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
@@ -96,23 +93,15 @@ export function ObserverUpgradeBanner() {
     setError(null);
     try {
       setStage("downloading");
-      // Same idempotency as onboarding: reuse an existing matched download.
-      const existing = await api.existingModelForTier(selectedTier);
-      const modelPath = existing ?? (await api.downloadModel(selectedTier));
-
-      const updated: NodeConfig = {
-        ...config,
-        role: "worker",
-        modelPath,
-      };
-      await api.saveConfig(updated);
-      setStoreConfig(updated);
-
-      // Restart the node so arc-node re-reads the new --model + --community-mode.
-      // node_manager already version-checks the binary on every restart so an
-      // older arc-node also gets refreshed.
-      setStage("restarting");
-      await api.restartNode();
+      // Clicking "Download & enable worker mode" is the user's explicit
+      // consent to contribute compute. The native command records it,
+      // reuses or downloads this machine's model tier (progress arrives on
+      // `model-download-progress`), switches the config to worker mode and
+      // restarts the node so arc-node re-reads --model + --community-mode.
+      // A whole-config `saveConfig` cannot make that change: once onboarding
+      // has stored a config, it keeps the stored contribution state.
+      const saved = await api.setComputeContribution(true);
+      setStoreConfig(saved);
 
       setOpen(false);
       setBusy(false);
@@ -344,7 +333,7 @@ export function ObserverUpgradeBanner() {
                   }}
                 >
                   {stage === "downloading" && progress
-                    ? `${formatBytes(progress.downloadedBytes)} of ${formatBytes(progress.totalBytes)} (${progress.totalBytes > 0 ? Math.floor((progress.downloadedBytes / progress.totalBytes) * 100) : 0}%)`
+                    ? modelDownloadStatus(progress)
                     : stage === "downloading"
                       ? "Connecting to Hugging Face..."
                       : "arc-node is reloading with --model and --community-mode."}

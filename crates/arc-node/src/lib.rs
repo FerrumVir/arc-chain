@@ -5,6 +5,7 @@ pub mod block_stm;
 pub mod build_identity;
 pub mod chunk_cache;
 pub mod coalesce;
+pub mod community_worker;
 // Offline qualification tools reuse the node's validated genesis/identity
 // parsing instead of maintaining another interpretation of chain identity.
 pub mod config;
@@ -21,6 +22,8 @@ pub mod row_cohort;
 pub mod row_residency;
 pub mod rpc;
 pub mod state_sync;
+/// Twin execution v0: pure rules (see docs/twin-execution.md).
+pub mod twin;
 #[cfg(unix)]
 mod unix_listener;
 pub mod validator_identity;

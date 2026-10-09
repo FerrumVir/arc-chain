@@ -1902,6 +1902,26 @@ impl NodeManager {
             anyhow::bail!("managed arc-node is already running");
         }
 
+        // Defense in depth for the consent switch (PR #138, ARC-48 F1): the
+        // worker flags, `--model`, the keep-awake flag, the recorded launch
+        // plan and the spawn log all follow one effective config. A stored
+        // config that still says worker + model while consent is recorded
+        // as withdrawn launches as an observer without the model, which is
+        // what `withdraw_compute_consent` persists. Consent `None` keeps the
+        // existing rule (a worker with a model from before the question
+        // counts as opted in), so v0.8.10 workers start unchanged.
+        let effective = effective_launch_config(config);
+        if matches!(effective, std::borrow::Cow::Owned(_)) {
+            push_log(
+                &self.logs,
+                "warn",
+                "compute contribution is switched off; starting as an observer without the model or worker flags"
+                    .to_string(),
+            )
+            .await;
+        }
+        let config: &NodeConfig = &effective;
+
         // Network identity is application-owned, never WebView/config-owned.
         // Both files must resolve from the signed Tauri resource bundle and
         // must remain regular files. Falling back to arc-node defaults (or to
@@ -2165,6 +2185,21 @@ impl NodeManager {
             cmd.arg("--community-mode").arg("--full-integer-worker");
             for origin in crate::rpc_client::PRODUCTION_RPC_ORIGINS {
                 cmd.arg("--community-rpc-url").arg(origin);
+            }
+        }
+        if keep_awake_during_jobs_requested(config) {
+            // Probed like --threads: an unknown flag is a hard clap failure,
+            // and a node that will not start is worse than one that may sleep.
+            if binary_supports_flag(&binary, "--prevent-sleep-during-jobs") {
+                cmd.arg("--prevent-sleep-during-jobs");
+            } else {
+                push_log(
+                    &self.logs,
+                    "warn",
+                    "this arc-node cannot keep the computer awake during jobs; update arc-node to use that setting"
+                        .to_string(),
+                )
+                .await;
             }
         }
 
@@ -3122,6 +3157,36 @@ fn request_graceful_stop(
     _shutdown_control: Option<&DesktopShutdownControl>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("this platform exposes no supported graceful process signal")
+}
+
+/// The config a launch follows. Defense in depth for the consent switch
+/// (PR #138, ARC-48 F1): a stored config that still says worker + model while
+/// `compute_consent` is recorded as withdrawn launches as an observer without
+/// the model, exactly what `withdraw_compute_consent` persists, so the worker
+/// flags, `--model`, the keep-awake flag and the recorded launch plan agree
+/// with each other. Consent `None` keeps the existing rule: a worker with a
+/// model from before the question counts as opted in.
+pub(crate) fn effective_launch_config(config: &NodeConfig) -> std::borrow::Cow<'_, NodeConfig> {
+    if config.role == "worker"
+        && config.model_path.is_some()
+        && !crate::commands::compute_contribution_enabled(config)
+    {
+        std::borrow::Cow::Owned(NodeConfig {
+            role: "observer".into(),
+            model_path: None,
+            ..config.clone()
+        })
+    } else {
+        std::borrow::Cow::Borrowed(config)
+    }
+}
+
+/// Whether to start the node with `--prevent-sleep-during-jobs`: only a
+/// worker computes jobs, and only a user who turned the setting on.
+fn keep_awake_during_jobs_requested(config: &NodeConfig) -> bool {
+    config.role == "worker"
+        && config.model_path.is_some()
+        && config.prevent_sleep_during_jobs == Some(true)
 }
 
 async fn push_log(logs: &Arc<Mutex<VecDeque<LogEntry>>>, level: &str, message: String) {
@@ -6855,5 +6920,102 @@ mod tests {
         }
         let _ = unrelated.wait();
         result.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod effective_launch_config_tests {
+    use super::*;
+
+    fn worker_with_model(consent: Option<bool>) -> NodeConfig {
+        NodeConfig {
+            role: "worker".into(),
+            model_path: Some("/models/standard.gguf".into()),
+            compute_consent: consent,
+            prevent_sleep_during_jobs: Some(true),
+            ..NodeConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_consent_launches_an_observer_without_the_model() {
+        let stored = worker_with_model(Some(false));
+        let launched = effective_launch_config(&stored);
+        assert!(matches!(launched, std::borrow::Cow::Owned(_)));
+        assert_eq!(launched.role, "observer");
+        assert_eq!(launched.model_path, None);
+        // No worker flags, no `--model`, no keep-awake, and the plan the
+        // launch records says the same.
+        assert!(!keep_awake_during_jobs_requested(&launched));
+        assert!(!(launched.role == "worker" && launched.model_path.is_some()));
+        // Everything else is the stored config.
+        assert_eq!(launched.rpc_port, stored.rpc_port);
+        assert_eq!(launched.p2p_port, stored.p2p_port);
+        assert_eq!(launched.data_dir, stored.data_dir);
+        assert_eq!(launched.compute_consent, Some(false));
+    }
+
+    #[test]
+    fn consent_given_or_never_asked_launches_the_stored_config_unchanged() {
+        for consent in [Some(true), None] {
+            let stored = worker_with_model(consent);
+            let launched = effective_launch_config(&stored);
+            assert!(
+                matches!(launched, std::borrow::Cow::Borrowed(_)),
+                "{consent:?}"
+            );
+            assert_eq!(launched.role, "worker");
+            assert_eq!(launched.model_path, stored.model_path);
+            assert!(keep_awake_during_jobs_requested(&launched));
+        }
+    }
+
+    #[test]
+    fn an_observer_is_never_rewritten() {
+        for consent in [Some(false), Some(true), None] {
+            let observer = NodeConfig {
+                role: "observer".into(),
+                model_path: None,
+                compute_consent: consent,
+                ..NodeConfig::default()
+            };
+            assert!(matches!(
+                effective_launch_config(&observer),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod keep_awake_flag_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_worker_whose_user_turned_it_on_keeps_the_computer_awake() {
+        let worker = NodeConfig {
+            role: "worker".into(),
+            model_path: Some("/m.gguf".into()),
+            ..NodeConfig::default()
+        };
+        assert!(
+            !keep_awake_during_jobs_requested(&worker),
+            "off unless the user turned it on"
+        );
+        let on = NodeConfig {
+            prevent_sleep_during_jobs: Some(true),
+            ..worker
+        };
+        assert!(keep_awake_during_jobs_requested(&on));
+        let observer = NodeConfig {
+            role: "observer".into(),
+            ..on.clone()
+        };
+        assert!(!keep_awake_during_jobs_requested(&observer));
+        let no_model = NodeConfig {
+            model_path: None,
+            ..on
+        };
+        assert!(!keep_awake_during_jobs_requested(&no_model));
     }
 }

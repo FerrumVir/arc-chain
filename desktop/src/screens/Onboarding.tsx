@@ -14,6 +14,7 @@ import {
 import clsx from "clsx";
 import { useAppStore } from "../lib/store";
 import { api, isTauri } from "../lib/tauri";
+import { modelDownloadStatus } from "../lib/format";
 import { LogoMark, Tagline } from "../components/Logo";
 import {
   DEFAULT_NODE_CONFIG,
@@ -174,17 +175,23 @@ export function Onboarding() {
       //    role + modelPath set makes the node eligible to advertise an exact,
       //    fully loaded artifact. It does not promise assignment or payment.
       //    No model means observer/router mode with no local model execution.
+      //    Choosing the model here is the user's explicit consent to run ARC
+      //    jobs on this computer; choosing observer mode is an explicit no.
       const config: NodeConfig = {
         ...DEFAULT_NODE_CONFIG,
         role: modelPath ? "worker" : "observer",
         modelPath,
+        computeConsent: modelPath !== null,
       };
       setStoreConfig(config);
 
       // 3. Download the arc-node binary if it isn't already there.
       setLaunchStage("downloading");
       await api.ensureBinary();
-      await api.saveConfig(config);
+      // Onboarding's own save: it records the compute choice made above. A
+      // plain `saveConfig` keeps the stored contribution state once a config
+      // exists (commands.rs), so a re-run wizard has to go this way.
+      await api.completeOnboarding(config);
 
       // 4. Start the node + wait for either real peers OR a coordinator
       //    fallback (Lite mode survives residential UDP blocks).
@@ -566,6 +573,9 @@ export function Onboarding() {
                   Machines with at least 16 GB RAM pre-select it; smaller
                   machines stay useful as observer/routers. A model creates
                   eligibility, not guaranteed assignments or rewards.
+                  Continuing with the model lets ARC run inference jobs on
+                  this computer while the app is open; choose Skip to keep it
+                  an observer. You can change this any time in Settings.
                 </p>
                 <p
                   style={{
@@ -789,18 +799,9 @@ export function Onboarding() {
                       ? "We'll download the node binary and start an observer/router without local model execution. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards."
                       : "We'll fetch the selected model, download the node binary, and start the process. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards.")}
                   {launching && launchStage === "model" && modelProgress && (
-                    <>
-                      {formatBytes(modelProgress.downloadedBytes)} of{" "}
-                      {formatBytes(modelProgress.totalBytes)} (
-                      {modelProgress.totalBytes > 0
-                        ? Math.floor(
-                            (modelProgress.downloadedBytes /
-                              modelProgress.totalBytes) *
-                              100,
-                          )
-                        : 0}
-                      %) — Hugging Face is fast, this is the bulk of the wait.
-                    </>
+                    <span data-testid="model-download-status">
+                      {modelDownloadStatus(modelProgress)}
+                    </span>
                   )}
                   {launching &&
                     launchStage === "model" &&

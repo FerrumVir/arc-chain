@@ -376,7 +376,7 @@ class Fixture:
             "commit": SOURCE_COMMIT,
             "platform": "linux-x86_64",
             "rust_target": "x86_64-unknown-linux-gnu",
-            "version": "0.8.10",
+            "version": "0.8.11",
             "workflow_run_id": 1234,
             "workflow_run_attempt": 1,
             "files": {

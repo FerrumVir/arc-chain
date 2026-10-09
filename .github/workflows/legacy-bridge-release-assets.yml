@@ -1,0 +1,283 @@
+name: Legacy bridge release handoff
+
+# Assembles everything the owner needs to publish the legacy bridge release
+# (docs/LEGACY-BRIDGE.md): the launcher for every platform a released v0.7
+# updater can request, under the exact v0.7 asset names, plus a byte-for-byte
+# copy of a qualified v0.8 desktop release's latest.json whose four updater
+# signatures were verified with the key every v0.5.4..v0.7.11 desktop embeds.
+#
+# This workflow never creates, edits, or publishes a GitHub release or tag.
+# Publication, and the separate decision to mark the release "Latest", are
+# owner actions. The handoff records whether the inputs are eligible for
+# "Latest": the pinned node must not publish hostnames and the desktop release
+# must contain the first-launch compute question.
+on:
+  workflow_dispatch:
+    inputs:
+      desktop_tag:
+        description: Exact v0.8 desktop release that v0.7 desktops will install
+        required: true
+        type: string
+  push:
+    branches-ignore: [main]
+    paths:
+      - .github/workflows/legacy-bridge-release-assets.yml
+      - scripts/legacy-bridge/**
+
+concurrency:
+  group: legacy-bridge-release-assets-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A branch push exercises the pipeline against the current release as a
+  # stand-in; its handoff is always marked not eligible for "Latest".
+  # v0.8.11 is the stand-in. The real desktop_tag is the first release
+  # containing this question (legacy_upgrade::hold_at_startup); v0.8.11 does not.
+  DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.11' }}
+
+jobs:
+  pins:
+    name: pins equal the signed v0.8 release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Recompute every pin from the release and its owner signature
+        run: python3 scripts/legacy-bridge/pin-release.py --check
+
+  build:
+    name: launcher ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-24.04
+            builds: x86_64-unknown-linux-musl=arc-node-linux-x86_64
+          - label: linux-aarch64
+            runner: ubuntu-24.04-arm
+            builds: aarch64-unknown-linux-musl=arc-node-linux-aarch64
+          - label: macos
+            runner: macos-15
+            builds: aarch64-apple-darwin=arc-node-macos-arm64 x86_64-apple-darwin=arc-node-macos-x86_64
+          - label: windows-x86_64
+            runner: windows-latest
+            builds: x86_64-pc-windows-msvc=arc-node-windows-x86_64.exe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc
+      - name: Install the musl C toolchain for ring
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+      - name: Build, check, and stage under the legacy asset names
+        shell: bash
+        env:
+          BUILDS: ${{ matrix.builds }}
+        run: |
+          set -euo pipefail
+          bridge_version="$(jq -er .bridge_version crates/arc-legacy-bridge/pins/active.json)"
+          mkdir -p dist
+          for build in $BUILDS; do
+            target="${build%%=*}"
+            asset="${build#*=}"
+            cargo build --release --locked -p arc-legacy-bridge --target "$target"
+            suffix=""
+            [ "$target" = x86_64-pc-windows-msvc ] && suffix=".exe"
+            cp "target/$target/release/arc-legacy-bridge$suffix" "dist/$asset"
+            case "$target" in
+              *-linux-musl) file "dist/$asset" | grep -Eq 'statically linked|static-pie linked' ;;
+            esac
+            runner_arch="$(uname -m)"
+            if [ "$target" = x86_64-apple-darwin ] && [ "$runner_arch" = arm64 ]; then
+              if arch -x86_64 /usr/bin/true 2>/dev/null; then
+                arch -x86_64 "dist/$asset" --version | tee "dist/$asset.version"
+              else
+                lipo -archs "dist/$asset" | tee "dist/$asset.version"
+                grep -qx x86_64 "dist/$asset.version"
+                continue
+              fi
+            else
+              "dist/$asset" --version | tee "dist/$asset.version"
+            fi
+            grep -qF "arc-node $bridge_version " "dist/$asset.version"
+          done
+          rm -f dist/*.version
+          ls -l dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: launcher-${{ matrix.label }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  desktop:
+    name: desktop latest.json for v0.7 updaters
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - name: Verify the desktop release and every updater signature
+        run: |
+          set -euo pipefail
+          [[ "$DESKTOP_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          for tag in v0.5.4 v0.6.0 v0.7.0 v0.7.7 v0.7.10 v0.7.11 "$DESKTOP_TAG"; do
+            git fetch --no-tags --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+          done
+          pubkey="$(git show v0.7.11:desktop/src-tauri/tauri.conf.json | jq -er .plugins.updater.pubkey)"
+          for tag in v0.5.4 v0.6.0 v0.7.0 v0.7.7 v0.7.10; do
+            [ "$(git show "$tag:desktop/src-tauri/tauri.conf.json" | jq -er .plugins.updater.pubkey)" = "$pubkey" ]
+          done
+          curl -fsS --retry 3 "https://api.github.com/repos/FerrumVir/arc-chain/releases/tags/$DESKTOP_TAG" > release.json
+          jq -e '.draft == false and .prerelease == false and .immutable == true and .author.login == "github-actions[bot]"' release.json
+          mkdir -p handoff-desktop
+          curl -fsSL --retry 3 -o handoff-desktop/latest.json \
+            "https://github.com/FerrumVir/arc-chain/releases/download/$DESKTOP_TAG/latest.json"
+          python3 - handoff-desktop/latest.json "$DESKTOP_TAG" <<'PY'
+          import json, sys
+          manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+          tag = sys.argv[2]
+          version = tuple(int(part) for part in manifest["version"].split("."))
+          assert "v" + manifest["version"] == tag, (manifest["version"], tag)
+          assert version >= (0, 8, 0), version
+          for platform in ("darwin-aarch64", "darwin-x86_64", "linux-x86_64", "windows-x86_64"):
+              url = manifest["platforms"][platform]["url"]
+              assert url.startswith(f"https://github.com/FerrumVir/arc-chain/releases/download/{tag}/"), url
+          PY
+          cargo build --release --locked --manifest-path tests/release/tauri-updater-verifier/Cargo.toml
+          verifier=tests/release/tauri-updater-verifier/target/release/tauri-updater-verifier
+          for platform in darwin-aarch64 darwin-x86_64 linux-x86_64 windows-x86_64; do
+            url="$(jq -er --arg p "$platform" '.platforms[$p].url' handoff-desktop/latest.json)"
+            jq -er --arg p "$platform" '.platforms[$p].signature' handoff-desktop/latest.json > signature
+            curl -fsSL --retry 3 -o payload "$url"
+            "$verifier" "$pubkey" payload signature
+            rm -f payload signature
+          done
+          # The dialog alone is not enough: the release must also hold every
+          # v0.7 origin fail-closed (never-ran nodes, earlier fences).
+          if git cat-file -e "$DESKTOP_TAG:desktop/src/components/LegacyUpgradeDialog.tsx" 2>/dev/null \
+            && git show "$DESKTOP_TAG:desktop/src-tauri/src/legacy_upgrade.rs" 2>/dev/null | grep -q '^pub fn hold_at_startup('; then
+            echo true > handoff-desktop/has-consent-question
+          else
+            echo false > handoff-desktop/has-consent-question
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-latest-json
+          path: handoff-desktop/
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble:
+    name: assemble the owner handoff
+    needs: [pins, build, desktop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: collected
+      - name: Assemble assets, checksums, provenance, and release notes
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          pins=crates/arc-legacy-bridge/pins/active.json
+          bridge_version="$(jq -er .bridge_version "$pins")"
+          release_dir="handoff/v$bridge_version"
+          mkdir -p "$release_dir"
+          for asset in arc-node-linux-x86_64 arc-node-linux-aarch64 arc-node-macos-arm64 arc-node-macos-x86_64 arc-node-windows-x86_64.exe; do
+            found="$(find collected -type f -name "$asset" | head -n 1)"
+            [ -n "$found" ] || { echo "missing $asset" >&2; exit 1; }
+            install -m 0755 "$found" "$release_dir/$asset"
+          done
+          install -m 0644 collected/desktop-latest-json/latest.json "$release_dir/latest.json"
+          (cd "$release_dir" && sha256sum arc-node-* latest.json > SHA256SUMS)
+          privacy_safe="$(jq -r .node_release.worker_names_privacy_safe "$pins")"
+          consent_question="$(cat collected/desktop-latest-json/has-consent-question)"
+          python3 - "$pins" "$release_dir" "$privacy_safe" "$consent_question" <<'PY'
+          import hashlib, json, os, sys
+          from pathlib import Path
+          pins = json.load(open(sys.argv[1], encoding="utf-8"))
+          release_dir = Path(sys.argv[2])
+          privacy_safe = sys.argv[3] == "true"
+          consent_question = sys.argv[4] == "true"
+          desktop = json.loads((release_dir / "latest.json").read_text(encoding="utf-8"))
+          blockers = []
+          if not privacy_safe:
+              blockers.append(f"pinned arc-node {pins['node_release']['tag']} publishes worker hostnames (needs a build with PR #134)")
+          if not consent_question:
+              blockers.append(f"desktop release v{desktop['version']} has no first-launch compute question")
+          provenance = {
+              "schema": "arc.legacy-bridge.handoff.v1",
+              "bridge_tag": "v" + pins["bridge_version"],
+              "source_commit": os.environ["SOURCE_SHA"],
+              "workflow_run": f"{os.environ['RUN_ID']}/{os.environ['RUN_ATTEMPT']}",
+              "pinned_node_release": pins["node_release"]["tag"],
+              "pinned_node_commit": pins["node_release"]["commit"],
+              "desktop_release": "v" + desktop["version"],
+              "assets": {
+                  path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in sorted(release_dir.iterdir())
+                  if path.name != "SHA256SUMS"
+              },
+              "eligible_for_latest": not blockers,
+              "blockers": blockers,
+          }
+          Path("handoff/legacy-bridge-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+          notes = f"""ARC Node v{pins['bridge_version']}: bridge from v0.7 to the new network
+
+          This release exists so installs made by ARC v0.7 can move to the
+          current network without any manual steps. It is not a v0.7 feature
+          release.
+
+          - Headless v0.7 nodes: the daily v0.7 updater installs a small
+            launcher as `bin/arc-node`. It leaves the v0.7 data directory exactly
+            as it is, downloads arc-node {pins['node_release']['version']} pinned by
+            tag and SHA-256 after checking the owner-signed release manifest,
+            and runs it at stake 0 in a fresh data directory. Compute stays
+            off until you opt in with
+            `~/.arc/bin/arc-node --legacy-bridge-compute on --download-model`
+            (or `--model /path/to/llama-2-7b-chat.Q4_K_M.gguf`).
+          - Desktop v0.7 apps: starting the node installs the same launcher.
+            Settings > Check for updates installs ARC Node {desktop['version']}, which
+            asks once whether to keep contributing compute.
+
+          New installs should use the current v0.8 release and its installer,
+          not this release.
+          """
+          Path("handoff/RELEASE-NOTES.md").write_text(notes, encoding="utf-8")
+          print(json.dumps(provenance, indent=2))
+          PY
+          cat handoff/RELEASE-NOTES.md
+          ls -l "$release_dir"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: legacy-bridge-release-handoff
+          path: handoff/
+          if-no-files-found: error
+          retention-days: 90

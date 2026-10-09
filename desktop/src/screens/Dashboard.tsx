@@ -27,6 +27,7 @@ import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
 import { NumberTicker } from "../components/NumberTicker";
 import { ObserverUpgradeBanner } from "../components/ObserverUpgradeBanner";
+import { WorkerJobsCard } from "../components/WorkerJobs";
 import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { StatusPill } from "../components/StatusPill";
 import { api } from "../lib/tauri";
@@ -565,6 +566,8 @@ export function Dashboard() {
       )}
 
       <ObserverUpgradeBanner />
+
+      <WorkerJobsCard />
 
 
       <Card featured style={{ marginBottom: "var(--space-6)" }}>

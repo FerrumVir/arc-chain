@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 
+/// Twin execution v0 orchestration (coordinator-side, off by default).
+mod twin_dispatch;
+
 /// Exact transport for the primary ARC HTTP API. Production validators use a
 /// Unix socket so a crashed origin cannot be replaced by a local TCP binder.
 #[derive(Clone, Debug)]
@@ -606,6 +609,9 @@ pub struct NodeState {
     /// seed-poll requests. Value is the assigned job id; an empty value means
     /// a claim long-poll currently holds the worker's reservation.
     pub community_active_jobs: Arc<dashmap::DashMap<String, String>>,
+    /// Twin execution, region tags and generated demand. Every switch in its
+    /// configuration defaults to off; see `docs/twin-execution.md`.
+    community_twin: Arc<twin_dispatch::CommunityTwinState>,
     /// Shared outbound HTTP client for ALL coordinator→shard traffic.
     /// Built once at boot so the keep-alive connection pool survives across
     /// requests. Previously every /inference/run_sharded and
@@ -730,7 +736,9 @@ pub struct ShardInfo {
 pub struct CommunityWorker {
     /// Self-chosen worker ID (hex of validator pubkey or a uuid).
     pub worker_id: String,
-    /// Operator-friendly name (hostname, city, whatever).
+    /// Public display label, as produced by [`community_public_name`]: a
+    /// validated operator-chosen nickname, otherwise `node-` plus a short hash
+    /// of the worker's public key. Never a hostname or other machine metadata.
     pub name: String,
     /// What this worker can do. For now: just "inference".
     pub capabilities: Vec<String>,
@@ -780,6 +788,139 @@ const COMMUNITY_WORKER_PLATFORM_MAX_BYTES: usize = 64;
 const COMMUNITY_WORKER_MODEL_MAX_BYTES: usize = 128;
 const COMMUNITY_WORKER_CAPABILITIES_MAX: usize = 16;
 const COMMUNITY_WORKER_CAPABILITY_MAX_BYTES: usize = 32;
+
+/// Longest operator-chosen nickname shown on public worker scoreboards.
+pub const COMMUNITY_NICKNAME_MAX_BYTES: usize = 48;
+
+/// Hex characters of the worker address shown in the default public label.
+const COMMUNITY_DEFAULT_NAME_HEX_CHARS: usize = 8;
+
+/// The privacy-safe default public label for a community worker: `node-`
+/// plus the first eight hex characters of its address. A worker's address is
+/// the BLAKE3 hash of its public key, so the label is a short hash of the
+/// public key, stable for the life of the key, and lets an operator find
+/// their own row by address prefix. It is never derived from the hostname,
+/// user name, data directory, or any other machine metadata.
+pub fn community_default_public_name(worker_id: &str) -> String {
+    let trimmed = worker_id.trim();
+    let bare = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    let digest_hex = match Hash256::from_hex(bare) {
+        Ok(address) => address.to_hex(),
+        // Non-address IDs only exist in legacy or test registrations. Hash
+        // them so the label still reveals nothing beyond the ID itself.
+        Err(_) => arc_crypto::hash_bytes(trimmed.as_bytes()).to_hex(),
+    };
+    format!("node-{}", &digest_hex[..COMMUNITY_DEFAULT_NAME_HEX_CHARS])
+}
+
+/// Accept an operator-chosen nickname for public display, or say why not.
+///
+/// A nickname is 1-48 ASCII letters, digits, spaces, `-` or `_`, starting and
+/// ending with a letter or digit. The narrow alphabet keeps markup, control,
+/// bidi-override, and look-alike characters off every validator's public
+/// scoreboard, and excludes the `.` and `(` of the legacy `name (hostname)`
+/// registrations. Names shaped like an operating system's default computer
+/// name are refused as well, because a person's first name is usually part
+/// of one ("Ada's MacBook Pro" becomes `Adas-MacBook-Pro`).
+pub fn validate_community_nickname(nickname: &str) -> Result<(), &'static str> {
+    if nickname.is_empty() {
+        return Err("nickname is empty");
+    }
+    if nickname.len() > COMMUNITY_NICKNAME_MAX_BYTES {
+        return Err("nickname is longer than 48 characters");
+    }
+    let bytes = nickname.as_bytes();
+    if !bytes
+        .iter()
+        .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_'))
+    {
+        return Err("nickname may contain only ASCII letters, digits, spaces, '-' and '_'");
+    }
+    if !bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        || !bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err("nickname must start and end with a letter or digit");
+    }
+    if looks_like_default_computer_name(nickname) {
+        return Err("nickname looks like a computer's default hostname");
+    }
+    Ok(())
+}
+
+/// Default computer names that operating systems derive from the owner's
+/// name or that identify a specific machine: Apple's `<Name>s-MacBook-Pro`,
+/// `<Name>s-MBP`, `<Name>s-iMac`, `<Name>s-Mac-mini`; Windows' random
+/// `DESKTOP-XXXXXXX` / `LAPTOP-XXXXXXXX` and the older `<NAME>-PC`.
+fn looks_like_default_computer_name(nickname: &str) -> bool {
+    const DEVICE_TOKENS: &[&str] = &[
+        "macbook",
+        "macbookpro",
+        "macbookair",
+        "imac",
+        "imacpro",
+        "macmini",
+        "macstudio",
+        "macpro",
+        "mbp",
+        "mba",
+        "localhost",
+    ];
+    let lower = nickname.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.iter().any(|token| DEVICE_TOKENS.contains(token)) {
+        return true;
+    }
+    if tokens
+        .windows(2)
+        .any(|pair| pair[0] == "mac" && matches!(pair[1], "mini" | "studio" | "pro"))
+    {
+        return true;
+    }
+    if tokens.len() == 2
+        && matches!(tokens[0], "desktop" | "laptop")
+        && (7..=8).contains(&tokens[1].len())
+    {
+        return true;
+    }
+    tokens.len() >= 2 && tokens.last() == Some(&"pc")
+}
+
+/// The label a community worker is shown under on every public surface.
+///
+/// Returns the requested nickname when [`validate_community_nickname`]
+/// accepts it, and the worker's [`community_default_public_name`] otherwise.
+/// A nickname shaped like a default label (`node-` plus eight hex characters)
+/// is kept only when it is this worker's own default, so one worker cannot
+/// impersonate another's row.
+///
+/// Validators apply this when a worker registers and again whenever the
+/// registry is served, so a name stored before this rule existed (for example
+/// `arc-1a2b3c4d (Adas-MacBook-Pro.local)`) is never published.
+pub fn community_public_name(worker_id: &str, requested: &str) -> String {
+    let default_name = community_default_public_name(worker_id);
+    let nickname = requested.trim();
+    if validate_community_nickname(nickname).is_err() {
+        return default_name;
+    }
+    // Compare case-folded, with `_` and spaces read as `-`, so look-alikes
+    // such as `Node-DeadBeef` or `node_deadbeef` cannot pass for another
+    // worker's default label either.
+    let folded = nickname.to_ascii_lowercase().replace(['_', ' '], "-");
+    let reserved_shape = folded.strip_prefix("node-").is_some_and(|suffix| {
+        suffix.len() == COMMUNITY_DEFAULT_NAME_HEX_CHARS
+            && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    if reserved_shape && !folded.eq_ignore_ascii_case(&default_name) {
+        return default_name;
+    }
+    nickname.to_string()
+}
 
 /// Time a shard registry entry is considered fresh. Entries older than this
 /// are dropped at read time. Must be greater than the shard announcement
@@ -1512,6 +1653,9 @@ pub fn build_node_state(
         community_work_queue: None,
         community_work_results: None,
         community_active_jobs: Arc::new(dashmap::DashMap::new()),
+        community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
+            crate::twin::TwinConfig::default(),
+        )),
         // One client, one connection pool, for the life of the process.
         // `pool_idle_timeout` is deliberately longer than the 15 s shard
         // announcement tick so an idle inter-seed connection survives between
@@ -1942,6 +2086,9 @@ pub async fn serve(
     // sends `true` and let Axum drain every active handler before returning.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
+    // Twin execution v0 and generated community demand
+    // (docs/twin-execution.md). Every switch defaults to off.
+    community_twin: crate::twin::TwinConfig,
 ) -> anyhow::Result<()> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
         anyhow::bail!(
@@ -1968,6 +2115,13 @@ pub async fn serve(
     node.native_serving = native_serving;
     node.native_request_admission = native_request_admission;
     node.consensus_engine = consensus_engine;
+    node.community_twin = Arc::new(twin_dispatch::CommunityTwinState::new(community_twin));
+    if node.community_twin.config.twin_execution {
+        tracing::info!(
+            spot_check_per_mille = node.community_twin.config.spot_check_per_mille,
+            "community twin execution enabled: each community job runs on two independent workers"
+        );
+    }
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
     }
@@ -2067,6 +2221,9 @@ pub async fn serve(
             }
         }
     });
+    // Rate-limited public demo and replay jobs for idle workers, when the
+    // operator enabled the demand pump.
+    twin_dispatch::spawn_community_demand_pump(&node);
 
     // ── Dedicated inference compute pool ────────────────────────────────
     if compute_threads > 0 {
@@ -2342,6 +2499,12 @@ pub async fn serve(
                 .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
         )
         .route("/community/list", get(community_list))
+        // This node's own community worker: state and job counters for the
+        // desktop app. Validators run no worker and answer 404.
+        .route(
+            crate::community_worker::COMMUNITY_WORKER_STATUS_PATH,
+            get(community_worker_status),
+        )
         // Community inference work dispatch (long-poll claim + submit)
         .route(
             COMMUNITY_CLAIM_WORK_PATH,
@@ -2368,6 +2531,26 @@ pub async fn serve(
             get(community_reward_approval_status),
         )
         .route("/community/reward_policy", get(community_reward_policy))
+        // Twin execution v0 (docs/twin-execution.md): a worker's signed
+        // region report and read-only twin views. The sealed production
+        // gateway must allowlist these paths before they are public.
+        .route(
+            crate::twin::COMMUNITY_REGION_PATH,
+            post(twin_dispatch::community_region_signed)
+                .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/community/twin_stats",
+            get(twin_dispatch::community_twin_stats),
+        )
+        .route(
+            "/community/twin_receipts",
+            get(twin_dispatch::community_twin_receipts),
+        )
+        .route(
+            "/community/twin/{job_id}",
+            get(twin_dispatch::community_twin_receipt),
+        )
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -7416,11 +7599,106 @@ async fn inference_run(
             "sealed recovery probe coordinator cannot dispatch to the exact accepted canary worker",
         ));
     }
+    // Public demo: a caller-labelled public, testnet-only prompt that is
+    // always run by two independent community workers (twin execution).
+    let public_demo = req
+        .get("public_demo")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let max_tokens = if public_demo {
+        if force_local || recovery_probe_id.is_some() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "public_demo cannot be combined with force_local or a recovery probe",
+            ));
+        }
+        if !node.community_twin.config.twin_execution {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the public demo is not enabled on this coordinator",
+            ));
+        }
+        if !twin_dispatch::twin_dispatch_ready(&node) || !readiness.community_dispatch_ready {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the public demo runs every prompt on two independent community workers, and fewer than two are available on this coordinator now",
+            ));
+        }
+        twin_dispatch::admit_public_demo(&node, input_text)
+            .map_err(|(status, message)| api_error(status, message))?;
+        max_tokens.min(crate::twin::PUBLIC_DEMO_MAX_TOKENS)
+    } else {
+        max_tokens
+    };
     if !force_local && readiness.community_dispatch_ready {
         let dispatched_at = std::time::Instant::now();
         let assigned_model_id = node
             .model_artifact_id
             .map(|model_id| format!("0x{}", model_id.to_hex()));
+        if recovery_probe_id.is_none() && (public_demo || twin_dispatch::twin_dispatch_ready(&node))
+        {
+            let (source, community_input) = if public_demo {
+                (
+                    crate::twin::DemandSource::PublicDemo,
+                    node.inference_model
+                        .as_ref()
+                        .map(|model| model.apply_chat_template(input_text))
+                        .unwrap_or_else(|| input_text.to_string()),
+                )
+            } else {
+                (
+                    crate::twin::DemandSource::PublicRequest,
+                    input_text.to_string(),
+                )
+            };
+            match twin_dispatch::dispatch_twin(
+                &node,
+                twin_dispatch::TwinDispatchRequest {
+                    input: community_input,
+                    max_tokens,
+                    model_id_hint: assigned_model_id.clone(),
+                    source,
+                    public_prompt: None,
+                    reference: None,
+                },
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    let dispatch_ms =
+                        u64::try_from(dispatched_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    return Ok(Json(twin_dispatch::twin_inference_response(
+                        &node,
+                        input_text,
+                        outcome,
+                        live_workers,
+                        dispatch_ms,
+                        public_demo,
+                    )));
+                }
+                Err(error) if error.local_fallback_safe && !public_demo => {
+                    tracing::warn!(
+                        reason = %error.message,
+                        "twin dispatch could not be enqueued; trying single-worker dispatch"
+                    );
+                }
+                Err(error) if error.local_fallback_safe => {
+                    return Err(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("the public demo could not be dispatched: {}", error.message),
+                    ));
+                }
+                Err(error) => {
+                    return Err(api_error(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!(
+                            "Twin community inference did not complete within its verified dispatch budget: {}. The assignment may still resolve; query its twin receipt rather than starting duplicate work.",
+                            error.message
+                        ),
+                    ));
+                }
+            }
+        }
         match dispatch_to_community_worker_with_probe(
             &node,
             input_text.to_string(),
@@ -7534,6 +7812,14 @@ async fn inference_run(
                 );
             }
         }
+    }
+    // A public demo prompt only ever runs on two community workers; it never
+    // falls through to this coordinator's own model.
+    if public_demo {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the public demo could not be dispatched to two community workers",
+        ));
     }
 
     // Check if we have a loaded model (prefer candle float backend for quality)
@@ -8212,8 +8498,13 @@ async fn workers_scoreboard(
         avg_ms_per_job: f64,
         last_total_ms: u64,
         score: f64,
+        /// Twin execution tallies and the coarse region tag. Omitted while
+        /// twin execution and the demand pump are both off.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        twin: Option<twin_dispatch::WorkerTwinRow>,
     }
 
+    let twin_rows = twin_dispatch::worker_rows(&node);
     let mut rows: Vec<WorkerScore> = Vec::new();
     for entry in node.community_workers.iter() {
         let (w, ts) = entry.value();
@@ -8246,7 +8537,9 @@ async fn workers_scoreboard(
         };
         rows.push(WorkerScore {
             worker_id: w.worker_id.clone(),
-            name: w.name.clone(),
+            // Re-derived on every read: a label stored before this rule (a
+            // legacy `name (hostname)` registration) must never be served.
+            name: community_public_name(&w.worker_id, &w.name),
             platform: w.platform.clone(),
             capabilities: w.capabilities.clone(),
             model: w.model.clone(),
@@ -8260,6 +8553,7 @@ async fn workers_scoreboard(
             avg_ms_per_job: avg_ms,
             last_total_ms: w.last_total_ms,
             score,
+            twin: twin_rows.get(&w.worker_id).cloned(),
         });
     }
 
@@ -8277,14 +8571,18 @@ async fn workers_scoreboard(
     let coordinator_model_id = coordinator_model.map(|(_, model_id)| model_id);
     let eligible_inference_workers = live_inference_worker_count(&node);
 
-    Json(json!({
+    let mut body = json!({
         "workers": rows,
         "count_visible": rows.len(),
         "count_total": node.community_workers.len(),
         "coordinator_model": coordinator_model_name,
         "coordinator_model_id": coordinator_model_id,
         "eligible_inference_workers": eligible_inference_workers,
-    }))
+    });
+    if let Some(summary) = twin_dispatch::scoreboard_summary(&node) {
+        body["twin"] = summary;
+    }
+    Json(body)
 }
 
 const INFERENCE_ACTIVITY_SCHEMA: &str = "arc.inference.activity.v1";
@@ -13180,7 +13478,9 @@ async fn community_register(
 
     let worker = CommunityWorker {
         worker_id: req.worker_id.clone(),
-        name: req.name,
+        // Older workers append the machine hostname, which usually carries the
+        // owner's first name. Store only the privacy-safe public label.
+        name: community_public_name(&req.worker_id, &req.name),
         capabilities,
         model,
         model_id,
@@ -13249,6 +13549,21 @@ async fn community_heartbeat(
     }
 }
 
+/// GET /community/worker/status
+/// This node's own community worker: whether it is polling or computing, how
+/// many coordinators accepted its last registration, and the jobs it claimed,
+/// completed, and had quorum-verified since the process started. Local
+/// observations for the desktop app, not chain or reward evidence.
+async fn community_worker_status()
+-> Result<Json<crate::community_worker::CommunityWorkerSnapshot>, (StatusCode, String)> {
+    crate::community_worker::installed()
+        .map(|status| Json(status.snapshot()))
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "this node is not running a community worker".to_string(),
+        ))
+}
+
 /// GET /community/list
 /// Returns all fresh community workers. Entries older than
 /// COMMUNITY_WORKER_TTL_SECS are pruned at read time. The dashboard
@@ -13262,7 +13577,9 @@ async fn community_list(AxumState(node): AxumState<NodeState>) -> Json<serde_jso
     for entry in node.community_workers.iter() {
         let (w, ts) = entry.value();
         if now.duration_since(*ts) <= ttl {
-            live.push(w.clone());
+            let mut public = w.clone();
+            public.name = community_public_name(&w.worker_id, &w.name);
+            live.push(public);
         } else {
             expired.push(entry.key().clone());
         }
@@ -13932,6 +14249,40 @@ async fn verify_community_result_with_quorum(
     result: &WorkResult,
 ) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
     validate_community_reward_profile(result).map_err(CommunityResultVerificationError::Invalid)?;
+    let recomputed = recompute_community_output_with_quorum(node, work_item).await?;
+    let output_hash = compare_community_result_with_tokens(
+        result,
+        &recomputed.generated,
+        &recomputed.output_text,
+    )
+    .map_err(CommunityResultVerificationError::Invalid)?;
+
+    Ok(CommunityResultVerification {
+        output_hash,
+        tokens_generated: recomputed.generated.len(),
+        range_count: recomputed.range_count,
+        range_position_quorum_count: recomputed.range_position_quorum_count,
+    })
+}
+
+/// The validators' authenticated 2-of-3 recomputation of an assignment,
+/// independent of any worker's claim. Twin execution recomputes once and
+/// classifies both legs against this output.
+struct CommunityCanonicalRecompute {
+    generated: Vec<u32>,
+    output_text: String,
+    output_hash: Hash256,
+    range_count: usize,
+    range_position_quorum_count: usize,
+}
+
+/// Recompute an assignment through three authenticated, distinct
+/// active-validator replicas per layer range. Every failure is `Unavailable`:
+/// without a worker claim there is nothing for it to prove invalid.
+async fn recompute_community_output_with_quorum(
+    node: &NodeState,
+    work_item: &WorkItem,
+) -> Result<CommunityCanonicalRecompute, CommunityResultVerificationError> {
     let canonical = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE;
     if work_item.execution_profile != canonical {
         return Err(CommunityResultVerificationError::Unavailable(format!(
@@ -14057,13 +14408,16 @@ async fn verify_community_result_with_quorum(
         &active_validators,
     )
     .map_err(CommunityResultVerificationError::Unavailable)?;
-    let actual_output = model.decode(&run.generated);
-    let output_hash = compare_community_result_with_tokens(result, &run.generated, &actual_output)
-        .map_err(CommunityResultVerificationError::Invalid)?;
-
-    Ok(CommunityResultVerification {
-        output_hash,
-        tokens_generated: run.generated.len(),
+    let output_text = model.decode(&run.generated);
+    let output_bytes: Vec<u8> = run
+        .generated
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
+    Ok(CommunityCanonicalRecompute {
+        output_hash: arc_crypto::hash_bytes(&output_bytes),
+        generated: run.generated,
+        output_text,
         range_count: pipeline.len(),
         range_position_quorum_count,
     })
@@ -15707,6 +16061,18 @@ pub async fn community_claim_work(
                 ));
             }
 
+            // A twin leg must go to a worker independent of its sibling
+            // (crate::twin::decide_claim); a refused or briefly deferred leg
+            // goes back on the queue for another worker.
+            let twin_claim = twin_dispatch::claim_decision(&node, &item.job_id, &req.worker_id);
+            if let Some(reason) = twin_claim.and_then(twin_dispatch::refusal_reason) {
+                twin_dispatch::requeue_item(&node, item);
+                return Ok(Json(json!({
+                    "status": "no_work",
+                    "reason": reason,
+                })));
+            }
+
             // Bind this coordinator-issued job to the worker that actually
             // claimed it before returning the prompt. The pending record can
             // disappear here when the dispatcher timed out while the item was
@@ -15716,12 +16082,19 @@ pub async fn community_claim_work(
                 .as_ref()
                 .and_then(|pending| pending.get_mut(&item.job_id))
             else {
+                if twin_claim.is_some() {
+                    twin_dispatch::release_claim(&node, &item.job_id, &req.worker_id);
+                }
                 return Ok(Json(json!({
                     "status": "no_work",
                     "reason": "job_expired",
                 })));
             };
             if pending.assigned_worker.is_some() {
+                drop(pending);
+                if twin_claim.is_some() {
+                    twin_dispatch::release_claim(&node, &item.job_id, &req.worker_id);
+                }
                 return Ok(Json(json!({
                     "status": "no_work",
                     "reason": "job_already_claimed",
@@ -16064,6 +16437,17 @@ pub async fn community_submit_work(
     };
 
     let job_id = result.job_id.clone();
+    // A twin leg is compared with its sibling first; validators recompute
+    // only when the group needs them (see `twin_dispatch`).
+    if twin_dispatch::is_twin_leg(&node, &job_id) {
+        return twin_dispatch::submit_twin_leg(
+            &node,
+            submission_reservation,
+            assigned_worker,
+            result,
+            verified_attestation,
+        );
+    }
     let verification = if result.success {
         match verify_community_result_with_quorum(&node, &work_item, &result).await {
             Ok(verification) => Some(verification),
@@ -18182,7 +18566,7 @@ mod tests {
         directory
     }
 
-    fn canonical_profile() -> String {
+    pub(super) fn canonical_profile() -> String {
         arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string()
     }
 
@@ -20668,7 +21052,7 @@ mod tests {
     use std::sync::atomic::AtomicU32;
     use std::time::Instant;
 
-    fn test_model_id() -> String {
+    pub(super) fn test_model_id() -> String {
         format!(
             "0x{}",
             arc_crypto::hash_bytes(b"synthetic-model-artifact-exact-bytes").to_hex()
@@ -20812,7 +21196,9 @@ mod tests {
         Arc::new(model)
     }
 
-    fn fake_node_with_workers(workers: Vec<(CommunityWorker, std::time::Instant)>) -> NodeState {
+    pub(super) fn fake_node_with_workers(
+        workers: Vec<(CommunityWorker, std::time::Instant)>,
+    ) -> NodeState {
         // Build a minimal NodeState by hand. We can't call build_node_state
         // because it requires real Arc<StateDB> and Arc<Mempool>; we only
         // touch fields the router reads.
@@ -20842,6 +21228,9 @@ mod tests {
             community_work_queue: Some(Arc::new(tokio::sync::Mutex::new(rx))),
             community_work_results: Some(Arc::new(dashmap::DashMap::new())),
             community_active_jobs: Arc::new(dashmap::DashMap::new()),
+            community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
+                crate::twin::TwinConfig::default(),
+            )),
             attestation_nonce: Arc::new(AtomicU64::new(0)),
             latency_stats: Arc::new(dashmap::DashMap::new()),
 
@@ -20921,7 +21310,7 @@ mod tests {
         }
     }
 
-    fn worker(id: &str, caps: &[&str]) -> CommunityWorker {
+    pub(super) fn worker(id: &str, caps: &[&str]) -> CommunityWorker {
         CommunityWorker {
             worker_id: id.into(),
             name: format!("test-{}", id),
@@ -22030,6 +22419,204 @@ mod tests {
             "peer connectivity must never masquerade as worker registration"
         );
         assert!(!node.community_workers.contains_key("expired-worker"));
+    }
+
+    #[test]
+    fn community_default_public_name_is_a_short_public_key_hash() {
+        let keypair = arc_crypto::KeyPair::generate_ed25519();
+        let address_hex = keypair.address().to_hex();
+        let worker_id = format!("0x{address_hex}");
+        assert_eq!(
+            community_default_public_name(&worker_id),
+            format!("node-{}", &address_hex[..8])
+        );
+        // Stable for the key, whatever the case or prefix of the ID.
+        assert_eq!(
+            community_default_public_name(&address_hex.to_ascii_uppercase()),
+            community_default_public_name(&worker_id)
+        );
+        // Non-address legacy IDs still get an opaque, well-formed label.
+        let legacy = community_default_public_name("fast_reliable");
+        assert_eq!(legacy.len(), "node-".len() + 8, "{legacy}");
+        assert!(legacy.starts_with("node-"));
+        assert!(legacy[5..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn community_public_name_redacts_legacy_hostname_registrations() {
+        let worker_id = format!("0x{}", "c4".repeat(32));
+        // v0.8.10 and earlier registered `<label> (<hostname>)`.
+        for legacy in [
+            "arc-1a2b3c4d (Adas-MacBook-Pro.local)",
+            "arc-1a2b3c4d (DESKTOP-1A2B3C4)",
+            "arc-1a2b3c4d (ada-ThinkPad-X1-Carbon)",
+            "github-linux-x86_64-community-verification (fv-az123-456)",
+            "LAX (vultr-lax-1)",
+        ] {
+            assert_eq!(
+                community_public_name(&worker_id, legacy),
+                "node-c4c4c4c4",
+                "{legacy} must not be published"
+            );
+        }
+    }
+
+    #[test]
+    fn community_nicknames_keep_safe_labels_and_refuse_the_rest() {
+        let worker_id = format!("0x{}", "5e".repeat(32));
+        let longest = "n".repeat(COMMUNITY_NICKNAME_MAX_BYTES);
+        let too_long = "n".repeat(COMMUNITY_NICKNAME_MAX_BYTES + 1);
+        for accepted in [
+            "basement rig 2",
+            "A",
+            "rig_01",
+            "github-linux-x86_64-community-verification",
+            // Its own default label is not an impersonation.
+            "node-5e5e5e5e",
+            longest.as_str(),
+        ] {
+            assert_eq!(
+                community_public_name(&worker_id, accepted),
+                accepted,
+                "{accepted} is a safe nickname"
+            );
+        }
+        assert_eq!(community_public_name(&worker_id, "  rig 7  "), "rig 7");
+        for refused in [
+            "",
+            "   ",
+            "-rig",
+            "rig-",
+            "rig.local",
+            "ada@home",
+            "ada's rig",
+            "<b>rig</b>",
+            "rig\u{202e}gnp",
+            "r\u{00e9}seau",
+            "tab\there",
+            "line\nbreak",
+            too_long.as_str(),
+            "Adas-MacBook-Pro",
+            "adas-mbp",
+            "Adas MacBook Air",
+            "adas-imac",
+            "adas mac mini",
+            "DESKTOP-1A2B3C4",
+            "LAPTOP-ABCD1234",
+            "ADA-PC",
+            "localhost",
+            // Another worker's default label, and look-alikes of it.
+            "node-deadbeef",
+            "Node-DeadBeef",
+            "NODE-DEADBEEF",
+            "node_deadbeef",
+            "node deadbeef",
+        ] {
+            assert_eq!(
+                community_public_name(&worker_id, refused),
+                "node-5e5e5e5e",
+                "{refused:?} must fall back to the default label"
+            );
+        }
+        assert!(
+            validate_community_nickname("Adas-MacBook-Pro")
+                .unwrap_err()
+                .contains("hostname")
+        );
+    }
+
+    #[tokio::test]
+    async fn community_register_stores_only_a_privacy_safe_public_name() {
+        let keypair = arc_crypto::KeyPair::generate_ed25519();
+        let mut legacy = community_register_payload(&keypair);
+        legacy.name = "arc-1a2b3c4d (Adas-MacBook-Pro.local)".to_string();
+        let worker_id = legacy.worker_id.clone();
+        let node = fake_node_with_workers(Vec::new());
+
+        let signed = sign_community_request(COMMUNITY_REGISTER_PATH, legacy, &keypair).unwrap();
+        let response = community_register_signed(AxumState(node.clone()), Json(signed))
+            .await
+            .expect("a legacy name is redacted, not rejected");
+        assert_eq!(response.0["worker_id"], worker_id);
+        let stored = node
+            .community_workers
+            .get(&worker_id)
+            .unwrap()
+            .0
+            .name
+            .clone();
+        assert_eq!(stored, format!("node-{}", &keypair.address().to_hex()[..8]));
+
+        let mut renamed = community_register_payload(&keypair);
+        renamed.name = "basement rig".to_string();
+        let signed = sign_community_request(COMMUNITY_REGISTER_PATH, renamed, &keypair).unwrap();
+        let response = community_register_signed(AxumState(node.clone()), Json(signed))
+            .await
+            .expect("a valid nickname re-registers");
+        assert_eq!(response.0["worker_id"], worker_id);
+        let stored = node
+            .community_workers
+            .get(&worker_id)
+            .unwrap()
+            .0
+            .name
+            .clone();
+        assert_eq!(stored, "basement rig");
+    }
+
+    #[tokio::test]
+    async fn scoreboard_and_list_never_serve_hostnames_stored_before_the_upgrade() {
+        let now = std::time::Instant::now();
+        let legacy_id = format!("0x{}", "7a".repeat(32));
+        let mut legacy = worker(&legacy_id, &["inference"]);
+        legacy.name = "arc-1a2b3c4d (Adas-MacBook-Pro.local)".to_string();
+        let mut nicknamed = worker("nicknamed-worker", &["inference"]);
+        nicknamed.name = "basement rig".to_string();
+        let node = fake_node_with_workers(vec![(legacy, now), (nicknamed, now)]);
+
+        let board = workers_scoreboard(AxumState(node.clone()), Query(HashMap::new()))
+            .await
+            .0;
+        let listed = community_list(AxumState(node.clone())).await.0;
+        for rows in [&board["workers"], &listed["workers"]] {
+            let names: HashMap<&str, &str> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row["worker_id"].as_str().unwrap(),
+                        row["name"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(names.len(), 2);
+            assert_eq!(names[legacy_id.as_str()], "node-7a7a7a7a");
+            assert_eq!(names["nicknamed-worker"], "basement rig");
+        }
+        let served = format!("{board}{listed}");
+        assert!(!served.contains("MacBook") && !served.contains("Adas"));
+    }
+
+    #[tokio::test]
+    async fn worker_status_route_serves_this_process_worker() {
+        // The only test in this binary that installs the process-wide status.
+        let status = crate::community_worker::install(Arc::new(
+            crate::community_worker::CommunityWorkerStatus::new(
+                "0xworker",
+                "node-worker",
+                6,
+                false,
+            ),
+        ));
+        status.record_claim();
+        status.record_outcome(crate::community_worker::JobOutcome::Completed { verified: true });
+
+        let Json(served) = community_worker_status()
+            .await
+            .expect("an installed worker is served");
+        assert_eq!(served, status.snapshot());
+        assert!(served.jobs_completed >= 1 && served.jobs_verified >= 1);
     }
 
     #[test]
@@ -26259,6 +26846,7 @@ mod tests {
                     Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
+                    crate::twin::TwinConfig::default(),
                 )
                 .await
                 .unwrap();
@@ -26345,6 +26933,7 @@ mod tests {
                 Arc::new(crate::native_inference::NativeRequestAdmission::default()),
                 Some(shutdown_rx),
                 Arc::new(arc_net::transport::TransportWirePolicy::default()),
+                crate::twin::TwinConfig::default(),
             )
             .await
         });

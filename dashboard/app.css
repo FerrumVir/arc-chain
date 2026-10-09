@@ -1,6 +1,6 @@
 /* ARC network console: the engraved Arc look of the desktop app. White line on Arc blue.
-   The tokens (colours, faces, radii) live in tailwind.config.cjs and reach this file as CSS custom properties
-   published by tailwind.input.css; rebuild with `npm run build:css`.
+   The tokens (colours, faces, radii) reach this file as CSS custom properties published by tailwind.css, a reviewed
+   static file (Tailwind 3.4.17's compiled base layer); verify-css.mjs pins its bytes.
    Marcellus is for words only. Every number is set in Hanken Grotesk with lining tabular figures, or in JetBrains Mono
    where it is a hash, an address or code. */
 

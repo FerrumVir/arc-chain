@@ -1,0 +1,988 @@
+{
+  "schema": "arc.legacy-bridge.v07-argv.v1",
+  "about": "Every command line a released v0.6.0..v0.7.11 supervisor starts arc-node with. tests/legacy-bridge/check_v07_fixtures.py proves each tag's source still builds it; crates/arc-legacy-bridge/src/consent.rs runs each through the bridge and requires compute off until the owner opts in. Placeholder seeds only.",
+  "shapes": [
+    {
+      "name": "desktop worker",
+      "supervisor": "v0.7 desktop app (node_manager.rs start)",
+      "argv": [
+        "--rpc",
+        "127.0.0.1:9090",
+        "--p2p-port",
+        "9091",
+        "--data-dir",
+        "/Users/ada/.arc",
+        "--validator-seed",
+        "sunset quantum orbit rally window cabin echo velvet amber planet hazard tide",
+        "--eth-rpc-port",
+        "0",
+        "--seeds-file",
+        "/Applications/ARC Node.app/Contents/Resources/resources/testnet-seeds.txt",
+        "--genesis",
+        "/Applications/ARC Node.app/Contents/Resources/resources/genesis.toml",
+        "--community-mode",
+        "--model",
+        "/Users/ada/.arc/models/standard.gguf"
+      ],
+      "expect": {
+        "kind": "desktop",
+        "community_mode": true,
+        "model": true
+      },
+      "source_checks": [
+        {
+          "path": "desktop/src-tauri/src/node_manager.rs",
+          "contains": [
+            "cmd.arg(\"--rpc\") .arg(format!(\"127.0.0.1:{}\", rpc_port)) .arg(\"--p2p-port\") .arg(p2p_port.to_string()) .arg(\"--data-dir\") .arg(&data_dir) .arg(\"--validator-seed\") .arg(validator_seed) .arg(\"--eth-rpc-port\") .arg(\"0\")",
+            "cmd.arg(\"--seeds-file\").arg(seeds);",
+            "cmd.arg(\"--genesis\").arg(genesis);",
+            "if config.role == \"worker\" && config.model_path.is_some() { cmd.arg(\"--community-mode\"); }",
+            "if let Some(model) = &config.model_path { cmd.arg(\"--model\").arg(model); }"
+          ],
+          "absent": [
+            "\"--stake\"",
+            "\"--min-stake\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "desktop observer",
+      "supervisor": "v0.7 desktop app",
+      "argv": [
+        "--rpc",
+        "127.0.0.1:9090",
+        "--p2p-port",
+        "9091",
+        "--data-dir",
+        "/Users/ada/.arc",
+        "--validator-seed",
+        "sunset quantum orbit rally window cabin echo velvet amber planet hazard tide",
+        "--eth-rpc-port",
+        "0",
+        "--seeds-file",
+        "/Applications/ARC Node.app/Contents/Resources/resources/testnet-seeds.txt",
+        "--genesis",
+        "/Applications/ARC Node.app/Contents/Resources/resources/genesis.toml"
+      ],
+      "expect": {
+        "kind": "desktop",
+        "community_mode": false,
+        "model": false
+      },
+      "source_checks": [
+        {
+          "path": "desktop/src-tauri/src/node_manager.rs",
+          "contains": [
+            "cmd.arg(\"--rpc\") .arg(format!(\"127.0.0.1:{}\", rpc_port)) .arg(\"--p2p-port\") .arg(p2p_port.to_string()) .arg(\"--data-dir\") .arg(&data_dir) .arg(\"--validator-seed\") .arg(validator_seed) .arg(\"--eth-rpc-port\") .arg(\"0\")",
+            "cmd.arg(\"--seeds-file\").arg(seeds);",
+            "cmd.arg(\"--genesis\").arg(genesis);",
+            "if config.role == \"worker\" && config.model_path.is_some() { cmd.arg(\"--community-mode\"); }",
+            "if let Some(model) = &config.model_path { cmd.arg(\"--model\").arg(model); }"
+          ],
+          "absent": [
+            "\"--stake\"",
+            "\"--min-stake\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "desktop non-worker role with a model",
+      "supervisor": "v0.7 desktop app, hand-edited store",
+      "argv": [
+        "--rpc",
+        "127.0.0.1:9090",
+        "--p2p-port",
+        "9091",
+        "--data-dir",
+        "/Users/ada/.arc",
+        "--validator-seed",
+        "sunset quantum orbit rally window cabin echo velvet amber planet hazard tide",
+        "--eth-rpc-port",
+        "0",
+        "--seeds-file",
+        "/Applications/ARC Node.app/Contents/Resources/resources/testnet-seeds.txt",
+        "--genesis",
+        "/Applications/ARC Node.app/Contents/Resources/resources/genesis.toml",
+        "--model",
+        "/Users/ada/.arc/models/standard.gguf"
+      ],
+      "expect": {
+        "kind": "desktop",
+        "community_mode": false,
+        "model": true
+      },
+      "source_checks": [
+        {
+          "path": "desktop/src-tauri/src/node_manager.rs",
+          "contains": [
+            "cmd.arg(\"--rpc\") .arg(format!(\"127.0.0.1:{}\", rpc_port)) .arg(\"--p2p-port\") .arg(p2p_port.to_string()) .arg(\"--data-dir\") .arg(&data_dir) .arg(\"--validator-seed\") .arg(validator_seed) .arg(\"--eth-rpc-port\") .arg(\"0\")",
+            "cmd.arg(\"--seeds-file\").arg(seeds);",
+            "cmd.arg(\"--genesis\").arg(genesis);",
+            "if config.role == \"worker\" && config.model_path.is_some() { cmd.arg(\"--community-mode\"); }",
+            "if let Some(model) = &config.model_path { cmd.arg(\"--model\").arg(model); }"
+          ],
+          "absent": [
+            "\"--stake\"",
+            "\"--min-stake\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "desktop observer without bundled resources",
+      "supervisor": "v0.7 desktop app, dev build",
+      "argv": [
+        "--rpc",
+        "127.0.0.1:9090",
+        "--p2p-port",
+        "9091",
+        "--data-dir",
+        "/Users/ada/.arc",
+        "--validator-seed",
+        "sunset quantum orbit rally window cabin echo velvet amber planet hazard tide",
+        "--eth-rpc-port",
+        "0"
+      ],
+      "expect": {
+        "kind": "desktop",
+        "community_mode": false,
+        "model": false
+      },
+      "source_checks": [
+        {
+          "path": "desktop/src-tauri/src/node_manager.rs",
+          "contains": [
+            "cmd.arg(\"--rpc\") .arg(format!(\"127.0.0.1:{}\", rpc_port)) .arg(\"--p2p-port\") .arg(p2p_port.to_string()) .arg(\"--data-dir\") .arg(&data_dir) .arg(\"--validator-seed\") .arg(validator_seed) .arg(\"--eth-rpc-port\") .arg(\"0\")",
+            "cmd.arg(\"--seeds-file\").arg(seeds);",
+            "cmd.arg(\"--genesis\").arg(genesis);",
+            "if config.role == \"worker\" && config.model_path.is_some() { cmd.arg(\"--community-mode\"); }",
+            "if let Some(model) = &config.model_path { cmd.arg(\"--model\").arg(model); }"
+          ],
+          "absent": [
+            "\"--stake\"",
+            "\"--min-stake\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "desktop worker on Windows without HOME",
+      "supervisor": "v0.7 desktop app",
+      "argv": [
+        "--rpc",
+        "127.0.0.1:9090",
+        "--p2p-port",
+        "9091",
+        "--data-dir",
+        ".\\.arc",
+        "--validator-seed",
+        "sunset quantum orbit rally window cabin echo velvet amber planet hazard tide",
+        "--eth-rpc-port",
+        "0",
+        "--seeds-file",
+        "C:\\Program Files\\ARC Node\\resources\\testnet-seeds.txt",
+        "--genesis",
+        "C:\\Program Files\\ARC Node\\resources\\genesis.toml",
+        "--community-mode",
+        "--model",
+        "C:\\Users\\ada\\.arc\\models\\standard.gguf"
+      ],
+      "expect": {
+        "kind": "desktop",
+        "community_mode": true,
+        "model": true
+      },
+      "source_checks": [
+        {
+          "path": "desktop/src-tauri/src/node_manager.rs",
+          "contains": [
+            "cmd.arg(\"--rpc\") .arg(format!(\"127.0.0.1:{}\", rpc_port)) .arg(\"--p2p-port\") .arg(p2p_port.to_string()) .arg(\"--data-dir\") .arg(&data_dir) .arg(\"--validator-seed\") .arg(validator_seed) .arg(\"--eth-rpc-port\") .arg(\"0\")",
+            "cmd.arg(\"--seeds-file\").arg(seeds);",
+            "cmd.arg(\"--genesis\").arg(genesis);",
+            "if config.role == \"worker\" && config.model_path.is_some() { cmd.arg(\"--community-mode\"); }",
+            "if let Some(model) = &config.model_path { cmd.arg(\"--model\").arg(model); }"
+          ],
+          "absent": [
+            "\"--stake\"",
+            "\"--min-stake\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "launchd observer",
+      "supervisor": "install-community-node.sh launchd plist (relaunched by arc-auto-update.sh)",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "/Users/ada/.arc/seeds.txt",
+        "--genesis",
+        "/Users/ada/.arc/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/Users/ada/.arc/data",
+        "--community-mode"
+      ],
+      "expect": {
+        "kind": "headless",
+        "community_mode": true,
+        "model": false
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-community-node.sh",
+          "contains": [
+            "<string>$ARC_DIR/bin/arc-node</string> <string>--rpc</string><string>0.0.0.0:$RPC_PORT</string> <string>--p2p-port</string><string>$P2P_PORT</string> <string>--seeds-file</string><string>$ARC_DIR/seeds.txt</string> <string>--genesis</string><string>$ARC_DIR/genesis.toml</string> <string>--validator-seed</string><string>$VALIDATOR_SEED</string> <string>--stake</string><string>0</string> <string>--min-stake</string><string>0</string> <string>--eth-rpc-port</string><string>0</string> <string>--data-dir</string><string>$ARC_DIR/data</string> $MODEL_PLIST_ARGS <string>--community-mode</string>",
+            "MODEL_PLIST_ARGS=\"<string>--model</string><string>$MODEL_PATH</string>\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "launchd worker",
+      "supervisor": "install-community-node.sh launchd plist",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "/Users/ada/.arc/seeds.txt",
+        "--genesis",
+        "/Users/ada/.arc/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/Users/ada/.arc/data",
+        "--model",
+        "/Users/ada/.arc/model.gguf",
+        "--community-mode"
+      ],
+      "expect": {
+        "kind": "headless",
+        "community_mode": true,
+        "model": true
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-community-node.sh",
+          "contains": [
+            "<string>$ARC_DIR/bin/arc-node</string> <string>--rpc</string><string>0.0.0.0:$RPC_PORT</string> <string>--p2p-port</string><string>$P2P_PORT</string> <string>--seeds-file</string><string>$ARC_DIR/seeds.txt</string> <string>--genesis</string><string>$ARC_DIR/genesis.toml</string> <string>--validator-seed</string><string>$VALIDATOR_SEED</string> <string>--stake</string><string>0</string> <string>--min-stake</string><string>0</string> <string>--eth-rpc-port</string><string>0</string> <string>--data-dir</string><string>$ARC_DIR/data</string> $MODEL_PLIST_ARGS <string>--community-mode</string>",
+            "MODEL_PLIST_ARGS=\"<string>--model</string><string>$MODEL_PATH</string>\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "systemd observer",
+      "supervisor": "install-community-node.sh systemd unit (relaunched by arc-auto-update.sh)",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "/home/ops/.arc/seeds.txt",
+        "--genesis",
+        "/home/ops/.arc/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/home/ops/.arc/data",
+        "--community-mode"
+      ],
+      "expect": {
+        "kind": "headless",
+        "community_mode": true,
+        "model": false
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-community-node.sh",
+          "contains": [
+            "ExecStart=$ARC_DIR/bin/arc-node \\\\ --rpc 0.0.0.0:$RPC_PORT \\\\ --p2p-port $P2P_PORT \\\\ --seeds-file $ARC_DIR/seeds.txt \\\\ --genesis $ARC_DIR/genesis.toml \\\\ --validator-seed $VALIDATOR_SEED \\\\ --stake 0 --min-stake 0 \\\\ --eth-rpc-port 0 \\\\ --data-dir $ARC_DIR/data \\\\ $MODEL_SYSTEMD_ARGS \\\\ --community-mode",
+            "MODEL_SYSTEMD_ARGS=\"--model $MODEL_PATH\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "systemd worker",
+      "supervisor": "install-community-node.sh systemd unit",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "/home/ops/.arc/seeds.txt",
+        "--genesis",
+        "/home/ops/.arc/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/home/ops/.arc/data",
+        "--model",
+        "/home/ops/.arc/model.gguf",
+        "--community-mode"
+      ],
+      "expect": {
+        "kind": "headless",
+        "community_mode": true,
+        "model": true
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-community-node.sh",
+          "contains": [
+            "ExecStart=$ARC_DIR/bin/arc-node \\\\ --rpc 0.0.0.0:$RPC_PORT \\\\ --p2p-port $P2P_PORT \\\\ --seeds-file $ARC_DIR/seeds.txt \\\\ --genesis $ARC_DIR/genesis.toml \\\\ --validator-seed $VALIDATOR_SEED \\\\ --stake 0 --min-stake 0 \\\\ --eth-rpc-port 0 \\\\ --data-dir $ARC_DIR/data \\\\ $MODEL_SYSTEMD_ARGS \\\\ --community-mode",
+            "MODEL_SYSTEMD_ARGS=\"--model $MODEL_PATH\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "no-root observer",
+      "supervisor": "install-community-node.sh no-root Linux fallback",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "/home/ops/.arc/seeds.txt",
+        "--genesis",
+        "/home/ops/.arc/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/home/ops/.arc/data"
+      ],
+      "expect": {
+        "kind": "headless",
+        "community_mode": false,
+        "model": false
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-community-node.sh",
+          "contains": [
+            "nohup \"$ARC_DIR/bin/arc-node\" \\ --rpc \"0.0.0.0:$RPC_PORT\" --p2p-port \"$P2P_PORT\" \\ --seeds-file \"$ARC_DIR/seeds.txt\" --genesis \"$ARC_DIR/genesis.toml\" \\ --validator-seed \"$VALIDATOR_SEED\" --stake 0 --min-stake 0 \\ --eth-rpc-port 0 --data-dir \"$ARC_DIR/data\" \\ $MODEL_SHELL_ARGS > \"$ARC_DIR/node.log\" 2>&1 &",
+            "MODEL_SHELL_ARGS=\"--model \\\"$MODEL_PATH\\\"\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "no-root worker",
+      "supervisor": "install-community-node.sh no-root Linux fallback (unquoted args keep the quotes)",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "/home/ops/.arc/seeds.txt",
+        "--genesis",
+        "/home/ops/.arc/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/home/ops/.arc/data",
+        "--model",
+        "\"/home/ops/.arc/model.gguf\""
+      ],
+      "expect": {
+        "kind": "headless",
+        "community_mode": false,
+        "model": true
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-community-node.sh",
+          "contains": [
+            "nohup \"$ARC_DIR/bin/arc-node\" \\ --rpc \"0.0.0.0:$RPC_PORT\" --p2p-port \"$P2P_PORT\" \\ --seeds-file \"$ARC_DIR/seeds.txt\" --genesis \"$ARC_DIR/genesis.toml\" \\ --validator-seed \"$VALIDATOR_SEED\" --stake 0 --min-stake 0 \\ --eth-rpc-port 0 --data-dir \"$ARC_DIR/data\" \\ $MODEL_SHELL_ARGS > \"$ARC_DIR/node.log\" 2>&1 &",
+            "MODEL_SHELL_ARGS=\"--model \\\"$MODEL_PATH\\\"\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "no-service observer",
+      "supervisor": "install-community-node.sh --no-service",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "/home/ops/.arc/seeds.txt",
+        "--genesis",
+        "/home/ops/.arc/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/home/ops/.arc/data",
+        "--model",
+        ""
+      ],
+      "expect": {
+        "kind": "headless",
+        "community_mode": false,
+        "model": false
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-community-node.sh",
+          "contains": [
+            "nohup \"$ARC_DIR/bin/arc-node\" \\ --rpc \"0.0.0.0:$RPC_PORT\" --p2p-port \"$P2P_PORT\" \\ --seeds-file \"$ARC_DIR/seeds.txt\" --genesis \"$ARC_DIR/genesis.toml\" \\ --validator-seed \"$VALIDATOR_SEED\" --stake 0 --min-stake 0 \\ --eth-rpc-port 0 --data-dir \"$ARC_DIR/data\" \\ --model \"$MODEL_PATH\" > \"$ARC_DIR/node.log\" 2>&1 &"
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "no-service worker",
+      "supervisor": "install-community-node.sh --no-service",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "/home/ops/.arc/seeds.txt",
+        "--genesis",
+        "/home/ops/.arc/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/home/ops/.arc/data",
+        "--model",
+        "/home/ops/.arc/model.gguf"
+      ],
+      "expect": {
+        "kind": "headless",
+        "community_mode": false,
+        "model": true
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-community-node.sh",
+          "contains": [
+            "nohup \"$ARC_DIR/bin/arc-node\" \\ --rpc \"0.0.0.0:$RPC_PORT\" --p2p-port \"$P2P_PORT\" \\ --seeds-file \"$ARC_DIR/seeds.txt\" --genesis \"$ARC_DIR/genesis.toml\" \\ --validator-seed \"$VALIDATOR_SEED\" --stake 0 --min-stake 0 \\ --eth-rpc-port 0 --data-dir \"$ARC_DIR/data\" \\ --model \"$MODEL_PATH\" > \"$ARC_DIR/node.log\" 2>&1 &"
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "auto-update.sh re-exec of a no-service observer",
+      "supervisor": "scripts/auto-update.sh (manual), whitespace re-split drops the empty value",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "/home/ops/.arc/seeds.txt",
+        "--genesis",
+        "/home/ops/.arc/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/home/ops/.arc/data",
+        "--model"
+      ],
+      "expect": {
+        "error": "MissingValue(\"--model\")"
+      },
+      "source_checks": [
+        {
+          "path": "scripts/auto-update.sh",
+          "contains": [
+            "pgrep -f 'arc-node.*(--validator-seed|--seeds-file)'",
+            "args=\"$(echo \"$cmdline\" | cut -d' ' -f2-)\"",
+            "nohup \"$old_bin\" $args"
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "auto-update.sh re-exec of a desktop observer",
+      "supervisor": "scripts/auto-update.sh (manual), whitespace re-split splits the phrase",
+      "argv": [
+        "--rpc",
+        "127.0.0.1:9090",
+        "--p2p-port",
+        "9091",
+        "--data-dir",
+        "/Users/ada/.arc",
+        "--validator-seed",
+        "sunset",
+        "quantum",
+        "orbit",
+        "rally",
+        "window",
+        "cabin",
+        "echo",
+        "velvet",
+        "amber",
+        "planet",
+        "hazard",
+        "tide",
+        "--eth-rpc-port",
+        "0",
+        "--seeds-file",
+        "/Applications/ARC",
+        "Node.app/Contents/Resources/resources/testnet-seeds.txt",
+        "--genesis",
+        "/Applications/ARC",
+        "Node.app/Contents/Resources/resources/genesis.toml"
+      ],
+      "expect": {
+        "error": "UnknownArgument(\"<a positional value>\")"
+      },
+      "source_checks": [
+        {
+          "path": "scripts/auto-update.sh",
+          "contains": [
+            "pgrep -f 'arc-node.*(--validator-seed|--seeds-file)'",
+            "args=\"$(echo \"$cmdline\" | cut -d' ' -f2-)\"",
+            "nohup \"$old_bin\" $args"
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "sero-quickstart",
+      "supervisor": "scripts/sero-quickstart.sh (manual, foreground)",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--p2p-port",
+        "9945",
+        "--seeds-file",
+        "testnet-seeds.txt",
+        "--genesis",
+        "genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0",
+        "--eth-rpc-port",
+        "0",
+        "--data-dir",
+        "/home/ops/.arc-quickstart/data",
+        "--model",
+        "/home/ops/.arc-quickstart/tinyllama-1.1b-chat.gguf"
+      ],
+      "launcher": ".arc-quickstart/arc-node",
+      "expect": {
+        "kind": "headless",
+        "community_mode": false,
+        "model": true,
+        "layout_refused": true
+      },
+      "source_checks": [
+        {
+          "path": "scripts/sero-quickstart.sh",
+          "contains": [
+            "exec ./arc-node \\ --rpc 0.0.0.0:9944 \\ --p2p-port 9945 \\ --seeds-file testnet-seeds.txt \\ --genesis genesis.toml \\ --validator-seed \"$VALIDATOR_SEED\" \\ --stake 0 \\ --min-stake 0 \\ --eth-rpc-port 0 \\ --data-dir \"${ARC_DIR}/data\" \\ --model \"$MODEL_PATH\""
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "install-node.sh validator",
+      "supervisor": "scripts/install-node.sh (built from source)",
+      "argv": [
+        "--config",
+        "/home/ops/.arc-chain/config.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--seeds-file",
+        "/home/ops/.arc-chain/arc-chain/testnet-seeds.txt",
+        "--genesis",
+        "/home/ops/.arc-chain/arc-chain/genesis.toml"
+      ],
+      "expect": {
+        "error": "UnknownArgument(\"--config\")"
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-node.sh",
+          "contains": [
+            "<string>--config</string> <string>${CONFIG_ABS}</string> <string>--validator-seed</string>"
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "install-inference-node.sh validator",
+      "supervisor": "scripts/install-inference-node.sh (built from source)",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--seeds-file",
+        "/home/ops/arc-chain/testnet-seeds.txt",
+        "--genesis",
+        "/home/ops/arc-chain/genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--model",
+        "/home/ops/arc-chain/model.gguf",
+        "--stake",
+        "5000000"
+      ],
+      "expect": {
+        "error": "Missing(\"--data-dir\")"
+      },
+      "source_checks": [
+        {
+          "path": "scripts/install-inference-node.sh",
+          "contains": [
+            "--model \"$MODEL_PATH\" \\\\ --stake 5000000"
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    },
+    {
+      "name": "join-inference.sh",
+      "supervisor": "scripts/join-inference.sh (built from source, foreground)",
+      "argv": [
+        "--rpc",
+        "0.0.0.0:9944",
+        "--seeds-file",
+        "testnet-seeds.txt",
+        "--genesis",
+        "genesis.toml",
+        "--validator-seed",
+        "community-ops-0a1b2c3d",
+        "--model",
+        "/home/ops/arc-chain/model.gguf",
+        "--stake",
+        "0",
+        "--min-stake",
+        "0"
+      ],
+      "expect": {
+        "error": "Missing(\"--data-dir\")"
+      },
+      "source_checks": [
+        {
+          "path": "scripts/join-inference.sh",
+          "contains": [
+            "--validator-seed \"$SEED\" \\ --model \"$MODEL_PATH\" \\ --stake 0 \\ --min-stake 0"
+          ]
+        }
+      ],
+      "tags": [
+        "v0.6.0",
+        "v0.7.0",
+        "v0.7.1",
+        "v0.7.2",
+        "v0.7.3",
+        "v0.7.4",
+        "v0.7.5",
+        "v0.7.6",
+        "v0.7.7",
+        "v0.7.10",
+        "v0.7.11"
+      ]
+    }
+  ]
+}
