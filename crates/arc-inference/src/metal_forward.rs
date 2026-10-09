@@ -1241,7 +1241,7 @@ mod tests {
                 values[row.clone()].copy_from_slice(&from_values[row.clone()]);
             }
         };
-        other.edit(&replace);
+        other.edit(replace);
         replace(&mut other_reference);
         let want = model.forward_one_token(13, &mut other_reference);
         assert_eq!(gpu.forward_one_token(13, &mut other), want);
