@@ -5,7 +5,7 @@ same answer, byte for byte, on different computers. The test runs one real
 7-billion-parameter model on four CPU platforms and checks that every run
 produces an identical transcript.
 
-**Status:** measured 2026-10-06 in workflow run [37467005539](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539) on commit `be37100b2`. On the full 16 x 32 workload, every completed run produced the same transcript, SHA-256 `d2c8c82b3a82beb166559b78ad26a748cbd6395c2cf13e8f012b03f90fa92872`. That covers Linux, Windows and Intel macOS with both the scalar and the AVX2 kernel, and Apple Silicon with the scalar kernel. Apple Silicon's NEON kernel matched on the smaller smoke test and on 3 of the 16 full-workload prompts; its full-workload run was deferred to free shared CI runners.
+**Status:** measured in workflow run [37467005539](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539) on commit `be37100b2`: attempts 1 to 3 on 2026-10-06 and attempt 4 on 2026-10-09. In attempt 4 the compare job ([job 113664110749](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539/job/113664110749), finished 2026-10-09T04:04:44Z) passed: **8 of 8** platform/kernel pairs produced the same transcript on the full 16 x 32 workload, SHA-256 `d2c8c82b3a82beb166559b78ad26a748cbd6395c2cf13e8f012b03f90fa92872` (130,821 bytes). That covers Linux, Windows and Intel macOS with both the scalar and the AVX2 kernel, and Apple Silicon with both the scalar and the NEON kernel. The NEON kernel accepted 176,175 of 176,175 projections. "Apple Silicon" here is one GitHub-hosted virtual Apple M1 runner with 7 GB of memory. The NEON shards 0 to 4 had been cancelled on 2026-10-06 to free shared CI runners and were re-run in attempt 4; shard 5 is from attempt 1.
 
 ## What is compared
 
@@ -48,15 +48,17 @@ the recorded loop is the engine's own generation loop.
 ## Results
 
 Full workload: 16 prompts x 32 new tokens, greedy, in
-[run 37467005539](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539), attempts 1-3 on
-2026-10-06, on commit `be37100b2`. The Apple Silicon legs ran as six prompt shards per kernel. Two
+[run 37467005539](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539), attempts 1-3 on 2026-10-06 and attempt 4 on
+2026-10-09, on commit `be37100b2`; the compare job that produced the table is
+[job 113664110749](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539/job/113664110749). The Apple Silicon legs ran as six prompt shards per kernel. Two
 scalar shards were re-run in later attempts of the same run: one lost its runner to a shutdown signal
-before producing output, and the other was stopped when the NEON shards were cancelled.
+before producing output, and the other was stopped when the NEON shards were cancelled. The NEON
+shards 0 to 4 were cancelled on 2026-10-06 and re-run in attempt 4 (shard 5 completed in attempt 1).
 
 | Platform (GitHub runner) | CPU reported by the runner | Kernel | Workload | Same transcript | Decode tok/s (CI runner) | SIMD projections accepted |
 | --- | --- | --- | --- | --- | --- | --- |
 | macOS 15, Apple Silicon (`macos-15`) | Apple M1 (Virtual) | scalar (`scalar-i8xi64`) | full, all 16 prompts | yes | 0.016 | not used |
-| macOS 15, Apple Silicon (`macos-15`) | Apple M1 (Virtual) | NEON (`neon-sdot-limb`) | smoke test; full-workload prompts 13-15 | yes | 0.015 | 9,000 of 9,000 (smoke); 32,850 of 32,850 (prompts 13-15) |
+| macOS 15, Apple Silicon (`macos-15`) | Apple M1 (Virtual) | NEON (`neon-sdot-limb`) | full, all 16 prompts | yes | 0.017 | 176,175 of 176,175 |
 | macOS 15, Intel (`macos-15-intel`) | Intel Core i7-8700B @ 3.20GHz | scalar (`scalar-i8xi64`) | full | yes | 0.65 | not used |
 | macOS 15, Intel (`macos-15-intel`) | Intel Core i7-8700B @ 3.20GHz | AVX2 (`avx2-limb`) | full | yes | 0.81 | 176,175 of 176,175 |
 | Linux, Ubuntu 24.04 (`ubuntu-24.04`) | AMD EPYC 9V74 | scalar (`scalar-i8xi64`) | full | yes | 0.77 | not used |
@@ -70,12 +72,22 @@ before producing output, and the other was stopped when the NEON shards were can
   `9867f7d8d0cceb1a1cc3474f5449060038b3e75a25cb9b7a02048ef496263dd3`. The RoPE tables come
   from each platform's math library, and they match on all four.
 - The engine API cross-check passed on every platform and kernel that ran the first prompt.
-- The run's compare job reports the Apple Silicon NEON pair as incomplete because its
-  full-workload shards were cancelled; every completed cell matches. The smoke test, 2 prompts x 4
-  tokens, matched on all eight cells: [run 37458030569](https://github.com/FerrumVir/arc-chain/actions/runs/37458030569).
+- The compare job of attempt 4 ([job 113664110749](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539/job/113664110749)) passed with no problems: 8 of 8 pairs
+  identical. The compare jobs of attempts 1 to 3 reported the Apple Silicon NEON pair as incomplete
+  because its shards 0 to 4 had been cancelled; attempt 4 re-ran exactly those five shards. The smoke
+  test, 2 prompts x 4 tokens, matched on all eight cells: [run 37458030569](https://github.com/FerrumVir/arc-chain/actions/runs/37458030569).
+- Checked outside CI on 2026-10-09: every artifact zip of run 37467005539 was verified against the
+  digest GitHub reports, and the six Apple Silicon NEON shard transcripts were joined in shard order,
+  exactly as the compare job joins them, and hashed with `shasum -a 256`:
+  `d2c8c82b3a82beb166559b78ad26a748cbd6395c2cf13e8f012b03f90fa92872`, 130,821 bytes, equal to the
+  published expected hash and byte-identical (`cmp`) to the Ubuntu scalar, Windows AVX2 and Intel macOS
+  AVX2 transcripts. Each NEON shard's header and every one of its prompt blocks equal the x86
+  transcript's, and the workflow's own `compare_results.py`, re-run on the downloaded artifacts, also
+  reports PASS, 8 of 8.
 - Decode tokens per second are forward passes per second on GitHub-hosted runners. The Apple
   Silicon runner has 7 GB of memory and swaps the ~7.3 GiB model, so its rate (about one token a
-  minute) measures swapping, not the chip.
+  minute) measures swapping, not the chip. NEON and scalar ran at about the same rate there (0.017
+  and 0.016), so this run shows that the NEON kernel gives the same answer, not that it is faster.
 
 ## How CI runs it
 
@@ -165,6 +177,10 @@ computer.
 - **Four runner types.** Other CPUs (for example RISC-V or 32-bit targets) are
   untested. The SIMD kernel is NEON dotprod on arm64 and AVX2 on x86_64; on
   arm64 the attention dot product also uses an exact NEON path in both jobs.
+  "Apple Silicon" is one GitHub-hosted virtual Apple M1 runner with 7 GB of
+  memory; other Apple chips are untested.
+- **One execution profile.** The run uses `arc.gguf-llama.i8-per-row.rope-interleaved.v1`;
+  other execution profiles are not part of it.
 - **Load-time floating point.** The engine's arithmetic is integer-only, but
   model loading uses floating point. Dequantizing GGUF blocks, requantizing
   rows to INT8 and converting embeddings and norms to Q16 use only exactly
