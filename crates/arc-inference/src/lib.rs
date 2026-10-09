@@ -28,6 +28,9 @@ pub mod modern;
 pub mod q4_engine;
 #[cfg(unix)]
 pub mod row_service;
+/// Lossless speculative decoding: drafters propose, one exact multi-row pass
+/// of the target verifies, and the output equals plain decoding bit for bit.
+pub mod speculative;
 pub mod streaming;
 /// Private-cohort, within-query tensor row partitioning.  This deliberately
 /// has no dependency on validator RPC or the public layer-pipeline endpoint.
