@@ -71,8 +71,8 @@ use std::time::{Duration, Instant};
 
 use metal::{
     Buffer, BufferRef, CommandBufferRef, CommandQueue, CommandQueueRef, CompileOptions,
-    ComputeCommandEncoderRef, ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily,
-    MTLResourceOptions, MTLSize, SharedEvent, SharedEventRef,
+    ComputeCommandEncoderRef, ComputePipelineState, Device, DeviceRef, MTLCommandBufferStatus,
+    MTLGPUFamily, MTLResourceOptions, MTLSize, SharedEvent, SharedEventRef,
 };
 use objc::Message;
 use objc::rc::autoreleasepool;
@@ -123,7 +123,7 @@ pub const DEFAULT_TILE: Tile = Tile {
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Weights per 16-byte block.
-const BLOCK_WEIGHTS: usize = 8;
+pub(crate) const BLOCK_WEIGHTS: usize = 8;
 const BLOCK_BYTES: usize = 16;
 const SCRATCH_POOL: usize = 8;
 const SELF_TEST_SEED: u64 = 0x00A2_C0DE_5EED_0016;
@@ -322,6 +322,11 @@ impl ResidentI16 {
     pub fn storage(&self) -> Storage {
         self.storage
     }
+
+    /// 16-byte weight blocks per row.
+    pub(crate) fn blocks(&self) -> usize {
+        self.blocks
+    }
 }
 
 /// Per-call device buffers: digit planes in, dots out.
@@ -461,7 +466,7 @@ fn tile_is_valid(tile: Tile) -> bool {
 
 /// GPU execution time of a completed command buffer, in seconds (read as in
 /// `metal_exact`: metal 0.29 has no accessor for these properties).
-fn gpu_seconds(commands: &CommandBufferRef) -> f64 {
+pub(crate) fn gpu_seconds(commands: &CommandBufferRef) -> f64 {
     let read = |property: &str| -> f64 {
         // SAFETY: GPUStartTime and GPUEndTime are read-only CFTimeInterval
         // (f64) properties of MTLCommandBuffer, and the buffer has completed.
@@ -518,6 +523,37 @@ pub fn split_planes(input: &[i64], planes: &mut [i8], stride: usize) -> Option<u
     Some(used)
 }
 
+/// Write every head's vector of `phase` as seven digit planes into `digits`
+/// (head h's planes start at `h * 7 * stride` bytes, `stride = blocks * 8`)
+/// and return the most planes any head uses.
+///
+/// # Safety
+/// `digits` must be a shared buffer of at least `heads * 7 * stride` bytes
+/// that no command buffer is reading or writing.
+pub(crate) unsafe fn split_heads_into(
+    digits: &BufferRef,
+    phase: &HeadPhase<'_>,
+    inputs: &[i64],
+) -> Result<usize, Refusal> {
+    let stride = phase.matrix.blocks * BLOCK_WEIGHTS;
+    let per_head = MAX_PLANES * stride;
+    if phase.heads.checked_mul(phase.matrix.n_cols) != Some(inputs.len()) {
+        return Err(Refusal::Shape);
+    }
+    // SAFETY: guaranteed by the caller.
+    let planes = unsafe {
+        std::slice::from_raw_parts_mut(digits.contents().cast::<i8>(), phase.heads * per_head)
+    };
+    let mut used = 1;
+    for (input, head_planes) in inputs
+        .chunks_exact(phase.matrix.n_cols)
+        .zip(planes.chunks_exact_mut(per_head))
+    {
+        used = used.max(split_planes(input, head_planes, stride).ok_or(Refusal::DigitSplit)?);
+    }
+    Ok(used)
+}
+
 /// Independent reference: the exact dot of every row in i128.
 pub fn reference_dots(weights: &[u8], n_cols: usize, input: &[i64]) -> Vec<i128> {
     weights
@@ -532,10 +568,10 @@ pub fn reference_dots(weights: &[u8], n_cols: usize, input: &[i64]) -> Vec<i128>
 }
 
 /// SplitMix64, for the self-test inputs.
-struct SplitMix64(u64);
+pub(crate) struct SplitMix64(pub(crate) u64);
 
 impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -544,14 +580,14 @@ impl SplitMix64 {
     }
 
     /// Uniform in `[-limit, limit]`.
-    fn symmetric(&mut self, limit: i64) -> i64 {
+    pub(crate) fn symmetric(&mut self, limit: i64) -> i64 {
         let span = 2 * limit as u64 + 1;
         (self.next_u64() % span) as i64 - limit
     }
 }
 
 /// Little-endian bytes of `values`.
-fn le_bytes(values: &[i16]) -> Vec<u8> {
+pub(crate) fn le_bytes(values: &[i16]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
@@ -992,6 +1028,21 @@ impl MetalExactI16 {
         })
     }
 
+    /// The engine's device (crate use: the MLA attention kernels share it).
+    pub(crate) fn device(&self) -> &DeviceRef {
+        &self.device
+    }
+
+    /// The engine's command queue.
+    pub(crate) fn queue(&self) -> &CommandQueueRef {
+        &self.queue
+    }
+
+    /// The simdgroup width every pipeline of this engine runs with.
+    pub(crate) fn simd_width(&self) -> u64 {
+        self.simd_width
+    }
+
     /// Whether two-phase head batches run in one command buffer here: the
     /// handoff reproduced the reference at start-up, and none has timed out or
     /// failed since. Otherwise [`Submission::OneCommandBuffer`] runs as
@@ -1019,7 +1070,11 @@ impl MetalExactI16 {
             .get_or_insert(reason);
     }
 
-    fn heads_pipeline(&self, planes: usize, tile: Tile) -> Result<&ComputePipelineState, Refusal> {
+    pub(crate) fn heads_pipeline(
+        &self,
+        planes: usize,
+        tile: Tile,
+    ) -> Result<&ComputePipelineState, Refusal> {
         self.heads_pipelines
             .get(&(planes, tile.rows_per_simdgroup, tile.mul16))
             .ok_or(Refusal::Shape)
@@ -1027,7 +1082,7 @@ impl MetalExactI16 {
 
     /// A head phase's shape against `out_len` outputs: the stack fits the
     /// matrix, the digit buffer fits the device, and the tile is valid.
-    fn check_heads_shape(
+    pub(crate) fn check_heads_shape(
         &self,
         phase: &HeadPhase<'_>,
         out_len: usize,
@@ -1054,7 +1109,7 @@ impl MetalExactI16 {
 
     /// The conditions of one projection per head, in its order: shape, then
     /// every head's guard.
-    fn check_heads(
+    pub(crate) fn check_heads(
         &self,
         phase: &HeadPhase<'_>,
         inputs: &[i64],
@@ -1079,26 +1134,12 @@ impl MetalExactI16 {
         phase: &HeadPhase<'_>,
         inputs: &[i64],
     ) -> Result<usize, Refusal> {
-        let stride = phase.matrix.blocks * BLOCK_WEIGHTS;
-        let per_head = MAX_PLANES * stride;
         // SAFETY: this call owns `scratch` (taken from the pool), its digit
-        // buffer holds at least `heads * per_head` bytes (`take_scratch` with
-        // `heads * blocks`), and no command buffer reads it now: none uses it
-        // yet, or the one that does waits at an event until the host is done.
-        let planes = unsafe {
-            std::slice::from_raw_parts_mut(
-                scratch.digits.contents().cast::<i8>(),
-                phase.heads * per_head,
-            )
-        };
-        let mut used = 1;
-        for (input, head_planes) in inputs
-            .chunks_exact(phase.matrix.n_cols)
-            .zip(planes.chunks_exact_mut(per_head))
-        {
-            used = used.max(split_planes(input, head_planes, stride).ok_or(Refusal::DigitSplit)?);
-        }
-        Ok(used)
+        // buffer holds at least `heads * 7 * blocks * 8` bytes (`take_scratch`
+        // with `heads * blocks`), and no command buffer reads it now: none
+        // uses it yet, or the one that does waits at an event until the host
+        // is done.
+        unsafe { split_heads_into(&scratch.digits, phase, inputs) }
     }
 
     fn encode_heads(
@@ -1107,6 +1148,27 @@ impl MetalExactI16 {
         pipeline: &ComputePipelineState,
         phase: &HeadPhase<'_>,
         scratch: &Scratch,
+        tile: Tile,
+    ) {
+        self.encode_heads_with(
+            encoder,
+            pipeline,
+            phase,
+            &scratch.digits,
+            &scratch.out,
+            tile,
+        );
+    }
+
+    /// Encode one head phase reading `digits` (every head's seven planes, as
+    /// [`split_heads_into`] writes them) and writing `out`.
+    pub(crate) fn encode_heads_with(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pipeline: &ComputePipelineState,
+        phase: &HeadPhase<'_>,
+        digits: &BufferRef,
+        out: &BufferRef,
         tile: Tile,
     ) {
         let fit = (pipeline.max_total_threads_per_threadgroup() / self.simd_width).max(1);
@@ -1121,8 +1183,8 @@ impl MetalExactI16 {
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(&phase.matrix.weights), 0);
-        encoder.set_buffer(1, Some(&scratch.digits), 0);
-        encoder.set_buffer(2, Some(&scratch.out), 0);
+        encoder.set_buffer(1, Some(digits), 0);
+        encoder.set_buffer(2, Some(out), 0);
         encoder.set_bytes(
             3,
             std::mem::size_of::<HeadsParams>() as u64,

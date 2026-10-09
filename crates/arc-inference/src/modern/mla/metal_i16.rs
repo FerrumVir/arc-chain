@@ -57,7 +57,26 @@
 //! head would refuse anywhere, the batch declines without writing, and the
 //! per-head loop computes the layer, so it returns the CPU's error.
 //!
-//! Wiring this as a worker default is a separate, reviewed step.
+//! # Attention on the GPU
+//!
+//! With a fifth switch, `ARC_METAL_EXACT_I16_ATTEND=1` or
+//! [`set_metal_exact_i16_attend`] (also off by default), an INT16 layer's
+//! heads run on the GPU from end to end: [`try_attend`] encodes every head's
+//! `wk_b` projection and epilogue, the absorbed attention over the latent
+//! cache (`ops::mla_attend`: scores, the two-pass softmax with the profile's
+//! exp table, the weighted latent sum and its truncating division) and every
+//! head's `wv_b` projection and epilogue in one command buffer per layer,
+//! with no host step between them ([`arc_gpu::metal_exact_mla`], which holds
+//! the kernels and the proof of their bounds). The RoPE of each head's query
+//! is the CPU's own `rope_interleaved`, computed before the layer is encoded.
+//! The device keeps a copy of the latent cache ([`KvMirror`], inside the
+//! [`super::model::StageCache`] it copies): the cache only appends, so each
+//! layer copies only the rows added since its previous call. If the CPU would
+//! refuse anything in the layer, the GPU sets a status bit, the layer
+//! declines without writing, and the head batch or the per-head loop runs, so
+//! the caller gets the CPU's error.
+//!
+//! Wiring any of this as a worker default is a separate, reviewed step.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -66,15 +85,19 @@ use std::sync::{Arc, OnceLock};
 
 use arc_gpu::metal_exact::Storage;
 use arc_gpu::metal_exact_i16::{HeadPhase, MetalExactI16, Refusal, ResidentI16, Submission};
+use arc_gpu::metal_exact_mla::{DeviceLatentCache, MetalExactMla, MlaLayer, MlaProbe, MlaRefusal};
 use rayon::prelude::*;
 
 use super::model::StageModel;
+use super::ops::LatentCache;
 use super::precision::I16Weights;
 use crate::modern::ModernError;
 use crate::modern::arith::dyadic_epilogue;
+use crate::modern::tables::EXP_TABLE;
 
 static REQUESTED: AtomicBool = AtomicBool::new(false);
 static HEADS_REQUESTED: AtomicBool = AtomicBool::new(false);
+static ATTEND_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Index into `Submission::ALL`, initially `Submission::DEFAULT`'s.
 static HEADS_SUBMISSION: AtomicU8 = AtomicU8::new(DEFAULT_SUBMISSION);
 /// `Submission::DEFAULT`'s place in `Submission::ALL`.
@@ -85,6 +108,7 @@ const _: () = assert!(matches!(
 ));
 static ENV_INIT: OnceLock<()> = OnceLock::new();
 static ENGINE: OnceLock<Result<Arc<MetalExactI16>, String>> = OnceLock::new();
+static MLA: OnceLock<Result<Arc<MetalExactMla>, String>> = OnceLock::new();
 
 static ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static ACCEPTED: AtomicU64 = AtomicU64::new(0);
@@ -98,6 +122,11 @@ static HEADS_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 static HEADS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static HEADS_OUTSIDE_SCOPE: AtomicU64 = AtomicU64::new(0);
 static HEADS_DECLINED: AtomicU64 = AtomicU64::new(0);
+static ATTEND_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
+static ATTEND_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static ATTEND_OUTSIDE_SCOPE: AtomicU64 = AtomicU64::new(0);
+static ATTEND_DECLINED: AtomicU64 = AtomicU64::new(0);
+static ATTEND_KV_ROWS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// The residency scope active on this thread, set only by
@@ -112,6 +141,9 @@ fn env_init() {
         }
         if std::env::var("ARC_METAL_EXACT_I16_HEADS").as_deref() == Ok("1") {
             HEADS_REQUESTED.store(true, Ordering::Relaxed);
+        }
+        if std::env::var("ARC_METAL_EXACT_I16_ATTEND").as_deref() == Ok("1") {
+            ATTEND_REQUESTED.store(true, Ordering::Relaxed);
         }
     });
 }
@@ -143,6 +175,20 @@ pub fn metal_exact_i16_heads_requested() -> bool {
     HEADS_REQUESTED.load(Ordering::Relaxed)
 }
 
+/// Turn attention on the GPU on or off process-wide. Default off; an explicit
+/// call overrides `ARC_METAL_EXACT_I16_ATTEND`. It also needs the INT16 switch
+/// and a residency scope.
+pub fn set_metal_exact_i16_attend(enabled: bool) {
+    env_init();
+    ATTEND_REQUESTED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the attention switch is on.
+pub fn metal_exact_i16_attend_requested() -> bool {
+    env_init();
+    ATTEND_REQUESTED.load(Ordering::Relaxed)
+}
+
 /// How head batches are submitted (default `Submission::DEFAULT`, a command
 /// buffer per phase).
 pub fn set_metal_i16_heads_submission(submission: Submission) {
@@ -163,6 +209,15 @@ pub fn metal_i16_engine() -> Result<Arc<MetalExactI16>, String> {
     ENGINE
         .get_or_init(|| MetalExactI16::new().map(Arc::new))
         .clone()
+}
+
+/// The process-wide attention engine on [`metal_i16_engine`]'s device, with
+/// the profile's exp table, created and self-tested on first use.
+pub fn metal_mla_engine() -> Result<Arc<MetalExactMla>, String> {
+    MLA.get_or_init(|| {
+        metal_i16_engine().and_then(|engine| MetalExactMla::new(engine, &EXP_TABLE).map(Arc::new))
+    })
+    .clone()
 }
 
 /// Counts of INT16 projections that reached the Metal hook (switch on).
@@ -186,6 +241,18 @@ pub struct MetalI16Census {
     pub heads_outside_scope: u64,
     /// Inside a scope, but the batch declined and the per-head loop ran.
     pub heads_declined: u64,
+    /// Layers whose heads reached the attention hook (the INT16 and attention
+    /// switches on).
+    pub attend_attempted: u64,
+    /// Layers whose heads, attention included, the GPU computed.
+    pub attend_accepted: u64,
+    /// No residency scope on the calling thread.
+    pub attend_outside_scope: u64,
+    /// Inside a scope, but the layer declined: the head batch or the per-head
+    /// loop ran instead.
+    pub attend_declined: u64,
+    /// Latent-cache rows copied to the device.
+    pub attend_kv_rows_uploaded: u64,
 }
 
 impl MetalI16Census {
@@ -214,6 +281,11 @@ impl MetalI16Census {
             heads_accepted: self.heads_accepted - earlier.heads_accepted,
             heads_outside_scope: self.heads_outside_scope - earlier.heads_outside_scope,
             heads_declined: self.heads_declined - earlier.heads_declined,
+            attend_attempted: self.attend_attempted - earlier.attend_attempted,
+            attend_accepted: self.attend_accepted - earlier.attend_accepted,
+            attend_outside_scope: self.attend_outside_scope - earlier.attend_outside_scope,
+            attend_declined: self.attend_declined - earlier.attend_declined,
+            attend_kv_rows_uploaded: self.attend_kv_rows_uploaded - earlier.attend_kv_rows_uploaded,
         }
     }
 }
@@ -234,6 +306,11 @@ pub fn metal_i16_census() -> MetalI16Census {
         heads_accepted: HEADS_ACCEPTED.load(Ordering::Relaxed),
         heads_outside_scope: HEADS_OUTSIDE_SCOPE.load(Ordering::Relaxed),
         heads_declined: HEADS_DECLINED.load(Ordering::Relaxed),
+        attend_attempted: ATTEND_ATTEMPTED.load(Ordering::Relaxed),
+        attend_accepted: ATTEND_ACCEPTED.load(Ordering::Relaxed),
+        attend_outside_scope: ATTEND_OUTSIDE_SCOPE.load(Ordering::Relaxed),
+        attend_declined: ATTEND_DECLINED.load(Ordering::Relaxed),
+        attend_kv_rows_uploaded: ATTEND_KV_ROWS.load(Ordering::Relaxed),
     }
 }
 
@@ -545,6 +622,184 @@ where
     true
 }
 
+/// The device's copy of a stage cache's latents and RoPE keys: one
+/// [`DeviceLatentCache`] per layer, kept inside the
+/// [`super::model::StageCache`] it copies.
+///
+/// The copy is exact because the cache only appends: `StageCache::push` is
+/// its only change, so the rows a layer's copy holds never change, and each
+/// attention call copies only the rows added since the previous one. A clone
+/// of the cache starts with an empty copy, whose rows are uploaded again on
+/// first use, so two caches never share one; a copy the GPU may still be
+/// using after a failed command buffer is dropped.
+#[derive(Default)]
+pub struct KvMirror {
+    layers: Vec<Option<DeviceLatentCache>>,
+}
+
+impl Clone for KvMirror {
+    /// An empty copy: a cloned cache uploads its own rows.
+    fn clone(&self) -> Self {
+        KvMirror::default()
+    }
+}
+
+impl std::fmt::Debug for KvMirror {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rows: Vec<Option<usize>> = self
+            .layers
+            .iter()
+            .map(|layer| layer.as_ref().map(DeviceLatentCache::rows))
+            .collect();
+        f.debug_struct("KvMirror").field("rows", &rows).finish()
+    }
+}
+
+impl KvMirror {
+    /// Layer `layer`'s device copy, if it has one.
+    pub fn layer(&self, layer: usize) -> Option<&DeviceLatentCache> {
+        self.layers.get(layer).and_then(Option::as_ref)
+    }
+
+    fn slot(&mut self, layer: usize) -> &mut Option<DeviceLatentCache> {
+        if self.layers.len() <= layer {
+            self.layers.resize_with(layer + 1, || None);
+        }
+        &mut self.layers[layer]
+    }
+}
+
+/// One INT16 layer's heads for [`try_attend`]: both per-head stacks, every
+/// head's queries, the layer's cache and the attention scale.
+pub(crate) struct AttendLayer<'a, R> {
+    pub(crate) key: HeadStack<'a>,
+    pub(crate) value: HeadStack<'a>,
+    /// Every head's non-RoPE query, one after another.
+    pub(crate) queries: &'a [i64],
+    /// Head `j`'s rotated RoPE query, by the CPU's own `rope_interleaved`.
+    pub(crate) rope_query: R,
+    pub(crate) cache: LatentCache<'a>,
+    pub(crate) lambda: i64,
+}
+
+/// Every head of one MLA layer on the GPU, attention included, in one
+/// command buffer: what the per-head loop of `layer_forward` computes, into
+/// `out` (heads x `value.rows`, one head after another). `mirror` holds the
+/// device's copy of the cache, `index` is the layer's place in it, and
+/// `probe`, if given, receives the values between the kernels.
+///
+/// Returns `true` only if `out` now holds exactly the loop's values. If the
+/// loop would refuse anywhere (shape, guard, scale domain, RoPE, an epilogue,
+/// an attention score), or the GPU cannot run the layer, nothing is written
+/// and the caller runs the head batch or the loop, which then returns the
+/// CPU's error.
+pub(crate) fn try_attend<R>(
+    layer: &AttendLayer<'_, R>,
+    mirror: &mut KvMirror,
+    index: usize,
+    out: &mut [i64],
+    probe: Option<&mut MlaProbe>,
+) -> bool
+where
+    R: Fn(usize) -> Result<Vec<i64>, ModernError>,
+{
+    if !(metal_exact_i16_requested() && metal_exact_i16_attend_requested()) {
+        return false;
+    }
+    count(&ATTEND_ATTEMPTED);
+    let active = ACTIVE.with(Cell::get);
+    if active.is_null() {
+        count(&ATTEND_OUTSIDE_SCOPE);
+        return false;
+    }
+    // SAFETY: ACTIVE is non-null only while `MetalI16Model::run` is executing
+    // on this thread, and `run` holds `&self` for the whole call, so the
+    // `Residency` it points to is alive and not mutated.
+    let residency = unsafe { &*active };
+    let decline = || {
+        count(&ATTEND_DECLINED);
+        false
+    };
+    let (key, value, view) = (&layer.key, &layer.value, &layer.cache);
+    let heads = key.heads;
+    if !key.admissible()
+        || !value.admissible()
+        || value.heads != heads
+        || value.cols != key.rows
+        || view.rank != key.rows
+        || heads.checked_mul(key.cols) != Some(layer.queries.len())
+        || heads.checked_mul(value.rows) != Some(out.len())
+    {
+        return decline();
+    }
+    let (Some((key_matrix, key_start)), Some((value_matrix, value_start))) = (
+        residency.find(key.weights.as_bytes(), heads * key.rows, key.cols),
+        residency.find(value.weights.as_bytes(), heads * value.rows, value.cols),
+    ) else {
+        return decline();
+    };
+    let Ok(mla) = metal_mla_engine() else {
+        return decline();
+    };
+    // Every head's RoPE query, as the per-head loop computes it.
+    let mut rope_queries = Vec::with_capacity(heads * view.rope_dim);
+    for head in 0..heads {
+        match (layer.rope_query)(head) {
+            Ok(qp) if qp.len() == view.rope_dim => rope_queries.extend(qp),
+            _ => return decline(),
+        }
+    }
+    let slot = mirror.slot(index);
+    if slot
+        .as_ref()
+        .is_some_and(|copy| copy.rank() != view.rank || copy.rope_dim() != view.rope_dim)
+    {
+        *slot = None;
+    }
+    let copy = slot.get_or_insert_with(|| mla.new_cache(view.rank, view.rope_dim));
+    match mla.sync(copy, view.latent, view.rope_keys, view.positions) {
+        Ok(rows) => {
+            ATTEND_KV_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+        }
+        Err(_) => return decline(),
+    }
+    let job = MlaLayer {
+        key: HeadPhase {
+            matrix: &key_matrix.matrix,
+            first_row: key_start,
+            heads,
+            rows: key.rows,
+        },
+        key_mu: key.mu,
+        key_k: key.k,
+        value: HeadPhase {
+            matrix: &value_matrix.matrix,
+            first_row: value_start,
+            heads,
+            rows: value.rows,
+        },
+        value_mu: value.mu,
+        value_k: value.k,
+        queries: layer.queries,
+        rope_queries: &rope_queries,
+        lambda: layer.lambda,
+        positions: view.positions,
+    };
+    match mla.layer(&job, copy, out, probe) {
+        Ok(()) => {
+            count(&ATTEND_ACCEPTED);
+            true
+        }
+        Err(refusal) => {
+            if refusal == MlaRefusal::Device {
+                // The GPU may still hold the copy's buffers: start over.
+                *mirror.slot(index) = None;
+            }
+            decline()
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::super::model::for_each_head;
@@ -647,6 +902,24 @@ pub(crate) mod test_support {
         fn drop(&mut self) {
             set_metal_exact_i16_heads(self.0);
             set_metal_i16_heads_submission(self.1);
+        }
+    }
+
+    /// Turns attention on the GPU on or off for one test and restores it
+    /// after, even on panic. Hold `kernel_switch_guard`.
+    pub(crate) struct AttendGuard(bool);
+
+    impl AttendGuard {
+        pub(crate) fn set(enabled: bool) -> Self {
+            let previous = AttendGuard(metal_exact_i16_attend_requested());
+            set_metal_exact_i16_attend(enabled);
+            previous
+        }
+    }
+
+    impl Drop for AttendGuard {
+        fn drop(&mut self) {
+            set_metal_exact_i16_attend(self.0);
         }
     }
 
@@ -768,12 +1041,92 @@ pub(crate) mod test_support {
         /// RoPE and absorbed attention of head `j`, as `layer_forward` runs
         /// them between the two projections.
         pub(crate) fn attend(&self, j: usize, qa: &[i64]) -> Result<Vec<i64>, ModernError> {
-            let base = j * self.dqk();
-            let mut qp = self.q[base + self.nope..base + self.dqk()].to_vec();
-            rope_interleaved(&mut qp, &self.cos, &self.sin)?;
+            let qp = self.rope_query(j)?;
             let mut u = vec![0i64; self.rank];
             mla_attend(qa, &qp, self.view(), self.lambda, &mut u)?;
             Ok(u)
+        }
+
+        /// Head `j`'s rotated RoPE query.
+        pub(crate) fn rope_query(&self, j: usize) -> Result<Vec<i64>, ModernError> {
+            let base = j * self.dqk();
+            let mut qp = self.q[base + self.nope..base + self.dqk()].to_vec();
+            rope_interleaved(&mut qp, &self.cos, &self.sin)?;
+            Ok(qp)
+        }
+
+        /// Every head's `wk_b` output (`qa`), on the CPU.
+        pub(crate) fn cpu_keys(&self) -> Vec<i64> {
+            let (key, _) = self.stacks();
+            (0..self.n_heads)
+                .flat_map(|j| self.key(&key, j).expect("in domain"))
+                .collect()
+        }
+
+        /// Every head's attention scores (heads x positions), as the first
+        /// loop of `mla_attend` defines them: `floor(dot * lambda / 2^46)`
+        /// with the dot in i128. A diagnostic: the layer's output and `u` are
+        /// checked against the CPU functions themselves.
+        pub(crate) fn cpu_scores(&self) -> Vec<i64> {
+            let qa = self.cpu_keys();
+            let (rank, rope_dim) = (self.rank, self.rope_dim);
+            let mut scores = Vec::with_capacity(self.n_heads * self.positions);
+            for j in 0..self.n_heads {
+                let head_qa = &qa[j * rank..(j + 1) * rank];
+                let qp = self.rope_query(j).expect("in domain");
+                for i in 0..self.positions {
+                    let latent = &self.latent[i * rank..(i + 1) * rank];
+                    let keys = &self.rope_keys[i * rope_dim..(i + 1) * rope_dim];
+                    let dot: i128 = head_qa
+                        .iter()
+                        .zip(latent)
+                        .map(|(&a, &c)| i128::from(a) * i128::from(c))
+                        .chain(
+                            qp.iter()
+                                .zip(keys)
+                                .map(|(&a, &c)| i128::from(a) * i128::from(c)),
+                        )
+                        .sum();
+                    let score = (dot * i128::from(self.lambda)) >> 46;
+                    scores.push(i64::try_from(score).expect("in domain"));
+                }
+            }
+            scores
+        }
+
+        /// The heads with attention on the GPU: `try_attend` with the INT16
+        /// and attention switches on, inside a scope that uploaded both
+        /// stacks, with `mirror` as the device's copy of the cache (layer 0).
+        /// Returns whether the GPU computed the layer, the output (sentinels
+        /// where nothing was written), the values between the kernels and
+        /// what the hooks counted. Hold `kernel_switch_guard`.
+        pub(crate) fn gpu_attend(
+            &self,
+            mirror: &mut KvMirror,
+        ) -> (bool, Vec<i64>, MlaProbe, MetalI16Census) {
+            let (key, value) = self.stacks();
+            let metal = MetalI16Model::from_weights(&[
+                (key.weights, key.heads * key.rows, key.cols),
+                (value.weights, value.heads * value.rows, value.cols),
+            ])
+            .expect("upload");
+            let _switch = SwitchGuard::set(true);
+            let _attend = AttendGuard::set(true);
+            let queries = self.queries();
+            let rope_query = |j: usize| self.rope_query(j);
+            let layer = AttendLayer {
+                key,
+                value,
+                queries: &queries,
+                rope_query: &rope_query,
+                cache: self.view(),
+                lambda: self.lambda,
+            };
+            let mut out = vec![0x7E57_7E57_7E57_7E57i64; self.n_heads * self.v_dim];
+            let mut probe = MlaProbe::default();
+            let before = metal_i16_census();
+            let done = metal.run(|| try_attend(&layer, mirror, 0, &mut out, Some(&mut probe)));
+            (done, out, probe, metal_i16_census().since(&before))
         }
 
         /// Head `j`'s `wk_b` projection, as `layer_forward` computes it.
@@ -866,7 +1219,7 @@ mod tests {
     use super::super::precision::tests::{Case, Outcome};
     use super::super::precision::{Bits, Schedule, project_i16, quantize_matrix};
     use super::test_support::{
-        HeadsGuard, LayerHeads, Rng, SwitchGuard, hooked, le_bytes, weights,
+        AttendGuard, HeadsGuard, LayerHeads, Rng, SwitchGuard, hooked, le_bytes, weights,
     };
     use super::*;
     use crate::canonical_simd::{
@@ -1561,6 +1914,351 @@ mod tests {
         assert!(out.iter().all(|&v| v == SENTINEL));
     }
 
+    /// Panic at the first index where `got` and `want` differ, naming it.
+    fn assert_same(got: &[i64], want: &[i64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: lengths");
+        if let Some(i) = got.iter().zip(want).position(|(g, w)| g != w) {
+            panic!(
+                "{what}: first difference at {i} of {}: GPU {} vs CPU {}",
+                got.len(),
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    /// The device's copy of layer 0 in `mirror` equals `layer`'s cache.
+    fn assert_kv_copy(mirror: &KvMirror, layer: &LayerHeads, what: &str) {
+        let (latent, keys) = mirror.layer(0).expect("a device copy").read();
+        assert_eq!(
+            (latent.len(), keys.len()),
+            (
+                layer.positions * layer.rank,
+                layer.positions * layer.rope_dim
+            ),
+            "{what}: rows of the device copy"
+        );
+        assert!(
+            latent == layer.latent[..latent.len()] && keys == layer.rope_keys[..keys.len()],
+            "{what}: the device copy differs from the cache"
+        );
+    }
+
+    /// `layer` with attention on the GPU against the CPU loop: the output,
+    /// every head's qa, attention scores and attention output u (the values
+    /// between the kernels), and the device's copy of the cache, with nothing
+    /// declined. Returns the device copy.
+    fn check_attention(layer: &LayerHeads, what: &str) -> KvMirror {
+        let schedule = if layer.positions <= 64 {
+            Schedule::Serial
+        } else {
+            Schedule::Pool
+        };
+        let want = layer.cpu(schedule).expect("in domain");
+        let mut mirror = KvMirror::default();
+        let (done, got, probe, delta) = layer.gpu_attend(&mut mirror);
+        assert!(done, "{what}: declined: {delta:?}");
+        assert_same(&probe.qa, &layer.cpu_keys(), &format!("{what}: qa"));
+        assert_same(
+            &probe.scores,
+            &layer.cpu_scores(),
+            &format!("{what}: scores"),
+        );
+        assert_same(&probe.u, &layer.latents(), &format!("{what}: u"));
+        assert_same(&got, &want, &format!("{what}: output"));
+        assert_kv_copy(&mirror, layer, what);
+        assert_eq!(
+            (
+                delta.attend_accepted,
+                delta.attend_declined,
+                delta.attend_kv_rows_uploaded,
+                delta.accepted
+            ),
+            (1, 0, layer.positions as u64, 0),
+            "{what}: {delta:?}"
+        );
+        mirror
+    }
+
+    /// The attention kernels passed their start-up self-test on this device
+    /// (`MetalExactMla::new` returns no engine otherwise) and pass it again.
+    #[test]
+    fn metal_i16_attention_kernels_pass_their_self_test_on_this_device() {
+        let _guard = kernel_switch_guard();
+        let mla = metal_mla_engine().expect("exact MLA attention");
+        let again = mla.self_test().expect("the attention self-test");
+        eprintln!(
+            "exact MLA attention self-test: at start-up {:?}, again {again:?}",
+            mla.self_test_report()
+        );
+        assert_eq!(again, mla.self_test_report());
+        assert!(again.compared >= 6 && again.refused == 4, "{again:?}");
+    }
+
+    /// Every head of a K2.6-shaped INT16 layer with attention on the GPU (64
+    /// heads; `wk_b` 512 x 128, `wv_b` 128 x 512, RoPE 64), at cache lengths
+    /// 1, 64, 512 and 4,096, equals the CPU loop of `layer_forward` byte for
+    /// byte: the layer's output, every head's qa, attention scores and
+    /// attention output u, and the device's copy of the cache. Nothing
+    /// declines. The 64-position cache then grows by single rows, as decoding
+    /// appends them: each call copies exactly one row and still matches.
+    #[test]
+    fn metal_i16_attention_layers_match_the_cpu_loop_at_k26_shapes() {
+        let _guard = kernel_switch_guard();
+        let mut rng = Rng(0xA77E_4D26);
+        for positions in [1usize, 64, 512, 4096] {
+            let mut layer = LayerHeads::new(&mut rng, 64, 512, 128, 64, 128, positions, 1 << 28);
+            let what = format!("K2.6 heads over {positions} cached positions");
+            let mut mirror = check_attention(&layer, &what);
+            if positions == 64 {
+                for step in 1..=3 {
+                    layer.positions += 1;
+                    layer
+                        .latent
+                        .extend((0..layer.rank).map(|_| rng.symmetric(1 << 28) as i32));
+                    layer
+                        .rope_keys
+                        .extend((0..layer.rope_dim).map(|_| rng.symmetric(1 << 14) as i32));
+                    let what = format!("{what}, then {step} appended");
+                    let want = layer.cpu(Schedule::Pool).expect("in domain");
+                    let (done, got, _, delta) = layer.gpu_attend(&mut mirror);
+                    assert!(done, "{what}: declined: {delta:?}");
+                    assert_same(&got, &want, &what);
+                    assert_kv_copy(&mirror, &layer, &what);
+                    assert_eq!(delta.attend_kv_rows_uploaded, 1, "{what}: {delta:?}");
+                }
+            }
+            eprintln!("{what}: identical (output, qa, scores, u, device cache)");
+        }
+    }
+
+    /// Attention on the GPU equals the CPU loop where the CPU's attention
+    /// takes its i128 path (heads with sum |q| >= 2^32 beside narrow heads in
+    /// one layer), and at the exp table's edges: with qa = (2^16, 0, ...),
+    /// qp = 0 and lambda = 2^30, score i is the cached latent value (i, 0),
+    /// chosen so that s - max is 0, -1, -255, -256, -257, -(16 * 2^16 - 1),
+    /// -16 * 2^16, -(16 * 2^16 + 1), i32::MIN and a value between steps.
+    #[test]
+    fn metal_i16_attention_matches_the_cpu_on_wide_queries_and_exp_table_edges() {
+        let _guard = kernel_switch_guard();
+        let mut rng = Rng(0x0E1D_E000);
+        // k from 24 on the first four heads' key rows makes their qa reach
+        // 2^40; the other heads keep k from 40.
+        let mut layer = LayerHeads::new(&mut rng, 8, 64, 32, 16, 16, 300, 1 << 20);
+        let rank = layer.rank;
+        for (row, k) in layer.k_k[..4 * rank].iter_mut().enumerate() {
+            *k = 24 + (row % 7) as u8;
+        }
+        let qa = layer.cpu_keys();
+        let wide: Vec<bool> = (0..layer.n_heads)
+            .map(|j| {
+                let qp = layer.rope_query(j).expect("in domain");
+                let mass: u128 = qa[j * rank..(j + 1) * rank]
+                    .iter()
+                    .chain(&qp)
+                    .map(|v| u128::from(v.unsigned_abs()))
+                    .sum();
+                mass >= 1 << 32
+            })
+            .collect();
+        assert!(wide.contains(&true) && wide.contains(&false), "{wide:?}");
+        check_attention(&layer, "wide and narrow heads");
+
+        let mut layer = LayerHeads::new(&mut rng, 2, 16, 8, 4, 8, 10, 1 << 20);
+        let (rank, nope, dqk) = (layer.rank, layer.nope, layer.dqk());
+        let one = 1i32 << 16;
+        let edges = [
+            0,
+            -1,
+            -255,
+            -256,
+            -257,
+            -(16 * one - 1),
+            -16 * one,
+            -(16 * one + 1),
+            i32::MIN,
+            -(8 * one + 129),
+        ];
+        for (i, &v) in edges.iter().enumerate() {
+            layer.latent[i * rank] = v;
+        }
+        let mut wk = vec![0i16; layer.n_heads * rank * nope];
+        for h in 0..layer.n_heads {
+            wk[h * rank * nope] = 1;
+            for r in 0..rank {
+                (layer.mu_k[h * rank + r], layer.k_k[h * rank + r]) =
+                    if r == 0 { (1 << 30, 30) } else { (0, 16) };
+            }
+            for (j, v) in layer.q[h * dqk..(h + 1) * dqk].iter_mut().enumerate() {
+                *v = if j == 0 { 1 << 16 } else { 0 };
+            }
+        }
+        layer.wk = le_bytes(&wk);
+        layer.lambda = 1 << 30;
+        let scores = layer.cpu_scores();
+        let want: Vec<i64> = edges.iter().map(|&v| i64::from(v)).collect();
+        assert_eq!(scores[..edges.len()], want[..], "the scores are the edges");
+        check_attention(&layer, "the exp table's edges");
+    }
+
+    /// Head 0's key rows at k = 16 and the largest mu on all-positive
+    /// weights, against `q` on every non-RoPE query value and latents of
+    /// 2^31 - 1: head 0's scores are far beyond 2^62.
+    fn overflow_scores(layer: &mut LayerHeads, q: i64) {
+        let (rank, nope) = (layer.rank, layer.nope);
+        for w in layer.wk[..2 * rank * nope].chunks_exact_mut(2) {
+            w.copy_from_slice(&32_767i16.to_le_bytes());
+        }
+        for row in 0..rank {
+            (layer.mu_k[row], layer.k_k[row]) = (i32::MAX, 16);
+        }
+        layer.q[..nope].fill(q);
+        layer.latent.fill(i32::MAX);
+    }
+
+    /// Whatever the CPU loop refuses, attention on the GPU declines without
+    /// writing, and the loop then returns the CPU's error: #183's cases (an
+    /// attention cache with no positions, RoPE tables of the wrong length, a
+    /// query past the accumulator guard, a key output beyond 2^62, a value
+    /// output beyond 2^62) and the attention's own (a score beyond 2^62, and
+    /// a score whose product with lambda overflows i128).
+    #[test]
+    fn metal_i16_attention_declines_whatever_the_cpu_refuses() {
+        let _guard = kernel_switch_guard();
+        let mut rng = Rng(0xDEC1_A77E);
+        let base = LayerHeads::new(&mut rng, 4, 16, 8, 4, 8, 3, 1 << 14);
+        let (dqk, nope, rank, v_dim) = (base.dqk(), base.nope, base.rank, base.v_dim);
+        let mut cases = Vec::new();
+        let mut layer = base.clone();
+        layer.positions = 0;
+        cases.push(("an attention cache with no positions", layer));
+        let mut layer = base.clone();
+        layer.cos.pop();
+        cases.push(("RoPE tables of the wrong length", layer));
+        let mut layer = base.clone();
+        layer.q[2 * dqk] = GUARD_MAX + 1;
+        cases.push(("a query past the accumulator guard", layer));
+        let mut layer = base.clone();
+        for row in rank..2 * rank {
+            (layer.mu_k[row], layer.k_k[row]) = (i32::MAX, 16);
+        }
+        for j in 0..nope {
+            let w = i16::from_le_bytes([
+                layer.wk[2 * (rank * nope + j)],
+                layer.wk[2 * (rank * nope + j) + 1],
+            ]);
+            layer.q[dqk + j] = if w < 0 { -(1 << 40) } else { 1 << 40 };
+        }
+        cases.push(("a key output beyond 2^62", layer));
+        let mut layer = base.clone();
+        layer.latent.fill(1 << 30);
+        for byte in layer.wv[..2 * rank].chunks_exact_mut(2) {
+            byte.copy_from_slice(&32_767i16.to_le_bytes());
+        }
+        for row in 0..v_dim {
+            (layer.mu_v[row], layer.k_v[row]) = (i32::MAX, 16);
+        }
+        cases.push(("a value output beyond 2^62", layer));
+        // qa near 2^49 against 2^31 - 1: scores near 2^66.
+        let mut layer = base.clone();
+        overflow_scores(&mut layer, 1 << 16);
+        cases.push(("an attention score beyond 2^62", layer));
+        // Rank 32, qa near 2^61 and lambda 2^31 - 1: products near 2^128.
+        let mut layer = LayerHeads::new(&mut rng, 4, 32, 8, 4, 8, 3, 1 << 14);
+        overflow_scores(&mut layer, 1 << 28);
+        layer.lambda = (1 << 31) - 1;
+        cases.push(("an attention score product beyond 2^127", layer));
+        for (name, layer) in cases {
+            let cpu = layer.cpu(Schedule::Serial);
+            assert!(cpu.is_err(), "{name}: the CPU must refuse, got {cpu:?}");
+            let mut mirror = KvMirror::default();
+            let (done, got, _, delta) = layer.gpu_attend(&mut mirror);
+            assert!(!done, "{name}");
+            assert!(
+                got.iter().all(|&v| v == SENTINEL),
+                "{name}: a declined layer must not write"
+            );
+            assert_eq!(
+                (delta.attend_accepted, delta.attend_declined),
+                (0, 1),
+                "{name}: {delta:?}"
+            );
+            eprintln!("{name}: declined; the CPU loop returns {cpu:?}");
+        }
+    }
+
+    /// Attention on the GPU needs the INT16 switch, the attention switch and
+    /// a scope that uploaded both stacks; without any of them it does not
+    /// run, counted as such, and writes nothing.
+    #[test]
+    fn metal_i16_attention_needs_its_switches_and_a_scope() {
+        let _guard = kernel_switch_guard();
+        if std::env::var("ARC_METAL_EXACT_I16_ATTEND").as_deref() != Ok("1") {
+            assert!(!metal_exact_i16_attend_requested());
+        }
+        let mut rng = Rng(0x5C0E_A77E);
+        let layer = LayerHeads::new(&mut rng, 4, 16, 8, 4, 8, 2, 1 << 14);
+        let (key, value) = layer.stacks();
+        let queries = layer.queries();
+        let rope_query = |j: usize| layer.rope_query(j);
+        let attend = AttendLayer {
+            key,
+            value,
+            queries: &queries,
+            rope_query: &rope_query,
+            cache: layer.view(),
+            lambda: layer.lambda,
+        };
+        let mut out = vec![SENTINEL; 4 * 8];
+        let mut mirror = KvMirror::default();
+        // Both switches on, but no scope on this thread.
+        let switch = SwitchGuard::set(true);
+        let on = AttendGuard::set(true);
+        let before = metal_i16_census();
+        assert!(!try_attend(&attend, &mut mirror, 0, &mut out, None));
+        let delta = metal_i16_census().since(&before);
+        assert_eq!(
+            (delta.attend_attempted, delta.attend_outside_scope),
+            (1, 1),
+            "{delta:?}"
+        );
+        // Inside a scope, but the stacks were not uploaded by it.
+        let other = LayerHeads::new(&mut rng, 4, 16, 8, 4, 8, 2, 1 << 14);
+        let (other_key, other_value) = other.stacks();
+        let metal = MetalI16Model::from_weights(&[
+            (other_key.weights, 4 * 16, 8),
+            (other_value.weights, 4 * 8, 16),
+        ])
+        .expect("upload");
+        let before = metal_i16_census();
+        assert!(!metal.run(|| try_attend(&attend, &mut mirror, 0, &mut out, None)));
+        let delta = metal_i16_census().since(&before);
+        assert_eq!(
+            (delta.attend_accepted, delta.attend_declined),
+            (0, 1),
+            "{delta:?}"
+        );
+        // The attention switch off: no attempt at all.
+        drop(on);
+        let off = AttendGuard::set(false);
+        let before = metal_i16_census();
+        assert!(!metal.run(|| try_attend(&attend, &mut mirror, 0, &mut out, None)));
+        assert_eq!(metal_i16_census().since(&before).attend_attempted, 0);
+        // The INT16 switch off, the attention switch on: no attempt either.
+        drop(off);
+        drop(switch);
+        let _no_int16 = SwitchGuard::set(false);
+        let _on = AttendGuard::set(true);
+        let before = metal_i16_census();
+        assert!(!metal.run(|| try_attend(&attend, &mut mirror, 0, &mut out, None)));
+        assert_eq!(metal_i16_census().since(&before).attend_attempted, 0);
+        assert!(out.iter().all(|&v| v == SENTINEL));
+        assert!(
+            mirror.layer(0).is_none(),
+            "nothing was copied to the device"
+        );
+    }
+
     /// The pinned K2.6 shapes the tests and the benchmark use: (name, rows,
     /// columns).
     pub(super) const K26_SHAPES: [(&str, usize, usize); 11] = [
@@ -1585,7 +2283,9 @@ mod tests {
 #[cfg(test)]
 mod bench {
     use super::super::precision::{Schedule, project_i16};
-    use super::test_support::{HeadsGuard, LayerHeads, Rng, SwitchGuard, le_bytes, weights};
+    use super::test_support::{
+        AttendGuard, HeadsGuard, LayerHeads, Rng, SwitchGuard, le_bytes, weights,
+    };
     use super::tests::K26_SHAPES;
     use super::*;
     use crate::canonical_simd::{self, kernel_switch_guard, set_fast_canonical_kernel};
@@ -1891,48 +2591,59 @@ mod bench {
 
     /// Timed turns per path in the layer-heads benchmark.
     const ROUNDS: usize = 11;
-    /// CPU serial, CPU pool, and the three GPU submissions.
-    const PATHS: usize = 5;
+    /// CPU serial, CPU pool, the three head-batch submissions, and the whole
+    /// layer with attention on the GPU.
+    const PATHS: usize = 6;
 
     /// One K2.6 layer's heads (64 heads, `wk_b` 512 x 128, `wv_b` 128 x
     /// 512) end to end: both projections and the RoPE and attention between
     /// them, as the CPU loop of `layer_forward` runs them (heads one after
-    /// another, and in parallel as #174 runs them) against the GPU batch in
-    /// each submission, at three cache lengths. Every timed output equals the
-    /// serial CPU loop. Virtualized-runner numbers.
+    /// another, and in parallel as #174 runs them), against #183's GPU batch
+    /// in each submission (attention on the CPU between the projections) and
+    /// the whole layer on the GPU (attention included, one command buffer),
+    /// at four cache lengths. Every timed output equals the serial CPU loop.
+    /// Hosted-VM CI measurements.
     #[test]
     #[ignore = "benchmark: run explicitly in release with --ignored --nocapture"]
     fn k26_layer_heads_benchmark() {
         let _guard = kernel_switch_guard();
         let engine = metal_i16_engine().expect("Metal device");
+        let mla = metal_mla_engine().expect("exact MLA attention");
         let threads = rayon::current_num_threads();
         let mut rng = Rng(0x0D15_EA5E_4EAD_0064);
         let (n_heads, rank, nope, rope_dim, v_dim) =
             (64usize, 512usize, 128usize, 64usize, 128usize);
         let mut md = String::new();
-        md.push_str("\n### Exact Metal INT16 GEMV: one K2.6 layer's 64 heads as one batch\n\n");
         md.push_str(
-            "Virtualized-runner measurement: GitHub-hosted macOS VM with a paravirtual \
-             Metal GPU. Not Apple GPU hardware numbers.\n\n",
+            "\n### Exact Metal INT16: one K2.6 layer's 64 heads, with attention on the GPU\n\n",
+        );
+        md.push_str(
+            "Hosted-VM CI measurement: a GitHub-hosted macOS VM with a paravirtual Metal \
+             GPU. Not Apple GPU hardware numbers; the M2 Ultra run waits for the Studio.\n\n",
         );
         md.push_str(&format!(
             "Each cell is the median (and minimum) wall time in µs, over {ROUNDS} turns taken \
-             in a rotating order, of one layer's heads: 64 `wk_b` (512 x 128) \
-             and 64 `wv_b` (128 x 512) projections with the RoPE and absorbed attention \
-             between them, over a cache of the given length. CPU columns run the per-head \
-             loop of `layer_forward` on {threads} rayon threads. GPU columns run `try_heads`; \
-             one command buffer per layer is in use on this device: {}. The last column is \
-             the GPU time of the 128 projections alone (two dispatches, back to back).\n\n",
+             in a rotating order, of one layer's heads: 64 `wk_b` (512 x 128) and 64 `wv_b` \
+             (128 x 512) projections with the RoPE and absorbed attention between them, over \
+             a cache of the given length. CPU columns run the per-head loop of `layer_forward` \
+             on {threads} rayon threads. The next three run #183's `try_heads` (attention on \
+             the CPU between the projections); one command buffer per layer is in use on this \
+             device: {}. \"GPU whole layer\" runs `try_attend`: both projections, their \
+             epilogues and the attention in one command buffer, the cache already on the \
+             device (as in decoding, where each token adds one row). The last two columns are \
+             GPU time from the command buffers' timestamps: the 128 projections alone, and \
+             the whole layer.\n\n",
             engine.one_command_buffer(),
         ));
         md.push_str(
             "| Cache positions | CPU, heads one after another | CPU, heads in parallel (#174) \
-             | GPU, one command buffer per layer | GPU, one per phase | GPU, one per head and \
-             phase (#177's hook) | GPU time of the projections |\n",
+             | GPU, one command buffer per layer (#183) | GPU, one per phase | GPU, one per head \
+             and phase (#177's hook) | GPU whole layer | GPU time of the projections | GPU time \
+             of the whole layer |\n",
         );
-        md.push_str("|---|---|---|---|---|---|---|\n");
+        md.push_str("|---|---|---|---|---|---|---|---|---|\n");
         let mut json_rows = Vec::new();
-        for positions in [1usize, 64, 512] {
+        for positions in [1usize, 64, 512, 4096] {
             let layer = LayerHeads::new(
                 &mut rng,
                 n_heads,
@@ -1957,6 +2668,17 @@ mod bench {
             .expect("upload");
             let switch = SwitchGuard::set(true);
             let heads_guard = HeadsGuard::set(true, Submission::OneCommandBuffer);
+            let attend_guard = AttendGuard::set(true);
+            let rope_query = |j: usize| layer.rope_query(j);
+            let attend_layer = AttendLayer {
+                key,
+                value,
+                queries: &queries,
+                rope_query: &rope_query,
+                cache: layer.view(),
+                lambda: layer.lambda,
+            };
+            let mut mirror = KvMirror::default();
             let mut out = vec![0i64; n_heads * v_dim];
             let gpu_run = |submission: Submission, out: &mut Vec<i64>| -> bool {
                 set_metal_i16_heads_submission(submission);
@@ -1968,7 +2690,13 @@ mod bench {
                     "{positions} positions, {submission:?}"
                 );
             }
-            // The five paths take turns, in a rotating order, so that drift
+            let before = metal_i16_census();
+            assert!(
+                metal.run(|| try_attend(&attend_layer, &mut mirror, 0, &mut out, None))
+                    && out == want,
+                "{positions} positions, the whole layer"
+            );
+            // The six paths take turns, in a rotating order, so that drift
             // on the VM (clocks, other tenants) cannot favour one of them.
             let mut samples: Vec<Vec<f64>> =
                 (0..PATHS).map(|_| Vec::with_capacity(ROUNDS)).collect();
@@ -1991,11 +2719,29 @@ mod bench {
                                     .expect("in domain"),
                             );
                         }
+                        5 => assert!(metal.run(|| try_attend(
+                            &attend_layer,
+                            &mut mirror,
+                            0,
+                            &mut out,
+                            None
+                        ))),
                         gpu => assert!(gpu_run(Submission::ALL[gpu - 2], &mut out)),
                     }
                     samples[path].push(start.elapsed().as_secs_f64());
                 }
             }
+            let delta = metal_i16_census().since(&before);
+            assert_eq!(
+                (
+                    delta.attend_accepted,
+                    delta.attend_declined,
+                    delta.attend_kv_rows_uploaded
+                ),
+                (1 + ROUNDS as u64, 0, positions as u64),
+                "{positions} positions: {delta:?}"
+            );
+            drop(attend_guard);
             drop(heads_guard);
             drop(switch);
             let stats: Vec<(f64, f64)> = samples
@@ -2005,7 +2751,8 @@ mod bench {
                     (median(times), low)
                 })
                 .collect();
-            // GPU time of the two dispatches alone, given every vector.
+            // GPU time of the two dispatches alone, given every vector, and
+            // of the whole layer.
             let key_matrix = engine
                 .upload(
                     key.weights.as_bytes(),
@@ -2043,16 +2790,46 @@ mod bench {
             let projections = engine
                 .time_heads(&phases, engine.tile(), repeats)
                 .expect("timing");
+            let rope_queries: Vec<i64> = (0..n_heads)
+                .flat_map(|j| layer.rope_query(j).expect("in domain"))
+                .collect();
+            let mut device_cache = mla.new_cache(rank, rope_dim);
+            mla.sync(
+                &mut device_cache,
+                &layer.latent,
+                &layer.rope_keys,
+                positions,
+            )
+            .expect("cache");
+            let job = MlaLayer {
+                key: a,
+                key_mu: &layer.mu_k,
+                key_k: &layer.k_k,
+                value: b,
+                value_mu: &layer.mu_v,
+                value_k: &layer.k_v,
+                queries: &queries,
+                rope_queries: &rope_queries,
+                lambda: layer.lambda,
+                positions,
+            };
+            let single = mla.time_layer(&job, &device_cache, 1).expect("timing");
+            let repeats = ((0.2 / single.max(1e-6)) as usize).clamp(3, 200);
+            let whole = mla
+                .time_layer(&job, &device_cache, repeats)
+                .expect("timing");
             let cell =
                 |(median, low): (f64, f64)| format!("{:.0} ({:.0})", median * 1e6, low * 1e6);
             md.push_str(&format!(
-                "| {positions} | {} | {} | {} | {} | {} | {:.0} |\n",
+                "| {positions} | {} | {} | {} | {} | {} | {} | {:.0} | {:.0} |\n",
                 cell(stats[0]),
                 cell(stats[1]),
                 cell(stats[2]),
                 cell(stats[3]),
                 cell(stats[4]),
+                cell(stats[5]),
                 projections * 1e6,
+                whole * 1e6,
             ));
             let us = |(median, low): (f64, f64)| serde_json::json!({"median": median * 1e6, "min": low * 1e6});
             json_rows.push(serde_json::json!({
@@ -2062,21 +2839,25 @@ mod bench {
                 "gpu_one_command_buffer_us": us(stats[2]),
                 "gpu_per_phase_us": us(stats[3]),
                 "gpu_per_head_us": us(stats[4]),
+                "gpu_whole_layer_us": us(stats[5]),
                 "gpu_projections_only_us": projections * 1e6,
+                "gpu_whole_layer_gpu_time_us": whole * 1e6,
             }));
         }
         md.push_str(
             "\nThe stacks are resident before anything is timed. Every GPU column computes the \
-             same integers as the CPU loop (checked before timing); the submissions differ \
-             only in host round trips: 1 commit and completion per layer with a shared-event \
-             handoff, 2 per layer, or 128 per layer.\n",
+             same integers as the CPU loop (checked before timing, and no layer declined); the \
+             head-batch submissions differ only in host round trips: 1 commit and completion \
+             per layer with a shared-event handoff, 2 per layer, or 128 per layer. The whole \
+             layer is 1 commit and 1 completion with no handoff.\n",
         );
         println!("{md}");
         let json = serde_json::json!({
-            "label": "virtualized-runner measurement",
+            "label": "hosted-VM CI measurement",
             "rayon_threads": threads,
             "one_command_buffer": engine.one_command_buffer(),
             "default_tile": DEFAULT_TILE.label(),
+            "attention_self_test": mla.self_test_report(),
             "rows": json_rows,
         });
         println!("METAL_EXACT_I16_HEADS_BENCH {json}");
