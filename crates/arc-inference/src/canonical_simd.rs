@@ -3,17 +3,36 @@
 //! This module does **not** define a new arithmetic profile. It computes the
 //! same integer value as the scalar kernel for every input it accepts, and
 //! refuses every input it cannot prove exact, leaving the existing scalar path
-//! to handle it. It is opt-in and defaults to OFF, so no admission, execution
-//! or consensus semantics change unless a caller explicitly enables it.
+//! to handle it. Turning it on or off therefore changes no admission,
+//! execution or consensus semantics, only speed.
 //!
-//! # Scope of the opt-in, stated exactly
+//! # Default per target
+//!
+//! * **x86-64 (AVX2): on.** The determinism proof (PR #136, run 37467005539)
+//!   decoded Llama-2-7B, 16 prompts x 32 tokens, with the scalar and the AVX2
+//!   kernel on Linux, Windows and Intel macOS. All six transcripts had the same
+//!   SHA-256 (`d2c8c82b...`), and the AVX2 legs accepted 176,175 of 176,175
+//!   projections. CPUs without AVX2, and x86-64 processes that Rosetta 2
+//!   translates on Apple Silicon, keep the scalar kernel.
+//! * **arm64 (NEON dotprod): off** until the full 16 x 32 proof passes on
+//!   arm64 hardware that does not swap. [`NEON_ON_BY_DEFAULT`] is the single
+//!   switch that turns it on.
+//! * **Overrides**, read once at first use: `ARC_CANONICAL_KERNEL=scalar`
+//!   forces the scalar reference, `simd` forces the vectorised kernel where the
+//!   CPU has one, and `auto` keeps the default. The older
+//!   `ARC_FAST_CANONICAL_KERNEL` still works: `1` selects the vectorised kernel
+//!   and any other value the scalar one. [`set_fast_canonical_kernel`] wins
+//!   over both.
+//!
+//! # Scope, stated exactly
 //!
 //! The integration point is [`crate::cached_integer_model::matmul_i8_into`],
-//! which is the **generic per-row I8 matmul**. When the flag is on this path is
-//! therefore reachable from *every* I8 matmul caller in the crate - whole-model
-//! forward, shard forward, validator routes - not only from the named canonical
-//! profile. That is deliberate but it is a wider blast radius than the profile
-//! name suggests, and it is why the flag is default-off and experiment-only.
+//! which is the **generic per-row I8 matmul**. When the kernel is on, this path
+//! is therefore reachable from *every* I8 matmul caller in the crate -
+//! whole-model forward, shard forward, validator routes - not only from the
+//! named canonical profile. That is a wider blast radius than the profile name
+//! suggests. It is safe because every accepted value is exact and every other
+//! input is refused to the scalar kernel.
 //!
 //! # Arithmetic-safety precondition, proved HERE and not inherited
 //!
@@ -80,8 +99,7 @@ use crate::integer_lut::FRAC_BITS;
 use rayon::prelude::*;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use std::cell::RefCell;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// Balanced base-256 digits used by the vectorised path.
 pub const LIMB_COUNT: usize = 4;
@@ -114,7 +132,183 @@ const _: () = assert!(16_384i64 * (MAX_COLS_FOR_I32 as i64 + 1) > i32::MAX as i6
 // The dot itself cannot overflow i64 anywhere inside the accepted domain.
 const _: () = assert!((MAX_COLS_FOR_I32 as i128) * 128 * (-LIMB_MIN as i128) < i64::MAX as i128);
 
-static FAST_KERNEL: AtomicBool = AtomicBool::new(false);
+/// Whether the vectorised kernel is on by default on x86-64 (AVX2).
+///
+/// On. The determinism proof (PR #136, run 37467005539) produced the same
+/// 16-prompt x 32-token Llama-2-7B transcript, SHA-256 `d2c8c82b...`, with the
+/// scalar and the AVX2 kernel on Linux, Windows and Intel macOS.
+pub const AVX2_ON_BY_DEFAULT: bool = true;
+
+/// Whether the vectorised kernel is on by default on arm64 (NEON dotprod).
+///
+/// Off. NEON matched the scalar kernel on the proof's smoke run and on 3 of its
+/// 16 full-workload prompts (32,850 of 32,850 projections), not yet on the
+/// whole workload. This constant is the single switch: set it to `true` once
+/// the full 16 x 32 proof passes on arm64 hardware that does not swap, and
+/// arm64 builds then run NEON by default, with the same overrides.
+pub const NEON_ON_BY_DEFAULT: bool = false;
+
+/// Operator override, read once at first use: `scalar`, `simd` or `auto`, in
+/// any letter case. An unrecognised value selects the scalar reference kernel.
+pub const KERNEL_ENV: &str = "ARC_CANONICAL_KERNEL";
+
+/// Older override, honoured when [`KERNEL_ENV`] is unset or empty: `1` selects
+/// the vectorised kernel and any other value the scalar one.
+pub const LEGACY_KERNEL_ENV: &str = "ARC_FAST_CANONICAL_KERNEL";
+
+// The process-wide kernel choice, packed as `(source << 2) | mode`. Zero means
+// not resolved yet; every resolved state has a non-zero mode.
+const STATE_UNRESOLVED: u8 = 0;
+const MODE_SCALAR: u8 = 1;
+const MODE_SIMD: u8 = 2;
+const MODE_MASK: u8 = 0b11;
+const SOURCE_DEFAULT: u8 = 0;
+const SOURCE_ENV: u8 = 1;
+const SOURCE_LEGACY_ENV: u8 = 2;
+const SOURCE_EXPLICIT: u8 = 3;
+
+static KERNEL_STATE: AtomicU8 = AtomicU8::new(STATE_UNRESOLVED);
+
+const fn pack_state(simd: bool, source: u8) -> u8 {
+    let mode = if simd { MODE_SIMD } else { MODE_SCALAR };
+    (source << 2) | mode
+}
+
+/// A resolved kernel request: the kernel, where the choice came from, and
+/// whether an override value was unrecognised (and so fell back to scalar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KernelChoice {
+    simd: bool,
+    source: u8,
+    unrecognised: bool,
+}
+
+/// Choose the kernel from the two override variables and this target's
+/// default. Pure, so the precedence is tested without touching the process
+/// environment.
+fn choose_kernel(
+    requested: Option<&str>,
+    legacy: Option<&str>,
+    simd_by_default: bool,
+) -> KernelChoice {
+    if let Some(value) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        let (simd, unrecognised) = if value.eq_ignore_ascii_case("auto") {
+            (simd_by_default, false)
+        } else if value.eq_ignore_ascii_case("simd") {
+            (true, false)
+        } else if value.eq_ignore_ascii_case("scalar") {
+            (false, false)
+        } else {
+            // Fail safe: the scalar kernel is the reference and always correct.
+            (false, true)
+        };
+        return KernelChoice {
+            simd,
+            source: SOURCE_ENV,
+            unrecognised,
+        };
+    }
+    if let Some(value) = legacy {
+        return KernelChoice {
+            simd: value == "1",
+            source: SOURCE_LEGACY_ENV,
+            unrecognised: false,
+        };
+    }
+    KernelChoice {
+        simd: simd_by_default,
+        source: SOURCE_DEFAULT,
+        unrecognised: false,
+    }
+}
+
+/// Whether the vectorised kernel is on when nothing overrides it, for this
+/// build target and process. Availability is checked separately, per call.
+pub fn simd_on_by_default() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        AVX2_ON_BY_DEFAULT && !running_under_rosetta()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        NEON_ON_BY_DEFAULT
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+/// True when this x86-64 macOS process is translated by Rosetta 2. The proof
+/// ran on Intel CPUs, not on translated AVX2, so the default stays scalar
+/// there; an operator can still force the vectorised kernel.
+#[cfg(target_arch = "x86_64")]
+fn running_under_rosetta() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let mut translated: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: `sysctlbyname` reads the NUL-terminated name and writes at
+        // most `size` bytes into `translated`, which outlives the call. A null
+        // new-value pointer with length 0 means nothing is set.
+        let status = unsafe {
+            libc::sysctlbyname(
+                c"sysctl.proc_translated".as_ptr(),
+                std::ptr::addr_of_mut!(translated).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        status == 0 && translated == 1
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// The process-wide kernel state, resolved from the overrides and this
+/// target's default on first use.
+fn kernel_state() -> u8 {
+    match KERNEL_STATE.load(Ordering::Relaxed) {
+        STATE_UNRESOLVED => resolve_kernel_state(),
+        state => state,
+    }
+}
+
+#[cold]
+fn resolve_kernel_state() -> u8 {
+    let requested = std::env::var(KERNEL_ENV).ok();
+    let legacy = std::env::var(LEGACY_KERNEL_ENV).ok();
+    let choice = choose_kernel(
+        requested.as_deref(),
+        legacy.as_deref(),
+        simd_on_by_default(),
+    );
+    let state = pack_state(choice.simd, choice.source);
+    // Installed only while still unresolved, so an explicit
+    // `set_fast_canonical_kernel` always wins over the environment and default.
+    match KERNEL_STATE.compare_exchange(
+        STATE_UNRESOLVED,
+        state,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        Ok(_) => {
+            if choice.unrecognised {
+                tracing::warn!(
+                    variable = KERNEL_ENV,
+                    value = requested.as_deref().unwrap_or_default(),
+                    "unrecognised kernel override (expected scalar, simd or auto); \
+                     using the scalar reference kernel"
+                );
+            }
+            state
+        }
+        Err(current) => current,
+    }
+}
 
 /// Why a projection declined the vectorised path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,8 +388,34 @@ pub fn projection_census() -> ProjectionCensus {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// This thread's `[attempted, accepted, refused]` projections. The global
+    /// census is shared by every test running in the process; this one lets a
+    /// test attribute projections to the calls made on its own thread.
+    static THREAD_CENSUS: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+#[cfg(test)]
+fn count_on_this_thread(slot: usize) {
+    THREAD_CENSUS.with(|cell| {
+        let mut counts = cell.get();
+        counts[slot] += 1;
+        cell.set(counts);
+    });
+}
+
+/// Return this thread's `[attempted, accepted, refused]` projection counts and
+/// reset them. Counted whether or not the global census is on.
+#[cfg(test)]
+pub(crate) fn take_thread_census() -> [u64; 3] {
+    THREAD_CENSUS.with(|cell| cell.replace([0; 3]))
+}
+
 #[inline]
 fn record_attempt() {
+    #[cfg(test)]
+    count_on_this_thread(0);
     if CENSUS_ON.load(Ordering::Relaxed) {
         N_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
     }
@@ -204,6 +424,8 @@ fn record_attempt() {
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn record_accept() {
+    #[cfg(test)]
+    count_on_this_thread(1);
     if CENSUS_ON.load(Ordering::Relaxed) {
         N_ACCEPTED.fetch_add(1, Ordering::Relaxed);
     }
@@ -211,6 +433,8 @@ fn record_accept() {
 
 #[inline]
 fn record_refusal(reason: Refusal) -> bool {
+    #[cfg(test)]
+    count_on_this_thread(2);
     if CENSUS_ON.load(Ordering::Relaxed) {
         match reason {
             Refusal::Unavailable => &N_UNAVAILABLE,
@@ -235,30 +459,50 @@ thread_local! {
 
 /// Enable or disable the vectorised canonical kernel process-wide.
 ///
-/// Default is OFF. When OFF, every call site keeps the exact scalar code path
-/// it had before this module existed.
+/// An explicit call wins over the environment overrides and the per-target
+/// default, whether it is made before or after first use. Both kernels compute
+/// the same values; see the module docs.
 pub fn set_fast_canonical_kernel(enabled: bool) {
-    FAST_KERNEL.store(enabled, Ordering::Relaxed);
+    KERNEL_STATE.store(pack_state(enabled, SOURCE_EXPLICIT), Ordering::Relaxed);
 }
 
 /// Whether the vectorised canonical kernel is enabled *and* available here.
 ///
-/// `ARC_FAST_CANONICAL_KERNEL=1` sets the initial state once, so an existing
-/// test binary can be run against the vectorised path without editing it. An
-/// explicit [`set_fast_canonical_kernel`] call afterwards still wins.
+/// On first use this resolves the per-target default and the
+/// `ARC_CANONICAL_KERNEL` and `ARC_FAST_CANONICAL_KERNEL` overrides (see the
+/// module docs), unless [`set_fast_canonical_kernel`] has already chosen.
 pub fn fast_canonical_kernel_enabled() -> bool {
-    static ENV_INIT: OnceLock<()> = OnceLock::new();
-    ENV_INIT.get_or_init(|| {
-        if std::env::var("ARC_FAST_CANONICAL_KERNEL").as_deref() == Ok("1") {
-            FAST_KERNEL.store(true, Ordering::Relaxed);
-        }
-    });
-    FAST_KERNEL.load(Ordering::Relaxed) && dotprod_available()
+    (kernel_state() & MODE_MASK) == MODE_SIMD && dotprod_available()
+}
+
+/// The projection kernel that I8 matmuls use right now, named as the
+/// determinism proof names them: `avx2-limb`, `neon-sdot-limb` or
+/// `scalar-i8xi64`.
+pub fn effective_kernel_name() -> &'static str {
+    if !fast_canonical_kernel_enabled() {
+        "scalar-i8xi64"
+    } else if cfg!(target_arch = "x86_64") {
+        "avx2-limb"
+    } else {
+        "neon-sdot-limb"
+    }
+}
+
+/// Where the current kernel choice came from: `default`, the name of the
+/// environment variable that made it, or `explicit`.
+pub fn kernel_choice_source() -> &'static str {
+    match kernel_state() >> 2 {
+        SOURCE_ENV => KERNEL_ENV,
+        SOURCE_LEGACY_ENV => LEGACY_KERNEL_ENV,
+        SOURCE_EXPLICIT => "explicit",
+        _ => "default",
+    }
 }
 
 /// Whether this build and CPU can run the vectorised path at all.
 /// The historical name is retained for callers: x86-64 requires AVX2,
-/// whereas ARM64 requires NEON dotprod. The opt-in still defaults to off.
+/// whereas ARM64 requires NEON dotprod. Whether it runs by default is decided
+/// per target; see the module docs.
 pub fn dotprod_available() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
@@ -852,17 +1096,17 @@ pub fn matmul_i8_batched_fast(
 }
 
 /// Serialises every test that observes or mutates the process-global kernel
-/// switches: `FAST_CANONICAL`, `CENSUS_ON`, the projection counters and the
+/// switches: `KERNEL_STATE`, `CENSUS_ON`, the projection counters and the
 /// prefill counters in [`crate::canonical_prefill`].
 ///
 /// These switches are deliberately process-wide — that is what makes them
 /// usable as an operator control — but the test harness runs tests in parallel
-/// threads of one process, so a test that asserts "off by default" will observe
-/// another test's opt-in unless both serialise. That is exactly how
-/// `disabled_unless_explicitly_requested` failed the first time the batched
-/// prefill conformance tests were ever executed: `run_batched_conformance`
-/// enables the kernel, restores it correctly afterwards, and the default-off
-/// assertion still ran inside that window.
+/// threads of one process, so a test that asserts a switch's state will observe
+/// another test's change unless both serialise. That is exactly how the former
+/// default-off test (`disabled_unless_explicitly_requested`) failed the first
+/// time the batched prefill conformance tests were ever executed:
+/// `run_batched_conformance` enables the kernel, restores it correctly
+/// afterwards, and the default-off assertion still ran inside that window.
 ///
 /// The lock lives outside `mod tests` because the prefill conformance tests sit
 /// in `cached_integer_model`, a different module, and must take the same one.
@@ -1230,14 +1474,101 @@ mod tests {
         assert!(!CENSUS_ON.load(Ordering::Relaxed));
     }
 
+    fn choice(requested: Option<&str>, legacy: Option<&str>, default: bool) -> (bool, u8, bool) {
+        let resolved = choose_kernel(requested, legacy, default);
+        (resolved.simd, resolved.source, resolved.unrecognised)
+    }
+
     #[test]
-    fn disabled_unless_explicitly_requested() {
-        // Off unless the operator opted in; never on by default.
-        let _guard = kernel_switch_guard();
-        if std::env::var("ARC_FAST_CANONICAL_KERNEL").as_deref() == Ok("1") {
-            assert!(fast_canonical_kernel_enabled() || !dotprod_available());
-        } else {
-            assert!(!fast_canonical_kernel_enabled());
+    fn kernel_overrides_take_precedence_and_fail_safe_to_scalar() {
+        // No override: this target's default.
+        assert_eq!(choice(None, None, true), (true, SOURCE_DEFAULT, false));
+        assert_eq!(choice(None, None, false), (false, SOURCE_DEFAULT, false));
+        // An operator can force the scalar reference whatever the default.
+        for value in ["scalar", "SCALAR", " Scalar "] {
+            let forced = choice(Some(value), None, true);
+            assert_eq!(forced, (false, SOURCE_ENV, false), "{value:?}");
         }
+        // ...force the vectorised kernel (the NEON opt-in), or keep the default.
+        assert_eq!(choice(Some("simd"), None, false), (true, SOURCE_ENV, false));
+        assert_eq!(choice(Some("auto"), None, true), (true, SOURCE_ENV, false));
+        assert_eq!(
+            choice(Some("auto"), None, false),
+            (false, SOURCE_ENV, false)
+        );
+        // The new variable wins over the old one, in both directions.
+        let new_wins = choice(Some("scalar"), Some("1"), true);
+        assert_eq!(new_wins, (false, SOURCE_ENV, false));
+        assert_eq!(
+            choice(Some("simd"), Some("0"), false),
+            (true, SOURCE_ENV, false)
+        );
+        // A value nobody recognises fails safe to scalar and is reported.
+        let typo = choice(Some("scaler"), None, true);
+        assert_eq!(typo, (false, SOURCE_ENV, true));
+        // Empty means unset.
+        let empty = choice(Some(" "), None, true);
+        assert_eq!(empty, (true, SOURCE_DEFAULT, false));
+        // The old variable keeps its meaning: `1` on, any other value off.
+        let legacy_on = choice(None, Some("1"), false);
+        assert_eq!(legacy_on, (true, SOURCE_LEGACY_ENV, false));
+        for value in ["0", "", "off", "true"] {
+            let legacy_off = choice(None, Some(value), true);
+            assert_eq!(legacy_off, (false, SOURCE_LEGACY_ENV, false), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_is_on_only_where_the_full_proof_ran() {
+        // x86-64: the AVX2 kernel, except under Rosetta 2 translation.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(simd_on_by_default(), !running_under_rosetta());
+        // arm64: NEON stays off until the full-workload proof passes.
+        #[cfg(target_arch = "aarch64")]
+        assert!(!simd_on_by_default());
+    }
+
+    #[test]
+    fn an_explicit_choice_wins_and_is_reported() {
+        let _guard = kernel_switch_guard();
+        let previous = fast_canonical_kernel_enabled();
+
+        set_fast_canonical_kernel(false);
+        assert!(!fast_canonical_kernel_enabled());
+        assert_eq!(effective_kernel_name(), "scalar-i8xi64");
+        assert_eq!(kernel_choice_source(), "explicit");
+
+        set_fast_canonical_kernel(true);
+        assert_eq!(fast_canonical_kernel_enabled(), dotprod_available());
+        let expected = if !dotprod_available() {
+            "scalar-i8xi64"
+        } else if cfg!(target_arch = "x86_64") {
+            "avx2-limb"
+        } else {
+            "neon-sdot-limb"
+        };
+        assert_eq!(effective_kernel_name(), expected);
+        assert_eq!(kernel_choice_source(), "explicit");
+
+        set_fast_canonical_kernel(previous);
+    }
+
+    #[test]
+    fn the_thread_census_counts_only_this_threads_projections() {
+        let _ = take_thread_census();
+        let cols = 64usize;
+        let w = weights_with_scale(4, cols, 1);
+        let good = vec![7i64; cols];
+        let mut out = vec![0i64; 4];
+        let accepted = matmul_i8_canonical_rows_fast(&w, &good, cols, &mut out);
+        let mut bad = good.clone();
+        bad[0] = LIMB_MAX + 1;
+        assert!(!matmul_i8_canonical_rows_fast(&w, &bad, cols, &mut out));
+        let [attempted, accepted_count, refused] = take_thread_census();
+        assert_eq!(attempted, 2);
+        assert_eq!(accepted_count, u64::from(accepted));
+        assert_eq!(refused, 2 - u64::from(accepted));
+        assert_eq!(accepted, dotprod_available());
+        assert_eq!(take_thread_census(), [0; 3], "taking the census resets it");
     }
 }

@@ -33,6 +33,32 @@ is published, the fixture has also passed natively on Apple arm64 and under the
 Apple x86_64/Rosetta target. CI results must still pass on the pushed commit;
 local evidence is not a substitute for that gate.
 
+## Projection kernel
+
+The canonical INT8 projections run on one of two kernels that compute the same
+integers: the scalar `i8 x i64` kernel, and a limb kernel (AVX2 on x86-64, NEON
+dotprod on arm64) that splits each activation into exact base-256 digits and
+refuses, to the scalar kernel, any input it cannot prove exact.
+
+- **x86-64: the AVX2 kernel is the default.** The determinism proof (PR #136,
+  run 37467005539) decoded Llama-2-7B, 16 prompts x 32 tokens, with both kernels
+  on Linux, Windows and Intel macOS; every transcript had the same SHA-256. CPUs
+  without AVX2, and x86-64 processes translated by Rosetta 2, use the scalar
+  kernel.
+- **arm64: the scalar kernel stays the default** until NEON passes the same full
+  workload. `NEON_ON_BY_DEFAULT` in `crates/arc-inference/src/canonical_simd.rs`
+  is the single switch for that.
+- **Override:** `ARC_CANONICAL_KERNEL=scalar` forces the scalar kernel, `simd`
+  forces the limb kernel where the CPU has one, and `auto` keeps the default.
+  The older `ARC_FAST_CANONICAL_KERNEL` still applies when the new variable is
+  unset: `1` selects the limb kernel, any other value the scalar one.
+
+The golden tests force each kernel in turn at 1, 2, 3 and 4 threads and hold
+both to the same committed digests: the whole-model sequence, one-shard and
+three-shard runs, the worker's generation call, the operator projection
+vectors and the interleaved-RoPE reference. A per-thread count confirms that
+the limb kernel ran every projection in its leg.
+
 ## What this does not prove
 
 The KAT is intentionally scoped. It does **not** establish bit identity for:

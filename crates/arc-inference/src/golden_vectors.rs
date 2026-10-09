@@ -620,55 +620,259 @@ fn integer_operators_match_the_independent_reference() {
     }
 }
 
+/// The interleaved-RoPE profile vectors from the independent reference, run on
+/// a `threads`-wide pool. With `kernel`, also checks which kernel ran.
+fn assert_interleaved_reference(
+    doc: &serde_json::Value,
+    fixture: &GoldenFixture,
+    threads: usize,
+    kernel: Option<Kernel>,
+) {
+    let section = &doc["interleaved_generation_v2"];
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("determinism test pool");
+    pool.install(|| {
+        let _ = crate::canonical_simd::take_thread_census();
+        let mut model = build_fixture_model(fixture);
+        assert_eq!(
+            hex::encode(model.weight_hash().0),
+            text(&section["model_weight_hash_before_row_rewrite"])
+        );
+        model
+            .canonicalize_gguf_interleaved_rope_rows()
+            .expect("the fixture is a complete canonical I8 model");
+        assert_eq!(model.arithmetic_profile(), text(&section["profile"]));
+
+        let sequence = run_whole_model(&model, &token_ids(&section["sequence_tokens"]));
+        assert_eq!(sequence.next_tokens, token_ids(&section["next_tokens"]));
+        let expected_logits: Vec<String> = section["logits_hashes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| text(v).to_owned())
+            .collect();
+        assert_eq!(sequence.logits_hashes, expected_logits, "{threads} threads");
+        assert_eq!(
+            sequence.kv_cache_hash,
+            text(&section["kv_cache_hash_split_half_layout"])
+        );
+
+        for run in section["generation_v2"].as_array().unwrap() {
+            let prompt = token_ids(&run["prompt"]);
+            let max_tokens = run["max_tokens"].as_u64().unwrap() as u32;
+            let eos = token_ids(&run["eos_tokens"]);
+            let (tokens, hash) = if run["repetition_penalty"].as_bool().unwrap() {
+                model.try_generate_v2(&prompt, max_tokens, &eos)
+            } else {
+                model.try_generate_v2_greedy(&prompt, max_tokens, &eos)
+            }
+            .expect("the vectors fit the fixture context window");
+            assert_eq!(tokens, token_ids(&run["tokens"]), "{threads} threads");
+            assert_eq!(hex::encode(hash.0), text(&run["output_hash"]));
+        }
+
+        if let Some(kernel) = kernel {
+            let case = format!("{kernel:?} kernel, {threads} threads, interleaved profile");
+            assert_projections_ran_on(kernel, None, &case);
+        }
+    });
+}
+
 #[test]
 fn interleaved_profile_and_generation_v2_match_the_independent_reference() {
     let doc = operators();
-    let section = &doc["interleaved_generation_v2"];
     let fixture = fixture();
     for threads in [1, 4] {
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("determinism test pool");
-        pool.install(|| {
-            let mut model = build_fixture_model(&fixture);
-            assert_eq!(
-                hex::encode(model.weight_hash().0),
-                text(&section["model_weight_hash_before_row_rewrite"])
-            );
-            model
-                .canonicalize_gguf_interleaved_rope_rows()
-                .expect("the fixture is a complete canonical I8 model");
-            assert_eq!(model.arithmetic_profile(), text(&section["profile"]));
+        assert_interleaved_reference(&doc, &fixture, threads, None);
+    }
+}
 
-            let sequence = run_whole_model(&model, &token_ids(&section["sequence_tokens"]));
-            assert_eq!(sequence.next_tokens, token_ids(&section["next_tokens"]));
-            let expected_logits: Vec<String> = section["logits_hashes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| text(v).to_owned())
-                .collect();
-            assert_eq!(sequence.logits_hashes, expected_logits, "{threads} threads");
-            assert_eq!(
-                sequence.kv_cache_hash,
-                text(&section["kv_cache_hash_split_half_layout"])
-            );
+// ── Both projection kernels against the same reviewed constants ─────────────
+//
+// The tests above run whichever kernel this process chose: by default the AVX2
+// limb kernel on x86-64 and the scalar kernel on arm64. The tests below force
+// each kernel in turn, at every thread count from 1 to 4, and hold both to the
+// same committed digests. A per-thread census shows that the vectorised leg ran
+// the vectorised kernel for every projection, with no fallback to scalar.
 
-            for run in section["generation_v2"].as_array().unwrap() {
-                let prompt = token_ids(&run["prompt"]);
-                let max_tokens = run["max_tokens"].as_u64().unwrap() as u32;
-                let eos = token_ids(&run["eos_tokens"]);
-                let (tokens, hash) = if run["repetition_penalty"].as_bool().unwrap() {
-                    model.try_generate_v2(&prompt, max_tokens, &eos)
-                } else {
-                    model.try_generate_v2_greedy(&prompt, max_tokens, &eos)
-                }
-                .expect("the vectors fit the fixture context window");
-                assert_eq!(tokens, token_ids(&run["tokens"]), "{threads} threads");
-                assert_eq!(hex::encode(hash.0), text(&run["output_hash"]));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kernel {
+    Scalar,
+    Vectorised,
+}
+
+/// The scalar kernel always, and the limb kernel when this CPU has one (AVX2
+/// on x86-64, NEON dotprod on arm64).
+fn kernels() -> &'static [Kernel] {
+    if crate::canonical_simd::dotprod_available() {
+        &[Kernel::Scalar, Kernel::Vectorised]
+    } else {
+        &[Kernel::Scalar]
+    }
+}
+
+/// Keeps one kernel selected process-wide until dropped, then restores the
+/// previous choice. It holds the kernel-switch lock, so no other test changes
+/// the kernel meanwhile.
+struct ForcedKernel {
+    previous: bool,
+    _switch: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for ForcedKernel {
+    fn drop(&mut self) {
+        crate::canonical_simd::set_fast_canonical_kernel(self.previous);
+    }
+}
+
+fn force_kernel(kernel: Kernel) -> ForcedKernel {
+    let switch = crate::canonical_simd::kernel_switch_guard();
+    let previous = crate::canonical_simd::fast_canonical_kernel_enabled();
+    crate::canonical_simd::set_fast_canonical_kernel(kernel == Kernel::Vectorised);
+    ForcedKernel {
+        previous,
+        _switch: switch,
+    }
+}
+
+/// Check, and reset, this thread's projection census for one leg. The scalar
+/// leg must never reach the vectorised kernel. The vectorised leg must run
+/// every projection on it, `expected` of them when the count is known.
+fn assert_projections_ran_on(kernel: Kernel, expected: Option<u64>, case: &str) {
+    let [attempted, accepted, refused] = crate::canonical_simd::take_thread_census();
+    match kernel {
+        Kernel::Scalar => assert_eq!(
+            attempted, 0,
+            "{case}: the scalar leg reached the vectorised kernel"
+        ),
+        Kernel::Vectorised => {
+            assert!(attempted > 0, "{case}: the vectorised kernel never ran");
+            assert_eq!(
+                (accepted, refused),
+                (attempted, 0),
+                "{case}: {refused} of {attempted} projections fell back to scalar"
+            );
+            if let Some(expected) = expected {
+                assert_eq!(attempted, expected, "{case}: projection count");
             }
-        });
+        }
+    }
+}
+
+#[test]
+fn golden_both_kernels_match_the_kat_on_every_thread_count() {
+    let fixture = fixture();
+    let expected = expected_sequence(&fixture);
+    // Seven projections per layer reach the kernel switch. The fixture's
+    // 23-row LM head is below `matmul_i8`'s 256-row cutover, so it never does.
+    let per_forward = 7 * fixture.n_layers as u64;
+    let sequence = per_forward * fixture.sequence_tokens.len() as u64;
+    // Legacy generation, as a community worker runs it: one BOS forward, one
+    // per prompt token and one per generated token (the fixture has no EOS).
+    let forwards =
+        1 + fixture.generation_prompt.len() as u64 + u64::from(fixture.generation_max_tokens);
+    let generation = per_forward * forwards;
+
+    for &kernel in kernels() {
+        let _forced = force_kernel(kernel);
+        for threads in [1, 2, 3, 4] {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("determinism test pool");
+            pool.install(|| {
+                let case = format!("{kernel:?} kernel, {threads} threads");
+                // The canonical I8 profile that community workers and
+                // validator shards run: no I16 promotion.
+                let model = build_fixture_model(&fixture);
+                assert!(model.has_canonical_i8_profile());
+                let _ = crate::canonical_simd::take_thread_census();
+
+                let whole = run_whole_model(&model, &fixture.sequence_tokens);
+                assert_eq!(whole, expected, "{case}: whole model drifted from the KAT");
+                assert_projections_ran_on(kernel, Some(sequence), &format!("{case}, whole model"));
+
+                let full_shard = run_full_shard(&model, &fixture.sequence_tokens);
+                assert_eq!(full_shard, expected, "{case}: one-shard run drifted");
+                assert_projections_ran_on(kernel, Some(sequence), &format!("{case}, one shard"));
+
+                let split =
+                    run_split_shards(&model, &fixture.sequence_tokens, &fixture.shard_boundaries);
+                assert_eq!(split.sequence, expected, "{case}: three-way shards drifted");
+                assert_eq!(
+                    split.hidden_hashes, fixture.expected.shard_hidden_hashes,
+                    "{case}: shard-boundary hidden state drifted from the KAT"
+                );
+                assert_projections_ran_on(kernel, Some(sequence), &format!("{case}, three shards"));
+
+                // The call a community worker makes for an assigned job.
+                let (tokens, hash) = model
+                    .try_generate(
+                        &fixture.generation_prompt,
+                        fixture.generation_max_tokens,
+                        &model.config.eos_tokens,
+                    )
+                    .expect("the KAT generation fits the fixture context window");
+                assert_eq!(
+                    tokens, fixture.expected.generated_tokens,
+                    "{case}: generation changed tokens"
+                );
+                assert_eq!(
+                    hex::encode(hash.0),
+                    fixture.expected.generated_output_hash,
+                    "{case}: generation changed the output hash"
+                );
+                assert_projections_ran_on(kernel, Some(generation), &format!("{case}, generation"));
+            });
+        }
+    }
+}
+
+#[test]
+fn golden_operator_projections_match_the_reference_on_both_kernels() {
+    use crate::cached_integer_model::matmul_i8_canonical_rows;
+
+    let doc = operators();
+    let cases = doc["matmul_rows"].as_array().unwrap();
+    for &kernel in kernels() {
+        let _forced = force_kernel(kernel);
+        let _ = crate::canonical_simd::take_thread_census();
+        for (index, case) in cases.iter().enumerate() {
+            let rows = case["rows"].as_u64().unwrap() as usize;
+            let weights = I8Weights {
+                data: ints(&case["weights"])
+                    .into_iter()
+                    .map(|w| w as i8)
+                    .collect(),
+                scales: ints(&case["scales"]),
+                n_rows: rows,
+                n_cols: case["cols"].as_u64().unwrap() as usize,
+            };
+            let mut output = vec![0i64; rows];
+            matmul_i8_canonical_rows(&weights, &ints(&case["input"]), &mut output)
+                .expect("the reference vectors are inside the checked domain");
+            assert_eq!(
+                output,
+                ints(&case["output"]),
+                "{kernel:?} kernel, projection case {index}"
+            );
+        }
+        let case = format!("{kernel:?} kernel, operator projections");
+        assert_projections_ran_on(kernel, Some(cases.len() as u64), &case);
+    }
+}
+
+#[test]
+fn golden_interleaved_profile_matches_the_reference_on_both_kernels() {
+    let doc = operators();
+    let fixture = fixture();
+    for &kernel in kernels() {
+        let _forced = force_kernel(kernel);
+        for threads in [1, 2, 3, 4] {
+            assert_interleaved_reference(&doc, &fixture, threads, Some(kernel));
+        }
     }
 }
 

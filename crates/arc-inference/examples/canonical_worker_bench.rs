@@ -21,11 +21,14 @@
 //!
 //! ```text
 //! cargo run --release --locked -p arc-inference --example canonical_worker_bench -- \
-//!     [--layers 32] [--positions 8] [--warmup 1] [--threads N] [--summary FILE]
+//!     [--layers 32] [--positions 8] [--warmup 1] [--threads N] [--summary FILE] \
+//!     [--expect-default KERNEL]
 //! ```
 //!
 //! `--summary` appends a Markdown table to an existing file, such as
-//! `$GITHUB_STEP_SUMMARY`.
+//! `$GITHUB_STEP_SUMMARY`. `--expect-default` fails the run unless the
+//! process default kernel has that name (`avx2-limb`, `neon-sdot-limb` or
+//! `scalar-i8xi64`), which lets CI check the default and the overrides.
 
 use arc_inference::cached_integer_model::{
     ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig,
@@ -69,6 +72,7 @@ struct Args {
     warmup: usize,
     threads: usize,
     summary: Option<String>,
+    expect_default: Option<String>,
 }
 
 fn number(flag: &str, value: &str) -> Result<usize, String> {
@@ -85,6 +89,7 @@ fn parse_args() -> Result<Args, String> {
         warmup: 1,
         threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
         summary: None,
+        expect_default: None,
     };
     let mut index = 0;
     while index < raw.len() {
@@ -98,6 +103,7 @@ fn parse_args() -> Result<Args, String> {
             "--warmup" => args.warmup = number(flag, value)?,
             "--threads" => args.threads = number(flag, value)?,
             "--summary" => args.summary = Some(value.clone()),
+            "--expect-default" => args.expect_default = Some(value.clone()),
             other => return Err(format!("unknown argument {other}; see the file header")),
         }
         index += 2;
@@ -364,6 +370,14 @@ fn main() -> Result<(), String> {
         args.threads,
         kernel_name()
     );
+    if let Some(expected) = &args.expect_default
+        && expected != kernel_name()
+    {
+        return Err(format!(
+            "the default kernel is {}, expected {expected}",
+            kernel_name()
+        ));
+    }
 
     let started = Instant::now();
     let model = build_model(args.layers);

@@ -82,6 +82,15 @@ jobs:
       # what the determinism proof's timings were measured with.
       - name: Build the benchmark
         run: cargo build --locked --release -p arc-inference --example canonical_worker_bench
+      # Every runner here is x86-64 with AVX2, where the limb kernel is the
+      # default; the run also times the scalar kernel for comparison.
       - name: Run the benchmark
         shell: bash
-        run: cargo run --locked --release -p arc-inference --example canonical_worker_bench -- --summary "$GITHUB_STEP_SUMMARY"
+        run: cargo run --locked --release -p arc-inference --example canonical_worker_bench -- --summary "$GITHUB_STEP_SUMMARY" --expect-default avx2-limb
+      # One layer is enough to prove the operator override reaches a real
+      # process: the default leg must run scalar and still match the AVX2 leg.
+      - name: Check that ARC_CANONICAL_KERNEL=scalar forces the scalar kernel
+        shell: bash
+        env:
+          ARC_CANONICAL_KERNEL: scalar
+        run: cargo run --locked --release -p arc-inference --example canonical_worker_bench -- --layers 1 --positions 2 --expect-default scalar-i8xi64

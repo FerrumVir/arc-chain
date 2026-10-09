@@ -462,12 +462,16 @@ pub(crate) mod tests {
                 (hashes, cache.digest())
             })
         };
+        // Scalar explicitly: the vectorised kernel is the x86-64 default, so
+        // relying on the default would compare it with itself.
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let previous = crate::canonical_simd::fast_canonical_kernel_enabled();
+        crate::canonical_simd::set_fast_canonical_kernel(false);
         let one = run(1);
         assert_eq!(one, run(3));
-        let _guard = crate::canonical_simd::kernel_switch_guard();
         crate::canonical_simd::set_fast_canonical_kernel(true);
         let simd = run(2);
-        crate::canonical_simd::set_fast_canonical_kernel(false);
+        crate::canonical_simd::set_fast_canonical_kernel(previous);
         assert_eq!(one, simd);
     }
 
