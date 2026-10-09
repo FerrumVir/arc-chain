@@ -1417,3 +1417,65 @@ fn golden_modes_seeded_sampling_rechecks_from_teacher_forced_logits() {
 fn golden_modes_stage_holders_verify_rows_in_one_pass() {
     panic!("not implemented: a stage holder cannot verify several rows in one call");
 }
+
+// ── Scratch only: print the token-by-token reference values to pin ─────────
+
+fn pin_section(reference: &Reference, tokens: &[u32]) -> serde_json::Value {
+    let logits: Vec<String> = (0..tokens.len())
+        .map(|position| hash_i64(&reference.trace.logits[&position]))
+        .collect();
+    let boundaries: Vec<Vec<String>> = (0..tokens.len())
+        .map(|position| {
+            (0..reference.n_layers())
+                .map(|layer| reference.trace.boundaries[&(position, layer)].clone())
+                .collect()
+        })
+        .collect();
+    serde_json::json!({
+        "tokens": tokens,
+        "logits_hashes": logits,
+        "boundary_hashes": boundaries,
+        "kv_cache_hash": hash_cache(&reference.kv),
+    })
+}
+
+#[test]
+fn golden_modes_print_reference_pins() {
+    let switch = KernelSwitch::hold();
+    let fixture = fixture();
+    let tokens = full_window(&fixture);
+    for profile in PROFILES {
+        let model = build_model(&fixture, profile);
+        let reference = switch.run(BASE_LEG, || Reference::new(&model, &tokens));
+        let section = pin_section(&reference, &tokens);
+        println!(
+            "EXECUTION_MODES_PIN full_window/{profile:?} {}",
+            serde_json::to_string(&section).unwrap()
+        );
+        let (prompt, max_tokens) = generation_case(&fixture, profile);
+        for generation in GENERATIONS {
+            let (generated, hash) = switch.run(BASE_LEG, || {
+                production_generate(&model, generation, &prompt, max_tokens)
+            });
+            let value = serde_json::json!({
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "tokens": generated,
+                "output_hash": hash,
+            });
+            println!(
+                "EXECUTION_MODES_PIN generation/{profile:?}/{generation:?} {}",
+                serde_json::to_string(&value).unwrap()
+            );
+        }
+    }
+    let wide = wide_fixture();
+    let tokens = wide_tokens(&wide);
+    let model = build_model(&wide, Profile::LegacySplitHalf);
+    let reference = switch.run(BASE_LEG, || Reference::new(&model, &tokens));
+    let section = pin_section(&reference, &tokens);
+    println!(
+        "EXECUTION_MODES_PIN wide/LegacySplitHalf {}",
+        serde_json::to_string(&section).unwrap()
+    );
+}
