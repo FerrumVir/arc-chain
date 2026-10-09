@@ -1,0 +1,231 @@
+name: Serving speed (bit-exact)
+
+# The serving layer of the dyadic profile (crates/arc-inference/src/modern/serving):
+# continuous batching, a content-addressed prefix cache and exact speculative
+# decoding, gated on batch and phase invariance. Design and numbers:
+# docs/serving-optimizations.md. Nothing here changes a consensus, reward or
+# native-inference binding, or the network's canonical model.
+#
+#   gate   rustfmt, clippy (deny warnings), and every arc-inference unit test
+#          (serving proofs, golden vectors, modern profile) on Linux x86-64
+#          (AVX2), Linux arm64 (NEON dotprod) and Windows x86-64 (AVX2); the
+#          modern tests run again with the SIMD kernels forced on.
+#   kernel the batched projection against one row at a time on synthetic
+#          matrices (Linux x86-64 and arm64).
+#   bench  the real SmolLM3-3B, downloaded at the pinned revision and converted
+#          on the runner: the golden digest through the serving engine, decode
+#          tok/s at concurrency 1..32, time to first token with and without the
+#          prefix cache, and the speculative speedup. CI-runner numbers.
+#
+# Linux and Windows only: macOS runners stay free for the release sequence.
+# Documentation-only changes do not run it.
+
+on:
+  pull_request:
+    branches: [main, modern-model-smollm3]
+    paths:
+      - 'crates/arc-inference/**'
+      - 'scripts/arc_modern/**'
+      - '.github/workflows/serving-speed.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Release optimisation without fat LTO: the same kernels, a much shorter
+  # build. Integer results cannot depend on optimisation settings.
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  SOURCE_MANIFEST: docs/protocol/packages/smollm3-3b.source.json
+  PINNED_MANIFEST: docs/protocol/packages/smollm3-3b.integer-package.json
+  CASES: scripts/arc_modern/smollm3_cases.json
+  WORKLOAD: scripts/arc_modern/serving_workload.json
+  # Matrix digest of the five golden SmolLM3-3B cases: identical on all eight
+  # OS x kernel cells and in the independent Python reference (PR #137,
+  # run 37473148757).
+  GOLDEN_DIGEST: 3e43f342c00cf3e3be3072e654e9d1c43f547a73b8a4fc6e906b7119e5cb49f2
+
+jobs:
+  gate:
+    name: gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Install every component rust-toolchain.toml lists up front.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: serving-gate-${{ matrix.os }}
+      - name: rustfmt (workspace packages)
+        if: matrix.os == 'ubuntu-latest'
+        run: ./scripts/rustfmt-workspace.sh --check
+      # Same feature set as the shipped node; CI's own clippy job runs on x86-64.
+      - name: Clippy (arc-inference with candle, all targets, deny warnings)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+      # The NEON kernels compile only on arm64. Repo CI has never run clippy
+      # there, so pre-existing arm64-only findings must not block this job:
+      # the step reports, and the serving files are checked by hand.
+      - name: Clippy on arm64 (report only)
+        if: runner.arch == 'ARM64'
+        continue-on-error: true
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+      - name: Unit tests (every arc-inference test, including the serving proofs; Linux and Windows x86-64)
+        if: runner.arch == 'X64'
+        run: cargo test -p arc-inference --lib --locked
+      - name: Unit tests on arm64 (modern profile, serving proofs, golden vectors)
+        if: runner.arch == 'ARM64'
+        run: |
+          set -euo pipefail
+          cargo test -p arc-inference --lib --locked modern::
+          cargo test -p arc-inference --lib --locked golden
+      - name: Modern-profile and serving tests with the SIMD kernels forced on
+        env:
+          ARC_FAST_CANONICAL_KERNEL: '1'
+        run: |
+          cargo test -p arc-inference --lib --locked modern::
+
+  kernel:
+    name: kernel (${{ matrix.os }})
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: serving-bench-${{ matrix.os }}
+          save-if: false
+      - name: Batched projection vs one row at a time (synthetic matrices, no model)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread' || true
+          cargo build --release --locked -p arc-inference --bin arc-serve-bench
+          ./target/release/arc-serve-bench gemm --kernel simd \
+            --out "$RUNNER_TEMP/evidence/gemm.json" --summary "$RUNNER_TEMP/evidence/gemm.md"
+          cat "$RUNNER_TEMP/evidence/gemm.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: gemm-${{ matrix.os }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  bench:
+    name: bench (${{ matrix.os }})
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: serving-bench-${{ matrix.os }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Model directory (the larger of / and /mnt)
+        run: |
+          set -euo pipefail
+          if [ -d /mnt ] && [ "$(df --output=avail -B1 /mnt | tail -1)" -gt "$(df --output=avail -B1 / | tail -1)" ]; then
+            sudo mkdir -p /mnt/arc-model
+            sudo chown "$(id -u):$(id -g)" /mnt/arc-model
+            dir=/mnt/arc-model
+          else
+            dir="$HOME/arc-model"
+            mkdir -p "$dir"
+          fi
+          mkdir -p "$RUNNER_TEMP/evidence"
+          echo "MODEL_DIR=$dir" >> "$GITHUB_ENV"
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+          df -h "$dir" || true
+      - name: Record runner facts (CPU, memory) for the tok/s labels
+        run: |
+          set -euo pipefail
+          {
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|L2|L3|Flags' | cut -c1-300 || true
+            free -b || true
+          } 2>&1 | tee "$EVIDENCE/runner.txt"
+      - name: Build arc-modern and arc-serve-bench
+        run: cargo build --release --locked -p arc-inference --bin arc-modern --bin arc-serve-bench
+      - name: Fetch SmolLM3-3B BF16 from Hugging Face (pinned revision, SHA-256 verified)
+        run: python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR"
+      - name: Convert on this runner and verify against the pinned package manifest
+        run: |
+          set -euo pipefail
+          ./target/release/arc-modern convert --source-dir "$MODEL_DIR" \
+            --source-manifest "$SOURCE_MANIFEST" --out "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --manifest-out "$EVIDENCE/smollm3-manifest.json" > "$EVIDENCE/convert.json"
+          rm -f "$MODEL_DIR"/model-*.safetensors
+          ./target/release/arc-modern verify --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --manifest "$PINNED_MANIFEST" | tee "$EVIDENCE/verify-pinned.json"
+      - name: Golden digest on the single-token path (must equal the pinned digest)
+        run: |
+          set -euo pipefail
+          ./target/release/arc-modern golden --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --tokenizer "$MODEL_DIR/tokenizer.json" --cases "$CASES" --kernel simd \
+            --out "$EVIDENCE/golden-single-token.json"
+          digest="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["matrix_digest"])' "$EVIDENCE/golden-single-token.json")"
+          echo "single-token golden digest: $digest"
+          test "$digest" = "$GOLDEN_DIGEST"
+      - name: Serving layer (golden through the serving engine, batching, prefix cache, speculation)
+        run: |
+          set -euo pipefail
+          ./target/release/arc-serve-bench all --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --tokenizer "$MODEL_DIR/tokenizer.json" --cases "$CASES" --workload "$WORKLOAD" \
+            --expect "$GOLDEN_DIGEST" --kernel simd \
+            --out "$EVIDENCE/serving-bench.json" --summary "$EVIDENCE/serving-bench.md"
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f "$EVIDENCE/serving-bench.md" ]; then
+            {
+              echo "Runner: $(grep -m1 'Model name' "$EVIDENCE/runner.txt" | sed 's/  */ /g' || echo unknown)"
+              echo
+              cat "$EVIDENCE/serving-bench.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: serving-bench-${{ matrix.os }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
