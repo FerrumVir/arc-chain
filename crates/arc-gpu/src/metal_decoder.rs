@@ -865,6 +865,47 @@ impl MetalDecoder {
         Ok(())
     }
 
+    /// How many leading rows of `layer`'s device KV cache equal `keys` and
+    /// `values`: the same number of rows each, `d_kv` values a row, at most
+    /// `kv_capacity` rows. Compares in place, without copying.
+    pub fn kv_rows_matching(
+        &self,
+        layer: usize,
+        keys: &[i64],
+        values: &[i64],
+    ) -> Result<usize, String> {
+        let d_kv = self.shape.d_kv;
+        if layer >= self.layers.len()
+            || keys.len() != values.len()
+            || !keys.len().is_multiple_of(d_kv)
+            || keys.len() / d_kv > self.shape.kv_capacity
+        {
+            return Err(format!(
+                "KV rows of layer {layer} do not fit the device cache"
+            ));
+        }
+        let state = &self.layers[layer];
+        // SAFETY: shared-storage buffers of `kv_capacity * d_kv` i64 values,
+        // and `keys.len()` is at most that (checked above). `step` needs
+        // `&mut self` and waits for every command buffer it commits, so no GPU
+        // write to these buffers is in flight while `&self` is borrowed.
+        let (device_k, device_v) = unsafe {
+            (
+                std::slice::from_raw_parts(state.k_cache.contents().cast::<i64>(), keys.len()),
+                std::slice::from_raw_parts(state.v_cache.contents().cast::<i64>(), values.len()),
+            )
+        };
+        if device_k == keys && device_v == values {
+            return Ok(keys.len() / d_kv);
+        }
+        Ok(keys
+            .chunks_exact(d_kv)
+            .zip(values.chunks_exact(d_kv))
+            .zip(device_k.chunks_exact(d_kv).zip(device_v.chunks_exact(d_kv)))
+            .take_while(|((k, v), (held_k, held_v))| k == held_k && v == held_v)
+            .count())
+    }
+
     /// One device KV-cache row.
     pub fn read_kv(&self, layer: usize, pos: usize) -> Result<(Vec<i64>, Vec<i64>), String> {
         let d_kv = self.shape.d_kv;

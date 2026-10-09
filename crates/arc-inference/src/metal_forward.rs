@@ -23,10 +23,13 @@
 //! # KV-cache mirror
 //!
 //! The device keeps its own copy of the KV cache. Before each token, every
-//! layer's device rows are reconciled with the caller's cache: rows the
-//! device has not seen are uploaded (so CPU and GPU tokens can be mixed on one
-//! cache), and if the last mirrored row no longer matches, the layer is
-//! uploaded again from scratch. A cache whose layers do not hold exactly
+//! row the device holds for a layer is compared with the caller's cache, and
+//! rows from the first difference on are uploaded. Rows the device has not
+//! seen are uploaded too, so CPU and GPU tokens can be mixed on one cache, and
+//! a caller can switch caches or change rows in place: the device copy always
+//! equals the caller's cache before a token runs. The check reads the caller's
+//! cache and the device copy once per token: for 7B, 2 MB of each per cached
+//! position. A cache whose layers do not hold exactly
 //! `position` rows runs on the CPU, which then behaves exactly as it always
 //! has.
 
@@ -346,6 +349,12 @@ impl<'a> MetalForward<'a> {
     /// Reconcile the device KV cache with `cache` for `layers`. Returns false
     /// when the GPU cannot run position `pos` from this cache; the CPU then
     /// computes the token.
+    ///
+    /// Every row the device holds is compared with the caller's cache, and
+    /// rows from the first difference on are uploaded again. So a different
+    /// cache, or rows changed in place, never leave a stale device row behind,
+    /// even where a row matches by coincidence (at layer 0, a row depends only
+    /// on its position's token).
     fn sync_mirror(&mut self, cache: &KVCache, pos: usize, layers: Range<usize>) -> bool {
         let shape = *self.decoder.shape();
         if pos >= shape.kv_capacity || pos >= shape.max_seq {
@@ -360,19 +369,14 @@ impl<'a> MetalForward<'a> {
             if keys.len() != pos * d_kv || values.len() != pos * d_kv {
                 return false;
             }
-            let mut mirrored = self.mirrored[layer].min(pos);
-            if mirrored > 0 {
-                let last = mirrored - 1;
-                let row = last * d_kv..(last + 1) * d_kv;
-                let same = matches!(
-                    self.decoder.read_kv(layer, last),
-                    Ok((k, v)) if k[..] == keys[row.clone()] && v[..] == values[row.clone()]
-                );
-                if !same {
-                    mirrored = 0;
-                }
-            }
-            for p in mirrored..pos {
+            let held = self.mirrored[layer].min(pos) * d_kv;
+            let Ok(valid) = self
+                .decoder
+                .kv_rows_matching(layer, &keys[..held], &values[..held])
+            else {
+                return false;
+            };
+            for p in valid..pos {
                 let row = p * d_kv..(p + 1) * d_kv;
                 if self
                     .decoder
@@ -988,18 +992,58 @@ mod tests {
         assert_eq!(mixed.k_data, reference.k_data);
         assert_eq!(mixed.v_data, reference.v_data);
         assert!(gpu.stats().kv_rows_uploaded > 0, "{:?}", gpu.stats());
-        // A different cache of the same length is detected and re-uploaded.
-        let mut other = KVCache::new(3);
-        for token in [5u32, 4, 3, 2, 1, 0, 8, 7] {
-            model.forward_one_token(token, &mut other);
+
+        fn filled(model: &CachedIntegerModel, tokens: &[u32]) -> KVCache {
+            let mut cache = KVCache::new(model.config.n_layers);
+            for &token in tokens {
+                model.forward_one_token(token, &mut cache);
+            }
+            cache
         }
-        let mut other_reference = KVCache::new(3);
-        for token in [5u32, 4, 3, 2, 1, 0, 8, 7] {
-            model.forward_one_token(token, &mut other_reference);
-        }
+        let before = gpu.stats();
+        // Switch to a different cache whose row at the device's last mirrored
+        // position (6) comes from the mixed session's token there. At layer 0
+        // that row is then identical while rows 0 to 5 differ, so every held
+        // row must be compared, not only the last (review ARC-76, finding 3).
+        let mut other = filled(&model, &[5, 4, 3, 2, 1, 0, 6, 7]);
+        let mut other_reference = filled(&model, &[5, 4, 3, 2, 1, 0, 6, 7]);
         let want = model.forward_one_token(11, &mut other_reference);
         assert_eq!(gpu.forward_one_token(11, &mut other), want);
         assert_eq!(other.k_data, other_reference.k_data);
+        assert_eq!(other.v_data, other_reference.v_data);
+
+        // A cache that shares rows 0 to 5 with the one the device holds: rows
+        // from the first difference on are uploaded again.
+        let mut other = filled(&model, &[5, 4, 3, 2, 1, 0, 8, 7]);
+        let mut other_reference = filled(&model, &[5, 4, 3, 2, 1, 0, 8, 7]);
+        let want = model.forward_one_token(12, &mut other_reference);
+        assert_eq!(gpu.forward_one_token(12, &mut other), want);
+        assert_eq!(other.k_data, other_reference.k_data);
+        assert_eq!(other.v_data, other_reference.v_data);
+
+        // Rows changed in place in the cache the device holds: row 3 of every
+        // layer is replaced by the mixed session's row 3.
+        let row = 3 * model.config.d_kv..4 * model.config.d_kv;
+        for layer in 0..model.config.n_layers {
+            for cache in [&mut other, &mut other_reference] {
+                cache.k_data[layer][row.clone()].copy_from_slice(&mixed.k_data[layer][row.clone()]);
+                cache.v_data[layer][row.clone()].copy_from_slice(&mixed.v_data[layer][row.clone()]);
+            }
+        }
+        let want = model.forward_one_token(13, &mut other_reference);
+        assert_eq!(gpu.forward_one_token(13, &mut other), want);
+        assert_eq!(other.k_data, other_reference.k_data);
+        assert_eq!(other.v_data, other_reference.v_data);
+        // All three ran on the GPU: none of these answers is a CPU fallback.
+        let after = gpu.stats();
+        assert_eq!(
+            (
+                after.gpu_tokens - before.gpu_tokens,
+                after.cpu_tokens - before.cpu_tokens
+            ),
+            (3, 0),
+            "{before:?} {after:?}"
+        );
     }
 
     #[test]
