@@ -462,7 +462,7 @@ fn speculative_stage_processes_match_plain_decoding_and_audit() {
             let at = format!("D {depth} R {rows} {}", drafter.name());
             let (done, _, _) = island
                 .coordinator
-                .run_speculative(&reqs, &config, &mut **drafter)
+                .run_speculative(&reqs, &config, drafter)
                 .unwrap();
             assert_matches(&expected, &done, &at);
             for (p, got) in plain.iter().zip(&done) {

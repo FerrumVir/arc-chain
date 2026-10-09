@@ -598,3 +598,56 @@ impl Drafter for ScriptedDrafter {
         drafts
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modern::arith::Selection;
+
+    fn request(id: u64) -> Request {
+        Request {
+            id,
+            prompt: vec![1, 2],
+            max_tokens: 8,
+            eos: Vec::new(),
+            selection: Selection::Argmax,
+        }
+    }
+
+    #[test]
+    fn ngram_drafts_continue_the_latest_match_and_extend_cycles() {
+        let mut d = NgramDrafter::default();
+        // "1 2" last occurred at the start, followed by 3, 1, 2, then the
+        // cycle continues through the proposals themselves.
+        assert_eq!(d.draft(&[1, 2, 3, 1, 2], 2, 5), vec![3, 1, 2, 3, 1]);
+        // Only the one-token suffix "2" recurs: what followed it is proposed.
+        assert_eq!(d.draft(&[7, 2, 5, 9, 2], 1, 2), vec![5, 9]);
+        // No earlier occurrence, too little context, or nothing asked.
+        assert!(d.draft(&[1, 2, 3], 1, 4).is_empty());
+        assert!(d.draft(&[4], 1, 4).is_empty());
+        assert!(d.draft(&[1, 2, 1, 2], 2, 0).is_empty());
+    }
+
+    #[test]
+    fn scripted_drafts_follow_the_script_on_the_true_path_only() {
+        let truth = HashMap::from([(7, vec![10, 11, 12, 13, 14, 15])]);
+        let script = Script::Pattern(vec![true, true, false]);
+        let mut d = ScriptedDrafter::new(truth, 50, script);
+        d.begin(&request(7));
+        // Outputs 0 and 1 are right, 2 is wrong, and so is everything after
+        // it (the context is then off the target's path).
+        assert_eq!(d.draft(&[1, 2], 2, 4), vec![10, 11, 13, 14]);
+        // Once the target corrected output 2, drafting follows it again.
+        assert_eq!(d.draft(&[1, 2, 10, 11, 12], 2, 2), vec![13, 14]);
+        // A context off the path only gets wrong drafts; past the end, none.
+        assert_eq!(d.draft(&[1, 2, 10, 99], 2, 2), vec![13, 14]);
+        assert!(d.draft(&[1, 2, 10, 11, 12, 13, 14, 15], 2, 3).is_empty());
+        d.begin(&request(8));
+        assert!(d.draft(&[1, 2], 2, 3).is_empty());
+        // Rates are independent per output and close to nominal.
+        let rate = Script::Rate { rate: 0.7, seed: 4 };
+        let right = (0..20_000).filter(|&i| rate.right(3, i)).count();
+        assert!((13_400..=14_600).contains(&right), "{right}");
+        assert!(!Script::Pattern(Vec::new()).right(1, 0));
+    }
+}

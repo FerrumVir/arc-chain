@@ -115,6 +115,9 @@ Tests (CI, never run locally):
 * `model::tests::truncated_caches_continue_like_fresh_ones`: logits and cache
   bytes after truncate-and-extend equal a cache that never held the dropped
   positions.
+* `speculative::tests`: the n-gram drafter continues the latest match and
+  extends cycles; the scripted drafter follows its script on the target's
+  path only, and its rate is close to nominal.
 * `tests/island_processes.rs::speculative_stage_processes_match_plain_decoding_and_audit`:
   four stage processes over TCP with emulated 1 ms hops; synchronous and
   pipelined shapes with a scripted and the n-gram drafter match the single

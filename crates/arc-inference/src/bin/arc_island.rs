@@ -1198,8 +1198,7 @@ fn cmd_spec_bench(args: &Args) -> Result<(), ModernError> {
                 });
                 // Plain decoding through the existing scheduler, one answer
                 // at a time: the baseline and the ledger every run must match.
-                let mut island =
-                    ProcessIsland::launch(&exe, &package_path, &cuts, &c, &stage_args)?;
+                let mut island = ProcessIsland::launch(&exe, &package_path, &cuts, &c, stage_args)?;
                 let timer = island.stages[0].hello["wan_timer_mode"].clone();
                 let schedule = Schedule {
                     pad_bytes_per_position: pad,
@@ -1253,12 +1252,10 @@ fn cmd_spec_bench(args: &Args) -> Result<(), ModernError> {
                             forget_finished: true,
                         };
                         let mut island =
-                            ProcessIsland::launch(&exe, &package_path, &cuts, &c, &stage_args)?;
-                        let (done, stats, spec) = island.coordinator.run_speculative(
-                            &requests,
-                            &config,
-                            &mut **drafter,
-                        )?;
+                            ProcessIsland::launch(&exe, &package_path, &cuts, &c, stage_args)?;
+                        let (done, stats, spec) = island
+                            .coordinator
+                            .run_speculative(&requests, &config, drafter)?;
                         let workers = island.shutdown()?;
                         let exact = matches_reference(&done, &reference);
                         let same_ledgers = done.len() == plain.len()
