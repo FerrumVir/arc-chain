@@ -417,6 +417,8 @@ pub struct MetalExactI16 {
     events: Mutex<Vec<(SharedEvent, u64)>>,
     /// Whether the one-command-buffer handoff reproduced the reference here.
     one_buffer: bool,
+    /// Why it did not, if it did not.
+    one_buffer_error: Option<String>,
     tile: Tile,
 }
 
@@ -556,7 +558,10 @@ impl MetalExactI16 {
         // The handoff is used only if it reproduces the reference here, on a
         // queue of its own so that a device without working shared events
         // cannot stall the engine's queue.
-        engine.one_buffer = engine.self_test_one_buffer().is_ok();
+        match engine.self_test_one_buffer() {
+            Ok(_) => engine.one_buffer = true,
+            Err(error) => engine.one_buffer_error = Some(error),
+        }
         Ok(engine)
     }
 
@@ -614,6 +619,7 @@ impl MetalExactI16 {
             scratch: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
             one_buffer: false,
+            one_buffer_error: None,
             tile: DEFAULT_TILE,
         })
     }
@@ -967,6 +973,11 @@ impl MetalExactI16 {
     /// [`Submission::OneCommandBuffer`] runs as [`Submission::PerPhase`].
     pub fn one_command_buffer(&self) -> bool {
         self.one_buffer
+    }
+
+    /// Why the one-command-buffer handoff failed its start-up test, if it did.
+    pub fn one_command_buffer_error(&self) -> Option<&str> {
+        self.one_buffer_error.as_deref()
     }
 
     fn heads_pipeline(&self, planes: usize, tile: Tile) -> Result<&ComputePipelineState, Refusal> {

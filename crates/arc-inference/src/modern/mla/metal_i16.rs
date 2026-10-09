@@ -769,8 +769,7 @@ pub(crate) mod test_support {
         }
 
         /// Head `j`'s `wk_b` projection, as `layer_forward` computes it.
-        pub(crate) fn key(&self, j: usize) -> Result<Vec<i64>, ModernError> {
-            let (key, _) = self.stacks();
+        pub(crate) fn key(&self, key: &HeadStack<'_>, j: usize) -> Result<Vec<i64>, ModernError> {
             let rows = j * self.rank..(j + 1) * self.rank;
             let base = j * self.dqk();
             let mut qa = vec![0i64; self.rank];
@@ -788,10 +787,21 @@ pub(crate) mod test_support {
 
         /// The per-head loop of `layer_forward`, on the CPU, on `schedule`.
         pub(crate) fn cpu(&self, schedule: Schedule) -> Result<Vec<i64>, String> {
-            let (_, value) = self.stacks();
+            let (key, value) = self.stacks();
+            self.cpu_with(&key, &value, schedule)
+        }
+
+        /// [`Self::cpu`] with stacks admitted once (as the stage loader admits
+        /// them), so a timed call does not rescan the weights.
+        pub(crate) fn cpu_with(
+            &self,
+            key: &HeadStack<'_>,
+            value: &HeadStack<'_>,
+            schedule: Schedule,
+        ) -> Result<Vec<i64>, String> {
             let mut out = vec![0i64; self.n_heads * self.v_dim];
             for_each_head(&mut out, self.v_dim, schedule, |j, block| {
-                let qa = self.key(j)?;
+                let qa = self.key(key, j)?;
                 let u = self.attend(j, &qa)?;
                 let rows = j * self.v_dim..(j + 1) * self.v_dim;
                 project_i16(
@@ -811,9 +821,10 @@ pub(crate) mod test_support {
         /// Every head's latent `u` (the second projection's input), on the
         /// CPU.
         pub(crate) fn latents(&self) -> Vec<i64> {
+            let (key, _) = self.stacks();
             (0..self.n_heads)
                 .flat_map(|j| {
-                    let qa = self.key(j).expect("in domain");
+                    let qa = self.key(&key, j).expect("in domain");
                     self.attend(j, &qa).expect("in domain")
                 })
                 .collect()
@@ -1373,8 +1384,9 @@ mod tests {
         let _guard = kernel_switch_guard();
         let engine = metal_i16_engine().expect("Metal device");
         eprintln!(
-            "one command buffer per layer on this device: {}",
-            engine.one_command_buffer()
+            "one command buffer per layer on this device: {} ({:?})",
+            engine.one_command_buffer(),
+            engine.one_command_buffer_error()
         );
         let mut rng = Rng(0x4EAD_0016);
         for (n_heads, rank, nope, rope_dim, v_dim, positions) in [
@@ -1479,13 +1491,15 @@ mod tests {
     fn metal_i16_one_command_buffer_handoff_is_exact_on_this_device() {
         let _guard = kernel_switch_guard();
         let engine = metal_i16_engine().expect("Metal device");
+        let report = engine.self_test_one_buffer();
+        eprintln!("one-command-buffer handoff self-test on a fresh queue: {report:?}");
         assert!(
             engine.one_command_buffer(),
-            "the shared-event handoff did not reproduce the reference here"
+            "the shared-event handoff failed its start-up test: {:?}",
+            engine.one_command_buffer_error()
         );
-        let report = engine.self_test_one_buffer().expect("handoff self-test");
+        let report = report.expect("handoff self-test");
         assert!(report.compared > 0 && report.refused > 0, "{report:?}");
-        eprintln!("one-command-buffer handoff self-test: {report:?}");
     }
 
     /// Head batches need the INT16 switch, the heads switch and a scope;
@@ -1915,16 +1929,27 @@ mod bench {
                 positions,
                 1 << 14,
             );
-            let want = layer.cpu(Schedule::Serial).expect("in domain");
-            let serial = time_wall(5, || {
-                std::hint::black_box(layer.cpu(Schedule::Serial).expect("in domain"));
-            });
-            let pool = time_wall(5, || {
-                std::hint::black_box(layer.cpu(Schedule::Pool).expect("in domain"));
-            });
-            // The stacks are resident before anything is timed.
+            // The stacks are admitted (and, for the GPU, resident) before
+            // anything is timed.
             let (key, value) = layer.stacks();
             let queries = layer.queries();
+            let want = layer
+                .cpu_with(&key, &value, Schedule::Serial)
+                .expect("in domain");
+            let serial = time_wall(5, || {
+                std::hint::black_box(
+                    layer
+                        .cpu_with(&key, &value, Schedule::Serial)
+                        .expect("in domain"),
+                );
+            });
+            let pool = time_wall(5, || {
+                std::hint::black_box(
+                    layer
+                        .cpu_with(&key, &value, Schedule::Pool)
+                        .expect("in domain"),
+                );
+            });
             let metal = MetalI16Model::from_weights(&[
                 (key.weights, n_heads * rank, nope),
                 (value.weights, n_heads * v_dim, rank),
