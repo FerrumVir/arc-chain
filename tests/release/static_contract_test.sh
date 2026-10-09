@@ -134,7 +134,7 @@ required_assets_are_built_and_gated() {
         'scripts/release/materialize-pretag-artifacts.py' \
         'Re-smoke the exact binaries selected for publication'
     do
-        printf '%s\n' "$headless_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$headless_block" || {
             printf 'headless release consumer is not exact-preflight bound: %s\n' \
                 "$required"
             return 1
@@ -235,7 +235,7 @@ linux_arm_asset_name_is_consistent_and_required() {
         capture && /optional:/ { exit }
         capture && /steps:/ { exit }
     ' "$RELEASE_WORKFLOW")"
-    if printf '%s\n' "$arm_matrix_block" | grep -Eq 'optional:[[:space:]]*true'; then
+    if grep -Eq 'optional:[[:space:]]*true' <<<"$arm_matrix_block"; then
         printf 'Linux ARM is a canonical required asset but its matrix leg is still optional\n'
         return 1
     fi
@@ -516,7 +516,7 @@ pretag_exact_byte_handoff_is_fail_closed() {
             capture && $0 ~ /^  [a-zA-Z0-9_-]+:$/ && $0 != job { exit }
         ' "$RELEASE_WORKFLOW")"
         for permission in 'actions: read' 'contents: read'; do
-            printf '%s\n' "$block" | grep -Fq "$permission" || {
+            grep -Fq "$permission" <<<"$block" || {
                 printf '%s download job lacks explicit %s permission\n' \
                     "$job" "$permission"
                 return 1
@@ -524,12 +524,12 @@ pretag_exact_byte_handoff_is_fail_closed() {
         done
     done
     for permission in 'actions: read' 'contents: write'; do
-        printf '%s\n' "$publish_block" | grep -Fq "$permission" || {
+        grep -Fq "$permission" <<<"$publish_block" || {
             printf 'publisher lacks minimal required permission: %s\n' "$permission"
             return 1
         }
     done
-    if printf '%s\n' "$publish_block" | grep -Eq 'packages: write|pull-requests: write|id-token: write'; then
+    if grep -Eq 'packages: write|pull-requests: write|id-token: write' <<<"$publish_block"; then
         printf 'publisher has unrelated write permissions\n'
         return 1
     fi
@@ -865,7 +865,7 @@ linux_compat_smoke_executes_real_headless_node() {
         'grep -q "HTTP/1.1 200"' \
         'grep -Eq "\"status\":\"(ok|degraded)\""'
     do
-        printf '%s\n' "$smoke_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$smoke_block" || {
             printf 'Ubuntu compatibility smoke is missing: %s\n' "$required"
             return 1
         }
@@ -951,12 +951,12 @@ release_supply_chain_and_npm_audits_are_blocking() {
         'ref: ${{ needs.validate.outputs.sha }}' \
         'bash scripts/ci/run-cargo-deny.sh "${{ matrix.manifest }}"'
     do
-        printf '%s\n' "$supply_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$supply_block" || {
             printf 'blocking release dependency-policy gate is missing: %s\n' "$required"
             return 1
         }
     done
-    if printf '%s\n' "$supply_block" | grep -Eq 'continue-on-error:[[:space:]]*true'; then
+    if grep -Eq 'continue-on-error:[[:space:]]*true' <<<"$supply_block"; then
         printf 'release cargo-deny gate is still advisory\n'
         return 1
     fi
@@ -972,7 +972,7 @@ release_supply_chain_and_npm_audits_are_blocking() {
         'manifest: desktop/src-tauri/Cargo.toml' \
         'manifest: tests/release/tauri-updater-verifier/Cargo.toml'
     do
-        printf '%s\n' "$supply_block" | grep -Fq -- "$manifest" || {
+        grep -Fq -- "$manifest" <<<"$supply_block" || {
             printf 'release cargo-deny matrix omits shipped/release-tool graph: %s\n' "$manifest"
             return 1
         }
@@ -985,12 +985,12 @@ release_supply_chain_and_npm_audits_are_blocking() {
         'tests/release/tauri-updater-verifier/Cargo.toml' \
         'bash scripts/ci/run-cargo-deny.sh "$manifest"'
     do
-        printf '%s\n' "$ci_audit_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$ci_audit_block" || {
             printf 'pull-request dependency-policy gate is missing: %s\n' "$required"
             return 1
         }
     done
-    if printf '%s\n' "$ci_audit_block" | grep -Eq 'continue-on-error:[[:space:]]*true'; then
+    if grep -Eq 'continue-on-error:[[:space:]]*true' <<<"$ci_audit_block"; then
         printf 'pull-request cargo-deny gate is advisory\n'
         return 1
     fi
@@ -1026,14 +1026,14 @@ release_supply_chain_and_npm_audits_are_blocking() {
         }
     done
 
-    printf '%s\n' "$quality_block" \
-        | grep -Fq 'npm --prefix "$package" audit --package-lock-only --audit-level=low' \
+    grep -Fq 'npm --prefix "$package" audit --package-lock-only --audit-level=low' \
+        <<<"$quality_block" \
         || {
             printf 'release-quality does not run the shared blocking npm audit loop\n'
             return 1
         }
-    printf '%s\n' "$quality_block" \
-        | grep -Fq 'for package in dashboard desktop sdk sdk/typescript sdks/typescript; do' || {
+    grep -Fq 'for package in dashboard desktop sdk sdk/typescript sdks/typescript; do' \
+        <<<"$quality_block" || {
             printf 'release-quality npm audit loop does not enumerate all five lockfiles\n'
             return 1
         }
@@ -1093,7 +1093,7 @@ cross_arch_golden_vectors_gate_publication() {
         'toolchain: nightly-2026-03-16' \
         'cargo test -p arc-inference --lib --locked golden -- --nocapture'
     do
-        printf '%s\n' "$golden_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$golden_block" || {
             printf 'cross-architecture release golden-vector gate is missing: %s\n' "$required"
             return 1
         }
@@ -1129,12 +1129,12 @@ cross_os_workspace_tests_are_blocking() {
         'cargo check --workspace --all-targets --locked' \
         'cargo test --workspace --lib --locked'
     do
-        printf '%s\n' "$test_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$test_block" || {
             printf 'cross-OS workspace test gate omits: %s\n' "$required"
             return 1
         }
     done
-    if printf '%s\n' "$test_block" | grep -Fq 'continue-on-error'; then
+    if grep -Fq 'continue-on-error' <<<"$test_block"; then
         printf 'Mac/Windows workspace tests are still optional\n'
         return 1
     fi
@@ -1160,7 +1160,7 @@ nondefault_release_features_have_distinct_blocking_statuses() {
         'cargo clippy -p arc-inference -p arc-node --all-targets --features candle --locked -- -D warnings' \
         'cargo test -p arc-inference -p arc-node --lib --features candle --locked'
     do
-        printf '%s\n' "$candle_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$candle_block" || {
             printf 'distinct release Candle status omits: %s\n' "$required"
             return 1
         }
@@ -1173,13 +1173,13 @@ nondefault_release_features_have_distinct_blocking_statuses() {
         'cargo check -p arc-crypto -p arc-state -p arc-node -p arc-bench --all-targets --features benchmark-tools --locked' \
         'cargo test -p arc-crypto -p arc-state -p arc-node -p arc-bench --lib --bins --tests --features benchmark-tools --locked'
     do
-        printf '%s\n' "$benchmark_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$benchmark_block" || {
             printf 'distinct benchmark-tools status omits: %s\n' "$required"
             return 1
         }
     done
-    if printf '%s\n%s\n' "$candle_block" "$benchmark_block" \
-        | grep -Eq 'continue-on-error:[[:space:]]*true'; then
+    if grep -Eq 'continue-on-error:[[:space:]]*true' \
+        <<<"$candle_block"$'\n'"$benchmark_block"; then
         printf 'a nondefault production/security feature status is advisory\n'
         return 1
     fi
@@ -1251,8 +1251,8 @@ shellcheck_gates_share_the_blocking_warning_policy() {
         printf 'local quality harness does not mirror the blocking warning/error ShellCheck policy\n'
         return 1
     }
-    if printf '%s\n%s\n' "$release_contract_block" "$shellcheck_block" \
-        | grep -Eq 'continue-on-error:[[:space:]]*true'; then
+    if grep -Eq 'continue-on-error:[[:space:]]*true' \
+        <<<"$release_contract_block"$'\n'"$shellcheck_block"; then
         printf 'a blocking ShellCheck gate is advisory\n'
         return 1
     fi
@@ -1384,14 +1384,14 @@ release_secret_jobs_require_the_owner_environment() {
     backup_workflow_block="$(cat "$SIGNING_BACKUP_WORKFLOW")"
 
     for block in "$signer_block" "$manifest_block" "$backup_readiness_block" "$backup_workflow_block"; do
-        printf '%s\n' "$block" | grep -Eq '^[[:space:]]+environment:[[:space:]]+release$' || {
+        grep -Eq '^[[:space:]]+environment:[[:space:]]+release$' <<<"$block" || {
             printf 'a signing-key or recovery-passphrase job is not bound to the release environment\n'
             return 1
         }
     done
     for block in "$unsigned_block" "$handoff_block" "$assembly_block" \
         "$publish_draft_block" "$draft_verify_block" "$publish_block" "$published_verify_block"; do
-        if printf '%s\n' "$block" | grep -Eq '^[[:space:]]+environment:[[:space:]]+release$'; then
+        if grep -Eq '^[[:space:]]+environment:[[:space:]]+release$' <<<"$block"; then
             printf 'a no-secret build, handoff, verifier, or publisher job requests the release environment\n'
             return 1
         fi
@@ -1405,7 +1405,7 @@ release_secret_jobs_require_the_owner_environment() {
         'Normalize and package the exact no-key bundle handoff' \
         'overwrite: false'
     do
-        printf '%s\n' "$unsigned_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$unsigned_block" || {
             printf 'no-key desktop build omits: %s\n' "$required"
             return 1
         }
@@ -1424,7 +1424,7 @@ release_secret_jobs_require_the_owner_environment() {
             return 1
         }
     done
-    if printf '%s\n' "$unsigned_block" | grep -Fq '${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}'; then
+    if grep -Fq '${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}' <<<"$unsigned_block"; then
         printf 'no-key desktop build can receive the updater private key\n'
         return 1
     fi
@@ -1437,12 +1437,12 @@ release_secret_jobs_require_the_owner_environment() {
         'retention-days: 2' \
         'overwrite: false'
     do
-        printf '%s\n' "$handoff_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$handoff_block" || {
             printf 'unprivileged desktop signer handoff omits: %s\n' "$required"
             return 1
         }
     done
-    if printf '%s\n' "$handoff_block" | grep -Eq 'TAURI_SIGNING_PRIVATE_KEY|environment:[[:space:]]+release'; then
+    if grep -Eq 'TAURI_SIGNING_PRIVATE_KEY|environment:[[:space:]]+release' <<<"$handoff_block"; then
         printf 'unprivileged desktop handoff can receive an updater key\n'
         return 1
     fi
@@ -1459,7 +1459,7 @@ release_secret_jobs_require_the_owner_environment() {
         'unsigned-desktop-handoff.py verify-signed' \
         'tauri-updater-verifier'
     do
-        printf '%s\n' "$signer_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$signer_block" || {
             printf 'isolated updater signer omits: %s\n' "$required"
             return 1
         }
@@ -1481,8 +1481,8 @@ release_secret_jobs_require_the_owner_environment() {
         capture { print }
         capture && /- name: Prove signer output/ { exit }
     ')"
-    if printf '%s\n' "$signing_step" \
-        | grep -Eq 'python|npm|cargo|rustc|build\.rs|tauri[[:space:]]+bundle|scripts/release'; then
+    if grep -Eq 'python|npm|cargo|rustc|build\.rs|tauri[[:space:]]+bundle|scripts/release' \
+        <<<"$signing_step"; then
         printf 'updater signing-key step executes a repository, lifecycle, compiler, or bundle surface\n'
         return 1
     fi
@@ -1494,8 +1494,8 @@ release_secret_jobs_require_the_owner_environment() {
         /- name: Sign only the verified updater payload/ { exit }
         { print }
     ')"
-    if printf '%s\n' "$pre_signer" | grep -Eq \
-        '(^|[[:space:]])(bash|sh|python3?|node)[[:space:]]+([^|;&]*\/)?scripts\/|cargo[[:space:]]+(build|run|test)|npm[[:space:]]+(run|exec)|signer[[:space:]]+sign[[:space:]]'; then
+    if grep -Eq \
+        '(^|[[:space:]])(bash|sh|python3?|node)[[:space:]]+([^|;&]*\/)?scripts\/|cargo[[:space:]]+(build|run|test)|npm[[:space:]]+(run|exec)|signer[[:space:]]+sign[[:space:]]' <<<"$pre_signer"; then
         printf 'updater signer executes repository/lifecycle/compiler/signer code before key exposure\n'
         return 1
     fi
@@ -1506,12 +1506,12 @@ release_secret_jobs_require_the_owner_environment() {
         'Upload the create-only unsigned manifest handoff' \
         'contents: read'
     do
-        printf '%s\n' "$assembly_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$assembly_block" || {
             printf 'no-secret release assembly omits: %s\n' "$required"
             return 1
         }
     done
-    if printf '%s\n' "$assembly_block" | grep -Eq 'ARC_RELEASE_MANIFEST_PRIVATE_KEY|contents:[[:space:]]+write'; then
+    if grep -Eq 'ARC_RELEASE_MANIFEST_PRIVATE_KEY|contents:[[:space:]]+write' <<<"$assembly_block"; then
         printf 'release assembly can access manifest signing or publication authority\n'
         return 1
     fi
@@ -1529,7 +1529,7 @@ release_secret_jobs_require_the_owner_environment() {
         'cleanup_key' \
         'Upload the create-only sealed release handoff'
     do
-        printf '%s\n' "$manifest_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$manifest_block" || {
             printf 'isolated release-manifest signer omits: %s\n' "$required"
             return 1
         }
@@ -1539,8 +1539,8 @@ release_secret_jobs_require_the_owner_environment() {
         capture { print }
         capture && /- name: Prove original bytes unchanged/ { exit }
     ')"
-    if printf '%s\n' "$manifest_signing_step" \
-        | grep -Eq 'python|npm|cargo|rustc|scripts/release|source[[:space:]]'; then
+    if grep -Eq 'python|npm|cargo|rustc|scripts/release|source[[:space:]]' \
+        <<<"$manifest_signing_step"; then
         printf 'manifest signing-key step executes repository or compiler code\n'
         return 1
     fi
@@ -1571,7 +1571,7 @@ release_secret_jobs_require_the_owner_environment() {
         'Verify the updater canary only after all recovered secrets are gone' \
         'ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}'
     do
-        printf '%s\n' "$backup_readiness_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$backup_readiness_block" || {
             printf 'isolated signing-backup readiness job omits: %s\n' "$required"
             return 1
         }
@@ -1581,8 +1581,8 @@ release_secret_jobs_require_the_owner_environment() {
         capture { print }
         capture && /- uses: dtolnay\/rust-toolchain@/ { exit }
     ')"
-    if printf '%s\n' "$backup_restore_step" \
-        | grep -Eq 'scripts\/|python|cargo|rustc|npm[[:space:]]+(run|exec)|source[[:space:]]|bash[[:space:]]'; then
+    if grep -Eq 'scripts\/|python|cargo|rustc|npm[[:space:]]+(run|exec)|source[[:space:]]|bash[[:space:]]' \
+        <<<"$backup_restore_step"; then
         printf 'backup recovery-secret step executes repository, lifecycle, compiler, or shell-source code\n'
         return 1
     fi
@@ -1616,7 +1616,7 @@ release_secret_jobs_require_the_owner_environment() {
         '/usr/bin/shred -u' \
         'cleanup_keys'
     do
-        printf '%s\n' "$backup_key_step" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$backup_key_step" || {
             printf 'inline signing-key backup secret window omits: %s\n' "$required"
             return 1
         }
@@ -1674,8 +1674,8 @@ release_secret_jobs_require_the_owner_environment() {
             return 1
         }
     done
-    if printf '%s\n%s\n' "$publish_draft_block" "$publish_block" \
-        | grep -Eq 'ARC_RELEASE_MANIFEST_PRIVATE_KEY|TAURI_SIGNING_PRIVATE_KEY|ARC_SIGNING_BACKUP_PASSPHRASE|environment:[[:space:]]+release'; then
+    if grep -Eq 'ARC_RELEASE_MANIFEST_PRIVATE_KEY|TAURI_SIGNING_PRIVATE_KEY|ARC_SIGNING_BACKUP_PASSPHRASE|environment:[[:space:]]+release' \
+        <<<"$publish_draft_block"$'\n'"$publish_block"; then
         printf 'publisher can access a signing key or release environment\n'
         return 1
     fi
@@ -1684,13 +1684,13 @@ release_secret_jobs_require_the_owner_environment() {
         'Download the immutable signed desktop artifact by ID' \
         'materialize-pretag-artifacts.py'
     do
-        printf '%s\n' "$desktop_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$desktop_block" || {
             printf 'tag-time desktop verification omits: %s\n' "$required"
             return 1
         }
     done
-    if printf '%s\n' "$desktop_block" \
-        | grep -Eq 'TAURI_SIGNING_PRIVATE_KEY|npx tauri build|environment:[[:space:]]+release'; then
+    if grep -Eq 'TAURI_SIGNING_PRIVATE_KEY|npx tauri build|environment:[[:space:]]+release' \
+        <<<"$desktop_block"; then
         printf 'tag-time desktop job rebuilds or re-exposes signing state instead of consuming reviewed bytes\n'
         return 1
     fi
@@ -1773,7 +1773,7 @@ publish_is_pinned_to_one_validated_commit_and_create_only() {
         'python3 scripts/release/select-pretag-artifacts.py' \
         '--github-output "$GITHUB_OUTPUT"'
     do
-        printf '%s\n' "$validate_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$validate_block" || {
             printf 'release validation does not export the validated tag commit: missing %s\n' "$required"
             return 1
         }
@@ -1786,7 +1786,7 @@ publish_is_pinned_to_one_validated_commit_and_create_only() {
         'toolchain: nightly-2026-03-16' \
         './scripts/ci_check.sh --full'
     do
-        printf '%s\n' "$quality_block" | grep -Fq -- "$required" || {
+        grep -Fq -- "$required" <<<"$quality_block" || {
             printf 'validated-commit release-quality job is missing: %s\n' "$required"
             return 1
         }
@@ -1819,8 +1819,8 @@ ref: ${{ needs.validate.outputs.sha }}' ]; then
             "$ref_values"
         return 1
     fi
-    printf '%s\n' "$assembly_block" \
-        | grep -Fq 'needs: [validate, release-quality, release-supply-chain, cross-arch-golden-vectors, headless, linux-server-compat, desktop]' \
+    grep -Fq 'needs: [validate, release-quality, release-supply-chain, cross-arch-golden-vectors, headless, linux-server-compat, desktop]' \
+        <<<"$assembly_block" \
         || {
             printf 'release assembly can run without an exact-ref quality, supply-chain, golden-vector, or asset gate\n'
             return 1
@@ -1956,8 +1956,8 @@ ref: ${{ needs.validate.outputs.sha }}' ]; then
         printf 'draft cleanup/upload or independently verified compare/publish ordering regressed\n'
         return 1
     fi
-    if printf '%s\n%s\n%s\n' "$publish_draft_block" "$cleanup_block" "$publish_block" \
-        | grep -Eq 'git[[:space:]]+(fetch|ls-remote|config)|scripts/release|actions/checkout@'; then
+    if grep -Eq 'git[[:space:]]+(fetch|ls-remote|config)|scripts/release|actions/checkout@' \
+        <<<"$publish_draft_block"$'\n'"$cleanup_block"$'\n'"$publish_block"; then
         printf 'a contents-write publisher can execute checkout, Git config/hooks, or repository code\n'
         return 1
     fi
