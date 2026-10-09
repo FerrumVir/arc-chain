@@ -1244,6 +1244,51 @@ impl std::fmt::Display for PipelineError {
     }
 }
 
+impl PipelineError {
+    /// The error for a public response: the same text without shard node
+    /// names or socket addresses. Callers log the full `Display` text.
+    fn public_message(&self) -> String {
+        match self {
+            PipelineError::MissingValidatorIdentity { .. } => {
+                "Shard identity unavailable or malformed for a pipeline replica".to_string()
+            }
+            PipelineError::Gap { expected, got, .. } => format!(
+                "Pipeline gap: expected layer {expected} next, got shard [{}, {})",
+                got.0, got.1
+            ),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// What a public caller sees when the validator shard pipeline fails while it
+/// runs. The error names shard holders, their socket addresses and request
+/// URLs, so its detail goes to this node's log only.
+const SHARD_PIPELINE_FAILED: &str = "the validator shard pipeline could not complete this request; the detail is in this node's log";
+
+fn public_pipeline_run_error(error: String) -> (StatusCode, Json<ApiError>) {
+    tracing::warn!(%error, "validator shard pipeline failed");
+    api_error(StatusCode::BAD_GATEWAY, SHARD_PIPELINE_FAILED)
+}
+
+/// The worker's answer when its result could not be verified yet. The
+/// verifier's reason goes to this coordinator's log.
+const COMMUNITY_VERIFICATION_UNAVAILABLE: &str = "community result could not complete independent verification and remains retryable; the detail is in the coordinator's log";
+
+/// The public text for a pipeline that could not be assembled. The full
+/// error, with shard node names and socket addresses, goes to this node's log.
+fn public_pipeline_assembly_reason(error: PipelineError) -> String {
+    tracing::warn!(%error, "validator shard pipeline could not be assembled");
+    error.public_message()
+}
+
+fn public_pipeline_assembly_error(error: PipelineError) -> (StatusCode, Json<ApiError>) {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        public_pipeline_assembly_reason(error),
+    )
+}
+
 /// Signed shard announcements retain the authenticated validator identity in
 /// the registry's `node_name` field. That field is also serialized by the
 /// legacy `/shards` view, so live callers must treat it as the canonical ID;
@@ -11930,8 +11975,8 @@ async fn inference_run_sharded(
         )
     })?;
 
-    let selection = assemble_profile_bound_pipeline_for(&node, None)
-        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let selection =
+        assemble_profile_bound_pipeline_for(&node, None).map_err(public_pipeline_assembly_error)?;
     let execution_profile = selection.execution_profile;
     let pipeline = selection.hops;
     let assurance = free_inference_assurance(true, false);
@@ -12083,7 +12128,7 @@ async fn inference_run_sharded(
     // leak them until TTL. Await the bounded parallel cleanup so no handler
     // can detach coordinator-owned tasks.
     cleanup_shards(&node, &pipeline, &request_id).await;
-    let run = run_result.map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
+    let run = run_result.map_err(public_pipeline_run_error)?;
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
     let generated = run.generated;
@@ -12481,8 +12526,8 @@ async fn inference_run_consensus(
         )
     })?;
 
-    let selection = assemble_profile_bound_pipeline_for(&node, None)
-        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let selection =
+        assemble_profile_bound_pipeline_for(&node, None).map_err(public_pipeline_assembly_error)?;
     let execution_profile = selection.execution_profile;
     let pipeline = selection.hops;
     let model_id = node.model_artifact_id.ok_or_else(|| {
@@ -12526,7 +12571,7 @@ async fn inference_run_consensus(
     .await;
 
     cleanup_shards(&node, &pipeline, &request_id).await;
-    let run = run_result.map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
+    let run = run_result.map_err(public_pipeline_run_error)?;
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
     let generated = run.generated;
@@ -15429,13 +15474,26 @@ fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, 
     Ok(replayed)
 }
 
+/// What callers see when `retain_verified_settlement` cannot prune or write
+/// its journal. Its errors become the public `reason` of a
+/// `reward_approval_quorum_unavailable` settlement in the `/inference/run`
+/// and `/community/submit_work` responses, and a journal error can name this
+/// server's filesystem paths, so the detail goes to the log only.
+const SETTLEMENT_JOURNAL_UNAVAILABLE: &str =
+    "this coordinator could not journal the verified settlement; the detail is in its log";
+
+fn public_settlement_journal_error(error: String) -> String {
+    tracing::error!(%error, "could not journal a verified settlement");
+    SETTLEMENT_JOURNAL_UNAVAILABLE.to_string()
+}
+
 fn retain_verified_settlement(
     node: &NodeState,
     payload: CommunityRewardApprovalPayload,
 ) -> Result<(), String> {
     let _gate = node.community_verified_settlements_gate.lock();
     let now = now_unix_ms();
-    prune_verified_settlements_locked(node)?;
+    prune_verified_settlements_locked(node).map_err(public_settlement_journal_error)?;
     if let Some(existing) = node
         .community_verified_settlements
         .get(&payload.reward.job_id)
@@ -15445,7 +15503,8 @@ fn retain_verified_settlement(
                 "verified settlement job already exists with different semantics".to_string(),
             );
         }
-        persist_verified_settlement_journal(node, &payload, existing.verified_at_unix_ms)?;
+        persist_verified_settlement_journal(node, &payload, existing.verified_at_unix_ms)
+            .map_err(public_settlement_journal_error)?;
         return Ok(());
     }
     if node.community_verified_settlements.len() >= VERIFIED_SETTLEMENT_CAP {
@@ -15455,7 +15514,8 @@ fn retain_verified_settlement(
     }
     // Durability precedes visibility: after this returns, a crash at any later
     // await can replay the exact independently verified payload.
-    persist_verified_settlement_journal(node, &payload, now)?;
+    persist_verified_settlement_journal(node, &payload, now)
+        .map_err(public_settlement_journal_error)?;
     node.community_verified_settlements.insert(
         payload.reward.job_id,
         VerifiedCommunitySettlement {
@@ -16497,11 +16557,11 @@ pub async fn community_submit_work(
                     reason = %error,
                     "community result verification unavailable; preserving assignment without penalty"
                 );
+                // The reason can name validator shard holders, their socket
+                // addresses and request URLs; it is logged above, not returned.
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "community result could not complete independent verification and remains retryable: {error}"
-                    ),
+                    COMMUNITY_VERIFICATION_UNAVAILABLE.to_string(),
                 ));
             }
         }
@@ -17905,7 +17965,7 @@ async fn inference_auto(
             "error": "No inference path available",
             "sharded_pipeline": false,
             // Say WHY the pipeline was rejected instead of just "false".
-            "sharded_pipeline_error": pipeline_check.err().map(|e| e.to_string()),
+            "sharded_pipeline_error": pipeline_check.err().map(public_pipeline_assembly_reason),
             "local_model": false,
             "community_workers": 0,
             "help": "Either: (1) load a model with --model, (2) have shard-holding nodes announce to this coordinator, or (3) start community workers with models"
@@ -19897,6 +19957,78 @@ mod tests {
                 .contains("decode settlement journal entry"),
             "persistent RPC boot must fail closed rather than discard earned work"
         );
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
+    /// The `tracing` output of one test, captured on the test's own thread.
+    #[derive(Clone, Default)]
+    struct ServerLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for ServerLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ServerLogs {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    #[test]
+    fn verified_settlement_journal_failures_reach_callers_without_server_paths() {
+        let logs = ServerLogs::default();
+        let _logging = logs.install();
+        let temporary = std::env::temp_dir().join(format!(
+            "arc-rpc-settlement-redaction-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temporary).unwrap();
+        // A regular file where the journal's parent directory should be: the
+        // journal error names this path.
+        let not_a_directory = temporary.join("not-a-directory");
+        std::fs::write(&not_a_directory, b"not a directory").unwrap();
+        let mut node = fake_node_with_workers(Vec::new());
+        node.community_settlement_journal_dir =
+            Some(Arc::new(not_a_directory.join("community-settlements")));
+        let job_id = Hash256([41; 32]);
+
+        let error =
+            retain_verified_settlement(&node, test_verified_settlement_payload(job_id, 100))
+                .unwrap_err();
+        assert_eq!(error, SETTLEMENT_JOURNAL_UNAVAILABLE);
+        assert!(!node.community_verified_settlements.contains_key(&job_id));
+        let logged = logs.text();
+        assert!(
+            logged.contains("could not journal a verified settlement"),
+            "{logged}"
+        );
+        assert!(logged.contains("not a real directory"), "{logged}");
+
+        // Without a journal directory the caller gets the same text.
+        node.community_settlement_journal_dir = None;
+        let error =
+            retain_verified_settlement(&node, test_verified_settlement_payload(job_id, 100))
+                .unwrap_err();
+        assert_eq!(error, SETTLEMENT_JOURNAL_UNAVAILABLE);
+        assert!(logs.text().contains("persistent state directory"));
         let _ = std::fs::remove_dir_all(temporary);
     }
 
@@ -23192,6 +23324,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inference_auto_reports_no_path_without_shard_holders() {
+        let logs = ServerLogs::default();
+        let _logging = logs.install();
+        let node = fake_node_with_workers(Vec::new());
+        announce_unsigned_test_shard(&node);
+
+        let (status, Json(body)) = inference_auto(
+            AxumState(node),
+            Json(json!({"input": "route this", "max_tokens": 8})),
+        )
+        .await
+        .expect_err("no inference path is available");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let detail: Value = serde_json::from_str(&body.error).unwrap();
+        assert_eq!(detail["error"], "No inference path available");
+        assert_eq!(
+            detail["sharded_pipeline_error"],
+            "Shard identity unavailable or malformed for a pipeline replica"
+        );
+        assert!(!body.error.contains("198.51.100.7"), "{}", body.error);
+        assert!(!body.error.contains("unsigned-holder"), "{}", body.error);
+        let logged = logs.text();
+        assert!(logged.contains("198.51.100.7:9090"), "{logged}");
+    }
+
+    #[tokio::test]
     async fn inference_auto_dispatches_to_a_community_worker_without_a_local_model() {
         let node = fake_node_with_workers(vec![(
             worker("w1", &["inference"]),
@@ -24276,10 +24434,14 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_verifier_preserves_assignment_without_worker_penalty() {
+        let logs = ServerLogs::default();
+        let _logging = logs.install();
         let worker_key = KeyPair::generate_ed25519();
         let worker_id = worker_key.address().to_hex();
         let node =
             fake_node_with_workers(vec![(worker(&worker_id, &["inference"]), Instant::now())]);
+        // The verifier's reason names this holder and its address.
+        announce_unsigned_test_shard(&node);
         let item = WorkItem {
             job_id: arc_crypto::hash_bytes(b"retryable-verifier-outage").to_hex(),
             input: "hello".to_string(),
@@ -24303,6 +24465,10 @@ mod tests {
             .expect_err("missing authenticated shard topology is retryable unavailability");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("remains retryable"));
+        // The worker gets a fixed text; the coordinator's log keeps the reason.
+        assert_eq!(error.1, COMMUNITY_VERIFICATION_UNAVAILABLE);
+        let logged = logs.text();
+        assert!(logged.contains("198.51.100.7:9090"), "{logged}");
         let pending = node
             .community_work_results
             .as_ref()
@@ -26171,6 +26337,30 @@ mod tests {
     // pin the behaviour that used to differ between them. Each case below
     // corresponds to a failure observed on the live network.
 
+    /// A fresh announcement of the test model, by a holder without a
+    /// validator identity, so pipeline assembly names the holder and its
+    /// documentation-range address in its error.
+    fn announce_unsigned_test_shard(node: &NodeState) {
+        node.shard_registry.insert(
+            "unsigned-holder".to_string(),
+            (
+                ShardInfo {
+                    start_layer: 0,
+                    end_layer: 1,
+                    total_layers: 1,
+                    model_id: test_model_id(),
+                    model_name: "redaction-test-model".to_string(),
+                    execution_profile: canonical_profile(),
+                    memory_mb: 1,
+                    full_model_mb: 1,
+                    socket_addr: "198.51.100.7:9090".to_string(),
+                    node_name: "unsigned-holder".to_string(),
+                },
+                std::time::Instant::now(),
+            ),
+        );
+    }
+
     fn shard(node: &str, addr: &str, start: usize, end: usize) -> ShardInfo {
         ShardInfo {
             start_layer: start,
@@ -27443,6 +27633,62 @@ mod tests {
                 covered: 27,
                 total: 32
             }
+        );
+    }
+
+    #[test]
+    fn pipeline_errors_reach_callers_without_shard_holders() {
+        let shards: Vec<ShardInfo> = live_topology()
+            .into_iter()
+            .filter(|s| s.start_layer != 12)
+            .collect();
+        let gap = assemble_pipeline(shards, &no_stats()).expect_err("layers 12..17 are missing");
+        assert!(matches!(gap, PipelineError::Gap { .. }), "{gap:?}");
+        // The log line keeps the holder and its address; callers do not.
+        assert!(gap.to_string().contains(":9090"), "{gap}");
+        assert_eq!(
+            gap.public_message(),
+            "Pipeline gap: expected layer 12 next, got shard [17, 22)"
+        );
+
+        let unsigned = vec![shard("unsigned-holder", "198.51.100.7:9090", 0, 32)];
+        let identity = assemble_pipeline_with_identity_policy(unsigned, &no_stats(), true)
+            .expect_err("an unsigned announcement has no validator identity");
+        assert!(
+            identity.to_string().contains("198.51.100.7:9090"),
+            "{identity}"
+        );
+        assert_eq!(
+            identity.public_message(),
+            "Shard identity unavailable or malformed for a pipeline replica"
+        );
+
+        // Variants that name no holder keep their text.
+        for error in [
+            PipelineError::ModelIdentityUnavailable,
+            PipelineError::NoShards,
+            PipelineError::Incomplete {
+                covered: 27,
+                total: 32,
+            },
+        ] {
+            assert_eq!(error.public_message(), error.to_string());
+        }
+
+        // A pipeline that fails while it runs reaches the caller as one fixed
+        // text, and this node's log keeps the request URL.
+        let logs = ServerLogs::default();
+        let _logging = logs.install();
+        let (status, Json(body)) = public_pipeline_run_error(
+            "send: error sending request for url (http://198.51.100.7:9090/inference/forward_shard)"
+                .to_string(),
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body.error, SHARD_PIPELINE_FAILED);
+        let logged = logs.text();
+        assert!(
+            logged.contains("http://198.51.100.7:9090/inference/forward_shard"),
+            "{logged}"
         );
     }
 
