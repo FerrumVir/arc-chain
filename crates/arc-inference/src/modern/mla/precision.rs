@@ -451,8 +451,9 @@ fn dot_i16_limbs(row: &[u8], digits: &LimbBlocks, scratch: &mut LimbScratch) -> 
         // little-endian words once, then write one limb per pass.
         // `(v / 128) / 128 == v / 16384` for truncating division.
         let values = &mut values[..width];
-        for (v, w) in values.iter_mut().zip(weights.chunks_exact(2)) {
-            *v = i16::from_le_bytes([w[0], w[1]]);
+        let (pairs, _) = weights.as_chunks::<2>();
+        for (v, &pair) in values.iter_mut().zip(pairs) {
+            *v = i16::from_le_bytes(pair);
         }
         let (low, middle, top) = (&mut low[..width], &mut middle[..width], &mut top[..width]);
         for (limb, &v) in low.iter_mut().zip(values.iter()) {

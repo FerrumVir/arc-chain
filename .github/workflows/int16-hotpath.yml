@@ -123,6 +123,19 @@ jobs:
           { echo "### INT16 projection, CI-runner benchmark (${{ matrix.os }}): not product speed"; echo
             head -1 runner.txt; echo
             grep -E '^(INT16 projection|\|)' bench.log; } >> "$GITHUB_STEP_SUMMARY"
+      # Diagnostic only: which loops of precision.rs the release build
+      # vectorized, and why not where it did not.
+      - name: Loop-vectorizer remarks for precision.rs (diagnostic, Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo rustc -p arc-inference --lib --release --locked -- \
+            -C remark=loop-vectorize -C debuginfo=1 > remarks.log 2>&1
+          grep -E 'mla/precision\.rs' remarks.log | sed -E 's#^.*crates/arc-inference/##' | sort -u > vectorize-remarks.txt
+          cat vectorize-remarks.txt
+          { echo "### Loop-vectorizer remarks, precision.rs ($RUNNER_ARCH)"; echo; echo '```'
+            cat vectorize-remarks.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -131,6 +144,7 @@ jobs:
             runner.txt
             mla-tests.log
             bench.log
+            remarks.log
           if-no-files-found: warn
 
   int16-e2e:
