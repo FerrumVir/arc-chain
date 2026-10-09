@@ -561,6 +561,33 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     prevent_sleep_during_jobs: bool,
 
+    /// Run the GPU self-test for the dyadic integer profile (SmolLM3; portable
+    /// WGSL kernels through wgpu: Vulkan, Metal, DX12) at community-worker
+    /// startup. OFF by default. A GPU passes only if its self-test digest
+    /// equals the CPU golden bit for bit. The result, with the adapter's
+    /// vendor, device, API and driver, is logged and reported locally in
+    /// `GET /community/worker/status`; it is never sent in registration.
+    /// Community jobs use the canonical INT8 reward profile, which has no GPU
+    /// kernels, so they run on the CPU either way. See
+    /// docs/gpu-worker-backend.md.
+    #[arg(long, default_value_t = false)]
+    gpu_inference: bool,
+
+    /// GPU for --gpu-inference: an adapter index or a name substring
+    /// (`arc-modern gpu-info` lists them). Default: the best hardware GPU,
+    /// software rasterizers last.
+    #[arg(long, value_name = "N|NAME", requires = "gpu_inference")]
+    gpu_adapter: Option<String>,
+
+    /// Operator known-answer rounds of the --gpu-inference self-test.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = arc_inference::modern::gpu::backend::DEFAULT_SELF_TEST_ROUNDS,
+        requires = "gpu_inference"
+    )]
+    gpu_self_test_rounds: usize,
+
     /// Ask a seed to assign this node a layer range at boot (POST /shards/join).
     ///
     /// OFF by default, and it used to be implicit for any staked node with a
@@ -5475,6 +5502,27 @@ async fn measure_community_origin_rtt(
     })
 }
 
+/// Log the dyadic-profile GPU gate's decision and keep it in the local worker
+/// status. Jobs (canonical INT8 profile) stay on the CPU and registration is
+/// unchanged whatever it decided.
+fn record_dyadic_gpu_self_test(
+    status: &arc_node::community_worker::CommunityWorkerStatus,
+    decision: &arc_inference::modern::gpu::backend::BackendDecision,
+) {
+    if decision.gpu_eligible() {
+        tracing::info!(
+            reason = %decision.reason,
+            "dyadic-profile GPU self-test passed; community jobs (canonical INT8 profile) still run on the CPU"
+        );
+    } else {
+        tracing::warn!(
+            reason = %decision.reason,
+            "dyadic-profile GPU self-test did not pass; community jobs run on the CPU as always"
+        );
+    }
+    status.record_dyadic_gpu_self_test(decision);
+}
+
 async fn post_signed_community<T: serde::Serialize>(
     client: &reqwest::Client,
     rpc_base: &str,
@@ -8989,6 +9037,39 @@ async fn run_arc_node() -> Result<()> {
                 cli.prevent_sleep_during_jobs,
             ),
         ));
+        // ── Optional GPU backend (--gpu-inference, default OFF) ──────────
+        // The dyadic self-test runs off the async runtime and is recorded
+        // locally. Canonical jobs remain on CPU; registration stays unchanged.
+        worker_status.set_gpu_inference_requested(cli.gpu_inference);
+        if cli.gpu_inference {
+            if worker_model.is_some() {
+                let config = arc_inference::modern::gpu::backend::GpuBackendConfig {
+                    enabled: true,
+                    adapter: cli.gpu_adapter.clone(),
+                    self_test_rounds: cli.gpu_self_test_rounds,
+                    ..Default::default()
+                };
+                let gate_status = worker_status.clone();
+                runtime_tasks.push(tokio::spawn(async move {
+                    match tokio::task::spawn_blocking(move || {
+                        arc_inference::modern::gpu::backend::select(&config)
+                    })
+                    .await
+                    {
+                        Ok(decision) => record_dyadic_gpu_self_test(&gate_status, &decision),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "dyadic-profile GPU self-test did not complete; community jobs run on the CPU as always"
+                        ),
+                    }
+                }));
+            } else {
+                tracing::warn!(
+                    "--gpu-inference has no effect: this node is not an inference worker \
+                     (no complete canonical model loaded)"
+                );
+            }
+        }
         let reregister = Arc::new(arc_node::community_worker::ReregistrationQueue::new());
         let registration_status = worker_status.clone();
         let registration_wakeup = reregister.clone();
@@ -9021,20 +9102,16 @@ async fn run_arc_node() -> Result<()> {
             // black hole and blocked in dispatch_to_community_worker for the
             // full community_dispatch_timeout — 60 s at the desktop's 16-token
             // default — before falling back to local.
-            let capabilities: Vec<String> = if model_name_c.is_some() && model_id_c.is_some() {
-                vec!["inference".to_string()]
-            } else {
-                vec!["relay".to_string()]
-            };
-            let register_payload = rpc::CommunityRegisterRequest {
-                worker_id: worker_id_c.clone(),
-                name: public_worker_name,
-                capabilities,
-                model: model_name_c,
-                model_id: model_id_c,
-                execution_profile: execution_profile_c,
-                platform: platform_c,
-            };
+            //
+            // GPU facts are never registered: jobs run on the CPU, and a GPU
+            // self-test result stays in the local worker status.
+            let register_payload = arc_node::community_worker::registration_request(
+                worker_id_c.clone(),
+                public_worker_name,
+                model_name_c.zip(model_id_c),
+                execution_profile_c,
+                platform_c,
+            );
             let heartbeat_payload = rpc::CommunityHeartbeatRequest {
                 worker_id: worker_id_c,
                 work_completed: None,
@@ -9686,6 +9763,7 @@ async fn run_arc_node() -> Result<()> {
                         }
                         let worker_execution_for_compute = worker_execution_permit.clone();
                         status_w.set_state(WorkerState::Computing);
+                        let status_for_compute = status_w.clone();
                         let inference = tokio::task::spawn_blocking(move || {
                             let _worker_execution_permit = worker_execution_for_compute;
                             // Created and dropped on this compute thread (the
@@ -9697,24 +9775,25 @@ async fn run_arc_node() -> Result<()> {
                             // admission immediately before allocating KV state;
                             // even a tokenizer-expanded prompt can only become
                             // a typed worker failure, never an indexing panic.
-                            let (generated, hash) = inference_model
-                                .try_generate(
-                                    &inference_tokens,
-                                    max_tokens,
-                                    &inference_model.config.eos_tokens,
-                                )
-                                .map_err(|error| {
+                            // compute_canonical_job runs it on the backend the
+                            // worker status names for this profile (the CPU).
+                            let job = arc_node::community_worker::compute_canonical_job(
+                                &inference_model,
+                                &inference_tokens,
+                                max_tokens,
+                                &status_for_compute,
+                            )
+                            .map_err(|error| {
                                     let helper_admitted = community_generation_fits_context(
                                         inference_tokens.len(),
                                         max_tokens,
                                         inference_model.config.max_seq,
                                     );
-                                    format!(
-                                        "{error}; worker_context_helper_admitted={helper_admitted}"
-                                    )
-                                })?;
-                            let output_text = inference_model.decode(&generated);
-                            Ok::<_, String>((generated, hash, output_text))
+                                format!(
+                                    "{error}; worker_context_helper_admitted={helper_admitted}"
+                                )
+                            })?;
+                            Ok::<_, String>((job.tokens, job.output_hash, job.text))
                         })
                         .await;
                         status_w.set_state(WorkerState::Polling);
@@ -10257,6 +10336,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn gpu_inference_is_off_by_default_and_its_options_require_it() {
+        let default = Cli::try_parse_from(["arc-node"]).unwrap();
+        assert!(!default.gpu_inference);
+        assert_eq!(default.gpu_adapter, None);
+        assert!(Cli::try_parse_from(["arc-node", "--gpu-adapter", "0"]).is_err());
+        assert!(Cli::try_parse_from(["arc-node", "--gpu-self-test-rounds", "2"]).is_err());
+        let on = Cli::try_parse_from([
+            "arc-node",
+            "--gpu-inference",
+            "--gpu-adapter",
+            "M2 Ultra",
+            "--gpu-self-test-rounds",
+            "2",
+        ])
+        .unwrap();
+        assert!(on.gpu_inference);
+        assert_eq!(on.gpu_adapter.as_deref(), Some("M2 Ultra"));
+        assert_eq!(on.gpu_self_test_rounds, 2);
     }
 
     #[test]

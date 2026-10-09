@@ -14,6 +14,10 @@
 //! * [`arith`] and [`tables`]: the operators and their exact tables;
 //! * [`bpe`] and [`chat`]: the byte-level BPE tokenizer and the chat prompt.
 
+// The same profile on a GPU (arc-gpu's portable WGSL kernels), with the
+// `--gpu` command-line path and the Proof Kit's GPU mode.
+pub mod gpu;
+
 pub mod arith;
 pub mod bpe;
 pub mod chat;

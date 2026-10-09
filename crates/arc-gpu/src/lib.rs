@@ -6,6 +6,7 @@ pub mod gpu_memory;
 pub mod hardware_detect;
 pub mod metal_icb;
 pub mod metal_verify;
+pub mod modern;
 pub mod neon_verify;
 
 pub use gpu_memory::{

@@ -85,6 +85,8 @@ pub struct CommunityWorkerStatus {
     jobs_declined: AtomicU64,
     last_job_completed_unix_ms: AtomicU64,
     last_registration_unix_ms: AtomicU64,
+    /// Which backend computes jobs, and the dyadic GPU gate's result.
+    inference_backend: Mutex<WorkerBackendStatus>,
 }
 
 /// What `GET /community/worker/status` returns.
@@ -110,6 +112,51 @@ pub struct CommunityWorkerSnapshot {
     pub last_registration_unix_ms: Option<u64>,
     pub started_unix_ms: u64,
     pub prevent_sleep_during_jobs: bool,
+    /// The backend that computes this worker's jobs (always the CPU in this
+    /// version) and, separately, the `--gpu-inference` self-test result.
+    pub inference_backend: WorkerBackendStatus,
+}
+
+/// Schema of [`WorkerBackendStatus`].
+pub const WORKER_BACKEND_SCHEMA: &str = "arc.community.worker-backend.v1";
+/// The backend that computes community jobs.
+pub const SERVING_BACKEND_CPU: &str = "cpu";
+/// Why jobs run on the CPU.
+pub const SERVING_REASON: &str = "community jobs use the canonical INT8 reward profile, which has no \
+     GPU kernels; the GPU self-test covers the dyadic profile only";
+
+/// What the worker computes jobs on, kept apart from what the GPU gate found.
+/// Local only (`GET /community/worker/status`): registration never carries
+/// GPU facts ([`registration_request`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct WorkerBackendStatus {
+    pub schema: &'static str,
+    /// The backend that computes community jobs: `cpu`.
+    pub serving_backend: &'static str,
+    /// The execution profile of those jobs.
+    pub serving_profile: &'static str,
+    pub serving_reason: &'static str,
+    /// `--gpu-inference` was given.
+    pub gpu_inference_requested: bool,
+    /// The dyadic-profile GPU gate (`arc.inference-backend.v1`: whether a GPU
+    /// passed, the reason, the self-test digests and the adapter's vendor,
+    /// device, API and driver); `null` until it ran, and when the switch is
+    /// off.
+    pub dyadic_gpu_self_test: Option<serde_json::Value>,
+}
+
+impl WorkerBackendStatus {
+    fn new() -> Self {
+        Self {
+            schema: WORKER_BACKEND_SCHEMA,
+            serving_backend: SERVING_BACKEND_CPU,
+            serving_profile:
+                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+            serving_reason: SERVING_REASON,
+            gpu_inference_requested: false,
+            dyadic_gpu_self_test: None,
+        }
+    }
 }
 
 fn unix_ms_now() -> u64 {
@@ -145,7 +192,36 @@ impl CommunityWorkerStatus {
             jobs_declined: AtomicU64::new(0),
             last_job_completed_unix_ms: AtomicU64::new(0),
             last_registration_unix_ms: AtomicU64::new(0),
+            inference_backend: Mutex::new(WorkerBackendStatus::new()),
         }
+    }
+
+    /// Record that `--gpu-inference` was given.
+    pub fn set_gpu_inference_requested(&self, requested: bool) {
+        self.inference_backend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .gpu_inference_requested = requested;
+    }
+
+    /// Record the dyadic GPU gate's decision. It changes nothing about how
+    /// jobs are computed or what registration carries.
+    pub fn record_dyadic_gpu_self_test(
+        &self,
+        decision: &arc_inference::modern::gpu::backend::BackendDecision,
+    ) {
+        self.inference_backend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .dyadic_gpu_self_test = Some(decision.to_json());
+    }
+
+    /// The backend status as the snapshot reports it.
+    pub fn inference_backend(&self) -> WorkerBackendStatus {
+        self.inference_backend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn set_state(&self, state: WorkerState) {
@@ -207,8 +283,70 @@ impl CommunityWorkerStatus {
             ),
             started_unix_ms: self.started_unix_ms,
             prevent_sleep_during_jobs: self.prevent_sleep_during_jobs,
+            inference_backend: self.inference_backend(),
         }
     }
+}
+
+/// The registration request: `inference` for a worker with a complete
+/// canonical model, otherwise `relay`. It never carries GPU facts: jobs run
+/// on the CPU, so a GPU that passed the dyadic self-test is reported only in
+/// the local status ([`WorkerBackendStatus`]).
+pub fn registration_request(
+    worker_id: String,
+    name: String,
+    model: Option<(String, String)>,
+    execution_profile: Option<String>,
+    platform: String,
+) -> crate::rpc::CommunityRegisterRequest {
+    let capabilities = if model.is_some() {
+        vec!["inference".to_string()]
+    } else {
+        vec!["relay".to_string()]
+    };
+    let (model, model_id) = model.unzip();
+    crate::rpc::CommunityRegisterRequest {
+        worker_id,
+        name,
+        capabilities,
+        model,
+        model_id,
+        execution_profile,
+        platform,
+    }
+}
+
+/// One computed community job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalJobOutput {
+    pub tokens: Vec<u32>,
+    pub output_hash: arc_crypto::Hash256,
+    pub text: String,
+    /// The backend that computed it ([`SERVING_BACKEND_CPU`]).
+    pub backend: &'static str,
+}
+
+/// Compute one community job: the worker's whole compute step, on the
+/// backend the status names for the canonical reward profile. That is the
+/// CPU whatever the dyadic GPU gate found, because no GPU kernels exist for
+/// this profile; a GPU path for it must keep this function's output
+/// byte-identical (the offline tests compare both switch settings).
+pub fn compute_canonical_job(
+    model: &arc_inference::cached_integer_model::CachedIntegerModel,
+    prompt: &[u32],
+    max_tokens: u32,
+    status: &CommunityWorkerStatus,
+) -> Result<CanonicalJobOutput, arc_inference::cached_integer_model::GenerationError> {
+    let backend = status.inference_backend().serving_backend;
+    debug_assert_eq!(backend, SERVING_BACKEND_CPU);
+    let (tokens, output_hash) = model.try_generate(prompt, max_tokens, &model.config.eos_tokens)?;
+    let text = model.decode(&tokens);
+    Ok(CanonicalJobOutput {
+        tokens,
+        output_hash,
+        text,
+        backend,
+    })
 }
 
 static INSTALLED: OnceLock<Arc<CommunityWorkerStatus>> = OnceLock::new();
@@ -560,6 +698,210 @@ mod tests {
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["state"], "computing");
         assert_eq!(json["jobs_verified"], 1);
+    }
+
+    /// A complete canonical INT8 model (one layer), built in process: the
+    /// worker's job path with no file, network or registration.
+    fn canonical_model() -> arc_inference::cached_integer_model::CachedIntegerModel {
+        use arc_inference::cached_integer_model::{
+            ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, ModelConfig,
+        };
+        const ONE: i64 = 1 << 16;
+        let (d, d_ff, vocab_size) = (8usize, 16usize, 12usize);
+        let weights = |rows: usize, cols: usize, salt: usize| {
+            let values: Vec<f32> = (0..rows * cols)
+                .map(|i| (((i * 7 + salt) % 13) as f32 - 6.0) / 40.0)
+                .collect();
+            I8Weights::quantize_f32(&values, rows, cols)
+        };
+        let embedding: Vec<f32> = (0..vocab_size * d)
+            .map(|i| (((i + 5) % 17) as f32 - 8.0) / 30.0)
+            .collect();
+        let model = CachedIntegerModel {
+            config: ModelConfig {
+                n_layers: 1,
+                d_model: d,
+                n_heads: 2,
+                n_kv_heads: 2,
+                d_ff,
+                d_head: d / 2,
+                d_kv: d,
+                vocab_size,
+                attn_scale: ONE / 2,
+                rope_cos: vec![ONE; 64],
+                rope_sin: vec![0; 64],
+                max_seq: 48,
+                eos_tokens: Vec::new(),
+                bos_token: 1,
+                chat_template: String::new(),
+                arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
+            },
+            embedding_q16: embedding
+                .iter()
+                .map(|v| (*v * ONE as f32).round() as i64)
+                .collect(),
+            embedding_i8: I8Weights::quantize_f32(&embedding, vocab_size, d),
+            layers: vec![CachedLayer {
+                wq: weights(d, d, 1),
+                wk: weights(d, d, 2),
+                wv: weights(d, d, 3),
+                wo: weights(d, d, 4),
+                w_gate: weights(d_ff, d, 5),
+                w_up: weights(d_ff, d, 6),
+                w_down: weights(d, d_ff, 7),
+                attn_norm: vec![ONE; d],
+                ffn_norm: vec![ONE; d],
+            }],
+            final_norm: vec![ONE; d],
+            output_weight: weights(vocab_size, d, 8),
+            vocab: [
+                "<unk>",
+                "<s>",
+                "</s>",
+                "▁ARC",
+                "▁proof",
+                "▁GPU",
+                "▁exact",
+                "▁bit",
+                "▁worker",
+                "▁job",
+                "▁yes",
+                "▁no",
+            ]
+            .iter()
+            .map(|t| t.to_string())
+            .collect(),
+            q4_layers: None,
+            q4_output: None,
+            i16_layers: None,
+            i16_output: None,
+            block_i8_layers: None,
+            block_i8_output: None,
+            ternary_layers: None,
+            ternary_output: None,
+            ternary_hybrid_layers: None,
+            ternary_hybrid_output: None,
+        };
+        assert!(model.has_canonical_i8_profile());
+        model
+    }
+
+    const JOB_PROMPT: [u32; 4] = [3, 4, 5, 6];
+
+    /// The registration request this worker sends, as `main` builds it.
+    fn registration(status: &CommunityWorkerStatus) -> crate::rpc::CommunityRegisterRequest {
+        // `status` is deliberately available: nothing in it may reach
+        // registration.
+        let _ = status.snapshot();
+        registration_request(
+            "0xabc".into(),
+            "node-abc".into(),
+            Some(("arc-1L-8d-2h-12v".into(), "0x01".into())),
+            Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.into()),
+            "macos-aarch64".into(),
+        )
+    }
+
+    /// The worker path offline, with the switch off and then on (the gate on
+    /// this machine's adapter; required on the CI GPU jobs): the same job
+    /// output, computed on the CPU, and the same registration request without
+    /// any GPU fact.
+    #[test]
+    fn gpu_inference_changes_neither_job_output_nor_registration() {
+        use arc_inference::modern::gpu::backend::{GpuBackendConfig, select};
+
+        let model = canonical_model();
+        let off = CommunityWorkerStatus::new("0xabc", "node-abc", 6, false);
+        off.record_dyadic_gpu_self_test(&select(&GpuBackendConfig::default()));
+        let disabled = compute_canonical_job(&model, &JOB_PROMPT, 6, &off).unwrap();
+        assert_eq!(disabled.backend, "cpu");
+        assert_eq!(disabled.tokens.len(), 6);
+        // The worker computes exactly what the model's own generation does.
+        let (tokens, hash) = model.generate(&JOB_PROMPT, 6, &[]);
+        assert_eq!(
+            (disabled.tokens.clone(), disabled.output_hash),
+            (tokens, hash)
+        );
+
+        let on = CommunityWorkerStatus::new("0xabc", "node-abc", 6, false);
+        on.set_gpu_inference_requested(true);
+        let config = GpuBackendConfig {
+            enabled: true,
+            adapter: std::env::var("ARC_GPU_ADAPTER").ok(),
+            self_test_rounds: 2,
+            ..GpuBackendConfig::default()
+        };
+        let decision = select(&config);
+        eprintln!("dyadic GPU gate: {}", decision.reason);
+        if std::env::var("ARC_GPU_REQUIRE").as_deref() == Ok("1") {
+            assert!(decision.gpu_eligible(), "{}", decision.reason);
+        }
+        on.record_dyadic_gpu_self_test(&decision);
+        let enabled = compute_canonical_job(&model, &JOB_PROMPT, 6, &on).unwrap();
+        assert_eq!(enabled, disabled, "the switch changed a job's output");
+        assert_eq!(enabled.backend, SERVING_BACKEND_CPU);
+
+        // Registration: identical with the switch off and on, `inference`
+        // only, and no GPU fact anywhere in the signed payload.
+        let (reg_off, reg_on) = (registration(&off), registration(&on));
+        assert_eq!(reg_on.capabilities, ["inference"]);
+        let (json_off, json_on) = (
+            serde_json::to_string(&reg_off).unwrap(),
+            serde_json::to_string(&reg_on).unwrap(),
+        );
+        assert_eq!(json_on, json_off);
+        assert!(!json_on.to_lowercase().contains("gpu"), "{json_on}");
+        if let Some(adapter) = decision.adapter() {
+            assert!(!json_on.contains(&adapter.name), "{json_on}");
+        }
+
+        // The status keeps the two apart: jobs on the CPU, the gate's result
+        // (and adapter) beside it.
+        let status = serde_json::to_value(on.snapshot()).unwrap()["inference_backend"].clone();
+        assert_eq!(status["schema"], WORKER_BACKEND_SCHEMA);
+        assert_eq!(status["serving_backend"], "cpu");
+        assert_eq!(
+            status["serving_profile"],
+            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        assert_eq!(status["gpu_inference_requested"], true);
+        let gate = &status["dyadic_gpu_self_test"];
+        assert_eq!(gate["profile"], arc_inference::modern::PROFILE);
+        assert_eq!(gate["gpu_self_test_passed"], decision.gpu_eligible());
+        assert!(
+            !gate["reason"]
+                .as_str()
+                .unwrap()
+                .contains("serving on the GPU")
+        );
+        if decision.gpu_eligible() {
+            assert_eq!(gate["dyadic_backend"], "gpu-wgpu");
+            assert!(gate["adapter"]["name"].is_string());
+        }
+        let off_status = serde_json::to_value(off.snapshot()).unwrap()["inference_backend"].clone();
+        assert_eq!(off_status["serving_backend"], "cpu");
+        assert_eq!(off_status["gpu_inference_requested"], false);
+        assert_eq!(
+            off_status["dyadic_gpu_self_test"]["gpu_self_test_passed"],
+            false
+        );
+    }
+
+    #[test]
+    fn a_relay_registers_as_relay_and_a_fresh_status_has_no_gate_result() {
+        let relay = registration_request(
+            "0xabc".into(),
+            "node-abc".into(),
+            None,
+            None,
+            "linux-x86_64".into(),
+        );
+        assert_eq!(relay.capabilities, ["relay"]);
+        assert_eq!((relay.model, relay.model_id), (None, None));
+        let status = CommunityWorkerStatus::new("0xabc", "node-abc", 6, false).inference_backend();
+        assert_eq!(status.serving_backend, "cpu");
+        assert!(!status.gpu_inference_requested);
+        assert_eq!(status.dyadic_gpu_self_test, None);
     }
 
     #[test]
