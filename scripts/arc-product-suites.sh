@@ -29,8 +29,8 @@
 #        arc-product-suites.sh --self-test      prove failure propagation
 set -uo pipefail
 
-REPO=/Users/excaulibur/work/arc-chain-readiness-20260919
-OUT=/Users/excaulibur/work/outputs/arc-chain-readiness-20260919
+REPO="${HOME}/work/arc-chain-readiness-20260919"
+OUT="${HOME}/work/outputs/arc-chain-readiness-20260919"
 export PATH="$HOME/.local/bin:$HOME/.local/node/bin:$PATH"
 
 FAILED=()

@@ -3,7 +3,7 @@
 ## Repository and Sep 18 update
 
 - Repository: [FerrumVir/arc-chain](https://github.com/FerrumVir/arc-chain), public; default branch `main`.
-- No local Git checkout exists at `/Users/excaulibur/work/arc-ch`; that directory is not a repository. GitHub CLI was authenticated as `FerrumVir` with `repo` and `workflow` scopes.
+- No local Git checkout exists at `~/work/arc-ch`; that directory is not a repository. GitHub CLI was authenticated as `FerrumVir` with `repo` and `workflow` scopes.
 - `main` head: `f616705d6058b75543f6a894dfb7254410055453`, authored/committed `2026-09-18T20:11:46Z` (3:11:46 PM America/Chicago), pushed `20:11:48Z`.
 - The update is merged PR [#104](https://github.com/FerrumVir/arc-chain/pull/104), “docs: ARC v3 live recovery deployment record”; source branch `docs/v3-live-recovery-record`; merge `20:11:47Z`. It adds only `docs/recovery/v3-live-recovery.md` (61 lines), with a valid GitHub signature.
 

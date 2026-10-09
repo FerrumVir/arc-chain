@@ -9,7 +9,11 @@ use arc_inference::cached_integer_model::{KVCache, load_cached_model};
 use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_llama::ModelWeights;
 
-const MODEL_PATH: &str = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
+/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
+fn model_path() -> String {
+    let home = std::env::var("HOME").expect("HOME is set");
+    format!("{home}/.arc-models/llama-2-7b.gguf")
+}
 
 fn top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
@@ -30,7 +34,7 @@ fn main() {
 
     // ─── Candle reference path ───────────────────────────────────────
     eprintln!("Loading candle reference model...");
-    let mut file = std::fs::File::open(MODEL_PATH).expect("open gguf");
+    let mut file = std::fs::File::open(model_path()).expect("open gguf");
     let content = candle_core::quantized::gguf_file::Content::read(&mut file).expect("parse gguf");
     let mut candle_model = ModelWeights::from_gguf(content, &mut file, &device).expect("from_gguf");
     eprintln!("Loaded candle model.");
@@ -57,7 +61,7 @@ fn main() {
 
     // ─── Our integer path ────────────────────────────────────────────
     eprintln!("\nLoading our integer model...");
-    let integer_model = load_cached_model(MODEL_PATH).expect("our load");
+    let integer_model = load_cached_model(&model_path()).expect("our load");
     eprintln!(
         "  block_i8_layers installed: {}",
         integer_model.block_i8_layers.is_some()
