@@ -769,6 +769,98 @@ mod tests {
         assert_eq!(gpu_out, vec![SENTINEL]);
     }
 
+    /// A row range is checked against its own scales, as the CPU checks a
+    /// view: a scale outside the range cannot refuse it, and one inside can.
+    #[test]
+    fn row_ranges_check_the_scale_bound_against_their_own_rows() {
+        let _guard = kernel_switch_guard();
+        assert!(!canonical_simd::fast_canonical_kernel_enabled());
+        assert!(!metal_exact_gemv_requested());
+        let engine = metal_engine().expect("Metal device");
+        let cols = 64usize;
+        let input = vec![PLANE_MAX; cols];
+        let largest = i64::MAX / (128 * cols as i64 * PLANE_MAX);
+        let mut rng = Rng(0x5CA1_E5A0);
+        let mut w = weights(&mut rng, 8, cols);
+        // Row 6 is one past the bound for this input; row 7 has no |s|.
+        w.scales[6] = largest + 1;
+        w.scales[7] = i64::MIN;
+        let matrix = engine
+            .upload(&w.data, &w.scales, 8, cols, Storage::Shared)
+            .expect("upload");
+        let limb_kernel = canonical_simd::dotprod_available();
+        for (start, end) in [
+            (0usize, 6usize),
+            (2, 5),
+            (5, 6),
+            (0, 7),
+            (6, 7),
+            (7, 8),
+            (5, 8),
+            (0, 8),
+        ] {
+            let rows = end - start;
+            let accepted = end <= 6;
+            let mut cpu = vec![SENTINEL; rows];
+            assert_eq!(
+                matmul_i8_canonical_row_range(&w, start, end, &input, &mut cpu).is_ok(),
+                accepted,
+                "rows {start}..{end}: the CPU's checked entry"
+            );
+            let view = I8Weights {
+                data: w.data[start * cols..end * cols].to_vec(),
+                scales: w.scales[start..end].to_vec(),
+                n_rows: rows,
+                n_cols: cols,
+            };
+            let mut limb = vec![SENTINEL; rows];
+            assert_eq!(
+                canonical_simd::matmul_i8_canonical_rows_fast(&view, &input, cols, &mut limb),
+                accepted && limb_kernel,
+                "rows {start}..{end}: the CPU limb kernel"
+            );
+            let mut gpu = vec![SENTINEL; rows];
+            let result = engine.project_rows(&matrix, start..end, &input, &mut gpu);
+            if accepted {
+                assert_eq!(result, Ok(MAX_PLANES), "rows {start}..{end}");
+                assert_eq!(gpu, cpu, "rows {start}..{end}");
+                if limb_kernel {
+                    assert_eq!(limb, cpu, "rows {start}..{end}");
+                }
+            } else {
+                assert_eq!(
+                    result,
+                    Err(Refusal::ScaleMultiplyWouldOverflow),
+                    "rows {start}..{end}"
+                );
+                assert_eq!(
+                    gpu,
+                    vec![SENTINEL; rows],
+                    "rows {start}..{end}: a refusal must not write"
+                );
+            }
+        }
+
+        // Through the hook: a shard's rows that leave out rows 6 and 7 run on
+        // the GPU (checked against the whole matrix, they would be refused).
+        let metal = MetalModel::from_matrices(&[&w]).expect("upload");
+        let mut want = vec![SENTINEL; 6];
+        matmul_i8_canonical_row_range(&w, 0, 6, &input, &mut want).expect("rows 0..6");
+        let _switch = SwitchGuard::set(true);
+        metal.run(|| {
+            let before = metal_census();
+            let mut got = vec![SENTINEL; 6];
+            matmul_i8_canonical_row_range(&w, 0, 6, &input, &mut got).expect("rows 0..6");
+            assert_eq!(got, want);
+            let delta = metal_census().since(&before);
+            assert_eq!(
+                (delta.accepted, delta.in_scope_fallbacks()),
+                (1, 0),
+                "{delta:?}"
+            );
+        });
+    }
+
     /// The raw-dot mode plus the CPU's own dyadic epilogue `(acc * mu) >> k`
     /// reproduces the SmolLM3 profile's projection exactly.
     #[test]

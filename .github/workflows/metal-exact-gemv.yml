@@ -1,29 +1,41 @@
 name: Metal exact GEMV (hosted macOS)
 
 # GitHub-hosted Apple Silicon runners are virtual machines that expose a
-# paravirtual Metal GPU. The probe job reports what that device is (name,
-# limits, an integer kernel checked against the CPU, read bandwidth). The
-# exact-gemv job runs the canonical INT8 GEMV kernel (crates/arc-gpu/src/
-# metal_exact.rs) against the CPU scalar kernel and the golden KATs, then
-# benchmarks the Llama-2-7B projection shapes. Every timing either job prints
-# is a virtualized-runner measurement, not a measurement of Apple GPU hardware.
+# paravirtual Metal GPU. The exact-gemv job runs the canonical INT8 GEMV kernel
+# (crates/arc-gpu/src/metal_exact.rs) against the CPU scalar kernel and the
+# golden KATs, then benchmarks the Llama-2-7B projection shapes. The probe job,
+# run by hand only, reports what the device is (name, limits, an integer
+# kernel checked against the CPU, read bandwidth). Every timing either job
+# prints is a virtualized-runner measurement, not a measurement of Apple GPU
+# hardware.
 #
 # Optional and never a required check. The kernel and its engine hook are
 # opt-in (`metal-exact` feature, ARC_METAL_EXACT_GEMV=1) and off by default.
+#
+# macOS runners also serve the release and proof sequences, so this workflow
+# takes at most one of them per push: it runs only when the exact Metal path
+# itself changes (other changes can run it by hand with workflow_dispatch, on
+# any branch), and a newer push cancels an older run that is still queued or
+# running.
 
 on:
   pull_request:
     branches: [main]
+    # The exact files, so changes to other Metal kernels (for example the
+    # INT16 ones, which have their own workflow) do not start this job too.
     paths:
       - .github/workflows/metal-exact-gemv.yml
-      - scripts/ci/metal-probe/**
-      - crates/arc-gpu/**
-      - crates/arc-inference/**
-      - Cargo.lock
+      - crates/arc-gpu/src/metal_exact.rs
+      - crates/arc-gpu/src/metal_exact_gemv.metal
+      - crates/arc-inference/src/metal_gemv.rs
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,6 +43,8 @@ env:
 jobs:
   probe:
     name: Metal probe (macos-15, hosted)
+    # By hand only: the exact-gemv job reports the device and bandwidth too.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 15
     steps:
