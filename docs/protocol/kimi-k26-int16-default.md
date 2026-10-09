@@ -70,6 +70,7 @@ Reproducible offline checks (fresh WORK/OUT directories; fixture weights only):
 cargo +nightly-2026-03-16 build --locked -p arc-inference --bin arc-mla
 python scripts/arc_mla/check_precision_slices.py target/debug/arc-mla WORK OUT
 python scripts/arc_mla/check_int16_rows.py target/debug/arc-mla ROW_OUT
+python scripts/arc_mla/check_yarn_cli.py target/debug/arc-mla YARN_CLI_OUT
 python -m unittest scripts/arc_mla/tests/test_stream_slices.py -v
 cargo +nightly-2026-03-16 test --locked -p arc-inference --lib modern::mla
 ```
@@ -111,3 +112,18 @@ and below even this plan. No fetch is authorized by these calculations; fresh
 resource checks and the separate storage/census/oracle gates still apply. The
 ~33 GB/token and 13–25% speed reduction are projections, not fixture-derived
 throughput measurements. This code stage establishes no real Kimi quality/timing.
+
+### YaRN CLI fixture policy repair
+
+The metadata-only CLI harness now uses distinct INT16 and historical INT8 pending
+fixtures. The INT16 fixture adds one byte per promoted BF16 matrix element to the
+historical segment sizes, calculated from the pinned configuration. Omitted and
+explicit INT16 preparation/finalization must be identical; the legacy fixture
+requires `--historical-int8`. Both paths test incomplete full selection, forged
+source, cleared pending marker, substituted policy and wrong segment sizes.
+Legacy metadata under the default and policy-only relabelling are rejected.
+All hashes in these fixtures are synthetic placeholders, not real-weight proof.
+
+This repairs a stale test caller, not the production policy contract. #164 can
+use the same INT16-default contract above at the corrected #168 head. No package,
+model identity, arithmetic or resource-budget change follows from this repair.
