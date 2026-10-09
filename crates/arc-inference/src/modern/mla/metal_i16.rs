@@ -1962,7 +1962,8 @@ mod bench {
             }
             // The five paths take turns, in a rotating order, so that drift
             // on the VM (clocks, other tenants) cannot favour one of them.
-            let mut samples = vec![Vec::with_capacity(ROUNDS); PATHS];
+            let mut samples: Vec<Vec<f64>> =
+                (0..PATHS).map(|_| Vec::with_capacity(ROUNDS)).collect();
             for round in 0..ROUNDS {
                 for turn in 0..PATHS {
                     let path = (turn + round) % PATHS;
