@@ -7,6 +7,9 @@ pub mod hardware_detect;
 /// Exact canonical per-row INT8 GEMV on Apple GPUs (opt-in `metal-exact`).
 #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_exact;
+/// Exact INT16 GEMV of the MLA + MoE profile on Apple GPUs (opt-in `metal-exact`).
+#[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_exact_i16;
 pub mod metal_icb;
 pub mod metal_verify;
 pub mod neon_verify;

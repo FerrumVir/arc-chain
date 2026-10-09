@@ -609,6 +609,37 @@ impl StageModel {
         self.bytes.as_slice()
     }
 
+    /// Every INT16 matrix stack this stage projects, as the admitted weights,
+    /// the stack's total rows (elements times rows) and the row length: the
+    /// query, KV and output projections, the per-head key and value stacks,
+    /// the dense or shared-expert FFN, and the LM head. The embedding is a
+    /// lookup, not a projection, and is left out. For the exact Metal GEMV's
+    /// residency scope (`super::metal_i16::MetalI16Model`).
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn int16_projection_matrices(&self) -> Vec<(I16Weights<'_>, usize, usize)> {
+        let data = self.bytes.as_slice();
+        let mut matrices: Vec<&MatRef> = Vec::new();
+        for w in &self.layers {
+            match &w.query {
+                QueryProjection::Direct(m) => matrices.push(m),
+                QueryProjection::Lora { a, b, .. } => matrices.extend([a, b]),
+            }
+            matrices.extend([&w.wkv_a, &w.wk_b, &w.wv_b, &w.wo]);
+            match &w.ffn {
+                FfnWeights::Dense(dense) => matrices.extend(dense.iter()),
+                FfnWeights::Moe(moe) => matrices.extend(moe.shared.iter()),
+            }
+        }
+        if let Some(head) = &self.head {
+            matrices.push(&head.lm_head);
+        }
+        matrices
+            .into_iter()
+            .filter(|m| m.wide)
+            .map(|m| (I16Weights::admitted(&data[m.q.clone()]), m.mu.len(), m.cols))
+            .collect()
+    }
+
     /// Whether a segment belongs to the executed range (spec §4.7).
     pub fn executes_segment(&self, segment: &str) -> bool {
         let c = self.config();
@@ -2330,6 +2361,196 @@ pub(crate) mod tests {
                     "{schedule:?}, {threads} threads"
                 );
             }
+        }
+    }
+
+    /// The generation digest the pinned goldens hold: tokens, every logits
+    /// hash, every boundary digest.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    fn generation_digest(run: &MlaGeneration) -> String {
+        let mut h = blake3::Hasher::new();
+        for t in &run.tokens {
+            h.update(&t.to_le_bytes());
+        }
+        for d in run.logits_hashes.iter().chain(&run.boundary_digests) {
+            h.update(d);
+        }
+        h.finalize().to_hex().to_string()
+    }
+
+    /// Every INT16 view of the four pinned INT16 fixtures (every class and
+    /// every stack element) through the exact Metal GEMV hook, inside a
+    /// residency scope of the whole fixture: the legacy kernel's bytes, for
+    /// ordinary inputs, the CPU's four-digit edges and an input just past
+    /// them. The embedding is a lookup, never uploaded, so its views stay on
+    /// the CPU.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn int16_fixture_projections_match_on_metal_i16() {
+        use super::super::metal_i16::test_support::SwitchGuard;
+        use super::super::metal_i16::{MetalI16Model, metal_i16_census};
+        use super::super::precision::tests::Case;
+        use crate::canonical_simd::{LIMB_MAX, LIMB_MIN};
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+        ))
+        .unwrap();
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let mut rng = Lcg(176);
+        let (mut views, mut on_gpu) = (0, 0);
+        for (name, c) in int16_fixtures() {
+            let bytes = tiny_package(&c, StageSpec::full(&c));
+            let package_hash = blake3::hash(&bytes).to_hex().to_string();
+            assert_eq!(pinned[name][0], package_hash, "{name}");
+            let model = StageModel::from_owned(bytes).unwrap();
+            let metal = MetalI16Model::new(&model).expect("the exact INT16 Metal GEMV");
+            let data = model.bytes();
+            for (label, m) in dyadic_matrices(&model) {
+                if !m.wide {
+                    continue;
+                }
+                for index in 0..m.mu.len() / m.rows {
+                    let view = m.view(data, index);
+                    let q = view.q16.expect("an INT16 view").as_bytes();
+                    let what = format!("{name} {label}[{index}]");
+                    let cols = view.cols;
+                    let typical: Vec<i64> = (0..cols)
+                        .map(|_| (rng.next() % (1 << 21)) as i64 - (1 << 20))
+                        .collect();
+                    let edges: Vec<i64> = (0..cols)
+                        .map(|j| match j % 3 {
+                            0 => LIMB_MAX,
+                            1 => LIMB_MIN,
+                            _ => 7,
+                        })
+                        .collect();
+                    let mut outside = typical.clone();
+                    outside[cols / 2] = LIMB_MIN - 1;
+                    for x in [&typical, &edges, &outside] {
+                        let case = Case {
+                            q,
+                            rows: view.rows,
+                            cols,
+                            mu: view.mu,
+                            k: view.k,
+                            x,
+                        };
+                        let want = case.legacy();
+                        assert!(want.is_ok(), "{what}");
+                        let switch = SwitchGuard::set(true);
+                        let before = metal_i16_census();
+                        let got = metal.run(|| case.current(Some(Schedule::Serial)));
+                        let delta = metal_i16_census().since(&before);
+                        drop(switch);
+                        assert_eq!(got, want, "{what}");
+                        let resident = label != "embed";
+                        assert_eq!(delta.accepted, u64::from(resident), "{what}: {delta:?}");
+                        assert_eq!(delta.not_resident, u64::from(!resident), "{what}");
+                        on_gpu += usize::from(resident);
+                    }
+                    views += 1;
+                }
+            }
+        }
+        // As in int16_fixture_projections_match_the_legacy_kernel: 198 views,
+        // of which the four embeddings stay on the CPU.
+        assert_eq!(views, 198);
+        assert_eq!(on_gpu, 3 * (198 - 4));
+    }
+
+    /// The four pinned INT16 fixture goldens (tokens, every logits hash and
+    /// every boundary digest of an 8-token generation) hold with every INT16
+    /// projection of the forward pass on the exact Metal GEMV, scalar and
+    /// SIMD CPU kernels alike; and so does each fixture split into one stage
+    /// per layer, each stage with its own residency scope.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn int16_fixture_goldens_hold_on_metal_i16() {
+        use super::super::metal_i16::test_support::SwitchGuard;
+        use super::super::metal_i16::{MetalI16Model, metal_i16_census};
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+        ))
+        .unwrap();
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let request = GenerationRequest {
+            prompt: &[3, 17, 5, 49, 0],
+            max_tokens: 8,
+            eos: &[],
+            selection: Selection::Rp64Argmax,
+        };
+        let tokens = [3, 17, 5, 49, 0];
+        for (name, c) in int16_fixtures() {
+            let bytes = tiny_package(&c, StageSpec::full(&c));
+            let package_hash = blake3::hash(&bytes).to_hex().to_string();
+            assert_eq!(pinned[name][0], package_hash, "{name}");
+            let model = StageModel::from_owned(bytes).unwrap();
+            // The CPU first, with the switch off.
+            let cpu = model.generate(&request).unwrap();
+            assert_eq!(pinned[name][1], generation_digest(&cpu), "{name}: CPU");
+            let reference = model
+                .run_sequence(&tokens, None, 3, Selection::Rp64Argmax)
+                .unwrap();
+
+            let metal = MetalI16Model::new(&model).expect("the exact INT16 Metal GEMV");
+            let wide: Vec<&MatRef> = dyadic_matrices(&model)
+                .into_iter()
+                .filter(|(label, m)| m.wide && label != "embed")
+                .map(|(_, m)| m)
+                .collect();
+            assert_eq!(metal.resident_matrices(), wide.len(), "{name}");
+            // INT16 projections per forwarded position: one per matrix, and
+            // one per head for the per-head key and value stacks.
+            let per_position: u64 = wide.iter().map(|m| (m.mu.len() / m.rows) as u64).sum();
+            let switch = SwitchGuard::set(true);
+            for fast in [false, true] {
+                crate::canonical_simd::set_fast_canonical_kernel(fast);
+                let before = metal_i16_census();
+                let run = metal.run(|| model.generate(&request)).unwrap();
+                let delta = metal_i16_census().since(&before);
+                assert_eq!(
+                    pinned[name][1],
+                    generation_digest(&run),
+                    "{name}: Metal, fast {fast}"
+                );
+                assert_eq!(run.tokens, cpu.tokens, "{name}");
+                let forwards = (request.prompt.len() + run.tokens.len() - 1) as u64;
+                assert_eq!(delta.accepted, per_position * forwards, "{name}: {delta:?}");
+                assert_eq!(delta.in_scope_fallbacks(), 0, "{name}: {delta:?}");
+            }
+            crate::canonical_simd::set_fast_canonical_kernel(false);
+
+            let mut inputs: Option<Vec<i64>> = None;
+            for layer in 0..c.n_layers {
+                let stage = StageSpec {
+                    first_layer: layer,
+                    end_layer: layer + 1,
+                };
+                let part = StageModel::from_owned(tiny_package(&c, stage)).unwrap();
+                let part_metal = MetalI16Model::new(&part).expect("the exact INT16 Metal GEMV");
+                let before = metal_i16_census();
+                let out = part_metal
+                    .run(|| part.run_sequence(&tokens, inputs.as_deref(), 3, Selection::Rp64Argmax))
+                    .unwrap();
+                let delta = metal_i16_census().since(&before);
+                assert!(delta.accepted > 0, "{name} layer {layer}: {delta:?}");
+                assert_eq!(
+                    delta.in_scope_fallbacks(),
+                    0,
+                    "{name} layer {layer}: {delta:?}"
+                );
+                if layer + 1 == c.n_layers {
+                    assert_eq!(out.hidden, reference.hidden, "{name}");
+                    assert_eq!(out.logits_hashes, reference.logits_hashes, "{name}");
+                    assert_eq!(out.derived, reference.derived, "{name}");
+                }
+                inputs = Some(out.hidden);
+            }
+            drop(switch);
+            println!(
+                "golden {name} on the exact INT16 Metal GEMV: run {}",
+                generation_digest(&cpu)
+            );
         }
     }
 }
