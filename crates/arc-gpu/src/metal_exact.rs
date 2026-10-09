@@ -44,7 +44,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use metal::{
     Buffer, BufferRef, CommandBufferRef, CommandQueue, CompileOptions, ComputeCommandEncoderRef,
@@ -70,7 +70,7 @@ pub const ROWS_PER_SIMDGROUP: [u32; 4] = [1, 2, 4, 8];
 /// Simdgroups per threadgroup accepted by [`Tile`].
 pub const SIMDGROUPS: [u32; 4] = [1, 2, 4, 8];
 
-const BLOCK_BYTES: usize = 16;
+pub(crate) const BLOCK_BYTES: usize = 16;
 const SCRATCH_POOL: usize = 8;
 const SELF_TEST_SEED: u64 = 0x00A2_C0DE_5EED_0001;
 const READ_PROBE_THREADS: u64 = 256 * 1024;
@@ -230,13 +230,13 @@ pub struct SelfTestReport {
 /// stored with a stride rounded up to 16 bytes; the padding is zero, so it
 /// adds nothing to any sum.
 pub struct ResidentMatrix {
-    weights: Buffer,
-    scales: Buffer,
-    n_rows: usize,
-    n_cols: usize,
-    stride: usize,
+    pub(crate) weights: Buffer,
+    pub(crate) scales: Buffer,
+    pub(crate) n_rows: usize,
+    pub(crate) n_cols: usize,
+    pub(crate) stride: usize,
     /// `max_i |s_i|`, or `None` if some scale is `i64::MIN` (no absolute value).
-    max_abs_scale: Option<i64>,
+    pub(crate) max_abs_scale: Option<i64>,
     storage: Storage,
 }
 
@@ -257,6 +257,11 @@ impl ResidentMatrix {
     pub fn storage(&self) -> Storage {
         self.storage
     }
+
+    /// `max_i |s_i|`, or `None` if some scale is `i64::MIN`.
+    pub fn max_abs_scale(&self) -> Option<i64> {
+        self.max_abs_scale
+    }
 }
 
 /// Per-call device buffers: digit planes in, results out.
@@ -267,14 +272,14 @@ struct Scratch {
     out_capacity: usize,
 }
 
-/// Mirrors `ExactGemvParams` in the kernel source.
+/// Mirrors `ExactGemvParams` in the kernel sources.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Params {
-    rows: u32,
-    row_offset: u32,
-    blocks: u32,
-    mode: u32,
+pub(crate) struct Params {
+    pub(crate) rows: u32,
+    pub(crate) row_offset: u32,
+    pub(crate) blocks: u32,
+    pub(crate) mode: u32,
 }
 
 /// One encoded projection.
@@ -290,13 +295,17 @@ struct Dispatch<'a> {
 
 /// The exact Metal GEMV engine: one device, one queue, every pipeline.
 pub struct MetalExactGemv {
-    device: Device,
-    queue: CommandQueue,
+    pub(crate) device: Device,
+    pub(crate) queue: CommandQueue,
     pipelines: HashMap<(usize, u32, bool), ComputePipelineState>,
     read_pipeline: ComputePipelineState,
-    simd_width: u64,
+    pub(crate) simd_width: u64,
     scratch: Mutex<Vec<Scratch>>,
-    tile: Tile,
+    pub(crate) tile: Tile,
+    /// The one-command-buffer decoder's kernels (`metal_decoder`), compiled
+    /// on first use from their own library, so that the single-projection
+    /// engine never depends on them.
+    decoder: OnceLock<Result<crate::metal_decoder::DecoderPipelines, String>>,
 }
 
 fn kernel_name(planes: usize, rows: u32, mul16: bool) -> String {
@@ -308,7 +317,7 @@ fn kernel_name(planes: usize, rows: u32, mul16: bool) -> String {
 /// metal 0.29 has no accessor for these properties, so they are read with
 /// objc's typed message send (not its `msg_send!` macro, which expands an
 /// undeclared `cargo-clippy` cfg).
-fn gpu_seconds(commands: &CommandBufferRef) -> f64 {
+pub(crate) fn gpu_seconds(commands: &CommandBufferRef) -> f64 {
     let read = |property: &str| -> f64 {
         // SAFETY: GPUStartTime and GPUEndTime are read-only CFTimeInterval
         // (f64) properties of MTLCommandBuffer, and the buffer has completed.
@@ -489,7 +498,37 @@ impl MetalExactGemv {
             simd_width,
             scratch: Mutex::new(Vec::new()),
             tile: Tile::DEFAULT,
+            decoder: OnceLock::new(),
         })
+    }
+
+    /// The decoder kernels, compiled once on first use.
+    pub(crate) fn decoder_pipelines(
+        &self,
+    ) -> Result<&crate::metal_decoder::DecoderPipelines, String> {
+        self.decoder
+            .get_or_init(|| {
+                autoreleasepool(|| crate::metal_decoder::DecoderPipelines::build(&self.device))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Threadgroups and threads for a projection of `rows` rows with `tile`.
+    pub(crate) fn geometry(
+        &self,
+        pipeline: &ComputePipelineState,
+        rows: usize,
+        tile: Tile,
+    ) -> (MTLSize, MTLSize) {
+        let fit = (pipeline.max_total_threads_per_threadgroup() / self.simd_width).max(1);
+        let simdgroups = u64::from(tile.simdgroups).min(fit);
+        let rows_per_group = simdgroups * u64::from(tile.rows_per_simdgroup);
+        let groups = (rows as u64).div_ceil(rows_per_group);
+        (
+            MTLSize::new(groups, 1, 1),
+            MTLSize::new(simdgroups * self.simd_width, 1, 1),
+        )
     }
 
     /// Device name, limits and GPU families.
@@ -739,10 +778,7 @@ impl MetalExactGemv {
     }
 
     fn encode(&self, encoder: &ComputeCommandEncoderRef, job: &Dispatch<'_>) {
-        let fit = (job.pipeline.max_total_threads_per_threadgroup() / self.simd_width).max(1);
-        let simdgroups = u64::from(job.tile.simdgroups).min(fit);
-        let rows_per_group = simdgroups * u64::from(job.tile.rows_per_simdgroup);
-        let groups = (job.rows.len() as u64).div_ceil(rows_per_group);
+        let (groups, threads) = self.geometry(job.pipeline, job.rows.len(), job.tile);
         let params = Params {
             rows: job.rows.len() as u32,
             row_offset: job.rows.start as u32,
@@ -762,10 +798,7 @@ impl MetalExactGemv {
             std::mem::size_of::<Params>() as u64,
             std::ptr::from_ref(&params).cast(),
         );
-        encoder.dispatch_thread_groups(
-            MTLSize::new(groups, 1, 1),
-            MTLSize::new(simdgroups * self.simd_width, 1, 1),
-        );
+        encoder.dispatch_thread_groups(groups, threads);
     }
 
     fn new_scratch(&self, stride: usize, rows: usize) -> Scratch {
@@ -1097,21 +1130,23 @@ mod tests {
 
     #[test]
     fn kernel_source_is_integer_only() {
-        let code = strip_comments(KERNEL_SOURCE);
-        let words: Vec<&str> = code
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .filter(|w| !w.is_empty())
-            .collect();
-        for banned in ["float", "half", "double", "bfloat", "fast", "precise"] {
-            assert!(
-                !words.iter().any(|w| w.starts_with(banned)),
-                "the exact kernels must not use {banned}"
-            );
+        for source in [KERNEL_SOURCE, crate::metal_decoder::DECODER_SOURCE] {
+            let code = strip_comments(source);
+            let words: Vec<&str> = code
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| !w.is_empty())
+                .collect();
+            for banned in ["float", "half", "double", "bfloat", "fast", "precise"] {
+                assert!(
+                    !words.iter().any(|w| w.starts_with(banned)),
+                    "the exact kernels must not use {banned}"
+                );
+            }
+            // No native integer division or modulo (Apple GPUs lower it in
+            // software; #150 found a miscompiled one on an M2 Ultra).
+            assert!(!code.contains('/'), "the exact kernels must not divide");
+            assert!(!code.contains('%'), "the exact kernels must not use modulo");
         }
-        // No native integer division or modulo (Apple GPUs lower it in
-        // software; #150 found a miscompiled one on an M2 Ultra).
-        assert!(!code.contains('/'), "the exact kernels must not divide");
-        assert!(!code.contains('%'), "the exact kernels must not use modulo");
     }
 
     #[test]
