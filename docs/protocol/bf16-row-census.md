@@ -117,8 +117,9 @@ model inventory and fixed histograms still occupy memory.
 `check_census_memory.py OUT` uses the pinned real configuration's 5,891,392
 semantic rows and actual row widths/KV-B geometry, a virtual all-NaN BF16 source,
 and the native inventory. Every row is flagged; only 1000 identities are retained.
-It measures process peak RSS through report serialization. It fetches no weights
-and does not simulate safetensors headers or hashing I/O. The measured report
+It records process peak RSS through report serialization, exact semantic component
+dimensions, output bytes and elapsed time. It fetches no weights and does not
+simulate safetensors headers or hashing I/O. The measured report
 belongs in delivery evidence; it is not a real-data RSS guarantee.
 
 ```sh
@@ -135,6 +136,10 @@ oracle corpus. Read-tile invariance includes nonconstant KV-B; row 1 in a key
 transpose and row 33 in a value component are explicit converter-error controls.
 Source snapshots, deterministic CLI outputs, hashes and ignored/expert shape-only
 handling are retained. The existing Linux x86/ARM and Windows slice CI runs it.
+Cap controls include zero and the exact flagged-count boundary. Injected output
+creation and mid-serialization disk-full failures must return exit 2, emit no
+success summary and preserve the sources. A failed write can leave a partial
+report: consume output only after exit 0; existing output paths are never overwritten.
 
 Next is a **separately dispatched** admitted Studio census, not a download by
 this tool-completion pass. Operator conditions: fresh Studio disk/RAM/heavy-job

@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Synthetic-only census counts checked against actual converter outcomes."""
 import argparse
+import contextlib
+import errno
 from fractions import Fraction
 import hashlib
+import io
 import json
 from pathlib import Path
 import struct
 import subprocess
 import sys
+from unittest import mock
 
 import numpy as np
 
@@ -437,13 +441,16 @@ def main():
     capped_manifest = capped_source / manifest_path.name
     full = census.census(capped_source, capped_manifest, POLICIES['all-int16'])
     assert full['rejected_row_count'] > 3
-    for cap in (0, 1, 3):
+    cap_boundaries = (0, 1, 3, full['rejected_row_count'] - 1,
+                      full['rejected_row_count'], full['rejected_row_count'] + 1)
+    for cap in cap_boundaries:
         limited = census.census(capped_source, capped_manifest, POLICIES['all-int16'], max_rejected_rows=cap)
         assert limited['counts'] == full['counts']
         assert limited['classes'] == full['classes']
         assert limited['tensor_totals'] == full['tensor_totals']
         assert limited['rejected_row_count'] == full['rejected_row_count']
-        assert limited['rejected_rows_retained'] <= cap
+        assert limited['rejected_rows_retained'] == min(cap, full['rejected_row_count'])
+        assert limited['rejected_rows_truncated'] == (cap < full['rejected_row_count'])
         assert sum(len(r['rejected_rows']) for r in limited['tensors']) == limited['rejected_rows_retained']
         assert sum(r['rejected_rows_omitted'] for r in limited['tensors']) == limited['rejected_rows_omitted']
         assert limited['rejected_rows_retained'] + limited['rejected_rows_omitted'] == limited['rejected_row_count']
@@ -465,12 +472,70 @@ def main():
             pass
         else:
             raise AssertionError('invalid rejection cap accepted')
+    # Output failures must exit unsuccessfully without printing a success
+    # summary or changing source bytes. Exercise actual CLI serialization,
+    # including a disk-full failure after part of the JSON was written.
+    output_failures = []
+    real_open = Path.open
+    for mode in ('create', 'write'):
+        destination = out / f'failed-{mode}.json'
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        class FailingWriter:
+            def __init__(self, stream):
+                self.stream, self.remaining = stream, 64
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.stream.close()
+
+            def write(self, value):
+                if len(value) > self.remaining:
+                    self.stream.write(value[:self.remaining])
+                    raise OSError(errno.ENOSPC, 'synthetic disk full')
+                self.remaining -= len(value)
+                return self.stream.write(value)
+
+        def failing_open(path, *args, **kwargs):
+            if path == destination:
+                if mode == 'create':
+                    raise OSError(errno.EACCES, 'synthetic output denied')
+                return FailingWriter(real_open(path, *args, **kwargs))
+            return real_open(path, *args, **kwargs)
+
+        argv = [str(cli), '--source-dir', str(source), '--source-manifest', str(manifest_path),
+                '--precision', str(policy_paths['all-int16']), '--out', str(destination)]
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(Path, 'open', failing_open), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                census.main()
+            except SystemExit as failure:
+                assert failure.code == 2
+            else:
+                raise AssertionError('output failure reported success')
+        assert stdout.getvalue() == '' and 'synthetic' in stderr.getvalue()
+        if mode == 'create':
+            assert not destination.exists()
+        else:
+            assert destination.stat().st_size == 64
+            try:
+                json.loads(destination.read_text())
+            except json.JSONDecodeError:
+                pass
+            else:
+                raise AssertionError('partial report appears complete')
+        assert snapshot(source) == before
+        output_failures.append(dict(mode=mode, exit_code=2, stderr=stderr.getvalue(),
+                                    source_unchanged=True, success_output=False))
     for repeat in ('a', 'b'):
         subprocess.run([sys.executable, str(cli), '--source-dir', str(source), '--source-manifest', str(manifest_path),
                         '--precision', str(policy_paths['all-int16']), '--out', str(out / f'deterministic-{repeat}.json')], check=True)
     assert (out / 'deterministic-a.json').read_bytes() == (out / 'deterministic-b.json').read_bytes()
     assert snapshot(source) == before == {name: hashlib.sha256(raw).hexdigest() for name, raw in original.items()}
     summary = dict(engine_dependency=census.ENGINE, synthetic_only=True, converter_controls=results,
+                   rejection_cap_boundaries=list(cap_boundaries), output_failure_controls=output_failures,
                    input_controls=metadata_controls, exhaustive_finite_maxima_per_precision=32640,
                    source_unchanged=True, deterministic=True, tile_size_invariance=[7, 32768])
     (out / 'results.json').write_text(json.dumps(summary, sort_keys=True, indent=2) + '\n')
