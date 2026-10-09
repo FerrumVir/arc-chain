@@ -209,3 +209,134 @@ typedef decltype(exact_gemv_i16<1, 1, 0>) exact_gemv_i16_t;
 
 EXACT_GEMV_I16_PLANES(0)
 EXACT_GEMV_I16_PLANES(1)
+
+// ---------------------------------------------------------------------------
+// Per-head projections in one dispatch (MLA's per-head key and value stacks).
+//
+// A stack of `heads` matrices of `rows` x `cols`, stored one after another
+// (head h's row i is matrix row row_offset + h * rows + i), each projected
+// with its own activation vector. The grid's y coordinate is the head. Every
+// output row is computed by exactly the steps of exact_gemv_i16 above, so
+// the proof at the top of this file applies to it row by row: the same
+// weights, the same per-row loop, the same int block and lane sums, the same
+// ulong recombination and 16-bit reduction. Only two things depend on the
+// head: which digit planes the row reads (its own head's, written by the
+// host from that head's vector, which passed the guard on its own) and which
+// output slot it writes. The host refuses a stack whose rows do not fit the
+// matrix, and the offsets below are formed in ulong.
+
+struct ExactI16HeadsParams {
+    uint rows;        // output rows of each head
+    uint row_offset;  // matrix row of head 0's first row
+    uint blocks;      // 16-byte weight blocks per row; 8-byte digit blocks per plane
+    uint heads;       // heads in this dispatch (the grid's y size)
+};
+
+// Digit planes per head in the digit buffer: every head's vector is written
+// as all seven planes, so head h's planes start at h * 7 * blocks blocks.
+constant uint I16_HEAD_PLANES = 7;
+
+template <uint PLANES, uint ROWS, uint MUL16>
+kernel void exact_gemv_i16_heads(
+    device const uint4 *weights [[buffer(0)]],
+    device const uint2 *digits [[buffer(1)]],
+    device long *out [[buffer(2)]],
+    constant ExactI16HeadsParams &p [[buffer(3)]],
+    uint2 tg_index [[threadgroup_position_in_grid]],
+    uint sg_index [[simdgroup_index_in_threadgroup]],
+    uint sg_count [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg_width [[threads_per_simdgroup]])
+{
+    const uint head = tg_index.y;
+    const uint first = (tg_index.x * sg_count + sg_index) * ROWS;
+    // Uniform across the simdgroup, so simd_sum below always sees full groups.
+    if (head >= p.heads || first >= p.rows) {
+        return;
+    }
+    device const uint2 *head_digits =
+        digits + ulong(head) * ulong(I16_HEAD_PLANES) * ulong(p.blocks);
+    const ulong head_row = ulong(p.row_offset) + ulong(head) * ulong(p.rows);
+
+    // Rows past the end of the head load the head's last row (in bounds)
+    // and never store.
+    device const uint4 *row_ptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        const uint local = min(first + r, p.rows - 1u);
+        row_ptr[r] = weights + (head_row + ulong(local)) * ulong(p.blocks);
+    }
+
+    ulong total[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        total[r] = 0;
+    }
+
+    const uint span = I16_FLUSH * sg_width;
+    for (uint start = lane; start < p.blocks; start += span) {
+        // The loop below runs at most I16_FLUSH times.
+        const uint stop = start + min(p.blocks - start, span);
+        int part[ROWS][PLANES];
+        for (uint r = 0; r < ROWS; ++r) {
+            for (uint d = 0; d < PLANES; ++d) {
+                part[r][d] = 0;
+            }
+        }
+        for (uint b = start; b < stop; b += sg_width) {
+            uint2 c[PLANES];
+            for (uint d = 0; d < PLANES; ++d) {
+                c[d] = head_digits[d * p.blocks + b];
+            }
+            for (uint r = 0; r < ROWS; ++r) {
+                const uint4 w = row_ptr[r][b];
+                for (uint d = 0; d < PLANES; ++d) {
+                    part[r][d] += dot8<MUL16>(w, c[d]);
+                }
+            }
+        }
+        for (uint r = 0; r < ROWS; ++r) {
+            for (uint d = 0; d < PLANES; ++d) {
+                total[r] += as_type<ulong>(long(part[r][d])) << (8u * d);
+            }
+        }
+    }
+
+    // Sum total[r] over the lanes modulo 2^64, in four exact 16-bit pieces.
+    for (uint r = 0; r < ROWS; ++r) {
+        ulong sum = 0;
+        for (uint piece = 0; piece < 4u; ++piece) {
+            const int bits = int((total[r] >> (16u * piece)) & 0xFFFFUL);
+            sum += ulong(uint(simd_sum(bits))) << (16u * piece);
+        }
+        total[r] = sum;
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        if (lane == r && first + r < p.rows) {
+            out[ulong(head) * ulong(p.rows) + ulong(first + r)] = as_type<long>(total[r]);
+        }
+    }
+}
+
+typedef decltype(exact_gemv_i16_heads<1, 1, 0>) exact_gemv_i16_heads_t;
+
+#define EXACT_GEMV_I16_HEADS(P, R, M)                                           \
+    template [[host_name("exact_gemv_i16_heads_p" #P "_r" #R "_m" #M)]]        \
+    kernel exact_gemv_i16_heads_t exact_gemv_i16_heads<P, R, M>;
+
+#define EXACT_GEMV_I16_HEADS_ROWS(P, M)                                         \
+    EXACT_GEMV_I16_HEADS(P, 1, M)                                               \
+    EXACT_GEMV_I16_HEADS(P, 2, M)                                               \
+    EXACT_GEMV_I16_HEADS(P, 4, M)                                               \
+    EXACT_GEMV_I16_HEADS(P, 8, M)
+
+#define EXACT_GEMV_I16_HEADS_PLANES(M)                                          \
+    EXACT_GEMV_I16_HEADS_ROWS(1, M)                                             \
+    EXACT_GEMV_I16_HEADS_ROWS(2, M)                                             \
+    EXACT_GEMV_I16_HEADS_ROWS(3, M)                                             \
+    EXACT_GEMV_I16_HEADS_ROWS(4, M)                                             \
+    EXACT_GEMV_I16_HEADS_ROWS(5, M)                                             \
+    EXACT_GEMV_I16_HEADS_ROWS(6, M)                                             \
+    EXACT_GEMV_I16_HEADS_ROWS(7, M)
+
+EXACT_GEMV_I16_HEADS_PLANES(0)
+EXACT_GEMV_I16_HEADS_PLANES(1)

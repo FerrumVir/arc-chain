@@ -17,7 +17,8 @@ name: Metal exact INT16 GEMV (hosted macOS)
 #
 # macOS runners also serve the release and proof sequences, so this workflow
 # takes at most one of them per push: it runs on pull requests only when its
-# own files change (the INT16 kernel, its engine, its hook module, the pinned
+# own files change (the INT16 kernel, its engine, its hook module, the MLA
+# model that calls the hooks and holds the goldens-on-GPU tests, the pinned
 # INT16 fixture goldens, this file), and a newer push cancels an older run
 # that is still queued or running. Other changes can run it by hand
 # (workflow_dispatch, once this file is on the default branch).
@@ -29,6 +30,7 @@ on:
       - crates/arc-gpu/src/metal_exact_i16.rs
       - crates/arc-gpu/src/metal_exact_gemv_i16.metal
       - crates/arc-inference/src/modern/mla/metal_i16.rs
+      - crates/arc-inference/src/modern/mla/model.rs
       - docs/protocol/reference/int16-fixture-goldens.json
   workflow_dispatch:
 
