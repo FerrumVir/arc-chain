@@ -450,7 +450,7 @@ mod tests {
     /// directly; each must equal `want`. In-domain cases must be accepted.
     fn assert_gpu_matches(case: &Case<'_>, want: &Outcome, tiles: &[Tile], what: &str) {
         let (got, delta) = hooked(case);
-        assert_eq!(&got, want, "{what}: hook");
+        assert_eq!(got, *want, "{what}: hook");
         assert_eq!(delta.in_scope_fallbacks(), 0, "{what}: {delta:?}");
         // Inputs past the guard (or the shape) are refused by `project_i16`
         // before the hook; every other input reaches the GPU.
@@ -470,8 +470,8 @@ mod tests {
             .expect("upload");
         for &tile in tiles {
             assert_eq!(
-                &engine_outcome(&matrix, case, tile),
-                want,
+                engine_outcome(&matrix, case, tile),
+                *want,
                 "{what}: tile {}",
                 tile.label()
             );
@@ -970,6 +970,21 @@ mod bench {
         engine.time_batch(items, tile, repeats).expect("timing")
     }
 
+    /// One shape's measurements.
+    struct Measured {
+        name: &'static str,
+        rows: usize,
+        cols: usize,
+        best: Tile,
+        best_seconds: f64,
+        default_seconds: f64,
+        five_plane_seconds: f64,
+        call_seconds: f64,
+        cpu_scalar_seconds: f64,
+        cpu_simd_seconds: Option<f64>,
+        sweep: Vec<(Tile, f64)>,
+    }
+
     #[test]
     #[ignore = "benchmark: run explicitly in release with --ignored --nocapture"]
     fn k26_int16_projection_benchmark() {
@@ -978,6 +993,8 @@ mod bench {
         let device = engine.report();
         // The INT8 engine's read probe (#176): the same kernel and buffer size
         // that its benchmark reports, so the two fractions are comparable.
+        // The VM's bandwidth varies, so it is probed before and after the
+        // shapes and the best reading is the device figure.
         let probe = crate::metal_gemv::metal_engine().expect("Metal device");
         let read = |storage| {
             let times = probe
@@ -985,15 +1002,12 @@ mod bench {
                 .expect("read probe");
             READ_PROBE_BYTES as f64 / times[0] / 1e9
         };
-        let read_shared = read(Storage::Shared);
-        let read_private = read(Storage::Private);
-        let device_gbps = read_shared.max(read_private);
+        let mut reads = vec![read(Storage::Shared), read(Storage::Private)];
         let threads = rayon::current_num_threads();
         let simd = canonical_simd::dotprod_available();
 
         let mut rng = Rng(0x0D15_EA5E_BE4C_0016);
-        let mut rows_md = Vec::new();
-        let mut json_rows = Vec::new();
+        let mut measured = Vec::new();
         for (name, rows, cols) in K26_SHAPES {
             let q = le_bytes(&weights(&mut rng, rows * cols));
             let admitted = I16Weights::new(&q).expect("admitted");
@@ -1005,7 +1019,6 @@ mod bench {
             let matrix = engine
                 .upload(&q, rows, cols, Storage::Shared)
                 .expect("upload");
-            let bytes = (rows * cols * 2) as f64;
 
             // Exactness first: the benchmarked path must match the CPU.
             let cpu = |out: &mut Vec<i64>| {
@@ -1040,42 +1053,24 @@ mod bench {
             } else {
                 None
             };
-            let gbps = bytes / best_seconds / 1e9;
-            rows_md.push(format!(
-                "| {name} | {rows}x{cols} | {} | {:.1} | {gbps:.1} | {:.0}% | {:.1} | {:.1} | {:.1} | {:.0} | {} |",
-                best.label(),
-                best_seconds * 1e6,
-                100.0 * gbps / device_gbps,
-                default_seconds * 1e6,
-                five_plane_seconds * 1e6,
-                call_seconds * 1e6,
-                cpu_scalar_seconds * 1e6,
-                cpu_simd_seconds.map_or("n/a".to_string(), |s| format!("{:.0}", s * 1e6)),
-            ));
-            json_rows.push(serde_json::json!({
-                "shape": name,
-                "rows": rows,
-                "cols": cols,
-                "weight_bytes": rows * cols * 2,
-                "best_tile": best.label(),
-                "gpu_us_3_planes": best_seconds * 1e6,
-                "gpu_gbps_3_planes": gbps,
-                "fraction_of_measured_read_bandwidth": gbps / device_gbps,
-                "gpu_us_default_tile": default_seconds * 1e6,
-                "gpu_us_5_planes": five_plane_seconds * 1e6,
-                "single_call_wall_us": call_seconds * 1e6,
-                "cpu_scalar_us": cpu_scalar_seconds * 1e6,
-                "cpu_simd_us": cpu_simd_seconds.map(|s| s * 1e6),
-                "tile_sweep_us": sweep
-                    .iter()
-                    .map(|(tile, seconds)| (tile.label(), seconds * 1e6))
-                    .collect::<Vec<_>>(),
-            }));
+            measured.push(Measured {
+                name,
+                rows,
+                cols,
+                best,
+                best_seconds,
+                default_seconds,
+                five_plane_seconds,
+                call_seconds,
+                cpu_scalar_seconds,
+                cpu_simd_seconds,
+                sweep,
+            });
         }
 
         // One K2.6 layer's 64 heads (wk_b 512x128 and wv_b 128x512 each) as
-        // 128 projections encoded in one command buffer: what batching the
-        // heads would cost, against one call per head.
+        // 128 projections encoded in one command buffer, against one call per
+        // head.
         let (n_heads, rank, nope) = (64usize, 512usize, 128usize);
         let wk = le_bytes(&weights(&mut rng, n_heads * rank * nope));
         let wv = le_bytes(&weights(&mut rng, n_heads * nope * rank));
@@ -1123,6 +1118,9 @@ mod bench {
             }
         });
 
+        reads.push(read(Storage::Shared));
+        reads.push(read(Storage::Private));
+        let device_gbps = reads.iter().copied().fold(0.0, f64::max);
         let mut md = String::new();
         md.push_str("### Exact Metal INT16 GEMV, Kimi K2.6 projection shapes\n\n");
         md.push_str(
@@ -1130,14 +1128,19 @@ mod bench {
              Metal GPU. Not Apple GPU hardware numbers.\n\n",
         );
         md.push_str(&format!(
-            "Device `{}`; max buffer {} bytes; simdgroup width {}; measured read bandwidth \
-             {read_shared:.1} GB/s (shared) and {read_private:.1} GB/s (private), 256 MiB, best \
-             of 10 (the #176 probe); fractions below are of the larger. CPU columns: \
+            "Device `{}`; max buffer {} bytes; simdgroup width {}. Read bandwidth, 256 MiB, best \
+             of 10 (the #176 probe), shared and private storage, before and after the shapes: \
+             {}; the fractions below are of the best, {device_gbps:.1} GB/s. CPU columns: \
              `project_i16` on {threads} rayon threads, scalar and SIMD limbs{}. Build: this \
              workflow's release profile (LTO off, 16 codegen units).\n\n",
             device.name,
             device.max_buffer_length,
             device.thread_execution_width,
+            reads
+                .iter()
+                .map(|gbps| format!("{gbps:.1}"))
+                .collect::<Vec<_>>()
+                .join(", "),
             if simd { "" } else { " (SIMD unavailable)" },
         ));
         md.push_str(
@@ -1145,15 +1148,54 @@ mod bench {
              tile | GPU µs, 5 planes | One call, wall µs | CPU scalar µs | CPU SIMD µs |\n",
         );
         md.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
-        for row in &rows_md {
-            md.push_str(row);
-            md.push('\n');
+        let mut json_rows = Vec::new();
+        for m in &measured {
+            let gbps = (m.rows * m.cols * 2) as f64 / m.best_seconds / 1e9;
+            let simd_us = m
+                .cpu_simd_seconds
+                .map_or("n/a".to_string(), |s| format!("{:.0}", s * 1e6));
+            md.push_str(&format!(
+                "| {} | {}x{} | {} | {:.1} | {gbps:.1} | {:.0}% | {:.1} | {:.1} | {:.1} | {:.0} | \
+                 {simd_us} |\n",
+                m.name,
+                m.rows,
+                m.cols,
+                m.best.label(),
+                m.best_seconds * 1e6,
+                100.0 * gbps / device_gbps,
+                m.default_seconds * 1e6,
+                m.five_plane_seconds * 1e6,
+                m.call_seconds * 1e6,
+                m.cpu_scalar_seconds * 1e6,
+            ));
+            json_rows.push(serde_json::json!({
+                "shape": m.name,
+                "rows": m.rows,
+                "cols": m.cols,
+                "weight_bytes": m.rows * m.cols * 2,
+                "best_tile": m.best.label(),
+                "gpu_us_3_planes": m.best_seconds * 1e6,
+                "gpu_gbps_3_planes": gbps,
+                "fraction_of_measured_read_bandwidth": gbps / device_gbps,
+                "gpu_us_default_tile": m.default_seconds * 1e6,
+                "gpu_us_5_planes": m.five_plane_seconds * 1e6,
+                "single_call_wall_us": m.call_seconds * 1e6,
+                "cpu_scalar_us": m.cpu_scalar_seconds * 1e6,
+                "cpu_simd_us": m.cpu_simd_seconds.map(|s| s * 1e6),
+                "tile_sweep_us": m
+                    .sweep
+                    .iter()
+                    .map(|(tile, seconds)| (tile.label(), seconds * 1e6))
+                    .collect::<Vec<_>>(),
+            }));
         }
         md.push_str(&format!(
-            "\nGPU µs: one projection's GPU time (command-buffer timestamps, many projections \
+            "\nGPU µs: one projection's GPU time (command-buffer timestamps, the same projection \
              encoded back to back), three digit planes (|x| <= 2^17). GB/s counts INT16 weight \
-             bytes only. One call, wall µs: `project_i16` through the opt-in hook (digit split, \
-             dispatch, wait, read-back and the CPU epilogue). Default tile {}.\n\n\
+             bytes only; a matrix of a few MiB can stay partly in the GPU's cache across those \
+             repeats, which a 256 MiB probe cannot, so its fraction can exceed 100%. One call, \
+             wall µs: `project_i16` through the opt-in hook (digit split, dispatch, wait, \
+             read-back and the CPU epilogue). Default tile {}.\n\n\
              One K2.6 layer's 64 heads (128 projections, {heads_bytes} weight bytes): {:.1} µs \
              of GPU time in one command buffer ({:.1} GB/s), against {:.1} µs as 128 separate \
              calls.\n",
@@ -1166,8 +1208,8 @@ mod bench {
         let json = serde_json::json!({
             "label": "virtualized-runner measurement",
             "device": device,
-            "read_gbps_shared": read_shared,
-            "read_gbps_private": read_private,
+            "read_gbps": reads,
+            "device_gbps": device_gbps,
             "rayon_threads": threads,
             "default_tile": DEFAULT_TILE.label(),
             "shapes": json_rows,

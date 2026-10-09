@@ -88,11 +88,13 @@ pub const SIMDGROUPS: [u32; 4] = crate::metal_exact::SIMDGROUPS;
 /// to at most `1024 * 65535 < 2^27`.
 pub const MAX_SIMD_WIDTH: u64 = 1024;
 
-/// Default decomposition: four rows per simdgroup, two simdgroups, 32-bit
-/// products. Every tile computes the same integers.
+/// Default decomposition: two rows per simdgroup, eight simdgroups, 32-bit
+/// products. On the hosted runner's first sweep (PR #177) it had the lowest
+/// mean time relative to each K2.6 shape's best tile. Every tile computes the
+/// same integers; this only changes speed.
 pub const DEFAULT_TILE: Tile = Tile {
-    rows_per_simdgroup: 4,
-    simdgroups: 2,
+    rows_per_simdgroup: 2,
+    simdgroups: 8,
     mul16: false,
 };
 
@@ -123,12 +125,14 @@ const _: () = assert!(ACCUMULATOR_GUARD - 1 > plane_bound(127, MAX_PLANES - 1) a
 // The guard keeps every true dot inside i64: 32767 * (guard - 1) = 2^63 - 32775.
 const _: () = assert!(32_767 * (ACCUMULATOR_GUARD - 1) == (1u128 << 63) - 32_775);
 // A block sum is below 2^25, and 64 of them fit in int, 65 might not.
-const _: () = assert!(BLOCK_SUM_MAX == 33_553_408 && BLOCK_SUM_MAX < 1 << 25);
+const _: () = assert!(BLOCK_SUM_MAX == 33_553_408);
+const _: () = assert!(BLOCK_SUM_MAX < (1 << 25));
 const _: () = assert!(FLUSH_ITERATIONS * BLOCK_SUM_MAX <= i32::MAX as i64);
 const _: () = assert!((FLUSH_ITERATIONS + 1) * BLOCK_SUM_MAX > i32::MAX as i64);
 // The 16-bit variant's products: |h * c| <= 128 * 128 and l * c in
 // [255 * -128, 255 * 127], both inside i16.
-const _: () = assert!(128 * 128 <= i16::MAX as i64 && 255 * 128 <= i16::MAX as i64);
+const _: () = assert!(128 * 128 <= i16::MAX as i64);
+const _: () = assert!(255 * 128 <= i16::MAX as i64);
 // The kernel's reduction pieces: at most MAX_SIMD_WIDTH lanes of 65535.
 const _: () = assert!(MAX_SIMD_WIDTH * 65_535 < 1 << 31);
 // Plane offsets 7 * blocks + block and block + 64 * MAX_SIMD_WIDTH stay in u32.
