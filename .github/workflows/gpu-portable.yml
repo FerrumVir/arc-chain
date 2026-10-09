@@ -1,0 +1,364 @@
+name: GPU portable kernels (bit-exact)
+
+# Exactness gate for the portable WGSL kernels (crates/arc-gpu/src/modern,
+# docs/gpu-portable-kernels.md): a GPU must reproduce the CPU integer engine's
+# logits, tokens and golden digests bit for bit.
+#
+#   lint      rustfmt, clippy (arc-gpu, arc-inference), actionlint, CPU-only
+#             unit tests.
+#   lavapipe  Linux, Mesa lavapipe (Vulkan on llvmpipe): every kernel against
+#             the CPU operators (known-answer tests incl. domain refusals),
+#             the tiny SmolLM3-shaped model CPU vs GPU, the Proof Kit's
+#             gpu-check with per-layer trace hashes.
+#   warp      Windows, WARP (the DX12 software adapter): the same.
+#   smollm3   (pushes to gpu-portable-* branches, or the `gpu-proof` label)
+#             the real SmolLM3-3B golden prompts on lavapipe and WARP against
+#             the pinned CPU golden 3e43f342...49f2.
+#
+# Software rasterizers prove exactness only; their tok/s are labelled and say
+# nothing about GPU speed. There are no macOS jobs: Mac runners are reserved
+# for releases. Apple GPUs are covered by volunteers (Proof Kit GPU mode) and
+# later by a self-hosted Metal runner.
+
+on:
+  push:
+    branches: ['gpu-portable-**']
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'crates/arc-gpu/**'
+      - 'crates/arc-inference/src/modern/**'
+      - 'crates/arc-inference/src/bin/arc_modern.rs'
+      - 'scripts/arc_modern/golden/**'
+      - 'scripts/arc_modern/gpu_tiny_check.sh'
+      - 'docs/gpu-portable-kernels.md'
+      - '.github/workflows/gpu-portable.yml'
+
+permissions:
+  contents: read
+
+# One run per commit and event. Push and pull_request runs of the same commit
+# use separate groups, so opening a PR never cancels a branch push's
+# real-model run that is still in progress.
+concurrency:
+  group: gpu-portable-${{ github.event_name }}-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  RUST_BACKTRACE: '1'
+  PY_NUMPY: numpy==2.5.3
+  SOURCE_MANIFEST: docs/protocol/packages/smollm3-3b.source.json
+  PINNED_MANIFEST: docs/protocol/packages/smollm3-3b.integer-package.json
+  CASES: scripts/arc_modern/smollm3_cases.json
+  CPU_GOLDEN: scripts/arc_modern/golden/smollm3-3b.cpu-golden.json
+
+jobs:
+  lint:
+    name: fmt + clippy + actionlint
+    if: github.event.action != 'labeled' || github.event.label.name == 'gpu-proof'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: gpu-portable-lint
+      - name: rustfmt (workspace)
+        run: ./scripts/rustfmt-workspace.sh --check
+      - name: Install pinned Actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            > "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+      - name: actionlint (this workflow) and shellcheck (tiny check script)
+        run: |
+          "$RUNNER_TEMP/actionlint" -color .github/workflows/gpu-portable.yml
+          shellcheck scripts/arc_modern/gpu_tiny_check.sh
+      # Same feature set as the shipped node (arc-node enables candle); without
+      # it, candle-only helpers in existing arc-inference code are reported as
+      # dead (the pattern of modern-model-smollm3.yml).
+      - name: Clippy (arc-gpu, arc-inference with candle; all targets; deny warnings)
+        run: cargo clippy -p arc-gpu -p arc-inference --all-targets --features arc-inference/candle --locked -- -D warnings
+      - name: CPU-side unit tests (module sources, adapter selection, CLI parsing, CPU trace)
+        run: |
+          cargo test -p arc-gpu --lib --locked modern -- --nocapture
+          cargo test -p arc-inference --lib --locked modern::gpu -- --nocapture
+
+  lavapipe:
+    name: lavapipe (Linux, Vulkan software)
+    if: github.event.action != 'labeled' || github.event.label.name == 'gpu-proof'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      WGPU_BACKEND: vulkan
+      ARC_GPU_ADAPTER: llvmpipe
+      ARC_GPU_REQUIRE: '1'
+      ARC_GPU_KAT_ROUNDS: '300'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: gpu-portable-linux
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install Mesa lavapipe (Vulkan on llvmpipe) and numpy
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers vulkan-tools
+          python -m pip install --disable-pip-version-check "$PY_NUMPY"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          { vulkaninfo --summary || true; } 2>&1 | tee "$RUNNER_TEMP/evidence/vulkaninfo.txt"
+      - name: Every kernel vs the CPU operators, tiny model forward, generation and traces
+        run: cargo test --release -p arc-inference --lib --locked modern::gpu -- --test-threads=1 --nocapture
+      - name: Build arc-modern
+        run: cargo build --release --locked -p arc-inference --bin arc-modern
+      - name: Adapters seen by wgpu
+        run: ./target/release/arc-modern gpu-info --json-out "$RUNNER_TEMP/evidence/gpu-info.json"
+      - name: Tiny model, CPU golden vs GPU golden vs Proof Kit gpu-check
+        run: scripts/arc_modern/gpu_tiny_check.sh "$RUNNER_TEMP/tiny" "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: gpu-lavapipe
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  warp:
+    name: WARP (Windows, DX12 software)
+    if: github.event.action != 'labeled' || github.event.label.name == 'gpu-proof'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      WGPU_BACKEND: dx12
+      ARC_GPU_ADAPTER: basic render
+      ARC_GPU_REQUIRE: '1'
+      ARC_GPU_KAT_ROUNDS: '150'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: gpu-portable-windows
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: numpy and evidence directory
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check "$PY_NUMPY"
+          mkdir -p "$RUNNER_TEMP/evidence"
+      - name: Every kernel vs the CPU operators, tiny model forward, generation and traces
+        shell: bash
+        run: cargo test --release -p arc-inference --lib --locked modern::gpu -- --test-threads=1 --nocapture
+      - name: Build arc-modern
+        shell: bash
+        run: cargo build --release --locked -p arc-inference --bin arc-modern
+      - name: Adapters seen by wgpu
+        shell: bash
+        run: ./target/release/arc-modern gpu-info --json-out "$RUNNER_TEMP/evidence/gpu-info.json"
+      - name: Tiny model, CPU golden vs GPU golden vs Proof Kit gpu-check
+        shell: bash
+        run: scripts/arc_modern/gpu_tiny_check.sh "$RUNNER_TEMP/tiny" "$RUNNER_TEMP/evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: gpu-warp
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
+
+  smollm3:
+    name: SmolLM3-3B golden on ${{ matrix.name }}
+    if: >-
+      github.event_name == 'push' ||
+      (contains(github.event.pull_request.labels.*.name, 'gpu-proof') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'gpu-proof'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # lavapipe runs all five golden prompts (about 0.24 tok/s).
+          - name: lavapipe
+            os: ubuntu-latest
+            backend: vulkan
+            adapter: llvmpipe
+            check_args: --trace-forwards 2
+            batched: true
+          # WARP needs more than a minute per forward pass of the 3B model, so
+          # the full run (479 passes) cannot fit a 6-hour job: it checks the
+          # first passes of the first golden case exactly, plus a traced pass.
+          - name: WARP
+            os: windows-latest
+            backend: dx12
+            adapter: basic render
+            check_args: --prefix-forwards 4 --trace-forwards 1
+            batched: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 340
+    env:
+      WGPU_BACKEND: ${{ matrix.backend }}
+      ARC_GPU_ADAPTER: ${{ matrix.adapter }}
+      ARC_GPU_REQUIRE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: gpu-portable-${{ runner.os }}
+          save-if: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install Mesa lavapipe (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers vulkan-tools
+      - name: Choose a model directory with room for 9.3 GB
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux)
+              if [ "$(df --output=avail -B1 /mnt | tail -1)" -gt "$(df --output=avail -B1 / | tail -1)" ]; then
+                sudo mkdir -p /mnt/arc-model
+                sudo chown "$(id -u):$(id -g)" /mnt/arc-model
+                dir=/mnt/arc-model
+              else
+                dir="$HOME/arc-model"
+              fi
+              ;;
+            *) dir="$RUNNER_TEMP/arc-model" ;;
+          esac
+          mkdir -p "$dir" "$RUNNER_TEMP/evidence"
+          echo "MODEL_DIR=$dir" >> "$GITHUB_ENV"
+          echo "EVIDENCE=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+      - name: Record runner facts
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            case "$RUNNER_OS" in
+              Linux) { lscpu | grep -E 'Model name|^CPU\(s\)' ; free -b; vulkaninfo --summary; } || true ;;
+              Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory" ;;
+            esac
+          } 2>&1 | tee "$EVIDENCE/runner.txt"
+      - name: Build arc-modern
+        shell: bash
+        run: cargo build --release --locked -p arc-inference --bin arc-modern
+      - name: Fetch SmolLM3-3B BF16 from Hugging Face (pinned revision, SHA-256 verified)
+        shell: bash
+        run: python scripts/arc_modern/fetch_source.py --manifest "$SOURCE_MANIFEST" --dir "$MODEL_DIR"
+      - name: Convert on this OS and check the pinned package manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/arc-modern convert --source-dir "$MODEL_DIR" \
+            --source-manifest "$SOURCE_MANIFEST" --out "$MODEL_DIR/smollm3-3b.arcipkg" \
+            | tee "$EVIDENCE/smollm3-convert.json"
+          rm -f "$MODEL_DIR"/model-*.safetensors
+          ./target/release/arc-modern verify --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --manifest "$PINNED_MANIFEST" | tee "$EVIDENCE/smollm3-verify-pinned.json"
+      - name: Proof Kit GPU mode on the golden prompts (self-test, digest, traces, tok/s)
+        shell: bash
+        env:
+          CHECK_ARGS: ${{ matrix.check_args }}
+        run: |
+          set -euo pipefail
+          read -r -a extra <<< "$CHECK_ARGS"
+          ./target/release/arc-modern gpu-check --package "$MODEL_DIR/smollm3-3b.arcipkg" \
+            --tokenizer "$MODEL_DIR/tokenizer.json" --cases "$CASES" --golden "$CPU_GOLDEN" \
+            --out "$EVIDENCE/smollm3-gpu-check.json" --run-out "$EVIDENCE/smollm3-gpu-run.json" \
+            --self-test-rounds 8 "${extra[@]}"
+      - name: Batched prefill (16 tokens per pass) on the first golden case
+        if: matrix.batched
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$CASES" "$EVIDENCE/smollm3-first-case.json" <<'PY'
+          import json, sys
+          cases = json.load(open(sys.argv[1]))
+          cases["cases"] = cases["cases"][:1]
+          json.dump(cases, open(sys.argv[2], "w"))
+          PY
+          ./target/release/arc-modern golden --gpu --gpu-batch 16 \
+            --package "$MODEL_DIR/smollm3-3b.arcipkg" --tokenizer "$MODEL_DIR/tokenizer.json" \
+            --cases "$EVIDENCE/smollm3-first-case.json" --out "$EVIDENCE/smollm3-gpu-batch16.json"
+          python - "$EVIDENCE/smollm3-gpu-batch16.json" "$CPU_GOLDEN" <<'PY'
+          import json, sys
+          got = json.load(open(sys.argv[1]))["cases"][0]
+          want = json.load(open(sys.argv[2]))["cases"][0]
+          print(f"case {got['id']}: batched logits_digest {got['logits_digest']}, CPU golden {want['logits_digest']}")
+          assert got["id"] == want["id"]
+          assert got["logits_hashes"] == want["logits_hashes"], "batched prefill differs from the CPU golden"
+          assert got["tokens"] == want["tokens"]
+          PY
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python - "$EVIDENCE/smollm3-gpu-check.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          if not path.exists():
+              print("### SmolLM3-3B GPU check: no result file")
+              raise SystemExit(0)
+          r = json.loads(path.read_text())
+          a = r["gpu"]["adapter"]
+          print(f"### SmolLM3-3B on {a['name']} ({a['backend']}, {a['driver']} {a['driver_info']})")
+          print()
+          g = r["golden"]
+          print(f"- pass: **{r['pass']}** (mode: {g['mode']})")
+          if g["mode"] == "full":
+              print(f"- golden matrix digest: `{g['matrix_digest']}` (CPU golden `{g['expected_matrix_digest']}`, match: {g['match']})")
+          else:
+              print(f"- prefix of case {g['prefix']['case']}: {g['prefix']['matched_forwards']}/{g['prefix']['forwards']} forward passes with logits identical to the CPU golden")
+          print(f"- self-test: {r['self_test']['report']['cases']} kernel cases, {r['self_test']['report']['mismatch_count']} mismatches")
+          print(f"- per-layer trace check: {json.dumps(r['trace_check'])}")
+          print(f"- first divergence: {json.dumps(r['first_divergence'])}")
+          t = r["timing"]
+          print(f"- timing ({r['gpu']['speed_label']}): {json.dumps(t)}")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: gpu-smollm3-${{ matrix.name }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: warn
