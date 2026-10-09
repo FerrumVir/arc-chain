@@ -3,8 +3,9 @@ name: Metal exact GEMV (hosted macOS)
 # GitHub-hosted Apple Silicon runners are virtual machines that expose a
 # paravirtual Metal GPU. The exact-gemv job runs the canonical INT8 GEMV kernel
 # (crates/arc-gpu/src/metal_exact.rs) and the one-command-buffer-per-token
-# decoder (metal_decoder.rs, arc-inference metal_forward.rs) against the CPU
-# engine and the golden KATs, then benchmarks the Llama-2-7B shapes. The probe
+# decoder (metal_decoder.rs, arc-inference metal_forward.rs), with its
+# multi-row passes, against the CPU engine and the golden KATs, then
+# benchmarks the Llama-2-7B shapes. The probe
 # job, run by hand only, reports what the device is (name, limits, an integer
 # kernel checked against the CPU, read bandwidth). Every timing either job
 # prints is a virtualized-runner measurement, not a measurement of Apple GPU
@@ -137,16 +138,17 @@ jobs:
         env:
           ARC_METAL_BENCH_MD: ${{ runner.temp }}/metal-bench.md
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_gemv::bench -- --ignored --nocapture --test-threads=1
-      - name: Benchmark a 7B token and the KV-mirror cost by context (virtualized-runner measurement)
+      - name: Benchmark a 7B token, the KV-mirror cost and multi-row passes (virtualized-runner measurement)
         if: ${{ !cancelled() }}
         env:
           ARC_METAL_TOKEN_BENCH_MD: ${{ runner.temp }}/metal-token-bench.md
           ARC_METAL_KV_BENCH_MD: ${{ runner.temp }}/metal-kv-bench.md
+          ARC_METAL_ROWS_BENCH_MD: ${{ runner.temp }}/metal-rows-bench.md
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_forward::bench -- --ignored --nocapture --test-threads=1
       - name: Benchmark summary
         if: always()
         run: |
-          for summary in "$RUNNER_TEMP/metal-bench.md" "$RUNNER_TEMP/metal-token-bench.md" "$RUNNER_TEMP/metal-kv-bench.md"; do
+          for summary in "$RUNNER_TEMP/metal-bench.md" "$RUNNER_TEMP/metal-token-bench.md" "$RUNNER_TEMP/metal-kv-bench.md" "$RUNNER_TEMP/metal-rows-bench.md"; do
             if [ -f "$summary" ]; then
               cat "$summary" >> "$GITHUB_STEP_SUMMARY"
             fi

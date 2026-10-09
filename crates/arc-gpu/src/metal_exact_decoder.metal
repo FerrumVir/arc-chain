@@ -649,3 +649,551 @@ kernel void residual_add(
     }
     hidden[gid] = wadd(hidden[gid], delta[gid]);
 }
+
+// ---- multi-row passes: up to 8 consecutive tokens at once ----------------
+//
+// The kernels below run k = 1..8 consecutive tokens of one sequence in one
+// pass (metal_decoder.rs, MetalDecoder::step_rows). Each is its single-row
+// counterpart above with a row index r: row r reads and writes its own slice
+// of every activation buffer (rows are contiguous, n values apart), and its
+// token sits at position pos + r. The arithmetic of a row is exactly that of
+// the single-row kernel, so a k-row pass equals k single-row passes value for
+// value. Only the projections change shape: exact_gemm_dyn applies each
+// weight it reads to all k rows.
+
+// rms_norm, one threadgroup of 256 threads per row.
+kernel void rms_norm_rows(
+    device const long *x [[buffer(0)]],
+    device const long *gamma [[buffer(1)]],
+    device long *y [[buffer(2)]],
+    device atomic_uint *status [[buffer(3)]],
+    constant NormParams &p [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]])
+{
+    threadgroup ulong part_lo[256];
+    threadgroup ulong part_hi[256];
+    threadgroup long inv_rms;
+    device const long *xr = x + ulong(row) * ulong(p.n);
+    device long *yr = y + ulong(row) * ulong(p.n);
+    ulong2 acc = ulong2(0UL, 0UL);
+    bool big = false;
+    for (uint j = tid; j < p.n; j += threads) {
+        const ulong m = magnitude(xr[j]);
+        if (m >= NORM_LIMIT) {
+            big = true;
+        }
+        acc = add128(acc, mul_wide(m, m));
+    }
+    if (big) {
+        atomic_fetch_or_explicit(status, ST_NORM_DOMAIN, memory_order_relaxed);
+    }
+    part_lo[tid] = acc.x;
+    part_hi[tid] = acc.y;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            const ulong2 s = add128(ulong2(part_lo[tid], part_hi[tid]),
+                                    ulong2(part_lo[tid + stride], part_hi[tid + stride]));
+            part_lo[tid] = s.x;
+            part_hi[tid] = s.y;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        const ulong2 mean = udiv128(ulong2(part_lo[0], part_hi[0]), ulong(p.n));
+        const ulong mean_sq = (mean.x >> 16) | (mean.y << 48);
+        inv_rms = isqrt_q16(wadd(as_type<long>(mean_sq), 1));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const long inv = inv_rms;
+    for (uint j = tid; j < p.n; j += threads) {
+        const long norm = sar(wmul(xr[j], inv), 16);
+        yr[j] = sar(wmul(norm, gamma[j]), 16);
+    }
+}
+
+// split_planes, one threadgroup of 256 threads per row. Row r's planes start
+// at r * 4 * stride, and its plane count goes to ctrl[r].
+kernel void split_planes_rows(
+    device const long *x [[buffer(0)]],
+    device char *planes [[buffer(1)]],
+    device uint *ctrl [[buffer(2)]],
+    device atomic_uint *status [[buffer(3)]],
+    constant SplitParams &p [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]])
+{
+    threadgroup ulong mass[256];
+    threadgroup uint top[256];
+    device const long *xr = x + ulong(row) * ulong(p.n);
+    device char *pr = planes + ulong(row) * 4UL * ulong(p.stride);
+    ulong sum_abs = 0UL;
+    uint used = 1u;
+    bool bad = false;
+    for (uint j = tid; j < p.stride; j += threads) {
+        if (j >= p.n) {
+            for (uint d = 0u; d < 4u; ++d) {
+                pr[d * p.stride + j] = char(0);
+            }
+            continue;
+        }
+        const long v = xr[j];
+        if (v < PLANE_MIN_V || v > PLANE_MAX_V) {
+            bad = true;
+        }
+        ulong u = as_type<ulong>(v);
+        ulong rebuilt = 0UL;
+        for (uint d = 0u; d < 4u; ++d) {
+            const int low = int(u & 255UL);
+            const int c = (low > 127) ? (low - 256) : low;
+            pr[d * p.stride + j] = char(c);
+            rebuilt += as_type<ulong>(long(c)) << (8u * d);
+            u = (u - as_type<ulong>(long(c))) >> 8;
+            if (c != 0) {
+                used = max(used, d + 1u);
+            }
+        }
+        if (as_type<long>(rebuilt) != v) {
+            bad = true;
+        }
+        sum_abs += magnitude(v);
+    }
+    if (bad) {
+        atomic_fetch_or_explicit(status, ST_SPLIT_DOMAIN, memory_order_relaxed);
+    }
+    mass[tid] = sum_abs;
+    top[tid] = used;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            mass[tid] += mass[tid + stride];
+            top[tid] = max(top[tid], top[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        ctrl[row] = top[0];
+        const ulong2 bound = mul_wide(mass[0] << 7, p.max_scale);
+        if (bound.y != 0UL || bound.x > I64_MAX_U) {
+            atomic_fetch_or_explicit(status, ST_SCALE_BOUND, memory_order_relaxed);
+        }
+    }
+}
+
+struct RopeRowsParams {
+    uint n_heads;
+    uint n_kv_heads;
+    uint pairs; // d_head / 2
+    uint d_head;
+    uint pos;   // position of row 0
+    uint d_kv;
+    uint rows;
+    uint pad0;
+};
+
+// rope_store, thread (i, head, row): row r is the token at pos + r. Its query
+// is rotated in place in row r of q, and its key and value land in cache row
+// pos + r.
+kernel void rope_store_rows(
+    device long *q [[buffer(0)]],
+    device const long *k [[buffer(1)]],
+    device const long *v [[buffer(2)]],
+    device long *k_cache [[buffer(3)]],
+    device long *v_cache [[buffer(4)]],
+    device const long *cos_table [[buffer(5)]],
+    device const long *sin_table [[buffer(6)]],
+    constant RopeRowsParams &p [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    const uint i = gid.x;
+    const uint head = gid.y;
+    const uint row = gid.z;
+    if (i >= p.pairs || head >= p.n_heads + p.n_kv_heads || row >= p.rows) {
+        return;
+    }
+    const uint pos = p.pos + row;
+    const ulong t = ulong(pos) * ulong(p.pairs) + ulong(i);
+    const long c = cos_table[t];
+    const long s = sin_table[t];
+    if (head < p.n_heads) {
+        const ulong base = (ulong(row) * ulong(p.n_heads) + ulong(head)) * ulong(p.d_head);
+        const long x0 = q[base + i];
+        const long x1 = q[base + i + p.pairs];
+        q[base + i] = wsub(sar(wmul(x0, c), 16), sar(wmul(x1, s), 16));
+        q[base + i + p.pairs] = wadd(sar(wmul(x0, s), 16), sar(wmul(x1, c), 16));
+    } else {
+        const ulong head_base = ulong(head - p.n_heads) * ulong(p.d_head);
+        const ulong src = ulong(row) * ulong(p.d_kv) + head_base;
+        const ulong dst = ulong(pos) * ulong(p.d_kv) + head_base;
+        const long x0 = k[src + i];
+        const long x1 = k[src + i + p.pairs];
+        k_cache[dst + i] = wsub(sar(wmul(x0, c), 16), sar(wmul(x1, s), 16));
+        k_cache[dst + i + p.pairs] = wadd(sar(wmul(x0, s), 16), sar(wmul(x1, c), 16));
+        v_cache[dst + i] = v[src + i];
+        v_cache[dst + i + p.pairs] = v[src + i + p.pairs];
+    }
+}
+
+struct AttnRowsParams {
+    uint d_head;
+    uint d_kv;
+    uint positions; // pos + 1: the positions row 0 attends to
+    uint n_heads;
+    long attn_scale;
+};
+
+// attention, one 32-lane simdgroup per (head, row). Row r attends to cache
+// positions 0 .. pos + r, which hold the earlier rows of this pass (written
+// by rope_store_rows before this kernel runs) and nothing after it.
+kernel void attention_rows(
+    device const long *q [[buffer(0)]],
+    device const long *k_cache [[buffer(1)]],
+    device const long *v_cache [[buffer(2)]],
+    device long *out [[buffer(3)]],
+    device const long *lut [[buffer(4)]],
+    device const uint *head_kv [[buffer(5)]],
+    constant AttnRowsParams &p [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tg.x;
+    const uint row = tg.y;
+    const uint dh = p.d_head;
+    const uint positions = p.positions + row;
+    const ulong kv_base = ulong(head_kv[head]) * ulong(dh);
+    const ulong q_base = (ulong(row) * ulong(p.n_heads) + ulong(head)) * ulong(dh);
+    long qv[HEAD_SLOTS];
+    long acc[HEAD_SLOTS];
+    for (uint s = 0u; s < HEAD_SLOTS; ++s) {
+        const uint dd = lane + 32u * s;
+        qv[s] = (dd < dh) ? q[q_base + dd] : 0;
+        acc[s] = 0;
+    }
+    long running_max = -4611686018427387904L; // i64::MIN / 2
+    long running_sum = 0;
+    for (uint j = 0u; j < positions; ++j) {
+        const ulong cache_row = ulong(j) * ulong(p.d_kv) + kv_base;
+        ulong partial = 0UL;
+        for (uint s = 0u; s < HEAD_SLOTS; ++s) {
+            const uint dd = lane + 32u * s;
+            if (dd < dh) {
+                partial += as_type<ulong>(qv[s]) * as_type<ulong>(k_cache[cache_row + dd]);
+            }
+        }
+        const long dot = as_type<long>(simd_sum_u64(partial));
+        const long score = sar(wmul(sar(dot, 16), p.attn_scale), 16);
+        if (score > running_max) {
+            const long correction = iexp(wsub(running_max, score), lut);
+            running_sum = sar(wmul(running_sum, correction), 16);
+            for (uint s = 0u; s < HEAD_SLOTS; ++s) {
+                acc[s] = sar(wmul(acc[s], correction), 16);
+            }
+            running_max = score;
+        }
+        const long w = iexp(wsub(score, running_max), lut);
+        running_sum = wadd(running_sum, w);
+        for (uint s = 0u; s < HEAD_SLOTS; ++s) {
+            const uint dd = lane + 32u * s;
+            if (dd < dh) {
+                acc[s] = wadd(acc[s], sar(wmul(w, v_cache[cache_row + dd]), 16));
+            }
+        }
+    }
+    if (running_sum > 0) {
+        for (uint s = 0u; s < HEAD_SLOTS; ++s) {
+            acc[s] = div_trunc(wmul(acc[s], ONE_Q16), running_sum);
+        }
+    }
+    for (uint s = 0u; s < HEAD_SLOTS; ++s) {
+        const uint dd = lane + 32u * s;
+        if (dd < dh) {
+            out[q_base + dd] = acc[s];
+        }
+    }
+}
+
+struct ExactGemmParams {
+    uint rows;       // matrix rows to compute
+    uint row_offset; // first matrix row
+    uint blocks;     // 16-byte blocks per matrix row (and per digit plane)
+    uint inputs;     // activation rows sharing each weight read, 1..8
+};
+
+// The 16 signed bytes of a block, widened once to 16 bits (exact: they lie in
+// [-128, 127]) so that every matrix row and every activation row and digit
+// plane of the multi-row projection reuses them instead of unpacking again.
+struct Wide16 {
+    short4 q0;
+    short4 q1;
+    short4 q2;
+    short4 q3;
+};
+
+static inline Wide16 widen16(uint4 v) {
+    Wide16 u;
+    u.q0 = short4(as_type<char4>(v.x));
+    u.q1 = short4(as_type<char4>(v.y));
+    u.q2 = short4(as_type<char4>(v.z));
+    u.q3 = short4(as_type<char4>(v.w));
+    return u;
+}
+
+// The integer dot16 computes: 16 products of magnitude at most 16,384 (exact
+// in 16 bits with MUL16, in 32 bits otherwise), summed in 32 bits. Any four
+// of them sum to at most 65,536 and all sixteen to at most 262,144.
+template <uint MUL16>
+static inline int dot_wide(Wide16 w, Wide16 c) {
+    int4 s;
+    if (MUL16 != 0) {
+        s = int4(w.q0 * c.q0) + int4(w.q1 * c.q1) + int4(w.q2 * c.q2) + int4(w.q3 * c.q3);
+    } else {
+        s = int4(w.q0) * int4(c.q0) + int4(w.q1) * int4(c.q1) + int4(w.q2) * int4(c.q2) +
+            int4(w.q3) * int4(c.q3);
+    }
+    return s.x + s.y + s.z + s.w;
+}
+
+// The exact projection of K activation rows (K = 1..8) with every weight
+// block read once and applied to all K rows. Digits are row-major: plane d of
+// activation row x is block row x * 4 + d; ctrl[x] holds row x's plane count
+// and the kernel runs the largest (planes above a row's own count are zero, so
+// they add nothing). Each weight block is widened once for all K rows and
+// planes, and each digit block once for all the simdgroup's matrix rows.
+//
+// Exactness. Each block product is the integer of #176's dot16: at most 16
+// terms of magnitude 16,384, so it is exact in 32 bits. It is scaled by 256^d
+// and added into a 64-bit accumulator per (matrix row, activation row). Every
+// partial sum is an integer of magnitude below 2^56 (the bound of #176's
+// recombination), so the additions are exact in any order, across blocks,
+// lanes and the simdgroup reduction alike; the total is the integer
+// sum_d S_d * 256^d that the single-row kernel forms. The epilogue is the
+// single-row one: (acc * s) >> 16, wrapping in 64 bits, with an arithmetic
+// shift.
+template <uint ROWS, uint MUL16, uint K>
+kernel void exact_gemm_dyn(
+    device const uint4 *weights [[buffer(0)]],
+    device const uint4 *digits [[buffer(1)]],
+    device const long *scales [[buffer(2)]],
+    device long *out [[buffer(3)]],
+    constant ExactGemmParams &p [[buffer(4)]],
+    device const uint *ctrl [[buffer(5)]],
+    uint tg_index [[threadgroup_position_in_grid]],
+    uint sg_index [[simdgroup_index_in_threadgroup]],
+    uint sg_count [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg_width [[threads_per_simdgroup]])
+{
+    uint planes = 1u;
+    for (uint x = 0u; x < K; ++x) {
+        planes = max(planes, min(ctrl[x], 4u));
+    }
+    const uint first = (tg_index * sg_count + sg_index) * ROWS;
+    if (first >= p.rows) {
+        return;
+    }
+
+    device const uint4 *row_ptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        const uint local = min(first + r, p.rows - 1u);
+        row_ptr[r] = weights + ulong(p.row_offset + local) * ulong(p.blocks);
+    }
+
+    ulong acc[ROWS][K];
+    for (uint r = 0; r < ROWS; ++r) {
+        for (uint x = 0; x < K; ++x) {
+            acc[r][x] = 0UL;
+        }
+    }
+
+    for (uint b = lane; b < p.blocks; b += sg_width) {
+        Wide16 w[ROWS];
+        for (uint r = 0; r < ROWS; ++r) {
+            w[r] = widen16(row_ptr[r][b]);
+        }
+        for (uint x = 0; x < K; ++x) {
+            for (uint d = 0; d < 4u; ++d) {
+                if (d < planes) {
+                    const Wide16 c =
+                        widen16(digits[(ulong(x) * 4UL + ulong(d)) * ulong(p.blocks) + b]);
+                    for (uint r = 0; r < ROWS; ++r) {
+                        const long part = long(dot_wide<MUL16>(w[r], c));
+                        acc[r][x] += as_type<ulong>(part) << (8u * d);
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        for (uint x = 0; x < K; ++x) {
+            acc[r][x] = simd_sum_u64(acc[r][x]);
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        if (lane == r && first + r < p.rows) {
+            const ulong scale = as_type<ulong>(scales[p.row_offset + first + r]);
+            for (uint x = 0; x < K; ++x) {
+                const ulong product = acc[r][x] * scale;
+                ulong shifted = product >> 16;
+                if (as_type<long>(product) < 0) {
+                    shifted |= 0xFFFF000000000000UL;
+                }
+                out[ulong(x) * ulong(p.rows) + first + r] = as_type<long>(shifted);
+            }
+        }
+    }
+}
+
+typedef decltype(exact_gemm_dyn<4, 0, 1>) exact_gemm_dyn_t;
+
+#define EXACT_GEMM_DYN(M, K)                                                    \
+    template [[host_name("exact_gemm_dyn_m" #M "_k" #K)]]                      \
+    kernel exact_gemm_dyn_t exact_gemm_dyn<4, M, K>;
+
+EXACT_GEMM_DYN(0, 1)
+EXACT_GEMM_DYN(0, 2)
+EXACT_GEMM_DYN(0, 3)
+EXACT_GEMM_DYN(0, 4)
+EXACT_GEMM_DYN(0, 5)
+EXACT_GEMM_DYN(0, 6)
+EXACT_GEMM_DYN(0, 7)
+EXACT_GEMM_DYN(0, 8)
+EXACT_GEMM_DYN(1, 1)
+EXACT_GEMM_DYN(1, 2)
+EXACT_GEMM_DYN(1, 3)
+EXACT_GEMM_DYN(1, 4)
+EXACT_GEMM_DYN(1, 5)
+EXACT_GEMM_DYN(1, 6)
+EXACT_GEMM_DYN(1, 7)
+EXACT_GEMM_DYN(1, 8)
+
+// Digit blocks staged per step: one per lane of a 32-lane simdgroup.
+#define STAGE_SHIFT 5u
+#define STAGE_BLOCKS (1u << STAGE_SHIFT)
+
+// exact_gemm_dyn with the activation rows' digit blocks staged in threadgroup
+// memory, STAGE_BLOCKS blocks at a time, and shared by all the threadgroup's
+// simdgroups instead of each reading them from device memory. Lane l takes
+// block base + l of every step: the blocks it takes in exact_gemm_dyn. The
+// staged values are the device values, so the arithmetic, and every value,
+// is exactly exact_gemm_dyn's. Every thread loads and meets every barrier;
+// simdgroups past the matrix's rows only skip the arithmetic.
+template <uint ROWS, uint MUL16, uint K>
+kernel void exact_gemm_staged(
+    device const uint4 *weights [[buffer(0)]],
+    device const uint4 *digits [[buffer(1)]],
+    device const long *scales [[buffer(2)]],
+    device long *out [[buffer(3)]],
+    constant ExactGemmParams &p [[buffer(4)]],
+    device const uint *ctrl [[buffer(5)]],
+    uint tg_index [[threadgroup_position_in_grid]],
+    uint sg_index [[simdgroup_index_in_threadgroup]],
+    uint sg_count [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]])
+{
+    threadgroup uint4 staged[K * 4u * STAGE_BLOCKS];
+    uint planes = 1u;
+    for (uint x = 0u; x < K; ++x) {
+        planes = max(planes, min(ctrl[x], 4u));
+    }
+    const uint first = (tg_index * sg_count + sg_index) * ROWS;
+    const bool active = first < p.rows;
+
+    device const uint4 *row_ptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        const uint local = min(first + r, p.rows - 1u);
+        row_ptr[r] = weights + ulong(p.row_offset + local) * ulong(p.blocks);
+    }
+
+    ulong acc[ROWS][K];
+    for (uint r = 0; r < ROWS; ++r) {
+        for (uint x = 0; x < K; ++x) {
+            acc[r][x] = 0UL;
+        }
+    }
+
+    for (uint base = 0u; base < p.blocks; base += STAGE_BLOCKS) {
+        for (uint i = tid; i < K * 4u * STAGE_BLOCKS; i += threads) {
+            const uint plane_row = i >> STAGE_SHIFT; // x * 4 + d
+            const uint b = base + (i & (STAGE_BLOCKS - 1u));
+            uint4 v = uint4(0u);
+            if ((plane_row & 3u) < planes && b < p.blocks) {
+                v = digits[ulong(plane_row) * ulong(p.blocks) + b];
+            }
+            staged[i] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint b = base + lane;
+        if (active && b < p.blocks) {
+            Wide16 w[ROWS];
+            for (uint r = 0; r < ROWS; ++r) {
+                w[r] = widen16(row_ptr[r][b]);
+            }
+            for (uint x = 0; x < K; ++x) {
+                for (uint d = 0; d < 4u; ++d) {
+                    if (d < planes) {
+                        const Wide16 c = widen16(staged[((x << 2) + d) * STAGE_BLOCKS + lane]);
+                        for (uint r = 0; r < ROWS; ++r) {
+                            const long part = long(dot_wide<MUL16>(w[r], c));
+                            acc[r][x] += as_type<ulong>(part) << (8u * d);
+                        }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!active) {
+        return;
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        for (uint x = 0; x < K; ++x) {
+            acc[r][x] = simd_sum_u64(acc[r][x]);
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        if (lane == r && first + r < p.rows) {
+            const ulong scale = as_type<ulong>(scales[p.row_offset + first + r]);
+            for (uint x = 0; x < K; ++x) {
+                const ulong product = acc[r][x] * scale;
+                ulong shifted = product >> 16;
+                if (as_type<long>(product) < 0) {
+                    shifted |= 0xFFFF000000000000UL;
+                }
+                out[ulong(x) * ulong(p.rows) + first + r] = as_type<long>(shifted);
+            }
+        }
+    }
+}
+
+typedef decltype(exact_gemm_staged<4, 0, 1>) exact_gemm_staged_t;
+
+#define EXACT_GEMM_STAGED(M, K)                                                 \
+    template [[host_name("exact_gemm_staged_m" #M "_k" #K)]]                   \
+    kernel exact_gemm_staged_t exact_gemm_staged<4, M, K>;
+
+EXACT_GEMM_STAGED(0, 1)
+EXACT_GEMM_STAGED(0, 2)
+EXACT_GEMM_STAGED(0, 3)
+EXACT_GEMM_STAGED(0, 4)
+EXACT_GEMM_STAGED(0, 5)
+EXACT_GEMM_STAGED(0, 6)
+EXACT_GEMM_STAGED(0, 7)
+EXACT_GEMM_STAGED(0, 8)
+EXACT_GEMM_STAGED(1, 1)
+EXACT_GEMM_STAGED(1, 2)
+EXACT_GEMM_STAGED(1, 3)
+EXACT_GEMM_STAGED(1, 4)
+EXACT_GEMM_STAGED(1, 5)
+EXACT_GEMM_STAGED(1, 6)
+EXACT_GEMM_STAGED(1, 7)
+EXACT_GEMM_STAGED(1, 8)
+
