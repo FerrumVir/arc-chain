@@ -22,9 +22,14 @@ name: Metal exact GEMV (hosted macOS)
 
 on:
   pull_request:
+    # The exact files, so changes to other Metal kernels (for example the
+    # INT16 ones, which have their own workflow) do not start this job too.
+    # No branch filter: stacked pull requests are checked too.
     paths:
       - .github/workflows/metal-exact-gemv.yml
-      - crates/arc-gpu/src/metal_exact*
+      - crates/arc-gpu/src/metal_exact.rs
+      - crates/arc-gpu/src/metal_exact_gemv.metal
+      - crates/arc-gpu/src/metal_exact_decoder.metal
       - crates/arc-gpu/src/metal_decoder.rs
       - crates/arc-inference/src/metal_gemv.rs
       - crates/arc-inference/src/metal_forward.rs
