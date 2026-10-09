@@ -78,24 +78,29 @@ jobs:
       - name: Show the GPU under test
         run: system_profiler SPDisplaysDataType
       # No other workflow lints aarch64 or macOS-only code, so existing
-      # diagnostics there are reported but only the new Metal GEMV files gate.
-      - name: Clippy on the Metal GEMV code (any diagnostic in it fails)
+      # diagnostics there are only reported. Any diagnostic in the new Metal
+      # GEMV files fails the job in the last step, after the tests have run,
+      # so one run reports both.
+      - name: Clippy on the Metal GEMV code
         run: |
           set -euo pipefail
           cargo clippy -p arc-gpu -p arc-inference --all-targets --locked \
             --features arc-gpu/metal-exact,arc-inference/metal-exact \
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.txt"
-          if grep -E '^crates/(arc-gpu/src/metal_exact|arc-inference/src/metal_gemv|arc-inference/src/golden_vectors)\.rs:' "$RUNNER_TEMP/clippy.txt"; then
-            echo '::error::clippy reported diagnostics in the Metal GEMV code'
-            exit 1
+          if grep -E '^crates/(arc-gpu/src/metal_exact|arc-inference/src/metal_gemv|arc-inference/src/golden_vectors)\.rs:' "$RUNNER_TEMP/clippy.txt" > "$RUNNER_TEMP/clippy-metal.txt"; then
+            echo '::warning::clippy reported diagnostics in the Metal GEMV code; the last step fails the job'
           fi
       - name: Kernel unit tests and device self-test
+        if: ${{ !cancelled() }}
         run: cargo test --release --locked -p arc-gpu --features metal-exact --lib metal_exact -- --test-threads=1 --nocapture
       - name: Byte-identical tests against the CPU scalar kernel and the golden KATs
+        if: ${{ !cancelled() }}
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib -- --test-threads=1 --nocapture metal_gemv golden_cached_integer_kat_holds_on_the_exact_metal_gemv
       - name: Every arc-inference library test with the feature compiled in (switch off)
+        if: ${{ !cancelled() }}
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib
       - name: Benchmark the 7B projection shapes (virtualized-runner measurement)
+        if: ${{ !cancelled() }}
         env:
           ARC_METAL_BENCH_MD: ${{ runner.temp }}/metal-bench.md
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_gemv::bench -- --ignored --nocapture --test-threads=1
@@ -104,4 +109,12 @@ jobs:
         run: |
           if [ -f "$RUNNER_TEMP/metal-bench.md" ]; then
             cat "$RUNNER_TEMP/metal-bench.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: No clippy diagnostics in the Metal GEMV code
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -s "$RUNNER_TEMP/clippy-metal.txt" ]; then
+            cat "$RUNNER_TEMP/clippy-metal.txt"
+            echo '::error::clippy reported diagnostics in the Metal GEMV code'
+            exit 1
           fi

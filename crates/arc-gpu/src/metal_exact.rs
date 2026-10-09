@@ -89,8 +89,18 @@ const _: () = assert!(PLANE_MIN == plane_bound(-128));
 // i32 digit sums: 16,384 * K fits exactly up to K = 131,071 and not beyond.
 const _: () = assert!(16_384i64 * (MAX_COLS as i64) <= i32::MAX as i64);
 const _: () = assert!(16_384i64 * (MAX_COLS as i64 + 1) > i32::MAX as i64);
-// Recombination: |acc| <= 2^31 * (1 + 2^8 + 2^16 + 2^24) stays far inside i64.
-const _: () = assert!((1i128 << 31) * (1 + (1 << 8) + (1 << 16) + (1 << 24)) < (1i128 << 56));
+/// The largest `|acc|` four i32 digit-plane sums can recombine to:
+/// `2^31 * (1 + 2^8 + 2^16 + 2^24)`.
+const fn recombined_max() -> i128 {
+    let (mut total, mut d) = (0i128, 0usize);
+    while d < MAX_PLANES {
+        total += (1i128 << 31) << (8 * d);
+        d += 1;
+    }
+    total
+}
+// Recombination stays far inside i64.
+const _: () = assert!(recombined_max() < (1i128 << 56));
 
 /// Why a projection was not computed on the GPU. No output is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -291,6 +301,9 @@ fn kernel_name(planes: usize, rows: u32, mul16: bool) -> String {
 }
 
 /// GPU execution time of a completed command buffer, in seconds.
+// objc 0.2's `msg_send!` expands a `cfg(feature = "cargo-clippy")` attribute,
+// which this crate does not declare.
+#[allow(unexpected_cfgs)]
 fn gpu_seconds(commands: &CommandBufferRef) -> f64 {
     // SAFETY: GPUStartTime and GPUEndTime are read-only CFTimeInterval
     // properties of MTLCommandBuffer; the buffer has completed.
@@ -786,7 +799,7 @@ impl MetalExactGemv {
             let smallest = pool
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, s)| size(*s))
+                .min_by_key(|(_, s)| size(s))
                 .map(|(index, s)| (index, size(s)));
             match smallest {
                 Some((index, kept)) if kept < size(&scratch) => {
