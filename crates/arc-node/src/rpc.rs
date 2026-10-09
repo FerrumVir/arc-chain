@@ -429,17 +429,14 @@ pub struct NodeState {
     pub community_rewards_v1_enabled: bool,
     /// Coordinator switch `--community-release-on-verification`, off by
     /// default. When set, a verified single-worker community job takes one of
-    /// three paths once its authenticated 2-of-3 recomputation passes:
+    /// two paths once its authenticated 2-of-3 recomputation passes:
     /// - Its settlement is journaled and the answer goes to the waiting
     ///   `/inference/run` caller at once; the five-of-six reward approvals
     ///   then run on the existing settlement retry loop.
-    /// - No reward could be paid within the epoch budgets, counting this
-    ///   coordinator's unpaid journaled rewards: the answer goes out at once
-    ///   with a `reward_not_eligible_budget_exhausted` settlement, and nothing
-    ///   is journaled.
-    /// - The journal is at `VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER`, or this
-    ///   job's settlement could not be journaled: the job settles inline
-    ///   before the answer, exactly as with the switch off.
+    /// - The journal is at `VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER`, the
+    ///   reward is beyond this coordinator's budget once its unpaid journaled
+    ///   rewards count, or the settlement could not be journaled: the job
+    ///   settles inline before the answer, exactly as with the switch off.
     pub community_release_on_verification: bool,
     /// Whether the last check under `--community-release-on-verification`
     /// found the journal at its high-water mark, so each crossing is logged
@@ -15951,12 +15948,12 @@ enum EarlyRelease {
         settlement: Value,
         answer_release: Value,
     },
-    /// No reward can be paid within the epoch budgets, counting this
-    /// coordinator's unpaid journaled rewards: answer now, journal nothing.
-    NotEligible { settlement: Value },
-    /// Settle inline before answering, exactly as with the switch off: the
-    /// journal is at its high-water mark, or it could not take this job.
-    Inline,
+    /// Settle inline before answering, exactly as with the switch off. The
+    /// journal is at its high-water mark, the reward is beyond this
+    /// coordinator's budget once its unpaid journaled rewards count, or the
+    /// journal could not take this job (`journal_error`, logged by the caller
+    /// once the inline settlement has finished).
+    Inline { journal_error: Option<String> },
     /// The journal entry vanished between the write and the release; reported
     /// exactly as `submit_verified_community_reward` reports it.
     Failed(String),
@@ -15999,10 +15996,12 @@ fn unpaid_verified_settlements(node: &NodeState, worker: Hash256) -> UnpaidSettl
 }
 
 /// `require_community_reward_issuance_capacity`, counting this coordinator's
-/// unpaid journaled rewards as already issued. They are paid from the same
-/// treasury and epoch budgets, so a job beyond them could only wait out its
-/// expiry. Used by `--community-release-on-verification` only; the default
-/// path keeps the mined-only check.
+/// unpaid journaled rewards as already issued, since they draw on the same
+/// treasury and epoch budgets. `--community-release-on-verification` answers
+/// before the approvals only when this passes. Otherwise the job settles
+/// inline, as with the switch off: it is still journaled, and may still be
+/// paid if a pending reward fails or from a later epoch. Rewards journaled
+/// on other coordinators are not visible here.
 fn require_issuance_capacity_counting_unpaid(
     node: &NodeState,
     worker: Hash256,
@@ -16035,16 +16034,20 @@ fn require_issuance_capacity_counting_unpaid(
 }
 
 /// `--community-release-on-verification`: decide how to settle one verified
-/// job without ever doing worse than the switch-off ordering.
+/// job without ever doing worse than the switch-off ordering. Every outcome
+/// other than an early release is the switch-off path itself.
 /// - At the journal's high-water mark, settle inline (backpressure).
-/// - If no reward can be paid within the budgets, counting unpaid journaled
-///   rewards, answer with an explicit not-eligible settlement.
+/// - If the reward is beyond the budgets once this coordinator's unpaid
+///   journaled rewards count, settle inline.
 /// - Otherwise journal the job exactly as `submit_verified_community_reward`
 ///   does and leave the five-of-six approvals to the existing settlement
 ///   retry loop. If the journal write fails, settle inline.
 ///
 /// Nothing here awaits, so the journal entry, the single retry task and the
-/// reported pending state are established together.
+/// reported pending state are established together. The mark and the budget
+/// are read without a lock across handlers, so verifications finishing at the
+/// same moment can all pass before any of them journals; the overshoot is
+/// bounded by the coordinator's concurrent verifications.
 fn release_verified_community_reward(
     node: &NodeState,
     work_item: &WorkItem,
@@ -16055,7 +16058,9 @@ fn release_verified_community_reward(
 ) -> EarlyRelease {
     // The inline path reports a malformed identity with its own error.
     let Ok(worker) = parse_hash256_hex(&result.worker_id, "worker_id") else {
-        return EarlyRelease::Inline;
+        return EarlyRelease::Inline {
+            journal_error: None,
+        };
     };
     let unpaid = unpaid_verified_settlements(node, worker);
     let above_high_water = unpaid.total >= VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER;
@@ -16071,7 +16076,9 @@ fn release_verified_community_reward(
                 "verified-settlement journal reached its high-water mark; answering after reward approvals until it drains"
             );
         }
-        return EarlyRelease::Inline;
+        return EarlyRelease::Inline {
+            journal_error: None,
+        };
     }
     if was_above_high_water {
         tracing::info!(
@@ -16084,15 +16091,10 @@ fn release_verified_community_reward(
         tracing::info!(
             job_id = %work_item.job_id,
             %reason,
-            "verified community answer released without a reward: no budget left for it"
+            "verified community reward is beyond this coordinator's budget once its unpaid journaled rewards count; settling it inline before answering"
         );
-        return EarlyRelease::NotEligible {
-            settlement: unsubmitted_community_reward_settlement(
-                "reward_not_eligible_budget_exhausted",
-                &result.job_id,
-                &result.worker_id,
-                reason,
-            ),
+        return EarlyRelease::Inline {
+            journal_error: None,
         };
     }
     let job_id = match retain_verified_community_reward(
@@ -16105,12 +16107,9 @@ fn release_verified_community_reward(
     ) {
         Ok(job_id) => job_id,
         Err(error) => {
-            tracing::error!(
-                job_id = %work_item.job_id,
-                %error,
-                "verified reward could not be journaled for release on verification; settling this job inline before answering"
-            );
-            return EarlyRelease::Inline;
+            return EarlyRelease::Inline {
+                journal_error: Some(error),
+            };
         }
     };
     schedule_verified_settlement_retry(node, job_id);
@@ -16848,8 +16847,8 @@ pub async fn community_submit_work(
             // caller is answered. With the switch on, the result above has
             // already passed its 2-of-3 recomputation, and
             // `release_verified_community_reward` decides: journal it and
-            // answer now (the retry loop collects the approvals), answer now
-            // with a not-eligible settlement, or settle inline as by default.
+            // answer now (the retry loop collects the approvals), or settle
+            // inline exactly as by default.
             let submitted = if release_answer_before_settlement(&node, &pending.assignment_epoch) {
                 match release_verified_community_reward(
                     &node,
@@ -16866,9 +16865,8 @@ pub async fn community_submit_work(
                         answer_release = Some(release);
                         Ok(settlement)
                     }
-                    EarlyRelease::NotEligible { settlement } => Ok(settlement),
                     EarlyRelease::Failed(reason) => Err(reason),
-                    EarlyRelease::Inline => {
+                    EarlyRelease::Inline { journal_error } => {
                         // The default path for this job, byte for byte.
                         let inline = submit_verified_community_reward(
                             &node,
@@ -16879,12 +16877,21 @@ pub async fn community_submit_work(
                             &worker_attestation,
                         )
                         .await;
-                        if let Err(reason) = &inline {
-                            tracing::error!(
+                        // One line per job that missed release on verification
+                        // through an error, worded by how it ended.
+                        match (&inline, &journal_error) {
+                            (Err(reason), _) => tracing::error!(
                                 job_id = %job_id,
                                 %reason,
-                                "inline settlement of a verified community reward failed; the answer goes out without a journaled reward"
-                            );
+                                ?journal_error,
+                                "verified community reward was not settled; the answer goes out without a journaled reward"
+                            ),
+                            (Ok(_), Some(error)) => tracing::warn!(
+                                job_id = %job_id,
+                                %error,
+                                "release on verification could not journal this verified reward; it was settled inline instead"
+                            ),
+                            (Ok(_), None) => {}
                         }
                         inline
                     }
@@ -22280,9 +22287,13 @@ mod tests {
         );
         assert_eq!(fixture.approval_request_count(), 0);
         assert_eq!(fixture.coordinator.mempool.len(), 0);
+        // One error line for the job, naming the cause.
         let logged = logs.text();
-        assert!(
-            logged.contains("inline settlement of a verified community reward failed"),
+        assert_eq!(
+            logged
+                .matches("verified community reward was not settled")
+                .count(),
+            1,
             "{logged}"
         );
         assert!(logged.contains(cause), "{logged}");
@@ -22300,6 +22311,8 @@ mod tests {
         assert_journal_failure_settles_inline(&fixture, &logs, "reviewed capacity 256").await;
         let logged = logs.text();
         assert!(logged.contains("reached its high-water mark"), "{logged}");
+        // The mark sent it inline before any release attempt touched the journal.
+        assert!(logged.contains("journal_error=None"), "{logged}");
     }
 
     #[tokio::test]
@@ -22313,11 +22326,9 @@ mod tests {
         fixture.coordinator.community_settlement_journal_dir =
             Some(Arc::new(not_a_directory.join("community-settlements")));
         assert_journal_failure_settles_inline(&fixture, &logs, "not a real directory").await;
+        // The release attempt's journal error is carried into that one line.
         let logged = logs.text();
-        assert!(
-            logged.contains("could not be journaled for release on verification"),
-            "{logged}"
-        );
+        assert!(logged.contains("journal_error=Some("), "{logged}");
     }
 
     #[tokio::test]
@@ -22327,11 +22338,9 @@ mod tests {
         let mut fixture = ReleaseOnVerificationFixture::build(true).await;
         fixture.coordinator.community_settlement_journal_dir = None;
         assert_journal_failure_settles_inline(&fixture, &logs, "persistent state directory").await;
+        // The release attempt's journal error is carried into that one line.
         let logged = logs.text();
-        assert!(
-            logged.contains("could not be journaled for release on verification"),
-            "{logged}"
-        );
+        assert!(logged.contains("journal_error=Some("), "{logged}");
     }
 
     #[tokio::test]
@@ -22389,9 +22398,102 @@ mod tests {
         assert_eq!(fixture.approval_request_count(), 5);
     }
 
+    /// What main (`b26f9739`) returns for one community job that settled
+    /// inline and reached the mempool: the `/inference/run` body and the
+    /// worker's submit body, field for field. Only the elapsed `dispatch_ms`
+    /// and the verifier's range-position count are taken from `answer`.
+    fn main_inline_bodies(
+        fixture: &ReleaseOnVerificationFixture,
+        job_hash: Hash256,
+        result: &WorkResult,
+        attestation_hash: Hash256,
+        answer: &Value,
+    ) -> (Value, Value) {
+        let submission = fixture
+            .coordinator
+            .community_reward_submissions
+            .get(&job_hash)
+            .unwrap()
+            .clone();
+        let mut settlement =
+            pending_mined_receipt_value(&fixture.coordinator, job_hash, &submission);
+        settlement["worker_attestation_hash"] =
+            Value::String(format!("0x{}", attestation_hash.to_hex()));
+        let verification = json!({
+            "method": "authenticated_shard_quorum_2_of_3_per_range",
+            "profile_bound": true,
+            "quorum_verified": true,
+            "execution_profile": canonical_profile(),
+            "output_hash": result.output_hash,
+            "tokens_generated": result.tokens_generated,
+            "ranges": 1,
+            "range_position_quorums": answer["verification"]["range_position_quorums"],
+            "signatures_required_per_quorum": COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED,
+            "replicas_contacted_per_quorum": COMMUNITY_VERIFICATION_REPLICAS,
+        });
+        let input_hash = arc_crypto::hash_bytes(b"ARC");
+        let expected_answer = json!({
+            "success": true,
+            "recovery_probe_id": Value::Null,
+            "routed_via": format!("community:{}", result.worker_id),
+            "inference": {
+                "model": "community-served",
+                "model_hash": format!("0x{}", fixture.model_id.to_hex()),
+                "input": "ARC",
+                "input_hash": format!("0x{}", hex::encode(input_hash.0)),
+                "output": result.output,
+                "output_hash": result.output_hash,
+                "tokens_generated": result.tokens_generated,
+                "inference_ms": result.total_ms,
+                "ms_per_token": result.ms_per_token,
+                "encode_ms": 0,
+                "deterministic": result.engine.contains("integer"),
+                "engine": result.engine,
+                "dispatch_ms": answer["inference"]["dispatch_ms"],
+            },
+            "attestation": {
+                "status": "worker_certificate_handled_by_settlement",
+                "request_overrides_applied": false,
+                "note": "bond and challenge_period request fields apply only to the local fallback; community certificates use the protocol-fixed shape reported by settlement",
+            },
+            "worker": {
+                "worker_id": result.worker_id,
+                "live_workers_at_dispatch": 1,
+            },
+            "verification": verification,
+            "settlement": settlement,
+        });
+        let expected_submit = json!({
+            "ok": true,
+            "job_id": result.job_id,
+            "dispatcher_connected": true,
+            "verification": verification,
+            "settlement": settlement,
+        });
+        assert!(answer["inference"]["dispatch_ms"].is_u64());
+        assert!(
+            answer["verification"]["range_position_quorums"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        (expected_answer, expected_submit)
+    }
+
+    /// Equal as values and byte for byte as serialized JSON.
+    fn assert_same_body(actual: &Value, expected: &Value) {
+        assert_eq!(actual, expected);
+        assert_eq!(
+            serde_json::to_string(actual).unwrap(),
+            serde_json::to_string(expected).unwrap()
+        );
+    }
+
     #[tokio::test]
-    async fn release_on_verification_says_not_eligible_once_unpaid_rewards_fill_the_budget() {
+    async fn release_on_verification_settles_a_reward_beyond_the_unpaid_budget_like_switch_off() {
+        let logs = CapturedLogs::default();
+        let _logging = logs.install();
         let fixture = ReleaseOnVerificationFixture::build(true).await;
+        fixture.open_approvals();
         let worker = fixture.worker.address();
         let budget = prospective_community_reward_budget(
             &fixture.coordinator,
@@ -22403,57 +22505,43 @@ mod tests {
         // that are journaled but not yet paid.
         fixture.journal_unpaid_settlements(budget.worker_remaining_this_epoch - 1, worker);
 
+        // The last slot is still released early.
         let first = fixture.start_job().await;
         let response = released_answer(first.run).await;
         assert_eq!(response["answer_release"]["settlement"], "pending");
         let Json(submitted) = first.submit.await.unwrap().unwrap();
-        assert_eq!(
-            submitted["settlement"]["status"],
-            "verified_pending_approval"
-        );
+        assert_eq!(submitted["answer_release"], response["answer_release"]);
 
-        // That release took the last of the budget, so the next answer says
-        // its reward is not eligible instead of "pending", and nothing is
-        // journaled for it.
+        // The next reward is beyond the budget once unpaid rewards count. It
+        // is neither refused nor released early: it settles inline, so the
+        // caller and the worker get exactly what the switch-off path returns,
+        // and the reward is journaled and submitted as it would be there.
         let second = fixture.start_job().await;
-        let response = released_answer(second.run).await;
-        assert_eq!(
-            response["inference"]["output_hash"],
-            second.result.output_hash
-        );
-        assert!(response.get("answer_release").is_none());
-        assert_eq!(
-            response["settlement"]["status"],
-            "reward_not_eligible_budget_exhausted"
-        );
-        assert_eq!(response["settlement"]["submitted"], false);
-        assert!(response["settlement"]["tx_hash"].is_null());
-        assert_eq!(
-            response["settlement"]["worker_attestation_hash"],
-            format!("0x{}", second.attestation_hash.to_hex())
-        );
-        let reason = response["settlement"]["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(
-            reason.contains("worker epoch budget is exhausted"),
-            "{reason}"
-        );
+        let answer = released_answer(second.run).await;
         let Json(submitted) = second.submit.await.unwrap().unwrap();
-        assert!(submitted.get("answer_release").is_none());
-        assert_eq!(submitted["settlement"], response["settlement"]);
+        let (expected_answer, expected_submit) = main_inline_bodies(
+            &fixture,
+            second.job_hash,
+            &second.result,
+            second.attestation_hash,
+            &answer,
+        );
+        assert_same_body(&answer, &expected_answer);
+        assert_same_body(&submitted, &expected_submit);
+        assert_eq!(answer["settlement"]["status"], "pending_mined_receipt");
         assert!(
             fixture
                 .coordinator
                 .community_verified_settlements
-                .contains_key(&first.job_hash)
-        );
-        assert!(
-            !fixture
-                .coordinator
-                .community_verified_settlements
                 .contains_key(&second.job_hash)
+        );
+        assert!(fixture.reward_submitted(second.job_hash));
+        let logged = logs.text();
+        assert!(
+            logged.contains(
+                "beyond this coordinator's budget once its unpaid journaled rewards count"
+            ),
+            "{logged}"
         );
     }
 
@@ -22462,89 +22550,17 @@ mod tests {
         let fixture = ReleaseOnVerificationFixture::build(false).await;
         fixture.open_approvals();
         let job = fixture.start_job().await;
-        let response = released_answer(job.run).await;
+        let answer = released_answer(job.run).await;
         let Json(submitted) = job.submit.await.unwrap().unwrap();
-        let submission = fixture
-            .coordinator
-            .community_reward_submissions
-            .get(&job.job_hash)
-            .unwrap()
-            .clone();
-
-        // What main (b26f9739) returns for this request, field for field.
-        // Only the elapsed `dispatch_ms` and the verifier's range-position
-        // count are taken from the run.
-        let mut settlement =
-            pending_mined_receipt_value(&fixture.coordinator, job.job_hash, &submission);
-        settlement["worker_attestation_hash"] =
-            Value::String(format!("0x{}", job.attestation_hash.to_hex()));
-        let verification = json!({
-            "method": "authenticated_shard_quorum_2_of_3_per_range",
-            "profile_bound": true,
-            "quorum_verified": true,
-            "execution_profile": canonical_profile(),
-            "output_hash": job.result.output_hash,
-            "tokens_generated": job.result.tokens_generated,
-            "ranges": 1,
-            "range_position_quorums": response["verification"]["range_position_quorums"],
-            "signatures_required_per_quorum": COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED,
-            "replicas_contacted_per_quorum": COMMUNITY_VERIFICATION_REPLICAS,
-        });
-        let input_hash = arc_crypto::hash_bytes(b"ARC");
-        let expected_answer = json!({
-            "success": true,
-            "recovery_probe_id": Value::Null,
-            "routed_via": format!("community:{}", job.result.worker_id),
-            "inference": {
-                "model": "community-served",
-                "model_hash": format!("0x{}", fixture.model_id.to_hex()),
-                "input": "ARC",
-                "input_hash": format!("0x{}", hex::encode(input_hash.0)),
-                "output": job.result.output,
-                "output_hash": job.result.output_hash,
-                "tokens_generated": job.result.tokens_generated,
-                "inference_ms": job.result.total_ms,
-                "ms_per_token": job.result.ms_per_token,
-                "encode_ms": 0,
-                "deterministic": job.result.engine.contains("integer"),
-                "engine": job.result.engine,
-                "dispatch_ms": response["inference"]["dispatch_ms"],
-            },
-            "attestation": {
-                "status": "worker_certificate_handled_by_settlement",
-                "request_overrides_applied": false,
-                "note": "bond and challenge_period request fields apply only to the local fallback; community certificates use the protocol-fixed shape reported by settlement",
-            },
-            "worker": {
-                "worker_id": job.result.worker_id,
-                "live_workers_at_dispatch": 1,
-            },
-            "verification": verification,
-            "settlement": settlement,
-        });
-        let expected_submit = json!({
-            "ok": true,
-            "job_id": job.result.job_id,
-            "dispatcher_connected": true,
-            "verification": verification,
-            "settlement": settlement,
-        });
-        assert!(response["inference"]["dispatch_ms"].is_u64());
-        assert!(
-            response["verification"]["range_position_quorums"]
-                .as_u64()
-                .is_some_and(|count| count > 0)
+        let (expected_answer, expected_submit) = main_inline_bodies(
+            &fixture,
+            job.job_hash,
+            &job.result,
+            job.attestation_hash,
+            &answer,
         );
-        assert_eq!(response, expected_answer);
-        assert_eq!(
-            serde_json::to_string(&response).unwrap(),
-            serde_json::to_string(&expected_answer).unwrap()
-        );
-        assert_eq!(submitted, expected_submit);
-        assert_eq!(
-            serde_json::to_string(&submitted).unwrap(),
-            serde_json::to_string(&expected_submit).unwrap()
-        );
+        assert_same_body(&answer, &expected_answer);
+        assert_same_body(&submitted, &expected_submit);
     }
 
     #[tokio::test]

@@ -397,7 +397,7 @@ Say this only after steps 1–2 above, with numbers read from `twin_stats` and r
 
 ## 13. Release on verification (`--community-release-on-verification`, off by default)
 
-A coordinator switch for single-worker community jobs. It changes no consensus, genesis or on-chain rule. With the switch on, no job is handled worse than with the switch off, and with the switch off nothing changes.
+A coordinator switch for single-worker community jobs. It changes no consensus, genesis or on-chain rule. With the switch on, a job is either answered early or settled on the switch-off path itself, so no job is handled worse than with the switch off. With the switch off, nothing changes.
 
 **Default ordering.** The waiting `/inference/run` caller is answered only after three steps: the worker's run, the validators' authenticated 2-of-3 recomputation, and the reward approvals (five of six validators, each recomputing the job, before the 0x25 transaction enters the mempool).
 
@@ -407,21 +407,29 @@ A coordinator switch for single-worker community jobs. It changes no consensus, 
    - The caller waits for the approvals, holding one of the coordinator's two public permits, so intake slows to the approval rate.
    - Crossing the mark is logged once at warn level, and dropping back below it at info level.
    - Why 192 (75 % of the 256-entry journal): the remaining 64 entries absorb jobs already in flight when the mark is crossed and the paths that always journal inline (twin legs, recovery probes), well before the cap at which no mode can journal a reward.
+   - Under today's budgets this is a safety net only. Entries that release on verification creates stay below the coordinator's 16-per-epoch budget (point 2), so only always-inline paths, or entries left from a run without the switch, can reach 192.
 2. **Budget.** The coordinator counts its own journaled rewards that are neither paid nor expired as already issued, on top of the mined rewards the chain counts.
    - It checks them against the promotional treasury and the epoch budgets: 40 network-wide, 16 per coordinator and 8 per worker (`crates/arc-state/src/lib.rs`).
-   - If no reward could be paid, the answer goes out at once with settlement status `reward_not_eligible_budget_exhausted` and the reason, without `answer_release`, and nothing is journaled. So no answer says "pending" for a reward that cannot be paid.
-   - Rewards journaled on other coordinators are not visible here, so the network and worker budgets are counted from this coordinator's side only.
+   - If that leaves no room for this reward, the job settles inline, exactly as with the switch off. It is still journaled, and it may still be paid if a pending reward fails, or from a later epoch when an epoch boundary falls inside its expiry window.
 3. **Release.** Otherwise the settlement is written to the crash-durable journal, and the caller is answered at once with `answer_release` and a `verified_pending_approval` settlement.
    - The approvals then run on the existing retry loop (`schedule_verified_settlement_retry`), the loop that already retries a failed first attempt and replays the journal after a restart.
    - Its first attempt starts one second after the answer.
-4. **Journal failure.** If that journal write fails (the journal is full, an I/O error, or no journal directory), the failure is logged at error level with its cause, and the job settles inline, exactly as with the switch off.
-   - If the inline journal write fails too, the answer carries the default path's `reward_approval_quorum_unavailable` settlement with the reason, and that is logged as well.
+4. **Journal failure.** If that journal write fails (the journal is full, an I/O error, or no journal directory), the job settles inline, exactly as with the switch off.
+   - Each such job logs one line. It is a warning if the inline settlement then succeeded. It is an error with the cause if it failed, and the answer then carries the default path's `reward_approval_quorum_unavailable` settlement.
+
+**Limits of the budget check.**
+- **Only this coordinator's pending rewards are visible**, so a released "pending" reward can still go unpaid when approvals stall on several coordinators.
+  - A worker claims from all six coordinators, and each counts only its own entries. Up to 6 × (8 − mined) of one worker's rewards can be pending against (8 − mined) payable, which is about 5 × (8 − mined) answers too many.
+  - Network-wide, up to 96 rewards can be pending (six coordinators × 16) against 40 payable.
+  - On the 8 Oct sample a worker has about one pending reward at a time (INFERRED), so these bounds apply only while approvals stall.
+- **The checks are not atomic across handlers.** The mark and the budget are read without a lock, so verifications that finish at the same moment can all pass before any of them journals. The overshoot is bounded by the coordinator's concurrent verifications: its two public permits plus late submits.
 
 **What does not change.**
 - No answer is released before its 2-of-3 recomputation has matched the worker's output.
 - Settlement is the same code: the same five-of-six approvals, 0x25 transaction, backoff and expiry. The chain enforces the budgets as before.
 - A settlement that fails after the release is recorded in `last_error` and retried as before. It never changes or withdraws the answer already sent.
-- Each job has one journal entry and one retry task. A repeated worker submit or a status read during the approvals is answered from that state and never starts a second attempt. The chain's job marker still refuses a second payment.
+- Each job has one journal entry and one retry task, and the chain's job marker still refuses a second payment.
+- For a released job, a repeated worker submit or a status read during the approvals is answered from its state and never starts a second attempt (tested). A job settled inline behaves exactly as with the switch off, including that path's pre-existing overlap between its inline attempt and a retry started by a resubmit or a status read.
 - Twin execution and sealed recovery probes keep the default ordering. Recovery probes are rollout tooling that reads the settlement evidence from the same response.
 - With the switch off, a journal failure still releases the answer without a reward and without a log line. That is the pre-existing behaviour, and a separate fix is planned.
 
@@ -453,7 +461,7 @@ A coordinator switch for single-worker community jobs. It changes no consensus, 
 - **Where to ask.** Ask the same origin that answered `/inference/run`, which is the `coordinator`. Until the reward is mined, only that coordinator knows the job; any other validator answers 404 "community reward job is unknown".
 - **What it reports.** `settlement_status_url` reports `verified_pending_approval`, then `pending_mined_receipt`, then the mined receipt.
 - **When pending ends.** "Pending" ends at block `expires_at_height`, 86,001 blocks after the job was journaled: about 5.6 h at the 8 Oct block rate (INFERRED). A reward still unpaid then is pruned, and the URL returns the same 404 on every validator.
-- **Not eligible.** A job that is not eligible has no `answer_release`. Its settlement status is `reward_not_eligible_budget_exhausted`, with `submitted: false`, `tx_hash: null` and a `reason`.
+- **Inline jobs.** A job that settles inline (at the mark, beyond the budget, or after a journal failure) has no `answer_release`. Its responses are exactly the switch-off responses.
 - **Worker response.** The worker's `/community/submit_work` response carries the same `settlement` and `answer_release`.
 - **Switch off.** With the switch off, `answer_release` never appears and both responses are unchanged.
 
