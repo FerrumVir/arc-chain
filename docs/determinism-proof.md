@@ -84,6 +84,22 @@ shards 0 to 4 were cancelled on 2026-10-06 and re-run in attempt 4 (shard 5 comp
   AVX2 transcripts. Each NEON shard's header and every one of its prompt blocks equal the x86
   transcript's, and the workflow's own `compare_results.py`, re-run on the downloaded artifacts, also
   reports PASS, 8 of 8.
+- A separate lab run on a throwaway branch (not part of this workflow) repeated the full 16 x 32
+  workload on GitHub's Linux arm64 runner (`ubuntu-24.04-arm`: 4-core Neoverse-N2, about 16 GB of
+  memory, no swap activity), where the model does not swap. The scalar and NEON kernels again
+  produced SHA-256 `d2c8c82b3a82beb166559b78ad26a748cbd6395c2cf13e8f012b03f90fa92872`, the NEON
+  kernel accepted 176,175 of 176,175 projections, and it decoded at 2.84 tokens per second against
+  1.89 for the scalar kernel
+  ([run 37882594919](https://github.com/FerrumVir/arc-chain/actions/runs/37882594919)).
+- The same lab method, run with the legacy split-half profile (`INT8 integer (per-row,
+  cross-platform deterministic)`, the reward profile that validator shards and full-integer
+  community workers are pinned to; the interleaved profile above, which the native executor uses,
+  is this profile with the Q and K weight rows reordered at load, under its own profile label),
+  gave one common SHA-256, `4464b4b1a3df705622ffc6c47e39ef92646823843f49a470c84e457225459bca`, on
+  Linux x86_64, Windows x86_64 and Linux arm64, each with the scalar and the SIMD kernel: 6 of 6
+  cells, with the SIMD kernels accepting 175,950 of 175,950 projections
+  ([run 37931434482](https://github.com/FerrumVir/arc-chain/actions/runs/37931434482)). That run
+  did not include Intel macOS or Apple Silicon, so those are not covered for this profile.
 - Decode tokens per second are forward passes per second on GitHub-hosted runners. The Apple
   Silicon runner has 7 GB of memory and swaps the ~7.3 GiB model, so its rate (about one token a
   minute) measures swapping, not the chip. NEON and scalar ran at about the same rate there (0.017
@@ -179,8 +195,9 @@ computer.
   arm64 the attention dot product also uses an exact NEON path in both jobs.
   "Apple Silicon" is one GitHub-hosted virtual Apple M1 runner with 7 GB of
   memory; other Apple chips are untested.
-- **One execution profile.** The run uses `arc.gguf-llama.i8-per-row.rope-interleaved.v1`;
-  other execution profiles are not part of it.
+- **Two execution profiles, not equally covered.** This workflow runs
+  `arc.gguf-llama.i8-per-row.rope-interleaved.v1`. The legacy split-half profile was run separately,
+  in a lab run, on Linux x86_64, Windows x86_64 and Linux arm64 only (see Results).
 - **Load-time floating point.** The engine's arithmetic is integer-only, but
   model loading uses floating point. Dequantizing GGUF blocks, requantizing
   rows to INT8 and converting embeddings and norms to Q16 use only exactly
