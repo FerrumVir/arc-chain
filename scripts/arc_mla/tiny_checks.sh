@@ -4,6 +4,10 @@
 #
 #   bash scripts/arc_mla/tiny_checks.sh ARC_MLA_BINARY WORKDIR EVIDENCE_DIR
 #
+# Historical INT8 BF16-matrix comparison: the independent Python preparer
+# implements this policy only. Kimi creation now defaults to INT16, so select
+# --historical-int8 explicitly for every compared whole/stage conversion.
+# Separate Kimi controls below require omitted == explicit INT16 != historical.
 # For the Moonlight-like and the Kimi-like tiny model, each with INT8 dyadic
 # experts and with INT4 group-32 experts (spec section 13):
 #   1. the Rust converter and the independent Python preparer produce the same
@@ -43,13 +47,44 @@ for combo in moonlight:i8 kimi:i8 moonlight:i4g32 kimi:i4g32; do
   manifest="$src/tiny-mla.source.json"
   cases="$src/tiny-mla.cases.json"
   full="$pkgs-0-4.arcspkg"
-  echo "== $variant ($fmt experts): packages (Rust converter vs Python preparer)"
-  "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --experts "$fmt" --out "$full" \
+  echo "== $variant ($fmt experts): historical INT8 matrix packages (Rust converter vs Python preparer)"
+  "$BIN" convert --historical-int8 --source-dir "$src" --source-manifest "$manifest" --experts "$fmt" --out "$full" \
     --manifest-out "$out/manifest.json" --report "$out/convert-0-4.json" > /dev/null
+  if [ "$variant" = kimi ]; then
+    # The Python preparer is intentionally not reused as an INT16 oracle.
+    # Verify that retaining historical comparisons has not hidden the new default.
+    python -c 'import json,sys; json.dump(dict(version=1, **{k:"int16" for k in ("attention","dense","shared","embedding","head")}),open(sys.argv[1],"w"))' "$out/int16-policy.json"
+    "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --experts "$fmt" \
+      --out "$pkgs-default.arcspkg" --manifest-out "$out/default-manifest.json" > /dev/null
+    "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --experts "$fmt" \
+      --precision "$out/int16-policy.json" --out "$pkgs-int16.arcspkg" \
+      --manifest-out "$out/int16-manifest.json" > /dev/null
+    python - "$full" "$pkgs-default.arcspkg" "$pkgs-int16.arcspkg" "$out" <<'PYCONTROL'
+import hashlib, json, struct, sys
+from pathlib import Path
+legacy, default, explicit = (Path(p).read_bytes() for p in sys.argv[1:4])
+out = Path(sys.argv[4])
+def model(raw):
+    return json.loads(raw[16:16 + struct.unpack_from('<Q', raw, 8)[0]])['model']
+wide = json.loads((out / 'int16-policy.json').read_bytes())
+assert model(legacy).get('precision') is None, 'Python comparison requires historical matrix policy'
+assert model(default)['precision'] == model(explicit)['precision'] == wide
+assert default == explicit, 'omitted policy differs from explicit INT16 bytes'
+assert default != legacy, 'INT16 default silently became historical INT8'
+a, b = ((out / (name + '-manifest.json')).read_bytes() for name in ('default', 'int16'))
+assert a == b, 'omitted/explicit INT16 manifests differ'
+assert json.loads(a)['model_root'] != json.loads((out / 'manifest.json').read_bytes())['model_root']
+(out / 'creation-policy-check.json').write_text(json.dumps(dict(
+    historical_precision=None, default_precision=wide, explicit_precision=wide,
+    default_explicit_bytes_and_manifest_equal=True, historical_identity_distinct=True,
+    package_sha256={k: hashlib.sha256(v).hexdigest() for k,v in
+                    [('historical',legacy),('default',default),('explicit',explicit)]}), indent=2)+'\n')
+PYCONTROL
+  fi
   for layers in 0:4 0:2 2:4 0:1 1:2 2:3 3:4; do
     tag="${layers/:/-}"
     if [ "$tag" != "0-4" ]; then
-      "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --layers "$layers" --experts "$fmt" \
+      "$BIN" convert --historical-int8 --source-dir "$src" --source-manifest "$manifest" --layers "$layers" --experts "$fmt" \
         --out "$pkgs-$tag.arcspkg" --report "$out/convert-$tag.json" > /dev/null
     fi
     py_ref prepare --source-dir "$src" --source-manifest "$manifest" --layers "$layers" --experts "$fmt" \
