@@ -1881,6 +1881,11 @@ mod bench {
         }
     }
 
+    /// Timed turns per path in the layer-heads benchmark.
+    const ROUNDS: usize = 11;
+    /// CPU serial, CPU pool, and the three GPU submissions.
+    const PATHS: usize = 5;
+
     /// One K2.6 layer's heads (64 heads, `wk_b` 512 x 128, `wv_b` 128 x
     /// 512) end to end: both projections and the RoPE and attention between
     /// them, as the CPU loop of `layer_forward` runs them (heads one after
@@ -1903,7 +1908,8 @@ mod bench {
              Metal GPU. Not Apple GPU hardware numbers.\n\n",
         );
         md.push_str(&format!(
-            "Each figure is the median wall time of one layer's heads: 64 `wk_b` (512 x 128) \
+            "Each cell is the median (and minimum) wall time in µs, over {ROUNDS} turns taken \
+             in a rotating order, of one layer's heads: 64 `wk_b` (512 x 128) \
              and 64 `wv_b` (128 x 512) projections with the RoPE and absorbed attention \
              between them, over a cache of the given length. CPU columns run the per-head \
              loop of `layer_forward` on {threads} rayon threads. GPU columns run `try_heads`; \
@@ -1936,40 +1942,60 @@ mod bench {
             let want = layer
                 .cpu_with(&key, &value, Schedule::Serial)
                 .expect("in domain");
-            let serial = time_wall(5, || {
-                std::hint::black_box(
-                    layer
-                        .cpu_with(&key, &value, Schedule::Serial)
-                        .expect("in domain"),
-                );
-            });
-            let pool = time_wall(5, || {
-                std::hint::black_box(
-                    layer
-                        .cpu_with(&key, &value, Schedule::Pool)
-                        .expect("in domain"),
-                );
-            });
             let metal = MetalI16Model::from_weights(&[
                 (key.weights, n_heads * rank, nope),
                 (value.weights, n_heads * v_dim, rank),
             ])
             .expect("upload");
             let switch = SwitchGuard::set(true);
-            let mut gpu = Vec::new();
+            let heads_guard = HeadsGuard::set(true, Submission::OneCommandBuffer);
+            let mut out = vec![0i64; n_heads * v_dim];
+            let gpu_run = |submission: Submission, out: &mut Vec<i64>| -> bool {
+                set_metal_i16_heads_submission(submission);
+                metal.run(|| try_heads(key, &queries, value, |j, qa| layer.attend(j, qa), out))
+            };
             for submission in Submission::ALL {
-                let _heads = HeadsGuard::set(true, submission);
-                let mut out = vec![0i64; n_heads * v_dim];
-                let run = |out: &mut Vec<i64>| {
-                    metal.run(|| try_heads(key, &queries, value, |j, qa| layer.attend(j, qa), out))
-                };
                 assert!(
-                    run(&mut out) && out == want,
+                    gpu_run(submission, &mut out) && out == want,
                     "{positions} positions, {submission:?}"
                 );
-                gpu.push(time_wall(5, || assert!(run(&mut out))));
             }
+            // The five paths take turns, in a rotating order, so that drift
+            // on the VM (clocks, other tenants) cannot favour one of them.
+            let mut samples = vec![Vec::with_capacity(ROUNDS); PATHS];
+            for round in 0..ROUNDS {
+                for turn in 0..PATHS {
+                    let path = (turn + round) % PATHS;
+                    let start = Instant::now();
+                    match path {
+                        0 => {
+                            std::hint::black_box(
+                                layer
+                                    .cpu_with(&key, &value, Schedule::Serial)
+                                    .expect("in domain"),
+                            );
+                        }
+                        1 => {
+                            std::hint::black_box(
+                                layer
+                                    .cpu_with(&key, &value, Schedule::Pool)
+                                    .expect("in domain"),
+                            );
+                        }
+                        gpu => assert!(gpu_run(Submission::ALL[gpu - 2], &mut out)),
+                    }
+                    samples[path].push(start.elapsed().as_secs_f64());
+                }
+            }
+            drop(heads_guard);
             drop(switch);
+            let stats: Vec<(f64, f64)> = samples
+                .into_iter()
+                .map(|times| {
+                    let low = times.iter().copied().fold(f64::INFINITY, f64::min);
+                    (median(times), low)
+                })
+                .collect();
             // GPU time of the two dispatches alone, given every vector.
             let key_matrix = engine
                 .upload(
@@ -2008,22 +2034,25 @@ mod bench {
             let projections = engine
                 .time_heads(&phases, engine.tile(), repeats)
                 .expect("timing");
+            let cell =
+                |(median, low): (f64, f64)| format!("{:.0} ({:.0})", median * 1e6, low * 1e6);
             md.push_str(&format!(
-                "| {positions} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} |\n",
-                serial * 1e6,
-                pool * 1e6,
-                gpu[0] * 1e6,
-                gpu[1] * 1e6,
-                gpu[2] * 1e6,
+                "| {positions} | {} | {} | {} | {} | {} | {:.0} |\n",
+                cell(stats[0]),
+                cell(stats[1]),
+                cell(stats[2]),
+                cell(stats[3]),
+                cell(stats[4]),
                 projections * 1e6,
             ));
+            let us = |(median, low): (f64, f64)| serde_json::json!({"median": median * 1e6, "min": low * 1e6});
             json_rows.push(serde_json::json!({
                 "positions": positions,
-                "cpu_serial_us": serial * 1e6,
-                "cpu_parallel_heads_us": pool * 1e6,
-                "gpu_one_command_buffer_us": gpu[0] * 1e6,
-                "gpu_per_phase_us": gpu[1] * 1e6,
-                "gpu_per_head_us": gpu[2] * 1e6,
+                "cpu_serial_us": us(stats[0]),
+                "cpu_parallel_heads_us": us(stats[1]),
+                "gpu_one_command_buffer_us": us(stats[2]),
+                "gpu_per_phase_us": us(stats[3]),
+                "gpu_per_head_us": us(stats[4]),
                 "gpu_projections_only_us": projections * 1e6,
             }));
         }
