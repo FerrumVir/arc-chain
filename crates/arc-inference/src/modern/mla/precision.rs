@@ -4,6 +4,7 @@ use crate::modern::{ModernError, arith::dyadic_epilogue, convert::bf16_parts};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -261,6 +262,18 @@ impl<'a> I16Weights<'a> {
     pub fn as_bytes(&self) -> &'a [u8] {
         self.bytes
     }
+
+    /// Rows `rows` of these weights read as a matrix of `cols` columns. Whole
+    /// rows of admitted weights start at even offsets, so they are admitted
+    /// too: no scan.
+    ///
+    /// # Panics
+    /// If the rows are not inside the weights.
+    pub fn rows(&self, rows: Range<usize>, cols: usize) -> Self {
+        Self {
+            bytes: &self.bytes[rows.start * cols * 2..rows.end * cols * 2],
+        }
+    }
 }
 
 /// Whether any little-endian INT16 value of `bytes`, read at even offsets,
@@ -276,20 +289,33 @@ const ROW_CHUNK: usize = 64;
 /// Columns per weight-limb block: one row's three i8 limb blocks live on the
 /// stack (6 KiB) next to one block of activation digits (8 KiB).
 const COL_BLOCK: usize = 2048;
-/// Smaller matrices run on the calling thread: below about a quarter million
+/// Smaller work runs on the calling thread: below about a quarter million
 /// weights a thread-pool round trip costs more than it saves. The per-head MLA
-/// `wk_b`/`wv_b` slices are smaller and run once per head.
+/// `wk_b`/`wv_b` slices are smaller, so an INT16 layer runs its heads in
+/// parallel instead (`model.rs`, `StageModel::head_schedule`).
 const PARALLEL_MIN_WEIGHTS: usize = 1 << 18;
 
-/// How the row dots of a projection are scheduled. Each row's dot is one
-/// exact integer sum computed by one task, so no schedule can change a value.
+/// How independent tasks (the row chunks of a projection, the heads of a
+/// layer) are scheduled. Each task writes only its own outputs as exact
+/// integer sums, so no schedule can change a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Schedule {
-    /// Row chunks one after another on the calling thread, with no pool.
+    /// Tasks one after another on the calling thread, with no pool.
     Serial,
-    /// Row chunks as tasks of the current rayon pool: the global pool (sized
-    /// by `arc-mla --threads N`) unless the caller installed another one.
+    /// Tasks of the current rayon pool: the global pool (sized by
+    /// `arc-mla --threads N`) unless the caller installed another one.
     Pool,
+}
+
+impl Schedule {
+    /// The pool for work of at least 2^18 weights, the calling thread below.
+    pub(crate) fn for_work(weights: usize) -> Self {
+        if weights >= PARALLEL_MIN_WEIGHTS {
+            Schedule::Pool
+        } else {
+            Schedule::Serial
+        }
+    }
 }
 
 /// Exact INT16 projection: row dots, then the shared dyadic epilogue.
@@ -312,11 +338,7 @@ pub fn project_i16(
     x: &[i64],
     out: &mut [i64],
 ) -> Result<(), ModernError> {
-    let schedule = if rows.saturating_mul(cols) >= PARALLEL_MIN_WEIGHTS {
-        Schedule::Pool
-    } else {
-        Schedule::Serial
-    };
+    let schedule = Schedule::for_work(rows.saturating_mul(cols));
     project_i16_scheduled(q, rows, cols, mu, k, x, out, schedule)
 }
 
@@ -916,6 +938,12 @@ pub(crate) mod tests {
         // Odd lengths leave a dangling byte and are refused.
         assert!(I16Weights::new(&[1, 0, 0]).is_err());
         assert!(I16Weights::new(&[]).is_ok());
+        // Whole rows of admitted weights are admitted, without a scan.
+        let values: Vec<i16> = (0..12).map(|v| v * 1000 - 5000).collect();
+        let bytes = le_bytes(&values);
+        let matrix = I16Weights::new(&bytes).unwrap();
+        assert_eq!(matrix.rows(1..3, 4).as_bytes(), &bytes[8..24]);
+        assert!(matrix.rows(3..3, 4).as_bytes().is_empty());
         // The legacy per-call scan refused exactly the same weights.
         let minimum = le_bytes(&[3, i16::MIN, 5]);
         let mut out = [0; 3];
@@ -1199,12 +1227,18 @@ pub(crate) mod tests {
             })
             .collect();
         let simd = crate::canonical_simd::dotprod_available();
+        // The build is the CI one, not the shipped fat-LTO, one-unit build.
+        let profile = |name: &str| std::env::var(name).unwrap_or_else(|_| "unset".into());
         println!(
             "INT16 projection, CI-runner timings (not product speed): {} {}, {threads} logical CPUs, \
-             SIMD backend {}, {BENCH_RUNS} timed runs after one warm-up",
+             SIMD backend {}, {BENCH_RUNS} timed runs after one warm-up; build: release profile with \
+             CARGO_PROFILE_RELEASE_LTO={} and CARGO_PROFILE_RELEASE_CODEGEN_UNITS={} (unset: \
+             Cargo.toml's fat LTO and 1 unit)",
             std::env::consts::OS,
             std::env::consts::ARCH,
             if simd { "available" } else { "unavailable" },
+            profile("CARGO_PROFILE_RELEASE_LTO"),
+            profile("CARGO_PROFILE_RELEASE_CODEGEN_UNITS"),
         );
         println!(
             "| shape | rows x cols | kernel | build | threads | median ms | min ms | speedup |"
@@ -1281,5 +1315,105 @@ pub(crate) mod tests {
             }
             crate::canonical_simd::set_fast_canonical_kernel(false);
         }
+        bench_layer_heads(&pools, simd);
+    }
+
+    /// One K2.6 layer's per-head projections, scheduled by the driver
+    /// `layer_forward` uses (`for_each_head`): 64 heads of `wk_b` (512 x 128,
+    /// the absorbed query) and `wv_b` (128 x 512, the head output). Each slice
+    /// is below the row-parallel threshold, so before head parallelism every
+    /// one ran on one thread. Attention itself is unchanged and not timed.
+    fn bench_layer_heads(pools: &[(usize, rayon::ThreadPool)], simd: bool) {
+        use super::super::model::for_each_head;
+        let (n_heads, rank, nope, v_dim) = (64usize, 512usize, 128usize, 128usize);
+        let shape = "K2.6 layer heads (64 x wk_b 512x128 + wv_b 128x512)";
+        let dims = "64 x 131072";
+        let mut rng = Xorshift(0x0D15_EA5E_0000_0064);
+        let wk_values: Vec<i16> = (0..n_heads * rank * nope)
+            .map(|_| rng.symmetric(32767) as i16)
+            .collect();
+        let wv_values: Vec<i16> = (0..n_heads * v_dim * rank)
+            .map(|_| rng.symmetric(32767) as i16)
+            .collect();
+        let (wk, wv) = (le_bytes(&wk_values), le_bytes(&wv_values));
+        let mut scale = |rows: usize| -> Vec<i32> {
+            (0..rows)
+                .map(|_| ((1u64 << 30) + rng.draw() % (1 << 30)) as i32)
+                .collect()
+        };
+        let (mu_k, mu_v) = (scale(n_heads * rank), scale(n_heads * v_dim));
+        let (k_k, k_v) = (vec![46u8; n_heads * rank], vec![46u8; n_heads * v_dim]);
+        let q_nope: Vec<i64> = (0..n_heads * nope)
+            .map(|_| rng.symmetric(1 << 17))
+            .collect();
+        let u: Vec<i64> = (0..n_heads * rank)
+            .map(|_| rng.symmetric(1 << 17))
+            .collect();
+        let (wk_all, wv_all) = (I16Weights::new(&wk).unwrap(), I16Weights::new(&wv).unwrap());
+        // Head j's block: its absorbed query (rank values), then its output
+        // (v_dim values), so both projections are compared.
+        let width = rank + v_dim;
+        let (ks, vs) = (
+            |j: usize| j * rank..(j + 1) * rank,
+            |j: usize| j * v_dim..(j + 1) * v_dim,
+        );
+        let head = |j: usize, block: &mut [i64]| -> Result<(), ModernError> {
+            let (qa, out) = block.split_at_mut(rank);
+            let x = &q_nope[j * nope..(j + 1) * nope];
+            project_i16(
+                wk_all.rows(ks(j), nope),
+                rank,
+                nope,
+                &mu_k[ks(j)],
+                &k_k[ks(j)],
+                x,
+                qa,
+            )?;
+            let (u_j, wv_j) = (&u[ks(j)], wv_all.rows(vs(j), rank));
+            project_i16(wv_j, v_dim, rank, &mu_v[vs(j)], &k_v[vs(j)], u_j, out)
+        };
+        for fast in [false, true] {
+            if fast && !simd {
+                continue;
+            }
+            crate::canonical_simd::set_fast_canonical_kernel(fast);
+            let kernel = if fast { "SIMD limbs" } else { "scalar" };
+            let (before, before_min, want) = timed(|| {
+                let mut all = vec![0i64; n_heads * width];
+                for (j, block) in all.chunks_mut(width).enumerate() {
+                    let (qa, out) = block.split_at_mut(rank);
+                    let wk_j = &wk[j * rank * nope * 2..(j + 1) * rank * nope * 2];
+                    let x = &q_nope[j * nope..(j + 1) * nope];
+                    legacy_project_i16(wk_j, rank, nope, &mu_k[ks(j)], &k_k[ks(j)], x, qa).unwrap();
+                    let wv_j = &wv[j * v_dim * rank * 2..(j + 1) * v_dim * rank * 2];
+                    let (mu, k) = (&mu_v[vs(j)], &k_v[vs(j)]);
+                    legacy_project_i16(wv_j, v_dim, rank, mu, k, &u[ks(j)], out).unwrap();
+                }
+                all
+            });
+            println!(
+                "| {shape} | {dims} | {kernel} | before (legacy, heads serial) | 1 | {before:.1} | {before_min:.1} | 1.00 |"
+            );
+            for (build, schedule) in [
+                ("after, heads serial (555faab3)", Schedule::Serial),
+                ("after", Schedule::Pool),
+            ] {
+                for (t, pool) in pools {
+                    let (after, after_min, got) = timed(|| {
+                        pool.install(|| {
+                            let mut all = vec![0i64; n_heads * width];
+                            for_each_head(&mut all, width, schedule, head).unwrap();
+                            all
+                        })
+                    });
+                    assert_eq!(got, want, "{shape}, {kernel}, {build}, {t} threads");
+                    println!(
+                        "| {shape} | {dims} | {kernel} | {build} | {t} | {after:.1} | {after_min:.1} | {:.2} |",
+                        before / after
+                    );
+                }
+            }
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(false);
     }
 }

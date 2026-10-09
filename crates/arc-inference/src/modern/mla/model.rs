@@ -21,7 +21,7 @@ use super::ops::{
     router_logits, routing_weights, select_experts, selection_keys,
 };
 use super::package::{self, StageHeader, StageSpec};
-use super::precision::{I16Weights, holds_int16_min};
+use super::precision::{I16Weights, Schedule, holds_int16_min};
 use crate::modern::ModernError;
 use crate::modern::arith::{self, ACTIVATION_LIMIT, Selection, add_residual, rms_norm};
 use crate::modern::model::GenerationRequest;
@@ -421,6 +421,37 @@ pub struct StageModel {
     embed: Option<MatRef>,
     layers: Vec<LayerWeights>,
     head: Option<HeadWeights>,
+    /// Tests force the head schedule of INT16 layers with this.
+    #[cfg(test)]
+    forced_head_schedule: Option<Schedule>,
+}
+
+/// Run `per_head` once per head on `schedule`: head `j` writes only the
+/// `width`-value block `j` of `out` and reads shared, read-only inputs, so
+/// the schedule cannot change a value. On failure the error of the lowest
+/// failing head is returned, as the serial loop returns it.
+pub(crate) fn for_each_head<F>(
+    out: &mut [i64],
+    width: usize,
+    schedule: Schedule,
+    per_head: F,
+) -> Result<(), ModernError>
+where
+    F: Fn(usize, &mut [i64]) -> Result<(), ModernError> + Sync + Send,
+{
+    match schedule {
+        Schedule::Serial => out
+            .chunks_mut(width)
+            .enumerate()
+            .try_for_each(|(head, block)| per_head(head, block)),
+        Schedule::Pool => out
+            .par_chunks_mut(width)
+            .enumerate()
+            .map(|(head, block)| per_head(head, block))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect(),
+    }
 }
 
 /// Tokens, digests and timings of one generation (spec §7).
@@ -539,7 +570,29 @@ impl StageModel {
             embed,
             layers,
             head,
+            #[cfg(test)]
+            forced_head_schedule: None,
         })
+    }
+
+    /// How the heads of layer `w` run. An INT16 layer runs its heads in
+    /// parallel when their `wk_b` and `wv_b` projections hold at least 2^18
+    /// weights together (K2.6: 64 heads x 2 x 65,536): each per-head slice is
+    /// below the row-parallel threshold of `project_i16`, and INT16
+    /// projections keep no thread-local state. INT8 heads stay on the calling
+    /// thread: the opt-in limb kernel's thread-local scratch could be
+    /// re-entered by a projection nested in another rayon task through work
+    /// stealing.
+    fn head_schedule(&self, w: &LayerWeights) -> Schedule {
+        if !(w.wk_b.wide && w.wv_b.wide) {
+            return Schedule::Serial;
+        }
+        #[cfg(test)]
+        if let Some(forced) = self.forced_head_schedule {
+            return forced;
+        }
+        let per_head = w.wk_b.rows * w.wk_b.cols + w.wv_b.rows * w.wv_b.cols;
+        Schedule::for_work(self.config().n_heads.saturating_mul(per_head))
     }
 
     pub fn config(&self) -> &MlaConfig {
@@ -713,11 +766,10 @@ impl StageModel {
         };
         let (nope, dqk, lambda) = (c.qk_nope_dim, c.d_qk(), c.attention_lambda);
         let mut heads = vec![0i64; c.d_attn_out()];
-        // Heads run one after another: each projection is already parallel
-        // over its rows, and the opt-in limb kernel keeps per-thread scratch
-        // that a projection nested inside another rayon task could re-enter
-        // through work stealing.
-        for (j, out) in heads.chunks_mut(c.v_head_dim).enumerate() {
+        // Heads are independent: head j reads q, the cache and its own weights
+        // and writes only its output block. `head_schedule` says whether they
+        // run in parallel (INT16 layers large enough) or one after another.
+        for_each_head(&mut heads, c.v_head_dim, self.head_schedule(w), |j, out| {
             let base = j * dqk;
             let mut qp = q[base + nope..base + dqk].to_vec();
             rope_interleaved(&mut qp, cos, sin)?;
@@ -727,8 +779,8 @@ impl StageModel {
                 .project(&q[base..base + nope], &mut qa)?;
             let mut u = vec![0i64; rank];
             mla_attend(&qa, &qp, view, lambda, &mut u)?;
-            w.wv_b.view(data, j).project(&u, out)?;
-        }
+            w.wv_b.view(data, j).project(&u, out)
+        })?;
         let mut y = vec![0i64; c.d_model];
         w.wo.view(data, 0).project(&heads, &mut y)?;
         add_residual(h, &y)?;
@@ -753,8 +805,10 @@ impl StageModel {
         let chosen = select_experts(&keys, c.n_experts_per_tok, c.n_group, c.topk_group)?;
         let chosen_sigma: Vec<i64> = chosen.iter().map(|&e| sigma[e]).collect();
         let weights = routing_weights(&chosen_sigma, c.routed_scaling_q32, c.norm_topk_prob);
-        // Experts run one after another for the same reason as heads: their
-        // projections are parallel over rows.
+        // Experts run one after another: each expert projection is already
+        // parallel over its rows, and INT8 experts may use the opt-in limb
+        // kernel, whose thread-local scratch a projection nested inside
+        // another rayon task could re-enter through work stealing.
         let outputs = match &m.experts {
             ExpertStacks::Int8([gate, up, down]) => chosen
                 .iter()
@@ -2182,5 +2236,100 @@ pub(crate) mod tests {
         assert!(open(0, 2).is_ok());
         assert!(open(3, 4).is_ok());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The heads of INT16 layers run in parallel or one after another, on 1,
+    /// 2 and N threads, scalar and SIMD: every generation equals the pinned
+    /// fixture golden (tokens, every logits hash, every boundary digest).
+    #[test]
+    fn int16_heads_in_parallel_keep_the_pinned_goldens() {
+        use super::super::precision::tests::thread_pools;
+        // A K2.6 layer's heads (64 x (512 x 128 + 128 x 512) weights) are
+        // parallel by size; a tiny fixture's are not, so both are forced here.
+        assert_eq!(
+            Schedule::for_work(64 * (512 * 128 + 128 * 512)),
+            Schedule::Pool
+        );
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+        ))
+        .unwrap();
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let pools = thread_pools();
+        let request = GenerationRequest {
+            prompt: &[3, 17, 5, 49, 0],
+            max_tokens: 8,
+            eos: &[],
+            selection: Selection::Rp64Argmax,
+        };
+        for (name, c) in int16_fixtures() {
+            let mut model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
+            assert_eq!(model.head_schedule(&model.layers[0]), Schedule::Serial);
+            for forced in [Schedule::Serial, Schedule::Pool] {
+                model.forced_head_schedule = Some(forced);
+                assert_eq!(model.head_schedule(&model.layers[0]), forced);
+                for fast in [false, true] {
+                    crate::canonical_simd::set_fast_canonical_kernel(fast);
+                    for (threads, pool) in &pools {
+                        let run = pool.install(|| model.generate(&request)).unwrap();
+                        let mut h = blake3::Hasher::new();
+                        for t in &run.tokens {
+                            h.update(&t.to_le_bytes());
+                        }
+                        for d in run.logits_hashes.iter().chain(&run.boundary_digests) {
+                            h.update(d);
+                        }
+                        assert_eq!(
+                            pinned[name][1],
+                            h.finalize().to_hex().to_string(),
+                            "{name}: heads {forced:?}, fast {fast}, {threads} threads"
+                        );
+                    }
+                }
+            }
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+    }
+
+    /// The head driver gives the same blocks on every schedule and thread
+    /// count and, on failure, the lowest failing head's error, as the serial
+    /// loop does.
+    #[test]
+    fn for_each_head_is_schedule_free_and_reports_the_lowest_failing_head() {
+        use super::super::precision::tests::thread_pools;
+        let fill = |head: usize, block: &mut [i64]| -> Result<(), ModernError> {
+            for (i, v) in block.iter_mut().enumerate() {
+                *v = (head * 1000 + i) as i64;
+            }
+            Ok(())
+        };
+        let fail = |head: usize, block: &mut [i64]| -> Result<(), ModernError> {
+            block.fill(head as i64);
+            match head {
+                3 => Err(ModernError::Domain("head 3".into())),
+                7 => Err(ModernError::Invalid("head 7".into())),
+                _ => Ok(()),
+            }
+        };
+        let mut want = vec![0i64; 40];
+        for_each_head(&mut want, 4, Schedule::Serial, fill).unwrap();
+        assert_eq!(want[37], 9001);
+        for (threads, pool) in &thread_pools() {
+            for schedule in [Schedule::Serial, Schedule::Pool] {
+                let mut got = vec![0i64; 40];
+                pool.install(|| for_each_head(&mut got, 4, schedule, fill))
+                    .unwrap();
+                assert_eq!(got, want, "{schedule:?}, {threads} threads");
+                let mut out = vec![0i64; 40];
+                let err = pool
+                    .install(|| for_each_head(&mut out, 4, schedule, fail))
+                    .unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    "out of the profile's domain: head 3",
+                    "{schedule:?}, {threads} threads"
+                );
+            }
+        }
     }
 }

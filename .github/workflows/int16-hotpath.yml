@@ -122,6 +122,8 @@ jobs:
             modern::mla::precision::tests::int16_projection_benchmark \
             -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee bench.log
           { echo "### INT16 projection, CI-runner benchmark (${{ matrix.os }}): not product speed"; echo
+            echo "Build: release profile with LTO off and 16 codegen units (this workflow's settings), not the shipped fat-LTO, single-unit build. Use the before/after ratios; the milliseconds are this runner's only."
+            echo
             head -1 runner.txt; echo
             grep -E '^(INT16 projection|\|)' bench.log; } >> "$GITHUB_STEP_SUMMARY"
       # Diagnostic only: the limb split is kept out of line so its machine code

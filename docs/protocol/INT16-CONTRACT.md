@@ -86,10 +86,21 @@ The `-32768` exclusion is checked once, when weights are admitted: the stage
 loader scans every INT16 matrix of the executed layers, and a wide `QView`
 holds `precision::I16Weights`, which only the loader or the scanning
 `I16Weights::new` can construct. A projection never rescans its matrix (debug
-builds re-check every loader view). Rows run in parallel over disjoint 64-row
-chunks of the current Rayon pool for matrices of at least 2^18 weights, and on
-the calling thread below that. Each row's dot is one exact integer sum, so
-thread count and schedule cannot change a byte. With the opt-in limb kernel,
+builds re-check every loader view). Before this change every projection also
+rescanned its matrix; the check is now load-only, like INT8's `-128` rule. A
+package edited on disk after it was loaded is outside the supported profile:
+an injected `-32768` is no longer refused, and in release builds, which have
+no overflow checks, the accumulator overflow it can cause near the input bound
+wraps silently instead of refusing.
+
+Rows run in parallel over disjoint 64-row chunks of the current Rayon pool for
+matrices of at least 2^18 weights, and on the calling thread below that. The
+per-head `wk_b`/`wv_b` slices of an INT16 layer are below that threshold, so
+the heads themselves run in parallel when they hold at least 2^18 weights
+together (K2.6: 64 heads); INT8 heads stay serial, because the opt-in INT8
+limb kernel keeps thread-local scratch. Each row's dot is one exact integer
+sum and each head writes only its own output, so thread count and schedule
+cannot change a byte. With the opt-in limb kernel,
 activation digits are split once per projection in 2,048-column blocks, and
 each row's weight block is split into limbs on the stack.
 
