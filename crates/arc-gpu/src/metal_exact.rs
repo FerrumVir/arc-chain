@@ -232,15 +232,27 @@ pub struct SelfTestReport {
 pub struct ResidentMatrix {
     weights: Buffer,
     scales: Buffer,
+    /// The same scales on the host, for the scale bound of a row range.
+    host_scales: Vec<i64>,
     n_rows: usize,
     n_cols: usize,
     stride: usize,
-    /// `max_i |s_i|`, or `None` if some scale is `i64::MIN` (no absolute value).
+    /// `max_i |s_i|` over every row, or `None` if some scale is `i64::MIN`.
     max_abs_scale: Option<i64>,
     storage: Storage,
 }
 
 impl ResidentMatrix {
+    /// `max |s_i|` over `rows`, or `None` if one of them is `i64::MIN`: the
+    /// scales the CPU limb kernel checks when it projects the same rows.
+    fn max_abs_scale_of(&self, rows: &Range<usize>) -> Option<i64> {
+        if rows.start == 0 && rows.end == self.n_rows {
+            self.max_abs_scale
+        } else {
+            max_abs(&self.host_scales[rows.clone()])
+        }
+    }
+
     pub fn n_rows(&self) -> usize {
         self.n_rows
     }
@@ -318,11 +330,20 @@ fn gpu_seconds(commands: &CommandBufferRef) -> f64 {
     read("GPUEndTime") - read("GPUStartTime")
 }
 
-/// `128 * sum_j |x_j| * max_i |s_i| <= i64::MAX`, with every step checked.
+/// `max_i |s_i|`, or `None` if some scale is `i64::MIN` (no absolute value).
+fn max_abs(scales: &[i64]) -> Option<i64> {
+    scales
+        .iter()
+        .try_fold(0i64, |max, scale| scale.checked_abs().map(|a| max.max(a)))
+}
+
+/// `128 * sum_j |x_j| * max_i |s_i| <= i64::MAX`, with every step checked,
+/// where `max_abs_scale` is taken over the rows being projected.
 ///
 /// Multiplication by a non-negative bound is monotonic, so this holds exactly
-/// when `canonical_simd::post_scale_bound_holds` holds for every row. A scale
-/// of `i64::MIN` has no absolute value and is refused, as on the CPU.
+/// when `canonical_simd::post_scale_bound_holds` holds for every one of those
+/// rows: for a whole matrix and for a row range alike. A scale of `i64::MIN`
+/// has no absolute value and is refused, as on the CPU.
 pub fn scale_bound_holds(input: &[i64], max_abs_scale: Option<i64>) -> bool {
     let Some(scale) = max_abs_scale else {
         return false;
@@ -596,16 +617,14 @@ impl MetalExactGemv {
                 (n_rows * std::mem::size_of::<i64>()) as u64,
                 MTLResourceOptions::StorageModeShared,
             );
-            let max_abs_scale = scales
-                .iter()
-                .try_fold(0i64, |max, scale| scale.checked_abs().map(|a| max.max(a)));
             Ok(ResidentMatrix {
                 weights,
                 scales: scales_buffer,
+                host_scales: scales.to_vec(),
+                max_abs_scale: max_abs(scales),
                 n_rows,
                 n_cols,
                 stride,
-                max_abs_scale,
                 storage,
             })
         })
@@ -690,7 +709,8 @@ impl MetalExactGemv {
         })
     }
 
-    /// The same checks, in the same order, as the CPU limb kernel.
+    /// The same checks, in the same order, as the CPU limb kernel, over the
+    /// rows being projected: a row range is checked against its own scales.
     fn check(
         &self,
         matrix: &ResidentMatrix,
@@ -711,7 +731,9 @@ impl MetalExactGemv {
         if matrix.n_cols > MAX_COLS {
             return Err(Refusal::InnerDimAboveI32Bound);
         }
-        if epilogue == Epilogue::CanonicalQ16 && !scale_bound_holds(input, matrix.max_abs_scale) {
+        if epilogue == Epilogue::CanonicalQ16
+            && !scale_bound_holds(input, matrix.max_abs_scale_of(rows))
+        {
             return Err(Refusal::ScaleMultiplyWouldOverflow);
         }
         Ok(())
