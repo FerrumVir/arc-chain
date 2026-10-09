@@ -496,11 +496,13 @@ struct Cli {
 
     /// Coordinator: answer the waiting `/inference/run` caller as soon as the
     /// validators' 2-of-3 recomputation verifies a single-worker community
-    /// result, then collect the five-of-six reward approvals on the existing
-    /// settlement retry path. Approvals, retries and the 0x25 reward are
-    /// unchanged; only the moment the caller is answered moves. The response
-    /// then carries `answer_release` and a `verified_pending_approval`
-    /// settlement. Off by default; see docs/twin-execution.md, section 13.
+    /// result and its settlement is journaled, then collect the five-of-six
+    /// reward approvals on the existing settlement retry path. Approvals,
+    /// retries and the 0x25 reward are unchanged. At the journal's high-water
+    /// mark, or when the journal write fails, a job settles as with the switch
+    /// off. A job beyond the epoch budgets, counting unpaid journaled rewards,
+    /// is answered with a not-eligible settlement. Off by default; see
+    /// docs/twin-execution.md, section 13.
     #[arg(long, default_value_t = false)]
     community_release_on_verification: bool,
 
