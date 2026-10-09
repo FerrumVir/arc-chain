@@ -6,8 +6,9 @@ name: INT16 projection hot path (bit-identical)
 # run only for pull requests to main. The branch push trigger used while the
 # change was iterated is removed; run this by hand (workflow_dispatch), which
 # works once the file is on the default branch. Pull requests stacked on this
-# branch (base perf-int16-hotpath, or perf-metal-int16-gemv stacked on it) run
-# the same gate, without the macOS leg.
+# branch (base perf-int16-hotpath, perf-metal-int16-gemv stacked on it, or
+# perf-metal-int16-heads stacked on that) run the same gate, without the
+# macOS leg.
 #
 #   lint          rustfmt and clippy (deny warnings) for arc-inference.
 #   test-bench    the MLA profile unit tests (pinned golden digests, the INT16
@@ -28,7 +29,7 @@ name: INT16 projection hot path (bit-identical)
 
 on:
   pull_request:
-    branches: [perf-int16-hotpath, perf-metal-int16-gemv]
+    branches: [perf-int16-hotpath, perf-metal-int16-gemv, perf-metal-int16-heads]
   workflow_dispatch:
     inputs:
       macos:

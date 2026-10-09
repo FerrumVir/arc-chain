@@ -6,8 +6,12 @@ name: Metal exact INT16 GEMV (hosted macOS)
 # and the legacy oracle of the MLA + MoE profile: #174's random and edge
 # matrices, window-edge conversions, every INT16 view of the four pinned
 # INT16 fixtures, the four pinned fixture goldens end to end with the GPU
-# hooked in, and pinned Kimi K2.6 shapes. It also runs the INT8 kernel of
-# #176 that this branch carries, then benchmarks K2.6 projection shapes.
+# hooked in, and pinned Kimi K2.6 shapes. With the exact MLA attention
+# (crates/arc-gpu/src/metal_exact_mla.rs) it runs an INT16 layer's heads on the
+# GPU from end to end against the CPU loop, at K2.6 head shapes and cache
+# lengths up to 4,096, and the goldens with attention on the GPU. It also runs
+# the INT8 kernel of #176 that this branch carries, then benchmarks K2.6
+# projection shapes and a K2.6 layer's heads.
 # Every timing is a virtualized-runner measurement, not a measurement of
 # Apple GPU hardware.
 #
@@ -17,9 +21,10 @@ name: Metal exact INT16 GEMV (hosted macOS)
 #
 # macOS runners also serve the release and proof sequences, so this workflow
 # takes at most one of them per push: it runs on pull requests only when its
-# own files change (the INT16 kernel, its engine, its hook module, the MLA
-# model that calls the hooks and holds the goldens-on-GPU tests, the pinned
-# INT16 fixture goldens, this file), and a newer push cancels an older run
+# own files change (the INT16 kernel, its engine, the attention kernels and
+# their engine, the hook module, the MLA model that calls the hooks and holds
+# the goldens-on-GPU tests, the pinned INT16 fixture goldens, this file), and
+# a newer push cancels an older run
 # that is still queued or running. Other changes can run it by hand
 # (workflow_dispatch, once this file is on the default branch).
 
@@ -29,6 +34,8 @@ on:
       - .github/workflows/metal-exact-int16.yml
       - crates/arc-gpu/src/metal_exact_i16.rs
       - crates/arc-gpu/src/metal_exact_gemv_i16.metal
+      - crates/arc-gpu/src/metal_exact_mla.rs
+      - crates/arc-gpu/src/metal_exact_mla.metal
       - crates/arc-inference/src/modern/mla/metal_i16.rs
       - crates/arc-inference/src/modern/mla/model.rs
       - docs/protocol/reference/int16-fixture-goldens.json
@@ -81,13 +88,13 @@ jobs:
           cargo clippy -p arc-gpu -p arc-inference --all-targets --locked \
             --features arc-gpu/metal-exact,arc-inference/metal-exact \
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.txt"
-          if grep -E '^crates/(arc-gpu/src/metal_exact(_i16)?|arc-inference/src/(metal_gemv|golden_vectors|modern/mla/(metal_i16|precision|model|mod)))\.rs:' "$RUNNER_TEMP/clippy.txt" > "$RUNNER_TEMP/clippy-metal.txt"; then
+          if grep -E '^crates/(arc-gpu/src/metal_exact(_i16|_mla)?|arc-inference/src/(metal_gemv|golden_vectors|modern/mla/(metal_i16|precision|model|mod)))\.rs:' "$RUNNER_TEMP/clippy.txt" > "$RUNNER_TEMP/clippy-metal.txt"; then
             echo '::warning::clippy reported diagnostics in the Metal GEMV code; the last step fails the job'
           fi
       - name: Kernel unit tests and device self-tests (INT8 and INT16)
         if: ${{ !cancelled() }}
         run: cargo test --release --locked -p arc-gpu --features metal-exact --lib metal_exact -- --test-threads=1 --nocapture
-      - name: INT16 byte-identical tests (fixtures, goldens, random and window edges, K2.6 shapes)
+      - name: INT16 byte-identical tests (fixtures, goldens, random and window edges, K2.6 shapes, attention on the GPU)
         if: ${{ !cancelled() }}
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib -- --test-threads=1 --nocapture metal_i16
       - name: INT8 byte-identical tests of #176 (CPU scalar kernel and golden KATs)
@@ -96,7 +103,7 @@ jobs:
       - name: Every other arc-inference library test with the feature compiled in (switches off)
         if: ${{ !cancelled() }}
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib -- --skip metal_i16 --skip metal_gemv
-      - name: Benchmark K2.6 INT16 projection shapes (virtualized-runner measurement)
+      - name: Benchmark K2.6 INT16 projection shapes and a layer's heads (hosted-VM measurement)
         if: ${{ !cancelled() }}
         env:
           ARC_METAL_BENCH_MD: ${{ runner.temp }}/metal-int16-bench.md

@@ -368,6 +368,12 @@ pub struct StageCache {
     latent: Vec<Vec<i32>>,
     rope_keys: Vec<Vec<i32>>,
     positions: usize,
+    /// The exact Metal attention's device copy of these rows (opt-in; empty
+    /// unless that path runs). `push` is the cache's only change and only
+    /// appends, which is what keeps the copy exact; a clone starts with an
+    /// empty copy.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    mirror: super::metal_i16::KvMirror,
 }
 
 impl StageCache {
@@ -640,22 +646,28 @@ impl StageModel {
             .collect()
     }
 
-    /// The heads of INT16 layer `w` as one exact Metal GEMV batch
-    /// (`super::metal_i16::try_heads`): every head's `wk_b` projection, then
-    /// for every head the RoPE and absorbed attention of the per-head loop in
-    /// `layer_forward`, then every head's `wv_b` projection. `false` means the
-    /// batch declined and wrote nothing; the loop then computes the heads.
+    /// The heads of INT16 layer `w` (stage layer `local`) on the GPU. First
+    /// every head with its attention (`super::metal_i16::try_attend`, with
+    /// the device copy of the cache in `mirror`); if that is off or
+    /// declines, one exact Metal GEMV batch (`super::metal_i16::try_heads`):
+    /// every head's `wk_b` projection, then for every head the RoPE and
+    /// absorbed attention of the per-head loop in `layer_forward` on the CPU,
+    /// then every head's `wv_b` projection. `false` means both declined (or
+    /// are off) and nothing was written; the loop then computes the heads.
     #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
     fn heads_on_metal(
         &self,
         w: &LayerWeights,
+        local: usize,
         q: &[i64],
         cos: &[i32],
         sin: &[i32],
         view: LatentCache<'_>,
+        mirror: &mut super::metal_i16::KvMirror,
         heads: &mut [i64],
     ) -> bool {
-        use super::metal_i16::{HeadStack, try_heads};
+        use super::metal_i16::{AttendLayer, HeadStack, try_attend, try_heads};
         if !(w.wk_b.wide && w.wv_b.wide) {
             return false;
         }
@@ -676,10 +688,25 @@ impl StageModel {
             .chunks(dqk)
             .flat_map(|head| head.iter().take(nope).copied())
             .collect();
-        let attend = |j: usize, qa: &[i64]| -> Result<Vec<i64>, ModernError> {
+        let rope_query = |j: usize| -> Result<Vec<i64>, ModernError> {
             let base = j * dqk;
             let mut qp = q[base + nope..base + dqk].to_vec();
             rope_interleaved(&mut qp, cos, sin)?;
+            Ok(qp)
+        };
+        let layer = AttendLayer {
+            key: stack(data, &w.wk_b),
+            value: stack(data, &w.wv_b),
+            queries: &queries,
+            rope_query: &rope_query,
+            cache: view,
+            lambda,
+        };
+        if try_attend(&layer, mirror, local, heads, None) {
+            return true;
+        }
+        let attend = |j: usize, qa: &[i64]| -> Result<Vec<i64>, ModernError> {
+            let qp = rope_query(j)?;
             let mut u = vec![0i64; view.rank];
             mla_attend(qa, &qp, view, lambda, &mut u)?;
             Ok(u)
@@ -728,6 +755,8 @@ impl StageModel {
             latent: vec![Vec::new(); self.layers.len()],
             rope_keys: vec![Vec::new(); self.layers.len()],
             positions: 0,
+            #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+            mirror: Default::default(),
         }
     }
 
@@ -850,12 +879,14 @@ impl StageModel {
         };
         let (nope, dqk, lambda) = (c.qk_nope_dim, c.d_qk(), c.attention_lambda);
         let mut heads = vec![0i64; c.d_attn_out()];
-        // Opt-in: an INT16 layer's heads as one exact Metal GEMV batch
-        // (`heads_on_metal`), which computes exactly what the loop below
-        // computes, or declines without writing and leaves the heads (and any
-        // error) to the loop.
+        // Opt-in: an INT16 layer's heads on the GPU (`heads_on_metal`), with
+        // the attention or as one exact Metal GEMV batch around the CPU's
+        // attention, which computes exactly what the loop below computes, or
+        // declines without writing and leaves the heads (and any error) to the
+        // loop.
         #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
-        let batched = self.heads_on_metal(w, &q, cos, sin, view, &mut heads);
+        let batched =
+            self.heads_on_metal(w, local, &q, cos, sin, view, &mut cache.mirror, &mut heads);
         #[cfg(not(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64")))]
         let batched = false;
         if !batched {
@@ -2599,6 +2630,165 @@ pub(crate) mod tests {
                 "golden {name} with head batches on the exact INT16 Metal GEMV: run {}",
                 pinned[name][1]
             );
+        }
+    }
+
+    /// The four pinned INT16 fixture goldens (tokens, every logits hash and
+    /// every boundary digest of an 8-token generation) hold with every INT16
+    /// layer's heads on the GPU from end to end: both per-head projections,
+    /// their epilogues and the attention, in one command buffer per layer.
+    /// Every other INT16 projection takes the per-projection hook. The census
+    /// shows one GPU layer per layer and forward, nothing declined, no head
+    /// batch, no head projection on the hook, and one cache row copied to the
+    /// device per layer and forward.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn int16_fixture_goldens_hold_with_attention_on_metal_i16() {
+        use super::super::metal_i16::test_support::{AttendGuard, SwitchGuard};
+        use super::super::metal_i16::{MetalI16Model, metal_i16_census};
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+        ))
+        .unwrap();
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let request = GenerationRequest {
+            prompt: &[3, 17, 5, 49, 0],
+            max_tokens: 8,
+            eos: &[],
+            selection: Selection::Rp64Argmax,
+        };
+        for (name, c) in int16_fixtures() {
+            let bytes = tiny_package(&c, StageSpec::full(&c));
+            let package_hash = blake3::hash(&bytes).to_hex().to_string();
+            assert_eq!(pinned[name][0], package_hash, "{name}");
+            let model = StageModel::from_owned(bytes).unwrap();
+            let metal = MetalI16Model::new(&model).expect("the exact INT16 Metal GEMV");
+            let wide: Vec<(String, &MatRef)> = dyadic_matrices(&model)
+                .into_iter()
+                .filter(|(label, m)| m.wide && label != "embed")
+                .collect();
+            let per_head = |label: &str| label.ends_with(".wk_b") || label.ends_with(".wv_b");
+            let others: u64 = wide
+                .iter()
+                .filter(|(label, _)| !per_head(label))
+                .map(|(_, m)| (m.mu.len() / m.rows) as u64)
+                .sum();
+            let layers = wide
+                .iter()
+                .filter(|(label, _)| label.ends_with(".wk_b"))
+                .count() as u64;
+            assert_eq!(
+                layers, c.n_layers as u64,
+                "{name}: every layer's heads are INT16"
+            );
+            let _switch = SwitchGuard::set(true);
+            let _attend = AttendGuard::set(true);
+            let before = metal_i16_census();
+            let run = metal.run(|| model.generate(&request)).unwrap();
+            let delta = metal_i16_census().since(&before);
+            assert_eq!(
+                pinned[name][1],
+                generation_digest(&run),
+                "{name}: attention on the GPU"
+            );
+            let forwards = (request.prompt.len() + run.tokens.len() - 1) as u64;
+            assert_eq!(
+                (
+                    delta.attend_accepted,
+                    delta.attend_declined,
+                    delta.attend_outside_scope,
+                    delta.heads_attempted,
+                    delta.attend_kv_rows_uploaded,
+                    delta.attend_kv_resets,
+                ),
+                (layers * forwards, 0, 0, 0, layers * forwards, 0),
+                "{name}: {delta:?}"
+            );
+            assert_eq!(delta.accepted, others * forwards, "{name}: {delta:?}");
+            assert_eq!(delta.in_scope_fallbacks(), 0, "{name}: {delta:?}");
+            println!(
+                "golden {name} with attention on the GPU: run {}",
+                pinned[name][1]
+            );
+        }
+    }
+
+    /// Token by token with attention on the GPU, against the CPU on its own
+    /// cache: every forward's boundary vector and logits are equal, the two
+    /// caches are equal, and the device's copy of every layer equals the
+    /// cache, byte for byte. A clone of the cache starts with no device copy,
+    /// uploads its own, and stays equal too.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn int16_fixture_kv_copies_hold_the_cache_on_metal_i16() {
+        use super::super::metal_i16::test_support::{AttendGuard, SwitchGuard};
+        use super::super::metal_i16::{MetalI16Model, metal_i16_census};
+        fn assert_copies(cache: &StageCache, what: &str) {
+            for (layer, (latent, keys)) in cache.latent.iter().zip(&cache.rope_keys).enumerate() {
+                let copy = cache.mirror.layer(layer).expect("a device copy");
+                let (device_latent, device_keys) = copy.read();
+                assert!(
+                    device_latent == *latent && device_keys == *keys,
+                    "{what}: layer {layer}'s device copy differs from the cache"
+                );
+            }
+        }
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        for (name, c) in int16_fixtures() {
+            let model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
+            let metal = MetalI16Model::new(&model).expect("the exact INT16 Metal GEMV");
+            let _switch = SwitchGuard::set(true);
+            let _attend = AttendGuard::set(true);
+            let (mut gpu, mut cpu) = (model.new_cache(), model.new_cache());
+            let tokens = [3u32, 17, 5, 49, 0, 7, 11, 2];
+            let layers = c.n_layers as u64;
+            let before = metal_i16_census();
+            for (step, &token) in tokens.iter().enumerate() {
+                let what = format!("{name}: token {step}");
+                let on_gpu = metal
+                    .run(|| model.forward(StageInput::Token(token), &mut gpu, None))
+                    .unwrap();
+                // Outside a scope every hook declines: the CPU alone.
+                let on_cpu = model
+                    .forward(StageInput::Token(token), &mut cpu, None)
+                    .unwrap();
+                assert_eq!(on_gpu, on_cpu, "{what}: boundary and logits");
+                assert_eq!(gpu.digest(), cpu.digest(), "{what}: cache");
+                assert_copies(&gpu, &what);
+            }
+            let delta = metal_i16_census().since(&before);
+            let steps = tokens.len() as u64;
+            assert_eq!(
+                (
+                    delta.attend_accepted,
+                    delta.attend_declined,
+                    delta.attend_outside_scope,
+                    delta.attend_kv_rows_uploaded,
+                    delta.attend_kv_resets
+                ),
+                (layers * steps, 0, layers * steps, layers * steps, 0),
+                "{name}: {delta:?}"
+            );
+            let mut copy = gpu.clone();
+            assert!(
+                (0..c.n_layers).all(|layer| copy.mirror.layer(layer).is_none()),
+                "{name}: a clone starts without a device copy"
+            );
+            let before = metal_i16_census();
+            let on_gpu = metal
+                .run(|| model.forward(StageInput::Token(9), &mut copy, None))
+                .unwrap();
+            let on_cpu = model.forward(StageInput::Token(9), &mut cpu, None).unwrap();
+            assert_eq!(on_gpu, on_cpu, "{name}: the clone's token");
+            assert_eq!(copy.digest(), cpu.digest(), "{name}: the clone's cache");
+            assert_copies(&copy, &format!("{name}: the clone"));
+            let delta = metal_i16_census().since(&before);
+            assert_eq!(
+                delta.attend_kv_rows_uploaded,
+                layers * (steps + 1),
+                "{name}: the clone uploads every row: {delta:?}"
+            );
+            println!("{name}: {steps} tokens and a clone, device copies equal to the cache");
         }
     }
 
