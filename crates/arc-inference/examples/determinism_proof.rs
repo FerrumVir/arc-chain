@@ -1,7 +1,9 @@
 //! Cross-platform determinism proof for the canonical per-row INT8 engine.
 //!
 //! Loads the pinned Llama-2-7B-Chat Q4_K_M GGUF through the canonical
-//! interleaved-RoPE INT8 profile, greedily decodes a fixed public prompt set
+//! interleaved-RoPE INT8 profile (the default; `--profile legacy` loads the
+//! legacy split-half profile that community workers and validators run instead),
+//! greedily decodes a fixed public prompt set
 //! and writes a platform-independent transcript. For every forward position
 //! the transcript records the BLAKE3 digest of the exact i64 logits and of the
 //! KV rows appended at that position, then the generated token IDs. Two
@@ -21,8 +23,8 @@
 //! ```text
 //! determinism_proof --model GGUF --prompts PROMPTS.json --kernel scalar|simd
 //!     --max-new-tokens N --transcript OUT.txt --run-json OUT.json
-//!     [--prompt-limit N] [--shard K/COUNT] [--deadline-seconds S]
-//!     [--no-engine-crosscheck]
+//!     [--profile interleaved|legacy] [--prompt-limit N] [--shard K/COUNT]
+//!     [--deadline-seconds S] [--no-engine-crosscheck]
 //! ```
 //!
 //! `--shard K/COUNT` runs only the K-th of COUNT contiguous slices of the
@@ -32,9 +34,9 @@
 //! reproduces the single-run transcript byte for byte.
 
 use arc_inference::cached_integer_model::{
-    CachedIntegerModel, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
-    GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1, KVCache,
-    load_cached_model_canonical_i8_interleaved_rope,
+    CANONICAL_REWARD_INFERENCE_PROFILE, CachedIntegerModel,
+    GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1, KVCache,
+    load_cached_model_canonical_i8, load_cached_model_canonical_i8_interleaved_rope,
 };
 use arc_inference::canonical_prefill;
 use arc_inference::canonical_simd;
@@ -50,7 +52,8 @@ const RUN_SCHEMA: &str = "arc-determinism-proof-run-v1";
 const PROMPT_SCHEMA: &str = "arc-determinism-proof-prompts-v1";
 const USAGE: &str = "usage: determinism_proof --model GGUF --prompts PROMPTS.json \
     --kernel scalar|simd --max-new-tokens N --transcript OUT.txt --run-json OUT.json \
-    [--prompt-limit N] [--shard K/COUNT] [--deadline-seconds S] [--no-engine-crosscheck]";
+    [--profile interleaved|legacy] [--prompt-limit N] [--shard K/COUNT] \
+    [--deadline-seconds S] [--no-engine-crosscheck]";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kernel {
@@ -77,10 +80,38 @@ impl Kernel {
     }
 }
 
+/// Which canonical per-row INT8 arithmetic profile to load.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    /// `arc.gguf-llama.i8-per-row.rope-interleaved.v1`: the original proof.
+    Interleaved,
+    /// The legacy split-half profile (`CANONICAL_REWARD_INFERENCE_PROFILE`) that
+    /// community workers and the validators' shard pipeline execute.
+    Legacy,
+}
+
+impl Profile {
+    fn requested_label(self) -> &'static str {
+        match self {
+            Profile::Interleaved => "interleaved",
+            Profile::Legacy => "legacy",
+        }
+    }
+
+    /// The execution-profile identity the loaded model must report.
+    fn expected_identity(self) -> &'static str {
+        match self {
+            Profile::Interleaved => GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+            Profile::Legacy => CANONICAL_REWARD_INFERENCE_PROFILE,
+        }
+    }
+}
+
 struct Args {
     model: String,
     prompts: String,
     kernel: Kernel,
+    profile: Profile,
     max_new_tokens: u32,
     transcript: String,
     run_json: String,
@@ -94,6 +125,7 @@ fn parse_args() -> Result<Args, String> {
     let mut model = None;
     let mut prompts = None;
     let mut kernel = None;
+    let mut profile = Profile::Interleaved;
     let mut max_new_tokens = None;
     let mut transcript = None;
     let mut run_json = None;
@@ -119,6 +151,17 @@ fn parse_args() -> Result<Args, String> {
                     "simd" => Kernel::Simd,
                     other => return Err(format!("--kernel must be scalar or simd, not {other}")),
                 })
+            }
+            "--profile" => {
+                profile = match value.as_str() {
+                    "interleaved" => Profile::Interleaved,
+                    "legacy" => Profile::Legacy,
+                    other => {
+                        return Err(format!(
+                            "--profile must be interleaved or legacy, not {other}"
+                        ));
+                    }
+                }
             }
             "--max-new-tokens" => {
                 let parsed: u32 = value
@@ -172,6 +215,7 @@ fn parse_args() -> Result<Args, String> {
         model: model.ok_or_else(|| missing("--model"))?,
         prompts: prompts.ok_or_else(|| missing("--prompts"))?,
         kernel: kernel.ok_or_else(|| missing("--kernel"))?,
+        profile,
         max_new_tokens: max_new_tokens.ok_or_else(|| missing("--max-new-tokens"))?,
         transcript: transcript.ok_or_else(|| missing("--transcript"))?,
         run_json: run_json.ok_or_else(|| missing("--run-json"))?,
@@ -593,10 +637,11 @@ fn main() -> Result<(), String> {
     canonical_simd::set_projection_census_enabled(true);
 
     eprintln!(
-        "determinism_proof: kernel={} ({}) arch={} os={} prompts={} shard={shard_index}/{shard_count} \
+        "determinism_proof: kernel={} ({}) profile={} arch={} os={} prompts={} shard={shard_index}/{shard_count} \
          (prompts {shard_start}..{shard_end}) max_new_tokens={}",
         args.kernel.requested_label(),
         args.kernel.effective_label(),
+        args.profile.requested_label(),
         std::env::consts::ARCH,
         std::env::consts::OS,
         prompts.len(),
@@ -611,15 +656,20 @@ fn main() -> Result<(), String> {
     let tokenizer =
         LlamaGgufSpmTokenizer::from_gguf(&args.model).map_err(|error| error.to_string())?;
     let load_started = Instant::now();
-    let model = load_cached_model_canonical_i8_interleaved_rope(&args.model)
-        .map_err(|error| error.to_string())?;
+    let model = match args.profile {
+        Profile::Interleaved => load_cached_model_canonical_i8_interleaved_rope(&args.model),
+        Profile::Legacy => load_cached_model_canonical_i8(&args.model),
+    }
+    .map_err(|error| error.to_string())?;
     let load_seconds = load_started.elapsed().as_secs_f64();
     let profile = model
         .canonical_execution_profile()
         .ok_or("the loaded model is not a complete canonical I8 profile")?;
-    if profile != GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE || !model.has_all_transformer_layers()
-    {
-        return Err(format!("unexpected execution profile {profile}"));
+    if profile != args.profile.expected_identity() || !model.has_all_transformer_layers() {
+        return Err(format!(
+            "unexpected execution profile {profile} for --profile {}",
+            args.profile.requested_label()
+        ));
     }
     let config = &model.config;
     if tokenizer.bos_token() != config.bos_token
@@ -866,6 +916,7 @@ fn main() -> Result<(), String> {
             "max_new_tokens": args.max_new_tokens,
             "generation_semantics": GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1,
             "tokenizer_profile": tokenizer.profile(),
+            "profile_requested": args.profile.requested_label(),
         },
         "timing": {
             "total_seconds": started.elapsed().as_secs_f64(),

@@ -21,6 +21,8 @@ powershell -ExecutionPolicy Bypass -File scripts\determinism-proof\run-proof.ps1
 param(
     [ValidateSet('scalar', 'simd')]
     [string]$Kernel = 'scalar',
+    [ValidateSet('interleaved', 'legacy')]
+    [string]$ProofProfile = 'interleaved',
     [string]$Model = $env:ARC_PROOF_MODEL,
     [string]$OutDir = $env:ARC_PROOF_OUT_DIR,
     [ValidateRange(1, 4000)]
@@ -80,6 +82,7 @@ $cargoArgs = @(
     '--model', $Model,
     '--prompts', (Join-Path $ScriptDir 'prompts.json'),
     '--kernel', $Kernel,
+    '--profile', $ProofProfile,
     '--max-new-tokens', "$MaxNewTokens",
     '--transcript', $transcript,
     '--run-json', $runJson
@@ -103,7 +106,7 @@ Write-Host ''
 Write-Host "transcript:        $transcript"
 Write-Host "combined SHA-256:  $combined"
 $expectedFile = Join-Path $ScriptDir 'expected-sha256.txt'
-if ($PromptLimit -gt 0 -or $Shard -or $MaxNewTokens -ne $DefaultMaxNewTokens) {
+if ($PromptLimit -gt 0 -or $Shard -or $MaxNewTokens -ne $DefaultMaxNewTokens -or $ProofProfile -ne 'interleaved') {
     Write-Host 'Non-default workload: compare with another machine that used the same options.'
 } elseif (Test-Path -LiteralPath $expectedFile -PathType Leaf) {
     $expected = Get-Content -LiteralPath $expectedFile |
