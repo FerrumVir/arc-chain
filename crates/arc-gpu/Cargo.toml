@@ -8,6 +8,9 @@ license.workspace = true
 [features]
 default = []
 metal-icb = ["dep:metal", "dep:objc"]
+# Exact canonical per-row INT8 GEMV through native Metal (src/metal_exact.rs).
+# Opt-in and Apple Silicon only; off in every default build.
+metal-exact = ["dep:metal", "dep:objc"]
 
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
