@@ -325,6 +325,26 @@ impl KVCache {
     pub fn push_v(&mut self, layer: usize, v: &[i64]) {
         self.v_data[layer].extend_from_slice(v);
     }
+
+    /// Keep only the first `seq_len` positions.
+    ///
+    /// Every position appends one K row and one V row per layer and nothing
+    /// rewrites an earlier row, so this restores exactly the cache that held
+    /// `seq_len` positions. Speculative decoding uses it to discard the rows
+    /// of rejected draft tokens. A `seq_len` at or past the current length is
+    /// a no-op.
+    pub fn truncate(&mut self, seq_len: usize) {
+        let held = self.seq_len;
+        if seq_len >= held {
+            return;
+        }
+        for rows in self.k_data.iter_mut().chain(self.v_data.iter_mut()) {
+            debug_assert!(rows.len().is_multiple_of(held), "ragged KV cache layer");
+            let width = rows.len() / held;
+            rows.truncate(seq_len * width);
+        }
+        self.seq_len = seq_len;
+    }
 }
 
 /// Quantize an i64 Q16 vector to i8 with per-vector scale.
@@ -4010,7 +4030,11 @@ impl CachedIntegerModel {
     /// lengths across nine chunk sizes, plus KV bytes and continuation decode),
     /// and it returns `None` **without touching `cache`** when it refuses. So
     /// which branch runs changes latency and scratch, never an output.
-    fn prefill_prompt_into_cache(&self, prompt: &[u32], cache: &mut KVCache) -> Option<Vec<i64>> {
+    pub(crate) fn prefill_prompt_into_cache(
+        &self,
+        prompt: &[u32],
+        cache: &mut KVCache,
+    ) -> Option<Vec<i64>> {
         if prompt.is_empty() {
             return None;
         }

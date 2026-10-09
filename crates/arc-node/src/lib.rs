@@ -28,6 +28,8 @@ pub mod twin;
 mod unix_listener;
 pub mod validator_identity;
 pub mod vrf;
+/// Opt-in lossless speculative decoding for community jobs (`--speculative`).
+pub mod worker_speculation;
 
 /// The live validator set — `(address, stake)` — shared between the consensus
 /// loop (which updates it on peer connect/disconnect) and the RPC layer (which

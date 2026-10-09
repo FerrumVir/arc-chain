@@ -479,6 +479,93 @@ fn golden_cached_integer_autoregressive_output_matches_known_answer() {
     }
 }
 
+/// Speculative decoding must reproduce the committed answer and output hash,
+/// whoever drafts and however many guesses a pass verifies.
+#[test]
+fn golden_speculative_generation_matches_known_answer_for_every_drafter() {
+    use crate::speculative::{
+        DraftModelDrafter, Drafter, GenerationSemantics, NgramDrafter, NoDrafter, SpeculativeConfig,
+    };
+    use std::sync::Arc;
+
+    /// Guesses the committed answer itself (`shift = 0`), or every token
+    /// shifted by `shift`, which makes every guess wrong.
+    struct KatDrafter {
+        answer: Vec<u32>,
+        shift: u32,
+        vocab: u32,
+    }
+
+    impl Drafter for KatDrafter {
+        fn label(&self) -> &str {
+            "kat"
+        }
+
+        fn propose(&mut self, _stream: &[u32], generated: &[u32], max_draft: usize) -> Vec<u32> {
+            self.answer
+                .iter()
+                .skip(generated.len())
+                .take(max_draft)
+                .map(|&token| (token + self.shift) % self.vocab)
+                .collect()
+        }
+    }
+
+    // Multi-row verification records the process-global prefill census.
+    let _switch = crate::canonical_simd::kernel_switch_guard();
+    let fixture = fixture();
+    let expected = &fixture.expected;
+    let vocab = fixture.vocab_size as u32;
+    for threads in [1, 2, 4] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("determinism test pool");
+        pool.install(|| {
+            // Plain canonical I8, so passes with guesses take the batched kernel.
+            let model = build_fixture_model(&fixture);
+            assert!(model.has_canonical_i8_profile());
+            let draft = Arc::new(build_fixture_model(&fixture));
+            for k in [1usize, 2, 3, 5, 8] {
+                let mut drafters: [Box<dyn Drafter>; 5] = [
+                    Box::new(KatDrafter {
+                        answer: expected.generated_tokens.clone(),
+                        shift: 0,
+                        vocab,
+                    }),
+                    Box::new(KatDrafter {
+                        answer: expected.generated_tokens.clone(),
+                        shift: 1,
+                        vocab,
+                    }),
+                    Box::new(NgramDrafter::new(1, 4)),
+                    Box::new(DraftModelDrafter::new(Arc::clone(&draft))),
+                    Box::new(NoDrafter),
+                ];
+                for drafter in &mut drafters {
+                    let out = model
+                        .try_generate_speculative(
+                            &fixture.generation_prompt,
+                            fixture.generation_max_tokens,
+                            &[],
+                            GenerationSemantics::LegacyV1,
+                            drafter.as_mut(),
+                            SpeculativeConfig::with_max_draft(k),
+                        )
+                        .expect("the KAT request fits the fixture window");
+                    let case = format!("{threads} threads, k={k}, {}", drafter.label());
+                    assert_eq!(out.tokens, expected.generated_tokens, "{case}");
+                    assert_eq!(
+                        hex::encode(out.output_hash.0),
+                        expected.generated_output_hash,
+                        "{case}"
+                    );
+                }
+            }
+        });
+    }
+}
+
 // ── Operator vectors from the independent reference ─────────────────────────
 //
 // `integer_operator_kat.json` is produced by `scripts/arc_conformance`, a
