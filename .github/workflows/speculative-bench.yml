@@ -42,7 +42,7 @@ env:
   DRAFT_BYTES: "1170781568"
   DRAFT_FILE: .speculative-bench/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
   MAX_NEW_TOKENS: "64"
-  CONFIGS: ngram:3,ngram:7,draft:3
+  CONFIGS: ngram:3,ngram2:3,ngram:7,draft:3
 
 jobs:
   bench:

@@ -46,9 +46,9 @@
 //! engine today, so none is implemented here.
 //!
 //! Speed depends on how a multi-row pass costs against one row. The batched
-//! kernel works in four-row quads, so `k = 3` (one quad) is the default, and
-//! a deterministic back-off halves the draft length and then pauses drafting
-//! when guesses keep missing.
+//! kernel works in four-row quads, so `k = 3` (one quad) is the default. A
+//! deterministic back-off pauses drafting for 1, 2, 4, 8 and then 16 passes
+//! while guesses keep missing, and gives back whole quads of a longer draft.
 
 use crate::cached_integer_model::{
     CachedIntegerModel, CachedLayer, GenerationError, I8Weights, KVCache, ModelConfig,
@@ -66,10 +66,13 @@ pub const DEFAULT_MAX_DRAFT: usize = 3;
 /// Upper bound on `k`. Each row's logits are a full vocabulary vector, so the
 /// bound also bounds a pass's transient memory.
 pub const MAX_DRAFT_LIMIT: usize = 32;
-/// Shortest suffix the n-gram drafter will match.
-pub const DEFAULT_MIN_NGRAM: usize = 2;
-/// Longest suffix the n-gram drafter will look up.
-pub const DEFAULT_MAX_NGRAM: usize = 4;
+/// Shortest suffix the n-gram drafter will match. On a CPU a pass of four
+/// rows costs 2.2 to 2.7 single rows (the CI bench measures it), so a guess
+/// must be likely to pay; two-token matches are mostly coincidences.
+pub const DEFAULT_MIN_NGRAM: usize = 3;
+/// Longest suffix the n-gram drafter will look up. A longer matched context
+/// picks a better earlier occurrence to copy from.
+pub const DEFAULT_MAX_NGRAM: usize = NGRAM_KEY_LEN;
 /// Longest n-gram a [`NgramDrafter`] can index.
 pub const NGRAM_KEY_LEN: usize = 8;
 /// Drafted tokens allowed per matched token (SuffixDecoding's `alpha`): a
@@ -78,10 +81,14 @@ pub const NGRAM_DRAFT_PER_MATCHED_TOKEN: usize = 2;
 /// The n-gram drafter stops extending a match (its confidence) here.
 pub const NGRAM_MAX_MATCH_LEN: usize = 32;
 /// Consecutive passes with no accepted guess before drafting pauses.
-pub const GOVERNOR_MISSES_BEFORE_PAUSE: u32 = 2;
+pub const GOVERNOR_MISSES_BEFORE_PAUSE: u32 = 1;
 /// The pause doubles per further miss, up to `2^GOVERNOR_MAX_PAUSE_EXPONENT`
 /// passes.
 pub const GOVERNOR_MAX_PAUSE_EXPONENT: u32 = 4;
+/// Guesses that fit in one four-row quad of the batched kernel with the
+/// pending row. A pass of two, three or four rows costs the same, so the
+/// back-off never shrinks a draft below this.
+pub const QUAD_DRAFTS: usize = crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS - 1;
 
 /// Which whole-model generation contract the speculative loop reproduces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,9 +139,9 @@ pub struct SpeculativeConfig {
     /// Most drafted tokens one pass verifies (`k`); `0` is plain decoding.
     /// Values above [`MAX_DRAFT_LIMIT`] are clamped.
     pub max_draft: usize,
-    /// Halve the draft length after a pass that accepted nothing and pause
-    /// drafting after repeated misses, so a drafter that keeps guessing wrong
-    /// costs little.
+    /// After a pass that accepted nothing, pause drafting (1, 2, 4, 8, then
+    /// 16 passes while the misses continue) and give back whole quads of a
+    /// longer draft, so a drafter that keeps guessing wrong costs little.
     pub adaptive: bool,
 }
 
@@ -519,11 +526,7 @@ pub fn check_draft_compatible(
                 .into(),
         );
     }
-    let embedding = draft
-        .config
-        .vocab_size
-        .checked_mul(draft.config.d_model)
-        .unwrap_or(usize::MAX);
+    let embedding = draft.config.vocab_size.saturating_mul(draft.config.d_model);
     if draft.embedding_q16.len() < embedding {
         return Err("the draft model has no complete embedding table".into());
     }
@@ -577,7 +580,8 @@ impl AcceptanceGovernor {
         }
         if accepted == 0 {
             self.misses = self.misses.saturating_add(1);
-            self.budget = (self.budget / 2).max(1);
+            // Rows inside one quad are free, so only whole quads are given back.
+            self.budget = (self.budget / 2).max(self.max_draft.min(QUAD_DRAFTS));
             if self.misses >= GOVERNOR_MISSES_BEFORE_PAUSE {
                 let exponent =
                     (self.misses - GOVERNOR_MISSES_BEFORE_PAUSE).min(GOVERNOR_MAX_PAUSE_EXPONENT);
@@ -1507,9 +1511,9 @@ mod tests {
     fn ngram_drafter_continues_a_period_past_the_end() {
         let mut drafter = NgramDrafter::default();
         let stream = [1u32, 20, 21, 22, 20, 21, 22, 20, 21];
-        // The suffix [21, 22, 20, 21] last occurred ending at index 6, and
-        // that match extends back one more token. It was followed by
-        // 22, 20, 21; the copy then runs on into its own output.
+        // The longest earlier occurrence of the stream's end is
+        // [20, 21, 22, 20, 21] at 1..6. It was followed by 22, 20, 21; the
+        // copy then runs on into its own output.
         assert_eq!(
             drafter.propose(&stream, &[], 6),
             vec![22, 20, 21, 22, 20, 21]
@@ -1540,11 +1544,15 @@ mod tests {
         let mut fresh = NgramDrafter::default();
         assert!(fresh.propose(&[1, 2, 3, 4, 5], &[], 4).is_empty());
         assert!(fresh.propose(&[], &[], 4).is_empty());
+        // The default needs three matching tokens: a repeated pair is not
+        // enough, a repeated triple is.
+        assert!(fresh.propose(&[7, 8, 1, 9, 7, 8], &[], 4).is_empty());
+        assert_eq!(fresh.propose(&[7, 8, 1, 9, 7, 8, 1], &[], 1), vec![9]);
     }
 
     #[test]
     fn ngram_drafter_reindexes_a_stream_that_is_not_an_extension() {
-        let mut drafter = NgramDrafter::default();
+        let mut drafter = NgramDrafter::new(2, 4);
         let first = [1u32, 2, 3, 9, 1, 2];
         assert_eq!(drafter.propose(&first, &[], 1), vec![3]);
         // A different stream with the same suffix must not see the old index.
@@ -1595,27 +1603,52 @@ mod tests {
     fn governor_backs_off_pauses_and_recovers() {
         let mut governor = AcceptanceGovernor::new(SpeculativeConfig::with_max_draft(8));
         assert_eq!(governor.budget(), 8);
+        // A miss pauses one pass and gives back one quad of the draft.
         governor.record(8, 0);
-        assert_eq!(governor.budget(), 4);
+        assert_eq!((governor.budget(), governor.budget()), (0, 4));
+        // Another miss: a two-pass pause, and never less than one quad.
         governor.record(4, 0);
-        // Second miss in a row: one paused pass, then the halved budget.
-        assert_eq!(governor.budget(), 0);
-        assert_eq!(governor.budget(), 2);
-        governor.record(2, 0);
-        assert_eq!((governor.budget(), governor.budget()), (0, 0));
-        assert_eq!(governor.budget(), 1);
+        assert_eq!(
+            (governor.budget(), governor.budget(), governor.budget()),
+            (0, 0, QUAD_DRAFTS)
+        );
+        governor.record(QUAD_DRAFTS, 0);
+        for _ in 0..4 {
+            assert_eq!(governor.budget(), 0);
+        }
+        assert_eq!(governor.budget(), QUAD_DRAFTS);
         // Full acceptance doubles the budget back up to k.
-        governor.record(1, 1);
-        assert_eq!(governor.budget(), 2);
-        governor.record(2, 2);
-        governor.record(4, 4);
-        governor.record(8, 8);
+        governor.record(QUAD_DRAFTS, QUAD_DRAFTS);
+        assert_eq!(governor.budget(), 2 * QUAD_DRAFTS);
+        governor.record(2 * QUAD_DRAFTS, 2 * QUAD_DRAFTS);
         assert_eq!(governor.budget(), 8);
         // A partial hit resets the miss streak without growing the budget.
         governor.record(8, 3);
         assert_eq!(governor.budget(), 8);
-        // Passes without drafts change nothing.
+        governor.record(8, 0);
+        assert_eq!((governor.budget(), governor.budget()), (0, 4));
+        // Passes without guesses change nothing.
         governor.record(0, 0);
-        assert_eq!(governor.budget(), 8);
+        assert_eq!(governor.budget(), 4);
+        // The pause stops growing at 16 passes.
+        let mut stubborn = AcceptanceGovernor::new(SpeculativeConfig::with_max_draft(3));
+        for _ in 0..10 {
+            assert_eq!(stubborn.budget(), 3);
+            stubborn.record(3, 0);
+            while stubborn.pause > 0 {
+                assert_eq!(stubborn.budget(), 0);
+            }
+        }
+        assert_eq!(stubborn.pause, 0);
+        stubborn.record(3, 0);
+        assert_eq!(stubborn.pause, 1 << GOVERNOR_MAX_PAUSE_EXPONENT);
+        // Without adaptation the budget is always k.
+        let mut fixed = AcceptanceGovernor::new(SpeculativeConfig {
+            max_draft: 5,
+            adaptive: false,
+        });
+        fixed.record(5, 0);
+        fixed.record(5, 0);
+        assert_eq!(fixed.budget(), 5);
     }
 }

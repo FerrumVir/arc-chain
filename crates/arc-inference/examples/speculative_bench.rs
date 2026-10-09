@@ -18,7 +18,7 @@
 //! one row, which is what decides whether speculation can pay at all.
 //!
 //! usage: speculative_bench --model GGUF [--draft-model GGUF] [--kernel scalar|simd]
-//!        [--max-new-tokens N] [--configs ngram:3,ngram:7,draft:3] [--prompt-limit N]
+//!        [--max-new-tokens N] [--configs ngram:3,ngram2:3,draft:3] [--prompt-limit N]
 //!        [--out FILE.json] [--summary FILE.md]
 
 use arc_inference::cached_integer_model::{
@@ -33,8 +33,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Public prompts written for this benchmark (no third-party text).
-const PROMPTS: [(&str, &str); 3] = [
+/// Public prompts written for this benchmark (no third-party text). Each is
+/// sent in the Llama-2 chat form `[INST] ... [/INST]`; the pinned GGUF carries
+/// no chat-template metadata, so `apply_chat_template` would pass raw text.
+const PROMPTS: [(&str, &str); 4] = [
     (
         "chat",
         "What are three simple habits that help people sleep better? Answer in a short numbered list.",
@@ -47,7 +49,14 @@ const PROMPTS: [(&str, &str); 3] = [
         "repetitive",
         "Repeat the following sentence exactly five times, one per line: The deterministic engine gives the same answer on every computer.",
     ),
+    (
+        "copy",
+        "Copy the following paragraph exactly, without changing a word: A deterministic engine computes every value with integer arithmetic, so the same prompt produces the same answer on every computer. Validators can therefore check a worker by running the same computation again and comparing the result.",
+    ),
 ];
+
+/// How much of each answer the report quotes.
+const QUOTE_CHARS: usize = 240;
 
 /// Row counts whose verify cost is measured.
 const VERIFY_ROWS: [usize; 6] = [1, 2, 3, 4, 5, 8];
@@ -254,7 +263,7 @@ fn main() -> Result<(), String> {
     let prompts: Vec<(&str, Vec<u32>)> = PROMPTS
         .iter()
         .take(args.prompt_limit)
-        .map(|(kind, text)| (*kind, model.encode(&model.apply_chat_template(text))))
+        .map(|(kind, text)| (*kind, model.encode(&format!("[INST] {text} [/INST]"))))
         .collect();
     if prompts.is_empty() {
         return Err("--prompt-limit leaves no prompt to run".into());
@@ -307,10 +316,18 @@ fn main() -> Result<(), String> {
             hex::encode(baseline.output_hash.0)
         );
         runs.push(run_json("none", 0, &baseline, true));
+        let answer: String = model
+            .decode(&baseline.tokens)
+            .chars()
+            .take(QUOTE_CHARS)
+            .collect();
+        println!("answer: {answer:?}");
 
         for (name, k) in &args.configs {
             let mut drafter: Box<dyn Drafter> = match name.as_str() {
                 "ngram" => Box::new(NgramDrafter::new(DEFAULT_MIN_NGRAM, DEFAULT_MAX_NGRAM)),
+                // Classic prompt lookup: two- to four-token suffixes.
+                "ngram2" => Box::new(NgramDrafter::new(2, 4)),
                 "draft" => match &draft {
                     Some(draft) => Box::new(DraftModelDrafter::new(Arc::clone(draft))),
                     None => {
@@ -347,6 +364,7 @@ fn main() -> Result<(), String> {
         prompt_reports.push(json!({
             "kind": kind,
             "prompt_tokens": prompt.len(),
+            "answer_head": answer,
             "production_try_generate": production_matches,
             "runs": runs,
         }));
