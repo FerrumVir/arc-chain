@@ -49,9 +49,10 @@
 //! [`set_metal_exact_i16_heads`] (also off by default), an INT16 layer's heads
 //! leave the per-projection hook: [`try_heads`] runs every head's `wk_b`
 //! projection in one dispatch, the CPU's RoPE and attention for every head,
-//! and every head's `wv_b` projection in one dispatch, in one command buffer
-//! per layer ([`set_metal_i16_heads_submission`] picks the submission; every
-//! submission computes the same integers). The epilogues are the CPU's
+//! and every head's `wv_b` projection in one dispatch, with a command buffer
+//! per phase by default, or in one command buffer per layer
+//! ([`set_metal_i16_heads_submission`] picks the submission; every submission
+//! computes the same integers). The epilogues are the CPU's
 //! `arith::dyadic_epilogue`, and the attention is the CPU's own code. If any
 //! head would refuse anywhere, the batch declines without writing, and the
 //! per-head loop computes the layer, so it returns the CPU's error.
@@ -74,8 +75,14 @@ use crate::modern::arith::dyadic_epilogue;
 
 static REQUESTED: AtomicBool = AtomicBool::new(false);
 static HEADS_REQUESTED: AtomicBool = AtomicBool::new(false);
-/// Index into `Submission::ALL`; 0 is one command buffer per layer.
-static HEADS_SUBMISSION: AtomicU8 = AtomicU8::new(0);
+/// Index into `Submission::ALL`, initially `Submission::DEFAULT`'s.
+static HEADS_SUBMISSION: AtomicU8 = AtomicU8::new(DEFAULT_SUBMISSION);
+/// `Submission::DEFAULT`'s place in `Submission::ALL`.
+const DEFAULT_SUBMISSION: u8 = 1;
+const _: () = assert!(matches!(
+    Submission::ALL[DEFAULT_SUBMISSION as usize],
+    Submission::DEFAULT
+));
 static ENV_INIT: OnceLock<()> = OnceLock::new();
 static ENGINE: OnceLock<Result<Arc<MetalExactI16>, String>> = OnceLock::new();
 
@@ -136,12 +143,13 @@ pub fn metal_exact_i16_heads_requested() -> bool {
     HEADS_REQUESTED.load(Ordering::Relaxed)
 }
 
-/// How head batches are submitted (default: one command buffer per layer).
+/// How head batches are submitted (default `Submission::DEFAULT`, a command
+/// buffer per phase).
 pub fn set_metal_i16_heads_submission(submission: Submission) {
     let index = Submission::ALL
         .iter()
         .position(|&s| s == submission)
-        .unwrap_or(0);
+        .unwrap_or(usize::from(DEFAULT_SUBMISSION));
     HEADS_SUBMISSION.store(index as u8, Ordering::Relaxed);
 }
 

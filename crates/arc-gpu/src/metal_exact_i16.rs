@@ -38,13 +38,17 @@
 //! (MLA's `wk_b` and `wv_b`), each head with its own vector, in one dispatch:
 //! the kernel's y grid index is the head, and every row runs exactly the
 //! steps of the single-matrix kernel. [`MetalExactI16::dot_heads_two_phase`]
-//! runs two such phases with a CPU step between them (MLA's attention) in one
-//! command buffer: the GPU signals a shared event after phase A and waits on it
-//! before phase B, while the host reads phase A, runs the step and writes
-//! phase B's digits. The host releases the GPU on every path, and both waits
-//! time out instead of hanging. The one-command-buffer handoff is used only
-//! after it reproduced the reference on this device at start-up; otherwise
-//! each phase gets its own command buffer, which computes the same integers.
+//! runs two such phases with a CPU step between them (MLA's attention), either
+//! with a command buffer per phase or in one command buffer: the GPU signals a
+//! shared event after phase A and waits on it before phase B, while the host
+//! reads phase A, runs the step and writes phase B's digits. The host releases
+//! the GPU on every path, and both waits time out instead of hanging (they
+//! poll, yielding the thread, for at most 10 s each). One-command-buffer
+//! batches run on a queue of their own, so a stalled handoff can never block a
+//! projection on the engine's queue. The handoff is used only after it
+//! reproduced the reference on this device at start-up, and never again after
+//! any handoff times out or its command buffer fails: every later request
+//! runs with a command buffer per phase, which computes the same integers.
 //!
 //! # Self-test
 //!
@@ -61,6 +65,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -224,7 +229,13 @@ pub enum Submission {
 }
 
 impl Submission {
-    /// Every mode, the default first.
+    /// The mode to use unless a measurement says otherwise: a command buffer
+    /// per phase. On the only device measured so far (the hosted VM's
+    /// paravirtual GPU) one command buffer per layer was 4.7-12.7% slower, and
+    /// its shared-event handoff has not yet run on Apple GPU hardware.
+    pub const DEFAULT: Submission = Submission::PerPhase;
+
+    /// Every mode.
     pub const ALL: [Submission; 3] = [
         Submission::OneCommandBuffer,
         Submission::PerPhase,
@@ -354,23 +365,29 @@ impl Drop for Release<'_> {
     }
 }
 
-/// Wait until `event` reaches `value`. `false` if the command buffer failed or
-/// the wait timed out.
-fn wait_for_event(event: &SharedEventRef, value: u64, commands: &CommandBufferRef) -> bool {
+/// Wait until `event` reaches `value`, polling and yielding the thread. `false`
+/// if the command buffer failed or `timeout` passed first (at once for a zero
+/// timeout).
+fn wait_for_event(
+    event: &SharedEventRef,
+    value: u64,
+    commands: &CommandBufferRef,
+    timeout: Duration,
+) -> bool {
     let start = Instant::now();
     loop {
+        if start.elapsed() >= timeout || commands.status() == MTLCommandBufferStatus::Error {
+            return false;
+        }
         if event.signaled_value() >= value {
             return true;
-        }
-        if commands.status() == MTLCommandBufferStatus::Error || start.elapsed() > HANDOFF_TIMEOUT {
-            return false;
         }
         std::thread::yield_now();
     }
 }
 
-/// Wait until the command buffer completes. `false` if it failed or the wait
-/// timed out.
+/// Wait until the command buffer completes, polling and yielding the thread.
+/// `false` if it failed or the wait timed out.
 fn wait_for_completion(commands: &CommandBufferRef) -> bool {
     let start = Instant::now();
     loop {
@@ -404,10 +421,13 @@ struct Dispatch<'a> {
     tile: Tile,
 }
 
-/// The exact INT16 Metal GEMV engine: one device, one queue, every pipeline.
+/// The exact INT16 Metal GEMV engine: one device, its queues, every pipeline.
 pub struct MetalExactI16 {
     device: Device,
     queue: CommandQueue,
+    /// The queue of one-command-buffer head batches, apart from `queue`: a
+    /// handoff that stalls can hold up only this queue, never a projection.
+    handoff_queue: CommandQueue,
     pipelines: HashMap<(usize, u32, bool), ComputePipelineState>,
     heads_pipelines: HashMap<(usize, u32, bool), ComputePipelineState>,
     simd_width: u64,
@@ -415,10 +435,12 @@ pub struct MetalExactI16 {
     /// Shared events for one-command-buffer head batches, each with the last
     /// value it reached. A batch owns its event until it completes.
     events: Mutex<Vec<(SharedEvent, u64)>>,
-    /// Whether the one-command-buffer handoff reproduced the reference here.
-    one_buffer: bool,
-    /// Why it did not, if it did not.
-    one_buffer_error: Option<String>,
+    /// Whether the one-command-buffer handoff is in use: it reproduced the
+    /// reference here at start-up, and no handoff has timed out or failed
+    /// since. Once cleared it stays cleared.
+    one_buffer: AtomicBool,
+    /// Why it is not in use, if it is not.
+    one_buffer_error: Mutex<Option<String>>,
     tile: Tile,
 }
 
@@ -553,14 +575,14 @@ impl MetalExactI16 {
     /// the self-test. Returns an error rather than an engine that disagrees
     /// with the reference.
     pub fn new() -> Result<Self, String> {
-        let mut engine = autoreleasepool(Self::build)?;
+        let engine = autoreleasepool(Self::build)?;
         engine.self_test(1)?;
         // The handoff is used only if it reproduces the reference here, on a
         // queue of its own so that a device without working shared events
-        // cannot stall the engine's queue.
+        // cannot stall the engine's queues.
         match engine.self_test_one_buffer() {
-            Ok(_) => engine.one_buffer = true,
-            Err(error) => engine.one_buffer_error = Some(error),
+            Ok(_) => engine.one_buffer.store(true, Ordering::Release),
+            Err(error) => engine.stop_one_buffer(error),
         }
         Ok(engine)
     }
@@ -610,16 +632,18 @@ impl MetalExactI16 {
             ));
         }
         let queue = device.new_command_queue();
+        let handoff_queue = device.new_command_queue();
         Ok(Self {
             device,
             queue,
+            handoff_queue,
             pipelines,
             heads_pipelines,
             simd_width,
             scratch: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
-            one_buffer: false,
-            one_buffer_error: None,
+            one_buffer: AtomicBool::new(false),
+            one_buffer_error: Mutex::new(None),
             tile: DEFAULT_TILE,
         })
     }
@@ -968,16 +992,31 @@ impl MetalExactI16 {
         })
     }
 
-    /// Whether two-phase head batches run in one command buffer here (the
-    /// handoff reproduced the reference at start-up). Otherwise
-    /// [`Submission::OneCommandBuffer`] runs as [`Submission::PerPhase`].
+    /// Whether two-phase head batches run in one command buffer here: the
+    /// handoff reproduced the reference at start-up, and none has timed out or
+    /// failed since. Otherwise [`Submission::OneCommandBuffer`] runs as
+    /// [`Submission::PerPhase`].
     pub fn one_command_buffer(&self) -> bool {
-        self.one_buffer
+        self.one_buffer.load(Ordering::Acquire)
     }
 
-    /// Why the one-command-buffer handoff failed its start-up test, if it did.
-    pub fn one_command_buffer_error(&self) -> Option<&str> {
-        self.one_buffer_error.as_deref()
+    /// Why the one-command-buffer handoff is not in use (its start-up test
+    /// failed, or a handoff timed out or failed), if it is not.
+    pub fn one_command_buffer_error(&self) -> Option<String> {
+        self.one_buffer_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Stop using the one-command-buffer handoff, for good, keeping the first
+    /// reason.
+    fn stop_one_buffer(&self, reason: String) {
+        self.one_buffer.store(false, Ordering::Release);
+        self.one_buffer_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(reason);
     }
 
     fn heads_pipeline(&self, planes: usize, tile: Tile) -> Result<&ComputePipelineState, Refusal> {
@@ -1160,8 +1199,18 @@ impl MetalExactI16 {
         self.check_heads(a, inputs_a, dots_a.len(), tile)?;
         self.check_heads_shape(b, dots_b.len(), tile)?;
         match submission {
-            Submission::OneCommandBuffer if self.one_buffer => self
-                .two_phase_one_buffer(&self.queue, a, inputs_a, b, between, dots_a, dots_b, tile)
+            Submission::OneCommandBuffer if self.one_command_buffer() => self
+                .two_phase_one_buffer(
+                    &self.handoff_queue,
+                    a,
+                    inputs_a,
+                    b,
+                    between,
+                    dots_a,
+                    dots_b,
+                    tile,
+                    HANDOFF_TIMEOUT,
+                )
                 .map(|()| Submission::OneCommandBuffer),
             Submission::OneCommandBuffer | Submission::PerPhase => {
                 self.dot_heads(a, inputs_a, dots_a, tile)?;
@@ -1196,9 +1245,11 @@ impl MetalExactI16 {
     }
 
     /// Both phases in one command buffer on `queue`, with a shared-event
-    /// handoff between them. Phase B is encoded with all seven digit planes,
-    /// because its vectors are not known when it is encoded; the planes a
-    /// head does not use are zero.
+    /// handoff between them; the host waits at most `event_timeout` for phase
+    /// A. Phase B is encoded with all seven digit planes, because its vectors
+    /// are not known when it is encoded; the planes a head does not use are
+    /// zero. A handoff that times out, or a command buffer that fails, stops
+    /// the engine's one-command-buffer mode for good.
     #[allow(clippy::too_many_arguments)]
     fn two_phase_one_buffer<F>(
         &self,
@@ -1210,6 +1261,7 @@ impl MetalExactI16 {
         dots_a: &mut [i64],
         dots_b: &mut [i64],
         tile: Tile,
+        event_timeout: Duration,
     ) -> Result<(), HeadsRefusal>
     where
         F: FnOnce(&[i64]) -> Option<Vec<i64>>,
@@ -1240,9 +1292,27 @@ impl MetalExactI16 {
                     event: &event,
                     value: value + 2,
                 };
-                if !wait_for_event(&event, value + 1, commands) {
+                if !wait_for_event(&event, value + 1, commands, event_timeout) {
                     drop(release);
                     completed = wait_for_completion(commands);
+                    let mut outcome = if completed {
+                        "then completed"
+                    } else {
+                        "did not complete"
+                    };
+                    if !completed && commands.status() != MTLCommandBufferStatus::Error {
+                        // If the GPU's signal of value + 1 came after the
+                        // release and lowered the event, release it again.
+                        event.set_signaled_value(value + 2);
+                        completed = wait_for_completion(commands);
+                        if completed {
+                            outcome = "completed only after a second release";
+                        }
+                    }
+                    self.stop_one_buffer(format!(
+                        "a handoff timed out after {event_timeout:?} waiting for phase A; its \
+                         command buffer {outcome}"
+                    ));
                     return Err(Refusal::Device.into());
                 }
                 // SAFETY: the GPU signalled after phase A's dispatch, which
@@ -1258,6 +1328,9 @@ impl MetalExactI16 {
                 drop(release);
                 completed = wait_for_completion(commands);
                 if !completed {
+                    self.stop_one_buffer(
+                        "a one-command-buffer head batch did not complete".to_string(),
+                    );
                     return Err(Refusal::Device.into());
                 }
                 prepared?;
@@ -1417,6 +1490,7 @@ impl MetalExactI16 {
                 &mut dots_a,
                 &mut dots_b,
                 tile,
+                HANDOFF_TIMEOUT,
             )
             .map_err(|refusal| format!("one-buffer self-test {}: {refusal}", tile.label()))?;
             let same = |got: &[i64], want: &[i128]| {
@@ -1442,6 +1516,7 @@ impl MetalExactI16 {
             &mut dots_a,
             &mut dots_b,
             DEFAULT_TILE,
+            HANDOFF_TIMEOUT,
         );
         if declined != Err(HeadsRefusal::Declined) {
             return Err(format!(
@@ -1963,6 +2038,118 @@ mod tests {
                 .collect::<Vec<_>>(),
             want_a
         );
+    }
+
+    /// A handoff that times out (forced here: the host stops waiting for
+    /// phase A at once) refuses the batch as a device error and stops the
+    /// one-command-buffer mode for good, and the engine stays usable: later
+    /// batches asked for in one command buffer run with a command buffer per
+    /// phase, and single projections on the engine's queue complete, all
+    /// exact.
+    #[test]
+    fn a_handoff_timeout_stops_one_buffer_mode_and_later_calls_stay_exact() {
+        let engine = MetalExactI16::new().expect("Metal device");
+        let gate = engine.one_command_buffer();
+        eprintln!(
+            "one command buffer at start-up: {gate} ({:?})",
+            engine.one_command_buffer_error()
+        );
+        let mut rng = SplitMix64(0x7111_E0FF);
+        let (heads, rows_a, cols_a, rows_b) = (3usize, 5usize, 17usize, 4usize);
+        let a_values: Vec<i16> = (0..heads * rows_a * cols_a)
+            .map(|_| rng.symmetric(WEIGHT_MAX) as i16)
+            .collect();
+        let b_values: Vec<i16> = (0..heads * rows_b * rows_a)
+            .map(|_| rng.symmetric(WEIGHT_MAX) as i16)
+            .collect();
+        let (a_bytes, b_bytes) = (le_bytes(&a_values), le_bytes(&b_values));
+        let a_matrix = engine
+            .upload(&a_bytes, heads * rows_a, cols_a, Storage::Shared)
+            .expect("upload");
+        let b_matrix = engine
+            .upload(&b_bytes, heads * rows_b, rows_a, Storage::Shared)
+            .expect("upload");
+        let a = HeadPhase {
+            matrix: &a_matrix,
+            first_row: 0,
+            heads,
+            rows: rows_a,
+        };
+        let b = HeadPhase {
+            matrix: &b_matrix,
+            first_row: 0,
+            heads,
+            rows: rows_b,
+        };
+        let inputs_a: Vec<i64> = (0..heads * cols_a)
+            .map(|_| rng.symmetric(1 << 20))
+            .collect();
+        let step = |dots: &[i64]| -> Vec<i64> { dots.iter().map(|&dot| dot >> 8).collect() };
+        let want_a: Vec<i128> = (0..heads)
+            .flat_map(|h| {
+                reference_dots(
+                    &a_bytes[h * rows_a * cols_a * 2..(h + 1) * rows_a * cols_a * 2],
+                    cols_a,
+                    &inputs_a[h * cols_a..(h + 1) * cols_a],
+                )
+            })
+            .collect();
+        let inputs_b = step(&want_a.iter().map(|&dot| dot as i64).collect::<Vec<_>>());
+        let want_b: Vec<i128> = (0..heads)
+            .flat_map(|h| {
+                reference_dots(
+                    &b_bytes[h * rows_b * rows_a * 2..(h + 1) * rows_b * rows_a * 2],
+                    rows_a,
+                    &inputs_b[h * rows_a..(h + 1) * rows_a],
+                )
+            })
+            .collect();
+        let wide = |dots: &[i64]| dots.iter().map(|&dot| i128::from(dot)).collect::<Vec<_>>();
+        let mut dots_a = vec![0i64; heads * rows_a];
+        let mut dots_b = vec![0i64; heads * rows_b];
+        let forced = engine.two_phase_one_buffer(
+            &engine.handoff_queue,
+            &a,
+            &inputs_a,
+            &b,
+            |dots| Some(step(dots)),
+            &mut dots_a,
+            &mut dots_b,
+            DEFAULT_TILE,
+            Duration::ZERO,
+        );
+        assert_eq!(forced, Err(HeadsRefusal::Refused(Refusal::Device)));
+        assert!(!engine.one_command_buffer());
+        let reason = engine.one_command_buffer_error();
+        eprintln!("after a forced handoff timeout: {reason:?}");
+        if gate {
+            assert!(
+                reason.as_deref().is_some_and(|r| r.contains("timed out")),
+                "{reason:?}"
+            );
+        }
+        for round in 0..3 {
+            let ran = engine
+                .dot_heads_two_phase(
+                    &a,
+                    &inputs_a,
+                    &b,
+                    |dots| Some(step(dots)),
+                    &mut dots_a,
+                    &mut dots_b,
+                    DEFAULT_TILE,
+                    Submission::OneCommandBuffer,
+                )
+                .expect("in domain");
+            assert_eq!(ran, Submission::PerPhase, "round {round}");
+            assert_eq!(wide(&dots_a), want_a, "round {round}");
+            assert_eq!(wide(&dots_b), want_b, "round {round}");
+            let mut dots = vec![0i64; rows_a];
+            engine
+                .dot_rows(&a_matrix, 0..rows_a, &inputs_a[..cols_a], &mut dots)
+                .expect("in domain");
+            assert_eq!(wide(&dots), want_a[..rows_a], "round {round}");
+        }
     }
 
     #[test]
