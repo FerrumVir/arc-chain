@@ -4755,6 +4755,12 @@ impl CachedIntegerModel {
     /// the caller selects each row's token with that row's generated history,
     /// and [`Self::rollback_rows`] drops the rows of rejected drafts.
     ///
+    /// It pays from four rows. The batched kernel works on quads of rows, so
+    /// one to three rows cost more per row than one-row calls; send those
+    /// through [`Self::forward_shard_token`], with the floor the prefill uses
+    /// ([`crate::canonical_prefill::batching_is_profitable`]).
+    /// `examples/stage_rows_bench.rs` measures both on the real model.
+    ///
     /// Canonical per-row I8 only: any other profile is refused, so the caller
     /// falls back to one-row calls. A refusal leaves `cache` unchanged.
     pub fn forward_shard_rows(
