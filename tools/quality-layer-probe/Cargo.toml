@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
-arc-inference = { git = "https://github.com/FerrumVir/arc-chain.git", rev = "8bd1e6a1696304517a261a06aee43c142b44f128" }
+arc-inference = { git = "https://github.com/FerrumVir/arc-chain.git", rev = "be0438e4aa0eb32d5fbdf81d26cc5b5dd0db6690" }
 serde_json = "1"
 sha2 = "0.10"
 

@@ -30,7 +30,7 @@ def validate_request(request, request_bytes):
     if len(request.get('graph',{}).get('executed_layers',[]))>1: required.add('moe')
     if set(request) != required:
         raise ValueError('request fields mismatch')
-    if request['engine_sha'] != '8bd1e6a1696304517a261a06aee43c142b44f128' or request['reference_sha256'] != REFERENCE_SHA:
+    if request['engine_sha'] != 'be0438e4aa0eb32d5fbdf81d26cc5b5dd0db6690' or request['reference_sha256'] != REFERENCE_SHA:
         raise ValueError('implementation pin mismatch')
     for key in required:
         if key.endswith('sha256') or key == 'model_root':

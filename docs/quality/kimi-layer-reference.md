@@ -8,7 +8,7 @@ never produce certification or a tolerance PASS.
 
 ## Implementations and provenance
 
-ARC is pinned to **provisional/unreviewed** #168 `8bd1e6a1696304517a261a06aee43c142b44f128`, with an
+ARC is pinned to **provisional/unreviewed** #168 `be0438e4aa0eb32d5fbdf81d26cc5b5dd0db6690`, with an
 isolated diagnostic Cargo.lock. The production lock, engine and other PRs are
 unchanged. The reviewed four-layer fixture generator produces the original
 source; only declared experiment depth changes. Embedding, selected original
@@ -146,7 +146,7 @@ control, three routed experts, nonzero shared outputs, official MoE combination
 with one **and two** shared experts, nibble -8/zero-scale decoding, model/input/
 scope/position/depth mismatches, missing/reordered layer/row/routing captures,
 nonfinite values, package/source corruption and no-output CLI rejection. The
-64 existing harness tests (including certification/budget/McNemar and host-evidence controls) remain unchanged.
+69 existing harness tests (including certification/budget/McNemar and host-evidence controls) remain unchanged.
 
 ## Real-weight follow-up: not admitted or executed
 
@@ -253,7 +253,7 @@ depths remain equal to the earlier capture; their original provenance is retaine
 
 ```sh
 # CPU dependencies are those in layer_probe/requirements.txt; no model downloads.
-# ENGINE is a clean checkout of 8bd1e6a1696304517a261a06aee43c142b44f128.
+# ENGINE is a clean checkout of be0438e4aa0eb32d5fbdf81d26cc5b5dd0db6690.
 cargo build --locked --manifest-path "$ENGINE/Cargo.toml" -p arc-inference --bin arc-mla
 cargo build --locked --manifest-path tools/quality-layer-probe/Cargo.toml
 PYTHONPATH=scripts python -m arc_quality.layer_probe.matrix \
@@ -315,7 +315,7 @@ directory, so their `[123]-*-tests.log` files are current, not superseded.
 ## Default-policy integration at the current pin
 
 The copied observer source hash is unchanged and is also compared byte-for-byte
-to the clean engine checkout before every fixture creation. Only the isolated
+to the exact pinned engine Git blob, with staged/unstaged source required clean before every fixture creation. Only the isolated
 Cargo.lock git revisions change; the production workspace lock is untouched.
 The raw engine provenance pin changes, while explicit-policy model/package roots
 and numerical identities must remain historical. Historical cross-host evidence
@@ -333,3 +333,22 @@ yield the 23.2800 GiB sequential RAM plan. Persisting reference weights adds
 plans 112.5915/185.2780 GiB. These are estimates, not resource admission.
 No new weights are fetched by this stage; the real census/oracle, resource
 admission, reference comparison and gaming-PC pipeline gates remain open.
+
+## Windows observer source identity
+
+The immutable observer is `-text` and keeps committed LF bytes. The engine's
+Rust file uses ordinary Git text handling and Windows may check it out as CRLF.
+The guard compares the observer with `git cat-file blob <exact-pin>:<path>`,
+not platform-transformed worktree bytes. It still requires the exact HEAD and
+a clean staged/unstaged inference source and fixture-generator tree. Compiled
+model worktree bytes must additionally equal the pinned LF blob or its exact
+LF-to-CRLF checkout form, independent of Git index hints. Observer
+bytes are never newline-normalized; build.rs still requires the original exact
+SHA-256. Substantive source/observer edits, staged edits and wrong pins reject.
+
+Each fixture records canonical/observer/worktree hashes, sizes and CRLF count
+in `engine-source.json`; platform checkout facts are outside model/capture
+identity. Tests create real Git LF/CRLF checkouts and exercise mutations. This
+repairs a checkout-representation mismatch, not engine arithmetic. The corrected
+#168 dependency changes only its historical tiny-model caller; all production
+source and the observer source hash are unchanged.

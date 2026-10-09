@@ -109,7 +109,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 8bd1e6a1696304517a261a06aee43c142b44f128
+          ref: be0438e4aa0eb32d5fbdf81d26cc5b5dd0db6690
           path: reviewed-engine
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -127,6 +127,10 @@ jobs:
             python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.9.1'
           fi
           python -m pip install 'numpy==2.2.6' 'safetensors==0.5.3' 'blake3==1.0.10'
+      - name: Observer source identity and checkout mutation controls
+        env:
+          PYTHONPATH: scripts
+        run: python -m unittest arc_quality.tests.test_observer_source -v
       - name: Build pinned engine and isolated diagnostic
         run: |
           cargo build --locked --manifest-path reviewed-engine/Cargo.toml -p arc-inference --bin arc-mla

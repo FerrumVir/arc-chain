@@ -14,7 +14,7 @@ mod observed {
     include!(concat!(env!("OUT_DIR"), "/observed_model.rs"));
 }
 
-const ENGINE: &str = "8bd1e6a1696304517a261a06aee43c142b44f128";
+const ENGINE: &str = "be0438e4aa0eb32d5fbdf81d26cc5b5dd0db6690";
 fn hash(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }

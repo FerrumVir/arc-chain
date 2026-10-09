@@ -8,8 +8,9 @@ from pathlib import Path
 from .compare import canonical, compare, sha, sha_file
 from .official import REFERENCE_SHA
 from .policies import RUN_NAMES, policy
+from .source_identity import verify_engine_source
 
-ENGINE_SHA='8bd1e6a1696304517a261a06aee43c142b44f128'
+ENGINE_SHA='be0438e4aa0eb32d5fbdf81d26cc5b5dd0db6690'
 
 
 def main():
@@ -23,13 +24,12 @@ def main():
     args=p.parse_args()
     precision=policy(args.policy)
     engine=Path(args.engine_source).resolve();binary=Path(args.arc_mla).resolve();diagnostic=Path(args.diagnostic).resolve()
-    head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=engine,text=True).strip()
-    if head!=ENGINE_SHA:raise ValueError('engine checkout is not the provisional exact pin')
-    subprocess.run(['git','diff','--quiet','HEAD','--','scripts/arc_mla','crates/arc-inference'],cwd=engine,check=True)
     observer=Path(__file__).resolve().parents[3]/'tools/quality-layer-probe/reference/model.rs'
-    if observer.read_bytes() != (engine/'crates/arc-inference/src/modern/mla/model.rs').read_bytes():
-        raise ValueError('observer source differs from pinned engine')
+    identity=verify_engine_source(engine, observer, ENGINE_SHA)
+    head=identity['engine_sha']
     out=Path(args.out).resolve();out.mkdir(parents=True,exist_ok=False)
+    # Checkout facts may differ per host; they are evidence, not model identity.
+    (out/'engine-source.json').write_bytes(canonical(identity))
     def command(*argv):
         r=subprocess.run(list(map(str,argv)),capture_output=True,text=True)
         with (out/'commands.log').open('a',encoding='utf-8') as f:f.write(f'{list(map(str,argv))}\nexit={r.returncode}\n{r.stdout}{r.stderr}\n')
