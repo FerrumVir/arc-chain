@@ -691,11 +691,12 @@ fn interleaved_profile_and_generation_v2_match_the_independent_reference() {
 
 // ── Both projection kernels against the same reviewed constants ─────────────
 //
-// The tests above run whichever kernel this process chose: by default the AVX2
-// limb kernel on x86-64 and the scalar kernel on arm64. The tests below force
-// each kernel in turn, at every thread count from 1 to 4, and hold both to the
-// same committed digests. A per-thread census shows that the vectorised leg ran
-// the vectorised kernel for every projection, with no fallback to scalar.
+// The tests above run whichever kernel this process chose: by default the limb
+// kernel where the CPU has one (AVX2 on x86-64, NEON dotprod on arm64) and the
+// scalar kernel elsewhere. The tests below force each kernel in turn, at every
+// thread count from 1 to 4, and hold both to the same committed digests. A
+// per-thread census shows that the vectorised leg ran the vectorised kernel
+// for every projection, with no fallback to scalar.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kernel {
@@ -705,10 +706,19 @@ enum Kernel {
 
 /// The scalar kernel always, and the limb kernel when this CPU has one (AVX2
 /// on x86-64, NEON dotprod on arm64).
+///
+/// The golden-vector workflow sets `ARC_GOLDEN_REQUIRE_VECTORISED=1` on every
+/// runner, all of which have a limb kernel. A CI leg that lacked one would then
+/// fail here instead of quietly testing the scalar kernel alone.
 fn kernels() -> &'static [Kernel] {
     if crate::canonical_simd::dotprod_available() {
         &[Kernel::Scalar, Kernel::Vectorised]
     } else {
+        assert!(
+            std::env::var("ARC_GOLDEN_REQUIRE_VECTORISED").as_deref() != Ok("1"),
+            "ARC_GOLDEN_REQUIRE_VECTORISED=1, but this CPU has no limb kernel \
+             (AVX2 on x86-64, NEON dotprod on arm64)"
+        );
         &[Kernel::Scalar]
     }
 }
@@ -731,6 +741,12 @@ fn force_kernel(kernel: Kernel) -> ForcedKernel {
     let switch = crate::canonical_simd::kernel_switch_guard();
     let previous = crate::canonical_simd::fast_canonical_kernel_enabled();
     crate::canonical_simd::set_fast_canonical_kernel(kernel == Kernel::Vectorised);
+    // Names the instruction set in CI logs (`--nocapture`): avx2-limb,
+    // neon-sdot-limb or scalar-i8xi64.
+    eprintln!(
+        "golden: {kernel:?} leg runs {}",
+        crate::canonical_simd::effective_kernel_name()
+    );
     ForcedKernel {
         previous,
         _switch: switch,

@@ -462,8 +462,8 @@ pub(crate) mod tests {
                 (hashes, cache.digest())
             })
         };
-        // Scalar explicitly: the vectorised kernel is the x86-64 default, so
-        // relying on the default would compare it with itself.
+        // Scalar explicitly: the vectorised kernel is the default on x86-64
+        // and arm64, so relying on the default would compare it with itself.
         let _guard = crate::canonical_simd::kernel_switch_guard();
         let previous = crate::canonical_simd::fast_canonical_kernel_enabled();
         crate::canonical_simd::set_fast_canonical_kernel(false);
