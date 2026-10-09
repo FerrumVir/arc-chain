@@ -1,0 +1,232 @@
+name: Determinism proof (Linux arm64, lab)
+
+# THROWAWAY LAB WORKFLOW. It lives only on the branch lab-neon-arm64-proof-20261009
+# (PR #136's head commit plus this one file). It is never merged, never run from
+# PR #136 or main, and nothing here changes the proof workflow of PR #136.
+#
+# Purpose: prove ARC's NEON dotprod limb kernel on arm64 hardware that does NOT
+# swap. The macos-15 Apple Silicon runner of PR #136 has 7 GB of RAM, less than
+# the ~7.3 GiB resident INT8 model, so it swaps; this lab uses GitHub's hosted
+# ubuntu-24.04-arm runner (4 vCPU Neoverse, 16 GB). It runs the SAME driver, the
+# SAME 16 prompts x 32 new tokens, the SAME pinned model and the SAME comparison
+# script as PR #136's determinism-proof workflow, for the scalar kernel and the
+# opt-in SIMD (NEON dotprod) kernel, and then requires the combined SHA-256 of
+# each leg to equal the published value in scripts/determinism-proof/expected-sha256.txt
+# (d2c8c82b3a82beb166559b78ad26a748cbd6395c2cf13e8f012b03f90fa92872, measured on
+# x86_64 Linux, Windows and Intel macOS and on Apple Silicon in run 37467005539).
+on:
+  push:
+    branches: [lab-neon-arm64-proof-20261009]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: determinism-proof-arm64-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Workload: every prompt in prompts.json, 32 new tokens (the published expected
+  # hash is for exactly this workload).
+  PROOF_PROMPT_LIMIT: ""
+  PROOF_MAX_NEW_TOKENS: "32"
+  # Pinned model: the same bytes as PR #136's workflow.
+  MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
+  MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+  MODEL_BYTES: "4081004224"
+  MODEL_FILE: .determinism-proof-model/llama-2-7b-chat.Q4_K_M.gguf
+
+jobs:
+  run:
+    name: ${{ matrix.runner }} / ${{ matrix.kernel }} / shard ${{ matrix.shard }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.job_timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04-arm, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: ubuntu-24.04-arm, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+    env:
+      RUNNER_LABEL: ${{ matrix.runner }}
+      KERNEL: ${{ matrix.kernel }}
+      SHARD: ${{ matrix.shard }}
+      DEADLINE_SECONDS: ${{ matrix.deadline_seconds }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner facts
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/determinism-proof"
+          mkdir -p "$out"
+          {
+            echo "leg: $RUNNER_LABEL / $KERNEL / shard $SHARD"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            uname -a
+            lscpu
+            free -b
+            grep -m 1 '^Features' /proc/cpuinfo || true
+            df -h .
+          } 2>&1 | tee "$out/runner-before.txt"
+
+      - name: Download and verify the pinned model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$MODEL_FILE")"
+          if [ ! -f "$MODEL_FILE" ]; then
+            curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+              --retry-max-time 900 --connect-timeout 20 --max-time 1800 \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$MODEL_FILE.partial" "$MODEL_URL"
+            mv "$MODEL_FILE.partial" "$MODEL_FILE"
+          fi
+          size="$(wc -c < "$MODEL_FILE" | tr -d ' ')"
+          if [ "$size" != "$MODEL_BYTES" ]; then
+            echo "::error::model is $size bytes, expected $MODEL_BYTES"
+            exit 1
+          fi
+          actual="$(sha256sum "$MODEL_FILE" | cut -d ' ' -f 1)"
+          if [ "$actual" != "$MODEL_SHA256" ]; then
+            echo "::error::model SHA-256 is $actual, expected $MODEL_SHA256"
+            exit 1
+          fi
+          echo "model verified: sha256 $actual, $size bytes"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - name: Build the proof driver (release, Candle GGUF loader)
+        shell: bash
+        run: cargo build --locked --release -p arc-inference --features candle --example determinism_proof
+
+      - name: Run the proof with the bash script
+        shell: bash
+        timeout-minutes: ${{ matrix.run_timeout }}
+        run: |
+          set -euo pipefail
+          args=(
+            --kernel "$KERNEL"
+            --model "$GITHUB_WORKSPACE/$MODEL_FILE"
+            --out-dir "$RUNNER_TEMP/determinism-proof"
+            --max-new-tokens "$PROOF_MAX_NEW_TOKENS"
+            --deadline-seconds "$DEADLINE_SECONDS"
+          )
+          if [ -n "$PROOF_PROMPT_LIMIT" ]; then
+            args+=(--prompt-limit "$PROOF_PROMPT_LIMIT")
+          fi
+          if [ "$SHARD" != "0/1" ]; then
+            args+=(--shard "$SHARD")
+          fi
+          bash scripts/determinism-proof/run-proof.sh "${args[@]}"
+
+      - name: Record memory after the run
+        if: always()
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/determinism-proof"
+          mkdir -p "$out"
+          {
+            free -b
+            grep -E '^(pswpin|pswpout|pgmajfault) ' /proc/vmstat || true
+          } 2>&1 | tee "$out/runner-after.txt"
+
+      - name: Assemble this leg's result
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/determinism-proof/assemble_result.py \
+            --out-dir "$RUNNER_TEMP/determinism-proof" \
+            --runner-label "$RUNNER_LABEL" --kernel "$KERNEL" --shard "$SHARD"
+
+      - name: Upload this leg's evidence (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: determinism-proof-leg-${{ matrix.runner }}-${{ matrix.kernel }}-${{ matrix.shard_tag }}
+          path: ${{ runner.temp }}/determinism-proof/
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+
+  compare:
+    name: compare both kernels with the published hash
+    needs: run
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download every leg's evidence
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: determinism-proof-leg-*
+          path: ${{ runner.temp }}/legs
+
+      - name: Compare the legs with each other (PR #136's comparison script)
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/determinism-proof/compare_results.py \
+            --results-dir "$RUNNER_TEMP/legs" \
+            --manifest docs/protocol/packages/llama-2-7b-q4km.manifest.json \
+            --expect ubuntu-24.04-arm:scalar --expect ubuntu-24.04-arm:simd \
+            --out-dir "$RUNNER_TEMP/evidence" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Require the published expected hash
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          temp = os.environ["RUNNER_TEMP"]
+          expected = None
+          for line in open("scripts/determinism-proof/expected-sha256.txt", encoding="utf-8"):
+              if re.fullmatch(r"[0-9a-f]{64}", line.strip()):
+                  expected = line.strip()
+                  break
+          evidence = json.load(open(os.path.join(temp, "evidence", "evidence.json"), encoding="utf-8"))
+          rows = []
+          ok = expected is not None and len(evidence["pairs"]) == 2
+          for pair in evidence["pairs"]:
+              same = pair.get("combined_sha256") == expected
+              ok = ok and same and not pair.get("problems")
+              rows.append("| %s | %s | `%s` | %s |" % (pair["runner"], pair["kernel"], pair.get("combined_sha256") or "missing", "yes" if same else "**NO**"))
+          summary = [
+              "## Equals the published expected hash: %s" % ("YES" if ok else "NO"),
+              "",
+              "Published (scripts/determinism-proof/expected-sha256.txt): `%s`" % expected,
+              "",
+              "| Runner | Kernel | Combined SHA-256 | Equals published |",
+              "|---|---|---|---|",
+          ] + rows
+          text = "\n".join(summary) + "\n"
+          print(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(text)
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: determinism-proof-evidence
+          path: |
+            ${{ runner.temp }}/evidence/
+            ${{ runner.temp }}/legs/
+          if-no-files-found: warn
+          retention-days: 90
+          overwrite: true
