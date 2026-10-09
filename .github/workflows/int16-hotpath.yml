@@ -136,6 +136,20 @@ jobs:
           cat vectorize-remarks.txt
           { echo "### Loop-vectorizer remarks, precision.rs ($RUNNER_ARCH)"; echo; echo '```'
             cat vectorize-remarks.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # Diagnostic only: the limb split is kept out of line so its machine code
+      # can be checked for vector instructions in the release library.
+      - name: Machine code of the INT16 limb split (diagnostic, Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          rlib=$(find target/release/deps -name 'libarc_inference-*.rlib' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
+          objdump -d -C --no-show-raw-insn "$rlib" 2>/dev/null \
+            | awk '/^[0-9a-f]+ <.*precision::split_block.*>:$/ {keep=1; next} /^$/ {keep=0} keep' > split-block.asm
+          total=$(grep -c . split-block.asm)
+          vector=$(grep -cE '%[xy]mm[0-9]|[[:space:],{]v[0-9]+\.|[[:space:],]q[0-9]+' split-block.asm)
+          echo "precision::split_block: $total instructions, $vector on vector registers"
+          echo "precision::split_block ($RUNNER_ARCH): $total instructions, $vector on vector registers" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -145,6 +159,7 @@ jobs:
             mla-tests.log
             bench.log
             remarks.log
+            split-block.asm
           if-no-files-found: warn
 
   int16-e2e:

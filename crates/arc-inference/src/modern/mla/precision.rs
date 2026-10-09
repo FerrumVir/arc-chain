@@ -395,21 +395,11 @@ fn row_dots(weights: &[u8], cols: usize, x: &[i64], digits: Option<&LimbBlocks>,
         }
         return;
     };
-    // One stack scratch per task, reused by every row: no allocation.
-    let mut scratch = LimbScratch {
-        values: [0; COL_BLOCK],
-        limbs: [[0; COL_BLOCK]; 3],
-    };
+    // One stack scratch per task (6 KiB), reused by every row: no allocation.
+    let mut limbs = [[0i8; COL_BLOCK]; 3];
     for (dot, row) in dots.iter_mut().zip(rows) {
-        *dot = dot_i16_limbs(row, digits, &mut scratch);
+        *dot = dot_i16_limbs(row, digits, &mut limbs);
     }
-}
-
-/// One task's stack scratch for the limb kernel (10 KiB): a column block of
-/// decoded weights and its three i8 limbs.
-struct LimbScratch {
-    values: [i16; COL_BLOCK],
-    limbs: [[i8; COL_BLOCK]; 3],
 }
 
 /// Exact `sum_j w_j x_j` of one little-endian INT16 row. `|w| <= 32767` and
@@ -441,35 +431,37 @@ fn dot_i16(row: &[u8], x: &[i64]) -> i64 {
 /// base-128 limbs, `w = l0 + 128 l1 + 16384 l2` by truncating division, so
 /// `|l0|, |l1| <= 127` and `|l2| <= 1`. Each block's combine and the running
 /// total are then bounded by `32767 * sum|x| < 2^63`.
-fn dot_i16_limbs(row: &[u8], digits: &LimbBlocks, scratch: &mut LimbScratch) -> i64 {
-    let LimbScratch { values, limbs } = scratch;
+fn dot_i16_limbs(row: &[u8], digits: &LimbBlocks, limbs: &mut [[i8; COL_BLOCK]; 3]) -> i64 {
     let [low, middle, top] = limbs;
     let mut total = 0i64;
     for (block, weights) in row.chunks(COL_BLOCK * 2).enumerate() {
-        let width = weights.len() / 2;
-        // Plain two-slice loops, the form compilers vectorize: decode the
-        // little-endian words once, then write one limb per pass.
-        // `(v / 128) / 128 == v / 16384` for truncating division.
-        let values = &mut values[..width];
         let (pairs, _) = weights.as_chunks::<2>();
-        for (v, &pair) in values.iter_mut().zip(pairs) {
-            *v = i16::from_le_bytes(pair);
-        }
+        let width = pairs.len();
         let (low, middle, top) = (&mut low[..width], &mut middle[..width], &mut top[..width]);
-        for (limb, &v) in low.iter_mut().zip(values.iter()) {
-            *limb = (v % 128) as i8;
-        }
-        for (limb, &v) in middle.iter_mut().zip(values.iter()) {
-            *limb = ((v / 128) % 128) as i8;
-        }
-        for (limb, &v) in top.iter_mut().zip(values.iter()) {
-            *limb = (v / 16384) as i8;
-        }
+        split_block(pairs, low, middle, top);
         total += digits.dot(block, low)
             + 128 * digits.dot(block, middle)
             + 16384 * digits.dot(block, top);
     }
     total
+}
+
+/// Split one column block of little-endian INT16 weights into its three
+/// signed base-128 limbs by truncating division (`(w / 128) / 128` is
+/// `w / 16384`). One plain map loop per limb, from fixed-size `[u8; 2]` words
+/// into exclusive slices: the form compilers vectorize. Kept out of line so
+/// CI can check its machine code for vector instructions.
+#[inline(never)]
+fn split_block(pairs: &[[u8; 2]], low: &mut [i8], middle: &mut [i8], top: &mut [i8]) {
+    for (limb, &pair) in low.iter_mut().zip(pairs) {
+        *limb = (i16::from_le_bytes(pair) % 128) as i8;
+    }
+    for (limb, &pair) in middle.iter_mut().zip(pairs) {
+        *limb = ((i16::from_le_bytes(pair) / 128) % 128) as i8;
+    }
+    for (limb, &pair) in top.iter_mut().zip(pairs) {
+        *limb = (i16::from_le_bytes(pair) / 16384) as i8;
+    }
 }
 
 #[cfg(test)]
@@ -1130,19 +1122,14 @@ pub(crate) mod tests {
     /// weight limbs split once, as a load-time copy would hold them (3 bytes
     /// per weight beside the mapped 2-byte weights).
     fn precompute_limbs(q: &[u8]) -> [Vec<i8>; 3] {
-        let n = q.len() / 2;
+        let (pairs, _) = q.as_chunks::<2>();
         let mut limbs = [
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
-            Vec::with_capacity(n),
+            vec![0i8; pairs.len()],
+            vec![0i8; pairs.len()],
+            vec![0i8; pairs.len()],
         ];
-        for w in q.chunks_exact(2) {
-            let v = i16::from_le_bytes([w[0], w[1]]);
-            let high = v / 128;
-            limbs[0].push((v % 128) as i8);
-            limbs[1].push((high % 128) as i8);
-            limbs[2].push((high / 128) as i8);
-        }
+        let [low, middle, top] = &mut limbs;
+        split_block(pairs, low, middle, top);
         limbs
     }
 
