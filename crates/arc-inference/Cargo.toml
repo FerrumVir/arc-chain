@@ -51,6 +51,11 @@ rand.workspace = true
 name = "arc-modern"
 path = "src/bin/arc_modern.rs"
 
+# Serving-layer measurements: continuous batching, prefix cache, speculation.
+[[bin]]
+name = "arc-serve-bench"
+path = "src/bin/arc_serve_bench.rs"
+
 # Examples that load GGUF models or run inference benchmarks against candle-
 # backed tensors pull in candle-core/candle-nn/candle-transformers. Declare
 # required-features so `cargo test --workspace` (default features) skips
