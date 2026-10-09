@@ -453,14 +453,24 @@ struct Cli {
 
     /// Lossless speculative decoding for community jobs. Off by default.
     ///
-    /// `ngram` drafts from the job's own tokens and needs no weights.
-    /// `draft:PATH` drafts with a small model that shares this model's
-    /// tokenizer, as an `.arc-int8` cache or a GGUF (TinyLlama-1.1B shares
-    /// Llama-2-7B's). The worker model still chooses every token, so the
-    /// output tokens, output hash and signed attestation are byte-identical
-    /// with this on or off, and validators recompute without it. It pays only
-    /// when a multi-row pass is cheaper per row than single rows, as on the
-    /// vectorised kernel (`ARC_FAST_CANONICAL_KERNEL=1`).
+    /// `ngram` guesses from the job's own tokens and needs no weights.
+    /// `draft:PATH` guesses with a small model that shares this model's
+    /// tokenizer. It accepts only a pinned file (the TinyLlama-1.1B-Chat Q8_0
+    /// GGUF, checked by size and SHA-256) and holds about 1.6 GB more RAM
+    /// plus about 88 KiB per position. If the file is missing, not the pinned
+    /// one or incompatible, the worker logs a warning and decodes plainly.
+    /// The worker model still chooses every token, so the output tokens,
+    /// output hash and signed attestation are byte-identical with this on or
+    /// off, and validators recompute without it.
+    ///
+    /// Measured in CI on 4-vCPU machines with this worker's model and
+    /// profile, it did not make jobs faster: `ngram` ran at 0.82-1.01x and
+    /// `draft:` at 0.49-0.78x the speed of plain decoding. Verifying 4 tokens
+    /// costs 2.2-2.7x one token on the vectorised kernel
+    /// (`ARC_FAST_CANONICAL_KERNEL=1`) and 3.3-3.9x on the scalar kernel.
+    /// It helped (up to 1.3x) only on copy- or repetition-heavy answers, with
+    /// the vectorised kernel, on a model profile whose answers are coherent.
+    /// Plain decoding stays the default.
     #[arg(
         long,
         value_name = "ngram|draft:PATH",
@@ -8278,37 +8288,52 @@ async fn run_arc_node() -> Result<()> {
     }
     // ── Optional lossless speculative decoding for community jobs ──────
     // Clap admits --speculative only with --full-integer-worker, whose model
-    // was checked just above. The drafter is loaded and checked against that
-    // model now, so a bad path or a foreign tokenizer stops startup instead
-    // of the first job.
-    let worker_speculation: Option<Arc<arc_node::worker_speculation::WorkerSpeculation>> =
-        match &cli.speculative {
-            Some(spec) => {
-                let model = inference_model.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--speculative needs the loaded full integer worker model")
-                })?;
-                let max_draft = cli
-                    .speculative_k
-                    .map_or(arc_inference::speculative::DEFAULT_MAX_DRAFT, usize::from);
-                let speculation =
-                    arc_node::worker_speculation::WorkerSpeculation::load(spec, max_draft, model)
-                        .map_err(|error| anyhow::anyhow!("--speculative {spec}: {error}"))?;
-                let fast_kernel = arc_inference::canonical_simd::fast_canonical_kernel_enabled();
-                tracing::info!(
-                    drafter = speculation.label(),
-                    max_draft,
-                    fast_kernel,
-                    "Speculative decoding enabled for community jobs; output tokens, hashes and attestations are unchanged"
-                );
-                if !fast_kernel {
-                    tracing::warn!(
-                        "--speculative is running on the scalar kernel. On CPUs, speculation helps only on copy- or repetition-heavy answers, and only with the vectorised kernel (ARC_FAST_CANONICAL_KERNEL=1), because verifying 4 tokens costs 2.2-3.7x one token there (CI measurement). Plain decoding stays the default."
+    // was checked just above. A drafter that cannot be used (a missing,
+    // unpinned or incompatible draft model) is logged, and the worker decodes
+    // plainly, which is also the default.
+    let worker_speculation: Option<Arc<arc_node::worker_speculation::WorkerSpeculation>> = match (
+        &cli.speculative,
+        inference_model.as_ref(),
+    ) {
+        (Some(spec), Some(model)) => {
+            let max_draft = cli
+                .speculative_k
+                .map_or(arc_inference::speculative::DEFAULT_MAX_DRAFT, usize::from);
+            match arc_node::worker_speculation::WorkerSpeculation::load(spec, max_draft, model) {
+                Ok(speculation) => {
+                    let fast_kernel =
+                        arc_inference::canonical_simd::fast_canonical_kernel_enabled();
+                    tracing::info!(
+                        drafter = speculation.label(),
+                        max_draft,
+                        fast_kernel,
+                        "Speculative decoding enabled for community jobs; output tokens, hashes and attestations are unchanged"
                     );
+                    if !fast_kernel {
+                        tracing::warn!(
+                            "--speculative is running on the scalar kernel. On CPUs, speculation helps only on copy- or repetition-heavy answers, and only with the vectorised kernel (ARC_FAST_CANONICAL_KERNEL=1): CI measured verifying 4 tokens at 2.2-2.7x one token on the vectorised kernel and 3.3-3.9x on the scalar kernel. Plain decoding stays the default."
+                        );
+                    }
+                    if let Some(memory) = speculation.draft_memory() {
+                        tracing::warn!(
+                            resident_mib = memory.resident_bytes / (1024 * 1024),
+                            kv_kib_per_position = memory.kv_bytes_per_position / 1024,
+                            "--speculative {spec} keeps a second model in memory, and in every CI measurement it was slower than plain decoding (0.49-0.99x the speed) because on a CPU its own forward passes cost more than its accepted guesses save. Plain decoding stays the default."
+                        );
+                    }
+                    Some(Arc::new(speculation))
                 }
-                Some(Arc::new(speculation))
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "--speculative {spec} could not be enabled; community jobs use plain decoding"
+                    );
+                    None
+                }
             }
-            None => None,
-        };
+        }
+        _ => None,
+    };
     if complete_startup_shutdown_if_requested(
         &shutdown_requested,
         Some(state.as_ref()),

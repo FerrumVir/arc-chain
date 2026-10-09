@@ -17,9 +17,93 @@ use arc_inference::speculative::{
     SpeculativeConfig, SpeculativeStats, check_draft_compatible,
 };
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+
+/// A draft model file that `--speculative draft:PATH` accepts, pinned by
+/// size and SHA-256.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedDraftModel {
+    /// What the file is, for logs.
+    pub name: &'static str,
+    /// Exact file size in bytes.
+    pub bytes: u64,
+    /// Lowercase hex SHA-256 of the whole file.
+    pub sha256: &'static str,
+}
+
+/// The draft model files the worker accepts. A draft model never changes an
+/// output, so this pin is about resources and identity: a known file with a
+/// known memory footprint, not whatever a path happens to hold.
+pub const PINNED_DRAFT_MODELS: &[PinnedDraftModel] = &[PinnedDraftModel {
+    // huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF at commit
+    // 52e7645ba7c309695bec7ac98f4f005b139cf465, file
+    // tinyllama-1.1b-chat-v1.0.Q8_0.gguf: the pin speculative-bench.yml uses.
+    name: "TinyLlama-1.1B-Chat-v1.0 Q8_0 GGUF",
+    bytes: 1_170_781_568,
+    sha256: "a4c9bb1dbaa372f6381a035fa5c02ef087aaa1ff1f843a56a22328114f03fc59",
+}];
+
+/// What a draft model adds to the worker's memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftMemory {
+    /// The loaded draft model's resident weights and tables.
+    pub resident_bytes: usize,
+    /// Draft K/V cache per position of a job: one K and one V row of `d_kv`
+    /// i64 values per layer.
+    pub kv_bytes_per_position: usize,
+}
+
+/// Check `path` against `pins`: its size must equal a pin's, and the whole
+/// file's SHA-256 must then match that pin. The size is checked first, so an
+/// unrelated large file is refused without being read.
+fn check_pinned_draft<'a>(
+    path: &Path,
+    pins: &'a [PinnedDraftModel],
+) -> Result<&'a PinnedDraftModel, String> {
+    let display = path.display();
+    let bytes = std::fs::metadata(path)
+        .map_err(|error| format!("cannot read draft model {display}: {error}"))?
+        .len();
+    let Some(pin) = pins.iter().find(|pin| pin.bytes == bytes) else {
+        let pinned: Vec<String> = pins
+            .iter()
+            .map(|pin| format!("{} ({} bytes)", pin.name, pin.bytes))
+            .collect();
+        return Err(format!(
+            "draft model {display} is {bytes} bytes and matches no pinned draft model; pinned: {}",
+            pinned.join(", ")
+        ));
+    };
+    let digest =
+        sha256_file(path).map_err(|error| format!("cannot hash draft model {display}: {error}"))?;
+    if digest != pin.sha256 {
+        return Err(format!(
+            "draft model {display} has SHA-256 {digest}, not the pinned {} ({})",
+            pin.name, pin.sha256
+        ));
+    }
+    Ok(pin)
+}
+
+/// Stream a file through SHA-256 with a bounded buffer.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
 
 /// The drafter named by `--speculative`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +176,16 @@ impl WorkerSpeculation {
     }
 
     /// Load what `spec` names and check it against the worker's model.
+    ///
+    /// A draft model file must match one of [`PINNED_DRAFT_MODELS`] by size
+    /// and SHA-256 before it is loaded.
+    ///
+    /// Memory: `ngram` keeps about 1 MB of match tables and nothing else. A
+    /// draft model stays resident beside the worker model: about 1.6 GB for
+    /// the pinned TinyLlama-1.1B in this engine's layout (its i64 embedding
+    /// table alone is 32,000 x 2,048 x 8 bytes, about 524 MB), plus about
+    /// 88 KiB of draft K/V cache per position of each job.
+    /// [`Self::draft_memory`] reports the exact figures for the loaded file.
     pub fn load(
         spec: &SpeculativeDrafterSpec,
         max_draft: usize,
@@ -101,6 +195,7 @@ impl WorkerSpeculation {
             SpeculativeDrafterSpec::Ngram => Self::ngram(max_draft),
             SpeculativeDrafterSpec::DraftModel(path) => {
                 Self::config(max_draft)?;
+                check_pinned_draft(path, PINNED_DRAFT_MODELS)?;
                 let display = path.display();
                 let source = path
                     .to_str()
@@ -140,6 +235,20 @@ impl WorkerSpeculation {
     /// Most guesses one target pass verifies (`k`).
     pub fn max_draft(&self) -> usize {
         self.config.max_draft
+    }
+
+    /// The memory a draft model adds, or `None` for `ngram`.
+    pub fn draft_memory(&self) -> Option<DraftMemory> {
+        match &self.drafter {
+            WorkerDrafter::Ngram => None,
+            WorkerDrafter::DraftModel(model) => Some(DraftMemory {
+                resident_bytes: model.memory_bytes(),
+                kv_bytes_per_position: model.config.n_layers
+                    * 2
+                    * model.config.d_kv
+                    * std::mem::size_of::<i64>(),
+            }),
+        }
     }
 
     fn new_drafter(&self) -> Box<dyn Drafter> {
@@ -308,7 +417,64 @@ mod tests {
         let Err(error) = WorkerSpeculation::load(&missing, 3, &target) else {
             panic!("a missing draft model must be refused");
         };
-        assert!(error.contains("cannot load draft model"), "{error}");
+        assert!(error.contains("cannot read draft model"), "{error}");
         assert!(WorkerSpeculation::load(&missing, 0, &target).is_err());
+    }
+
+    #[test]
+    fn draft_model_files_must_match_a_pin_by_size_and_sha256() {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"not really a model").unwrap();
+        file.flush().unwrap();
+        let path = file.path();
+        let digest = hex::encode(Sha256::digest(b"not really a model"));
+        let right = [PinnedDraftModel {
+            name: "fixture",
+            bytes: 18,
+            sha256: Box::leak(digest.into_boxed_str()),
+        }];
+        assert_eq!(check_pinned_draft(path, &right).unwrap().name, "fixture");
+
+        // Same size, different bytes.
+        let wrong_hash = [PinnedDraftModel {
+            sha256: "00".repeat(32).leak(),
+            ..right[0]
+        }];
+        let error = check_pinned_draft(path, &wrong_hash).unwrap_err();
+        assert!(error.contains("not the pinned fixture"), "{error}");
+
+        // A size no pin has is refused before the file is hashed.
+        let wrong_size = [PinnedDraftModel {
+            bytes: 19,
+            ..right[0]
+        }];
+        let error = check_pinned_draft(path, &wrong_size).unwrap_err();
+        assert!(error.contains("matches no pinned draft model"), "{error}");
+
+        // The worker's own pin list refuses any other file, so loading falls
+        // back before a model is read.
+        let target = synthetic_canonical_model(SyntheticModelSpec::tiny(26));
+        let spec = SpeculativeDrafterSpec::DraftModel(path.to_path_buf());
+        let Err(error) = WorkerSpeculation::load(&spec, 3, &target) else {
+            panic!("an unpinned draft model must be refused");
+        };
+        assert!(error.contains("matches no pinned draft model"), "{error}");
+        assert!(PINNED_DRAFT_MODELS.iter().all(|pin| pin.sha256.len() == 64));
+    }
+
+    #[test]
+    fn draft_memory_reports_the_loaded_drafter_and_nothing_for_ngram() {
+        let target = synthetic_canonical_model(SyntheticModelSpec::tiny(27));
+        assert_eq!(WorkerSpeculation::ngram(3).unwrap().draft_memory(), None);
+        let draft = Arc::new(synthetic_canonical_model(SyntheticModelSpec::tiny(28)));
+        let speculation =
+            WorkerSpeculation::with_draft_model(&target, Arc::clone(&draft), 3).unwrap();
+        let memory = speculation.draft_memory().unwrap();
+        assert_eq!(memory.resident_bytes, draft.memory_bytes());
+        // 3 layers x (K + V) x d_kv 32 x 8 bytes.
+        assert_eq!(memory.kv_bytes_per_position, 3 * 2 * 32 * 8);
     }
 }

@@ -67,8 +67,9 @@ pub const DEFAULT_MAX_DRAFT: usize = 3;
 /// bound also bounds a pass's transient memory.
 pub const MAX_DRAFT_LIMIT: usize = 32;
 /// Shortest suffix the n-gram drafter will match. On a CPU a pass of four
-/// rows costs 2.2 to 2.7 single rows (the CI bench measures it), so a guess
-/// must be likely to pay; two-token matches are mostly coincidences.
+/// rows costs 2.2 to 2.7 single rows on the vectorised kernels and 3.3 to 3.9
+/// on the scalar kernel (CI measurements), so a guess must be likely to pay;
+/// two-token matches are mostly coincidences.
 pub const DEFAULT_MIN_NGRAM: usize = 3;
 /// Longest suffix the n-gram drafter will look up. A longer matched context
 /// picks a better earlier occurrence to copy from.
