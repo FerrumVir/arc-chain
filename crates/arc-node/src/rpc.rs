@@ -21660,7 +21660,8 @@ mod tests {
         let response = released_answer(job.run).await;
         assert_eq!(response["inference"]["output_hash"], job.result.output_hash);
         assert_eq!(response["answer_release"]["settlement"], "pending");
-        job.submit.await.unwrap().unwrap();
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert_eq!(submitted["answer_release"], response["answer_release"]);
 
         // The first approval round fails after the answer was released ...
         wait_until("the first settlement attempt to fail", || {
@@ -21723,7 +21724,11 @@ mod tests {
         let job = fixture.start_job().await;
         let response = released_answer(job.run).await;
         assert_eq!(response["answer_release"]["settlement"], "pending");
-        job.submit.await.unwrap().unwrap();
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert_eq!(
+            submitted["settlement"]["status"],
+            "verified_pending_approval"
+        );
         wait_until("the reward transaction to reach the mempool", || {
             fixture.reward_submitted(job.job_hash)
         })
