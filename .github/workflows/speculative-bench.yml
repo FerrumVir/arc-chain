@@ -126,7 +126,7 @@ jobs:
             --kernel "$KERNEL" \
             --context 32 \
             --repeats 3 \
-            --ks 1,2,4,8 \
+            --ks 1,2,3,4,5,6,7,8 \
             --out "$out/result.json" \
             --summary "$out/summary.md" 2>&1 | tee "$out/bench.log" || status=$?
           if [ -f "$out/summary.md" ]; then
