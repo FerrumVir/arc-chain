@@ -588,6 +588,11 @@ mod tests {
                 for tile in [
                     Tile::DEFAULT,
                     Tile {
+                        rows_per_simdgroup: 4,
+                        simdgroups: 2,
+                        mul16: false,
+                    },
+                    Tile {
                         rows_per_simdgroup: 8,
                         simdgroups: 4,
                         mul16: true,
@@ -939,7 +944,6 @@ mod bench {
         let mut json_rows = Vec::new();
         let mut layer_items: Vec<(I8Weights, Vec<i64>)> = Vec::new();
         let mut lm_head_seconds = 0.0;
-        let mut best_tiles = Vec::new();
         for (name, rows, cols, per_layer) in SHAPES {
             let w = weights(&mut rng, rows, cols);
             let x3: Vec<i64> = (0..cols).map(|_| rng.symmetric(6_500_000)).collect();
@@ -964,7 +968,6 @@ mod bench {
             let (best, best_seconds) = sweep[0];
             let default_seconds = time_gpu(&engine, &[(&matrix, x3.as_slice())], Tile::DEFAULT);
             let four_plane_seconds = time_gpu(&engine, &[(&matrix, x4.as_slice())], best);
-            best_tiles.push(best);
             let mut out = vec![0i64; rows];
             let call_seconds = time_wall(20, || {
                 engine.project(&matrix, &x3, &mut out).expect("in domain");
@@ -1033,7 +1036,7 @@ mod bench {
             .collect();
         let items: Vec<(&ResidentMatrix, &[i64])> = resident.iter().map(|(m, x)| (m, *x)).collect();
         let layer_bytes: usize = resident.iter().map(|(m, _)| m.weight_bytes()).sum();
-        let layer_tile = best_tiles[0];
+        let layer_tile = Tile::DEFAULT;
         let layer_seconds = time_gpu(&engine, &items, layer_tile);
         let forward_seconds = 32.0 * layer_seconds + lm_head_seconds;
         let forward_bytes = 32.0 * layer_bytes as f64 + 32000.0 * 4096.0;

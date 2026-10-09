@@ -177,7 +177,9 @@ EXACT_GEMV_PLANES(0)
 EXACT_GEMV_PLANES(1)
 
 // Read-bandwidth probe for the benchmark: every thread XOR-folds a strided
-// share of the buffer, so every byte is loaded exactly once.
+// share of the buffer, so every byte is loaded exactly once. Four independent
+// loads per iteration keep enough requests in flight to approach the
+// device's read bandwidth.
 kernel void read_bandwidth(
     device const uint4 *src [[buffer(0)]],
     device uint *sink [[buffer(1)]],
@@ -185,9 +187,20 @@ kernel void read_bandwidth(
     uint gid [[thread_position_in_grid]],
     uint threads [[threads_per_grid]])
 {
-    uint4 fold = uint4(0u);
-    for (uint i = gid; i < count; i += threads) {
-        fold ^= src[i];
+    uint4 f0 = uint4(0u);
+    uint4 f1 = uint4(0u);
+    uint4 f2 = uint4(0u);
+    uint4 f3 = uint4(0u);
+    uint i = gid;
+    for (; i + 3u * threads < count; i += 4u * threads) {
+        f0 ^= src[i];
+        f1 ^= src[i + threads];
+        f2 ^= src[i + 2u * threads];
+        f3 ^= src[i + 3u * threads];
     }
+    for (; i < count; i += threads) {
+        f0 ^= src[i];
+    }
+    const uint4 fold = f0 ^ f1 ^ f2 ^ f3;
     sink[gid] = fold.x ^ fold.y ^ fold.z ^ fold.w;
 }

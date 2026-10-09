@@ -51,8 +51,9 @@ use metal::{
     ComputePipelineState, Device, MTLCommandBufferStatus, MTLGPUFamily, MTLResourceOptions,
     MTLSize,
 };
+use objc::Message;
 use objc::rc::autoreleasepool;
-use objc::{msg_send, sel, sel_impl};
+use objc::runtime::Sel;
 
 /// Source of every kernel this module runs.
 pub const KERNEL_SOURCE: &str = include_str!("metal_exact_gemv.metal");
@@ -154,11 +155,13 @@ pub struct Tile {
 }
 
 impl Tile {
-    /// Default decomposition: four rows per simdgroup, two simdgroups.
+    /// Default decomposition: four rows per simdgroup, two simdgroups,
+    /// 16-bit products. On the hosted runner it was within about 1% of the
+    /// fastest of the 32 tiles for every Llama-2-7B shape (run 37882303401).
     pub const DEFAULT: Tile = Tile {
         rows_per_simdgroup: 4,
         simdgroups: 2,
-        mul16: false,
+        mul16: true,
     };
 
     /// Every tile with compiled pipelines.
@@ -301,19 +304,18 @@ fn kernel_name(planes: usize, rows: u32, mul16: bool) -> String {
 }
 
 /// GPU execution time of a completed command buffer, in seconds.
-// objc 0.2's `msg_send!` expands a `cfg(feature = "cargo-clippy")` attribute,
-// which this crate does not declare.
-#[allow(unexpected_cfgs)]
+///
+/// metal 0.29 has no accessor for these properties, so they are read with
+/// objc's typed message send (not its `msg_send!` macro, which expands an
+/// undeclared `cargo-clippy` cfg).
 fn gpu_seconds(commands: &CommandBufferRef) -> f64 {
-    // SAFETY: GPUStartTime and GPUEndTime are read-only CFTimeInterval
-    // properties of MTLCommandBuffer; the buffer has completed.
-    let (start, end): (f64, f64) = unsafe {
-        (
-            msg_send![commands, GPUStartTime],
-            msg_send![commands, GPUEndTime],
-        )
+    let read = |property: &str| -> f64 {
+        // SAFETY: GPUStartTime and GPUEndTime are read-only CFTimeInterval
+        // (f64) properties of MTLCommandBuffer, and the buffer has completed.
+        unsafe { commands.send_message::<(), f64>(Sel::register(property), ()) }
+            .expect("MTLCommandBuffer GPU timestamps")
     };
-    end - start
+    read("GPUEndTime") - read("GPUStartTime")
 }
 
 /// `128 * sum_j |x_j| * max_i |s_i| <= i64::MAX`, with every step checked.
@@ -1012,7 +1014,7 @@ impl MetalExactGemv {
             Tile {
                 rows_per_simdgroup: 1,
                 simdgroups: 1,
-                mul16: true,
+                mul16: false,
             },
         ] {
             for epilogue in [Epilogue::CanonicalQ16, Epilogue::RawDot] {
