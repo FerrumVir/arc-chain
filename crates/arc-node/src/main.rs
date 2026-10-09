@@ -494,6 +494,16 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     enable_community_rewards_v1: bool,
 
+    /// Coordinator: answer the waiting `/inference/run` caller as soon as the
+    /// validators' 2-of-3 recomputation verifies a single-worker community
+    /// result, then collect the five-of-six reward approvals on the existing
+    /// settlement retry path. Approvals, retries and the 0x25 reward are
+    /// unchanged; only the moment the caller is answered moves. The response
+    /// then carries `answer_release` and a `verified_pending_approval`
+    /// settlement. Off by default; see docs/twin-execution.md, section 13.
+    #[arg(long, default_value_t = false)]
+    community_release_on_verification: bool,
+
     /// Coordinator: dispatch each community inference job to two community
     /// workers with distinct node keys and compare their outputs (twin
     /// execution v0). Validators recompute only on a mismatch, a spot check,
@@ -9994,6 +10004,7 @@ async fn run_arc_node() -> Result<()> {
             spot_check_per_mille: cli.community_twin_spot_check_per_mille,
             demand_interval_secs: cli.community_demand_interval_secs,
         },
+        cli.community_release_on_verification,
     )
     .await;
 
@@ -10276,6 +10287,20 @@ mod tests {
         ])
         .unwrap();
         assert!(configured.enable_native_inference_requests);
+    }
+
+    #[test]
+    fn community_release_on_verification_is_off_unless_requested() {
+        assert!(
+            !Cli::try_parse_from(["arc-node"])
+                .unwrap()
+                .community_release_on_verification
+        );
+        assert!(
+            Cli::try_parse_from(["arc-node", "--community-release-on-verification"])
+                .unwrap()
+                .community_release_on_verification
+        );
     }
 
     #[test]
@@ -11150,6 +11175,7 @@ mod tests {
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
                     arc_node::twin::TwinConfig::default(),
+                    false,
                 )
                 .await
                 .unwrap();

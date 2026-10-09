@@ -384,6 +384,7 @@ Say this only after steps 1–2 above, with numbers read from `twin_stats` and r
 | `--community-demand-dry-run` | off | coordinator: plan and log only |
 | `--community-demand-interval-secs N` | 120 | coordinator: tick (minimum 30) |
 | `--community-region-probe` | off | worker: opt-in region report |
+| `--community-release-on-verification` | off | coordinator: answer the caller once 2-of-3 verification passes; reward approvals follow on the settlement retry path (section 13) |
 
 | Endpoint | Kind | Gateway |
 |---|---|---|
@@ -393,3 +394,42 @@ Say this only after steps 1–2 above, with numbers read from `twin_stats` and r
 | `GET /community/twin_stats` | stats | needs allowlisting |
 | `GET /community/twin_receipts?limit=N` | receipts | needs allowlisting |
 | `GET /community/twin/{job_id}` | receipt | needs allowlisting |
+
+## 13. Release on verification (`--community-release-on-verification`, off by default)
+
+A coordinator switch for single-worker community jobs. It changes no consensus, genesis or on-chain rule.
+
+**What changes.** By default the waiting `/inference/run` caller is answered only after three steps: the worker's run, the validators' authenticated 2-of-3 recomputation, and the reward approvals (five of six validators, each recomputing the job, before the 0x25 transaction enters the mempool). With the switch on, the caller is answered as soon as the 2-of-3 recomputation has passed and the settlement is written to the crash-durable journal. The approvals then run on the existing settlement retry loop (`schedule_verified_settlement_retry`). That is the loop that already retries a failed first attempt and replays the journal after a restart. Its first attempt starts one second after the answer.
+
+**What does not change.**
+- No answer is released before its 2-of-3 recomputation has matched the worker's output.
+- Settlement is the same code: the same five-of-six approvals, issuance budget, 0x25 transaction, backoff and expiry.
+- A settlement that fails after the release is recorded (`last_error`) and retried as before. It never changes or withdraws the answer already sent.
+- Each job has one journal entry and one retry task. A repeated worker submit is an idempotent replay, and the chain's job marker still refuses a second payment.
+- Twin execution and sealed recovery probes keep the default ordering. Recovery probes are rollout tooling that reads the settlement evidence from the same response.
+
+**Latency effect.**
+- MEASURED, single sample (8 Oct 2026, one free 16-token desktop prompt on v0.8.11; timings from validator hop-sample timestamps and the mined receipt): 313 s from the click to the mined reward. That was worker compute 112 s, the validators' 2-of-3 recomputation about 60 s, and approvals by five of six validators about 135 s, all before the answer was released.
+- With the switch on, the about 135 s of approvals leave the request path: about 3 minutes to the answer for that prompt. This is INFERRED from the same sample, not measured with the switch on.
+- The margin to the coordinator's dispatch deadline grows by the same amount (INFERRED). The worker and the public inference permit are also freed at the release instead of after the approvals.
+
+**Response contract.** A released answer is the normal success response with two differences:
+- `settlement` is the existing `verified_pending_approval` object (`submitted: false`, `tx_hash: null`, `retry_running: true`).
+- A new `answer_release` object is added:
+
+```json
+"answer_release": {
+  "schema": "arc.community.answer-release.v1",
+  "mode": "on_verification",
+  "verification": "passed",
+  "settlement": "pending",
+  "settlement_status_url": "/community/reward_job/0x<job_id>"
+}
+```
+
+`settlement_status_url` is a public gateway route. It reports `verified_pending_approval`, then `pending_mined_receipt`, then the mined receipt. The worker's `/community/submit_work` response carries the same two fields. With the switch off, `answer_release` never appears and both responses are unchanged. The desktop already treats `verified_pending_approval` as not yet submitted: it shows the answer and pins no reward-receipt route for it.
+
+**Risk model.** The caller's answer has passed the same validator check as before, so only the timing of the answer and of settlement changes, not what is verified or paid. What remains:
+- A caller can hold an answer whose reward later fails to settle, for example when the issuance budget runs out or approvers stay unreachable until the reward expires. The worker would go unpaid in that case today as well; the difference is that the caller already has the answer.
+- More verified jobs can wait for approvals at once, because workers and permits are freed earlier. The approvers' bounded queues and the retry backoff handle this; a busy approver's HTTP 429 is retried.
+- Turning it off is a restart without the flag. Settlements already journaled keep retrying after the restart.
