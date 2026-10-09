@@ -464,13 +464,14 @@ struct Cli {
     /// off, and validators recompute without it.
     ///
     /// Measured in CI on 4-vCPU machines with this worker's model and
-    /// profile, it did not make jobs faster: `ngram` ran at 0.82-1.01x and
-    /// `draft:` at 0.49-0.78x the speed of plain decoding. Verifying 4 tokens
-    /// costs 2.2-2.7x one token on the vectorised kernel
-    /// (`ARC_FAST_CANONICAL_KERNEL=1`) and 3.3-3.9x on the scalar kernel.
-    /// It helped (up to 1.3x) only on copy- or repetition-heavy answers, with
-    /// the vectorised kernel, on a model profile whose answers are coherent.
-    /// Plain decoding stays the default.
+    /// profile, it did not make jobs faster. With the default draft length
+    /// of 3, `ngram` ran at 0.82-1.01x and `draft:` at 0.49-0.78x the speed
+    /// of plain decoding; at `--speculative-k 7`, `ngram` measured as low as
+    /// 0.65x. Verifying 4 tokens costs 2.2-2.7x one token on the vectorised
+    /// kernel (`ARC_FAST_CANONICAL_KERNEL=1`) and 3.3-3.9x on the scalar
+    /// kernel. It helped (up to 1.3x) only on copy- or repetition-heavy
+    /// answers, with the vectorised kernel, on a model profile whose answers
+    /// are coherent. Plain decoding stays the default.
     #[arg(
         long,
         value_name = "ngram|draft:PATH",

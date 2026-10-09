@@ -14,18 +14,19 @@ name: Speculative decoding bench
 # shared 4-vCPU runners, not production figures.
 #
 # Cost control: a run downloads about 21 GB from Hugging Face and uses about
-# 100 runner-minutes on four runners, so it never runs on an ordinary push. It
-# runs when started by hand (workflow_dispatch, once this file is on the
-# default branch) or when a pull request that changes the speculative engine
-# or this bench carries the `speculative-bench` label. A newer commit cancels
-# an older run of the same leg; an unrelated label event cancels nothing.
+# 100 runner-minutes on four runners, so it never runs on a push. It runs
+# when started by hand (workflow_dispatch, once this file is on the default
+# branch), or once at the moment the `speculative-bench` label is added to a
+# pull request that changes the speculative engine or this bench. One label
+# event is one run: later pushes do not re-run it, and measuring again means
+# removing and re-adding the label. An unrelated label event cancels nothing.
 # Models are downloaded each run and never uploaded. They are not cached:
 # actions/cache is not on the reviewed action allowlist
 # (tests/release/static_contract_test.sh). The unit and golden-vector tests
 # in ci.yml and golden-vectors.yml cover speculative.rs on every push.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [labeled]
     paths:
       - .github/workflows/speculative-bench.yml
       - crates/arc-inference/examples/speculative_bench.rs
@@ -56,8 +57,7 @@ jobs:
     name: 7B bench / ${{ matrix.runner }} / ${{ matrix.kernel }} / ${{ matrix.profile }}
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (contains(github.event.pull_request.labels.*.name, 'speculative-bench') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'speculative-bench'))
+      github.event.label.name == 'speculative-bench'
     # Per leg, so a skipped run (no label, or another label added) never
     # takes the slot of a run that is measuring.
     concurrency:
