@@ -8302,7 +8302,7 @@ async fn run_arc_node() -> Result<()> {
                 );
                 if !fast_kernel {
                     tracing::warn!(
-                        "--speculative is running on the scalar kernel, where a multi-row pass costs close to one row per row; set ARC_FAST_CANONICAL_KERNEL=1 for the vectorised kernel, where speculation pays"
+                        "--speculative is running on the scalar kernel. On CPUs, speculation helps only on copy- or repetition-heavy answers, and only with the vectorised kernel (ARC_FAST_CANONICAL_KERNEL=1), because verifying 4 tokens costs 2.2-3.7x one token there (CI measurement). Plain decoding stays the default."
                     );
                 }
                 Some(Arc::new(speculation))
