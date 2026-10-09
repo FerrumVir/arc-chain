@@ -95,15 +95,46 @@ shards 0 to 4 were cancelled on 2026-10-06 and re-run in attempt 4 (shard 5 comp
   cross-platform deterministic)`, the reward profile that validator shards and full-integer
   community workers are pinned to; the interleaved profile above, which the native executor uses,
   is this profile with the Q and K weight rows reordered at load, under its own profile label),
-  gave one common SHA-256, `4464b4b1a3df705622ffc6c47e39ef92646823843f49a470c84e457225459bca`, on
-  Linux x86_64, Windows x86_64 and Linux arm64, each with the scalar and the SIMD kernel: 6 of 6
-  cells, with the SIMD kernels accepting 175,950 of 175,950 projections
-  ([run 37931434482](https://github.com/FerrumVir/arc-chain/actions/runs/37931434482)). That run
-  did not include Intel macOS or Apple Silicon, so those are not covered for this profile.
+  gave one common SHA-256, `4464b4b1a3df705622ffc6c47e39ef92646823843f49a470c84e457225459bca`
+  (130,100 bytes), on every platform tested:
+  - [Run 37931434482](https://github.com/FerrumVir/arc-chain/actions/runs/37931434482): Linux x86_64, Windows x86_64 and Linux arm64, each with the scalar and
+    the SIMD kernel, 6 of 6 cells. The SIMD kernels accepted 175,950 of 175,950 projections.
+  - [Run 37934469968](https://github.com/FerrumVir/arc-chain/actions/runs/37934469968), whose compare job ([job 113945530730](https://github.com/FerrumVir/arc-chain/actions/runs/37934469968/job/113945530730)) reports PASS, 9 of 9 cells
+    identical: the same six cells again, plus Intel macOS (Intel Core i7-8700B, scalar and AVX2;
+    AVX2 accepted 175,950 of 175,950) and Apple Silicon (one virtual Apple M1 runner with 7 GB of
+    memory, NEON kernel only, six prompt shards joined in shard order; NEON accepted 175,950 of 175,950).
+    The legacy profile has no Apple Silicon scalar leg, so the NEON transcript is compared with the
+    x86 scalar transcript.
+  - Checked outside CI: every artifact zip was verified against GitHub's digest, every transcript
+    was re-hashed, the Apple Silicon shards were joined in shard order, and every cell is
+    byte-identical to the Linux scalar transcript of both runs.
 - Decode tokens per second are forward passes per second on GitHub-hosted runners. The Apple
   Silicon runner has 7 GB of memory and swaps the ~7.3 GiB model, so its rate (about one token a
   minute) measures swapping, not the chip. NEON and scalar ran at about the same rate there (0.017
   and 0.016), so this run shows that the NEON kernel gives the same answer, not that it is faster.
+
+### Speed of the fast kernel (CI-runner measurements)
+
+These are single measurements on shared, virtualized GitHub-hosted runners, not product
+benchmarks, and the CPU model of a runner can differ between jobs of the same run. The table lists
+only pairs whose scalar job and fast-kernel job reported the same CPU model (for the arm64 runner,
+Neoverse-N2 in the runner capture of every job), so each ratio compares like with like. Pairs whose
+two jobs ran on different CPU models, such as the Linux and Windows pairs of the 8-cell run above,
+are not shown. Apple Silicon is not shown either: its 7 GB runner swaps the model.
+
+| Platform | CPU (both jobs) | Profile | Scalar tok/s | Fast kernel tok/s | Ratio | Run |
+| --- | --- | --- | --- | --- | --- | --- |
+| Linux x86_64 | AMD EPYC 9V45 | legacy split-half | 1.43 | 2.70 (AVX2) | 1.89x | [37931434482](https://github.com/FerrumVir/arc-chain/actions/runs/37931434482) |
+| Windows x86_64 | AMD EPYC 9V45 | legacy split-half | 1.42 | 2.40 (AVX2) | 1.69x | [37934469968](https://github.com/FerrumVir/arc-chain/actions/runs/37934469968) |
+| Linux arm64 | Neoverse-N2 | legacy split-half | 1.86 | 2.88 (NEON) | 1.55x | [37931434482](https://github.com/FerrumVir/arc-chain/actions/runs/37931434482) |
+| Linux arm64 | Neoverse-N2 | legacy split-half | 1.89 | 2.87 (NEON) | 1.52x | [37934469968](https://github.com/FerrumVir/arc-chain/actions/runs/37934469968) |
+| Linux arm64 | Neoverse-N2 | interleaved | 1.89 | 2.84 (NEON) | 1.51x | [37882594919](https://github.com/FerrumVir/arc-chain/actions/runs/37882594919) |
+| macOS Intel | Intel Core i7-8700B | interleaved | 0.65 | 0.81 (AVX2) | 1.25x | [37467005539](https://github.com/FerrumVir/arc-chain/actions/runs/37467005539) |
+| macOS Intel | Intel Core i7-8700B | legacy split-half | 0.85 | 0.90 (AVX2) | 1.06x | [37934469968](https://github.com/FerrumVir/arc-chain/actions/runs/37934469968) |
+
+In these measurements the ratio is 1.06x to 1.25x on the Intel Core i7-8700B, 1.51x to 1.55x on
+Neoverse-N2 and 1.69x to 1.89x on AMD EPYC 9V45, so it depends on the processor. The transcripts
+are identical in every case, so none of this affects the determinism result.
 
 ## How CI runs it
 
@@ -195,9 +226,11 @@ computer.
   arm64 the attention dot product also uses an exact NEON path in both jobs.
   "Apple Silicon" is one GitHub-hosted virtual Apple M1 runner with 7 GB of
   memory; other Apple chips are untested.
-- **Two execution profiles, not equally covered.** This workflow runs
-  `arc.gguf-llama.i8-per-row.rope-interleaved.v1`. The legacy split-half profile was run separately,
-  in a lab run, on Linux x86_64, Windows x86_64 and Linux arm64 only (see Results).
+- **Two execution profiles.** This workflow runs `arc.gguf-llama.i8-per-row.rope-interleaved.v1`
+  on all four platforms with both kernels. The legacy split-half profile was run separately, in two
+  lab runs (see Results), with the same model and the same 16 x 32 workload: on Linux x86_64,
+  Windows x86_64, Linux arm64 and Intel macOS with both kernels, and on Apple Silicon with the NEON
+  kernel only (there was no scalar leg).
 - **Load-time floating point.** The engine's arithmetic is integer-only, but
   model loading uses floating point. Dequantizing GGUF blocks, requantizing
   rows to INT8 and converting embeddings and norms to Q16 use only exactly
