@@ -56,10 +56,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {runner: ubuntu-24.04, kernel: simd, profile: legacy}
-          - {runner: ubuntu-24.04, kernel: scalar, profile: legacy}
-          - {runner: ubuntu-24.04-arm, kernel: simd, profile: legacy}
-          - {runner: ubuntu-24.04-arm, kernel: simd, profile: interleaved}
+          - {runner: ubuntu-24.04, kernel: both, profile: legacy}
+          - {runner: ubuntu-24.04-arm, kernel: both, profile: legacy}
     env:
       RUNNER_LABEL: ${{ matrix.runner }}
       KERNEL: ${{ matrix.kernel }}
@@ -113,23 +111,22 @@ jobs:
         with:
           toolchain: nightly-2026-03-16
 
-      - name: Build the bench driver (release, Candle GGUF loader)
-        run: cargo build --locked --release -p arc-inference --features candle --example speculative_bench
+      - name: Build the stage-rows bench (release, Candle GGUF loader)
+        run: cargo build --locked --release -p arc-inference --features candle --example stage_rows_bench
 
-      - name: Run plain and speculative decoding
+      - name: Run k-row and one-row stage calls
         timeout-minutes: 110
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/speculative-bench"
           mkdir -p "$out"
           status=0
-          target/release/examples/speculative_bench \
+          target/release/examples/stage_rows_bench \
             --model "$GITHUB_WORKSPACE/$MODEL_FILE" \
-            --draft-model "$GITHUB_WORKSPACE/$DRAFT_FILE" \
             --kernel "$KERNEL" \
-            --profile "$PROFILE" \
-            --max-new-tokens "$MAX_NEW_TOKENS" \
-            --configs "$CONFIGS" \
+            --context 32 \
+            --repeats 3 \
+            --ks 1,2,4,8 \
             --out "$out/result.json" \
             --summary "$out/summary.md" 2>&1 | tee "$out/bench.log" || status=$?
           if [ -f "$out/summary.md" ]; then
