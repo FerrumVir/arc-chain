@@ -1,3 +1,5 @@
+> Current creation policy: [K2.6 INT16 default](kimi-k26-int16-default.md). The explicit policies and historical evidence below retain their original identities and SHA labels.
+
 # Provisional precision integration into lossless slices
 
 This #168 revision integrates ARC-66 engine commit

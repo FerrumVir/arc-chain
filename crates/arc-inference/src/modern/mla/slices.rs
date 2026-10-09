@@ -239,6 +239,7 @@ impl SliceSource {
                 "pre-quantised INT4 experts are stored as i4g32, never requantised",
             ));
         }
+        config.precision = super::precision::creation_default(&config.architecture);
         config.validate()?;
         if expert_groups == 0 || !config.n_routed_experts.is_multiple_of(expert_groups) {
             return Err(invalid(format!(
@@ -255,7 +256,8 @@ impl SliceSource {
         })
     }
 
-    /// Select a complete policy before planning, conversion or record hashing.
+    /// Explicit comparison policy override before conversion/hashing.
+    /// `None` explicitly requests the historical INT8 identity; `open` defaults K2.6 to INT16.
     pub fn with_precision(
         mut self,
         precision: Option<super::precision::Precision>,
@@ -1882,7 +1884,16 @@ mod tests {
         ] {
             let dir = temp_dir("pinned");
             let manifest = write_checkpoint(&c, storage, yarn, &dir);
-            let m = slice_all(&dir, &manifest, groups, &dir.join("slices"));
+            // Explicit historical comparison: never update these published identities.
+            let src = SliceSource::open(&dir, &manifest, None, groups)
+                .unwrap()
+                .with_precision(None)
+                .unwrap();
+            let out = dir.join("slices");
+            for unit in all_units(&src.config) {
+                convert_units(&src, &dir, &[unit], &out, false).unwrap();
+            }
+            let m = build_manifest(&src, &read_records(&src, &out).unwrap()).unwrap();
             got.push(m["manifest_blake3"].as_str().unwrap().to_string());
         }
         assert_eq!(

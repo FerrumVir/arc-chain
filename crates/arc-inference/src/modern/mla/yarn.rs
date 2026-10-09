@@ -241,11 +241,41 @@ pub fn finalize_pending_slices(
     max_seq: usize,
     probe_layers: Option<usize>,
 ) -> Result<Value, ModernError> {
+    finalize_pending_slices_with_precision(
+        config,
+        input,
+        max_seq,
+        probe_layers,
+        Some(super::precision::Precision::all_int16()),
+    )
+}
+
+/// Explicit historical/comparison policy; None preserves the original INT8 identity.
+pub fn finalize_pending_slices_with_precision(
+    config: &[u8],
+    input: &Value,
+    max_seq: usize,
+    probe_layers: Option<usize>,
+    precision: Option<super::precision::Precision>,
+) -> Result<Value, ModernError> {
+    if let Some(p) = &precision {
+        p.validate()?;
+    }
+    let mut c = official_config(config, max_seq, probe_layers)?;
+    c.precision = precision.clone();
+    let mut original = official_config(config, max_seq, None)?;
+    original.precision = precision.clone();
+    let pending_profile = if precision.is_some() {
+        super::precision::mixed_profile(super::PROFILE_I4G32)
+    } else {
+        super::PROFILE_I4G32
+    };
     let hash =
         crate::model_package::manifest_body_blake3(input).map_err(|e| invalid(e.to_string()))?;
     if input["manifest_blake3"] != hash
         || input["schema"] != "arc.integer-slice-manifest.v1"
-        || input["profile"] != super::PROFILE_I4G32
+        || input["profile"] != pending_profile
+        || super::slices::manifest_precision(input)? != precision
         || input["pending"] != json!(["rope_scaling yarn"])
         || !["model", "tables", "model_root"]
             .iter()
@@ -254,8 +284,6 @@ pub fn finalize_pending_slices(
     {
         return Err(invalid("not a valid pending K2.6 weight manifest"));
     }
-    let c = official_config(config, max_seq, probe_layers)?;
-    let original = official_config(config, max_seq, None)?;
     let all: Vec<SegmentDigest> = input["segments"]
         .as_array()
         .ok_or_else(|| invalid("no segments"))?
@@ -492,9 +520,12 @@ mod tests {
     fn full_and_probe_finalization_have_distinct_explicit_identities() {
         let input = pending();
         let saved = input.clone();
-        let full = finalize_pending_slices(CONFIG, &input, 4096, None).unwrap();
+        let full =
+            finalize_pending_slices_with_precision(CONFIG, &input, 4096, None, None).unwrap();
         for layers in 1..=3 {
-            let probe = finalize_pending_slices(CONFIG, &input, 4096, Some(layers)).unwrap();
+            let probe =
+                finalize_pending_slices_with_precision(CONFIG, &input, 4096, Some(layers), None)
+                    .unwrap();
             assert_eq!(probe["profile"], PROBE_PROFILE);
             assert_eq!(probe["model"]["n_layers"], layers);
             assert_eq!(
@@ -507,8 +538,12 @@ mod tests {
         }
         assert_eq!(input, saved, "must not clear the caller's pending fields");
         assert_eq!(full["profile"], PROFILE);
-        assert!(finalize_pending_slices(CONFIG, &input, 4096, Some(0)).is_err());
-        assert!(finalize_pending_slices(CONFIG, &input, 4096, Some(4)).is_err());
+        assert!(
+            finalize_pending_slices_with_precision(CONFIG, &input, 4096, Some(0), None).is_err()
+        );
+        assert!(
+            finalize_pending_slices_with_precision(CONFIG, &input, 4096, Some(4), None).is_err()
+        );
     }
 
     #[test]
@@ -542,13 +577,13 @@ mod tests {
             }
             seal(&mut v);
             assert!(
-                finalize_pending_slices(CONFIG, &v, 4096, Some(2)).is_err(),
+                finalize_pending_slices_with_precision(CONFIG, &v, 4096, Some(2), None).is_err(),
                 "{kind}"
             );
         }
         let mut v = pending();
         v["manifest_blake3"] = "0".repeat(64).into();
-        assert!(finalize_pending_slices(CONFIG, &v, 4096, None).is_err());
+        assert!(finalize_pending_slices_with_precision(CONFIG, &v, 4096, None, None).is_err());
         let mut c = official_config(CONFIG, 4096, Some(2)).unwrap();
         c.n_layers = 61;
         assert!(c.validate().is_err());

@@ -42,7 +42,7 @@ def budget():
         assembly_ram=(8+49*8+8)*2**20+depth*2**20
         largest_reference_matrix=max(v*d,experts*d*mf if moe else 0)
         reference_transient=4*largest_reference_matrix
-        for policy in ('legacy','int16','mixed'):
+        for policy in ('int16','legacy','mixed'):
             wide=set() if policy=='legacy' else set(classes) if policy=='int16' else {'attention','dense','head'}
             precision=None if policy=='legacy' else dict(version=1, **{key:'int16' if key in wide else 'int8' for key in classes})
             weight_bytes=fixed_bytes+row_scales+sum(elements*(2 if key in wide else 1) for key,elements in bf16_elements.items())
@@ -51,7 +51,7 @@ def budget():
             peak_disk=retained+2*weight_bytes+tables+disk_margin+reserve
             engine_ram=weight_bytes+tables+assembly_ram+3*GIB
             reference_ram=retained+reference_fp32+reference_transient+3*GIB
-            rows.append(dict(layers=depth,policy=policy,precision=precision,selected_sources=selected_sources,
+            rows.append(dict(layers=depth,policy=policy,policy_role='governing-default' if policy=='int16' else 'historical-comparison-only',precision=precision,selected_sources=selected_sources,
                 class_matrix_elements=bf16_elements,retained_source_bytes=retained,
                 slice_payload_bytes=weight_bytes,assembly_copy_bytes=weight_bytes,canonical_table_bytes=tables,
                 disk_header_alignment_scratch_margin_bytes=disk_margin,disk_reserve_bytes=reserve,
@@ -62,9 +62,9 @@ def budget():
                 reference_fp32_parameters_bytes=reference_fp32,reference_largest_fp32_tensor_scratch_bytes=reference_transient,
                 engine_resident_planning_bytes=engine_ram,reference_resident_planning_bytes=reference_ram,
                 sequential_available_ram_planning_bytes=max(conversion_scratch+transpose_scratch+3*GIB,engine_ram,reference_ram)))
-    return dict(engine_dependency='616ba16a60f43b5e70666ca24f5d7f9ce99ab932',dependency_review='provisional/unreviewed',
+    return dict(governing_policy='int16',policy_decision='TJ 2026-10-09: all five BF16 matrix classes INT16; native INT4 and router/norms unchanged',engine_dependency='616ba16a60f43b5e70666ca24f5d7f9ce99ab932',dependency_review='provisional/unreviewed',
         pins={p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in (config_path,source_path)},
-        assumptions=['Calculated bytes, not measured disk/RSS. No host admission.',
+        assumptions=['Calculated bytes, not measured disk/RSS. No host admission. INT16 is primary; legacy/mixed plans are historical comparisons, not authorized downgrades.',
         'INT16 nonzero rows require 2^-17 <= max(abs(w)) < 2^30 after semantic transpose. All-zero rows are supported. Count zero, below-range, in-range, at/above-range and nonfinite rows per tensor/class from retained BF16 before first real-tensor conversion. No flush rule is approved.',
         'Retain every selected original shard; do not delete source needed by reference.',
         'Slices and one assembled package set coexist; atomic rename does not duplicate the staging bundle.',

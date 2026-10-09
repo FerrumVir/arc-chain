@@ -57,7 +57,10 @@ const USAGE: &str = "usage: arc-mla <command> [options]
                  [--expert-groups G] [--experts i8|i4g32]
   slice-verify   --manifest MANIFEST.json --slices SLICES [--only NAME[,NAME..]] [--segments]
   slice-assemble-yarn --config CONFIG --source-manifest SOURCE --manifest SLICES.json --slices DIR --out-dir NEW_DIR [--probe-layers N | --fixture] [--stages N] [--precision POLICY.json]
-  # --precision POLICY.json also applies to slice-plan, slice and slice-manifest.
+  # --precision POLICY.json also applies to slice-plan, slice, slice-manifest, yarn-prepare.
+  # K2.6 creation defaults to all five BF16 matrix classes INT16. Native INT4/router/norms unchanged.
+  # --historical-int8 explicitly reproduces old comparison identities; conflicts with --precision.
+  # Explicit non-default policies are comparison experiments, not approved deployment policies.
   slice-assemble --manifest MANIFEST.json --slices SLICES --out PKG [--layers A:B]
 
 UNITS selects what to slice: --layers A:B, --embed, --head (everything when
@@ -221,7 +224,26 @@ fn open_model(args: &Args) -> Result<(StageModel, f64), ModernError> {
 
 fn precision_policy(
     args: &Args,
+    default: Option<arc_inference::modern::mla::precision::Precision>,
 ) -> Result<Option<arc_inference::modern::mla::precision::Precision>, ModernError> {
+    if args.flag("--historical-int8") {
+        if args.flag("--precision")
+            || args
+                .items
+                .iter()
+                .filter(|a| *a == "--historical-int8")
+                .count()
+                != 1
+        {
+            return Err(ModernError::Invalid(
+                "--historical-int8 conflicts with --precision or duplicate flag".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    if !args.flag("--precision") {
+        return Ok(default);
+    }
     if args.flag("--precision")
         && (args.items.iter().filter(|a| *a == "--precision").count() != 1
             || args
@@ -251,15 +273,25 @@ fn cmd_convert(args: &Args) -> Result<(), ModernError> {
         .map(|s| StageSpec::parse(&s))
         .transpose()?;
     let experts = ExpertFormat::parse(&args.value("--experts").unwrap_or_else(|| "i8".into()))?;
-    let precision = precision_policy(args)?;
-    let report = convert::convert_stage_with_precision(
-        &args.path("--source-dir")?,
-        &source,
-        stage,
-        experts,
-        precision,
-        &args.path("--out")?,
-    )?;
+    let explicit = args.flag("--precision") || args.flag("--historical-int8");
+    let report = if explicit {
+        convert::convert_stage_with_precision(
+            &args.path("--source-dir")?,
+            &source,
+            stage,
+            experts,
+            precision_policy(args, None)?,
+            &args.path("--out")?,
+        )?
+    } else {
+        convert::convert_stage(
+            &args.path("--source-dir")?,
+            &source,
+            stage,
+            experts,
+            &args.path("--out")?,
+        )?
+    };
     if let Some(path) = args.value("--manifest-out") {
         let manifest = report.manifest.as_ref().ok_or_else(|| {
             ModernError::Invalid("--manifest-out needs a whole-model conversion".into())
@@ -294,13 +326,23 @@ fn cmd_yarn_prepare(args: &Args) -> Result<(), ModernError> {
     } else {
         None
     };
-    let c = yarn::official_config(&config, max_seq, probe)?;
+    let mut c = yarn::official_config(&config, max_seq, probe)?;
+    c.precision = precision_policy(
+        args,
+        Some(arc_inference::modern::mla::precision::Precision::all_int16()),
+    )?;
     let manifest = if args.flag("--slice-manifest") {
         let input = read_json(&args.path("--slice-manifest")?)?;
         let target = args.path("--manifest-out")?;
         Some((
             target,
-            yarn::finalize_pending_slices(&config, &input, max_seq, probe)?,
+            yarn::finalize_pending_slices_with_precision(
+                &config,
+                &input,
+                max_seq,
+                probe,
+                c.precision.clone(),
+            )?,
         ))
     } else {
         if args.flag("--manifest-out") {
@@ -871,13 +913,14 @@ fn slice_source(args: &Args) -> Result<SliceSource, ModernError> {
         .value("--experts")
         .map(|e| ExpertFormat::parse(&e))
         .transpose()?;
-    SliceSource::open(
+    let src = SliceSource::open(
         &args.path("--source-dir")?,
         &args.path("--source-manifest")?,
         experts,
         args.number("--expert-groups", 1)?,
-    )?
-    .with_precision(precision_policy(args)?)
+    )?;
+    let policy = precision_policy(args, src.config.precision.clone())?;
+    src.with_precision(policy)
 }
 
 fn slice_units(args: &Args, src: &SliceSource) -> Result<Vec<slices::Unit>, ModernError> {
@@ -1001,7 +1044,16 @@ fn cmd_slice_verify(args: &Args) -> Result<(), ModernError> {
 
 fn cmd_slice_assemble(args: &Args) -> Result<(), ModernError> {
     let manifest = SliceManifest::read(&args.path("--manifest")?)?;
-    if slices::manifest_precision(&manifest.value)? != precision_policy(args)? {
+    if slices::manifest_precision(&manifest.value)?
+        != precision_policy(
+            args,
+            arc_inference::modern::mla::precision::creation_default(
+                manifest.value["shape"]["architecture"]
+                    .as_str()
+                    .unwrap_or(""),
+            ),
+        )?
+    {
         return Err(ModernError::Invalid(
             "slice precision differs from requested policy".into(),
         ));
@@ -1068,7 +1120,10 @@ fn cmd_slice_assemble_yarn(args: &Args) -> Result<(), ModernError> {
         &args.path("--slices")?,
         &args.path("--out-dir")?,
         count,
-        precision_policy(args)?,
+        precision_policy(
+            args,
+            Some(arc_inference::modern::mla::precision::Precision::all_int16()),
+        )?,
     )?;
     println!(
         "{}",

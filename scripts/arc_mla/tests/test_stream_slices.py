@@ -9,6 +9,7 @@ are replaced by fakes that record which shards are on disk at every download.
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import tempfile
 import unittest
@@ -47,7 +48,7 @@ class Fakes:
             return "already present"
         if dest.name.endswith(".safetensors"):
             self.fetches.append((dest.name, self.shards_on_disk()))
-        dest.write_bytes(b"\0" * size)
+        dest.write_bytes(b'{"model_type":"kimi_k2"}' if dest.name=='config.json' else b"\0" * size)
         return "downloaded"
 
     def run(self, cmd):
@@ -63,7 +64,7 @@ class Fakes:
             units = [f"layer.{i}" for i in range(a, b)]
             (self.out / "units").mkdir(parents=True, exist_ok=True)
             for u in units:
-                (self.out / "units" / f"{u}.json").write_text("{}")
+                (self.out / "units" / f"{u}.json").write_text(json.dumps({'context': {'precision': dict(version=1, **{k:'int16' for k in ('attention','dense','shared','embedding','head')})}}))
                 if u == self.crash_after_unit:
                     self.crash_after_unit = None
                     raise Interrupted(u)
@@ -78,7 +79,7 @@ class OneShardBound(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.work, self.out = root / "work", root / "slices"
-        entry = lambda name: {"name": name, "bytes": 10, "sha256": "0" * 64}  # noqa: E731
+        entry = lambda name: {"name": name, "bytes": len(b'{"model_type":"kimi_k2"}') if name=='config.json' else 10, "sha256": hashlib.sha256(b'{"model_type":"kimi_k2"}').hexdigest() if name=='config.json' else "0" * 64}  # noqa: E731
         self.manifest = root / "source.json"
         self.manifest.write_text(json.dumps({
             "schema": "arc.hf-source.v1", "repo": "arc-test/stream", "revision": "0", "max_seq": 8,
@@ -127,13 +128,25 @@ class OneShardBound(unittest.TestCase):
         (self.out / "units/layer.0.json").write_text(json.dumps({"context":{"precision":old}}))
         mixed = self.work / "mixed.json"
         mixed.write_text(json.dumps(dict(old, embedding="int8", shared="int8")))
-        for label, settings in [("omitted", []), ("different-non-null", ["--precision", str(mixed)])]:
+        for label, settings in [("historical", ["--historical-int8"]), ("different-non-null", ["--precision", str(mixed)])]:
             with self.subTest(policy=label):
                 with mock.patch.object(self.module,"fetch") as fetch, mock.patch.object(self.module,"run") as run:
                     with self.assertRaisesRegex(SystemExit,"resume precision"):
                         self.module.main(["--arc-mla","arc-mla","--source-manifest",str(self.manifest),"--work",str(self.work),"--out",str(self.out),"--resume", *settings])
                     fetch.assert_not_called();run.assert_not_called()
                 self.assertEqual(source.read_bytes(),b"retained source")
+
+    def test_omitted_policy_rejects_legacy_resume_before_fetch_or_delete(self):
+        first = Fakes(self.work, self.out, crash_after_unit="layer.0")
+        with self.assertRaises(Interrupted): self.main(first)
+        record = self.out / "units/layer.0.json"
+        record.write_text(json.dumps({"context": {}}))
+        before = {p.name:p.read_bytes() for p in self.work.iterdir()}
+        with mock.patch.object(self.module,"fetch") as fetch, mock.patch.object(self.module,"run") as run:
+            with self.assertRaisesRegex(SystemExit,"resume precision differs"):
+                self.module.main(["--arc-mla","arc-mla","--source-manifest",str(self.manifest),"--work",str(self.work),"--out",str(self.out),"--resume"])
+            fetch.assert_not_called(); run.assert_not_called()
+        self.assertEqual(before,{p.name:p.read_bytes() for p in self.work.iterdir()})
 
     def test_keep_source_still_keeps_shards_when_resuming(self):
         first = Fakes(self.work, self.out, crash_after_unit="layer.0")

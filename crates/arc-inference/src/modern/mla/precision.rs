@@ -21,6 +21,12 @@ pub struct Precision {
     pub embedding: Bits,
     pub head: Bits,
 }
+/// Creation default only. Never use this when decoding an existing identity.
+pub fn creation_default(architecture: &str) -> Option<Precision> {
+    (architecture == "kimi_k2" || architecture.starts_with("arc-test/kimi-k26"))
+        .then(Precision::all_int16)
+}
+
 impl Precision {
     pub fn all_int16() -> Self {
         Self {
@@ -297,6 +303,26 @@ pub fn project_i16(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn creation_defaults_cover_five_classes_without_changing_legacy_decoding() {
+        let p = creation_default("kimi_k2").unwrap();
+        assert_eq!(p, Precision::all_int16());
+        for name in [
+            "embed.q",
+            "lm_head.q",
+            "layer.0.q_a.q",
+            "layer.0.w_up.q",
+            "layer.1.shared.w_up.q",
+        ] {
+            assert_eq!(p.canonical(name), Bits::Int16, "{name}");
+        }
+        assert_eq!(p.canonical("layer.1.experts.0.w_up.q"), Bits::Int8);
+        assert_eq!(p.canonical("layer.1.router.q"), Bits::Int8);
+        // The classifier excludes these native classes; it does not recast them.
+        assert!(creation_default("deepseek_v3").is_none());
+        assert_eq!(creation_default("arc-test/kimi-k26-yarn"), Some(p));
+    }
+
     #[test]
     fn independent_python_row_router_norm_and_projection_oracle() {
         let corpus: Value = serde_json::from_str(include_str!(

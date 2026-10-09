@@ -170,7 +170,7 @@ jobs:
           bin=./target/release/arc-mla
           [ -f "$bin.exe" ] && bin="$bin.exe"
           bash scripts/arc_mla/slice_checks.sh "$PWD/$bin" "$RUNNER_TEMP/slices-work" "$RUNNER_TEMP/evidence"
-      - name: Provisional precision integration (offline; legacy, all-INT16, mixed)
+      - name: INT16-default integration (offline; omitted, explicit, historical)
         shell: bash
         run: |
           bin=./target/release/arc-mla

@@ -1,4 +1,6 @@
 {
+  "governing_policy": "int16",
+  "policy_decision": "TJ 2026-10-09: all five BF16 matrix classes INT16; native INT4 and router/norms unchanged",
   "engine_dependency": "616ba16a60f43b5e70666ca24f5d7f9ce99ab932",
   "dependency_review": "provisional/unreviewed",
   "pins": {
@@ -6,7 +8,7 @@
     "docs/protocol/packages/kimi-k26.source.json": "612f34f489b8c1b47e996310615ec6cee31a66d89be31357149e4b362ee719f7"
   },
   "assumptions": [
-    "Calculated bytes, not measured disk/RSS. No host admission.",
+    "Calculated bytes, not measured disk/RSS. No host admission. INT16 is primary; legacy/mixed plans are historical comparisons, not authorized downgrades.",
     "INT16 nonzero rows require 2^-17 <= max(abs(w)) < 2^30 after semantic transpose. All-zero rows are supported. Count zero, below-range, in-range, at/above-range and nonfinite rows per tensor/class from retained BF16 before first real-tensor conversion. No flush rule is approved.",
     "Retain every selected original shard; do not delete source needed by reference.",
     "Slices and one assembled package set coexist; atomic rename does not duplicate the staging bundle.",
@@ -20,40 +22,8 @@
   "rows": [
     {
       "layers": 1,
-      "policy": "legacy",
-      "precision": null,
-      "selected_sources": [
-        "model-00001-of-000064.safetensors",
-        "model-00062-of-000064.safetensors"
-      ],
-      "class_matrix_elements": {
-        "embedding": 1174405120,
-        "head": 1174405120,
-        "attention": 101122048,
-        "dense": 396361728,
-        "shared": 0
-      },
-      "retained_source_bytes": 5692637048,
-      "slice_payload_bytes": 2848653632,
-      "assembly_copy_bytes": 2848653632,
-      "canonical_table_bytes": 1048576,
-      "disk_header_alignment_scratch_margin_bytes": 536870912,
-      "disk_reserve_bytes": 5368709120,
-      "peak_disk_with_retained_sources_bytes": 17296572920,
-      "optional_persisted_fp32_cache_extra_disk_bytes": 11385270272,
-      "conversion_scratch_ram_bytes": 4751186240,
-      "kv_b_transpose_ram_bytes": 33554432,
-      "assembly_buffer_ram_bytes": 428867584,
-      "largest_source_bf16_tensor_bytes": 2348810240,
-      "reference_fp32_parameters_bytes": 11385270272,
-      "reference_largest_fp32_tensor_scratch_bytes": 4697620480,
-      "engine_resident_planning_bytes": 6499795264,
-      "reference_resident_planning_bytes": 24996753272,
-      "sequential_available_ram_planning_bytes": 24996753272
-    },
-    {
-      "layers": 1,
       "policy": "int16",
+      "policy_role": "governing-default",
       "precision": {
         "version": 1,
         "embedding": "int16",
@@ -93,7 +63,42 @@
     },
     {
       "layers": 1,
+      "policy": "legacy",
+      "policy_role": "historical-comparison-only",
+      "precision": null,
+      "selected_sources": [
+        "model-00001-of-000064.safetensors",
+        "model-00062-of-000064.safetensors"
+      ],
+      "class_matrix_elements": {
+        "embedding": 1174405120,
+        "head": 1174405120,
+        "attention": 101122048,
+        "dense": 396361728,
+        "shared": 0
+      },
+      "retained_source_bytes": 5692637048,
+      "slice_payload_bytes": 2848653632,
+      "assembly_copy_bytes": 2848653632,
+      "canonical_table_bytes": 1048576,
+      "disk_header_alignment_scratch_margin_bytes": 536870912,
+      "disk_reserve_bytes": 5368709120,
+      "peak_disk_with_retained_sources_bytes": 17296572920,
+      "optional_persisted_fp32_cache_extra_disk_bytes": 11385270272,
+      "conversion_scratch_ram_bytes": 4751186240,
+      "kv_b_transpose_ram_bytes": 33554432,
+      "assembly_buffer_ram_bytes": 428867584,
+      "largest_source_bf16_tensor_bytes": 2348810240,
+      "reference_fp32_parameters_bytes": 11385270272,
+      "reference_largest_fp32_tensor_scratch_bytes": 4697620480,
+      "engine_resident_planning_bytes": 6499795264,
+      "reference_resident_planning_bytes": 24996753272,
+      "sequential_available_ram_planning_bytes": 24996753272
+    },
+    {
+      "layers": 1,
       "policy": "mixed",
+      "policy_role": "historical-comparison-only",
       "precision": {
         "version": 1,
         "embedding": "int8",
@@ -133,41 +138,8 @@
     },
     {
       "layers": 2,
-      "policy": "legacy",
-      "precision": null,
-      "selected_sources": [
-        "model-00001-of-000064.safetensors",
-        "model-00002-of-000064.safetensors",
-        "model-00062-of-000064.safetensors"
-      ],
-      "class_matrix_elements": {
-        "embedding": 1174405120,
-        "head": 1174405120,
-        "attention": 202244096,
-        "dense": 396361728,
-        "shared": 44040192
-      },
-      "retained_source_bytes": 15501684512,
-      "slice_payload_bytes": 12512505856,
-      "assembly_copy_bytes": 12512505856,
-      "canonical_table_bytes": 2097152,
-      "disk_header_alignment_scratch_margin_bytes": 536870912,
-      "disk_reserve_bytes": 5368709120,
-      "peak_disk_with_retained_sources_bytes": 46434373408,
-      "optional_persisted_fp32_cache_extra_disk_bytes": 79622731264,
-      "conversion_scratch_ram_bytes": 4751555200,
-      "kv_b_transpose_ram_bytes": 33554432,
-      "assembly_buffer_ram_bytes": 429916160,
-      "largest_source_bf16_tensor_bytes": 2348810240,
-      "reference_fp32_parameters_bytes": 79622731264,
-      "reference_largest_fp32_tensor_scratch_bytes": 22548578304,
-      "engine_resident_planning_bytes": 16165744640,
-      "reference_resident_planning_bytes": 120894219552,
-      "sequential_available_ram_planning_bytes": 120894219552
-    },
-    {
-      "layers": 2,
       "policy": "int16",
+      "policy_role": "governing-default",
       "precision": {
         "version": 1,
         "embedding": "int16",
@@ -208,7 +180,43 @@
     },
     {
       "layers": 2,
+      "policy": "legacy",
+      "policy_role": "historical-comparison-only",
+      "precision": null,
+      "selected_sources": [
+        "model-00001-of-000064.safetensors",
+        "model-00002-of-000064.safetensors",
+        "model-00062-of-000064.safetensors"
+      ],
+      "class_matrix_elements": {
+        "embedding": 1174405120,
+        "head": 1174405120,
+        "attention": 202244096,
+        "dense": 396361728,
+        "shared": 44040192
+      },
+      "retained_source_bytes": 15501684512,
+      "slice_payload_bytes": 12512505856,
+      "assembly_copy_bytes": 12512505856,
+      "canonical_table_bytes": 2097152,
+      "disk_header_alignment_scratch_margin_bytes": 536870912,
+      "disk_reserve_bytes": 5368709120,
+      "peak_disk_with_retained_sources_bytes": 46434373408,
+      "optional_persisted_fp32_cache_extra_disk_bytes": 79622731264,
+      "conversion_scratch_ram_bytes": 4751555200,
+      "kv_b_transpose_ram_bytes": 33554432,
+      "assembly_buffer_ram_bytes": 429916160,
+      "largest_source_bf16_tensor_bytes": 2348810240,
+      "reference_fp32_parameters_bytes": 79622731264,
+      "reference_largest_fp32_tensor_scratch_bytes": 22548578304,
+      "engine_resident_planning_bytes": 16165744640,
+      "reference_resident_planning_bytes": 120894219552,
+      "sequential_available_ram_planning_bytes": 120894219552
+    },
+    {
+      "layers": 2,
       "policy": "mixed",
+      "policy_role": "historical-comparison-only",
       "precision": {
         "version": 1,
         "embedding": "int8",
@@ -249,42 +257,8 @@
     },
     {
       "layers": 3,
-      "policy": "legacy",
-      "precision": null,
-      "selected_sources": [
-        "model-00001-of-000064.safetensors",
-        "model-00002-of-000064.safetensors",
-        "model-00003-of-000064.safetensors",
-        "model-00062-of-000064.safetensors"
-      ],
-      "class_matrix_elements": {
-        "embedding": 1174405120,
-        "head": 1174405120,
-        "attention": 303366144,
-        "dense": 396361728,
-        "shared": 88080384
-      },
-      "retained_source_bytes": 25310731976,
-      "slice_payload_bytes": 22176358080,
-      "assembly_copy_bytes": 22176358080,
-      "canonical_table_bytes": 3145728,
-      "disk_header_alignment_scratch_margin_bytes": 536870912,
-      "disk_reserve_bytes": 5368709120,
-      "peak_disk_with_retained_sources_bytes": 75572173896,
-      "optional_persisted_fp32_cache_extra_disk_bytes": 147860192256,
-      "conversion_scratch_ram_bytes": 4751924160,
-      "kv_b_transpose_ram_bytes": 33554432,
-      "assembly_buffer_ram_bytes": 430964736,
-      "largest_source_bf16_tensor_bytes": 2348810240,
-      "reference_fp32_parameters_bytes": 147860192256,
-      "reference_largest_fp32_tensor_scratch_bytes": 22548578304,
-      "engine_resident_planning_bytes": 25831694016,
-      "reference_resident_planning_bytes": 198940728008,
-      "sequential_available_ram_planning_bytes": 198940728008
-    },
-    {
-      "layers": 3,
       "policy": "int16",
+      "policy_role": "governing-default",
       "precision": {
         "version": 1,
         "embedding": "int16",
@@ -326,7 +300,44 @@
     },
     {
       "layers": 3,
+      "policy": "legacy",
+      "policy_role": "historical-comparison-only",
+      "precision": null,
+      "selected_sources": [
+        "model-00001-of-000064.safetensors",
+        "model-00002-of-000064.safetensors",
+        "model-00003-of-000064.safetensors",
+        "model-00062-of-000064.safetensors"
+      ],
+      "class_matrix_elements": {
+        "embedding": 1174405120,
+        "head": 1174405120,
+        "attention": 303366144,
+        "dense": 396361728,
+        "shared": 88080384
+      },
+      "retained_source_bytes": 25310731976,
+      "slice_payload_bytes": 22176358080,
+      "assembly_copy_bytes": 22176358080,
+      "canonical_table_bytes": 3145728,
+      "disk_header_alignment_scratch_margin_bytes": 536870912,
+      "disk_reserve_bytes": 5368709120,
+      "peak_disk_with_retained_sources_bytes": 75572173896,
+      "optional_persisted_fp32_cache_extra_disk_bytes": 147860192256,
+      "conversion_scratch_ram_bytes": 4751924160,
+      "kv_b_transpose_ram_bytes": 33554432,
+      "assembly_buffer_ram_bytes": 430964736,
+      "largest_source_bf16_tensor_bytes": 2348810240,
+      "reference_fp32_parameters_bytes": 147860192256,
+      "reference_largest_fp32_tensor_scratch_bytes": 22548578304,
+      "engine_resident_planning_bytes": 25831694016,
+      "reference_resident_planning_bytes": 198940728008,
+      "sequential_available_ram_planning_bytes": 198940728008
+    },
+    {
+      "layers": 3,
       "policy": "mixed",
+      "policy_role": "historical-comparison-only",
       "precision": {
         "version": 1,
         "embedding": "int8",

@@ -26,6 +26,7 @@ resources per shard are measured, not estimated. Standard library only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -94,6 +95,7 @@ def main(argv: list) -> int:
     parser.add_argument("--head", action="store_true")
     parser.add_argument("--expert-groups", default="1")
     parser.add_argument("--experts")
+    parser.add_argument("--historical-int8", action="store_true", help="explicit pre-policy comparison profile")
     parser.add_argument("--precision", help="complete precision policy JSON, selected before conversion")
     parser.add_argument("--threads")
     parser.add_argument("--keep-source", action="store_true", help="do not delete shards after use")
@@ -108,7 +110,21 @@ def main(argv: list) -> int:
     if manifest.get("schema") != "arc.hf-source.v1":
         raise SystemExit("not an arc.hf-source.v1 manifest")
     work, out = Path(args.work), Path(args.out)
+    if args.historical_int8 and args.precision:
+        raise SystemExit("--historical-int8 conflicts with --precision")
     precision = None
+    def creation_default():
+        # Resolve only from original hash-verified configuration, never a stale unit record.
+        entry = next(f for f in manifest['files'] if f['name']=='config.json')
+        path = work / 'config.json'
+        if not path.exists():
+            raise SystemExit('omitted-policy resume needs retained verified config.json; no fetch performed')
+        raw = path.read_bytes()
+        if len(raw)!=entry['bytes'] or hashlib.sha256(raw).hexdigest()!=entry['sha256']:
+            raise SystemExit('creation default requires hash-verified config.json')
+        config = json.loads(raw); config = config.get('text_config', config)
+        return dict(version=1, **{k:'int16' for k in ('attention','dense','shared','embedding','head')}) if config.get('model_type')=='kimi_k2' else None
+
     if args.precision:
         precision = json.loads(Path(args.precision).read_text(encoding="utf-8"))
         fields = {"attention", "dense", "shared", "embedding", "head"}
@@ -116,6 +132,8 @@ def main(argv: list) -> int:
                 or type(precision["version"]) is not int or precision["version"] != 1
                 or any(precision[k] not in ("int8", "int16") for k in fields)):
             raise SystemExit("invalid complete precision policy")
+    if args.resume and not args.precision and not args.historical_int8 and any((out / 'units').glob('*.json')):
+        precision = creation_default()
     # Refuse a stale policy before fetching or deleting any source file.
     if args.resume:
         for record in (out / "units").glob("*.json"):
@@ -140,10 +158,14 @@ def main(argv: list) -> int:
     for entry in small:
         get(entry)
 
+    if not args.precision and not args.historical_int8:
+        precision = creation_default()
     common = ["--source-dir", str(work), "--source-manifest", str(manifest_path),
               "--expert-groups", args.expert_groups]
     if args.experts:
         common += ["--experts", args.experts]
+    if args.historical_int8:
+        common += ["--historical-int8"]
     if args.precision:
         common += ["--precision", str(Path(args.precision).resolve())]
     select = []
@@ -220,6 +242,8 @@ def main(argv: list) -> int:
                                "--out", str(manifest_out)])
     result = {
         "schema": "arc.slice-stream-report.v1",
+        "precision": precision,
+        "policy_selection": "explicit-historical-int8" if args.historical_int8 else "explicit-comparison" if args.precision else "creation-default",
         "source": {"repo": manifest["repo"], "revision": manifest["revision"]},
         "plan_peak_source_bytes": plan["peak_source_bytes"],
         "expert_groups": int(args.expert_groups),

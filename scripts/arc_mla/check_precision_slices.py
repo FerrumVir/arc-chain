@@ -22,15 +22,15 @@ def main():
     binary,work,evidence=(Path(p).resolve() for p in sys.argv[1:])
     work.mkdir(parents=True);evidence.mkdir(parents=True)
     wide=dict(version=1,**{k:'int16' for k in ['attention','dense','shared','embedding','head']})
-    policies={'legacy':None,'int16':wide,'mixed':dict(wide,embedding='int8',shared='int8')}
+    policies={'legacy':None,'default':wide,'int16':wide,'mixed':dict(wide,embedding='int8',shared='int8')}
     for label,policy in policies.items():
         print(f'{label}: precision={json.dumps(policy, sort_keys=True)}', flush=True)
         if policy:
             (work/(label+'.json')).write_text(json.dumps(policy))
     roots={};baseline=None;commands=[]
     for label,policy in policies.items():
-        settings=[]
-        if policy:
+        settings=["historical-int8"] if label=="legacy" else []
+        if policy and label!="default":
             path=work/(label+'.json');path.write_text(json.dumps(policy));settings=[path]
         cmd=[sys.executable,Path(__file__).with_name('check_yarn_slices.py'),binary,work/label,evidence/label,*settings]
         subprocess.run(list(map(str,cmd)),check=True);commands.append(list(map(str,cmd)))
@@ -49,8 +49,8 @@ def main():
             assert t['dtype']==expected,(label,n,t['dtype'],expected)
         # Reusing unit records under another policy must fail, not relabel.
         if policy:
-            other='mixed' if label=='int16' else 'int16'
-            for kind,flags in [('omitted',[]),('different-non-null',['--precision',str(work/(other+'.json'))])]:
+            other='mixed' if label in ('int16','default') else 'int16'
+            for kind,flags in [('historical',['--historical-int8']),('different-non-null',['--precision',str(work/(other+'.json'))])]:
                 bad=work/label/f'bad-resume-{kind}.json'
                 r=subprocess.run([str(binary),'slice-manifest','--source-dir',str(work/label/'source'),
                               '--source-manifest',str(work/label/'source/tiny-kimi-packed.source.json'),
@@ -77,7 +77,7 @@ def main():
                     r=subprocess.run([str(binary),'slice-assemble-yarn','--config',str(work/label/'source/config.json'),
                     '--source-manifest',str(work/label/'source/tiny-kimi-packed.source.json'),
                     '--manifest',str(work/label/'slices.json'),'--slices',str(work/label/'slices'),'--fixture',
-                    '--precision',str(settings[0]),'--out-dir',str(bad)],capture_output=True,text=True)
+                    *(['--precision',str(work/(label+'.json'))] if label!='default' else []),'--out-dir',str(bad)],capture_output=True,text=True)
                     assert r.returncode!=0 and not bad.exists()
                     expected=('selected slice file length mismatch' if kind=='raw' else
                               'selected bytes/metadata differ from committed segment')
@@ -86,6 +86,9 @@ def main():
                     (evidence/label/f'payload-substitution-{kind}.log').write_text(r.stderr)
                 finally:path.write_bytes(saved)
     assert len(set(roots.values()))==3
+    assert roots['default']==roots['int16']
+    for name in ['stage-0.arcspkg','manifest.json','pending.json']:
+        assert (evidence/'default'/name).read_bytes()==(evidence/'int16'/name).read_bytes(), name
     (evidence/'summary.json').write_text(json.dumps({'engine_dependency':'616ba16a60f43b5e70666ca24f5d7f9ce99ab932','dependency_review':'provisional/unreviewed','scope':'synthetic fixtures only; no quality or precision acceptance','policies':policies,'roots':roots,'native_int4_norm_router_bytes_unchanged':True,'commands':commands},indent=2)+'\n')
     print('PASS: legacy/all-INT16/mixed slice conversion, byte verification and engine consumption')
 

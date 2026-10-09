@@ -12,7 +12,14 @@ pub fn prepare_yarn_manifest(
     scope: Scope,
     max_seq: usize,
 ) -> Result<(MlaConfig, Value), ModernError> {
-    prepare_yarn_manifest_with_precision(input, config_bytes, source_bytes, scope, max_seq, None)
+    prepare_yarn_manifest_with_precision(
+        input,
+        config_bytes,
+        source_bytes,
+        scope,
+        max_seq,
+        Some(super::super::precision::Precision::all_int16()),
+    )
 }
 
 /// Caller-owned policy must match the committed conversion policy.
@@ -169,7 +176,7 @@ pub fn assemble_yarn_bundle(
         dir,
         out,
         stage_count,
-        None,
+        Some(super::super::precision::Precision::all_int16()),
     )
 }
 
@@ -470,9 +477,37 @@ mod tests {
                 assert_eq!(c.precision, Some(precision.clone()));
                 assert_eq!(MlaConfig::from_json(&m["model"]).unwrap(), c);
                 assert_eq!(m["profile"], c.profile());
+                let default =
+                    prepare_yarn_manifest(&parsed(&v), yarn::CONFIG, SOURCE, scope.clone(), 4096);
+                if mixed {
+                    assert!(default.is_err());
+                } else {
+                    assert_eq!(default.unwrap(), (c.clone(), m.clone()));
+                }
+                let meta = yarn::finalize_pending_slices_with_precision(
+                    yarn::CONFIG,
+                    &v,
+                    4096,
+                    depth,
+                    Some(precision.clone()),
+                )
+                .unwrap();
+                assert_eq!(meta["model_root"], m["model_root"]);
+                if !mixed {
+                    assert_eq!(
+                        yarn::finalize_pending_slices(yarn::CONFIG, &v, 4096, depth).unwrap(),
+                        meta
+                    );
+                }
                 assert!(
-                    prepare_yarn_manifest(&parsed(&v), yarn::CONFIG, SOURCE, scope.clone(), 4096)
-                        .is_err()
+                    prepare_yarn_manifest(
+                        &parsed(&pending_official()),
+                        yarn::CONFIG,
+                        SOURCE,
+                        scope.clone(),
+                        4096
+                    )
+                    .is_err()
                 );
                 let mut relabeled = pending_official();
                 relabeled["precision"] = v["precision"].clone();
@@ -504,20 +539,38 @@ mod tests {
             let scope = depth.map_or(Scope::FullKimiK26, |layers| {
                 Scope::EarlyLayersWithHeadProbe { layers }
             });
-            let (c, m) =
-                prepare_yarn_manifest(&parsed(&v), yarn::CONFIG, SOURCE, scope.clone(), 4096)
-                    .unwrap();
+            let (c, m) = prepare_yarn_manifest_with_precision(
+                &parsed(&v),
+                yarn::CONFIG,
+                SOURCE,
+                scope.clone(),
+                4096,
+                None,
+            )
+            .unwrap();
             assert_eq!(c.preparation.as_ref().unwrap().scope, scope);
             assert_eq!(c.n_layers, depth.unwrap_or(61));
             assert_eq!(MlaConfig::from_json(&m["model"]).unwrap(), c);
-            let old = yarn::finalize_pending_slices(yarn::CONFIG, &v, 4096, depth).unwrap();
+            let old =
+                yarn::finalize_pending_slices_with_precision(yarn::CONFIG, &v, 4096, depth, None)
+                    .unwrap();
             assert_eq!(m["model_root"], old["model_root"]);
             assert_eq!(m["segments"], old["segments"]);
             assert_eq!(m["source"], old["source"]);
         }
         let mut c = yarn::CONFIG.to_vec();
         c.push(b' ');
-        assert!(prepare_yarn_manifest(&parsed(&v), &c, SOURCE, Scope::FullKimiK26, 4096).is_err());
+        assert!(
+            prepare_yarn_manifest_with_precision(
+                &parsed(&v),
+                &c,
+                SOURCE,
+                Scope::FullKimiK26,
+                4096,
+                None
+            )
+            .is_err()
+        );
         for kind in ["source", "shape", "order", "missing", "scope"] {
             let mut bad = v.clone();
             match kind {
@@ -535,12 +588,13 @@ mod tests {
             }
             seal(&mut bad);
             assert!(
-                prepare_yarn_manifest(
+                prepare_yarn_manifest_with_precision(
                     &parsed(&bad),
                     yarn::CONFIG,
                     SOURCE,
                     Scope::EarlyLayersWithHeadProbe { layers: 2 },
-                    4096
+                    4096,
+                    None
                 )
                 .is_err(),
                 "{kind}"

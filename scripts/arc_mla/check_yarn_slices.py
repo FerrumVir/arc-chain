@@ -15,8 +15,10 @@ def read(p):
 
 def main():
     binary, work, evidence = (Path(p).resolve() for p in sys.argv[1:4])
-    policy = Path(sys.argv[4]).resolve() if len(sys.argv) == 5 else None
-    settings = ["--precision", policy] if policy else []
+    policy = Path(sys.argv[4]).resolve() if len(sys.argv) == 5 and sys.argv[4] != "historical-int8" else None
+    historical = len(sys.argv) == 5 and sys.argv[4] == "historical-int8"
+    effective = read(policy) if policy else (None if historical else dict(version=1, **{k:"int16" for k in ("attention","dense","shared","embedding","head")}))
+    settings = ["--precision", policy] if policy else (["--historical-int8"] if historical else [])
     root = Path(__file__).resolve().parents[2]
     work.mkdir(parents=True)
     evidence.mkdir(parents=True)
@@ -56,8 +58,8 @@ def main():
     full = work / 'bundle-1'
     assemble(full)
     finalized = read(full / 'manifest.json')
-    assert finalized['profile'] == ('arc.synthetic.kimi-k26-yarn.mixed-dyadic-row.i4g32.q16.v1' if policy else 'arc.synthetic.kimi-k26-yarn.i4g32.q16.v1')
-    assert finalized['model'].get('precision') == (read(policy) if policy else None)
+    assert finalized['profile'] == ('arc.synthetic.kimi-k26-yarn.mixed-dyadic-row.i4g32.q16.v1' if effective else 'arc.synthetic.kimi-k26-yarn.i4g32.q16.v1')
+    assert finalized['model'].get('precision') == effective
     assert read(manifest) == original, 'pending input changed'
     assert finalized['segments'][1:] == original['segments'], 'weight bytes requantized'
     run('verify', '--package', full / 'stage-0.arcspkg', '--manifest', full / 'manifest.json')
@@ -86,7 +88,7 @@ def main():
             reports.append(report); previous = boundary
         layouts.extend(['--layout', f'{count}=' + ','.join(map(str,reports))])
     subprocess.run([sys.executable, str(root / 'scripts/arc_mla/layout_check.py'), '--run', str(evidence / 'scalar.json'),
-                    '--label', 'synthetic packed canonical YaRN; precision=' + json.dumps(read(policy) if policy else None, sort_keys=True), *layouts, '--out', str(evidence / 'layouts.json'),
+                    '--label', 'synthetic packed canonical YaRN; precision=' + json.dumps(effective, sort_keys=True), *layouts, '--out', str(evidence / 'layouts.json'),
                     '--summary-md', str(evidence / 'layouts.md')], check=True)
 
     failures = []
@@ -130,15 +132,15 @@ def main():
         assert not out.exists() and not list(work.glob('.yarn-assembly-*'))
         failures.append(kind)
     # Same sealed manifest, independently changed/omitted caller policy.
-    if policy:
-        out = work / 'bad-omitted-policy'
+    if effective:
+        out = work / 'bad-historical-policy'
         run('slice-assemble-yarn', '--config', config, '--source-manifest', pin,
-            '--manifest', manifest, '--slices', slices, '--out-dir', out, '--fixture', fails=True)
+            '--manifest', manifest, '--slices', slices, '--out-dir', out, '--fixture', '--historical-int8', fails=True)
         assert not out.exists()
-        failures.append('omitted-caller-policy')
+        failures.append('historical-caller-policy')
     substitutions = []
-    if policy:
-        for key, value in [('version', 2), ('head', 'int8' if read(policy)['head']=='int16' else 'int16'), ('experts','int16')]:
+    if effective:
+        for key, value in [('version', 2), ('head', 'int8' if effective['head']=='int16' else 'int16'), ('experts','int16')]:
             m = copy.deepcopy(original);m['precision'][key]=value
             substitutions.append((key,m))
         m=copy.deepcopy(original);m.pop('precision');substitutions.append(('removed',m))
@@ -175,7 +177,7 @@ def main():
     shutil.copy(full / 'manifest.json', evidence / 'manifest.json')
     shutil.copy(full / 'report.json', evidence / 'assembly.json')
     (evidence / 'summary.json').write_text(json.dumps({'scope':'synthetic fixture only; no real K2.6 execution',
-        'pass':True, 'precision':read(policy) if policy else None, 'model_root':finalized['model_root'], 'rejections':failures,
+        'pass':True, 'precision':effective, 'model_root':finalized['model_root'], 'rejections':failures,
         'layouts':[1,2,4], 'cases':len(runs[0]['cases'])}, indent=2)+'\n')
     print(f'PASS: {len(failures)} corruption/identity/output checks; scalar/SIMD and 1/2/4 stages exact')
 

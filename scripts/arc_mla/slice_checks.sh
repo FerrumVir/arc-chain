@@ -25,6 +25,8 @@
 set -euo pipefail
 
 BIN="$1"
+# This suite retains the published pre-policy comparison identities.
+arc_historical() { "$BIN" "$1" --historical-int8 "${@:2}"; }
 WORK="$2"
 EV="$3"
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)"
@@ -57,7 +59,7 @@ for variant in plain yarn edge; do
   echo "== $variant"
   # 1. Streamed (shards deleted after use) vs every shard present.
   cp -R "$src" "$WORK/$variant-stream"
-  python "$ROOT/scripts/arc_mla/stream_slices.py" --arc-mla "$BIN" --source-manifest "$manifest" \
+  python "$ROOT/scripts/arc_mla/stream_slices.py" --arc-mla "$BIN" --historical-int8 --source-manifest "$manifest" \
     --work "$WORK/$variant-stream" --out "$WORK/$variant-streamed" --expert-groups 4 \
     --report "$out/stream-report.json" > "$out/stream.txt"
   left=0
@@ -65,9 +67,9 @@ for variant in plain yarn edge; do
     [ -e "$f" ] && left=$((left + 1))
   done
   same "$variant: shards left after streaming (only the unused vision shard)" "$left" 1
-  "$BIN" slice --source-dir "$src" --source-manifest "$manifest" --out-dir "$WORK/$variant-all" \
+  arc_historical slice --source-dir "$src" --source-manifest "$manifest" --out-dir "$WORK/$variant-all" \
     --expert-groups 4 --threads 1 > /dev/null
-  "$BIN" slice-manifest --source-dir "$src" --source-manifest "$manifest" --out-dir "$WORK/$variant-all" \
+  arc_historical slice-manifest --source-dir "$src" --source-manifest "$manifest" --out-dir "$WORK/$variant-all" \
     --expert-groups 4 --out "$out/manifest-all-1-thread.json" > /dev/null
   streamed="$(field "$WORK/$variant-streamed/manifest.json" manifest_blake3)"
   same "$variant: streamed vs all shards on 1 thread" "$streamed" \
@@ -76,9 +78,9 @@ for variant in plain yarn edge; do
   "$BIN" slice-verify --manifest "$out/manifest.json" --slices "$WORK/$variant-streamed" --segments \
     > "$out/verify.json"
   for groups in 1 2 8; do
-    "$BIN" slice --source-dir "$src" --source-manifest "$manifest" --out-dir "$WORK/$variant-g$groups" \
+    arc_historical slice --source-dir "$src" --source-manifest "$manifest" --out-dir "$WORK/$variant-g$groups" \
       --expert-groups "$groups" --discard > /dev/null
-    "$BIN" slice-manifest --source-dir "$src" --source-manifest "$manifest" --out-dir "$WORK/$variant-g$groups" \
+    arc_historical slice-manifest --source-dir "$src" --source-manifest "$manifest" --out-dir "$WORK/$variant-g$groups" \
       --expert-groups "$groups" --out "$out/manifest-g$groups.json" > /dev/null
     python - "$out/manifest.json" "$out/manifest-g$groups.json" <<'PY'
 import json, sys
@@ -95,9 +97,9 @@ PY
   # 3. Equivalence with the BF16 twin and with the converter's packages.
   if [ "$variant" = plain ]; then
     python "$ROOT/scripts/arc_mla/make_tiny_mla_model.py" "$WORK/bf16" --variant kimi > /dev/null
-    "$BIN" convert --source-dir "$WORK/bf16" --source-manifest "$WORK/bf16/tiny-mla.source.json" \
+    arc_historical convert --source-dir "$WORK/bf16" --source-manifest "$WORK/bf16/tiny-mla.source.json" \
       --experts i4g32 --out "$WORK/bf16.arcspkg" --manifest-out "$out/bf16-stage-manifest.json" > /dev/null
-    "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --experts i4g32 \
+    arc_historical convert --source-dir "$src" --source-manifest "$manifest" --experts i4g32 \
       --out "$WORK/packed.arcspkg" --manifest-out "$out/packed-stage-manifest.json" --report "$out/convert.json" > /dev/null
     python - "$out/manifest.json" "$out/bf16-stage-manifest.json" "$out/packed-stage-manifest.json" <<'PY'
 import json, sys
@@ -108,13 +110,13 @@ assert slices["segments"] == weights(packed["segments"])
 assert slices["model_root"] == packed["model_root"], "model roots differ"
 PY
     echo "ok   plain: segments = BF16 twin's i4g32 conversion; model root = converter's"
-    "$BIN" slice-assemble --manifest "$out/manifest.json" --slices "$WORK/$variant-streamed" \
+    arc_historical slice-assemble --manifest "$out/manifest.json" --slices "$WORK/$variant-streamed" \
       --out "$WORK/assembled.arcspkg" > "$out/assemble.json"
     same "plain: assembled package vs converter package (sha256)" \
       "$(field "$out/assemble.json" package sha256)" "$(field "$out/convert.json" package sha256)"
-    "$BIN" slice-assemble --manifest "$out/manifest.json" --slices "$WORK/$variant-streamed" \
+    arc_historical slice-assemble --manifest "$out/manifest.json" --slices "$WORK/$variant-streamed" \
       --layers 1:3 --out "$WORK/assembled-1-3.arcspkg" > "$out/assemble-1-3.json"
-    "$BIN" convert --source-dir "$src" --source-manifest "$manifest" --experts i4g32 --layers 1:3 \
+    arc_historical convert --source-dir "$src" --source-manifest "$manifest" --experts i4g32 --layers 1:3 \
       --out "$WORK/packed-1-3.arcspkg" --report "$out/convert-1-3.json" > /dev/null
     same "plain: assembled stage [1, 3) vs converter stage" \
       "$(field "$out/assemble-1-3.json" package sha256)" "$(field "$out/convert-1-3.json" package sha256)"
@@ -131,4 +133,4 @@ python "$ROOT/scripts/arc_mla/check_slice_engine.py" "$BIN" "$WORK" "$EV"
 echo "slice checks: all passed"
 
 # Explicit versioned preparation: fresh synthetic fixture only, never weights.
-python "$ROOT/scripts/arc_mla/check_yarn_slices.py" "$BIN" "$WORK/prepared-yarn" "$EV/prepared-yarn"
+python "$ROOT/scripts/arc_mla/check_yarn_slices.py" "$BIN" "$WORK/prepared-yarn" "$EV/prepared-yarn" historical-int8

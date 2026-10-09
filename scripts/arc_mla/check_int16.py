@@ -54,7 +54,7 @@ def main():
     policies = dict(legacy=None, int16=wide, mixed=mixed)
     for label, precision in policies.items():
         print(f'{label}: precision={json.dumps(precision, sort_keys=True)}', flush=True)
-        settings = []
+        settings = ["--historical-int8"]
         if precision:
             precision_path = out / (label + '-precision.json')
             precision_path.write_text(json.dumps(precision))
@@ -85,6 +85,11 @@ def main():
                                   '--out',out/(label+'-whole.bin'),'--report',out/(label+'-whole.json'),'--threads','1'])
         assert previous.read_bytes() == (out/(label+'-whole.bin')).read_bytes()
     # Actual CLI argument/schema rejection must leave no output package.
+    for label, tail in [('conflict',['--historical-int8','--precision',out/'int16-precision.json']),
+                        ('duplicate-history',['--historical-int8','--historical-int8'])]:
+        dest=out/(label+'.arcspkg')
+        r=run(label,base+tail+['--out',dest],expected=1)
+        assert 'conflicts' in r.stderr and not dest.exists()
     for label, tail in [('trailing',['--precision']), ('option-value',['--precision','--threads','1'])]:
         dest = out/(label+'-rejected.arcspkg')
         r = run(label,base+['--out',dest]+tail,expected=1)
@@ -97,7 +102,7 @@ def main():
     facts = dict(timestamp_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                  platform=platform.platform(), machine=platform.machine(), build=args.build_label,
                  threads=1, workload='synthetic BF16; 4 layers dense0+MoE1..3, width64, vocab300; fresh processes; warm filesystem caches; no GPU',
-                 precision_decision='unapproved; no quality/tolerance assessment',
+                 precision_decision='INT16 default by owner decision; explicit alternatives historical only; no quality/tolerance assessment',
                  policies=policies,
                  measurements=measures, files={p.name:dict(bytes=p.stat().st_size,sha256=hashlib.sha256(p.read_bytes()).hexdigest()) for p in out.glob('*.arcspkg')})
     (out/'measurements.json').write_text(json.dumps(facts,indent=2)+'\n')

@@ -22,7 +22,7 @@ def main():
     checks = []
 
     def run(*args, error=None):
-        result = subprocess.run([str(binary), *map(str, args)], capture_output=True, text=True)
+        result = subprocess.run([str(binary), *map(str, args), *(["--historical-int8"] if args[0] in ("convert", "slice-assemble") else [])], capture_output=True, text=True)
         if error is not None:
             assert result.returncode != 0, (args, "unexpected success")
             assert error in result.stderr, (args, result.stderr)

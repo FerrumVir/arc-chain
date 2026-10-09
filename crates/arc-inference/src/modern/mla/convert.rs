@@ -805,10 +805,20 @@ pub fn convert_stage(
     experts: ExpertFormat,
     out: &Path,
 ) -> Result<ConversionReport, ModernError> {
-    convert_stage_with_precision(dir, source, stage, experts, None, out)
+    let entry = source
+        .files
+        .iter()
+        .find(|f| f.name == "config.json")
+        .ok_or_else(|| ModernError::Invalid("source manifest does not pin config.json".into()))?;
+    let path = verify_source_file(dir, entry)?;
+    let bytes = std::fs::read(path).map_err(|e| ModernError::io("config.json", e))?;
+    let hf = parse_hf_weights_config(&bytes, source.max_seq)?;
+    let policy = super::precision::creation_default(&hf.config.architecture);
+    convert_stage_with_precision(dir, source, stage, experts, policy, out)
 }
 
-/// Convert with explicit class precision, binding the choice to the model identity.
+/// Convert with an explicit comparison policy, bound to identity.
+/// `None` explicitly selects historical INT8; use `convert_stage` for creation defaults.
 pub fn convert_stage_with_precision(
     dir: &Path,
     source: &SourceManifest,

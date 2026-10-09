@@ -53,6 +53,14 @@ def main():
             r=subprocess.run([str(binary),'convert','--source-dir',str(source),'--source-manifest',str(source/'tiny-mla.source.json'),
                               '--experts','i4g32','--precision',str(policy_path),'--out',str(pkg),'--threads','1'],capture_output=True,text=True)
             (case/'stdout.txt').write_text(r.stdout); (case/'stderr.txt').write_text(r.stderr)
+            default_pkg=case/'default.arcspkg'
+            default=subprocess.run([str(binary),'convert','--source-dir',str(source),'--source-manifest',str(source/'tiny-mla.source.json'),
+                              '--experts','i4g32','--out',str(default_pkg),'--threads','1'],capture_output=True,text=True)
+            (case/'default-stderr.txt').write_text(default.stderr)
+            assert (default.returncode==0)==accepted,(tag,default.stderr)
+            if accepted: assert default_pkg.read_bytes()==pkg.read_bytes(),tag
+            else: assert '[2^-17,2^30)' in default.stderr and name in default.stderr,tag
+
             assert (r.returncode==0)==accepted,(tag,r.stderr)
             if not accepted:
                 assert name in r.stderr and 'conversion row 0' in r.stderr and '[2^-17,2^30)' in r.stderr,(tag,r.stderr)
