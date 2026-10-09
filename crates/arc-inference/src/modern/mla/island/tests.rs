@@ -1212,3 +1212,476 @@ fn coordinator_rejects_substituted_return_metadata_without_harming_neighbour() {
     coordinator.shutdown().unwrap();
     worker.join().unwrap();
 }
+
+/// Asynchronous pipelined speculation (`speculative.rs`): tokens, logits
+/// hashes and every stage's commitment at every position equal plain
+/// decoding's for every drafter, acceptance pattern, depth, pass width and
+/// split; rollbacks truncate in place, replay from the log and skip queued
+/// dead work.
+mod speculation {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::mpsc::channel;
+
+    use super::*;
+    use crate::modern::mla::island::speculative::{
+        Drafter, NgramDrafter, Script, ScriptedDrafter, SpecConfig,
+    };
+    use crate::modern::mla::island::worker::{
+        SUPERSEDED, WorkerStats, serve_from, skip_superseded,
+    };
+
+    /// Proposes nothing, too many tokens, out-of-vocabulary tokens or plain
+    /// noise, in turn: the coordinator must survive any drafter.
+    struct Garbage {
+        state: u64,
+        vocab: u32,
+    }
+
+    impl Drafter for Garbage {
+        fn name(&self) -> String {
+            "garbage".into()
+        }
+
+        fn draft(&mut self, _context: &[u32], _prompt_len: usize, max: usize) -> Vec<u32> {
+            let vocab = u64::from(self.vocab);
+            match lcg(&mut self.state) % 4 {
+                0 => Vec::new(),
+                1 => (0..max + 3)
+                    .map(|_| (lcg(&mut self.state) % vocab) as u32)
+                    .collect(),
+                2 => vec![1, self.vocab + 7, 2],
+                _ => (0..max)
+                    .map(|_| (lcg(&mut self.state) % vocab) as u32)
+                    .collect(),
+            }
+        }
+    }
+
+    /// Never drafts: the pipeline holds only verified tokens.
+    struct Silent;
+
+    impl Drafter for Silent {
+        fn name(&self) -> String {
+            "silent".into()
+        }
+
+        fn draft(&mut self, _context: &[u32], _prompt_len: usize, _max: usize) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    /// (passes in flight, positions per pass): plain decoding, synchronous
+    /// chains, and pipelined passes of one and several positions.
+    const SHAPES: [(usize, usize); 7] = [(1, 1), (1, 2), (1, 4), (2, 1), (4, 1), (3, 2), (6, 3)];
+
+    /// Prompts of 1..=6 tokens (every other one repeated, so n-grams match),
+    /// budgets up to the context, some EOS ids and both selection rules.
+    fn spec_requests(c: &MlaConfig, count: usize, seed: u64) -> Vec<Request> {
+        let mut s = seed;
+        (0..count)
+            .map(|i| {
+                let len = 1 + (lcg(&mut s) % 6) as usize;
+                let mut prompt: Vec<u32> = (0..len)
+                    .map(|_| (lcg(&mut s) % c.vocab_size as u64) as u32)
+                    .collect();
+                if i % 2 == 1 {
+                    prompt.extend_from_within(..);
+                }
+                let room = (c.max_seq - prompt.len()) as u64;
+                let max_tokens = 1 + (lcg(&mut s) % room) as usize;
+                let eos = if i % 4 == 3 {
+                    vec![(lcg(&mut s) % c.vocab_size as u64) as u32]
+                } else {
+                    Vec::new()
+                };
+                let selection = if i % 2 == 1 {
+                    Selection::Argmax
+                } else {
+                    Selection::Rp64Argmax
+                };
+                Request {
+                    id: 2000 + i as u64,
+                    prompt,
+                    max_tokens,
+                    eos,
+                    selection,
+                }
+            })
+            .collect()
+    }
+
+    fn truth(reqs: &[Request], expected: &[MlaGeneration]) -> HashMap<u64, Vec<u32>> {
+        reqs.iter()
+            .zip(expected)
+            .map(|(r, g)| (r.id, g.tokens.clone()))
+            .collect()
+    }
+
+    fn drafters(
+        c: &MlaConfig,
+        reqs: &[Request],
+        expected: &[MlaGeneration],
+    ) -> Vec<Box<dyn Drafter>> {
+        let truth = truth(reqs, expected);
+        let scripted = |script: Script| -> Box<dyn Drafter> {
+            Box::new(ScriptedDrafter::new(truth.clone(), c.vocab_size, script))
+        };
+        vec![
+            scripted(Script::Pattern(vec![true])),
+            scripted(Script::Pattern(vec![false])),
+            scripted(Script::Pattern(vec![true, false])),
+            scripted(Script::Pattern(vec![true, true, false])),
+            scripted(Script::Rate { rate: 0.5, seed: 3 }),
+            Box::new(NgramDrafter::default()),
+            Box::new(Garbage {
+                state: 11,
+                vocab: c.vocab_size as u32,
+            }),
+            Box::new(Silent),
+        ]
+    }
+
+    /// The correctness gate: on every split (all of them for one format),
+    /// every drafter and every shape gives the single process's tokens,
+    /// logits hashes and boundary digests, and a ledger equal to plain
+    /// decoding's on the same ring at every position of every stage.
+    #[test]
+    fn speculation_matches_plain_decoding_for_any_drafter_depth_and_split() {
+        for (f, (lora, format)) in FORMATS.into_iter().enumerate() {
+            let c = synthetic::tiny_config(lora, format);
+            let whole = stage_model(&c, 0, c.n_layers, Router::Random);
+            let reqs = spec_requests(&c, 6, 31 + f as u64);
+            let expected: Vec<MlaGeneration> = reqs.iter().map(|r| reference(&whole, r)).collect();
+            let masks: Vec<u32> = if f == 0 {
+                (0..1 << (c.n_layers - 1)).collect()
+            } else {
+                vec![0, 0b010, 0b111]
+            };
+            for mask in masks {
+                let mut cuts = vec![0];
+                cuts.extend((1..c.n_layers).filter(|i| mask & (1 << (i - 1)) != 0));
+                cuts.push(c.n_layers);
+                let mut island = ThreadIsland::start(&c, &cuts, Router::Random, |_, _, _| {});
+                let plain_schedule = Schedule {
+                    forget_finished: true,
+                    ..Schedule::default()
+                };
+                let (plain, _) = island.coordinator.run(&reqs, &plain_schedule).unwrap();
+                for (g, got) in expected.iter().zip(&plain) {
+                    assert_matches(g, got, &format!("plain cuts {cuts:?} id {}", got.id));
+                }
+                for (depth, rows) in SHAPES {
+                    for mut drafter in drafters(&c, &reqs, &expected) {
+                        let config = SpecConfig {
+                            depth,
+                            rows,
+                            forget_finished: true,
+                            ..SpecConfig::default()
+                        };
+                        let at = format!(
+                            "{format:?} lora {lora} cuts {cuts:?} D {depth} R {rows} {}",
+                            drafter.name()
+                        );
+                        let (done, stats, spec) = island
+                            .coordinator
+                            .run_speculative(&reqs, &config, drafter.as_mut())
+                            .unwrap();
+                        for ((g, p), got) in expected.iter().zip(&plain).zip(&done) {
+                            assert_matches(g, got, &format!("{at} id {}", got.id));
+                            assert_eq!(got.ledger, p.ledger, "{at} id {}: commitments", got.id);
+                        }
+                        let tokens: u64 = expected.iter().map(|g| g.tokens.len() as u64).sum();
+                        assert_eq!(stats.generated_tokens, tokens, "{at}");
+                        assert!(spec.max_in_flight <= depth as u64, "{at}: {spec:?}");
+                        if rows == 1 && depth == 1 {
+                            assert_eq!(spec.drafted, 0, "{at}: plain decoding never drafts");
+                        }
+                    }
+                }
+                island.stop();
+            }
+        }
+    }
+
+    /// After speculative answers every stage holds exactly the verified
+    /// positions: each stage's log re-executes to its commitments, and the
+    /// rejected drafts were rolled back or skipped.
+    #[test]
+    fn speculative_answers_pass_every_stage_audit() {
+        let c = synthetic::tiny_config(true, ExpertFormat::Int4G32);
+        let whole = stage_model(&c, 0, c.n_layers, Router::Random);
+        let cuts = [0, 1, 3, 4];
+        let verifiers: Vec<StageModel> = cuts
+            .windows(2)
+            .map(|w| stage_model(&c, w[0], w[1], Router::Random))
+            .collect();
+        let verifier_refs: Vec<&StageModel> = verifiers.iter().collect();
+        let reqs = spec_requests(&c, 6, 77);
+        let expected: Vec<MlaGeneration> = reqs.iter().map(|r| reference(&whole, r)).collect();
+        let mut drafter = ScriptedDrafter::new(
+            truth(&reqs, &expected),
+            c.vocab_size,
+            Script::Rate { rate: 0.6, seed: 9 },
+        );
+        let mut island = ThreadIsland::start(&c, &cuts, Router::Random, |_, _, _| {});
+        let config = SpecConfig {
+            depth: 4,
+            rows: 2,
+            ..SpecConfig::default()
+        };
+        let (done, _, spec) = island
+            .coordinator
+            .run_speculative(&reqs, &config, &mut drafter)
+            .unwrap();
+        assert!(
+            spec.accepted > 0 && spec.rejected > 0 && spec.rollbacks > 0,
+            "{spec:?}"
+        );
+        for ((r, g), got) in reqs.iter().zip(&expected).zip(&done) {
+            assert_matches(g, got, &format!("id {}", r.id));
+            let revealed = island.coordinator.reveal(r.id).unwrap();
+            let verdicts = audit_all(
+                &got.ledger,
+                &revealed,
+                &verifier_refs,
+                &AuditContext::new(r, &got.tokens),
+            )
+            .unwrap();
+            for ((a, b), verdict) in verdicts {
+                assert!(
+                    matches!(verdict, Verdict::Valid { .. }),
+                    "id {} [{a}, {b}): {verdict:?}",
+                    r.id
+                );
+            }
+        }
+        let workers = island.stop();
+        let discarded: u64 = workers
+            .iter()
+            .map(|w| w.stats.rolled_back_positions + w.stats.skipped_positions)
+            .sum();
+        assert!(discarded > 0);
+    }
+
+    fn through(workers: &mut [StageWorker], frame: Frame) -> Frame {
+        workers
+            .iter_mut()
+            .fold(frame, |frame, w| w.process(frame).unwrap())
+    }
+
+    fn one(start: u32, token: u32) -> Frame {
+        Frame::Step {
+            id: u64::from(start),
+            items: vec![Item::new(5, start, 2, Selection::Rp64Argmax, vec![token])],
+        }
+    }
+
+    /// A rollback truncates every stage in place and is logged: a restarted
+    /// stage replays items and rollbacks to the same state, and continuing
+    /// gives the bytes of a ring that never saw the rejected draft.
+    #[test]
+    fn rollbacks_truncate_in_place_and_replay_from_the_log() {
+        let c = synthetic::tiny_config(true, ExpertFormat::Int8Dyadic);
+        let dir = std::env::temp_dir().join(format!("arc-island-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logged = || WorkerConfig {
+            log_dir: Some(dir.clone()),
+            fault: None,
+        };
+        let ring = |log: bool| -> Vec<StageWorker> {
+            [(0, 1), (1, 3), (3, 4)]
+                .into_iter()
+                .map(|(a, b)| {
+                    let config = if log && a == 1 {
+                        logged()
+                    } else {
+                        WorkerConfig::default()
+                    };
+                    StageWorker::new(stage_model(&c, a, b, Router::Random), config).unwrap()
+                })
+                .collect()
+        };
+        let prefill = Frame::Step {
+            id: 0,
+            items: vec![Item::new(5, 0, 2, Selection::Rp64Argmax, vec![3, 9])],
+        };
+        let mut reference = ring(false);
+        let expected: Vec<Frame> = [prefill.clone(), one(2, 4), one(3, 7), one(4, 8)]
+            .into_iter()
+            .map(|frame| through(&mut reference, frame))
+            .collect();
+        let mut spec = ring(true);
+        assert_eq!(through(&mut spec, prefill), expected[0]);
+        assert_eq!(through(&mut spec, one(2, 4)), expected[1]);
+        through(&mut spec, one(3, 40));
+        through(&mut spec, one(4, 41));
+        assert_eq!(spec[1].cached_positions(5), Some(5));
+        let rollback = Frame::Rollback { seq: 5, keep: 3 };
+        assert_eq!(through(&mut spec, rollback.clone()), rollback);
+        for w in &spec {
+            assert_eq!(w.cached_positions(5), Some(3));
+            assert_eq!(w.stats.rolled_back_positions, 2);
+        }
+        assert_eq!(through(&mut spec, one(3, 7)), expected[2]);
+        // Crash the logged stage and restart it from its log.
+        let restarted = StageWorker::new(stage_model(&c, 1, 3, Router::Random), logged()).unwrap();
+        assert_eq!(restarted.cached_positions(5), Some(4));
+        spec[1] = restarted;
+        assert_eq!(through(&mut spec, one(4, 8)), expected[3]);
+        // Every stage's log holds only the verified positions.
+        let reveal = || Frame::Reveal {
+            seq: 5,
+            stages: Vec::new(),
+        };
+        assert_eq!(
+            through(&mut spec, reveal()),
+            through(&mut reference, reveal())
+        );
+        // Unknown sequences are ignored; growing or a closed cache is refused.
+        assert!(
+            spec[0]
+                .process(Frame::Rollback { seq: 99, keep: 0 })
+                .is_ok()
+        );
+        assert!(
+            spec[0]
+                .process(Frame::Rollback { seq: 5, keep: 9 })
+                .is_err()
+        );
+        assert_eq!(spec[0].cached_positions(5), Some(5));
+        spec[0]
+            .process(Frame::Close {
+                seqs: vec![5],
+                forget: false,
+            })
+            .unwrap();
+        assert!(
+            spec[0]
+                .process(Frame::Rollback { seq: 5, keep: 1 })
+                .is_err()
+        );
+        drop(spec);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Early cancellation: an item that a rollback queued behind it discards
+    /// is marked superseded and passed on uncomputed; other sequences and
+    /// positions before the kept length are untouched.
+    #[test]
+    fn queued_rollbacks_mark_the_items_they_discard() {
+        let item = |seq: u64, start: u32| {
+            let mut item = Item::new(seq, start, 1, Selection::Argmax, vec![1]);
+            item.hidden = vec![1, 2];
+            item.pad = 9;
+            item
+        };
+        let mut frame = Frame::Step {
+            id: 1,
+            items: vec![item(7, 5), item(7, 6), item(8, 6)],
+        };
+        let queued: VecDeque<Result<Frame, ModernError>> = [
+            Ok(Frame::Rollback { seq: 7, keep: 6 }),
+            Ok(Frame::Rollback { seq: 8, keep: 7 }),
+            Err(ModernError::Invalid("undecodable".into())),
+        ]
+        .into_iter()
+        .collect();
+        let mut stats = WorkerStats::default();
+        skip_superseded(&mut frame, &queued, &mut stats);
+        let Frame::Step { items, .. } = &frame else {
+            panic!("step");
+        };
+        assert_eq!(items[0], item(7, 5));
+        assert_eq!(items[1].error.as_deref(), Some(SUPERSEDED));
+        assert!(items[1].hidden.is_empty() && items[1].pad == 0);
+        assert_eq!(items[2], item(8, 6));
+        assert_eq!((stats.skipped_items, stats.skipped_positions), (1, 1));
+    }
+
+    /// The serve loop itself: stale drafts, the rollback that discards them
+    /// and the replacement are all queued before the stage looks at the
+    /// first draft. It skips both drafts, computes the replacement exactly,
+    /// and forwards every frame in order.
+    #[test]
+    fn a_stage_skips_work_a_queued_rollback_discards() {
+        let c = synthetic::tiny_config(false, ExpertFormat::Int8Dyadic);
+        let fresh = || {
+            StageWorker::new(
+                stage_model(&c, 0, c.n_layers, Router::Random),
+                WorkerConfig::default(),
+            )
+            .unwrap()
+        };
+        let prefill = Frame::Step {
+            id: 0,
+            items: vec![Item::new(5, 0, 2, Selection::Rp64Argmax, vec![3, 9])],
+        };
+        let mut reference = fresh();
+        let mut worker = fresh();
+        for frame in [prefill, one(2, 4)] {
+            reference.process(frame.clone()).unwrap();
+            worker.process(frame).unwrap();
+        }
+        let expected = reference.process(one(3, 7)).unwrap();
+        let (tx, rx) = channel();
+        let rollback = Frame::Rollback { seq: 5, keep: 3 };
+        for frame in [
+            one(3, 40),
+            one(4, 41),
+            rollback.clone(),
+            one(3, 7),
+            Frame::Shutdown,
+        ] {
+            tx.send(frame.encode()).unwrap();
+        }
+        let mem = MemTransport::new();
+        let mut out = mem.listen("skip-next").unwrap();
+        let worker = serve_from(worker, rx, Arc::new(mem.clone()), "skip-next".into()).unwrap();
+        let mut link = out.accept().unwrap();
+        let got: Vec<Frame> = (0..5)
+            .map(|_| Frame::decode(&link.recv().unwrap()).unwrap())
+            .collect();
+        for (frame, start) in got[..2].iter().zip([3, 4]) {
+            let Frame::Step { items, .. } = frame else {
+                panic!("step");
+            };
+            assert_eq!(items[0].start, start);
+            assert_eq!(items[0].error.as_deref(), Some(SUPERSEDED));
+            assert!(items[0].commits.is_empty());
+        }
+        assert_eq!(got[2], rollback);
+        assert_eq!(got[3], expected);
+        assert_eq!(got[4], Frame::Shutdown);
+        assert_eq!(worker.stats.skipped_items, 2);
+        assert_eq!(worker.stats.rolled_back_positions, 0);
+        assert_eq!(worker.cached_positions(5), Some(4));
+    }
+
+    #[test]
+    fn speculation_refuses_empty_shapes_and_repeated_ids() {
+        let c = synthetic::tiny_config(false, ExpertFormat::Int8Dyadic);
+        let mut island = ThreadIsland::start(&c, &[0, 4], Router::Random, |_, _, _| {});
+        let reqs = spec_requests(&c, 2, 5);
+        for (depth, rows) in [(0, 1), (1, 0)] {
+            let config = SpecConfig {
+                depth,
+                rows,
+                ..SpecConfig::default()
+            };
+            assert!(
+                island
+                    .coordinator
+                    .run_speculative(&reqs, &config, &mut Silent)
+                    .is_err()
+            );
+        }
+        let twice = [reqs[0].clone(), reqs[0].clone()];
+        assert!(
+            island
+                .coordinator
+                .run_speculative(&twice, &SpecConfig::default(), &mut Silent)
+                .is_err()
+        );
+        island.stop();
+    }
+}

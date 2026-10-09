@@ -6,6 +6,7 @@
 //! native inference, nodes or keys; every process it starts listens on the
 //! addresses it is given (the benchmark uses 127.0.0.1 only).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -16,10 +17,15 @@ use arc_inference::modern::ModernError;
 use arc_inference::modern::arith::Selection;
 use arc_inference::modern::hex_lower;
 use arc_inference::modern::mla::config::{ExpertFormat, MlaConfig};
-use arc_inference::modern::mla::island::coordinator::{Completion, Coordinator, Request, Schedule};
+use arc_inference::modern::mla::island::coordinator::{
+    Completion, Coordinator, Request, RunStats, Schedule,
+};
 use arc_inference::modern::mla::island::even_cuts;
 use arc_inference::modern::mla::island::expert::{ExpertPlacement, RemoteExperts, serve_experts};
 use arc_inference::modern::mla::island::process::ProcessIsland;
+use arc_inference::modern::mla::island::speculative::{
+    Drafter, NgramDrafter, Script, ScriptedDrafter, SpecConfig, SpecStats,
+};
 use arc_inference::modern::mla::island::transport::{
     DeadlineTcpTransport, ShapedTransport, TcpTransport, Transport, WanProfile, timer_mode,
 };
@@ -49,6 +55,11 @@ const USAGE: &str = "usage: arc-island <command> [options]
              [--micro-batches G] [--concurrency B] [--prefill-chunk N] [--shutdown]
   regional-bench --package PKG --out JSON [--stages 40] [--rtt-ms 5,10,20]
              [--concurrencies 1,40] [--max-tokens 8] [--uplink-mbit 100]
+  spec-bench --package PKG --out JSON [--label TEXT] [--stages 4,8] [--hop-ms 1,5,16,50]
+             [--uplink-mbit 100] [--acceptance 0.5,0.7,0.9] [--sync-k 3,7]
+             [--async ROWSxDEPTH,...] [--no-ngram] [--requests 2] [--prompt-len 8]
+             [--max-tokens 48] [--jitter-frac 0.1] [--wan-wire-bytes B] [--seed N]
+             [--kernel scalar|simd] [--stage-threads 1]
   bench      --package PKG --out BENCH.json [--label TEXT] [--exe PATH]
              [--stages 1,2,4] [--pings N] [--payloads B,B,...]
              [--requests N] [--prompt-len N] [--max-tokens N]
@@ -353,6 +364,9 @@ fn cmd_stage(args: &Args) -> Result<(), ModernError> {
         "compute_seconds": s.compute_seconds,
         "emulated_data_hop": arc_inference::modern::mla::island::transport::shaped_hop_metrics(),
         "replayed_positions": s.replayed_positions,
+        "rolled_back_positions": s.rolled_back_positions,
+        "skipped_items": s.skipped_items,
+        "skipped_positions": s.skipped_positions,
     }));
     Ok(())
 }
@@ -1001,6 +1015,317 @@ fn cmd_regional_bench(args: &Args) -> Result<(), ModernError> {
     )
 }
 
+// ---------------------------------------------------------- speculation --
+
+/// `ROWSxDEPTH` pass shapes of the pipelined (asynchronous) runs.
+fn pass_shapes(text: &str) -> Result<Vec<(usize, usize)>, ModernError> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let bad = || ModernError::Invalid(format!("--async: {s:?} is not ROWSxDEPTH"));
+            let (rows, depth) = s.split_once('x').ok_or_else(bad)?;
+            let rows: usize = rows.parse().map_err(|_| bad())?;
+            let depth: usize = depth.parse().map_err(|_| bad())?;
+            if rows == 0 || depth == 0 {
+                return Err(bad());
+            }
+            Ok((rows, depth))
+        })
+        .collect()
+}
+
+fn mean(values: impl IntoIterator<Item = f64>) -> f64 {
+    let (sum, n) = values
+        .into_iter()
+        .fold((0.0, 0usize), |(sum, n), v| (sum + v, n + 1));
+    if n == 0 { f64::NAN } else { sum / n as f64 }
+}
+
+/// A numeric field (a JSON pointer) summed over stage statistics lines.
+fn stage_total(workers: &[Value], field: &str) -> f64 {
+    workers
+        .iter()
+        .map(|w| w.pointer(field).and_then(Value::as_f64).unwrap_or(0.0))
+        .sum()
+}
+
+/// One measured run of the speculation benchmark.
+struct SpecRun<'a> {
+    /// Stages, hop delay, jitter, uplink and padding of the island.
+    cell: &'a Value,
+    mode: &'static str,
+    drafter: String,
+    nominal: Option<f64>,
+    depth: usize,
+    rows: usize,
+    done: &'a [Completion],
+    stats: &'a RunStats,
+    spec: Option<&'a SpecStats>,
+    workers: &'a [Value],
+    exact: bool,
+    same_ledgers: bool,
+}
+
+impl SpecRun<'_> {
+    fn json(&self) -> Value {
+        let (rate_mean, rate_median) = answer_rates(self.done);
+        let mut row = json!({
+            "mode": self.mode,
+            "drafter": self.drafter,
+            "acceptance_nominal": self.nominal,
+            "depth": self.depth,
+            "rows": self.rows,
+            "answers": self.done.len(),
+            "generated_tokens": self.stats.generated_tokens,
+            "forwarded_positions": self.stats.forwarded_positions,
+            "seconds": self.stats.seconds,
+            "per_answer_decode_tok_s_mean": rate_mean,
+            "per_answer_decode_tok_s_median": rate_median,
+            "answer_seconds_mean": mean(self.done.iter().map(|c| c.finished_at - c.admitted_at)),
+            "first_token_seconds_mean": mean(self.done.iter().map(|c| c.first_token_at - c.admitted_at)),
+            "speculation": self.spec,
+            "acceptance_measured": self.spec.and_then(SpecStats::acceptance),
+            "stage_compute_seconds": stage_total(self.workers, "/compute_seconds"),
+            "stage_positions": stage_total(self.workers, "/positions"),
+            "stage_rolled_back_positions": stage_total(self.workers, "/rolled_back_positions"),
+            "stage_skipped_positions": stage_total(self.workers, "/skipped_positions"),
+            "network_residence_seconds":
+                stage_total(self.workers, "/emulated_data_hop/residence_seconds"),
+            "data_frames": stage_total(self.workers, "/emulated_data_hop/frames"),
+            "bit_exact_vs_single_process": self.exact,
+            "ledger_equal_to_plain": self.same_ledgers,
+        });
+        if let (Value::Object(row), Value::Object(cell)) = (&mut row, self.cell) {
+            row.extend(cell.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        row
+    }
+}
+
+/// Speculation on the emulated WAN: per-answer decode speed of plain
+/// decoding, synchronous chain speculation and asynchronous pipelined
+/// speculation. Every run gets fresh stage processes, so each stage counter
+/// covers exactly one run. Every answer is checked byte for byte against the
+/// single process and its ledger against plain decoding's.
+fn cmd_spec_bench(args: &Args) -> Result<(), ModernError> {
+    configure(args)?;
+    let exe = match args.value("--exe") {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_exe().map_err(|e| ModernError::Io(format!("{e}")))?,
+    };
+    let package_path = args.path("--package")?;
+    let model = StageModel::open(&package_path)?;
+    let c = model.config().clone();
+    let digest = package::digest_file(&package_path)?;
+    let label = args.value("--label").unwrap_or_else(|| "unlabelled".into());
+    let stages_list: Vec<usize> = args.list("--stages", "4,8")?;
+    let hops: Vec<f64> = args.list("--hop-ms", "1,5,16,50")?;
+    let uplinks: Vec<f64> = args.list("--uplink-mbit", "100")?;
+    let rates: Vec<f64> = args.list("--acceptance", "0.5,0.7,0.9")?;
+    let sync_k: Vec<usize> = args.list("--sync-k", "3,7")?;
+    let async_shapes = pass_shapes(&args.value("--async").unwrap_or_else(|| "1x8,2x8".into()))?;
+    let count = args.number("--requests", 2)?;
+    let prompt_len = args.number("--prompt-len", 8)?;
+    let max_tokens = args.number("--max-tokens", 48)?;
+    let jitter_frac = args.float("--jitter-frac", 0.1)?;
+    let wire_bytes = args.number("--wan-wire-bytes", 7168 * 4)?;
+    let seed = args.number("--seed", 1)? as u64;
+    let stage_threads = args.number("--stage-threads", 1)?;
+    let kernel = args.value("--kernel").unwrap_or_else(|| "scalar".into());
+    let finite = |v: &f64| v.is_finite() && *v >= 0.0;
+    if !hops.iter().all(finite)
+        || !uplinks.iter().all(finite)
+        || !finite(&jitter_frac)
+        || !rates.iter().all(|a| (0.0..=1.0).contains(a))
+        || stages_list.iter().any(|&s| s == 0 || s > c.n_layers)
+        || sync_k.contains(&0)
+        || count == 0
+        || prompt_len == 0
+        || max_tokens < 2
+    {
+        return Err(ModernError::Invalid(
+            "invalid speculation benchmark inputs".into(),
+        ));
+    }
+    let requests = bench_requests(&c, count, prompt_len, max_tokens);
+    let reference = reference_generations(&model, &requests)?;
+    let truth: HashMap<u64, Vec<u32>> = requests
+        .iter()
+        .zip(&reference)
+        .map(|(r, g)| (r.id, g.tokens.clone()))
+        .collect();
+    // Every position carries a Kimi-width boundary on the wire, as in the
+    // WAN sweep; the last stage returns commitments only.
+    let pad = wire_bytes.saturating_sub(c.d_model * 4) as u32;
+    // (mode, passes in flight, positions per pass).
+    let mut shapes: Vec<(&'static str, usize, usize)> =
+        sync_k.iter().map(|&k| ("sync", 1, k + 1)).collect();
+    shapes.extend(
+        async_shapes
+            .iter()
+            .map(|&(rows, depth)| ("async", depth, rows)),
+    );
+    let started = Instant::now();
+    let mut rows = Vec::new();
+    let mut failures = Vec::new();
+    for &stages in &stages_list {
+        let cuts = even_cuts(c.n_layers, stages);
+        for &hop in &hops {
+            for &mbit in &uplinks {
+                let stage_args = |s: usize| -> Vec<String> {
+                    vec![
+                        "--kernel".into(),
+                        kernel.clone(),
+                        "--threads".into(),
+                        stage_threads.to_string(),
+                        "--wan-ms".into(),
+                        hop.to_string(),
+                        "--wan-jitter-ms".into(),
+                        (hop * jitter_frac).to_string(),
+                        "--wan-mbit".into(),
+                        mbit.to_string(),
+                        "--wan-seed".into(),
+                        (s + 1).to_string(),
+                    ]
+                };
+                let cell = json!({
+                    "stages": stages,
+                    "hop_ms": hop,
+                    "jitter_ms": hop * jitter_frac,
+                    "uplink_mbit": mbit,
+                    "wire_bytes_per_position": wire_bytes,
+                });
+                // Plain decoding through the existing scheduler, one answer
+                // at a time: the baseline and the ledger every run must match.
+                let mut island =
+                    ProcessIsland::launch(&exe, &package_path, &cuts, &c, &stage_args)?;
+                let timer = island.stages[0].hello["wan_timer_mode"].clone();
+                let schedule = Schedule {
+                    pad_bytes_per_position: pad,
+                    forget_finished: true,
+                    ..Schedule::default()
+                };
+                let (plain, stats) = island.coordinator.run(&requests, &schedule)?;
+                let workers = island.shutdown()?;
+                let exact = matches_reference(&plain, &reference);
+                if !exact {
+                    failures.push(format!(
+                        "plain, {stages} stages, {hop} ms, {mbit} Mbit/s: differs from the single process"
+                    ));
+                }
+                let mut row = SpecRun {
+                    cell: &cell,
+                    mode: "plain",
+                    drafter: "none".into(),
+                    nominal: None,
+                    depth: 1,
+                    rows: 1,
+                    done: &plain,
+                    stats: &stats,
+                    spec: None,
+                    workers: &workers,
+                    exact,
+                    same_ledgers: exact,
+                }
+                .json();
+                row["wan_timer_mode"] = timer.clone();
+                eprintln!("spec-bench: {row}");
+                rows.push(row);
+                let mut drafters: Vec<(Option<f64>, Box<dyn Drafter>)> = rates
+                    .iter()
+                    .map(|&rate| {
+                        let script = Script::Rate { rate, seed };
+                        let drafter: Box<dyn Drafter> =
+                            Box::new(ScriptedDrafter::new(truth.clone(), c.vocab_size, script));
+                        (Some(rate), drafter)
+                    })
+                    .collect();
+                if !args.flag("--no-ngram") {
+                    drafters.push((None, Box::new(NgramDrafter::default())));
+                }
+                for (nominal, drafter) in &mut drafters {
+                    for &(mode, depth, rows_per_pass) in &shapes {
+                        let config = SpecConfig {
+                            depth,
+                            rows: rows_per_pass,
+                            pad_bytes_per_position: pad,
+                            forget_finished: true,
+                        };
+                        let mut island =
+                            ProcessIsland::launch(&exe, &package_path, &cuts, &c, &stage_args)?;
+                        let (done, stats, spec) = island.coordinator.run_speculative(
+                            &requests,
+                            &config,
+                            &mut **drafter,
+                        )?;
+                        let workers = island.shutdown()?;
+                        let exact = matches_reference(&done, &reference);
+                        let same_ledgers = done.len() == plain.len()
+                            && done.iter().zip(&plain).all(|(a, b)| a.ledger == b.ledger);
+                        if !(exact && same_ledgers) {
+                            failures.push(format!(
+                                "{mode} D {depth} R {rows_per_pass} {}, {stages} stages, {hop} ms, {mbit} Mbit/s: differs from plain decoding",
+                                drafter.name()
+                            ));
+                        }
+                        let mut row = SpecRun {
+                            cell: &cell,
+                            mode,
+                            drafter: drafter.name(),
+                            nominal: *nominal,
+                            depth,
+                            rows: rows_per_pass,
+                            done: &done,
+                            stats: &stats,
+                            spec: Some(&spec),
+                            workers: &workers,
+                            exact,
+                            same_ledgers,
+                        }
+                        .json();
+                        row["wan_timer_mode"] = timer.clone();
+                        eprintln!("spec-bench: {row}");
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+    }
+    let report = json!({
+        "schema": "arc-island-spec-bench-v1",
+        "label": label,
+        "platform": platform(),
+        "model": {"config": c.to_json(), "profile": c.profile(), "package": digest.to_json()},
+        "assumed": {
+            "stages": stages_list,
+            "hop_ms": hops,
+            "uplink_mbit": uplinks,
+            "jitter_fraction_of_hop": jitter_frac,
+            "wire_bytes_per_position": wire_bytes,
+            "requests": count,
+            "prompt_len": prompt_len,
+            "max_tokens": max_tokens,
+            "selection": "rp64-argmax",
+            "acceptance_nominal": rates,
+            "scripted_seed": seed,
+            "sync_k": sync_k,
+            "async_rows_x_depth": async_shapes,
+        },
+        "scope": "EMULATED measurements: synthetic MLA/MoE model (not Kimi), stage processes on one host joined by loopback TCP, every stage's outgoing hop shaped (one-way delay with jitter, bounded uplink, Kimi-width activation padding per position); the coordinator-to-first-stage hand-off is local. Per-answer decode tok/s = (tokens - 1) / (last token time - first token time). Scripted drafters know the plain output and are right with the nominal probability per drafted token (a fixed hash, so every mode sees the same acceptance pattern); their cost is about zero. The n-gram drafter has no weights. Every answer is checked byte for byte against the single process and its ledger against plain decoding's.",
+        "rows": rows,
+        "failures": failures,
+        "seconds": started.elapsed().as_secs_f64(),
+    });
+    write_json(&args.path("--out")?, &report)?;
+    if !failures.is_empty() {
+        return Err(ModernError::Invalid(format!(
+            "speculation exactness failures: {failures:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let mut items: Vec<String> = std::env::args().skip(1).collect();
     if items.is_empty() {
@@ -1019,6 +1344,7 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args),
         "bench" => cmd_bench(&args),
         "regional-bench" => cmd_regional_bench(&args),
+        "spec-bench" => cmd_spec_bench(&args),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::FAILURE;

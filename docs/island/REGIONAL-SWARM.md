@@ -99,17 +99,20 @@ are correctness bounds, not measured serving latency or throughput.
 
 - **ENG-8:** `Frame::Tree { id, prefix, nodes }` traverses every stage once.
   Topologically ordered `TreeNode`s name one token and either the live prefix
-  or an earlier node as parent. Each stage forks the corresponding KV locally,
-  returns per-node boundary/logits commitments and sampler selections, and drops
-  temporary branches. The prefix is unchanged even on error. Accepted paths are
-  re-executed and committed later through ordinary `Step` frames. Proposal/acceptance policy,
-  fused tree attention, prefix-cache sharing and tree memory admission belong to
-  ENG-8; this initial implementation clones caches and caps trees at 4096 nodes.
+  or an earlier node as parent. Each stage evaluates the nodes depth first on
+  the prefix's own KV, truncating back to each node's parent (no cache copies),
+  returns per-node boundary/logits commitments and sampler selections, and
+  truncates the prefix back to its own positions. The prefix is unchanged even
+  on error. Accepted paths are re-executed and committed later through ordinary
+  `Step` frames. Proposal/acceptance policy, fused tree attention and tree
+  memory admission belong to ENG-8; trees are capped at 4096 nodes.
   Use `Coordinator::forward_batch` to establish a live prefix,
   `Coordinator::verify_tree` to verify it and `close_sequences` to release it;
   these synchronous calls require an idle ring with no other frames in flight.
   `await_frame` discards nonmatching frames, so tree calls cannot currently be
-  interleaved with batched streams.
+  interleaved with batched streams. Pipelined chains with many passes of one
+  answer in flight, rolled back in place on rejection, are
+  `Coordinator::run_speculative` ([ASYNC-SPECULATION.md](ASYNC-SPECULATION.md)).
 - **ENG-9:** `Transport`/`Listener`/`Link` remain the frame transport boundary.
   `ReplicaConnector`/`StageSession::exchange` expose recovery sessions for alternate
   transports. Every connect must yield empty KV. Relays occupy independent ring

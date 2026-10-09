@@ -641,6 +641,35 @@ impl StageModel {
         }
     }
 
+    /// Keep the first `positions` positions of `cache` and drop the rest, in
+    /// place: how speculative decoding discards a rejected draft branch and
+    /// how a draft tree returns to a shared prefix. Entries are only ever
+    /// appended, so the kept prefix is byte-identical to the cache as it was
+    /// when it held `positions` positions; a failed forward's partial entries
+    /// are dropped as well. Nothing is copied.
+    pub fn truncate_cache(
+        &self,
+        cache: &mut StageCache,
+        positions: usize,
+    ) -> Result<(), ModernError> {
+        let c = self.config();
+        if cache.latent.len() != self.layers.len() || cache.rope_keys.len() != self.layers.len() {
+            return Err(invalid("the cache belongs to another stage"));
+        }
+        if positions > cache.positions {
+            return Err(invalid(format!(
+                "cannot keep {positions} positions of a cache holding {}",
+                cache.positions
+            )));
+        }
+        for (latent, keys) in cache.latent.iter_mut().zip(cache.rope_keys.iter_mut()) {
+            latent.truncate(positions * c.kv_lora_rank);
+            keys.truncate(positions * c.qk_rope_dim);
+        }
+        cache.positions = positions;
+        Ok(())
+    }
+
     /// One position through the stage (spec §5.7). Returns the output
     /// boundary vector and, for the last stage, the logits. When `trace` is
     /// given it receives the activation hash at every boundary of the stage
@@ -1420,6 +1449,48 @@ pub(crate) mod tests {
             boundary_digest(&run.hidden, c.d_model),
             out.boundary_digests[c.n_layers]
         );
+    }
+
+    /// A cache rolled back in place and extended with other tokens gives the
+    /// logits and cache bytes of a cache that never held the dropped
+    /// positions (speculative rollback and draft-tree branches).
+    #[test]
+    fn truncated_caches_continue_like_fresh_ones() {
+        for (lora, format) in FORMATS {
+            let c = tiny_config_with(lora, format);
+            let model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
+            let run = |cache: &mut StageCache, tokens: &[u32]| -> Vec<[u8; 32]> {
+                tokens
+                    .iter()
+                    .map(|&t| {
+                        let (_, logits) = model.forward(StageInput::Token(t), cache, None).unwrap();
+                        arith::logits_hash(&logits.unwrap())
+                    })
+                    .collect()
+            };
+            let mut fresh = model.new_cache();
+            let expected = run(&mut fresh, &[3, 17, 5, 9, 12]);
+            let mut branched = model.new_cache();
+            run(&mut branched, &[3, 17, 5, 40, 41, 42]);
+            model.truncate_cache(&mut branched, 3).unwrap();
+            assert_eq!(branched.positions(), 3);
+            assert_eq!(run(&mut branched, &[9, 12]), expected[3..].to_vec());
+            assert_eq!(branched.digest(), fresh.digest());
+            // Keeping every position changes nothing; growing is refused.
+            model.truncate_cache(&mut branched, 5).unwrap();
+            assert_eq!(branched.digest(), fresh.digest());
+            assert!(model.truncate_cache(&mut branched, 6).is_err());
+            // So is a cache of another stage.
+            let half = StageModel::from_owned(tiny_package(
+                &c,
+                StageSpec {
+                    first_layer: 0,
+                    end_layer: 2,
+                },
+            ))
+            .unwrap();
+            assert!(half.truncate_cache(&mut branched, 1).is_err());
+        }
     }
 
     /// The routed output for experts `chosen`, computed by hand: the spec's
