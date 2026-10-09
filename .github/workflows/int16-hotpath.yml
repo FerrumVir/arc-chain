@@ -14,7 +14,8 @@ name: INT16 projection hot path (bit-identical)
 #                 and golden known-answer tests, every arc-inference unit test
 #                 on Linux x86-64; then a release-mode timing of one INT16
 #                 projection, before and after, at pinned K2.6 shapes. Timings
-#                 are CI-runner numbers, not product speed.
+#                 are CI-runner numbers, not product speed. On Linux, the
+#                 limb split's machine code is checked for vector instructions.
 #   int16-e2e     the INT16 steps of mla-moe-moonlight.yml's tiny job: the
 #                 Fraction oracle, the arc-mla converter with scalar/SIMD
 #                 goldens and split stages, row-admission controls, and the
@@ -123,19 +124,6 @@ jobs:
           { echo "### INT16 projection, CI-runner benchmark (${{ matrix.os }}): not product speed"; echo
             head -1 runner.txt; echo
             grep -E '^(INT16 projection|\|)' bench.log; } >> "$GITHUB_STEP_SUMMARY"
-      # Diagnostic only: which loops of precision.rs the release build
-      # vectorized, and why not where it did not.
-      - name: Loop-vectorizer remarks for precision.rs (diagnostic, Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -uo pipefail
-          cargo rustc -p arc-inference --lib --release --locked -- \
-            -C remark=loop-vectorize -C debuginfo=1 > remarks.log 2>&1
-          grep -E 'mla/precision\.rs' remarks.log | sed -E 's#^.*crates/arc-inference/##' | sort -u > vectorize-remarks.txt
-          cat vectorize-remarks.txt
-          { echo "### Loop-vectorizer remarks, precision.rs ($RUNNER_ARCH)"; echo; echo '```'
-            cat vectorize-remarks.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       # Diagnostic only: the limb split is kept out of line so its machine code
       # can be checked for vector instructions in the release library.
       - name: Machine code of the INT16 limb split (diagnostic, Linux)
@@ -143,6 +131,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          cargo build -p arc-inference --lib --release --locked
           rlib=$(find target/release/deps -name 'libarc_inference-*.rlib' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
           objdump -d -C --no-show-raw-insn "$rlib" 2>/dev/null \
             | awk '/^[0-9a-f]+ <.*precision::split_block.*>:$/ {keep=1; next} /^$/ {keep=0} keep' > split-block.asm
@@ -158,7 +147,6 @@ jobs:
             runner.txt
             mla-tests.log
             bench.log
-            remarks.log
             split-block.asm
           if-no-files-found: warn
 
