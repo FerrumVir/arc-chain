@@ -16,6 +16,7 @@ const PING: u8 = 4;
 const SHUTDOWN: u8 = 5;
 const ERROR: u8 = 6;
 const TREE: u8 = 7;
+const ROLLBACK: u8 = 9;
 
 fn invalid(what: impl Into<String>) -> ModernError {
     ModernError::Invalid(format!("island frame: {}", what.into()))
@@ -411,6 +412,11 @@ pub enum Frame {
         prefix: u64,
         nodes: Vec<TreeNode>,
     },
+    /// Speculative decoding: every stage keeps the first `keep` positions of
+    /// `seq` (cache, forwarded tokens and activation log) and drops the rest,
+    /// in place. Links are first-in first-out, so each stage applies it after
+    /// every pass sent before it and before every pass sent after it.
+    Rollback { seq: u64, keep: u32 },
     /// The sequences are finished: drop their caches; with `forget` also
     /// their activation logs.
     Close { seqs: Vec<u64>, forget: bool },
@@ -445,6 +451,11 @@ impl Frame {
                     w.u32(node.parent.unwrap_or(u32::MAX));
                     node.item.write(&mut w);
                 }
+            }
+            Frame::Rollback { seq, keep } => {
+                w.u8(ROLLBACK);
+                w.u64(*seq);
+                w.u32(*keep);
             }
             Frame::Close { seqs, forget } => {
                 w.u8(CLOSE);
@@ -512,6 +523,10 @@ impl Frame {
                     .collect::<Result<_, ModernError>>()?;
                 Frame::Tree { id, prefix, nodes }
             }
+            ROLLBACK => Frame::Rollback {
+                seq: r.u64()?,
+                keep: r.u32()?,
+            },
             CLOSE => {
                 let forget = r.u8()? != 0;
                 let n = r.count()?;
@@ -604,6 +619,7 @@ mod tests {
                 seqs: vec![7, 8],
                 forget: true,
             },
+            Frame::Rollback { seq: 7, keep: 5 },
             Frame::Reveal {
                 seq: 7,
                 stages: vec![Revealed {

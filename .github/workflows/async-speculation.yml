@@ -1,0 +1,229 @@
+name: Async pipelined speculation (stacked on ENG-6)
+
+# Evidence for crates/arc-inference/src/modern/mla/island/speculative.rs: many
+# speculative passes of one answer in flight across the regional ring, KV
+# branches rolled back in place on rejection, byte-identical to plain
+# decoding. It runs for pull requests to main and to #167's branch
+# (agent/builder/ARC-68) that touch the island runtime (the paths
+# island-runtime.yml watches, plus this file), and by hand, so it keeps
+# running once this stack targets main. On pull requests to main the
+# repository workflows also run the new tests: they live in the modern::mla
+# unit suite and tests/island_processes.rs, which island-runtime.yml and
+# ci.yml already run. Nothing here talks to a node: every process listens on
+# 127.0.0.1.
+#
+#   tests    rustfmt and clippy (deny warnings), then the MLA profile and
+#            island unit tests on threads (the speculation correctness gate:
+#            every split, drafter, acceptance pattern, depth and pass width
+#            against plain decoding, rollback replay, early cancellation) and
+#            the stage-process tests over TCP. Linux x86-64 (debug unit tests,
+#            so overflow checks are on) and arm64 (release).
+#   bench    the emulated-WAN speculation benchmark on CI runners, one job per
+#            hop delay (1, 5, 16 and 50 ms one-way per shaped hop) plus a
+#            40-stage regional cell: plain vs synchronous vs pipelined
+#            speculation, every run checked byte for byte against the single
+#            process and its ledger against plain decoding's.
+#   report   one table from every bench job. EMULATED measurements on CI
+#            runners: a synthetic model, loopback processes, shaped hops.
+
+on:
+  pull_request:
+    branches: [main, 'agent/builder/ARC-68']
+    paths:
+      - 'crates/arc-inference/src/modern/mla/**'
+      - 'crates/arc-inference/src/bin/arc_island.rs'
+      - 'crates/arc-inference/tests/island_processes.rs'
+      - 'crates/arc-inference/tests/support/**'
+      - 'crates/arc-inference/Cargo.toml'
+      - 'scripts/arc_island/**'
+      - '.github/workflows/async-speculation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+
+jobs:
+  tests:
+    name: tests (fmt, clippy, unit, processes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - name: rustfmt (the island's files and the whole arc-inference package)
+        run: |
+          rustfmt --check --edition 2024 \
+            crates/arc-inference/src/modern/mla/*.rs \
+            crates/arc-inference/src/modern/mla/island/*.rs \
+            crates/arc-inference/src/bin/arc_island.rs \
+            crates/arc-inference/tests/island_processes.rs \
+            crates/arc-inference/tests/support/*.rs
+          cargo fmt -p arc-inference -- --check
+      - name: Clippy (arc-inference with candle, all targets, deny warnings)
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+      - name: Unit tests (MLA + MoE profile and the island on threads, debug)
+        run: cargo test -p arc-inference --lib --locked modern::mla -- --nocapture
+      - name: Stage processes over TCP
+        run: cargo test -p arc-inference --release --locked --test island_processes -- --nocapture
+
+  arm64:
+    name: tests (linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - name: Unit tests (MLA + MoE profile and the island on threads)
+        run: cargo test -p arc-inference --release --lib --locked modern::mla -- --nocapture
+      - name: Stage processes over TCP
+        run: cargo test -p arc-inference --release --locked --test island_processes -- --nocapture
+
+  workflow-syntax:
+    name: workflow syntax (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            > "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -version
+      - name: Check every workflow
+        run: |
+          "$RUNNER_TEMP/actionlint" -color
+
+  bench:
+    name: speculation bench, ${{ matrix.cell }} (CI runner, emulated WAN)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cell: 1 ms hops
+            tag: 1ms
+            shape: small
+            runs: '--stages 4,8 --hop-ms 1 --uplink-mbit 100;--stages 8 --hop-ms 1 --uplink-mbit 1000'
+          - cell: 5 ms hops
+            tag: 5ms
+            shape: small
+            runs: '--stages 4,8 --hop-ms 5 --uplink-mbit 100;--stages 8 --hop-ms 5 --uplink-mbit 1000'
+          - cell: 16 ms hops
+            tag: 16ms
+            shape: small
+            runs: '--stages 4,8 --hop-ms 16 --uplink-mbit 100;--stages 8 --hop-ms 16 --uplink-mbit 1000'
+          - cell: 50 ms hops
+            tag: 50ms
+            shape: small
+            runs: '--stages 4,8 --hop-ms 50 --uplink-mbit 100;--stages 8 --hop-ms 50 --uplink-mbit 1000'
+          - cell: 40 stages, regional RTT 5/10/20 ms
+            tag: regional40
+            shape: regional-40
+            runs: '--stages 40 --hop-ms 2.5,5,10 --uplink-mbit 100 --acceptance 0.7 --sync-k 3 --async 1x16 --no-ngram --prompt-len 4 --max-tokens 24'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - name: Build arc-island (release)
+        run: cargo build --release --locked -p arc-inference --bin arc-island
+      - name: Emulated-WAN speculation benchmark (CI-runner numbers, not product speed)
+        shell: bash
+        env:
+          SHAPE: ${{ matrix.shape }}
+          TAG: ${{ matrix.tag }}
+          SPEC_RUNS: ${{ matrix.runs }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/spec"
+          mkdir -p "$out"
+          { echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            lscpu | grep -E 'Model name|^CPU\(s\)' || true; } | tee "$out/runner-$TAG.txt"
+          ./target/release/arc-island synth --shape "$SHAPE" --out "$out/$SHAPE.arcspkg" > "$out/synth-$TAG.json"
+          IFS=';' read -r -a invocations <<< "$SPEC_RUNS"
+          for i in "${!invocations[@]}"; do
+            read -r -a flags <<< "${invocations[$i]}"
+            ./target/release/arc-island spec-bench --package "$out/$SHAPE.arcspkg" \
+              --out "$out/spec-$TAG-$i.json" \
+              --label "CI runner (GitHub ubuntu-latest), release build, EMULATED WAN" \
+              --kernel simd --threads 1 --stage-threads 1 "${flags[@]}" 2> "$out/spec-$TAG-$i.log"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: spec-bench-${{ matrix.tag }}
+          path: |
+            ${{ runner.temp }}/spec/*.json
+            ${{ runner.temp }}/spec/*.log
+            ${{ runner.temp }}/spec/*.txt
+          if-no-files-found: warn
+
+  report:
+    name: speculation report (emulated, CI runners)
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report regressions
+        run: python3 -m unittest discover -s scripts/arc_island -p 'test_*.py'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: spec-bench-*
+          path: ${{ runner.temp }}/spec
+          merge-multiple: true
+      - name: Speculation report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/arc_island/spec_report.py "$RUNNER_TEMP"/spec/spec-*.json \
+            --out "$RUNNER_TEMP/spec/spec-report.md"
+          cat "$RUNNER_TEMP/spec/spec-report.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: spec-report
+          path: ${{ runner.temp }}/spec/
+          if-no-files-found: warn

@@ -143,14 +143,19 @@ impl Coordinator {
         }
     }
 
-    fn send(&mut self, frame: &Frame, stats: &mut RunStats) -> Result<(), ModernError> {
+    /// The model configuration the ring serves.
+    pub fn config(&self) -> &MlaConfig {
+        &self.config
+    }
+
+    pub(super) fn send(&mut self, frame: &Frame, stats: &mut RunStats) -> Result<(), ModernError> {
         let bytes = frame.encode();
         stats.frames += 1;
         stats.bytes_sent += bytes.len() as u64;
         self.downstream.send(&bytes)
     }
 
-    fn recv(&mut self, stats: &mut RunStats) -> Result<Frame, ModernError> {
+    pub(super) fn recv(&mut self, stats: &mut RunStats) -> Result<Frame, ModernError> {
         let bytes = self
             .returns
             .recv_timeout(self.timeout)
@@ -165,7 +170,7 @@ impl Coordinator {
     }
 
     /// The refusals `StageModel::generate` makes before any forward call.
-    fn refusal(&self, request: &Request) -> Option<String> {
+    pub(super) fn refusal(&self, request: &Request) -> Option<String> {
         let c = &self.config;
         if request.prompt.is_empty() || request.max_tokens == 0 {
             return Some("generation needs a non-empty prompt and max_tokens >= 1".into());
@@ -463,10 +468,13 @@ impl Coordinator {
     }
 
     /// Verify drafted branches against a still-live prefix in one ring pass.
-    /// Requires an idle ring: `await_frame` discards nonmatching frames, so do
-    /// not interleave this with batched streams. Accepted paths are re-executed
+    /// Each stage evaluates the tree depth first on the prefix's own cache,
+    /// truncating back to each node's parent (no cache copies). Requires an
+    /// idle ring: `await_frame` discards nonmatching frames, so do not
+    /// interleave this with batched streams. Accepted paths are re-executed
     /// through ordinary Step frames; this call does not advance the live KV.
-    /// ENG-8 owns draft proposal and path acceptance; this API returns exact
+    /// Pipelined chains with many passes in flight use
+    /// `Coordinator::run_speculative` instead. This API returns exact
     /// per-node logits/commitments only.
     pub fn verify_tree(
         &mut self,

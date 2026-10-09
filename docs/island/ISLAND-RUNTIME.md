@@ -54,8 +54,9 @@ flowchart LR
   `TcpTransport` (length-prefixed frames, Nagle off) is the first; RDMA or
   Thunderbolt implementations plug into the same traits. `MemTransport` joins
   threads in tests. `ShapedTransport` emulates a wide-area hop for benchmarks.
-* **Wire** (`wire.rs`). Frames `Step`, `Close`, `Reveal`, `Ping`, `Shutdown`,
-  `Error`. Activations travel in the narrowest lossless width per vector
+* **Wire** (`wire.rs`). Frames `Step`, `Tree`, `Rollback`, `Close`, `Reveal`,
+  `Ping`, `Shutdown`, `Error` (`Tree` and `Rollback` serve speculation; see
+  [ASYNC-SPECULATION.md](ASYNC-SPECULATION.md)). Activations travel in the narrowest lossless width per vector
   (`i8`/`i16`/`i32`/`i64`), so the receiver hashes exactly the integers the
   sender produced. On the synthetic models every boundary fits `i32` (half of
   `i64`); `i16` or `i8` is never used unless every value fits.

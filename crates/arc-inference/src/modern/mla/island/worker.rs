@@ -7,8 +7,12 @@
 //! it to rebuild every open sequence's KV cache, and checks that replay
 //! reproduces every hash it committed before the restart (research-6 §4.3:
 //! "same log, two uses").
+//!
+//! Speculative decoding extends a sequence's one live cache with draft
+//! positions and drops them in place with a rollback (also logged). Draft
+//! trees branch off the same cache depth first. Neither copies a cache.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -78,6 +82,13 @@ pub struct WorkerStats {
     pub compute_seconds: f64,
     /// Positions replayed from the log at start.
     pub replayed_positions: u64,
+    /// Computed positions later dropped by a rollback (speculative work
+    /// that turned out to follow a rejected draft).
+    pub rolled_back_positions: u64,
+    /// Items not computed because a rollback already queued behind them
+    /// had discarded them (early cancellation), and their positions.
+    pub skipped_items: u64,
+    pub skipped_positions: u64,
 }
 
 #[derive(Clone)]
@@ -94,6 +105,11 @@ struct SeqState {
 
 const LOG_ITEM: u8 = 1;
 const LOG_CLOSE: u8 = 2;
+const LOG_ROLLBACK: u8 = 3;
+
+/// The error a stage records on an item that a rollback queued behind it has
+/// already discarded: the item is passed on without being computed.
+pub const SUPERSEDED: &str = "superseded by a queued rollback";
 
 /// One stage of an island.
 pub struct StageWorker {
@@ -173,6 +189,17 @@ impl StageWorker {
                 self.verify_tree(prefix, &mut nodes)?;
                 Frame::Tree { id, prefix, nodes }
             }
+            Frame::Rollback { seq, keep } => {
+                let applied = self.rollback(seq, keep as usize)?;
+                if applied && let Some(log) = &mut self.log {
+                    let mut w = Writer::default();
+                    w.u8(LOG_ROLLBACK);
+                    w.u64(seq);
+                    w.u32(keep);
+                    write_record(log, &w.bytes)?;
+                }
+                Frame::Rollback { seq, keep }
+            }
             Frame::Close { seqs, forget } => {
                 for &seq in &seqs {
                     self.close(seq, forget);
@@ -212,10 +239,13 @@ impl StageWorker {
         Ok(out)
     }
 
-    /// Fork caches locally, evaluate parents before children, and discard all
-    /// temporary branches even on failure. No draft mutates the live prefix or
-    /// persistent log. Returned items carry the same per-layer commitments as
-    /// ordinary sequential decoding for their individual paths.
+    /// Evaluate a draft tree on the live prefix's own state, depth first.
+    /// Before each node the prefix's cache, forwarded tokens and inputs are
+    /// truncated back to the node's parent, so siblings never see each
+    /// other's positions and no cache is copied. Afterwards, even on failure,
+    /// the prefix is truncated back to exactly its own positions, and no draft
+    /// reaches the persistent log. Returned items carry the same per-layer
+    /// commitments as ordinary sequential decoding of their individual paths.
     fn verify_tree(&mut self, prefix: u64, nodes: &mut [TreeNode]) -> Result<(), ModernError> {
         let invalid = || ModernError::Invalid("invalid tree topology or prefix".into());
         let base = self.seqs.get(&prefix).ok_or_else(invalid)?;
@@ -223,12 +253,20 @@ impl StageWorker {
         if nodes.is_empty() || nodes.len() > 4096 {
             return Err(invalid());
         }
-        let mut ids = std::collections::HashSet::new();
+        let mut ids = HashSet::new();
+        let mut children = vec![Vec::new(); nodes.len()];
+        let mut roots = Vec::new();
         for (i, node) in nodes.iter().enumerate() {
             let at = match node.parent {
-                Some(p) if (p as usize) < i => nodes[p as usize].item.start as usize + 1,
+                Some(p) if (p as usize) < i => {
+                    children[p as usize].push(i);
+                    nodes[p as usize].item.start as usize + 1
+                }
                 Some(_) => return Err(invalid()),
-                None => start,
+                None => {
+                    roots.push(i);
+                    start
+                }
             };
             if node.item.tokens.len() != 1
                 || node.item.start as usize != at
@@ -241,22 +279,67 @@ impl StageWorker {
                 return Err(invalid());
             }
         }
-        let result = (|| {
-            for i in 0..nodes.len() {
-                let source = nodes[i]
-                    .parent
-                    .map_or(prefix, |p| nodes[p as usize].item.seq);
-                let state = self.seqs.get(&source).ok_or_else(invalid)?.clone();
-                self.seqs.insert(nodes[i].item.seq, state);
-                let commit = self.run_item(&mut nodes[i].item)?;
-                nodes[i].item.commits.push(commit);
-            }
-            Ok(())
-        })();
-        for id in ids {
-            self.seqs.remove(&id);
+        // Depth-first preorder, children in frame order: every node follows
+        // its parent or a finished subtree of an earlier sibling.
+        let mut order = Vec::with_capacity(nodes.len());
+        let mut stack: Vec<usize> = roots.into_iter().rev().collect();
+        while let Some(i) = stack.pop() {
+            order.push(i);
+            stack.extend(children[i].iter().rev());
         }
+        let result = self.run_tree(prefix, nodes, &order);
+        self.truncate_state(prefix, start)?;
         result
+    }
+
+    /// The nodes of a validated tree, in `order`, on `prefix`'s state.
+    fn run_tree(
+        &mut self,
+        prefix: u64,
+        nodes: &mut [TreeNode],
+        order: &[usize],
+    ) -> Result<(), ModernError> {
+        for &i in order {
+            // The positions before a node hold the prefix and its ancestors.
+            self.truncate_state(prefix, nodes[i].item.start as usize)?;
+            let commit = self.run_on(prefix, &mut nodes[i].item)?;
+            nodes[i].item.commits.push(commit);
+        }
+        Ok(())
+    }
+
+    /// Speculative rollback: keep `seq`'s first `keep` positions (cache,
+    /// forwarded tokens, received inputs) and drop the rest in place. An
+    /// unknown sequence is ignored (a failed item already dropped it here);
+    /// a closed one, or `keep` beyond what this stage holds, is refused.
+    /// Returns whether the rollback applied.
+    fn rollback(&mut self, seq: u64, keep: usize) -> Result<bool, ModernError> {
+        if !self.seqs.contains_key(&seq) {
+            return Ok(false);
+        }
+        let dropped = self.truncate_state(seq, keep)?;
+        self.stats.rolled_back_positions += dropped as u64;
+        Ok(true)
+    }
+
+    /// Keep the first `keep` positions of `seq`'s cache, forwarded tokens and
+    /// received inputs; returns how many positions were dropped.
+    fn truncate_state(&mut self, seq: u64, keep: usize) -> Result<usize, ModernError> {
+        let d = self.model.config().d_model;
+        let state = self
+            .seqs
+            .get_mut(&seq)
+            .ok_or_else(|| ModernError::Invalid(format!("sequence {seq} is unknown here")))?;
+        let cache = state
+            .cache
+            .as_mut()
+            .ok_or_else(|| ModernError::Invalid(format!("sequence {seq} is closed")))?;
+        let held = cache.positions();
+        self.model.truncate_cache(cache, keep)?;
+        state.tokens.truncate(keep);
+        // The first stage receives token ids only; its inputs stay empty.
+        state.inputs.truncate(keep * d);
+        Ok(held - keep)
     }
 
     fn close(&mut self, seq: u64, forget: bool) {
@@ -301,6 +384,31 @@ impl StageWorker {
     }
 
     fn run_item(&mut self, item: &mut Item) -> Result<StageCommit, ModernError> {
+        if !self.seqs.contains_key(&item.seq) {
+            if item.start != 0 {
+                return Err(ModernError::Invalid(format!(
+                    "sequence {} is unknown here (position {})",
+                    item.seq, item.start
+                )));
+            }
+            let cache = self.model.new_cache();
+            self.seqs.insert(
+                item.seq,
+                SeqState {
+                    cache: Some(cache),
+                    prompt_len: item.prompt_len,
+                    selection: item.selection,
+                    tokens: Vec::new(),
+                    inputs: Vec::new(),
+                },
+            );
+        }
+        self.run_on(item.seq, item)
+    }
+
+    /// Run `item`'s positions on `key`'s state: the item's own sequence, or
+    /// the live prefix that a draft-tree node temporarily extends.
+    fn run_on(&mut self, key: u64, item: &mut Item) -> Result<StageCommit, ModernError> {
         let stage = self.model.stage();
         let c = self.model.config();
         let d = c.d_model;
@@ -317,26 +425,10 @@ impl StageWorker {
             ));
         }
         let start = item.start as usize;
-        if !self.seqs.contains_key(&item.seq) {
-            if start != 0 {
-                return Err(ModernError::Invalid(format!(
-                    "sequence {} is unknown here (position {start})",
-                    item.seq
-                )));
-            }
-            let cache = self.model.new_cache();
-            self.seqs.insert(
-                item.seq,
-                SeqState {
-                    cache: Some(cache),
-                    prompt_len: item.prompt_len,
-                    selection: item.selection,
-                    tokens: Vec::new(),
-                    inputs: Vec::new(),
-                },
-            );
-        }
-        let state = self.seqs.get_mut(&item.seq).expect("inserted");
+        let state = self
+            .seqs
+            .get_mut(&key)
+            .ok_or_else(|| ModernError::Invalid(format!("sequence {key} is unknown here")))?;
         let cache = state
             .cache
             .as_mut()
@@ -472,6 +564,12 @@ impl StageWorker {
                     r.done()?;
                     self.close(seq, forget);
                 }
+                LOG_ROLLBACK => {
+                    let seq = r.u64()?;
+                    let keep = r.u32()? as usize;
+                    r.done()?;
+                    self.rollback(seq, keep)?;
+                }
                 other => {
                     return Err(ModernError::Invalid(format!(
                         "{context}: record kind {other}"
@@ -558,25 +656,51 @@ pub fn incoming(mut listener: Box<dyn Listener>) -> Receiver<Vec<u8>> {
 }
 
 /// Run a worker: frames from `listener`, results to `next`, until a
-/// shutdown frame has been forwarded.
+/// shutdown frame has been forwarded. Frames that have already arrived wait
+/// in a local queue, so a stage that falls behind sees a rollback queued
+/// behind speculative work and skips the items it discards (early
+/// cancellation) instead of computing them.
 pub fn serve(
-    mut worker: StageWorker,
+    worker: StageWorker,
     listener: Box<dyn Listener>,
     transport: Arc<dyn Transport>,
     next: String,
 ) -> Result<StageWorker, ModernError> {
-    let frames = incoming(listener);
+    serve_from(worker, incoming(listener), transport, next)
+}
+
+/// [`serve`] on frames from a channel, as [`incoming`] delivers them.
+pub fn serve_from(
+    mut worker: StageWorker,
+    frames: Receiver<Vec<u8>>,
+    transport: Arc<dyn Transport>,
+    next: String,
+) -> Result<StageWorker, ModernError> {
     let mut downstream = Downstream::new(transport, next);
-    for bytes in frames {
-        let out = match Frame::decode(&bytes) {
+    let mut queue = VecDeque::new();
+    loop {
+        if queue.is_empty() {
+            let Ok(bytes) = frames.recv() else {
+                break;
+            };
+            queue.push_back(Frame::decode(&bytes));
+        }
+        queue.extend(frames.try_iter().map(|bytes| Frame::decode(&bytes)));
+        let Some(decoded) = queue.pop_front() else {
+            break;
+        };
+        let out = match decoded {
             Ok(Frame::Shutdown) => {
                 downstream.send(&Frame::Shutdown.encode())?;
                 return Ok(worker);
             }
-            Ok(frame) => worker.process(frame).unwrap_or_else(|e| Frame::Error {
-                stage: worker.name(),
-                message: e.to_string(),
-            }),
+            Ok(mut frame) => {
+                skip_superseded(&mut frame, &queue, &mut worker.stats);
+                worker.process(frame).unwrap_or_else(|e| Frame::Error {
+                    stage: worker.name(),
+                    message: e.to_string(),
+                })
+            }
             Err(e) => Frame::Error {
                 stage: worker.name(),
                 message: e.to_string(),
@@ -585,4 +709,33 @@ pub fn serve(
         downstream.send(&out.encode())?;
     }
     Ok(worker)
+}
+
+/// Mark every item of a `Step` that a rollback already queued behind it
+/// discards (same sequence, at or beyond the kept length) as superseded, so
+/// this stage and every later one pass it on without computing it. The
+/// rollback's sender had cancelled those items before sending it: links are
+/// first-in first-out, so they were on the ring ahead of it.
+pub fn skip_superseded(
+    frame: &mut Frame,
+    queued: &VecDeque<Result<Frame, ModernError>>,
+    stats: &mut WorkerStats,
+) {
+    let Frame::Step { items, .. } = frame else {
+        return;
+    };
+    for item in items.iter_mut() {
+        let superseded = item.error.is_none()
+            && queued.iter().any(|ahead| {
+                matches!(ahead, Ok(Frame::Rollback { seq, keep })
+                    if *seq == item.seq && *keep <= item.start)
+            });
+        if superseded {
+            item.error = Some(SUPERSEDED.into());
+            item.hidden.clear();
+            item.pad = 0;
+            stats.skipped_items += 1;
+            stats.skipped_positions += item.tokens.len() as u64;
+        }
+    }
 }

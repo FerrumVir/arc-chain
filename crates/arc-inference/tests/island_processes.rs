@@ -8,7 +8,10 @@
 //! * a tampering stage process is blamed by re-execution, and a lying
 //!   commitment breaks the link check;
 //! * a stage whose routed experts live in another process (expert
-//!   parallelism) gives the same bytes.
+//!   parallelism) gives the same bytes;
+//! * asynchronous pipelined speculation between stage processes over
+//!   emulated 1 ms hops gives plain decoding's tokens and commitments, and
+//!   every stage's log audits clean afterwards.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -388,6 +391,124 @@ fn a_stage_with_experts_in_another_process_matches_the_single_process() {
     island.shutdown().unwrap();
     let _ = server.kill();
     let _ = server.wait();
+}
+
+/// Asynchronous pipelined speculation between stage processes over TCP,
+/// every hop delayed 1 ms: synchronous chains and pipelined passes with a
+/// scripted and an n-gram drafter give the single process's bytes and plain
+/// decoding's ledger, and after a run that keeps the logs every stage of
+/// every answer re-executes to its commitments.
+#[test]
+fn speculative_stage_processes_match_plain_decoding_and_audit() {
+    use arc_inference::modern::mla::island::speculative::{
+        Drafter, NgramDrafter, Script, ScriptedDrafter, SpecConfig,
+    };
+    use std::collections::HashMap;
+    let scratch = Scratch::new("speculation");
+    let (path, c, model) = package(&scratch.0, "tiny-lora");
+    let reqs = requests(&c, 4);
+    let expected = reference(&model, &reqs);
+    let truth: HashMap<u64, Vec<u32>> = reqs
+        .iter()
+        .zip(&expected)
+        .map(|(r, g)| (r.id, g.tokens.clone()))
+        .collect();
+    let cuts = even_cuts(c.n_layers, 4);
+    let verifiers: Vec<StageModel> = cuts
+        .windows(2)
+        .map(|w| {
+            StageModel::open_range(
+                &path,
+                Some(StageSpec {
+                    first_layer: w[0],
+                    end_layer: w[1],
+                }),
+            )
+            .unwrap()
+        })
+        .collect();
+    let verifier_refs: Vec<&StageModel> = verifiers.iter().collect();
+    let mut island = ProcessIsland::launch(Path::new(EXE), &path, &cuts, &c, |s| {
+        vec![
+            "--wan-ms".into(),
+            "1".into(),
+            "--wan-seed".into(),
+            (s + 1).to_string(),
+        ]
+    })
+    .unwrap();
+    let plain_schedule = Schedule {
+        forget_finished: true,
+        ..schedule(1, 1)
+    };
+    let (plain, _) = island.coordinator.run(&reqs, &plain_schedule).unwrap();
+    assert_matches(&expected, &plain, "plain over TCP");
+    for (depth, rows) in [(1, 4), (4, 1), (3, 2)] {
+        let mut drafters: Vec<Box<dyn Drafter>> = vec![
+            Box::new(ScriptedDrafter::new(
+                truth.clone(),
+                c.vocab_size,
+                Script::Rate { rate: 0.6, seed: 1 },
+            )),
+            Box::new(NgramDrafter::default()),
+        ];
+        for drafter in &mut drafters {
+            let config = SpecConfig {
+                depth,
+                rows,
+                forget_finished: true,
+                ..SpecConfig::default()
+            };
+            let at = format!("D {depth} R {rows} {}", drafter.name());
+            let (done, _, _) = island
+                .coordinator
+                .run_speculative(&reqs, &config, &mut **drafter)
+                .unwrap();
+            assert_matches(&expected, &done, &at);
+            for (p, got) in plain.iter().zip(&done) {
+                assert_eq!(got.ledger, p.ledger, "{at} id {}", got.id);
+            }
+        }
+    }
+    // Keep the logs this time, then audit every stage of every answer.
+    let mut drafter =
+        ScriptedDrafter::new(truth, c.vocab_size, Script::Rate { rate: 0.6, seed: 2 });
+    let config = SpecConfig {
+        depth: 4,
+        rows: 1,
+        ..SpecConfig::default()
+    };
+    let (done, _, spec) = island
+        .coordinator
+        .run_speculative(&reqs, &config, &mut drafter)
+        .unwrap();
+    assert!(spec.rollbacks > 0, "{spec:?}");
+    assert_matches(&expected, &done, "audited speculative run");
+    for (r, got) in reqs.iter().zip(&done) {
+        let revealed = island.coordinator.reveal(r.id).unwrap();
+        let verdicts = audit_all(
+            &got.ledger,
+            &revealed,
+            &verifier_refs,
+            &AuditContext::new(r, &got.tokens),
+        )
+        .unwrap();
+        for ((a, b), verdict) in verdicts {
+            assert!(
+                matches!(verdict, Verdict::Valid { .. }),
+                "id {} [{a}, {b}): {verdict:?}",
+                r.id
+            );
+        }
+    }
+    let stats = island.shutdown().unwrap();
+    let discarded: u64 = stats
+        .iter()
+        .map(|s| {
+            s["rolled_back_positions"].as_u64().unwrap() + s["skipped_positions"].as_u64().unwrap()
+        })
+        .sum();
+    assert!(discarded > 0, "{stats:?}");
 }
 
 /// A last-stage process that emits a token other than its sampler's: every

@@ -47,8 +47,10 @@ pub struct PositionCommit {
     pub selected: Option<u32>,
 }
 
-/// Everything committed for one sequence, by every stage.
-#[derive(Debug, Clone)]
+/// Everything committed for one sequence, by every stage. Two ledgers are
+/// equal when every stage committed the same hashes, logits and tokens at
+/// every position.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ledger {
     n_layers: usize,
     /// Per position: the hash at every boundary `0 ..= L` once known.

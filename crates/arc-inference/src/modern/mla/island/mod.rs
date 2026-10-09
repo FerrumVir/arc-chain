@@ -12,6 +12,9 @@
 //! * [`coordinator`]: the ingress. Micro-batched pipeline scheduling with
 //!   continuous admission; per-sequence [`commit::Ledger`]s with link checks.
 //! * [`commit`]: the ledger and the re-execution audit of one stage.
+//! * [`speculative`]: asynchronous pipelined speculative decoding: many
+//!   draft passes of one answer in flight, rolled back in place when a draft
+//!   is rejected, byte-identical to plain decoding.
 //! * [`expert`]: expert parallelism inside a stage.
 //! * [`transport`]: the pluggable [`transport::Transport`] (TCP first;
 //!   in-memory for tests; a wide-area emulator for benchmarks).
@@ -31,6 +34,7 @@ pub mod coordinator;
 pub mod expert;
 pub mod process;
 pub mod replica;
+pub mod speculative;
 pub mod transport;
 pub mod wire;
 pub mod worker;
