@@ -1,0 +1,156 @@
+name: Speculative decoding bench
+
+# CI measurement of lossless speculative decoding on the live network model
+# (Llama-2-7B-Chat Q4_K_M, pinned by SHA-256, loaded as the canonical INT8
+# legacy split-half profile exactly as `--full-integer-worker` loads it).
+#
+# Every leg is also an exactness gate on the real 7B model: each speculative
+# run must return the same tokens and output hash as plain decoding, and the
+# first prompt is also checked against the production `try_generate`. The
+# driver exits non-zero on any difference. Timings are CI measurements on
+# shared 4-vCPU runners, not production figures.
+#
+# Cost control: it runs only when a pull request changes the speculative
+# engine or this bench, and a newer push cancels an older run. Models are
+# downloaded each run and never cached or uploaded.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/speculative-bench.yml
+      - crates/arc-inference/examples/speculative_bench.rs
+      - crates/arc-inference/src/speculative.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: speculative-bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The target: the same bytes as arc-node's TESTNET_MODEL_SHA256.
+  MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
+  MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+  MODEL_BYTES: "4081004224"
+  MODEL_FILE: .speculative-bench/llama-2-7b-chat.Q4_K_M.gguf
+  # The draft model: TinyLlama-1.1B-Chat, which uses Llama-2's tokenizer.
+  DRAFT_URL: https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/52e7645ba7c309695bec7ac98f4f005b139cf465/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+  DRAFT_SHA256: a4c9bb1dbaa372f6381a035fa5c02ef087aaa1ff1f843a56a22328114f03fc59
+  DRAFT_BYTES: "1170781568"
+  DRAFT_FILE: .speculative-bench/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+  MAX_NEW_TOKENS: "64"
+  CONFIGS: ngram:3,ngram:7,draft:3
+
+jobs:
+  bench:
+    name: 7B bench / ${{ matrix.runner }} / ${{ matrix.kernel }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, kernel: simd}
+          - {runner: ubuntu-24.04, kernel: scalar}
+          - {runner: ubuntu-24.04-arm, kernel: simd}
+    env:
+      RUNNER_LABEL: ${{ matrix.runner }}
+      KERNEL: ${{ matrix.kernel }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner facts
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/speculative-bench"
+          mkdir -p "$out"
+          {
+            echo "leg: $RUNNER_LABEL / $KERNEL"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            lscpu
+            free -b
+            df -h .
+          } 2>&1 | tee "$out/runner.txt"
+
+      - name: Download and verify the pinned models
+        run: |
+          set -euo pipefail
+          fetch() {
+            local url="$1" file="$2" bytes="$3" sha="$4"
+            mkdir -p "$(dirname "$file")"
+            curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+              --retry-max-time 900 --connect-timeout 20 --max-time 1800 \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$file.partial" "$url"
+            mv "$file.partial" "$file"
+            local size actual
+            size="$(wc -c < "$file" | tr -d ' ')"
+            if [ "$size" != "$bytes" ]; then
+              echo "::error::$file is $size bytes, expected $bytes"
+              exit 1
+            fi
+            actual="$(sha256sum "$file" | cut -d ' ' -f 1)"
+            if [ "$actual" != "$sha" ]; then
+              echo "::error::$file SHA-256 is $actual, expected $sha"
+              exit 1
+            fi
+            echo "verified $file: sha256 $actual, $size bytes"
+          }
+          fetch "$MODEL_URL" "$MODEL_FILE" "$MODEL_BYTES" "$MODEL_SHA256"
+          fetch "$DRAFT_URL" "$DRAFT_FILE" "$DRAFT_BYTES" "$DRAFT_SHA256"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - name: Build the bench driver (release, Candle GGUF loader)
+        run: cargo build --locked --release -p arc-inference --features candle --example speculative_bench
+
+      - name: Run plain and speculative decoding
+        timeout-minutes: 110
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/speculative-bench"
+          mkdir -p "$out"
+          status=0
+          target/release/examples/speculative_bench \
+            --model "$GITHUB_WORKSPACE/$MODEL_FILE" \
+            --draft-model "$GITHUB_WORKSPACE/$DRAFT_FILE" \
+            --kernel "$KERNEL" \
+            --max-new-tokens "$MAX_NEW_TOKENS" \
+            --configs "$CONFIGS" \
+            --out "$out/result.json" \
+            --summary "$out/summary.md" 2>&1 | tee "$out/bench.log" || status=$?
+          if [ -f "$out/summary.md" ]; then
+            {
+              echo "Runner: $RUNNER_LABEL ($(nproc) vCPU)."
+              echo
+              cat "$out/summary.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+      - name: Record memory after the run
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/speculative-bench"
+          mkdir -p "$out"
+          {
+            free -b
+            grep -E '^(pswpin|pswpout|pgmajfault) ' /proc/vmstat || true
+          } 2>&1 | tee "$out/runner-after.txt"
+
+      - name: Upload this leg's results (never the models)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: speculative-bench-${{ matrix.runner }}-${{ matrix.kernel }}
+          path: ${{ runner.temp }}/speculative-bench/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true

@@ -260,7 +260,17 @@ None of them is a profile:
   refuses inputs it cannot prove exact);
 * thread count (the KAT runs at 1, 2 and 4 threads);
 * layer-range sharding (the KAT's three-way split matches the whole model);
-* row-partitioned projections (§3.4).
+* row-partitioned projections (§3.4);
+* speculative decoding (`crates/arc-inference/src/speculative.rs`, opt-in with
+  the worker's `--speculative`). One pass forwards the pending token and the
+  drafted tokens as batched prefill rows. A row's logits select a token only
+  when that row's input is the token the model itself selected from the row
+  before, rejected rows are cut from the KV cache, and selection, EOS and
+  `max_tokens` follow the plain loop, so the drafter never chooses a token.
+  Evidence: the committed generation KAT is reproduced for every drafter,
+  draft length and thread count; v1, v2 and greedy outputs, and the final KV
+  cache bytes, equal plain decoding under adversarial drafts; and
+  `speculative-bench.yml` checks the real 7B model.
 
 ## 7. KV cache
 

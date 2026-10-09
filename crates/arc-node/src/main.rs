@@ -36,6 +36,12 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use zeroize::{Zeroize, Zeroizing};
 
+fn parse_speculative_drafter(
+    value: &str,
+) -> std::result::Result<arc_node::worker_speculation::SpeculativeDrafterSpec, String> {
+    value.parse()
+}
+
 fn parse_desktop_lifecycle_nonce(encoded: &str) -> std::result::Result<[u8; 32], String> {
     if encoded.len() != 64
         || !encoded
@@ -444,6 +450,35 @@ struct Cli {
     /// This flag is the explicit full-integer, no-shard-advertisement role.
     #[arg(long, default_value_t = false)]
     full_integer_worker: bool,
+
+    /// Lossless speculative decoding for community jobs. Off by default.
+    ///
+    /// `ngram` drafts from the job's own tokens and needs no weights.
+    /// `draft:PATH` drafts with a small model that shares this model's
+    /// tokenizer, as an `.arc-int8` cache or a GGUF (TinyLlama-1.1B shares
+    /// Llama-2-7B's). The worker model still chooses every token, so the
+    /// output tokens, output hash and signed attestation are byte-identical
+    /// with this on or off, and validators recompute without it. It pays only
+    /// when a multi-row pass is cheaper per row than single rows, as on the
+    /// vectorised kernel (`ARC_FAST_CANONICAL_KERNEL=1`).
+    #[arg(
+        long,
+        value_name = "ngram|draft:PATH",
+        value_parser = parse_speculative_drafter,
+        requires = "full_integer_worker"
+    )]
+    speculative: Option<arc_node::worker_speculation::SpeculativeDrafterSpec>,
+
+    /// Most drafted tokens one worker-model pass verifies under
+    /// --speculative: 1 to 32, default 3 (one four-row pass of the batched
+    /// kernel).
+    #[arg(
+        long,
+        value_name = "K",
+        requires = "speculative",
+        value_parser = clap::value_parser!(u16).range(1..=32)
+    )]
+    speculative_k: Option<u16>,
 
     /// First layer index to load (inclusive). Pipeline-parallel sharding.
     /// Together with --shard-end, makes this node a SHARD HOLDER for a slice
@@ -8241,6 +8276,39 @@ async fn run_arc_node() -> Result<()> {
             "--full-integer-worker invariant failed: worker must use the canonical per-row INT8 profile and must not advertise shard ranges"
         );
     }
+    // ── Optional lossless speculative decoding for community jobs ──────
+    // Clap admits --speculative only with --full-integer-worker, whose model
+    // was checked just above. The drafter is loaded and checked against that
+    // model now, so a bad path or a foreign tokenizer stops startup instead
+    // of the first job.
+    let worker_speculation: Option<Arc<arc_node::worker_speculation::WorkerSpeculation>> =
+        match &cli.speculative {
+            Some(spec) => {
+                let model = inference_model.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--speculative needs the loaded full integer worker model")
+                })?;
+                let max_draft = cli
+                    .speculative_k
+                    .map_or(arc_inference::speculative::DEFAULT_MAX_DRAFT, usize::from);
+                let speculation =
+                    arc_node::worker_speculation::WorkerSpeculation::load(spec, max_draft, model)
+                        .map_err(|error| anyhow::anyhow!("--speculative {spec}: {error}"))?;
+                let fast_kernel = arc_inference::canonical_simd::fast_canonical_kernel_enabled();
+                tracing::info!(
+                    drafter = speculation.label(),
+                    max_draft,
+                    fast_kernel,
+                    "Speculative decoding enabled for community jobs; output tokens, hashes and attestations are unchanged"
+                );
+                if !fast_kernel {
+                    tracing::warn!(
+                        "--speculative is running on the scalar kernel, where a multi-row pass costs close to one row per row; set ARC_FAST_CANONICAL_KERNEL=1 for the vectorised kernel, where speculation pays"
+                    );
+                }
+                Some(Arc::new(speculation))
+            }
+            None => None,
+        };
     if complete_startup_shutdown_if_requested(
         &shutdown_requested,
         Some(state.as_ref()),
@@ -9236,6 +9304,7 @@ async fn run_arc_node() -> Result<()> {
             let status_w = worker_status.clone();
             let reregister_w = reregister.clone();
             let prevent_sleep_during_jobs = cli.prevent_sleep_during_jobs;
+            let speculation_w = worker_speculation.clone();
 
             runtime_tasks.push(tokio::spawn(async move {
                 use arc_node::community_worker::{JobOutcome, KeepAwake, WorkerState};
@@ -9685,6 +9754,7 @@ async fn run_arc_node() -> Result<()> {
                             continue;
                         }
                         let worker_execution_for_compute = worker_execution_permit.clone();
+                        let job_speculation = speculation_w.clone();
                         status_w.set_state(WorkerState::Computing);
                         let inference = tokio::task::spawn_blocking(move || {
                             let _worker_execution_permit = worker_execution_for_compute;
@@ -9697,28 +9767,29 @@ async fn run_arc_node() -> Result<()> {
                             // admission immediately before allocating KV state;
                             // even a tokenizer-expanded prompt can only become
                             // a typed worker failure, never an indexing panic.
-                            let (generated, hash) = inference_model
-                                .try_generate(
-                                    &inference_tokens,
+                            // This is try_generate, or with --speculative its
+                            // speculative twin, which returns the same tokens
+                            // and hash and the same admission error.
+                            let job = arc_node::worker_speculation::generate_community_job(
+                                &inference_model,
+                                &inference_tokens,
+                                max_tokens,
+                                job_speculation.as_deref(),
+                            )
+                            .map_err(|error| {
+                                let helper_admitted = community_generation_fits_context(
+                                    inference_tokens.len(),
                                     max_tokens,
-                                    &inference_model.config.eos_tokens,
-                                )
-                                .map_err(|error| {
-                                    let helper_admitted = community_generation_fits_context(
-                                        inference_tokens.len(),
-                                        max_tokens,
-                                        inference_model.config.max_seq,
-                                    );
-                                    format!(
-                                        "{error}; worker_context_helper_admitted={helper_admitted}"
-                                    )
-                                })?;
-                            let output_text = inference_model.decode(&generated);
-                            Ok::<_, String>((generated, hash, output_text))
+                                    inference_model.config.max_seq,
+                                );
+                                format!("{error}; worker_context_helper_admitted={helper_admitted}")
+                            })?;
+                            let output_text = inference_model.decode(&job.tokens);
+                            Ok::<_, String>((job.tokens, job.output_hash, output_text, job.speculation))
                         })
                         .await;
                         status_w.set_state(WorkerState::Polling);
-                        let (generated, hash, output_text) = match inference {
+                        let (generated, hash, output_text, speculation_stats) = match inference {
                             Ok(Ok(result)) => result,
                             Ok(Err(error)) => {
                                 tracing::error!(
@@ -9796,6 +9867,18 @@ async fn run_arc_node() -> Result<()> {
                             elapsed_ms,
                             ms_per_tok
                         );
+                        if let Some(stats) = &speculation_stats {
+                            // Local diagnostics only: nothing here reaches the
+                            // result body or the attestation.
+                            tracing::info!(
+                                job_id,
+                                passes = stats.passes,
+                                drafted = stats.drafted_tokens,
+                                accepted = stats.accepted_tokens,
+                                tokens_per_pass = stats.tokens_per_pass(),
+                                "speculative job finished"
+                            );
+                        }
 
                         // ── Build + sign the InferenceAttestation tx ──
                         // First time only: query the chain for the worker's
@@ -10276,6 +10359,72 @@ mod tests {
         ])
         .unwrap();
         assert!(configured.enable_native_inference_requests);
+    }
+
+    #[test]
+    fn speculative_decoding_is_off_by_default_and_only_for_full_integer_workers() {
+        use arc_node::worker_speculation::SpeculativeDrafterSpec;
+
+        let default = Cli::try_parse_from(["arc-node"]).unwrap();
+        assert!(default.speculative.is_none() && default.speculative_k.is_none());
+
+        let ngram = Cli::try_parse_from([
+            "arc-node",
+            "--full-integer-worker",
+            "--speculative",
+            "ngram",
+        ])
+        .unwrap();
+        assert_eq!(ngram.speculative, Some(SpeculativeDrafterSpec::Ngram));
+        assert_eq!(ngram.speculative_k, None);
+
+        let draft = Cli::try_parse_from([
+            "arc-node",
+            "--full-integer-worker",
+            "--speculative",
+            "draft:/opt/arc/tinyllama-1.1b.arc-int8",
+            "--speculative-k",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(
+            draft.speculative,
+            Some(SpeculativeDrafterSpec::DraftModel(
+                "/opt/arc/tinyllama-1.1b.arc-int8".into()
+            ))
+        );
+        assert_eq!(draft.speculative_k, Some(5));
+
+        // Only the full integer worker role may opt in, and k needs the flag.
+        assert!(Cli::try_parse_from(["arc-node", "--speculative", "ngram"]).is_err());
+        assert!(
+            Cli::try_parse_from(["arc-node", "--full-integer-worker", "--speculative-k", "3"])
+                .is_err()
+        );
+        for bad in ["eagle", "draft:", "", "NGRAM"] {
+            assert!(
+                Cli::try_parse_from(["arc-node", "--full-integer-worker", "--speculative", bad])
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+        let with_k = |k: &str| {
+            Cli::try_parse_from([
+                "arc-node",
+                "--full-integer-worker",
+                "--speculative",
+                "ngram",
+                "--speculative-k",
+                k,
+            ])
+        };
+        for k in ["0", "33", "x"] {
+            assert!(with_k(k).is_err(), "k={k}");
+        }
+        assert_eq!(
+            with_k("32").unwrap().speculative_k.map(usize::from),
+            Some(arc_inference::speculative::MAX_DRAFT_LIMIT)
+        );
     }
 
     #[test]
