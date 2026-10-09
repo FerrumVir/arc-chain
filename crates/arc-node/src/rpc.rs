@@ -22271,11 +22271,13 @@ mod tests {
             "reward_approval_quorum_unavailable"
         );
         assert_eq!(response["settlement"]["submitted"], false);
-        let reason = response["settlement"]["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(reason.contains(cause), "{reason}");
+        // The cause is checked in the log below, not in this public reason:
+        // #189 replaces a journal error's detail there with a fixed text.
+        assert!(
+            response["settlement"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
         let Json(submitted) = job.submit.await.unwrap().unwrap();
         assert!(submitted.get("answer_release").is_none());
         assert_eq!(submitted["settlement"], response["settlement"]);
