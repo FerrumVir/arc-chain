@@ -1253,9 +1253,11 @@ fn cmd_spec_bench(args: &Args) -> Result<(), ModernError> {
                         };
                         let mut island =
                             ProcessIsland::launch(&exe, &package_path, &cuts, &c, stage_args)?;
-                        let (done, stats, spec) = island
-                            .coordinator
-                            .run_speculative(&requests, &config, drafter)?;
+                        let (done, stats, spec) = island.coordinator.run_speculative(
+                            &requests,
+                            &config,
+                            &mut **drafter,
+                        )?;
                         let workers = island.shutdown()?;
                         let exact = matches_reference(&done, &reference);
                         let same_ledgers = done.len() == plain.len()
