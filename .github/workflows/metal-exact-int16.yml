@@ -13,17 +13,23 @@ name: Metal exact INT16 GEMV (hosted macOS)
 #
 # Optional and never a required check. The kernels and their engine hooks are
 # opt-in (`metal-exact` feature; ARC_METAL_EXACT_I16=1 and
-# ARC_METAL_EXACT_GEMV=1 at run time) and off by default. One macOS job per
-# push: macOS runners also serve the release sequence.
+# ARC_METAL_EXACT_GEMV=1 at run time) and off by default.
+#
+# macOS runners also serve the release and proof sequences, so this workflow
+# takes at most one of them per push: it runs on pull requests only when its
+# own files change (the INT16 kernel, its engine, its hook module, the pinned
+# INT16 fixture goldens, this file), and a newer push cancels an older run
+# that is still queued or running. Other changes can run it by hand
+# (workflow_dispatch, once this file is on the default branch).
 
 on:
   pull_request:
     paths:
       - .github/workflows/metal-exact-int16.yml
-      - crates/arc-gpu/**
-      - crates/arc-inference/**
-      - docs/protocol/reference/int16-*.json
-      - Cargo.lock
+      - crates/arc-gpu/src/metal_exact_i16.rs
+      - crates/arc-gpu/src/metal_exact_gemv_i16.metal
+      - crates/arc-inference/src/modern/mla/metal_i16.rs
+      - docs/protocol/reference/int16-fixture-goldens.json
   workflow_dispatch:
 
 permissions:
