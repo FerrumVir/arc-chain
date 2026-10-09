@@ -4805,11 +4805,18 @@ impl CachedIntegerModel {
     /// the caller selects each row's token with that row's generated history,
     /// and [`Self::rollback_rows`] drops the rows of rejected drafts.
     ///
-    /// It pays from four rows. The batched kernel works on quads of rows, so
-    /// one to three rows cost more per row than one-row calls; send those
-    /// through [`Self::forward_shard_token`], with the floor the prefill uses
-    /// ([`crate::canonical_prefill::batching_is_profitable`]).
-    /// `examples/stage_rows_bench.rs` measures both on the real model.
+    /// When it pays. The batched kernel works on quads of four rows, so a call
+    /// costs about one quad's work per started quad, and its per-row saving
+    /// over one-row calls is a sawtooth in k. Measured on Llama-2-7B (bench run
+    /// 37998031423, `examples/stage_rows_bench.rs`, 4-vCPU runners):
+    ///
+    /// - with the vectorised kernel a call pays from three rows: 0.89 of the
+    ///   one-row cost per row on AVX2 and 0.73 on NEON at k = 3, falling to
+    ///   0.67 and 0.48 at k = 8. Five rows on AVX2 (1.05) are the exception;
+    /// - with the scalar kernel only whole quads pay, about 0.92 at k = 4
+    ///   and k = 8, and every other k costs more;
+    /// - one or two rows never pay, so send those through
+    ///   [`Self::forward_shard_token`].
     ///
     /// Canonical per-row I8 only: any other profile is refused, so the caller
     /// falls back to one-row calls. A refusal leaves `cache` unchanged.
