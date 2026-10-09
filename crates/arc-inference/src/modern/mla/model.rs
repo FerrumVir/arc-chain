@@ -640,6 +640,59 @@ impl StageModel {
             .collect()
     }
 
+    /// The heads of INT16 layer `w` as one exact Metal GEMV batch
+    /// (`super::metal_i16::try_heads`): every head's `wk_b` projection, then
+    /// for every head the RoPE and absorbed attention of the per-head loop in
+    /// `layer_forward`, then every head's `wv_b` projection. `false` means the
+    /// batch declined and wrote nothing; the loop then computes the heads.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    fn heads_on_metal(
+        &self,
+        w: &LayerWeights,
+        q: &[i64],
+        cos: &[i32],
+        sin: &[i32],
+        view: LatentCache<'_>,
+        heads: &mut [i64],
+    ) -> bool {
+        use super::metal_i16::{HeadStack, try_heads};
+        if !(w.wk_b.wide && w.wv_b.wide) {
+            return false;
+        }
+        fn stack<'a>(data: &'a [u8], m: &'a MatRef) -> HeadStack<'a> {
+            HeadStack {
+                weights: I16Weights::admitted(&data[m.q.clone()]),
+                heads: m.mu.len() / m.rows,
+                rows: m.rows,
+                cols: m.cols,
+                mu: &m.mu,
+                k: &m.k,
+            }
+        }
+        let c = self.config();
+        let data = self.bytes.as_slice();
+        let (nope, dqk, lambda) = (c.qk_nope_dim, c.d_qk(), c.attention_lambda);
+        let queries: Vec<i64> = q
+            .chunks(dqk)
+            .flat_map(|head| head.iter().take(nope).copied())
+            .collect();
+        let attend = |j: usize, qa: &[i64]| -> Result<Vec<i64>, ModernError> {
+            let base = j * dqk;
+            let mut qp = q[base + nope..base + dqk].to_vec();
+            rope_interleaved(&mut qp, cos, sin)?;
+            let mut u = vec![0i64; view.rank];
+            mla_attend(qa, &qp, view, lambda, &mut u)?;
+            Ok(u)
+        };
+        try_heads(
+            stack(data, &w.wk_b),
+            &queries,
+            stack(data, &w.wv_b),
+            attend,
+            heads,
+        )
+    }
+
     /// Whether a segment belongs to the executed range (spec §4.7).
     pub fn executes_segment(&self, segment: &str) -> bool {
         let c = self.config();
@@ -797,21 +850,32 @@ impl StageModel {
         };
         let (nope, dqk, lambda) = (c.qk_nope_dim, c.d_qk(), c.attention_lambda);
         let mut heads = vec![0i64; c.d_attn_out()];
-        // Heads are independent: head j reads q, the cache and its own weights
-        // and writes only its output block. `head_schedule` says whether they
-        // run in parallel (INT16 layers large enough) or one after another.
-        for_each_head(&mut heads, c.v_head_dim, self.head_schedule(w), |j, out| {
-            let base = j * dqk;
-            let mut qp = q[base + nope..base + dqk].to_vec();
-            rope_interleaved(&mut qp, cos, sin)?;
-            let mut qa = vec![0i64; rank];
-            w.wk_b
-                .view(data, j)
-                .project(&q[base..base + nope], &mut qa)?;
-            let mut u = vec![0i64; rank];
-            mla_attend(&qa, &qp, view, lambda, &mut u)?;
-            w.wv_b.view(data, j).project(&u, out)
-        })?;
+        // Opt-in: an INT16 layer's heads as one exact Metal GEMV batch
+        // (`heads_on_metal`), which computes exactly what the loop below
+        // computes, or declines without writing and leaves the heads (and any
+        // error) to the loop.
+        #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+        let batched = self.heads_on_metal(w, &q, cos, sin, view, &mut heads);
+        #[cfg(not(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64")))]
+        let batched = false;
+        if !batched {
+            // Heads are independent: head j reads q, the cache and its own
+            // weights and writes only its output block. `head_schedule` says
+            // whether they run in parallel (INT16 layers large enough) or one
+            // after another.
+            for_each_head(&mut heads, c.v_head_dim, self.head_schedule(w), |j, out| {
+                let base = j * dqk;
+                let mut qp = q[base + nope..base + dqk].to_vec();
+                rope_interleaved(&mut qp, cos, sin)?;
+                let mut qa = vec![0i64; rank];
+                w.wk_b
+                    .view(data, j)
+                    .project(&q[base..base + nope], &mut qa)?;
+                let mut u = vec![0i64; rank];
+                mla_attend(&qa, &qp, view, lambda, &mut u)?;
+                w.wv_b.view(data, j).project(&u, out)
+            })?;
+        }
         let mut y = vec![0i64; c.d_model];
         w.wo.view(data, 0).project(&heads, &mut y)?;
         add_residual(h, &y)?;
@@ -2456,6 +2520,86 @@ pub(crate) mod tests {
         // of which the four embeddings stay on the CPU.
         assert_eq!(views, 198);
         assert_eq!(on_gpu, 3 * (198 - 4));
+    }
+
+    /// The four pinned INT16 fixture goldens hold with every INT16 layer's
+    /// heads as one exact Metal GEMV batch (both projections of every head,
+    /// with the CPU's RoPE and attention between them) in every submission,
+    /// and every other INT16 projection on the per-projection hook. The census
+    /// shows one batch per layer and forward, no declined batch, and no head
+    /// projection on the per-projection hook.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn int16_fixture_goldens_hold_with_head_batches_on_metal_i16() {
+        use super::super::metal_i16::test_support::{HeadsGuard, SwitchGuard};
+        use super::super::metal_i16::{MetalI16Model, metal_i16_census};
+        use arc_gpu::metal_exact_i16::Submission;
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+        ))
+        .unwrap();
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let request = GenerationRequest {
+            prompt: &[3, 17, 5, 49, 0],
+            max_tokens: 8,
+            eos: &[],
+            selection: Selection::Rp64Argmax,
+        };
+        for (name, c) in int16_fixtures() {
+            let bytes = tiny_package(&c, StageSpec::full(&c));
+            let package_hash = blake3::hash(&bytes).to_hex().to_string();
+            assert_eq!(pinned[name][0], package_hash, "{name}");
+            let model = StageModel::from_owned(bytes).unwrap();
+            let metal = MetalI16Model::new(&model).expect("the exact INT16 Metal GEMV");
+            let wide: Vec<(String, &MatRef)> = dyadic_matrices(&model)
+                .into_iter()
+                .filter(|(label, m)| m.wide && label != "embed")
+                .collect();
+            let per_head = |label: &str| label.ends_with(".wk_b") || label.ends_with(".wv_b");
+            // INT16 projections per position outside the heads, and INT16
+            // layers (one batch each per position).
+            let others: u64 = wide
+                .iter()
+                .filter(|(label, _)| !per_head(label))
+                .map(|(_, m)| (m.mu.len() / m.rows) as u64)
+                .sum();
+            let layers = wide
+                .iter()
+                .filter(|(label, _)| label.ends_with(".wk_b"))
+                .count() as u64;
+            assert_eq!(
+                layers, c.n_layers as u64,
+                "{name}: every layer's heads are INT16"
+            );
+            let _switch = SwitchGuard::set(true);
+            for submission in Submission::ALL {
+                let _heads = HeadsGuard::set(true, submission);
+                let before = metal_i16_census();
+                let run = metal.run(|| model.generate(&request)).unwrap();
+                let delta = metal_i16_census().since(&before);
+                assert_eq!(
+                    pinned[name][1],
+                    generation_digest(&run),
+                    "{name}: head batches, {submission:?}"
+                );
+                let forwards = (request.prompt.len() + run.tokens.len() - 1) as u64;
+                assert_eq!(
+                    (
+                        delta.heads_accepted,
+                        delta.heads_declined,
+                        delta.heads_outside_scope
+                    ),
+                    (layers * forwards, 0, 0),
+                    "{name}: {submission:?}: {delta:?}"
+                );
+                assert_eq!(delta.accepted, others * forwards, "{name}: {delta:?}");
+                assert_eq!(delta.in_scope_fallbacks(), 0, "{name}: {delta:?}");
+            }
+            println!(
+                "golden {name} with head batches on the exact INT16 Metal GEMV: run {}",
+                pinned[name][1]
+            );
+        }
     }
 
     /// The four pinned INT16 fixture goldens (tokens, every logits hash and

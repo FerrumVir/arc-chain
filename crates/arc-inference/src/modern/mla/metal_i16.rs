@@ -43,20 +43,39 @@
 //! of a K2.6-sized INT16 layer (`Schedule::Pool`), are outside it and stay on
 //! the CPU, counted as `outside_scope`.
 //!
+//! # Head batches
+//!
+//! With a fourth switch, `ARC_METAL_EXACT_I16_HEADS=1` or
+//! [`set_metal_exact_i16_heads`] (also off by default), an INT16 layer's heads
+//! leave the per-projection hook: [`try_heads`] runs every head's `wk_b`
+//! projection in one dispatch, the CPU's RoPE and attention for every head,
+//! and every head's `wv_b` projection in one dispatch, in one command buffer
+//! per layer ([`set_metal_i16_heads_submission`] picks the submission; every
+//! submission computes the same integers). The epilogues are the CPU's
+//! `arith::dyadic_epilogue`, and the attention is the CPU's own code. If any
+//! head would refuse anywhere, the batch declines without writing, and the
+//! per-head loop computes the layer, so it returns the CPU's error.
+//!
 //! Wiring this as a worker default is a separate, reviewed step.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arc_gpu::metal_exact::Storage;
-use arc_gpu::metal_exact_i16::{MetalExactI16, Refusal, ResidentI16};
+use arc_gpu::metal_exact_i16::{HeadPhase, MetalExactI16, Refusal, ResidentI16, Submission};
+use rayon::prelude::*;
 
 use super::model::StageModel;
 use super::precision::I16Weights;
+use crate::modern::ModernError;
+use crate::modern::arith::dyadic_epilogue;
 
 static REQUESTED: AtomicBool = AtomicBool::new(false);
+static HEADS_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Index into `Submission::ALL`; 0 is one command buffer per layer.
+static HEADS_SUBMISSION: AtomicU8 = AtomicU8::new(0);
 static ENV_INIT: OnceLock<()> = OnceLock::new();
 static ENGINE: OnceLock<Result<Arc<MetalExactI16>, String>> = OnceLock::new();
 
@@ -68,6 +87,10 @@ static REFUSED_SHAPE: AtomicU64 = AtomicU64::new(0);
 static REFUSED_GUARD: AtomicU64 = AtomicU64::new(0);
 static REFUSED_SPLIT: AtomicU64 = AtomicU64::new(0);
 static DEVICE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static HEADS_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
+static HEADS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static HEADS_OUTSIDE_SCOPE: AtomicU64 = AtomicU64::new(0);
+static HEADS_DECLINED: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// The residency scope active on this thread, set only by
@@ -79,6 +102,9 @@ fn env_init() {
     ENV_INIT.get_or_init(|| {
         if std::env::var("ARC_METAL_EXACT_I16").as_deref() == Ok("1") {
             REQUESTED.store(true, Ordering::Relaxed);
+        }
+        if std::env::var("ARC_METAL_EXACT_I16_HEADS").as_deref() == Ok("1") {
+            HEADS_REQUESTED.store(true, Ordering::Relaxed);
         }
     });
 }
@@ -94,6 +120,34 @@ pub fn set_metal_exact_i16(enabled: bool) {
 pub fn metal_exact_i16_requested() -> bool {
     env_init();
     REQUESTED.load(Ordering::Relaxed)
+}
+
+/// Turn head batches on or off process-wide. Default off; an explicit call
+/// overrides `ARC_METAL_EXACT_I16_HEADS`. They also need the INT16 switch and
+/// a residency scope.
+pub fn set_metal_exact_i16_heads(enabled: bool) {
+    env_init();
+    HEADS_REQUESTED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the head-batch switch is on.
+pub fn metal_exact_i16_heads_requested() -> bool {
+    env_init();
+    HEADS_REQUESTED.load(Ordering::Relaxed)
+}
+
+/// How head batches are submitted (default: one command buffer per layer).
+pub fn set_metal_i16_heads_submission(submission: Submission) {
+    let index = Submission::ALL
+        .iter()
+        .position(|&s| s == submission)
+        .unwrap_or(0);
+    HEADS_SUBMISSION.store(index as u8, Ordering::Relaxed);
+}
+
+/// The submission head batches use.
+pub fn metal_i16_heads_submission() -> Submission {
+    Submission::ALL[usize::from(HEADS_SUBMISSION.load(Ordering::Relaxed)) % Submission::ALL.len()]
 }
 
 /// The process-wide engine, created and self-tested on first use.
@@ -116,6 +170,14 @@ pub struct MetalI16Census {
     pub refused_accumulator_bound: u64,
     pub refused_digit_split: u64,
     pub device_errors: u64,
+    /// Layers whose heads reached the head-batch hook (both switches on).
+    pub heads_attempted: u64,
+    /// Layers whose heads the GPU batch computed.
+    pub heads_accepted: u64,
+    /// No residency scope on the calling thread.
+    pub heads_outside_scope: u64,
+    /// Inside a scope, but the batch declined and the per-head loop ran.
+    pub heads_declined: u64,
 }
 
 impl MetalI16Census {
@@ -140,6 +202,10 @@ impl MetalI16Census {
                 - earlier.refused_accumulator_bound,
             refused_digit_split: self.refused_digit_split - earlier.refused_digit_split,
             device_errors: self.device_errors - earlier.device_errors,
+            heads_attempted: self.heads_attempted - earlier.heads_attempted,
+            heads_accepted: self.heads_accepted - earlier.heads_accepted,
+            heads_outside_scope: self.heads_outside_scope - earlier.heads_outside_scope,
+            heads_declined: self.heads_declined - earlier.heads_declined,
         }
     }
 }
@@ -156,6 +222,10 @@ pub fn metal_i16_census() -> MetalI16Census {
         refused_accumulator_bound: REFUSED_GUARD.load(Ordering::Relaxed),
         refused_digit_split: REFUSED_SPLIT.load(Ordering::Relaxed),
         device_errors: DEVICE_ERRORS.load(Ordering::Relaxed),
+        heads_attempted: HEADS_ATTEMPTED.load(Ordering::Relaxed),
+        heads_accepted: HEADS_ACCEPTED.load(Ordering::Relaxed),
+        heads_outside_scope: HEADS_OUTSIDE_SCOPE.load(Ordering::Relaxed),
+        heads_declined: HEADS_DECLINED.load(Ordering::Relaxed),
     }
 }
 
@@ -311,10 +381,168 @@ pub(crate) fn try_dots(q: &[u8], rows: usize, cols: usize, x: &[i64], dots: &mut
     }
 }
 
+/// One per-head INT16 stack of an MLA layer (`wk_b` or `wv_b`): `heads`
+/// matrices of `rows` x `cols`, one after another, with their row scales.
+#[derive(Clone, Copy)]
+pub(crate) struct HeadStack<'a> {
+    pub(crate) weights: I16Weights<'a>,
+    pub(crate) heads: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) mu: &'a [i32],
+    pub(crate) k: &'a [u8],
+}
+
+impl HeadStack<'_> {
+    /// The shapes `project_i16` checks for each head, and its scale domain
+    /// on every row.
+    fn admissible(&self) -> bool {
+        let rows = self.heads.checked_mul(self.rows);
+        let bytes = rows
+            .and_then(|rows| rows.checked_mul(self.cols))
+            .and_then(|weights| weights.checked_mul(2));
+        self.heads > 0
+            && self.rows > 0
+            && self.cols > 0
+            && bytes == Some(self.weights.as_bytes().len())
+            && rows == Some(self.mu.len())
+            && rows == Some(self.k.len())
+            && self
+                .mu
+                .iter()
+                .zip(self.k)
+                .all(|(&m, &s)| (m == 0 && s == 16) || (m >= 1 << 30 && (16..=62).contains(&s)))
+    }
+}
+
+/// The dyadic epilogue of `dots` with row scales `mu` and `k`, or `None` if
+/// one output is beyond 2^62.
+fn epilogue_rows(dots: &[i64], mu: &[i32], k: &[u8]) -> Option<Vec<i64>> {
+    dots.iter()
+        .zip(mu.iter().zip(k))
+        .map(|(&dot, (&m, &s))| dyadic_epilogue(dot, m, s).ok())
+        .collect()
+}
+
+/// The heads of one MLA layer as a GPU batch: every head's `key` (`wk_b`)
+/// projection of its `queries` vector, then `attend(head, qa)` on the CPU
+/// (RoPE and absorbed attention, giving the head's latent `u`), then every
+/// head's `value` (`wv_b`) projection of `u`, into `out` (heads x
+/// `value.rows`, one head after another).
+///
+/// Returns `true` only if `out` now holds exactly what the per-head loop of
+/// `layer_forward` computes: the GPU computes exact dots, the epilogues are
+/// `arith::dyadic_epilogue` and the attention is `attend` itself. If any head
+/// would refuse at any step (shape, guard, scale domain, epilogue, RoPE,
+/// attention), or the GPU refuses, nothing is written and the caller runs the
+/// per-head loop, which then returns the CPU's error.
+pub(crate) fn try_heads<A>(
+    key: HeadStack<'_>,
+    queries: &[i64],
+    value: HeadStack<'_>,
+    attend: A,
+    out: &mut [i64],
+) -> bool
+where
+    A: Fn(usize, &[i64]) -> Result<Vec<i64>, ModernError> + Sync,
+{
+    if !(metal_exact_i16_requested() && metal_exact_i16_heads_requested()) {
+        return false;
+    }
+    count(&HEADS_ATTEMPTED);
+    let active = ACTIVE.with(Cell::get);
+    if active.is_null() {
+        count(&HEADS_OUTSIDE_SCOPE);
+        return false;
+    }
+    // SAFETY: ACTIVE is non-null only while `MetalI16Model::run` is executing
+    // on this thread, and `run` holds `&self` for the whole call, so the
+    // `Residency` it points to is alive and not mutated.
+    let residency = unsafe { &*active };
+    let decline = || {
+        count(&HEADS_DECLINED);
+        false
+    };
+    let heads = key.heads;
+    if !key.admissible()
+        || !value.admissible()
+        || value.heads != heads
+        || value.cols != key.rows
+        || heads.checked_mul(key.cols) != Some(queries.len())
+        || heads.checked_mul(value.rows) != Some(out.len())
+    {
+        return decline();
+    }
+    let (Some((key_matrix, key_start)), Some((value_matrix, value_start))) = (
+        residency.find(key.weights.as_bytes(), heads * key.rows, key.cols),
+        residency.find(value.weights.as_bytes(), heads * value.rows, value.cols),
+    ) else {
+        return decline();
+    };
+    let a = HeadPhase {
+        matrix: &key_matrix.matrix,
+        first_row: key_start,
+        heads,
+        rows: key.rows,
+    };
+    let b = HeadPhase {
+        matrix: &value_matrix.matrix,
+        first_row: value_start,
+        heads,
+        rows: value.rows,
+    };
+    // The CPU step between the phases: every head's key epilogue and its
+    // attention, in parallel over heads (each head reads only shared inputs
+    // and its own dots). Any refusal declines the whole batch.
+    let between = |dots: &[i64]| -> Option<Vec<i64>> {
+        let latents: Vec<Option<Vec<i64>>> = dots
+            .par_chunks(key.rows)
+            .enumerate()
+            .map(|(head, head_dots)| {
+                let rows = head * key.rows..(head + 1) * key.rows;
+                let qa = epilogue_rows(head_dots, &key.mu[rows.clone()], &key.k[rows])?;
+                let u = attend(head, &qa).ok()?;
+                (u.len() == value.cols).then_some(u)
+            })
+            .collect();
+        let mut inputs = Vec::with_capacity(heads * value.cols);
+        for u in latents {
+            inputs.extend(u?);
+        }
+        Some(inputs)
+    };
+    let engine = &residency.engine;
+    let mut dots_a = vec![0i64; heads * key.rows];
+    let mut dots_b = vec![0i64; heads * value.rows];
+    if engine
+        .dot_heads_two_phase(
+            &a,
+            queries,
+            &b,
+            between,
+            &mut dots_a,
+            &mut dots_b,
+            engine.tile(),
+            metal_i16_heads_submission(),
+        )
+        .is_err()
+    {
+        return decline();
+    }
+    let Some(result) = epilogue_rows(&dots_b, value.mu, value.k) else {
+        return decline();
+    };
+    out.copy_from_slice(&result);
+    count(&HEADS_ACCEPTED);
+    true
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::super::precision::Schedule;
+    use super::super::model::for_each_head;
+    use super::super::ops::{LatentCache, mla_attend, rope_interleaved};
     use super::super::precision::tests::{Case, Outcome};
+    use super::super::precision::{Schedule, project_i16};
     use super::*;
 
     /// Turns the runtime switch on or off for one test and restores it after,
@@ -390,13 +618,237 @@ pub(crate) mod test_support {
         let outcome = metal.run(|| case.current(Some(Schedule::Serial)));
         (outcome, metal_i16_census().since(&before))
     }
+
+    /// Turns head batches on or off, with a submission, for one test and
+    /// restores both after, even on panic. Hold `kernel_switch_guard`.
+    pub(crate) struct HeadsGuard(bool, Submission);
+
+    impl HeadsGuard {
+        pub(crate) fn set(enabled: bool, submission: Submission) -> Self {
+            let previous = HeadsGuard(
+                metal_exact_i16_heads_requested(),
+                metal_i16_heads_submission(),
+            );
+            set_metal_exact_i16_heads(enabled);
+            set_metal_i16_heads_submission(submission);
+            previous
+        }
+    }
+
+    impl Drop for HeadsGuard {
+        fn drop(&mut self) {
+            set_metal_exact_i16_heads(self.0);
+            set_metal_i16_heads_submission(self.1);
+        }
+    }
+
+    /// One MLA layer's heads with random INT16 `wk_b` and `wv_b` stacks, a
+    /// random latent cache and RoPE tables: the inputs of the per-head loop
+    /// in `layer_forward`.
+    #[derive(Clone)]
+    pub(crate) struct LayerHeads {
+        pub(crate) n_heads: usize,
+        pub(crate) rank: usize,
+        pub(crate) nope: usize,
+        pub(crate) rope_dim: usize,
+        pub(crate) v_dim: usize,
+        pub(crate) positions: usize,
+        pub(crate) wk: Vec<u8>,
+        pub(crate) wv: Vec<u8>,
+        pub(crate) mu_k: Vec<i32>,
+        pub(crate) k_k: Vec<u8>,
+        pub(crate) mu_v: Vec<i32>,
+        pub(crate) k_v: Vec<u8>,
+        /// `n_heads` queries of `nope + rope_dim` values.
+        pub(crate) q: Vec<i64>,
+        pub(crate) latent: Vec<i32>,
+        pub(crate) rope_keys: Vec<i32>,
+        pub(crate) cos: Vec<i32>,
+        pub(crate) sin: Vec<i32>,
+        pub(crate) lambda: i64,
+    }
+
+    impl LayerHeads {
+        /// Random heads: Q16 queries up to 1, latents up to `magnitude`, RoPE
+        /// keys up to 1/4, and K2.6's attention scale for the head width.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn new(
+            rng: &mut Rng,
+            n_heads: usize,
+            rank: usize,
+            nope: usize,
+            rope_dim: usize,
+            v_dim: usize,
+            positions: usize,
+            magnitude: i64,
+        ) -> Self {
+            let dqk = nope + rope_dim;
+            LayerHeads {
+                n_heads,
+                rank,
+                nope,
+                rope_dim,
+                v_dim,
+                positions,
+                wk: le_bytes(&weights(rng, n_heads * rank * nope)),
+                wv: le_bytes(&weights(rng, n_heads * v_dim * rank)),
+                mu_k: (0..n_heads * rank).map(|_| rng.mu()).collect(),
+                k_k: (0..n_heads * rank).map(|r| 40 + (r % 23) as u8).collect(),
+                mu_v: (0..n_heads * v_dim).map(|_| rng.mu()).collect(),
+                k_v: (0..n_heads * v_dim).map(|r| 40 + (r % 23) as u8).collect(),
+                q: (0..n_heads * dqk).map(|_| rng.symmetric(1 << 16)).collect(),
+                latent: (0..positions * rank)
+                    .map(|_| rng.symmetric(magnitude) as i32)
+                    .collect(),
+                rope_keys: (0..positions * rope_dim)
+                    .map(|_| rng.symmetric(1 << 14) as i32)
+                    .collect(),
+                cos: (0..rope_dim / 2)
+                    .map(|_| rng.symmetric(1 << 16) as i32)
+                    .collect(),
+                sin: (0..rope_dim / 2)
+                    .map(|_| rng.symmetric(1 << 16) as i32)
+                    .collect(),
+                lambda: crate::modern::tables::attention_lambda(dqk),
+            }
+        }
+
+        pub(crate) fn dqk(&self) -> usize {
+            self.nope + self.rope_dim
+        }
+
+        pub(crate) fn view(&self) -> LatentCache<'_> {
+            LatentCache {
+                latent: &self.latent,
+                rope_keys: &self.rope_keys,
+                positions: self.positions,
+                rank: self.rank,
+                rope_dim: self.rope_dim,
+            }
+        }
+
+        /// The `wk_b` and `wv_b` stacks.
+        pub(crate) fn stacks(&self) -> (HeadStack<'_>, HeadStack<'_>) {
+            (
+                HeadStack {
+                    weights: I16Weights::new(&self.wk).expect("admitted"),
+                    heads: self.n_heads,
+                    rows: self.rank,
+                    cols: self.nope,
+                    mu: &self.mu_k,
+                    k: &self.k_k,
+                },
+                HeadStack {
+                    weights: I16Weights::new(&self.wv).expect("admitted"),
+                    heads: self.n_heads,
+                    rows: self.v_dim,
+                    cols: self.rank,
+                    mu: &self.mu_v,
+                    k: &self.k_v,
+                },
+            )
+        }
+
+        /// Every head's non-RoPE query, one after another.
+        pub(crate) fn queries(&self) -> Vec<i64> {
+            self.q
+                .chunks(self.dqk())
+                .flat_map(|head| head.iter().take(self.nope).copied())
+                .collect()
+        }
+
+        /// RoPE and absorbed attention of head `j`, as `layer_forward` runs
+        /// them between the two projections.
+        pub(crate) fn attend(&self, j: usize, qa: &[i64]) -> Result<Vec<i64>, ModernError> {
+            let base = j * self.dqk();
+            let mut qp = self.q[base + self.nope..base + self.dqk()].to_vec();
+            rope_interleaved(&mut qp, &self.cos, &self.sin)?;
+            let mut u = vec![0i64; self.rank];
+            mla_attend(qa, &qp, self.view(), self.lambda, &mut u)?;
+            Ok(u)
+        }
+
+        /// Head `j`'s `wk_b` projection, as `layer_forward` computes it.
+        pub(crate) fn key(&self, j: usize) -> Result<Vec<i64>, ModernError> {
+            let (key, _) = self.stacks();
+            let rows = j * self.rank..(j + 1) * self.rank;
+            let base = j * self.dqk();
+            let mut qa = vec![0i64; self.rank];
+            project_i16(
+                key.weights.rows(rows.clone(), self.nope),
+                self.rank,
+                self.nope,
+                &self.mu_k[rows.clone()],
+                &self.k_k[rows],
+                &self.q[base..base + self.nope],
+                &mut qa,
+            )?;
+            Ok(qa)
+        }
+
+        /// The per-head loop of `layer_forward`, on the CPU, on `schedule`.
+        pub(crate) fn cpu(&self, schedule: Schedule) -> Result<Vec<i64>, String> {
+            let (_, value) = self.stacks();
+            let mut out = vec![0i64; self.n_heads * self.v_dim];
+            for_each_head(&mut out, self.v_dim, schedule, |j, block| {
+                let qa = self.key(j)?;
+                let u = self.attend(j, &qa)?;
+                let rows = j * self.v_dim..(j + 1) * self.v_dim;
+                project_i16(
+                    value.weights.rows(rows.clone(), self.rank),
+                    self.v_dim,
+                    self.rank,
+                    &self.mu_v[rows.clone()],
+                    &self.k_v[rows],
+                    &u,
+                    block,
+                )
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(out)
+        }
+
+        /// Every head's latent `u` (the second projection's input), on the
+        /// CPU.
+        pub(crate) fn latents(&self) -> Vec<i64> {
+            (0..self.n_heads)
+                .flat_map(|j| {
+                    let qa = self.key(j).expect("in domain");
+                    self.attend(j, &qa).expect("in domain")
+                })
+                .collect()
+        }
+
+        /// The heads as one GPU batch: `try_heads` with both switches on and
+        /// `submission`, inside a scope that uploaded both stacks. Returns
+        /// whether it batched, the output (sentinels where nothing was
+        /// written) and what the hooks counted. Hold `kernel_switch_guard`.
+        pub(crate) fn gpu(&self, submission: Submission) -> (bool, Vec<i64>, MetalI16Census) {
+            let (key, value) = self.stacks();
+            let metal = MetalI16Model::from_weights(&[
+                (key.weights, key.heads * key.rows, key.cols),
+                (value.weights, value.heads * value.rows, value.cols),
+            ])
+            .expect("upload");
+            let _switch = SwitchGuard::set(true);
+            let _heads = HeadsGuard::set(true, submission);
+            let queries = self.queries();
+            let mut out = vec![0x7E57_7E57_7E57_7E57i64; self.n_heads * self.v_dim];
+            let before = metal_i16_census();
+            let batched =
+                metal.run(|| try_heads(key, &queries, value, |j, qa| self.attend(j, qa), &mut out));
+            (batched, out, metal_i16_census().since(&before))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::precision::tests::{Case, Outcome};
     use super::super::precision::{Bits, Schedule, project_i16, quantize_matrix};
-    use super::test_support::{Rng, SwitchGuard, hooked, le_bytes, weights};
+    use super::test_support::{
+        HeadsGuard, LayerHeads, Rng, SwitchGuard, hooked, le_bytes, weights,
+    };
     use super::*;
     use crate::canonical_simd::{
         self, LIMB_COUNT, LIMB_MAX, LIMB_MIN, kernel_switch_guard, set_fast_canonical_kernel,
@@ -911,6 +1363,182 @@ mod tests {
         assert_eq!(metal_i16_census().since(&before).accepted, 0);
     }
 
+    /// A layer's heads as one GPU batch equal the per-head CPU loop of
+    /// `layer_forward` (serial, and on the pool as #174 runs them) at K2.6's
+    /// dims (64 heads, `wk_b` 512 x 128, `wv_b` 128 x 512) and at the tiny
+    /// fixtures' dims, for every submission, with latents that need two or
+    /// four digit planes. Nothing goes through the per-projection hook.
+    #[test]
+    fn metal_i16_head_batches_match_the_per_head_cpu_loop() {
+        let _guard = kernel_switch_guard();
+        let engine = metal_i16_engine().expect("Metal device");
+        eprintln!(
+            "one command buffer per layer on this device: {}",
+            engine.one_command_buffer()
+        );
+        let mut rng = Rng(0x4EAD_0016);
+        for (n_heads, rank, nope, rope_dim, v_dim, positions) in [
+            (64usize, 512usize, 128usize, 64usize, 128usize, 5usize),
+            (4, 16, 8, 4, 8, 3),
+            (4, 16, 128, 64, 8, 1),
+        ] {
+            for magnitude in [1i64 << 14, 1 << 28] {
+                let layer = LayerHeads::new(
+                    &mut rng, n_heads, rank, nope, rope_dim, v_dim, positions, magnitude,
+                );
+                let what = format!(
+                    "{n_heads} heads of {rank}x{nope} and {v_dim}x{rank}, |latent| <= {magnitude}"
+                );
+                let want = layer.cpu(Schedule::Serial).expect("in domain");
+                assert_eq!(layer.cpu(Schedule::Pool), Ok(want.clone()), "{what}: pool");
+                for submission in Submission::ALL {
+                    let (batched, got, delta) = layer.gpu(submission);
+                    assert!(batched, "{what}: {submission:?} declined: {delta:?}");
+                    assert_eq!(got, want, "{what}: {submission:?}");
+                    assert_eq!(
+                        (delta.heads_accepted, delta.heads_declined, delta.accepted),
+                        (1, 0, 0),
+                        "{what}: {submission:?}: {delta:?}"
+                    );
+                }
+                eprintln!("{what}: identical in every submission");
+            }
+        }
+    }
+
+    /// Whatever the per-head loop refuses, the batch declines without
+    /// writing, in every submission, and the loop then returns the CPU's
+    /// error: an attention cache with no positions, RoPE tables of the wrong
+    /// length, a query past the accumulator guard, a key output beyond 2^62
+    /// (between the phases) and a value output beyond 2^62 (after them).
+    #[test]
+    fn metal_i16_head_batches_decline_whatever_the_cpu_refuses() {
+        let _guard = kernel_switch_guard();
+        let mut rng = Rng(0xDEC1_1E16);
+        let base = LayerHeads::new(&mut rng, 4, 16, 8, 4, 8, 3, 1 << 14);
+        let (dqk, nope, rank, v_dim) = (base.dqk(), base.nope, base.rank, base.v_dim);
+        let mut cases = Vec::new();
+        let mut layer = base.clone();
+        layer.positions = 0;
+        cases.push(("an attention cache with no positions", layer));
+        let mut layer = base.clone();
+        layer.cos.pop();
+        cases.push(("RoPE tables of the wrong length", layer));
+        let mut layer = base.clone();
+        layer.q[2 * dqk] = GUARD_MAX + 1;
+        cases.push(("a query past the accumulator guard", layer));
+        // Head 1's key rows at k = 16 and the largest mu, against a query
+        // whose products with row 0 are all positive.
+        let mut layer = base.clone();
+        for row in rank..2 * rank {
+            (layer.mu_k[row], layer.k_k[row]) = (i32::MAX, 16);
+        }
+        for j in 0..nope {
+            let w = i16::from_le_bytes([
+                layer.wk[2 * (rank * nope + j)],
+                layer.wk[2 * (rank * nope + j) + 1],
+            ]);
+            layer.q[dqk + j] = if w < 0 { -(1 << 40) } else { 1 << 40 };
+        }
+        cases.push(("a key output beyond 2^62", layer));
+        // Head 0's first value row of +32767 at k = 16 and the largest mu,
+        // against latents of 2^30.
+        let mut layer = base.clone();
+        layer.latent.fill(1 << 30);
+        for byte in layer.wv[..2 * rank].chunks_exact_mut(2) {
+            byte.copy_from_slice(&32_767i16.to_le_bytes());
+        }
+        for row in 0..v_dim {
+            (layer.mu_v[row], layer.k_v[row]) = (i32::MAX, 16);
+        }
+        cases.push(("a value output beyond 2^62", layer));
+        for (name, layer) in cases {
+            let cpu = layer.cpu(Schedule::Serial);
+            assert!(cpu.is_err(), "{name}: the CPU must refuse, got {cpu:?}");
+            for submission in Submission::ALL {
+                let (batched, got, delta) = layer.gpu(submission);
+                assert!(!batched, "{name}: {submission:?}");
+                assert!(
+                    got.iter().all(|&v| v == SENTINEL),
+                    "{name}: {submission:?}: a declined batch must not write"
+                );
+                assert_eq!(
+                    (delta.heads_accepted, delta.heads_declined),
+                    (0, 1),
+                    "{name}: {submission:?}: {delta:?}"
+                );
+            }
+            eprintln!("{name}: declined; the CPU loop returns {cpu:?}");
+        }
+    }
+
+    /// The one-command-buffer handoff (phase A, a shared-event handoff to the
+    /// CPU step, phase B) passed its start-up test on this device and passes
+    /// it again on a fresh queue.
+    #[test]
+    fn metal_i16_one_command_buffer_handoff_is_exact_on_this_device() {
+        let _guard = kernel_switch_guard();
+        let engine = metal_i16_engine().expect("Metal device");
+        assert!(
+            engine.one_command_buffer(),
+            "the shared-event handoff did not reproduce the reference here"
+        );
+        let report = engine.self_test_one_buffer().expect("handoff self-test");
+        assert!(report.compared > 0 && report.refused > 0, "{report:?}");
+        eprintln!("one-command-buffer handoff self-test: {report:?}");
+    }
+
+    /// Head batches need the INT16 switch, the heads switch and a scope;
+    /// without any of them the per-head loop runs, counted as such.
+    #[test]
+    fn metal_i16_head_batches_need_both_switches_and_a_scope() {
+        let _guard = kernel_switch_guard();
+        if std::env::var("ARC_METAL_EXACT_I16_HEADS").as_deref() != Ok("1") {
+            assert!(!metal_exact_i16_heads_requested());
+        }
+        let mut rng = Rng(0x5C0E_4EAD);
+        let layer = LayerHeads::new(&mut rng, 4, 16, 8, 4, 8, 2, 1 << 14);
+        let (key, value) = layer.stacks();
+        let queries = layer.queries();
+        let mut out = vec![SENTINEL; 4 * 8];
+        let attend = |j: usize, qa: &[i64]| layer.attend(j, qa);
+        // Switches on, but no scope on this thread.
+        let switch = SwitchGuard::set(true);
+        let heads = HeadsGuard::set(true, Submission::OneCommandBuffer);
+        let before = metal_i16_census();
+        assert!(!try_heads(key, &queries, value, attend, &mut out));
+        let delta = metal_i16_census().since(&before);
+        assert_eq!(
+            (delta.heads_attempted, delta.heads_outside_scope),
+            (1, 1),
+            "{delta:?}"
+        );
+        // Inside a scope, but the stacks were not uploaded by it.
+        let other = LayerHeads::new(&mut rng, 4, 16, 8, 4, 8, 2, 1 << 14);
+        let (other_key, other_value) = other.stacks();
+        let metal = MetalI16Model::from_weights(&[
+            (other_key.weights, 4 * 16, 8),
+            (other_value.weights, 4 * 8, 16),
+        ])
+        .expect("upload");
+        let before = metal_i16_census();
+        assert!(!metal.run(|| try_heads(key, &queries, value, attend, &mut out)));
+        let delta = metal_i16_census().since(&before);
+        assert_eq!(
+            (delta.heads_accepted, delta.heads_declined),
+            (0, 1),
+            "{delta:?}"
+        );
+        // The heads switch off: no attempt at all.
+        drop(heads);
+        let _heads = HeadsGuard::set(false, Submission::OneCommandBuffer);
+        let before = metal_i16_census();
+        assert!(!metal.run(|| try_heads(key, &queries, value, attend, &mut out)));
+        assert_eq!(metal_i16_census().since(&before).heads_attempted, 0);
+        drop(switch);
+        assert!(out.iter().all(|&v| v == SENTINEL));
+    }
+
     /// The pinned K2.6 shapes the tests and the benchmark use: (name, rows,
     /// columns).
     pub(super) const K26_SHAPES: [(&str, usize, usize); 11] = [
@@ -934,8 +1562,8 @@ mod tests {
 /// --test-threads=1`.
 #[cfg(test)]
 mod bench {
-    use super::super::precision::project_i16;
-    use super::test_support::{Rng, SwitchGuard, le_bytes, weights};
+    use super::super::precision::{Schedule, project_i16};
+    use super::test_support::{HeadsGuard, LayerHeads, Rng, SwitchGuard, le_bytes, weights};
     use super::tests::K26_SHAPES;
     use super::*;
     use crate::canonical_simd::{self, kernel_switch_guard, set_fast_canonical_kernel};
@@ -1221,8 +1849,174 @@ mod bench {
             },
         });
         println!("METAL_EXACT_I16_BENCH {json}");
+        append_summary(&md);
+    }
+
+    /// Append `md` to the file named by `ARC_METAL_BENCH_MD`, if any (each
+    /// benchmark adds its own table to the CI summary).
+    fn append_summary(md: &str) {
+        use std::io::Write;
         if let Ok(path) = std::env::var("ARC_METAL_BENCH_MD") {
-            std::fs::write(path, md).expect("write the benchmark summary");
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("open the benchmark summary");
+            file.write_all(md.as_bytes())
+                .expect("write the benchmark summary");
         }
+    }
+
+    /// One K2.6 layer's heads (64 heads, `wk_b` 512 x 128, `wv_b` 128 x
+    /// 512) end to end: both projections and the RoPE and attention between
+    /// them, as the CPU loop of `layer_forward` runs them (heads one after
+    /// another, and in parallel as #174 runs them) against the GPU batch in
+    /// each submission, at three cache lengths. Every timed output equals the
+    /// serial CPU loop. Virtualized-runner numbers.
+    #[test]
+    #[ignore = "benchmark: run explicitly in release with --ignored --nocapture"]
+    fn k26_layer_heads_benchmark() {
+        let _guard = kernel_switch_guard();
+        let engine = metal_i16_engine().expect("Metal device");
+        let threads = rayon::current_num_threads();
+        let mut rng = Rng(0x0D15_EA5E_4EAD_0064);
+        let (n_heads, rank, nope, rope_dim, v_dim) =
+            (64usize, 512usize, 128usize, 64usize, 128usize);
+        let mut md = String::new();
+        md.push_str("\n### Exact Metal INT16 GEMV: one K2.6 layer's 64 heads as one batch\n\n");
+        md.push_str(
+            "Virtualized-runner measurement: GitHub-hosted macOS VM with a paravirtual \
+             Metal GPU. Not Apple GPU hardware numbers.\n\n",
+        );
+        md.push_str(&format!(
+            "Each figure is the median wall time of one layer's heads: 64 `wk_b` (512 x 128) \
+             and 64 `wv_b` (128 x 512) projections with the RoPE and absorbed attention \
+             between them, over a cache of the given length. CPU columns run the per-head \
+             loop of `layer_forward` on {threads} rayon threads. GPU columns run `try_heads`; \
+             one command buffer per layer is in use on this device: {}. The last column is \
+             the GPU time of the 128 projections alone (two dispatches, back to back).\n\n",
+            engine.one_command_buffer(),
+        ));
+        md.push_str(
+            "| Cache positions | CPU, heads one after another | CPU, heads in parallel (#174) \
+             | GPU, one command buffer per layer | GPU, one per phase | GPU, one per head and \
+             phase (#177's hook) | GPU time of the projections |\n",
+        );
+        md.push_str("|---|---|---|---|---|---|---|\n");
+        let mut json_rows = Vec::new();
+        for positions in [1usize, 64, 512] {
+            let layer = LayerHeads::new(
+                &mut rng,
+                n_heads,
+                rank,
+                nope,
+                rope_dim,
+                v_dim,
+                positions,
+                1 << 14,
+            );
+            let want = layer.cpu(Schedule::Serial).expect("in domain");
+            let serial = time_wall(5, || {
+                std::hint::black_box(layer.cpu(Schedule::Serial).expect("in domain"));
+            });
+            let pool = time_wall(5, || {
+                std::hint::black_box(layer.cpu(Schedule::Pool).expect("in domain"));
+            });
+            // The stacks are resident before anything is timed.
+            let (key, value) = layer.stacks();
+            let queries = layer.queries();
+            let metal = MetalI16Model::from_weights(&[
+                (key.weights, n_heads * rank, nope),
+                (value.weights, n_heads * v_dim, rank),
+            ])
+            .expect("upload");
+            let switch = SwitchGuard::set(true);
+            let mut gpu = Vec::new();
+            for submission in Submission::ALL {
+                let _heads = HeadsGuard::set(true, submission);
+                let mut out = vec![0i64; n_heads * v_dim];
+                let run = |out: &mut Vec<i64>| {
+                    metal.run(|| try_heads(key, &queries, value, |j, qa| layer.attend(j, qa), out))
+                };
+                assert!(
+                    run(&mut out) && out == want,
+                    "{positions} positions, {submission:?}"
+                );
+                gpu.push(time_wall(5, || assert!(run(&mut out))));
+            }
+            drop(switch);
+            // GPU time of the two dispatches alone, given every vector.
+            let key_matrix = engine
+                .upload(
+                    key.weights.as_bytes(),
+                    n_heads * rank,
+                    nope,
+                    Storage::Shared,
+                )
+                .expect("upload");
+            let value_matrix = engine
+                .upload(
+                    value.weights.as_bytes(),
+                    n_heads * v_dim,
+                    rank,
+                    Storage::Shared,
+                )
+                .expect("upload");
+            let a = HeadPhase {
+                matrix: &key_matrix,
+                first_row: 0,
+                heads: n_heads,
+                rows: rank,
+            };
+            let b = HeadPhase {
+                matrix: &value_matrix,
+                first_row: 0,
+                heads: n_heads,
+                rows: v_dim,
+            };
+            let latents = layer.latents();
+            let phases = [(&a, queries.as_slice()), (&b, latents.as_slice())];
+            let single = engine
+                .time_heads(&phases, engine.tile(), 1)
+                .expect("timing");
+            let repeats = ((0.2 / single.max(1e-6)) as usize).clamp(3, 200);
+            let projections = engine
+                .time_heads(&phases, engine.tile(), repeats)
+                .expect("timing");
+            md.push_str(&format!(
+                "| {positions} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} |\n",
+                serial * 1e6,
+                pool * 1e6,
+                gpu[0] * 1e6,
+                gpu[1] * 1e6,
+                gpu[2] * 1e6,
+                projections * 1e6,
+            ));
+            json_rows.push(serde_json::json!({
+                "positions": positions,
+                "cpu_serial_us": serial * 1e6,
+                "cpu_parallel_heads_us": pool * 1e6,
+                "gpu_one_command_buffer_us": gpu[0] * 1e6,
+                "gpu_per_phase_us": gpu[1] * 1e6,
+                "gpu_per_head_us": gpu[2] * 1e6,
+                "gpu_projections_only_us": projections * 1e6,
+            }));
+        }
+        md.push_str(
+            "\nThe stacks are resident before anything is timed. Every GPU column computes the \
+             same integers as the CPU loop (checked before timing); the submissions differ \
+             only in host round trips: 1 commit and completion per layer with a shared-event \
+             handoff, 2 per layer, or 128 per layer.\n",
+        );
+        println!("{md}");
+        let json = serde_json::json!({
+            "label": "virtualized-runner measurement",
+            "rayon_threads": threads,
+            "one_command_buffer": engine.one_command_buffer(),
+            "default_tile": DEFAULT_TILE.label(),
+            "rows": json_rows,
+        });
+        println!("METAL_EXACT_I16_HEADS_BENCH {json}");
+        append_summary(&md);
     }
 }
