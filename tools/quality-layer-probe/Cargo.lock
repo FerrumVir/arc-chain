@@ -23,7 +23,7 @@ dependencies = [
 [[package]]
 name = "arc-bincode"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=05afa5b068268860e4206307fb44c909645557ed#05afa5b068268860e4206307fb44c909645557ed"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=8bd1e6a1696304517a261a06aee43c142b44f128#8bd1e6a1696304517a261a06aee43c142b44f128"
 dependencies = [
  "cu-bincode",
  "serde",
@@ -33,7 +33,7 @@ dependencies = [
 [[package]]
 name = "arc-crypto"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=05afa5b068268860e4206307fb44c909645557ed#05afa5b068268860e4206307fb44c909645557ed"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=8bd1e6a1696304517a261a06aee43c142b44f128#8bd1e6a1696304517a261a06aee43c142b44f128"
 dependencies = [
  "blake3",
  "blst",
@@ -59,7 +59,7 @@ dependencies = [
 [[package]]
 name = "arc-gpu"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=05afa5b068268860e4206307fb44c909645557ed#05afa5b068268860e4206307fb44c909645557ed"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=8bd1e6a1696304517a261a06aee43c142b44f128#8bd1e6a1696304517a261a06aee43c142b44f128"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -81,7 +81,7 @@ dependencies = [
 [[package]]
 name = "arc-inference"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=05afa5b068268860e4206307fb44c909645557ed#05afa5b068268860e4206307fb44c909645557ed"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=8bd1e6a1696304517a261a06aee43c142b44f128#8bd1e6a1696304517a261a06aee43c142b44f128"
 dependencies = [
  "arc-crypto",
  "arc-gpu",
@@ -115,7 +115,7 @@ dependencies = [
 [[package]]
 name = "arc-types"
 version = "0.8.11"
-source = "git+https://github.com/FerrumVir/arc-chain.git?rev=05afa5b068268860e4206307fb44c909645557ed#05afa5b068268860e4206307fb44c909645557ed"
+source = "git+https://github.com/FerrumVir/arc-chain.git?rev=8bd1e6a1696304517a261a06aee43c142b44f128#8bd1e6a1696304517a261a06aee43c142b44f128"
 dependencies = [
  "arc-bincode",
  "arc-crypto",

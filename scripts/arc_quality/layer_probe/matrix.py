@@ -7,7 +7,7 @@ import sys
 import struct
 from pathlib import Path
 from .compare import canonical, sha
-from .policies import CLASSES, NAMES
+from .policies import CLASSES, NAMES, RUN_NAMES
 
 
 def process_cell(measurement):
@@ -25,8 +25,16 @@ def preserved_payload(package):
 
 def summarize(root):
     import numpy as np
-    rows=[]; interactions={}; identities={}
+    rows=[]; interactions={}; identities={}; default_equivalence={}
     for depth in (1,2,3):
+        omitted=root/f'depth-{depth}'/'default'; explicit=root/f'depth-{depth}'/'int16'
+        for directory in ('slices','bundle'):
+            files={str(f.relative_to(omitted/directory)):f.read_bytes() for f in (omitted/directory).rglob('*') if f.is_file()}
+            other={str(f.relative_to(explicit/directory)):f.read_bytes() for f in (explicit/directory).rglob('*') if f.is_file()}
+            assert files==other,(depth,directory,'omitted/explicit INT16 bytes differ')
+        for name in ('slices.json','request.json','arc.json','reference.json'):
+            assert json.loads((omitted/name).read_bytes())==json.loads((explicit/name).read_bytes()),(depth,name,'omitted/explicit INT16 differ')
+        default_equivalence[str(depth)]={'slices_segments_packages_manifests_equal':True,'requests_raw_arc_reference_equal':True}
         records={p:json.loads((root/f'depth-{depth}'/p/'arc.json').read_bytes()) for p in NAMES}
         refs={p:json.loads((root/f'depth-{depth}'/p/'reference.json').read_bytes()) for p in NAMES}
         baseline=records['legacy']['tensors']
@@ -64,14 +72,14 @@ def summarize(root):
             interactions[str(depth)][key]={'max_absolute_nonadditive_residual':float(np.max(np.abs(residual))),
                                            'rmse_nonadditive_residual':float(np.sqrt(np.mean(residual**2)))}
     data={'schema':'arc.precision-fixture-matrix.v1','status':'MEASURED_NON_CERTIFYING','certified':False,
-          'dependency_review':'provisional/unreviewed','policies':list(NAMES),'rows':rows,'identities':identities,
+          'dependency_review':'provisional/unreviewed','primary_profile':'int16','comparison_profiles':list(NAMES[1:]),'default_equivalence':default_equivalence,'policies':list(NAMES),'rows':rows,'identities':identities,
           'interactions':interactions,'interaction_definition':'(all-INT16 ARC minus legacy ARC) minus sum(single-class ARC minus legacy ARC), Q16 rescaled; nonlinear and routing interactions, not additive quality attribution',
           'reference':'original selected BF16/F32 and original native INT4 group scales -> official CPU FP32; never dequantized ARC packages',
           'native_int4_norm_router_bytes_unchanged':True,
           'inactive':'shared has no layer in depth 1; its identity changes but execution tensors must equal legacy',
           'host':json.loads((root/'depth-1/legacy/arc-resources.json').read_bytes())['host']}
     (root/'matrix.json').write_bytes(canonical(data))
-    lines=['# Synthetic precision errors (non-certifying)', '',str(data['host']),'',
+    lines=['# Synthetic precision errors (non-certifying)', '', 'Primary: INT16 default (omitted and explicit equivalent at each depth). Legacy and single-class mixed policies are historical comparison experiments; no downgrade approval.', '',str(data['host']),'',
            '|Depth|Policy|Tensor|max abs|relative L2|max abs / ref L2|top-1|routing set differences|','|---:|---|---|---:|---:|---:|---|---|']
     for r in rows:
         top='' if r['top1_positions'] is None else f"{r['top1_agreements']}/{r['top1_positions']}"
@@ -93,10 +101,11 @@ def main():
     for key in ('engine-source','arc-mla','diagnostic','out'):p.add_argument('--'+key,required=True)
     args=p.parse_args();root=Path(args.out).resolve();root.mkdir(parents=True,exist_ok=False)
     for depth in (1,2,3):
-        for name in NAMES:
+        for name in RUN_NAMES:
             out=root/f'depth-{depth}'/name
             command=[sys.executable,'-m','arc_quality.layer_probe.run','--engine-source',args.engine_source,
-                     '--arc-mla',args.arc_mla,'--diagnostic',args.diagnostic,'--layers',str(depth),'--policy',name,'--out',str(out)]
+                     '--arc-mla',args.arc_mla,'--diagnostic',args.diagnostic,'--layers',str(depth),'--out',str(out)]
+            if name != 'default': command += ['--policy',name]
             with (root/f'{depth}-{name}.log').open('w') as f:subprocess.run(command,stdout=f,stderr=subprocess.STDOUT,check=True)
             env={**os.environ,'ARC_LAYER_FIXTURE':str(out),'ARC_LAYER_DIAGNOSTIC':str(Path(args.diagnostic).resolve())}
             with (root/f'{depth}-{name}-tests.log').open('w') as f:

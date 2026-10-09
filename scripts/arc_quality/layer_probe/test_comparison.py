@@ -25,6 +25,33 @@ class ActualFixture(unittest.TestCase):
         return compare(self.arc if arc is None else arc, self.ref if ref is None else ref,
                        self.request, self.request_bytes)
 
+    def test_capture_default_explicit_and_historical_admission(self):
+        import sys
+        from .policies import policy
+        with tempfile.TemporaryDirectory(dir=self.root) as tmp:
+            tmp = Path(tmp)
+            tokens = tmp/'tokens.json'; tokens.write_bytes(canonical(self.request['token_ids']))
+            explicit = tmp/'precision.json'; explicit.write_bytes(canonical(self.request['precision']))
+            base = [sys.executable, '-m', 'arc_quality.layer_probe.capture',
+                    '--bundle', str(self.root/'bundle'), '--source-dir', str(self.root/'source'),
+                    '--source-manifest', str(self.root/'source/tiny-kimi-packed.source.json'),
+                    '--original-source-dir', str(self.root/'original'),
+                    '--original-source-manifest', str(self.root/'original/tiny-kimi-packed.source.json'),
+                    '--tokens', str(tokens), '--diagnostic', os.environ['ARC_LAYER_DIAGNOSTIC']]
+            controls = [('omitted', [], self.request['precision'] == policy('int16')),
+                        ('explicit', ['--precision', str(explicit)], self.request['precision'] is not None),
+                        ('historical', ['--historical-int8'], self.request['precision'] is None)]
+            for name, flags, valid in controls:
+                out = tmp/name
+                result = subprocess.run(base+flags+['--out',str(out)], capture_output=True, text=True)
+                if valid:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads((out/'arc.json').read_bytes()), self.arc)
+                    self.assertEqual(json.loads((out/'reference.json').read_bytes()), self.ref)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(out.exists())
+
     def test_valid_but_substituted_policy_cli_rejected(self):
         from .policies import policy
         for value in (None, policy('int16'), policy('attention')):
@@ -60,7 +87,7 @@ class ActualFixture(unittest.TestCase):
             self.assertAlmostEqual(metrics['max_absolute_error_over_reference_l2'], expected, places=14)
 
     def test_mismatched_alignment(self):
-        changes = {'model_root': '0'*64, 'token_ids': [1,42,7,4],
+        changes = {'engine_sha': '0'*40, 'model_root': '0'*64, 'token_ids': [1,42,7,4],
                    'positions': [1,2,3,4], 'scope': {'kind':'full_kimi_k26'},
                    'mask': 'bidirectional', 'graph': {'executed_layers':[1]}, 'precision':{'version':999}}
         for engine in ('arc', 'ref'):
@@ -166,6 +193,7 @@ class ActualFixture(unittest.TestCase):
                     self.assertTrue(all(w>0 for w in row['weights']))
                     self.assertTrue(any(x!=0 for x in row['shared']))
         self.assertTrue(self.arc['observer']['verified_against_unmodified_engine'])
+        self.assertTrue(self.arc['observer']['scalar_simd_full_split_equal'])
         if len(self.arc['layer_order'])==1 and self.request['precision'] is None:
             self.assertEqual(sha(canonical(self.arc['tensors'])),'fd1309caa28fdc3e58f7b12f3f9ccff5d897100d1e9252061e3e3e97573f3596')
         elif len(self.arc['layer_order'])>1:

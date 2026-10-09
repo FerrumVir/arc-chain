@@ -3,13 +3,13 @@ import argparse
 import json
 from pathlib import Path
 from .compare import canonical, sha
-from .policies import NAMES
+from .policies import RUN_NAMES
 
 
 def compare_hosts(a,b):
     evidence={}
     for depth in (1,2,3):
-        for name in NAMES:
+        for name in RUN_NAMES:
             key=f'depth-{depth}/{name}';left=json.loads((a/key/'arc.json').read_bytes());right=json.loads((b/key/'arc.json').read_bytes())
             # ARC raw data includes alignment, model/package/source/policy pins, tensors,
             # native routing, and observer identity; no timing field is ignored here.

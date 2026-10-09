@@ -7,9 +7,9 @@ import sys
 from pathlib import Path
 from .compare import canonical, compare, sha, sha_file
 from .official import REFERENCE_SHA
-from .policies import NAMES, policy
+from .policies import RUN_NAMES, policy
 
-ENGINE_SHA='05afa5b068268860e4206307fb44c909645557ed'
+ENGINE_SHA='8bd1e6a1696304517a261a06aee43c142b44f128'
 
 
 def main():
@@ -19,20 +19,23 @@ def main():
     p.add_argument('--diagnostic',required=True)
     p.add_argument('--out',required=True)
     p.add_argument('--layers',type=int,choices=[1,2,3],default=1)
-    p.add_argument('--policy',choices=NAMES,default='legacy')
+    p.add_argument('--policy',choices=RUN_NAMES,default='default')
     args=p.parse_args()
     precision=policy(args.policy)
     engine=Path(args.engine_source).resolve();binary=Path(args.arc_mla).resolve();diagnostic=Path(args.diagnostic).resolve()
     head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=engine,text=True).strip()
     if head!=ENGINE_SHA:raise ValueError('engine checkout is not the provisional exact pin')
     subprocess.run(['git','diff','--quiet','HEAD','--','scripts/arc_mla','crates/arc-inference'],cwd=engine,check=True)
+    observer=Path(__file__).resolve().parents[3]/'tools/quality-layer-probe/reference/model.rs'
+    if observer.read_bytes() != (engine/'crates/arc-inference/src/modern/mla/model.rs').read_bytes():
+        raise ValueError('observer source differs from pinned engine')
     out=Path(args.out).resolve();out.mkdir(parents=True,exist_ok=False)
     def command(*argv):
         r=subprocess.run(list(map(str,argv)),capture_output=True,text=True)
         with (out/'commands.log').open('a',encoding='utf-8') as f:f.write(f'{list(map(str,argv))}\nexit={r.returncode}\n{r.stdout}{r.stderr}\n')
         if r.returncode:raise RuntimeError(r.stderr)
-    precision_args=[]
-    if precision is not None:
+    precision_args=['--historical-int8'] if args.policy == 'legacy' else []
+    if precision is not None and args.policy != 'default':
         (out/'precision.json').write_bytes(canonical(precision))
         precision_args=['--precision',out/'precision.json']
     original=out/'original';source=out/'source';slices=out/'slices';bundle=out/'bundle'
@@ -72,6 +75,7 @@ def main():
                      'reference_dtype':'source BF16/F32 and packed INT4 group32 -> FP32 CPU','arc_dtype':'dyadic integer weights, Q16 activation/logits',
                      'original_head_preserved':True,'runtime_io':'local files; no downloader or API client invoked',
                      'dependency_review':'provisional/unreviewed', 'policy_name':args.policy,
+                     'profile_role':'primary INT16 default' if args.policy in ('default','int16') else 'historical comparison experiment',
                      'inactive_classes':['shared'] if args.layers==1 else [],
                      'measurements':{k:json.loads((out/(k+'-resources.json')).read_bytes()) for k in ['arc','reference']}}
     (out/'comparison.json').write_bytes(canonical(report))

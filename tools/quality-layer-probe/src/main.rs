@@ -14,7 +14,7 @@ mod observed {
     include!(concat!(env!("OUT_DIR"), "/observed_model.rs"));
 }
 
-const ENGINE: &str = "05afa5b068268860e4206307fb44c909645557ed";
+const ENGINE: &str = "8bd1e6a1696304517a261a06aee43c142b44f128";
 fn hash(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }
@@ -70,7 +70,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if tokens.is_empty() || tokens.len() != positions.len() || tokens.len() > c.max_seq {
         return Err("invalid sequence length".into());
     }
+    arc_inference::canonical_simd::set_fast_canonical_kernel(false);
     let mut cache = model.new_cache();
+    let mut simd_cache = model.new_cache();
     let stages = (0..c.n_layers)
         .map(|i| {
             StageModel::open_range(
@@ -112,6 +114,20 @@ fn run() -> Result<(), Box<dyn Error>> {
         let mut trace = Vec::new();
         let (whole, whole_logits) =
             model.forward(StageInput::Token(token), &mut cache, Some(&mut trace))?;
+        arc_inference::canonical_simd::set_fast_canonical_kernel(true);
+        if !arc_inference::canonical_simd::fast_canonical_kernel_enabled() {
+            return Err("SIMD required for this diagnostic control".into());
+        }
+        let mut simd_trace = Vec::new();
+        let (simd_hidden, simd_logits) = model.forward(
+            StageInput::Token(token),
+            &mut simd_cache,
+            Some(&mut simd_trace),
+        )?;
+        arc_inference::canonical_simd::set_fast_canonical_kernel(false);
+        if simd_hidden != whole || simd_logits != whole_logits || simd_trace != trace {
+            return Err("scalar/SIMD mismatch".into());
+        }
         let mut hidden = Vec::new();
         for layer in 0..c.n_layers {
             let input = if layer == 0 {
@@ -167,7 +183,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let out = json!({"schema":"arc.layer-probe.raw.v2","engine":"arc-integer","alignment":request,
         "provenance":{"engine_sha":ENGINE,"request_sha256":hash(&request_bytes),"package_sha256":hash(model.bytes()),"source_manifest_sha256":hash(&source)},
         "numeric":{"dtype":"int64","fraction_bits":16,"unit_scale":1.0/65536.0},
-        "tensors":tensors,"tensor_sha256":tensor_hashes,"layer_order":(0..c.n_layers).collect::<Vec<_>>(),"routing":routing,"routing_numeric":{"weights_fraction_bits":32,"activations_fraction_bits":16},"observer":{"base_model_sha256":"15f2baef5e3db2a54ecba6831ee25d02570c84b3ce6026ba87cd3ca012af29eb","verified_against_unmodified_engine":true}});
+        "tensors":tensors,"tensor_sha256":tensor_hashes,"layer_order":(0..c.n_layers).collect::<Vec<_>>(),"routing":routing,"routing_numeric":{"weights_fraction_bits":32,"activations_fraction_bits":16},"observer":{"base_model_sha256":"15f2baef5e3db2a54ecba6831ee25d02570c84b3ce6026ba87cd3ca012af29eb","verified_against_unmodified_engine":true,"scalar_simd_full_split_equal":true}});
     // Validation completes before creating the output; never replace a record.
     let out_path = Path::new(&args[4]);
     let bytes = serde_json::to_vec_pretty(&out)?;

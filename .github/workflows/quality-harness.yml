@@ -109,7 +109,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 05afa5b068268860e4206307fb44c909645557ed
+          ref: 8bd1e6a1696304517a261a06aee43c142b44f128
           path: reviewed-engine
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -165,7 +165,7 @@ jobs:
         with:
           pattern: offline-original-layer-reference-*
           path: ${{ runner.temp }}/layer-hosts
-      - name: Require every ARC record to match Linux (21 runs per host)
+      - name: Require every ARC record to match Linux (24 runs per host)
         env:
           PYTHONPATH: scripts
         run: |

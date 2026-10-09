@@ -11,7 +11,7 @@ from arc_quality.layer_probe.compare import canonical
 from arc_quality.layer_probe.cross_host import compare_hosts
 from arc_quality.layer_probe.matrix import process_cell
 from arc_quality.layer_probe import measured
-from arc_quality.layer_probe.policies import NAMES
+from arc_quality.layer_probe.policies import RUN_NAMES
 
 
 class HostEvidenceTests(unittest.TestCase):
@@ -24,12 +24,12 @@ class HostEvidenceTests(unittest.TestCase):
                    'tensor_sha256': {'logits': 'float'}, 'tensors': {'logits': [[1.0, 2.0]]}}
             for root in (left, right):
                 for depth in (1, 2, 3):
-                    for name in NAMES:
+                    for name in RUN_NAMES:
                         path = root/f'depth-{depth}'/name
                         path.mkdir(parents=True)
                         (path/'arc.json').write_bytes(canonical(arc))
                         (path/'reference.json').write_bytes(canonical(ref))
-            self.assertEqual(len(compare_hosts(left, right)['runs']), 21)
+            self.assertEqual(len(compare_hosts(left, right)['runs']), 24)
             path = right/'depth-3/head'
             changed = copy.deepcopy(ref)
             changed['tensors']['logits'][0][0] += 1e-6

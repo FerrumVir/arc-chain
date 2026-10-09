@@ -8,12 +8,12 @@ never produce certification or a tolerance PASS.
 
 ## Implementations and provenance
 
-ARC is pinned to **provisional/unreviewed** #168 `05afa5b068268860e4206307fb44c909645557ed`, with an
+ARC is pinned to **provisional/unreviewed** #168 `8bd1e6a1696304517a261a06aee43c142b44f128`, with an
 isolated diagnostic Cargo.lock. The production lock, engine and other PRs are
 unchanged. The reviewed four-layer fixture generator produces the original
 source; only declared experiment depth changes. Embedding, selected original
 layers and head retain their original shard bytes/hashes, including packed INT4
-experts. The one-layer ARC tensor hash remains
+experts. The historical INT8 one-layer ARC tensor hash remains
 `fd1309caa28fdc3e58f7b12f3f9ccff5d897100d1e9252061e3e3e97573f3596`.
 
 The official source/config retain revision
@@ -79,7 +79,7 @@ weights. Set disagreement, order disagreement and expert-weight L1 are separate
 from boundary/logit errors; shared-output and router-input errors are also
 reported. No common routing choice is imposed to improve apparent agreement.
 
-Studio ARM measurements, tiny synthetic fixtures:
+Historical Studio ARM measurements (original legacy INT8 evidence; not the new primary INT16 report), tiny synthetic fixtures:
 
 | Depth | Tensor | Max absolute error | Relative L2 |
 |---|---|---:|---:|
@@ -132,7 +132,7 @@ python -m unittest discover -s scripts/arc_quality/tests -t scripts -v
 
 Use fresh output directories. `capture` also supports existing verified 2/3-layer
 synthetic bundles; real-weight capture remains restricted to one layer. The CI
-Linux x86, macOS ARM64 and Windows x86 jobs each run all 21 depth/policy pairs
+Linux x86, macOS ARM64 and Windows x86 jobs each run all 24 depth/policy pairs
 and upload separate artifacts. A dependent job downloads all three and compares
 every ARC record from ARM64 and Windows against Linux using `cross_host.py`;
 missing records or differing alignment, weights, tensors or routing fail the
@@ -140,13 +140,13 @@ job. FP32 values remain host-specific. No labels are changed; ordinary pushes
 still cannot fetch weights. This matrix covers these CPU runners, not all
 backends or macOS Intel.
 
-Eighteen targeted tests run for each graph: honest alignment, actual reference
+Nineteen targeted tests run for each graph: honest alignment, actual reference
 reexecution, native observer/full/stage equality, immutable one-layer integer
 control, three routed experts, nonzero shared outputs, official MoE combination
 with one **and two** shared experts, nibble -8/zero-scale decoding, model/input/
 scope/position/depth mismatches, missing/reordered layer/row/routing captures,
 nonfinite values, package/source corruption and no-output CLI rejection. The
-62 existing certification/budget/McNemar regressions remain unchanged.
+64 existing harness tests (including certification/budget/McNemar and host-evidence controls) remain unchanged.
 
 ## Real-weight follow-up: not admitted or executed
 
@@ -199,14 +199,12 @@ is missing for this one-layer path. Real-weight MoE/multi-layer scaling, padded/
 cache/reference BF16 compute, tokenizer/chat, full model, quality certification
 and lab internet pipeline need separate work and evidence.
 
-Disk planning (not measured peaks): slices W=2,848,653,632 bytes; package about
-W + 1,048,576 canonical-table bytes; retained reference sources S=5,692,637,048.
-Allow 512 MiB headers/temporary margin plus 5 GiB reserve. Keeping slices through
-comparison requires `(S + 2W + tables + margin + reserve) = 16.1087 GiB`.
-Removing only newly produced verified slices after assembly would reduce the
-later retained footprint to 13.4557 GiB, but does not eliminate the assembly
-peak. This pass performs no such removal and admits no fetch. The earlier
-31.486 GiB Studio snapshot is historical; gaming PC capacity remains unknown.
+INT16-default disk planning (not measured peaks): retain 5.3017 GiB original
+sources, 5.3038 GiB slices and 5.3038 GiB assembled package, canonical tables,
+0.5 GiB scratch/metadata allowance and 5 GiB reserve: **21.4103 GiB peak**.
+The previous 16.1087 GiB peak / 13.4557 GiB post-assembly figures were historical
+INT8 only and cannot admit this default. This pass removes no sources or slices
+and admits no fetch. Gaming PC capacity remains unknown.
 
 RAM planning: original one-layer graph has 2,846,317,568 parameters, requiring
 10.6034 GiB for FP32 embedding/layer/norm/head alone. The largest source BF16
@@ -223,14 +221,16 @@ real-weight peak. There is no real-layer timing or quality result in this PR.
 
 ## Provisional precision matrix
 
-The dependency incorporates unreviewed #156 `596a61f6`; neither that independent
-review nor cumulative #168/#164 review is closed by these fixture results.
+The current dependency incorporates #156 row-window work. The cumulative
+#168 default/census delta and this #164 integration remain provisional/unreviewed;
+prior scoped reviews do not accept these changes.
 The isolated lock changes only git revision pins. The observer source is copied
 byte-for-byte from the exact engine revision and hash-checked before compilation.
 No production lock, engine arithmetic or other PR is changed.
 
-`run --policy` accepts `legacy`, `int16`, or a single class: `attention`, `dense`,
-`shared`, `embedding`, `head`. Legacy omits engine precision (request explicitly
+`run` without `--policy` (or with `--policy default`) now selects INT16.
+Explicit `run --policy` accepts `legacy`, `int16`, or a single class: `attention`, `dense`,
+`shared`, `embedding`, `head`. Legacy passes `--historical-int8` at every creation step (request explicitly
 records null); all-INT16 promotes the five classes; each single-class control
 sets that class INT16 and all other classes INT8. Native INT4 experts, router,
 norm and bias retain their representations. No legacy slice is reused under a
@@ -238,7 +238,10 @@ new policy. The same complete policy is passed before conversion, manifest
 construction and canonical YaRN assembly. Capture requests include the complete
 policy; the actual diagnostic rejects missing or mismatched policy against its
 verified package. Generic `capture --precision POLICY.json` likewise requires a
-caller policy matching the manifest; omitted means legacy.
+caller policy matching the manifest; omission means all-INT16.
+`capture --historical-int8` is required for a policy-absent historical bundle.
+The flags conflict, and a JSON null policy is rejected. These creation/capture
+defaults never modify deserialization of historical identities.
 
 The reference always reads retained **original** source weights, never ARC's
 converted/dequantized package. The matrix checks original weight provenance,
@@ -250,7 +253,7 @@ depths remain equal to the earlier capture; their original provenance is retaine
 
 ```sh
 # CPU dependencies are those in layer_probe/requirements.txt; no model downloads.
-# ENGINE is a clean checkout of 05afa5b068268860e4206307fb44c909645557ed.
+# ENGINE is a clean checkout of 8bd1e6a1696304517a261a06aee43c142b44f128.
 cargo build --locked --manifest-path "$ENGINE/Cargo.toml" -p arc-inference --bin arc-mla
 cargo build --locked --manifest-path tools/quality-layer-probe/Cargo.toml
 PYTHONPATH=scripts python -m arc_quality.layer_probe.matrix \
@@ -261,28 +264,36 @@ PYTHONPATH=scripts python -m arc_quality.layer_probe.cross_host \
   studio-evidence x86-evidence cross-host.json
 ```
 
-This executes 21 paired captures and 18 regressions per capture, retains original
+This executes 24 paired captures (omitted default, explicit INT16, legacy and
+five single-class comparisons at each depth) and 19 regressions per capture, retains original
 inputs, policies, packages and both raw outputs, and writes per-layer absolute,
 relative/RMSE errors, per-position final-logit top-1 IDs/agreement and native
 routing differences. `matrix.json` reports `(all - legacy) - sum(single - legacy)`
 for every tensor to expose nonadditivity; no ranking or additive quality claim
-is inferred. Small fixtures do not select a production precision policy.
+is inferred. INT16 is primary by TJ’s policy, not by a tolerance or performance inference
+from these fixtures. Legacy/mixed policies remain historical comparison
+experiments, not permission to downgrade. The report checks default versus
+explicit INT16 slice/segment/package/manifest bytes, requests and raw captures
+at every depth. Every capture also executes scalar and SIMD full models,
+comparing outputs/logits/traces before observer/split checks. Unsupported SIMD
+fails the diagnostic control rather than claiming participation.
 
 Resource measurements use one fresh child for each implementation, Unix
 `getrusage` maximum RSS (bytes on macOS, KiB converted to bytes on Linux) and
 wall/user/system seconds. Windows records wall seconds with RSS and CPU times
 explicitly null (tables say "not measured"); no sampled RSS is passed off as a
-peak. ARC diagnostic uses a debug build and verifies whole,
+peak. ARC diagnostic uses a debug build and verifies scalar/SIMD whole,
 split and observed forwards; FP32 includes interpreter/torch imports, weight
-load, forward and serialization. Local conversion uses a release binary and
-CI uses debug; conversion is outside the measured children. OS cache is
+load, forward and serialization. This revision uses debug binaries locally and in
+CI; conversion is outside the measured children. OS cache is
 uncontrolled, there is one sample, and shapes are tiny. These are host-specific
 whole-process setup measurements, not matched inference throughput or real-model
 RAM estimates. Cross-host comparison requires exact ARC raw records while
 retaining each host's FP32 outputs/errors; FP32 equality is never a golden rule.
 
-One-layer disk planning remains **16.1087 GiB legacy / 21.4103 GiB all-INT16 /
-19.2228 GiB the earlier mixed policy** (the latter is not a single-class control).
+Primary one-layer disk planning is **21.4103 GiB INT16**. Historical
+comparisons are **16.1087 GiB legacy / 19.2228 GiB the earlier mixed policy**
+(the latter is not a single-class control and does not admit the default).
 Retained sources, slice/assembly copies, scratch, reference expansion and reserve
 must all be budgeted for the selected policy. The conservative sequential
 reference RAM envelope is **23.2800 GiB**, not measured admission or a proven
@@ -300,3 +311,25 @@ rerun evidence cited in the review. Do not add those two sets when counting
 tests. This labels the old archive; it does not rewrite its raw evidence.
 Fresh CI matrix artifacts have one test log per depth/policy in a new output
 directory, so their `[123]-*-tests.log` files are current, not superseded.
+
+## Default-policy integration at the current pin
+
+The copied observer source hash is unchanged and is also compared byte-for-byte
+to the clean engine checkout before every fixture creation. Only the isolated
+Cargo.lock git revisions change; the production workspace lock is untouched.
+The raw engine provenance pin changes, while explicit-policy model/package roots
+and numerical identities must remain historical. Historical cross-host evidence
+keeps its original SHA; current Linux/macOS/Windows 24-record comparisons are
+separate CI artifacts, never inferred from old green jobs. FP32 reference errors
+remain host-specific and are not golden digests.
+
+The INT16 one-layer plan retains 5.3017 GiB original sources, 5.3038 GiB slices
+and 5.3038 GiB assembly copy, canonical tables, 0.5 GiB scratch allowance and
+5 GiB reserve. Conversion RAM planning is 4.4249 GiB plus 0.0312 GiB KV-B
+transpose; assembly buffers 0.3994 GiB. Original-source FP32 expansion is
+10.6034 GiB plus 4.3750 GiB largest transient; source retention and 3 GiB margin
+yield the 23.2800 GiB sequential RAM plan. Persisting reference weights adds
+10.6034 GiB disk. Two/three-layer disk plans are 48.8174/76.2245 GiB and RAM
+plans 112.5915/185.2780 GiB. These are estimates, not resource admission.
+No new weights are fetched by this stage; the real census/oracle, resource
+admission, reference comparison and gaming-PC pipeline gates remain open.

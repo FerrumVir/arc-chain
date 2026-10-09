@@ -16,10 +16,14 @@ def main():
     for name in ('bundle', 'source-dir', 'source-manifest', 'original-source-dir',
                  'original-source-manifest', 'tokens', 'diagnostic', 'out'):
         p.add_argument('--' + name, required=True)
-    p.add_argument('--precision', help='complete caller-owned policy JSON; omitted requires legacy')
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('--precision', help='complete caller-owned comparison policy JSON')
+    group.add_argument('--historical-int8', action='store_true', help='explicit historical policy-absent INT8 comparison')
     args = p.parse_args()
-    from .policies import validate
-    precision = json.loads(Path(args.precision).read_bytes()) if args.precision else None
+    from .policies import validate, policy
+    precision = json.loads(Path(args.precision).read_bytes()) if args.precision else (None if args.historical_int8 else policy('int16'))
+    if args.precision and precision is None:
+        raise ValueError('null policy requires explicit --historical-int8')
     validate(precision)
     bundle = Path(args.bundle)
     source = Path(args.source_dir)

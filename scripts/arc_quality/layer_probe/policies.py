@@ -1,10 +1,12 @@
 """Complete, explicit fixture policies; no shipping recommendation."""
 CLASSES = ('attention', 'dense', 'shared', 'embedding', 'head')
-NAMES = ('legacy', 'int16') + CLASSES
+NAMES = ('int16', 'legacy') + CLASSES
+RUN_NAMES = ('default',) + NAMES
 
 
 def policy(name):
     if name == 'legacy': return None
+    if name == 'default': name = 'int16'
     if name not in NAMES: raise ValueError('unknown policy')
     return {'version': 1, **{k: 'int16' if name in ('int16', k) else 'int8' for k in CLASSES}}
 
