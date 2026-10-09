@@ -3110,7 +3110,7 @@ mod bench {
                         "k {k}, staged {staged}: the pass and the one-row passes differ"
                     );
                 }
-                fused.set_staged_gemm(true);
+                fused.set_staged_gemm(false);
                 if step >= WARM_UP {
                     for (series, time) in samples.iter_mut().zip(times) {
                         series.push(time);
@@ -3134,8 +3134,8 @@ mod bench {
              {ROWS_CONTEXT} cached positions before every pass; each pass is rolled back with \
              `truncate`. Every time is the median of {TOKENS} passes after {WARM_UP} warm-up \
              passes, and every pass's logits equal the one-row passes'. Two multi-row \
-             projections: digit planes staged in threadgroup memory (the default) and read from \
-             device memory by every simdgroup.\n\n",
+             projections: digit planes staged in threadgroup memory, and read from device \
+             memory by every simdgroup (the default).\n\n",
             device.name,
         ));
         md.push_str(

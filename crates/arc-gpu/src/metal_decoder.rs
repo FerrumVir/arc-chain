@@ -1103,7 +1103,7 @@ impl MetalDecoder {
             head_kv: head_kv_buffer,
             io,
             rows_io: row_activations(device, &s, MAX_ROWS),
-            staged_gemm: true,
+            staged_gemm: false,
             engine,
         })
     }
@@ -1113,9 +1113,9 @@ impl MetalDecoder {
     }
 
     /// Which multi-row projection [`Self::step_rows`] uses: with the digit
-    /// planes staged in threadgroup memory (the default) or read by every
-    /// simdgroup from device memory. Both compute the same integers; this
-    /// changes speed only.
+    /// planes staged in threadgroup memory, or read by every simdgroup from
+    /// device memory (the default, 4-5% faster on the hosted VM). Both
+    /// compute the same integers; this changes speed only.
     pub fn set_staged_gemm(&mut self, staged: bool) {
         self.staged_gemm = staged;
     }
