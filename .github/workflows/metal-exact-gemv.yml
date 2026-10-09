@@ -1,18 +1,32 @@
 name: Metal exact GEMV (hosted macOS)
 
 # GitHub-hosted Apple Silicon runners are virtual machines that expose a
-# paravirtual Metal GPU. This workflow first checks that Metal compute works
-# there at all (device, an integer kernel checked against the CPU, read
-# bandwidth). Every timing it prints is a virtualized-runner measurement, not
-# a measurement of Apple GPU hardware.
+# paravirtual Metal GPU. The probe job reports what that device is (name,
+# limits, an integer kernel checked against the CPU, read bandwidth). The
+# exact-gemv job runs the canonical INT8 GEMV kernel (crates/arc-gpu/src/
+# metal_exact.rs) against the CPU scalar kernel and the golden KATs, then
+# benchmarks the Llama-2-7B projection shapes. Every timing either job prints
+# is a virtualized-runner measurement, not a measurement of Apple GPU hardware.
+#
+# Optional and never a required check. The kernel and its engine hook are
+# opt-in (`metal-exact` feature, ARC_METAL_EXACT_GEMV=1) and off by default.
 
 on:
-  push:
-    branches: [perf-metal-exact-gemv]
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/metal-exact-gemv.yml
+      - scripts/ci/metal-probe/**
+      - crates/arc-gpu/**
+      - crates/arc-inference/**
+      - Cargo.lock
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   probe:
@@ -44,4 +58,50 @@ jobs:
               cat "$RUNNER_TEMP/metal-probe.txt"
               echo '</pre>'
             } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  exact-gemv:
+    name: Exact Metal GEMV (macos-15, hosted)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: metal-exact-gemv
+      - name: Show the GPU under test
+        run: system_profiler SPDisplaysDataType
+      # No other workflow lints aarch64 or macOS-only code, so existing
+      # diagnostics there are reported but only the new Metal GEMV files gate.
+      - name: Clippy on the Metal GEMV code (any diagnostic in it fails)
+        run: |
+          set -euo pipefail
+          cargo clippy -p arc-gpu -p arc-inference --all-targets --locked \
+            --features arc-gpu/metal-exact,arc-inference/metal-exact \
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.txt"
+          if grep -E '^crates/(arc-gpu/src/metal_exact|arc-inference/src/metal_gemv|arc-inference/src/golden_vectors)\.rs:' "$RUNNER_TEMP/clippy.txt"; then
+            echo '::error::clippy reported diagnostics in the Metal GEMV code'
+            exit 1
+          fi
+      - name: Kernel unit tests and device self-test
+        run: cargo test --release --locked -p arc-gpu --features metal-exact --lib metal_exact -- --test-threads=1 --nocapture
+      - name: Byte-identical tests against the CPU scalar kernel and the golden KATs
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib -- --test-threads=1 --nocapture metal_gemv golden_cached_integer_kat_holds_on_the_exact_metal_gemv
+      - name: Every arc-inference library test with the feature compiled in (switch off)
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib
+      - name: Benchmark the 7B projection shapes (virtualized-runner measurement)
+        env:
+          ARC_METAL_BENCH_MD: ${{ runner.temp }}/metal-bench.md
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_gemv::bench -- --ignored --nocapture --test-threads=1
+      - name: Benchmark summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/metal-bench.md" ]; then
+            cat "$RUNNER_TEMP/metal-bench.md" >> "$GITHUB_STEP_SUMMARY"
           fi
