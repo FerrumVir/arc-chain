@@ -11,7 +11,11 @@
 // range identically to a single-range node of the same configuration.
 use arc_inference::cached_integer_model::{load_cached_model_ranges, load_cached_model_shard};
 
-const MODEL_PATH: &str = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
+/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
+fn model_path() -> String {
+    let home = std::env::var("HOME").expect("HOME is set");
+    format!("{home}/.arc-models/llama-2-7b.gguf")
+}
 
 fn summarize(tag: &str, layers_loaded: &[bool], per_layer_bytes: &[usize]) {
     let total: usize = per_layer_bytes.iter().sum();
@@ -46,7 +50,7 @@ fn main() {
         ranges
     );
     let merged =
-        load_cached_model_ranges(MODEL_PATH, &ranges).expect("load_cached_model_ranges failed");
+        load_cached_model_ranges(&model_path(), &ranges).expect("load_cached_model_ranges failed");
 
     let n = merged.config.n_layers;
     let merged_flags: Vec<bool> = merged.layers.iter().map(|l| l.is_loaded()).collect();
@@ -92,7 +96,7 @@ fn main() {
     for &(s, e) in &ranges {
         eprintln!("B) comparing against load_cached_model_shard({s}, {e}) ...");
         let single =
-            load_cached_model_shard(MODEL_PATH, s, e).expect("load_cached_model_shard failed");
+            load_cached_model_shard(&model_path(), s, e).expect("load_cached_model_shard failed");
         assert_eq!(single.config.n_layers, n);
         for i in s..e {
             let a = &merged.layers[i];

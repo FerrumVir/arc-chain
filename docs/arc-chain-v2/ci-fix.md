@@ -6,7 +6,7 @@ The failing post-merge CI run was [35390119807](https://github.com/FerrumVir/arc
 
 ## Local patch
 
-In fresh checkout `/Users/excaulibur/work/arc-chain-readiness-20260919`, only these lockfile entries changed:
+In fresh checkout `~/work/arc-chain-readiness-20260919`, only these lockfile entries changed:
 
 - `Cargo.lock`: `rustls 0.23.43` -> `0.23.45`, checksum updated.
 - `desktop/src-tauri/Cargo.lock`: `rustls 0.23.43` -> `0.23.45`, checksum updated.

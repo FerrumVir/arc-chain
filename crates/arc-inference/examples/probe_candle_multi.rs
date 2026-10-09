@@ -6,7 +6,11 @@ use arc_inference::cached_integer_model::{KVCache, load_cached_model};
 use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_llama::ModelWeights;
 
-const MODEL_PATH: &str = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
+/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
+fn model_path() -> String {
+    let home = std::env::var("HOME").expect("HOME is set");
+    format!("{home}/.arc-models/llama-2-7b.gguf")
+}
 
 fn argmax_f32(v: &[f32]) -> (usize, f32) {
     let mut ai = 0;
@@ -48,12 +52,12 @@ fn main() {
     let device = Device::Cpu;
 
     eprintln!("Loading candle...");
-    let mut file = std::fs::File::open(MODEL_PATH).unwrap();
+    let mut file = std::fs::File::open(model_path()).unwrap();
     let content = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
     let mut candle_model = ModelWeights::from_gguf(content, &mut file, &device).unwrap();
 
     eprintln!("Loading integer...");
-    let integer_model = load_cached_model(MODEL_PATH).unwrap();
+    let integer_model = load_cached_model(&model_path()).unwrap();
     let mut cache = KVCache::new(integer_model.config.n_layers);
 
     // Prompt: "The capital of France is"
