@@ -1,0 +1,299 @@
+name: Determinism proof
+
+# Public, reproducible evidence that ARC's canonical per-row INT8 engine gives
+# byte-identical output for a real 7B model (Llama-2-7B-Chat Q4_K_M, pinned by
+# SHA-256) on four CPU platforms: Apple Silicon macOS, Intel macOS, Linux
+# x86_64 and Windows x86_64. Each platform runs the default scalar projection
+# kernel and the opt-in SIMD limb kernel (NEON dotprod on arm64, AVX2 on
+# x86_64) in separate jobs.
+#
+# Every leg writes a platform-independent transcript: the BLAKE3 of the exact
+# logits and K/V rows at every forward position plus every generated token ID.
+# The compare job is green only if every transcript has the same SHA-256. CPU
+# only; GPU backends are not covered. docs/determinism-proof.md explains the
+# scope and how to run the same check on your own machine.
+#
+# Cost control: a pull request runs this only when it changes the proof's own
+# files AND carries the `determinism-proof` label, so ordinary CI never runs it.
+# workflow_dispatch works once this file is on the default branch.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - .github/workflows/determinism-proof.yml
+      - crates/arc-inference/examples/determinism_proof.rs
+      - scripts/determinism-proof/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per commit: a newer commit's run does not cancel or wait behind an
+# older run's long macOS legs. Duplicate triggers for the same commit queue.
+concurrency:
+  group: determinism-proof-${{ github.event.pull_request.number || github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Workload. Empty PROOF_PROMPT_LIMIT means every prompt in prompts.json. The
+  # published expected hash is for all 16 prompts x 32 new tokens.
+  PROOF_PROMPT_LIMIT: ""
+  PROOF_MAX_NEW_TOKENS: "32"
+  # Pinned model: the same bytes as arc-node's TESTNET_MODEL_SHA256 and
+  # docs/protocol/packages/llama-2-7b-q4km.manifest.json.
+  MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
+  MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+  MODEL_BYTES: "4081004224"
+  MODEL_FILE: .determinism-proof-model/llama-2-7b-chat.Q4_K_M.gguf
+  # The model is downloaded on every run and is not kept in the Actions cache.
+  # On 2026-10-06 the repository cache already held 10.05 GB of ordinary CI
+  # caches against its 10 GB budget, so a 4 GB entry would evict them and slow
+  # normal CI. Caching would also need actions/cache added to the reviewed
+  # GitHub-action allowlist in tests/release/static_contract_test.sh.
+
+jobs:
+  run:
+    name: ${{ matrix.runner }} / ${{ matrix.kernel }} / shard ${{ matrix.shard }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'determinism-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'determinism-proof'))
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.job_timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15 is Apple Silicon with 7 GB of RAM, less than the ~7.3 GiB
+        # resident INT8 model, so it swaps: the smoke run measured ~57 s per
+        # forward there, against ~1 s on the x86 runners. Each of its kernels
+        # therefore runs as six parallel prompt shards (at most ~155 forwards,
+        # ~2.5 h each). Every prompt starts from an empty KV cache, and the
+        # compare job joins the shard transcripts into the exact bytes a single
+        # run writes. The driver checks its deadline between prompts, so the
+        # deadline leaves a 30-minute margin inside the run step's timeout.
+        include:
+          - {runner: macos-15, kernel: scalar, shard: "0/6", shard_tag: 1of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "1/6", shard_tag: 2of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "2/6", shard_tag: 3of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "3/6", shard_tag: 4of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "4/6", shard_tag: 5of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: scalar, shard: "5/6", shard_tag: 6of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "0/6", shard_tag: 1of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "1/6", shard_tag: 2of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "2/6", shard_tag: 3of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "3/6", shard_tag: 4of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "4/6", shard_tag: 5of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "5/6", shard_tag: 6of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15-intel, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: macos-15-intel, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: ubuntu-24.04, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: ubuntu-24.04, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: windows-latest, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: windows-latest, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+    env:
+      RUNNER_LABEL: ${{ matrix.runner }}
+      KERNEL: ${{ matrix.kernel }}
+      SHARD: ${{ matrix.shard }}
+      DEADLINE_SECONDS: ${{ matrix.deadline_seconds }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner facts
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/determinism-proof"
+          mkdir -p "$out"
+          {
+            echo "leg: $RUNNER_LABEL / $KERNEL / shard $SHARD"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            case "$RUNNER_OS" in
+              macOS)
+                sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+                sysctl vm.swapusage
+                vm_stat
+                ;;
+              Linux)
+                lscpu
+                free -b
+                ;;
+              Windows)
+                powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory"
+                ;;
+            esac
+            df -h .
+          } 2>&1 | tee "$out/runner-before.txt"
+
+      - name: Download and verify the pinned model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$MODEL_FILE")"
+          if [ ! -f "$MODEL_FILE" ]; then
+            curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+              --retry-max-time 900 --connect-timeout 20 --max-time 1800 \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$MODEL_FILE.partial" "$MODEL_URL"
+            mv "$MODEL_FILE.partial" "$MODEL_FILE"
+          fi
+          size="$(wc -c < "$MODEL_FILE" | tr -d ' ')"
+          if [ "$size" != "$MODEL_BYTES" ]; then
+            echo "::error::model is $size bytes, expected $MODEL_BYTES"
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$MODEL_FILE" | cut -d ' ' -f 1)"
+          else
+            actual="$(shasum -a 256 "$MODEL_FILE" | cut -d ' ' -f 1)"
+          fi
+          if [ "$actual" != "$MODEL_SHA256" ]; then
+            echo "::error::model SHA-256 is $actual, expected $MODEL_SHA256"
+            exit 1
+          fi
+          echo "model verified: sha256 $actual, $size bytes"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - name: Build the proof driver (release, Candle GGUF loader)
+        shell: bash
+        run: cargo build --locked --release -p arc-inference --features candle --example determinism_proof
+
+      - name: Reduce background memory use (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo mdutil -a -i off || true
+          sudo purge || true
+          sysctl vm.swapusage
+
+      - name: Run the proof with the bash script (macOS, Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        timeout-minutes: ${{ matrix.run_timeout }}
+        run: |
+          set -euo pipefail
+          args=(
+            --kernel "$KERNEL"
+            --model "$GITHUB_WORKSPACE/$MODEL_FILE"
+            --out-dir "$RUNNER_TEMP/determinism-proof"
+            --max-new-tokens "$PROOF_MAX_NEW_TOKENS"
+            --deadline-seconds "$DEADLINE_SECONDS"
+          )
+          if [ -n "$PROOF_PROMPT_LIMIT" ]; then
+            args+=(--prompt-limit "$PROOF_PROMPT_LIMIT")
+          fi
+          if [ "$SHARD" != "0/1" ]; then
+            args+=(--shard "$SHARD")
+          fi
+          bash scripts/determinism-proof/run-proof.sh "${args[@]}"
+
+      - name: Run the proof with the PowerShell script (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: ${{ matrix.run_timeout }}
+        run: |
+          $params = @{
+            Kernel = $env:KERNEL
+            Model = (Join-Path $env:GITHUB_WORKSPACE $env:MODEL_FILE)
+            OutDir = (Join-Path $env:RUNNER_TEMP 'determinism-proof')
+            MaxNewTokens = [int]$env:PROOF_MAX_NEW_TOKENS
+            DeadlineSeconds = [int]$env:DEADLINE_SECONDS
+          }
+          if ($env:PROOF_PROMPT_LIMIT) { $params.PromptLimit = [int]$env:PROOF_PROMPT_LIMIT }
+          if ($env:SHARD -ne '0/1') { $params.Shard = $env:SHARD }
+          & ./scripts/determinism-proof/run-proof.ps1 @params
+
+      - name: Record memory after the run
+        if: always()
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/determinism-proof"
+          mkdir -p "$out"
+          {
+            case "$RUNNER_OS" in
+              macOS)
+                sysctl vm.swapusage
+                vm_stat
+                ;;
+              Linux)
+                free -b
+                grep -E '^(pswpin|pswpout|pgmajfault) ' /proc/vmstat || true
+                ;;
+              Windows)
+                echo "not recorded on Windows"
+                ;;
+            esac
+          } 2>&1 | tee "$out/runner-after.txt"
+
+      - name: Assemble this leg's result
+        if: always()
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
+          "$py" scripts/determinism-proof/assemble_result.py \
+            --out-dir "$RUNNER_TEMP/determinism-proof" \
+            --runner-label "$RUNNER_LABEL" --kernel "$KERNEL" --shard "$SHARD"
+
+      - name: Upload this leg's evidence (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: determinism-proof-leg-${{ matrix.runner }}-${{ matrix.kernel }}-${{ matrix.shard_tag }}
+          path: ${{ runner.temp }}/determinism-proof/
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+
+  compare:
+    name: compare all platforms and kernels
+    needs: run
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'determinism-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'determinism-proof')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download every leg's evidence
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: determinism-proof-leg-*
+          path: ${{ runner.temp }}/legs
+
+      - name: Compare combined hashes across platforms and kernels
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/determinism-proof/compare_results.py \
+            --results-dir "$RUNNER_TEMP/legs" \
+            --manifest docs/protocol/packages/llama-2-7b-q4km.manifest.json \
+            --expect macos-15:scalar --expect macos-15:simd \
+            --expect macos-15-intel:scalar --expect macos-15-intel:simd \
+            --expect ubuntu-24.04:scalar --expect ubuntu-24.04:simd \
+            --expect windows-latest:scalar --expect windows-latest:simd \
+            --out-dir "$RUNNER_TEMP/evidence" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the cross-platform evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: determinism-proof-evidence
+          path: |
+            ${{ runner.temp }}/evidence/
+            ${{ runner.temp }}/legs/
+          if-no-files-found: warn
+          retention-days: 90
+          overwrite: true
