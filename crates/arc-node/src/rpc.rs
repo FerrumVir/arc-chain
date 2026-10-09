@@ -16033,6 +16033,18 @@ fn require_issuance_capacity_counting_unpaid(
     Ok(())
 }
 
+/// Whether an inline settlement's error is the reward budget refusing the job:
+/// the issuance check the inline path runs first still refuses it with the
+/// same words. Once this coordinator's epoch budget is spent that is the
+/// normal outcome for the rest of the epoch, as with the switch off, so it is
+/// logged at info rather than as a failure.
+fn inline_refusal_is_budget_policy(node: &NodeState, worker_id: &str, reason: &str) -> bool {
+    parse_hash256_hex(worker_id, "worker_id").is_ok_and(|worker| {
+        require_community_reward_issuance_capacity(node, worker, node.validator_address)
+            .is_err_and(|refusal| refusal == reason)
+    })
+}
+
 /// `--community-release-on-verification`: decide how to settle one verified
 /// job without ever doing worse than the switch-off ordering. Every outcome
 /// other than an early release is the switch-off path itself.
@@ -16878,8 +16890,22 @@ pub async fn community_submit_work(
                         )
                         .await;
                         // One line per job that missed release on verification
-                        // through an error, worded by how it ended.
+                        // through an error or a budget refusal, worded by how
+                        // it ended.
                         match (&inline, &journal_error) {
+                            (Err(reason), _)
+                                if inline_refusal_is_budget_policy(
+                                    &node,
+                                    &result.worker_id,
+                                    reason,
+                                ) =>
+                            {
+                                tracing::info!(
+                                    job_id = %job_id,
+                                    %reason,
+                                    "verified community reward was refused by the reward budget; the answer goes out without a reward, as with the switch off"
+                                )
+                            }
                             (Err(reason), _) => tracing::error!(
                                 job_id = %job_id,
                                 %reason,
@@ -22545,6 +22571,33 @@ mod tests {
             ),
             "{logged}"
         );
+    }
+
+    #[test]
+    fn release_on_verification_logs_a_budget_refusal_as_policy() {
+        // The empty test chain has no funded treasury, so the issuance check
+        // the inline path runs first refuses every reward.
+        let node = fake_node_with_workers(Vec::new());
+        let worker = Hash256([7; 32]);
+        let refusal =
+            require_community_reward_issuance_capacity(&node, worker, node.validator_address)
+                .unwrap_err();
+        assert!(inline_refusal_is_budget_policy(
+            &node,
+            &worker.to_hex(),
+            &refusal
+        ));
+        // Any other inline error is still a failure.
+        assert!(!inline_refusal_is_budget_policy(
+            &node,
+            &worker.to_hex(),
+            "verified settlement journal reached its reviewed capacity 256"
+        ));
+        assert!(!inline_refusal_is_budget_policy(
+            &node,
+            "not-a-worker-id",
+            &refusal
+        ));
     }
 
     #[tokio::test]

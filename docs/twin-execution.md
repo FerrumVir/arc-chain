@@ -407,15 +407,17 @@ A coordinator switch for single-worker community jobs. It changes no consensus, 
    - The caller waits for the approvals, holding one of the coordinator's two public permits, so intake slows to the approval rate.
    - Crossing the mark is logged once at warn level, and dropping back below it at info level.
    - Why 192 (75 % of the 256-entry journal): the remaining 64 entries absorb jobs already in flight when the mark is crossed and the paths that always journal inline (twin legs, recovery probes), well before the cap at which no mode can journal a reward.
-   - Under today's budgets this is a safety net only. Entries that release on verification creates stay below the coordinator's 16-per-epoch budget (point 2), so only always-inline paths, or entries left from a run without the switch, can reach 192.
+   - Under today's budgets this is a safety net only. Entries that release on verification creates stay below the coordinator's 16-per-epoch budget (point 2). Only jobs settled inline, or entries left from a run without the switch, can reach 192. Jobs settled inline hold the caller's permit through their approvals, so they build up at the switch-off rate.
 2. **Budget.** The coordinator counts its own journaled rewards that are neither paid nor expired as already issued, on top of the mined rewards the chain counts.
    - It checks them against the promotional treasury and the epoch budgets: 40 network-wide, 16 per coordinator and 8 per worker (`crates/arc-state/src/lib.rs`).
-   - If that leaves no room for this reward, the job settles inline, exactly as with the switch off. It is still journaled, and it may still be paid if a pending reward fails, or from a later epoch when an epoch boundary falls inside its expiry window.
+   - If that leaves no room for this reward, the job settles inline, exactly as with the switch off.
+     - The inline path still journals it unless the mined rewards alone have spent the budget. A journaled job may still be paid if a pending reward fails, or from a later epoch when an epoch boundary falls inside its expiry window.
+     - If the mined rewards alone have spent the budget, the inline path refuses the reward, exactly as with the switch off. That refusal is normal for the rest of the epoch, so it is logged at info level.
 3. **Release.** Otherwise the settlement is written to the crash-durable journal, and the caller is answered at once with `answer_release` and a `verified_pending_approval` settlement.
    - The approvals then run on the existing retry loop (`schedule_verified_settlement_retry`), the loop that already retries a failed first attempt and replays the journal after a restart.
    - Its first attempt starts one second after the answer.
 4. **Journal failure.** If that journal write fails (the journal is full, an I/O error, or no journal directory), the job settles inline, exactly as with the switch off.
-   - Each such job logs one line. It is a warning if the inline settlement then succeeded. It is an error with the cause if it failed, and the answer then carries the default path's `reward_approval_quorum_unavailable` settlement.
+   - Each such job logs one line. It is a warning if the inline settlement then succeeded. If it failed, the answer carries the default path's `reward_approval_quorum_unavailable` settlement, and the line is an error with the cause, or info if the cause was the budget refusal of point 2.
 
 **Limits of the budget check.**
 - **Only this coordinator's pending rewards are visible**, so a released "pending" reward can still go unpaid when approvals stall on several coordinators.
