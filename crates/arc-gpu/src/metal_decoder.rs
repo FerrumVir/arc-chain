@@ -21,6 +21,13 @@
 //! The decoder keeps its own copy of the KV cache in shared memory. The
 //! caller mirrors it with [`MetalDecoder::write_kv`] and reads each token's
 //! new rows from [`DecoderStep`].
+//!
+//! [`MetalDecoder::step_rows`] runs up to [`MAX_ROWS`] consecutive tokens of
+//! one sequence in one pass. The projections read each weight once for all
+//! rows (`exact_gemm_dyn`), and every other kernel runs per row with the
+//! single-row arithmetic. Row r sits at position `pos + r` and attends to the
+//! rows before it, so the pass equals that many [`MetalDecoder::step`] calls,
+//! value for value.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -33,7 +40,7 @@ use objc::rc::autoreleasepool;
 
 use crate::metal_exact::{
     BLOCK_BYTES, MAX_COLS, MAX_PLANES, MetalExactGemv, Params, ROWS_PER_SIMDGROUP, ResidentMatrix,
-    gpu_seconds,
+    Tile, gpu_seconds,
 };
 
 /// Source of the decoder kernels.
@@ -55,6 +62,10 @@ pub const MAX_HEAD_DIM: usize = 256;
 pub const MAX_KV_CAPACITY: usize = 32_768;
 /// Entries of the CPU engine's exp table.
 pub const EXP_TABLE_LEN: usize = 4097;
+/// Most tokens one [`MetalDecoder::step_rows`] pass runs.
+pub const MAX_ROWS: usize = 8;
+/// Matrix rows per simdgroup in the multi-row projection.
+const GEMM_ROWS: u32 = 4;
 
 const GROUP_THREADS: u64 = 256;
 const ELEMENTWISE_THREADS: u64 = 256;
@@ -69,6 +80,12 @@ pub(crate) struct DecoderPipelines {
     silu: ComputePipelineState,
     residual: ComputePipelineState,
     gemv: Vec<((u32, bool), ComputePipelineState)>,
+    rms_norm_rows: ComputePipelineState,
+    split_rows: ComputePipelineState,
+    rope_rows: ComputePipelineState,
+    attention_rows: ComputePipelineState,
+    /// Keyed by (16-bit products, activation rows).
+    gemm: Vec<((bool, usize), ComputePipelineState)>,
 }
 
 impl DecoderPipelines {
@@ -93,6 +110,13 @@ impl DecoderPipelines {
                 gemv.push(((rows, mul16), make(&name)?));
             }
         }
+        let mut gemm = Vec::new();
+        for mul16 in [false, true] {
+            for inputs in 1..=MAX_ROWS {
+                let name = format!("exact_gemm_dyn_m{}_k{inputs}", u8::from(mul16));
+                gemm.push(((mul16, inputs), make(&name)?));
+            }
+        }
         let pipelines = Self {
             rms_norm: make("rms_norm")?,
             split: make("split_planes")?,
@@ -101,10 +125,17 @@ impl DecoderPipelines {
             silu: make("silu_mul")?,
             residual: make("residual_add")?,
             gemv,
+            rms_norm_rows: make("rms_norm_rows")?,
+            split_rows: make("split_planes_rows")?,
+            rope_rows: make("rope_store_rows")?,
+            attention_rows: make("attention_rows")?,
+            gemm,
         };
         for (name, pipeline) in [
             ("rms_norm", &pipelines.rms_norm),
             ("split_planes", &pipelines.split),
+            ("rms_norm_rows", &pipelines.rms_norm_rows),
+            ("split_planes_rows", &pipelines.split_rows),
         ] {
             if pipeline.max_total_threads_per_threadgroup() < GROUP_THREADS {
                 return Err(format!(
@@ -112,10 +143,28 @@ impl DecoderPipelines {
                 ));
             }
         }
-        if pipelines.attention.thread_execution_width() != 32 {
+        if pipelines.attention.thread_execution_width() != 32
+            || pipelines.attention_rows.thread_execution_width() != 32
+        {
             return Err("attention needs 32-lane simdgroups".to_string());
         }
+        // The multi-row projection reduces 64-bit sums across a 32-lane
+        // simdgroup and needs a lane per matrix row of its tile.
+        for (_, pipeline) in &pipelines.gemm {
+            if pipeline.thread_execution_width() != 32
+                || pipeline.max_total_threads_per_threadgroup() < 32
+            {
+                return Err("the multi-row projection needs 32-lane simdgroups".to_string());
+            }
+        }
         Ok(pipelines)
+    }
+
+    fn gemm_for(&self, mul16: bool, inputs: usize) -> Option<&ComputePipelineState> {
+        self.gemm
+            .iter()
+            .find(|(key, _)| *key == (mul16, inputs))
+            .map(|(_, pipeline)| pipeline)
     }
 
     fn gemv_for(&self, rows: u32, mul16: bool) -> Option<&ComputePipelineState> {
@@ -170,6 +219,38 @@ struct AttnParams {
 struct VecParams {
     n: u32,
     pad: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RopeRowsParams {
+    n_heads: u32,
+    n_kv_heads: u32,
+    pairs: u32,
+    d_head: u32,
+    pos: u32,
+    d_kv: u32,
+    rows: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttnRowsParams {
+    d_head: u32,
+    d_kv: u32,
+    positions: u32,
+    n_heads: u32,
+    attn_scale: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GemmParams {
+    rows: u32,
+    row_offset: u32,
+    blocks: u32,
+    inputs: u32,
 }
 
 fn set_params<T: Copy>(encoder: &ComputeCommandEncoderRef, index: u64, value: &T) {
@@ -467,6 +548,156 @@ fn encode_gemv(
     encoder.dispatch_thread_groups(groups, threads);
 }
 
+// ---- multi-row encoders: `rows` consecutive tokens, rows contiguous ------
+
+#[allow(clippy::too_many_arguments)]
+fn encode_norm_rows(
+    encoder: &ComputeCommandEncoderRef,
+    pipes: &DecoderPipelines,
+    status: &BufferRef,
+    x: &BufferRef,
+    gamma: &BufferRef,
+    y: &BufferRef,
+    n: usize,
+    rows: usize,
+) {
+    encoder.set_compute_pipeline_state(&pipes.rms_norm_rows);
+    encoder.set_buffer(0, Some(x), 0);
+    encoder.set_buffer(1, Some(gamma), 0);
+    encoder.set_buffer(2, Some(y), 0);
+    encoder.set_buffer(3, Some(status), 0);
+    set_params(
+        encoder,
+        4,
+        &NormParams {
+            n: n as u32,
+            pad: [0; 3],
+        },
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(GROUP_THREADS, 1, 1),
+    );
+}
+
+/// Digit planes of `rows` activation rows: row r's planes at
+/// `r * MAX_PLANES * stride`, its plane count in `ctrl[r]`.
+#[allow(clippy::too_many_arguments)]
+fn encode_split_rows(
+    encoder: &ComputeCommandEncoderRef,
+    pipes: &DecoderPipelines,
+    status: &BufferRef,
+    x: &BufferRef,
+    planes: &BufferRef,
+    ctrl: &BufferRef,
+    n: usize,
+    max_scale: u64,
+    rows: usize,
+) {
+    encoder.set_compute_pipeline_state(&pipes.split_rows);
+    encoder.set_buffer(0, Some(x), 0);
+    encoder.set_buffer(1, Some(planes), 0);
+    encoder.set_buffer(2, Some(ctrl), 0);
+    encoder.set_buffer(3, Some(status), 0);
+    set_params(
+        encoder,
+        4,
+        &SplitParams {
+            n: n as u32,
+            stride: stride_of(n) as u32,
+            max_scale,
+        },
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(rows as u64, 1, 1),
+        MTLSize::new(GROUP_THREADS, 1, 1),
+    );
+}
+
+fn encode_rope_rows(
+    encoder: &ComputeCommandEncoderRef,
+    pipes: &DecoderPipelines,
+    buffers: &RopeBuffers<'_>,
+    params: RopeRowsParams,
+) {
+    encoder.set_compute_pipeline_state(&pipes.rope_rows);
+    encoder.set_buffer(0, Some(buffers.q), 0);
+    encoder.set_buffer(1, Some(buffers.k), 0);
+    encoder.set_buffer(2, Some(buffers.v), 0);
+    encoder.set_buffer(3, Some(buffers.k_cache), 0);
+    encoder.set_buffer(4, Some(buffers.v_cache), 0);
+    encoder.set_buffer(5, Some(buffers.cos), 0);
+    encoder.set_buffer(6, Some(buffers.sin), 0);
+    set_params(encoder, 7, &params);
+    let heads = u64::from(params.n_heads + params.n_kv_heads);
+    let pairs = u64::from(params.pairs);
+    encoder.dispatch_threads(
+        MTLSize::new(pairs, heads, u64::from(params.rows)),
+        MTLSize::new(pairs.min(64), 1, 1),
+    );
+}
+
+fn encode_attention_rows(
+    encoder: &ComputeCommandEncoderRef,
+    pipes: &DecoderPipelines,
+    buffers: &AttnBuffers<'_>,
+    params: AttnRowsParams,
+    rows: usize,
+) {
+    encoder.set_compute_pipeline_state(&pipes.attention_rows);
+    encoder.set_buffer(0, Some(buffers.q), 0);
+    encoder.set_buffer(1, Some(buffers.k_cache), 0);
+    encoder.set_buffer(2, Some(buffers.v_cache), 0);
+    encoder.set_buffer(3, Some(buffers.out), 0);
+    encoder.set_buffer(4, Some(buffers.lut), 0);
+    encoder.set_buffer(5, Some(buffers.head_kv), 0);
+    set_params(encoder, 6, &params);
+    encoder.dispatch_thread_groups(
+        MTLSize::new(u64::from(params.n_heads), rows as u64, 1),
+        MTLSize::new(32, 1, 1),
+    );
+}
+
+/// One full-matrix canonical projection of `rows` activation rows, each
+/// weight read once for all of them. Output row-major: `rows` x `n_rows`.
+#[allow(clippy::too_many_arguments)]
+fn encode_gemm(
+    encoder: &ComputeCommandEncoderRef,
+    engine: &MetalExactGemv,
+    pipes: &DecoderPipelines,
+    matrix: &ResidentMatrix,
+    digits: &BufferRef,
+    ctrl: &BufferRef,
+    out: &BufferRef,
+    rows: usize,
+) {
+    let tile = Tile {
+        rows_per_simdgroup: GEMM_ROWS,
+        ..engine.tile
+    };
+    let pipeline = pipes
+        .gemm_for(tile.mul16, rows)
+        .expect("a multi-row pipeline exists for 1..=MAX_ROWS rows");
+    let (groups, threads) = engine.geometry(pipeline, matrix.n_rows, tile);
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(&matrix.weights), 0);
+    encoder.set_buffer(1, Some(digits), 0);
+    encoder.set_buffer(2, Some(&matrix.scales), 0);
+    encoder.set_buffer(3, Some(out), 0);
+    set_params(
+        encoder,
+        4,
+        &GemmParams {
+            rows: matrix.n_rows as u32,
+            row_offset: 0,
+            blocks: (matrix.stride / BLOCK_BYTES) as u32,
+            inputs: rows as u32,
+        },
+    );
+    encoder.set_buffer(5, Some(ctrl), 0);
+    encoder.dispatch_thread_groups(groups, threads);
+}
+
 // ---- public types --------------------------------------------------------
 
 /// Dimensions of a Llama-family decoder in the canonical profile.
@@ -707,6 +938,30 @@ pub struct MetalDecoder {
     lut: Buffer,
     head_kv: Buffer,
     io: Activations,
+    /// Activations of [`MAX_ROWS`] rows for [`MetalDecoder::step_rows`].
+    rows_io: Activations,
+}
+
+/// Activation buffers for `rows` contiguous rows.
+fn row_activations(device: &DeviceRef, s: &DecoderShape, rows: usize) -> Activations {
+    let widest = s.d_model.max(s.d_ff);
+    Activations {
+        hidden: new_shared(device, rows * s.d_model * 8),
+        normed: new_shared(device, rows * s.d_model * 8),
+        q: new_shared(device, rows * s.d_model * 8),
+        k: new_shared(device, rows * s.d_kv * 8),
+        v: new_shared(device, rows * s.d_kv * 8),
+        attn: new_shared(device, rows * s.d_model * 8),
+        proj: new_shared(device, rows * s.d_model * 8),
+        gate: new_shared(device, rows * s.d_ff * 8),
+        up: new_shared(device, rows * s.d_ff * 8),
+        act: new_shared(device, rows * s.d_ff * 8),
+        ff: new_shared(device, rows * s.d_model * 8),
+        logits: new_shared(device, rows * s.vocab * 8),
+        digits: new_shared(device, rows * MAX_PLANES * stride_of(widest)),
+        ctrl: new_shared(device, rows * 4),
+        status: new_shared(device, 16),
+    }
 }
 
 fn check_matrix(
@@ -817,6 +1072,7 @@ impl MetalDecoder {
             lut: upload_i64(device, &weights.exp_lut),
             head_kv: head_kv_buffer,
             io,
+            rows_io: row_activations(device, &s, MAX_ROWS),
             engine,
         })
     }
@@ -1202,6 +1458,320 @@ impl MetalDecoder {
             &io.digits,
             &io.ctrl,
             &io.logits,
+        );
+        rec.after_dispatch()
+    }
+
+    /// Run layers `layers`, and the final norm and LM head if `logits`, for
+    /// `rows = hidden_in.len() / d_model` consecutive tokens (1 to
+    /// [`MAX_ROWS`]) at positions `pos..pos + rows`, in one pass. Row r
+    /// attends to cache rows `0..pos` and to rows 0 to r of this pass, so the
+    /// result equals `rows` calls of [`Self::step`] at `pos`, `pos + 1`, and
+    /// so on, value for value. Every returned vector holds the rows one after
+    /// another: `k_rows[l]` and `v_rows[l]` are `rows * d_kv` values (cache
+    /// rows `pos..pos + rows`), `hidden` is `rows * d_model`, and `logits` is
+    /// `rows * vocab`. Rows `0..pos` of every layer's device KV cache must
+    /// already mirror the CPU cache.
+    pub fn step_rows(
+        &mut self,
+        hidden_in: &[i64],
+        pos: usize,
+        layers: Range<usize>,
+        logits: bool,
+        submission: Submission,
+    ) -> Result<DecoderStep, DecoderRefusal> {
+        let s = self.shape;
+        let rows = hidden_in.len() / s.d_model;
+        if rows == 0 || rows > MAX_ROWS || rows * s.d_model != hidden_in.len() {
+            return Err(DecoderRefusal::Input(format!(
+                "{} values are not 1 to {MAX_ROWS} rows of d_model {}",
+                hidden_in.len(),
+                s.d_model
+            )));
+        }
+        if layers.start > layers.end || layers.end > s.n_layers {
+            return Err(DecoderRefusal::Input(format!("layer range {layers:?}")));
+        }
+        if pos + rows > s.kv_capacity || pos + rows > s.max_seq {
+            return Err(DecoderRefusal::Input(format!(
+                "positions {pos}..{} past the device cache ({}) or the RoPE tables ({})",
+                pos + rows,
+                s.kv_capacity,
+                s.max_seq
+            )));
+        }
+        let pipes = self
+            .engine
+            .decoder_pipelines()
+            .map_err(DecoderRefusal::Input)?;
+        autoreleasepool(|| {
+            write_i64(&self.rows_io.hidden, 0, hidden_in);
+            write_u32(&self.rows_io.status, 0);
+            let mut rec = Recorder::new(&self.engine.queue, submission);
+            for layer in layers.clone() {
+                self.encode_layer_rows(&mut rec, pipes, layer, pos, rows)?;
+                rec.after_layer()?;
+            }
+            if logits {
+                self.encode_head_rows(&mut rec, pipes, rows)?;
+            }
+            let (gpu_seconds, command_buffers, dispatches) = rec.finish()?;
+            let status = read_u32(&self.rows_io.status);
+            if status != 0 {
+                return Err(DecoderRefusal::Status(status));
+            }
+            let mut k_rows = Vec::with_capacity(layers.len());
+            let mut v_rows = Vec::with_capacity(layers.len());
+            for layer in layers {
+                let state = &self.layers[layer];
+                k_rows.push(read_i64(&state.k_cache, pos * s.d_kv, rows * s.d_kv));
+                v_rows.push(read_i64(&state.v_cache, pos * s.d_kv, rows * s.d_kv));
+            }
+            Ok(DecoderStep {
+                k_rows,
+                v_rows,
+                hidden: read_i64(&self.rows_io.hidden, 0, rows * s.d_model),
+                logits: logits.then(|| read_i64(&self.rows_io.logits, 0, rows * s.vocab)),
+                gpu_seconds,
+                command_buffers,
+                dispatches,
+            })
+        })
+    }
+
+    fn encode_layer_rows(
+        &self,
+        rec: &mut Recorder<'_>,
+        pipes: &DecoderPipelines,
+        layer: usize,
+        pos: usize,
+        rows: usize,
+    ) -> Result<(), DecoderRefusal> {
+        let s = &self.shape;
+        let l = &self.layers[layer];
+        let w = &l.weights;
+        let io = &self.rows_io;
+        let engine = self.engine.as_ref();
+
+        encode_norm_rows(
+            rec.encoder,
+            pipes,
+            &io.status,
+            &io.hidden,
+            &l.attn_norm,
+            &io.normed,
+            s.d_model,
+            rows,
+        );
+        rec.after_dispatch()?;
+        encode_split_rows(
+            rec.encoder,
+            pipes,
+            &io.status,
+            &io.normed,
+            &io.digits,
+            &io.ctrl,
+            s.d_model,
+            l.qkv_scale,
+            rows,
+        );
+        rec.after_dispatch()?;
+        for (matrix, out) in [(&w.wq, &io.q), (&w.wk, &io.k), (&w.wv, &io.v)] {
+            encode_gemm(
+                rec.encoder,
+                engine,
+                pipes,
+                matrix,
+                &io.digits,
+                &io.ctrl,
+                out,
+                rows,
+            );
+            rec.after_dispatch()?;
+        }
+        encode_rope_rows(
+            rec.encoder,
+            pipes,
+            &RopeBuffers {
+                q: &io.q,
+                k: &io.k,
+                v: &io.v,
+                k_cache: &l.k_cache,
+                v_cache: &l.v_cache,
+                cos: &self.rope_cos,
+                sin: &self.rope_sin,
+            },
+            RopeRowsParams {
+                n_heads: s.n_heads as u32,
+                n_kv_heads: s.n_kv_heads as u32,
+                pairs: (s.d_head / 2) as u32,
+                d_head: s.d_head as u32,
+                pos: pos as u32,
+                d_kv: s.d_kv as u32,
+                rows: rows as u32,
+                pad: 0,
+            },
+        );
+        rec.after_dispatch()?;
+        encode_attention_rows(
+            rec.encoder,
+            pipes,
+            &AttnBuffers {
+                q: &io.q,
+                k_cache: &l.k_cache,
+                v_cache: &l.v_cache,
+                out: &io.attn,
+                lut: &self.lut,
+                head_kv: &self.head_kv,
+            },
+            AttnRowsParams {
+                d_head: s.d_head as u32,
+                d_kv: s.d_kv as u32,
+                positions: (pos + 1) as u32,
+                n_heads: s.n_heads as u32,
+                attn_scale: s.attn_scale,
+            },
+            rows,
+        );
+        rec.after_dispatch()?;
+        encode_split_rows(
+            rec.encoder,
+            pipes,
+            &io.status,
+            &io.attn,
+            &io.digits,
+            &io.ctrl,
+            s.d_model,
+            l.o_scale,
+            rows,
+        );
+        rec.after_dispatch()?;
+        encode_gemm(
+            rec.encoder,
+            engine,
+            pipes,
+            &w.wo,
+            &io.digits,
+            &io.ctrl,
+            &io.proj,
+            rows,
+        );
+        rec.after_dispatch()?;
+        encode_residual(rec.encoder, pipes, &io.hidden, &io.proj, rows * s.d_model);
+        rec.after_dispatch()?;
+        encode_norm_rows(
+            rec.encoder,
+            pipes,
+            &io.status,
+            &io.hidden,
+            &l.ffn_norm,
+            &io.normed,
+            s.d_model,
+            rows,
+        );
+        rec.after_dispatch()?;
+        encode_split_rows(
+            rec.encoder,
+            pipes,
+            &io.status,
+            &io.normed,
+            &io.digits,
+            &io.ctrl,
+            s.d_model,
+            l.gate_up_scale,
+            rows,
+        );
+        rec.after_dispatch()?;
+        for (matrix, out) in [(&w.w_gate, &io.gate), (&w.w_up, &io.up)] {
+            encode_gemm(
+                rec.encoder,
+                engine,
+                pipes,
+                matrix,
+                &io.digits,
+                &io.ctrl,
+                out,
+                rows,
+            );
+            rec.after_dispatch()?;
+        }
+        encode_silu(
+            rec.encoder,
+            pipes,
+            &io.gate,
+            &io.up,
+            &io.act,
+            &self.lut,
+            rows * s.d_ff,
+        );
+        rec.after_dispatch()?;
+        encode_split_rows(
+            rec.encoder,
+            pipes,
+            &io.status,
+            &io.act,
+            &io.digits,
+            &io.ctrl,
+            s.d_ff,
+            l.down_scale,
+            rows,
+        );
+        rec.after_dispatch()?;
+        encode_gemm(
+            rec.encoder,
+            engine,
+            pipes,
+            &w.w_down,
+            &io.digits,
+            &io.ctrl,
+            &io.ff,
+            rows,
+        );
+        rec.after_dispatch()?;
+        encode_residual(rec.encoder, pipes, &io.hidden, &io.ff, rows * s.d_model);
+        rec.after_dispatch()
+    }
+
+    fn encode_head_rows(
+        &self,
+        rec: &mut Recorder<'_>,
+        pipes: &DecoderPipelines,
+        rows: usize,
+    ) -> Result<(), DecoderRefusal> {
+        let s = &self.shape;
+        let io = &self.rows_io;
+        encode_norm_rows(
+            rec.encoder,
+            pipes,
+            &io.status,
+            &io.hidden,
+            &self.final_norm,
+            &io.normed,
+            s.d_model,
+            rows,
+        );
+        rec.after_dispatch()?;
+        encode_split_rows(
+            rec.encoder,
+            pipes,
+            &io.status,
+            &io.normed,
+            &io.digits,
+            &io.ctrl,
+            s.d_model,
+            self.output_scale,
+            rows,
+        );
+        rec.after_dispatch()?;
+        encode_gemm(
+            rec.encoder,
+            self.engine.as_ref(),
+            pipes,
+            &self.output,
+            &io.digits,
+            &io.ctrl,
+            &io.logits,
+            rows,
         );
         rec.after_dispatch()
     }

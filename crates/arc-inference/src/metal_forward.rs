@@ -16,9 +16,10 @@
 //! # Self-test
 //!
 //! The first [`MetalForward::new`] in a process runs a small random model with
-//! grouped-query attention token by token on the GPU and on the CPU, and as a
-//! two-way shard split, and compares every logit, hidden state, token and KV
-//! row. A device that disagrees on one integer is never used.
+//! grouped-query attention token by token on the GPU and on the CPU, as one
+//! multi-row pass, and as a two-way shard split, and compares every logit,
+//! hidden state, token and KV row. A device that disagrees on one integer is
+//! never used.
 //!
 //! # KV-cache mirror
 //!
@@ -42,14 +43,26 @@
 //! difference in [`MetalForwardStats::mirror_mismatches`], which the tests
 //! require to be zero. A cache whose layers do not hold exactly `position`
 //! rows runs on the CPU, which then behaves exactly as it always has.
+//!
+//! # Multi-row passes
+//!
+//! [`MetalForward::forward_rows_exact`] (the whole model, as #182's CPU call
+//! of that name) and [`MetalForward::forward_shard_rows`] (one stage, as
+//! #185's CPU call of that name) run up to [`MAX_ROWS`] consecutive tokens
+//! per GPU pass, every weight read once for all of them
+//! (`MetalDecoder::step_rows`): the verify step of speculative decoding.
+//! They return exactly what the same one-row calls would, row for row, and
+//! append the same KV rows. Rejected rows are dropped with
+//! [`MetalForward::rollback_rows`] (#185) or [`MirroredKvCache::truncate`]
+//! (#182), and the device keeps its copy of the rows below the new length.
 
 use std::ops::{Deref, Range};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arc_gpu::metal_decoder::{
-    DecoderLayerWeights, DecoderRefusal, DecoderShape, DecoderStep, DecoderWeights, MetalDecoder,
-    Submission,
+    DecoderLayerWeights, DecoderRefusal, DecoderShape, DecoderStep, DecoderWeights, MAX_ROWS,
+    MetalDecoder, Submission,
 };
 use arc_gpu::metal_exact::{ResidentMatrix, Storage};
 
@@ -87,6 +100,8 @@ pub struct MetalForwardStats {
     /// Rows the check uploaded again, from the first one it found different
     /// from the cache. Zero unless a change escaped the wrapper's marks.
     pub mirror_mismatches: u64,
+    /// Multi-row GPU passes. Their rows count in `gpu_tokens`.
+    pub multi_row_passes: u64,
 }
 
 /// A [`KVCache`] for the GPU path. It records, per layer, the first row that
@@ -156,17 +171,48 @@ impl MirroredKvCache {
         )
     }
 
-    /// Keep the first `positions` rows (of `d_kv` values) of every layer, and
-    /// at most `positions` for `seq_len`.
-    pub fn truncate(&mut self, positions: usize, d_kv: usize) {
-        let len = positions.saturating_mul(d_kv);
-        for (keys, values) in self.cache.k_data.iter_mut().zip(&mut self.cache.v_data) {
-            keys.truncate(len);
-            values.truncate(len);
+    /// Keep only the first `seq_len` positions, as `KVCache::truncate` does
+    /// in #182: every position appended one K and one V row per layer and
+    /// nothing rewrites an earlier row, so this restores exactly the cache
+    /// that held `seq_len` positions. Speculative decoding uses it to drop the
+    /// rows of rejected draft tokens; the device keeps its copy of the rows
+    /// below `seq_len`. A `seq_len` at or past the current length changes
+    /// nothing.
+    pub fn truncate(&mut self, seq_len: usize) {
+        let held = self.cache.seq_len;
+        if seq_len >= held {
+            return;
         }
-        self.cache.seq_len = self.cache.seq_len.min(positions);
+        for rows in self
+            .cache
+            .k_data
+            .iter_mut()
+            .chain(self.cache.v_data.iter_mut())
+        {
+            debug_assert!(rows.len().is_multiple_of(held), "ragged KV cache layer");
+            let width = rows.len() / held;
+            rows.truncate(seq_len * width);
+        }
+        self.cache.seq_len = seq_len;
         for mark in &mut self.dirty_from {
-            *mark = (*mark).min(positions);
+            *mark = (*mark).min(seq_len);
+        }
+    }
+
+    /// Keep `keep` positions of `width` values per layer:
+    /// [`MetalForward::rollback_rows`]'s change, after its checks.
+    fn keep_rows(&mut self, keep: usize, width: usize) {
+        for rows in self
+            .cache
+            .k_data
+            .iter_mut()
+            .chain(self.cache.v_data.iter_mut())
+        {
+            rows.truncate(keep * width);
+        }
+        self.cache.seq_len = keep;
+        for mark in &mut self.dirty_from {
+            *mark = (*mark).min(keep);
         }
     }
 
@@ -201,6 +247,117 @@ impl Deref for MirroredKvCache {
         &self.cache
     }
 }
+
+// ---- #185's multi-row stage types ---------------------------------------
+//
+// `CachedIntegerModel::forward_shard_rows` and `rollback_rows` (#185, stacked
+// on #179) define these types in `cached_integer_model`, which this branch
+// does not contain yet. They are mirrored here variant for variant, so that
+// the GPU and CPU calls take and return the same values; once both pull
+// requests are in, this module uses #185's types and drops these copies.
+// `ShardRowsError::GpuRefused` is the one addition.
+
+/// The rows a stage holder runs in one call: consecutive positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardRowsInput {
+    /// Token ids, for the stage that holds the embedding (`start_layer == 0`).
+    Tokens(Vec<u32>),
+    /// Hidden states from the previous stage, `d_model` values per row.
+    Hidden(Vec<Vec<i64>>),
+}
+
+/// What a stage holder returns for the rows of one call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardRowsOutput {
+    /// The residual stream leaving the stage, one row per input row.
+    Hidden(Vec<Vec<i64>>),
+    /// Raw logits of every row, before any repetition penalty, from the stage
+    /// that holds the output head. The caller selects each row's token with
+    /// that row's own generated history.
+    Logits(Vec<Vec<i64>>),
+}
+
+/// Why a multi-row stage call or a rollback refused. A refusal leaves the
+/// cache exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardRowsError {
+    /// A check that [`CachedIntegerModel::forward_shard_token`] also makes:
+    /// KV continuity and residency on every layer, the hidden width, and the
+    /// RoPE table, which the last row must fit.
+    Shard(ShardForwardError),
+    /// The call carried no rows.
+    NoRows,
+    /// `[start_layer, end_layer)` is empty, or runs past the model or the cache.
+    BadLayerRange {
+        start_layer: usize,
+        end_layer: usize,
+        n_layers: usize,
+    },
+    /// Token ids sent to a stage without the embedding, or hidden rows sent
+    /// to the stage that holds it.
+    WrongInput { start_layer: usize },
+    /// A token id this node holds no embedding row for.
+    TokenNotEmbedded { token: u32 },
+    /// The model is not the canonical per-row I8 profile.
+    NotCanonicalProfile,
+    /// A model dimension is zero, so no row can run.
+    BadShape,
+    /// The stage ends at the last layer but does not hold the final norm and
+    /// output head.
+    HeadNotLoaded,
+    /// A rollback asked to keep more positions than the cache holds.
+    RollbackGrows {
+        keep: usize,
+        cached_positions: usize,
+    },
+    /// A layer's K or V rows disagree with the cache's position count.
+    RaggedCache {
+        layer: usize,
+        values: usize,
+        expected: usize,
+    },
+    /// GPU only (not in #185): the GPU did not run the rows (a status bit,
+    /// a device error, or more positions than the device KV cache holds).
+    /// Nothing was appended; the caller runs the CPU's call instead.
+    GpuRefused { reason: String },
+}
+
+impl ShardRowsError {
+    /// Stable machine-readable tag, in the style of [`ShardForwardError::kind`].
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ShardRowsError::Shard(error) => error.kind(),
+            ShardRowsError::NoRows => "no_rows",
+            ShardRowsError::BadLayerRange { .. } => "bad_layer_range",
+            ShardRowsError::WrongInput { .. } => "wrong_input",
+            ShardRowsError::TokenNotEmbedded { .. } => "token_not_embedded",
+            ShardRowsError::NotCanonicalProfile => "not_canonical_profile",
+            ShardRowsError::BadShape => "bad_shape",
+            ShardRowsError::HeadNotLoaded => "head_not_loaded",
+            ShardRowsError::RollbackGrows { .. } => "rollback_grows",
+            ShardRowsError::RaggedCache { .. } => "ragged_cache",
+            ShardRowsError::GpuRefused { .. } => "gpu_refused",
+        }
+    }
+}
+
+impl From<ShardForwardError> for ShardRowsError {
+    fn from(error: ShardForwardError) -> Self {
+        ShardRowsError::Shard(error)
+    }
+}
+
+impl std::fmt::Display for ShardRowsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShardRowsError::Shard(error) => write!(f, "{error}"),
+            ShardRowsError::GpuRefused { reason } => write!(f, "gpu_refused: {reason}"),
+            other => write!(f, "{}: {other:?}", other.kind()),
+        }
+    }
+}
+
+impl std::error::Error for ShardRowsError {}
 
 /// A model resident on the GPU, served one command buffer per token.
 pub struct MetalForward<'a> {
@@ -471,6 +628,305 @@ impl<'a> MetalForward<'a> {
             position,
             generated_tokens,
         )
+    }
+
+    /// Exactly `rows.len()` calls of [`Self::forward_one_token`], in order,
+    /// returning each call's logits. Up to [`MAX_ROWS`] tokens run in one GPU
+    /// pass, every weight read once for all of them; a pass the GPU refuses
+    /// runs on the CPU engine row by row. Provisional name: the GPU
+    /// counterpart of `CachedIntegerModel::forward_rows_exact` in #182.
+    pub fn forward_rows_exact(
+        &mut self,
+        rows: &[u32],
+        cache: &mut MirroredKvCache,
+    ) -> Vec<Vec<i64>> {
+        let mut logits = Vec::with_capacity(rows.len());
+        for chunk in rows.chunks(MAX_ROWS) {
+            logits.extend(self.forward_rows_pass(chunk, cache));
+        }
+        logits
+    }
+
+    /// One pass of 1 to [`MAX_ROWS`] rows.
+    fn forward_rows_pass(&mut self, rows: &[u32], cache: &mut MirroredKvCache) -> Vec<Vec<i64>> {
+        let model = self.model;
+        let cfg = &model.config;
+        let d = cfg.d_model;
+        let count = rows.len();
+        // A token past the embedding returns no logits and leaves the cache
+        // alone, which moves every later row: such rows run one at a time,
+        // exactly as the single-row calls would.
+        if rows
+            .iter()
+            .any(|&token| model.embedding_q16.len() < (token as usize + 1) * d)
+        {
+            return rows
+                .iter()
+                .map(|&token| self.forward_one_token(token, cache))
+                .collect();
+        }
+        let pos = cache.seq_len;
+        let layers = 0..cfg.n_layers;
+        let shape = *self.decoder.shape();
+        let fits = pos + count <= shape.kv_capacity && pos + count <= shape.max_seq;
+        if fits && self.sync_mirror(cache, pos, layers.clone()) {
+            let mut hidden = Vec::with_capacity(count * d);
+            for &token in rows {
+                let idx = (token as usize).min(cfg.vocab_size - 1);
+                hidden.extend_from_slice(&model.embedding_q16[idx * d..(idx + 1) * d]);
+            }
+            match self
+                .decoder
+                .step_rows(&hidden, pos, layers.clone(), true, self.submission)
+            {
+                Ok(step) => {
+                    self.commit_rows(cache, &step, layers, pos, count);
+                    return step
+                        .logits
+                        .unwrap_or_default()
+                        .chunks_exact(cfg.vocab_size)
+                        .map(<[i64]>::to_vec)
+                        .collect();
+                }
+                Err(refusal) => self.note_refusal(&refusal),
+            }
+        }
+        self.stats.cpu_tokens += count as u64;
+        rows.iter()
+            .map(|&token| cache.cpu_forward_one_token(model, token))
+            .collect()
+    }
+
+    /// Runs `k` consecutive positions through layers `[start_layer,
+    /// end_layer)` in one pass over the weights: the GPU twin of #185's
+    /// `CachedIntegerModel::forward_shard_rows`, with its checks, in its
+    /// order, and its errors. The rows produce exactly the hidden states,
+    /// raw logits and K/V rows that `k` one-row calls would. Up to
+    /// [`MAX_ROWS`] rows run per GPU pass, and passes follow one another
+    /// on the device; their rows reach `cache` only when every pass
+    /// succeeded. Any refusal, including [`ShardRowsError::GpuRefused`],
+    /// leaves `cache` unchanged.
+    pub fn forward_shard_rows(
+        &mut self,
+        input: ShardRowsInput,
+        cache: &mut MirroredKvCache,
+        start_layer: usize,
+        end_layer: usize,
+        position: usize,
+    ) -> Result<ShardRowsOutput, ShardRowsError> {
+        let model = self.model;
+        let cfg = &model.config;
+        let d = cfg.d_model;
+        let rows = match &input {
+            ShardRowsInput::Tokens(tokens) => tokens.len(),
+            ShardRowsInput::Hidden(states) => states.len(),
+        };
+        if rows == 0 {
+            return Err(ShardRowsError::NoRows);
+        }
+        if !model.has_canonical_i8_profile() {
+            return Err(ShardRowsError::NotCanonicalProfile);
+        }
+        if d == 0
+            || cfg.d_head == 0
+            || cfg.n_heads == 0
+            || cfg.n_kv_heads == 0
+            || cfg.d_kv == 0
+            || cfg.vocab_size == 0
+        {
+            return Err(ShardRowsError::BadShape);
+        }
+        if start_layer >= end_layer
+            || end_layer > cfg.n_layers
+            || end_layer > model.layers.len()
+            || end_layer > cache.k_data.len()
+            || end_layer > cache.v_data.len()
+        {
+            return Err(ShardRowsError::BadLayerRange {
+                start_layer,
+                end_layer,
+                n_layers: cfg.n_layers,
+            });
+        }
+        // Every row must fit the RoPE table, as each one-row call requires.
+        let last = position.saturating_add(rows - 1);
+        if last >= cfg.max_seq {
+            return Err(ShardForwardError::PositionOutOfRange {
+                position: last,
+                max_seq: cfg.max_seq,
+            }
+            .into());
+        }
+        for layer in start_layer..end_layer {
+            let cached = cache.k_data[layer].len() / cfg.d_kv;
+            if cached != position {
+                return Err(ShardForwardError::KvCacheOutOfSync {
+                    layer,
+                    expected_positions: position,
+                    cached_positions: cached,
+                }
+                .into());
+            }
+        }
+        for layer in start_layer..end_layer {
+            if !model.layers[layer].is_loaded() {
+                return Err(ShardForwardError::LayerNotLoaded { layer }.into());
+            }
+        }
+        let terminal = end_layer == cfg.n_layers;
+        if terminal
+            && (model.final_norm.len() != d
+                || model.output_weight.n_rows != cfg.vocab_size
+                || model.output_weight.n_cols != d
+                || model.output_weight.scales.len() != cfg.vocab_size
+                || model.output_weight.data.len() != cfg.vocab_size * d)
+        {
+            return Err(ShardRowsError::HeadNotLoaded);
+        }
+        let mut hidden = Vec::with_capacity(rows * d);
+        match input {
+            ShardRowsInput::Tokens(tokens) => {
+                if start_layer != 0 {
+                    return Err(ShardRowsError::WrongInput { start_layer });
+                }
+                for token in tokens {
+                    // The same clamp as `forward_shard_token`.
+                    let idx = (token as usize).min(cfg.vocab_size - 1);
+                    let row = model
+                        .embedding_q16
+                        .get(idx * d..(idx + 1) * d)
+                        .ok_or(ShardRowsError::TokenNotEmbedded { token })?;
+                    hidden.extend_from_slice(row);
+                }
+            }
+            ShardRowsInput::Hidden(states) => {
+                if start_layer == 0 {
+                    return Err(ShardRowsError::WrongInput { start_layer });
+                }
+                for state in &states {
+                    if state.len() != d {
+                        return Err(ShardForwardError::BadHiddenDim {
+                            got: state.len(),
+                            expected: d,
+                        }
+                        .into());
+                    }
+                    hidden.extend_from_slice(state);
+                }
+            }
+        }
+
+        let refused = |reason: String| ShardRowsError::GpuRefused { reason };
+        let layers = start_layer..end_layer;
+        let shape = *self.decoder.shape();
+        if position + rows > shape.kv_capacity {
+            return Err(refused(format!(
+                "positions {position}..{} past the device KV cache of {}",
+                position + rows,
+                shape.kv_capacity
+            )));
+        }
+        if !self.sync_mirror(cache, position, layers.clone()) {
+            return Err(refused("the device cannot mirror this cache".to_string()));
+        }
+        // Every pass first; the device keeps each pass's K/V rows for the
+        // next. Nothing reaches `cache` unless they all succeed.
+        let mut steps = Vec::with_capacity(rows.div_ceil(MAX_ROWS));
+        for (index, chunk) in hidden.chunks(MAX_ROWS * d).enumerate() {
+            let at = position + index * MAX_ROWS;
+            match self
+                .decoder
+                .step_rows(chunk, at, layers.clone(), terminal, self.submission)
+            {
+                Ok(step) => steps.push((at, chunk.len() / d, step)),
+                Err(refusal) => {
+                    self.note_refusal(&refusal);
+                    return Err(refused(refusal.to_string()));
+                }
+            }
+        }
+        let width = if terminal { cfg.vocab_size } else { d };
+        let mut out = Vec::with_capacity(rows);
+        for (at, count, step) in steps {
+            self.commit_rows(cache, &step, layers.clone(), at, count);
+            let values = if terminal {
+                step.logits.unwrap_or_default()
+            } else {
+                step.hidden
+            };
+            out.extend(values.chunks_exact(width).map(<[i64]>::to_vec));
+        }
+        Ok(if terminal {
+            ShardRowsOutput::Logits(out)
+        } else {
+            ShardRowsOutput::Hidden(out)
+        })
+    }
+
+    /// Keeps the first `keep` positions of `cache` and drops the rest, as
+    /// #185's `CachedIntegerModel::rollback_rows` does on a stage holder
+    /// (with its checks and errors): the K/V rows of rejected drafts go and
+    /// every earlier row stays byte for byte. Keeping as many positions as
+    /// the cache holds is a no-op. The device keeps its copy of the kept rows.
+    pub fn rollback_rows(
+        &self,
+        cache: &mut MirroredKvCache,
+        keep: usize,
+    ) -> Result<(), ShardRowsError> {
+        let held = cache.seq_len;
+        if keep > held {
+            return Err(ShardRowsError::RollbackGrows {
+                keep,
+                cached_positions: held,
+            });
+        }
+        let width = self.model.config.d_kv;
+        let expected = held.saturating_mul(width);
+        if cache.k_data.len() != cache.v_data.len() {
+            return Err(ShardRowsError::RaggedCache {
+                layer: cache.k_data.len().min(cache.v_data.len()),
+                values: 0,
+                expected,
+            });
+        }
+        for (layer, (keys, values)) in cache.k_data.iter().zip(&cache.v_data).enumerate() {
+            for held_values in [keys.len(), values.len()] {
+                if held_values != 0 && held_values != expected {
+                    return Err(ShardRowsError::RaggedCache {
+                        layer,
+                        values: held_values,
+                        expected,
+                    });
+                }
+            }
+        }
+        cache.keep_rows(keep, width);
+        Ok(())
+    }
+
+    /// Append a multi-row step's KV rows to the caller's cache, as the
+    /// single-row calls would, one row after another.
+    fn commit_rows(
+        &mut self,
+        cache: &mut MirroredKvCache,
+        step: &DecoderStep,
+        layers: Range<usize>,
+        pos: usize,
+        count: usize,
+    ) {
+        for ((layer, k), v) in layers.zip(&step.k_rows).zip(&step.v_rows) {
+            cache.cache.push_k(layer, k);
+            cache.cache.push_v(layer, v);
+            // The appended rows are the device's own rows.
+            self.mirrored[layer] = pos + count;
+            if let Some(mark) = cache.dirty_from.get_mut(layer) {
+                *mark = pos + count;
+            }
+        }
+        cache.cache.seq_len = pos + count;
+        self.stats.gpu_tokens += count as u64;
+        self.stats.multi_row_passes += 1;
+        self.last_gpu_seconds = step.gpu_seconds;
     }
 
     /// Append the step's KV rows to the caller's cache, as the CPU does.
@@ -772,6 +1228,7 @@ fn run_self_test() -> Result<(), String> {
     let mut gpu = MetalForward::build(&model, shape.max_seq)?;
     let mut cpu_cache = KVCache::new(shape.n_layers);
     let mut gpu_cache = MirroredKvCache::new(shape.n_layers);
+    let mut cpu_logits = Vec::with_capacity(tokens.len());
     for (index, &token) in tokens.iter().enumerate() {
         let want = model.forward_one_token(token, &mut cpu_cache);
         let got = gpu.forward_one_token(token, &mut gpu_cache);
@@ -780,6 +1237,7 @@ fn run_self_test() -> Result<(), String> {
                 "self-test token {index}: GPU logits differ from the CPU"
             ));
         }
+        cpu_logits.push(want);
     }
     if gpu_cache.k_data != cpu_cache.k_data
         || gpu_cache.v_data != cpu_cache.v_data
@@ -787,7 +1245,19 @@ fn run_self_test() -> Result<(), String> {
     {
         return Err("self-test: the GPU KV cache differs from the CPU".to_string());
     }
-    if gpu.stats().gpu_tokens != tokens.len() as u64 {
+    // The same tokens as one multi-row pass.
+    let mut rows_cache = MirroredKvCache::new(shape.n_layers);
+    if gpu.forward_rows_exact(&tokens, &mut rows_cache) != cpu_logits
+        || rows_cache.k_data != cpu_cache.k_data
+        || rows_cache.v_data != cpu_cache.v_data
+        || gpu.stats().multi_row_passes != 1
+    {
+        return Err(format!(
+            "self-test: a multi-row pass differs from the CPU ({:?})",
+            gpu.stats()
+        ));
+    }
+    if gpu.stats().gpu_tokens != 2 * tokens.len() as u64 {
         return Err(format!(
             "self-test: in-domain tokens fell back to the CPU ({:?})",
             gpu.stats()
@@ -1317,7 +1787,7 @@ mod tests {
             layers
         );
         // Back to 3 positions: the rows kept are still on the device.
-        cache.truncate(3, d_kv);
+        cache.truncate(3);
         for (keys, values) in reference.k_data.iter_mut().zip(&mut reference.v_data) {
             keys.truncate(3 * d_kv);
             values.truncate(3 * d_kv);
@@ -1493,6 +1963,511 @@ mod tests {
         assert_eq!(
             (stats.gpu_tokens, stats.mirror_mismatches),
             (3, 0),
+            "{stats:?}"
+        );
+    }
+
+    // ---- multi-row passes ------------------------------------------------
+
+    /// `small_shape` with room for several multi-row passes.
+    fn rows_shape() -> SyntheticShape {
+        SyntheticShape {
+            max_seq: 40,
+            ..small_shape()
+        }
+    }
+
+    /// A shard output as plain data, to compare: the hidden state, or the
+    /// token id and the logits hash.
+    type Plain = (Vec<i64>, Option<(u32, [u8; 32])>);
+
+    fn plain(output: &ShardOutput) -> Plain {
+        match output {
+            ShardOutput::Hidden(hidden) => (hidden.clone(), None),
+            ShardOutput::Token { id, logits_hash } => (Vec::new(), Some((*id, logits_hash.0))),
+        }
+    }
+
+    /// The next stage's input for a stage's output.
+    fn next_input(output: &ShardOutput) -> ShardInput {
+        match output {
+            ShardOutput::Hidden(hidden) => ShardInput::Hidden(hidden.clone()),
+            ShardOutput::Token { .. } => ShardInput::Token(0),
+        }
+    }
+
+    /// Every stage's outputs for `tokens` at `position..`, one row at a time
+    /// on the CPU (all rows through a stage before the next, which changes
+    /// nothing: a layer's rows depend only on that layer's inputs).
+    fn cpu_stage_rows(
+        model: &CachedIntegerModel,
+        cache: &mut KVCache,
+        stages: &[(usize, usize)],
+        tokens: &[u32],
+        histories: &[Vec<u32>],
+        position: usize,
+    ) -> Vec<Vec<Plain>> {
+        let mut inputs: Vec<ShardInput> = tokens.iter().map(|&t| ShardInput::Token(t)).collect();
+        let mut per_stage = Vec::new();
+        for &(start, end) in stages {
+            let outputs: Vec<ShardOutput> = inputs
+                .into_iter()
+                .zip(histories)
+                .enumerate()
+                .map(|(r, (input, history))| {
+                    model
+                        .forward_shard_token_with_history(
+                            input,
+                            cache,
+                            start,
+                            end,
+                            position + r,
+                            history,
+                        )
+                        .expect("CPU stage")
+                })
+                .collect();
+            inputs = outputs.iter().map(next_input).collect();
+            per_stage.push(outputs.iter().map(plain).collect());
+        }
+        per_stage
+    }
+
+    /// The same stages as multi-row GPU calls ([`MetalForward::forward_shard_rows`]).
+    /// The last stage returns raw logits; each row then gets the selection the
+    /// one-row call makes, with its own history, so the two compare as plain
+    /// data.
+    fn gpu_stage_rows(
+        gpu: &mut MetalForward<'_>,
+        cache: &mut MirroredKvCache,
+        stages: &[(usize, usize)],
+        tokens: &[u32],
+        histories: &[Vec<u32>],
+        position: usize,
+    ) -> Vec<Vec<Plain>> {
+        let mut input = ShardRowsInput::Tokens(tokens.to_vec());
+        let mut per_stage = Vec::new();
+        for &(start, end) in stages {
+            match gpu
+                .forward_shard_rows(input, cache, start, end, position)
+                .expect("GPU stage")
+            {
+                ShardRowsOutput::Hidden(rows) => {
+                    per_stage.push(rows.iter().map(|row| (row.clone(), None)).collect());
+                    input = ShardRowsInput::Hidden(rows);
+                }
+                ShardRowsOutput::Logits(rows) => {
+                    per_stage.push(
+                        rows.into_iter()
+                            .zip(histories)
+                            .map(|(mut logits, history)| {
+                                let id =
+                                    select_next_token_with_repetition_penalty(&mut logits, history);
+                                let bytes: Vec<u8> =
+                                    logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+                                (Vec::new(), Some((id, arc_crypto::hash_bytes(&bytes).0)))
+                            })
+                            .collect(),
+                    );
+                    input = ShardRowsInput::Tokens(Vec::new());
+                }
+            }
+        }
+        per_stage
+    }
+
+    /// A k-row pass equals k single-row CPU passes: logits, every KV row and
+    /// `seq_len`, for k in {1, 2, 3, 4, 8}, after single-row tokens and
+    /// twice in a row.
+    #[test]
+    fn multi_row_passes_match_single_row_cpu_passes() {
+        let _guard = kernel_switch_guard();
+        let shape = rows_shape();
+        let model = synthetic_model(0x5EED_0000_0000_000C, shape);
+        let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
+        for k in [1usize, 2, 3, 4, 8] {
+            let before = gpu.stats();
+            let mut reference = KVCache::new(shape.n_layers);
+            let mut cache = MirroredKvCache::new(shape.n_layers);
+            for token in [7u32, 70, 170] {
+                let want = model.forward_one_token(token, &mut reference);
+                assert_eq!(gpu.forward_one_token(token, &mut cache), want, "k {k}");
+            }
+            for pass in 0..2u32 {
+                let rows: Vec<u32> = (0..k as u32)
+                    .map(|i| (pass * 97 + i * 31 + 11) % 280)
+                    .collect();
+                let want: Vec<Vec<i64>> = rows
+                    .iter()
+                    .map(|&t| model.forward_one_token(t, &mut reference))
+                    .collect();
+                assert_eq!(
+                    gpu.forward_rows_exact(&rows, &mut cache),
+                    want,
+                    "k {k}, pass {pass}"
+                );
+            }
+            assert_eq!(cache.k_data, reference.k_data, "k {k}");
+            assert_eq!(cache.v_data, reference.v_data, "k {k}");
+            assert_eq!(cache.seq_len, reference.seq_len, "k {k}");
+            let after = gpu.stats();
+            assert_eq!(
+                (
+                    after.gpu_tokens - before.gpu_tokens,
+                    after.cpu_tokens - before.cpu_tokens,
+                    after.multi_row_passes - before.multi_row_passes,
+                    after.mirror_mismatches,
+                ),
+                (3 + 2 * k as u64, 0, 2, 0),
+                "k {k}: {after:?}"
+            );
+        }
+    }
+
+    /// Speculative rollback on the whole model: of a 4-row pass the first 2
+    /// rows are accepted, `truncate` drops the other 2, and a 3-row pass and
+    /// a single row continue. Everything equals the CPU forwarding only the
+    /// accepted rows.
+    #[test]
+    fn rejected_rows_truncate_and_the_sequence_continues() {
+        let _guard = kernel_switch_guard();
+        let shape = rows_shape();
+        let model = synthetic_model(0x5EED_0000_0000_000D, shape);
+        let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
+        let mut reference = KVCache::new(shape.n_layers);
+        let mut cache = MirroredKvCache::new(shape.n_layers);
+        let prefix = [3u32, 141, 59];
+        let want: Vec<Vec<i64>> = prefix
+            .iter()
+            .map(|&t| model.forward_one_token(t, &mut reference))
+            .collect();
+        assert_eq!(gpu.forward_rows_exact(&prefix, &mut cache), want);
+        let draft = [26u32, 53, 58, 97];
+        let got = gpu.forward_rows_exact(&draft, &mut cache);
+        let accepted: Vec<Vec<i64>> = draft[..2]
+            .iter()
+            .map(|&t| model.forward_one_token(t, &mut reference))
+            .collect();
+        assert_eq!(got[..2], accepted[..]);
+        cache.truncate(prefix.len() + 2);
+        assert_eq!(cache.k_data, reference.k_data);
+        assert_eq!(cache.v_data, reference.v_data);
+        assert_eq!(cache.seq_len, reference.seq_len);
+        let next = [23u32, 84, 62];
+        let want: Vec<Vec<i64>> = next
+            .iter()
+            .map(|&t| model.forward_one_token(t, &mut reference))
+            .collect();
+        assert_eq!(gpu.forward_rows_exact(&next, &mut cache), want);
+        let want = model.forward_one_token(64, &mut reference);
+        assert_eq!(gpu.forward_one_token(64, &mut cache), want);
+        assert_eq!(cache.k_data, reference.k_data);
+        assert_eq!(cache.v_data, reference.v_data);
+        let stats = gpu.stats();
+        assert_eq!(
+            (
+                stats.gpu_tokens,
+                stats.cpu_tokens,
+                stats.multi_row_passes,
+                stats.mirror_mismatches,
+            ),
+            (3 + 4 + 3 + 1, 0, 3, 0),
+            "{stats:?}"
+        );
+    }
+
+    /// The stage variant ([`MetalForward::forward_shard_rows`]) on 1-, 2- and
+    /// 3-way splits, k in {1, 2, 3, 4, 8}, two passes each: equal to one-row
+    /// CPU stage calls at every boundary (hidden states between stages; the
+    /// token and logits hash each row's raw logits give at the end) and in
+    /// every KV row. Then a rollback: 2 of 4 drafted rows accepted,
+    /// [`MetalForward::rollback_rows`], and a 3-row pass continues.
+    #[test]
+    fn multi_row_shard_steps_match_single_row_cpu_shards() {
+        let _guard = kernel_switch_guard();
+        let shape = rows_shape();
+        let model = synthetic_model(0x5EED_0000_0000_000E, shape);
+        let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
+        let splits: [&[(usize, usize)]; 3] =
+            [&[(0, 3)], &[(0, 1), (1, 3)], &[(0, 1), (1, 2), (2, 3)]];
+        for stages in splits {
+            for k in [1usize, 2, 3, 4, 8] {
+                let before = gpu.stats();
+                let mut reference = KVCache::new(shape.n_layers);
+                let mut cache = MirroredKvCache::new(shape.n_layers);
+                let mut generated: Vec<u32> = Vec::new();
+                for pass in 0..2u32 {
+                    let tokens: Vec<u32> = (0..k as u32)
+                        .map(|i| (pass * 89 + i * 41 + 5) % 280)
+                        .collect();
+                    let histories: Vec<Vec<u32>> = (0..k)
+                        .map(|r| [generated.as_slice(), &tokens[..r]].concat())
+                        .collect();
+                    let position = generated.len();
+                    let want = cpu_stage_rows(
+                        &model,
+                        &mut reference,
+                        stages,
+                        &tokens,
+                        &histories,
+                        position,
+                    );
+                    let got =
+                        gpu_stage_rows(&mut gpu, &mut cache, stages, &tokens, &histories, position);
+                    assert_eq!(got, want, "{stages:?}, k {k}, pass {pass}");
+                    generated.extend(&tokens);
+                }
+                assert_eq!(cache.k_data, reference.k_data, "{stages:?}, k {k}");
+                assert_eq!(cache.v_data, reference.v_data, "{stages:?}, k {k}");
+                let after = gpu.stats();
+                let calls = 2 * stages.len() as u64;
+                assert_eq!(
+                    (
+                        after.gpu_tokens - before.gpu_tokens,
+                        after.cpu_tokens - before.cpu_tokens,
+                        after.multi_row_passes - before.multi_row_passes,
+                        after.mirror_mismatches,
+                    ),
+                    (calls * k as u64, 0, calls, 0),
+                    "{stages:?}, k {k}: {after:?}"
+                );
+            }
+        }
+
+        // Rollback through two stages.
+        let stages = [(0usize, 1usize), (1, 3)];
+        let mut reference = KVCache::new(shape.n_layers);
+        let mut cache = MirroredKvCache::new(shape.n_layers);
+        let prefix = [9u32, 99, 199];
+        let histories: Vec<Vec<u32>> = (0..3).map(|r| prefix[..r].to_vec()).collect();
+        let want = cpu_stage_rows(&model, &mut reference, &stages, &prefix, &histories, 0);
+        let got = gpu_stage_rows(&mut gpu, &mut cache, &stages, &prefix, &histories, 0);
+        assert_eq!(got, want);
+        let draft = [17u32, 34, 51, 68];
+        let histories: Vec<Vec<u32>> = (0..4)
+            .map(|r| [prefix.as_slice(), &draft[..r]].concat())
+            .collect();
+        let got = gpu_stage_rows(&mut gpu, &mut cache, &stages, &draft, &histories, 3);
+        let want = cpu_stage_rows(
+            &model,
+            &mut reference,
+            &stages,
+            &draft[..2],
+            &histories[..2],
+            3,
+        );
+        let accepted: Vec<Vec<_>> = got.iter().map(|stage| stage[..2].to_vec()).collect();
+        assert_eq!(accepted, want);
+        gpu.rollback_rows(&mut cache, 5).expect("rollback");
+        assert_eq!(cache.k_data, reference.k_data);
+        assert_eq!(cache.seq_len, 5);
+        let next = [85u32, 102, 119];
+        let history: Vec<u32> = [prefix.as_slice(), &draft[..2]].concat();
+        let histories: Vec<Vec<u32>> = (0..3)
+            .map(|r| [history.as_slice(), &next[..r]].concat())
+            .collect();
+        let want = cpu_stage_rows(&model, &mut reference, &stages, &next, &histories, 5);
+        let got = gpu_stage_rows(&mut gpu, &mut cache, &stages, &next, &histories, 5);
+        assert_eq!(got, want);
+        assert_eq!(cache.k_data, reference.k_data);
+        assert_eq!(cache.v_data, reference.v_data);
+        let stats = gpu.stats();
+        assert_eq!(
+            (stats.cpu_tokens, stats.mirror_mismatches),
+            (0, 0),
+            "{stats:?}"
+        );
+    }
+
+    /// The stage call refuses what #185's CPU call refuses, with the same
+    /// errors in the same order, and a refusal leaves the cache unchanged; so
+    /// does a rollback that would grow the cache.
+    #[test]
+    fn multi_row_shard_calls_refuse_like_the_cpu_stage_call() {
+        let _guard = kernel_switch_guard();
+        let shape = rows_shape();
+        let model = synthetic_model(0x5EED_0000_0000_0011, shape);
+        let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
+        let mut cache = MirroredKvCache::new(shape.n_layers);
+        let first = gpu
+            .forward_shard_rows(ShardRowsInput::Tokens(vec![1, 2]), &mut cache, 0, 1, 0)
+            .expect("stage 0");
+        let ShardRowsOutput::Hidden(hidden) = first else {
+            panic!("the first stage returns hidden rows");
+        };
+        gpu.forward_shard_rows(ShardRowsInput::Hidden(hidden.clone()), &mut cache, 1, 3, 0)
+            .expect("stage 1");
+        let (keys, values, seq_len) = (cache.k_data.clone(), cache.v_data.clone(), cache.seq_len);
+        let cases = [
+            (
+                ShardRowsInput::Tokens(vec![]),
+                0,
+                1,
+                2,
+                ShardRowsError::NoRows,
+            ),
+            (
+                ShardRowsInput::Tokens(vec![3]),
+                1,
+                1,
+                2,
+                ShardRowsError::BadLayerRange {
+                    start_layer: 1,
+                    end_layer: 1,
+                    n_layers: 3,
+                },
+            ),
+            (
+                ShardRowsInput::Tokens(vec![3]),
+                0,
+                4,
+                2,
+                ShardRowsError::BadLayerRange {
+                    start_layer: 0,
+                    end_layer: 4,
+                    n_layers: 3,
+                },
+            ),
+            (
+                ShardRowsInput::Tokens(vec![3; 39]),
+                0,
+                1,
+                2,
+                ShardRowsError::Shard(ShardForwardError::PositionOutOfRange {
+                    position: 40,
+                    max_seq: 40,
+                }),
+            ),
+            (
+                ShardRowsInput::Tokens(vec![3]),
+                0,
+                1,
+                1,
+                ShardRowsError::Shard(ShardForwardError::KvCacheOutOfSync {
+                    layer: 0,
+                    expected_positions: 1,
+                    cached_positions: 2,
+                }),
+            ),
+            (
+                ShardRowsInput::Tokens(vec![3]),
+                1,
+                3,
+                2,
+                ShardRowsError::WrongInput { start_layer: 1 },
+            ),
+            (
+                ShardRowsInput::Hidden(vec![hidden[0].clone()]),
+                0,
+                1,
+                2,
+                ShardRowsError::WrongInput { start_layer: 0 },
+            ),
+            (
+                ShardRowsInput::Hidden(vec![vec![0; 3]]),
+                1,
+                3,
+                2,
+                ShardRowsError::Shard(ShardForwardError::BadHiddenDim {
+                    got: 3,
+                    expected: 64,
+                }),
+            ),
+        ];
+        for (input, start, end, position, want) in cases {
+            let kind = want.kind();
+            assert_eq!(
+                gpu.forward_shard_rows(input, &mut cache, start, end, position),
+                Err(want),
+                "{kind}"
+            );
+            assert_eq!(cache.k_data, keys, "{kind}: a refusal changed the cache");
+            assert_eq!(cache.v_data, values, "{kind}: a refusal changed the cache");
+            assert_eq!(
+                cache.seq_len, seq_len,
+                "{kind}: a refusal changed the cache"
+            );
+        }
+        assert_eq!(
+            gpu.rollback_rows(&mut cache, 3),
+            Err(ShardRowsError::RollbackGrows {
+                keep: 3,
+                cached_positions: 2,
+            })
+        );
+        gpu.rollback_rows(&mut cache, 2)
+            .expect("keeping every position is a no-op");
+        assert_eq!(cache.k_data, keys);
+        assert_eq!(gpu.stats().cpu_tokens, 0, "{:?}", gpu.stats());
+    }
+
+    /// A pass the GPU refuses runs on the CPU engine row by row, with the
+    /// same answer and the same cache.
+    #[test]
+    fn refused_rows_run_on_the_cpu_with_the_same_answer() {
+        let _guard = kernel_switch_guard();
+        let shape = rows_shape();
+        let mut model = synthetic_model(0x5EED_0000_0000_000F, shape);
+        // Gains of 2^40 push the normed vector far outside four digits.
+        model.layers[1].ffn_norm = vec![1 << 40; shape.d_model];
+        let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
+        let mut reference = KVCache::new(shape.n_layers);
+        let mut cache = MirroredKvCache::new(shape.n_layers);
+        let rows = [1u32, 2, 3, 4, 5];
+        let want: Vec<Vec<i64>> = rows
+            .iter()
+            .map(|&t| model.forward_one_token(t, &mut reference))
+            .collect();
+        assert_eq!(gpu.forward_rows_exact(&rows, &mut cache), want);
+        assert_eq!(cache.k_data, reference.k_data);
+        assert_eq!(cache.v_data, reference.v_data);
+        let stats = gpu.stats();
+        assert_eq!(
+            (stats.gpu_tokens, stats.cpu_tokens, stats.multi_row_passes),
+            (0, 5, 0),
+            "{stats:?}"
+        );
+        assert_ne!(stats.refusal_bits, 0, "{stats:?}");
+    }
+
+    /// Real-width rows: two Llama-2-7B-width layers, 3 and then 8 rows in one
+    /// pass each, against the CPU.
+    #[test]
+    fn llama_7b_width_rows_match_the_cpu() {
+        let _guard = kernel_switch_guard();
+        let shape = SyntheticShape {
+            n_layers: 2,
+            d_model: 4096,
+            n_heads: 32,
+            n_kv_heads: 32,
+            d_ff: 11008,
+            vocab: 4096,
+            max_seq: 16,
+            embedding_rows: 16,
+        };
+        let model = synthetic_model(0x5EED_0000_0000_0010, shape);
+        let mut gpu = MetalForward::new(&model, shape.max_seq).expect("GPU decoder");
+        let mut reference = KVCache::new(2);
+        let mut cache = MirroredKvCache::new(2);
+        let passes: [&[u32]; 2] = [&[3, 1, 4], &[1, 5, 9, 2, 6, 5, 3, 5]];
+        for rows in passes {
+            let want: Vec<Vec<i64>> = rows
+                .iter()
+                .map(|&t| model.forward_one_token(t, &mut reference))
+                .collect();
+            assert_eq!(gpu.forward_rows_exact(rows, &mut cache), want);
+        }
+        assert_eq!(cache.k_data, reference.k_data);
+        assert_eq!(cache.v_data, reference.v_data);
+        let stats = gpu.stats();
+        assert_eq!(
+            (
+                stats.gpu_tokens,
+                stats.cpu_tokens,
+                stats.multi_row_passes,
+                stats.mirror_mismatches,
+            ),
+            (11, 0, 2, 0),
             "{stats:?}"
         );
     }
@@ -2052,6 +3027,133 @@ mod bench {
         });
         println!("METAL_KV_MIRROR_BENCH {json}");
         if let Ok(path) = std::env::var("ARC_METAL_KV_BENCH_MD") {
+            std::fs::write(path, md).expect("write the benchmark summary");
+        }
+    }
+
+    /// Rows per pass for the multi-row benchmark.
+    const ROW_COUNTS: [usize; 4] = [1, 2, 4, 8];
+    /// Cached positions before every measured pass.
+    const ROWS_CONTEXT: usize = 128;
+
+    /// What verifying k rows costs: one k-row pass against k single-row
+    /// passes, from the same cached context (each measurement is rolled back
+    /// with `truncate`, the speculative-decoding pattern).
+    #[test]
+    #[ignore = "benchmark: run explicitly in release with --ignored --nocapture"]
+    fn multi_row_cost_by_k() {
+        let _guard = kernel_switch_guard();
+        metal_forward_self_test().expect("self-test");
+        let device = metal_engine().expect("Metal device").report();
+        let max_seq = ROWS_CONTEXT + 2 * MAX_ROWS + 16;
+        let shape = SyntheticShape {
+            n_layers: 2,
+            d_model: 4096,
+            n_heads: 32,
+            n_kv_heads: 32,
+            d_ff: 11008,
+            vocab: 4096,
+            max_seq,
+            embedding_rows: EMBEDDING_ROWS,
+        };
+        let model = synthetic_model(0x0007_B70C_E400_00D0, shape);
+        let d_kv = model.config.d_kv;
+        let mut fused = MetalForward::new(&model, max_seq).expect("GPU decoder");
+        fused.set_verify_mirror(false);
+        let mut rng = SynthRng(0x0007_B70C_E400_00D1);
+        let mut random_rows = || -> Vec<Vec<i64>> {
+            (0..shape.n_layers)
+                .map(|_| {
+                    (0..ROWS_CONTEXT * d_kv)
+                        .map(|_| rng.below(1 << 19) - (1 << 18))
+                        .collect()
+                })
+                .collect()
+        };
+        let (keys, values) = (random_rows(), random_rows());
+        let mut cache = MirroredKvCache::from_cache(KVCache {
+            k_data: keys,
+            v_data: values,
+            seq_len: ROWS_CONTEXT,
+        });
+        let tokens: Vec<u32> = (0..MAX_ROWS).map(|t| (t % EMBEDDING_ROWS) as u32).collect();
+        // (k, pass wall, pass GPU, k single-row passes wall), seconds.
+        let mut results: Vec<(usize, f64, f64, f64)> = Vec::new();
+        for k in ROW_COUNTS {
+            let (mut pass_wall, mut pass_gpu, mut singles) = (Vec::new(), Vec::new(), Vec::new());
+            for step in 0..WARM_UP + TOKENS {
+                let start = Instant::now();
+                let rows = fused.forward_rows_exact(&tokens[..k], &mut cache);
+                let wall = start.elapsed().as_secs_f64();
+                let gpu = fused.last_gpu_seconds();
+                cache.truncate(ROWS_CONTEXT);
+                let start = Instant::now();
+                let single: Vec<Vec<i64>> = tokens[..k]
+                    .iter()
+                    .map(|&token| fused.forward_one_token(token, &mut cache))
+                    .collect();
+                let single_wall = start.elapsed().as_secs_f64();
+                cache.truncate(ROWS_CONTEXT);
+                assert_eq!(rows, single, "k {k}: the pass and the single rows differ");
+                if step >= WARM_UP {
+                    pass_wall.push(wall);
+                    pass_gpu.push(gpu);
+                    singles.push(single_wall);
+                }
+            }
+            results.push((k, median(pass_wall), median(pass_gpu), median(singles)));
+        }
+        let stats = fused.stats();
+        assert_eq!(stats.cpu_tokens, 0, "{stats:?}");
+
+        let one_row = results[0].3;
+        let mut md = String::new();
+        md.push_str("### Verifying k rows: one multi-row pass against k single-row passes\n\n");
+        md.push_str(
+            "Hosted-VM CI measurement: GitHub-hosted macOS VM (Apple M1, virtual), paravirtual \
+             Metal GPU. Not Apple GPU hardware numbers.\n\n",
+        );
+        md.push_str(&format!(
+            "Device `{}`. Two real-width Llama-2-7B layers (d_kv 4096) and a 4,096-token head, \
+             {ROWS_CONTEXT} cached positions before every pass; each pass is rolled back with \
+             `truncate`. Every time is the median of {TOKENS} passes after {WARM_UP} warm-up \
+             passes, and every pass's logits equal the single-row passes'.\n\n",
+            device.name,
+        ));
+        md.push_str(
+            "| k | One k-row pass: wall ms (GPU ms) | Per row | k single-row passes: wall ms | \
+             Per row | k-row pass / one single-row pass |\n|---|---|---|---|---|---|\n",
+        );
+        for &(k, wall, gpu, singles) in &results {
+            md.push_str(&format!(
+                "| {k} | {:.1} ({:.1}) | {:.1} | {:.1} | {:.1} | {:.2}x |\n",
+                wall * 1e3,
+                gpu * 1e3,
+                wall * 1e3 / k as f64,
+                singles * 1e3,
+                singles * 1e3 / k as f64,
+                wall / one_row,
+            ));
+        }
+        println!("{md}");
+        let json = serde_json::json!({
+            "label": "hosted-VM CI measurement",
+            "device": device,
+            "layers": shape.n_layers,
+            "cached_positions": ROWS_CONTEXT,
+            "results": results
+                .iter()
+                .map(|&(k, wall, gpu, singles)| serde_json::json!({
+                    "rows": k,
+                    "pass_wall_ms": wall * 1e3,
+                    "pass_gpu_ms": gpu * 1e3,
+                    "single_rows_wall_ms": singles * 1e3,
+                    "pass_over_one_row": wall / one_row,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!("METAL_ROWS_BENCH {json}");
+        if let Ok(path) = std::env::var("ARC_METAL_ROWS_BENCH_MD") {
             std::fs::write(path, md).expect("write the benchmark summary");
         }
     }
