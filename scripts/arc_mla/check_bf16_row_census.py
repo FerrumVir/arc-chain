@@ -431,7 +431,40 @@ def main():
     assert snapshot(source) == before
     saved.rename(shard)
     (out / 'partial-report.json').write_text(json.dumps(partial, indent=2) + '\n')
+    # One report-wide budget, including both KV components and native rows.
     before = snapshot(source)
+    capped_source = out / 'sample-source'
+    capped_manifest = capped_source / manifest_path.name
+    full = census.census(capped_source, capped_manifest, POLICIES['all-int16'])
+    assert full['rejected_row_count'] > 3
+    for cap in (0, 1, 3):
+        limited = census.census(capped_source, capped_manifest, POLICIES['all-int16'], max_rejected_rows=cap)
+        assert limited['counts'] == full['counts']
+        assert limited['classes'] == full['classes']
+        assert limited['tensor_totals'] == full['tensor_totals']
+        assert limited['rejected_row_count'] == full['rejected_row_count']
+        assert limited['rejected_rows_retained'] <= cap
+        assert sum(len(r['rejected_rows']) for r in limited['tensors']) == limited['rejected_rows_retained']
+        assert sum(r['rejected_rows_omitted'] for r in limited['tensors']) == limited['rejected_rows_omitted']
+        assert limited['rejected_rows_retained'] + limited['rejected_rows_omitted'] == limited['rejected_row_count']
+        assert limited == census.census(capped_source, capped_manifest, POLICIES['all-int16'], chunk_elements=7, max_rejected_rows=cap)
+    assert snapshot(source) == before
+    # Explicit all-flagged case exceeds the default limit without allocating
+    # all identities. Counts/statistics continue through the omitted tail.
+    budget = census.RejectionBudget(3)
+    distributions = [census.Distribution('int16', budget) for _ in range(2)]
+    for d in distributions:
+        for row in range(2000):
+            d.add(0x7fc1, row, [row])
+        assert d.rejected_count == 2000 and d.counts['nonfinite'] == 2000
+    assert sum(len(d.rejected) for d in distributions) == 3
+    for invalid in (-1, 100001, True):
+        try:
+            census.RejectionBudget(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid rejection cap accepted')
     for repeat in ('a', 'b'):
         subprocess.run([sys.executable, str(cli), '--source-dir', str(source), '--source-manifest', str(manifest_path),
                         '--precision', str(policy_paths['all-int16']), '--out', str(out / f'deterministic-{repeat}.json')], check=True)

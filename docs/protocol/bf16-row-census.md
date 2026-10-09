@@ -36,9 +36,9 @@ means invalid inputs/hash/metadata/output location. A partial or empty scan is
 not whole-model support. `admission_approved` is always false. Inspect inventory,
 missing scope and both native/selectable admission flags before further work.
 
-## Version 2 report
+## Version 3 report (bounded rejection details)
 
-The schema is `arc.bf16-row-census.v2`: `tensors`, `classes`, top-level `rows`
+The schema is `arc.bf16-row-census.v3`: `tensors`, `classes`, top-level `rows`
 and `counts` now include BF16 **norms and routers**, in addition to the five
 selectable classes. `native_or_ignored_tensors` retains shape-only experts,
 correction biases and ignored vision/rotary tensors; they are not value-scanned.
@@ -64,12 +64,19 @@ source dtype/shape, class, actual precision, layout and semantic shape. Fields:
   are binary64 representations; `median_bf16_pair` and `median_exact` decimal
   numerator/denominator strings preserve the exact even median independently
   of display rounding. Even medians are the mean of the two middle observations.
-- `rejected_rows`: **every** row rejected by actual admission or fixed INT16
+- `rejected_rows`: a bounded prefix of rows rejected by actual admission or fixed INT16
   diagnostics, with zero-based semantic row, semantic coordinates, maximum
   absolute BF16 encoding, separate actual/diagnostic rejection categories and
   intersection flag. Tensor name/component live in the enclosing record;
-  identity is `(tensor, layout, semantic_row)`. No truncation/sampling of these
-  identities occurs. Nonfinite rows have their own rejection category.
+  identity is `(tensor, layout, semantic_row)`. A shared `--max-rejected-rows` budget (default 1000, allowed 0..100000)
+  bounds identity storage across the entire report, including native diagnostics
+  and both KV-B components. Counts, distributions and statistics remain complete.
+  Each component declares `rejected_row_count`, `rejected_rows_omitted` and
+  `rejected_rows_truncated`. The root adds the configured limit and total retained
+  identities. Truncation is explicit, never silent; use limit 0 for counts only.
+  Retention follows deterministic shard/tensor scan order, with key then value
+  within each KV-B head; it is not a random or representative sample. Nonfinite
+  rows have their own rejection category.
 
 `tensor_totals` also pools both KV-B components into one tensor summary (ordinary
 tensors have one component). Tensor, class and global statistics use pooled histogram counts, **not averages or
@@ -101,9 +108,18 @@ Payload reads are bounded by `--chunk-elements` (default 32768, max 524288).
 Rows span chunks; KV-B uses rank-column tiles, never a whole-tensor transpose.
 Per-file JSON metadata is capped at 16 MiB. Histograms have 32768 unsigned-64
 bins per active component/class/global accumulator, independent of tensor size.
-Metadata/result memory scales with tensor inventory **and every rejected row**;
-required rejection identities can be large and are not capped silently. This
-is bounded payload reading, not a constant-memory output or measured RAM budget.
+Metadata/result memory scales with tensor inventory and the explicitly bounded
+rejection-detail budget. JSON is written incrementally with `json.dump`, without
+materializing a second full serialized report. Full counts continue after the
+budget is exhausted. This is not a constant-memory whole-model claim: metadata,
+model inventory and fixed histograms still occupy memory.
+
+`check_census_memory.py OUT` uses the pinned real configuration's 5,891,392
+semantic rows and actual row widths/KV-B geometry, a virtual all-NaN BF16 source,
+and the native inventory. Every row is flagged; only 1000 identities are retained.
+It measures process peak RSS through report serialization. It fetches no weights
+and does not simulate safetensors headers or hashing I/O. The measured report
+belongs in delivery evidence; it is not a real-data RSS guarantee.
 
 ```sh
 python scripts/arc_mla/check_bf16_row_census.py \
@@ -125,6 +141,8 @@ this tool-completion pass. Operator conditions: fresh Studio disk/RAM/heavy-job
 report; at least 140 GB free; at most 60 GB cumulative anonymous downloads and
 40 GB resident; exact official revision and LFS SHA256 verification before use;
 retain the verified layer-0 shard. The gaming PC gates the later pipeline, not
-this census. The independent full-forward oracle remains a nonblocking follow-up.
-Real-layer conversion/quality is conditional on census and reviewed heads. No
+this census. The independent full-forward oracle is not required for this read-only census.
+It **is required before real-weight conversion and quality work**, as the stricter
+admission documents specify. Census authorization does not authorize conversion
+or quality measurements. No
 implicit fallback, owner precision decision or Kimi performance claim follows.
