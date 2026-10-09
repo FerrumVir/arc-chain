@@ -1266,8 +1266,8 @@ impl PipelineError {
 /// URLs, so its detail goes to this node's log only.
 const SHARD_PIPELINE_FAILED: &str = "the validator shard pipeline could not complete this request; the detail is in this node's log";
 
-fn public_pipeline_run_error(error: String) -> (StatusCode, Json<ApiError>) {
-    tracing::warn!(%error, "validator shard pipeline failed");
+fn public_pipeline_run_error(request_id: &str, error: String) -> (StatusCode, Json<ApiError>) {
+    tracing::warn!(%request_id, %error, "validator shard pipeline failed");
     api_error(StatusCode::BAD_GATEWAY, SHARD_PIPELINE_FAILED)
 }
 
@@ -12128,7 +12128,7 @@ async fn inference_run_sharded(
     // leak them until TTL. Await the bounded parallel cleanup so no handler
     // can detach coordinator-owned tasks.
     cleanup_shards(&node, &pipeline, &request_id).await;
-    let run = run_result.map_err(public_pipeline_run_error)?;
+    let run = run_result.map_err(|error| public_pipeline_run_error(&request_id, error))?;
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
     let generated = run.generated;
@@ -12571,7 +12571,7 @@ async fn inference_run_consensus(
     .await;
 
     cleanup_shards(&node, &pipeline, &request_id).await;
-    let run = run_result.map_err(public_pipeline_run_error)?;
+    let run = run_result.map_err(|error| public_pipeline_run_error(&request_id, error))?;
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
     let generated = run.generated;
@@ -15482,8 +15482,8 @@ fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, 
 const SETTLEMENT_JOURNAL_UNAVAILABLE: &str =
     "this coordinator could not journal the verified settlement; the detail is in its log";
 
-fn public_settlement_journal_error(error: String) -> String {
-    tracing::error!(%error, "could not journal a verified settlement");
+fn public_settlement_journal_error(job_id: Hash256, error: String) -> String {
+    tracing::error!(job_id = %job_id, %error, "could not journal a verified settlement");
     SETTLEMENT_JOURNAL_UNAVAILABLE.to_string()
 }
 
@@ -15493,7 +15493,8 @@ fn retain_verified_settlement(
 ) -> Result<(), String> {
     let _gate = node.community_verified_settlements_gate.lock();
     let now = now_unix_ms();
-    prune_verified_settlements_locked(node).map_err(public_settlement_journal_error)?;
+    prune_verified_settlements_locked(node)
+        .map_err(|error| public_settlement_journal_error(payload.reward.job_id, error))?;
     if let Some(existing) = node
         .community_verified_settlements
         .get(&payload.reward.job_id)
@@ -15504,7 +15505,7 @@ fn retain_verified_settlement(
             );
         }
         persist_verified_settlement_journal(node, &payload, existing.verified_at_unix_ms)
-            .map_err(public_settlement_journal_error)?;
+            .map_err(|error| public_settlement_journal_error(payload.reward.job_id, error))?;
         return Ok(());
     }
     if node.community_verified_settlements.len() >= VERIFIED_SETTLEMENT_CAP {
@@ -15515,7 +15516,7 @@ fn retain_verified_settlement(
     // Durability precedes visibility: after this returns, a crash at any later
     // await can replay the exact independently verified payload.
     persist_verified_settlement_journal(node, &payload, now)
-        .map_err(public_settlement_journal_error)?;
+        .map_err(|error| public_settlement_journal_error(payload.reward.job_id, error))?;
     node.community_verified_settlements.insert(
         payload.reward.job_id,
         VerifiedCommunitySettlement {
@@ -17394,17 +17395,22 @@ async fn get_model_shards(
                 "execution_profiles": execution_profiles,
             })))
         }
-        Err(error) => Ok(Json(json!({
-            "model_id": model_id_hex,
-            "pipeline": [],
-            "shard_count": 0,
-            "total_layers": total_layers,
-            "fully_covered": false,
-            "profile_bound": false,
-            "execution_profile": Value::Null,
-            "execution_profiles": execution_profiles,
-            "planning_error": error.to_string(),
-        }))),
+        Err(error) => {
+            // A read-only view: the full error, with holder names and socket
+            // addresses, goes to the debug log rather than the caller.
+            tracing::debug!(%error, "model shard pipeline could not be planned");
+            Ok(Json(json!({
+                "model_id": model_id_hex,
+                "pipeline": [],
+                "shard_count": 0,
+                "total_layers": total_layers,
+                "fully_covered": false,
+                "profile_bound": false,
+                "execution_profile": Value::Null,
+                "execution_profiles": execution_profiles,
+                "planning_error": error.public_message(),
+            })))
+        }
     }
 }
 
@@ -20016,6 +20022,8 @@ mod tests {
         assert_eq!(error, SETTLEMENT_JOURNAL_UNAVAILABLE);
         assert!(!node.community_verified_settlements.contains_key(&job_id));
         let logged = logs.text();
+        // The log line names the job, so operators can tie it to the job.
+        assert!(logged.contains(&job_id.to_hex()), "{logged}");
         assert!(
             logged.contains("could not journal a verified settlement"),
             "{logged}"
@@ -27680,6 +27688,7 @@ mod tests {
         let logs = ServerLogs::default();
         let _logging = logs.install();
         let (status, Json(body)) = public_pipeline_run_error(
+            "free-request-7",
             "send: error sending request for url (http://198.51.100.7:9090/inference/forward_shard)"
                 .to_string(),
         );
@@ -27690,6 +27699,25 @@ mod tests {
             logged.contains("http://198.51.100.7:9090/inference/forward_shard"),
             "{logged}"
         );
+        assert!(logged.contains("free-request-7"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn model_shards_planning_error_omits_shard_holders() {
+        let node = fake_node_with_workers(Vec::new());
+        announce_unsigned_test_shard(&node);
+        let params = HashMap::from([("model_id".to_string(), test_model_id())]);
+
+        let Ok(Json(body)) = get_model_shards(AxumState(node), Query(params)).await else {
+            panic!("the test model is announced");
+        };
+        assert_eq!(
+            body["planning_error"],
+            "Shard identity unavailable or malformed for a pipeline replica"
+        );
+        let text = body.to_string();
+        assert!(!text.contains("198.51.100.7"), "{text}");
+        assert!(!text.contains("unsigned-holder"), "{text}");
     }
 
     #[test]
