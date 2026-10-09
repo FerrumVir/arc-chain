@@ -1219,7 +1219,7 @@ fn coordinator_rejects_substituted_return_metadata_without_harming_neighbour() {
 /// split; rollbacks truncate in place, replay from the log and skip queued
 /// dead work.
 mod speculation {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{BTreeSet, HashMap, VecDeque};
     use std::sync::mpsc::channel;
 
     use super::*;
@@ -1317,40 +1317,77 @@ mod speculation {
             .collect()
     }
 
+    /// What a drafter's script guarantees about the drafts it sends.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Forces {
+        /// Nothing: always right, or not scripted.
+        Nothing,
+        /// Some drafts are wrong.
+        Rejections,
+        /// Every draft is wrong.
+        EveryDraft,
+    }
+
     fn drafters(
         c: &MlaConfig,
         reqs: &[Request],
         expected: &[MlaGeneration],
-    ) -> Vec<Box<dyn Drafter>> {
+    ) -> Vec<(Box<dyn Drafter>, Forces)> {
         let truth = truth(reqs, expected);
         let scripted = |script: Script| -> Box<dyn Drafter> {
             Box::new(ScriptedDrafter::new(truth.clone(), c.vocab_size, script))
         };
+        let case = |drafter: Box<dyn Drafter>, forces: Forces| (drafter, forces);
         vec![
-            scripted(Script::Pattern(vec![true])),
-            scripted(Script::Pattern(vec![false])),
-            scripted(Script::Pattern(vec![true, false])),
-            scripted(Script::Pattern(vec![true, true, false])),
-            scripted(Script::Rate { rate: 0.5, seed: 3 }),
-            Box::new(NgramDrafter::default()),
-            Box::new(Garbage {
-                state: 11,
-                vocab: c.vocab_size as u32,
-            }),
-            Box::new(Silent),
+            case(scripted(Script::Pattern(vec![true])), Forces::Nothing),
+            case(scripted(Script::Pattern(vec![false])), Forces::EveryDraft),
+            case(
+                scripted(Script::Pattern(vec![true, false])),
+                Forces::Rejections,
+            ),
+            case(
+                scripted(Script::Pattern(vec![true, true, false])),
+                Forces::Rejections,
+            ),
+            case(
+                scripted(Script::Rate { rate: 0.5, seed: 3 }),
+                Forces::Rejections,
+            ),
+            case(Box::new(NgramDrafter::default()), Forces::Nothing),
+            case(
+                Box::new(Garbage {
+                    state: 11,
+                    vocab: c.vocab_size as u32,
+                }),
+                Forces::Nothing,
+            ),
+            case(Box::new(Silent), Forces::Nothing),
         ]
     }
 
     /// The correctness gate: on every split (all of them for one format),
     /// every drafter and every shape gives the single process's tokens,
     /// logits hashes and boundary digests, and a ledger equal to plain
-    /// decoding's on the same ring at every position of every stage.
+    /// decoding's on the same ring at every position of every stage. It also
+    /// proves speculation ran: drafters whose script makes drafts wrong cause
+    /// rejections, rollbacks and (with passes in flight) cancelled passes,
+    /// and their rejections land at every row that carries drafts.
     #[test]
     fn speculation_matches_plain_decoding_for_any_drafter_depth_and_split() {
         for (f, (lora, format)) in FORMATS.into_iter().enumerate() {
             let c = synthetic::tiny_config(lora, format);
             let whole = stage_model(&c, 0, c.n_layers, Router::Random);
-            let reqs = spec_requests(&c, 6, 31 + f as u64);
+            let mut reqs = spec_requests(&c, 6, 31 + f as u64);
+            // One answer that runs to the end of the context without EOS, so
+            // every scripted pattern reaches every row of every shape.
+            let prompt = vec![5, 6, 7];
+            reqs.push(Request {
+                id: 2900,
+                max_tokens: c.max_seq - prompt.len(),
+                prompt,
+                eos: Vec::new(),
+                selection: Selection::Argmax,
+            });
             let expected: Vec<MlaGeneration> = reqs.iter().map(|r| reference(&whole, r)).collect();
             let masks: Vec<u32> = if f == 0 {
                 (0..1 << (c.n_layers - 1)).collect()
@@ -1371,7 +1408,9 @@ mod speculation {
                     assert_matches(g, got, &format!("plain cuts {cuts:?} id {}", got.id));
                 }
                 for (depth, rows) in SHAPES {
-                    for mut drafter in drafters(&c, &reqs, &expected) {
+                    // Rows at which a forced rejection was observed, over drafters.
+                    let mut rejected_rows = BTreeSet::new();
+                    for (mut drafter, forces) in drafters(&c, &reqs, &expected) {
                         let config = SpecConfig {
                             depth,
                             rows,
@@ -1393,9 +1432,46 @@ mod speculation {
                         let tokens: u64 = expected.iter().map(|g| g.tokens.len() as u64).sum();
                         assert_eq!(stats.generated_tokens, tokens, "{at}");
                         assert!(spec.max_in_flight <= depth as u64, "{at}: {spec:?}");
+                        // Prove the drafts reached the ring: every rejection is
+                        // attributed to the row that carried it and rolls the
+                        // stages back.
+                        let attributed: u64 = spec.rejected_rows.iter().sum();
+                        assert_eq!(attributed, spec.rejected, "{at}: {spec:?}");
+                        assert!(spec.rollbacks >= spec.rejected, "{at}: {spec:?}");
+                        if depth == 1 {
+                            // A synchronous pass carries the verified token at
+                            // row 0, and nothing is on the ring behind it.
+                            let row0 = spec.rejected_rows.first().copied().unwrap_or(0);
+                            assert_eq!(row0, 0, "{at}: {spec:?}");
+                            assert_eq!(spec.cancelled_passes, 0, "{at}: {spec:?}");
+                        }
                         if rows == 1 && depth == 1 {
                             assert_eq!(spec.drafted, 0, "{at}: plain decoding never drafts");
+                        } else if forces != Forces::Nothing {
+                            // The script makes drafts wrong: they must have been
+                            // rejected and rolled back, and with passes in
+                            // flight, later passes must have been cancelled.
+                            assert!(spec.rejected > 0 && spec.rollbacks > 0, "{at}: {spec:?}");
+                            if depth > 1 {
+                                assert!(spec.cancelled_passes > 0, "{at}: {spec:?}");
+                            }
+                            for (row, &n) in spec.rejected_rows.iter().enumerate() {
+                                if n > 0 {
+                                    rejected_rows.insert(row);
+                                }
+                            }
                         }
+                    }
+                    if rows > 1 || depth > 1 {
+                        // Forced rejections landed at every row that carries
+                        // drafts: rows 1.. of a synchronous pass, every row of a
+                        // pipelined one.
+                        let first = usize::from(depth == 1);
+                        let every_row: BTreeSet<usize> = (first..rows).collect();
+                        assert_eq!(
+                            rejected_rows, every_row,
+                            "cuts {cuts:?} D {depth} R {rows}: rows with forced rejections"
+                        );
                     }
                 }
                 island.stop();

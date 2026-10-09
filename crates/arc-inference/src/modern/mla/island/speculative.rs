@@ -101,6 +101,9 @@ pub struct SpecStats {
     pub accepted: u64,
     /// Drafts the target's selection replaced.
     pub rejected: u64,
+    /// Rejected drafts by the row that carried them within their pass:
+    /// `rejected_rows[r]` counts drafts rejected at row `r`.
+    pub rejected_rows: Vec<u64>,
     /// The most passes of one answer on the ring at once.
     pub max_in_flight: u64,
     /// Time spent in the drafter.
@@ -108,6 +111,13 @@ pub struct SpecStats {
 }
 
 impl SpecStats {
+    fn reject_at(&mut self, row: usize) {
+        if self.rejected_rows.len() <= row {
+            self.rejected_rows.resize(row + 1, 0);
+        }
+        self.rejected_rows[row] += 1;
+    }
+
     /// Accepted drafts over verified drafts (`None` before any).
     pub fn acceptance(&self) -> Option<f64> {
         let verified = self.accepted + self.rejected;
@@ -148,6 +158,23 @@ fn cancel_all(ring: &mut VecDeque<Sent>) -> u64 {
         }
     }
     cancelled
+}
+
+/// The row at which position `at` travelled: in the pass just returned
+/// (`start .. start + count`) or in a live pass still on the ring.
+fn row_of(at: usize, start: usize, count: usize, ring: &VecDeque<Sent>) -> Option<usize> {
+    if (start..start + count).contains(&at) {
+        return Some(at - start);
+    }
+    ring.iter().find_map(|sent| match sent {
+        Sent::Pass {
+            start: first,
+            count: n,
+            live: true,
+            ..
+        } if (*first..*first + *n).contains(&at) => Some(at - *first),
+        _ => None,
+    })
 }
 
 fn kind(frame: &Frame) -> &'static str {
@@ -389,6 +416,9 @@ impl Coordinator {
                     }
                     Some(_) => {
                         tally.spec.rejected += 1;
+                        if let Some(row) = row_of(at, start, count, &ring) {
+                            tally.spec.reject_at(row);
+                        }
                         tokens.truncate(at);
                         tokens.push(token);
                         true

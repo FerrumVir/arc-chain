@@ -3,9 +3,13 @@ name: Async pipelined speculation (stacked on ENG-6)
 # Evidence for crates/arc-inference/src/modern/mla/island/speculative.rs: many
 # speculative passes of one answer in flight across the regional ring, KV
 # branches rolled back in place on rejection, byte-identical to plain
-# decoding. The repository-wide workflows run only for pull requests to main;
-# this one runs for pull requests stacked on #167 (branch agent/builder/ARC-68)
-# and by hand. Nothing here talks to a node: every process listens on
+# decoding. It runs for pull requests to main and to #167's branch
+# (agent/builder/ARC-68) that touch the island runtime (the paths
+# island-runtime.yml watches, plus this file), and by hand, so it keeps
+# running once this stack targets main. On pull requests to main the
+# repository workflows also run the new tests: they live in the modern::mla
+# unit suite and tests/island_processes.rs, which island-runtime.yml and
+# ci.yml already run. Nothing here talks to a node: every process listens on
 # 127.0.0.1.
 #
 #   tests    rustfmt and clippy (deny warnings), then the MLA profile and
@@ -24,7 +28,15 @@ name: Async pipelined speculation (stacked on ENG-6)
 
 on:
   pull_request:
-    branches: ['agent/builder/ARC-68']
+    branches: [main, 'agent/builder/ARC-68']
+    paths:
+      - 'crates/arc-inference/src/modern/mla/**'
+      - 'crates/arc-inference/src/bin/arc_island.rs'
+      - 'crates/arc-inference/tests/island_processes.rs'
+      - 'crates/arc-inference/tests/support/**'
+      - 'crates/arc-inference/Cargo.toml'
+      - 'scripts/arc_island/**'
+      - '.github/workflows/async-speculation.yml'
   workflow_dispatch:
 
 permissions:

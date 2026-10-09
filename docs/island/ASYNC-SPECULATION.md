@@ -97,10 +97,22 @@ Tests (CI, never run locally):
   (4,1), (3,2), (6,3)}, eight drafters (always right, always wrong,
   alternating, two-in-three, rate 0.5, n-gram, garbage with over-long and
   out-of-vocabulary drafts, silent), requests with EOS ids and both selection
-  rules. Tokens, every logits hash and every boundary digest equal the single
+  rules, plus one answer that runs to the end of the context without EOS.
+  Tokens, every logits hash and every boundary digest equal the single
   process's `generate`; the whole ledger (every stage's hashes, logits hash
   and selected token at every position) equals plain decoding's on the same
-  ring.
+  ring. The test also proves speculation ran, so drafts that silently stopped
+  reaching the ring would fail it:
+  * `SpecStats::rejected_rows` attributes every rejection to the row that
+    carried the rejected draft, and every rejection triggered a rollback.
+  * Each drafter whose script makes drafts wrong (always wrong, the two
+    patterns, rate 0.5) caused rejections and rollbacks in every speculative
+    shape, plus cancelled passes whenever passes were in flight (D > 1).
+  * Synchronous passes never had a rejection at row 0, which carries the
+    verified token, and never cancelled a pass.
+  * Across these drafters, rejections landed at every row that carries
+    drafts: rows 1 to R - 1 of a synchronous pass and every row of a
+    pipelined one.
 * `speculative_answers_pass_every_stage_audit`: after speculative answers that
   keep their logs, every stage's reveal re-executes to its commitments
   (`audit_all` gives `Valid` for every stage).
@@ -147,7 +159,11 @@ python3 scripts/arc_island/spec_report.py spec.json --out spec.md
 CI runs one bench job per hop delay (1, 5, 16 and 50 ms one-way per shaped
 hop; 4 and 8 stages at 100 Mbit/s, 8 stages at 1 Gbit/s) plus a 40-stage
 regional cell (RTT 5/10/20 ms), and the `report` job renders one table into
-the run summary and the `spec-report` artifact. **These are emulated
+the run summary and the `spec-report` artifact. The workflow runs for pull
+requests to `main` and to #167's branch that touch the island runtime, so it
+keeps running after the stack lands. On pull requests to `main`, ci.yml and
+island-runtime.yml also run every new test: they sit in the `modern::mla`
+unit suite and `tests/island_processes.rs`. **These are emulated
 measurements on CI runners**: a synthetic model, one host, shaped loopback
 links. They are not real-WAN or Kimi speeds, and the measured tables live in
 the pull request and the CI artifacts, not here.
