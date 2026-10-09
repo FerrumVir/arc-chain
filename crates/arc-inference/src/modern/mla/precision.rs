@@ -447,23 +447,22 @@ fn dot_i16_limbs(row: &[u8], digits: &LimbBlocks, scratch: &mut LimbScratch) -> 
     let mut total = 0i64;
     for (block, weights) in row.chunks(COL_BLOCK * 2).enumerate() {
         let width = weights.len() / 2;
-        // Two plain loops over fixed-width values, which compilers vectorize:
-        // decode the little-endian words, then split them.
+        // Plain two-slice loops, the form compilers vectorize: decode the
+        // little-endian words once, then write one limb per pass.
+        // `(v / 128) / 128 == v / 16384` for truncating division.
         let values = &mut values[..width];
         for (v, w) in values.iter_mut().zip(weights.chunks_exact(2)) {
             *v = i16::from_le_bytes([w[0], w[1]]);
         }
         let (low, middle, top) = (&mut low[..width], &mut middle[..width], &mut top[..width]);
-        for (((&v, l0), l1), l2) in values
-            .iter()
-            .zip(low.iter_mut())
-            .zip(middle.iter_mut())
-            .zip(top.iter_mut())
-        {
-            let high = v / 128;
-            *l0 = (v % 128) as i8;
-            *l1 = (high % 128) as i8;
-            *l2 = (high / 128) as i8;
+        for (limb, &v) in low.iter_mut().zip(values.iter()) {
+            *limb = (v % 128) as i8;
+        }
+        for (limb, &v) in middle.iter_mut().zip(values.iter()) {
+            *limb = ((v / 128) % 128) as i8;
+        }
+        for (limb, &v) in top.iter_mut().zip(values.iter()) {
+            *limb = (v / 16384) as i8;
         }
         total += digits.dot(block, low)
             + 128 * digits.dot(block, middle)
@@ -936,9 +935,9 @@ pub(crate) mod tests {
     /// boundaries and +-32767, row-chunk edges (63, 64, 65 rows), column
     /// block edges (2047, 2048, 2049), the SIMD activation-domain edges and
     /// one value past them, the largest accepted accumulator mass with every
-    /// product of row 0 the same sign (a dot within 2^15 of 2^63) and the
-    /// first refused one, zero rows, and scales at k = 40 and 62 and
-    /// mu = 2^30 and 2^31 - 1.
+    /// product of row 0 the same sign (for rows of +-32767 the dot is
+    /// 2^63 - 32,775) and the first refused one, zero rows, and scales at
+    /// k = 40 and 62 and mu = 2^30 and 2^31 - 1.
     #[test]
     fn int16_projection_matches_the_legacy_kernel_on_random_and_edge_matrices() {
         use crate::canonical_simd::{LIMB_MAX, LIMB_MIN};
@@ -1126,6 +1125,61 @@ pub(crate) mod tests {
         (ms[BENCH_RUNS / 2], ms[0], first)
     }
 
+    /// The rejected design, measured by the benchmark only: the three i8
+    /// weight limbs split once, as a load-time copy would hold them (3 bytes
+    /// per weight beside the mapped 2-byte weights).
+    fn precompute_limbs(q: &[u8]) -> [Vec<i8>; 3] {
+        let n = q.len() / 2;
+        let mut limbs = [
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        ];
+        for w in q.chunks_exact(2) {
+            let v = i16::from_le_bytes([w[0], w[1]]);
+            let high = v / 128;
+            limbs[0].push((v % 128) as i8);
+            limbs[1].push((high % 128) as i8);
+            limbs[2].push((high / 128) as i8);
+        }
+        limbs
+    }
+
+    /// A projection over precomputed limbs, with the digits, column blocks,
+    /// kernels, row chunks and epilogue of `project_i16`.
+    fn project_precomputed(
+        limbs: &[Vec<i8>; 3],
+        rows: usize,
+        cols: usize,
+        mu: &[i32],
+        k: &[u8],
+        x: &[i64],
+    ) -> Vec<i64> {
+        use rayon::prelude::*;
+        let digits = LimbBlocks::new(x, COL_BLOCK).expect("in-domain input");
+        let mut out = vec![0i64; rows];
+        out.par_chunks_mut(ROW_CHUNK)
+            .enumerate()
+            .for_each(|(chunk_index, dots)| {
+                for (offset, dot) in dots.iter_mut().enumerate() {
+                    let row = (chunk_index * ROW_CHUNK + offset) * cols;
+                    *dot = (0..cols.div_ceil(COL_BLOCK))
+                        .map(|block| {
+                            let lo = row + block * COL_BLOCK;
+                            let hi = row + cols.min((block + 1) * COL_BLOCK);
+                            digits.dot(block, &limbs[0][lo..hi])
+                                + 128 * digits.dot(block, &limbs[1][lo..hi])
+                                + 16384 * digits.dot(block, &limbs[2][lo..hi])
+                        })
+                        .sum::<i64>();
+                }
+            });
+        for ((v, &m), &s) in out.iter_mut().zip(mu).zip(k) {
+            *v = dyadic_epilogue(*v, m, s).unwrap();
+        }
+        out
+    }
+
     /// CI-runner timing of one INT16 projection, the legacy kernel ("before")
     /// against this one ("after"), at two pinned Kimi K2.6 shapes
     /// (`docs/protocol/reference/kimi-k26/config.json`): a 16,384-row slice of
@@ -1220,6 +1274,21 @@ pub(crate) mod tests {
                         "| {shape} | {rows} x {cols} | {kernel} | after | {t} | {after:.1} | {after_min:.1} | {:.2} |",
                         before / after
                     );
+                }
+                if fast {
+                    // The memory tradeoff, measured: limbs precomputed at load.
+                    let limbs = precompute_limbs(&q);
+                    let mib = limbs.iter().map(Vec::len).sum::<usize>() as f64 / f64::from(1 << 20);
+                    for (t, pool) in &pools {
+                        let (pre, pre_min, got) = timed(|| {
+                            pool.install(|| project_precomputed(&limbs, rows, cols, &mu, &k, &x))
+                        });
+                        assert_eq!(got, want, "{shape}, precomputed limbs, {t} threads");
+                        println!(
+                            "| {shape} | {rows} x {cols} | {kernel} | not adopted: limbs precomputed at load (+{mib:.0} MiB) | {t} | {pre:.1} | {pre_min:.1} | {:.2} |",
+                            before / pre
+                        );
+                    }
                 }
             }
             crate::canonical_simd::set_fast_canonical_kernel(false);
