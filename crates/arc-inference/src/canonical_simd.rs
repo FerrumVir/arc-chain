@@ -732,6 +732,116 @@ pub(crate) fn exact_row_dots_fast(
     }
 }
 
+/// Activation digits split once per projection, in column blocks, for exact
+/// row dots that may run inside rayon tasks.
+///
+/// [`exact_row_dots_fast`] splits its input into the thread-local
+/// `LIMB_SCRATCH` and holds that borrow across its own parallel loop, so it
+/// must not run inside another rayon task: work stealing could re-enter the
+/// borrow. These digits belong to the caller instead. They are split once and
+/// then read by every row from any thread, with no borrow, allocation or
+/// nested parallelism per row.
+///
+/// The arithmetic is the module's: the same balanced base-256 digits from
+/// [`split_limbs`] and the same exact dot kernels. Only the block width bounds
+/// the kernels' i32 partial sums, so any number of columns is accepted.
+#[derive(Debug)]
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+pub(crate) struct LimbBlocks {
+    /// Columns per block, in `1..=MAX_COLS_FOR_I32`.
+    block: usize,
+    /// Total columns (the input length).
+    cols: usize,
+    /// Block `b` is `LIMB_COUNT` contiguous planes of its own width: the
+    /// layout [`split_limbs`] writes and the dot kernels read.
+    digits: Vec<i8>,
+    /// Digit planes each block needs; its higher planes are all zero.
+    used: Vec<usize>,
+}
+
+impl LimbBlocks {
+    /// Split `input` into blocks of `block` columns.
+    ///
+    /// `None` is a refusal, counted by the census like the other entry
+    /// points: no exact vector backend here, an empty input or block, a block
+    /// above the i32 partial-sum bound, or an activation outside the exact
+    /// four-digit domain. The caller then computes the same integers with its
+    /// scalar kernel.
+    pub(crate) fn new(input: &[i64], block: usize) -> Option<Self> {
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let _ = (input, block);
+            record_attempt();
+            record_refusal(Refusal::Unavailable);
+            None
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        {
+            record_attempt();
+            if !dotprod_available() {
+                record_refusal(Refusal::Unavailable);
+                return None;
+            }
+            if input.is_empty() || block == 0 {
+                record_refusal(Refusal::Shape);
+                return None;
+            }
+            if block > MAX_COLS_FOR_I32 {
+                record_refusal(Refusal::InnerDimAboveI32Bound);
+                return None;
+            }
+            let mut digits = vec![0i8; LIMB_COUNT * input.len()];
+            let mut used = Vec::with_capacity(input.len().div_ceil(block));
+            for (values, planes) in input
+                .chunks(block)
+                .zip(digits.chunks_mut(LIMB_COUNT * block))
+            {
+                let Some(planes_used) = split_limbs(values, planes) else {
+                    record_refusal(Refusal::ActivationOutOfDomain);
+                    return None;
+                };
+                used.push(planes_used);
+            }
+            record_accept();
+            Some(Self {
+                block,
+                cols: input.len(),
+                digits,
+                used,
+            })
+        }
+    }
+
+    /// Exact `sum_j row[j] * input[b * block + j]` over block `b`.
+    ///
+    /// # Panics
+    /// If `b` is not a block of the input or `row` is not exactly its width.
+    pub(crate) fn dot(&self, b: usize, row: &[i8]) -> i64 {
+        let used = self.used[b];
+        let start = b * self.block;
+        let width = self.block.min(self.cols - start);
+        assert_eq!(row.len(), width, "limb block width");
+        let planes = &self.digits[LIMB_COUNT * start..LIMB_COUNT * (start + width)];
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        {
+            // SAFETY: `new` returned this value, so the vector backend is
+            // available on this CPU. `row` holds `width` bytes, and `planes`
+            // holds the `LIMB_COUNT * width` digits that `split_limbs` wrote
+            // for this block with stride `width`. `used <= LIMB_COUNT`, and
+            // `width <= block <= MAX_COLS_FOR_I32` bounds the i32 partial sums.
+            unsafe { dot_limbs_dotprod(row.as_ptr(), planes, width, used) }
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let _ = (planes, used);
+            unreachable!("LimbBlocks::new refuses without a vector backend")
+        }
+    }
+}
+
 /// Batched form of [`matmul_i8_canonical_rows_fast`]: `n_tokens` activations
 /// against the same weight matrix.
 ///
@@ -1039,6 +1149,90 @@ mod tests {
         let mut output = vec![0; 1];
         assert!(matmul_i8_canonical_rows_fast(&w, &input, cols, &mut output));
         assert_eq!(output[0], scalar_dot(&w.data, &input) >> FRAC_BITS);
+    }
+
+    /// Block dots summed over a row equal the scalar dot, at every SIMD tail
+    /// and block edge, with raw -128 weights and the digit-domain extremes.
+    #[test]
+    fn limb_blocks_match_scalar_dots_at_every_block_edge() {
+        if !dotprod_available() {
+            return;
+        }
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for cols in [1usize, 15, 16, 17, 31, 32, 33, 1023, 1024, 1025, 2049, 4097] {
+            let input: Vec<i64> = (0..cols)
+                .map(|j| match j % 4 {
+                    0 => LIMB_MAX,
+                    1 => LIMB_MIN,
+                    2 => (next() % 16_777_216) as i64 - 8_388_608,
+                    _ => 0,
+                })
+                .collect();
+            let mut row: Vec<i8> = (0..cols).map(|_| next() as u8 as i8).collect();
+            row[0] = -128;
+            for block in [1usize, 16, 33, 1024, 2048] {
+                let blocks = LimbBlocks::new(&input, block).expect("in-domain input");
+                let total: i64 = row
+                    .chunks(block)
+                    .enumerate()
+                    .map(|(b, part)| blocks.dot(b, part))
+                    .sum();
+                assert_eq!(total, scalar_dot(&row, &input), "cols={cols} block={block}");
+            }
+        }
+    }
+
+    #[test]
+    fn limb_blocks_refuse_what_the_kernels_cannot_prove() {
+        assert!(LimbBlocks::new(&[1, LIMB_MAX + 1, 3], 2).is_none());
+        assert!(LimbBlocks::new(&[1, LIMB_MIN - 1], 16).is_none());
+        assert!(LimbBlocks::new(&[], 16).is_none());
+        assert!(LimbBlocks::new(&[1], 0).is_none());
+        assert!(LimbBlocks::new(&[1], MAX_COLS_FOR_I32 + 1).is_none());
+        assert_eq!(
+            LimbBlocks::new(&[1], MAX_COLS_FOR_I32).is_some(),
+            dotprod_available()
+        );
+    }
+
+    /// The digits are plain shared data: many rayon tasks read them at once
+    /// (the nesting that the thread-local scratch of `exact_row_dots_fast`
+    /// cannot allow), and every row still equals its scalar dot.
+    #[test]
+    fn limb_blocks_are_read_concurrently_inside_rayon_tasks() {
+        use rayon::prelude::*;
+        if !dotprod_available() {
+            return;
+        }
+        let cols = 3000usize;
+        let input: Vec<i64> = (0..cols as i64)
+            .map(|j| (j * 7919) % 2_000_003 - 1_000_001)
+            .collect();
+        let rows: Vec<Vec<i8>> = (0..97usize)
+            .map(|r| {
+                (0..cols)
+                    .map(|j| ((r * 31 + j * 17) % 256) as u8 as i8)
+                    .collect()
+            })
+            .collect();
+        let blocks = LimbBlocks::new(&input, 1024).expect("in-domain input");
+        let parallel: Vec<i64> = rows
+            .par_iter()
+            .map(|row| {
+                row.chunks(1024)
+                    .enumerate()
+                    .map(|(b, part)| blocks.dot(b, part))
+                    .sum::<i64>()
+            })
+            .collect();
+        let serial: Vec<i64> = rows.iter().map(|row| scalar_dot(row, &input)).collect();
+        assert_eq!(parallel, serial);
     }
 
     #[test]

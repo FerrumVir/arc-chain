@@ -21,6 +21,7 @@ use super::ops::{
     router_logits, routing_weights, select_experts, selection_keys,
 };
 use super::package::{self, StageHeader, StageSpec};
+use super::precision::{I16Weights, holds_int16_min};
 use crate::modern::ModernError;
 use crate::modern::arith::{self, ACTIVATION_LIMIT, Selection, add_residual, rms_norm};
 use crate::modern::model::GenerationRequest;
@@ -63,6 +64,8 @@ struct MatRef {
 }
 
 impl MatRef {
+    /// Stack element `index`, read from the package bytes the loader checked
+    /// (every caller passes its own `StageModel`'s bytes).
     fn view<'a>(&'a self, bytes: &'a [u8], index: usize) -> QView<'a> {
         let size = self.rows * self.cols * if self.wide { 2 } else { 1 };
         let start = self.q.start + index * size;
@@ -74,7 +77,11 @@ impl MatRef {
             } else {
                 as_i8(&bytes[start..start + size])
             },
-            q16: self.wide.then_some(&bytes[start..start + size]),
+            // `Loader::mat` refused any -32768 in the whole stack range `q`
+            // before this `MatRef` existed; elements start at even offsets.
+            q16: self
+                .wide
+                .then(|| I16Weights::admitted(&bytes[start..start + size])),
             mu: &self.mu[index * self.rows..(index + 1) * self.rows],
             k: &self.k[index * self.rows..(index + 1) * self.rows],
         }
@@ -253,8 +260,10 @@ impl Loader<'_> {
             return Err(invalid(format!("{name}: inconsistent matrix shape")));
         }
         let weights = &self.data[q.clone()];
+        // The one-time -32768 check of every INT16 matrix: projections rely on
+        // it through `I16Weights` and never rescan.
         if if wide {
-            weights.chunks_exact(2).any(|v| v == [0, 128])
+            holds_int16_min(weights)
         } else {
             weights.par_chunks(1 << 20).any(|c| c.contains(&0x80))
         } {
@@ -1956,5 +1965,222 @@ pub(crate) mod tests {
         downgraded[8..16].copy_from_slice(&len.to_le_bytes());
         downgraded.extend_from_slice(text.as_bytes());
         assert!(StageModel::from_owned(downgraded).is_err());
+    }
+
+    /// The four INT16 fixtures of `int16-fixture-goldens.json`, configured as
+    /// `mixed_precision_goldens_and_split_stages` configures them (the tests
+    /// below check the package hashes against the pinned file).
+    fn int16_fixtures() -> Vec<(&'static str, MlaConfig)> {
+        use super::super::precision::{Bits, Precision};
+        use super::super::yarn::{ATTENTION_LAMBDA, Preparation, Scope};
+        [
+            ("int16-dense", true, false, false),
+            ("int16-moe", false, false, true),
+            ("mixed-moe", false, true, true),
+            ("int16-yarn-moe", false, false, true),
+        ]
+        .into_iter()
+        .map(|(name, dense_only, mixed, lora)| {
+            let mut c = tiny_config_with(lora, ExpertFormat::Int4G32);
+            if dense_only {
+                c.n_layers = 1;
+            }
+            let mut precision = Precision::all_int16();
+            if mixed {
+                precision.head = Bits::Int8;
+                precision.dense = Bits::Int8;
+            }
+            c.precision = Some(precision);
+            if name == "int16-yarn-moe" {
+                c.architecture = "arc-test/kimi-k26-yarn".into();
+                c.qk_nope_dim = 128;
+                c.qk_rope_dim = 64;
+                c.attention_lambda = ATTENTION_LAMBDA;
+                c.preparation = Some(Preparation {
+                    scope: Scope::SyntheticFixture,
+                });
+            }
+            c.validate().unwrap();
+            (name, c)
+        })
+        .collect()
+    }
+
+    /// Every dyadic matrix of a stage by package name: embedding, attention,
+    /// dense or shared FFN, head. Routed experts are never INT16.
+    fn dyadic_matrices(model: &StageModel) -> Vec<(String, &MatRef)> {
+        let mut all = Vec::new();
+        if let Some(embed) = &model.embed {
+            all.push(("embed".to_string(), embed));
+        }
+        for (layer, w) in model.stage.layers().zip(&model.layers) {
+            let p = format!("layers.{layer}");
+            match &w.query {
+                QueryProjection::Direct(m) => all.push((format!("{p}.wq"), m)),
+                QueryProjection::Lora { a, b, .. } => {
+                    all.push((format!("{p}.wq_a"), a));
+                    all.push((format!("{p}.wq_b"), b));
+                }
+            }
+            for (name, m) in [
+                ("wkv_a", &w.wkv_a),
+                ("wk_b", &w.wk_b),
+                ("wv_b", &w.wv_b),
+                ("wo", &w.wo),
+            ] {
+                all.push((format!("{p}.{name}"), m));
+            }
+            let (prefix, ffn) = match &w.ffn {
+                FfnWeights::Dense(dense) => ("", &**dense),
+                FfnWeights::Moe(moe) => ("shared.", &moe.shared),
+            };
+            for (name, m) in ["w_gate", "w_up", "w_down"].into_iter().zip(ffn) {
+                all.push((format!("{p}.{prefix}{name}"), m));
+            }
+        }
+        if let Some(head) = &model.head {
+            all.push(("lm_head".to_string(), &head.lm_head));
+        }
+        all
+    }
+
+    /// Every INT16 view of the four pinned INT16 fixtures, every stack
+    /// element: the bytes the loader admitted pass a fresh -32768 scan, and
+    /// the projection gives the legacy kernel's bytes, serial and on 1, 2 and
+    /// N threads, scalar and SIMD, for ordinary inputs, the SIMD digit-domain
+    /// edges and an input just past them.
+    #[test]
+    fn int16_fixture_projections_match_the_legacy_kernel() {
+        use super::super::precision::tests::{Case, thread_pools};
+        use crate::canonical_simd::{LIMB_MAX, LIMB_MIN};
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+        ))
+        .unwrap();
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let pools = thread_pools();
+        let mut rng = Lcg(156);
+        let mut views = 0;
+        for (name, c) in int16_fixtures() {
+            let bytes = tiny_package(&c, StageSpec::full(&c));
+            let package_hash = blake3::hash(&bytes).to_hex().to_string();
+            assert_eq!(pinned[name][0], package_hash, "{name}");
+            let model = StageModel::from_owned(bytes).unwrap();
+            let data = model.bytes();
+            for (label, m) in dyadic_matrices(&model) {
+                if !m.wide {
+                    continue;
+                }
+                for index in 0..m.mu.len() / m.rows {
+                    let view = m.view(data, index);
+                    let q = view.q16.expect("an INT16 view").as_bytes();
+                    let what = format!("{name} {label}[{index}]");
+                    assert!(I16Weights::new(q).is_ok(), "{what}");
+                    let cols = view.cols;
+                    let typical: Vec<i64> = (0..cols)
+                        .map(|_| (rng.next() % (1 << 21)) as i64 - (1 << 20))
+                        .collect();
+                    let edges: Vec<i64> = (0..cols)
+                        .map(|j| match j % 3 {
+                            0 => LIMB_MAX,
+                            1 => LIMB_MIN,
+                            _ => 7,
+                        })
+                        .collect();
+                    let mut outside = typical.clone();
+                    outside[cols / 2] = LIMB_MIN - 1;
+                    for x in [&typical, &edges, &outside] {
+                        let case = Case {
+                            q,
+                            rows: view.rows,
+                            cols,
+                            mu: view.mu,
+                            k: view.k,
+                            x,
+                        };
+                        case.assert_matches_legacy(&pools, &what);
+                        assert!(case.legacy().is_ok(), "{what}");
+                    }
+                    views += 1;
+                }
+            }
+        }
+        // 10 + 38 + 34 + 38 INT16 matrices; each per-head `wk_b`/`wv_b` stack
+        // holds 4 views: 16 + 62 + 58 + 62.
+        assert_eq!(views, 198);
+    }
+
+    /// The one-time -32768 check is complete: one -32768 at the first, a
+    /// middle or the last weight of any INT16 matrix tensor of the four
+    /// fixtures (every class and every stack element) refuses the package,
+    /// whole or as any stage that executes the tensor. A stage that does not
+    /// execute a tensor never reads it, so it can never view it either.
+    #[test]
+    fn int16_minimum_is_refused_at_load_in_every_matrix() {
+        let minimum = i16::MIN.to_le_bytes();
+        let mut tensors = 0;
+        for (name, c) in int16_fixtures() {
+            let bytes = tiny_package(&c, StageSpec::full(&c));
+            let model = StageModel::from_owned(bytes.clone()).unwrap();
+            for e in &model.header.entries {
+                if e.dtype != package::Dtype::I16
+                    || !e.name.ends_with(".q")
+                    || e.name.contains("router")
+                {
+                    continue;
+                }
+                let matrix = e.name.strip_suffix(".q").unwrap();
+                let range = model.header.range(e);
+                let weights = range.len() / 2;
+                for at in [0, weights / 2, weights - 1] {
+                    let mut bad = bytes.clone();
+                    let byte = range.start + 2 * at;
+                    bad[byte..byte + 2].copy_from_slice(&minimum);
+                    let Err(err) = StageModel::from_owned(bad) else {
+                        panic!("{name}: -32768 at weight {at} of {} was admitted", e.name);
+                    };
+                    let err = err.to_string();
+                    assert!(
+                        err.contains(&format!("{matrix}: weight minimum is not a profile value")),
+                        "{name} {} at {at}: {err}",
+                        e.name
+                    );
+                }
+                tensors += 1;
+            }
+        }
+        // 10 + 38 + 34 + 38: every INT16 matrix tensor of the four fixtures.
+        assert_eq!(tensors, 120);
+        // A mapped package, opened whole or as stages (`open_range`).
+        let (_, c) = int16_fixtures()
+            .into_iter()
+            .find(|(name, _)| *name == "int16-moe")
+            .unwrap();
+        let mut bytes = tiny_package(&c, StageSpec::full(&c));
+        let model = StageModel::from_owned(bytes.clone()).unwrap();
+        let range = model
+            .header
+            .range(model.header.entry("layers.2.wo.q").unwrap());
+        bytes[range.end - 2..range.end].copy_from_slice(&minimum);
+        let path = std::env::temp_dir().join(format!(
+            "arc-mla-int16-minimum-{}.arcspkg",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let open = |first_layer, end_layer| {
+            StageModel::open_range(
+                &path,
+                Some(StageSpec {
+                    first_layer,
+                    end_layer,
+                }),
+            )
+        };
+        assert!(StageModel::open(&path).is_err());
+        assert!(open(2, 3).is_err());
+        assert!(open(1, 4).is_err());
+        assert!(open(0, 2).is_ok());
+        assert!(open(3, 4).is_ok());
+        std::fs::remove_file(&path).unwrap();
     }
 }

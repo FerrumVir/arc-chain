@@ -81,8 +81,17 @@ existing AVX2/ARM NEON exact INT8-dot kernels for each limb. Signed remainder
 and truncating division preserve exact reconstruction for negative weights.
 No activation requantization is introduced. Unsupported SIMD/input domains
 use the scalar implementation; a SIMD flag alone is not an acceleration claim.
-The implementation materializes at most 64 rows of three weight limbs per
-projection. This is a correctness prerequisite, not a tuned INT16 kernel.
+
+The `-32768` exclusion is checked once, when weights are admitted: the stage
+loader scans every INT16 matrix of the executed layers, and a wide `QView`
+holds `precision::I16Weights`, which only the loader or the scanning
+`I16Weights::new` can construct. A projection never rescans its matrix (debug
+builds re-check every loader view). Rows run in parallel over disjoint 64-row
+chunks of the current Rayon pool for matrices of at least 2^18 weights, and on
+the calling thread below that. Each row's dot is one exact integer sum, so
+thread count and schedule cannot change a byte. With the opt-in limb kernel,
+activation digits are split once per projection in 2,048-column blocks, and
+each row's weight block is split into limbs on the stack.
 
 ## Reproduction and fixture evidence
 
@@ -129,7 +138,8 @@ new profiles without allocating a real full model. These are synthetic tests.
    only legacy INT8 pending slices; it must not relabel their bytes as INT16.
    Keep pending-marker, scope/source and corruption rejection gates in #168.
 3. #164 must pin the integrated engine, pass `q16: None` for legacy `QView`
-   literals or actual LE bytes for wide views, and update its isolated observer
+   literals or `Some(I16Weights::new(bytes)?)` (the one-time `-32768` check)
+   for wide views, and update its isolated observer
    against the new source hash. Reference dequantization must use selected
    signed-16 q * mu * 2^-k, or original BF16 for a source-reference experiment,
    with that distinction and dtype declared. Same weights, inputs, positions,
@@ -152,8 +162,10 @@ Do not discard source tensors required for same-input reference execution.
 Conversion additionally materializes original BF16 bits (2E) and output INT16
 bytes (2E) for one matrix, its scales (5R), a row buffer (2C), existing writer
 buffer (8 MiB), mmap residency and transpose scratch. Execution maps packages;
-INT16 weight-limb scratch is at most `3*64*C` bytes plus three 64-row dot arrays
-and existing per-thread activation-limb scratch. Reference FP32 expansion, KV
+INT16 weight-limb scratch is one 6 KiB stack block per running task, plus
+`4*C` bytes of activation digits per projection; nothing is allocated per row
+chunk. Weight limbs are not precomputed: that would add 3 bytes per INT16 weight
+of anonymous memory, outside the mapped package. Reference FP32 expansion, KV
 cache, OS overhead and actual available RAM must be budgeted separately. There
 is no inference from tiny RSS to real-model admission. Fresh Studio and gaming
 PC disk/RAM measurements and PC endpoint/target-volume information remain
