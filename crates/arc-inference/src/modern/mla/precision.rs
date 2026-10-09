@@ -396,10 +396,20 @@ fn row_dots(weights: &[u8], cols: usize, x: &[i64], digits: Option<&LimbBlocks>,
         return;
     };
     // One stack scratch per task, reused by every row: no allocation.
-    let mut limbs = [[0i8; COL_BLOCK]; 3];
+    let mut scratch = LimbScratch {
+        values: [0; COL_BLOCK],
+        limbs: [[0; COL_BLOCK]; 3],
+    };
     for (dot, row) in dots.iter_mut().zip(rows) {
-        *dot = dot_i16_limbs(row, digits, &mut limbs);
+        *dot = dot_i16_limbs(row, digits, &mut scratch);
     }
+}
+
+/// One task's stack scratch for the limb kernel (10 KiB): a column block of
+/// decoded weights and its three i8 limbs.
+struct LimbScratch {
+    values: [i16; COL_BLOCK],
+    limbs: [[i8; COL_BLOCK]; 3],
 }
 
 /// Exact `sum_j w_j x_j` of one little-endian INT16 row. `|w| <= 32767` and
@@ -431,26 +441,33 @@ fn dot_i16(row: &[u8], x: &[i64]) -> i64 {
 /// base-128 limbs, `w = l0 + 128 l1 + 16384 l2` by truncating division, so
 /// `|l0|, |l1| <= 127` and `|l2| <= 1`. Each block's combine and the running
 /// total are then bounded by `32767 * sum|x| < 2^63`.
-fn dot_i16_limbs(row: &[u8], digits: &LimbBlocks, limbs: &mut [[i8; COL_BLOCK]; 3]) -> i64 {
+fn dot_i16_limbs(row: &[u8], digits: &LimbBlocks, scratch: &mut LimbScratch) -> i64 {
+    let LimbScratch { values, limbs } = scratch;
+    let [low, middle, top] = limbs;
     let mut total = 0i64;
     for (block, weights) in row.chunks(COL_BLOCK * 2).enumerate() {
         let width = weights.len() / 2;
-        let [low, middle, top] = &mut *limbs;
-        for (((w, l0), l1), l2) in weights
-            .chunks_exact(2)
+        // Two plain loops over fixed-width values, which compilers vectorize:
+        // decode the little-endian words, then split them.
+        let values = &mut values[..width];
+        for (v, w) in values.iter_mut().zip(weights.chunks_exact(2)) {
+            *v = i16::from_le_bytes([w[0], w[1]]);
+        }
+        let (low, middle, top) = (&mut low[..width], &mut middle[..width], &mut top[..width]);
+        for (((&v, l0), l1), l2) in values
+            .iter()
             .zip(low.iter_mut())
             .zip(middle.iter_mut())
             .zip(top.iter_mut())
         {
-            let v = i16::from_le_bytes([w[0], w[1]]);
             let high = v / 128;
             *l0 = (v % 128) as i8;
             *l1 = (high % 128) as i8;
             *l2 = (high / 128) as i8;
         }
-        total += digits.dot(block, &low[..width])
-            + 128 * digits.dot(block, &middle[..width])
-            + 16384 * digits.dot(block, &top[..width]);
+        total += digits.dot(block, low)
+            + 128 * digits.dot(block, middle)
+            + 16384 * digits.dot(block, top);
     }
     total
 }
@@ -1123,14 +1140,15 @@ pub(crate) mod tests {
         use std::hint::black_box;
         let _guard = crate::canonical_simd::kernel_switch_guard();
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let counts = [1, threads];
         let counts = if threads > 1 {
-            vec![1, threads]
+            &counts[..]
         } else {
-            vec![1]
+            &counts[..1]
         };
         let pools: Vec<(usize, rayon::ThreadPool)> = counts
-            .into_iter()
-            .map(|t| {
+            .iter()
+            .map(|&t| {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(t)
                     .build()

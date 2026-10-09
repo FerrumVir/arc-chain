@@ -2166,7 +2166,7 @@ pub(crate) mod tests {
             "arc-mla-int16-minimum-{}.arcspkg",
             std::process::id()
         ));
-        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&path, bytes).unwrap();
         let open = |first_layer, end_layer| {
             StageModel::open_range(
                 &path,
