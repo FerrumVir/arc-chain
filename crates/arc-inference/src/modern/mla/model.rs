@@ -21,6 +21,7 @@ use super::ops::{
     router_logits, routing_weights, select_experts, selection_keys,
 };
 use super::package::{self, StageHeader, StageSpec};
+use super::precision::{I16Weights, Schedule, holds_int16_min};
 use crate::modern::ModernError;
 use crate::modern::arith::{self, ACTIVATION_LIMIT, Selection, add_residual, rms_norm};
 use crate::modern::model::GenerationRequest;
@@ -63,6 +64,8 @@ struct MatRef {
 }
 
 impl MatRef {
+    /// Stack element `index`, read from the package bytes the loader checked
+    /// (every caller passes its own `StageModel`'s bytes).
     fn view<'a>(&'a self, bytes: &'a [u8], index: usize) -> QView<'a> {
         let size = self.rows * self.cols * if self.wide { 2 } else { 1 };
         let start = self.q.start + index * size;
@@ -74,7 +77,11 @@ impl MatRef {
             } else {
                 as_i8(&bytes[start..start + size])
             },
-            q16: self.wide.then_some(&bytes[start..start + size]),
+            // `Loader::mat` refused any -32768 in the whole stack range `q`
+            // before this `MatRef` existed; elements start at even offsets.
+            q16: self
+                .wide
+                .then(|| I16Weights::admitted(&bytes[start..start + size])),
             mu: &self.mu[index * self.rows..(index + 1) * self.rows],
             k: &self.k[index * self.rows..(index + 1) * self.rows],
         }
@@ -253,8 +260,10 @@ impl Loader<'_> {
             return Err(invalid(format!("{name}: inconsistent matrix shape")));
         }
         let weights = &self.data[q.clone()];
+        // The one-time -32768 check of every INT16 matrix: projections rely on
+        // it through `I16Weights` and never rescan.
         if if wide {
-            weights.chunks_exact(2).any(|v| v == [0, 128])
+            holds_int16_min(weights)
         } else {
             weights.par_chunks(1 << 20).any(|c| c.contains(&0x80))
         } {
@@ -412,6 +421,37 @@ pub struct StageModel {
     embed: Option<MatRef>,
     layers: Vec<LayerWeights>,
     head: Option<HeadWeights>,
+    /// Tests force the head schedule of INT16 layers with this.
+    #[cfg(test)]
+    forced_head_schedule: Option<Schedule>,
+}
+
+/// Run `per_head` once per head on `schedule`: head `j` writes only the
+/// `width`-value block `j` of `out` and reads shared, read-only inputs, so
+/// the schedule cannot change a value. On failure the error of the lowest
+/// failing head is returned, as the serial loop returns it.
+pub(crate) fn for_each_head<F>(
+    out: &mut [i64],
+    width: usize,
+    schedule: Schedule,
+    per_head: F,
+) -> Result<(), ModernError>
+where
+    F: Fn(usize, &mut [i64]) -> Result<(), ModernError> + Sync + Send,
+{
+    match schedule {
+        Schedule::Serial => out
+            .chunks_mut(width)
+            .enumerate()
+            .try_for_each(|(head, block)| per_head(head, block)),
+        Schedule::Pool => out
+            .par_chunks_mut(width)
+            .enumerate()
+            .map(|(head, block)| per_head(head, block))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect(),
+    }
 }
 
 /// Tokens, digests and timings of one generation (spec §7).
@@ -530,7 +570,29 @@ impl StageModel {
             embed,
             layers,
             head,
+            #[cfg(test)]
+            forced_head_schedule: None,
         })
+    }
+
+    /// How the heads of layer `w` run. An INT16 layer runs its heads in
+    /// parallel when their `wk_b` and `wv_b` projections hold at least 2^18
+    /// weights together (K2.6: 64 heads x 2 x 65,536): each per-head slice is
+    /// below the row-parallel threshold of `project_i16`, and INT16
+    /// projections keep no thread-local state. INT8 heads stay on the calling
+    /// thread: the opt-in limb kernel's thread-local scratch could be
+    /// re-entered by a projection nested in another rayon task through work
+    /// stealing.
+    fn head_schedule(&self, w: &LayerWeights) -> Schedule {
+        if !(w.wk_b.wide && w.wv_b.wide) {
+            return Schedule::Serial;
+        }
+        #[cfg(test)]
+        if let Some(forced) = self.forced_head_schedule {
+            return forced;
+        }
+        let per_head = w.wk_b.rows * w.wk_b.cols + w.wv_b.rows * w.wv_b.cols;
+        Schedule::for_work(self.config().n_heads.saturating_mul(per_head))
     }
 
     pub fn config(&self) -> &MlaConfig {
@@ -704,11 +766,10 @@ impl StageModel {
         };
         let (nope, dqk, lambda) = (c.qk_nope_dim, c.d_qk(), c.attention_lambda);
         let mut heads = vec![0i64; c.d_attn_out()];
-        // Heads run one after another: each projection is already parallel
-        // over its rows, and the opt-in limb kernel keeps per-thread scratch
-        // that a projection nested inside another rayon task could re-enter
-        // through work stealing.
-        for (j, out) in heads.chunks_mut(c.v_head_dim).enumerate() {
+        // Heads are independent: head j reads q, the cache and its own weights
+        // and writes only its output block. `head_schedule` says whether they
+        // run in parallel (INT16 layers large enough) or one after another.
+        for_each_head(&mut heads, c.v_head_dim, self.head_schedule(w), |j, out| {
             let base = j * dqk;
             let mut qp = q[base + nope..base + dqk].to_vec();
             rope_interleaved(&mut qp, cos, sin)?;
@@ -718,8 +779,8 @@ impl StageModel {
                 .project(&q[base..base + nope], &mut qa)?;
             let mut u = vec![0i64; rank];
             mla_attend(&qa, &qp, view, lambda, &mut u)?;
-            w.wv_b.view(data, j).project(&u, out)?;
-        }
+            w.wv_b.view(data, j).project(&u, out)
+        })?;
         let mut y = vec![0i64; c.d_model];
         w.wo.view(data, 0).project(&heads, &mut y)?;
         add_residual(h, &y)?;
@@ -744,8 +805,10 @@ impl StageModel {
         let chosen = select_experts(&keys, c.n_experts_per_tok, c.n_group, c.topk_group)?;
         let chosen_sigma: Vec<i64> = chosen.iter().map(|&e| sigma[e]).collect();
         let weights = routing_weights(&chosen_sigma, c.routed_scaling_q32, c.norm_topk_prob);
-        // Experts run one after another for the same reason as heads: their
-        // projections are parallel over rows.
+        // Experts run one after another: each expert projection is already
+        // parallel over its rows, and INT8 experts may use the opt-in limb
+        // kernel, whose thread-local scratch a projection nested inside
+        // another rayon task could re-enter through work stealing.
         let outputs = match &m.experts {
             ExpertStacks::Int8([gate, up, down]) => chosen
                 .iter()
@@ -1956,5 +2019,317 @@ pub(crate) mod tests {
         downgraded[8..16].copy_from_slice(&len.to_le_bytes());
         downgraded.extend_from_slice(text.as_bytes());
         assert!(StageModel::from_owned(downgraded).is_err());
+    }
+
+    /// The four INT16 fixtures of `int16-fixture-goldens.json`, configured as
+    /// `mixed_precision_goldens_and_split_stages` configures them (the tests
+    /// below check the package hashes against the pinned file).
+    fn int16_fixtures() -> Vec<(&'static str, MlaConfig)> {
+        use super::super::precision::{Bits, Precision};
+        use super::super::yarn::{ATTENTION_LAMBDA, Preparation, Scope};
+        [
+            ("int16-dense", true, false, false),
+            ("int16-moe", false, false, true),
+            ("mixed-moe", false, true, true),
+            ("int16-yarn-moe", false, false, true),
+        ]
+        .into_iter()
+        .map(|(name, dense_only, mixed, lora)| {
+            let mut c = tiny_config_with(lora, ExpertFormat::Int4G32);
+            if dense_only {
+                c.n_layers = 1;
+            }
+            let mut precision = Precision::all_int16();
+            if mixed {
+                precision.head = Bits::Int8;
+                precision.dense = Bits::Int8;
+            }
+            c.precision = Some(precision);
+            if name == "int16-yarn-moe" {
+                c.architecture = "arc-test/kimi-k26-yarn".into();
+                c.qk_nope_dim = 128;
+                c.qk_rope_dim = 64;
+                c.attention_lambda = ATTENTION_LAMBDA;
+                c.preparation = Some(Preparation {
+                    scope: Scope::SyntheticFixture,
+                });
+            }
+            c.validate().unwrap();
+            (name, c)
+        })
+        .collect()
+    }
+
+    /// Every dyadic matrix of a stage by package name: embedding, attention,
+    /// dense or shared FFN, head. Routed experts are never INT16.
+    fn dyadic_matrices(model: &StageModel) -> Vec<(String, &MatRef)> {
+        let mut all = Vec::new();
+        if let Some(embed) = &model.embed {
+            all.push(("embed".to_string(), embed));
+        }
+        for (layer, w) in model.stage.layers().zip(&model.layers) {
+            let p = format!("layers.{layer}");
+            match &w.query {
+                QueryProjection::Direct(m) => all.push((format!("{p}.wq"), m)),
+                QueryProjection::Lora { a, b, .. } => {
+                    all.push((format!("{p}.wq_a"), a));
+                    all.push((format!("{p}.wq_b"), b));
+                }
+            }
+            for (name, m) in [
+                ("wkv_a", &w.wkv_a),
+                ("wk_b", &w.wk_b),
+                ("wv_b", &w.wv_b),
+                ("wo", &w.wo),
+            ] {
+                all.push((format!("{p}.{name}"), m));
+            }
+            let (prefix, ffn) = match &w.ffn {
+                FfnWeights::Dense(dense) => ("", &**dense),
+                FfnWeights::Moe(moe) => ("shared.", &moe.shared),
+            };
+            for (name, m) in ["w_gate", "w_up", "w_down"].into_iter().zip(ffn) {
+                all.push((format!("{p}.{prefix}{name}"), m));
+            }
+        }
+        if let Some(head) = &model.head {
+            all.push(("lm_head".to_string(), &head.lm_head));
+        }
+        all
+    }
+
+    /// Every INT16 view of the four pinned INT16 fixtures, every stack
+    /// element: the bytes the loader admitted pass a fresh -32768 scan, and
+    /// the projection gives the legacy kernel's bytes, serial and on 1, 2 and
+    /// N threads, scalar and SIMD, for ordinary inputs, the SIMD digit-domain
+    /// edges and an input just past them.
+    #[test]
+    fn int16_fixture_projections_match_the_legacy_kernel() {
+        use super::super::precision::tests::{Case, thread_pools};
+        use crate::canonical_simd::{LIMB_MAX, LIMB_MIN};
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+        ))
+        .unwrap();
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let pools = thread_pools();
+        let mut rng = Lcg(156);
+        let mut views = 0;
+        for (name, c) in int16_fixtures() {
+            let bytes = tiny_package(&c, StageSpec::full(&c));
+            let package_hash = blake3::hash(&bytes).to_hex().to_string();
+            assert_eq!(pinned[name][0], package_hash, "{name}");
+            let model = StageModel::from_owned(bytes).unwrap();
+            let data = model.bytes();
+            for (label, m) in dyadic_matrices(&model) {
+                if !m.wide {
+                    continue;
+                }
+                for index in 0..m.mu.len() / m.rows {
+                    let view = m.view(data, index);
+                    let q = view.q16.expect("an INT16 view").as_bytes();
+                    let what = format!("{name} {label}[{index}]");
+                    assert!(I16Weights::new(q).is_ok(), "{what}");
+                    let cols = view.cols;
+                    let typical: Vec<i64> = (0..cols)
+                        .map(|_| (rng.next() % (1 << 21)) as i64 - (1 << 20))
+                        .collect();
+                    let edges: Vec<i64> = (0..cols)
+                        .map(|j| match j % 3 {
+                            0 => LIMB_MAX,
+                            1 => LIMB_MIN,
+                            _ => 7,
+                        })
+                        .collect();
+                    let mut outside = typical.clone();
+                    outside[cols / 2] = LIMB_MIN - 1;
+                    for x in [&typical, &edges, &outside] {
+                        let case = Case {
+                            q,
+                            rows: view.rows,
+                            cols,
+                            mu: view.mu,
+                            k: view.k,
+                            x,
+                        };
+                        case.assert_matches_legacy(&pools, &what);
+                        assert!(case.legacy().is_ok(), "{what}");
+                    }
+                    views += 1;
+                }
+            }
+        }
+        // 10 + 38 + 34 + 38 INT16 matrices; each per-head `wk_b`/`wv_b` stack
+        // holds 4 views: 16 + 62 + 58 + 62.
+        assert_eq!(views, 198);
+    }
+
+    /// The one-time -32768 check is complete: one -32768 at the first, a
+    /// middle or the last weight of any INT16 matrix tensor of the four
+    /// fixtures (every class and every stack element) refuses the package,
+    /// whole or as any stage that executes the tensor. A stage that does not
+    /// execute a tensor never reads it, so it can never view it either.
+    #[test]
+    fn int16_minimum_is_refused_at_load_in_every_matrix() {
+        let minimum = i16::MIN.to_le_bytes();
+        let mut tensors = 0;
+        for (name, c) in int16_fixtures() {
+            let bytes = tiny_package(&c, StageSpec::full(&c));
+            let model = StageModel::from_owned(bytes.clone()).unwrap();
+            for e in &model.header.entries {
+                if e.dtype != package::Dtype::I16
+                    || !e.name.ends_with(".q")
+                    || e.name.contains("router")
+                {
+                    continue;
+                }
+                let matrix = e.name.strip_suffix(".q").unwrap();
+                let range = model.header.range(e);
+                let weights = range.len() / 2;
+                for at in [0, weights / 2, weights - 1] {
+                    let mut bad = bytes.clone();
+                    let byte = range.start + 2 * at;
+                    bad[byte..byte + 2].copy_from_slice(&minimum);
+                    let Err(err) = StageModel::from_owned(bad) else {
+                        panic!("{name}: -32768 at weight {at} of {} was admitted", e.name);
+                    };
+                    let err = err.to_string();
+                    assert!(
+                        err.contains(&format!("{matrix}: weight minimum is not a profile value")),
+                        "{name} {} at {at}: {err}",
+                        e.name
+                    );
+                }
+                tensors += 1;
+            }
+        }
+        // 10 + 38 + 34 + 38: every INT16 matrix tensor of the four fixtures.
+        assert_eq!(tensors, 120);
+        // A mapped package, opened whole or as stages (`open_range`).
+        let (_, c) = int16_fixtures()
+            .into_iter()
+            .find(|(name, _)| *name == "int16-moe")
+            .unwrap();
+        let mut bytes = tiny_package(&c, StageSpec::full(&c));
+        let model = StageModel::from_owned(bytes.clone()).unwrap();
+        let range = model
+            .header
+            .range(model.header.entry("layers.2.wo.q").unwrap());
+        bytes[range.end - 2..range.end].copy_from_slice(&minimum);
+        let path = std::env::temp_dir().join(format!(
+            "arc-mla-int16-minimum-{}.arcspkg",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let open = |first_layer, end_layer| {
+            StageModel::open_range(
+                &path,
+                Some(StageSpec {
+                    first_layer,
+                    end_layer,
+                }),
+            )
+        };
+        assert!(StageModel::open(&path).is_err());
+        assert!(open(2, 3).is_err());
+        assert!(open(1, 4).is_err());
+        assert!(open(0, 2).is_ok());
+        assert!(open(3, 4).is_ok());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The heads of INT16 layers run in parallel or one after another, on 1,
+    /// 2 and N threads, scalar and SIMD: every generation equals the pinned
+    /// fixture golden (tokens, every logits hash, every boundary digest).
+    #[test]
+    fn int16_heads_in_parallel_keep_the_pinned_goldens() {
+        use super::super::precision::tests::thread_pools;
+        // A K2.6 layer's heads (64 x (512 x 128 + 128 x 512) weights) are
+        // parallel by size; a tiny fixture's are not, so both are forced here.
+        assert_eq!(
+            Schedule::for_work(64 * (512 * 128 + 128 * 512)),
+            Schedule::Pool
+        );
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+        ))
+        .unwrap();
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let pools = thread_pools();
+        let request = GenerationRequest {
+            prompt: &[3, 17, 5, 49, 0],
+            max_tokens: 8,
+            eos: &[],
+            selection: Selection::Rp64Argmax,
+        };
+        for (name, c) in int16_fixtures() {
+            let mut model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
+            assert_eq!(model.head_schedule(&model.layers[0]), Schedule::Serial);
+            for forced in [Schedule::Serial, Schedule::Pool] {
+                model.forced_head_schedule = Some(forced);
+                assert_eq!(model.head_schedule(&model.layers[0]), forced);
+                for fast in [false, true] {
+                    crate::canonical_simd::set_fast_canonical_kernel(fast);
+                    for (threads, pool) in &pools {
+                        let run = pool.install(|| model.generate(&request)).unwrap();
+                        let mut h = blake3::Hasher::new();
+                        for t in &run.tokens {
+                            h.update(&t.to_le_bytes());
+                        }
+                        for d in run.logits_hashes.iter().chain(&run.boundary_digests) {
+                            h.update(d);
+                        }
+                        assert_eq!(
+                            pinned[name][1],
+                            h.finalize().to_hex().to_string(),
+                            "{name}: heads {forced:?}, fast {fast}, {threads} threads"
+                        );
+                    }
+                }
+            }
+        }
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+    }
+
+    /// The head driver gives the same blocks on every schedule and thread
+    /// count and, on failure, the lowest failing head's error, as the serial
+    /// loop does.
+    #[test]
+    fn for_each_head_is_schedule_free_and_reports_the_lowest_failing_head() {
+        use super::super::precision::tests::thread_pools;
+        let fill = |head: usize, block: &mut [i64]| -> Result<(), ModernError> {
+            for (i, v) in block.iter_mut().enumerate() {
+                *v = (head * 1000 + i) as i64;
+            }
+            Ok(())
+        };
+        let fail = |head: usize, block: &mut [i64]| -> Result<(), ModernError> {
+            block.fill(head as i64);
+            match head {
+                3 => Err(ModernError::Domain("head 3".into())),
+                7 => Err(ModernError::Invalid("head 7".into())),
+                _ => Ok(()),
+            }
+        };
+        let mut want = vec![0i64; 40];
+        for_each_head(&mut want, 4, Schedule::Serial, fill).unwrap();
+        assert_eq!(want[37], 9001);
+        for (threads, pool) in &thread_pools() {
+            for schedule in [Schedule::Serial, Schedule::Pool] {
+                let mut got = vec![0i64; 40];
+                pool.install(|| for_each_head(&mut got, 4, schedule, fill))
+                    .unwrap();
+                assert_eq!(got, want, "{schedule:?}, {threads} threads");
+                let mut out = vec![0i64; 40];
+                let err = pool
+                    .install(|| for_each_head(&mut out, 4, schedule, fail))
+                    .unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    "out of the profile's domain: head 3",
+                    "{schedule:?}, {threads} threads"
+                );
+            }
+        }
     }
 }

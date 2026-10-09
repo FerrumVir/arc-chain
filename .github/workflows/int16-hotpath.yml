@@ -1,0 +1,197 @@
+name: INT16 projection hot path (bit-identical)
+
+# Gate and CI-runner timing for the INT16 projection hot path of the MLA + MoE
+# profile (crates/arc-inference/src/modern/mla/precision.rs `project_i16`),
+# stacked on #156 (branch agent/builder/ARC-66). The repository-wide workflows
+# run only for pull requests to main. The branch push trigger used while the
+# change was iterated is removed; run this by hand (workflow_dispatch), which
+# works once the file is on the default branch.
+#
+#   lint          rustfmt and clippy (deny warnings) for arc-inference.
+#   test-bench    the MLA profile unit tests (pinned golden digests, the INT16
+#                 fixture goldens, and the new byte-for-byte comparisons with
+#                 the pre-change kernel on 1, 2 and N threads), the limb-kernel
+#                 and golden known-answer tests, every arc-inference unit test
+#                 on Linux x86-64; then a release-mode timing of one INT16
+#                 projection, before and after, at pinned K2.6 shapes. Timings
+#                 are CI-runner numbers, not product speed. On Linux, the
+#                 limb split's machine code is checked for vector instructions.
+#   int16-e2e     the INT16 steps of mla-moe-moonlight.yml's tiny job: the
+#                 Fraction oracle, the arc-mla converter with scalar/SIMD
+#                 goldens and split stages, row-admission controls, and the
+#                 tiny models through every check.
+#
+# macOS runners serve the release sequence (standing rule, 2026-10-06), so the
+# macOS arm64 leg runs only when the `macos` input is set.
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: Also run the macOS arm64 leg (macOS runners serve the release sequence)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Release optimisation without fat LTO: the same code, a shorter build.
+  # Integer results cannot depend on optimisation settings.
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+  PY_NUMPY: numpy==2.5.3
+  PY_BLAKE3: blake3==1.0.10
+
+jobs:
+  lint:
+    name: rustfmt + clippy (arc-inference, deny warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - name: rustfmt (arc-inference)
+        run: cargo fmt -p arc-inference -- --check
+      # Same feature set as the shipped node and as the MLA workflow's rust job.
+      - name: Clippy (arc-inference with candle, all targets, deny warnings)
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+
+  test-bench:
+    name: tests + CI benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest is x86-64 (AVX2), ubuntu-24.04-arm is arm64 (NEON
+        # dotprod), windows-latest is x86-64 (AVX2), macos-15 is Apple Silicon.
+        os: ${{ fromJSON(inputs.macos && '["ubuntu-latest","ubuntu-24.04-arm","windows-latest","macos-15"]' || '["ubuntu-latest","ubuntu-24.04-arm","windows-latest"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - name: Runner facts (CPU, memory) for the benchmark labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            case "$RUNNER_OS" in
+              Linux) { lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|L2|L3'; free -b; } || true ;;
+              macOS) sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize || true ;;
+              Windows) powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors,L2CacheSize,L3CacheSize; Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory" ;;
+            esac
+          } 2>&1 | tee runner.txt
+      - name: MLA profile tests, INT16 legacy equivalence, pinned goldens (scalar and SIMD)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p arc-inference --lib --locked modern::mla -- --nocapture 2>&1 | tee mla-tests.log
+          { echo "### Golden digests on $RUNNER_OS $RUNNER_ARCH"; echo; echo '```'
+            grep -E '^(golden |yarn )' mla-tests.log; grep '^test result' mla-tests.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Limb kernel and golden known-answer tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p arc-inference --lib --locked canonical_simd
+          cargo test -p arc-inference --lib --locked golden
+      - name: Every arc-inference unit test (Linux x86-64)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p arc-inference --lib --locked
+      - name: CI benchmark, release build (CI-runner numbers, not product speed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p arc-inference --lib --release --locked \
+            modern::mla::precision::tests::int16_projection_benchmark \
+            -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee bench.log
+          { echo "### INT16 projection, CI-runner benchmark (${{ matrix.os }}): not product speed"; echo
+            echo "Build: release profile with LTO off and 16 codegen units (this workflow's settings), not the shipped fat-LTO, single-unit build. Use the before/after ratios; the milliseconds are this runner's only."
+            echo
+            head -1 runner.txt; echo
+            grep -E '^(INT16 projection|\|)' bench.log; } >> "$GITHUB_STEP_SUMMARY"
+      # Diagnostic only: the limb split is kept out of line so its machine code
+      # can be checked for vector instructions in the release library.
+      - name: Machine code of the INT16 limb split (diagnostic, Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo build -p arc-inference --lib --release --locked
+          rlib=$(find target/release/deps -name 'libarc_inference-*.rlib' -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-)
+          objdump -d -C --no-show-raw-insn "$rlib" 2>/dev/null \
+            | awk '/^[0-9a-f]+ <.*precision::split_block.*>:$/ {keep=1; next} /^$/ {keep=0} keep' > split-block.asm
+          total=$(grep -c . split-block.asm)
+          vector=$(grep -cE '%[xy]mm[0-9]|[[:space:],{]v[0-9]+\.|[[:space:],]q[0-9]+' split-block.asm)
+          echo "precision::split_block: $total instructions, $vector on vector registers"
+          echo "precision::split_block ($RUNNER_ARCH): $total instructions, $vector on vector registers" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: int16-hotpath-${{ matrix.os }}
+          path: |
+            runner.txt
+            mla-tests.log
+            bench.log
+            split-block.asm
+          if-no-files-found: warn
+
+  int16-e2e:
+    name: INT16 end to end (arc-mla CLI, oracle, converter controls, tiny models)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+          save-if: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Python dependencies
+        run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
+      - name: Independent exact-rational INT16 arithmetic corpus (offline)
+        run: python scripts/arc_mla/int16_oracle.py docs/protocol/reference/int16-row-oracle.json --check
+      - name: Python reference unit tests
+        working-directory: scripts
+        run: python -m unittest arc_conformance.tests.test_mla_moe_reference -v
+      - name: Build arc-mla
+        run: cargo build --release --locked -p arc-inference --bin arc-mla
+      - name: Mixed INT16 BF16 conversion, scalar/SIMD and split stages (no download)
+        run: python scripts/arc_mla/check_int16.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/int16" --build-label release
+      - name: Per-class INT16 row admission through the actual converter (offline)
+        run: python scripts/arc_mla/check_int16_rows.py ./target/release/arc-mla "$RUNNER_TEMP/tiny-evidence/int16-rows"
+      - name: Tiny models through every check
+        shell: bash
+        run: bash scripts/arc_mla/tiny_checks.sh ./target/release/arc-mla "$RUNNER_TEMP/tiny" "$RUNNER_TEMP/tiny-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: int16-hotpath-e2e
+          path: ${{ runner.temp }}/tiny-evidence/
+          if-no-files-found: warn

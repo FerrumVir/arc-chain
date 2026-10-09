@@ -14,6 +14,8 @@ use crate::modern::arith::{
 };
 use crate::modern::convert::bf16_parts;
 
+use super::precision::I16Weights;
+
 /// Row chunk for parallel projections.
 const ROW_CHUNK: usize = 64;
 
@@ -33,8 +35,9 @@ pub struct QView<'a> {
     pub cols: usize,
     /// Row-major INT8 weights in `[-127, 127]`, empty when q16 is present.
     pub q: &'a [i8],
-    /// Little-endian INT16 bytes (q is empty when present); no alignment assumption.
-    pub q16: Option<&'a [u8]>,
+    /// Little-endian INT16 weights admitted once without -32768 (q is empty
+    /// when present); no alignment assumption.
+    pub q16: Option<I16Weights<'a>>,
     pub mu: &'a [i32],
     pub k: &'a [u8],
 }
@@ -44,7 +47,7 @@ impl<'a> QView<'a> {
         self.rows > 0
             && self.cols > 0
             && self.q16.map_or(self.q.len() == self.rows * self.cols, |q| {
-                self.q.is_empty() && q.len() == self.rows * self.cols * 2
+                self.q.is_empty() && q.as_bytes().len() == self.rows * self.cols * 2
             })
             && self.mu.len() == self.rows
             && self.k.len() == self.rows
@@ -99,10 +102,12 @@ impl<'a> QView<'a> {
         let mu = i64::from(self.mu[token]);
         let shift = u32::from(self.k[token]).saturating_sub(FRAC_BITS);
         if let Some(q) = self.q16 {
-            return Ok(q[token * self.cols * 2..(token + 1) * self.cols * 2]
-                .chunks_exact(2)
-                .map(|v| (i64::from(i16::from_le_bytes([v[0], v[1]])) * mu) >> shift)
-                .collect());
+            return Ok(
+                q.as_bytes()[token * self.cols * 2..(token + 1) * self.cols * 2]
+                    .chunks_exact(2)
+                    .map(|v| (i64::from(i16::from_le_bytes([v[0], v[1]])) * mu) >> shift)
+                    .collect(),
+            );
         }
         Ok(self
             .row(token)
