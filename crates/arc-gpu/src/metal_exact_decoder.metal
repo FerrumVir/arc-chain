@@ -1070,3 +1070,130 @@ EXACT_GEMM_DYN(1, 5)
 EXACT_GEMM_DYN(1, 6)
 EXACT_GEMM_DYN(1, 7)
 EXACT_GEMM_DYN(1, 8)
+
+// Digit blocks staged per step: one per lane of a 32-lane simdgroup.
+#define STAGE_SHIFT 5u
+#define STAGE_BLOCKS (1u << STAGE_SHIFT)
+
+// exact_gemm_dyn with the activation rows' digit blocks staged in threadgroup
+// memory, STAGE_BLOCKS blocks at a time, and shared by all the threadgroup's
+// simdgroups instead of each reading them from device memory. Lane l takes
+// block base + l of every step: the blocks it takes in exact_gemm_dyn. The
+// staged values are the device values, so the arithmetic, and every value,
+// is exactly exact_gemm_dyn's. Every thread loads and meets every barrier;
+// simdgroups past the matrix's rows only skip the arithmetic.
+template <uint ROWS, uint MUL16, uint K>
+kernel void exact_gemm_staged(
+    device const uint4 *weights [[buffer(0)]],
+    device const uint4 *digits [[buffer(1)]],
+    device const long *scales [[buffer(2)]],
+    device long *out [[buffer(3)]],
+    constant ExactGemmParams &p [[buffer(4)]],
+    device const uint *ctrl [[buffer(5)]],
+    uint tg_index [[threadgroup_position_in_grid]],
+    uint sg_index [[simdgroup_index_in_threadgroup]],
+    uint sg_count [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]])
+{
+    threadgroup uint4 staged[K * 4u * STAGE_BLOCKS];
+    uint planes = 1u;
+    for (uint x = 0u; x < K; ++x) {
+        planes = max(planes, min(ctrl[x], 4u));
+    }
+    const uint first = (tg_index * sg_count + sg_index) * ROWS;
+    const bool active = first < p.rows;
+
+    device const uint4 *row_ptr[ROWS];
+    for (uint r = 0; r < ROWS; ++r) {
+        const uint local = min(first + r, p.rows - 1u);
+        row_ptr[r] = weights + ulong(p.row_offset + local) * ulong(p.blocks);
+    }
+
+    ulong acc[ROWS][K];
+    for (uint r = 0; r < ROWS; ++r) {
+        for (uint x = 0; x < K; ++x) {
+            acc[r][x] = 0UL;
+        }
+    }
+
+    for (uint base = 0u; base < p.blocks; base += STAGE_BLOCKS) {
+        for (uint i = tid; i < K * 4u * STAGE_BLOCKS; i += threads) {
+            const uint plane_row = i >> STAGE_SHIFT; // x * 4 + d
+            const uint b = base + (i & (STAGE_BLOCKS - 1u));
+            uint4 v = uint4(0u);
+            if ((plane_row & 3u) < planes && b < p.blocks) {
+                v = digits[ulong(plane_row) * ulong(p.blocks) + b];
+            }
+            staged[i] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint b = base + lane;
+        if (active && b < p.blocks) {
+            Wide16 w[ROWS];
+            for (uint r = 0; r < ROWS; ++r) {
+                w[r] = widen16(row_ptr[r][b]);
+            }
+            for (uint x = 0; x < K; ++x) {
+                for (uint d = 0; d < 4u; ++d) {
+                    if (d < planes) {
+                        const Wide16 c = widen16(staged[((x << 2) + d) * STAGE_BLOCKS + lane]);
+                        for (uint r = 0; r < ROWS; ++r) {
+                            const long part = long(dot_wide<MUL16>(w[r], c));
+                            acc[r][x] += as_type<ulong>(part) << (8u * d);
+                        }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!active) {
+        return;
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        for (uint x = 0; x < K; ++x) {
+            acc[r][x] = simd_sum_u64(acc[r][x]);
+        }
+    }
+
+    for (uint r = 0; r < ROWS; ++r) {
+        if (lane == r && first + r < p.rows) {
+            const ulong scale = as_type<ulong>(scales[p.row_offset + first + r]);
+            for (uint x = 0; x < K; ++x) {
+                const ulong product = acc[r][x] * scale;
+                ulong shifted = product >> 16;
+                if (as_type<long>(product) < 0) {
+                    shifted |= 0xFFFF000000000000UL;
+                }
+                out[ulong(x) * ulong(p.rows) + first + r] = as_type<long>(shifted);
+            }
+        }
+    }
+}
+
+typedef decltype(exact_gemm_staged<4, 0, 1>) exact_gemm_staged_t;
+
+#define EXACT_GEMM_STAGED(M, K)                                                 \
+    template [[host_name("exact_gemm_staged_m" #M "_k" #K)]]                   \
+    kernel exact_gemm_staged_t exact_gemm_staged<4, M, K>;
+
+EXACT_GEMM_STAGED(0, 1)
+EXACT_GEMM_STAGED(0, 2)
+EXACT_GEMM_STAGED(0, 3)
+EXACT_GEMM_STAGED(0, 4)
+EXACT_GEMM_STAGED(0, 5)
+EXACT_GEMM_STAGED(0, 6)
+EXACT_GEMM_STAGED(0, 7)
+EXACT_GEMM_STAGED(0, 8)
+EXACT_GEMM_STAGED(1, 1)
+EXACT_GEMM_STAGED(1, 2)
+EXACT_GEMM_STAGED(1, 3)
+EXACT_GEMM_STAGED(1, 4)
+EXACT_GEMM_STAGED(1, 5)
+EXACT_GEMM_STAGED(1, 6)
+EXACT_GEMM_STAGED(1, 7)
+EXACT_GEMM_STAGED(1, 8)
+

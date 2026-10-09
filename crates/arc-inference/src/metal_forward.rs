@@ -466,6 +466,12 @@ impl<'a> MetalForward<'a> {
         self.verify_mirror = verify;
     }
 
+    /// Which multi-row projection the multi-row passes use (see
+    /// `MetalDecoder::set_staged_gemm`). Changes speed only.
+    pub fn set_staged_gemm(&mut self, staged: bool) {
+        self.decoder.set_staged_gemm(staged);
+    }
+
     pub fn stats(&self) -> MetalForwardStats {
         self.stats
     }
@@ -3077,38 +3083,48 @@ mod bench {
             seq_len: ROWS_CONTEXT,
         });
         let tokens: Vec<u32> = (0..MAX_ROWS).map(|t| (t % EMBEDDING_ROWS) as u32).collect();
-        // (k, pass wall, pass GPU, k single-row passes wall), seconds.
-        let mut results: Vec<(usize, f64, f64, f64)> = Vec::new();
+        // (k, staged pass wall, staged pass GPU, unstaged pass wall, unstaged
+        // pass GPU, k one-row passes wall), seconds.
+        let mut results: Vec<(usize, [f64; 5])> = Vec::new();
         for k in ROW_COUNTS {
-            let (mut pass_wall, mut pass_gpu, mut singles) = (Vec::new(), Vec::new(), Vec::new());
+            let mut samples: [Vec<f64>; 5] = Default::default();
             for step in 0..WARM_UP + TOKENS {
-                let start = Instant::now();
-                let rows = fused.forward_rows_exact(&tokens[..k], &mut cache);
-                let wall = start.elapsed().as_secs_f64();
-                let gpu = fused.last_gpu_seconds();
-                cache.truncate(ROWS_CONTEXT);
-                let start = Instant::now();
+                let single_start = Instant::now();
                 let single: Vec<Vec<i64>> = tokens[..k]
                     .iter()
                     .map(|&token| fused.forward_one_token(token, &mut cache))
                     .collect();
-                let single_wall = start.elapsed().as_secs_f64();
+                let single_wall = single_start.elapsed().as_secs_f64();
                 cache.truncate(ROWS_CONTEXT);
-                assert_eq!(rows, single, "k {k}: the pass and the single rows differ");
+                let mut times = [0.0; 5];
+                times[4] = single_wall;
+                for (slot, staged) in [(0usize, true), (2, false)] {
+                    fused.set_staged_gemm(staged);
+                    let start = Instant::now();
+                    let rows = fused.forward_rows_exact(&tokens[..k], &mut cache);
+                    times[slot] = start.elapsed().as_secs_f64();
+                    times[slot + 1] = fused.last_gpu_seconds();
+                    cache.truncate(ROWS_CONTEXT);
+                    assert_eq!(
+                        rows, single,
+                        "k {k}, staged {staged}: the pass and the one-row passes differ"
+                    );
+                }
+                fused.set_staged_gemm(true);
                 if step >= WARM_UP {
-                    pass_wall.push(wall);
-                    pass_gpu.push(gpu);
-                    singles.push(single_wall);
+                    for (series, time) in samples.iter_mut().zip(times) {
+                        series.push(time);
+                    }
                 }
             }
-            results.push((k, median(pass_wall), median(pass_gpu), median(singles)));
+            results.push((k, samples.map(median)));
         }
         let stats = fused.stats();
         assert_eq!(stats.cpu_tokens, 0, "{stats:?}");
 
-        let one_row = results[0].3;
+        let one_row = results[0].1[4];
         let mut md = String::new();
-        md.push_str("### Verifying k rows: one multi-row pass against k single-row passes\n\n");
+        md.push_str("### Verifying k rows: one multi-row pass against k one-row passes\n\n");
         md.push_str(
             "Hosted-VM CI measurement: GitHub-hosted macOS VM (Apple M1, virtual), paravirtual \
              Metal GPU. Not Apple GPU hardware numbers.\n\n",
@@ -3117,22 +3133,29 @@ mod bench {
             "Device `{}`. Two real-width Llama-2-7B layers (d_kv 4096) and a 4,096-token head, \
              {ROWS_CONTEXT} cached positions before every pass; each pass is rolled back with \
              `truncate`. Every time is the median of {TOKENS} passes after {WARM_UP} warm-up \
-             passes, and every pass's logits equal the single-row passes'.\n\n",
+             passes, and every pass's logits equal the one-row passes'. Two multi-row \
+             projections: digit planes staged in threadgroup memory (the default) and read from \
+             device memory by every simdgroup.\n\n",
             device.name,
         ));
         md.push_str(
-            "| k | One k-row pass: wall ms (GPU ms) | Per row | k single-row passes: wall ms | \
-             Per row | k-row pass / one single-row pass |\n|---|---|---|---|---|---|\n",
+            "| k | Staged pass: wall ms (GPU ms) | Per row | Unstaged pass: wall ms (GPU ms) | \
+             Per row | k one-row passes: wall ms | Per row | Staged pass / one one-row pass |\n\
+             |---|---|---|---|---|---|---|---|\n",
         );
-        for &(k, wall, gpu, singles) in &results {
+        for &(k, [staged, staged_gpu, unstaged, unstaged_gpu, singles]) in &results {
+            let rows = k as f64;
             md.push_str(&format!(
-                "| {k} | {:.1} ({:.1}) | {:.1} | {:.1} | {:.1} | {:.2}x |\n",
-                wall * 1e3,
-                gpu * 1e3,
-                wall * 1e3 / k as f64,
+                "| {k} | {:.1} ({:.1}) | {:.1} | {:.1} ({:.1}) | {:.1} | {:.1} | {:.1} | {:.2}x |\n",
+                staged * 1e3,
+                staged_gpu * 1e3,
+                staged * 1e3 / rows,
+                unstaged * 1e3,
+                unstaged_gpu * 1e3,
+                unstaged * 1e3 / rows,
                 singles * 1e3,
-                singles * 1e3 / k as f64,
-                wall / one_row,
+                singles * 1e3 / rows,
+                staged / one_row,
             ));
         }
         println!("{md}");
@@ -3143,12 +3166,14 @@ mod bench {
             "cached_positions": ROWS_CONTEXT,
             "results": results
                 .iter()
-                .map(|&(k, wall, gpu, singles)| serde_json::json!({
+                .map(|&(k, [staged, staged_gpu, unstaged, unstaged_gpu, singles])| serde_json::json!({
                     "rows": k,
-                    "pass_wall_ms": wall * 1e3,
-                    "pass_gpu_ms": gpu * 1e3,
+                    "staged_pass_wall_ms": staged * 1e3,
+                    "staged_pass_gpu_ms": staged_gpu * 1e3,
+                    "unstaged_pass_wall_ms": unstaged * 1e3,
+                    "unstaged_pass_gpu_ms": unstaged_gpu * 1e3,
                     "single_rows_wall_ms": singles * 1e3,
-                    "pass_over_one_row": wall / one_row,
+                    "staged_pass_over_one_row": staged / one_row,
                 }))
                 .collect::<Vec<_>>(),
         });

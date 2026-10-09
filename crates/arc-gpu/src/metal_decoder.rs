@@ -66,6 +66,10 @@ pub const EXP_TABLE_LEN: usize = 4097;
 pub const MAX_ROWS: usize = 8;
 /// Matrix rows per simdgroup in the multi-row projection.
 const GEMM_ROWS: u32 = 4;
+/// Simdgroups per threadgroup in the staged multi-row projection, which
+/// share one copy of the digit planes (fewer if the pipeline cannot run
+/// that many threads).
+const STAGED_SIMDGROUPS: u32 = 8;
 
 const GROUP_THREADS: u64 = 256;
 const ELEMENTWISE_THREADS: u64 = 256;
@@ -86,6 +90,8 @@ pub(crate) struct DecoderPipelines {
     attention_rows: ComputePipelineState,
     /// Keyed by (16-bit products, activation rows).
     gemm: Vec<((bool, usize), ComputePipelineState)>,
+    /// The same, with the digit planes staged in threadgroup memory.
+    gemm_staged: Vec<((bool, usize), ComputePipelineState)>,
 }
 
 impl DecoderPipelines {
@@ -111,10 +117,18 @@ impl DecoderPipelines {
             }
         }
         let mut gemm = Vec::new();
+        let mut gemm_staged = Vec::new();
         for mul16 in [false, true] {
             for inputs in 1..=MAX_ROWS {
-                let name = format!("exact_gemm_dyn_m{}_k{inputs}", u8::from(mul16));
-                gemm.push(((mul16, inputs), make(&name)?));
+                let m = u8::from(mul16);
+                gemm.push((
+                    (mul16, inputs),
+                    make(&format!("exact_gemm_dyn_m{m}_k{inputs}"))?,
+                ));
+                gemm_staged.push((
+                    (mul16, inputs),
+                    make(&format!("exact_gemm_staged_m{m}_k{inputs}"))?,
+                ));
             }
         }
         let pipelines = Self {
@@ -130,6 +144,7 @@ impl DecoderPipelines {
             rope_rows: make("rope_store_rows")?,
             attention_rows: make("attention_rows")?,
             gemm,
+            gemm_staged,
         };
         for (name, pipeline) in [
             ("rms_norm", &pipelines.rms_norm),
@@ -150,7 +165,7 @@ impl DecoderPipelines {
         }
         // The multi-row projection reduces 64-bit sums across a 32-lane
         // simdgroup and needs a lane per matrix row of its tile.
-        for (_, pipeline) in &pipelines.gemm {
+        for (_, pipeline) in pipelines.gemm.iter().chain(&pipelines.gemm_staged) {
             if pipeline.thread_execution_width() != 32
                 || pipeline.max_total_threads_per_threadgroup() < 32
             {
@@ -160,8 +175,13 @@ impl DecoderPipelines {
         Ok(pipelines)
     }
 
-    fn gemm_for(&self, mul16: bool, inputs: usize) -> Option<&ComputePipelineState> {
-        self.gemm
+    fn gemm_for(&self, mul16: bool, inputs: usize, staged: bool) -> Option<&ComputePipelineState> {
+        let table = if staged {
+            &self.gemm_staged
+        } else {
+            &self.gemm
+        };
+        table
             .iter()
             .find(|(key, _)| *key == (mul16, inputs))
             .map(|(_, pipeline)| pipeline)
@@ -660,6 +680,8 @@ fn encode_attention_rows(
 
 /// One full-matrix canonical projection of `rows` activation rows, each
 /// weight read once for all of them. Output row-major: `rows` x `n_rows`.
+/// `staged` picks the kernel that shares the digit planes through
+/// threadgroup memory; both compute the same integers.
 #[allow(clippy::too_many_arguments)]
 fn encode_gemm(
     encoder: &ComputeCommandEncoderRef,
@@ -670,13 +692,19 @@ fn encode_gemm(
     ctrl: &BufferRef,
     out: &BufferRef,
     rows: usize,
+    staged: bool,
 ) {
     let tile = Tile {
         rows_per_simdgroup: GEMM_ROWS,
-        ..engine.tile
+        simdgroups: if staged {
+            STAGED_SIMDGROUPS
+        } else {
+            engine.tile.simdgroups
+        },
+        mul16: engine.tile.mul16,
     };
     let pipeline = pipes
-        .gemm_for(tile.mul16, rows)
+        .gemm_for(tile.mul16, rows, staged)
         .expect("a multi-row pipeline exists for 1..=MAX_ROWS rows");
     let (groups, threads) = engine.geometry(pipeline, matrix.n_rows, tile);
     encoder.set_compute_pipeline_state(pipeline);
@@ -940,6 +968,8 @@ pub struct MetalDecoder {
     io: Activations,
     /// Activations of [`MAX_ROWS`] rows for [`MetalDecoder::step_rows`].
     rows_io: Activations,
+    /// Multi-row projections stage the digit planes in threadgroup memory.
+    staged_gemm: bool,
 }
 
 /// Activation buffers for `rows` contiguous rows.
@@ -1073,12 +1103,21 @@ impl MetalDecoder {
             head_kv: head_kv_buffer,
             io,
             rows_io: row_activations(device, &s, MAX_ROWS),
+            staged_gemm: true,
             engine,
         })
     }
 
     pub fn shape(&self) -> &DecoderShape {
         &self.shape
+    }
+
+    /// Which multi-row projection [`Self::step_rows`] uses: with the digit
+    /// planes staged in threadgroup memory (the default) or read by every
+    /// simdgroup from device memory. Both compute the same integers; this
+    /// changes speed only.
+    pub fn set_staged_gemm(&mut self, staged: bool) {
+        self.staged_gemm = staged;
     }
 
     /// INT8 weight bytes one token reads: every layer's seven projections and
@@ -1586,6 +1625,7 @@ impl MetalDecoder {
                 &io.ctrl,
                 out,
                 rows,
+                self.staged_gemm,
             );
             rec.after_dispatch()?;
         }
@@ -1655,6 +1695,7 @@ impl MetalDecoder {
             &io.ctrl,
             &io.proj,
             rows,
+            self.staged_gemm,
         );
         rec.after_dispatch()?;
         encode_residual(rec.encoder, pipes, &io.hidden, &io.proj, rows * s.d_model);
@@ -1692,6 +1733,7 @@ impl MetalDecoder {
                 &io.ctrl,
                 out,
                 rows,
+                self.staged_gemm,
             );
             rec.after_dispatch()?;
         }
@@ -1726,6 +1768,7 @@ impl MetalDecoder {
             &io.ctrl,
             &io.ff,
             rows,
+            self.staged_gemm,
         );
         rec.after_dispatch()?;
         encode_residual(rec.encoder, pipes, &io.hidden, &io.ff, rows * s.d_model);
@@ -1772,6 +1815,7 @@ impl MetalDecoder {
             &io.ctrl,
             &io.logits,
             rows,
+            self.staged_gemm,
         );
         rec.after_dispatch()
     }
