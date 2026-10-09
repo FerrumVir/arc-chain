@@ -126,11 +126,14 @@ impl KernelSwitch {
                 (threads, pool)
             })
             .collect();
-        Self {
+        let switch = Self {
             _lock: lock,
             previous,
             pools,
-        }
+        };
+        // Printed under --nocapture so CI logs show which legs really ran.
+        println!("golden_modes legs on this runner: {:?}", switch.legs());
+        switch
     }
 
     /// Every leg this machine can run. The vectorised kernel runs only where
