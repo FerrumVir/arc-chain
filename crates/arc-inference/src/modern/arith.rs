@@ -155,7 +155,9 @@ pub fn dyadic_epilogue(acc: i64, mu: i32, k: u8) -> Result<i64, ModernError> {
 /// When the opt-in limb kernel is enabled (`ARC_FAST_CANONICAL_KERNEL=1` or
 /// `canonical_simd::set_fast_canonical_kernel`) it computes the exact row dot
 /// products; on refusal, or when it is off, the scalar kernel computes the same
-/// integers. The epilogue is shared, so both paths produce identical outputs.
+/// integers. Otherwise, when [`super::kernels::set_reference_kernel`] selected
+/// an exact SIMD kernel, that kernel computes them. The epilogue is shared, so
+/// every path produces identical outputs.
 pub fn project(m: &DyadicMatrix, x: &[i64], out: &mut [i64]) -> Result<(), ModernError> {
     if x.len() != m.cols || out.len() != m.rows {
         return Err(ModernError::Invalid(format!(
@@ -167,8 +169,12 @@ pub fn project(m: &DyadicMatrix, x: &[i64], out: &mut [i64]) -> Result<(), Moder
         )));
     }
     check_projection_input(x)?;
-    let simd = crate::canonical_simd::fast_canonical_kernel_enabled()
-        && crate::canonical_simd::exact_row_dots_fast(&m.q, m.rows, m.cols, x, out);
+    let legacy = crate::canonical_simd::fast_canonical_kernel_enabled();
+    let kernel = super::kernels::reference_kernel();
+    if !legacy && kernel != super::kernels::Kernel::Scalar {
+        return super::kernels::project_reference(m, x, kernel, out);
+    }
+    let simd = legacy && crate::canonical_simd::exact_row_dots_fast(&m.q, m.rows, m.cols, x, out);
     if !simd {
         out.par_chunks_mut(ROW_CHUNK)
             .enumerate()
@@ -187,24 +193,51 @@ pub fn project(m: &DyadicMatrix, x: &[i64], out: &mut [i64]) -> Result<(), Moder
 
 /// Embedding row `e_j = (q_tj * mu_t) >> (k_t - 16)` (spec §5.3).
 pub fn embed_row(m: &DyadicMatrix, token: usize) -> Result<Vec<i64>, ModernError> {
+    let mut out = vec![0i64; m.cols];
+    embed_row_into(m, token, &mut out)?;
+    Ok(out)
+}
+
+/// [`embed_row`] into a caller-owned buffer of `m.cols` values.
+pub fn embed_row_into(m: &DyadicMatrix, token: usize, out: &mut [i64]) -> Result<(), ModernError> {
     if token >= m.rows {
         return Err(domain("token id is outside the vocabulary"));
     }
+    if out.len() != m.cols {
+        return Err(ModernError::Invalid(format!(
+            "embedding output: {} values for width {}",
+            out.len(),
+            m.cols
+        )));
+    }
     let mu = i64::from(m.mu[token]);
     let shift = u32::from(m.k[token]).saturating_sub(FRAC_BITS);
-    Ok(m.row(token)
-        .iter()
-        .map(|&w| (i64::from(w) * mu) >> shift)
-        .collect())
+    for (slot, &w) in out.iter_mut().zip(m.row(token)) {
+        *slot = (i64::from(w) * mu) >> shift;
+    }
+    Ok(())
 }
 
 /// RMS normalisation with an exact square root (spec §5.4).
 pub fn rms_norm(x: &[i64], gain: &[i64], eps_q32: i64) -> Result<Vec<i64>, ModernError> {
-    if x.is_empty() || gain.len() != x.len() || eps_q32 < 1 {
+    let mut out = vec![0i64; x.len()];
+    rms_norm_into(x, gain, eps_q32, &mut out)?;
+    Ok(out)
+}
+
+/// [`rms_norm`] into a caller-owned buffer of `x.len()` values.
+pub fn rms_norm_into(
+    x: &[i64],
+    gain: &[i64],
+    eps_q32: i64,
+    out: &mut [i64],
+) -> Result<(), ModernError> {
+    if x.is_empty() || gain.len() != x.len() || out.len() != x.len() || eps_q32 < 1 {
         return Err(ModernError::Invalid(format!(
-            "rms_norm shape: input {}, gain {}, eps_q32 {eps_q32}",
+            "rms_norm shape: input {}, gain {}, output {}, eps_q32 {eps_q32}",
             x.len(),
-            gain.len()
+            gain.len(),
+            out.len()
         )));
     }
     let mut squares: i128 = 0;
@@ -219,16 +252,14 @@ pub fn rms_norm(x: &[i64], gain: &[i64], eps_q32: i64) -> Result<Vec<i64>, Moder
         return Err(domain("rms_norm mean square beyond 2^92"));
     }
     let inverse_rms = isqrt_u128((1u128 << 92) / mean as u128) as i128;
-    x.iter()
-        .zip(gain)
-        .map(|(&v, &g)| {
-            let product = i128::from(v)
-                .checked_mul(inverse_rms)
-                .and_then(|p| p.checked_mul(i128::from(g)))
-                .ok_or_else(|| domain("rms_norm product beyond 2^127"))?;
-            to_activation(product >> 46, "rms_norm output beyond 2^62")
-        })
-        .collect()
+    for ((slot, &v), &g) in out.iter_mut().zip(x).zip(gain) {
+        let product = i128::from(v)
+            .checked_mul(inverse_rms)
+            .and_then(|p| p.checked_mul(i128::from(g)))
+            .ok_or_else(|| domain("rms_norm product beyond 2^127"))?;
+        *slot = to_activation(product >> 46, "rms_norm output beyond 2^62")?;
+    }
+    Ok(())
 }
 
 /// Rotate one head in split-half pairing at one position (spec §5.5).
@@ -315,23 +346,49 @@ pub fn attention_head(
     }
     let max_score = scores.iter().copied().max().unwrap_or(0);
     let mut total: i64 = 0;
-    let mut weighted = vec![0i64; width];
-    for (position, &score) in scores.iter().enumerate() {
-        let weight = exp_q16(score - max_score);
-        if weight == 0 {
-            continue;
+    if cache.positions <= MAX_I64_WEIGHTED_POSITIONS {
+        let mut weighted = vec![0i64; width];
+        for (position, &score) in scores.iter().enumerate() {
+            let weight = exp_q16(score - max_score);
+            if weight == 0 {
+                continue;
+            }
+            total += weight;
+            let base = position * cache.stride + cache.offset;
+            for (acc, &v) in weighted.iter_mut().zip(&cache.values[base..base + width]) {
+                *acc += weight * i64::from(v);
+            }
         }
-        total += weight;
-        let base = position * cache.stride + cache.offset;
-        for (acc, &v) in weighted.iter_mut().zip(&cache.values[base..base + width]) {
-            *acc += weight * i64::from(v);
+        for (slot, &acc) in out.iter_mut().zip(&weighted) {
+            *slot = acc / total;
         }
-    }
-    for (slot, &acc) in out.iter_mut().zip(&weighted) {
-        *slot = acc / total;
+    } else {
+        // Longer contexts can carry a weighted sum past i64; i128 holds it
+        // for every position count a usize can index.
+        let mut weighted = vec![0i128; width];
+        for (position, &score) in scores.iter().enumerate() {
+            let weight = exp_q16(score - max_score);
+            if weight == 0 {
+                continue;
+            }
+            total += weight;
+            let base = position * cache.stride + cache.offset;
+            for (acc, &v) in weighted.iter_mut().zip(&cache.values[base..base + width]) {
+                *acc += i128::from(weight * i64::from(v));
+            }
+        }
+        for (slot, &acc) in out.iter_mut().zip(&weighted) {
+            // A weighted mean of values in i32, so the quotient fits.
+            *slot = (acc / i128::from(total)) as i64;
+        }
     }
     Ok(())
 }
+
+/// Most attended positions whose weighted value sums fit i64: each term is
+/// `weight * v` with `0 < weight <= 2^16` and `v` an i32, so `2^16` terms
+/// stay inside `[-2^63, 2^63)`. Beyond it [`attention_head`] sums in i128.
+pub const MAX_I64_WEIGHTED_POSITIONS: usize = 1 << 16;
 
 /// `sigma(g)` in Q16 (spec §5.7).
 #[inline]
@@ -412,21 +469,32 @@ pub fn argmax(values: &[i64]) -> usize {
 
 /// Select the next token from `logits` given the tokens generated so far.
 pub fn select(logits: &[i64], generated: &[u32], selection: Selection) -> Result<u32, ModernError> {
+    select_into(logits, generated, selection, &mut Vec::new())
+}
+
+/// [`select`] with a reusable buffer for the penalised copy of the logits.
+pub fn select_into(
+    logits: &[i64],
+    generated: &[u32],
+    selection: Selection,
+    scratch: &mut Vec<i64>,
+) -> Result<u32, ModernError> {
     if logits.is_empty() {
         return Err(ModernError::Invalid("empty logits".into()));
     }
     let index = match selection {
         Selection::Argmax => argmax(logits),
         Selection::Rp64Argmax => {
-            let mut penalised = logits.to_vec();
+            scratch.clear();
+            scratch.extend_from_slice(logits);
             for &token in generated.iter().rev().take(64) {
-                if let Some(value) = penalised.get_mut(token as usize) {
+                if let Some(value) = scratch.get_mut(token as usize) {
                     let wide = i128::from(*value);
                     let next = if wide > 0 { wide * 5 / 6 } else { wide * 6 / 5 };
                     *value = to_activation(next, "repetition penalty beyond 2^62")?;
                 }
             }
-            argmax(&penalised)
+            argmax(scratch)
         }
     };
     u32::try_from(index).map_err(|_| ModernError::Invalid("vocabulary beyond u32".into()))
@@ -434,8 +502,30 @@ pub fn select(logits: &[i64], generated: &[u32], selection: Selection) -> Result
 
 /// BLAKE3 of logits as little-endian i64 (spec §6.3).
 pub fn logits_hash(logits: &[i64]) -> [u8; 32] {
-    let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
-    *blake3::hash(&bytes).as_bytes()
+    let mut hasher = blake3::Hasher::new();
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: i64 has no padding and every bit pattern is a valid u8
+        // sequence; on a little-endian target its in-memory bytes are exactly
+        // its little-endian encoding, so this hashes the same bytes as the
+        // portable branch without copying them.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(logits.as_ptr().cast::<u8>(), std::mem::size_of_val(logits))
+        };
+        // BLAKE3 is a tree hash: the multithreaded update gives the same
+        // digest as the serial one. It only pays off for large inputs.
+        if bytes.len() >= 1 << 17 {
+            hasher.update_rayon(bytes);
+        } else {
+            hasher.update(bytes);
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
+    for chunk in logits.chunks(4096) {
+        let bytes: Vec<u8> = chunk.iter().flat_map(|v| v.to_le_bytes()).collect();
+        hasher.update(&bytes);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// BLAKE3 of the concatenated per-position logits hashes (spec §6.3).
@@ -619,6 +709,45 @@ mod tests {
         assert!((gated_silu(g, u).unwrap() + 374_550).abs() < 40);
         let g = -3 * ONE;
         assert!(sigmoid_q16(g) > 0 && sigmoid_q16(g) < ONE / 10);
+    }
+
+    #[test]
+    fn logits_hash_is_the_hash_of_the_little_endian_bytes() {
+        for len in [0usize, 1, 5, 20_000, 131_073] {
+            let logits: Vec<i64> = (0..len)
+                .map(|i| (i as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64))
+                .collect();
+            let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert_eq!(logits_hash(&logits), *blake3::hash(&bytes).as_bytes());
+        }
+    }
+
+    #[test]
+    fn buffer_variants_match_the_allocating_operators() {
+        let x = [ONE, -2 * ONE, 3 * ONE, 7];
+        let gain = [ONE, ONE, 2 * ONE, ONE + 5];
+        let mut out = [0i64; 4];
+        rms_norm_into(&x, &gain, 4295, &mut out).unwrap();
+        assert_eq!(out.to_vec(), rms_norm(&x, &gain, 4295).unwrap());
+        assert!(rms_norm_into(&x, &gain, 4295, &mut [0i64; 3]).is_err());
+        let m = matrix(2, 2, vec![2, -3, 0, 1], 1 << 30, 40);
+        let mut row = [0i64; 2];
+        embed_row_into(&m, 0, &mut row).unwrap();
+        assert_eq!(row.to_vec(), embed_row(&m, 0).unwrap());
+        assert!(embed_row_into(&m, 2, &mut row).is_err());
+        let logits = [5, 9, 9, -4];
+        let mut scratch = Vec::new();
+        let cases: [(&[u32], Selection); 3] = [
+            (&[], Selection::Argmax),
+            (&[1], Selection::Rp64Argmax),
+            (&[1, 1, 2], Selection::Rp64Argmax),
+        ];
+        for (generated, selection) in cases {
+            assert_eq!(
+                select_into(&logits, generated, selection, &mut scratch).unwrap(),
+                select(&logits, generated, selection).unwrap()
+            );
+        }
     }
 
     #[test]

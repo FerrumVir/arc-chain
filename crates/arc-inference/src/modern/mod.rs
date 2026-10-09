@@ -11,13 +11,23 @@
 //! * [`package`]: the `arc.integer-package.v1` file format and its manifest;
 //! * [`model`]: the integer forward pass (GQA, NoPE layers, tied INT8
 //!   embedding, i32 KV cache) and generation;
+//! * [`engine`]: the fast forward pass (fused projections, SIMD attention,
+//!   no per-token allocation) computing the same function, and the
+//!   engine/kernel specs used on the command line and in CI;
+//! * [`kernels`]: the exact INT8 x i64 GEMV kernels (scalar, AVX2, NEON) with
+//!   forced dispatch, reusable by fused and mixture-of-experts projections;
+//! * [`bench`]: decode speed, thread scaling, phase profile, kernel
+//!   throughput and read bandwidth, with a cross-kernel digest check;
 //! * [`arith`] and [`tables`]: the operators and their exact tables;
 //! * [`bpe`] and [`chat`]: the byte-level BPE tokenizer and the chat prompt.
 
 pub mod arith;
+pub mod bench;
 pub mod bpe;
 pub mod chat;
 pub mod convert;
+pub mod engine;
+pub mod kernels;
 pub mod model;
 pub mod package;
 pub mod safetensors;
