@@ -601,6 +601,11 @@ struct Cli {
     /// Defaults to on for aarch64, off elsewhere. Pass the flag to force it.
     #[arg(long, default_value_t = false)]
     enable_i16: bool,
+
+    /// Capacity-aware inference pricing v0: advisory quotes, off by default.
+    /// See docs/inference-pricing.md.
+    #[command(flatten)]
+    inference_pricing: arc_node::inference_pricing::PricingArgs,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -9983,6 +9988,7 @@ async fn run_arc_node() -> Result<()> {
         compute_threads,
         genesis_chain_identity,
         cli.enable_community_rewards_v1,
+        cli.inference_pricing.to_config(),
         native_serving,
         native_request_admission,
         Some(shutdown_rx),
@@ -11145,6 +11151,7 @@ mod tests {
                     0,
                     None,
                     false,
+                    arc_node::inference_pricing::PricingConfig::default(),
                     None,
                     Arc::new(arc_node::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
