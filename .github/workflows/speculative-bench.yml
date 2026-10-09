@@ -2,7 +2,10 @@ name: Speculative decoding bench
 
 # CI measurement of lossless speculative decoding on the live network model
 # (Llama-2-7B-Chat Q4_K_M, pinned by SHA-256, loaded as the canonical INT8
-# legacy split-half profile exactly as `--full-integer-worker` loads it).
+# legacy split-half profile exactly as `--full-integer-worker` loads it). One
+# more leg loads the versioned GGUF interleaved-RoPE profile for both models,
+# whose answers are coherent, to measure the drafters on predictable text; the
+# live network does not run that profile.
 #
 # Every leg is also an exactness gate on the real 7B model: each speculative
 # run must return the same tokens and output hash as plain decoding, and the
@@ -46,19 +49,21 @@ env:
 
 jobs:
   bench:
-    name: 7B bench / ${{ matrix.runner }} / ${{ matrix.kernel }}
+    name: 7B bench / ${{ matrix.runner }} / ${{ matrix.kernel }} / ${{ matrix.profile }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {runner: ubuntu-24.04, kernel: simd}
-          - {runner: ubuntu-24.04, kernel: scalar}
-          - {runner: ubuntu-24.04-arm, kernel: simd}
+          - {runner: ubuntu-24.04, kernel: simd, profile: legacy}
+          - {runner: ubuntu-24.04, kernel: scalar, profile: legacy}
+          - {runner: ubuntu-24.04-arm, kernel: simd, profile: legacy}
+          - {runner: ubuntu-24.04-arm, kernel: simd, profile: interleaved}
     env:
       RUNNER_LABEL: ${{ matrix.runner }}
       KERNEL: ${{ matrix.kernel }}
+      PROFILE: ${{ matrix.profile }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,7 +75,7 @@ jobs:
           out="$RUNNER_TEMP/speculative-bench"
           mkdir -p "$out"
           {
-            echo "leg: $RUNNER_LABEL / $KERNEL"
+            echo "leg: $RUNNER_LABEL / $KERNEL / $PROFILE"
             echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
             lscpu
             free -b
@@ -122,13 +127,14 @@ jobs:
             --model "$GITHUB_WORKSPACE/$MODEL_FILE" \
             --draft-model "$GITHUB_WORKSPACE/$DRAFT_FILE" \
             --kernel "$KERNEL" \
+            --profile "$PROFILE" \
             --max-new-tokens "$MAX_NEW_TOKENS" \
             --configs "$CONFIGS" \
             --out "$out/result.json" \
             --summary "$out/summary.md" 2>&1 | tee "$out/bench.log" || status=$?
           if [ -f "$out/summary.md" ]; then
             {
-              echo "Runner: $RUNNER_LABEL ($(nproc) vCPU)."
+              echo "Runner: $RUNNER_LABEL ($(nproc) vCPU), $PROFILE profile."
               echo
               cat "$out/summary.md"
             } >> "$GITHUB_STEP_SUMMARY"
@@ -149,7 +155,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: speculative-bench-${{ matrix.runner }}-${{ matrix.kernel }}
+          name: speculative-bench-${{ matrix.runner }}-${{ matrix.kernel }}-${{ matrix.profile }}
           path: ${{ runner.temp }}/speculative-bench/
           if-no-files-found: error
           retention-days: 30

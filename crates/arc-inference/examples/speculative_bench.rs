@@ -1,11 +1,12 @@
 //! Speculative decoding on the real network model: exactness first, then
 //! speed. CI runs this on 4-vCPU runners (`.github/workflows/speculative-bench.yml`).
 //!
-//! The target is loaded exactly as a community worker loads it
+//! By default the target is loaded exactly as a community worker loads it
 //! (`load_cached_model_canonical_i8`, the legacy split-half canonical INT8
-//! profile) and every job uses the worker's contract (`try_generate`,
-//! legacy v1, with the model's EOS tokens). For each public prompt the driver
-//! runs:
+//! profile). `--profile interleaved` loads the versioned GGUF interleaved-RoPE
+//! profile instead, for both models, to measure the drafters on coherent text.
+//! Every job uses the worker's contract (`try_generate`, legacy v1, with the
+//! model's EOS tokens). For each public prompt the driver runs:
 //!
 //! * `none`: the speculative engine with no drafter, which forwards exactly
 //!   the rows plain decoding forwards and is the timing baseline;
@@ -18,11 +19,13 @@
 //! one row, which is what decides whether speculation can pay at all.
 //!
 //! usage: speculative_bench --model GGUF [--draft-model GGUF] [--kernel scalar|simd]
+//!        [--profile legacy|interleaved]
 //!        [--max-new-tokens N] [--configs ngram:3,ngram2:3,draft:3] [--prompt-limit N]
 //!        [--out FILE.json] [--summary FILE.md]
 
 use arc_inference::cached_integer_model::{
     CachedIntegerModel, KVCache, load_cached_model_canonical_i8,
+    load_cached_model_canonical_i8_interleaved_rope,
 };
 use arc_inference::canonical_simd;
 use arc_inference::speculative::{
@@ -66,6 +69,7 @@ struct Args {
     model: String,
     draft_model: Option<String>,
     kernel: String,
+    profile: String,
     max_new_tokens: u32,
     configs: Vec<(String, usize)>,
     prompt_limit: usize,
@@ -78,6 +82,7 @@ fn parse_args() -> Result<Args, String> {
         model: String::new(),
         draft_model: None,
         kernel: "scalar".into(),
+        profile: "legacy".into(),
         max_new_tokens: 64,
         configs: vec![("ngram".into(), 3), ("ngram".into(), 7)],
         prompt_limit: PROMPTS.len(),
@@ -91,6 +96,7 @@ fn parse_args() -> Result<Args, String> {
             "--model" => args.model = value()?,
             "--draft-model" => args.draft_model = Some(value()?),
             "--kernel" => args.kernel = value()?,
+            "--profile" => args.profile = value()?,
             "--max-new-tokens" => {
                 args.max_new_tokens = value()?.parse().map_err(|e| format!("{e}"))?;
             }
@@ -121,7 +127,20 @@ fn parse_args() -> Result<Args, String> {
     if args.kernel != "scalar" && args.kernel != "simd" {
         return Err("--kernel must be scalar or simd".into());
     }
+    if args.profile != "legacy" && args.profile != "interleaved" {
+        return Err("--profile must be legacy or interleaved".into());
+    }
     Ok(args)
+}
+
+/// Load a GGUF in the canonical INT8 profile the run asked for.
+fn load_model(path: &str, interleaved: bool) -> Result<CachedIntegerModel, String> {
+    let loaded = if interleaved {
+        load_cached_model_canonical_i8_interleaved_rope(path)
+    } else {
+        load_cached_model_canonical_i8(path)
+    };
+    loaded.map_err(|e| format!("load {path}: {e}"))
 }
 
 fn seconds(nanos: u64) -> f64 {
@@ -222,8 +241,9 @@ fn main() -> Result<(), String> {
     }
     canonical_simd::set_fast_canonical_kernel(simd);
 
+    let interleaved = args.profile == "interleaved";
     let load_started = Instant::now();
-    let model = load_cached_model_canonical_i8(&args.model).map_err(|e| e.to_string())?;
+    let model = load_model(&args.model, interleaved)?;
     let load_s = load_started.elapsed().as_secs_f64();
     if !model.has_canonical_i8_profile() || !model.has_all_transformer_layers() {
         return Err("the target did not load as a complete canonical INT8 model".into());
@@ -243,7 +263,7 @@ fn main() -> Result<(), String> {
         None => None,
         Some(path) => {
             let draft_started = Instant::now();
-            let draft = load_cached_model_canonical_i8(path).map_err(|e| e.to_string())?;
+            let draft = load_model(path, interleaved)?;
             let compatible = check_draft_compatible(&model, &draft);
             draft_report = json!({
                 "path": path,
