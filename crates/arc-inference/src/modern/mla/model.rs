@@ -647,8 +647,8 @@ impl StageModel {
     }
 
     /// The heads of INT16 layer `w` (stage layer `local`) on the GPU. First
-    /// the whole layer with its attention (`super::metal_i16::try_attend`,
-    /// with the device copy of the cache in `mirror`); if that is off or
+    /// every head with its attention (`super::metal_i16::try_attend`, with
+    /// the device copy of the cache in `mirror`); if that is off or
     /// declines, one exact Metal GEMV batch (`super::metal_i16::try_heads`):
     /// every head's `wk_b` projection, then for every head the RoPE and
     /// absorbed attention of the per-head loop in `layer_forward` on the CPU,
@@ -2699,8 +2699,9 @@ pub(crate) mod tests {
                     delta.attend_outside_scope,
                     delta.heads_attempted,
                     delta.attend_kv_rows_uploaded,
+                    delta.attend_kv_resets,
                 ),
-                (layers * forwards, 0, 0, 0, layers * forwards),
+                (layers * forwards, 0, 0, 0, layers * forwards, 0),
                 "{name}: {delta:?}"
             );
             assert_eq!(delta.accepted, others * forwards, "{name}: {delta:?}");
@@ -2762,9 +2763,10 @@ pub(crate) mod tests {
                     delta.attend_accepted,
                     delta.attend_declined,
                     delta.attend_outside_scope,
-                    delta.attend_kv_rows_uploaded
+                    delta.attend_kv_rows_uploaded,
+                    delta.attend_kv_resets
                 ),
-                (layers * steps, 0, layers * steps, layers * steps),
+                (layers * steps, 0, layers * steps, layers * steps, 0),
                 "{name}: {delta:?}"
             );
             let mut copy = gpu.clone();

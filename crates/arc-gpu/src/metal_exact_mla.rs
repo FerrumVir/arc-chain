@@ -14,8 +14,10 @@
 //! 3. every head's `wv_b` projection of the attention output, then its
 //!    epilogue.
 //!
-//! The whole layer is encoded in one command buffer: one commit and one wait,
-//! with no host step between the projections. The caller supplies each head's
+//! Every head of the layer, attention included, is encoded in one command
+//! buffer: one commit and one wait, with no host step between the projections.
+//! The rest of the layer (its query, KV-A and output projections, the cache
+//! row, the FFN) is not part of it. The caller supplies each head's
 //! rotated RoPE query (the CPU's own `rope_interleaved`, computed before the
 //! layer is encoded) and keeps the device's copy of the latent cache, a
 //! [`DeviceLatentCache`], in step with its own.
@@ -35,6 +37,25 @@
 //! returns the CPU's own error. No floating point, division or modulo
 //! appears in the kernels (`mla_source_is_integer_only` checks).
 //!
+//! # Device memory
+//!
+//! The cache copies and the scratch buffers of one engine draw on a single
+//! device-memory budget ([`MetalExactMla::set_device_budget`]; by default a
+//! quarter of the device's recommended working set). A reservation that would
+//! exceed it is refused ([`MlaRefusal::Memory`]) and the caller computes on the
+//! CPU, so a long context declines instead of exhausting memory. Every buffer
+//! is checked to have been allocated before it is written. The scratch that
+//! grows with the context is sized to the next power of two of the positions,
+//! so a decode reuses it from token to token.
+//!
+//! # The cache copy and the host cache
+//!
+//! [`MetalExactMla::sync`] copies only the rows a [`DeviceLatentCache`] does not
+//! hold yet: it relies on the host cache only appending. It also checks that
+//! assumption every time: if the host cache holds fewer rows than the copy, or
+//! the copy's last row no longer equals the host's, the copy starts over from
+//! the host cache, and the sync reports it.
+//!
 //! # Start-up self-test
 //!
 //! [`MetalExactMla::new`] compiles the kernels, then runs
@@ -44,10 +65,11 @@
 //! values at the i32 extremes, and each of the three refusals. An engine that
 //! differs from the reference on one integer is never returned.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use metal::{
-    Buffer, BufferRef, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState,
+    Buffer, BufferRef, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, DeviceRef,
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
 use objc::rc::autoreleasepool;
@@ -130,6 +152,9 @@ pub enum MlaRefusal {
     Status(u32),
     /// The command buffer did not complete.
     Device,
+    /// The device-memory budget would be exceeded, or a buffer could not be
+    /// allocated.
+    Memory,
 }
 
 impl From<Refusal> for MlaRefusal {
@@ -154,6 +179,9 @@ impl std::fmt::Display for MlaRefusal {
             MlaRefusal::Cache => f.write_str("the device cache does not hold the positions"),
             MlaRefusal::Status(bits) => write!(f, "the kernels refused (status {bits:#x})"),
             MlaRefusal::Device => f.write_str("GPU command buffer did not complete"),
+            MlaRefusal::Memory => {
+                f.write_str("the attention path's device-memory budget would be exceeded")
+            }
         }
     }
 }
@@ -181,6 +209,73 @@ pub struct MlaLayer<'a> {
     pub positions: usize,
 }
 
+/// The attention path's device memory: what its cache copies and scratch
+/// buffers hold, against a limit.
+#[derive(Debug)]
+struct DeviceBudget {
+    limit: AtomicU64,
+    used: AtomicU64,
+}
+
+impl DeviceBudget {
+    /// Hold `bytes` until the returned reservation drops, or `None` if that
+    /// would exceed the limit.
+    fn reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let next = used.checked_add(bytes)?;
+            if next > self.limit.load(Ordering::Acquire) {
+                return None;
+            }
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    return Some(Reservation {
+                        budget: Arc::clone(self),
+                        bytes,
+                    });
+                }
+                Err(actual) => used = actual,
+            }
+        }
+    }
+}
+
+/// Bytes held against the budget until dropped.
+#[derive(Debug)]
+struct Reservation {
+    budget: Arc<DeviceBudget>,
+    bytes: u64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// A shared-storage buffer of at least `bytes` bytes (16 at least), checked to
+/// have been allocated: Metal returns nil when it cannot.
+fn shared_buffer(device: &DeviceRef, bytes: usize) -> Result<Buffer, MlaRefusal> {
+    let buffer = device.new_buffer(bytes.max(16) as u64, MTLResourceOptions::StorageModeShared);
+    if buffer.contents().is_null() {
+        return Err(MlaRefusal::Memory);
+    }
+    Ok(buffer)
+}
+
+/// What one [`MetalExactMla::sync`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    /// Rows copied from the host cache.
+    pub copied: usize,
+    /// Whether the copy started over because the host cache had shrunk or its
+    /// last copied row had changed.
+    pub reset: bool,
+}
+
 /// The device's copy of one layer's latent cache: the first [`Self::rows`]
 /// positions of the caller's cache, `rank` latent values and `rope_dim` RoPE
 /// key values (i32) each. [`MetalExactMla::sync`] appends rows; rows already
@@ -193,6 +288,8 @@ pub struct DeviceLatentCache {
     rope_dim: usize,
     capacity: usize,
     rows: usize,
+    /// The buffers' bytes, held against the engine's budget.
+    _reservation: Option<Reservation>,
 }
 
 impl DeviceLatentCache {
@@ -306,6 +403,30 @@ struct Sizes {
 }
 
 impl Sizes {
+    /// The same sizes with room for the positions up to the next power of two,
+    /// so that a decode reuses its scratch from token to token.
+    fn with_slack(self) -> Sizes {
+        let positions = (self.scores / self.heads.max(1)).max(1);
+        Sizes {
+            scores: self.heads.max(1) * positions.next_power_of_two(),
+            ..self
+        }
+    }
+
+    /// Bytes of a scratch set of these sizes.
+    fn bytes(&self) -> usize {
+        self.digits_a
+            + 24 * self.key_rows
+            + 5 * self.key_rows
+            + 8 * self.rope
+            + 8 * self.scores * 2
+            + 8 * self.heads
+            + self.digits_b
+            + 16 * self.value_rows
+            + 5 * self.value_rows
+            + 4
+    }
+
     fn covers(&self, other: &Sizes) -> bool {
         self.digits_a >= other.digits_a
             && self.key_rows >= other.key_rows
@@ -350,6 +471,8 @@ struct MlaScratch {
     value_k: Buffer,
     out: Buffer,
     status: Buffer,
+    /// The buffers' bytes, held against the engine's budget.
+    _reservation: Reservation,
 }
 
 /// Copy `values` to the start of a shared buffer.
@@ -395,6 +518,7 @@ pub struct MetalExactMla {
     table: Vec<i64>,
     exp_table: Buffer,
     scratch: Mutex<Vec<MlaScratch>>,
+    budget: Arc<DeviceBudget>,
     report: SelfTestReport,
 }
 
@@ -429,8 +553,8 @@ impl MetalExactMla {
             let scores = pipeline("mla_scores")?;
             let softmax = pipeline("mla_softmax")?;
             let weighted = pipeline("mla_weighted")?;
-            let bytes = std::mem::size_of_val(exp_table) as u64;
-            let table_buffer = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+            let table_buffer = shared_buffer(device, std::mem::size_of_val(exp_table))
+                .map_err(|refusal| format!("the exp table: {refusal}"))?;
             // SAFETY: a new shared buffer of exactly the table's size that no
             // command buffer references yet.
             unsafe { write(&table_buffer, exp_table) };
@@ -443,6 +567,10 @@ impl MetalExactMla {
                 table: exp_table.to_vec(),
                 exp_table: table_buffer,
                 scratch: Mutex::new(Vec::new()),
+                budget: Arc::new(DeviceBudget {
+                    limit: AtomicU64::new(device.recommended_max_working_set_size() / 4),
+                    used: AtomicU64::new(0),
+                }),
                 report: SelfTestReport::default(),
             })
         })?;
@@ -460,6 +588,23 @@ impl MetalExactMla {
         self.report
     }
 
+    /// The device-memory budget of the cache copies and scratch buffers, in
+    /// bytes (by default a quarter of the device's recommended working set).
+    pub fn device_budget(&self) -> u64 {
+        self.budget.limit.load(Ordering::Acquire)
+    }
+
+    /// Set the device-memory budget. Memory already held stays held; new
+    /// reservations beyond the budget are refused.
+    pub fn set_device_budget(&self, bytes: u64) {
+        self.budget.limit.store(bytes, Ordering::Release);
+    }
+
+    /// Device bytes the cache copies and scratch buffers hold now.
+    pub fn device_bytes_in_use(&self) -> u64 {
+        self.budget.used.load(Ordering::Acquire)
+    }
+
     /// An empty device cache for one layer.
     pub fn new_cache(&self, rank: usize, rope_dim: usize) -> DeviceLatentCache {
         let device = self.engine.device();
@@ -470,24 +615,27 @@ impl MetalExactMla {
             rope_dim,
             capacity: 0,
             rows: 0,
+            _reservation: None,
         }
     }
 
     /// Bring `cache` to `positions` rows of `latent` and `rope_keys`
-    /// (row-major, `rank` and `rope_dim` values a row) and return the rows
-    /// copied from them. Rows the device already holds are kept as they are,
-    /// so `latent` and `rope_keys` must be the same append-only cache every
-    /// time. A full copy grows to at least twice its capacity, moving its
-    /// rows on the device side, so each call copies only the new rows.
+    /// (row-major, `rank` and `rope_dim` values a row). Rows the device already
+    /// holds are not copied again, because the host cache only appends; that
+    /// is checked first: if the host holds fewer rows than the copy, or the
+    /// copy's last row differs from the host's, the copy starts over. A copy
+    /// grows to at least twice its capacity, within the device-memory budget,
+    /// moving its rows on the device side.
     pub fn sync(
         &self,
         cache: &mut DeviceLatentCache,
         latent: &[i32],
         rope_keys: &[i32],
         positions: usize,
-    ) -> Result<usize, MlaRefusal> {
+    ) -> Result<SyncReport, MlaRefusal> {
         let (rank, rope_dim) = (cache.rank, cache.rope_dim);
-        if positions > MAX_POSITIONS
+        if rank == 0
+            || positions > MAX_POSITIONS
             || positions.checked_mul(rank).is_none_or(|n| latent.len() < n)
             || positions
                 .checked_mul(rope_dim)
@@ -495,8 +643,45 @@ impl MetalExactMla {
         {
             return Err(MlaRefusal::Cache);
         }
+        let mut report = SyncReport::default();
+        // The append-only check (see the module documentation).
+        if cache.rows > 0 {
+            let host_rows = if rope_dim == 0 {
+                latent.len() / rank
+            } else {
+                (latent.len() / rank).min(rope_keys.len() / rope_dim)
+            };
+            let last = cache.rows - 1;
+            let changed = host_rows < cache.rows || {
+                // SAFETY: shared buffers of `capacity >= rows` rows; `&mut
+                // cache` excludes every other use, and `layer` waits for its
+                // command buffer before returning, so no GPU work writes them.
+                let (device_latent, device_keys) = unsafe {
+                    (
+                        std::slice::from_raw_parts(
+                            cache.latent.contents().cast::<i32>().add(last * rank),
+                            rank,
+                        ),
+                        std::slice::from_raw_parts(
+                            cache
+                                .rope_keys
+                                .contents()
+                                .cast::<i32>()
+                                .add(last * rope_dim),
+                            rope_dim,
+                        ),
+                    )
+                };
+                *device_latent != latent[last * rank..(last + 1) * rank]
+                    || *device_keys != rope_keys[last * rope_dim..(last + 1) * rope_dim]
+            };
+            if changed {
+                cache.rows = 0;
+                report.reset = true;
+            }
+        }
         if positions <= cache.rows {
-            return Ok(0);
+            return Ok(report);
         }
         if positions > cache.capacity {
             // positions <= MAX_POSITIONS (checked above) and MIN_CACHE_ROWS is
@@ -509,20 +694,22 @@ impl MetalExactMla {
                     .checked_mul(width)
                     .and_then(|n| n.checked_mul(4))
                     .filter(|&b| b as u64 <= max)
-                    .map(|b| b.max(16) as u64)
             };
             let (Some(latent_bytes), Some(rope_bytes)) = (bytes(rank), bytes(rope_dim)) else {
                 return Err(MlaRefusal::Cache);
             };
+            // The new buffers are reserved before they exist and while the old
+            // ones are still held, which is the peak of a growth.
+            let reservation = self
+                .budget
+                .reserve((latent_bytes.max(16) + rope_bytes.max(16)) as u64)
+                .ok_or(MlaRefusal::Memory)?;
             let device = self.engine.device();
-            let grown_latent =
-                device.new_buffer(latent_bytes, MTLResourceOptions::StorageModeShared);
-            let grown_keys = device.new_buffer(rope_bytes, MTLResourceOptions::StorageModeShared);
+            let grown_latent = shared_buffer(device, latent_bytes)?;
+            let grown_keys = shared_buffer(device, rope_bytes)?;
             // SAFETY: the old buffers hold `rows` rows and the new ones at
-            // least as many; they are distinct allocations. `layer` waits
-            // until its command buffer has finished before it returns, and
-            // `&mut cache` excludes every other use, so no GPU work touches
-            // either.
+            // least as many; they are distinct allocations, and no GPU work
+            // touches either (as above).
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     cache.latent.contents().cast::<i32>(),
@@ -538,6 +725,7 @@ impl MetalExactMla {
             cache.latent = grown_latent;
             cache.rope_keys = grown_keys;
             cache.capacity = capacity;
+            cache._reservation = Some(reservation);
         }
         let first = cache.rows;
         // SAFETY: shared buffers of `capacity >= positions` rows, unused by
@@ -556,7 +744,8 @@ impl MetalExactMla {
                 .copy_from_slice(&rope_keys[first * rope_dim..positions * rope_dim]);
         }
         cache.rows = positions;
-        Ok(positions - first)
+        report.copied = positions - first;
+        Ok(report)
     }
 
     /// The conditions every bound of the kernels assumes, and the CPU
@@ -651,40 +840,59 @@ impl MetalExactMla {
         })
     }
 
-    fn new_scratch(&self, sizes: Sizes) -> MlaScratch {
+    /// A scratch set of `sizes`, its bytes reserved against the budget first.
+    fn new_scratch(&self, sizes: Sizes) -> Result<MlaScratch, MlaRefusal> {
+        let reservation = self
+            .budget
+            .reserve(sizes.bytes() as u64 + 16 * 16)
+            .ok_or(MlaRefusal::Memory)?;
         let device = self.engine.device();
-        let buffer = |bytes: usize| {
-            device.new_buffer(bytes.max(16) as u64, MTLResourceOptions::StorageModeShared)
-        };
-        MlaScratch {
+        let buffer = |bytes: usize| shared_buffer(device, bytes);
+        Ok(MlaScratch {
             sizes,
-            digits_a: buffer(sizes.digits_a),
-            dots_a: buffer(8 * sizes.key_rows),
-            key_mu: buffer(4 * sizes.key_rows),
-            key_k: buffer(sizes.key_rows),
-            qa: buffer(8 * sizes.key_rows),
-            qp: buffer(8 * sizes.rope),
-            scores: buffer(8 * sizes.scores),
-            weights: buffer(8 * sizes.scores),
-            totals: buffer(8 * sizes.heads),
-            u: buffer(8 * sizes.key_rows),
-            digits_b: buffer(sizes.digits_b),
-            dots_b: buffer(8 * sizes.value_rows),
-            value_mu: buffer(4 * sizes.value_rows),
-            value_k: buffer(sizes.value_rows),
-            out: buffer(8 * sizes.value_rows),
-            status: buffer(4),
-        }
+            digits_a: buffer(sizes.digits_a)?,
+            dots_a: buffer(8 * sizes.key_rows)?,
+            key_mu: buffer(4 * sizes.key_rows)?,
+            key_k: buffer(sizes.key_rows)?,
+            qa: buffer(8 * sizes.key_rows)?,
+            qp: buffer(8 * sizes.rope)?,
+            scores: buffer(8 * sizes.scores)?,
+            weights: buffer(8 * sizes.scores)?,
+            totals: buffer(8 * sizes.heads)?,
+            u: buffer(8 * sizes.key_rows)?,
+            digits_b: buffer(sizes.digits_b)?,
+            dots_b: buffer(8 * sizes.value_rows)?,
+            value_mu: buffer(4 * sizes.value_rows)?,
+            value_k: buffer(sizes.value_rows)?,
+            out: buffer(8 * sizes.value_rows)?,
+            status: buffer(4)?,
+            _reservation: reservation,
+        })
     }
 
-    fn take_scratch(&self, sizes: Sizes) -> MlaScratch {
+    /// Pooled scratch that covers `sizes`, or a new set with slack for the
+    /// positions. If the budget refuses a new set, the pool is emptied (its
+    /// sets are released) and the set tried once more.
+    fn take_scratch(&self, sizes: Sizes) -> Result<MlaScratch, MlaRefusal> {
         let reused = {
             let mut pool = self.scratch.lock().unwrap_or_else(PoisonError::into_inner);
             pool.iter()
                 .position(|s| s.sizes.covers(&sizes))
                 .map(|index| pool.swap_remove(index))
         };
-        reused.unwrap_or_else(|| self.new_scratch(sizes))
+        if let Some(scratch) = reused {
+            return Ok(scratch);
+        }
+        match self.new_scratch(sizes.with_slack()) {
+            Err(MlaRefusal::Memory) => {
+                self.scratch
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clear();
+                self.new_scratch(sizes.with_slack())
+            }
+            other => other,
+        }
     }
 
     fn return_scratch(&self, scratch: MlaScratch) {
@@ -760,8 +968,8 @@ impl MetalExactMla {
             .max(1)
     }
 
-    /// The whole layer, in order, on one serial compute encoder: each dispatch
-    /// completes before the next starts and sees its writes.
+    /// Every head's work, in order, on one serial compute encoder: each
+    /// dispatch completes before the next starts and sees its writes.
     #[allow(clippy::too_many_arguments)]
     fn encode(
         &self,
@@ -908,7 +1116,7 @@ impl MetalExactMla {
         let tile = self.engine.tile();
         let d = self.check(job, cache, out.len(), tile)?;
         autoreleasepool(|| {
-            let s = self.take_scratch(d.sizes);
+            let s = self.take_scratch(d.sizes)?;
             let mut completed = true;
             let outcome = (|| -> Result<(), MlaRefusal> {
                 let planes_a = self.prepare(&s, job)?;
@@ -965,7 +1173,7 @@ impl MetalExactMla {
         let out_len = job.value.heads.saturating_mul(job.value.rows);
         let d = self.check(job, cache, out_len, tile)?;
         autoreleasepool(|| {
-            let s = self.take_scratch(d.sizes);
+            let s = self.take_scratch(d.sizes)?;
             let outcome = (|| -> Result<f64, MlaRefusal> {
                 let planes_a = self.prepare(&s, job)?;
                 let pipeline_a = self.engine.heads_pipeline(planes_a, tile)?;
@@ -1476,6 +1684,105 @@ mod tests {
         assert_eq!(reference_exp(-(16 << 16), &table), 0);
         assert_eq!(reference_exp(-(16 << 16) + 1, &table), 0);
         assert_eq!(reference_exp(-1, &table), 16 * 4095 + ((16 * 255) >> 8));
+    }
+
+    /// The cache copy checks the host cache on every sync: a rewritten last
+    /// row, a shrink, and a truncate followed by different rows each make the
+    /// copy start over and end equal to the host. Growth and scratch beyond the
+    /// device-memory budget are refused with nothing written, and memory
+    /// released returns to the budget.
+    #[test]
+    fn mla_cache_copy_checks_the_host_and_keeps_to_the_budget() {
+        let engine = Arc::new(MetalExactI16::new().expect("Metal device"));
+        let table: Vec<i64> = (0..EXP_TABLE_LEN as i64).map(|i| (i * i) >> 8).collect();
+        let mla = MetalExactMla::new(engine, &table).expect("MLA attention self-test");
+        let (rank, rope_dim) = (16usize, 4usize);
+        let mut rng = SplitMix64(0x7417_B0D6);
+        let row = |rng: &mut SplitMix64, width: usize, limit: i64| -> Vec<i32> {
+            (0..width).map(|_| rng.symmetric(limit) as i32).collect()
+        };
+        let mut latent: Vec<i32> = (0..40).flat_map(|_| row(&mut rng, rank, 1 << 20)).collect();
+        let mut keys: Vec<i32> = (0..40)
+            .flat_map(|_| row(&mut rng, rope_dim, 1 << 14))
+            .collect();
+        let mut cache = mla.new_cache(rank, rope_dim);
+        let sync = |cache: &mut DeviceLatentCache, latent: &[i32], keys: &[i32], n: usize| {
+            mla.sync(cache, latent, keys, n)
+                .map(|report| (report.copied, report.reset))
+        };
+        assert_eq!(sync(&mut cache, &latent, &keys, 20), Ok((20, false)));
+        assert_eq!(sync(&mut cache, &latent, &keys, 30), Ok((10, false)));
+        assert_eq!(sync(&mut cache, &latent, &keys, 30), Ok((0, false)));
+        // The last copied row rewritten in place.
+        latent[29 * rank] ^= 1;
+        assert_eq!(sync(&mut cache, &latent, &keys, 30), Ok((30, true)));
+        assert_eq!(
+            cache.read(),
+            (latent[..30 * rank].to_vec(), keys[..30 * rope_dim].to_vec())
+        );
+        // The host shrinks below the copy.
+        latent.truncate(25 * rank);
+        keys.truncate(25 * rope_dim);
+        assert_eq!(sync(&mut cache, &latent, &keys, 25), Ok((25, true)));
+        // A truncate, then different rows appended past the copy's length.
+        latent.truncate(20 * rank);
+        keys.truncate(20 * rope_dim);
+        for _ in 0..12 {
+            latent.extend(row(&mut rng, rank, 1 << 20));
+            keys.extend(row(&mut rng, rope_dim, 1 << 14));
+        }
+        assert_eq!(sync(&mut cache, &latent, &keys, 32), Ok((32, true)));
+        assert_eq!(
+            cache.read(),
+            (latent[..32 * rank].to_vec(), keys[..32 * rope_dim].to_vec())
+        );
+        // The budget: a growth beyond it is refused and leaves the copy as it
+        // was; within it, the copy grows; dropped, its memory returns.
+        let held = mla.device_bytes_in_use();
+        let rows = 4096usize;
+        let big_latent = vec![7i32; rows * rank];
+        let big_keys = vec![-7i32; rows * rope_dim];
+        let mut big = mla.new_cache(rank, rope_dim);
+        mla.set_device_budget(held + 1024);
+        assert_eq!(
+            sync(&mut big, &big_latent, &big_keys, rows),
+            Err(MlaRefusal::Memory)
+        );
+        assert_eq!((big.rows(), big.capacity()), (0, 0));
+        mla.set_device_budget(u64::MAX);
+        assert_eq!(
+            sync(&mut big, &big_latent, &big_keys, rows),
+            Ok((rows, false))
+        );
+        assert!(mla.device_bytes_in_use() > held);
+        drop(big);
+        assert_eq!(mla.device_bytes_in_use(), held);
+        // Scratch for a longer context than any pooled set, beyond the budget:
+        // refused before anything runs, and the output is untouched.
+        let layer = TestLayer::random(&mut rng, [2, 16, 8, 4, 8], 3_000, 46, 1 << 20);
+        let storage = crate::metal_exact::Storage::Shared;
+        let key = mla
+            .engine
+            .upload(&le_bytes(&layer.wk), 2 * 16, 8, storage)
+            .expect("upload");
+        let value = mla
+            .engine
+            .upload(&le_bytes(&layer.wv), 2 * 8, 16, storage)
+            .expect("upload");
+        let mut long = mla.new_cache(16, 4);
+        assert!(sync(&mut long, &layer.latent, &layer.rope_keys, layer.positions).is_ok());
+        let job = layer.job(&key, &value);
+        let mut out = vec![0x7E57i64; 2 * 8];
+        mla.set_device_budget(mla.device_bytes_in_use());
+        assert_eq!(
+            mla.layer(&job, &long, &mut out, None),
+            Err(MlaRefusal::Memory)
+        );
+        assert!(out.iter().all(|&v| v == 0x7E57));
+        mla.set_device_budget(u64::MAX);
+        let want = reference_layer(&layer, &table).expect("in domain");
+        assert_eq!(mla.layer(&job, &long, &mut out, None), Ok(()));
+        assert_eq!(out, want.out);
     }
 
     #[test]

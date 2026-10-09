@@ -69,12 +69,20 @@
 //! with no host step between them ([`arc_gpu::metal_exact_mla`], which holds
 //! the kernels and the proof of their bounds). The RoPE of each head's query
 //! is the CPU's own `rope_interleaved`, computed before the layer is encoded.
-//! The device keeps a copy of the latent cache ([`KvMirror`], inside the
-//! [`super::model::StageCache`] it copies): the cache only appends, so each
-//! layer copies only the rows added since its previous call. If the CPU would
-//! refuse anything in the layer, the GPU sets a status bit, the layer
-//! declines without writing, and the head batch or the per-head loop runs, so
-//! the caller gets the CPU's error.
+//! This covers a layer's heads only, both projections and the attention; the
+//! layer's query, KV-A and output projections, its cache row and its FFN run
+//! as before. The device keeps a copy of the latent cache ([`KvMirror`],
+//! inside the [`super::model::StageCache`] it copies): the cache only appends,
+//! so each layer copies only the rows added since its previous call, and every
+//! call checks that the host cache has not shrunk and that the copy's last row
+//! still equals the host's, starting the copy over if not (counted as
+//! `attend_kv_resets`). The copies and the GPU's scratch keep to a
+//! device-memory budget (by default a quarter of the device's recommended
+//! working set; `ARC_METAL_EXACT_I16_DEVICE_BUDGET_MB` overrides it), and a
+//! layer beyond it runs on the CPU (counted as `attend_over_budget`). If the
+//! CPU would refuse anything in the layer, the GPU sets a status bit, the
+//! layer declines without writing, and the head batch or the per-head loop
+//! runs, so the caller gets the CPU's error.
 //!
 //! Wiring any of this as a worker default is a separate, reviewed step.
 
@@ -127,6 +135,8 @@ static ATTEND_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static ATTEND_OUTSIDE_SCOPE: AtomicU64 = AtomicU64::new(0);
 static ATTEND_DECLINED: AtomicU64 = AtomicU64::new(0);
 static ATTEND_KV_ROWS: AtomicU64 = AtomicU64::new(0);
+static ATTEND_KV_RESETS: AtomicU64 = AtomicU64::new(0);
+static ATTEND_OVER_BUDGET: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// The residency scope active on this thread, set only by
@@ -212,10 +222,20 @@ pub fn metal_i16_engine() -> Result<Arc<MetalExactI16>, String> {
 }
 
 /// The process-wide attention engine on [`metal_i16_engine`]'s device, with
-/// the profile's exp table, created and self-tested on first use.
+/// the profile's exp table, created and self-tested on first use. Its
+/// device-memory budget is `ARC_METAL_EXACT_I16_DEVICE_BUDGET_MB` MiB if that
+/// is set, otherwise the engine's default.
 pub fn metal_mla_engine() -> Result<Arc<MetalExactMla>, String> {
     MLA.get_or_init(|| {
-        metal_i16_engine().and_then(|engine| MetalExactMla::new(engine, &EXP_TABLE).map(Arc::new))
+        let mla = metal_i16_engine()
+            .and_then(|engine| MetalExactMla::new(engine, &EXP_TABLE).map(Arc::new))?;
+        if let Some(mib) = std::env::var("ARC_METAL_EXACT_I16_DEVICE_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            mla.set_device_budget(mib.saturating_mul(1 << 20));
+        }
+        Ok(mla)
     })
     .clone()
 }
@@ -253,6 +273,11 @@ pub struct MetalI16Census {
     pub attend_declined: u64,
     /// Latent-cache rows copied to the device.
     pub attend_kv_rows_uploaded: u64,
+    /// Device copies started over because the host cache had shrunk or its
+    /// last copied row had changed (zero while the cache only appends).
+    pub attend_kv_resets: u64,
+    /// Layers declined because the device-memory budget would be exceeded.
+    pub attend_over_budget: u64,
 }
 
 impl MetalI16Census {
@@ -286,6 +311,8 @@ impl MetalI16Census {
             attend_outside_scope: self.attend_outside_scope - earlier.attend_outside_scope,
             attend_declined: self.attend_declined - earlier.attend_declined,
             attend_kv_rows_uploaded: self.attend_kv_rows_uploaded - earlier.attend_kv_rows_uploaded,
+            attend_kv_resets: self.attend_kv_resets - earlier.attend_kv_resets,
+            attend_over_budget: self.attend_over_budget - earlier.attend_over_budget,
         }
     }
 }
@@ -311,6 +338,8 @@ pub fn metal_i16_census() -> MetalI16Census {
         attend_outside_scope: ATTEND_OUTSIDE_SCOPE.load(Ordering::Relaxed),
         attend_declined: ATTEND_DECLINED.load(Ordering::Relaxed),
         attend_kv_rows_uploaded: ATTEND_KV_ROWS.load(Ordering::Relaxed),
+        attend_kv_resets: ATTEND_KV_RESETS.load(Ordering::Relaxed),
+        attend_over_budget: ATTEND_OVER_BUDGET.load(Ordering::Relaxed),
     }
 }
 
@@ -628,10 +657,12 @@ where
 ///
 /// The copy is exact because the cache only appends: `StageCache::push` is
 /// its only change, so the rows a layer's copy holds never change, and each
-/// attention call copies only the rows added since the previous one. A clone
-/// of the cache starts with an empty copy, whose rows are uploaded again on
-/// first use, so two caches never share one; a copy the GPU may still be
-/// using after a failed command buffer is dropped.
+/// attention call copies only the rows added since the previous one. Each
+/// call also checks that: a host cache with fewer rows than the copy, or one
+/// whose last copied row differs from the copy's, makes the copy start over.
+/// A clone of the cache starts with an empty copy, whose rows are uploaded
+/// again on first use, so two caches never share one; a copy the GPU may
+/// still be using after a failed command buffer is dropped.
 #[derive(Default)]
 pub struct KvMirror {
     layers: Vec<Option<DeviceLatentCache>>,
@@ -758,10 +789,18 @@ where
     }
     let copy = slot.get_or_insert_with(|| mla.new_cache(view.rank, view.rope_dim));
     match mla.sync(copy, view.latent, view.rope_keys, view.positions) {
-        Ok(rows) => {
-            ATTEND_KV_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+        Ok(report) => {
+            ATTEND_KV_ROWS.fetch_add(report.copied as u64, Ordering::Relaxed);
+            if report.reset {
+                count(&ATTEND_KV_RESETS);
+            }
         }
-        Err(_) => return decline(),
+        Err(refusal) => {
+            if refusal == MlaRefusal::Memory {
+                count(&ATTEND_OVER_BUDGET);
+            }
+            return decline();
+        }
     }
     let job = MlaLayer {
         key: HeadPhase {
@@ -791,9 +830,11 @@ where
             true
         }
         Err(refusal) => {
-            if refusal == MlaRefusal::Device {
+            match refusal {
                 // The GPU may still hold the copy's buffers: start over.
-                *mirror.slot(index) = None;
+                MlaRefusal::Device => *mirror.slot(index) = None,
+                MlaRefusal::Memory => count(&ATTEND_OVER_BUDGET),
+                _ => {}
             }
             decline()
         }
@@ -1972,9 +2013,10 @@ mod tests {
                 delta.attend_accepted,
                 delta.attend_declined,
                 delta.attend_kv_rows_uploaded,
+                delta.attend_kv_resets,
                 delta.accepted
             ),
-            (1, 0, layer.positions as u64, 0),
+            (1, 0, layer.positions as u64, 0, 0),
             "{what}: {delta:?}"
         );
         mirror
@@ -2025,7 +2067,11 @@ mod tests {
                     assert!(done, "{what}: declined: {delta:?}");
                     assert_same(&got, &want, &what);
                     assert_kv_copy(&mirror, &layer, &what);
-                    assert_eq!(delta.attend_kv_rows_uploaded, 1, "{what}: {delta:?}");
+                    assert_eq!(
+                        (delta.attend_kv_rows_uploaded, delta.attend_kv_resets),
+                        (1, 0),
+                        "{what}: {delta:?}"
+                    );
                 }
             }
             eprintln!("{what}: identical (output, qa, scores, u, device cache)");
@@ -2099,6 +2145,79 @@ mod tests {
         let want: Vec<i64> = edges.iter().map(|&v| i64::from(v)).collect();
         assert_eq!(scores[..edges.len()], want[..], "the scores are the edges");
         check_attention(&layer, "the exp table's edges");
+    }
+
+    /// The device copy checks the host cache on every call: after the cache's
+    /// last row is rewritten in place, or the cache shrinks, the next call
+    /// starts the copy over (counted once) and still equals the CPU loop; an
+    /// unchanged cache is not reset.
+    #[test]
+    fn metal_i16_attention_resets_a_device_copy_the_host_cache_no_longer_matches() {
+        let _guard = kernel_switch_guard();
+        let mut rng = Rng(0x7A1C_E5E7);
+        let mut layer = LayerHeads::new(&mut rng, 4, 16, 8, 4, 8, 12, 1 << 20);
+        let mut mirror = KvMirror::default();
+        let check = |layer: &LayerHeads, mirror: &mut KvMirror, resets: u64, what: &str| {
+            let want = layer.cpu(Schedule::Serial).expect("in domain");
+            let (done, got, _, delta) = layer.gpu_attend(mirror);
+            assert!(done, "{what}: declined: {delta:?}");
+            assert_same(&got, &want, what);
+            assert_kv_copy(mirror, layer, what);
+            assert_eq!(
+                (delta.attend_kv_resets, delta.attend_declined),
+                (resets, 0),
+                "{what}: {delta:?}"
+            );
+        };
+        check(&layer, &mut mirror, 0, "the first call");
+        let last = (layer.positions - 1) * layer.rank;
+        layer.latent[last] ^= 1;
+        check(&layer, &mut mirror, 1, "the last row rewritten in place");
+        layer.positions -= 2;
+        layer.latent.truncate(layer.positions * layer.rank);
+        layer.rope_keys.truncate(layer.positions * layer.rope_dim);
+        check(&layer, &mut mirror, 1, "the cache shrunk by two rows");
+        check(&layer, &mut mirror, 0, "the cache unchanged");
+    }
+
+    /// A layer whose device copy would exceed the device-memory budget
+    /// declines without writing (counted as over budget) and the CPU loop
+    /// computes it; within the budget the GPU computes it. The budget is
+    /// restored afterwards, even on a panic.
+    #[test]
+    fn metal_i16_attention_keeps_to_the_device_memory_budget() {
+        struct Restore(Arc<MetalExactMla>, u64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                self.0.set_device_budget(self.1);
+            }
+        }
+        let _guard = kernel_switch_guard();
+        let mla = metal_mla_engine().expect("exact MLA attention");
+        let _restore = Restore(Arc::clone(&mla), mla.device_budget());
+        eprintln!(
+            "device-memory budget {} bytes, {} in use",
+            mla.device_budget(),
+            mla.device_bytes_in_use()
+        );
+        let mut rng = Rng(0xB0D6_E7E5);
+        let layer = LayerHeads::new(&mut rng, 8, 64, 16, 8, 16, 2048, 1 << 20);
+        let want = layer.cpu(Schedule::Pool).expect("in domain");
+        let mut mirror = KvMirror::default();
+        mla.set_device_budget(mla.device_bytes_in_use());
+        let (done, got, _, delta) = layer.gpu_attend(&mut mirror);
+        assert!(!done, "beyond the budget");
+        assert!(got.iter().all(|&v| v == SENTINEL));
+        assert_eq!(
+            (delta.attend_declined, delta.attend_over_budget),
+            (1, 1),
+            "{delta:?}"
+        );
+        mla.set_device_budget(u64::MAX);
+        let (done, got, _, delta) = layer.gpu_attend(&mut mirror);
+        assert!(done, "within the budget: {delta:?}");
+        assert_same(&got, &want, "within the budget");
+        assert_eq!(delta.attend_over_budget, 0, "{delta:?}");
     }
 
     /// Head 0's key rows at k = 16 and the largest mu on all-positive
@@ -2591,8 +2710,8 @@ mod bench {
 
     /// Timed turns per path in the layer-heads benchmark.
     const ROUNDS: usize = 11;
-    /// CPU serial, CPU pool, the three head-batch submissions, and the whole
-    /// layer with attention on the GPU.
+    /// CPU serial, CPU pool, the three head-batch submissions, and the heads
+    /// with their attention on the GPU.
     const PATHS: usize = 6;
 
     /// One K2.6 layer's heads (64 heads, `wk_b` 512 x 128, `wv_b` 128 x
@@ -2600,7 +2719,7 @@ mod bench {
     /// them, as the CPU loop of `layer_forward` runs them (heads one after
     /// another, and in parallel as #174 runs them), against #183's GPU batch
     /// in each submission (attention on the CPU between the projections) and
-    /// the whole layer on the GPU (attention included, one command buffer),
+    /// the layer's heads on the GPU with their attention (one command buffer),
     /// at four cache lengths. Every timed output equals the serial CPU loop.
     /// Hosted-VM CI measurements.
     #[test]
@@ -2628,18 +2747,19 @@ mod bench {
              a cache of the given length. CPU columns run the per-head loop of `layer_forward` \
              on {threads} rayon threads. The next three run #183's `try_heads` (attention on \
              the CPU between the projections); one command buffer per layer is in use on this \
-             device: {}. \"GPU whole layer\" runs `try_attend`: both projections, their \
+             device: {}. \"GPU heads with attention\" runs `try_attend`: both projections, their \
              epilogues and the attention in one command buffer, the cache already on the \
              device (as in decoding, where each token adds one row). The last two columns are \
              GPU time from the command buffers' timestamps: the 128 projections alone, and \
-             the whole layer.\n\n",
+             the heads with attention. Every column covers a layer's heads only; the \
+             layer's other projections, its cache row and its FFN are not in it.\n\n",
             engine.one_command_buffer(),
         ));
         md.push_str(
             "| Cache positions | CPU, heads one after another | CPU, heads in parallel (#174) \
              | GPU, one command buffer per layer (#183) | GPU, one per phase | GPU, one per head \
-             and phase (#177's hook) | GPU whole layer | GPU time of the projections | GPU time \
-             of the whole layer |\n",
+             and phase (#177's hook) | GPU heads with attention (#188) | GPU time of the \
+             projections | GPU time of the heads with attention |\n",
         );
         md.push_str("|---|---|---|---|---|---|---|---|---|\n");
         let mut json_rows = Vec::new();
@@ -2694,7 +2814,7 @@ mod bench {
             assert!(
                 metal.run(|| try_attend(&attend_layer, &mut mirror, 0, &mut out, None))
                     && out == want,
-                "{positions} positions, the whole layer"
+                "{positions} positions, the heads with attention"
             );
             // The six paths take turns, in a rotating order, so that drift
             // on the VM (clocks, other tenants) cannot favour one of them.
@@ -2752,7 +2872,7 @@ mod bench {
                 })
                 .collect();
             // GPU time of the two dispatches alone, given every vector, and
-            // of the whole layer.
+            // of the heads with their attention.
             let key_matrix = engine
                 .upload(
                     key.weights.as_bytes(),
@@ -2839,17 +2959,17 @@ mod bench {
                 "gpu_one_command_buffer_us": us(stats[2]),
                 "gpu_per_phase_us": us(stats[3]),
                 "gpu_per_head_us": us(stats[4]),
-                "gpu_whole_layer_us": us(stats[5]),
+                "gpu_heads_attention_us": us(stats[5]),
                 "gpu_projections_only_us": projections * 1e6,
-                "gpu_whole_layer_gpu_time_us": whole * 1e6,
+                "gpu_heads_attention_gpu_time_us": whole * 1e6,
             }));
         }
         md.push_str(
             "\nThe stacks are resident before anything is timed. Every GPU column computes the \
              same integers as the CPU loop (checked before timing, and no layer declined); the \
              head-batch submissions differ only in host round trips: 1 commit and completion \
-             per layer with a shared-event handoff, 2 per layer, or 128 per layer. The whole \
-             layer is 1 commit and 1 completion with no handoff.\n",
+             per layer with a shared-event handoff, 2 per layer, or 128 per layer. The heads \
+             with attention are 1 commit and 1 completion with no handoff.\n",
         );
         println!("{md}");
         let json = serde_json::json!({

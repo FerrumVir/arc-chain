@@ -27,9 +27,9 @@
 //  * there is no floating point, no division and no modulo in this file.
 //
 // Where the CPU would return an error, a kernel sets a bit in the status
-// word and writes 0. The host then discards the whole layer, and the CPU loop
-// computes it, so a layer refuses exactly when the CPU refuses, with the
-// CPU's own error.
+// word and writes 0. The host then discards every head's result, and the
+// CPU loop computes the heads, so a layer refuses exactly when the CPU
+// refuses, with the CPU's own error.
 //
 // Bounds. Before every dispatch the host (metal_exact_mla.rs) has checked:
 // 0 < lambda < 2^31; rank <= 2^16 and rope_dim <= 2^12; every row scale has
