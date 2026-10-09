@@ -3300,6 +3300,27 @@ impl CachedIntegerModel {
     /// Uses pre-allocated buffers (q/k/v/attn_out/gate/up/gated/ff_out).
     /// When Q4 weights are enabled (via enable_q4), uses 4-bit matmul on x86_64.
     pub fn forward_one_token(&self, token: u32, cache: &mut KVCache) -> Vec<i64> {
+        self.forward_one_token_observed(token, cache, |_, _, _| {})
+    }
+
+    /// [`Self::forward_one_token`], also reporting every layer boundary.
+    ///
+    /// After layer `l` has added its attention and FFN residuals,
+    /// `on_layer(position, l, hidden)` receives the residual stream that the
+    /// next layer (after the last layer, the final norm) reads. These are the
+    /// per-layer boundaries a commitment or a teacher-forced re-check compares.
+    /// The observer only reads: the logits, the KV cache and every intermediate
+    /// value are exactly those of `forward_one_token`, which calls this with an
+    /// empty observer.
+    pub fn forward_one_token_observed<F>(
+        &self,
+        token: u32,
+        cache: &mut KVCache,
+        mut on_layer: F,
+    ) -> Vec<i64>
+    where
+        F: FnMut(usize, usize, &[i64]),
+    {
         let cfg = &self.config;
         let d = cfg.d_model;
         let pos = cache.seq_len;
@@ -3540,6 +3561,7 @@ impl CachedIntegerModel {
             for i in 0..d {
                 hidden[i] += ff_out[i];
             }
+            on_layer(pos, layer_idx, &hidden);
         }
 
         cache.seq_len = pos + 1;
@@ -3605,6 +3627,32 @@ impl CachedIntegerModel {
         chunk_size: usize,
         all_positions: bool,
     ) -> Option<Vec<Vec<i64>>> {
+        self.prefill_canonical_i8_batched_observed(
+            tokens,
+            cache,
+            chunk_size,
+            all_positions,
+            |_, _, _| {},
+        )
+    }
+
+    /// [`Self::prefill_canonical_i8_batched`], also reporting every layer
+    /// boundary of every prefilled position, with the same arguments as
+    /// [`Self::forward_one_token_observed`]. Within a chunk the reports arrive
+    /// layer by layer, so index them by (position, layer) rather than by call
+    /// order. Nothing is reported when the prefill refuses. The observer only
+    /// reads, so the returned logits and the cache are unchanged by it.
+    pub fn prefill_canonical_i8_batched_observed<F>(
+        &self,
+        tokens: &[u32],
+        cache: &mut KVCache,
+        chunk_size: usize,
+        all_positions: bool,
+        mut on_layer: F,
+    ) -> Option<Vec<Vec<i64>>>
+    where
+        F: FnMut(usize, usize, &[i64]),
+    {
         use crate::canonical_prefill::{PrefillRefusal, record_chunk, record_prefill_refusal};
         let cfg = &self.config;
         let (d, dkv, dff, dh) = (cfg.d_model, cfg.d_kv, cfg.d_ff, cfg.d_head);
@@ -3768,6 +3816,9 @@ impl CachedIntegerModel {
                 matmul_i8_into_batched(&layer.w_down, &gate, t_n, dff, &mut ffo);
                 for i in 0..t_n * d {
                     hidden[i] += ffo[i];
+                }
+                for (ti, row) in hidden.chunks_exact(d).enumerate() {
+                    on_layer(base + done + ti, li, row);
                 }
             }
             cache.seq_len = base + done + t_n;

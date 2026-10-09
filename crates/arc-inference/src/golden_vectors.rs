@@ -15,6 +15,10 @@ use arc_crypto::hash_bytes;
 use rayon::ThreadPoolBuilder;
 use serde::Deserialize;
 
+// Every execution mode (one pass, chunked, restored prefix, speculative,
+// stage splits, thread counts) held to the token-by-token run on this model.
+mod execution_modes;
+
 const FIXTURE_JSON: &str = include_str!("../tests/fixtures/integer_inference_kat.json");
 
 #[derive(Clone, Debug, Deserialize)]
