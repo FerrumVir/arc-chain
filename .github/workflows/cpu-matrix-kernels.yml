@@ -1,11 +1,13 @@
 name: CPU matrix kernels
 
-# Exactness gate for the multi-row (batched) CPU kernels in
+# Exactness gate for the CPU limb kernels in
 # crates/arc-inference/src/canonical_simd.rs: NEON SDOT and SMMLA (i8mm) on
-# arm64; AVX2, AVX-VNNI and AVX-512 VNNI on x86-64. Every kernel the runner's
-# CPU has must give outputs byte-identical to the scalar kernel in the unit
-# tests, the golden vectors, the execution-mode suite (one leg per kernel) and
-# the batched-prefill conformance tests (once per kernel, pinned).
+# arm64; AVX2, AVX-VNNI and AVX-512 VNNI on x86-64, for multi-row calls and,
+# with SMMLA and VNNI, one-row calls. Every kernel the runner's CPU has must
+# give outputs byte-identical to the scalar kernel in the unit tests, the
+# golden vectors (with the kernel pinned for the whole process), the
+# execution-mode suite (one leg per kernel) and the batched-prefill
+# conformance tests (once per kernel, pinned).
 #
 # Each leg first logs the CPU model and flags, the features the process
 # detects and the kernels it can run, and checks that detection agrees with
@@ -166,12 +168,24 @@ jobs:
         run: cargo test -p arc-inference --lib --locked -- --skip golden
       - name: Golden vectors and the execution-mode suite, one leg per kernel
         run: cargo test -p arc-inference --lib --locked golden -- --nocapture
-      - name: Batched prefill conformance with each multi-row kernel pinned
+      - name: Golden vectors and batched prefill with each kernel pinned
         run: |
           set -euo pipefail
-          # The list has no trailing newline, hence the `|| [ -n ... ]`.
+          # Per kernel, two processes. The first enables the vector path for
+          # the whole process and runs the known-answer golden tests that
+          # decode one token at a time (the worker's path), with the report
+          # showing the kernel the process selected. The second runs the
+          # batched-prefill conformance tests, which switch the path
+          # themselves. The list has no trailing newline, hence the
+          # `|| [ -n ... ]`.
           while IFS= read -r kernel || [ -n "$kernel" ]; do
             if [ -z "$kernel" ]; then continue; fi
+            echo "::group::golden one-row decode on $kernel"
+            ARC_FAST_CANONICAL_KERNEL=1 ARC_CANONICAL_BATCHED_KERNEL="$kernel" \
+              cargo test -p arc-inference --lib --locked -- \
+              golden_cached interleaved_profile_and_generation_v2 batched_kernel_report \
+              --nocapture < /dev/null
+            echo "::endgroup::"
             echo "::group::batched prefill on $kernel"
             ARC_CANONICAL_BATCHED_KERNEL="$kernel" \
               cargo test -p arc-inference --lib --locked batched_prefill -- --nocapture < /dev/null

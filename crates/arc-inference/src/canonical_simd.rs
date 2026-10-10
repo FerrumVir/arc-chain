@@ -93,6 +93,10 @@
 //!   lanes. Each lane holds one (row, token) dot over every column, so it is
 //!   bounded by `16_384 * K` exactly as above: at most `2_147_467_264` for
 //!   `K = 131_071`, under `i32::MAX`. Lanes are widened to i64 per plane.
+//!   A token without a partner (one token, or the last of an odd count) is
+//!   paired with itself plane by plane (planes 0 and 1, then 2 and 3), so a
+//!   lane is one (row, plane) dot, with the same bound, and lanes are combined
+//!   in i64 with `256^l`.
 //! * **VPDPBUSD.** It multiplies *unsigned* bytes by signed bytes, so the
 //!   digits are offset: `c' = c + 128` lies in `[0, 255]` (it is the byte
 //!   `c ^ 0x80`), and `sum_j w_j * c_j = sum_j w_j * c'_j - 128 * sum_j w_j`.
@@ -107,6 +111,12 @@
 //! therefore returns the scalar kernel's integer dot for every input this
 //! module accepts, and they share the scale epilogue, so outputs are
 //! byte-identical by construction. The tests check it on every CI runner.
+//!
+//! One-row projections ([`matmul_i8_canonical_rows_fast`], which every
+//! one-token decode step takes) run on the selected kernel too when it is a
+//! matrix-extension kernel ([`BatchedKernel::serves_one_row`]), as a
+//! one-token batched call with the same checks, digits and epilogue. With
+//! `neon-sdot-limb` or `avx2-limb` selected they keep their one-row kernel.
 //!
 //! The opt-in is unchanged. These kernels run only when
 //! [`fast_canonical_kernel_enabled`] is true (`ARC_FAST_CANONICAL_KERNEL=1`
@@ -138,7 +148,8 @@ pub const LIMB_MIN: i64 = -2_155_905_152;
 pub const MAX_COLS_FOR_I32: usize = 131_071;
 /// Bound on a batched call's token count, so the digit scratch stays bounded.
 /// `n_tokens * LIMB_COUNT * in_size` bytes at most, i.e. 4 MiB per 1024 tokens
-/// at `in_size = 1024`. Larger batches must be chunked by the caller.
+/// at `in_size = 1024`, and as much again on the SMMLA kernel, which re-lays
+/// the digits as token pairs. Larger batches must be chunked by the caller.
 pub const MAX_BATCH_TOKENS: usize = 1024;
 
 const fn derive_limb_bound(digit: i64) -> i64 {
@@ -369,6 +380,14 @@ impl BatchedKernel {
         Self::ALL.into_iter().find(|kernel| kernel.label() == label)
     }
 
+    /// Whether one-row projections run on this kernel too. The
+    /// matrix-extension kernels do: VNNI takes one token as it is, and SMMLA
+    /// pairs the token's digit planes where it would pair two tokens. The
+    /// base kernels keep their one-row kernels (`dot_limbs_dotprod`).
+    pub const fn serves_one_row(self) -> bool {
+        matches!(self, Self::NeonI8mm | Self::AvxVnni | Self::Avx512Vnni)
+    }
+
     /// Whether this build and CPU can run the kernel, detected at run time.
     /// Each matrix-extension kernel also requires its architecture's base
     /// kernel, which runs a lone row and any input the extension skips.
@@ -481,7 +500,9 @@ fn record_batched_run(kernel: BatchedKernel) {
     LAST_BATCHED.store(kernel as u8 + 1, Ordering::Relaxed);
 }
 
-/// How many batched projections `kernel` has computed in this process.
+/// How many projections `kernel` has computed in this process through
+/// [`matmul_i8_batched_fast`]: multi-row calls, and one-row calls on a kernel
+/// that [serves one row](BatchedKernel::serves_one_row).
 pub fn batched_kernel_runs(kernel: BatchedKernel) -> u64 {
     BATCHED_RUNS[kernel as usize].load(Ordering::Relaxed)
 }
@@ -1048,7 +1069,9 @@ unsafe fn vnni512_tile<const T: usize>(
 }
 
 /// Two weight rows against `T` tokens, as [`vnni512_tile`] but with the
-/// 256-bit VEX `vpdpbusd` of AVX-VNNI and `len` a multiple of 32.
+/// 256-bit VEX `vpdpbusd` of AVX-VNNI and `len` a multiple of 32. A lane
+/// takes one instruction per 32 columns here, so the row-sum lanes are
+/// bounded by `512 * len / 32`.
 ///
 /// # Safety
 /// AVX2 and AVX-VNNI available; otherwise as [`vnni512_tile`].
@@ -1137,6 +1160,12 @@ pub(crate) fn matmul_i8_canonical_rows_fast_view(
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
+        // A matrix-extension kernel serves one row as a one-token batched
+        // call: the same checks, digits and epilogue, so the same bytes, and
+        // it records its own attempt and outcome.
+        if let Some(kernel) = selected_batched_kernel().filter(|k| k.serves_one_row()) {
+            return matmul_i8_batched_view(kernel, weights, input, 1, in_size, output);
+        }
         record_attempt();
         if !dotprod_available() {
             return record_refusal(Refusal::Unavailable);
@@ -1304,11 +1333,30 @@ pub fn matmul_i8_batched_fast(
 /// [`Refusal::Unavailable`], writing nothing, when this CPU lacks it.
 ///
 /// Every check and the digit split are shared by all kernels and run before
-/// any output is written. `NeonI8mm` pairs tokens, so a single token runs on
-/// `NeonSdot`; [`batched_kernel_runs`] records the kernel that ran.
+/// any output is written. `NeonI8mm` pairs two tokens per instruction, or an
+/// odd token's own digit planes; [`batched_kernel_runs`] records the kernel
+/// that ran.
 pub fn matmul_i8_batched_with(
     kernel: BatchedKernel,
     weights: &I8Weights,
+    inputs: &[i64],
+    n_tokens: usize,
+    in_size: usize,
+    output: &mut [i64],
+) -> bool {
+    matmul_i8_batched_view(
+        kernel,
+        I8WeightsView::from(weights),
+        inputs,
+        n_tokens,
+        in_size,
+        output,
+    )
+}
+
+pub(crate) fn matmul_i8_batched_view(
+    kernel: BatchedKernel,
+    weights: I8WeightsView<'_>,
     inputs: &[i64],
     n_tokens: usize,
     in_size: usize,
@@ -1341,7 +1389,7 @@ pub fn matmul_i8_batched_with(
         if in_size > MAX_COLS_FOR_I32 {
             return record_refusal(Refusal::InnerDimAboveI32Bound);
         }
-        let scales = &weights.scales[..];
+        let scales = weights.scales;
         // The post-dot bound must hold for EVERY token, so it is checked
         // against every token's own activation before anything is written.
         // Tokens are independent, so the checks run in parallel; whether any
@@ -1367,7 +1415,7 @@ pub fn matmul_i8_batched_with(
         // extra planes are zero - so one `used` for the whole call keeps the
         // inner loops branch-free.
         let job = BatchJob {
-            data: &weights.data[..],
+            data: weights.data,
             scales,
             inputs,
             n_rows: weights.n_rows,
@@ -1426,9 +1474,8 @@ fn run_batched(
     limbs: &mut [i8],
     out: SendPtr,
 ) -> BatchedKernel {
-    // SMMLA pairs tokens: one token alone would leave half of every
-    // instruction idle, so a single row runs on SDOT.
-    if kernel == BatchedKernel::NeonI8mm && job.n_tokens > 1 {
+    if kernel == BatchedKernel::NeonI8mm {
+        // SMMLA pairs two tokens, or an odd token's own digit planes.
         run_i8mm(job, limbs, out);
         return BatchedKernel::NeonI8mm;
     }
@@ -1580,13 +1627,37 @@ fn run_quads(job: BatchJob<'_>, limbs: &[i8], out: SendPtr) {
     });
 }
 
+/// The digit planes one token block may hold, so that a block of tokens stays
+/// in L2 (1 MiB or more per core on the CPUs these kernels target) next to
+/// the row block's weights. The tile functions stream every plane of the
+/// block once per row tile; past about 32 tokens of 4,096 columns, planes for
+/// every token at once outgrew L2 and k = 64 cost more per row than k = 32.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const TOKEN_BLOCK_BYTES: usize = 512 * 1024;
+
+/// Tokens per token block: as many whole tiles of `tile` tokens as fit
+/// [`TOKEN_BLOCK_BYTES`] at `bytes_per_token`, and at least one tile.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn token_block(bytes_per_token: usize, tile: usize) -> usize {
+    (TOKEN_BLOCK_BYTES / bytes_per_token.max(1)).max(tile) / tile * tile
+}
+
 /// `SMMLA` driver: tiles of four rows (two row pairs) by up to four token
-/// pairs.
+/// pairs, then an odd last token on its own.
 ///
-/// The digit planes are first re-laid as token pairs (see [`i8mm_tile`]); an
-/// odd final token is paired with zero digits, whose lanes are never written.
-/// A short final row tile repeats its last row, likewise discarded. Columns
-/// past the last multiple of 8 are summed in i64 by [`tail_dot`].
+/// The digit planes are first re-laid for [`i8mm_tile`]. Token pairs sit side
+/// by side, each 8-column block holding the first token's eight digits and
+/// then the second's. An odd last token, with no partner, is paired with
+/// itself plane by plane: planes 0 and 1, then planes 2 and 3 (a missing plane
+/// is zeros), so each of its lanes is one (row, plane) dot, combined in i64
+/// with the plane's place value `256^l`. Both copies together hold at most
+/// `n_tokens * LIMB_COUNT * in_size` bytes, which
+/// `crate::canonical_prefill::prefill_chunk_scratch_bytes` charges.
+///
+/// A short final row tile repeats its last row, whose lanes are never
+/// written. Columns past the last multiple of 8 are summed in i64 by
+/// [`tail_dot`]. Within a row block, token pairs run in blocks of
+/// [`token_block`] pairs.
 #[cfg(target_arch = "aarch64")]
 fn run_i8mm(job: BatchJob<'_>, limbs: &[i8], out: SendPtr) {
     let BatchJob {
@@ -1599,7 +1670,7 @@ fn run_i8mm(job: BatchJob<'_>, limbs: &[i8], out: SendPtr) {
         used,
     } = job;
     let len = in_size / 8 * 8;
-    let n_pairs = n_tokens.div_ceil(2);
+    let n_pairs = n_tokens / 2;
     let pair_len = used * 2 * len;
     let mut pairs = vec![0i8; n_pairs * pair_len];
     if pair_len > 0 {
@@ -1608,9 +1679,6 @@ fn run_i8mm(job: BatchJob<'_>, limbs: &[i8], out: SendPtr) {
             .enumerate()
             .for_each(|(pair, interleaved)| {
                 for (half, token) in [2 * pair, 2 * pair + 1].into_iter().enumerate() {
-                    if token >= n_tokens {
-                        continue;
-                    }
                     for (l, plane) in interleaved.chunks_exact_mut(2 * len).enumerate() {
                         let digits = &limbs[(token * LIMB_COUNT + l) * in_size..][..len];
                         for (block, eight) in plane.chunks_exact_mut(16).zip(digits.chunks_exact(8))
@@ -1621,63 +1689,133 @@ fn run_i8mm(job: BatchJob<'_>, limbs: &[i8], out: SendPtr) {
                 }
             });
     }
-    let pairs = &pairs[..];
+    let solo_token = (n_tokens % 2 == 1).then_some(n_tokens - 1);
+    let solo_pairs = if solo_token.is_some() {
+        used.div_ceil(2)
+    } else {
+        0
+    };
+    let mut solo = vec![0i8; solo_pairs * 2 * len];
+    if let Some(token) = solo_token
+        && len > 0
+    {
+        for (pair, interleaved) in solo.chunks_exact_mut(2 * len).enumerate() {
+            for (half, l) in [2 * pair, 2 * pair + 1].into_iter().enumerate() {
+                if l >= used {
+                    continue;
+                }
+                let digits = &limbs[(token * LIMB_COUNT + l) * in_size..][..len];
+                for (block, eight) in interleaved.chunks_exact_mut(16).zip(digits.chunks_exact(8)) {
+                    block[8 * half..8 * half + 8].copy_from_slice(eight);
+                }
+            }
+        }
+    }
+    let (pairs, solo) = (&pairs[..], &solo[..]);
+    let block_pairs = token_block(pair_len, 4);
     let row_block = (131_072 / in_size).max(1).next_multiple_of(4);
     let n_blocks = n_rows.div_ceil(row_block);
     (0..n_blocks).into_par_iter().for_each(|block| {
         let first = block * row_block;
         let end = (first + row_block).min(n_rows);
+        let mut p0 = 0usize;
+        while p0 < n_pairs {
+            let p1 = (p0 + block_pairs).min(n_pairs);
+            let mut r = first;
+            while r < end {
+                let real = (end - r).min(4);
+                let row = |k: usize| data[(r + k.min(real - 1)) * in_size..].as_ptr();
+                let rows = [[row(0), row(1)], [row(2), row(3)]];
+                let mut p = p0;
+                while p < p1 {
+                    let count = (p1 - p).min(4);
+                    let pair = |q: usize| pairs[(p + q.min(count - 1)) * pair_len..].as_ptr();
+                    // SAFETY: FEAT_I8MM was detected by `kernel.available()`.
+                    // Each row pointer starts a whole row (`in_size >= len`
+                    // bytes), and each pair pointer starts a whole pair of
+                    // `used * 2 * len` interleaved digits; `len` is a multiple
+                    // of 8 and at most `MAX_COLS_FOR_I32`.
+                    let totals = unsafe {
+                        match count {
+                            1 => widen(i8mm_tile(&rows, &[pair(0)], len, used)),
+                            2 => widen(i8mm_tile(&rows, &[pair(0), pair(1)], len, used)),
+                            3 => widen(i8mm_tile(&rows, &[pair(0), pair(1), pair(2)], len, used)),
+                            _ => widen(i8mm_tile(
+                                &rows,
+                                &[pair(0), pair(1), pair(2), pair(3)],
+                                len,
+                                used,
+                            )),
+                        }
+                    };
+                    for (rp, by_pair) in totals.iter().enumerate() {
+                        for (q, lanes) in by_pair.iter().enumerate().take(count) {
+                            for (lane, &dot) in lanes.iter().enumerate() {
+                                let i = r + 2 * rp + lane / 2;
+                                let token = 2 * (p + q) + lane % 2;
+                                if i >= r + real {
+                                    continue;
+                                }
+                                let acc = dot
+                                    + tail_dot(
+                                        &data[i * in_size + len..(i + 1) * in_size],
+                                        &inputs[token * in_size + len..(token + 1) * in_size],
+                                    );
+                                // SAFETY: `token < n_tokens` and `i < n_rows`,
+                                // so the element is inside `output`. Each rayon
+                                // task owns a disjoint row range, so no two
+                                // tasks write the same element.
+                                unsafe {
+                                    *out.get().add(token * n_rows + i) =
+                                        (acc * scales[i]) >> FRAC_BITS
+                                };
+                            }
+                        }
+                    }
+                    p += count;
+                }
+                r += real;
+            }
+            p0 = p1;
+        }
+        let Some(token) = solo_token else {
+            return;
+        };
         let mut r = first;
         while r < end {
             let real = (end - r).min(4);
             let row = |k: usize| data[(r + k.min(real - 1)) * in_size..].as_ptr();
             let rows = [[row(0), row(1)], [row(2), row(3)]];
-            let mut p = 0usize;
-            while p < n_pairs {
-                let count = (n_pairs - p).min(4);
-                let pair = |q: usize| pairs[(p + q.min(count - 1)) * pair_len..].as_ptr();
-                // SAFETY: FEAT_I8MM was detected by `kernel.available()`.
-                // Each row pointer starts a whole row (`in_size >= len`
-                // bytes), and each pair pointer starts a whole pair of
-                // `used * 2 * len` interleaved digits; `len` is a multiple
-                // of 8 and at most `MAX_COLS_FOR_I32`.
-                let totals = unsafe {
-                    match count {
-                        1 => widen(i8mm_tile(&rows, &[pair(0)], len, used)),
-                        2 => widen(i8mm_tile(&rows, &[pair(0), pair(1)], len, used)),
-                        3 => widen(i8mm_tile(&rows, &[pair(0), pair(1), pair(2)], len, used)),
-                        _ => widen(i8mm_tile(
-                            &rows,
-                            &[pair(0), pair(1), pair(2), pair(3)],
-                            len,
-                            used,
-                        )),
-                    }
-                };
-                for (rp, by_pair) in totals.iter().enumerate() {
-                    for (q, lanes) in by_pair.iter().enumerate().take(count) {
-                        for (lane, &dot) in lanes.iter().enumerate() {
-                            let i = r + 2 * rp + lane / 2;
-                            let token = 2 * (p + q) + lane % 2;
-                            if i >= r + real || token >= n_tokens {
-                                continue;
-                            }
-                            let acc = dot
-                                + tail_dot(
-                                    &data[i * in_size + len..(i + 1) * in_size],
-                                    &inputs[token * in_size + len..(token + 1) * in_size],
-                                );
-                            // SAFETY: `token < n_tokens` and `i < n_rows`, so
-                            // the element is inside `output`. Each rayon task
-                            // owns a disjoint row range, so no two tasks write
-                            // the same element.
-                            unsafe {
-                                *out.get().add(token * n_rows + i) = (acc * scales[i]) >> FRAC_BITS
-                            };
-                        }
-                    }
+            let pair = |q: usize| solo[q.min(solo_pairs - 1) * 2 * len..].as_ptr();
+            // SAFETY: as above; each plane-pair pointer starts `2 * len`
+            // interleaved digits, which `i8mm_tile` reads as its one plane.
+            let totals = unsafe {
+                if solo_pairs == 1 {
+                    widen(i8mm_tile(&rows, &[pair(0)], len, 1))
+                } else {
+                    widen(i8mm_tile(&rows, &[pair(0), pair(1)], len, 1))
                 }
-                p += count;
+            };
+            for (rp, by_pair) in totals.iter().enumerate() {
+                for half in 0..2 {
+                    let i = r + 2 * rp + half;
+                    if i >= r + real {
+                        continue;
+                    }
+                    // Lanes `2 * half` and `2 * half + 1` of pair `q` hold this
+                    // row against planes `2q` and `2q + 1`.
+                    let mut acc = tail_dot(
+                        &data[i * in_size + len..(i + 1) * in_size],
+                        &inputs[token * in_size + len..(token + 1) * in_size],
+                    );
+                    for (q, lanes) in by_pair.iter().enumerate().take(solo_pairs) {
+                        acc += lanes[2 * half] * (1i64 << (16 * q));
+                        acc += lanes[2 * half + 1] * (1i64 << (16 * q + 8));
+                    }
+                    // SAFETY: `token < n_tokens` and `i < n_rows`, so the
+                    // element is inside `output`; rows are disjoint per task.
+                    unsafe { *out.get().add(token * n_rows + i) = (acc * scales[i]) >> FRAC_BITS };
+                }
             }
             r += real;
         }
@@ -1703,10 +1841,11 @@ fn offset_digits(job: BatchJob<'_>, limbs: &mut [i8]) {
 /// VNNI driver: tiles of `R` rows by up to four tokens. `step` is the
 /// columns per instruction (64 or 32); columns past the last whole step are
 /// summed in i64 by [`tail_dot`]. `tile` returns, per row and token, the
-/// exact plane-weighted dot of the covered columns; on a row tile's first
-/// token tile (`fresh`) it also fills the rows' weight sums, which the later
-/// token tiles reuse. A short final row tile repeats its last row, whose
-/// lanes are never written.
+/// exact plane-weighted dot of the covered columns; on the first token tile
+/// of a row tile in each token block (`fresh`) it also fills the rows' weight
+/// sums, which the block's later token tiles reuse. A short final row tile
+/// repeats its last row, whose lanes are never written. Within a row block,
+/// tokens run in blocks of [`token_block`] tokens.
 #[cfg(target_arch = "x86_64")]
 fn run_vnni<const R: usize, F>(job: BatchJob<'_>, planes: &[i8], step: usize, out: SendPtr, tile: F)
 where
@@ -1719,51 +1858,57 @@ where
         n_rows,
         n_tokens,
         in_size,
-        ..
+        used,
     } = job;
     let len = in_size / step * step;
+    let block_tokens = token_block(used * in_size, 4);
     let row_block = (131_072 / in_size).max(1).next_multiple_of(R);
     let n_blocks = n_rows.div_ceil(row_block);
     (0..n_blocks).into_par_iter().for_each(|block| {
         let first = block * row_block;
         let end = (first + row_block).min(n_rows);
-        let mut r = first;
-        while r < end {
-            let real = (end - r).min(R);
-            let row_of = |k: usize| r + k.min(real - 1);
-            let rows: [*const i8; R] =
-                std::array::from_fn(|k| data[row_of(k) * in_size..].as_ptr());
-            // The offset correction's weight sums, filled by the first token
-            // tile.
-            let mut sums = [0i64; R];
-            let mut t = 0usize;
-            while t < n_tokens {
-                let count = (n_tokens - t).min(4);
-                let tokens: [*const i8; 4] = std::array::from_fn(|q| {
-                    planes[(t + q.min(count - 1)) * LIMB_COUNT * in_size..].as_ptr()
-                });
-                let totals = tile(&rows, &tokens[..count], len, &mut sums, t == 0);
-                for (k, by_token) in totals.iter().enumerate().take(real) {
-                    let i = r + k;
-                    for (q, &dot) in by_token.iter().enumerate().take(count) {
-                        let token = t + q;
-                        let acc = dot
-                            + tail_dot(
-                                &data[i * in_size + len..(i + 1) * in_size],
-                                &inputs[token * in_size + len..(token + 1) * in_size],
-                            );
-                        // SAFETY: `token < n_tokens` and `i < n_rows`, so the
-                        // element is inside `output`. Each rayon task owns a
-                        // disjoint row range, so no two tasks write the same
-                        // element.
-                        unsafe {
-                            *out.get().add(token * n_rows + i) = (acc * scales[i]) >> FRAC_BITS
-                        };
+        let mut t0 = 0usize;
+        while t0 < n_tokens {
+            let t1 = (t0 + block_tokens).min(n_tokens);
+            let mut r = first;
+            while r < end {
+                let real = (end - r).min(R);
+                let row_of = |k: usize| r + k.min(real - 1);
+                let rows: [*const i8; R] =
+                    std::array::from_fn(|k| data[row_of(k) * in_size..].as_ptr());
+                // The offset correction's weight sums, filled by the block's
+                // first token tile.
+                let mut sums = [0i64; R];
+                let mut t = t0;
+                while t < t1 {
+                    let count = (t1 - t).min(4);
+                    let tokens: [*const i8; 4] = std::array::from_fn(|q| {
+                        planes[(t + q.min(count - 1)) * LIMB_COUNT * in_size..].as_ptr()
+                    });
+                    let totals = tile(&rows, &tokens[..count], len, &mut sums, t == t0);
+                    for (k, by_token) in totals.iter().enumerate().take(real) {
+                        let i = r + k;
+                        for (q, &dot) in by_token.iter().enumerate().take(count) {
+                            let token = t + q;
+                            let acc = dot
+                                + tail_dot(
+                                    &data[i * in_size + len..(i + 1) * in_size],
+                                    &inputs[token * in_size + len..(token + 1) * in_size],
+                                );
+                            // SAFETY: `token < n_tokens` and `i < n_rows`, so
+                            // the element is inside `output`. Each rayon task
+                            // owns a disjoint row range, so no two tasks write
+                            // the same element.
+                            unsafe {
+                                *out.get().add(token * n_rows + i) = (acc * scales[i]) >> FRAC_BITS
+                            };
+                        }
                     }
+                    t += count;
                 }
-                t += count;
+                r += real;
             }
-            r += real;
+            t0 = t1;
         }
     });
 }
@@ -2190,6 +2335,13 @@ mod tests {
             "batched kernel selected automatically: {:?}",
             best_batched_kernel().map(BatchedKernel::label)
         );
+        // Under ARC_FAST_CANONICAL_KERNEL / ARC_CANONICAL_BATCHED_KERNEL these
+        // show what this test process actually runs.
+        println!(
+            "fast kernel enabled: {}; kernel selected now: {:?}",
+            fast_canonical_kernel_enabled(),
+            selected_batched_kernel().map(BatchedKernel::label)
+        );
         if let Ok(path) = std::env::var("ARC_BATCHED_KERNELS_OUT") {
             std::fs::write(&path, available.join("\n")).expect("write the kernel list");
         }
@@ -2283,8 +2435,7 @@ mod tests {
             _ if c % 2 == 0 => -128,
             _ => 127,
         });
-        let tokens = 3;
-        let inputs: Vec<i64> = (0..tokens * cols)
+        let inputs: Vec<i64> = (0..3 * cols)
             .map(|i| match (i / cols, i % 2) {
                 (0, _) => LIMB_MIN,
                 (1, _) => LIMB_MAX,
@@ -2292,15 +2443,25 @@ mod tests {
                 _ => LIMB_MIN,
             })
             .collect();
-        let want = scalar_batched(&w, &inputs, tokens, cols);
-        for kernel in kernels {
-            let mut got = vec![SENTINEL; tokens * rows];
-            assert!(
-                matmul_i8_batched_with(kernel, &w, &inputs, tokens, cols, &mut got),
-                "{} refused K = {cols}",
-                kernel.label()
-            );
-            assert_eq!(got, want, "{} at K = {cols}", kernel.label());
+        // One token takes the one-row paths (SMMLA on paired digit planes);
+        // three take the multi-row tiles.
+        for tokens in [1, 3] {
+            let inputs = &inputs[..tokens * cols];
+            let want = scalar_batched(&w, inputs, tokens, cols);
+            for &kernel in &kernels {
+                let mut got = vec![SENTINEL; tokens * rows];
+                assert!(
+                    matmul_i8_batched_with(kernel, &w, inputs, tokens, cols, &mut got),
+                    "{} refused K = {cols}, {tokens} tokens",
+                    kernel.label()
+                );
+                assert_eq!(
+                    got,
+                    want,
+                    "{} at K = {cols}, {tokens} tokens",
+                    kernel.label()
+                );
+            }
         }
     }
 
@@ -2365,8 +2526,8 @@ mod tests {
             );
         }
         if BatchedKernel::NeonI8mm.available() {
-            // SMMLA pairs tokens, so one token runs on SDOT and says so.
-            let before = batched_kernel_runs(BatchedKernel::NeonSdot);
+            // One token runs on SMMLA too, with its digit planes paired.
+            let before = batched_kernel_runs(BatchedKernel::NeonI8mm);
             let mut out = vec![0i64; 8];
             assert!(matmul_i8_batched_with(
                 BatchedKernel::NeonI8mm,
@@ -2376,7 +2537,58 @@ mod tests {
                 cols,
                 &mut out
             ));
-            assert!(batched_kernel_runs(BatchedKernel::NeonSdot) > before);
+            assert!(batched_kernel_runs(BatchedKernel::NeonI8mm) > before);
         }
+    }
+
+    /// The one-row entry every decode step takes, with each kernel pinned:
+    /// the matrix-extension kernels serve it (and count it), the base
+    /// kernels keep their one-row kernel, and every result is the scalar one.
+    #[test]
+    fn one_row_entry_matches_scalar_on_every_kernel() {
+        let _guard = kernel_switch_guard();
+        let previous = batched_kernel_preference();
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for kernel in available_batched_kernels() {
+            set_batched_kernel_preference(Some(kernel));
+            assert_eq!(selected_batched_kernel(), Some(kernel));
+            for cols in [1usize, 8, 9, 31, 64, 65, 4096, 4097] {
+                for rows in [1usize, 3, 4, 9] {
+                    let w = weights_from(rows, cols, |_, _| (next() % 256) as u8 as i8);
+                    let input: Vec<i64> = (0..cols)
+                        .map(|j| match (next() % 5, j % 2) {
+                            (0, _) => LIMB_MIN,
+                            (1, _) => LIMB_MAX,
+                            (2, _) => 0,
+                            (_, 0) => -(((next() % 8_388_608) as i64) + 1),
+                            _ => ((next() % 8_388_608) as i64) + 1,
+                        })
+                        .collect();
+                    let want = scalar_batched(&w, &input, 1, cols);
+                    let before = batched_kernel_runs(kernel);
+                    let mut got = vec![SENTINEL; rows];
+                    assert!(
+                        matmul_i8_canonical_rows_fast(&w, &input, cols, &mut got),
+                        "{} refused one row, cols={cols} rows={rows}",
+                        kernel.label()
+                    );
+                    assert_eq!(got, want, "{} cols={cols} rows={rows}", kernel.label());
+                    if kernel.serves_one_row() {
+                        assert!(
+                            batched_kernel_runs(kernel) > before,
+                            "{} served one row but was not recorded",
+                            kernel.label()
+                        );
+                    }
+                }
+            }
+        }
+        set_batched_kernel_preference(previous);
     }
 }

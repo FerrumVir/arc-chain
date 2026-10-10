@@ -9,9 +9,14 @@ name: CPU matrix-kernel bench
 # AVX-512 VNNI on x86-64). One machine runs every stage, so one 2-stage split
 # is measured; #185 found 2 and 4 stages cost the same per row.
 #
+# It also times the worker's own decode (`try_generate`, as
+# --full-integer-worker calls it) with every kernel: 16 decoded tokens after
+# an 8-token prompt, as T(1 + 16) - T(1).
+#
 # Every run is also an exactness check on the real model: the k-row and
-# one-row calls must hand on bit-identical rows and logits, and the pinned
-# kernel must be the one that ran, or the driver exits non-zero. Timings are
+# one-row calls must hand on bit-identical rows and logits, the pinned kernel
+# must be the one that ran, and every kernel's generation must return the
+# same tokens and output hash, or the driver exits non-zero. Timings are
 # CI-runner measurements on shared 4-vCPU hosted runners, not production
 # figures. Hosted x86-64 hosts vary from run to run: AMD EPYC 7763 (AVX2
 # only), EPYC 9V74 (AVX-512 VNNI) and EPYC 9V45 (AVX-512 VNNI and AVX-VNNI)
@@ -19,13 +24,17 @@ name: CPU matrix-kernel bench
 # Windows leg, and every leg records its CPU.
 #
 # Cost control: a leg downloads about 4 GB and an x86-64 leg takes up to an
-# hour, so, like speculative-bench.yml, it never runs on a push. It runs when
-# started by hand (workflow_dispatch, once this file is on the default
-# branch), or once at the moment the `cpu-matrix-bench` label is added to a
-# pull request that changes the kernels or this bench. One label event is one
-# run; measuring again means removing and re-adding the label. The model is
-# never uploaded or cached.
+# hour, so it runs only when there is something new to measure: on a push that
+# changes this file or the bench driver (the push's own diff, not a pull
+# request's), once at the moment the `cpu-matrix-bench` label is added to a
+# pull request that changes the kernels or this bench (removing and re-adding
+# the label measures again), or by hand once this file is on the default
+# branch. The model is never uploaded or cached.
 on:
+  push:
+    paths:
+      - .github/workflows/cpu-matrix-bench.yml
+      - crates/arc-inference/examples/stage_rows_bench.rs
   pull_request:
     types: [labeled]
     paths:
@@ -50,6 +59,7 @@ jobs:
   bench:
     name: 7B rows bench (${{ matrix.leg }})
     if: >-
+      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'cpu-matrix-bench'
     # Per leg, so a skipped run (another label added) never takes the slot of
@@ -141,6 +151,8 @@ jobs:
             --kernel all \
             --splits 2 \
             --ks 1,2,4,8,16,32,64 \
+            --decode-tokens 16 \
+            --decode-prompt 8 \
             --context 32 \
             --repeats 3 \
             --out "$out/result.json" \

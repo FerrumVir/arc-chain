@@ -22,13 +22,21 @@
 //! `avx-vnni-limb` and `avx512-vnni-limb` on x86-64. `simd` is the base
 //! kernel of the architecture (SDOT or AVX2), `best` the one chosen
 //! automatically, and `all` (the default) is `scalar` plus every multi-row
-//! kernel this CPU has. One-row calls always run the one-row kernel (scalar,
-//! or SDOT/AVX2), so for every vectorised kernel the baseline is the same
-//! one-row pass. The report also records which multi-row kernel ran: a
-//! one-row k-row call on `neon-i8mm-limb` runs SDOT, because SMMLA pairs rows.
+//! kernel this CPU has. One-row calls run the pinned kernel too when it is a
+//! matrix-extension kernel (SMMLA, VNNI), and the one-row kernel of the ISA
+//! (SDOT, AVX2) otherwise, so each kernel's ratio is against its own one-row
+//! pass; the report keeps the absolute times. It also records which kernel
+//! ran each k-row call, and exits non-zero if it was not the pinned one.
+//!
+//! Decode. With `--decode-tokens N` (default 16; 0 skips it) the driver also
+//! times the worker's own generation, `try_generate`, as `--full-integer-worker`
+//! calls it, with every kernel: `T(1 + N) - T(1)` over a `--decode-prompt`
+//! token prompt is N decode steps. Every kernel must return the same tokens
+//! and output hash, or the driver exits non-zero.
 //!
 //! usage: stage_rows_bench --model GGUF [--kernel all|scalar|simd|best|LABEL,...]
 //!        [--splits 2,4] [--context N] [--repeats N] [--ks 1,2,4,8,16,32,64]
+//!        [--decode-tokens N] [--decode-prompt N]
 //!        [--cpu NAME] [--out FILE.json] [--summary FILE.md]
 
 use arc_crypto::{Hash256, hash_bytes};
@@ -50,6 +58,8 @@ struct Args {
     context: usize,
     repeats: usize,
     ks: Vec<usize>,
+    decode_tokens: u32,
+    decode_prompt: usize,
     cpu: Option<String>,
     out: Option<String>,
     summary: Option<String>,
@@ -153,6 +163,8 @@ fn parse_args() -> Result<Args, String> {
         context: 32,
         repeats: 3,
         ks: vec![1, 2, 4, 8, 16, 32, 64],
+        decode_tokens: 16,
+        decode_prompt: 8,
         cpu: None,
         out: None,
         summary: None,
@@ -177,6 +189,12 @@ fn parse_args() -> Result<Args, String> {
                     .map(parse_count)
                     .collect::<Result<Vec<_>, _>>()?
             }
+            "--decode-tokens" => {
+                args.decode_tokens = value()?
+                    .parse()
+                    .map_err(|_| "--decode-tokens takes a whole number".to_string())?
+            }
+            "--decode-prompt" => args.decode_prompt = parse_count(&value()?)?,
             "--cpu" => args.cpu = Some(value()?),
             "--out" => args.out = Some(value()?),
             "--summary" => args.summary = Some(value()?),
@@ -188,6 +206,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if args.repeats == 0 || args.ks.is_empty() || args.ks.contains(&0) {
         return Err("--repeats and every k must be at least 1".into());
+    }
+    if args.decode_tokens > 0 && args.decode_prompt == 0 {
+        return Err("--decode-prompt must be at least 1".into());
     }
     if args.splits.is_empty() || args.splits.contains(&0) {
         return Err("every split needs at least one stage".into());
@@ -282,6 +303,37 @@ fn roll_back(
     Ok(())
 }
 
+/// The worker's own decode: `try_generate`, as `--full-integer-worker` calls
+/// it, with no EOS so a call generates exactly `max_tokens`. `T(1 + n) - T(1)`
+/// over the same prompt is `n` decode steps, without the prompt and the first
+/// token. Returns the median milliseconds per decoded token, and the longer
+/// call's tokens and output hash.
+fn decode_ms_per_token(
+    model: &CachedIntegerModel,
+    prompt: &[u32],
+    tokens: u32,
+    repeats: usize,
+) -> Result<(f64, Vec<u32>, Hash256), String> {
+    let mut per_token = Vec::with_capacity(repeats);
+    let mut output = None;
+    for _ in 0..repeats {
+        let started = Instant::now();
+        model
+            .try_generate(prompt, 1, &[])
+            .map_err(|error| format!("try_generate: {error}"))?;
+        let first = started.elapsed().as_secs_f64();
+        let started = Instant::now();
+        let generated = model
+            .try_generate(prompt, 1 + tokens, &[])
+            .map_err(|error| format!("try_generate: {error}"))?;
+        let all = started.elapsed().as_secs_f64();
+        per_token.push((all - first) * 1000.0 / f64::from(tokens));
+        output = Some(generated);
+    }
+    let (generated, hash) = output.ok_or("no decode run")?;
+    Ok((median(&per_token), generated, hash))
+}
+
 fn median(samples: &[f64]) -> f64 {
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -333,8 +385,14 @@ fn main() -> Result<(), String> {
 
     let mut results: Vec<Value> = Vec::new();
     let mut table = String::from(
-        "| Kernel | Split | k | One k-row call per stage, ms per row | k one-row calls per stage, ms per row | k-row cost / one-row cost | Multi-row kernel that ran |\n|---|---|---|---|---|---|---|\n",
+        "| Kernel | Split | k | One k-row call per stage, ms per row | k one-row calls per stage, ms per row | k-row cost / one-row cost | Kernel that ran the k-row call |\n|---|---|---|---|---|---|---|\n",
     );
+    let decode_prompt: Vec<u32> = (0..args.decode_prompt).map(token).collect();
+    let mut decode_table = String::from(
+        "| Kernel | Decode, ms per token | Decode, tokens per second |\n|---|---|---|\n",
+    );
+    let mut decode_results: Vec<Value> = Vec::new();
+    let mut decode_reference: Option<(Vec<u32>, Hash256)> = None;
     for &choice in &args.kernels {
         canonical_simd::set_fast_canonical_kernel(choice.is_some());
         canonical_simd::set_batched_kernel_preference(choice);
@@ -383,11 +441,7 @@ fn main() -> Result<(), String> {
                     ran.join(" + ")
                 };
                 if let Some(pinned) = choice {
-                    let expected = if pinned == BatchedKernel::NeonI8mm && k == 1 {
-                        BatchedKernel::NeonSdot.label()
-                    } else {
-                        pinned.label()
-                    };
+                    let expected = pinned.label();
                     if ran != expected {
                         return Err(format!(
                             "{kernel}, {split}, k={k}: expected {expected} to run, but {ran} ran"
@@ -418,6 +472,31 @@ fn main() -> Result<(), String> {
                 }));
             }
         }
+        if args.decode_tokens > 0 {
+            let (ms, generated, hash) =
+                decode_ms_per_token(&model, &decode_prompt, args.decode_tokens, args.repeats)?;
+            // The first kernel's generation is the reference for the rest.
+            let reference = decode_reference.get_or_insert_with(|| (generated.clone(), hash));
+            if reference.0 != generated || reference.1 != hash {
+                return Err(format!(
+                    "{kernel}: try_generate returned other tokens or another output hash"
+                ));
+            }
+            let per_second = 1000.0 / ms;
+            println!("{kernel}: decode {ms:.1} ms/token, {per_second:.2} tokens/s");
+            decode_table.push_str(&format!("| {kernel} | {ms:.1} | {per_second:.2} |\n"));
+            decode_results.push(json!({
+                "kernel": kernel,
+                "ms_per_token": ms,
+                "tokens_per_second": per_second,
+                "tokens": generated,
+                "output_hash": hash.to_hex(),
+            }));
+        }
+    }
+    if args.decode_tokens > 0 {
+        table.push('\n');
+        table.push_str(&decode_table);
     }
 
     let report = json!({
@@ -432,6 +511,9 @@ fn main() -> Result<(), String> {
         "context": args.context,
         "repeats": args.repeats,
         "results": results,
+        "decode_prompt_tokens": args.decode_prompt,
+        "decode_tokens": args.decode_tokens,
+        "decode": decode_results,
     });
     if let Some(path) = &args.out {
         let text = serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?;

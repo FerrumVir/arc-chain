@@ -1185,6 +1185,10 @@ pub(crate) fn matmul_i8_into_batched(
     });
 }
 
+/// Elements per task of the batched layer's SiLU products: large enough to
+/// amortize a task, small enough that one 11,008-wide row spans every thread.
+const SILU_CHUNK: usize = 2048;
+
 /// Disjoint-range output pointer for the batched matmul. See the identical
 /// wrapper in `canonical_simd` for why a field accessor is used.
 #[derive(Clone, Copy)]
@@ -3770,6 +3774,13 @@ impl CachedIntegerModel {
     /// projection reads its weights once for all `t_n` rows. `on_layer`
     /// observes the rows leaving every layer. The caller checks the shapes and
     /// sets `cache.seq_len`.
+    ///
+    /// The work between the projections runs on every thread of the pool.
+    /// Rows are independent: each row's norms, RoPE and residual adds, and
+    /// each element's SiLU product, run the same code in the same order as
+    /// one row at a time, on whichever thread holds them, so spreading them
+    /// across threads cannot change a value. The K/V appends and `on_layer`
+    /// stay sequential, in position order.
     fn forward_layers_batched<F>(
         &self,
         hidden: &mut [i64],
@@ -3795,10 +3806,10 @@ impl CachedIntegerModel {
 
         for li in layers {
             let layer = &self.layers[li];
-            for ti in 0..t_n {
-                normed[ti * d..(ti + 1) * d]
-                    .copy_from_slice(&layernorm(&hidden[ti * d..(ti + 1) * d], &layer.attn_norm));
-            }
+            normed
+                .par_chunks_mut(d)
+                .zip(hidden.par_chunks(d))
+                .for_each(|(out, row)| out.copy_from_slice(&layernorm(row, &layer.attn_norm)));
             matmul_i8_into_batched(&layer.wq, &normed, t_n, d, &mut q);
             matmul_i8_into_batched(&layer.wk, &normed, t_n, d, &mut k);
             matmul_i8_into_batched(&layer.wv, &normed, t_n, d, &mut v);
@@ -3806,28 +3817,33 @@ impl CachedIntegerModel {
             // RoPE at each token's absolute position, then K/V appended in
             // position order. Pushing the whole chunk before attention is
             // safe because each token attends over `pos + 1` entries only.
-            for ti in 0..t_n {
-                let pos = first_position + ti;
-                for h in 0..cfg.n_heads {
-                    apply_rope(
-                        &mut q[ti * d + h * dh..ti * d + (h + 1) * dh],
-                        pos,
-                        dh,
-                        &cfg.rope_cos,
-                        &cfg.rope_sin,
-                    );
-                }
-                for h in 0..cfg.n_kv_heads {
-                    apply_rope(
-                        &mut k[ti * dkv + h * dh..ti * dkv + (h + 1) * dh],
-                        pos,
-                        dh,
-                        &cfg.rope_cos,
-                        &cfg.rope_sin,
-                    );
-                }
-                cache.push_k(li, &k[ti * dkv..(ti + 1) * dkv]);
-                cache.push_v(li, &v[ti * dkv..(ti + 1) * dkv]);
+            q.par_chunks_mut(d)
+                .zip(k.par_chunks_mut(dkv))
+                .enumerate()
+                .for_each(|(ti, (q_row, k_row))| {
+                    let pos = first_position + ti;
+                    for h in 0..cfg.n_heads {
+                        apply_rope(
+                            &mut q_row[h * dh..(h + 1) * dh],
+                            pos,
+                            dh,
+                            &cfg.rope_cos,
+                            &cfg.rope_sin,
+                        );
+                    }
+                    for h in 0..cfg.n_kv_heads {
+                        apply_rope(
+                            &mut k_row[h * dh..(h + 1) * dh],
+                            pos,
+                            dh,
+                            &cfg.rope_cos,
+                            &cfg.rope_sin,
+                        );
+                    }
+                });
+            for (k_row, v_row) in k.chunks_exact(dkv).zip(v.chunks_exact(dkv)) {
+                cache.push_k(li, k_row);
+                cache.push_v(li, v_row);
             }
 
             {
@@ -3861,22 +3877,30 @@ impl CachedIntegerModel {
             }
 
             matmul_i8_into_batched(&layer.wo, &attn, t_n, d, &mut proj);
-            for i in 0..t_n * d {
-                hidden[i] += proj[i];
-            }
-            for ti in 0..t_n {
-                normed[ti * d..(ti + 1) * d]
-                    .copy_from_slice(&layernorm(&hidden[ti * d..(ti + 1) * d], &layer.ffn_norm));
-            }
+            hidden
+                .par_iter_mut()
+                .zip(proj.par_iter())
+                .for_each(|(h, p)| *h += p);
+            normed
+                .par_chunks_mut(d)
+                .zip(hidden.par_chunks(d))
+                .for_each(|(out, row)| out.copy_from_slice(&layernorm(row, &layer.ffn_norm)));
             matmul_i8_into_batched(&layer.w_gate, &normed, t_n, d, &mut gate);
             matmul_i8_into_batched(&layer.w_up, &normed, t_n, d, &mut up);
-            for j in 0..t_n * dff {
-                gate[j] = (silu_i64(gate[j]) * up[j]) >> FRAC_BITS;
-            }
+            // Element-wise, so any chunking is exact; fixed-size chunks
+            // spread even a single row across threads.
+            gate.par_chunks_mut(SILU_CHUNK)
+                .zip(up.par_chunks(SILU_CHUNK))
+                .for_each(|(gate, up)| {
+                    for (g, &u) in gate.iter_mut().zip(up) {
+                        *g = (silu_i64(*g) * u) >> FRAC_BITS;
+                    }
+                });
             matmul_i8_into_batched(&layer.w_down, &gate, t_n, dff, &mut ffo);
-            for i in 0..t_n * d {
-                hidden[i] += ffo[i];
-            }
+            hidden
+                .par_iter_mut()
+                .zip(ffo.par_iter())
+                .for_each(|(h, f)| *h += f);
             for (ti, row) in hidden.chunks_exact(d).enumerate() {
                 on_layer(first_position + ti, li, row);
             }
@@ -4767,12 +4791,13 @@ impl CachedIntegerModel {
     /// the prefill's scratch budget
     /// ([`crate::canonical_prefill::MAX_PREFILL_SCRATCH_BYTES`]). Per row
     /// that is the prefill's activation and digit scratch
-    /// ([`crate::canonical_prefill::prefill_chunk_scratch_bytes`]) plus the
-    /// rows the call returns. On the stage that holds the head, those are the
+    /// ([`crate::canonical_prefill::prefill_chunk_scratch_bytes`], which
+    /// includes the SMMLA kernel's paired copy of the digits) plus the rows
+    /// the call returns. On the stage that holds the head, those are the
     /// final norm and the logits, which it holds twice (computed and
     /// returned). The prefill's [`crate::canonical_simd::MAX_BATCH_TOKENS`]
-    /// ceiling applies too. At Llama-2-7B width this is 521 rows on an inner
-    /// stage and 261 on the last.
+    /// ceiling applies too. At Llama-2-7B width this is 480 rows on an inner
+    /// stage and 250 on the last.
     pub fn max_shard_rows(&self, end_layer: usize) -> usize {
         let cfg = &self.config;
         let scratch = crate::canonical_prefill::prefill_chunk_scratch_bytes(

@@ -82,8 +82,9 @@ fn build_model(fixture: &GoldenFixture, profile: Profile) -> CachedIntegerModel 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kernel {
     Scalar,
-    /// The exact limb kernels: one-row projections run AVX2 on x86-64 and
-    /// NEON dotprod on arm64, and multi-row projections run this kernel.
+    /// The exact limb kernels with this multi-row kernel selected. One-row
+    /// projections run it too when it is a matrix-extension kernel (SMMLA,
+    /// VNNI); with SDOT or AVX2 they run the one-row kernel of that ISA.
     Vectorised(BatchedKernel),
 }
 
