@@ -1007,6 +1007,20 @@ fn matmul_i8_view_into(
         weights.scales.len(),
         "matmul output/scales mismatch"
     );
+    // Study builds only (never in a node or release binary); see the module.
+    #[cfg(feature = "float-accumulation-study")]
+    if crate::float_accumulation_study::enabled() {
+        crate::float_accumulation_study::matmul_batched_f32(
+            weights.data,
+            weights.scales,
+            weights.n_rows,
+            input,
+            1,
+            in_size,
+            output,
+        );
+        return;
+    }
     // Opt-in bit-exact vectorised path. Default OFF, so the scalar datapath
     // below is unchanged unless a caller explicitly enables it. The fast path
     // refuses any input it cannot prove exact and returns false, leaving the
@@ -1145,6 +1159,20 @@ pub(crate) fn matmul_i8_into_batched(
         inputs.len(),
         output.len()
     );
+    // Study builds only (never in a node or release binary); see the module.
+    #[cfg(feature = "float-accumulation-study")]
+    if crate::float_accumulation_study::enabled() {
+        crate::float_accumulation_study::matmul_batched_f32(
+            &weights.data,
+            &weights.scales,
+            weights.n_rows,
+            inputs,
+            n_tokens,
+            in_size,
+            output,
+        );
+        return;
+    }
     if crate::canonical_simd::fast_canonical_kernel_enabled()
         && crate::canonical_simd::matmul_i8_batched_fast(weights, inputs, n_tokens, in_size, output)
     {

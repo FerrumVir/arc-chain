@@ -78,6 +78,21 @@ jobs:
         with:
           toolchain: nightly-2026-03-16
 
+      - name: Keep the f32-accumulation study out of node builds
+        run: |
+          set -euo pipefail
+          # The non-canonical study mode exists only with arc-inference's
+          # float-accumulation-study feature. No arc-node feature set may
+          # enable it, so no node, worker or release binary contains it.
+          for features in "" "--all-features"; do
+            tree="$(cargo tree --locked -p arc-node $features -e features -i arc-inference)"
+            if printf '%s\n' "$tree" | grep -q 'float-accumulation-study'; then
+              echo "::error::arc-node $features enables arc-inference/float-accumulation-study"
+              exit 1
+            fi
+          done
+          echo "arc-node never enables float-accumulation-study"
+
       - name: Download and verify the pinned model (#182's fetch)
         run: |
           set -euo pipefail

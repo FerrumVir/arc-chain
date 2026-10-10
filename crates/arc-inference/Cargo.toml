@@ -17,6 +17,13 @@ candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
 # `experimental-ip` requires the actual implementation files at
 # crates/arc-inference/src/ternary_engine.rs and ternary_hybrid.rs.
 experimental-ip = []
+# NON-CANONICAL, study only: every weight projection accumulates in f32
+# (src/float_accumulation_study.rs) to measure how often a float
+# implementation of ARC's algorithm chooses the exact engine's tokens. No
+# workspace crate enables it, so no node, worker or release binary contains
+# the code; .github/workflows/draft-verify-bench.yml checks arc-node's
+# feature set on every run.
+float-accumulation-study = []
 
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
@@ -162,3 +169,7 @@ required-features = ["candle"]
 [[example]]
 name = "draft_verify_bench"
 required-features = ["candle"]
+
+[[example]]
+name = "float_accumulation_study"
+required-features = ["candle", "float-accumulation-study"]

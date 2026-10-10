@@ -13,6 +13,10 @@ pub mod canonical_simd;
 pub mod committee;
 pub mod distributed;
 pub mod draft_verify;
+// Non-canonical f32 accumulation for agreement studies; compiled only with
+// the `float-accumulation-study` feature, which no workspace crate enables.
+#[cfg(feature = "float-accumulation-study")]
+pub mod float_accumulation_study;
 pub mod gas;
 pub mod gguf_integer;
 pub mod gguf_meta;
