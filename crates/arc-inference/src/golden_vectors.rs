@@ -483,6 +483,143 @@ fn golden_cached_integer_autoregressive_output_matches_known_answer() {
     }
 }
 
+/// The same pinned known answers with every per-row I8 projection of the
+/// whole-model path computed by the exact Metal GEMV (`metal-exact` feature,
+/// Apple Silicon only), and a three-way shard split that matches the CPU.
+#[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn golden_cached_integer_kat_holds_on_the_exact_metal_gemv() {
+    use crate::metal_gemv::test_support::SwitchGuard;
+    use crate::metal_gemv::{MetalModel, metal_census};
+
+    let _guard = crate::canonical_simd::kernel_switch_guard();
+    let fixture = fixture();
+    let expected = expected_sequence(&fixture);
+    let model = build_fixture_model(&fixture);
+    assert_eq!(
+        hex::encode(model.weight_hash().0),
+        fixture.expected.model_weight_hash
+    );
+    let cpu_split = run_split_shards(&model, &fixture.sequence_tokens, &fixture.shard_boundaries);
+
+    let metal = MetalModel::new(&model).expect("the exact Metal GEMV must be available");
+    assert_eq!(metal.resident_matrices(), fixture.n_layers * 7 + 1);
+    let _switch = SwitchGuard::set(true);
+    let before = metal_census();
+    let whole = metal.run(|| run_whole_model(&model, &fixture.sequence_tokens));
+    let delta = metal_census().since(&before);
+    assert_eq!(whole, expected, "the Metal GEMV path drifted from the KAT");
+    // Seven projections per layer per token reach the hook. The 23-row output
+    // projection takes matmul_i8's small-output loop and never does.
+    let projections = (fixture.n_layers * 7 * fixture.sequence_tokens.len()) as u64;
+    assert_eq!(delta.accepted, projections, "{delta:?}");
+    assert_eq!(delta.in_scope_fallbacks(), 0, "{delta:?}");
+
+    let before = metal_census();
+    let split =
+        metal.run(|| run_split_shards(&model, &fixture.sequence_tokens, &fixture.shard_boundaries));
+    let delta = metal_census().since(&before);
+    assert_eq!(
+        split, cpu_split,
+        "Metal shard split differs from the CPU shard split"
+    );
+    assert_eq!(delta.accepted, projections, "{delta:?}");
+    assert_eq!(delta.in_scope_fallbacks(), 0, "{delta:?}");
+}
+
+/// The pinned known answers with every token computed in one command buffer
+/// on the GPU (`metal-exact`, Apple Silicon only): the whole model, and a
+/// three-way shard split that must also match the CPU split.
+#[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn golden_cached_integer_kat_holds_with_one_command_buffer_per_token() {
+    use crate::metal_forward::{MetalForward, MirroredKvCache};
+
+    let _guard = crate::canonical_simd::kernel_switch_guard();
+    let fixture = fixture();
+    let expected = expected_sequence(&fixture);
+    let model = build_fixture_model(&fixture);
+    let cpu_split = run_split_shards(&model, &fixture.sequence_tokens, &fixture.shard_boundaries);
+    let mut gpu =
+        MetalForward::new(&model, fixture.max_seq).expect("the GPU decoder must be available");
+
+    let mut cache = MirroredKvCache::new(model.config.n_layers);
+    let mut next_tokens = Vec::new();
+    let mut logits_hashes = Vec::new();
+    for &token in &fixture.sequence_tokens {
+        let logits = gpu.forward_one_token(token, &mut cache);
+        next_tokens.push(crate::integer_lut::argmax_i64(&logits) as u32);
+        logits_hashes.push(hash_i64(&logits));
+    }
+    let whole = SequenceResult {
+        next_tokens,
+        logits_hashes,
+        kv_cache_hash: hash_cache(&cache),
+    };
+    assert_eq!(
+        whole, expected,
+        "one command buffer per token drifted from the KAT"
+    );
+    let stats = gpu.stats();
+    assert_eq!(
+        (stats.gpu_tokens, stats.cpu_tokens),
+        (fixture.sequence_tokens.len() as u64, 0),
+        "{stats:?}"
+    );
+
+    let boundaries = &fixture.shard_boundaries;
+    let ranges = [
+        (0, boundaries[0]),
+        (boundaries[0], boundaries[1]),
+        (boundaries[1], model.config.n_layers),
+    ];
+    let mut cache = MirroredKvCache::new(model.config.n_layers);
+    let mut next_tokens = Vec::new();
+    let mut logits_hashes = Vec::new();
+    let mut hidden_hashes = Vec::new();
+    for (position, &token) in fixture.sequence_tokens.iter().enumerate() {
+        let mut input = ShardInput::Token(token);
+        for &(start, end) in &ranges {
+            match gpu
+                .forward_shard_token(input, &mut cache, start, end, position)
+                .expect("contiguous shard sequence")
+            {
+                ShardOutput::Hidden(hidden) => {
+                    hidden_hashes.push(hash_i64(&hidden));
+                    input = ShardInput::Hidden(hidden);
+                }
+                ShardOutput::Token { id, logits_hash } => {
+                    next_tokens.push(id);
+                    logits_hashes.push(hex::encode(logits_hash.0));
+                    input = ShardInput::Token(0);
+                }
+            }
+        }
+    }
+    let split = ShardSequenceResult {
+        sequence: SequenceResult {
+            next_tokens,
+            logits_hashes,
+            kv_cache_hash: hash_cache(&cache),
+        },
+        hidden_hashes,
+    };
+    assert_eq!(
+        split, cpu_split,
+        "the GPU shard split differs from the CPU shard split"
+    );
+    assert_eq!(
+        split.sequence, expected,
+        "the GPU shard split drifted from the KAT"
+    );
+    let stats = gpu.stats();
+    assert_eq!(
+        (stats.cpu_tokens, stats.mirror_mismatches),
+        (0, 0),
+        "{stats:?}"
+    );
+}
+
 // ── Operator vectors from the independent reference ─────────────────────────
 //
 // `integer_operator_kat.json` is produced by `scripts/arc_conformance`, a
