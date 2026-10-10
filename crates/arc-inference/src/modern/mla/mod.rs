@@ -16,6 +16,8 @@
 //! * [`ops`]: interleaved RoPE, absorbed MLA attention, INT16 router rows,
 //!   expert selection with index tie-breaking, Q32 routing weights, and the
 //!   exact expert combine;
+//! * [`q4_kernels`]: opt-in exact INT4 routed-expert kernels (SDOT and SMMLA
+//!   on arm64, AVX2 and VNNI on x86-64);
 //! * [`package`]: stage packages (any contiguous layer range), segment
 //!   digests, the layout-independent model root, and the stage manifest;
 //! * [`convert`]: BF16 safetensors to stage packages, integer-only;
@@ -32,6 +34,7 @@ pub mod model;
 pub mod ops;
 pub mod package;
 pub mod precision;
+pub mod q4_kernels;
 pub mod yarn;
 mod yarn_constants;
 

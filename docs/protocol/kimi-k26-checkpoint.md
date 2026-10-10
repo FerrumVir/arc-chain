@@ -73,6 +73,14 @@ attention, shared expert and router at INT8.
 The routed experts are 571 GB of the 582 GB; the remaining ~11.7 GB is
 embedding, LM head, attention, the dense layer, shared experts and routers.
 
+**INT4 scale summaries [CALC].** The engine keeps a parsed summary of each
+expert matrix's group scales, 16 B per row, built on the matrix's first
+projection (`ops::Q4ScaleTable`). Per expert that is 11,264 rows = 180,224 B,
+0.73% of its 24.8 MB; 69.2 MB per MoE layer once all 384 experts have run;
+4.15 GB over K2.6's 60 MoE layers. `StageModel::q4_scale_table_bytes` reports
+what a stage holds (and `q4_scale_table_bound` the most it can reach), and
+`arc-mla` records it beside `int8_weights`.
+
 **Per sequence [CALC].**
 - KV cache: `61 × (512 + 64)` i32 per position = 140,544 B; 576 MB at 4,096
   positions, 18.4 GB at 131,072, 36.8 GB at the full 262,144.

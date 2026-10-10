@@ -1,0 +1,87 @@
+name: MLA INT4 expert bench
+
+# CI-runner benchmark of one K2.6-shaped MoE layer on CPU
+# (`modern::mla::model::tests::k26_moe_layer_benchmark`): the per-token time
+# of single-row passes and the per-row cost of k-row passes, k = 1 to 16, for
+# the scalar reference and each INT4 routed-expert kernel the runner has
+# (SDOT and SMMLA on arm64; AVX2 and VNNI on x86-64). Every measured pass is
+# also checked byte for byte against the scalar reference. These are
+# measurements on shared hosted runners, not product speed.
+#
+# It runs only when the `mla-q4-bench` label is added to a pull request, or by
+# hand (workflow_dispatch, once the file is on the default branch). There is
+# no push trigger.
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  bench:
+    name: bench (${{ matrix.leg }})
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'mla-q4-bench'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {leg: linux-x86-64-a, runner: ubuntu-24.04}
+          - {leg: linux-x86-64-b, runner: ubuntu-24.04}
+          - {leg: linux-arm64, runner: ubuntu-24.04-arm}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner CPU and memory
+        run: |
+          set -euo pipefail
+          { lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket|L2|L3|Flags' | cut -c1-400; free -g; } | tee runner.txt
+      # Keep this dated toolchain aligned with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: mla-q4-bench-${{ matrix.leg }}
+      - name: K2.6-shaped MoE layer benchmark (release; CI-runner numbers, not product speed)
+        env:
+          ARC_MLA_Q4_BENCH_MD: ${{ runner.temp }}/mla-q4-bench.md
+        run: |
+          set -euo pipefail
+          cargo test -p arc-inference --lib --release --locked \
+            modern::mla::model::tests::k26_moe_layer_benchmark \
+            -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee bench.log
+          {
+            echo "## ${{ matrix.leg }}"
+            echo
+            echo '```'
+            grep -E 'Model name|^CPU\(s\)' runner.txt || true
+            echo '```'
+            echo
+            cat "$RUNNER_TEMP/mla-q4-bench.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mla-q4-bench-${{ matrix.leg }}
+          path: |
+            runner.txt
+            bench.log
+          if-no-files-found: warn
