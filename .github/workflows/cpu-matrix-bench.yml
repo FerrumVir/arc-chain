@@ -13,20 +13,25 @@ name: CPU matrix-kernel bench
 # one-row calls must hand on bit-identical rows and logits, and the pinned
 # kernel must be the one that ran, or the driver exits non-zero. Timings are
 # CI-runner measurements on shared 4-vCPU hosted runners, not production
-# figures. Hosted x86-64 hosts vary, and each leg records its CPU: the Linux
-# hosts were AMD EPYC 7763 (AVX2 only) in this workflow's first run, and the
-# Windows host an AMD EPYC 9V45 with AVX-512 VNNI and AVX-VNNI, so x86-64 runs
-# on one Linux and one Windows leg.
+# figures. Hosted x86-64 hosts vary from run to run: AMD EPYC 7763 (AVX2
+# only), EPYC 9V74 (AVX-512 VNNI) and EPYC 9V45 (AVX-512 VNNI and AVX-VNNI)
+# have all appeared on both Linux and Windows. So x86-64 runs on a Linux and a
+# Windows leg, and every leg records its CPU.
 #
-# Cost control: a leg downloads about 4 GB and an x86-64 leg takes about an
-# hour, so the bench runs only when this file or the bench driver changes in
-# a pull request (bump BENCH_REVISION to measure again), or by hand once this
-# file is on the default branch. The model is never uploaded or cached.
+# Cost control: a leg downloads about 4 GB and an x86-64 leg takes up to an
+# hour, so, like speculative-bench.yml, it never runs on a push. It runs when
+# started by hand (workflow_dispatch, once this file is on the default
+# branch), or once at the moment the `cpu-matrix-bench` label is added to a
+# pull request that changes the kernels or this bench. One label event is one
+# run; measuring again means removing and re-adding the label. The model is
+# never uploaded or cached.
 on:
   pull_request:
+    types: [labeled]
     paths:
       - .github/workflows/cpu-matrix-bench.yml
       - crates/arc-inference/examples/stage_rows_bench.rs
+      - crates/arc-inference/src/canonical_simd.rs
   workflow_dispatch:
 
 permissions:
@@ -35,7 +40,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  BENCH_REVISION: "2"
   # The same bytes as arc-node's TESTNET_MODEL_SHA256 and #182's bench.
   MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
   MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
@@ -45,6 +49,11 @@ env:
 jobs:
   bench:
     name: 7B rows bench (${{ matrix.leg }})
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'cpu-matrix-bench'
+    # Per leg, so a skipped run (another label added) never takes the slot of
+    # a run that is measuring.
     concurrency:
       group: cpu-matrix-bench-${{ github.event.pull_request.number || github.ref }}-${{ matrix.leg }}
       cancel-in-progress: true
@@ -73,7 +82,7 @@ jobs:
           out="$RUNNER_TEMP/cpu-matrix-bench"
           mkdir -p "$out"
           {
-            echo "leg: $LEG, bench revision $BENCH_REVISION"
+            echo "leg: $LEG"
             echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
             if [ "$RUNNER_OS" = Linux ]; then
               lscpu
