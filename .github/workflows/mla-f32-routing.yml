@@ -1,0 +1,62 @@
+name: MLA f32-accumulation routing study (scratch)
+
+# Scratch study on a scratch branch, never for merge. It teacher-forces the
+# MLA + MoE profile's algorithm with every weight dot accumulated in f32 (the
+# TEST-ONLY, non-canonical float_study module, compiled only into
+# arc-inference's own unit tests) against the exact engine, on the INT16 MoE
+# fixtures and two larger synthetic MoEs with Kimi-style routing. It reports
+# per-token agreement, expert-routing flips (the selected top-k set differs)
+# and how the two relate. Every number is a CI measurement on a shared runner,
+# on synthetic random-weight models. Runs only on a push to this branch.
+on:
+  push:
+    branches: [scratch/mla-f32-routing]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mla-f32-routing-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_LTO: 'off'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+
+jobs:
+  study:
+    name: MLA f32-accumulation routing study (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: mla-f32-routing
+      - name: Runner
+        run: |
+          nproc
+          free -g
+          uname -m
+      # The study module is declared #[cfg(test)], so a library build without
+      # tests cannot contain it: this build fails if any non-test code refers
+      # to it.
+      - name: The library builds without the study (no production path reaches it)
+        run: cargo build --release --locked -p arc-inference --lib
+      - name: Study (teacher-forced, f32 accumulation vs exact)
+        env:
+          ARC_STUDY_MD: ${{ runner.temp }}/study.md
+        run: cargo test --release --locked -p arc-inference --lib -- --ignored --nocapture --test-threads=1 int16_moe_f32_accumulation_study
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/study.md" ]; then
+            cat "$RUNNER_TEMP/study.md" >> "$GITHUB_STEP_SUMMARY"
+          fi

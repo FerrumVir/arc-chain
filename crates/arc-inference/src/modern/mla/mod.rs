@@ -28,6 +28,9 @@
 pub mod boundary;
 pub mod config;
 pub mod convert;
+/// TEST ONLY, non-canonical: f32 accumulation for an agreement study.
+#[cfg(test)]
+pub(crate) mod float_study;
 /// Opt-in exact Metal GEMV for the INT16 projection.
 #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_i16;

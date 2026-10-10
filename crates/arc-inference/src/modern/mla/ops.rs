@@ -74,6 +74,15 @@ impl<'a> QView<'a> {
             return super::precision::project_i16(q, self.rows, self.cols, self.mu, self.k, x, out);
         }
         check_projection_input(x)?;
+        // TEST ONLY, non-canonical study (`float_study`): the dots in f32.
+        #[cfg(test)]
+        if super::float_study::enabled() {
+            super::float_study::dots_i8(self.q, self.cols, x, out);
+            for ((slot, &mu), &k) in out.iter_mut().zip(self.mu).zip(self.k) {
+                *slot = dyadic_epilogue(*slot, mu, k)?;
+            }
+            return Ok(());
+        }
         let simd = crate::canonical_simd::fast_canonical_kernel_enabled()
             && crate::canonical_simd::exact_row_dots_fast(self.q, self.rows, self.cols, x, out);
         if !simd {
@@ -190,7 +199,59 @@ pub struct Q4View<'a> {
 }
 
 impl Q4View<'_> {
+    /// [`Self::row`] with each group's dot formed in f32 and the group scales
+    /// exact (TEST ONLY, non-canonical; see `float_study`).
+    #[cfg(test)]
+    fn row_f32(&self, r: usize, x: &[i64]) -> Result<i64, ModernError> {
+        let groups = self.cols / Q4_GROUP;
+        let packed = &self.q4[r * self.cols / 2..(r + 1) * self.cols / 2];
+        let scales = &self.scales[r * groups..(r + 1) * groups];
+        let mut parts = Vec::with_capacity(groups);
+        let mut top: Option<i32> = None;
+        for &bits in scales {
+            let (_, m, e) = bf16_parts(bits)?;
+            if m > 0 {
+                top = Some(top.map_or(e, |t| t.max(e)));
+            }
+            parts.push((m, e));
+        }
+        let Some(top) = top else {
+            return Ok(0);
+        };
+        let mut total: i128 = 0;
+        for (g, &(m, e)) in parts.iter().enumerate() {
+            if m == 0 || e < top - Q4_SCALE_SPAN {
+                continue;
+            }
+            let first = g * Q4_GROUP;
+            let weights: Vec<f32> = (0..Q4_GROUP)
+                .map(|offset| q4_value(packed, first + offset) as f32)
+                .collect();
+            let acc = super::float_study::dot(&weights, &x[first..first + Q4_GROUP]);
+            total += (i128::from(m) * i128::from(acc)) << (e - top + Q4_SCALE_SPAN);
+        }
+        let exponent = top - Q4_SCALE_SPAN;
+        let value = if exponent < 0 {
+            floor_shift(total, (-exponent) as u32)
+        } else if total == 0 {
+            0
+        } else if exponent > 62 {
+            return Err(domain("INT4 projection output beyond 2^62"));
+        } else {
+            total
+                .checked_mul(1i128 << exponent)
+                .ok_or_else(|| domain("INT4 projection output beyond 2^62"))?
+        };
+        to_activation(value, "INT4 projection output beyond 2^62")
+    }
+
     fn row(&self, r: usize, x: &[i64]) -> Result<i64, ModernError> {
+        // TEST ONLY, non-canonical study (`float_study`): each group's dot in
+        // f32, the group scales exact.
+        #[cfg(test)]
+        if super::float_study::enabled() {
+            return self.row_f32(r, x);
+        }
         let groups = self.cols / Q4_GROUP;
         let packed = &self.q4[r * self.cols / 2..(r + 1) * self.cols / 2];
         let scales = &self.scales[r * groups..(r + 1) * groups];
@@ -474,6 +535,17 @@ pub fn router_logits(q: &[i16], k: &[u8], x: &[i64], out: &mut [i64]) -> Result<
     let mass: u128 = x.iter().map(|v| u128::from(v.unsigned_abs())).sum();
     if mass * 32_767 >= 1u128 << 63 {
         return Err(domain("router input magnitude (32767 * sum |x| >= 2^63)"));
+    }
+    // TEST ONLY, non-canonical study (`float_study`): each logit's dot in
+    // f32, the shift exact.
+    #[cfg(test)]
+    if super::float_study::enabled() {
+        for ((slot, row), &shift) in out.iter_mut().zip(q.chunks_exact(width)).zip(k) {
+            let weights: Vec<f32> = row.iter().map(|&w| f32::from(w)).collect();
+            let acc = super::float_study::dot(&weights, x);
+            *slot = to_activation(i128::from(acc >> shift), "router logit beyond 2^62")?;
+        }
+        return Ok(());
     }
     for ((slot, row), &shift) in out.iter_mut().zip(q.chunks_exact(width)).zip(k) {
         // |w| <= 32767 and 32767 * sum |x| < 2^63 bound every partial sum.

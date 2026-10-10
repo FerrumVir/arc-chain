@@ -379,6 +379,13 @@ pub(crate) fn project_i16_scheduled(
     {
         return Err(ModernError::Invalid("INT16 weight/scale domain".into()));
     }
+    // TEST ONLY, non-canonical study (`float_study`): the dots in f32. Not
+    // compiled outside this crate's unit tests.
+    #[cfg(test)]
+    if super::float_study::enabled() {
+        super::float_study::dots_i16(q, cols, x, out);
+        return epilogue(out, mu, k);
+    }
     // Opt-in exact Metal GEMV: compiled only with the `metal-exact` feature,
     // and used only when ARC_METAL_EXACT_I16=1 (or set_metal_exact_i16) is on
     // AND the call runs inside a MetalI16Model scope that uploaded these

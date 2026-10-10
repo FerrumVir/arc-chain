@@ -898,6 +898,9 @@ impl StageModel {
         router_logits(&m.router_q, &m.router_k, x, &mut logits)?;
         let (sigma, keys) = selection_keys(&logits, &m.bias)?;
         let chosen = select_experts(&keys, c.n_experts_per_tok, c.n_group, c.topk_group)?;
+        // TEST ONLY: the f32-accumulation study records every selection.
+        #[cfg(test)]
+        super::float_study::record_route(&chosen);
         let chosen_sigma: Vec<i64> = chosen.iter().map(|&e| sigma[e]).collect();
         let weights = routing_weights(&chosen_sigma, c.routed_scaling_q32, c.norm_topk_prob);
         // Experts run one after another: each expert projection is already
@@ -2153,6 +2156,244 @@ pub(crate) mod tests {
             (name, c)
         })
         .collect()
+    }
+
+    /// A larger synthetic MoE for the f32-accumulation study: Kimi-style
+    /// routing (64 experts in 8 groups, 4 groups kept, top 8), INT16 attention
+    /// and shared experts, INT4 routed experts, `d_model` wide.
+    fn synthetic_moe(d_model: usize, n_layers: usize, max_seq: usize) -> MlaConfig {
+        use super::super::precision::Precision;
+        let mut c = tiny_config_with(true, ExpertFormat::Int4G32);
+        c.n_layers = n_layers;
+        c.first_k_dense = 1;
+        c.d_model = d_model;
+        c.n_heads = 8;
+        c.q_lora_rank = d_model / 4;
+        c.kv_lora_rank = d_model / 8;
+        c.qk_nope_dim = 32;
+        c.qk_rope_dim = 16;
+        c.v_head_dim = 32;
+        c.d_ff = 2 * d_model;
+        c.n_routed_experts = 64;
+        c.n_experts_per_tok = 8;
+        c.n_shared_experts = 1;
+        c.moe_d_ff = d_model / 4;
+        c.n_group = 8;
+        c.topk_group = 4;
+        c.vocab_size = 512;
+        c.max_seq = max_seq;
+        c.attention_lambda = crate::modern::tables::attention_lambda(c.d_qk());
+        c.precision = Some(Precision::all_int16());
+        c.validate().unwrap();
+        c
+    }
+
+    /// Teacher-force `tokens` after `prompt`, as `generate` runs them: the
+    /// token each step selects, and every MoE layer's selected experts in call
+    /// order (one entry per MoE layer per forward).
+    fn teacher_force(
+        model: &StageModel,
+        prompt: &[u32],
+        tokens: &[u32],
+        selection: Selection,
+    ) -> Result<(Vec<u32>, Vec<Vec<usize>>), ModernError> {
+        use super::super::float_study::Routes;
+        let routes = Routes::record();
+        let mut cache = model.new_cache();
+        let mut logits = None;
+        for &t in prompt {
+            logits = model.forward(StageInput::Token(t), &mut cache, None)?.1;
+        }
+        let mut choices = Vec::with_capacity(tokens.len());
+        for (j, &t) in tokens.iter().enumerate() {
+            let step = logits.take().ok_or_else(|| invalid("no logits"))?;
+            choices.push(arith::select(&step, &tokens[..j], selection)?);
+            if j + 1 < tokens.len() {
+                logits = model.forward(StageInput::Token(t), &mut cache, None)?.1;
+            }
+        }
+        Ok((choices, routes.take()))
+    }
+
+    /// TEST ONLY, NON-CANONICAL study (`float_study`): how often the MLA +
+    /// MoE algorithm with every weight dot accumulated in f32 chooses the
+    /// exact engine's tokens and experts, teacher-forced on the exact
+    /// engine's own generations. The INT16 MoE fixtures (int16-moe, mixed-moe,
+    /// int16-yarn-moe) and two larger synthetic MoEs with Kimi-style routing.
+    /// Reports per-token agreement, expert-set flips (the top-k set differs),
+    /// and mismatches against flips at the same forward. Run explicitly:
+    /// `cargo test --release -p arc-inference --lib -- --ignored --nocapture
+    /// --test-threads=1 int16_moe_f32_accumulation_study`.
+    #[test]
+    #[ignore = "study: run explicitly with --ignored --nocapture"]
+    fn int16_moe_f32_accumulation_study() {
+        use super::super::float_study::F32Accumulation;
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        // (name, config, prompts, prompt length)
+        let mut models: Vec<(String, MlaConfig, usize, usize)> = int16_fixtures()
+            .into_iter()
+            .filter(|(_, c)| c.n_layers > c.first_k_dense)
+            .map(|(name, c)| (name.to_string(), c, 24, 5))
+            .collect();
+        models.push(("synthetic-moe-512".into(), synthetic_moe(512, 6, 136), 4, 8));
+        models.push((
+            "synthetic-moe-2048".into(),
+            synthetic_moe(2048, 4, 72),
+            2,
+            8,
+        ));
+        let selection = Selection::Rp64Argmax;
+        let mut md = String::from(
+            "\n### MLA + MoE with f32 accumulation vs the exact engine (study, CI measurement)\n\n\
+             TEST ONLY, non-canonical: every weight dot (INT16, INT8, the INT4 experts' \
+             32-value groups, the router) formed in f32 with 16 fused multiply-add lanes and \
+             rounded, everything else exact; teacher-forced on the exact engine's own \
+             generations (Rp64Argmax). Synthetic random-weight models, not Kimi weights.\n\n\
+             | Model | d_model | routed experts (top-k) | prompts x generated | token agreement | \
+             mismatches | expert sets compared | flips | forwards with a flip | mismatch rate at \
+             a forward with a flip | mismatch rate at a forward without |\n\
+             |---|---|---|---|---|---|---|---|---|---|---|\n",
+        );
+        let mut rows = Vec::new();
+        for (name, c, prompts, prompt_len) in models {
+            let start = std::time::Instant::now();
+            let model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
+            let moe_layers = c.n_layers - c.first_k_dense;
+            let generated = c.max_seq - prompt_len;
+            let mut rng = Lcg(u64::from_le_bytes(
+                blake3::hash(name.as_bytes()).as_bytes()[..8]
+                    .try_into()
+                    .unwrap(),
+            ));
+            let (mut positions, mut agree, mut sets, mut flips) = (0u64, 0u64, 0u64, 0u64);
+            let mut flip_layers = vec![0u64; moe_layers];
+            // [flip at that forward][token mismatch]
+            let mut table = [[0u64; 2]; 2];
+            let (mut exact_errors, mut f32_errors) = (0u64, 0u64);
+            for _ in 0..prompts {
+                let prompt: Vec<u32> = (0..prompt_len)
+                    .map(|_| (rng.next() % c.vocab_size as u64) as u32)
+                    .collect();
+                let request = GenerationRequest {
+                    prompt: &prompt,
+                    max_tokens: generated,
+                    eos: &[],
+                    selection,
+                };
+                let Ok(exact) = model.generate(&request) else {
+                    exact_errors += 1;
+                    continue;
+                };
+                let (exact_choices, exact_routes) =
+                    teacher_force(&model, &prompt, &exact.tokens, selection).unwrap();
+                assert_eq!(
+                    exact_choices, exact.tokens,
+                    "{name}: exact teacher forcing must reproduce the exact generation"
+                );
+                let forwards = prompt_len + exact.tokens.len() - 1;
+                assert_eq!(exact_routes.len(), forwards * moe_layers, "{name}");
+                let study = {
+                    let _f32 = F32Accumulation::on();
+                    teacher_force(&model, &prompt, &exact.tokens, selection)
+                };
+                let Ok((f32_choices, f32_routes)) = study else {
+                    f32_errors += 1;
+                    continue;
+                };
+                assert_eq!(f32_routes.len(), exact_routes.len(), "{name}");
+                let sorted = |set: &Vec<usize>| {
+                    let mut set = set.clone();
+                    set.sort_unstable();
+                    set
+                };
+                let mut flip_at = vec![false; forwards];
+                for (i, (a, b)) in exact_routes.iter().zip(&f32_routes).enumerate() {
+                    sets += 1;
+                    if sorted(a) != sorted(b) {
+                        flips += 1;
+                        flip_layers[i % moe_layers] += 1;
+                        flip_at[i / moe_layers] = true;
+                    }
+                }
+                for (j, (&want, &got)) in exact.tokens.iter().zip(&f32_choices).enumerate() {
+                    positions += 1;
+                    let same = want == got;
+                    agree += u64::from(same);
+                    // Generated token j is chosen from forward prompt_len - 1 + j.
+                    let flip = flip_at[prompt_len - 1 + j];
+                    table[usize::from(flip)][usize::from(!same)] += 1;
+                }
+            }
+            let rate = |num: u64, den: u64| {
+                if den == 0 {
+                    f64::NAN
+                } else {
+                    num as f64 / den as f64
+                }
+            };
+            let p = rate(agree, positions);
+            let flip_rate = rate(flips, sets);
+            let with_flip = table[1][0] + table[1][1];
+            let without_flip = table[0][0] + table[0][1];
+            md.push_str(&format!(
+                "| {name} | {} | {} ({}) | {prompts} x {generated} | {agree}/{positions} = {:.5} | {} \
+                 | {sets} | {flips} ({:.5}) | {with_flip} | {}/{with_flip} = {:.4} | {}/{without_flip} \
+                 = {:.4} |\n",
+                c.d_model,
+                c.n_routed_experts,
+                c.n_experts_per_tok,
+                p,
+                positions - agree,
+                flip_rate,
+                table[1][1],
+                rate(table[1][1], with_flip),
+                table[0][1],
+                rate(table[0][1], without_flip),
+            ));
+            let row = serde_json::json!({
+                "model": name,
+                "d_model": c.d_model,
+                "routed_experts": c.n_routed_experts,
+                "top_k": c.n_experts_per_tok,
+                "moe_layers": moe_layers,
+                "prompts": prompts,
+                "generated_per_prompt": generated,
+                "positions": positions,
+                "agree": agree,
+                "p": p,
+                "expert_sets": sets,
+                "flips": flips,
+                "flip_rate": flip_rate,
+                "flips_by_moe_layer": flip_layers,
+                "forwards_with_flip": with_flip,
+                "mismatch_given_flip": [table[1][1], with_flip],
+                "mismatch_given_no_flip": [table[0][1], without_flip],
+                "exact_errors": exact_errors,
+                "f32_errors": f32_errors,
+                "seconds": start.elapsed().as_secs_f64(),
+            });
+            println!("MLA_F32_STUDY_ROW {row}");
+            rows.push(row);
+        }
+        md.push_str(
+            "\nA flip compares the f32 run's selected expert set with the exact run's at the same \
+             forward and MoE layer (as sets). The last two columns split generated tokens by \
+             whether any MoE layer flipped at the forward that chose them.\n",
+        );
+        println!("{md}");
+        if let Ok(path) = std::env::var("ARC_STUDY_MD") {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            file.write_all(md.as_bytes()).unwrap();
+        }
+        println!(
+            "MLA_F32_STUDY {}",
+            serde_json::json!({"label": "CI measurement, test-only study", "rows": rows})
+        );
     }
 
     /// Every dyadic matrix of a stage by package name: embedding, attention,
