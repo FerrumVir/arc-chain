@@ -298,7 +298,7 @@ pub fn generate_with_drafter(
     drafter: &mut dyn TokenDrafter,
     config: &DraftVerifyConfig,
 ) -> Result<DraftOutput, DraftVerifyError> {
-    model.preflight_generation(prompt.len(), max_tokens)?;
+    let _admission = model.preflight_generation(prompt.len(), max_tokens)?;
     let mut run = Verifier::new(model, config)?;
     run.generate(prompt, max_tokens as usize, eos_tokens, drafter)?;
     Ok(run.finish())

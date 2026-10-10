@@ -42,6 +42,12 @@ env:
   # Release b11534, the version the agreement experiment measured.
   LLAMA_CPP_COMMIT: 50e3e3e480c80b9ee0ea067e475602d540dc62c8
   MAX_NEW_TOKENS: "128"
+  # Largest draft length. Run 38024682881 used 31, the cap from llama.cpp's
+  # measured run lengths, and verified 1.5 rows per committed token: on CPU a
+  # 16- or 32-row pass costs more per committed token than a plain step. 7 is
+  # where #185's measured row costs (bench run 37998031423) and the measured
+  # agreement give the most tokens per verifier second.
+  DRAFT_CAP: "7"
 
 jobs:
   bench:
@@ -157,6 +163,7 @@ jobs:
             --profile "$PROFILE" \
             --kernel simd \
             --max-new-tokens "$MAX_NEW_TOKENS" \
+            --cap "$DRAFT_CAP" \
             --out "$out/result.json" \
             --summary "$out/summary.md" 2>&1 | tee "$out/bench.log" || status=$?
           if [ -f "$out/summary.md" ]; then
