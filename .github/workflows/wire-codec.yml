@@ -1,0 +1,150 @@
+name: Wire codec study (scratch)
+
+# Scratch study on a scratch branch, never for merge. Lossless compression of
+# the exact 7B's stage traffic: the boundary hidden states of the 2- and 4-way
+# pipeline splits and column-sharded Wq partial sums, as the i64 they are sent
+# as, teacher-forced on the agreement experiment's recorded sequences (run
+# 38018929905). CI measurements on shared runners. Runs only on a push to this
+# scratch branch.
+on:
+  push:
+    branches: [scratch/wire-codec]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: wire-codec-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
+  MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+  MODEL_BYTES: "4081004224"
+  MODEL_FILE: .wire-codec/llama-2-7b-chat.Q4_K_M.gguf
+  SOURCE_RUN: "38018929905"
+
+jobs:
+  codec:
+    name: codecs / ${{ matrix.runner }} / ${{ matrix.profile }} / ${{ matrix.category }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm]
+        profile: [interleaved, legacy]
+        category: [chat, code, math, longform, copy]
+        include:
+          - {runner: ubuntu-24.04, profile: legacy, category: chat}
+    env:
+      RUNNER_LABEL: ${{ matrix.runner }}
+      PROFILE: ${{ matrix.profile }}
+      CATEGORY: ${{ matrix.category }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner facts
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/wire-codec"
+          mkdir -p "$out"
+          { echo "leg: $RUNNER_LABEL / $PROFILE / $CATEGORY"; lscpu; free -b; } 2>&1 | tee "$out/runner.txt"
+
+      - name: Download and verify the pinned model (#182's fetch)
+        run: |
+          set -euo pipefail
+          fetch() {
+            local url="$1" file="$2" bytes="$3" sha="$4"
+            mkdir -p "$(dirname "$file")"
+            curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+              --retry-max-time 900 --connect-timeout 20 --max-time 1800 \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$file.partial" "$url"
+            mv "$file.partial" "$file"
+            local size actual
+            size="$(wc -c < "$file" | tr -d ' ')"
+            if [ "$size" != "$bytes" ]; then
+              echo "::error::$file is $size bytes, expected $bytes"
+              exit 1
+            fi
+            actual="$(sha256sum "$file" | cut -d ' ' -f 1)"
+            if [ "$actual" != "$sha" ]; then
+              echo "::error::$file SHA-256 is $actual, expected $sha"
+              exit 1
+            fi
+            echo "verified $file: sha256 $actual, $size bytes"
+          }
+          fetch "$MODEL_URL" "$MODEL_FILE" "$MODEL_BYTES" "$MODEL_SHA256"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - name: Build the study (release; adds zstd to the lockfile on the runner)
+        run: cargo build --release -p arc-inference --features candle --example wire_codec_study
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          run-id: ${{ env.SOURCE_RUN }}
+          github-token: ${{ github.token }}
+          name: arc-${{ matrix.profile }}-${{ matrix.category }}
+          path: arc-out
+
+      - name: Run the codecs on the stage traffic
+        timeout-minutes: 120
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/wire-codec"
+          arch=arm64
+          if [ "$RUNNER_LABEL" = ubuntu-24.04 ]; then arch=x86; fi
+          arcs="$(find arc-out -name 'arc-*.json' | sort | paste -sd, -)"
+          target/release/examples/wire_codec_study --model "$GITHUB_WORKSPACE/$MODEL_FILE" \
+            --profile "$PROFILE" --arc "$arcs" \
+            --out "$out/codec-$arch-$PROFILE-$CATEGORY.json" 2>&1 | tee "$out/codec-$arch-$PROFILE-$CATEGORY.log"
+
+      - name: Upload (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codec-${{ matrix.runner }}-${{ matrix.profile }}-${{ matrix.category }}
+          path: ${{ runner.temp }}/wire-codec/
+          if-no-files-found: error
+          retention-days: 30
+
+  report:
+    name: Codec report
+    needs: codec
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: codec-*
+          path: all
+
+      - name: Tabulate
+        run: |
+          set -euo pipefail
+          mkdir -p report
+          python3 experiments/wire-codec/report.py all report/report.md report/report.json "$GITHUB_RUN_ID"
+          cat report/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wire-codec-report
+          path: report/
+          if-no-files-found: error
+          retention-days: 30

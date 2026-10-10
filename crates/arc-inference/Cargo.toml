@@ -52,6 +52,9 @@ candle-transformers = { version = "0.8", optional = true }
 
 [dev-dependencies]
 rand.workspace = true
+# Scratch wire-codec study only (not for merge).
+zstd = "0.13"
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 
 # Modern-model CLI (SmolLM3-3B): convert, verify, generate, golden, ppl.
 [[bin]]
@@ -173,3 +176,7 @@ required-features = ["candle"]
 [[example]]
 name = "float_accumulation_study"
 required-features = ["candle", "float-accumulation-study"]
+
+[[example]]
+name = "wire_codec_study"
+required-features = ["candle"]
