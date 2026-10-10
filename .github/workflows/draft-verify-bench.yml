@@ -1,0 +1,163 @@
+name: Drafter and exact verifier bench
+
+# llama.cpp (release b11534, built from source, CPU) runs the same pinned
+# Llama-2-7B-Chat Q4_K_M as a drafter in another process, and ARC's exact
+# engine verifies its proposals k rows at a time (crates/arc-inference/src/
+# draft_verify.rs). Every leg is an exactness gate on the real 7B model: each
+# drafted run, on the whole model and on 2- and 4-stage splits, must return
+# the same tokens and output hash as production try_generate, or the bench
+# exits non-zero. It then measures exact tok/s against plain decoding and how
+# the time splits between the drafter and the verifier. Timings are CI
+# measurements on shared 4-vCPU runners, not production figures.
+#
+# Cost control: it runs when a pull request changes the drafter, the
+# verifier or this bench, and a newer push cancels an older run. Models are
+# downloaded each run and never cached or uploaded.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/draft-verify-bench.yml
+      - crates/arc-inference/examples/draft_verify_bench.rs
+      - crates/arc-inference/src/draft_verify.rs
+      - tools/llama-drafter/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: draft-verify-bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The target: the same bytes as arc-node's TESTNET_MODEL_SHA256 (#182's
+  # pinned download). The drafter loads the same file.
+  MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
+  MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+  MODEL_BYTES: "4081004224"
+  MODEL_FILE: .draft-verify-bench/llama-2-7b-chat.Q4_K_M.gguf
+  LLAMA_CPP_REPO: https://github.com/ggml-org/llama.cpp
+  # Release b11534, the version the agreement experiment measured.
+  LLAMA_CPP_COMMIT: 50e3e3e480c80b9ee0ea067e475602d540dc62c8
+  MAX_NEW_TOKENS: "128"
+
+jobs:
+  bench:
+    name: 7B drafter + verifier / ${{ matrix.runner }} / ${{ matrix.profile }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        profile: [interleaved, legacy]
+    env:
+      RUNNER_LABEL: ${{ matrix.runner }}
+      PROFILE: ${{ matrix.profile }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner facts
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/draft-verify-bench"
+          mkdir -p "$out"
+          {
+            echo "leg: $RUNNER_LABEL / $PROFILE"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            lscpu
+            free -b
+            df -h .
+          } 2>&1 | tee "$out/runner.txt"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - name: Download and verify the pinned model (#182's fetch)
+        run: |
+          set -euo pipefail
+          fetch() {
+            local url="$1" file="$2" bytes="$3" sha="$4"
+            mkdir -p "$(dirname "$file")"
+            curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+              --retry-max-time 900 --connect-timeout 20 --max-time 1800 \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$file.partial" "$url"
+            mv "$file.partial" "$file"
+            local size actual
+            size="$(wc -c < "$file" | tr -d ' ')"
+            if [ "$size" != "$bytes" ]; then
+              echo "::error::$file is $size bytes, expected $bytes"
+              exit 1
+            fi
+            actual="$(sha256sum "$file" | cut -d ' ' -f 1)"
+            if [ "$actual" != "$sha" ]; then
+              echo "::error::$file SHA-256 is $actual, expected $sha"
+              exit 1
+            fi
+            echo "verified $file: sha256 $actual, $size bytes"
+          }
+          fetch "$MODEL_URL" "$MODEL_FILE" "$MODEL_BYTES" "$MODEL_SHA256"
+
+      - name: Fetch llama.cpp at the pinned commit
+        run: |
+          set -euo pipefail
+          dir=tools/llama-drafter/llama.cpp
+          git init -q "$dir"
+          git -C "$dir" fetch -q --depth 1 "$LLAMA_CPP_REPO" "$LLAMA_CPP_COMMIT"
+          git -C "$dir" checkout -q FETCH_HEAD
+          got="$(git -C "$dir" rev-parse HEAD)"
+          if [ "$got" != "$LLAMA_CPP_COMMIT" ]; then
+            echo "::error::llama.cpp is at $got, expected $LLAMA_CPP_COMMIT"
+            exit 1
+          fi
+          echo "llama.cpp at $got"
+
+      - name: Build the llama.cpp drafter (CPU, Release)
+        run: |
+          set -euo pipefail
+          cmake -S tools/llama-drafter -B build-drafter -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-drafter --target llama-drafter -j "$(nproc)"
+
+      - name: Build the bench (release, Candle GGUF loader)
+        run: cargo build --locked --release -p arc-inference --features candle --example draft_verify_bench
+
+      - name: Run plain and drafted decoding
+        timeout-minutes: 140
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/draft-verify-bench"
+          mkdir -p "$out"
+          drafter="$(find build-drafter -type f -name llama-drafter -perm -u+x | head -n 1)"
+          status=0
+          target/release/examples/draft_verify_bench \
+            --model "$GITHUB_WORKSPACE/$MODEL_FILE" \
+            --drafter "$GITHUB_WORKSPACE/$drafter" \
+            --drafter-model "$GITHUB_WORKSPACE/$MODEL_FILE" \
+            --profile "$PROFILE" \
+            --kernel simd \
+            --max-new-tokens "$MAX_NEW_TOKENS" \
+            --out "$out/result.json" \
+            --summary "$out/summary.md" 2>&1 | tee "$out/bench.log" || status=$?
+          if [ -f "$out/summary.md" ]; then
+            {
+              echo "Runner: $RUNNER_LABEL ($(nproc) vCPU)."
+              echo
+              cat "$out/summary.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+      - name: Upload this leg's results (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: draft-verify-bench-${{ matrix.runner }}-${{ matrix.profile }}
+          path: ${{ runner.temp }}/draft-verify-bench/
+          if-no-files-found: error
+          retention-days: 30

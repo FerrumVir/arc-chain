@@ -12,6 +12,7 @@ pub mod canonical_prefill;
 pub mod canonical_simd;
 pub mod committee;
 pub mod distributed;
+pub mod draft_verify;
 pub mod gas;
 pub mod gguf_integer;
 pub mod gguf_meta;
