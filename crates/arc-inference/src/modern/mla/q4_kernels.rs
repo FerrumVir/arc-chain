@@ -64,15 +64,21 @@ const GROUP_BYTES: usize = GROUP / 2;
 /// Rows per parallel task.
 const ROW_CHUNK: usize = 16;
 
+/// Largest group sum of a signed kernel: 32 products of at most 8 * 128.
+const SIGNED_GROUP_MAX: i64 = (GROUP as i64) * 8 * 128;
+/// Largest lane of an unsigned-weight kernel before its correction: 32
+/// products of at most 15 * 128.
+const UNSIGNED_GROUP_MAX: i64 = (GROUP as i64) * 15 * 128;
+
 const _: () = assert!(GROUP == 32);
-// Signed kernels: 32 products of at most 8 * 128 per group.
-const _: () = assert!(32 * 8 * 128 <= i32::MAX as i64);
-// Unsigned-weight kernels: pair sums below the 16-bit saturation, and a whole
-// group of products of at most 15 * 128 in an i32 lane.
+const _: () = assert!(SIGNED_GROUP_MAX <= i32::MAX as i64);
+// Pair sums below the 16-bit saturation, and a lane and its correction
+// (8 times a group's digit sum, at most the signed bound) in an i32.
 const _: () = assert!(2 * 15 * 128 <= i16::MAX as i64);
-const _: () = assert!(32 * 15 * 128 + 32 * 8 * 128 <= i32::MAX as i64);
+const _: () = assert!(UNSIGNED_GROUP_MAX + SIGNED_GROUP_MAX <= i32::MAX as i64);
 // The dot of a group over four planes, in i64.
-const _: () = assert!(32_768i128 * (1 + 256 + 65_536 + 16_777_216) < (1i128 << 40));
+const _: () =
+    assert!((SIGNED_GROUP_MAX as i128) * (1 + 256 + 65_536 + 16_777_216) < i64::MAX as i128);
 
 /// An exact INT4 expert kernel. Every kernel computes the same integers; they
 /// differ only in the instruction that multiplies the bytes.
