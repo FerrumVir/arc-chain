@@ -28,6 +28,13 @@
 //! single-row arithmetic. Row r sits at position `pos + r` and attends to the
 //! rows before it, so the pass equals that many [`MetalDecoder::step`] calls,
 //! value for value.
+//!
+//! [`MetalDecoder::new_float_draft`] builds a NON-CANONICAL decoder for a
+//! speculative-decoding drafter: every projection forms its dot product in
+//! f32 (`metal_float_draft`) instead of splitting its input into digit planes
+//! for the exact GEMV, and every other kernel is the exact one. Its tokens are
+//! proposals that ARC's exact engine verifies, never outputs. A decoder built
+//! with [`MetalDecoder::new`] never runs those kernels.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -42,6 +49,7 @@ use crate::metal_exact::{
     BLOCK_BYTES, MAX_COLS, MAX_PLANES, MetalExactGemv, Params, ROWS_PER_SIMDGROUP, ResidentMatrix,
     Tile, gpu_seconds,
 };
+use crate::metal_float_draft::{FloatDraftKernels, RowThreads};
 
 /// Source of the decoder kernels.
 pub const DECODER_SOURCE: &str = include_str!("metal_exact_decoder.metal");
@@ -877,6 +885,8 @@ struct Activations {
     digits: Buffer,
     ctrl: Buffer,
     status: Buffer,
+    /// A projection input as f32 (float-draft decoders only).
+    xf: Buffer,
 }
 
 /// Command buffers for one step, ended according to the [`Submission`].
@@ -970,6 +980,15 @@ pub struct MetalDecoder {
     rows_io: Activations,
     /// Multi-row projections stage the digit planes in threadgroup memory.
     staged_gemm: bool,
+    /// NON-CANONICAL f32 projections, for a drafter
+    /// ([`MetalDecoder::new_float_draft`]); `None` for an exact decoder.
+    float: Option<FloatDraft>,
+}
+
+/// The f32 projections of a float-draft decoder.
+struct FloatDraft {
+    kernels: FloatDraftKernels,
+    threads: RowThreads,
 }
 
 /// Activation buffers for `rows` contiguous rows.
@@ -991,6 +1010,7 @@ fn row_activations(device: &DeviceRef, s: &DecoderShape, rows: usize) -> Activat
         digits: new_shared(device, rows * MAX_PLANES * stride_of(widest)),
         ctrl: new_shared(device, rows * 4),
         status: new_shared(device, 16),
+        xf: new_shared(device, rows * widest * 4),
     }
 }
 
@@ -1019,6 +1039,57 @@ impl MetalDecoder {
         engine: Arc<MetalExactGemv>,
         shape: DecoderShape,
         weights: DecoderWeights,
+    ) -> Result<Self, String> {
+        Self::build(engine, shape, weights, None)
+    }
+
+    /// NON-CANONICAL: the same decoder with every projection's dot product
+    /// formed in f32 (`metal_float_draft`), for a speculative-decoding
+    /// drafter. Every other kernel is the exact one. Its logits and KV rows
+    /// are those of the CPU engine with the f32-accumulation study on
+    /// (`arc_inference::float_accumulation_study`), not ARC's: use them only
+    /// to propose tokens that the exact engine verifies. It runs
+    /// [`Self::step`]; [`Self::step_rows`] is exact only and refuses. The f32
+    /// kernels must first pass their self-test on this device.
+    pub fn new_float_draft(
+        engine: Arc<MetalExactGemv>,
+        shape: DecoderShape,
+        weights: DecoderWeights,
+    ) -> Result<Self, String> {
+        let kernels = FloatDraftKernels::new(&engine)?;
+        Self::build(
+            engine,
+            shape,
+            weights,
+            Some(FloatDraft {
+                kernels,
+                threads: RowThreads::DEFAULT,
+            }),
+        )
+    }
+
+    /// Whether this decoder drafts with f32 projections.
+    pub fn is_float_draft(&self) -> bool {
+        self.float.is_some()
+    }
+
+    /// How many threads run each row of a float-draft decoder's projections.
+    /// Changes speed only; an exact decoder refuses.
+    pub fn set_float_row_threads(&mut self, threads: RowThreads) -> Result<(), String> {
+        match &mut self.float {
+            Some(float) => {
+                float.threads = threads;
+                Ok(())
+            }
+            None => Err("an exact decoder has no f32 projections".to_string()),
+        }
+    }
+
+    fn build(
+        engine: Arc<MetalExactGemv>,
+        shape: DecoderShape,
+        weights: DecoderWeights,
+        float: Option<FloatDraft>,
     ) -> Result<Self, String> {
         shape.validate()?;
         engine.decoder_pipelines()?;
@@ -1090,6 +1161,7 @@ impl MetalDecoder {
             digits: new_shared(device, MAX_PLANES * stride_of(widest)),
             ctrl: new_shared(device, 16),
             status: new_shared(device, 16),
+            xf: new_shared(device, widest * 4),
         };
         Ok(Self {
             shape: s,
@@ -1104,6 +1176,7 @@ impl MetalDecoder {
             io,
             rows_io: row_activations(device, &s, MAX_ROWS),
             staged_gemm: false,
+            float,
             engine,
         })
     }
@@ -1280,6 +1353,53 @@ impl MetalDecoder {
         })
     }
 
+    /// The input of the projections that follow: its digit planes for the
+    /// exact GEMV, or, in a float-draft decoder, its f32 values.
+    fn encode_input(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pipes: &DecoderPipelines,
+        x: &BufferRef,
+        n: usize,
+        max_scale: u64,
+    ) {
+        let io = &self.io;
+        match &self.float {
+            None => encode_split(
+                encoder, pipes, &io.status, x, &io.digits, &io.ctrl, n, max_scale,
+            ),
+            Some(float) => float.kernels.encode_to_f32(encoder, x, &io.xf, n),
+        }
+    }
+
+    /// One projection of the input [`Self::encode_input`] prepared: the exact
+    /// GEMV, or, in a float-draft decoder, the f32 one.
+    fn encode_projection(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pipes: &DecoderPipelines,
+        matrix: &ResidentMatrix,
+        out: &BufferRef,
+    ) {
+        let io = &self.io;
+        match &self.float {
+            None => encode_gemv(
+                encoder,
+                self.engine.as_ref(),
+                pipes,
+                matrix,
+                &io.digits,
+                &io.ctrl,
+                out,
+            ),
+            Some(float) => {
+                float
+                    .kernels
+                    .encode_gemv(encoder, matrix, &io.xf, out, float.threads, false);
+            }
+        }
+    }
+
     fn encode_layer(
         &self,
         rec: &mut Recorder<'_>,
@@ -1291,7 +1411,6 @@ impl MetalDecoder {
         let l = &self.layers[layer];
         let w = &l.weights;
         let io = &self.io;
-        let engine = self.engine.as_ref();
 
         encode_norm(
             rec.encoder,
@@ -1303,27 +1422,10 @@ impl MetalDecoder {
             s.d_model,
         );
         rec.after_dispatch()?;
-        encode_split(
-            rec.encoder,
-            pipes,
-            &io.status,
-            &io.normed,
-            &io.digits,
-            &io.ctrl,
-            s.d_model,
-            l.qkv_scale,
-        );
+        self.encode_input(rec.encoder, pipes, &io.normed, s.d_model, l.qkv_scale);
         rec.after_dispatch()?;
         for (matrix, out) in [(&w.wq, &io.q), (&w.wk, &io.k), (&w.wv, &io.v)] {
-            encode_gemv(
-                rec.encoder,
-                engine,
-                pipes,
-                matrix,
-                &io.digits,
-                &io.ctrl,
-                out,
-            );
+            self.encode_projection(rec.encoder, pipes, matrix, out);
             rec.after_dispatch()?;
         }
         encode_rope(
@@ -1370,26 +1472,9 @@ impl MetalDecoder {
             s.n_heads,
         );
         rec.after_dispatch()?;
-        encode_split(
-            rec.encoder,
-            pipes,
-            &io.status,
-            &io.attn,
-            &io.digits,
-            &io.ctrl,
-            s.d_model,
-            l.o_scale,
-        );
+        self.encode_input(rec.encoder, pipes, &io.attn, s.d_model, l.o_scale);
         rec.after_dispatch()?;
-        encode_gemv(
-            rec.encoder,
-            engine,
-            pipes,
-            &w.wo,
-            &io.digits,
-            &io.ctrl,
-            &io.proj,
-        );
+        self.encode_projection(rec.encoder, pipes, &w.wo, &io.proj);
         rec.after_dispatch()?;
         encode_residual(rec.encoder, pipes, &io.hidden, &io.proj, s.d_model);
         rec.after_dispatch()?;
@@ -1403,27 +1488,10 @@ impl MetalDecoder {
             s.d_model,
         );
         rec.after_dispatch()?;
-        encode_split(
-            rec.encoder,
-            pipes,
-            &io.status,
-            &io.normed,
-            &io.digits,
-            &io.ctrl,
-            s.d_model,
-            l.gate_up_scale,
-        );
+        self.encode_input(rec.encoder, pipes, &io.normed, s.d_model, l.gate_up_scale);
         rec.after_dispatch()?;
         for (matrix, out) in [(&w.w_gate, &io.gate), (&w.w_up, &io.up)] {
-            encode_gemv(
-                rec.encoder,
-                engine,
-                pipes,
-                matrix,
-                &io.digits,
-                &io.ctrl,
-                out,
-            );
+            self.encode_projection(rec.encoder, pipes, matrix, out);
             rec.after_dispatch()?;
         }
         encode_silu(
@@ -1436,26 +1504,9 @@ impl MetalDecoder {
             s.d_ff,
         );
         rec.after_dispatch()?;
-        encode_split(
-            rec.encoder,
-            pipes,
-            &io.status,
-            &io.act,
-            &io.digits,
-            &io.ctrl,
-            s.d_ff,
-            l.down_scale,
-        );
+        self.encode_input(rec.encoder, pipes, &io.act, s.d_ff, l.down_scale);
         rec.after_dispatch()?;
-        encode_gemv(
-            rec.encoder,
-            engine,
-            pipes,
-            &w.w_down,
-            &io.digits,
-            &io.ctrl,
-            &io.ff,
-        );
+        self.encode_projection(rec.encoder, pipes, &w.w_down, &io.ff);
         rec.after_dispatch()?;
         encode_residual(rec.encoder, pipes, &io.hidden, &io.ff, s.d_model);
         rec.after_dispatch()
@@ -1478,26 +1529,9 @@ impl MetalDecoder {
             s.d_model,
         );
         rec.after_dispatch()?;
-        encode_split(
-            rec.encoder,
-            pipes,
-            &io.status,
-            &io.normed,
-            &io.digits,
-            &io.ctrl,
-            s.d_model,
-            self.output_scale,
-        );
+        self.encode_input(rec.encoder, pipes, &io.normed, s.d_model, self.output_scale);
         rec.after_dispatch()?;
-        encode_gemv(
-            rec.encoder,
-            self.engine.as_ref(),
-            pipes,
-            &self.output,
-            &io.digits,
-            &io.ctrl,
-            &io.logits,
-        );
+        self.encode_projection(rec.encoder, pipes, &self.output, &io.logits);
         rec.after_dispatch()
     }
 
@@ -1519,6 +1553,11 @@ impl MetalDecoder {
         logits: bool,
         submission: Submission,
     ) -> Result<DecoderStep, DecoderRefusal> {
+        if self.float.is_some() {
+            return Err(DecoderRefusal::Input(
+                "multi-row passes are exact only; this decoder drafts in f32".to_string(),
+            ));
+        }
         let s = self.shape;
         let rows = hidden_in.len() / s.d_model;
         if rows == 0 || rows > MAX_ROWS || rows * s.d_model != hidden_in.len() {

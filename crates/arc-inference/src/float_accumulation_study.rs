@@ -5,7 +5,8 @@
 //! node, worker or release binary contains it (see the feature's note in
 //! `Cargo.toml` and the `cargo tree` check in
 //! `.github/workflows/draft-verify-bench.yml`). Even when compiled in, it is
-//! off until a study binary calls [`set_enabled`].
+//! off until a study binary calls [`set_enabled`], or a test turns it on for
+//! its own thread with [`on_this_thread`].
 //!
 //! When on, every canonical per-row I8 weight projection (the one-row and the
 //! batched path) computes the same quantities from the same operands as the
@@ -22,17 +23,51 @@
 
 use crate::integer_lut::FRAC_BITS;
 use rayon::prelude::*;
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// f32 accumulation for the projections this thread calls.
+    static ON_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Turns f32 accumulation on or off for every projection in this process.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::SeqCst);
 }
 
+/// Whether the projection about to run on this thread accumulates in f32:
+/// on for the whole process, or for this thread ([`on_this_thread`]).
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::SeqCst)
+    ENABLED.load(Ordering::SeqCst) || ON_THIS_THREAD.with(Cell::get)
+}
+
+/// Turns f32 accumulation on for the projections this thread calls until the
+/// returned guard drops, leaving every other thread exact: for tests that
+/// compare against this engine while other tests run. A projection checks
+/// the switch on the thread that calls it, before any of its own parallel
+/// work, so its rayon workers follow the caller.
+#[must_use = "f32 accumulation is on only while the guard lives"]
+pub fn on_this_thread() -> ThisThread {
+    ON_THIS_THREAD.with(|on| on.set(true));
+    ThisThread {
+        _not_send: PhantomData,
+    }
+}
+
+/// See [`on_this_thread`]. Dropping it turns this thread's switch off.
+pub struct ThisThread {
+    /// The switch belongs to the thread that set it.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for ThisThread {
+    fn drop(&mut self) {
+        ON_THIS_THREAD.with(|on| on.set(false));
+    }
 }
 
 const LANES: usize = 16;

@@ -34,8 +34,13 @@ on:
       - crates/arc-gpu/src/metal_exact_gemv.metal
       - crates/arc-gpu/src/metal_exact_decoder.metal
       - crates/arc-gpu/src/metal_decoder.rs
+      - crates/arc-gpu/src/metal_float_draft.rs
+      - crates/arc-gpu/src/metal_float_draft.metal
       - crates/arc-inference/src/metal_gemv.rs
       - crates/arc-inference/src/metal_forward.rs
+      - crates/arc-inference/src/metal_float_draft.rs
+      - crates/arc-inference/src/float_accumulation_study.rs
+      - crates/arc-inference/src/draft_verify.rs
       - crates/arc-inference/src/cached_integer_model.rs
       - crates/arc-inference/src/integer_lut.rs
       - crates/arc-inference/src/canonical_simd.rs
@@ -119,14 +124,25 @@ jobs:
         run: |
           set -euo pipefail
           cargo clippy -p arc-gpu -p arc-inference --all-targets --locked \
-            --features arc-gpu/metal-exact,arc-inference/metal-exact \
+            --features arc-gpu/metal-exact,arc-inference/metal-exact,arc-inference/float-accumulation-study \
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.txt"
-          if grep -E '^crates/(arc-gpu/src/metal_(exact|decoder)|arc-inference/src/(metal_gemv|metal_forward|golden_vectors))\.rs:' "$RUNNER_TEMP/clippy.txt" > "$RUNNER_TEMP/clippy-metal.txt"; then
+          if grep -E '^crates/(arc-gpu/src/metal_(exact|decoder|float_draft)|arc-inference/src/(metal_gemv|metal_forward|metal_float_draft|golden_vectors))\.rs:' "$RUNNER_TEMP/clippy.txt" > "$RUNNER_TEMP/clippy-metal.txt"; then
             echo '::warning::clippy reported diagnostics in the Metal GEMV code; the last step fails the job'
           fi
       - name: Kernel unit tests and device self-test
         if: ${{ !cancelled() }}
         run: cargo test --release --locked -p arc-gpu --features metal-exact --lib metal_exact -- --test-threads=1 --nocapture
+      # NON-CANONICAL drafter (proposals only; the exact engine verifies every
+      # token): its f32 kernels against a CPU model of the study's order, bit
+      # for bit, then the whole drafter against the CPU engine with the
+      # study's f32 accumulation on (the feature exists only in this test
+      # build), and generation with it against plain exact decoding.
+      - name: f32 drafter kernels equal the study's order, bit for bit
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p arc-gpu --features metal-exact --lib metal_float_draft -- --test-threads=1 --nocapture
+      - name: f32 drafter equals the CPU study engine; drafting never changes the output
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p arc-inference --features metal-exact,float-accumulation-study --lib metal_float_draft::tests -- --test-threads=1 --nocapture
       - name: Byte-identical tests against the CPU engine and the golden KATs
         if: ${{ !cancelled() }}
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib -- --test-threads=1 --nocapture metal_gemv metal_forward golden_cached_integer_kat_holds
@@ -145,10 +161,15 @@ jobs:
           ARC_METAL_KV_BENCH_MD: ${{ runner.temp }}/metal-kv-bench.md
           ARC_METAL_ROWS_BENCH_MD: ${{ runner.temp }}/metal-rows-bench.md
         run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_forward::bench -- --ignored --nocapture --test-threads=1
+      - name: Benchmark the f32 drafter against the exact decoder (virtualized-runner measurement)
+        if: ${{ !cancelled() }}
+        env:
+          ARC_METAL_DRAFT_BENCH_MD: ${{ runner.temp }}/metal-draft-bench.md
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_float_draft::bench -- --ignored --nocapture --test-threads=1
       - name: Benchmark summary
         if: always()
         run: |
-          for summary in "$RUNNER_TEMP/metal-bench.md" "$RUNNER_TEMP/metal-token-bench.md" "$RUNNER_TEMP/metal-kv-bench.md" "$RUNNER_TEMP/metal-rows-bench.md"; do
+          for summary in "$RUNNER_TEMP/metal-draft-bench.md" "$RUNNER_TEMP/metal-bench.md" "$RUNNER_TEMP/metal-token-bench.md" "$RUNNER_TEMP/metal-kv-bench.md" "$RUNNER_TEMP/metal-rows-bench.md"; do
             if [ -f "$summary" ]; then
               cat "$summary" >> "$GITHUB_STEP_SUMMARY"
             fi

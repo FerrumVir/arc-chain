@@ -24,6 +24,11 @@ pub mod integer_engine;
 pub mod integer_lut;
 pub mod llama_spm_tokenizer;
 pub mod low_residency;
+/// NON-CANONICAL: a drafter for exact speculative decoding, ARC's algorithm
+/// with f32 accumulation on Apple GPUs; the exact engine verifies every token
+/// it proposes (opt-in).
+#[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_float_draft;
 /// One command buffer per token on Apple GPUs, exact (opt-in).
 #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_forward;

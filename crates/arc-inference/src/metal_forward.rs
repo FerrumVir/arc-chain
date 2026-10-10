@@ -64,7 +64,7 @@ use arc_gpu::metal_decoder::{
     DecoderLayerWeights, DecoderRefusal, DecoderShape, DecoderStep, DecoderWeights, MAX_ROWS,
     MetalDecoder, Submission,
 };
-use arc_gpu::metal_exact::{ResidentMatrix, Storage};
+use arc_gpu::metal_exact::{MetalExactGemv, ResidentMatrix, Storage};
 
 use crate::cached_integer_model::{
     ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig,
@@ -379,6 +379,73 @@ pub fn metal_forward_self_test() -> Result<(), String> {
     SELF_TEST.get_or_init(run_self_test).clone()
 }
 
+/// What a [`MetalDecoder`] for `model` needs: the engine, the shape with a
+/// device KV cache of `kv_capacity` positions (at most the model's
+/// `max_seq`), and every weight matrix uploaded once. The exact decoder and
+/// the float drafter (`crate::metal_float_draft`) both start here, so they
+/// read the same model the same way.
+pub(crate) fn decoder_inputs(
+    model: &CachedIntegerModel,
+    kv_capacity: usize,
+) -> Result<(Arc<MetalExactGemv>, DecoderShape, DecoderWeights), String> {
+    let cfg = &model.config;
+    if !model.has_canonical_i8_profile() {
+        return Err("the GPU decoder runs only the canonical per-row INT8 profile".into());
+    }
+    if model.layers.len() != cfg.n_layers || model.layers.iter().any(|l| !l.is_loaded()) {
+        return Err("the GPU decoder needs every layer loaded".into());
+    }
+    let engine = metal_engine()?;
+    let upload = |w: &I8Weights| -> Result<Arc<ResidentMatrix>, String> {
+        engine
+            .upload(&w.data, &w.scales, w.n_rows, w.n_cols, Storage::Shared)
+            .map(Arc::new)
+    };
+    let mut layers = Vec::with_capacity(cfg.n_layers);
+    for layer in &model.layers {
+        layers.push(DecoderLayerWeights {
+            wq: upload(&layer.wq)?,
+            wk: upload(&layer.wk)?,
+            wv: upload(&layer.wv)?,
+            wo: upload(&layer.wo)?,
+            w_gate: upload(&layer.w_gate)?,
+            w_up: upload(&layer.w_up)?,
+            w_down: upload(&layer.w_down)?,
+            attn_norm: layer.attn_norm.clone(),
+            ffn_norm: layer.ffn_norm.clone(),
+        });
+    }
+    let output = upload(&model.output_weight)?;
+    let weights = DecoderWeights {
+        layers,
+        final_norm: model.final_norm.clone(),
+        output,
+        rope_cos: cfg.rope_cos.clone(),
+        rope_sin: cfg.rope_sin.clone(),
+        exp_lut: EXP_LUT.to_vec(),
+    };
+    Ok((engine, decoder_shape(model, kv_capacity), weights))
+}
+
+/// The decoder shape of `model` with a device KV cache of `kv_capacity`
+/// positions (at most the model's `max_seq`).
+pub(crate) fn decoder_shape(model: &CachedIntegerModel, kv_capacity: usize) -> DecoderShape {
+    let cfg = &model.config;
+    DecoderShape {
+        n_layers: cfg.n_layers,
+        d_model: cfg.d_model,
+        n_heads: cfg.n_heads,
+        n_kv_heads: cfg.n_kv_heads,
+        d_head: cfg.d_head,
+        d_kv: cfg.d_kv,
+        d_ff: cfg.d_ff,
+        vocab: cfg.vocab_size,
+        attn_scale: cfg.attn_scale,
+        max_seq: cfg.max_seq,
+        kv_capacity: kv_capacity.min(cfg.max_seq),
+    }
+}
+
 impl<'a> MetalForward<'a> {
     /// Upload `model` with a device KV cache of `kv_capacity` positions
     /// (at most the model's `max_seq`), after the process-wide self-test.
@@ -389,54 +456,7 @@ impl<'a> MetalForward<'a> {
 
     fn build(model: &'a CachedIntegerModel, kv_capacity: usize) -> Result<Self, String> {
         let cfg = &model.config;
-        if !model.has_canonical_i8_profile() {
-            return Err("the GPU decoder runs only the canonical per-row INT8 profile".into());
-        }
-        if model.layers.len() != cfg.n_layers || model.layers.iter().any(|l| !l.is_loaded()) {
-            return Err("the GPU decoder needs every layer loaded".into());
-        }
-        let engine = metal_engine()?;
-        let upload = |w: &I8Weights| -> Result<Arc<ResidentMatrix>, String> {
-            engine
-                .upload(&w.data, &w.scales, w.n_rows, w.n_cols, Storage::Shared)
-                .map(Arc::new)
-        };
-        let mut layers = Vec::with_capacity(cfg.n_layers);
-        for layer in &model.layers {
-            layers.push(DecoderLayerWeights {
-                wq: upload(&layer.wq)?,
-                wk: upload(&layer.wk)?,
-                wv: upload(&layer.wv)?,
-                wo: upload(&layer.wo)?,
-                w_gate: upload(&layer.w_gate)?,
-                w_up: upload(&layer.w_up)?,
-                w_down: upload(&layer.w_down)?,
-                attn_norm: layer.attn_norm.clone(),
-                ffn_norm: layer.ffn_norm.clone(),
-            });
-        }
-        let output = upload(&model.output_weight)?;
-        let shape = DecoderShape {
-            n_layers: cfg.n_layers,
-            d_model: cfg.d_model,
-            n_heads: cfg.n_heads,
-            n_kv_heads: cfg.n_kv_heads,
-            d_head: cfg.d_head,
-            d_kv: cfg.d_kv,
-            d_ff: cfg.d_ff,
-            vocab: cfg.vocab_size,
-            attn_scale: cfg.attn_scale,
-            max_seq: cfg.max_seq,
-            kv_capacity: kv_capacity.min(cfg.max_seq),
-        };
-        let weights = DecoderWeights {
-            layers,
-            final_norm: model.final_norm.clone(),
-            output,
-            rope_cos: cfg.rope_cos.clone(),
-            rope_sin: cfg.rope_sin.clone(),
-            exp_lut: EXP_LUT.to_vec(),
-        };
+        let (engine, shape, weights) = decoder_inputs(model, kv_capacity)?;
         let decoder = MetalDecoder::new(engine, shape, weights)?;
         Ok(Self {
             model,
