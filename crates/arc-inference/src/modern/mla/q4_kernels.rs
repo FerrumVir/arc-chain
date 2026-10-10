@@ -39,9 +39,11 @@
 //!
 //! Selection. The kernels run only behind the existing opt-in
 //! (`canonical_simd::fast_canonical_kernel_enabled`, `ARC_FAST_CANONICAL_KERNEL`).
-//! The widest kernel the CPU has is the default; `ARC_MLA_Q4_KERNEL=<label>`,
-//! `=scalar` or [`set_q4_kernel_pin`] pins one for tests and benchmarks, and a
-//! pinned kernel the CPU lacks falls back to the best it has.
+//! The default is [`best_q4_kernel`]: SMMLA, then SDOT, on arm64; AVX2 on
+//! x86-64, which the bench measured faster than both VNNI kernels at these
+//! shapes. `ARC_MLA_Q4_KERNEL=<label>`, `=scalar` or [`set_q4_kernel_pin`] pins
+//! one for tests and benchmarks, and a pinned kernel the CPU lacks falls back
+//! to the default.
 //! [`q4_kernel_runs`] counts the projections each kernel, and the scalar
 //! reference, computed.
 
@@ -154,12 +156,18 @@ pub fn available_q4_kernels() -> Vec<Q4Kernel> {
         .collect()
 }
 
-/// The kernel used when nothing is pinned: the widest this CPU has.
+/// The kernel used when nothing is pinned. On arm64, SMMLA, then SDOT. On
+/// x86-64, AVX2 before the VNNI kernels: at one K2.6-shaped MoE layer, AVX2
+/// was the fastest on every hosted x86-64 CPU the bench measured. A one-row
+/// AVX-512 VNNI pass took 24% longer on an EPYC 9V45 (CI run 38057646072)
+/// and 23% longer on a Xeon Platinum 8370C (CI run 38058847095); AVX-VNNI
+/// took 3% longer on the EPYC 9V45. With one token the entities (its digit
+/// planes) fill 3 of a VNNI vector's 8 or 16 lanes.
 pub fn best_q4_kernel() -> Option<Q4Kernel> {
     [
-        Q4Kernel::Avx512Vnni,
-        Q4Kernel::AvxVnni,
         Q4Kernel::Avx2,
+        Q4Kernel::AvxVnni,
+        Q4Kernel::Avx512Vnni,
         Q4Kernel::NeonI8mm,
         Q4Kernel::NeonSdot,
     ]
