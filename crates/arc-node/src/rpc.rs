@@ -21384,12 +21384,14 @@ mod tests {
         (validator_keys, recovered, temporary)
     }
 
-    /// The reward fixture with real RoPE angles (the base fixture rotates
-    /// nothing, which makes the two profiles agree) and Q/K rows scaled by
-    /// `qk_gain`, so attention follows the rotated keys.
+    /// The reward fixture with real RoPE angles and pseudo-random attention
+    /// weights. The base fixture rotates nothing and its Q and K rows are
+    /// near copies of each other; even with real angles, the two profiles
+    /// generated the same tokens on it for every small job tried.
     fn dual_profile_test_model(
-        qk_gain: i64,
+        seed: u64,
     ) -> arc_inference::cached_integer_model::CachedIntegerModel {
+        use arc_inference::cached_integer_model::I8Weights;
         let mut model = test_reward_inference_model();
         let (rope_cos, rope_sin) = arc_inference::cached_integer_model::compute_rope_tables(
             model.config.d_head,
@@ -21398,10 +21400,24 @@ mod tests {
         );
         model.config.rope_cos = rope_cos;
         model.config.rope_sin = rope_sin;
+        let mut state = seed;
+        let mut random = |rows: usize, cols: usize| {
+            let values: Vec<f32> = (0..rows * cols)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+                })
+                .collect();
+            I8Weights::quantize_f32(&values, rows, cols)
+        };
+        let d = model.config.d_model;
         for layer in &mut model.layers {
-            for scale in layer.wq.scales.iter_mut().chain(layer.wk.scales.iter_mut()) {
-                *scale *= qk_gain;
-            }
+            layer.wq = random(d, d);
+            layer.wk = random(d, d);
+            layer.wv = random(d, d);
+            layer.wo = random(d, d);
         }
         model
     }
@@ -21414,9 +21430,9 @@ mod tests {
         &'static str,
         u32,
     ) {
-        for qk_gain in [1, 8, 40] {
-            let legacy = dual_profile_test_model(qk_gain);
-            let mut interleaved = dual_profile_test_model(qk_gain);
+        for seed in 1..=64u64 {
+            let legacy = dual_profile_test_model(seed);
+            let mut interleaved = dual_profile_test_model(seed);
             interleaved
                 .canonicalize_gguf_interleaved_rope_rows()
                 .unwrap();
@@ -21431,7 +21447,7 @@ mod tests {
                 "done ARC",
             ] {
                 let prompt = legacy.encode(input);
-                for max_tokens in 1..=6u32 {
+                for max_tokens in 1..=8u32 {
                     if legacy.generate(&prompt, max_tokens, &[]).0
                         != interleaved.generate(&prompt, max_tokens, &[]).0
                     {
