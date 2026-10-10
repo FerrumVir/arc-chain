@@ -92,7 +92,7 @@ impl MatRef {
 
 /// A stack of INT4 group-32 matrices whose packed values stay in the
 /// package bytes (spec §13).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Q4Ref {
     rows: usize,
     cols: usize,
@@ -119,16 +119,15 @@ impl Q4Ref {
         let groups = self.rows * self.cols / Q4_GROUP;
         let start = self.q4.start + index * size;
         let scales = &self.scales[index * groups..(index + 1) * groups];
-        Q4View {
-            rows: self.rows,
-            cols: self.cols,
-            q4: &bytes[start..start + size],
+        let table = self.tables[index]
+            .get_or_init(|| Q4ScaleTable::build(scales, self.rows, self.cols / Q4_GROUP));
+        Q4View::with_table(
+            self.rows,
+            self.cols,
+            &bytes[start..start + size],
             scales,
-            table: Some(
-                self.tables[index]
-                    .get_or_init(|| Q4ScaleTable::build(scales, self.rows, self.cols / Q4_GROUP)),
-            ),
-        }
+            table,
+        )
     }
 
     /// Memory of the scale summaries built so far.
@@ -138,6 +137,20 @@ impl Q4Ref {
             .filter_map(OnceLock::get)
             .map(Q4ScaleTable::bytes)
             .sum()
+    }
+}
+
+/// A clone starts with no scale summaries: each is tied to the scales it was
+/// built from, and the clone's scales are a new copy.
+impl Clone for Q4Ref {
+    fn clone(&self) -> Self {
+        Self::new(
+            self.rows,
+            self.cols,
+            self.q4.clone(),
+            self.scales.clone(),
+            self.tables.len(),
+        )
     }
 }
 

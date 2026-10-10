@@ -187,9 +187,43 @@ pub struct Q4View<'a> {
     pub q4: &'a [u8],
     /// `rows * cols / 32` BF16 bit patterns (non-negative, finite).
     pub scales: &'a [u16],
-    /// The rows' scale summaries ([`Q4ScaleTable::build`] of `scales`), when
-    /// the owner keeps one; otherwise each projection builds its own.
-    pub table: Option<&'a Q4ScaleTable>,
+    /// The rows' scale summaries, when the owner keeps them
+    /// ([`Self::with_table`]); otherwise each projection builds its own.
+    /// Private, so a view can only get a table through its constructor, and a
+    /// projection refuses a table not built from this view's `scales`.
+    table: Option<&'a Q4ScaleTable>,
+}
+
+impl<'a> Q4View<'a> {
+    /// A view whose projections summarise its scales themselves.
+    pub fn new(rows: usize, cols: usize, q4: &'a [u8], scales: &'a [u16]) -> Self {
+        Self {
+            rows,
+            cols,
+            q4,
+            scales,
+            table: None,
+        }
+    }
+
+    /// A view that uses `table`, which must be [`Q4ScaleTable::build`] of
+    /// exactly these `scales` (the same slice, unchanged since): projections
+    /// with any other table are refused, never computed with it.
+    pub fn with_table(
+        rows: usize,
+        cols: usize,
+        q4: &'a [u8],
+        scales: &'a [u16],
+        table: &'a Q4ScaleTable,
+    ) -> Self {
+        Self {
+            rows,
+            cols,
+            q4,
+            scales,
+            table: Some(table),
+        }
+    }
 }
 
 /// The mantissa and exponent of a BF16 group scale (`m * 2^e`), its sign
@@ -326,6 +360,9 @@ impl Q4RowSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q4ScaleTable {
     rows: Vec<Q4RowSummary>,
+    /// The address and length of the scales it was built from: a view's
+    /// projection uses the table only with that same slice.
+    source: (usize, usize),
 }
 
 impl Q4ScaleTable {
@@ -337,7 +374,13 @@ impl Q4ScaleTable {
                 .take(rows)
                 .map(Q4RowSummary::of)
                 .collect(),
+            source: (scales.as_ptr() as usize, scales.len()),
         }
+    }
+
+    /// Whether this table was built from exactly `scales`: the same slice.
+    fn built_from(&self, scales: &[u16]) -> bool {
+        self.source == (scales.as_ptr() as usize, scales.len())
     }
 
     /// Rows summarised.
@@ -463,8 +506,12 @@ impl Q4View<'_> {
         let groups = self.cols / Q4_GROUP;
         let built;
         let table = match self.table {
-            Some(table) if table.len() == self.rows => table,
-            Some(_) => return Err(invalid("INT4 scale table does not match its matrix")),
+            Some(table) if table.len() == self.rows && table.built_from(self.scales) => table,
+            Some(_) => {
+                return Err(invalid(
+                    "INT4 scale table was not built from this matrix's scales",
+                ));
+            }
             None => {
                 built = Q4ScaleTable::build(self.scales, self.rows, groups);
                 &built
@@ -1494,6 +1541,44 @@ mod tests {
         );
         assert!(narrow > 10_000 && wide > 10_000 && cut_in > 1_000 && cut_out > 1_000);
         assert!(refused > 100);
+    }
+
+    /// A view refuses a scale table built from another matrix's scales, even
+    /// with the same row count, and computes with its own table exactly what
+    /// it computes without one.
+    #[test]
+    fn a_view_refuses_a_scale_table_of_another_matrix() {
+        let values: Vec<i8> = (0..4 * 64).map(|i| ((i * 7) % 16) as i8 - 8).collect();
+        let packed = pack_q4(&values);
+        let scales: Vec<u16> = (0..8).map(|g| bf16(0.5 + g as f32)).collect();
+        let other: Vec<u16> = (0..8).map(|g| bf16(2.0 + g as f32)).collect();
+        let x: Vec<i64> = (0..64).map(|j| (j - 20) * 977).collect();
+        let mut plain = [0i64; 4];
+        Q4View::new(4, 64, &packed, &scales)
+            .project(&x, &mut plain)
+            .unwrap();
+        let own = Q4ScaleTable::build(&scales, 4, 2);
+        let mut with_own = [0i64; 4];
+        Q4View::with_table(4, 64, &packed, &scales, &own)
+            .project(&x, &mut with_own)
+            .unwrap();
+        assert_eq!(with_own, plain);
+        // Another matrix's table, and a table of a copy of the same values:
+        // both refused, the output untouched.
+        let foreign = Q4ScaleTable::build(&other, 4, 2);
+        let copy = scales.clone();
+        let copied = Q4ScaleTable::build(&copy, 4, 2);
+        for table in [&foreign, &copied] {
+            let mut out = [7i64; 4];
+            let err = Q4View::with_table(4, 64, &packed, &scales, table)
+                .project(&x, &mut out)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("not built from this matrix"),
+                "{err}"
+            );
+            assert_eq!(out, [7; 4]);
+        }
     }
 
     #[test]

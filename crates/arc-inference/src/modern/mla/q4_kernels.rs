@@ -30,12 +30,21 @@
 //!   `32 * 1,920 = 61,440` before the correction;
 //! * the dot: `|sum_d 256^d S_d| <= 32,768 * (1 + 2^8 + 2^16 + 2^24) < 2^40`.
 //!
-//! Layouts. The SDOT, AVX2 and VNNI kernels put entities in lanes: per group
-//! and 4-column quad, a vector holds 4, 8 or 16 entities' four digits, and the
-//! row's 4-byte weight quad is broadcast against it, so a lane accumulates one
-//! entity's group sum with no horizontal reduction. SMMLA multiplies a pair of
-//! rows (8 columns each) by a pair of entities, as #190's tiles do. The digit
-//! layouts depend on the activations only and are built once per call.
+//! Layouts. Every lane accumulates one (row, entity) group sum, with no
+//! horizontal reduction.
+//! * x86-64 puts rows in the lanes, 8 (AVX2, AVX-VNNI) or 16 (AVX-512 VNNI)
+//!   per vector, and broadcasts one entity's 4-byte digit quad against them,
+//!   so every lane is busy whatever the token count. Each block of rows is
+//!   unpacked and transposed once per group (an 8 x 8 transpose of 4-byte
+//!   quads) and then serves every entity.
+//! * SDOT (by element) puts entities in its 4 lanes and broadcasts the row's
+//!   weight quad; SMMLA multiplies a pair of rows (8 columns each) by a pair of
+//!   entities, as #190's tiles do. Rows in SDOT's lanes would need the same
+//!   transpose, which costs about what the idle lane does at one token
+//!   (three entities in four lanes), so arm64 keeps entities in lanes.
+//!
+//! The digit layouts depend on the activations only and are built once per
+//! call.
 //!
 //! Selection. The kernels run only behind the existing opt-in
 //! (`canonical_simd::fast_canonical_kernel_enabled`, `ARC_FAST_CANONICAL_KERNEL`).
@@ -49,8 +58,6 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-
-use rayon::prelude::*;
 
 use crate::canonical_simd::{LIMB_COUNT, split_limbs};
 use crate::modern::ModernError;
@@ -340,6 +347,7 @@ impl Digits {
     /// l holding entity `b * width + l`'s digits of columns `32g + 4q ..
     /// 32g + 4q + 4` (zero past the last entity). Returns the bytes and the
     /// block count.
+    #[cfg(target_arch = "aarch64")]
     fn lanes(&self, width: usize) -> (Vec<i8>, usize) {
         let groups = self.cols / GROUP;
         let blocks = self.entities().div_ceil(width);
@@ -358,24 +366,35 @@ impl Digits {
         (out, blocks)
     }
 
-    /// `8 * sum_{j in g} c_j` per group and entity, at `g * stride + e` with
-    /// `stride = blocks * width`: what the unsigned-weight kernels subtract.
-    fn offsets(&self, stride: usize) -> Vec<i32> {
-        let groups = self.cols / GROUP;
-        let mut out = vec![0i32; groups * stride];
-        for e in 0..self.entities() {
-            for (g, chunk) in self.entity(e).chunks_exact(GROUP).enumerate() {
-                out[g * stride + e] = 8 * chunk.iter().map(|&c| i32::from(c)).sum::<i32>();
+    /// The x86 kernels' operands: each entity's digits as one little-endian
+    /// i32 per 4-column quad, at `(g * E + e) * QUADS + q`, and the offset
+    /// corrections `8 * sum_{j in g} c_ej` at `g * E + e` (E entities).
+    #[cfg(target_arch = "x86_64")]
+    fn quad_words(&self) -> (Vec<i32>, Vec<i32>) {
+        let (groups, entities) = (self.cols / GROUP, self.entities());
+        let mut quads = vec![0i32; groups * entities * QUADS];
+        let mut offsets = vec![0i32; groups * entities];
+        for e in 0..entities {
+            for (g, group) in self.entity(e).chunks_exact(GROUP).enumerate() {
+                offsets[g * entities + e] = 8 * group.iter().map(|&c| i32::from(c)).sum::<i32>();
+                for (q, quad) in group.chunks_exact(4).enumerate() {
+                    quads[(g * entities + e) * QUADS + q] = i32::from_le_bytes([
+                        quad[0] as u8,
+                        quad[1] as u8,
+                        quad[2] as u8,
+                        quad[3] as u8,
+                    ]);
+                }
             }
         }
-        out
+        (quads, offsets)
     }
 
     /// Entity pairs for SMMLA: for pair p, group g and 8-column block k, 16
     /// bytes at `((p * groups + g) * 4 + k) * 16`, entity 2p's eight digits
     /// then entity 2p + 1's (zero past the last entity). Returns the bytes and
     /// the pair count.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    #[cfg(target_arch = "aarch64")]
     fn pairs(&self) -> (Vec<i8>, usize) {
         let groups = self.cols / GROUP;
         let pairs = self.entities().div_ceil(2);
@@ -396,6 +415,7 @@ impl Digits {
 }
 
 /// `dots[t * groups + g] = sum_d 256^d s[g * stride + t * planes + d]`.
+#[cfg(target_arch = "aarch64")]
 fn fold_planes(s: &[i32], stride: usize, digits: &Digits, groups: usize, dots: &mut [i64]) {
     for t in 0..digits.tokens {
         for g in 0..groups {
@@ -411,8 +431,9 @@ fn fold_planes(s: &[i32], stride: usize, digits: &Digits, groups: usize, dots: &
 }
 
 /// One row's group sums for every entity block: `(packed row, lane digits,
-/// offsets, blocks, sums)`.
-type LaneKernel = fn(&[u8], &[i8], &[i32], usize, &mut [i32]);
+/// blocks, sums)`.
+#[cfg(target_arch = "aarch64")]
+type LaneKernel = fn(&[u8], &[i8], usize, &mut [i32]);
 
 /// Every row of `view` against the k tokens of `digits` with `kernel`: for
 /// each row r, `finish(r, dots, out)` receives the group dots
@@ -440,15 +461,15 @@ where
     }
     match kernel {
         #[cfg(target_arch = "aarch64")]
-        Q4Kernel::NeonSdot => lanes(view, digits, res, &finish, 4, false, neon::row_sdot),
+        Q4Kernel::NeonSdot => lanes(view, digits, res, &finish, 4, neon::row_sdot),
         #[cfg(target_arch = "aarch64")]
         Q4Kernel::NeonI8mm => neon::pairs_i8mm(view, digits, res, &finish),
         #[cfg(target_arch = "x86_64")]
-        Q4Kernel::Avx2 => lanes(view, digits, res, &finish, 8, true, x86::row_avx2),
+        Q4Kernel::Avx2 => x86::row_blocks(view, digits, res, &finish, 8, x86::block_avx2),
         #[cfg(target_arch = "x86_64")]
-        Q4Kernel::AvxVnni => lanes(view, digits, res, &finish, 8, true, x86::row_vnni256),
+        Q4Kernel::AvxVnni => x86::row_blocks(view, digits, res, &finish, 8, x86::block_vnni256),
         #[cfg(target_arch = "x86_64")]
-        Q4Kernel::Avx512Vnni => lanes(view, digits, res, &finish, 16, true, x86::row_vnni512),
+        Q4Kernel::Avx512Vnni => x86::row_blocks(view, digits, res, &finish, 16, x86::block_vnni512),
         #[allow(unreachable_patterns)]
         _ => Err(ModernError::Invalid(format!(
             "INT4 kernel {} is not built for this architecture",
@@ -457,29 +478,24 @@ where
     }
 }
 
-/// The lane-kernel driver: rows in parallel chunks, entities in blocks of
-/// `width`, the row kernel `row` on each row.
-#[allow(dead_code)]
+/// The arm64 lane-kernel driver: rows in parallel chunks, entities in
+/// blocks of `width` lanes, the row kernel `row` on each row.
+#[cfg(target_arch = "aarch64")]
 fn lanes<F>(
     view: &Q4View<'_>,
     digits: &Digits,
     res: &mut [i64],
     finish: &F,
     width: usize,
-    offset: bool,
     row: LaneKernel,
 ) -> Result<(), ModernError>
 where
     F: Fn(usize, &[i64], &mut [i64]) -> Result<(), ModernError> + Sync,
 {
+    use rayon::prelude::*;
     let (k, groups, half) = (digits.tokens, view.cols / GROUP, view.cols / 2);
     let (layout, blocks) = digits.lanes(width);
     let stride = blocks * width;
-    let offsets = if offset {
-        digits.offsets(stride)
-    } else {
-        Vec::new()
-    };
     res.par_chunks_mut(ROW_CHUNK * k)
         .enumerate()
         .try_for_each(|(chunk, out)| {
@@ -487,13 +503,7 @@ where
             let mut dots = vec![0i64; k * groups];
             for (i, row_out) in out.chunks_mut(k).enumerate() {
                 let r = chunk * ROW_CHUNK + i;
-                row(
-                    &view.q4[r * half..(r + 1) * half],
-                    &layout,
-                    &offsets,
-                    blocks,
-                    &mut s,
-                );
+                row(&view.q4[r * half..(r + 1) * half], &layout, blocks, &mut s);
                 fold_planes(&s, stride, digits, groups, &mut dots);
                 finish(r, &dots, row_out)?;
             }
@@ -570,13 +580,7 @@ mod neon {
     /// One row's group sums, four entities per block, with by-element SDOT:
     /// `s[g * stride + b * 4 + l]` for entity `4b + l`, `stride = 4 * blocks`.
     /// No offset: the weights are signed.
-    pub(super) fn row_sdot(
-        packed: &[u8],
-        digits: &[i8],
-        _offsets: &[i32],
-        blocks: usize,
-        s: &mut [i32],
-    ) {
+    pub(super) fn row_sdot(packed: &[u8], digits: &[i8], blocks: usize, s: &mut [i32]) {
         let groups = packed.len() / GROUP_BYTES;
         let stride = blocks * 4;
         assert!(
@@ -759,204 +763,317 @@ mod neon {
 mod x86 {
     use std::arch::x86_64::*;
 
-    use super::{GROUP_BYTES, QUADS};
+    use rayon::prelude::*;
 
-    /// The eight 4-column quads of one packed group as unsigned bytes `q + 8`
-    /// (the nibble XOR 8), quad i in bytes `4i .. 4i + 4` of word i.
-    ///
-    /// # Safety
-    /// `packed` is valid for 16 reads (SSE2 is part of x86-64).
-    #[inline]
-    unsafe fn unpack_unsigned(packed: *const u8) -> [u32; 8] {
-        // SAFETY: the caller's contract; the stores write the local array.
-        unsafe {
-            let p = _mm_loadu_si128(packed.cast());
-            let mask = _mm_set1_epi8(0x0F);
-            let low = _mm_and_si128(p, mask);
-            let high = _mm_and_si128(_mm_srli_epi16::<4>(p), mask);
-            let eight = _mm_set1_epi8(8);
-            // Column 2i is byte i's low nibble, column 2i + 1 its high one.
-            let first = _mm_xor_si128(_mm_unpacklo_epi8(low, high), eight);
-            let second = _mm_xor_si128(_mm_unpackhi_epi8(low, high), eight);
-            let mut quads = [0u32; 8];
-            _mm_storeu_si128(quads.as_mut_ptr().cast(), first);
-            _mm_storeu_si128(quads.as_mut_ptr().add(4).cast(), second);
-            quads
+    use super::{Digits, GROUP, GROUP_BYTES, QUADS, ROW_CHUNK};
+    use crate::modern::ModernError;
+    use crate::modern::mla::ops::Q4View;
+
+    /// One block of rows in lanes: `(packed rows, digit quads, offsets,
+    /// entities, sums)`, the sums at `s[(g * E + e) * width + i]` for row i.
+    pub(super) type BlockKernel = fn(&[&[u8]], &[i32], &[i32], usize, &mut [i32]);
+
+    /// The x86-64 driver. Rows sit in the lanes, `width` per block, and each
+    /// entity's 4-byte digit quad is broadcast against them, so every lane
+    /// does useful work whatever the token count. Blocks run in parallel
+    /// chunks; a block past a chunk's last row repeats that row and its extra
+    /// lanes are dropped.
+    pub(super) fn row_blocks<F>(
+        view: &Q4View<'_>,
+        digits: &Digits,
+        res: &mut [i64],
+        finish: &F,
+        width: usize,
+        kernel: BlockKernel,
+    ) -> Result<(), ModernError>
+    where
+        F: Fn(usize, &[i64], &mut [i64]) -> Result<(), ModernError> + Sync,
+    {
+        let (k, groups, half) = (digits.tokens, view.cols / GROUP, view.cols / 2);
+        let entities = digits.entities();
+        let (quads, offsets) = digits.quad_words();
+        // The sum buffer grows with the entities (688 KiB at 16 tokens and
+        // 16 rows per block), so each worker allocates its buffers once.
+        res.par_chunks_mut(ROW_CHUNK * k)
+            .enumerate()
+            .try_for_each_init(
+                || {
+                    (
+                        vec![0i32; groups * entities * width],
+                        vec![0i64; k * groups],
+                    )
+                },
+                |(s, dots), (chunk, out)| {
+                    let count = out.len() / k;
+                    let first = chunk * ROW_CHUNK;
+                    let mut block: [&[u8]; 16] = [&[]; 16];
+                    for start in (0..count).step_by(width) {
+                        for (i, slot) in block.iter_mut().take(width).enumerate() {
+                            let r = first + (start + i).min(count - 1);
+                            *slot = &view.q4[r * half..(r + 1) * half];
+                        }
+                        kernel(&block[..width], &quads, &offsets, entities, s);
+                        for i in 0..width.min(count - start) {
+                            fold_block(s, width, i, digits, groups, dots);
+                            let row = start + i;
+                            finish(first + row, dots, &mut out[row * k..(row + 1) * k])?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+    }
+
+    /// Row i of a block: `dots[t * groups + g] = sum_d 256^d s[(g * E + t *
+    /// planes + d) * width + i]`.
+    fn fold_block(
+        s: &[i32],
+        width: usize,
+        i: usize,
+        digits: &Digits,
+        groups: usize,
+        dots: &mut [i64],
+    ) {
+        let entities = digits.entities();
+        for t in 0..digits.tokens {
+            for g in 0..groups {
+                let base = g * entities + t * digits.planes;
+                let mut dot = 0i64;
+                for d in 0..digits.planes {
+                    // Multiplication, not `<<`, as in canonical_simd.
+                    dot += i64::from(s[(base + d) * width + i]) * (1i64 << (8 * d));
+                }
+                dots[t * groups + g] = dot;
+            }
         }
     }
 
-    /// Checks shared by the x86 row kernels: `width` entities per block.
+    /// One packed group of a row as 32 unsigned bytes `q + 8` (the nibble
+    /// XOR 8), byte j holding column j: columns 0-15 in the low 128 bits,
+    /// so 32-bit lane q holds quad q.
+    ///
+    /// # Safety
+    /// AVX2 is available; `packed` is valid for 16 reads.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn unpack_row(packed: *const u8) -> __m256i {
+        // SAFETY: the caller's contract; the rest are register operations.
+        unsafe {
+            // Byte i of the group in 16-bit lane i: its low nibble stays in
+            // the lane's low byte (column 2i), its high nibble moves to the
+            // high byte (column 2i + 1).
+            let wide = _mm256_cvtepu8_epi16(_mm_loadu_si128(packed.cast()));
+            let low = _mm256_and_si256(wide, _mm256_set1_epi16(0x0F));
+            let high = _mm256_slli_epi16::<4>(_mm256_and_si256(wide, _mm256_set1_epi16(0xF0)));
+            _mm256_xor_si256(_mm256_or_si256(low, high), _mm256_set1_epi8(8))
+        }
+    }
+
+    /// Eight rows of eight 4-byte quads to eight quads of eight rows: lane i
+    /// of output q is row i's quad q.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    #[allow(unused_unsafe)]
+    unsafe fn transpose8(r: [__m256i; 8]) -> [__m256i; 8] {
+        // SAFETY: register operations only.
+        unsafe {
+            // Per 128-bit half: quads 0-3 in the low half, 4-7 in the high.
+            let t0 = _mm256_unpacklo_epi32(r[0], r[1]);
+            let t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+            let t2 = _mm256_unpacklo_epi32(r[2], r[3]);
+            let t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+            let t4 = _mm256_unpacklo_epi32(r[4], r[5]);
+            let t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+            let t6 = _mm256_unpacklo_epi32(r[6], r[7]);
+            let t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+            // Rows 0-3 (u0..u3) and 4-7 (u4..u7) of quads q | q + 4.
+            let u0 = _mm256_unpacklo_epi64(t0, t2);
+            let u1 = _mm256_unpackhi_epi64(t0, t2);
+            let u2 = _mm256_unpacklo_epi64(t1, t3);
+            let u3 = _mm256_unpackhi_epi64(t1, t3);
+            let u4 = _mm256_unpacklo_epi64(t4, t6);
+            let u5 = _mm256_unpackhi_epi64(t4, t6);
+            let u6 = _mm256_unpacklo_epi64(t5, t7);
+            let u7 = _mm256_unpackhi_epi64(t5, t7);
+            [
+                _mm256_permute2x128_si256::<0x20>(u0, u4),
+                _mm256_permute2x128_si256::<0x20>(u1, u5),
+                _mm256_permute2x128_si256::<0x20>(u2, u6),
+                _mm256_permute2x128_si256::<0x20>(u3, u7),
+                _mm256_permute2x128_si256::<0x31>(u0, u4),
+                _mm256_permute2x128_si256::<0x31>(u1, u5),
+                _mm256_permute2x128_si256::<0x31>(u2, u6),
+                _mm256_permute2x128_si256::<0x31>(u3, u7),
+            ]
+        }
+    }
+
+    /// The quads of group `g` of eight rows, rows in lanes.
+    ///
+    /// # Safety
+    /// AVX2 is available; every row holds group `g` (16 bytes at `16g`).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn group_of_eight(rows: &[&[u8]], g: usize) -> [__m256i; 8] {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let mut unpacked = [_mm256_setzero_si256(); 8];
+            for (slot, row) in unpacked.iter_mut().zip(rows) {
+                *slot = unpack_row(row.as_ptr().add(g * GROUP_BYTES));
+            }
+            transpose8(unpacked)
+        }
+    }
+
+    /// Checks shared by the block kernels: `width` rows of the same length,
+    /// and buffers for every group and entity.
     fn check(
-        packed: &[u8],
-        digits: &[i8],
+        rows: &[&[u8]],
+        quads: &[i32],
         offsets: &[i32],
-        blocks: usize,
+        entities: usize,
         s: &[i32],
         width: usize,
     ) -> usize {
-        let groups = packed.len() / GROUP_BYTES;
-        let stride = blocks * width;
+        let groups = rows.first().map_or(0, |row| row.len() / GROUP_BYTES);
         assert!(
-            digits.len() >= groups * QUADS * stride * 4
-                && offsets.len() >= groups * stride
-                && s.len() >= groups * stride,
-            "x86 INT4 row kernel: short digit, offset or sum buffer"
+            rows.len() == width
+                && rows.iter().all(|row| row.len() == groups * GROUP_BYTES)
+                && quads.len() >= groups * entities * QUADS
+                && offsets.len() >= groups * entities
+                && s.len() >= groups * entities * width,
+            "x86 INT4 block kernel: bad block or short buffer"
         );
         groups
     }
 
-    /// One row's group sums, eight entities per block, AVX2: `vpmaddubsw`
-    /// (unsigned weights by signed digits, exact pair sums) then `vpmaddwd`
-    /// by ones; the offset sums are subtracted.
-    pub(super) fn row_avx2(
-        packed: &[u8],
-        digits: &[i8],
+    /// Eight rows per block, AVX2: `vpmaddubsw` (unsigned weights by signed
+    /// digits, exact pair sums), `vpmaddwd` by ones, then the offset sums
+    /// subtracted.
+    pub(super) fn block_avx2(
+        rows: &[&[u8]],
+        quads: &[i32],
         offsets: &[i32],
-        blocks: usize,
+        entities: usize,
         s: &mut [i32],
     ) {
-        let groups = check(packed, digits, offsets, blocks, s, 8);
+        let groups = check(rows, quads, offsets, entities, s, 8);
         // SAFETY: `project_tokens` runs this kernel only when the CPU has
-        // AVX2; every access is inside the buffers `check` bounded.
-        unsafe { row_avx2_inner(packed, digits, offsets, blocks, s, groups) }
+        // AVX2; `check` bounded every access.
+        unsafe { block_avx2_inner(rows, quads, offsets, entities, s, groups) }
     }
 
     #[target_feature(enable = "avx2")]
-    unsafe fn row_avx2_inner(
-        packed: &[u8],
-        digits: &[i8],
+    unsafe fn block_avx2_inner(
+        rows: &[&[u8]],
+        quads: &[i32],
         offsets: &[i32],
-        blocks: usize,
+        entities: usize,
         s: &mut [i32],
         groups: usize,
     ) {
-        // SAFETY: see `row_avx2`.
+        // SAFETY: see `block_avx2`.
         unsafe {
-            let (stride, step) = (blocks * 8, blocks * 32);
             let ones = _mm256_set1_epi16(1);
             for g in 0..groups {
-                let quads = unpack_unsigned(packed.as_ptr().add(g * GROUP_BYTES));
-                let mut weights = [_mm256_setzero_si256(); 8];
-                for (w, &quad) in weights.iter_mut().zip(&quads) {
-                    *w = _mm256_set1_epi32(quad as i32);
-                }
-                for b in 0..blocks {
-                    let base = digits.as_ptr().add((g * QUADS * blocks + b) * 32);
+                let w = group_of_eight(rows, g);
+                for e in 0..entities {
+                    let base = (g * entities + e) * QUADS;
                     let mut acc = _mm256_setzero_si256();
-                    for (q, &w) in weights.iter().enumerate() {
-                        let c = _mm256_loadu_si256(base.add(q * step).cast());
-                        let pairs = _mm256_maddubs_epi16(w, c);
-                        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(pairs, ones));
+                    for (q, &wq) in w.iter().enumerate() {
+                        let c = _mm256_set1_epi32(quads[base + q]);
+                        acc = _mm256_add_epi32(
+                            acc,
+                            _mm256_madd_epi16(_mm256_maddubs_epi16(wq, c), ones),
+                        );
                     }
-                    let at = g * stride + b * 8;
-                    let offset = _mm256_loadu_si256(offsets.as_ptr().add(at).cast());
-                    _mm256_storeu_si256(
-                        s.as_mut_ptr().add(at).cast(),
-                        _mm256_sub_epi32(acc, offset),
-                    );
+                    let acc = _mm256_sub_epi32(acc, _mm256_set1_epi32(offsets[g * entities + e]));
+                    _mm256_storeu_si256(s.as_mut_ptr().add((g * entities + e) * 8).cast(), acc);
                 }
             }
         }
     }
 
-    /// As [`row_avx2`] with the 256-bit `vpdpbusd` of AVX-VNNI.
-    pub(super) fn row_vnni256(
-        packed: &[u8],
-        digits: &[i8],
+    /// As [`block_avx2`] with the 256-bit `vpdpbusd` of AVX-VNNI.
+    pub(super) fn block_vnni256(
+        rows: &[&[u8]],
+        quads: &[i32],
         offsets: &[i32],
-        blocks: usize,
+        entities: usize,
         s: &mut [i32],
     ) {
-        let groups = check(packed, digits, offsets, blocks, s, 8);
+        let groups = check(rows, quads, offsets, entities, s, 8);
         // SAFETY: `project_tokens` runs this kernel only when the CPU has
-        // AVX2 and AVX-VNNI; every access is inside the buffers `check`
-        // bounded.
-        unsafe { row_vnni256_inner(packed, digits, offsets, blocks, s, groups) }
+        // AVX2 and AVX-VNNI; `check` bounded every access.
+        unsafe { block_vnni256_inner(rows, quads, offsets, entities, s, groups) }
     }
 
     #[target_feature(enable = "avx2,avxvnni")]
-    unsafe fn row_vnni256_inner(
-        packed: &[u8],
-        digits: &[i8],
+    unsafe fn block_vnni256_inner(
+        rows: &[&[u8]],
+        quads: &[i32],
         offsets: &[i32],
-        blocks: usize,
+        entities: usize,
         s: &mut [i32],
         groups: usize,
     ) {
-        // SAFETY: see `row_vnni256`.
+        // SAFETY: see `block_vnni256`.
         unsafe {
-            let (stride, step) = (blocks * 8, blocks * 32);
             for g in 0..groups {
-                let quads = unpack_unsigned(packed.as_ptr().add(g * GROUP_BYTES));
-                let mut weights = [_mm256_setzero_si256(); 8];
-                for (w, &quad) in weights.iter_mut().zip(&quads) {
-                    *w = _mm256_set1_epi32(quad as i32);
-                }
-                for b in 0..blocks {
-                    let base = digits.as_ptr().add((g * QUADS * blocks + b) * 32);
+                let w = group_of_eight(rows, g);
+                for e in 0..entities {
+                    let base = (g * entities + e) * QUADS;
                     let mut acc = _mm256_setzero_si256();
-                    for (q, &w) in weights.iter().enumerate() {
-                        let c = _mm256_loadu_si256(base.add(q * step).cast());
-                        acc = _mm256_dpbusd_avx_epi32(acc, w, c);
+                    for (q, &wq) in w.iter().enumerate() {
+                        acc = _mm256_dpbusd_avx_epi32(acc, wq, _mm256_set1_epi32(quads[base + q]));
                     }
-                    let at = g * stride + b * 8;
-                    let offset = _mm256_loadu_si256(offsets.as_ptr().add(at).cast());
-                    _mm256_storeu_si256(
-                        s.as_mut_ptr().add(at).cast(),
-                        _mm256_sub_epi32(acc, offset),
-                    );
+                    let acc = _mm256_sub_epi32(acc, _mm256_set1_epi32(offsets[g * entities + e]));
+                    _mm256_storeu_si256(s.as_mut_ptr().add((g * entities + e) * 8).cast(), acc);
                 }
             }
         }
     }
 
-    /// One row's group sums, sixteen entities per block, with the 512-bit
-    /// `vpdpbusd` of AVX-512 VNNI.
-    pub(super) fn row_vnni512(
-        packed: &[u8],
-        digits: &[i8],
+    /// Sixteen rows per block, with the 512-bit `vpdpbusd` of AVX-512 VNNI.
+    pub(super) fn block_vnni512(
+        rows: &[&[u8]],
+        quads: &[i32],
         offsets: &[i32],
-        blocks: usize,
+        entities: usize,
         s: &mut [i32],
     ) {
-        let groups = check(packed, digits, offsets, blocks, s, 16);
+        let groups = check(rows, quads, offsets, entities, s, 16);
         // SAFETY: `project_tokens` runs this kernel only when the CPU has
-        // AVX-512F and AVX-512 VNNI; every access is inside the buffers
-        // `check` bounded.
-        unsafe { row_vnni512_inner(packed, digits, offsets, blocks, s, groups) }
+        // AVX-512F and AVX-512 VNNI; `check` bounded every access.
+        unsafe { block_vnni512_inner(rows, quads, offsets, entities, s, groups) }
     }
 
     #[target_feature(enable = "avx512f,avx512vnni")]
-    unsafe fn row_vnni512_inner(
-        packed: &[u8],
-        digits: &[i8],
+    unsafe fn block_vnni512_inner(
+        rows: &[&[u8]],
+        quads: &[i32],
         offsets: &[i32],
-        blocks: usize,
+        entities: usize,
         s: &mut [i32],
         groups: usize,
     ) {
-        // SAFETY: see `row_vnni512`.
+        // SAFETY: see `block_vnni512`.
         unsafe {
-            let (stride, step) = (blocks * 16, blocks * 64);
             for g in 0..groups {
-                let quads = unpack_unsigned(packed.as_ptr().add(g * GROUP_BYTES));
-                let mut weights = [_mm512_setzero_si512(); 8];
-                for (w, &quad) in weights.iter_mut().zip(&quads) {
-                    *w = _mm512_set1_epi32(quad as i32);
+                let low = group_of_eight(&rows[..8], g);
+                let high = group_of_eight(&rows[8..16], g);
+                let mut w = [_mm512_setzero_si512(); 8];
+                for ((slot, &l), &h) in w.iter_mut().zip(&low).zip(&high) {
+                    *slot = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(l), h);
                 }
-                for b in 0..blocks {
-                    let base = digits.as_ptr().add((g * QUADS * blocks + b) * 64);
+                for e in 0..entities {
+                    let base = (g * entities + e) * QUADS;
                     let mut acc = _mm512_setzero_si512();
-                    for (q, &w) in weights.iter().enumerate() {
-                        let c = _mm512_loadu_si512(base.add(q * step).cast());
-                        acc = _mm512_dpbusd_epi32(acc, w, c);
+                    for (q, &wq) in w.iter().enumerate() {
+                        acc = _mm512_dpbusd_epi32(acc, wq, _mm512_set1_epi32(quads[base + q]));
                     }
-                    let at = g * stride + b * 16;
-                    let offset = _mm512_loadu_si512(offsets.as_ptr().add(at).cast());
-                    _mm512_storeu_si512(
-                        s.as_mut_ptr().add(at).cast(),
-                        _mm512_sub_epi32(acc, offset),
-                    );
+                    let acc = _mm512_sub_epi32(acc, _mm512_set1_epi32(offsets[g * entities + e]));
+                    _mm512_storeu_si512(s.as_mut_ptr().add((g * entities + e) * 16).cast(), acc);
                 }
             }
         }
@@ -1091,13 +1208,7 @@ pub(crate) mod tests {
             (24, 2048),
         ] {
             let (packed, scales) = matrix(&mut rng, rows, cols);
-            let view = Q4View {
-                rows,
-                cols,
-                q4: &packed,
-                scales: &scales,
-                table: None,
-            };
+            let view = Q4View::new(rows, cols, &packed, &scales);
             for k in [1, 2, 3, 5, 8, 16, 17] {
                 for bits in [8, 20, 30] {
                     let xs = activations(&mut rng, cols, k, bits);
@@ -1136,13 +1247,7 @@ pub(crate) mod tests {
         let _restore = KernelRestore;
         let mut rng = Rng(0x0004_C0DE_0000_0002);
         let (packed, scales) = matrix(&mut rng, 9, 64);
-        let view = Q4View {
-            rows: 9,
-            cols: 64,
-            q4: &packed,
-            scales: &scales,
-            table: None,
-        };
+        let view = Q4View::new(9, 64, &packed, &scales);
         let mut xs = activations(&mut rng, 64, 3, 20);
         xs[1][17] = LIMB_MAX + 1;
         use_pin(Q4Pin::Scalar);
