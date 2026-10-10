@@ -20,7 +20,17 @@ class ObserverSourceTests(unittest.TestCase):
         self.source.parent.mkdir(parents=True)
         self.canonical = b'fn value() -> i32 {\n    17\n}\n'
         self.source.write_bytes(self.canonical)
-        self.git('add', MODEL_PATH)
+        self.extra_paths = ('crates/arc-inference/src/modern/mla/ops.rs',
+                            'crates/arc-inference/src/canonical_simd.rs',
+                            'scripts/arc_mla/make_tiny_kimi_packed.py',
+                            'scripts/arc_mla/make_tiny_mla_model.py',
+                            'scripts/arc_conformance/mla_moe_reference.py',
+                            'scripts/arc_conformance/modern_reference.py')
+        for name in self.extra_paths:
+            path = self.engine/name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(self.canonical)
+        self.git('add', '.')
         self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
                  'commit', '-qm', 'immutable test source')
         self.revision = self.git('rev-parse', 'HEAD').decode().strip()
@@ -35,7 +45,8 @@ class ObserverSourceTests(unittest.TestCase):
 
     def test_clean_lf_and_real_crlf_checkout_preserve_blob_identity(self):
         lf = self.verify()
-        self.source.unlink()
+        for name in (MODEL_PATH, *self.extra_paths):
+            (self.engine/name).unlink()
         self.git('checkout-index', '-a')
         self.assertEqual(self.source.read_bytes(), self.canonical.replace(b'\n', b'\r\n'))
         self.assertNotEqual(self.source.read_bytes(), self.observer.read_bytes())  # old guard fails
@@ -43,6 +54,8 @@ class ObserverSourceTests(unittest.TestCase):
         self.assertEqual(crlf['observer_sha256'], crlf['git_blob_sha256'])
         self.assertEqual(lf['git_blob_sha256'], crlf['git_blob_sha256'])
         self.assertNotEqual(crlf['worktree_sha256'], crlf['git_blob_sha256'])
+        self.assertEqual(crlf['source_file_count'], 1 + len(self.extra_paths))
+        self.assertTrue(all(v['checkout_form'] == 'crlf' for v in crlf['source_files'].values()))
 
     def test_substantive_unstaged_and_staged_source_mutation_rejected(self):
         self.source.write_bytes(self.canonical.replace(b'17', b'18').replace(b'\n', b'\r\n'))
@@ -55,6 +68,43 @@ class ObserverSourceTests(unittest.TestCase):
     def test_index_hint_cannot_hide_substantive_worktree_mutation(self):
         self.git('update-index', '--assume-unchanged', MODEL_PATH)
         self.source.write_bytes(self.canonical.replace(b'17', b'18'))
+        with self.assertRaisesRegex(ValueError, 'beyond checkout line endings'):
+            self.verify()
+
+    def test_hidden_nonmodel_and_generator_edits_rejected(self):
+        for flag in ('assume-unchanged', 'skip-worktree'):
+            for name in self.extra_paths:
+                with self.subTest(flag=flag, path=name):
+                    path = self.engine/name
+                    self.git('update-index', '--'+flag, name)
+                    path.write_bytes(self.canonical.replace(b'17', b'18'))
+                    # Demonstrate the index-based guard cannot see this change.
+                    self.git('diff', '--quiet', self.revision)
+                    with self.assertRaisesRegex(ValueError, 'beyond checkout line endings'):
+                        self.verify()
+                    path.write_bytes(self.canonical)
+                    self.git('update-index', '--no-'+flag, name)
+
+    def test_nonmodel_and_generator_staged_edits_rejected(self):
+        for name in self.extra_paths:
+            with self.subTest(path=name):
+                path = self.engine/name
+                path.write_bytes(self.canonical.replace(b'17', b'18'))
+                self.git('add', name)
+                # Restoring the worktree must not hide a staged alteration.
+                path.write_bytes(self.canonical)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.verify()
+                self.git('add', name)
+
+    def test_hidden_missing_file_and_mixed_eol_rejected(self):
+        name = self.extra_paths[0]
+        path = self.engine/name
+        self.git('update-index', '--assume-unchanged', name)
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, 'missing/nonregular'):
+            self.verify()
+        path.write_bytes(self.canonical.replace(b'\n', b'\r\n', 1))
         with self.assertRaisesRegex(ValueError, 'beyond checkout line endings'):
             self.verify()
 

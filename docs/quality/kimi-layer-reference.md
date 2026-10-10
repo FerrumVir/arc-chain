@@ -146,7 +146,8 @@ control, three routed experts, nonzero shared outputs, official MoE combination
 with one **and two** shared experts, nibble -8/zero-scale decoding, model/input/
 scope/position/depth mismatches, missing/reordered layer/row/routing captures,
 nonfinite values, package/source corruption and no-output CLI rejection. The
-69 existing harness tests (including certification/budget/McNemar and host-evidence controls) remain unchanged.
+72-test harness includes the source-coverage regressions alongside unchanged
+certification/budget/McNemar and host-evidence controls.
 
 ## Real-weight follow-up: not admitted or executed
 
@@ -340,9 +341,13 @@ The immutable observer is `-text` and keeps committed LF bytes. The engine's
 Rust file uses ordinary Git text handling and Windows may check it out as CRLF.
 The guard compares the observer with `git cat-file blob <exact-pin>:<path>`,
 not platform-transformed worktree bytes. It still requires the exact HEAD and
-a clean staged/unstaged inference source and fixture-generator tree. Compiled
-model worktree bytes must additionally equal the pinned LF blob or its exact
-LF-to-CRLF checkout form, independent of Git index hints. Observer
+a clean staged/unstaged inference source and fixture-generator tree. Every
+tracked file in the inference crate, MLA fixture scripts and their
+`arc_conformance` imports is enumerated from the pinned Git tree and read
+independently of index hints. Text must equal the pinned bytes or the exact
+LF-to-CRLF checkout form; binary and already-CRLF blobs must match exactly.
+Separate worktree and cached diffs reject staged changes, including a changed
+index whose worktree has been restored. Observer
 bytes are never newline-normalized; build.rs still requires the original exact
 SHA-256. Substantive source/observer edits, staged edits and wrong pins reject.
 
@@ -352,3 +357,29 @@ identity. Tests create real Git LF/CRLF checkouts and exercise mutations. This
 repairs a checkout-representation mismatch, not engine arithmetic. The corrected
 #168 dependency changes only its historical tiny-model caller; all production
 source and the observer source hash are unchanged.
+
+### Source coverage repair
+
+`source_identity.SOURCE_SCOPES` covers all tracked files under
+`crates/arc-inference`, `scripts/arc_mla` and `scripts/arc_conformance` at the
+existing `be0438e4` pin (138 files, 2,418,911 canonical bytes). The whole inference
+crate includes non-MLA kernels, loaders, CLI, build/manifest and checked-in
+fixtures. The entire MLA script tree includes both tiny generators. The
+conformance tree covers `make_tiny_kimi_packed`'s quantizer import and its
+`modern_reference` dependency, rather than trusting only the entry script.
+
+The inventory comes from `git ls-tree <pin>`, and batched object reads use those
+immutable blob IDs. Each worktree file is independently read and compared;
+assume-unchanged, skip-worktree, timestamps and index caches cannot omit it.
+Missing/nonregular tracked entries fail. The exact immutable observer comparison
+is unchanged. `engine-source.json` records every covered path and both hashes.
+These facts are outside package/capture identities. This is scoped tracked-source
+validation, not a hermetic build or attestation of installed Python packages,
+Cargo registry dependencies, other workspace crates, untracked files or binaries.
+The isolated lock and executable digests remain separate provenance controls.
+
+Regressions cover hidden ops/SIMD Rust edits, both generators and their two
+reference modules under assume-unchanged and skip-worktree; staged changes with
+a restored worktree; missing files; exact LF/CRLF acceptance; mixed-line-ending
+rejection; and unchanged observer/wrong-pin controls. Arithmetic, dependency pin,
+precision policy and historical package identities are unchanged.
