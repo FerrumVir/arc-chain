@@ -4844,18 +4844,21 @@ impl CachedIntegerModel {
     /// - one or two rows never pay, so send those through
     ///   [`Self::forward_shard_token`].
     ///
-    /// CPUs with matrix extensions run cheaper multi-row kernels
-    /// ([`crate::canonical_simd::BatchedKernel`]). Measured the same way for
-    /// k = 1 to 64 (bench run 38025683929), per row against one-row calls:
+    /// CPUs with matrix extensions run cheaper kernels
+    /// ([`crate::canonical_simd::BatchedKernel`]), for one-row calls too.
+    /// Measured the same way for k = 1 to 64 (bench run 38030963937), with
+    /// each kernel's own one-row calls as the baseline:
     ///
-    /// - SMMLA (i8mm, Neoverse-N2): 0.31 at k = 2, 0.15 at k = 8 and 0.13 to
-    ///   0.14 from k = 16 to 64. One row runs SDOT and does not pay;
-    /// - AVX-512 VNNI (AMD EPYC 9V45): 0.51 at k = 1, 0.28 at k = 2, 0.15 at
-    ///   k = 8 and 0.13 to 0.14 from k = 16 to 64;
-    /// - AVX-VNNI on the same CPU: 0.57 at k = 1, 0.31 at k = 2 and 0.17 to
-    ///   0.18 from k = 8 to 64.
+    /// - SMMLA (i8mm, Neoverse-N2): a one-row call takes about 150 ms against
+    ///   345 ms on SDOT. Per row, a k-row call costs 0.72 of it at k = 2, 0.31
+    ///   at k = 8 and 0.28 from k = 16 to 64 (42 to 46 ms from k = 8);
+    /// - AVX-512 VNNI (Intel Xeon Platinum 8573C): a one-row call takes about
+    ///   295 ms against 680 ms on AVX2; 0.59 at k = 2, 0.28 at k = 8 and 0.22
+    ///   to 0.27 from k = 16 to 64 (66 to 84 ms from k = 8);
+    /// - AVX-VNNI on the same CPU: about 320 ms per one-row call; 0.56 at
+    ///   k = 2, 0.30 at k = 8 and 0.23 to 0.27 from k = 16 to 64.
     ///
-    /// With these kernels a call pays from two rows, and from one with VNNI.
+    /// With these kernels a call pays from two rows.
     ///
     /// Canonical per-row I8 only: any other profile is refused, so the caller
     /// falls back to one-row calls. A refusal leaves `cache` unchanged.
