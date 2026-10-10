@@ -156,7 +156,9 @@ const SCRIPTS: [Script; 7] = [
 struct Scripted<'a> {
     script: Script,
     reference: &'a [u32],
-    expected: Box<dyn Fn(&[u32]) -> Vec<u32> + 'a>,
+    model: &'a CachedIntegerModel,
+    semantics: ExactSemantics,
+    prompt: &'a [u32],
     vocab: u32,
     calls: usize,
 }
@@ -181,7 +183,7 @@ impl TokenDrafter for Scripted<'_> {
         );
         assert_eq!(
             stream,
-            (self.expected)(generated).as_slice(),
+            expected_stream(self.model, self.semantics, self.prompt, generated).as_slice(),
             "the drafter was not shown the exact prefix"
         );
         if self.script == Script::FailsSecond && self.calls >= 2 {
@@ -268,9 +270,9 @@ fn check(
     let mut scripted = script.map(|script| Scripted {
         script,
         reference: &reference.0,
-        expected: Box::new(move |generated: &[u32]| {
-            expected_stream(model, semantics, prompt, generated)
-        }),
+        model,
+        semantics,
+        prompt,
         vocab: u32::try_from(model.config.vocab_size).expect("small vocabulary"),
         calls: 0,
     });
@@ -504,9 +506,9 @@ fn golden_draft_verify_leaves_plain_decodings_cache() {
                 let mut drafter = Scripted {
                     script,
                     reference: &reference.0,
-                    expected: Box::new(|generated: &[u32]| {
-                        expected_stream(&model, semantics, &prompt, generated)
-                    }),
+                    model: &model,
+                    semantics,
+                    prompt: &prompt,
                     vocab: 23,
                     calls: 0,
                 };
