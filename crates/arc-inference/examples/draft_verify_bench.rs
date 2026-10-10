@@ -21,7 +21,12 @@
 //!
 //! usage: draft_verify_bench --model GGUF --drafter PATH --drafter-model GGUF
 //!        [--profile legacy|interleaved] [--kernel scalar|simd]
-//!        [--max-new-tokens N] [--cap K] [--out FILE.json] [--summary FILE.md]
+//!        [--max-new-tokens N] [--configs CAP[:MARGIN],...] [--out FILE.json]
+//!        [--summary FILE.md]
+//!
+//! `--configs 7,31,31:0.25` runs the drafter three ways: draft cap 7, cap 31,
+//! and cap 31 with a 0.25-logit margin floor. The first is also run on the
+//! stage splits.
 
 use arc_inference::cached_integer_model::{
     CachedIntegerModel, load_cached_model_canonical_i8,
@@ -89,7 +94,7 @@ struct Args {
     profile: String,
     kernel: String,
     max_new_tokens: u32,
-    cap: usize,
+    configs: Vec<(usize, f32)>,
     out: Option<String>,
     summary: Option<String>,
 }
@@ -102,7 +107,7 @@ fn parse_args() -> Result<Args, String> {
         profile: "legacy".into(),
         kernel: "simd".into(),
         max_new_tokens: 128,
-        cap: DraftPolicy::MEASURED.cap,
+        configs: vec![(7, 0.0)],
         out: None,
         summary: None,
     };
@@ -118,7 +123,20 @@ fn parse_args() -> Result<Args, String> {
             "--max-new-tokens" => {
                 args.max_new_tokens = value()?.parse().map_err(|e| format!("{e}"))?;
             }
-            "--cap" => args.cap = value()?.parse().map_err(|e| format!("{e}"))?,
+            "--configs" => {
+                args.configs = value()?
+                    .split(',')
+                    .filter(|item| !item.is_empty())
+                    .map(|item| -> Result<(usize, f32), String> {
+                        let (cap, margin) = item.split_once(':').unwrap_or((item, "0"));
+                        let cap = cap.parse().map_err(|e| format!("config {item:?}: {e}"))?;
+                        let margin = margin
+                            .parse()
+                            .map_err(|e| format!("config {item:?}: {e}"))?;
+                        Ok((cap, margin))
+                    })
+                    .collect::<Result<_, String>>()?;
+            }
             "--out" => args.out = Some(value()?),
             "--summary" => args.summary = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
@@ -157,6 +175,7 @@ fn stats_json(stats: &DraftStats) -> Value {
         "rows_verified": stats.rows_verified,
         "rows_rolled_back": stats.rows_rolled_back,
         "drafter_errors": stats.drafter_errors,
+        "margin_stops": stats.margin_stops,
         "draft_lengths": stats.draft_lengths,
         "prefill_s": seconds(stats.prefill_nanos),
         "draft_s": seconds(stats.draft_nanos),
@@ -167,6 +186,7 @@ fn stats_json(stats: &DraftStats) -> Value {
 /// One run's report, and whether it equals the reference.
 fn run_json(
     name: &str,
+    stages: usize,
     output: &DraftOutput,
     reference: &(Vec<u32>, String),
     drafter_micros: u64,
@@ -179,11 +199,14 @@ fn run_json(
     (
         json!({
             "run": name,
+            "stages": stages,
             "identical": identical,
             "tokens": output.tokens.len(),
             "output_hash": hash,
             "decode_tok_s": rate(output.tokens.len(), decode_nanos),
             "tokens_per_step": if steps == 0 { 0.0 } else { output.tokens.len() as f64 / steps as f64 },
+            "tokens_per_pass": if stats.passes == 0 { 0.0 } else { (output.tokens.len() - stats.plain_steps) as f64 / stats.passes as f64 },
+            "rows_per_token": if output.tokens.is_empty() { 0.0 } else { stats.rows_verified as f64 / output.tokens.len() as f64 },
             "acceptance": if stats.drafted == 0 { 0.0 } else { stats.accepted as f64 / stats.drafted as f64 },
             "drafter_reported_s": drafter_micros as f64 / 1e6,
             "stats": stats_json(stats),
@@ -238,18 +261,34 @@ fn main() -> Result<(), String> {
     let drafter_load_s = drafter_started.elapsed().as_secs_f64();
     println!("drafter {} ready in {drafter_load_s:.0} s", drafter.label());
 
-    let policy = DraftPolicy {
-        cap: args.cap,
-        ..DraftPolicy::MEASURED
-    };
-    let whole = DraftVerifyConfig {
-        semantics: ExactSemantics::Worker,
-        stage_ends: vec![n_layers],
-        policy,
-    };
+    let drafted: Vec<(String, DraftVerifyConfig)> = args
+        .configs
+        .iter()
+        .map(|&(cap, min_margin)| {
+            let name = if min_margin > 0.0 {
+                format!("cap {cap}, margin {min_margin}")
+            } else {
+                format!("cap {cap}")
+            };
+            let policy = DraftPolicy {
+                cap,
+                min_margin,
+                ..DraftPolicy::MEASURED
+            };
+            (
+                name,
+                DraftVerifyConfig {
+                    semantics: ExactSemantics::Worker,
+                    stage_ends: vec![n_layers],
+                    policy,
+                },
+            )
+        })
+        .collect();
+    let (first_name, first) = drafted.first().cloned().ok_or("--configs is empty")?;
     let plain_config = DraftVerifyConfig {
         policy: DraftPolicy::OFF,
-        ..whole.clone()
+        ..first.clone()
     };
     let splits = [
         vec![n_layers / 2, n_layers],
@@ -288,23 +327,19 @@ fn main() -> Result<(), String> {
             &plain_config,
         )
         .map_err(|e| e.to_string())?;
-        let (plain_report, same) = run_json("plain", &plain, &reference, 0);
+        let (plain_report, same) = run_json("plain", 1, &plain, &reference, 0);
         all_identical &= same;
         println!("plain: {plain_report}");
         runs.push(plain_report);
 
-        let mut configs = vec![("drafted", whole.clone())];
+        let mut configs = drafted.clone();
         if kind != previous_category {
             for ends in &splits {
                 configs.push((
-                    if ends.len() == 2 {
-                        "drafted, 2 stages"
-                    } else {
-                        "drafted, 4 stages"
-                    },
+                    first_name.clone(),
                     DraftVerifyConfig {
                         stage_ends: ends.clone(),
-                        ..whole.clone()
+                        ..first.clone()
                     },
                 ));
             }
@@ -322,13 +357,14 @@ fn main() -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?;
             let (report, same) = run_json(
-                name,
+                &name,
+                config.stage_ends.len(),
                 &output,
                 &reference,
                 drafter.reported_micros() - before,
             );
             all_identical &= same;
-            println!("{name}: {report}");
+            println!("{name}, {} stage(s): {report}", config.stage_ends.len());
             runs.push(report);
         }
         reports.push(json!({
@@ -349,7 +385,8 @@ fn main() -> Result<(), String> {
         "kernel": args.kernel,
         "rayon_threads": rayon::current_num_threads(),
         "max_new_tokens": args.max_new_tokens,
-        "policy": { "min": policy.min, "start": policy.start, "cap": policy.cap, "probe_after": policy.probe_after },
+        "configs": drafted.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
+        "policy": { "min": DraftPolicy::MEASURED.min, "start": DraftPolicy::MEASURED.start, "probe_after": DraftPolicy::MEASURED.probe_after },
         "load_s": load_s,
         "drafter_load_s": drafter_load_s,
         "all_identical": all_identical,
@@ -373,66 +410,109 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-/// Per-category totals: tokens over decode seconds, so long outputs weigh more.
+/// Per drafted configuration, whole model, totalled over the prompts: tokens
+/// over decode seconds, so long outputs weigh more.
 fn markdown(report: &Value) -> String {
-    let mut out = format!(
-        "{} profile, kernel {}, up to {} new tokens, draft policy {}. MEASURED on a CI runner.\n\n\
-         | category | prompts | tokens | plain tok/s | drafted tok/s | speedup | tokens/step | acceptance | drafter s | verifier s | drafter share | identical |\n\
-         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
-        report["profile"].as_str().unwrap_or("?"),
-        report["kernel"].as_str().unwrap_or("?"),
-        report["max_new_tokens"],
-        report["policy"],
-    );
+    let f = |v: &Value| v.as_f64().unwrap_or(0.0);
     let prompts = report["prompts"].as_array().cloned().unwrap_or_default();
-    let mut categories: Vec<&str> = Vec::new();
+    let configs: Vec<String> = report["configs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.as_str().map(str::to_string))
+        .collect();
+    let mut categories: Vec<String> = Vec::new();
     for p in &prompts {
-        let kind = p["category"].as_str().unwrap_or("?");
+        let kind = p["category"].as_str().unwrap_or("?").to_string();
         if !categories.contains(&kind) {
             categories.push(kind);
         }
     }
-    categories.push("all");
-    for kind in categories {
-        let mut n = 0;
-        let (mut tokens, mut plain_s, mut drafted_s, mut draft_s, mut verify_s) =
-            (0.0, 0.0, 0.0, 0.0, 0.0);
-        let (mut steps, mut drafted, mut accepted) = (0.0, 0.0, 0.0);
-        let mut identical = true;
+    let all_identical = prompts
+        .iter()
+        .flat_map(|p| p["runs"].as_array().cloned().unwrap_or_default())
+        .all(|run| run["identical"].as_bool().unwrap_or(false));
+    let mut out = format!(
+        "{} profile, kernel {}, up to {} new tokens, {} prompts. Every run identical to try_generate (whole model and stage splits): {all_identical}. MEASURED on a CI runner.\n\n\
+         | config | tokens | tok/s | vs plain | tokens/pass | tokens/step | rows per committed token | wasted rows | acceptance | margin stops | drafter s | verifier s | drafter share |\n\
+         |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        report["profile"].as_str().unwrap_or("?"),
+        report["kernel"].as_str().unwrap_or("?"),
+        report["max_new_tokens"],
+        prompts.len(),
+    );
+    // (tokens, seconds) of plain decoding, per category and in all.
+    let plain = |category: Option<&str>| -> (f64, f64) {
+        let mut acc = (0.0, 0.0);
         for p in prompts
             .iter()
-            .filter(|p| kind == "all" || p["category"].as_str() == Some(kind))
+            .filter(|p| category.is_none_or(|c| p["category"].as_str() == Some(c)))
         {
-            n += 1;
             for run in p["runs"].as_array().into_iter().flatten() {
-                identical &= run["identical"].as_bool().unwrap_or(false);
-                let s = &run["stats"];
-                let f = |v: &Value| v.as_f64().unwrap_or(0.0);
-                match run["run"].as_str() {
-                    Some("plain") => plain_s += f(&s["verify_s"]),
-                    Some("drafted") => {
-                        tokens += f(&run["tokens"]);
-                        drafted_s += f(&s["draft_s"]) + f(&s["verify_s"]);
-                        draft_s += f(&s["draft_s"]);
-                        verify_s += f(&s["verify_s"]);
-                        steps += f(&s["passes"]) + f(&s["plain_steps"]);
-                        drafted += f(&s["drafted"]);
-                        accepted += f(&s["accepted"]);
-                    }
-                    _ => {}
+                if run["run"].as_str() == Some("plain") {
+                    acc.0 += f(&run["tokens"]);
+                    acc.1 += f(&run["stats"]["verify_s"]);
                 }
             }
         }
-        let ratio = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
+        acc
+    };
+    let drafted = |config: &str, category: Option<&str>| -> Vec<Value> {
+        prompts
+            .iter()
+            .filter(|p| category.is_none_or(|c| p["category"].as_str() == Some(c)))
+            .flat_map(|p| p["runs"].as_array().cloned().unwrap_or_default())
+            .filter(|run| run["run"].as_str() == Some(config) && run["stages"].as_u64() == Some(1))
+            .collect()
+    };
+    let ratio = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
+    let (plain_tokens, plain_s) = plain(None);
+    out.push_str(&format!(
+        "| plain | {plain_tokens:.0} | {:.2} | 1.00x | | | 1.00 | 0 | | | | {plain_s:.1} | |\n",
+        ratio(plain_tokens, plain_s)
+    ));
+    for config in &configs {
+        let runs = drafted(config, None);
+        let sum = |key: &str| -> f64 { runs.iter().map(|r| f(&r["stats"][key])).sum() };
+        let tokens: f64 = runs.iter().map(|r| f(&r["tokens"])).sum();
+        let (draft_s, verify_s) = (sum("draft_s"), sum("verify_s"));
+        let (passes, plain_steps) = (sum("passes"), sum("plain_steps"));
         out.push_str(&format!(
-            "| {kind} | {n} | {tokens:.0} | {:.2} | {:.2} | {:.2}x | {:.2} | {:.0}% | {draft_s:.1} | {verify_s:.1} | {:.0}% | {identical} |\n",
-            ratio(tokens, plain_s),
-            ratio(tokens, drafted_s),
-            ratio(plain_s, drafted_s),
-            ratio(tokens, steps),
-            100.0 * ratio(accepted, drafted),
-            100.0 * ratio(draft_s, drafted_s),
+            "| {config} | {tokens:.0} | {:.2} | {:.2}x | {:.2} | {:.2} | {:.2} | {:.0} | {:.0}% | {:.0} | {draft_s:.1} | {verify_s:.1} | {:.0}% |\n",
+            ratio(tokens, draft_s + verify_s),
+            ratio(plain_s, draft_s + verify_s),
+            ratio(tokens - plain_steps, passes),
+            ratio(tokens, passes + plain_steps),
+            ratio(sum("rows_verified"), tokens),
+            sum("rows_rolled_back"),
+            100.0 * ratio(sum("accepted"), sum("drafted")),
+            sum("margin_stops"),
+            100.0 * ratio(draft_s, draft_s + verify_s),
         ));
+    }
+    out.push_str("\nSpeed against plain decoding per category:\n\n| config |");
+    for category in &categories {
+        out.push_str(&format!(" {category} |"));
+    }
+    out.push_str("\n|---|");
+    for _ in &categories {
+        out.push_str("---:|");
+    }
+    out.push('\n');
+    for config in &configs {
+        out.push_str(&format!("| {config} |"));
+        for category in &categories {
+            let runs = drafted(config, Some(category));
+            let seconds: f64 = runs
+                .iter()
+                .map(|r| f(&r["stats"]["draft_s"]) + f(&r["stats"]["verify_s"]))
+                .sum();
+            out.push_str(&format!(
+                " {:.2}x |",
+                ratio(plain(Some(category)).1, seconds)
+            ));
+        }
+        out.push('\n');
     }
     out
 }

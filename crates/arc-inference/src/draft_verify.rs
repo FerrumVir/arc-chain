@@ -47,24 +47,43 @@ pub enum ExactSemantics {
     V2,
 }
 
+/// What the verifier asks a drafter for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DraftRequest<'a> {
+    /// Every token the verifier has consumed, in order, followed by the
+    /// pending token it consumes next; the proposals are for the tokens it
+    /// emits after that.
+    pub stream: &'a [u32],
+    /// The output so far, which is ARC's repetition-penalty history.
+    pub generated: &'a [u32],
+    /// Propose at most this many tokens.
+    pub max_draft: usize,
+    /// Stop after the first proposal whose margin is below this (0 never
+    /// stops early). The verifier drops that proposal and decides the
+    /// position itself.
+    pub min_margin: f32,
+}
+
+/// A drafter's proposals.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Proposal {
+    pub tokens: Vec<u32>,
+    /// The drafter's margin at each proposal, its first choice's logit minus
+    /// its second's, or empty when it does not know them.
+    pub margins: Vec<f32>,
+}
+
 /// Proposes tokens to follow an exact prefix.
 pub trait TokenDrafter {
     /// Short stable name for logs and reports.
     fn label(&self) -> &str;
 
-    /// Propose up to `max_draft` tokens to follow `stream`.
-    ///
-    /// `stream` is every token the verifier has consumed, in order, followed
-    /// by the pending token it consumes next; the proposals are for the tokens
-    /// it emits after that. `generated` is the output so far, which is ARC's
-    /// repetition-penalty history. Proposals beyond `max_draft`, and any token
-    /// outside the vocabulary with everything after it, are ignored.
-    fn propose(
-        &mut self,
-        stream: &[u32],
-        generated: &[u32],
-        max_draft: usize,
-    ) -> Result<Vec<u32>, DraftError>;
+    /// Propose up to `request.max_draft` tokens to follow `request.stream`.
+    /// Proposals beyond `max_draft`, any token outside the vocabulary with
+    /// everything after it, and (when `min_margin` is above 0) the first
+    /// proposal whose margin is below it with everything after it are
+    /// ignored.
+    fn propose(&mut self, request: &DraftRequest<'_>) -> Result<Proposal, DraftError>;
 }
 
 /// Never proposes anything: every step is plain exact decoding.
@@ -76,8 +95,8 @@ impl TokenDrafter for NoDrafter {
         "none"
     }
 
-    fn propose(&mut self, _: &[u32], _: &[u32], _: usize) -> Result<Vec<u32>, DraftError> {
-        Ok(Vec::new())
+    fn propose(&mut self, _: &DraftRequest<'_>) -> Result<Proposal, DraftError> {
+        Ok(Proposal::default())
     }
 }
 
@@ -99,13 +118,17 @@ impl std::error::Error for DraftError {}
 /// `cap`); after a miss it shrinks to `(k - 1) / 2` (at least `min`). A pass
 /// at `min` that matches nothing switches drafting off for `probe_after`
 /// plain steps, then the next pass tries `min` again; `probe_after == 0`
-/// never switches it off.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// never switches it off. With `min_margin` above 0, a draft also ends before
+/// the first proposal whose margin (the drafter's first-choice logit minus its
+/// second) is below it: the verifier decides that near-tie position itself,
+/// so no rows are spent after a likely miss.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DraftPolicy {
     pub min: usize,
     pub start: usize,
     pub cap: usize,
     pub probe_after: usize,
+    pub min_margin: f32,
 }
 
 impl DraftPolicy {
@@ -115,6 +138,7 @@ impl DraftPolicy {
         start: 0,
         cap: 0,
         probe_after: 0,
+        min_margin: 0.0,
     };
 
     /// Quad-aligned lengths from 3 to 31. The cap comes from the measured
@@ -127,6 +151,7 @@ impl DraftPolicy {
         start: 3,
         cap: 31,
         probe_after: 16,
+        min_margin: 0.0,
     };
 
     /// Always `k` drafts per pass, never switched off.
@@ -136,6 +161,7 @@ impl DraftPolicy {
             start: k,
             cap: k,
             probe_after: 0,
+            min_margin: 0.0,
         }
     }
 }
@@ -201,6 +227,8 @@ pub struct DraftStats {
     pub rows_verified: usize,
     pub rows_rolled_back: usize,
     pub drafter_errors: usize,
+    /// Passes whose draft ended before a proposal below the margin floor.
+    pub margin_stops: usize,
     /// Passes per number of drafts verified.
     pub draft_lengths: BTreeMap<usize, usize>,
     pub prefill_nanos: u64,
@@ -274,7 +302,7 @@ impl From<ShardRowsError> for DraftVerifyError {
 }
 
 /// One generation's settings.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DraftVerifyConfig {
     pub semantics: ExactSemantics,
     /// The exclusive end layer of every verifier stage, in order; the last is
@@ -455,15 +483,31 @@ impl<'m> Verifier<'m> {
     fn ask(&mut self, drafter: &mut dyn TokenDrafter, pending: u32, want: usize) -> Vec<u32> {
         let started = Instant::now();
         self.stream.push(pending);
-        let proposed = drafter.propose(&self.stream, &self.generated, want);
+        let min_margin = self.length.policy.min_margin;
+        let proposed = drafter.propose(&DraftRequest {
+            stream: &self.stream,
+            generated: &self.generated,
+            max_draft: want,
+            min_margin,
+        });
         self.stream.pop();
         self.stats.draft_nanos += elapsed_nanos(started);
         match proposed {
-            Ok(mut drafts) => {
+            Ok(proposal) => {
+                let mut drafts = proposal.tokens;
                 drafts.truncate(want);
                 let vocab = self.model.config.vocab_size;
                 if let Some(bad) = drafts.iter().position(|&t| t as usize >= vocab) {
                     drafts.truncate(bad);
+                }
+                if min_margin > 0.0
+                    && proposal.margins.len() >= drafts.len()
+                    && let Some(unsure) = proposal.margins[..drafts.len()]
+                        .iter()
+                        .position(|&m| m < min_margin)
+                {
+                    drafts.truncate(unsure);
+                    self.stats.margin_stops += 1;
                 }
                 drafts
             }
@@ -671,21 +715,16 @@ impl TokenDrafter for ProcessDrafter {
         &self.label
     }
 
-    fn propose(
-        &mut self,
-        stream: &[u32],
-        generated: &[u32],
-        max_draft: usize,
-    ) -> Result<Vec<u32>, DraftError> {
-        let request = draft_request(stream, generated, max_draft);
+    fn propose(&mut self, request: &DraftRequest<'_>) -> Result<Proposal, DraftError> {
+        let line = draft_request(request);
         self.stdin
-            .write_all(request.as_bytes())
+            .write_all(line.as_bytes())
             .and_then(|()| self.stdin.flush())
             .map_err(|e| DraftError(format!("writing to the drafter: {e}")))?;
-        let line = self.read_line()?;
-        let (micros, tokens) = parse_draft_reply(&line, max_draft)?;
+        let reply = self.read_line()?;
+        let (micros, proposal) = parse_draft_reply(&reply, request.max_draft)?;
         self.reported_micros += micros;
-        Ok(tokens)
+        Ok(proposal)
     }
 }
 
@@ -699,9 +738,16 @@ impl Drop for ProcessDrafter {
 }
 
 /// The request line for [`ProcessDrafter`].
-pub fn draft_request(stream: &[u32], generated: &[u32], max_draft: usize) -> String {
-    let mut line = String::with_capacity(24 + 7 * (stream.len() + generated.len()));
-    let _ = write!(line, "PROPOSE {max_draft} {}", stream.len());
+pub fn draft_request(request: &DraftRequest<'_>) -> String {
+    let (stream, generated) = (request.stream, request.generated);
+    let mut line = String::with_capacity(32 + 7 * (stream.len() + generated.len()));
+    let _ = write!(
+        line,
+        "PROPOSE {} {} {}",
+        request.max_draft,
+        request.min_margin,
+        stream.len()
+    );
     for token in stream {
         let _ = write!(line, " {token}");
     }
@@ -714,22 +760,30 @@ pub fn draft_request(stream: &[u32], generated: &[u32], max_draft: usize) -> Str
 }
 
 /// Parses a reply line from a [`ProcessDrafter`]: the reported compute
-/// microseconds and the proposed tokens.
-pub fn parse_draft_reply(line: &str, max_draft: usize) -> Result<(u64, Vec<u32>), DraftError> {
+/// microseconds and the proposals: `OK <micros> <count> <tokens...>`,
+/// optionally followed by one margin per token.
+pub fn parse_draft_reply(line: &str, max_draft: usize) -> Result<(u64, Proposal), DraftError> {
     let bad = || DraftError(format!("bad drafter reply: {:.80}", line.trim_end()));
     let mut words = line.split_ascii_whitespace();
     match words.next() {
         Some("OK") => {
             let micros: u64 = words.next().and_then(|w| w.parse().ok()).ok_or_else(bad)?;
             let count: usize = words.next().and_then(|w| w.parse().ok()).ok_or_else(bad)?;
-            let tokens: Vec<u32> = words
-                .map(str::parse)
-                .collect::<Result<_, _>>()
-                .map_err(|_| bad())?;
-            if tokens.len() != count || count > max_draft {
+            let rest: Vec<&str> = words.collect();
+            if count > max_draft || (rest.len() != count && rest.len() != 2 * count) {
                 return Err(bad());
             }
-            Ok((micros, tokens))
+            let tokens: Vec<u32> = rest[..count]
+                .iter()
+                .map(|w| w.parse())
+                .collect::<Result<_, _>>()
+                .map_err(|_| bad())?;
+            let margins: Vec<f32> = rest[count..]
+                .iter()
+                .map(|w| w.parse())
+                .collect::<Result<_, _>>()
+                .map_err(|_| bad())?;
+            Ok((micros, Proposal { tokens, margins }))
         }
         Some("ERR") => Err(DraftError(format!(
             "the drafter refused: {:.200}",
@@ -805,22 +859,40 @@ mod tests {
 
     #[test]
     fn draft_protocol_round_trips() {
-        assert_eq!(
-            draft_request(&[1, 2, 3], &[9], 4),
-            "PROPOSE 4 3 1 2 3 1 9\n"
-        );
-        assert_eq!(draft_request(&[1], &[], 2), "PROPOSE 2 1 1 0\n");
+        let request = DraftRequest {
+            stream: &[1, 2, 3],
+            generated: &[9],
+            max_draft: 4,
+            min_margin: 0.25,
+        };
+        assert_eq!(draft_request(&request), "PROPOSE 4 0.25 3 1 2 3 1 9\n");
+        let request = DraftRequest {
+            stream: &[1],
+            generated: &[],
+            max_draft: 2,
+            min_margin: 0.0,
+        };
+        assert_eq!(draft_request(&request), "PROPOSE 2 0 1 1 0\n");
+        let proposal = |tokens: Vec<u32>, margins: Vec<f32>| Proposal { tokens, margins };
         assert_eq!(
             parse_draft_reply("OK 120 2 5 6\n", 4),
-            Ok((120, vec![5, 6]))
+            Ok((120, proposal(vec![5, 6], Vec::new())))
         );
-        assert_eq!(parse_draft_reply("OK 0 0\n", 4), Ok((0, Vec::new())));
+        assert_eq!(
+            parse_draft_reply("OK 120 2 5 6 1.5 0.125\n", 4),
+            Ok((120, proposal(vec![5, 6], vec![1.5, 0.125])))
+        );
+        assert_eq!(
+            parse_draft_reply("OK 0 0\n", 4),
+            Ok((0, Proposal::default()))
+        );
         for bad in [
             "",
             "OK",
             "OK 1",
             "OK 1 2 5",
-            "OK 1 1 5 6",
+            "OK 1 1 5 6 7",
+            "OK 1 1 5 x",
             "OK x 1 5",
             "OK 1 5 1 2 3 4 5",
             "NO 1 1 1",

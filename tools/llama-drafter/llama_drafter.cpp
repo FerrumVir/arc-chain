@@ -2,16 +2,19 @@
 //
 // Speaks ProcessDrafter's line protocol on stdin/stdout:
 //   start:   prints "READY <n_vocab>"
-//   request: "PROPOSE <max_draft> <n> <stream...> <m> <generated...>"
+//   request: "PROPOSE <max_draft> <min_margin> <n> <stream...> <m> <generated...>"
 //            stream = every token the verifier consumed, then the pending token
-//   reply:   "OK <micros> <count> <tokens...>" or "ERR <reason>"
+//   reply:   "OK <micros> <count> <tokens...> <margins...>" or "ERR <reason>"
+//            margin = first choice's logit minus the second's, after the penalty
 //   "QUIT" exits.
 //
 // It keeps one KV cache, reuses its longest common prefix with each new
 // stream and drops the rest, then proposes greedily from the stream's last
 // position. Each choice applies ARC's own repetition penalty first (every
 // occurrence among the last 64 generated or drafted tokens: positive logits
-// x5/6, others x6/5) and takes the first maximum, as ARC's worker does. The
+// x5/6, others x6/5) and takes the first maximum, as ARC's worker does. It
+// stops after the first proposal whose margin is below min_margin, so no time
+// is spent drafting past a near-tie the verifier will decide itself. The
 // verifier checks every proposal exactly, so nothing here affects ARC's
 // output, only how many drafts it accepts.
 //
@@ -21,6 +24,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -91,7 +95,7 @@ struct Drafter {
     }
 
     std::string propose(const std::vector<llama_token> & stream, const std::vector<llama_token> & generated,
-                        size_t max_draft) {
+                        size_t max_draft, float min_margin) {
         if (stream.empty()) {
             return "ERR empty stream";
         }
@@ -119,6 +123,7 @@ struct Drafter {
 
         std::vector<llama_token> history = generated;
         std::vector<llama_token> drafts;
+        std::vector<float> margins;
         std::vector<float> logits((size_t) n_vocab);
         for (size_t i = 0; i < max_draft; ++i) {
             const float * row = llama_get_logits_ith(ctx, -1);
@@ -128,9 +133,17 @@ struct Drafter {
             logits.assign(row, row + n_vocab);
             arc_penalty(logits, history);
             const llama_token next = (llama_token) argmax_first(logits);
+            float second = -INFINITY;
+            for (int t = 0; t < n_vocab; ++t) {
+                if (t != next && logits[(size_t) t] > second) {
+                    second = logits[(size_t) t];
+                }
+            }
+            const float margin = logits[(size_t) next] - second;
             drafts.push_back(next);
+            margins.push_back(margin);
             history.push_back(next);
-            if (llama_vocab_is_eog(vocab, next) || i + 1 == max_draft) {
+            if (llama_vocab_is_eog(vocab, next) || i + 1 == max_draft || margin < min_margin) {
                 break;
             }
             std::vector<llama_token> one = cached;
@@ -144,6 +157,11 @@ struct Drafter {
         out << drafts.size();
         for (llama_token t : drafts) {
             out << ' ' << t;
+        }
+        char buf[32];
+        for (float m : margins) {
+            std::snprintf(buf, sizeof(buf), " %.4f", m);
+            out << buf;
         }
         return out.str();
     }
@@ -216,14 +234,16 @@ int main(int argc, char ** argv) {
             continue;
         }
         long max_draft = -1;
+        float min_margin = 0.0f;
         std::vector<llama_token> stream, generated;
-        if (!(in >> max_draft) || max_draft < 0 || !read_tokens(in, stream) || !read_tokens(in, generated)) {
+        if (!(in >> max_draft >> min_margin) || max_draft < 0 || !read_tokens(in, stream) ||
+            !read_tokens(in, generated)) {
             std::printf("ERR malformed request\n");
             std::fflush(stdout);
             continue;
         }
         const auto started = std::chrono::steady_clock::now();
-        const std::string reply = d.propose(stream, generated, (size_t) max_draft);
+        const std::string reply = d.propose(stream, generated, (size_t) max_draft, min_margin);
         const long long micros = std::chrono::duration_cast<std::chrono::microseconds>(
                                      std::chrono::steady_clock::now() - started)
                                      .count();

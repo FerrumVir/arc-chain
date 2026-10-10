@@ -45,12 +45,14 @@ env:
   # Release b11534, the version the agreement experiment measured.
   LLAMA_CPP_COMMIT: 50e3e3e480c80b9ee0ea067e475602d540dc62c8
   MAX_NEW_TOKENS: "128"
-  # Largest draft length. Run 38024682881 used 31, the cap from llama.cpp's
-  # measured run lengths, and verified 1.5 rows per committed token: on CPU a
-  # 16- or 32-row pass costs more per committed token than a plain step. 7 is
-  # where #185's measured row costs (bench run 37998031423) and the measured
-  # agreement give the most tokens per verifier second.
-  DRAFT_CAP: "7"
+  # Drafted configurations, CAP[:MARGIN]. Cap 31 is the cap from llama.cpp's
+  # measured run lengths; cap 7 is where #185's measured row costs (bench run
+  # 37998031423) and the measured agreement give the most tokens per verifier
+  # second (bench runs 38024682881 and 38029847057). The margin floors end a
+  # draft before llama.cpp's first near-tie, where 55% of its proposals below a
+  # 0.25-logit margin miss (agreement study run 38024838399). The first
+  # configuration also runs on the 2- and 4-stage splits.
+  DRAFT_CONFIGS: "7,31,31:0.05,31:0.25,31:0.5"
 
 jobs:
   bench:
@@ -64,7 +66,7 @@ jobs:
       group: draft-verify-bench-${{ github.event.pull_request.number || github.ref }}-${{ matrix.runner }}-${{ matrix.profile }}
       cancel-in-progress: true
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -160,7 +162,7 @@ jobs:
         run: cargo build --locked --release -p arc-inference --features candle --example draft_verify_bench
 
       - name: Run plain and drafted decoding
-        timeout-minutes: 140
+        timeout-minutes: 200
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/draft-verify-bench"
@@ -174,7 +176,7 @@ jobs:
             --profile "$PROFILE" \
             --kernel simd \
             --max-new-tokens "$MAX_NEW_TOKENS" \
-            --cap "$DRAFT_CAP" \
+            --configs "$DRAFT_CONFIGS" \
             --out "$out/result.json" \
             --summary "$out/summary.md" 2>&1 | tee "$out/bench.log" || status=$?
           if [ -f "$out/summary.md" ]; then

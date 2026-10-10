@@ -11,8 +11,8 @@ use crate::cached_integer_model::{
 };
 use crate::canonical_simd;
 use crate::draft_verify::{
-    DraftError, DraftPolicy, DraftVerifyConfig, DraftVerifyError, ExactSemantics, NoDrafter,
-    TokenDrafter, Verifier, generate_with_drafter,
+    DraftError, DraftPolicy, DraftRequest, DraftVerifyConfig, DraftVerifyError, ExactSemantics,
+    NoDrafter, Proposal, TokenDrafter, Verifier, generate_with_drafter,
 };
 use std::sync::MutexGuard;
 
@@ -168,12 +168,8 @@ impl TokenDrafter for Scripted<'_> {
         "scripted"
     }
 
-    fn propose(
-        &mut self,
-        stream: &[u32],
-        generated: &[u32],
-        max_draft: usize,
-    ) -> Result<Vec<u32>, DraftError> {
+    fn propose(&mut self, request: &DraftRequest<'_>) -> Result<Proposal, DraftError> {
+        let (stream, generated, max_draft) = (request.stream, request.generated, request.max_draft);
         self.calls += 1;
         assert!(max_draft > 0, "asked for no drafts");
         assert_eq!(
@@ -208,11 +204,22 @@ impl TokenDrafter for Scripted<'_> {
                 }
             })
             .collect();
+        // A calibrated drafter: confident where it is right, near a tie where
+        // it is wrong. The overlong script reports no margins at all.
+        let mut margins: Vec<f32> = drafts
+            .iter()
+            .zip(continuation)
+            .map(|(draft, right)| if draft == right { 2.0 } else { 0.1 })
+            .collect();
         if self.script == Script::Overlong {
             drafts.insert(1.min(drafts.len()), self.vocab);
             drafts.extend([0, 1, 2]);
+            margins.clear();
         }
-        Ok(drafts)
+        Ok(Proposal {
+            tokens: drafts,
+            margins,
+        })
     }
 }
 
@@ -229,6 +236,11 @@ fn policies() -> Vec<DraftPolicy> {
             start: 1,
             cap: 15,
             probe_after: 2,
+            min_margin: 0.0,
+        },
+        DraftPolicy {
+            min_margin: 0.5,
+            ..DraftPolicy::MEASURED
         },
     ]
 }
@@ -329,6 +341,12 @@ fn check(
         }
         _ => {}
     }
+    if policy.min_margin > 0.0 && script.is_some() {
+        assert_eq!(
+            stats.accepted, stats.drafted,
+            "{case}: a calibrated drafter's near-ties were verified: {stats:?}"
+        );
+    }
     if policy == DraftPolicy::OFF {
         assert_eq!(stats.passes, 0, "{case}: {stats:?}");
         assert_eq!(
@@ -388,7 +406,12 @@ fn golden_draft_verify_equals_plain_decoding() {
                 // pass can stop inside an accepted run.
                 let eos = [reference.0[reference.0.len() / 2]];
                 let stopped = plain(&model, semantics, &long, &eos);
-                for policy in [DraftPolicy::fixed(3), DraftPolicy::MEASURED, policies()[6]] {
+                for policy in [
+                    DraftPolicy::fixed(3),
+                    DraftPolicy::MEASURED,
+                    policies()[6],
+                    policies()[7],
+                ] {
                     for script in [
                         Script::Right,
                         Script::Mixed(1),
@@ -566,11 +589,11 @@ fn golden_draft_verify_process_drafter_round_trip() {
     use crate::draft_verify::ProcessDrafter;
     use std::process::Command;
 
-    // Proposes [5, 6], or [5] when asked for one token.
+    // Proposes [5, 6] with margins [1.5, 0.1], or [5] when asked for one.
     let script = "echo 'READY 23'\n\
         while read -r cmd max rest; do\n\
           case \"$cmd\" in\n\
-            PROPOSE) if [ \"$max\" -ge 2 ]; then echo 'OK 7 2 5 6'; else echo 'OK 7 1 5'; fi ;;\n\
+            PROPOSE) if [ \"$max\" -ge 2 ]; then echo 'OK 7 2 5 6 1.5 0.1'; else echo 'OK 7 1 5 1.5'; fi ;;\n\
             QUIT) exit 0 ;;\n\
             *) echo 'ERR unknown request' ;;\n\
           esac\n\
@@ -593,6 +616,25 @@ fn golden_draft_verify_process_drafter_round_trip() {
     assert_eq!(output.stats.drafter_errors, 0);
     assert!(output.stats.passes > 0);
     assert_eq!(drafter.reported_micros(), 7 * output.stats.passes as u64);
+
+    // With a margin floor of 0.5 every draft ends before the 0.1 proposal.
+    let config = DraftVerifyConfig {
+        policy: DraftPolicy {
+            min_margin: 0.5,
+            ..DraftPolicy::fixed(2)
+        },
+        ..config
+    };
+    let output = generate_with_drafter(&model, &prompt, MAX_TOKENS, &[], &mut drafter, &config)
+        .expect("the run completes");
+    assert_eq!(output.tokens, reference.0);
+    assert_eq!(hex::encode(output.output_hash.0), reference.1);
+    assert!(output.stats.margin_stops > 0, "{:?}", output.stats);
+    assert_eq!(
+        output.stats.drafted, output.stats.passes,
+        "{:?}",
+        output.stats
+    );
 
     let refused = ProcessDrafter::spawn(Command::new("/bin/sh").arg("-c").arg(script), "sh", 32000);
     assert!(refused.is_err(), "a vocabulary mismatch must be refused");
